@@ -36,7 +36,7 @@ import { provideScrollState } from '../../components/chat/scrollStateHandle';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { threadScrollKey } from '../savedScroll';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { archiveThreadCount, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedPane, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT } from '../store';
+import { archiveThreadCount, focusedPane, focusedThreadId, generatedTitleIds, mobileView, threadDrawerOpen, threadMap, threadsLoaded, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT } from '../store';
 import { _resetThreadOpenMarksForTesting, takeThreadOpenStart } from '../../utils/threadOpenMarks';
 import { closeDashboardSheet, dashboardSheetOpen, openDashboardSheet } from '../dashboards';
 import { loadAllThreads, loadThreadEvents } from './thread-loading';
@@ -87,7 +87,6 @@ beforeEach(() => {
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
-  resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
   _resetRowIntentsForTesting();
   focusedPane.value = 'thread';
@@ -430,43 +429,6 @@ describe('unfocusThread', () => {
     } finally {
       (globalThis as any).innerWidth = origWidth;
     }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Per-thread CC preferences — reset on thread switch
-// ---------------------------------------------------------------------------
-
-describe('CC pending preferences reset on thread switch', () => {
-  it('focusThread resets pending CC model and reasoning effort', () => {
-    codingAgentPendingModel.value = 'opus';
-    codingAgentPendingReasoningEffort.value = 'max';
-
-    focusThread('t1');
-
-    expect(codingAgentPendingModel.value).toBeNull();
-    expect(codingAgentPendingReasoningEffort.value).toBeNull();
-  });
-
-  it('switching between threads resets pending preferences', () => {
-    focusThread('t1');
-    codingAgentPendingModel.value = 'sonnet';
-    codingAgentPendingReasoningEffort.value = 'low';
-
-    focusThread('t2');
-
-    expect(codingAgentPendingModel.value).toBeNull();
-    expect(codingAgentPendingReasoningEffort.value).toBeNull();
-  });
-
-  it('unfocusThread resets pending CC preferences (compose view starts fresh)', () => {
-    codingAgentPendingModel.value = 'opus';
-    codingAgentPendingReasoningEffort.value = 'max';
-
-    unfocusThread();
-
-    expect(codingAgentPendingModel.value).toBeNull();
-    expect(codingAgentPendingReasoningEffort.value).toBeNull();
   });
 });
 

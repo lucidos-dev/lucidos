@@ -692,15 +692,21 @@ export async function pickRung(page: Page, value: string): Promise<void> {
   await pickerStepSettled(row);
   await row.click();
   await expect(page.locator('.control-dropdown:visible')).toHaveCount(0, { timeout: 5_000 });
+  await answerRungSwitchIfAsked(page, 2_000);
+}
+
+/** Choose to switch this thread when a rung pick asks what to do with its
+ *  cache. The question waits on an estimate, so a slow run can ask after
+ *  `pickRung` returned; a caller waiting on the pick calls this again. */
+export async function answerRungSwitchIfAsked(page: Page, timeout: number): Promise<void> {
   const confirm = page.locator('.confirm-dialog');
-  const asked = await confirm.waitFor({ state: 'visible', timeout: 2_000 }).then(() => true, () => false);
-  if (asked) {
-    const { switchHereLabel, switchLabel } = rungSwitchCopy({ from: '', to: '', extraCostUsd: null, canHandOff: true });
-    const switchThread = confirm.getByRole('button', { name: switchHereLabel })
-      .or(confirm.getByRole('button', { name: switchLabel, exact: true }));
-    await switchThread.click();
-    await expect(confirm).toHaveCount(0, { timeout: 5_000 });
-  }
+  const asked = await confirm.waitFor({ state: 'visible', timeout }).then(() => true, () => false);
+  if (!asked) return;
+  const { switchHereLabel, switchLabel } = rungSwitchCopy({ from: '', to: '', extraCostUsd: null, canHandOff: true });
+  const switchThread = confirm.getByRole('button', { name: switchHereLabel })
+    .or(confirm.getByRole('button', { name: switchLabel, exact: true }));
+  await switchThread.click();
+  await expect(confirm).toHaveCount(0, { timeout: 5_000 });
 }
 
 /** Click a content-header action by its ACTION class (`.file-edit-btn`,

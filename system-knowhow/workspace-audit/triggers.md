@@ -66,6 +66,14 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
 - **A trigger script that reaches the workspace database through libpq defaults.** The `scripts` section owns the check and its fix (`system-knowhow/workspace-audit/scripts.md`, the `db-defaults` scan). Its scan covers `data/triggers/**/scripts/**` too. Report those hits once, under the trigger. Severity: **broken**, since each fire now fails to connect.
 
+- **A trigger relying on knowhow a plugin removed, with no warning on record.** An update or uninstall now records its *affected triggers* and warns each fire (`system-knowhow/plugins.md` § "Affected triggers"). Two cases escape it: a removal from before that, and a trigger made after the removal. Find them by hand:
+
+  ```bash
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "SELECT e.event_type, e.aggregate_id, f FROM events e, jsonb_array_elements_text(coalesce(e.payload->'data'->'files_removed', e.payload->'data'->'files_deleted', '[]')) f WHERE e.event_type IN ('PluginInstalled', 'PluginUninstalled') AND e.payload->'data'->'affected_triggers' IS NULL"
+  ```
+
+  Keep each path still missing under `data/`. For each live trigger, report a kept path its `run.intent` or script path names, or knowhow under its own `apps/<app_id>/knowhow/` or `triggers/<slug>/knowhow/`. Skip triggers that plugin owns. Severity: **stale**, since each fire runs without its recipe. Fix per `system-knowhow/triggers.md` § "Know-how a plugin removed".
+
 - **Old-form `tap` strings.** The field was a four-string union and is now a discriminated union object. The engine rejects the strings with `400 Bad Request` at write time. Grep every code-bearing surface in the root's § "What to walk": trigger scripts, app code (`ui/`, `*.html`, inline `<script>`), shared scripts, and fenced `python` / `bash` / `js` / `ts` blocks in knowhow. Skip `data/artifacts/` and `data/postgres/`, which hold no code that calls the API.
 
   Match each form whatever its quotes. The key is bare (`tap:` in JS, TS) or quoted (`"tap":` or `'tap':` in Python, shell, JSON bodies). The value takes either quote, and JSON inside a string escapes both (`\"tap\": \"modal\"`):

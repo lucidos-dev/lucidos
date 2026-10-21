@@ -177,19 +177,6 @@ impl LucidosEngine {
                                 match engine.claim_thread_for_spawn(thread_id, None).await {
                                     Ok(Some(claim)) => break Ok(claim),
                                     Err(e) => break Err(e),
-                                    Ok(None) if continue_reason.as_deref()
-                                        == Some(crate::engine::agent_recovery::EFFORT_RESTART_REASON) =>
-                                    {
-                                        // The live run started after the pick, so
-                                        // it already runs at the new effort, and
-                                        // its start delivered any discarded input.
-                                        crate::log!(
-                                            "[SpawnConsumer] Effort resume thread={} event={} found a live run, nothing to resume",
-                                            thread_id,
-                                            event_id
-                                        );
-                                        return;
-                                    }
                                     Ok(None) => {
                                         // A live run holds the thread, and reads
                                         // the input as a follow-up.
@@ -346,23 +333,13 @@ impl LucidosEngine {
                             //
                             // Try again after a start failure delivers the
                             // message the agent never read, with its images.
-                            // The effort resume delivers what the store says
-                            // the pick discarded. The agent saw nothing of it,
-                            // so the bare continue message would leave the
-                            // request lost. The first prompt carries the
-                            // inputs' ids, so its read settles them.
+                            // The first prompt carries the inputs' ids, so its
+                            // read settles them.
                             let undelivered = match continue_reason.as_deref() {
                                 Some(
                                     crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON,
                                 ) => {
                                     crate::engine::agent_recovery::undelivered_input(
-                                        engine.pool(),
-                                        thread_id,
-                                    )
-                                    .await
-                                }
-                                Some(crate::engine::agent_recovery::EFFORT_RESTART_REASON) => {
-                                    crate::engine::agent_recovery::discarded_input(
                                         engine.pool(),
                                         thread_id,
                                     )

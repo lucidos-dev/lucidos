@@ -40,6 +40,8 @@ function releaseCheckOf(
     latest: latest
       ? { version: '9.9.9', notes: null, install: null, command: null, ...latest }
       : null,
+    update_address: null,
+    update_address_error: null,
     ...over,
   };
 }

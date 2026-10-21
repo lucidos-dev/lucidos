@@ -9,6 +9,7 @@ import {
 import { describeSetupRunNote } from '../../utils/engineEventExplainers';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { NO_ENGINE_REQUIREMENT_SENTENCE } from './engineRequirement';
+import { AFFECTED_TRIGGERS_NEXT_RUN, AffectedTriggerList } from './AffectedTriggerList';
 import { PluginFileList } from './PluginFileList';
 import { PluginSection, pluginPanelHeader } from './PluginSection';
 import { ProposeUpstreamButton } from './ProposeUpstreamButton';
@@ -87,6 +88,7 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
   const replacedOutright = pathsWithoutOwnRow(req.overwrites, localChanges);
   const removedOutright = pathsWithoutOwnRow(req.removes ?? [], localChanges);
   const isUpdate = req.is_update === true;
+  const affected = req.affected_triggers ?? [];
 
   // The action fns resolve the panel themselves (into a receipt on success,
   // closed on failure), so busy normally never resets visibly. Reset in a
@@ -220,6 +222,15 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
           />
         )}
 
+        {affected.length > 0 && (
+          <AffectedTriggerList
+            label="Triggers that use these files"
+            triggers={affected}
+            tone="danger"
+            note={`These triggers are not part of this plugin, so the update leaves them as they are. ${AFFECTED_TRIGGERS_NEXT_RUN}`}
+          />
+        )}
+
         {newFiles.length > 0 && (
           <PluginFileList label="New files" files={newFiles} />
         )}
@@ -336,6 +347,14 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
 
         {(installed.removed_files ?? []).length > 0 && (
           <PluginFileList label="Files removed" files={installed.removed_files!} />
+        )}
+
+        {(installed.affected_triggers ?? []).length > 0 && (
+          <AffectedTriggerList
+            label="Triggers to check"
+            triggers={installed.affected_triggers!}
+            note={AFFECTED_TRIGGERS_NEXT_RUN}
+          />
         )}
 
         {req.setup && <SetupStepsSection setup={req.setup} request={req} />}

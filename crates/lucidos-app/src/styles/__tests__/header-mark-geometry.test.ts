@@ -597,37 +597,36 @@ describe('the nav chevrons are pinned to one shared span', () => {
   it('the chevrons and the mark cannot be squeezed by a long title', () => {
     const fixed = cssRules(markCss).find(r => r.selector.includes('.header-nav-cluster > .icon-btn'));
     expect(fixed?.props.get('flex')).toBe('0 0 auto');
-    expect(fixed?.selector).toContain('.header-nav-cluster > .header-mark-pair');
+    expect(fixed?.selector).toContain('.header-nav-cluster > .header-mark-group');
   });
 
-  it('the floor is the thread row\'s narrowest width, Home included', () => {
-    // A floor that leaves out Home lets the pair overflow the cluster on the
-    // floor arm, which pushes a chevron into an edge control.
+  it('the floor is the thread row\'s narrowest width, the whole group included', () => {
+    // A floor without Home or the dashboard toggle lets the group overflow
+    // the cluster on the floor arm. A chevron then hits an edge control.
     const floor = decl(block(markCss, ':root {'), '--header-nav-min-span') ?? '';
-    for (const term of ['--mobile-header-icon-box', '--header-mark-tap', '--header-nav-gap']) {
+    expect(floor, 'two chevrons, Home and the dashboard toggle').toContain('4 * var(--mobile-header-icon-box)');
+    for (const term of ['--header-mark-tap', '--header-nav-gap']) {
       expect(floor, `the floor must count ${term}`).toContain(`var(${term})`);
     }
-    // The pair gap is gone before the floor engages. Counting it would hold
-    // the chevrons apart for a gap that is not there.
-    expect(floor, 'the floor must not count the pair gap').not.toContain('--header-mark-pair-gap');
+    // The group gaps are gone before the floor engages. Counting them would
+    // hold the chevrons apart for gaps that are not there.
+    expect(floor, 'the floor must not count the group gap').not.toContain('--header-mark-group-gap');
   });
 
-  it('Home and the mark spread apart when there is room, and close up when there is not', () => {
-    // The pair asks for the max gap and is the one fixed-size member allowed to
-    // shrink, down to its children touching. Only with Home in it: the mark
-    // alone keeps the plain `0 0 auto`, so it stays on the axis.
-    const pair = cssRules(markCss)
-      .find(r => r.selector === '.header-nav-cluster > .header-mark-pair:has(> .home-thread-btn)');
-    expect(pair, 'the Home pair rule is gone').toBeDefined();
-    const flex = pair!.props.get('flex') ?? '';
+  it('the group centres the mark, spreads out when there is room, and closes up when there is not', () => {
+    const group = cssRules(markCss)
+      .filter(r => r.selector === '.header-nav-cluster > .header-mark-group')
+      .find(r => r.props.has('grid-template-columns'));
+    expect(group, 'the group rule is gone').toBeDefined();
+    // Equal side columns put the mark on the axis, with or without Home.
+    expect(group!.props.get('grid-template-columns')).toBe('1fr auto 1fr');
+    const flex = group!.props.get('flex') ?? '';
     expect(flex, 'it may shrink but never grow').toMatch(/^0 1 calc\(/);
-    for (const term of ['--mobile-header-icon-box', '--header-mark-tap', '--header-mark-pair-gap-max']) {
+    for (const term of ['--mobile-header-icon-box', '--header-mark-tap', '--header-mark-group-gap-max']) {
       expect(flex, `the basis must count ${term}`).toContain(`var(${term})`);
     }
-    expect(pair!.props.get('justify-content'), 'the free space goes between Home and the mark')
-      .toBe('space-between');
     const fixedGaps = cssRules(markCss)
-      .filter(r => r.selector.includes('.header-mark-pair') && r.props.has('gap'));
+      .filter(r => r.selector.includes('.header-mark-group') && r.props.has('gap'));
     expect(fixedGaps, 'a fixed gap cannot close up, and it would stack on the spread').toEqual([]);
   });
 });
@@ -665,7 +664,7 @@ describe('the nav chevrons reach past their button for a tap', () => {
     // on the reach would stay inside the button. The neighbours rise instead.
     expect(rule('.header-nav-cluster > .nav-chevron::before').get('z-index')).toBeUndefined();
     const inside = rule(
-      '.header-nav-cluster > .brand-mark-slot, .header-nav-cluster > .header-mark-pair, '
+      '.header-nav-cluster > .brand-mark-slot, .header-nav-cluster > .header-mark-group, '
       + '.header-title-cluster > .mobile-content-title',
     );
     expect(inside.get('position')).toBe('relative');

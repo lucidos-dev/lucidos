@@ -194,8 +194,8 @@ async function runAll([command, ...prefix], cwd) {
   if (!sessionId) throw new Error('the first turn reported no session id');
   const resumed = await run(['--model', 'haiku', '--print', '--resume', sessionId], [
     userTurn('Say exactly: "drift-two" and nothing else. Do not create any files.'),
-    // The engine never sends this one (CodingAgent::control_reach). It stays as
-    // a canary: the day the real CLI accepts it, the shapes differ.
+    // The engine sends neither of the next two: the rung locks for a turn
+    // (ADR 0542). They stay as canaries: the day the CLI changes, shapes differ.
     controlTurn('set_reasoning_effort', { effort: 'low' }),
     controlTurn('set_model', { model: 'haiku' }),
     controlTurn('interrupt'),

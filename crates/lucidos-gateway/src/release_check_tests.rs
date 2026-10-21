@@ -214,6 +214,20 @@ fn version_is_newer_compares_numerically_and_refuses_junk() {
 
 // ── The preference file ─────────────────────────────────────────────────────
 
+fn only_enabled(enabled: bool) -> UpdatesToml {
+    UpdatesToml {
+        enabled,
+        ..UpdatesToml::default()
+    }
+}
+
+fn with_address(address: &str) -> UpdatesToml {
+    UpdatesToml {
+        update_address: address.to_string(),
+        ..UpdatesToml::default()
+    }
+}
+
 #[test]
 fn a_missing_or_malformed_preference_defaults_to_enabled() {
     assert_eq!(parse_updates_toml(""), UpdatesToml::default());
@@ -238,19 +252,26 @@ fn a_file_carrying_the_removed_field_still_parses() {
     // The stale value that used to mean "polls nothing". It now polls, because
     // the field is gone and `enabled` defaults true.
     let never_answered = parse_updates_toml("[release_check]\nnotice_acknowledged = false\n");
-    assert_eq!(never_answered, UpdatesToml { enabled: true });
+    assert_eq!(never_answered, only_enabled(true));
 
     // An answered notice beside an explicit off switch keeps the off switch.
     let turned_off =
         parse_updates_toml("[release_check]\nenabled = false\nnotice_acknowledged = true\n");
-    assert_eq!(turned_off, UpdatesToml { enabled: false });
+    assert_eq!(turned_off, only_enabled(false));
 }
 
 #[test]
 fn render_then_parse_round_trips() {
     for cfg in [
-        UpdatesToml { enabled: false },
-        UpdatesToml { enabled: true },
+        only_enabled(false),
+        only_enabled(true),
+        with_address("http://127.0.0.1:5173/api/v1/data/artifacts/releases/rc/latest.json"),
+        UpdatesToml {
+            enabled: false,
+            update_address: r#"https://example.com/a "quoted" \ path"#.to_string(),
+        },
+        // A refused value survives a rewrite, so it stays visible until fixed.
+        with_address("http://example.com/latest.json"),
     ] {
         assert_eq!(parse_updates_toml(&render_updates_toml(&cfg)), cfg);
     }
@@ -260,11 +281,85 @@ fn render_then_parse_round_trips() {
 fn writing_the_preference_is_atomic_and_readable_back() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nested/updates.toml");
-    let cfg = UpdatesToml { enabled: false };
+    let cfg = only_enabled(false);
     write_updates_toml(Some(&path), &cfg).unwrap();
     assert_eq!(read_updates_toml(Some(&path)), cfg);
     // No temp file is left behind by the rename.
     assert!(!path.with_extension("toml.tmp").exists());
+}
+
+#[test]
+fn the_update_address_is_read_raw_and_judged_by_the_shared_rule() {
+    let cfg = parse_updates_toml(
+        "[release_check]\nupdate_address = \"http://localhost:5173/latest.json\"\n",
+    );
+    assert!(
+        cfg.enabled,
+        "naming only the address keeps the default switch"
+    );
+    assert_eq!(
+        cfg.address().unwrap().unwrap().as_str(),
+        "http://localhost:5173/latest.json"
+    );
+
+    // A hand-edited bad value is kept and refused, never dropped to default.
+    let bad = parse_updates_toml("[release_check]\nupdate_address = \"http://example.com/x\"\n");
+    assert_eq!(bad.update_address, "http://example.com/x");
+    assert!(bad.address().is_err());
+
+    // A value of the wrong type keeps the rest of the file, and is refused.
+    let typed = parse_updates_toml("[release_check]\nenabled = false\nupdate_address = 5\n");
+    assert!(!typed.enabled);
+    assert!(typed.address().is_err());
+}
+
+#[test]
+fn a_write_keeps_the_field_it_does_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let dep = deployment_in(dir.path(), true);
+    let config = dep.config_path.clone().unwrap();
+    let check = ReleaseCheck::with_origin(&dep, "http://127.0.0.1:9/x", POLL_INTERVAL);
+
+    check
+        .update_config(None, Some(" https://example.com/latest.json "))
+        .unwrap();
+    check.update_config(Some(false), None).unwrap();
+    let cfg = read_updates_toml(Some(&config));
+    assert!(!cfg.enabled);
+    assert_eq!(cfg.update_address, "https://example.com/latest.json");
+
+    check.update_config(Some(true), None).unwrap();
+    check.update_config(None, Some("")).unwrap();
+    assert_eq!(read_updates_toml(Some(&config)), only_enabled(true));
+}
+
+#[test]
+fn a_refused_address_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let dep = deployment_in(dir.path(), true);
+    let config = dep.config_path.clone().unwrap();
+    let check = ReleaseCheck::with_origin(&dep, "http://127.0.0.1:9/x", POLL_INTERVAL);
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    for bad in [
+        "http://example.com/latest.json",
+        "file:///tmp/latest.json",
+        "/tmp/x",
+    ] {
+        let err = check.update_config(Some(false), Some(bad)).unwrap_err();
+        assert!(matches!(err, ConfigWriteError::InvalidAddress(_)), "{bad}");
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+}
+
+#[test]
+fn a_set_address_is_logged_at_startup() {
+    assert_eq!(update_address_log_line(&UpdatesToml::default()), None);
+    let set = update_address_log_line(&with_address("https://example.com/latest.json")).unwrap();
+    assert!(set.contains("https://example.com/latest.json"), "{set}");
+    assert!(set.contains("not the published release"), "{set}");
+    let refused = update_address_log_line(&with_address("http://example.com/x")).unwrap();
+    assert!(refused.contains("refused"), "{refused}");
 }
 
 #[test]
@@ -327,7 +422,7 @@ pub(crate) async fn origin_serving(response: String, delay: Duration) -> Origin 
 /// An installed deployment whose preference lives in `dir`.
 pub(crate) fn deployment_in(dir: &Path, enabled: bool) -> Deployment {
     let config = dir.join("updates.toml");
-    write_updates_toml(Some(&config), &UpdatesToml { enabled }).unwrap();
+    write_updates_toml(Some(&config), &only_enabled(enabled)).unwrap();
     Deployment {
         packaged: true,
         exe: Some(dir.join("runtime/lucidos-1.2.3-host/lucidos-gateway")),
@@ -570,7 +665,7 @@ async fn the_preference_is_re_read_on_every_tick() {
     check.refresh(false).await;
     assert_eq!(origin.requests(), 1);
 
-    write_updates_toml(Some(&config), &UpdatesToml { enabled: false }).unwrap();
+    write_updates_toml(Some(&config), &only_enabled(false)).unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
     let snapshot = check.refresh(false).await;
 
@@ -649,4 +744,143 @@ async fn an_installer_install_is_offered_a_command_and_a_bundle_is_not() {
     assert_eq!(snapshot["latest"]["install"], "desktop-app");
     // The client installs a bundle, so there is no command to copy.
     assert_eq!(snapshot["latest"]["command"], serde_json::Value::Null);
+}
+
+// ── The update address ──────────────────────────────────────────────────────
+
+fn set_address(dep: &Deployment, address: &str) {
+    write_updates_toml(dep.config_path.as_deref(), &with_address(address)).unwrap();
+}
+
+#[tokio::test]
+async fn a_set_address_is_fetched_as_a_plain_latest_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = origin_serving(http_ok(r#"{"version":"98.0.0"}"#), Duration::ZERO).await;
+    let rc = origin_serving(
+        http_ok(r#"{"version":"99.0.0","notes":"rc","platforms":{}}"#),
+        Duration::ZERO,
+    )
+    .await;
+    let dep = deployment_in(dir.path(), true);
+    let address = rc
+        .url
+        .replace("/api/update-check", "/releases/rc/latest.json");
+    set_address(&dep, &address);
+    let check = ReleaseCheck::with_origin(&dep, &default.url, POLL_INTERVAL);
+
+    let snapshot = check.refresh(false).await;
+    assert_eq!(default.requests(), 0, "the default origin is not asked");
+    assert_eq!(snapshot["latest"]["version"], "99.0.0");
+    assert_eq!(snapshot["update_address"], address);
+    assert_eq!(snapshot["update_address_error"], Value::Null);
+    let seen = rc.seen.lock().unwrap();
+    let target = seen[0].split_whitespace().nth(1).unwrap().to_string();
+    assert_eq!(target, "/releases/rc/latest.json", "no query parameters");
+}
+
+#[tokio::test]
+async fn an_unset_address_asks_the_default_origin_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
+
+    let snapshot = check.refresh(false).await;
+    assert_eq!(snapshot["update_address"], Value::Null);
+    let seen = origin.seen.lock().unwrap();
+    let target = seen[0].split_whitespace().nth(1).unwrap();
+    let (platform, arch) = (
+        platform_key(std::env::consts::OS).unwrap(),
+        arch_key(std::env::consts::ARCH).unwrap(),
+    );
+    assert_eq!(
+        target,
+        check_url("/api/update-check", platform, arch, crate::LUCIDOS_RELEASE)
+    );
+}
+
+#[tokio::test]
+async fn a_refused_address_fails_closed_and_sends_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
+    let dep = deployment_in(dir.path(), true);
+    let check = ReleaseCheck::with_origin(&dep, &origin.url, Duration::from_millis(1));
+    check.refresh(false).await;
+    assert_eq!(origin.requests(), 1);
+
+    set_address(&dep, "http://example.com/latest.json");
+    let snapshot = check.refresh(true).await;
+    assert_eq!(origin.requests(), 1, "no request under a refused address");
+    assert!(snapshot["update_address_error"].is_string(), "{snapshot}");
+    assert_eq!(snapshot["last_error"], snapshot["update_address_error"]);
+    assert_eq!(snapshot["update_address"], "http://example.com/latest.json");
+    // The default origin's earlier answer is not offered either.
+    assert_eq!(snapshot["latest"], Value::Null);
+    assert_eq!(snapshot["checked_at"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_changed_address_is_polled_at_once_and_hides_the_old_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = origin_serving(http_ok(r#"{"version":"98.0.0"}"#), Duration::ZERO).await;
+    let rc = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
+    let dep = deployment_in(dir.path(), true);
+    let check = ReleaseCheck::with_origin(&dep, &default.url, POLL_INTERVAL);
+    assert_eq!(check.refresh(false).await["latest"]["version"], "98.0.0");
+
+    set_address(&dep, &rc.url);
+    // The hour is not up, and the answer still comes from the new address.
+    assert_eq!(check.refresh(false).await["latest"]["version"], "99.0.0");
+    assert_eq!(rc.requests(), 1);
+
+    set_address(&dep, "");
+    assert_eq!(
+        check.snapshot()["latest"],
+        Value::Null,
+        "stale until re-polled"
+    );
+    assert_eq!(check.refresh(false).await["latest"]["version"], "98.0.0");
+    assert_eq!(default.requests(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_poll_of_a_new_address_drops_the_old_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let rc = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
+    let down = origin_serving(
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            .to_string(),
+        Duration::ZERO,
+    )
+    .await;
+    let dep = deployment_in(dir.path(), true);
+    let check = ReleaseCheck::with_origin(&dep, &down.url, POLL_INTERVAL);
+    set_address(&dep, &rc.url);
+    assert_eq!(check.refresh(false).await["latest"]["version"], "99.0.0");
+
+    // Back to the default, which is down: the rc offer must not pass as published.
+    set_address(&dep, "");
+    let snapshot = check.refresh(false).await;
+    assert!(snapshot["last_error"].is_string(), "got {snapshot}");
+    assert_eq!(snapshot["latest"], Value::Null, "got {snapshot}");
+    assert_eq!(snapshot["checked_at"], Value::Null, "got {snapshot}");
+}
+
+#[tokio::test]
+async fn the_relayed_version_never_comes_from_another_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = origin_serving(http_ok(r#"{"version":"98.0.0"}"#), Duration::ZERO).await;
+    let dep = deployment_in(dir.path(), true);
+    let check = ReleaseCheck::with_origin(&dep, &default.url, POLL_INTERVAL);
+    check.refresh(false).await;
+    assert_eq!(check.latest_version().as_deref(), Some("98.0.0"));
+
+    set_address(&dep, "http://127.0.0.1:9/latest.json");
+    assert_eq!(check.latest_version(), None, "stale until re-polled");
+    set_address(&dep, "http://example.com/latest.json");
+    assert_eq!(
+        check.latest_version(),
+        None,
+        "a refused address offers nothing"
+    );
 }

@@ -8,8 +8,8 @@
 // `Name your session's branch` answers with the branch the message's session
 // context names (ADR 0491), or NO_SESSION_CONTEXT_REPLY.
 // A turn naming `your reasoning effort` answers `effort: X`, X being the
-// CLAUDE_CODE_EFFORT_LEVEL it was spawned with. The effort restart's resume
-// note names it too, so a spec sees what the restarted process runs at.
+// CLAUDE_CODE_EFFORT_LEVEL it was spawned with, so a spec sees what the
+// process runs at.
 // `Take N seconds` makes that turn last N seconds. An interrupt ends the
 // turn in flight at once, with an error result and no reply.
 // A fresh session's first message carries the thread history ahead of the

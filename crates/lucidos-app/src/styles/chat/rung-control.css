@@ -131,9 +131,18 @@
 }
 
 @media (hover: hover) {
-    .rung-pill:has(> .rung-trigger:hover) {
+    .rung-pill:not([data-locked]):has(> .rung-trigger:hover) {
         border-color: var(--accent);
     }
+}
+
+/* A running turn keeps its rung: the pill dims, and a press says why. */
+.rung-pill[data-locked] {
+    opacity: 0.5;
+}
+
+.rung-pill[data-locked] button {
+    cursor: default;
 }
 
 /* ── A step at each end ── */

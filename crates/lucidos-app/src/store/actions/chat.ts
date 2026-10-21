@@ -8,8 +8,6 @@ import {
   selectedScope,
   selectedCodingAgent,
   scopeToFolder,
-  codingAgentPendingModel,
-  codingAgentPendingReasoningEffort,
   cancelingThreadIds,
   removingQueuedMessageIds,
   queuedMessageRemovalKey,
@@ -347,10 +345,10 @@ export async function sendMessage(
     focus?: boolean;
     // Per-draft selection carried from `sendCompose` (compose first-send). When
     // present these win over the global signals; when absent (raw-new sends +
-    // follow-ups) the globals below are used, preserving the old behavior. The
-    // Lucidos Agent path uses model/reasoningEffort; the coding-agent path uses
-    // ccModel/ccReasoningEffort. `undefined` = not supplied (fall back);
-    // `ccModel: null` = the explicit "default" pick (omit cc_model).
+    // follow-ups) a chat thread falls back to its own pick, and a coding-agent
+    // thread sends none. The Lucidos Agent path uses model/reasoningEffort; the
+    // coding-agent path uses ccModel/ccReasoningEffort. `ccModel: null` = the
+    // explicit "default" pick (omit cc_model).
     modelOverride?: string;
     reasoningEffortOverride?: string;
     providerOverride?: string;
@@ -449,7 +447,7 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
     device_id: getDeviceId(),
     // reasoning_effort is set below: chat threads send it only when there's an
     // override or a per-thread pick (else the backend reuses the thread's last
-    // effort); CC threads only set it when the user has a pending pick. Neither
+    // effort); CC threads only set it from a compose first-send override. Neither
     // may carry a stray default — for chat that would re-break per-thread memory,
     // and for CC the backend resolves from the prior session /
     // CodingAgentSettingsChanged events.
@@ -507,34 +505,11 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
     } else if (threadBeforeSend.meta.repoId) {
       body.repo_id = threadBeforeSend.meta.repoId;
     }
-    // Apply the CC model/effort pick. A compose first-send passes the DRAFT's
-    // resolved override (per-draft; `undefined` never reaches here from
-    // sendCompose — it resolves to a value or null); raw-new sends + follow-ups
-    // pass nothing, so we fall back to the global `codingAgentPending*` (the
-    // active-thread control menu's per-thread pending, reconciled by
-    // loadCommands). `null` = the explicit "default" pick → omit cc_model so the
-    // backend resolves its own default. For an active follow-up we deliberately
-    // do NOT clear the global pending here — it stays visible until
-    // loadCommands() confirms the session adopted it (matched value), avoiding
-    // the race where a stale in-flight fetch clears the user's pick.
-    const ccModel = options?.ccModelOverride !== undefined
-      ? options.ccModelOverride
-      : codingAgentPendingModel.value;
-    if (ccModel !== null) {
-      body.cc_model = ccModel;
-    }
-    const ccEffort = options?.ccReasoningEffortOverride !== undefined
-      ? options.ccReasoningEffortOverride
-      : codingAgentPendingReasoningEffort.value;
-    if (ccEffort !== null) {
-      body.reasoning_effort = ccEffort;
-    }
-    // No CC pick and a CC thread → omit reasoning_effort entirely so the
-    // backend falls through cc_reasoning_effort → prev_effort (live session)
-    // → event_effort (CodingAgentSettingsChanged) → cc_default. The chat
-    // default ('high') is a chat preference, not a CC preference, and would
-    // wrongly override the prior session's effort on a follow-up after the
-    // user already picked something else mid-session.
+    // A compose first-send carries the draft's pick; `null` is the explicit
+    // default, so the field is omitted. A follow-up carries none: the engine
+    // runs the pick recorded on the thread (ADR 0542).
+    if (options?.ccModelOverride) body.cc_model = options.ccModelOverride;
+    if (options?.ccReasoningEffortOverride) body.reasoning_effort = options.ccReasoningEffortOverride;
   } else {
     // Chat thread: an explicit override or this thread's pending pick; otherwise
     // omit so the backend reuses the thread's last effort (?? account default).

@@ -206,31 +206,16 @@ export async function retryUnsentPick(toolUseId: string): Promise<AnswerOutcome 
   return outcome;
 }
 
-/** What a control request did, as `sendCodingAgentControl` reports it.
- *  - `ok`: the live session takes it now.
- *  - `next-turn`: recorded, and it takes effect from the session's next turn.
- *  - `pending`: a 404, so no live session. The caller falls back to the
- *    pending pick, with no toast, so a benign race never looks like an error.
- *  - `error`: a hard failure, already toasted. */
-export type ControlSendResult = 'ok' | 'next-turn' | 'pending' | 'error';
-
-/** Whether the live session recorded the change, now or for its next turn. */
-export function sessionRecorded(result: ControlSendResult): boolean {
-  return result === 'ok' || result === 'next-turn';
-}
-
-/** Send a control request to a running coding-agent session. Generic: works
- *  with any control subtype the engine serves (set_model, set_reasoning_effort). */
-export async function sendCodingAgentControl(threadId: string, request: Record<string, string>): Promise<ControlSendResult> {
+/** Record a model or effort pick for a started coding-agent thread, which
+ *  its next turn runs on. Resolves false on a failure, already toasted. The
+ *  engine refuses a pick while a turn runs; the toast carries its reason. */
+export async function sendCodingAgentControl(threadId: string, request: Record<string, string>): Promise<boolean> {
   try {
-    const res = await sendControlRequest(threadId, request);
-    return res.takes_effect === 'next-turn' ? 'next-turn' : 'ok';
+    await sendControlRequest(threadId, request);
+    return true;
   } catch (err) {
-    if (err instanceof ApiError && err.httpCode === 404) {
-      return 'pending';
-    }
-    const detail = err instanceof ApiError ? err.reason : 'session may have ended';
-    showToast(`Failed to send control request: ${detail}`, 'error');
-    return 'error';
+    const detail = err instanceof ApiError ? err.reason : errorDetail(err);
+    showToast(`Could not change the model and effort: ${detail}`, 'error');
+    return false;
   }
 }

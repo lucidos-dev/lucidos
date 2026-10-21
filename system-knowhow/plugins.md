@@ -205,6 +205,7 @@ A plugin may ship *reusable widgets* (ADR 0414). Such a widget's plugin owns it,
 - When the manifest has no `engine`, the note "This plugin doesn't say which Lucidos version it needs." The staged payload carries `engine_requirement` (as authored, or `null` when undeclared)
 - Every `data/`-relative path the install will write (overwrites called out separately in yellow)
 - On an update, **Files to remove**: every path the previous version shipped and this one dropped. The staged payload carries them as `removes`. An edited one is listed under **Your edits** instead (see "An update keeps your changes")
+- On an update, **Triggers that use these files**: every *affected trigger*, open by default. Each row names the trigger, the removed path, and why it matched. The staged payload carries them as `affected_triggers` (see "Affected triggers")
 - The `setup` field rendered as markdown, if present. On an update it adds a line saying whether setup runs again after this update, and why. The staged payload carries `setup_run`: `null` when confirming starts no setup thread, otherwise the occasion it would seed
 
 The user clicks **Install** (or **Update**) or **Cancel**. Until they click, no bytes hit `data/`.
@@ -214,7 +215,7 @@ The user clicks **Install** (or **Update**) or **Cancel**. Until they click, no 
 
 Uninstall is symmetric: confirming it deletes the recorded files and commits the deletion (`"Uninstall plugin: <id> v<version>"`) before emitting `PluginUninstalled`.
 
-**Confirming does not close the panel: it becomes a receipt.** It turns into a read-only record of what the engine wrote or deleted, with a timestamp and no buttons. The header's back arrow leaves it. It keeps its nav-history row, relabelled "Installed <name>" / "Uninstalled <name>", so Back or a reload still shows what happened. Cancel closes the panel, since nothing happened.
+**Confirming does not close the panel: it becomes a receipt.** It turns into a read-only record of what the engine wrote or deleted, with a timestamp and no buttons. It lists any affected triggers under **Triggers to check**. The header's back arrow leaves it. It keeps its nav-history row, relabelled "Installed <name>" / "Uninstalled <name>", so Back or a reload still shows what happened. Cancel closes the panel, since nothing happened.
 
 **Setup runs on confirm, but only when there's *new* setup to run.** If the manifest carried a non-empty `setup` field, confirming spawns a **Lucidos Agent setup thread** and navigates the user into it.
 
@@ -560,7 +561,7 @@ Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins: the
 
 1. **Cadence is user-specific.** Heavy users want it every 6h, light users weekly. Hardcoding `0 0 4 * * *` in the bundle makes that decision for them.
 2. **The schedule is workspace state, not reference material.** A plugin shipping a cron entry is like a library shipping a crontab line: wrong layer. Knowhow is "how to do this well", cron triggers are "when I want it to happen".
-3. **Orphaned cron entries.** A cron trigger the install instructions create as a side effect (an agent calling `create_trigger`) carries no plugin provenance. Uninstall does not remove it, so it is left pointing at deleted knowhow. A shipped `trigger.toml` avoids this, because uninstall deletes exactly the triggers stamped with the plugin id.
+3. **Orphaned cron entries.** A cron trigger the install instructions create as a side effect (an agent calling `create_trigger`) carries no plugin provenance. Uninstall leaves it in place, and so does an update that drops the knowhow it runs. Lucidos warns about it as an *affected trigger* (see "Affected triggers"), but the trigger still points at deleted knowhow until the user edits it. A shipped `trigger.toml` avoids this, because uninstall deletes exactly the triggers stamped with the plugin id.
 4. **Install-time prompt is the right UX.** When `install_plugin` lands the knowhow, the LLM tells the user *"This plugin works best with a reflection trigger. Want me to set one up? Daily at 4am is a good default."* Conversational, opinionated default, but the user owns the schedule.
 
 So if a plugin would benefit from a cron trigger, mention it in the manifest `description`. The install-time LLM then offers to set one up. The canonical example is `browser-learning` v0.2.0, which ships knowhow only and relies on that prompt for its reflection (cron) trigger.
@@ -752,6 +753,27 @@ If the recorded manifest has no `source`, the update returns an error rather tha
 
 Only recorded paths are candidates, so a file the user added beside a dropped one stays, and so does its folder. A dropped file the user edited is saved aside before it goes (see "An update keeps your changes").
 
+### Affected triggers
+
+An *affected trigger* is one the plugin does not own that relies on a path its update or uninstall removes. A trigger made with `create_trigger` during setup is the usual case: it carries no plugin id, so the update leaves it as it is. Lucidos matches a trigger to a removed path in three ways:
+
+| Reason (`reason`) | When it matches |
+|---|---|
+| `named-in-run` | The intent text or script path names the path, with or without `data/` or `.md`. A `load_knowhow` id counts only when it has a slash. |
+| `owning-app` | The path is knowhow under the trigger's own app, `apps/<app_id>/knowhow/`. |
+| `trigger-knowhow` | The path is knowhow under the trigger's own `triggers/<slug>/knowhow/` folder. |
+
+A match is exact. `x.md` does not match `x-v2.md`, a one-word knowhow id is not a match, and an app asset such as `apps/<app>/assets/icon.svg` never matches by app ownership. A trigger the acting plugin owns is never reported, because the re-sync handles it. A trigger another plugin owns is.
+
+**A match is a warning only.** The engine never edits, pauses or deletes an affected trigger, and the match never blocks the confirm. Four surfaces carry the warning:
+
+- the panel, before the user confirms;
+- the receipt, under **Triggers to check**;
+- one notification per confirm, with no web push. Its tap opens the trigger, or the trigger list when there are several. The title reads `<Plugin> update removed know-how a trigger uses`, or `Removing <Plugin> removed know-how a trigger uses`;
+- each later fire of the trigger, as a `[REMOVED KNOW-HOW]` block (see `system-knowhow/triggers.md` § "Know-how a plugin removed").
+
+The confirm matches against the paths it actually deleted, with the same function the staging used. So a trigger made between staging and confirm still appears in the event.
+
 A version that fails to parse (`compare_versions` with garbage on either side) counts as needing an update. The engine prefers attempting the install over silently doing nothing on corrupted data.
 
 ## Uninstall semantics
@@ -769,7 +791,9 @@ Uninstall stages a confirmation panel, just like install, and deletes nothing un
 3. Emits `PluginUninstalled` with `files`, `files_deleted` and `files_missing`. A file that vanished between staging and confirm goes into `files_missing`.
 4. Deletes the triggers stamped with this plugin's id, and reloads WASM signers if an `auth-modules/` file went.
 
-The confirm response carries `files_deleted`, `files_missing` and a `summary` such as `Uninstalled Browser Learning v0.1.0 (2 files removed).` **Cancel** drops the staging and emits `PluginUninstallCanceled`.
+The panel also lists every affected trigger under **Triggers that use these files**, from the staged `affected_triggers` (see "Affected triggers"). Uninstall leaves those triggers in place.
+
+The confirm response carries `files_deleted`, `files_missing`, `affected_triggers` (omitted when empty) and a `summary` such as `Uninstalled Browser Learning v0.1.0 (2 files removed).` **Cancel** drops the staging and emits `PluginUninstallCanceled`.
 
 What this means for plugin authors:
 
@@ -871,6 +895,9 @@ Emitted on every successful install, overwrites and updates included (there is n
     },
     "files": ["knowhow/browser-skills.md", "knowhow/browser-knowhow-reflection.md"],
     "files_removed": ["apps/browser-learning/knowhow/browser-skills.md"],
+    "affected_triggers": [
+      { "trigger_id": "<uuid>", "trigger_name": "Nightly browser reflection", "paths": [{ "path": "apps/browser-learning/knowhow/browser-skills.md", "reason": "owning-app" }] }
+    ],
     "installed_at": "2026-04-29T12:34:56+00:00",
     "source_type": "git",
     "actor": { ... }
@@ -879,6 +906,8 @@ Emitted on every successful install, overwrites and updates included (there is n
 ```
 
 `files_removed` (at `payload.data.files_removed`) lists the paths this update deleted because the new version dropped them (see "Versioning and updates"). It is omitted when empty, which covers every fresh install.
+
+`affected_triggers` (at `payload.data.affected_triggers`) lists the affected triggers of those removed paths (see "Affected triggers"). It is omitted when empty. Rows from before the field carry none, so a fire never warns about their removals.
 
 The two outer wrappers come from how Lucidos persists `SystemEvent`: serde's `tag = "type", content = "data"` adds `{type, data}`, and `install_from_unpacked_with_bus` packs the raw manifest into a payload map under `manifest` before assigning that map to `SystemEvent::PluginInstalled.manifest`. Net effect: the raw manifest fields (`version`, `source`, `setup`, ...) sit at `payload.data.manifest.manifest.*`. `InstalledRecord` reads them at that path; do the same in any new consumer. `setup_thread_id` sits one level up, at `payload.data.manifest.setup_thread_id`, because the engine records it rather than the author.
 
@@ -933,11 +962,14 @@ This one IS stored, unlike the Modified badge beside it, and the difference is t
   "files": ["knowhow/browser-skills.md", "knowhow/browser-knowhow-reflection.md"],
   "files_deleted": ["knowhow/browser-skills.md"],
   "files_missing": ["knowhow/browser-knowhow-reflection.md"],
+  "affected_triggers": [
+    { "trigger_id": "<uuid>", "trigger_name": "Nightly browser reflection", "paths": [{ "path": "knowhow/browser-skills.md", "reason": "named-in-run" }] }
+  ],
   "actor": { ... }
 }
 ```
 
-`files` is every recorded path, and `files_deleted` plus `files_missing` split it. Each list is omitted when empty. Rows from before uninstall deleted files carry neither.
+`files` is every recorded path, and `files_deleted` plus `files_missing` split it. Each list is omitted when empty. Rows from before uninstall deleted files carry neither. `affected_triggers` matches against `files_deleted` and is also omitted when empty.
 
 Both events are useful trigger sources. Examples worth considering:
 

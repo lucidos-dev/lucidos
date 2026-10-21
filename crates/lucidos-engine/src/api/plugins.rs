@@ -39,6 +39,7 @@ use crate::engine::tools::plugins::{
     PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX,
 };
 use crate::scheduler::plugin_updates::ScanCause;
+use crate::triggers::affected::AffectedTrigger;
 
 /// Plugin archives are mostly text bundles; cap well below the router-wide
 /// `DefaultBodyLimit` that `api/mod.rs` layers over the merged API router. The
@@ -576,6 +577,10 @@ pub(super) struct ConfirmInstallResponse {
     /// update deleted. Absent when it deleted none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub removed_files: Vec<String>,
+    /// Triggers the plugin does not own that relied on a removed file.
+    /// Absent when none did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub affected_triggers: Vec<AffectedTrigger>,
     /// Set when the installed plugin shipped `setup` instructions: the id of
     /// the Lucidos Agent thread spawned to walk the user through them. The
     /// frontend navigates the user to this thread after a successful install.
@@ -703,6 +708,7 @@ pub(super) async fn confirm_install(
             summary: outcome.summary,
             installed_files: outcome.installed_files,
             removed_files: outcome.removed_files,
+            affected_triggers: outcome.affected_triggers,
             setup_thread_id: outcome.setup_thread_id,
             local_changes: outcome.local_changes.map(Into::into),
         })),
@@ -743,6 +749,9 @@ pub(super) struct ConfirmUninstallResponse {
     pub summary: String,
     pub files_deleted: Vec<String>,
     pub files_missing: Vec<String>,
+    /// As on [`ConfirmInstallResponse`], over the deleted files.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub affected_triggers: Vec<AffectedTrigger>,
 }
 
 /// `POST /api/v1/plugins/uninstall/:uninstall_id/confirm` — user accepted the
@@ -770,6 +779,7 @@ pub(super) async fn confirm_uninstall(
             summary: outcome.summary,
             files_deleted: outcome.files_deleted,
             files_missing: outcome.files_missing,
+            affected_triggers: outcome.affected_triggers,
         })),
         Err(e) => Err(err(pending_status(&e), &e)),
     }

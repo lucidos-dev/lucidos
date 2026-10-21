@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { fetchThreadContext, declineSuccessorOffer, type SuccessorImplementer, type ThreadContext } from '../../api/client';
 import {
-  codingAgentPendingModel, codingAgentPendingReasoningEffort, effectiveThreadStatus, focusedThreadId, showToast,
-  successorCardThreadId, successorOffer, threadMap, type SuccessorOffer,
+  effectiveThreadStatus, focusedThreadId, showToast, successorCardPick, successorCardThreadId, successorOffer,
+  threadMap, type SuccessorOffer,
 } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { continueInSuccessor } from '../../store/actions/successor';
@@ -122,19 +122,26 @@ export function SuccessorCard() {
   }, [coldAt]);
 
   const offer = successorOffer(thread, context, Date.now());
+  // Keyed on whether the card shows, not on its offer: a warm card turning
+  // cold stays open and keeps its pick.
+  const cardShows = offer !== null;
   useEffect(() => {
-    const shown = offer ? threadId : null;
+    const shown = cardShows ? threadId : null;
     successorCardThreadId.value = shown;
-    return () => { if (successorCardThreadId.value === shown) successorCardThreadId.value = null; };
-  }, [offer, threadId]);
+    return () => {
+      if (successorCardThreadId.value === shown) successorCardThreadId.value = null;
+      if (shown !== null && successorCardPick.value?.threadId === shown) successorCardPick.value = null;
+    };
+  }, [cardShows, threadId]);
 
   // The last card shown, so it keeps its words while it rolls shut.
   const shown = useRef<{ threadId: string; offer: SuccessorOffer; finding: string } | null>(null);
   if (threadId && offer && context) shown.current = { threadId, offer, finding: successorFinding(context) };
   const last = shown.current;
 
-  const model = codingAgentPendingModel.value;
-  const effort = codingAgentPendingReasoningEffort.value;
+  const pick = successorCardPick.value;
+  const model = pick && pick.threadId === threadId ? pick.model : null;
+  const effort = pick && pick.threadId === threadId ? pick.effort : null;
   const aimed = aimedLabel(model, effort);
 
   async function choose(target: { threadId: string; offer: SuccessorOffer }, choice: Choice): Promise<void> {

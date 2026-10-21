@@ -160,7 +160,10 @@ describe('installWidgetFrame', () => {
     };
 
     beforeEach(() => vi.useFakeTimers());
-    afterEach(() => vi.useRealTimers());
+    afterEach(() => {
+      vi.useRealTimers();
+      document.body.innerHTML = '';
+    });
 
     it('posts a menu request with no point once the press outlasts a long press', () => {
       installWidgetFrame();
@@ -178,6 +181,39 @@ describe('installWidgetFrame', () => {
       vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
       expect(longPressMenu().defaultPrevented).toBe(true);
       expect(menus()).toHaveLength(1);
+    });
+
+    it('a hold that opens the menu selects no text, until the next press', () => {
+      const root = document.documentElement;
+      document.body.innerHTML = '<p>Twelve minutes left</p>';
+      installWidgetFrame();
+      mark({ place: 'dashboard', size: 'small', menu: true });
+      document.body.dispatchEvent(finger('pointerdown'));
+      expect(root.style.getPropertyValue('user-select')).toBe('');
+      window.getSelection()?.selectAllChildren(document.body);
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+      expect(window.getSelection()?.rangeCount).toBe(0);
+      expect(root.style.getPropertyValue('user-select')).toBe('none');
+      expect(root.style.getPropertyValue('-webkit-user-select')).toBe('none');
+      window.dispatchEvent(finger('pointerup'));
+      expect(root.style.getPropertyValue('user-select')).toBe('none');
+      document.body.dispatchEvent(finger('pointerdown'));
+      expect(root.style.getPropertyValue('user-select')).toBe('');
+      expect(root.style.getPropertyValue('-webkit-user-select')).toBe('');
+    });
+
+    it("the next press gives back the widget's own selection style", () => {
+      const root = document.documentElement;
+      root.style.setProperty('user-select', 'text');
+      installWidgetFrame();
+      mark({ place: 'dashboard', size: 'small', menu: true });
+      document.body.dispatchEvent(finger('pointerdown'));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+      expect(root.style.getPropertyValue('user-select')).toBe('none');
+      document.body.dispatchEvent(finger('pointerdown'));
+      expect(root.style.getPropertyValue('user-select')).toBe('text');
+      expect(root.style.getPropertyPriority('user-select')).toBe('');
+      root.style.removeProperty('user-select');
     });
 
     it("a long-press menu that comes first cancels the hold", () => {

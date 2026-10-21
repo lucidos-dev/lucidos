@@ -57,64 +57,6 @@ impl CodingAgent {
             _ => Self::ClaudeCode,
         }
     }
-
-    /// When a control request reaches this backend's agent.
-    pub fn control_reach(self, request: &ControlRequest) -> ControlReach {
-        match (self, request) {
-            (_, ControlRequest::Interrupt) => ControlReach::RunningTurn,
-            (_, ControlRequest::SetReasoningEffort { .. }) => self.effort_reach(),
-            (Self::ClaudeCode, ControlRequest::SetModel { .. }) => ControlReach::RunningTurn,
-            (Self::Codex, ControlRequest::SetModel { .. }) => ControlReach::NextTurn,
-        }
-    }
-
-    /// When a reasoning-effort change reaches this backend's agent.
-    pub fn effort_reach(self) -> ControlReach {
-        match self {
-            // Claude Code refuses `set_reasoning_effort` on stream-json. Effort
-            // reaches it only as `CLAUDE_CODE_EFFORT_LEVEL` at spawn.
-            Self::ClaudeCode => ControlReach::Spawn,
-            Self::Codex => ControlReach::NextTurn,
-        }
-    }
-}
-
-/// When a control request reaches the agent: [`CodingAgent::control_reach`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlReach {
-    /// It reaches the turn in flight.
-    RunningTurn,
-    /// The control channel carries it, and the backend applies it when its
-    /// next turn starts.
-    NextTurn,
-    /// The backend takes it only at spawn, so it is never sent. The engine
-    /// restarts a live session to apply it (`claude_code::control::effort_restart`).
-    Spawn,
-}
-
-impl ControlReach {
-    /// When the user sees the change take effect. `turn_runs_on` says a turn
-    /// in flight keeps running without the change. With none, the next turn
-    /// is the next message, so every reach takes effect now.
-    pub fn takes_effect(self, turn_runs_on: bool) -> TakesEffect {
-        match self {
-            Self::NextTurn | Self::Spawn if turn_runs_on => TakesEffect::NextTurn,
-            _ => TakesEffect::Now,
-        }
-    }
-}
-
-/// When a control change takes effect, as `POST /api/v1/claude-code/control`
-/// reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TakesEffect {
-    Now,
-    NextTurn,
-}
-
-impl TakesEffect {
-    pub const ALL: [Self; 2] = [Self::Now, Self::NextTurn];
 }
 
 /// Canonical event emitted by a coding agent. Implementors translate their
@@ -317,15 +259,13 @@ pub enum InputWithdrawal {
     Refused(String),
 }
 
-/// Runtime control request — set parameters or interrupt the current turn.
-/// Implementors translate to their CLI's protocol; unsupported variants may
-/// be no-ops on a given backend.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "subtype", rename_all = "snake_case")]
+/// Runtime control request. Implementors translate it to their CLI's protocol.
+/// A model or effort never travels here: the rung is fixed for a session's
+/// life, and the next spawn reads a pick (ADR 0542).
+#[derive(Debug, Clone)]
 pub enum ControlRequest {
+    /// Stop the turn in flight. The session stays resumable.
     Interrupt,
-    SetModel { model: String },
-    SetReasoningEffort { effort: String },
 }
 
 /// The Claude Code profile a thread is bound to: its *account pin*.
@@ -635,10 +575,7 @@ pub trait AgentRuntime: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AccountPin, AgentInput, CodingAgent, ControlReach, ControlRequest, SessionContextBlock,
-        SessionContextDue, TakesEffect,
-    };
+    use super::{AccountPin, AgentInput, CodingAgent, SessionContextBlock, SessionContextDue};
     use crate::api::ChatImage;
 
     fn input(text: &str) -> AgentInput {
@@ -700,59 +637,6 @@ mod tests {
     }
 
     const HOME_CLAUDE: &str = "/home/u/.claude";
-
-    fn model() -> ControlRequest {
-        ControlRequest::SetModel {
-            model: "haiku".into(),
-        }
-    }
-
-    fn effort() -> ControlRequest {
-        ControlRequest::SetReasoningEffort {
-            effort: "low".into(),
-        }
-    }
-
-    /// Claude Code refuses `set_reasoning_effort` on stream-json, and takes
-    /// effort only at spawn. Codex applies a model or effort at its next turn.
-    #[test]
-    fn each_backend_names_when_a_control_request_reaches_its_agent() {
-        use CodingAgent::{ClaudeCode, Codex};
-        use ControlReach::{NextTurn, RunningTurn, Spawn};
-        let cases = [
-            (ClaudeCode, ControlRequest::Interrupt, RunningTurn),
-            (ClaudeCode, model(), RunningTurn),
-            (ClaudeCode, effort(), Spawn),
-            (Codex, ControlRequest::Interrupt, RunningTurn),
-            (Codex, model(), NextTurn),
-            (Codex, effort(), NextTurn),
-        ];
-        for (agent, request, reach) in cases {
-            assert_eq!(
-                agent.control_reach(&request),
-                reach,
-                "{agent:?} {request:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn only_a_turn_that_runs_on_defers_a_change() {
-        use ControlReach::{NextTurn, RunningTurn, Spawn};
-        for reach in [RunningTurn, NextTurn, Spawn] {
-            assert_eq!(reach.takes_effect(false), TakesEffect::Now, "{reach:?}");
-        }
-        assert_eq!(RunningTurn.takes_effect(true), TakesEffect::Now);
-        assert_eq!(NextTurn.takes_effect(true), TakesEffect::NextTurn);
-        assert_eq!(Spawn.takes_effect(true), TakesEffect::NextTurn);
-    }
-
-    /// Wire contract: the control endpoint's `takes_effect` values.
-    #[test]
-    fn takes_effect_is_kebab_case_on_the_wire() {
-        assert_eq!(serde_json::json!(TakesEffect::Now), "now");
-        assert_eq!(serde_json::json!(TakesEffect::NextTurn), "next-turn");
-    }
 
     fn default_pin(dir: &str) -> AccountPin {
         AccountPin::DefaultConfigDir {

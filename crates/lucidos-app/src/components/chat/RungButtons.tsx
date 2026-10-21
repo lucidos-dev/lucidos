@@ -87,15 +87,19 @@ function stepOnArrow(step: RungSteps | undefined, e: KeyboardEvent): void {
 }
 
 /** One end of the pill: ‹ steps to the previous rung, › to the next. */
-function RungStep({ dir, step }: { dir: 'prev' | 'next'; step: RungSteps | undefined }) {
+function RungStep({ dir, step, lockedReason }: {
+  dir: 'prev' | 'next';
+  step: RungSteps | undefined;
+  lockedReason: string | null;
+}) {
   const label = dir === 'prev' ? 'Previous model and effort' : 'Next model and effort';
   return (
     <button
       type="button"
       class="rung-step"
       aria-label={label}
-      data-tooltip={label}
-      aria-disabled={!step?.[dir]}
+      data-tooltip={lockedReason ?? label}
+      aria-disabled={lockedReason !== null || !step?.[dir]}
       onMouseDown={keepFocusOnPress}
       onKeyDown={(e) => stepOnArrow(step, e)}
       onClick={() => step?.[dir]?.()}
@@ -108,7 +112,9 @@ function RungStep({ dir, step }: { dir: 'prev' | 'next'; step: RungSteps | undef
 /** The control's boxes, with no data of its own. The real control and the
  *  placeholder shown until its code arrives both draw them, so the box never
  *  changes as it loads. */
-export function RungButtons({ shown, faces = [], rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step }: {
+export function RungButtons({
+  shown, faces = [], rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step, lockedReason = null,
+}: {
   rowAttrs?: Record<string, string>;
   /** What the control names, or null until the commands have loaded. */
   shown: ShownRung | null;
@@ -121,14 +127,18 @@ export function RungButtons({ shown, faces = [], rowAttrs = PINNED_ROW_ATTRS, ex
    *  the list has no row for, which leaves its button disabled. Absent until
    *  the commands have loaded. */
   step?: RungSteps;
+  /** Why the rung cannot change now, which dims the pill and makes it inert.
+   *  A press still reaches `onOpen` and the steps, which say why. */
+  lockedReason?: string | null;
 }) {
   return (
-    <div class="rung-control rung-pill" {...rowAttrs}>
-      <RungStep dir="prev" step={step} />
+    <div class="rung-control rung-pill" data-locked={lockedReason !== null || undefined} {...rowAttrs}>
+      <RungStep dir="prev" step={step} lockedReason={lockedReason} />
       <button
         type="button"
         class="rung-trigger"
-        data-tooltip={tooltipWithShortcut('Model and effort', 'openAgentMenu')}
+        data-tooltip={lockedReason ?? tooltipWithShortcut('Model and effort', 'openAgentMenu')}
+        aria-disabled={lockedReason !== null || undefined}
         ref={triggerRef}
         aria-label={openLabel(shown)}
         aria-haspopup="listbox"
@@ -140,7 +150,7 @@ export function RungButtons({ shown, faces = [], rowAttrs = PINNED_ROW_ATTRS, ex
         {shown && <RungLabel shown={shown} faces={faces} />}
         <ChevronDownIcon size="0.75rem" />
       </button>
-      <RungStep dir="next" step={step} />
+      <RungStep dir="next" step={step} lockedReason={lockedReason} />
     </div>
   );
 }

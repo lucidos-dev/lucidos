@@ -141,6 +141,14 @@ while it is off.
 
 Dev builds launched from a source checkout skip the check.
 
+**Another update address.** You can point the check at another `latest.json`,
+to test a release before it is published. Set it in Settings > System >
+Overview > Maintenance, with `lucidos update-address set`, or as
+`update_address` in `~/.lucidos/updates.toml`. While it is set, both the gateway
+and the macOS app ask that address instead of `lucidos.dev`, and send none of
+the three values above. Settings shows the address until you choose **Use
+default**. An update must still carry our signature to install.
+
 ### Release notes
 
 Opening **Settings > System > What's New** downloads the project's published

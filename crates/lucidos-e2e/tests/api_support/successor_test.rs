@@ -842,8 +842,8 @@ async fn the_narrative_spawn_carries_the_request_recorded_at_the_card() {
 }
 
 /// The control route refuses an effort the thread's backend does not offer,
-/// before it reaches a session or records anything. A valid tier gets past
-/// the check and stops only at the missing live session.
+/// before it records anything. A valid tier between turns is recorded at
+/// once, with the picking device as its actor (ADR 0542).
 #[tokio::test]
 async fn control_refuses_an_effort_the_backend_does_not_offer() {
     let client = user_client().await;
@@ -881,10 +881,68 @@ async fn control_refuses_an_effort_the_backend_does_not_offer() {
     let resp = control("low").await.expect("control request failed");
     assert_eq!(
         resp.status().as_u16(),
-        404,
-        "a valid tier passes the check and stops at the missing live session"
+        200,
+        "a pick between turns is recorded"
     );
+    let pick: Option<(Option<String>, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT payload->>'reasoning_effort', payload->'actor' FROM events \
+         WHERE thread_id = $1 AND event_type = 'CodingAgentSettingsChanged' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("read the recorded pick");
+    // The picker reads the pair back from the commands read.
+    let commands: serde_json::Value = client
+        .get(format!(
+            "{}/api/v1/claude-code/commands?thread_id={thread_id}",
+            base_url()
+        ))
+        .send()
+        .await
+        .expect("commands request failed")
+        .json()
+        .await
+        .expect("commands body was not JSON");
     delete_thread_rows(&pool, thread_id).await;
+    let (effort, actor) = pick.expect("the pick is a settings event");
+    assert_eq!(effort.as_deref(), Some("low"));
+    assert!(
+        actor.is_some_and(|a| !a.is_null()),
+        "the pick names who made it"
+    );
+    assert_eq!(commands["current_reasoning_effort"], "low", "{commands}");
+    assert_eq!(commands["current_model"], "claude-opus-5-5", "{commands}");
+}
+
+/// While a turn runs, the rung is locked: a pick is refused with a reason the
+/// client can tell apart, and nothing is recorded (ADR 0542).
+#[tokio::test]
+async fn control_refuses_a_pick_while_a_turn_runs() {
+    let client = user_client().await;
+    let pool = connect().await;
+    for status in ["running", "waiting_for_user_answer"] {
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread_summary(&pool, thread_id, status).await;
+        let resp = client
+            .post(format!("{}/api/v1/claude-code/control", base_url()))
+            .json(&json!({
+                "thread_id": thread_id,
+                "request": {"subtype": "set_model", "model": "claude-sonnet-5-5"},
+            }))
+            .send()
+            .await
+            .expect("control request failed");
+        let code = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await.expect("control body was not JSON");
+        let recorded = count_events_of_type(&pool, thread_id, "CodingAgentSettingsChanged").await;
+        delete_thread_rows(&pool, thread_id).await;
+
+        assert_eq!(code, 409, "{status}: a pick mid-turn is refused: {body}");
+        assert_eq!(body["reason"], "turn-running", "{status}: {body}");
+        assert_eq!(recorded, 0, "{status}: a refused pick records nothing");
+    }
 }
 
 /// A narrative with the six sections the route requires.

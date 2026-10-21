@@ -827,8 +827,7 @@ export function prefillCompose(text: string): string {
  *  A focused DRAFT is left alone here, because emptiness is what decides its
  *  fate and this function cannot see it. `seedSuggestion` reads the draft and
  *  steps off an occupied one itself. `unfocusThread` rather than a bare
- *  `setFocusedThread(null)`, so the leaving thread's coding-agent pending picks
- *  are reset and the thread pane is revealed. That is how a mobile user tapping
+ *  `setFocusedThread(null)`, so the thread pane is revealed. That is how a mobile user tapping
  *  the header button reaches the conversation that starts. */
 function dropNonComposingFocus(): void {
   const id = focusedThreadId.value;

@@ -369,8 +369,8 @@ impl EventBus {
         // `SupersededByFollowup` is the mid-turn redirect `arm_followup_redirect`
         // arms when a follow-up lands on a live Codex turn: the caller steered,
         // they did not abandon (`thread_events/cause.rs`), and the child runs
-        // the redirected turn immediately after. An `EffortRestart` is the same
-        // shape: the engine resumes the child at the new effort. Reporting it would wake the
+        // the redirected turn immediately after. An older `EffortRestart` is the
+        // same shape: the engine resumed the child. Reporting it would wake the
         // parent with a false "child canceled" card for work that is still
         // running, and the parent may spawn a replacement. The redirected
         // turn's own terminal is the real report. Dropping out of the terminal

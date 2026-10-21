@@ -520,8 +520,7 @@ pub(crate) async fn emit_background_task_failure(
 /// to chase the enum into `types.rs`.
 pub use crate::engine::types::StopReason;
 
-#[cfg(test)]
-pub(crate) use control::record_control_request;
+pub use control::{RungPick, RungPickOutcome};
 
 /// Returned by [`LucidosEngine::interrupt_agent`] when the session is already
 /// idle/waiting — i.e. a Cancel (Stop) click that races a turn which already

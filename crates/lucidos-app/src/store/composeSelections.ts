@@ -204,9 +204,6 @@ export function resolveProvider(threadId: string | null | undefined): string | n
 // Coding-agent model/effort have no account-wide default (they're per-thread on
 // the backend), so compose resolves purely to THIS draft's override or "no pick"
 // (null → the send omits the field and the backend applies its own default).
-// Deliberately does NOT read the global `codingAgentPending*` — that is the
-// active-thread pending, and inheriting it would leak an active thread's mid-
-// session pick into a fresh draft.
 export function resolveCcModel(threadId: string | null | undefined): CodingAgentModelValue | null {
   return getComposeSelectionOverride(threadId).ccModel ?? null;
 }

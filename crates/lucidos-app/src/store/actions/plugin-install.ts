@@ -82,6 +82,7 @@ export function markPluginInstalled(
         installed_files: result.installed_files,
         removed_files: result.removed_files,
         local_changes: result.local_changes,
+        affected_triggers: result.affected_triggers,
       },
     },
   };

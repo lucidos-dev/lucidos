@@ -4,9 +4,9 @@ import { apiRequest, assertHealthy, ensureOnThreadPane, gotoWithRetry, touchPres
 import { ensureHomeThread, psql, seedChatThread } from './db-helpers';
 
 /**
- * The phone dashboard is a sheet over any thread (ADR 0538). A button at the
- * end of the thread title row opens it, over Home or any other thread. Opening
- * it never changes focus, so the hash and the title row stay put. Closing it
+ * The phone dashboard is a sheet over any thread (ADR 0538). A button beside
+ * the mark in the thread header opens it, over Home or any other thread. Opening
+ * it never changes focus, so the hash stays put. Closing it
  * never reloads a tile. The phone dashboard has its own tiles, apart from the
  * desktop one.
  */
@@ -48,7 +48,7 @@ async function dashboardTiles(page: Page, dashboard: 'phone' | 'desktop'): Promi
   return (await resp.json()).tiles;
 }
 
-const toggle = (page: Page) => page.locator('.mobile-thread-title-row:visible .dashboard-sheet-toggle');
+const toggle = (page: Page) => page.locator('.mobile-thread-header .header-mark-group .dashboard-sheet-toggle:visible');
 const sheet = (page: Page) => page.locator('.dashboard-sheet-panel');
 const tile = (page: Page, appId: string): Locator => sheet(page).locator(`.dashboard-tile[data-dashboard-tile^="${appId}?"]`);
 const frame = (page: Page, appId: string) => tile(page, appId).frameLocator('iframe');
@@ -71,14 +71,10 @@ async function openSheet(page: Page): Promise<void> {
   await expect(sheet(page)).toHaveCSS('transform', 'none');
 }
 
-/** The visible title row's top and bottom, in px. */
-const rowEdges = (page: Page) => page.evaluate(() => {
-  const row = [...document.querySelectorAll('.mobile-thread-title-row')]
-    .find((r) => r.getBoundingClientRect().height > 0)!.getBoundingClientRect();
-  return { top: row.top, bottom: row.bottom };
-});
+/** The app header's bottom edge, in px. */
+const headerBottom = (page: Page) => page.evaluate(() => document.querySelector('.app-header')!.getBoundingClientRect().bottom);
 
-/** The sheet's top edge, and the 0.75rem gap it keeps below the title row, in px. */
+/** The sheet's top edge, and the 0.75rem gap it keeps below the app header, in px. */
 const sheetEdges = (page: Page) => page.evaluate(() => ({
   top: document.querySelector('.dashboard-sheet-panel')!.getBoundingClientRect().top,
   gap: parseFloat(getComputedStyle(document.documentElement).fontSize) * 0.75,
@@ -107,34 +103,30 @@ test.describe('The dashboard sheet on a phone', () => {
     for (const path of written) await apiRequest(page).delete(`/api/v1/data/${path}`);
   });
 
-  test('Home opens as a plain chat, with the dashboard button in its title row', async ({ page }) => {
+  test('Home opens as a plain chat, with the dashboard button in the header', async ({ page }) => {
     await openHome(page);
     await expect(page.locator('.home-pane')).toHaveCount(0);
     await expect(page.locator('[data-home-face]')).toHaveCount(0);
     await expect(sheet(page)).toHaveCount(0);
   });
 
-  test('the button opens the sheet over Home, and the hash and title row stay put', async ({ page }) => {
+  test('the button opens the sheet over Home below the header, and the hash stays put', async ({ page }) => {
     await addToDashboard(page, a);
     await openHome(page);
     const hash = await page.evaluate(() => location.hash);
-    const rowBefore = await rowEdges(page);
 
     await openSheet(page);
     await expect(tile(page, a)).toBeVisible();
     expect(await page.evaluate(() => location.hash)).toBe(hash);
-    const row = await rowEdges(page);
-    expect(row.top).toBeCloseTo(rowBefore.top, 0);
-    expect(row.bottom).toBeCloseTo(rowBefore.bottom, 0);
     const sheet = await sheetEdges(page);
-    expect(sheet.top).toBeCloseTo(row.bottom + sheet.gap, 0);
+    expect(sheet.top).toBeCloseTo((await headerBottom(page)) + sheet.gap, 0);
   });
 
   for (const [name, title] of [
     ['a short title', 'E2E short'],
     ['a long title', 'E2E a long thread title that has to wrap onto a second line on a narrow phone screen'],
   ] as const) {
-    test(`over a thread with ${name}, the sheet hangs from the title row, and focus stays`, async ({ page }) => {
+    test(`over a thread with ${name}, the sheet hangs from the header, and focus stays`, async ({ page }) => {
       const threadId = seedChatThread({ turns: 1, needles: [], title });
       try {
         await addToDashboard(page, a);
@@ -144,9 +136,8 @@ test.describe('The dashboard sheet on a phone', () => {
 
         const hash = await page.evaluate(() => location.hash);
         await openSheet(page);
-        const row = await rowEdges(page);
         const sheet = await sheetEdges(page);
-        expect(sheet.top).toBeCloseTo(row.bottom + sheet.gap, 0);
+        expect(sheet.top).toBeCloseTo((await headerBottom(page)) + sheet.gap, 0);
         expect(await page.evaluate(() => location.hash)).toBe(hash);
         expect(await page.evaluate(() => localStorage.getItem('lucidos-focused-thread'))).toBe(threadId);
       } finally {
@@ -168,10 +159,10 @@ test.describe('The dashboard sheet on a phone', () => {
   test('a tap on the dim above the sheet closes it', async ({ page }) => {
     await openHome(page);
     await openSheet(page);
-    const row = await rowEdges(page);
+    const bottom = await headerBottom(page);
     const { gap } = await sheetEdges(page);
 
-    await page.mouse.click(8, row.bottom + gap / 2);
+    await page.mouse.click(8, bottom + gap / 2);
     await expect(sheet(page)).toBeHidden();
   });
 

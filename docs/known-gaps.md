@@ -434,7 +434,7 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Where:** `crates/lucidos-app/src/components/chat/useRungState.ts` (`cardPickRidesSend`, `cardPickSendProceeds`, the card branch of `pickModelSelection`), `crates/lucidos-app/src/components/chat/SuccessorCard.tsx`
 - **Gap:** A pick made under the Successor card aims the successor, but it lands in the same pending pair any send in this thread carries. The send check asks the rung switch question only while the card shows. After *Stay here*, or once the card goes cold, the next send switches the thread and rebuilds its cache with no question. The check also ignores a thread that runs the default implementer's model, so an effort-only pick there never asks.
 - **Why:** One rung control serves two targets: the successor and the current thread. Each guard patches one path through that shared state, and the edge cases keep multiplying.
-- **Status:** Open, deferred for a redesign. The intended shape: the successor's model is chosen in one place on the card, and the prompt box's rung control only ever applies to the current thread.
+- **Status:** Resolved. A card pick now lives in its own `successorCardPick` signal, never in a pair a send carries, and the card drops it when it closes. A send while the card holds it asks first, and *Switch* records it on the engine. The redesign still stands as the cleaner shape: the successor's model is chosen in one place on the card, and the prompt box's rung control only ever applies to the current thread.
 
 ### A failed warm Continue leaves its successor request open
 - **Where:** `crates/lucidos-engine/src/api/threads/successor.rs` (`request_narrative`), `crates/lucidos-engine/src/engine/successor.rs` (`pending_successor_request`)

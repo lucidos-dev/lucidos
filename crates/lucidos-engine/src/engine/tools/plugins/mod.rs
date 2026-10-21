@@ -31,7 +31,10 @@ use crate::engine::thread_events::{
 use crate::engine::tools::agent_tool_actor;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::engine::LucidosEngine;
+use crate::triggers::affected::{self, AffectedTrigger};
+use crate::triggers::TriggerConfig;
 
+mod affected_triggers;
 pub(crate) mod marketplaces;
 mod merge;
 mod registry;
@@ -238,15 +241,7 @@ impl LucidosEngine {
                     Some(s) if !s.is_empty() => s.to_string(),
                     _ => return Err("Error: id is required".to_string()),
                 };
-                super::lift_legacy_string(
-                    prepare_uninstall_plugin(
-                        &self.workspace_path,
-                        &self.pool,
-                        &self.pending_uninstalls,
-                        &id,
-                    )
-                    .await,
-                )
+                super::lift_legacy_string(stage_uninstall_request(self, &id).await)
             }
             other => Err(format!("Error: unknown plugin tool '{}'", other)),
         }
@@ -312,7 +307,7 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     // The staging body is synchronous, so its credentials are resolved here.
     let credentials = credentials_for_source(&engine.pool, source_str).await;
     let running = running_release();
-    match tokio::task::spawn_blocking(move || {
+    let staged = match tokio::task::spawn_blocking(move || {
         prepare_install_request(
             &workspace,
             &pending,
@@ -326,22 +321,23 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     {
         Ok(s) => s,
         Err(e) => format!("Error: install staging task panicked: {}", e),
-    }
+    };
+    affected_triggers::annotate_staged(staged, &affected_triggers::snapshot_triggers(engine))
 }
 
-/// Stage an uninstall from the Plugins panel (the uninstall counterpart of
-/// [`stage_install_request`]). Resolves `id`, builds a `PendingUninstall`, and
-/// returns the `[PLUGIN_UNINSTALL_REQUEST]` sentinel for the HTTP handler to
-/// unwrap — the same staging the `uninstall_plugin` LLM tool produces, so both
-/// paths land in the identical confirm panel.
+/// Stage an uninstall (the uninstall counterpart of [`stage_install_request`]).
+/// Resolves `id`, builds a `PendingUninstall`, and returns the
+/// `[PLUGIN_UNINSTALL_REQUEST]` sentinel. The `uninstall_plugin` LLM tool and
+/// the Plugins panel's route both call it, so both land in the same panel.
 pub(crate) async fn stage_uninstall_request(engine: &LucidosEngine, id: &str) -> String {
-    prepare_uninstall_plugin(
+    let staged = prepare_uninstall_plugin(
         &engine.workspace_path,
         &engine.pool,
         &engine.pending_uninstalls,
         id,
     )
-    .await
+    .await;
+    affected_triggers::annotate_staged(staged, &affected_triggers::snapshot_triggers(engine))
 }
 
 /// Normalize a plugin manifest's `setup` instructions: trimmed, with an empty
@@ -771,6 +767,8 @@ pub struct ConfirmedUninstall {
     pub summary: String,
     pub files_deleted: Vec<String>,
     pub files_missing: Vec<String>,
+    /// Triggers the plugin does not own that relied on a deleted file.
+    pub affected_triggers: Vec<AffectedTrigger>,
 }
 
 /// Pop the pending uninstall, delete each `files_present` entry from `data/`,
@@ -804,6 +802,7 @@ pub async fn confirm_pending_uninstall(
             &engine.workspace_path,
             &engine.event_bus,
             &pending,
+            &affected_triggers::snapshot_triggers(engine),
             actor.clone(),
         )
         .await?
@@ -861,11 +860,13 @@ pub(crate) async fn cancel_pending_uninstall_with_bus(
 }
 
 /// Pure delete-and-emit. Tests inject a `MockEventBus` to assert the event
-/// payload without standing up the engine.
+/// payload without standing up the engine. `triggers` is every trigger, for
+/// reporting the ones a deleted file leaves without their knowhow.
 pub(crate) async fn uninstall_with_bus(
     workspace_path: &Path,
     bus: &dyn EventBusEmitter,
     pending: &PendingUninstall,
+    triggers: &[TriggerConfig],
     actor: Option<MessageOrigin>,
 ) -> Result<ConfirmedUninstall, String> {
     let data_dir = workspace_path.join(DATA_DIR);
@@ -934,16 +935,26 @@ pub(crate) async fn uninstall_with_bus(
         }
     }
 
+    let affected = affected::affected_triggers(&files_deleted, triggers, &pending.plugin_id);
     bus.emit(BusEvent::System(SystemEvent::PluginUninstalled {
         id: pending.plugin_id.clone(),
         version: pending.plugin_version.clone(),
         files: all_files,
         files_deleted: files_deleted.clone(),
         files_missing: files_missing_now.clone(),
-        actor,
+        affected_triggers: affected.clone(),
+        actor: actor.clone(),
     }))
     .await
     .map_err(|e| format!("emit PluginUninstalled: {}", e))?;
+    affected_triggers::notify(
+        bus,
+        &pending.plugin_name,
+        affected_triggers::Removal::Uninstall,
+        &affected,
+        actor,
+    )
+    .await;
 
     let mut summary = format!(
         "Uninstalled {} v{}",
@@ -962,6 +973,7 @@ pub(crate) async fn uninstall_with_bus(
         summary,
         files_deleted,
         files_missing: files_missing_now,
+        affected_triggers: affected,
     })
 }
 
@@ -1052,6 +1064,8 @@ pub struct ConfirmedInstall {
     pub installed_files: Vec<String>,
     /// Files the previous version shipped and this one dropped, now deleted.
     pub removed_files: Vec<String>,
+    /// Triggers the plugin does not own that relied on a removed file.
+    pub affected_triggers: Vec<AffectedTrigger>,
     /// Set when the install met local edits to the files it ships.
     pub local_changes: Option<LocalChangeReport>,
     /// The Lucidos Agent thread spawned to walk the user through the plugin's
@@ -1358,6 +1372,7 @@ pub async fn confirm_pending_install(
                 setup_thread_id,
                 local: writes,
                 removals,
+                triggers: affected_triggers::snapshot_triggers(engine),
                 ..InstallContext::plain(pending.source_type, true)
             },
         )
@@ -1371,6 +1386,7 @@ pub async fn confirm_pending_install(
         summary,
         installed_files,
         removed_files,
+        affected_triggers,
         ..
     } = write;
 
@@ -1408,6 +1424,7 @@ pub async fn confirm_pending_install(
         summary,
         installed_files,
         removed_files,
+        affected_triggers,
         local_changes,
         setup_thread_id,
     })
@@ -1900,6 +1917,9 @@ pub(crate) struct InstallContext {
     /// `data/`-relative paths the previous version shipped and this one
     /// dropped, deleted after the writes. Edited ones are already saved aside.
     pub(crate) removals: Vec<String>,
+    /// Every trigger, for reporting the ones a removal leaves without their
+    /// knowhow. Empty when nothing is removed.
+    pub(crate) triggers: Vec<TriggerConfig>,
 }
 
 impl InstallContext {
@@ -1913,6 +1933,7 @@ impl InstallContext {
             setup_thread_id: None,
             local: LocalChangeWrites::default(),
             removals: Vec::new(),
+            triggers: Vec::new(),
         }
     }
 }
@@ -1926,6 +1947,7 @@ pub(crate) struct InstallWrite {
     pub(crate) installed_files: Vec<String>,
     /// Every `data/`-relative path deleted because this version dropped it.
     pub(crate) removed_files: Vec<String>,
+    pub(crate) affected_triggers: Vec<AffectedTrigger>,
     /// The second commit, recording the merged working tree plus any
     /// saved-aside copies. `None` when the install met no local edits.
     pub(crate) local_changes_commit: Option<String>,
@@ -1971,6 +1993,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
         setup_thread_id,
         local,
         removals,
+        triggers,
     } = ctx;
     let (manifest, planned) = validate_tree(plugin_root).map_err(|e| e.to_string())?;
     let data_dir = workspace_path.join(DATA_DIR);
@@ -2020,6 +2043,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
         installed_files.push(data_relative.clone());
     }
     let removed_files = remove_dropped_files(&data_dir, &removals)?;
+    let affected = affected::affected_triggers(&removed_files, &triggers, &manifest.id);
 
     // Commit the freshly-written files into the workspace git repo BEFORE
     // emitting PluginInstalled — every other data-writing path (write_file /
@@ -2116,12 +2140,23 @@ pub(crate) async fn install_from_unpacked_with_bus(
         manifest: serde_json::Value::Object(payload),
         files: installed_files.clone(),
         files_removed: removed_files.clone(),
+        affected_triggers: affected.clone(),
         installed_at,
         source_type: source_type.as_str().to_string(),
-        actor,
+        actor: actor.clone(),
     }))
     .await
     .map_err(|e| format!("event emit failed: {}", e))?;
+    affected_triggers::notify(
+        bus,
+        &manifest.name,
+        affected_triggers::Removal::Update {
+            version: &manifest.version,
+        },
+        &affected,
+        actor,
+    )
+    .await;
 
     // One line, whatever the manifest carries. The receipt panel prints this
     // as its description. It renders the manifest's `setup` as its own
@@ -2145,6 +2180,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
         summary: result,
         installed_files,
         removed_files,
+        affected_triggers: affected,
         local_changes_commit,
     })
 }
@@ -2209,3 +2245,7 @@ mod media_tests;
 #[cfg(test)]
 #[path = "../plugins_tests/widgets.rs"]
 mod widgets_tests;
+
+#[cfg(test)]
+#[path = "../plugins_tests/affected_triggers.rs"]
+mod affected_triggers_tests;

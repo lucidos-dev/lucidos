@@ -32,6 +32,9 @@ paths:
   - "scripts/check-mirror-pushers.sh"
   - "scripts/mirror-push-gate.sh"
   - "scripts/lib/check_mirror_pushers_test.sh"
+  # The local rc channel, described under "Test an update before publishing".
+  - "scripts/publish-rc-channel.sh"
+  - "scripts/lib/rc_channel*.sh"
 ---
 
 # Build, Packaging & Installer
@@ -252,6 +255,16 @@ to `main`, creates a `v*` tag or publishes a Release. Preserve that.
 - **Banner and changelog text come from `scripts/lib/release_notes.sh`.**
 - **Ask once per release whether it needs a release notice.** See
   `docs/release-pipeline-notes.md`.
+
+### Test an update before publishing: the rc channel
+
+- **`scripts/publish-rc-channel.sh <version>` is by hand only.** Phase A names
+  it in its handoff and never runs it.
+- **It writes only `<workspace>/data/artifacts/releases/rc/`.** It reads the
+  staging and never touches `~/.lucidos` or the app's data.
+  `scripts/lib/rc_channel_test.sh` asserts both.
+- **The bundle keeps its real signature.** The update address changes where the
+  app looks, never which key it trusts. Steps: `docs/desktop-app.md`.
 
 ## Installer (`install.sh` + `uninstall.sh`)
 

@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 /**
  * The dashboard sheet: the phone dashboard over the open thread. Its toggle
- * sits in the thread title row, on a phone only. Opening never moves focus.
+ * sits beside the mark in the thread header, on a phone only. Opening never
+ * moves focus.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
@@ -10,7 +11,7 @@ import { act } from 'preact/test-utils';
 vi.mock('../Dashboard', () => ({ Dashboard: () => <div data-stub="dashboard" /> }));
 
 import { DashboardSheet } from '../DashboardSheet';
-import { MobileThreadTitleBar } from '../../layout/MobileAppHeader';
+import { MOBILE_PANE_CONFIGS } from '../../layout/MobileAppHeader';
 import { DashboardRail } from '../DashboardRail';
 import { closeDashboardSheet, dashboardSheetOpen } from '../../../store/dashboards';
 import { focusedThreadId, mobileView, setMobileView, threadMap } from '../../../store/store';
@@ -21,7 +22,8 @@ import { viewportIsMobile } from '../../../utils/viewport';
 
 let host: HTMLDivElement;
 
-const toggle = () => host.querySelector<HTMLButtonElement>('.mobile-thread-title-row .dashboard-sheet-toggle');
+const ThreadHeader = MOBILE_PANE_CONFIGS.thread.Header;
+const toggle = () => host.querySelector<HTMLButtonElement>('.mobile-thread-header .header-mark-group .dashboard-sheet-toggle');
 const sheet = () => document.querySelector<HTMLElement>('.dashboard-sheet');
 const panel = () => document.querySelector<HTMLElement>('.dashboard-sheet-panel');
 
@@ -29,7 +31,7 @@ function mountPhone(): void {
   viewportIsMobile.value = true;
   threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { title: 'A thread', section: 'inbox' }, eventsLoaded: true })]]);
   focusedThreadId.value = 't1';
-  act(() => render(<><MobileThreadTitleBar /><DashboardSheet /></>, host));
+  act(() => render(<><ThreadHeader /><DashboardSheet /></>, host));
 }
 
 beforeEach(() => {
@@ -48,7 +50,7 @@ afterEach(() => {
   _resetOverlayStackForTesting();
 });
 
-describe('the title row button', () => {
+describe('the header button', () => {
   it('shows on a phone thread, labelled and unpressed while the sheet is closed', () => {
     mountPhone();
     const button = toggle();
@@ -57,12 +59,12 @@ describe('the title row button', () => {
     expect(button!.getAttribute('aria-pressed')).toBe('false');
   });
 
-  it('shows on Home as on any thread', () => {
+  it('shows with no thread focused, and opens the sheet there', () => {
     viewportIsMobile.value = true;
-    threadMap.value = new Map([['home', makeThreadState('home', { meta: { title: 'Home', home: true, section: 'inbox' }, eventsLoaded: true })]]);
-    focusedThreadId.value = 'home';
-    act(() => render(<MobileThreadTitleBar />, host));
+    act(() => render(<><ThreadHeader /><DashboardSheet /></>, host));
     expect(toggle()).not.toBeNull();
+    act(() => toggle()!.click());
+    expect(dashboardSheetOpen.value).toBe(true);
   });
 
   it('is absent outside the phone layout', () => {
@@ -140,7 +142,7 @@ describe('the sheet', () => {
 describe('what ends the sheet', () => {
   afterEach(() => setMobileView('thread'));
 
-  it('closes when the pane changes, so it never covers a pane without a title row', () => {
+  it('closes when the pane changes, so it never covers a pane without its toggle', () => {
     mountPhone();
     act(() => toggle()!.click());
     act(() => setMobileView('content'));

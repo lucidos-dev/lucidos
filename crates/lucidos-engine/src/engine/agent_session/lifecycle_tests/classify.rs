@@ -165,22 +165,6 @@ fn user_hit_stop_wins_over_empty_text() {
 /// "Canceled ✕". Still a cancel mechanically (no Generated, no proposal); only
 /// the cause differs. The redirect flag is meaningful only when user_hit_stop
 /// is set (an interrupt fired); it never overrides shutdown/error precedence.
-/// An effort restart is a redirect too, and keeps its own cause, so the
-/// popover explains the pick rather than a follow-up nobody sent.
-#[test]
-fn an_effort_restart_interrupt_classifies_with_its_own_cause() {
-    use crate::engine::thread_events::CancelCause;
-    let (terminal, emit_idle) =
-        classify_result(true, Some(CancelCause::EffortRestart), false, None, false);
-    assert_eq!(terminal, TerminalKind::Canceled(CancelCause::EffortRestart));
-    assert!(emit_idle);
-    assert_eq!(
-        TurnCancel::of(&Some(terminal)),
-        TurnCancel::Redirected,
-        "the work continues on the branch, so nothing is proposed or withheld"
-    );
-}
-
 #[test]
 fn redirect_followup_classifies_as_superseded_by_followup() {
     use crate::engine::thread_events::CancelCause;

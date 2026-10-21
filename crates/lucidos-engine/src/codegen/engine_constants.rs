@@ -31,7 +31,6 @@ use crate::llm::judgment::endpoint::{
     TYPESAFE_CREDENTIAL_SERVICE,
 };
 use crate::llm::judgment::WAKE_DECISION_DEFAULT;
-use crate::runtime::TakesEffect;
 use crate::voice::sections::SECTIONS;
 
 use super::{quoted, REGENERATE};
@@ -185,13 +184,6 @@ pub(super) fn render() -> String {
     ts.from("engine/summary_tree/log.rs");
     let kinds = list(&EntryKind::ALL.map(|k| k.as_str()));
     ts.renamed("EntryKind::as_str", "ENTRY_KINDS", kinds);
-
-    ts.from("runtime/agent_runtime.rs");
-    let takes_effect = TakesEffect::ALL.map(|t| serde_json::to_value(t).expect("a unit variant"));
-    let takes_effect = takes_effect
-        .each_ref()
-        .map(|v| v.as_str().expect("a string"));
-    ts.renamed("TakesEffect", "TAKES_EFFECT_VALUES", list(&takes_effect));
 
     ts.from("api/presence_pong.rs");
     let outcomes =

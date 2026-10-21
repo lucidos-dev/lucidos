@@ -61,7 +61,8 @@ static OWED_KIND: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// An effort restart discarded `m` before the agent read it.
+/// An effort restart discarded `m` before the agent read it. Older threads
+/// carry these; nothing writes one since the rung locks for a turn (ADR 0542).
 const DISCARDED: &str = "\
 EXISTS ( \
          SELECT 1 FROM events d \
@@ -71,7 +72,7 @@ EXISTS ( \
 
 /// The one definition of a *discarded input* still owed, over alias `m` and
 /// thread id `$1`.
-pub(crate) static DISCARDED_AND_OWED: LazyLock<String> =
+static DISCARDED_AND_OWED: LazyLock<String> =
     LazyLock::new(|| format!("{} AND {UNSETTLED} AND {DISCARDED}", *OWED_KIND));
 
 /// The columns of an [`EventRow`], over alias `m`.
@@ -91,7 +92,7 @@ pub(crate) const OWED_ROW_COLUMNS: &str =
 ///   "latest" is the previous session. A cache keep-alive forwards nothing and
 ///   does not count, or its beat would hide the message. Older rows stay as
 ///   they are: replaying a stale message answers nobody.
-/// * it is [`DISCARDED_AND_OWED`]: an effort restart discarded it, in
+/// * it is [`DISCARDED_AND_OWED`]: an older effort restart discarded it, in
 ///   whichever session. It stays owed until some session's agent reads it.
 pub(crate) static STRANDED_FOLLOW_UPS_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(

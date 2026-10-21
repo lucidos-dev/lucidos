@@ -337,7 +337,7 @@ pub(super) fn classify_result(
     let terminal = if is_shutdown {
         TerminalKind::Aborted(AbortCause::EngineShutdown)
     } else if user_hit_stop {
-        // A redirect (a follow-up, an effort restart) is mechanically a
+        // A redirect (a follow-up) is mechanically a
         // cancel, but it is NOT a user Stop, so it carries its own cause.
         TerminalKind::Canceled(redirect_cause.unwrap_or(CancelCause::UserStop))
     } else if let Some(error) = cc_error {
@@ -533,8 +533,7 @@ pub(super) fn lane_thread_end(
         Some(StopReason::Apply | StopReason::Discard | StopReason::Archive) => {
             return Some(LaneThreadEnd::Failed(LANE_THREAD_CLOSED.to_string()))
         }
-        // A lane thread never restarts for an effort pick (`effort_restart`).
-        Some(StopReason::EffortRestart) | None => {}
+        None => {}
     }
     match conflict_resolution_cleanup_action(has_unmerged, last_terminal, continuation_pending) {
         ConflictResolutionCleanupAction::Apply => Some(LaneThreadEnd::Completed),
@@ -784,8 +783,7 @@ pub(super) enum TurnCancel {
     None,
     /// The user pressed Stop.
     Stopped,
-    /// A follow-up or an effort restart interrupted the turn, and the work
-    /// continues.
+    /// A follow-up interrupted the turn, and the work continues.
     Redirected,
     /// The turn ended in failure, so it did not finish.
     Failed,

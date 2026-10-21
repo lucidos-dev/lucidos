@@ -25,8 +25,7 @@ import { fetchThreadContext, declineSuccessorOffer, type ThreadContext } from '.
 import { startFreshDraft } from '../../../store/actions/compose';
 import { continueInSuccessor } from '../../../store/actions/successor';
 import {
-  codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedThreadId, successorCardThreadId, successorOffer,
-  threadMap, toasts,
+  focusedThreadId, successorCardPick, successorCardThreadId, successorOffer, threadMap, toasts,
 } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import type { StoredEvent } from '../../../store/thread-events';
@@ -137,8 +136,7 @@ describe('SuccessorCard', () => {
     document.body.innerHTML = '';
     threadMap.value = new Map();
     focusedThreadId.value = null;
-    codingAgentPendingModel.value = null;
-    codingAgentPendingReasoningEffort.value = null;
+    successorCardPick.value = null;
     toasts.value = [];
     vi.clearAllMocks();
   });
@@ -176,8 +174,7 @@ describe('SuccessorCard', () => {
   });
 
   it('continues on the picked model and effort, and names the pick', async () => {
-    codingAgentPendingModel.value = 'claude-opus-5-6';
-    codingAgentPendingReasoningEffort.value = 'high';
+    successorCardPick.value = { threadId: 't1', model: 'claude-opus-5-6', effort: 'high' };
     const host = await mount();
     expect(option(host, 'Continue with context').textContent).toContain('It runs on');
     await act(async () => { option(host, 'Continue with context').click(); });
@@ -236,6 +233,21 @@ describe('SuccessorCard', () => {
     await act(async () => { await new Promise((r) => setTimeout(r, 250)); });
     expect(successorCardThreadId.value).toBeNull();
     expect(fetchThreadContext).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the pick when a warm card turns cold and stays open, and drops it when the card closes', async () => {
+    vi.mocked(fetchThreadContext).mockResolvedValue(
+      reading({ warm: true, cold: true, cold_at: new Date(Date.now() + 120).toISOString() }),
+    );
+    const pick = { threadId: 't1', model: 'claude-opus-5-6', effort: 'high' };
+    successorCardPick.value = pick;
+    const host = await mount();
+    expect(host.querySelector('.successor-card')?.getAttribute('data-offer')).toBe('warm');
+    await act(async () => { await new Promise((r) => setTimeout(r, 250)); });
+    expect(host.querySelector('.successor-card')?.getAttribute('data-offer')).toBe('cold');
+    expect(successorCardPick.value).toEqual(pick);
+    await act(async () => { focusedThreadId.value = null; });
+    expect(successorCardPick.value).toBeNull();
   });
 
   it('reads no context while a turn runs, and draws nothing', async () => {

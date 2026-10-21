@@ -13,7 +13,9 @@ export function revealDashboard(): void {
     showDashboardRail();
     return;
   }
-  // The sheet hangs from the thread pane's title row, so land there first.
+  // The sheet belongs to the open thread and hangs below the header holding
+  // its toggle. So land on the thread, and bring a scrolled-away header back.
   if (mobileView.value !== 'thread') navigateToPane('thread');
+  document.dispatchEvent(new Event('reveal-mobile-bars'));
   openDashboardSheet();
 }

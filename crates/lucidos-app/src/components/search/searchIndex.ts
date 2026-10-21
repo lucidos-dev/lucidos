@@ -122,6 +122,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'system:versions', label: 'Versions', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
   { id: 'system:maintenance', label: 'Maintenance', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
   { id: 'system:update-check', label: 'Check for updates automatically', subview: 'system-overview', path: 'Settings → System → Overview → Maintenance', anchor: 'system:update-check', keywords: 'update check automatic new version release', when: () => releaseCheck.value?.supported === true },
+  { id: 'system:update-address', label: 'Update address', subview: 'system-overview', path: 'Settings → System → Overview → Maintenance', anchor: 'system:update-address', keywords: 'update address url latest.json release candidate rc staged test override', when: () => releaseCheck.value?.update_address !== undefined },
   { id: 'system:installs', label: 'Installs', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:installs', keywords: 'installs install machines desktop app versions' },
 
   // What's New, and the Communication Surfaces sample page Debugging opens

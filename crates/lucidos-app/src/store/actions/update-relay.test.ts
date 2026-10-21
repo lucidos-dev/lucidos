@@ -21,6 +21,8 @@ function status(current: string, relay: NonNullable<GatewayStatus['update_relay'
       checked_at: null,
       last_error: null,
       latest: null,
+      update_address: null,
+      update_address_error: null,
     },
     update_relay: { client: { version: current, blocker: null }, request: relay },
   };

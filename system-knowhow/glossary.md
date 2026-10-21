@@ -31,6 +31,9 @@ A *thread* currently doing work (the system's turn), shown by the row's status i
 
 As a **query filter**, "active" is the **union** of the `running` and `waiting_for_user_answer` statuses. It is `--active` on `lucidos threads list` / `count`, and `active` on `GET /api/v1/threads/{list,count}`, the `threads` tool and `lucidos.threads`. That union answers "is anything busy?" wrongly, since a thread parked on a question waits on the human. Ask that with the *status filter* instead.
 
+### Affected trigger
+A *trigger* a *plugin* does not own that relies on a file the plugin's update or uninstall removes. Usually one an agent made during the plugin's setup. Lucidos only warns: in the plugin panel, on its receipt, in one notification, and in each later fire. It never edits, pauses or deletes the trigger. The warning ends when the user edits the trigger or the file returns. See `system-knowhow/plugins.md` § "Affected triggers".
+
 ### Agent archive
 An agent archiving a *thread* itself, through the `threads` tool's `archive` action or `lucidos threads archive`. It reaches only its own thread and its own direct *child threads*. It runs the same *cascading archive* as the Archive button, so the same states refuse it. A *pinned thread* is the one difference: an agent is refused one (`thread_pinned`), and a pinned sub-thread stays open while the rest goes (ADR 0312). A child is archived at once.
 
@@ -377,7 +380,7 @@ It opens in a tab on that install's own address, port and all. Pairing is per ga
 ### Dashboard
 A grid of live *widget* tiles and *app shortcuts* in square cells. **There are two dashboards, `phone` and `desktop`, and each has its own tiles.** A screen in the phone's swipe layout shows the phone dashboard, and one in the split layout shows the desktop dashboard, a tablet included. A widget tile is a *widget instance* at one of its *widget sizes*, live like any widget frame. An app shortcut is a quarter-size tile that opens its app, and both kinds sync across devices. Before ADR 0496 this was the "Home board": one tile set, the widgets pinned to Home.
 
-**On a phone, the dashboard is a *dashboard sheet* over the open thread.** A button at the end of the thread's title row opens it, on every thread, Home included. Home is a plain chat there, as on a desktop.
+**On a phone, the dashboard is a *dashboard sheet* over the open thread.** A button beside the Lucidos mark in the thread header opens it, on every thread, Home included. Home is a plain chat there, as on a desktop.
 
 **On a desktop, the dashboard is a rail at the window's right edge**, the full height of the window, beside the header and the panes. It stays in view whatever the Conversation and the Canvas show. Drag its left edge to resize it: it is two cells wide at least, and wider shows more columns. Its button, the dashboard icon in the window's top-right corner, reads Show dashboard or Hide dashboard and stays put either way. Each device remembers its width and whether it shows (ADRs 0466, 0468).
 
@@ -391,7 +394,7 @@ The CLI has `lucidos widgets dashboard`, `dashboard-add`, `dashboard-remove` and
 See also: *dashboard sheet*, *home thread*, *app shortcut*, *widget size*, *widget shelf*, *last used device*, ADR 0432, ADR 0455, ADR 0466, ADR 0496, ADR 0532, ADR 0538.
 
 ### Dashboard sheet
-The phone *dashboard* drawn over the open thread. A button at the trailing end of the thread's title row toggles it, on every thread. It rises from the bottom edge and hangs 0.75rem below the title row, so a strip of the thread shows above it. The header and that strip dim, while the title row and its button stay clear. A tap on the button or on the dim closes it.
+The phone *dashboard* drawn over the open thread. A button on the right of the Lucidos mark in the thread header toggles it, with or without a thread open. It rises from the bottom edge and hangs 0.75rem below the header, so a strip of the thread shows above it. That strip dims, while the header and its button stay clear. A tap on the button or on the dim closes it.
 
 **Opening it never changes the thread you are in.** A *widget* tile that asks which thread is focused gets the thread under the sheet, so a thread-aware tile describes that thread. Moving to another thread or pane closes the sheet. It keeps its tiles live while closed, so a reopen shows them as they were.
 
@@ -1474,6 +1477,11 @@ Only then does it stay in the *thread* under a **Not sent** card that quotes it,
 It is kept on the sending device, so a page reload brings it back, Retry included. That covers a send the reload cut off, whose card says so. If the message did arrive after all, it shows as sent. **Discard** removes the card without sending. Other devices never see it, and your *draft* never holds a copy.
 See also: *draft*.
 
+### Update address
+Where this machine's update check looks for a new Lucidos, as a `latest.json` URL. Empty means the published release, which is the default. A developer sets another one to test a release before it is published. It must use `https`, or `http` to `localhost`, `127.0.0.1` or `[::1]`.
+
+One setting covers the whole machine: the gateway's hourly check and the macOS app's **Check for Updates** both read it. Set it in **Settings > System > Overview > Maintenance**, with `lucidos update-address set <url>`, or as `update_address` in `~/.lucidos/updates.toml`. While it is set, that section shows a banner naming it, with **Use default** to clear it. A refused address is an error there, never a silent fall back to the default. An update must still carry the Lucidos signature to install.
+
 ### Urgent follow-up
 A *child follow-up* marked `urgent: true`, which stops the child's current turn so it reads the message now, not at its next natural break. An ordinary follow-up queues, because a steer should never throw away an in-flight build. Urgency loses whatever the interrupted turn was mid-way through. So use it for messages that cannot wait (a cancellation, "stop, you are working from a wrong assumption"), not for hurry.
 
@@ -2004,7 +2012,7 @@ It opens a list of *intelligence rungs* from the thread's own *intelligence ladd
 
 There is no Default row: while nothing is picked, the ladder's default rung wears the checkmark in its own place in the list. The pill never reads "Default" either. With no model of its own, a thread names its *default implementer*. When none is set, it names the backend ("Codex"), whose own config picks.
 
-A mid-thread change that rewrites a warm prompt cache asks first. The confirm states the estimated extra cost, a one-time re-read. A coding-agent thread may hand off to a new thread on the picked rung. Both kinds can Keep the current pair or Switch anyway. A pick made in the compose view belongs to that draft and never changes an account *preference*.
+On a started coding-agent thread, the model and effort stay fixed while a turn runs, so the control is disabled until the turn ends. A pick between turns is saved at once, and the next turn runs on it, from any device. A mid-thread change that rewrites a warm prompt cache asks first, and the confirm states the estimated extra cost of a one-time re-read. A coding-agent thread may hand off to a new thread on the picked rung. Both kinds can Keep the current pair or Switch anyway. A pick made in the compose view belongs to that draft and never changes an account *preference*.
 
 ### Intelligence rung
 One option on the *intelligence ladder*: one model at one reasoning effort, such as Opus 5.5 at medium. It shows an intelligence *band*, a cost *band* and a time *band*. A rung is on or off, and only a rung that is on may be picked by an agent. A higher rung is more intelligent. The UI may say just "rung". Not a cache rung, which marks the prompt cache inside a memory view.

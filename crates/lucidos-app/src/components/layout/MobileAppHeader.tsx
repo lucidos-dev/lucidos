@@ -112,8 +112,8 @@ function MobileThreadsHeader() {
 }
 
 /** Mobile thread header. The row is built around a CENTRED cluster of back
- *  chevron, Home and the Lucidos mark, forward chevron, with one drawer
- *  affordance at each edge.
+ *  chevron, Home, the Lucidos mark and the dashboard toggle, forward chevron,
+ *  with one drawer affordance at each edge.
  *
  *  The mark is three controls in one: the brand, the connection light, and the
  *  menu carrying New thread, Search everywhere and Workspaces. Those three used
@@ -141,12 +141,14 @@ function MobileThreadHeader() {
             e2e/mobile-threads-title-alignment-all.spec.ts. */}
         <div class="header-nav-cluster">
           <ThreadBackButton />
-          {/* Home and the mark centre as one pair between the chevrons. So
-              this mark's menu drops its Home row, which the threads row's
-              mark keeps. */}
-          <span class="header-mark-pair">
+          {/* Home, the mark and the dashboard toggle centre as one group
+              between the chevrons, the mark on the row's axis. So this
+              mark's menu drops its Home row, which the threads row's mark
+              keeps. */}
+          <span class="header-mark-group">
             <ThreadHeaderHomeButton />
             <BrandMenuButton />
+            <DashboardSheetToggle />
           </span>
           <ThreadForwardButton />
         </div>
@@ -245,7 +247,6 @@ export function MobileThreadTitleBar() {
       data-scroller-pinned
     >
       <ThreadTitleMenu thread={eventThread} title={threadTitle} status={threadVisualStatus(eventThread)} />
-      <DashboardSheetToggle />
       <WidgetShelf threadId={threadId} />
     </div>
   );

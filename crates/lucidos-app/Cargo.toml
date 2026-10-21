@@ -35,6 +35,8 @@ lucidos-owner-lock = { path = "../lucidos-owner-lock" }
 # thing that can tell a trapped user why their engine is ten releases old, and
 # at uninstall, where it names what this uninstaller cannot remove.
 lucidos-installs = { path = "../lucidos-installs" }
+# The rule for the update address the gateway hands an update check.
+lucidos-update-address = { path = "../lucidos-update-address" }
 # image-png: decode the embedded PNG menu-bar template icon via Image::from_bytes
 # (install_tray in lib.rs). Not in tauri's default feature set.
 #
@@ -139,3 +141,6 @@ tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 tempfile = "3"
+# The mock runtime, for driving the real updater plugin against a loopback
+# fixture (the signature tests in src/updater.rs).
+tauri = { version = "2", features = ["test"] }

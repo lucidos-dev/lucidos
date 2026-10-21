@@ -2336,6 +2336,34 @@ That stops a remote caller from pairing itself in.
 Nothing you run from a coding-agent session, a trigger or a script needs this.
 Those already prove they are local, and the CLI attaches that proof itself.
 
+### `lucidos update-address show | set <url> | reset`
+
+The *update address* is the `latest.json` URL that update checks read instead of
+the published release. Use it to test an update before it is published.
+
+```bash
+lucidos update-address show            # the address in use, or why it is refused.
+lucidos update-address set https://example.com/latest.json
+lucidos update-address reset           # back to the published release.
+lucidos update-address show --port 5300   # a gateway on an unusual port.
+```
+
+- **One setting, three editors.** The gateway stores it in
+  `~/.lucidos/updates.toml`. **Settings → System → Maintenance** and
+  `PUT /~/api/v1/control/release-check` edit the same value.
+- **The rule:** `https`, or `http` only to `localhost`, `127.0.0.1` or `[::1]`.
+  `set` refuses anything else before it sends a request.
+- **Both checks honour it.** The gateway's update announce and the desktop
+  app's updater read it on each check, so a change needs no restart.
+- **Signatures still count.** The app checks every bundle against the key built
+  into it, whatever the address.
+- **A refused stored value fails closed.** `show` names the error, and update
+  checks fail until you fix or reset it.
+
+The file is shared by every gateway on the machine, so any running gateway will
+do. The command probes 5252 then 5251. It needs the machine-local token, so it
+works only on the machine Lucidos runs on.
+
 ### `lucidos webhooks list | create | update --id <id> | delete --id <id>`
 
 An endpoint a third party posts to, emitting one **pinned** domain event that a

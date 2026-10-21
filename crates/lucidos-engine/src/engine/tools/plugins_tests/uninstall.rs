@@ -62,7 +62,7 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
         .unwrap()
         .remove(&uninstall_id)
         .unwrap();
-    let outcome = uninstall_with_bus(&scratch, &bus, &pending, None)
+    let outcome = uninstall_with_bus(&scratch, &bus, &pending, &[], None)
         .await
         .expect("uninstall_with_bus");
 
@@ -262,7 +262,7 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    let outcome = uninstall_with_bus(&workspace, &bus, &pending, None)
+    let outcome = uninstall_with_bus(&workspace, &bus, &pending, &[], None)
         .await
         .expect("uninstall should succeed");
     assert!(
@@ -374,7 +374,7 @@ source = "https://github.com/x/uninstall-track"
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    let outcome = uninstall_with_bus(&scratch, &bus, &pending, None)
+    let outcome = uninstall_with_bus(&scratch, &bus, &pending, &[], None)
         .await
         .expect("uninstall");
     assert_eq!(outcome.files_deleted.len(), write.installed_files.len());
@@ -622,7 +622,7 @@ async fn uninstall_with_bus_handles_file_disappearing_between_prepare_and_confir
     };
 
     let bus = MockEventBus::new();
-    let outcome = super::uninstall_with_bus(&scratch, &bus, &pending, None)
+    let outcome = super::uninstall_with_bus(&scratch, &bus, &pending, &[], None)
         .await
         .expect("race must not fail uninstall");
 

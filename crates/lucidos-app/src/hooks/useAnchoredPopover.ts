@@ -234,11 +234,17 @@ export function useAnchoredPosition(
       if (rafId !== null) return;
       rafId = requestAnimationFrame(recompute);
     };
+    // The panel's own scroll cannot move its anchor. Measuring restores its
+    // `scrollTop`, which fires a scroll, so answering it would loop every frame.
+    const onScroll = (e: Event) => {
+      if (e.target instanceof Node && panelRef.current?.contains(e.target)) return;
+      schedule();
+    };
     measureNow.current = measure;
     measure();
     // Capture-phase: the chat pane is its own scroll container, not window — bubbling
     // scrolls would never reach a non-capture window listener.
-    window.addEventListener('scroll', schedule, { capture: true, passive: true });
+    window.addEventListener('scroll', onScroll, { capture: true, passive: true });
     window.addEventListener('resize', schedule);
     // visualViewport tracks the mobile virtual keyboard. On iOS Safari with
     // `interactive-widget=resizes-visual` (Lucidos's viewport meta), neither
@@ -328,7 +334,7 @@ export function useAnchoredPosition(
       ro?.disconnect();
       mo?.disconnect();
       movingAnchor?.removeEventListener('transitionend', schedule);
-      window.removeEventListener('scroll', schedule, true);
+      window.removeEventListener('scroll', onScroll, true);
       window.removeEventListener('resize', schedule);
       if (vv) {
         vv.removeEventListener('resize', schedule);
@@ -350,13 +356,17 @@ export function useAnchoredPosition(
 /** The panel's height without the `--anchor-room` cap its caller applies.
  *  Measured under that cap, a panel always fits the side that capped it. It
  *  could then never move back to a roomier side once its content grew. The var
- *  goes and comes back in one task, so nothing paints in between. */
+ *  goes and comes back in one task, so nothing paints in between. Uncapped,
+ *  the panel cannot scroll and the browser resets `scrollTop`, so it is put
+ *  back: a scroll inside the panel re-measures it. */
 export function naturalPanelHeight(panel: HTMLElement): number {
   const room = panel.style.getPropertyValue('--anchor-room');
   if (!room) return panel.offsetHeight;
+  const { scrollTop } = panel;
   panel.style.removeProperty('--anchor-room');
   const height = panel.offsetHeight;
   panel.style.setProperty('--anchor-room', room);
+  panel.scrollTop = scrollTop;
   return height;
 }
 

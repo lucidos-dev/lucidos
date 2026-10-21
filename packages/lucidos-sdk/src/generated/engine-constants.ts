@@ -109,9 +109,6 @@ export const WAKE_DECISION_DEFAULT_ENDPOINT = "openai";
 /** `EntryKind::as_str` in `engine/summary_tree/log.rs`. */
 export const ENTRY_KINDS = ["prompt (human)", "prompt (agent)", "prompt (engine)", "response", "call", "result", "report", "turn", "artifact"] as const;
 
-/** `TakesEffect` in `runtime/agent_runtime.rs`. */
-export const TAKES_EFFECT_VALUES = ["now", "next-turn"] as const;
-
 /** `PresenceOutcome::BY_STRENGTH` in `api/presence_pong.rs`. */
 export const PRESENCE_OUTCOMES_BY_STRENGTH = ["shown", "auto_read", "silenced", "not_shown"] as const;
 

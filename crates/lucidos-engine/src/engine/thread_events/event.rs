@@ -111,7 +111,8 @@ pub enum ThreadEvent {
         mode: ActorMode,
         /// Model the engine will use to answer this message. Stamped at request
         /// time so the route tooltip can display it before ResponseGenerated
-        /// fires. Coding-agent sessions still rely on CodingAgentSettingsChanged.
+        /// fires. A coding-agent turn stamps the rung its spawn resolves
+        /// (`coding_agent_rung`), which no pick changes mid-turn (ADR 0542).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         /// Reasoning effort the engine will use to answer this message.

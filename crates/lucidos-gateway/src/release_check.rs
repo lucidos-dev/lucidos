@@ -12,8 +12,14 @@
 //!
 //! The request carries platform, arch and version. It also carries the caller's
 //! IP, as any HTTP request does, and `PRIVACY.md` says so.
+//!
+//! An *update address* in the same file replaces the origin with a plain
+//! `latest.json` URL, for testing a release candidate before it is published.
+//! That request carries no query parameters. A refused address fails closed:
+//! no request goes out and the snapshot reports why.
 
 use futures::StreamExt;
+use lucidos_update_address::UpdateAddress;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -59,11 +65,24 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 pub struct UpdatesToml {
     /// `[release_check] enabled`. Default true.
     pub enabled: bool,
+    /// `[release_check] update_address`, exactly as stored. Empty means the
+    /// default. Kept raw, so a hand-edited bad value is reported, not dropped.
+    pub update_address: String,
 }
 
 impl Default for UpdatesToml {
     fn default() -> Self {
-        UpdatesToml { enabled: true }
+        UpdatesToml {
+            enabled: true,
+            update_address: String::new(),
+        }
+    }
+}
+
+impl UpdatesToml {
+    /// The stored address under the shared rule. `Ok(None)` is the default.
+    pub fn address(&self) -> Result<Option<UpdateAddress>, String> {
+        UpdateAddress::parse(&self.update_address)
     }
 }
 
@@ -79,6 +98,18 @@ struct RawUpdatesToml {
 struct RawReleaseCheck {
     #[serde(default = "default_true")]
     enabled: bool,
+    /// Any TOML value, so a non-string reaches the address rule and is refused
+    /// there, rather than failing the whole file back to the defaults.
+    #[serde(default)]
+    update_address: Option<toml::Value>,
+}
+
+fn raw_address(value: Option<toml::Value>) -> String {
+    match value {
+        None => String::new(),
+        Some(toml::Value::String(s)) => s,
+        Some(other) => other.to_string(),
+    }
 }
 
 fn default_true() -> bool {
@@ -105,6 +136,7 @@ pub fn parse_updates_toml(contents: &str) -> UpdatesToml {
         Ok(raw) => match raw.release_check {
             Some(rc) => UpdatesToml {
                 enabled: rc.enabled,
+                update_address: raw_address(rc.update_address),
             },
             None => UpdatesToml::default(),
         },
@@ -120,6 +152,14 @@ pub fn parse_updates_toml(contents: &str) -> UpdatesToml {
 /// Render the file with its explanatory comments, since the `toml` serializer
 /// drops them.
 pub fn render_updates_toml(cfg: &UpdatesToml) -> String {
+    let address = if cfg.update_address.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "update_address = {}\n",
+            toml::Value::String(cfg.update_address.clone())
+        )
+    };
     format!(
         "# Lucidos update check (ADR 0108, ADR 0139).\n\
          #\n\
@@ -128,14 +168,33 @@ pub fn render_updates_toml(cfg: &UpdatesToml) -> String {
          # the version you run. It also carries your IP address, as any web\n\
          # request does. Nothing else is sent, and nothing installs itself.\n\
          #\n\
-         # enabled  false stops the automatic check. It is on by default, and\n\
-         #          the same switch lives in Settings, System, Overview. You\n\
-         #          can still check by hand there while it is off.\n\
+         # enabled         false stops the automatic check. It is on by default,\n\
+         #                 and the same switch lives in Settings > System >\n\
+         #                 Overview > Maintenance. You can still check by hand\n\
+         #                 there while it is off.\n\
+         # update_address  a latest.json URL to read instead of the published\n\
+         #                 release, to test a release candidate. https, or http\n\
+         #                 to localhost only. Absent means the default. The same\n\
+         #                 Maintenance section shows it while it is set.\n\
          \n\
          [release_check]\n\
-         enabled = {}\n",
+         enabled = {}\n\
+         {address}",
         cfg.enabled
     )
+}
+
+/// The startup log line for a set address, or `None` when it is unset.
+pub fn update_address_log_line(cfg: &UpdatesToml) -> Option<String> {
+    match cfg.address() {
+        Ok(None) => None,
+        Ok(Some(address)) => Some(format!(
+            "[ReleaseCheck] update address overridden: updates come from {address}, not the published release"
+        )),
+        Err(e) => Some(format!(
+            "[ReleaseCheck] update address refused, no update check runs until it is fixed: {e}"
+        )),
+    }
 }
 
 /// Write the preference atomically (temp plus rename). Its directory is the
@@ -396,6 +455,17 @@ struct ReleaseState {
     /// up to date". Without it the caller sees the unchanged snapshot and
     /// cannot tell a working check that found nothing from one that never ran.
     last_error: Option<String>,
+    /// The raw update address the last attempt used. An answer from another
+    /// address is stale: it is not shown, and the next refresh polls again.
+    polled_address: String,
+}
+
+/// Why a preference write was refused.
+#[derive(Debug)]
+pub enum ConfigWriteError {
+    /// The update address breaks the shared rule. Nothing was written.
+    InvalidAddress(String),
+    Io(std::io::Error),
 }
 
 /// The gateway's one release check. Held on `GatewayInner` and shared by the
@@ -454,8 +524,13 @@ impl ReleaseCheck {
     /// The newest published version, when the last answer named one later
     /// than ours.
     pub fn latest_version(&self) -> Option<String> {
+        let cfg = self.config();
         let st = self.state.lock().unwrap();
-        st.latest.as_ref().map(|release| release.version.clone())
+        let current = answer_is_current(&cfg, cfg.address().is_ok(), &st);
+        st.latest
+            .as_ref()
+            .filter(|_| current)
+            .map(|release| release.version.clone())
     }
 
     /// The current preference, re-read from disk on every call.
@@ -473,12 +548,33 @@ impl ReleaseCheck {
     /// it. `None` carries the stored value through instead of erroring, so a
     /// body that names no field settles rather than failing. It still rewrites
     /// the file, and it still creates one that was never written.
-    pub fn update_config(&self, enabled: Option<bool>) -> std::io::Result<()> {
+    ///
+    /// An address is checked before anything is written, and stored in its
+    /// normalised form. `Some("")` resets it to the default.
+    pub fn update_config(
+        &self,
+        enabled: Option<bool>,
+        update_address: Option<&str>,
+    ) -> Result<(), ConfigWriteError> {
+        let address = update_address
+            .map(UpdateAddress::parse)
+            .transpose()
+            .map_err(ConfigWriteError::InvalidAddress)?;
         let mut cfg = read_updates_toml(self.config_path.as_deref());
         if let Some(v) = enabled {
             cfg.enabled = v;
         }
-        write_updates_toml(self.config_path.as_deref(), &cfg)
+        if let Some(address) = address {
+            cfg.update_address = address.map(|a| a.to_string()).unwrap_or_default();
+        }
+        write_updates_toml(self.config_path.as_deref(), &cfg).map_err(ConfigWriteError::Io)
+    }
+
+    /// Log the update address once at startup, when one is set.
+    pub fn log_update_address(&self) {
+        if let Some(line) = update_address_log_line(&self.config()) {
+            crate::log!("{line}");
+        }
     }
 
     /// May a request go out right now? Both gates, in one place.
@@ -495,14 +591,20 @@ impl ReleaseCheck {
         force || self.config().enabled
     }
 
-    /// Has enough time passed since the last attempt?
+    /// Has enough time passed since the last attempt? A changed address is
+    /// due at once, since the stored answer came from somewhere else.
     fn poll_is_due(&self, force: bool) -> bool {
         let floor = if force {
             FORCED_POLL_FLOOR
         } else {
             self.interval
         };
-        match self.state.lock().unwrap().last_attempt {
+        let address = self.config().update_address;
+        let st = self.state.lock().unwrap();
+        if st.polled_address != address {
+            return true;
+        }
+        match st.last_attempt {
             Some(at) => at.elapsed() >= floor,
             None => true,
         }
@@ -524,7 +626,8 @@ impl ReleaseCheck {
 
     /// One request, and what it did to the stored answer.
     ///
-    /// A failure logs and leaves the previous answer standing. It still moves
+    /// A failure logs and leaves the previous answer standing, unless that
+    /// answer came from another update address. It still moves
     /// `last_attempt`, so a broken origin is asked once an interval rather than
     /// on every refresh.
     ///
@@ -532,14 +635,28 @@ impl ReleaseCheck {
     /// is what makes a concurrent caller wait for the answer instead of reading
     /// an empty one: a poll in flight still reads as due, so the caller queues
     /// on `poll_lock` rather than returning past it.
+    ///
+    /// A refused update address sends nothing. `snapshot` reports the refusal.
     async fn poll_once(&self) {
         let Some((platform, arch)) = self.target else {
             return;
         };
-        let url = check_url(&self.origin, platform, arch, self.current_version);
+        let cfg = self.config();
+        let url = match cfg.address() {
+            Ok(Some(address)) => address.to_string(),
+            Ok(None) => check_url(&self.origin, platform, arch, self.current_version),
+            Err(_) => return,
+        };
         let outcome = self.fetch(&url).await;
         let mut st = self.state.lock().unwrap();
         st.last_attempt = Some(Instant::now());
+        if st.polled_address != cfg.update_address {
+            // The stored answer came from the other address. A failure here
+            // must not let it pass as this address's offer.
+            st.latest = None;
+            st.checked_at = None;
+            st.polled_address = cfg.update_address;
+        }
         match outcome {
             Ok(published) => {
                 st.checked_at = Some(chrono::Utc::now());
@@ -581,10 +698,19 @@ impl ReleaseCheck {
     ///
     /// An older gateway omits the whole field, and the frontend reads that as
     /// "no offer", which is the ADR 0105 degradation.
+    ///
+    /// `update_address` is the address in use, or the refused raw value beside
+    /// `update_address_error`. A refused address also reads as `last_error` and
+    /// offers nothing, so it can never look like "up to date".
     pub fn snapshot(&self) -> Value {
         let cfg = self.config();
         let st = self.state.lock().unwrap();
-        let latest = st.latest.as_ref().map(|release| {
+        let (update_address, address_error) = match cfg.address() {
+            Ok(address) => (address.map(|a| a.to_string()), None),
+            Err(e) => (Some(cfg.update_address.clone()), Some(e)),
+        };
+        let current = answer_is_current(&cfg, address_error.is_none(), &st);
+        let latest = st.latest.as_ref().filter(|_| current).map(|release| {
             json!({
                 "version": release.version,
                 "notes": release.notes,
@@ -596,11 +722,19 @@ impl ReleaseCheck {
             "enabled": cfg.enabled,
             "supported": self.supported,
             "current_version": self.current_version,
-            "checked_at": st.checked_at.map(|t| t.to_rfc3339()),
-            "last_error": st.last_error,
+            "checked_at": st.checked_at.filter(|_| current).map(|t| t.to_rfc3339()),
+            "last_error": address_error.clone().or_else(|| st.last_error.clone().filter(|_| current)),
             "latest": latest,
+            "update_address": update_address,
+            "update_address_error": address_error,
         })
     }
+}
+
+/// Whether the stored answer belongs to the address in use. An answer from
+/// another address, or any answer under a refused one, offers nothing.
+fn answer_is_current(cfg: &UpdatesToml, address_ok: bool, st: &ReleaseState) -> bool {
+    address_ok && st.polled_address == cfg.update_address
 }
 
 #[cfg(test)]

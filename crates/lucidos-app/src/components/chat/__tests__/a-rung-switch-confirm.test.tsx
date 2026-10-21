@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
- * A pick on a live thread asks before it rebuilds the thread's cache. Keep and
- * a dismissal send nothing. "Switch anyway" is the only path that reaches the
- * live session, and the handoff starts a successor on the picked rung.
+ * A pick on a started thread asks before it rebuilds the thread's cache. Keep
+ * and a dismissal send nothing. "Switch anyway" is the only path that records
+ * the pick on the engine, and the handoff starts a successor on the picked rung.
  */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -37,7 +37,7 @@ const response: CodingAgentCommandsResponse = {
 } as unknown as CodingAgentCommandsResponse;
 
 let hasActiveSession = true;
-const sendCodingAgentControl = vi.fn(() => Promise.resolve('ok' as const));
+const sendCodingAgentControl = vi.fn(() => Promise.resolve(true));
 const fetchSwitchEstimate = vi.fn<() => Promise<SwitchEstimate>>();
 const continueInSuccessor = vi.fn((_threadId: string, _message: string | undefined, _implementer?: unknown) =>
   Promise.resolve({ path: 'brief' as const, successor_thread_id: 's1', link: '[Next](thread:ws/s1)' }));
@@ -67,7 +67,7 @@ const { RungControl } = await import('../RungControl');
 const { passSendGate, sendGateAsks } = await import('../rungSwitch');
 const { ConfirmDialog } = await import('../../shared/ConfirmDialog');
 const { controlMenuParts } = await import('../controlMenuParts');
-const { codingAgentPendingModel, codingAgentPendingReasoningEffort, confirmState, settleConfirm, successorCardThreadId, threadMap, toasts } =
+const { confirmState, settleConfirm, successorCardPick, successorCardThreadId, threadMap, toasts } =
   await import('../../../store/store');
 const { patchDraft, clearDraft } = await import('../../../store/composeDrafts');
 const { makeThreadState } = await import('../../../store/actions/threads-test-helpers');
@@ -90,8 +90,8 @@ function click(selector: string, text?: string): void {
   el.click();
 }
 
-function seedThread(status: 'idle' | 'running') {
-  threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { channel: 'claude_code', status } })]]);
+function seedThread() {
+  threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { channel: 'claude_code', status: 'idle' } })]]);
 }
 
 /** Pick Opus 5.6 · high from the pill's list, then wait for what follows. */
@@ -105,7 +105,7 @@ async function pickHigh(): Promise<void> {
 beforeEach(() => {
   vi.clearAllMocks();
   hasActiveSession = true;
-  seedThread('idle');
+  seedThread();
   host = document.createElement('div');
   document.body.appendChild(host);
   render(<><RungControl threadId="t1" codingAgent="claude-code" /><ConfirmDialog /></>, host);
@@ -117,9 +117,8 @@ afterEach(() => {
   settleConfirm(false);
   clearDraft('t1');
   threadMap.value = new Map();
-  codingAgentPendingModel.value = null;
-  codingAgentPendingReasoningEffort.value = null;
   successorCardThreadId.value = null;
+  successorCardPick.value = null;
   toasts.value = [];
 });
 
@@ -129,12 +128,12 @@ async function startedPick(estimate: SwitchEstimate): Promise<void> {
   await pickHigh();
 }
 
-describe('a rung pick on a live thread', () => {
+describe('a rung pick on a started idle thread', () => {
   it('asks the engine what the pick costs, and switches silently when the cache is kept', async () => {
     await startedPick(KEEPS_CACHE);
     expect(fetchSwitchEstimate).toHaveBeenCalledWith('t1', 'claude-opus-5-6', 'high');
     expect(confirmState.value.visible).toBe(false);
-    expect(sendCodingAgentControl).toHaveBeenCalledWith('t1', { subtype: 'set_model', model: 'claude-opus-5-6' });
+    expect(sendCodingAgentControl).toHaveBeenCalledWith('t1', { subtype: 'set_model', model: 'claude-opus-5-6', effort: 'high' });
   });
 
   it('asks first when the pick rebuilds the cache, and sends nothing before an answer', async () => {
@@ -146,7 +145,6 @@ describe('a rung pick on a live thread', () => {
     expect(text).not.toMatch(/slow/i);
     expect(sendCodingAgentControl).not.toHaveBeenCalled();
     expect(continueInSuccessor).not.toHaveBeenCalled();
-    expect(codingAgentPendingModel.value).toBeNull();
   });
 
   it('offers the handoff and the switch as two choice cards, the handoff first, and Keep in the foot', async () => {
@@ -166,7 +164,6 @@ describe('a rung pick on a live thread', () => {
     await settle();
     expect(sendCodingAgentControl).not.toHaveBeenCalled();
     expect(continueInSuccessor).not.toHaveBeenCalled();
-    expect(codingAgentPendingModel.value).toBeNull();
   });
 
   it('sends nothing when the dialog is dismissed', async () => {
@@ -178,12 +175,12 @@ describe('a rung pick on a live thread', () => {
     expect(continueInSuccessor).not.toHaveBeenCalled();
   });
 
-  it('switches the live session only on Switch anyway', async () => {
+  it('records the pick, model and effort in one request, only on Switch anyway', async () => {
     await startedPick(REBUILD);
     click('[data-role="confirm-extra"]');
     await settle();
-    expect(sendCodingAgentControl).toHaveBeenCalledWith('t1', { subtype: 'set_model', model: 'claude-opus-5-6' });
-    expect(sendCodingAgentControl).toHaveBeenCalledWith('t1', { subtype: 'set_reasoning_effort', effort: 'high' });
+    expect(sendCodingAgentControl).toHaveBeenCalledTimes(1);
+    expect(sendCodingAgentControl).toHaveBeenCalledWith('t1', { subtype: 'set_model', model: 'claude-opus-5-6', effort: 'high' });
     expect(continueInSuccessor).not.toHaveBeenCalled();
   });
 
@@ -215,8 +212,8 @@ describe('a rung pick on a live thread', () => {
     expect(fetchSwitchEstimate).not.toHaveBeenCalled();
     expect(confirmState.value.visible).toBe(false);
     expect(sendCodingAgentControl).not.toHaveBeenCalled();
-    expect(codingAgentPendingModel.value).toBe('claude-opus-5-6');
-    expect(codingAgentPendingReasoningEffort.value).toBe('high');
+    expect(successorCardPick.value).toEqual({ threadId: 't1', model: 'claude-opus-5-6', effort: 'high' });
+    expect(document.querySelector('.rung-trigger')!.textContent).toContain('high');
   });
 
   describe('a send in the thread while the Successor card holds a pick', () => {
@@ -234,14 +231,37 @@ describe('a rung pick on a live thread', () => {
       expect(confirmState.value.visible).toBe(true);
       click('[data-role="confirm-cancel"]');
       expect(await sent).toBe(false);
+      expect(sendCodingAgentControl).not.toHaveBeenCalled();
     });
 
-    it('lets the send go on Switch here', async () => {
+    it('records the pick here, then lets the send go, on Switch here', async () => {
       await underCardPick();
       const sent = passSendGate('t1');
       await settle();
       click('[data-role="confirm-extra"]');
       expect(await sent).toBe(true);
+      expect(sendCodingAgentControl).toHaveBeenCalledWith('t1', { subtype: 'set_model', model: 'claude-opus-5-6', effort: 'high' });
+      expect(successorCardPick.value).toBeNull();
+    });
+
+    it('asks even when the cache is kept, since the pick was meant for the successor', async () => {
+      await underCardPick();
+      fetchSwitchEstimate.mockResolvedValue(KEEPS_CACHE);
+      const sent = passSendGate('t1');
+      await settle();
+      expect(confirmState.value.visible).toBe(true);
+      click('[data-role="confirm-cancel"]');
+      expect(await sent).toBe(false);
+      expect(sendCodingAgentControl).not.toHaveBeenCalled();
+    });
+
+    it('cancels the send when recording the pick fails', async () => {
+      await underCardPick();
+      sendCodingAgentControl.mockResolvedValueOnce(false);
+      const sent = passSendGate('t1');
+      await settle();
+      click('[data-role="confirm-extra"]');
+      expect(await sent).toBe(false);
     });
 
     it('hands off in place of the send, and cancels it', async () => {
@@ -271,17 +291,6 @@ describe('a rung pick on a live thread', () => {
     });
   });
 
-  it('offers no handoff while a turn runs, since a successor starts from an idle thread', async () => {
-    seedThread('running');
-    await startedPick(REBUILD);
-    expect(document.querySelector('[data-role="confirm-ok"]')!.textContent).toBe('Switch anyway');
-    expect(document.querySelector('[data-role="confirm-extra"]')).toBeNull();
-    click('[data-role="confirm-ok"]');
-    await settle();
-    expect(sendCodingAgentControl).toHaveBeenCalled();
-    expect(continueInSuccessor).not.toHaveBeenCalled();
-  });
-
   it('says so, and switches nothing, when the engine cannot price the switch', async () => {
     fetchSwitchEstimate.mockRejectedValue(new Error('engine down'));
     await settle();
@@ -300,45 +309,17 @@ describe('a rung pick on an idle thread whose session has exited', () => {
     await settle();
   });
 
-  it('asks first when the pick rebuilds a warm cache, and stores nothing before an answer', async () => {
-    await startedPick(REBUILD);
-    expect(fetchSwitchEstimate).toHaveBeenCalledWith('t1', 'claude-opus-5-6', 'high');
-    expect(confirmState.value.visible).toBe(true);
-    expect(codingAgentPendingModel.value).toBeNull();
-    expect(codingAgentPendingReasoningEffort.value).toBeNull();
-  });
-
-  it('stores nothing on Keep', async () => {
-    await startedPick(REBUILD);
-    click('[data-role="confirm-cancel"]');
-    await settle();
-    expect(codingAgentPendingModel.value).toBeNull();
-    expect(codingAgentPendingReasoningEffort.value).toBeNull();
-    expect(continueInSuccessor).not.toHaveBeenCalled();
-  });
-
-  it('stores the pick for the next turn on Switch anyway, and sends no control request', async () => {
+  it('records the pick on the engine on Switch anyway, as on a live thread', async () => {
     await startedPick(REBUILD);
     click('[data-role="confirm-extra"]');
     await settle();
-    expect(codingAgentPendingModel.value).toBe('claude-opus-5-6');
-    expect(codingAgentPendingReasoningEffort.value).toBe('high');
-    expect(sendCodingAgentControl).not.toHaveBeenCalled();
+    expect(sendCodingAgentControl).toHaveBeenCalledTimes(1);
+    expect(sendCodingAgentControl).toHaveBeenCalledWith('t1', { subtype: 'set_model', model: 'claude-opus-5-6', effort: 'high' });
   });
 
-  it('offers the handoff, as on a live idle thread', async () => {
-    await startedPick(REBUILD);
-    click('[data-role="confirm-ok"]');
-    await settle();
-    expect(continueInSuccessor).toHaveBeenCalledWith('t1', undefined, expect.anything());
-    expect(codingAgentPendingModel.value).toBeNull();
-  });
-
-  it('stores the pick silently when the cache is cold, with no confirm', async () => {
+  it('records the pick silently when the cache is cold, with no confirm', async () => {
     await startedPick(KEEPS_CACHE);
     expect(confirmState.value.visible).toBe(false);
-    expect(codingAgentPendingModel.value).toBe('claude-opus-5-6');
-    expect(codingAgentPendingReasoningEffort.value).toBe('high');
-    expect(sendCodingAgentControl).not.toHaveBeenCalled();
+    expect(sendCodingAgentControl).toHaveBeenCalledTimes(1);
   });
 });

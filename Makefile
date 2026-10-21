@@ -168,12 +168,12 @@ test-gateway:
 	cargo test --locked -p lucidos-gateway
 
 # The small library crates' own unit tests. Each one's tests are hermetic
-# (a throwaway $HOME, pool or lock dir, no Postgres) and all twelve finish in
+# (a throwaway $HOME, pool or lock dir, no Postgres) and they all finish in
 # about a second. `make lint` compiles them under `--all-targets` and runs none, so
 # without this target a broken token check or capability check still passes.
 TEST_CRATES := lucidos-build-slot lucidos-capabilities lucidos-claude-code-managed \
 	lucidos-file-backup-exclusion lucidos-frame-capability lucidos-engine-socket lucidos-gateway-constants lucidos-home \
-	lucidos-installs lucidos-local-token lucidos-owner-lock lucidos-pg-url lucidos-tailscale
+	lucidos-installs lucidos-local-token lucidos-owner-lock lucidos-pg-url lucidos-tailscale lucidos-update-address
 test-crates:
 	cargo test --locked $(addprefix -p ,$(TEST_CRATES))
 

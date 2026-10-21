@@ -81,7 +81,8 @@ pub(crate) fn holds_thread(session: &AgentSession) -> bool {
 
 /// Claim `thread_id` under the caller's `agent_sessions` lock, or say who
 /// holds it. An entry whose run has let go is replaced. Its model, effort and
-/// command lists carry over, because the next spawn resumes with them.
+/// command lists carry over, so the picker reads them until the next spawn
+/// resolves its own rung.
 pub(crate) fn claim_thread_for(
     sessions: &mut HashMap<Uuid, AgentSession>,
     thread_id: Uuid,
@@ -140,7 +141,6 @@ pub(crate) fn claim_thread_for(
             cancel_actor: None,
             redirect_cause: None,
             redirect_followup_pending: false,
-            effort_resume: None,
             stop: entry.stop.clone(),
             interrupt: entry.interrupt.clone(),
             idle_notify: entry.idle_notify.clone(),

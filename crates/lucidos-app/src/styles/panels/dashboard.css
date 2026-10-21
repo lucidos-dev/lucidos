@@ -381,17 +381,14 @@
 
 /* --- The dashboard sheet: the phone dashboard over the open thread ---
 
-   The title row and its toggle stay clear of both dims. The row's edges arrive
-   as --sheet-row-top and --sheet-row-bottom (components/dashboard/DashboardSheet.tsx),
-   so a two-line title or a larger UI scale moves the sheet with it. */
+   It hangs below the app header, which carries its toggle and stays clear of
+   the dim (components/dashboard/DashboardSheet.tsx). */
 
 @media (--phone-layout) {
     .dashboard-sheet {
         --sheet-gap: 0.75rem;
         /* 1.25rem in the default theme, and a theme's own surface radius scales it. */
         --sheet-corner-radius: calc(var(--radius-surface) * 5 / 3);
-        --sheet-row-top: var(--app-header-bottom);
-        --sheet-row-bottom: var(--app-header-bottom);
         position: fixed;
         inset: 0;
         z-index: var(--z-control-panel);
@@ -402,19 +399,11 @@
         position: absolute;
         left: 0;
         right: 0;
+        top: var(--app-header-bottom);
+        height: var(--sheet-gap);
         background: var(--scrim);
         opacity: 0;
         transition: opacity var(--duration-slow) ease;
-    }
-
-    .dashboard-sheet-dim-top {
-        top: 0;
-        height: var(--sheet-row-top);
-    }
-
-    .dashboard-sheet-dim-gap {
-        top: var(--sheet-row-bottom);
-        height: var(--sheet-gap);
     }
 
     .dashboard-sheet.is-open .dashboard-sheet-dim {
@@ -428,7 +417,7 @@
         left: 0;
         right: 0;
         bottom: 0;
-        top: calc(var(--sheet-row-bottom) + var(--sheet-gap));
+        top: calc(var(--app-header-bottom) + var(--sheet-gap));
         overflow-y: auto;
         overscroll-behavior: contain;
         padding-bottom: var(--safe-area-bottom);
@@ -461,16 +450,7 @@
         transition: opacity var(--duration-fast) ease;
     }
 
-    /* The button at the trailing end of the title row, on the title's first
-       line. It overhangs the row by its margin instead of growing it. */
-    .mobile-thread-title-row .dashboard-sheet-toggle {
-        flex: none;
-        width: 2rem;
-        height: 2rem;
-        margin-block: calc((var(--title-line-box) - 2rem) / 2);
-    }
-
-    .mobile-thread-title-row .dashboard-sheet-toggle[aria-pressed="true"] {
+    .dashboard-sheet-toggle[aria-pressed="true"] {
         color: var(--text-primary);
         background: var(--bg-hover);
     }

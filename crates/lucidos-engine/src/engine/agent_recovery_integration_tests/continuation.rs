@@ -488,30 +488,6 @@ async fn a_harden_request_resumes_with_the_harden_message() {
     teardown_test_db(&db_name).await;
 }
 
-/// An effort restart resumes with the nudge that says why the turn stopped,
-/// so the agent never reads the interruption as the user's request.
-#[tokio::test]
-async fn an_effort_restart_resumes_with_the_effort_nudge() {
-    use crate::engine::agent_recovery::{
-        continue_input_for_reason, EFFORT_RESTART_REASON, EFFORT_RESTART_USER_MESSAGE,
-    };
-
-    let (pool, db_name) = setup_test_db().await;
-    assert_eq!(
-        continue_input_for_reason(
-            &pool,
-            std::path::Path::new("/nonexistent"),
-            Uuid::new_v4(),
-            Some(EFFORT_RESTART_REASON)
-        )
-        .await,
-        EFFORT_RESTART_USER_MESSAGE,
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
 /// Try again after a start failure must hand the agent the message it never
 /// read, with the same words the user typed (the I7 contract). The events are
 /// the ones a real start failure leaves.
@@ -656,32 +632,10 @@ async fn stranded_ids(pool: &sqlx::PgPool, thread_id: Uuid, first_prompt: &[Uuid
     .collect()
 }
 
-/// An effort pick that interrupts a turn before the agent read its first
-/// prompt leaves that prompt owed to the resume. A follow-up the session
-/// forwarded stays out: `stranded_follow_ups` redelivers it.
+/// An older thread an effort restart left with a discarded prompt: the next
+/// session delivers it, ahead of the follow-up queued behind it.
 #[tokio::test]
-async fn an_effort_restart_before_the_first_read_leaves_its_message_owed() {
-    use crate::engine::agent_recovery::discarded_input;
-
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let thread_id = Uuid::new_v4();
-    let (prompt, _) = effort_pick_discards_the_first_prompt(&bus, thread_id).await;
-
-    let owed = discarded_input(&pool, thread_id)
-        .await
-        .expect("the first prompt the agent never read is owed");
-    assert_eq!(owed.text, "Hey");
-    assert_eq!(owed.event_ids, [prompt]);
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Race 1: the user's message wins the gap between the effort pick and the
-/// resume's claim. Its session, not the resume, delivers the discarded prompt.
-#[tokio::test]
-async fn a_message_that_wins_the_gap_after_an_effort_pick_gets_the_discarded_prompt() {
+async fn the_next_session_delivers_an_older_discarded_prompt() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -697,58 +651,6 @@ async fn a_message_that_wins_the_gap_after_an_effort_pick_gets_the_discarded_pro
         stranded_ids(&pool, thread_id, &[newer]).await,
         [prompt, follow_up],
         "the new message's session delivers the discarded prompt, oldest first"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Race 2: the follow-up queued behind the discarded prompt is read after the
-/// interrupt, and its turn ends on its own. The prompt is still owed, the
-/// resume carries it, and its read closes the discard.
-#[tokio::test]
-async fn a_follow_up_read_after_an_effort_pick_leaves_the_discarded_prompt_owed() {
-    use crate::engine::agent_recovery::discarded_input;
-
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let thread_id = Uuid::new_v4();
-    let (prompt, follow_up) = effort_pick_discards_the_first_prompt(&bus, thread_id).await;
-    let read = |input_event_id| ThreadEvent::CodingAgentInputRead {
-        input_event_id,
-        started_turn: false,
-        verbatim: false,
-    };
-    emit_cc(&bus, thread_id, read(follow_up)).await;
-    emit_cc(
-        &bus,
-        thread_id,
-        ThreadEvent::ResponseGenerated {
-            text: "done".into(),
-            images: vec![],
-            model: None,
-            reasoning_effort: None,
-        },
-    )
-    .await;
-
-    let owed = discarded_input(&pool, thread_id)
-        .await
-        .expect("the turn that read the follow-up never read the prompt");
-    assert_eq!(owed.text, "Hey");
-    assert_eq!(owed.event_ids, [prompt]);
-
-    let resume = Uuid::new_v4();
-    assert!(
-        stranded_ids(&pool, thread_id, &[resume, prompt])
-            .await
-            .is_empty(),
-        "the resume carries the prompt as its first prompt, so it does not redeliver it"
-    );
-    emit_cc(&bus, thread_id, read(prompt)).await;
-    assert!(
-        discarded_input(&pool, thread_id).await.is_none(),
-        "the resume's read closes the discard"
     );
 
     pool.close().await;
@@ -797,27 +699,17 @@ async fn effort_pick_discards_a_child_wake(bus: &EventBus, thread_id: Uuid) -> U
     wake
 }
 
-/// Race 2 for a child wake: the effort resume opens with the completion card,
-/// and its read closes the discard.
+/// An older discarded child wake stays owed to the next session until its
+/// agent reads it.
 #[tokio::test]
-async fn the_effort_resume_carries_a_discarded_child_wake() {
-    use crate::engine::agent_recovery::discarded_input;
-
+async fn an_older_discarded_child_wake_stays_owed_until_read() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
     let wake = effort_pick_discards_a_child_wake(&bus, thread_id).await;
+    let next = Uuid::new_v4();
 
-    let owed = discarded_input(&pool, thread_id)
-        .await
-        .expect("the wake no turn read is owed");
-    assert!(
-        owed.text.contains("[CHILD THREAD COMPLETED]"),
-        "{}",
-        owed.text
-    );
-    assert!(owed.text.contains("child did the thing"));
-    assert_eq!(owed.event_ids, [wake]);
+    assert_eq!(stranded_ids(&pool, thread_id, &[next]).await, [wake]);
 
     emit_cc(
         &bus,
@@ -830,19 +722,18 @@ async fn the_effort_resume_carries_a_discarded_child_wake() {
     )
     .await;
     assert!(
-        discarded_input(&pool, thread_id).await.is_none(),
-        "the resume's read closes the discard"
+        stranded_ids(&pool, thread_id, &[next]).await.is_empty(),
+        "a read closes the discard"
     );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// The resume after a discarded continuation sends its own nudge, and a
-/// keep-alive only warms the cache: neither is owed.
+/// A discarded continuation sent its own nudge, and a keep-alive only warms
+/// the cache: neither is owed.
 #[tokio::test]
 async fn a_discarded_continuation_or_keep_alive_leaves_nothing_owed() {
-    use crate::engine::agent_recovery::discarded_input;
     use crate::engine::thread_events::{ActorMode, EngineReason, MessageOrigin};
 
     let (pool, db_name) = setup_test_db().await;
@@ -878,7 +769,9 @@ async fn a_discarded_continuation_or_keep_alive_leaves_nothing_owed() {
         .await;
     }
 
-    assert!(discarded_input(&pool, thread_id).await.is_none());
+    assert!(stranded_ids(&pool, thread_id, &[Uuid::new_v4()])
+        .await
+        .is_empty());
 
     pool.close().await;
     teardown_test_db(&db_name).await;

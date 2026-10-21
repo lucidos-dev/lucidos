@@ -193,6 +193,26 @@ describe('computeAnchorPosition', () => {
     expect(props.get('--anchor-room')).toBe('252px');
   });
 
+  /** Uncapped, the panel stops scrolling and the browser clamps `scrollTop` to
+   *  0. Every scroll inside the menu re-measures, so the menu jumped to its
+   *  top as the user reached its last row. */
+  it('keeps the scroll position of a capped panel it measures', () => {
+    const props = new Map<string, string>([['--anchor-room', '252px']]);
+    let scrollTop = 48;
+    const panel = {
+      style: {
+        getPropertyValue: (k: string) => props.get(k) ?? '',
+        removeProperty: (k: string) => { props.delete(k); scrollTop = 0; return ''; },
+        setProperty: (k: string, v: string) => { props.set(k, v); },
+      },
+      get offsetHeight() { return props.has('--anchor-room') ? 252 : 300; },
+      get scrollTop() { return scrollTop; },
+      set scrollTop(v: number) { scrollTop = v; },
+    } as unknown as HTMLElement;
+    naturalPanelHeight(panel);
+    expect(panel.scrollTop).toBe(48);
+  });
+
   it('never caps a panel that fits below it', () => {
     setViewport(1280, 800);
     const pos = computeAnchorPosition(fakeAnchor({ top: 100, bottom: 120, left: 50, right: 100 }), 200, 300);

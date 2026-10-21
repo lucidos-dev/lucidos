@@ -43,9 +43,8 @@ describe('the dashboard sheet motion', () => {
     expect(reducedOpen.get('opacity')).toBe('1');
   });
 
-  it('leaves the title row to stay clear: the dims never reach into it', () => {
-    expect(rule('.dashboard-sheet-dim-top').props.get('height')).toBe('var(--sheet-row-top)');
-    expect(rule('.dashboard-sheet-dim-gap').props.get('top')).toBe('var(--sheet-row-bottom)');
-    expect(rule('.dashboard-sheet-panel').props.get('top')).toBe('calc(var(--sheet-row-bottom) + var(--sheet-gap))');
+  it('hangs below the app header, which the dim never reaches into', () => {
+    expect(rule('.dashboard-sheet-dim').props.get('top')).toBe('var(--app-header-bottom)');
+    expect(rule('.dashboard-sheet-panel').props.get('top')).toBe('calc(var(--app-header-bottom) + var(--sheet-gap))');
   });
 });

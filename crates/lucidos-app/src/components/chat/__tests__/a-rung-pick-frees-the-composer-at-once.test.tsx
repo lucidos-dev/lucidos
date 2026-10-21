@@ -25,8 +25,8 @@ const response: CodingAgentCommandsResponse = {
   ladder_rungs: [{ model: 'claude-opus-5-5', effort: 'medium', label: 'Opus 5.5', estimated: true }],
 } as unknown as CodingAgentCommandsResponse;
 
-let answerControl: ((result: 'ok') => void) | null = null;
-const sendCodingAgentControl = vi.fn(() => new Promise<'ok'>((resolve) => { answerControl = resolve; }));
+let answerControl: ((recorded: boolean) => void) | null = null;
+const sendCodingAgentControl = vi.fn(() => new Promise<boolean>((resolve) => { answerControl = resolve; }));
 const fetchSwitchEstimate = vi.fn(() => Promise.resolve({ context_tokens: 1000, rebuilds_cache: false, extra_cost_usd: null }));
 
 vi.mock('../../../api/client', async (importOriginal) => ({
@@ -69,7 +69,7 @@ afterEach(() => {
   host.remove();
 });
 
-describe('a rung pick on a live thread', () => {
+describe('a rung pick on a started thread', () => {
   it('frees the UI behind before its control request answers', async () => {
     render(<RungControl threadId="t1" codingAgent="claude-code" />, host);
     await settle();
@@ -83,7 +83,7 @@ describe('a rung pick on a live thread', () => {
     expect(document.documentElement.hasAttribute('data-overlay-open'),
       'the list still holds the UI behind inert').toBe(false);
 
-    answerControl!('ok');
+    answerControl!(true);
     await settle();
   });
 });

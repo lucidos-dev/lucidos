@@ -56,7 +56,7 @@ import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import type { UnproposedReason } from '../generated/thread-event-wire';
 import { resetContentScroll } from './savedScroll';
-import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort, PendingCommits, ReleaseNoticeView, ThreadContext } from '../api/client';
+import type { Change, ChangelogRelease, PendingCommits, ReleaseNoticeView, ThreadContext } from '../api/client';
 import type { UpdateRelay, ReleaseCheck } from '../api/client/control';
 import type { ApplyEstimates, LandingLane, MainCheck } from '../api/client/changes';
 import type { EnvironmentVariable, ModelInfo, ResponseStyle } from '../api/types';
@@ -1132,6 +1132,11 @@ export function successorOffer(
 /** The thread whose Successor card is on screen, or `null`. A model pick on
  *  that thread aims the successor and switches nothing here. */
 export const successorCardThreadId = signal<string | null>(null);
+
+/** The model and effort picked under the Successor card, for the successor
+ *  only. The thread's own pick on the engine stays put. The card drops it
+ *  when it closes, so it never outlives the card it was picked under. */
+export const successorCardPick = signal<{ threadId: string; model: string; effort: string | null } | null>(null);
 
 /** Whether an idle coding agent still holds the newest message unread, so its
  *  next turn starts by itself (ADR 0268). A message queued behind a turn that
@@ -2225,19 +2230,6 @@ export const pendingChatMessage = signal<string | null>(null);
 // Bumped when a coding-agent session starts or resumes, so components re-fetch
 // their commands.
 export const codingAgentSessionVersion = signal(0);
-
-// The active thread's coding-agent model and effort pick, sent with its next
-// follow-up. `loadCommands` clears each once the live session adopts it. A
-// compose draft never reads these: its picks live in `composeSelections`.
-export const codingAgentPendingModel = signal<CodingAgentModelValue | null>(null);
-export const codingAgentPendingReasoningEffort = signal<CodingAgentReasoningEffort | null>(null);
-
-/** Reset the pending picks. `focusThread` calls it on every focus, including
- *  a tap on the thread that is already open. */
-export function resetCodingAgentPendingPreferences(): void {
-  codingAgentPendingModel.value = null;
-  codingAgentPendingReasoningEffort.value = null;
-}
 
 // --- Apps ---
 export const appsList = signal<Loadable<App[]>>({ status: 'not-loaded' });

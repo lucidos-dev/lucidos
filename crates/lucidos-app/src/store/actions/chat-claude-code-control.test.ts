@@ -1,14 +1,12 @@
 /**
- * `sendCodingAgentControl` passes on when the engine says a change takes
- * effect. A Codex pick made mid-turn lands on the next turn, and the menu
- * toasts that rather than claiming it applied.
+ * `sendCodingAgentControl` reports whether the engine recorded a pick. A
+ * refusal, such as a pick made while a turn runs, toasts the engine's reason.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 import type { sendControlRequest as SendControlRequest } from '../../api/client';
 
 const showToast = vi.fn();
-// Typed, so every `takes_effect` below is checked against the generated values.
 const sendControlRequest = vi.fn<typeof SendControlRequest>();
 
 class ApiError extends Error {
@@ -38,19 +36,16 @@ const effort = { subtype: 'set_reasoning_effort', effort: 'low' };
 describe('sendCodingAgentControl', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('reports a change that applies now as ok', async () => {
-    sendControlRequest.mockResolvedValueOnce({ ok: true, takes_effect: 'now' });
-    expect(await sendCodingAgentControl('t1', effort)).toBe('ok');
-  });
-
-  it('reports a change that waits for the next turn', async () => {
-    sendControlRequest.mockResolvedValueOnce({ ok: true, takes_effect: 'next-turn' });
-    expect(await sendCodingAgentControl('t1', effort)).toBe('next-turn');
-  });
-
-  it('keeps a missing session as a pending pick, with no toast', async () => {
-    sendControlRequest.mockRejectedValueOnce(new ApiError(404, 'No session'));
-    expect(await sendCodingAgentControl('t1', effort)).toBe('pending');
+  it('reports a recorded pick', async () => {
+    sendControlRequest.mockResolvedValueOnce({ ok: true });
+    expect(await sendCodingAgentControl('t1', effort)).toBe(true);
     expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('toasts the engine reason when a running turn refuses the pick', async () => {
+    const reason = 'The model and effort stay fixed while a turn runs. Pick again when it ends.';
+    sendControlRequest.mockRejectedValueOnce(new ApiError(409, reason));
+    expect(await sendCodingAgentControl('t1', effort)).toBe(false);
+    expect(showToast).toHaveBeenCalledWith(expect.stringContaining(reason), 'error');
   });
 });

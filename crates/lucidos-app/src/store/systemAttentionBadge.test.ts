@@ -42,6 +42,8 @@ function offer(version: string): void {
     checked_at: null,
     last_error: null,
     latest: { version, notes: null, install: 'desktop-app', command: null },
+    update_address: null,
+    update_address_error: null,
   };
 }
 

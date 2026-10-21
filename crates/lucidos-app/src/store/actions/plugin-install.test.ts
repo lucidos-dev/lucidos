@@ -92,6 +92,21 @@ describe('markPluginInstalled', () => {
     expect(receipt.request.plugin_name).toBe('Habit Tracker');
   });
 
+  it('carries the triggers that rely on a file the update removed', () => {
+    const form = openPending();
+    const affected = [{
+      trigger_id: 't-1',
+      trigger_name: 'Daily habit check',
+      paths: [{ path: 'apps/habit-tracker/knowhow/daily.md', reason: 'owning-app' as const }],
+    }];
+
+    markPluginInstalled(form, { ...engineResult, affected_triggers: affected });
+
+    const receipt = activeInlineForm.value;
+    if (receipt?.type !== 'plugin-install') throw new Error('expected a receipt');
+    expect(receipt.installed?.affected_triggers).toEqual(affected);
+  });
+
   it('replaces the panel history entry instead of pushing a second one', () => {
     const form = openPending();
     pushNavState.mockClear();

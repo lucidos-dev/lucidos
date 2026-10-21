@@ -134,11 +134,33 @@ let endHold: (() => void) | null = null;
 // Set once a hold opened the menu: the platform's own long-press menu that
 // may follow it is swallowed, so one press opens one menu.
 let heldOpenedMenu = false;
+// The root's own selection styles, kept from a hold until the next press.
+let stylesBeforeHold: Array<[property: string, value: string, priority: string]> | null = null;
 const sizeListeners = new Set<(size: WidgetSize | null) => void>();
 const visibilityListeners = new Set<(visible: boolean) => void>();
 
 function notify<T>(listeners: Set<(value: T) => void>, value: T): void {
   for (const cb of [...listeners]) runIsolated(() => cb(value));
+}
+
+/** iOS starts its own text selection just after a hold opens the menu. A
+ *  hold turns selection off until the next press, so the menu comes alone. */
+function holdSelection(): void {
+  const { style } = document.documentElement;
+  stylesBeforeHold ??= ['user-select', '-webkit-user-select'].map((property) =>
+    [property, style.getPropertyValue(property), style.getPropertyPriority(property)]);
+  for (const [property] of stylesBeforeHold) style.setProperty(property, 'none', 'important');
+  window.getSelection()?.removeAllRanges();
+}
+
+function releaseSelection(): void {
+  if (!stylesBeforeHold) return;
+  const { style } = document.documentElement;
+  for (const [property, value, priority] of stylesBeforeHold) {
+    if (value) style.setProperty(property, value, priority);
+    else style.removeProperty(property);
+  }
+  stylesBeforeHold = null;
 }
 
 function postMenuRequest(at?: Point): void {
@@ -163,6 +185,7 @@ function trackPress(down: PointerEvent): void {
   const timer = setTimeout(() => {
     end();
     heldOpenedMenu = true;
+    holdSelection();
     postMenuRequest();
   }, LONG_PRESS_DELAY_MS);
   endHold = end;
@@ -182,6 +205,7 @@ function trackPress(down: PointerEvent): void {
  *  Only a menu press measures the selection, as the host's policy does. */
 function notePress(e: PointerEvent): void {
   heldOpenedMenu = false;
+  releaseSelection();
   primaryDown = e.isPrimary !== false && e.button === 0;
   menuPress = opensContextMenu(e);
   selectionAtPress = menuPress && selectionCovers(window.getSelection(), { x: e.clientX, y: e.clientY });
@@ -326,6 +350,7 @@ export function _resetWidgetFrameForTesting(): void {
   visible = true;
   menu = menuPress = selectionAtPress = menuFromPointer = menuOverSelection = false;
   primaryDown = heldOpenedMenu = false;
+  releaseSelection();
   endHold?.();
   sizeListeners.clear();
   visibilityListeners.clear();

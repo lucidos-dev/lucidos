@@ -35,6 +35,7 @@ mod data_store;
 mod event_waits;
 mod events;
 mod frontend_preview;
+mod gateway;
 mod intelligence_ladder;
 /// Manifest-generated subcommands, one per `cli = true` capability domain,
 /// rendered by `build.rs` from `lucidos-capabilities`. Wire each enum below.
@@ -61,6 +62,7 @@ mod request_read;
 mod spawn_thread;
 mod successor;
 mod threads;
+mod update_address;
 mod wake_parent;
 mod workspace;
 
@@ -194,6 +196,20 @@ enum Command {
         /// or absent. Implies `--qr`.
         #[arg(long)]
         host: Option<String>,
+    },
+    /// Read or change the update address: the latest.json URL update checks
+    /// read instead of the published release.
+    ///
+    /// The setting is the gateway's, and Settings, System, Maintenance edits
+    /// the same value. Only https is accepted, or http to localhost,
+    /// 127.0.0.1 or [::1].
+    #[command(name = "update-address")]
+    UpdateAddress {
+        #[command(subcommand)]
+        action: UpdateAddressAction,
+        /// Gateway port, when it is not on 5252 (packaged) or 5251 (dev).
+        #[arg(long, global = true)]
+        port: Option<u16>,
     },
     /// Run a heavy build under a *build slot*, so parallel worktrees cannot
     /// pile N full compiles onto one host and OOM it.
@@ -1067,6 +1083,19 @@ pub(crate) struct CredentialsCliArgs {
 }
 
 #[derive(Subcommand)]
+enum UpdateAddressAction {
+    /// Print the address in use, or why the stored one is refused.
+    Show,
+    /// Read updates from this latest.json URL from now on.
+    Set {
+        /// The latest.json URL.
+        url: String,
+    },
+    /// Go back to the published release.
+    Reset,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum CredentialsAction {
     /// Every stored credential, its auth type, the base URLs it covers, and
     /// the variable names a command names to get it.
@@ -1852,6 +1881,15 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 qr: qr || host.is_some(),
                 host: host.as_deref(),
             })?;
+            Ok(0)
+        }
+        Command::UpdateAddress { action, port } => {
+            let action = match action {
+                UpdateAddressAction::Show => update_address::Action::Show,
+                UpdateAddressAction::Set { url } => update_address::Action::Set(url),
+                UpdateAddressAction::Reset => update_address::Action::Reset,
+            };
+            update_address::cmd_update_address(&action, port)?;
             Ok(0)
         }
         Command::AwaitEvent(args) => {

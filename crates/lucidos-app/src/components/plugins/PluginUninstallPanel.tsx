@@ -5,6 +5,7 @@ import {
   cancelPluginUninstallAction,
   confirmPluginUninstallAction,
 } from '../../store/actions/plugin-uninstall';
+import { AFFECTED_TRIGGERS_NEXT_RUN, AffectedTriggerList } from './AffectedTriggerList';
 import { PluginFileList } from './PluginFileList';
 import { pluginPanelHeader } from './PluginSection';
 
@@ -92,6 +93,15 @@ function PluginUninstallConfirm({ form }: { form: PluginUninstallForm }) {
           />
         )}
 
+        {(req.affected_triggers ?? []).length > 0 && (
+          <AffectedTriggerList
+            label="Triggers that use these files"
+            triggers={req.affected_triggers!}
+            tone="danger"
+            note={`These triggers are not part of this plugin, so uninstalling leaves them as they are. ${AFFECTED_TRIGGERS_NEXT_RUN}`}
+          />
+        )}
+
         {req.files_missing.length > 0 && (
           <PluginFileList label="Already gone" files={req.files_missing} />
         )}
@@ -133,6 +143,14 @@ export function PluginUninstallReceiptPanel({ form }: { form: PluginUninstallFor
 
         {removed.files_missing.length > 0 && (
           <PluginFileList label="Already gone" files={removed.files_missing} />
+        )}
+
+        {(removed.affected_triggers ?? []).length > 0 && (
+          <AffectedTriggerList
+            label="Triggers to check"
+            triggers={removed.affected_triggers!}
+            note={AFFECTED_TRIGGERS_NEXT_RUN}
+          />
         )}
       </div>
     </div>

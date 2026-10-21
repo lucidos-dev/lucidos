@@ -2,10 +2,10 @@ import { test, expect, Page } from './fixtures';
 import { navigateToApp, assertHealthy, ensureMobileView } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
-/** A phone reaches Home from a Home icon paired with the mark in the thread
- *  pane's header, landing on Home as a plain chat (ADR 0496, amended). The thread
- *  drawer's header has no Home icon, so the menu its mark opens keeps a Home
- *  row; the thread pane's menu drops it. */
+/** A phone reaches Home from a Home icon in the thread pane's header, left of
+ *  the mark, with the dashboard toggle on its right. It lands on Home as a
+ *  plain chat (ADR 0496, amended). The thread drawer's header has no Home icon,
+ *  so the menu its mark opens keeps a Home row; the thread pane's menu drops it. */
 test.describe('The home thread from the phone header', () => {
   let home: string;
 
@@ -26,45 +26,48 @@ test.describe('The home thread from the phone header', () => {
     await ensureMobileView(page, 'thread');
   });
 
-  test('Home and the mark centre together, and Home opens it', async ({ page }) => {
-    const home = page.locator('.mobile-thread-header .header-mark-pair .home-thread-btn');
+  test('the mark sits on the row middle between Home and the dashboard, and Home opens it', async ({ page }) => {
+    const home = page.locator('.mobile-thread-header .header-mark-group .home-thread-btn');
     await expect(home).toBeVisible();
+    await expect(page.locator('.mobile-thread-header .header-mark-group .dashboard-sheet-toggle')).toBeVisible();
 
     const offset = await page.evaluate(() => {
       const row = document.querySelector('.mobile-thread-header .mobile-header-row')!.getBoundingClientRect();
-      const pair = document.querySelector('.mobile-thread-header .header-mark-pair')!.getBoundingClientRect();
-      return (pair.left + pair.right) / 2 - (row.left + row.right) / 2;
+      const mark = document.querySelector('.mobile-thread-header .header-mark-group .brand-mark-slot')!.getBoundingClientRect();
+      return (mark.left + mark.right) / 2 - (row.left + row.right) / 2;
     });
-    expect(Math.abs(offset), `the pair sits ${offset}px off the row middle`).toBeLessThan(2.5);
+    expect(Math.abs(offset), `the mark sits ${offset}px off the row middle`).toBeLessThan(1);
 
     await home.click();
     await expectHomeOpen(page);
   });
 
-  test('Home and the mark spread apart when the row has room, and touch when it has none', async ({ page }) => {
+  test('the group spreads out when the row has room, and touches when it has none', async ({ page }) => {
     // The app writes the scale itself once preferences load, so wait for that
     // write before ours, or ours is reverted under the measurement.
     await page.waitForFunction(() => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 });
-    await expect(page.locator('.mobile-thread-header .header-mark-pair .home-thread-btn')).toBeVisible();
+    await expect(page.locator('.mobile-thread-header .header-mark-group .home-thread-btn')).toBeVisible();
 
     const measure = () => page.evaluate(() => {
       const header = document.querySelector('.mobile-thread-header')!;
       const box = (sel: string) => header.querySelector(sel)!.getBoundingClientRect();
       const probe = document.createElement('div');
-      probe.style.width = 'var(--header-mark-pair-gap-max)';
+      probe.style.width = 'var(--header-mark-group-gap-max)';
       document.body.appendChild(probe);
       const max = probe.getBoundingClientRect().width;
       probe.remove();
       const row = box('.mobile-header-row');
-      const pair = box('.header-mark-pair');
+      const group = box('.header-mark-group');
       const home = box('.home-thread-btn');
       const mark = box('.brand-mark-slot');
+      const dash = box('.dashboard-sheet-toggle');
       return {
         max,
-        gap: mark.left - home.right,
-        offset: (pair.left + pair.right) / 2 - (row.left + row.right) / 2,
-        backClearance: pair.left - box('button[aria-label="Previous thread"]').right,
-        forwardClearance: box('button[aria-label="Next thread"]').left - pair.right,
+        homeGap: mark.left - home.right,
+        dashGap: dash.left - mark.right,
+        offset: (mark.left + mark.right) / 2 - (row.left + row.right) / 2,
+        backClearance: group.left - box('button[aria-label="Previous thread"]').right,
+        forwardClearance: box('button[aria-label="Next thread"]').left - group.right,
       };
     });
 
@@ -74,14 +77,16 @@ test.describe('The home thread from the phone header', () => {
         .poll(() => page.evaluate(() => getComputedStyle(document.documentElement).fontSize))
         .toBe(`${rootPx}px`);
       const m = await measure();
-      if (roomy) {
-        expect(m.gap, `ui-scale ${scale}: gap ${m.gap.toFixed(1)} is not the max ${m.max.toFixed(1)}`).toBeCloseTo(m.max, 0);
-      } else {
-        expect(m.gap, `ui-scale ${scale}: gap ${m.gap.toFixed(1)} did not close up`).toBeCloseTo(0, 0);
+      for (const [side, gap] of [['Home', m.homeGap], ['dashboard', m.dashGap]] as const) {
+        if (roomy) {
+          expect(gap, `ui-scale ${scale}: ${side} gap ${gap.toFixed(1)} is not the max ${m.max.toFixed(1)}`).toBeCloseTo(m.max, 0);
+        } else {
+          expect(gap, `ui-scale ${scale}: ${side} gap ${gap.toFixed(1)} did not close up`).toBeCloseTo(0, 0);
+        }
       }
-      expect(Math.abs(m.offset), `ui-scale ${scale}: the pair sits ${m.offset}px off the row middle`).toBeLessThan(2.5);
-      expect(m.backClearance, `ui-scale ${scale}: the back chevron overlaps the pair`).toBeGreaterThan(0);
-      expect(m.forwardClearance, `ui-scale ${scale}: the forward chevron overlaps the pair`).toBeGreaterThan(0);
+      expect(Math.abs(m.offset), `ui-scale ${scale}: the mark sits ${m.offset}px off the row middle`).toBeLessThan(1);
+      expect(m.backClearance, `ui-scale ${scale}: the back chevron overlaps the group`).toBeGreaterThan(0);
+      expect(m.forwardClearance, `ui-scale ${scale}: the forward chevron overlaps the group`).toBeGreaterThan(0);
     }
   });
 

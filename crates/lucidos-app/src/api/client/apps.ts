@@ -2,7 +2,7 @@ import { API, API_BASE, json, mutatingFetch, retryTransient, throwIfNotOk, throw
 import { readDeviceId } from '../../utils/deviceIdHeader';
 import { lucidos, WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
 import { canonicalWidgetParams, hasWidgetParams, type WidgetParams } from '../../utils/widgetParams';
-import type { App, PinnedAppEntry } from '../../store/types';
+import type { AffectedTrigger, App, PinnedAppEntry } from '../../store/types';
 import type { ApiResult, ArtifactsResponse, UploadResponse } from '../types';
 
 // --- Workspaces ---
@@ -81,6 +81,9 @@ export interface PluginConfirmInstallResponse {
   /** What the install did to files the user had locally edited. Absent when it
    *  met none, which is every fresh install. */
   local_changes?: PluginLocalChangesResult;
+  /** Triggers this plugin does not own that rely on a file the update deleted.
+   *  The engine leaves them untouched. Absent when none do. */
+  affected_triggers?: AffectedTrigger[];
 }
 
 /** User accepted the staged install in the install panel. The engine writes
@@ -140,6 +143,9 @@ export interface PluginConfirmUninstallResponse {
   summary: string;
   files_deleted: string[];
   files_missing: string[];
+  /** Triggers this plugin does not own that rely on a file the uninstall
+   *  deleted. The engine leaves them untouched. Absent when none do. */
+  affected_triggers?: AffectedTrigger[];
 }
 
 /** User accepted the staged uninstall in the panel. The engine deletes the

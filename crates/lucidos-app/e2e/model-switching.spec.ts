@@ -21,14 +21,12 @@ async function setupIdleCCThread(page: Page) {
   await waitForActionPanel(page, 'Archive', 120_000);
 }
 
-/** Install API route handlers that force has_active_session: true in commands
- * responses and intercept control commands (returning success).
- * This allows testing the rung control without needing a live CC process.
- * Call it BEFORE the thread is set up. The app reads the commands again only on
- * a session event. A mock installed after the last event never reaches it, so
- * the app holds `has_active_session: false`.
+/** Install API route handlers that record control requests and answer success.
+ * The commands read then reports the recorded pair, as the engine does. Call
+ * it BEFORE the thread is set up: the app reads the commands again only on a
+ * session event.
  * Returns the control requests the app sent, in order. */
-async function mockActiveSession(page: Page) {
+async function mockRungPicks(page: Page) {
   let modelOverride: string | null = null;
   let effortOverride: string | null = null;
   const controls: Array<{ subtype?: string; model?: string; effort?: string }> = [];
@@ -36,7 +34,6 @@ async function mockActiveSession(page: Page) {
   await page.route('**/api/v1/claude-code/commands*', async (route) => {
     const response = await route.fetch();
     const body = await response.json();
-    body.has_active_session = true;
     if (modelOverride) body.current_model = modelOverride;
     if (effortOverride) body.current_reasoning_effort = effortOverride;
     await route.fulfill({
@@ -46,7 +43,7 @@ async function mockActiveSession(page: Page) {
     });
   });
 
-  // A pick on a live thread asks what it costs first. This one is free.
+  // A pick on a started thread asks what it costs first. This one is free.
   await page.route(/\/api\/v1\/threads\/[^/]+\/switch-estimate/, async (route) => {
     await route.fulfill({
       status: 200,
@@ -66,7 +63,7 @@ async function mockActiveSession(page: Page) {
   await page.route('**/api/v1/claude-code/control', async (route) => {
     const request = route.request().postDataJSON()?.request ?? {};
     if (request.subtype === 'set_model') modelOverride = request.model;
-    if (request.subtype === 'set_reasoning_effort') effortOverride = request.effort;
+    if (request.effort) effortOverride = request.effort;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -107,7 +104,7 @@ test.describe('Model switching', () => {
   });
 
   test('rung list shows the ladder with the current rung checked', async ({ page }) => {
-    await mockActiveSession(page);
+    await mockRungPicks(page);
     await setupIdleCCThread(page);
 
     const dropdown = await openRungList(page);
@@ -126,7 +123,7 @@ test.describe('Model switching', () => {
   });
 
   test('ending the test mid-refetch does not fail the commands mock', async ({ page }) => {
-    await mockActiveSession(page);
+    await mockRungPicks(page);
     await navigateToApp(page);
 
     // Leave a commands fetch in flight and end the test under it.
@@ -134,7 +131,7 @@ test.describe('Model switching', () => {
   });
 
   test('Escape closes the rung list', async ({ page }) => {
-    await mockActiveSession(page);
+    await mockRungPicks(page);
     await setupIdleCCThread(page);
 
     const dropdown = await openRungList(page);
@@ -143,7 +140,7 @@ test.describe('Model switching', () => {
   });
 
   test('picking a rung sends its model and effort and updates the selection', async ({ page }) => {
-    const controls = await mockActiveSession(page);
+    const controls = await mockRungPicks(page);
     await setupIdleCCThread(page);
 
     await openRungList(page);
@@ -156,11 +153,9 @@ test.describe('Model switching', () => {
     await pickRung(page, target!.value);
 
     await expect.poll(() => controls.map((c) => c.subtype)).toContain('set_model');
-    expect(controls.find((c) => c.subtype === 'set_model')?.model).toBe(target!.model);
-    if (target!.effort) {
-      await expect.poll(() => controls.find((c) => c.subtype === 'set_reasoning_effort')?.effort)
-        .toBe(target!.effort);
-    }
+    const modelPick = controls.find((c) => c.subtype === 'set_model');
+    expect(modelPick?.model).toBe(target!.model);
+    expect(modelPick?.effort).toBe(target!.effort || undefined);
 
     // Re-open to verify selection changed
     await openRungList(page);

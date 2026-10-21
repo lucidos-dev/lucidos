@@ -52,7 +52,7 @@ async fn uninstall_removes_the_plugins_widget() {
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    uninstall_with_bus(&scratch, &MockEventBus::new(), &pending, None)
+    uninstall_with_bus(&scratch, &MockEventBus::new(), &pending, &[], None)
         .await
         .expect("uninstall");
     assert!(!scratch.join("data/apps/board").exists());

@@ -1,124 +1,65 @@
 use super::*;
 use crate::engine::CcCommandsResult;
 
-/// Record on the session the model or effort a control request switches to.
-/// The session is the only place that learns of it: the request goes straight
-/// to the runtime, past the run loop.
-pub(crate) fn record_control_request(
-    session: &mut crate::engine::AgentSession,
-    request: &crate::runtime::ControlRequest,
-) {
-    match request {
-        crate::runtime::ControlRequest::SetModel { model } => {
-            session.current_model = Some(model.clone());
-        }
-        crate::runtime::ControlRequest::SetReasoningEffort { effort } => {
-            session.current_reasoning_effort = Some(effort.clone());
-        }
-        _ => {}
-    }
+/// A model or effort the user picked for a started coding-agent thread, as
+/// `POST /api/v1/claude-code/control` takes it. The `subtype` names match the
+/// picker's command definitions (`cc_command_definitions`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "subtype", rename_all = "snake_case")]
+pub enum RungPick {
+    /// A model, with the effort picked beside it. One request records both,
+    /// so a turn starting between two requests cannot split the pair.
+    SetModel {
+        model: String,
+        #[serde(default)]
+        effort: Option<String>,
+    },
+    SetReasoningEffort {
+        effort: String,
+    },
 }
 
-/// How a change the backend takes only at spawn reaches a live session. Every
-/// restart puts it in force on the session's next call.
+/// What [`LucidosEngine::record_rung_pick`] did with a pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EffortRestart {
-    /// Nothing restarts. A session with no user turn running exits at idle,
-    /// so the next spawn carries the change. A session that is ending, or
-    /// that runs a merge turn, runs on without it.
-    NotNeeded,
-    /// Interrupt the turn as a redirect. Its end resumes the session.
-    InterruptTurn,
-    /// The turn waits on a question: stop the process and keep the card. The
-    /// answer resumes the session.
-    KeepQuestion,
+pub enum RungPickOutcome {
+    /// Recorded. The thread's next spawn runs on it.
+    Recorded,
+    /// Refused: a turn runs, and its rung stays fixed until it ends.
+    TurnRunning,
 }
 
-/// A turn of the user's own runs. A cache keep-alive's hidden turn is not one:
-/// its process exits at idle, so the next real turn spawns anyway.
-fn user_turn_in_flight(session: &crate::engine::AgentSession) -> bool {
-    session.is_in_flight() && !session.keep_alive
+/// How long a pick waits for a finished turn's idle exit, and how often it
+/// re-checks meanwhile. The exit usually lands within milliseconds.
+const IDLE_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const IDLE_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn turn_open(status: crate::engine::thread_lifecycle::ThreadStatus) -> bool {
+    use crate::engine::thread_lifecycle::ThreadStatus;
+    matches!(
+        status,
+        ThreadStatus::Running | ThreadStatus::WaitingForUserAnswer | ThreadStatus::Paused
+    )
 }
 
-/// Decide how a control request with `reach` restarts `session`. A merge turn
-/// is never interrupted, because a canceled merge aborts its Apply.
-pub(crate) fn effort_restart(
-    session: &crate::engine::AgentSession,
-    reach: crate::runtime::ControlReach,
-    parked_on_question: bool,
-) -> EffortRestart {
-    let runs_on = reach != crate::runtime::ControlReach::Spawn
-        || !user_turn_in_flight(session)
-        || session.pending_stop.is_some()
-        || session.conflict.is_some();
-    if runs_on {
-        EffortRestart::NotNeeded
-    } else if parked_on_question {
-        EffortRestart::KeepQuestion
-    } else {
-        EffortRestart::InterruptTurn
-    }
+/// Whether a turn runs on a thread, so its rung is locked (ADR 0542). A turn
+/// runs while it starts, works, or waits on a question, which the status
+/// says. A live process counts too: a follow-up would reach it on its old
+/// rung. A cache keep-alive's hidden turn does not count, because it records
+/// no rung over the pick.
+pub(crate) fn rung_locked(
+    status: crate::engine::thread_lifecycle::ThreadStatus,
+    session: Option<&crate::engine::AgentSession>,
+) -> bool {
+    turn_open(status) || session.is_some_and(|s| s.is_live() && !s.keep_alive)
 }
 
-fn restart_session(
-    session: &mut crate::engine::AgentSession,
-    restart: EffortRestart,
-    actor: Option<crate::engine::thread_events::MessageOrigin>,
-) {
-    match restart {
-        EffortRestart::NotNeeded => return,
-        EffortRestart::InterruptTurn => {
-            session.redirect_cause = Some(crate::engine::thread_events::CancelCause::EffortRestart);
-            session.cancel_actor = actor.clone();
-            session.interrupt.notify_one();
-        }
-        EffortRestart::KeepQuestion => {
-            // Exited from here on, so an answer that lands while the process
-            // stops takes the no-live-session path, which resumes the session.
-            session.process_exited = true;
-            session.idle_notify.notify_waiters();
-            session.pending_stop = Some(StopReason::EffortRestart);
-            session.stop.notify_one();
-        }
-    }
-    session.effort_resume = Some(crate::engine::types::EffortResume { actor });
-}
-
-/// Record a control request on the session, and send it to the runtime when
-/// the backend takes it live. Returns when the change takes effect, and the
-/// request's reach. A change the backend takes only at spawn waits for
-/// [`restart_for_control_request`].
-pub(crate) fn deliver_control_request(
-    session: &mut crate::engine::AgentSession,
-    request: crate::runtime::ControlRequest,
-    parked_on_question: bool,
-) -> Result<(crate::runtime::TakesEffect, crate::runtime::ControlReach), &'static str> {
-    let crate::engine::SessionPhase::Running { control_tx } = &session.phase else {
-        return Err("The coding agent is still starting. Try again in a moment.");
-    };
-    let control_tx = control_tx.clone();
-    let reach = session.coding_agent.control_reach(&request);
-    let turn_runs_on = user_turn_in_flight(session)
-        && effort_restart(session, reach, parked_on_question) == EffortRestart::NotNeeded;
-    record_control_request(session, &request);
-    if reach != crate::runtime::ControlReach::Spawn {
-        control_tx
-            .send(request)
-            .map_err(|_| "Control channel closed")?;
-    }
-    Ok((reach.takes_effect(turn_runs_on), reach))
-}
-
-/// Restart `session` for a delivered request the backend takes only at spawn.
-/// Call it once the change is persisted, because the replacement reads it.
-pub(crate) fn restart_for_control_request(
-    session: &mut crate::engine::AgentSession,
-    reach: crate::runtime::ControlReach,
-    parked_on_question: bool,
-    actor: Option<crate::engine::thread_events::MessageOrigin>,
-) {
-    let restart = effort_restart(session, reach, parked_on_question);
-    restart_session(session, restart, actor);
+/// A live process a pick waits on before it refuses. The client frees the
+/// rung at the turn's Result, but the run loop still finishes the turn and
+/// then runs the idle exit. Only that exit may end the process: it keeps it
+/// for an input the agent still owes. An apply holds the process, so no exit
+/// comes.
+pub(crate) fn awaits_idle_exit(session: &crate::engine::AgentSession) -> bool {
+    session.is_live() && !session.keep_alive && session.change_claim.is_none()
 }
 
 /// The thread-less half of `stop_agent`: stop every session in the map that
@@ -420,68 +361,82 @@ impl LucidosEngine {
         }
     }
 
-    /// Apply a control request to a thread's live coding-agent session, through
-    /// [`deliver_control_request`]. Returns when the change takes effect.
-    ///
-    /// The restart comes after the settings event, in a second lock hold. A
-    /// replacement spawned before the event lands would run on the old effort.
-    pub async fn send_agent_control_request(
+    /// Record a rung pick on a started thread, unless a turn runs
+    /// ([`rung_locked`]). A finished turn's process gets [`IDLE_EXIT_WAIT`] to
+    /// exit first. The pick is a `CodingAgentSettingsChanged` with the user's
+    /// actor, which the next spawn reads through [`Self::cc_thread_settings`].
+    /// No running process ever receives it.
+    pub async fn record_rung_pick(
         &self,
         thread_id: Uuid,
-        request: crate::runtime::ControlRequest,
-        actor: Option<crate::engine::thread_events::MessageOrigin>,
-    ) -> Result<crate::runtime::TakesEffect, Box<dyn std::error::Error + Send + Sync>> {
-        let event = crate::engine::thread_events::ThreadEvent::from_control_request(
-            &request,
-            self.thread_coding_agent(thread_id).await,
-        );
-        // Read before the lock. A question answered after this read leaves the
-        // stopped session to resume itself (`finalize_direct_agent`).
-        let parked_on_question = match request {
-            crate::runtime::ControlRequest::SetReasoningEffort { .. } => {
-                crate::engine::agent_recovery::thread_parked_on_question(self.pool(), thread_id)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "Could not read whether thread {thread_id} waits on a question: {e}"
-                        )
-                    })?
+        pick: RungPick,
+        actor: Option<MessageOrigin>,
+    ) -> Result<RungPickOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let coding_agent = self.thread_coding_agent(thread_id).await;
+        let deadline = tokio::time::Instant::now() + IDLE_EXIT_WAIT;
+        // The guard is held until the pick is stored. A spawn claims its entry
+        // under this lock before it reads the rung, so it reads the pick or
+        // refuses it.
+        let sessions = loop {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+                    .bind(thread_id)
+                    .fetch_optional(self.pool())
+                    .await?;
+            let status = crate::engine::thread_lifecycle::ThreadStatus::parse(
+                status.as_deref().unwrap_or_default(),
+            );
+            let sessions = self.agent_sessions.lock().await;
+            let exiting = sessions
+                .get(&thread_id)
+                .filter(|s| awaits_idle_exit(s))
+                .map(|s| s.idle_notify.clone());
+            // The status still reads running between the turn's Result and its
+            // idle event, so only a question park or a pause refuses at once.
+            let parked = matches!(
+                status,
+                crate::engine::thread_lifecycle::ThreadStatus::WaitingForUserAnswer
+                    | crate::engine::thread_lifecycle::ThreadStatus::Paused
+            );
+            match exiting {
+                Some(idle_notify) if !parked && tokio::time::Instant::now() < deadline => {
+                    // Woken or timed out alike, the next pass re-reads both.
+                    let woken = idle_notify.notified();
+                    drop(sessions);
+                    _ = tokio::time::timeout(IDLE_EXIT_POLL, woken).await;
+                }
+                _ if rung_locked(status, sessions.get(&thread_id)) => {
+                    return Ok(RungPickOutcome::TurnRunning);
+                }
+                _ => break sessions,
             }
-            _ => false,
         };
-        let (takes_effect, reach) = {
-            let mut guard = self.agent_sessions.lock().await;
-            let session = guard
-                .get_mut(&thread_id)
-                .ok_or("No Claude Code session found for this thread")?;
-            deliver_control_request(session, request, parked_on_question)?
+        let (model, reasoning_effort) = match pick {
+            RungPick::SetModel { model, effort } => (Some(model), effort),
+            RungPick::SetReasoningEffort { effort } => (None, Some(effort)),
         };
-        if let Some(ev) = event {
-            if let Err(e) = self
-                .event_bus
-                .emit(crate::engine::event_bus::BusEvent::Thread {
-                    thread_id,
-                    event: ev,
-                    meta: crate::engine::thread_events::EventMeta {
-                        channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
-                        actor: actor.clone(),
-                        ..crate::engine::thread_events::EventMeta::NONE
-                    },
-                })
-                .await
-            {
-                log!(
-                    "[ClaudeCode] Failed to persist CodingAgentSettingsChanged for {}: {}",
-                    thread_id,
-                    e
-                );
-            }
-        }
-        // A session gone by now restarts nothing: its next spawn reads the event.
-        if let Some(session) = self.agent_sessions.lock().await.get_mut(&thread_id) {
-            restart_for_control_request(session, reach, parked_on_question, actor);
-        }
-        Ok(takes_effect)
+        self.event_bus
+            .emit(crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::CodingAgentSettingsChanged {
+                    model,
+                    reasoning_effort,
+                    coding_agent,
+                    // A settings-only emit: the Init-time emit pins the
+                    // session id and config dir.
+                    cc_session_id: None,
+                    claude_config_dir: None,
+                    claude_config_dir_explicit: None,
+                },
+                meta: crate::engine::thread_events::EventMeta {
+                    channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
+                    actor,
+                    ..crate::engine::thread_events::EventMeta::NONE
+                },
+            })
+            .await?;
+        drop(sessions);
+        Ok(RungPickOutcome::Recorded)
     }
 
     /// Query the latest CC settings (model, reasoning_effort) for a thread from events.
@@ -531,10 +486,38 @@ impl LucidosEngine {
         (model, effort)
     }
 
+    /// The model and effort a coding-agent turn runs on: the request's pick,
+    /// else the thread's settings, else the backend's default implementer
+    /// (`intelligence_ladder::fill_pick`). The spawn and the turn's
+    /// `MessageReceived` both resolve through here, so the two agree.
+    pub(crate) async fn coding_agent_rung(
+        &self,
+        thread_id: Uuid,
+        coding_agent: crate::runtime::CodingAgent,
+        requested_model: Option<String>,
+        requested_effort: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let (event_model, event_effort) = if requested_model.is_none() || requested_effort.is_none()
+        {
+            self.cc_thread_settings(thread_id).await
+        } else {
+            (None, None)
+        };
+        let default_implementer =
+            crate::runtime::intelligence_ladder::default_implementer(self.pool(), coding_agent)
+                .await;
+        crate::runtime::intelligence_ladder::fill_pick(
+            coding_agent,
+            requested_model.or(event_model),
+            requested_effort.or(event_effort),
+            default_implementer.as_ref(),
+            |model| crate::llm::model_registry::default_effort(self.model_registry(), model),
+        )
+    }
+
     /// The model and effort a coding-agent thread runs on. The model is its
-    /// latest setting, because the agent applies a model pick to the running
-    /// session. The effort is its *effort in force*, never a pick no call ran
-    /// at.
+    /// latest setting. The effort is its *effort in force*, never a pick no
+    /// call ran at.
     pub(crate) async fn cc_thread_runs_on(
         &self,
         thread_id: Uuid,
@@ -550,13 +533,18 @@ impl LucidosEngine {
         if let Some(s) = guard.get(&thread_id) {
             let has_active = s.is_live();
             let mut info = s.to_commands_info();
-            let model = s.current_model.clone();
-            let effort = s.current_reasoning_effort.clone();
+            // Only a live real turn reports its own pair. After a keep-alive
+            // or an exit, a pick made since is what the next turn runs.
+            let session_pair = (has_active && !s.keep_alive)
+                .then(|| (s.current_model.clone(), s.current_reasoning_effort.clone()));
+            let repo_key = s
+                .repo_root
+                .as_ref()
+                .map(|r| r.to_string_lossy().to_string());
+            drop(guard);
             // Session exists but Init hasn't arrived yet — use repo cache for commands
             if info.builtin_commands.is_empty() && info.skill_commands.is_empty() {
-                if let Some(ref repo) = s.repo_root {
-                    let repo_key = repo.to_string_lossy().to_string();
-                    drop(guard);
+                if let Some(repo_key) = repo_key {
                     let cache = self.cc_commands_cache.read().await;
                     if let Some(cached) = cache.get(&repo_key) {
                         info.builtin_commands = cached.builtin_commands.clone();
@@ -564,6 +552,10 @@ impl LucidosEngine {
                     }
                 }
             }
+            let (model, effort) = match session_pair {
+                Some(pair) => pair,
+                None => self.cc_thread_settings(thread_id).await,
+            };
             return CcCommandsResult {
                 info,
                 has_active_session: has_active,

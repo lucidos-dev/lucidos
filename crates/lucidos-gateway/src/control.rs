@@ -9,6 +9,7 @@ use crate::auth;
 use crate::error::ApiError;
 use crate::net_config;
 use crate::peers;
+use crate::release_check::ConfigWriteError;
 use crate::server::{GatewayState, RestoreStatus};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -645,11 +646,13 @@ async fn gateway_check_updates(
     Json(state.release_check().refresh(force).await)
 }
 
-/// Body for the release-check preference write. The field is optional, so a
+/// Body for the release-check preference write. Each field is optional, so a
 /// body that names nothing settles on the stored value rather than erroring.
 #[derive(Deserialize)]
 struct ReleaseCheckBody {
     enabled: Option<bool>,
+    /// A `latest.json` URL under the shared rule, or `""` for the default.
+    update_address: Option<String>,
 }
 
 /// PUT /~/api/v1/control/release-check: write `~/.lucidos/updates.toml` and
@@ -664,8 +667,11 @@ async fn set_release_check_config(
     // absent field settles on what is stored rather than on what this handler
     // last happened to see.
     check
-        .update_config(body.enabled)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .update_config(body.enabled, body.update_address.as_deref())
+        .map_err(|e| match e {
+            ConfigWriteError::InvalidAddress(msg) => ApiError::bad_request(msg),
+            ConfigWriteError::Io(e) => ApiError::internal(e.to_string()),
+        })?;
     Ok(Json(check.snapshot()))
 }
 
@@ -1186,6 +1192,33 @@ mod authz_tests {
                 "token {token:?} must not authenticate"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_refused_update_address_is_a_bad_request() {
+        use tower::ServiceExt as _;
+        let state = crate::server::GatewayState::for_tests();
+        let response = crate::server::gateway_router(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("PUT")
+                    .uri("/~/api/v1/control/release-check")
+                    .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"update_address":"http://example.com/latest.json"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // A 400, not the 500 a write without HOME would give: nothing was written.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains(lucidos_update_address::RULE), "{text}");
     }
 
     #[tokio::test]

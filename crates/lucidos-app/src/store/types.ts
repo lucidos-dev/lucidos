@@ -1239,7 +1239,31 @@ export interface PluginInstallRequest {
   /** The manifest's `engine` requirement as authored. Null when it declares
    *  none, which the panel says in a quiet note. */
   engine_requirement?: string | null;
+  /** Triggers this plugin does not own that rely on a path in `removes`.
+   *  Absent on a request staged before the engine sent it. */
+  affected_triggers?: AffectedTrigger[];
 }
+
+/** An *affected trigger*: one the plugin does not own that relies on a path
+ *  its update or uninstall removes. Mirrors `triggers::affected::AffectedTrigger`.
+ *  The engine never edits it, so the panels only warn. */
+export interface AffectedTrigger {
+  trigger_id: string;
+  trigger_name: string;
+  paths: AffectedPath[];
+}
+
+export interface AffectedPath {
+  /** `data/`-relative path the confirm removes. */
+  path: string;
+  reason: AffectedReason;
+}
+
+/** Why the trigger relies on the path:
+ *  - `named-in-run`: its intent or script path names it.
+ *  - `owning-app`: it is knowhow under the trigger's own app.
+ *  - `trigger-knowhow`: it is knowhow under the trigger's own folder. */
+export type AffectedReason = 'named-in-run' | 'owning-app' | 'trigger-knowhow';
 
 /** What a staged update will do with one locally-edited file.
  *  - `merged`: the edit and upstream's combine cleanly, and both survive.
@@ -1280,6 +1304,8 @@ export interface PluginInstallReceipt {
   /** What the install actually did to the user's local edits. Absent when it
    *  met none. The engine's answer, not the staged request's guess. */
   local_changes?: PluginLocalChangesResult;
+  /** Triggers that rely on a file the update removed. Absent when none do. */
+  affected_triggers?: AffectedTrigger[];
 }
 
 /** What a confirmed uninstall actually did. Mirrors `PluginInstallReceipt`;
@@ -1290,6 +1316,8 @@ export interface PluginUninstallReceipt {
   summary: string;
   files_deleted: string[];
   files_missing: string[];
+  /** Triggers that rely on a file the uninstall deleted. Absent when none do. */
+  affected_triggers?: AffectedTrigger[];
 }
 
 /** Plugin uninstall awaiting user confirmation in the uninstall panel.
@@ -1308,6 +1336,9 @@ export interface PluginUninstallRequest {
    *  deleted, or shared with another plugin). Shown for transparency
    *  but never re-deleted. */
   files_missing: string[];
+  /** Triggers this plugin does not own that rely on a file in `files_present`.
+   *  Absent on a request staged before the engine sent it. */
+  affected_triggers?: AffectedTrigger[];
 }
 
 // Email confirmation request from SSE (engine wants user to confirm sending)

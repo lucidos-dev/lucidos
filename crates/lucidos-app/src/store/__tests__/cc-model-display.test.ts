@@ -300,6 +300,40 @@ describe('exchangeReasoningEffort', () => {
   });
 });
 
+/** A rung pick between turns is a `CodingAgentSettingsChanged` with an actor,
+ *  grouped into the exchange before it. The next turn's starter carries the
+ *  pair it runs on (ADR 0542). */
+describe('a rung pick between coding-agent turns', () => {
+  const pick = { kind: 'device', device_id: 'test-device' };
+  const events = eventsMap([
+    [1, { type: 'MessageReceived', text: 'fix', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
+    [2, { type: 'CodingAgentSettingsChanged', model: 'claude-opus-5-6', reasoning_effort: 'medium', created: '2026-01-01T00:00:02Z' }],
+    [3, { type: 'CodingAgentIdled', has_changes: false, created: '2026-01-01T00:00:03Z' }],
+    [4, { type: 'CodingAgentSettingsChanged', model: 'claude-sonnet-5-6', actor: pick, created: '2026-01-01T00:00:04Z' } as unknown as StoredEvent],
+    [5, { type: 'CodingAgentSettingsChanged', reasoning_effort: 'high', actor: pick, created: '2026-01-01T00:00:05Z' } as unknown as StoredEvent],
+    [6, {
+      type: 'MessageReceived',
+      text: 'go on',
+      channel: 'claude_code',
+      model: 'claude-sonnet-5-6',
+      reasoning_effort: 'high',
+      created: '2026-01-01T00:00:06Z',
+    }],
+  ]);
+
+  it('leaves the earlier turn answered by the pair it ran on', () => {
+    const [earlier] = groupIntoExchanges(events);
+    expect(exchangeResponseModel(earlier)).toBe('claude-opus-5-6');
+    expect(exchangeReasoningEffort(earlier)).toBe('medium');
+  });
+
+  it('answers the next turn by its starter pair, before any spawn settings land', () => {
+    const [, next] = groupIntoExchanges(events);
+    expect(exchangeResponseModel(next)).toBe('claude-sonnet-5-6');
+    expect(exchangeReasoningEffort(next)).toBe('high');
+  });
+});
+
 /** A trigger fire is a chat turn whose starter event is `TriggerStarted` rather
  *  than `MessageReceived`: the fire resolves a model and an effort exactly like
  *  a typed message does, and the engine stamps both on that event. Reading only

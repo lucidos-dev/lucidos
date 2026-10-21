@@ -83,6 +83,7 @@ export function markPluginUninstalled(
         summary: result.summary,
         files_deleted: result.files_deleted,
         files_missing: result.files_missing,
+        affected_triggers: result.affected_triggers,
       },
     },
   };

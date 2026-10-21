@@ -744,6 +744,9 @@ pub enum SystemEvent {
     ///
     /// `files_removed` lists paths the previous version recorded and this one
     /// dropped, which the update deleted. Empty for a fresh install.
+    ///
+    /// `affected_triggers` lists the triggers this plugin does not own that
+    /// relied on a removed path. A fire of one reads it back to warn the agent.
     PluginInstalled {
         #[serde(default)]
         id: String,
@@ -751,6 +754,8 @@ pub enum SystemEvent {
         files: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files_removed: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        affected_triggers: Vec<crate::triggers::affected::AffectedTrigger>,
         installed_at: String,
         source_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -763,6 +768,7 @@ pub enum SystemEvent {
     /// `files_missing` is the subset that had already been removed by hand
     /// before this uninstall fired. The two new fields default to empty so
     /// old DB rows from the v1 guide-only flow deserialize unchanged.
+    /// `affected_triggers` is as on `PluginInstalled`, over `files_deleted`.
     PluginUninstalled {
         id: String,
         version: String,
@@ -771,6 +777,8 @@ pub enum SystemEvent {
         files_deleted: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files_missing: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        affected_triggers: Vec<crate::triggers::affected::AffectedTrigger>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },

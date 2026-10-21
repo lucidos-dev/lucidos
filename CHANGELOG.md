@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.50.1 — 2026-10-21
+
+### Added
+- Set the address the app and gateway check for updates, under Settings > Maintenance or with `lucidos update-address show`, `set` and `reset`. Reset returns to the public release channel.
+
+### Changed
+- A coding-agent thread's model and effort pill locks while a turn runs. A pick made just as a turn ends waits for the session to close, then applies.
+- A plugin update or uninstall lists the triggers that rely on files it removes, in the confirm panel and the receipt. A trigger that fires after its know-how was removed carries a warning.
+- On a phone, the dashboard button sits beside the mark in the thread header.
+
+### Fixed
+- A model and effort picked on the Successor card survive the handoff, and the new thread shows its own effort.
+- A long hold on a dashboard widget no longer selects text.
+- The Add widget and app shortcut list no longer bounces back up at the bottom on iOS.
 ## v0.50.0 — 2026-10-21
 
 ### Added

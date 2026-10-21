@@ -147,7 +147,7 @@ fn reset_per_turn_flags_clears_all_flags() {
     let mut last_emitted_idle = true;
     let mut emitted_terminal_event = true;
     let mut user_hit_stop = true;
-    let mut redirect_cause = Some(crate::engine::thread_events::CancelCause::EffortRestart);
+    let mut redirect_cause = Some(crate::engine::thread_events::CancelCause::SupersededByFollowup);
     let mut last_terminal_kind = Some(TerminalKind::Generated);
     let mut withheld_api_error = Some("API Error: dropped".to_string());
     let mut cancel_actor = Some(crate::engine::thread_events::MessageOrigin::Device {

@@ -555,6 +555,11 @@ Dev binds the same way since ADR 0096. Its **one shared dev gateway** takes **`5
 
 `install.sh` DOES step around an occupied port for a brand-new instance: an instance's port is a mutable property of its slug, not a published address. So an `install.sh` install laid down first keeps 5252, and the packaged app collides with it. The product reports that collision instead of resolving it. See *install inventory* and *port contention*.
 
+### rc channel
+A folder in a dev workspace, `data/artifacts/releases/rc/`, that serves one staged release candidate to this machine's packaged app. It holds the updater bundle, its `.sig` and a `latest.json`, and its engine serves them on loopback. A `.gitignore` of `*` keeps the bundle out of the workspace history. Distinct from the mirror's `rc/<version>` branch, which is the candidate's source tree.
+
+`scripts/publish-rc-channel.sh <version>` fills it from the release staging, by hand only, between Phase A and Phase B. Pointing the *update address* (`system-knowhow/glossary.md`) at its `latest.json` lets the real in-app updater install the candidate. Steps: `docs/desktop-app.md`, "Test an update before publishing"; ADR 0543.
+
 ### Install vehicle
 One of the three ways Lucidos gets onto a machine, each writing a distinct set of paths: the macOS **`.app`** from the DMG, an **`install.sh`** headless install (one or more slug-keyed instances sharing a runtime), and a **source checkout** run by `scripts/web-dev.sh`. A machine can carry all three at once, and each uninstaller reaches only its own. `crates/lucidos-installs` is the one place the layouts are written down. `scripts/lib/service.sh` mirrors the `.app`'s four paths for the shell uninstaller, and `service_test.sh` reads the Rust constants to keep the two in step.
 
@@ -1443,34 +1448,21 @@ The progressive-close behaviour: each invocation resolves EXACTLY ONE close *lay
 ### CodingAgent (enum)
 The Rust enum representing which *coding agent* (the user-facing role, see system-knowhow glossary) is driving a session. Two variants: `CodingAgent::ClaudeCode` (the `claude` CLI, `ClaudeCodeRuntime`) and `CodingAgent::Codex` (the OpenAI `codex` CLI, `CodexRuntime`). Wire/DB values are kebab-case (`"claude-code"` / `"codex"` — `as_str()` and serde share the root); `CodingAgent::parse` defaults unknown/NULL to `ClaudeCode` for legacy rows. Replaces the older `AgentKind` enum, whose name didn't make the scope explicit. The engine's `agent_runtimes` registry is keyed by this enum, so adding a coding agent is variant + runtime impl + registration. A thread's backend is chosen at first send, persisted on `SessionStarted.coding_agent` → `thread_summaries.coding_agent`, and locked (no mid-thread flips — the other backend has no session to resume).
 
-### Control reach
-When an in-thread control request reaches the *coding agent*: `CodingAgent::control_reach` returns a `ControlReach`. `RunningTurn` reaches the turn in flight (an interrupt, a Claude Code model switch). `NextTurn` rides the control channel and applies when the backend's next turn starts (a Codex model or effort). `Spawn` is never sent: the session records it and a spawn carries it (a Claude Code reasoning effort, which Claude Code takes only as `CLAUDE_CODE_EFFORT_LEVEL`). An *effort restart* brings that spawn at once. `ControlReach::takes_effect` maps it to the endpoint's `takes_effect`: `next-turn` only while an in-flight turn runs on at the old setting, else `now`, which is what the menu's toast reports.
-
 ### Effort in force
 The reasoning effort a coding-agent thread's calls actually run at, as opposed to the last one the user picked. It is read from the newest main-session `ContextCaptured`, the same record `thread_model` reads the model from (`handoff_estimate::thread_effort_in_force`). Before a thread's first call it falls back to the spawn-time `CodingAgentSettingsChanged`. A live session tracks it as `AgentSession.reasoning_effort_in_force`, seeded at spawn and updated per main-session usage frame, and a control request never writes it.
 
 Every surface that says what a thread runs on reads it: the terminal event's settings, the route popover's Effort row, "This thread runs on", and the switch estimate. A pick's `CodingAgentSettingsChanged` carries an `actor` and is never read as the effort in force. See `docs/plans/2026-10-20-report-the-effort-in-force.md`.
 
 ### Effort restart
-What a Claude Code reasoning-effort pick does to a live session, since Claude Code takes effort only at spawn. `claude_code::control::effort_restart` decides per session state:
-
-- **Idle, no process, or a cache keep-alive turn:** nothing. The process exits at idle, so the next spawn carries the pick.
-- **Turn running:** a graceful interrupt as a redirect (`AgentSession.redirect_cause`), so the turn ends as `ResponseCanceled` with `EffortRestart`. Like an *interrupt-and-redirect*, it passes `CancelCause::is_redirect` (the frontend's `isRedirectCancel`). An interrupt that beat the agent's read of the turn's input discards that input. The session stops owing it (`InputLedger::turn_interrupted`) and records a *discarded input*. The process then exits at its idle, unless inputs queued behind it are still owed.
-- **Parked on a question:** the process stops at once with `StopReason::EffortRestart`. The question stays answerable, as across an engine shutdown.
-- **A merge turn of any tier, or a session already stopping:** no restart, and the endpoint answers `next-turn`. A canceled merge would abort its Apply. A session still starting refuses the pick.
-
-The transcript draws a running-turn restart as one turn. The resume's `ContinuationStarted{effort_restart}` folds into the turn it cancelled as a *restart row* ("Restarted · You changed effort"), and opens no exchange. So it is the one `ContinuationStarted` that bypasses `BOUNDARY_CONTINUATION_HANDOFF` (`foldsAsEffortRestart` in `exchange-grouping.ts`). The turn reads Working between the cancel and the resume, and only its steps after the restart row decide whether it has ended (`latestRunSteps`). Any other end of the turn first, such as an abort or a follow-up, cancels the fold.
-
-The thread's status stays `running` across the gap. The `EffortRestart` cancel, and the `CodingAgentIdled` and `SessionEnded` that close the interrupted run, leave it alone (`keeping_status_across_redirect`), and `ContinuationRequested` starts the resumed turn. The same holds for every redirect cancel, so the status never reads `idle` between the two turns.
-
-The restart runs after the `CodingAgentSettingsChanged` is persisted, because the replacement reads it at spawn. A restart sets `AgentSession.effort_resume`. When the session ends, `resume_after_effort_restart` emits `ContinuationRequested` with reason `effort_restart`. The resumed turn spawns with `--resume`, the new effort and a short nudge (`EFFORT_RESTART_USER_MESSAGE`).
-
-A pick that interrupted the turn before the agent read its first prompt resumes with that prompt instead (`agent_recovery::discarded_input`). A run whose last turn ended on its own, after reading a follow-up, still resumes while that *discarded input* is owed. A follow-up the old process never read is redelivered by `stranded_follow_ups`. A resume that finds a live run routes nothing: that run started at the new effort and delivered the discarded input. A question still parked resumes only through its answer. Codex never restarts: it applies a pick on its next turn.
+What a Claude Code reasoning-effort pick used to do to a running turn: interrupt it as a redirect, then resume the session at the new effort. Since the *rung lock* (ADR 0542) nothing restarts a session. Older threads still carry its events: a `ResponseCanceled` with `CancelCause::EffortRestart`, and a `ContinuationRequested` / `ContinuationStarted` with reason `effort_restart` (`EFFORT_RESTART_REASON`). The transcript still folds such a resume into the turn it cancelled, as a *restart row* (`foldsAsEffortRestart` in `exchange-grouping.ts`). The status still reads `running` across the gap (`keeping_status_across_redirect`).
 
 ### Discarded input
-An input an *effort restart* interrupted before the coding agent read it, so the agent never will. The run loop records a `CodingAgentInputDiscarded` for each event that carried the input. Owed kinds are an allow-list: a `MessageReceived` of any mode, a `ChildThreadCompleted`, a `ChildReportFiled`, a `CodingAgentPromptSent`, and a `PromptInjected` that is not a cache keep-alive. A `ContinuationRequested` is never owed, since a later resume sends its own nudge. An owed input stays owed until a `CodingAgentInputRead` names it, unless a `QueuedMessageRemoved` takes it back. `stranded_follow_ups::DISCARDED_AND_OWED` is the one SQL definition.
+An input an older *effort restart* interrupted before the coding agent read it, recorded as a `CodingAgentInputDiscarded`. Nothing writes one now. Owed kinds are an allow-list: a `MessageReceived` of any mode, a `ChildThreadCompleted`, a `ChildReportFiled`, a `CodingAgentPromptSent`, and a `PromptInjected` that is not a cache keep-alive. An owed input stays owed until a `CodingAgentInputRead` names it or a `QueuedMessageRemoved` takes it back. The next session redelivers it as a *stranded follow-up*. `stranded_follow_ups::DISCARDED_AND_OWED` is the one SQL definition.
 
-The effort resume opens with it as its first prompt. Any other session that starts first redelivers it as a *stranded follow-up*, so it reaches the agent once, whichever session runs next.
+### Rung lock
+A coding-agent thread's model and effort stay fixed while a turn runs: while it starts, works, or waits on a question (`claude_code::control::rung_locked`). `POST /api/v1/claude-code/control` refuses a pick then with 409 and `reason: "turn-running"`, and the *rung control* is disabled. A live process counts as a running turn, though a pick waits briefly for a finished turn's idle exit. A cache keep-alive's hidden turn does not count. Between turns a pick is recorded (`record_rung_pick`) as a `CodingAgentSettingsChanged` carrying the user's actor, and the next spawn reads it. A model pick carries its effort in the same request, so a turn cannot start between the two halves.
+
+A coding-agent `MessageReceived` names the rung its turn runs on (`coding_agent_rung`). ADR 0542.
 
 ### Coding-agent branch
 The git branch an *agent session* works on, named for the thread that owns it (ADR 0041, ADR 0076):
@@ -4776,7 +4768,7 @@ Enforced per verb rather than per route, on every route and in-process tool carr
 
 **Creating a thread is not one of these verbs.** Any caller may create a top-thread, or move its own direct child to top level (ADR 0475). `CreateTopThread` and `DetachChild` stay in `ThreadReachVerb` only because stored approval cards name them. `ThreadReachVerb::needs_authority` is false for both, so the gate allows them and no card proposes them.
 
-Three more verbs aim at a thread's agent rather than at the tree's shape: controlling a live coding-agent session (`POST /api/v1/claude-code/control`), asking a *side question* (`POST /api/v1/side-questions`), which reads the thread's whole context, and dismissing that question's card (`POST /api/v1/side-questions/dismiss`).
+Three more verbs aim at a thread's agent rather than at the tree's shape: picking a coding-agent thread's model or effort (`POST /api/v1/claude-code/control`), asking a *side question* (`POST /api/v1/side-questions`), which reads the thread's whole context, and dismissing that question's card (`POST /api/v1/side-questions/dismiss`).
 
 **Deleting a thread is deliberately NOT one of these verbs.** It has no place on the ladder and no `ThreadReachVerb`, because the ladder's second question admits a thread carrying the *standing instruction*. It takes the *owner-device gate* instead, which refuses every agent outright (ADR 0192).
 

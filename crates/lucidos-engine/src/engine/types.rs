@@ -804,11 +804,6 @@ pub enum StopReason {
     /// User clicked Archive — `ThreadArchived` is the terminator; no
     /// `ResponseCanceled`.
     Archive,
-    /// A Claude Code effort pick restarts a session parked on a question
-    /// (`claude_code::control::effort_restart`). Nothing lands after the
-    /// question, so its card stays answerable, and the answer resumes the
-    /// session at the new effort.
-    EffortRestart,
 }
 
 impl StopReason {
@@ -828,14 +823,6 @@ pub enum ChangeClaim {
     Apply,
     /// An in-session Discard.
     Discard,
-}
-
-/// A resume an effort pick owes the turn it interrupted
-/// (`AgentSession::effort_resume`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct EffortResume {
-    /// Who picked the effort. The resume's `ContinuationRequested` carries it.
-    pub actor: Option<crate::engine::thread_events::MessageOrigin>,
 }
 
 /// How a session carries a merge-conflict resolution. The two tiers put the
@@ -878,8 +865,7 @@ pub enum SessionPhase {
     /// No process exists. A spawn waits for the apply; the apply's own merge
     /// session takes the entry over as `Starting`.
     Applying,
-    /// The agent process runs. `control_tx` reaches its runtime;
-    /// `deliver_control_request` keeps back what a backend takes only at spawn.
+    /// The agent process runs. `control_tx` reaches its runtime.
     Running {
         control_tx: tokio::sync::mpsc::UnboundedSender<crate::runtime::ControlRequest>,
     },
@@ -919,9 +905,8 @@ pub struct AgentSession {
     /// next turn on a resumed session.
     pub cancel_actor: Option<crate::engine::thread_events::MessageOrigin>,
     /// Why the interrupt about to land is a redirect, not a Stop: a follow-up
-    /// (`arm_followup_redirect`, `SupersededByFollowup`) or an effort pick
-    /// (`claude_code::control`, `EffortRestart`). The redirect analog of
-    /// `cancel_actor`. The run_session interrupt arm drains it
+    /// (`arm_followup_redirect`, `SupersededByFollowup`). The redirect analog
+    /// of `cancel_actor`. The run_session interrupt arm drains it
     /// (`take_session_redirect_cause`) and feeds it to `classify_result`. The
     /// interrupted turn's `ResponseCanceled` then carries it (rendered
     /// neutrally) instead of `UserStop` (rendered "Canceled ✕"). A real Stop click via
@@ -946,11 +931,6 @@ pub struct AgentSession {
     /// routing costs one kept-alive idle, not a subprocess pinned until the engine
     /// restarts.
     pub redirect_followup_pending: bool,
-    /// Set when a Claude Code effort pick restarts the session mid-turn
-    /// (`claude_code::control::effort_restart`). When the run ends, it resumes
-    /// the session at the new effort, unless the work goes on another way
-    /// (`run_session::completion::resumes_after_effort_restart`).
-    pub effort_resume: Option<EffortResume>,
     /// Generic stop signal for the run_session loop. Fired by `stop_agent` for
     /// every user-driven termination (Cancel, Apply, Discard, Archive). The
     /// engine shutdown sweep fires it directly: at once for a thread parked on a
@@ -1216,7 +1196,6 @@ impl AgentSession {
             cancel_actor: None,
             redirect_cause: None,
             redirect_followup_pending: false,
-            effort_resume: None,
             stop: Arc::new(tokio::sync::Notify::new()),
             interrupt: Arc::new(tokio::sync::Notify::new()),
             idle_notify: Arc::new(tokio::sync::Notify::new()),

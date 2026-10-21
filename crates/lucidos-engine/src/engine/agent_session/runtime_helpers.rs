@@ -200,8 +200,8 @@ impl LucidosEngine {
     /// own lifecycle event (`ChangeApplied` / `ChangeDiscarded` /
     /// `ThreadArchived`) and must NOT also emit `ResponseCanceled`.
     ///
-    /// At engine teardown, and on an effort restart, the whole body is skipped
-    /// for a session parked on an unanswered `AskUserQuestion` (see
+    /// At engine teardown, the whole body is skipped for a session parked
+    /// on an unanswered `AskUserQuestion` (see
     /// [`crate::engine::agent_recovery::preserve_question_park_at_shutdown`]):
     /// such a session must land NOTHING after its `UserQuestionAsked`.
     #[allow(clippy::too_many_arguments)]
@@ -228,13 +228,11 @@ impl LucidosEngine {
         // arrives as the per-session snapshot; from here on `is_shutdown` is the
         // real answer.
         let is_shutdown = self.session_is_shutting_down(is_shutdown);
-        let effort_restart = self.pending_stop_reason(thread_id).await
-            == Some(crate::engine::StopReason::EffortRestart);
         if crate::engine::agent_recovery::preserve_question_park_at_shutdown(
             &self.pool,
             arm,
             thread_id,
-            is_shutdown || effort_restart,
+            is_shutdown,
         )
         .await
         {
@@ -261,9 +259,8 @@ impl LucidosEngine {
             return;
         };
         // Refine a real-Cancel into a redirect cancel when this stop came from a
-        // redirect: one that escalated (the agent ignored the graceful
-        // interrupt), or an effort restart. It renders neutrally, not as
-        // "Canceled ✕".
+        // redirect that escalated (the agent ignored the graceful interrupt).
+        // It renders neutrally, not as "Canceled ✕".
         if let (Some(redirect), TerminalKind::Canceled(cause)) = (redirect_cause, &mut kind) {
             *cause = redirect;
         }
@@ -801,11 +798,10 @@ mod tests {
         );
     }
 
-    /// Source-scan tripwire: **a terminal event reports the model the session
-    /// runs on now.** A mid-session model change goes through
-    /// `send_agent_control_request`, which updates the session entry and never
-    /// reaches the run loop. So the loop's spawn-time `normalized_model` and
-    /// `cc_reasoning_effort` go stale, and no terminal may be built from them.
+    /// Source-scan tripwire: **a terminal event reports the model and effort
+    /// the session entry holds.** Only the entry knows the *effort in force*,
+    /// so no terminal may be built from the loop's
+    /// spawn-time `normalized_model` and `cc_reasoning_effort` locals.
     #[test]
     fn terminal_events_never_take_the_spawn_time_model() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

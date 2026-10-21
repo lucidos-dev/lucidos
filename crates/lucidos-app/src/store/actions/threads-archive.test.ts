@@ -34,7 +34,7 @@ import { putComposeOnThread } from '../../api/client';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '../composeDrafts';
-import { ALL_CHANNELS, confirmState, setDrawerGrouping, setSelectedOngoingGroup, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
+import { ALL_CHANNELS, confirmState, setDrawerGrouping, setSelectedOngoingGroup, focusedThreadId, generatedTitleIds, getThreadDisplaySection, mobileView, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
 import { ARCHIVE_PINNED_CONFIRM, focusThread, handleArchiveThread, subscriptionsStoppedByArchive } from './threads';
@@ -83,7 +83,6 @@ beforeEach(() => {
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
-  resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
   _resetRowIntentsForTesting();
   // Reset the thread filter to its neutral "show everything" state so one

@@ -1146,10 +1146,8 @@ describe('inputMode is sticky across compose sessions (toggle remembers last pic
 
 /** A CC reasoning-effort (or model) pick made in the compose view is a
  *  PER-DRAFT intent: it lives on THIS draft's override (`composeSelections`),
- *  applies to exactly the thread its send spawns, and is cleared afterward. It
- *  never touches the global `codingAgentPending*` signal (the active-thread
- *  mechanism), so it can't ride onto another draft or the next new thread —
- *  the leak this whole feature exists to prevent. */
+ *  applies to exactly the thread its send spawns, and is cleared afterward, so
+ *  it can't ride onto another draft or the next new thread. */
 describe('CC compose pick is per-draft (no cross-thread leak)', () => {
   let mockFetch: ReturnType<typeof vi.fn>;
   let chatBodies: Array<{ use_coding_agent?: boolean; reasoning_effort?: string; cc_model?: string }>;

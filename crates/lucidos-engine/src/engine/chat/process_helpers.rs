@@ -425,6 +425,29 @@ pub(super) fn build_trigger_knowhow_section(triggers_dir: &std::path::Path, slug
     section
 }
 
+/// Build the `[REMOVED KNOW-HOW]` block for a trigger fire whose know-how a
+/// plugin removed. Empty when nothing is removed. Like the block above it
+/// names this trigger's own files, so it rides in the volatile part of the
+/// message (ADR 0490). It only warns: the run still goes ahead.
+pub(super) fn build_removed_knowhow_section(
+    removed: &[crate::triggers::affected::RemovedKnowhow],
+) -> String {
+    if removed.is_empty() {
+        return String::new();
+    }
+    let mut section =
+        String::from("[REMOVED KNOW-HOW]\nA plugin removed know-how this trigger relied on:\n");
+    for r in removed {
+        section.push_str(&format!("- `{}`, removed by {}\n", r.path, r.removed_by));
+    }
+    section.push_str(
+        "Do not invent a replacement recipe silently. Look for current know-how with \
+         `load_knowhow`. Say in your result that this trigger's know-how was removed, \
+         and suggest the user edit the trigger.\n[END REMOVED KNOW-HOW]",
+    );
+    section
+}
+
 /// Wording must explicitly state no restart is needed; without that the LLM
 /// reads "shipped with the engine" as "baked into the binary" and tells
 /// users to restart. See the regression test for the full backstory.

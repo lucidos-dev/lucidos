@@ -294,42 +294,51 @@ mod apply_now_status_tests {
 #[derive(Deserialize)]
 pub(super) struct ControlRequestBody {
     thread_id: String,
-    request: crate::runtime::ControlRequest,
+    request: crate::engine::claude_code::RungPick,
 }
 
-/// A `set_reasoning_effort` names a tier the thread's backend offers for its
-/// model, as every other effort entry point requires. Otherwise the next
-/// spawn would read a string it cannot run at.
+/// The `reason` slug of a pick refused because a turn runs (ADR 0542).
+pub(crate) const TURN_RUNNING_REASON: &str = "turn-running";
+
+/// A picked effort names a tier the thread's backend offers for its model, as
+/// every other effort entry point requires. Otherwise the next spawn would
+/// read a string it cannot run at. A model pick's effort is checked against
+/// that model, a lone effort against the thread's current one.
 async fn refuse_unoffered_effort(
     engine: &SharedEngine,
     thread_id: uuid::Uuid,
-    request: &crate::runtime::ControlRequest,
+    pick: &crate::engine::claude_code::RungPick,
 ) -> Result<(), String> {
-    let crate::runtime::ControlRequest::SetReasoningEffort { effort } = request else {
-        return Ok(());
+    use crate::engine::claude_code::RungPick;
+    let (model, effort) = match pick {
+        RungPick::SetModel {
+            model,
+            effort: Some(effort),
+        } => (Some(model.clone()), effort),
+        RungPick::SetModel { effort: None, .. } => return Ok(()),
+        RungPick::SetReasoningEffort { effort } => {
+            (engine.cc_thread_settings(thread_id).await.0, effort)
+        }
     };
     let agent = engine.thread_coding_agent(thread_id).await;
-    let (model, _) = engine.cc_thread_settings(thread_id).await;
     match crate::runtime::validate_coding_agent_effort(agent, model.as_deref(), Some(effort))? {
         Some(_) => Ok(()),
         None => Err("reasoning_effort must name a level".to_string()),
     }
 }
 
+/// Record a model or effort pick on a started coding-agent thread. Its next
+/// turn runs on it. While a turn runs, the rung is locked and this refuses
+/// with 409 and [`TURN_RUNNING_REASON`].
 pub(super) async fn claude_code_control(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ControlRequestBody>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let thread_id = uuid::Uuid::parse_str(&body.thread_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Invalid thread_id" })),
-        )
-    })?;
-    // Control by another route, so it takes the same gate its four siblings do.
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let thread_id = uuid::Uuid::parse_str(&body.thread_id)
+        .map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
     // A thread-bound subprocess may drive only its own session or a
-    // descendant's, never a sibling's. Runs before the request reaches the session.
+    // descendant's, never a sibling's. Runs before anything is recorded.
     super::thread_reach::refuse_without_authority(
         &state.engine.event_bus,
         &headers,
@@ -337,32 +346,26 @@ pub(super) async fn claude_code_control(
         super::thread_reach::ThreadReachVerb::Control,
     )
     .await
-    .map_err(|e| {
-        (
-            e.status_code(),
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-    })?;
+    .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
     refuse_unoffered_effort(&state.engine, thread_id, &body.request)
         .await
-        .map_err(|message| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": message })),
-            )
-        })?;
+        .map_err(ApiError::bad_request)?;
     let actor = super::actor::user_actor(&headers, None);
-    state
+    let outcome = state
         .engine
-        .send_agent_control_request(thread_id, body.request, actor)
+        .record_rung_pick(thread_id, body.request, actor)
         .await
-        .map(|takes_effect| Json(serde_json::json!({ "ok": true, "takes_effect": takes_effect })))
-        .map_err(|e| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-        })
+        .map_err(|e| ApiError::internal(format!("Could not record the pick: {e}")))?;
+    match outcome {
+        crate::engine::claude_code::RungPickOutcome::Recorded => {
+            Ok(Json(serde_json::json!({ "ok": true })))
+        }
+        crate::engine::claude_code::RungPickOutcome::TurnRunning => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "The model and effort stay fixed while a turn runs. Pick again when it ends.",
+        )
+        .with_reason(TURN_RUNNING_REASON)),
+    }
 }
 
 #[derive(Deserialize)]

@@ -213,7 +213,7 @@ async fn resolve_plugin_query_ignores_uninstalled_plugin() {
     );
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
-    super::uninstall_with_bus(&scratch, &bus, &entry, None)
+    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None)
         .await
         .expect("uninstall must succeed");
 
@@ -322,7 +322,7 @@ async fn find_plugin_owning_file_returns_none_after_uninstall() {
     let _ = super::prepare_uninstall_plugin(&scratch, &pool, &pending, "no-role-playing").await;
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
-    super::uninstall_with_bus(&scratch, &bus, &entry, None)
+    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None)
         .await
         .expect("uninstall must succeed");
 
@@ -402,7 +402,7 @@ async fn find_plugin_owning_app_returns_none_after_uninstall() {
     let _ = super::prepare_uninstall_plugin(&scratch, &pool, &pending, "no-role-playing").await;
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
-    super::uninstall_with_bus(&scratch, &bus, &entry, None)
+    super::uninstall_with_bus(&scratch, &bus, &entry, &[], None)
         .await
         .expect("uninstall must succeed");
 
@@ -451,7 +451,7 @@ async fn check_plugin_updates_skips_uninstalled_plugin() {
     let _ = prepare_uninstall_plugin(&scratch, &pool, &pending, "fixture-plugin").await;
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
-    uninstall_with_bus(&scratch, &bus, &entry, None)
+    uninstall_with_bus(&scratch, &bus, &entry, &[], None)
         .await
         .expect("uninstall must succeed");
 

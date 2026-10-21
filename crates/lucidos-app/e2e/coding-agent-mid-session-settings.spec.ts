@@ -5,22 +5,44 @@ import {
   apiRequest, navigateToApp, assertHealthy, newThread, pickComposeDestination,
   sendMessage, sendMessageCapturingThreadId, waitForCCToStart, waitForActionPanel, dismissCCSession,
   waitForActiveSession, openRungList, readRungRows, pickRung, currentRungValue,
+  COMPOSER_FOLD_TRIGGER, answerRungSwitchIfAsked,
 } from './helpers';
+import type { Page } from '@playwright/test';
 
 /**
- * Bug: changing model or reasoning effort MID-SESSION (after CC is running)
- * doesn't persist. When the CC process exits idle and respawns on follow-up,
- * the model reverts to the base name (e.g., opus[1m] → opus) and reasoning
- * effort reverts to the default.
- *
- * Root causes fixed:
- * 1. send_cc_control_request() didn't update cc_commands_cache
- * 2. Session idle exit didn't save model/effort to cache before removal
- * 3. Respawn didn't fall back to cache when cc_model=None
+ * A started coding-agent thread's model and effort change between turns only
+ * (ADR 0542). A pick at idle is recorded on the engine, and the next turn's
+ * spawn runs on it, though the follow-up itself carries no rung. While a turn
+ * runs the engine refuses a pick, and the rung pill is locked.
  */
 
 const FAKE_CLAUDE = fileURLToPath(new URL('./fake-claude-code/claude.mjs', import.meta.url));
 const CLAUDE_PATH_PREF = 'coding_agent_claude_path';
+
+/** Press the rung control: its pill when drawn, else its row in the ⋯ menu. */
+async function pressRungControl(page: Page) {
+  const trigger = page.locator('.rung-trigger[aria-label^="Model"]:visible').first();
+  if (await trigger.isVisible()) {
+    // Locked, the trigger is aria-disabled, which Playwright waits out. A
+    // finger still presses it, and the press says why.
+    await trigger.click({ force: true });
+    return;
+  }
+  await page.locator(COMPOSER_FOLD_TRIGGER).first().click();
+  await page.locator('.thread-overflow-item[data-role="rung-control"]:visible').click();
+}
+
+/** Wait until the engine reports the picked rung. A pick waits out the
+ *  finished turn's idle exit, and a follow-up sent before it lands would
+ *  reach the old process. */
+async function waitForRecordedRung(page: Page, threadId: string, picked: { model: string; effort: string | null }) {
+  await expect(async () => {
+    await answerRungSwitchIfAsked(page, 250);
+    const data = await (await page.request.get(`/api/v1/claude-code/commands?thread_id=${threadId}`)).json();
+    expect(baseModel(data.current_model)).toBe(baseModel(picked.model));
+    if (picked.effort) expect(data.current_reasoning_effort).toBe(picked.effort);
+  }).toPass({ timeout: 15_000 });
+}
 
 /** The base model id, with its `[1m]` context-window twin folded in. */
 const baseModel = (model: string | null | undefined) => (model ?? '').replace(/\[1m\]$/, '');
@@ -56,18 +78,16 @@ test.describe('CC mid-session model/effort persistence', () => {
     await waitForActionPanel(page, 'Archive', 120_000);
 
     // === Change reasoning effort after CC went idle ===
-    // Session is removed from agent_sessions when process exits, so the pick
-    // stores the rung as a pending preference (codingAgentPendingModel and
-    // codingAgentPendingReasoningEffort). The follow-up sendMessage carries
-    // the effort as `reasoning_effort` in the request body, which the next CC
-    // spawn picks up. A rung commits its model and effort together.
+    // The pick is recorded on the engine, which the next spawn runs on. A
+    // rung commits its model and effort together.
     const before = await (await page.request.get(`/api/v1/claude-code/commands?thread_id=${sentThreadId}`)).json();
     await openRungList(page);
     const picked = (await readRungRows(page)).find((r) => !r.current && r.effort !== before.current_reasoning_effort);
     expect(picked).toBeTruthy();
     await pickRung(page, picked!.value);
+    await waitForRecordedRung(page, sentThreadId, picked!);
 
-    // Send follow-up to trigger respawn with pending effort applied
+    // Send a follow-up, which respawns on the recorded effort
     await sendMessage(page, 'Say exactly: "effort-still-picked". Do not create any files.');
     await waitForCCToStart(page, 60_000);
 
@@ -105,10 +125,7 @@ test.describe('CC mid-session model/effort persistence', () => {
     await waitForActionPanel(page, 'Archive', 120_000);
 
     // === Change model after CC went idle ===
-    // Session is removed from agent_sessions when process exits, so the pick
-    // stores the rung as a pending preference (codingAgentPendingModel). The
-    // follow-up sendMessage carries the model as `cc_model` in the request
-    // body, which the next CC spawn picks up.
+    // The pick is recorded on the engine, which the next spawn runs on.
     const before = await (await page.request.get(`/api/v1/claude-code/commands?thread_id=${sentThreadId}`)).json();
     await openRungList(page);
     const picked = (await readRungRows(page)).find(
@@ -116,8 +133,9 @@ test.describe('CC mid-session model/effort persistence', () => {
     );
     expect(picked).toBeTruthy();
     await pickRung(page, picked!.value);
+    await waitForRecordedRung(page, sentThreadId, picked!);
 
-    // Send follow-up, which triggers a respawn with the pending rung applied
+    // Send a follow-up, which respawns on the recorded rung
     await sendMessage(page, 'Say exactly: "model-still-picked". Do not create any files.');
     await waitForCCToStart(page, 60_000);
 
@@ -141,50 +159,48 @@ test.describe('CC mid-session model/effort persistence', () => {
     await dismissCCSession(page);
   });
 
-  // Claude Code takes effort only at spawn, so a pick mid-turn restarts the
-  // session: the turn ends as a redirect, and a resume runs at the new
-  // effort. The fake reports the CLAUDE_CODE_EFFORT_LEVEL it was spawned
-  // with, which is what proves the restarted process runs at the pick.
-  test('an effort pick mid-turn restarts the session at the new effort', async ({ page }) => {
+  // A running turn keeps its rung: the engine refuses a pick with a reason
+  // the client tells apart, and the pill says why. The turn runs to its end
+  // on the effort it started with, and the pill frees at idle.
+  test('a pick mid-turn is refused, and the rung pill is locked until idle', async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await pickComposeDestination(page);
 
     const threadId = await sendMessageCapturingThreadId(
-      page, 'Take 30 seconds. Report your reasoning effort. Do not create any files.',
+      page, 'Take 20 seconds. Report your reasoning effort. Do not create any files.',
     );
     const before = await waitForActiveSession(page, threadId);
     const picked = before.current_reasoning_effort === 'low' ? 'high' : 'low';
 
-    // A session still starting refuses the pick, so retry until it is live.
+    // The default split folds the pill into the ⋯ menu, so press the control
+    // wherever it is drawn. Locked, it opens no list and says why.
+    const lockReason = page.locator('.toast:visible', { hasText: 'stay fixed while a turn runs' });
     await expect(async () => {
-      const res = await apiRequest(page).post('/api/v1/claude-code/control', {
-        data: { thread_id: threadId, request: { subtype: 'set_reasoning_effort', effort: picked } },
-      });
-      expect(res.ok(), await res.text()).toBeTruthy();
-      expect((await res.json()).takes_effect).toBe('now');
-    }).toPass({ timeout: 20_000, intervals: [500, 1000] });
+      await pressRungControl(page);
+      await expect(lockReason.first()).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 30_000 });
+    await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
 
+    const res = await apiRequest(page).post('/api/v1/claude-code/control', {
+      data: { thread_id: threadId, request: { subtype: 'set_reasoning_effort', effort: picked } },
+    });
+    expect(res.status(), await res.text()).toBe(409);
+    expect((await res.json()).reason).toBe('turn-running');
+
+    // The turn ran at the effort it started with, and nothing restarted it.
+    await waitForActionPanel(page, 'Archive', 120_000);
     const eventsOf = (type: string, field: string) => psql(
       `SELECT payload->>'${field}' FROM events WHERE thread_id = '${threadId}' AND event_type = '${type}' ORDER BY sequence`,
     ).split('\n').map((l) => l.trim()).filter(Boolean);
+    const replies = eventsOf('ResponseGenerated', 'text');
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).not.toBe(`effort: ${picked}`);
+    expect(eventsOf('ResponseCanceled', 'cause')).toEqual([]);
 
-    // The interrupted turn is a redirect, never the user's Stop.
-    await expect.poll(() => eventsOf('ResponseCanceled', 'cause'), { timeout: 60_000 }).toEqual(['effort_restart']);
-    await expect.poll(() => eventsOf('ContinuationStarted', 'reason'), { timeout: 60_000 }).toEqual(['effort_restart']);
-    // The resumed process runs at the pick, and so does its next call.
-    await expect.poll(() => eventsOf('ResponseGenerated', 'text'), { timeout: 60_000 }).toEqual([`effort: ${picked}`]);
-    expect(psql(
-      `SELECT payload->>'reasoning_effort' FROM events WHERE thread_id = '${threadId}' AND event_type = 'ContextCaptured' `
-      + `AND payload->>'parent_tool_use_id' IS NULL AND payload->'usage'->>'input_tokens' IS NOT NULL ORDER BY sequence DESC LIMIT 1`,
-    )).toBe(picked);
-
-    // One turn: the restart row inside the reply names the cause, and no
-    // resume card opens a second turn.
-    await expect(page.locator('.event-row[data-role="restart"] .event-row-state:visible'))
-      .toHaveText('You changed effort', { timeout: 30_000 });
-    await expect(page.locator('.event-row[data-role="resume"]:visible')).toHaveCount(0);
-    await waitForActionPanel(page, 'Archive', 120_000);
+    // Idle frees it: the list opens again.
+    await openRungList(page);
+    await page.keyboard.press('Escape');
     await dismissCCSession(page);
   });
 });

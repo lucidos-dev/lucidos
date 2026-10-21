@@ -1332,8 +1332,7 @@ pub(crate) async fn thread_parked_on_question(
 /// Gated on `is_shutdown`, so a user Stop, Apply, Discard or Archive outside a
 /// teardown is untouched: each deliberately ends the turn and cancel-stamps the
 /// card itself. The gate is a *window*, not an actor test, so a raw Stop inside
-/// the teardown window is swallowed too. An effort restart passes `true` as
-/// well: it stops the process the same way, and the answer resumes it.
+/// the teardown window is swallowed too.
 pub(crate) async fn preserve_question_park_at_shutdown(
     pool: &sqlx::PgPool,
     site: &'static str,

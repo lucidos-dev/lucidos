@@ -1,7 +1,5 @@
 use serde_json::Value;
 
-use crate::runtime::CodingAgent;
-
 use super::{EventMeta, ThreadEvent};
 
 /// The one tool whose args the inline render reads, so the args strip spares it.
@@ -139,31 +137,6 @@ impl ThreadEvent {
         }
         payload.remove("args");
         payload.insert("args_stripped".to_string(), Value::Bool(true));
-    }
-
-    /// Convert a control request into a CodingAgentSettingsChanged event,
-    /// if applicable. `coding_agent` identifies which backend issued the change.
-    pub fn from_control_request(
-        request: &crate::runtime::ControlRequest,
-        coding_agent: CodingAgent,
-    ) -> Option<Self> {
-        use crate::runtime::ControlRequest;
-        let (model, effort) = match request {
-            ControlRequest::SetModel { model } => (Some(model.clone()), None),
-            ControlRequest::SetReasoningEffort { effort } => (None, Some(effort.clone())),
-            ControlRequest::Interrupt => return None,
-        };
-        Some(Self::CodingAgentSettingsChanged {
-            model,
-            reasoning_effort: effort,
-            coding_agent,
-            // Settings-only emit (user changed model or effort mid-session).
-            // The session id AND config dir are pinned by the Init-time emit; see
-            // the variant doc.
-            cc_session_id: None,
-            claude_config_dir: None,
-            claude_config_dir_explicit: None,
-        })
     }
 
     /// Returns the variant name as a string, matching the DB `event_type` column.

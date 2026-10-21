@@ -291,8 +291,6 @@ pub(super) async fn app_server_driver_task(
     let mut tracker = AppServerTracker::new(resume_session_id.clone());
     let mut next_id: u64 = 1;
     let mut pending: HashMap<u64, PendingRequest> = HashMap::new();
-    let mut model = config.model.clone();
-    let mut effort = config.reasoning_effort.clone();
     let mut queue: VecDeque<AgentInput> = VecDeque::new();
     // True once the thread response has established the session (the id itself
     // lives on `tracker.session_id`). Turns can start only once this is true.
@@ -376,9 +374,11 @@ pub(super) async fn app_server_driver_task(
                 let input = session_context.led(input);
                 let thread_id = tracker.session_id.clone().unwrap_or_default();
                 // The same validated effort goes to the turn and to the `Usage`.
-                let turn_effort =
-                    super::codex::validate_codex_effort(model.as_deref(), effort.as_deref())
-                        .map(String::from);
+                let turn_effort = super::codex::validate_codex_effort(
+                    config.model.as_deref(),
+                    config.reasoning_effort.as_deref(),
+                )
+                .map(String::from);
                 tracker.begin_turn(turn_effort.clone());
                 turn_start = std::time::Instant::now();
                 let (image_paths, guards) = write_image_files(&input.images);
@@ -387,7 +387,7 @@ pub(super) async fn app_server_driver_task(
                     &thread_id,
                     &input.text,
                     &image_paths,
-                    model.as_deref(),
+                    config.model.as_deref(),
                     turn_effort.as_deref(),
                 );
                 let id = next_id;
@@ -651,8 +651,6 @@ pub(super) async fn app_server_driver_task(
                             _ => {} // idle — nothing to interrupt
                         }
                     }
-                    Some(ControlRequest::SetModel { model: m }) => model = Some(m),
-                    Some(ControlRequest::SetReasoningEffort { effort: e }) => effort = Some(e),
                     None => {
                         shutdown = true;
                         break 'session;

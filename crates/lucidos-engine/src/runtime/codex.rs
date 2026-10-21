@@ -788,8 +788,6 @@ async fn driver_task(
     cancel: CancellationToken,
 ) {
     let mut tracker = TurnTracker::new(resume_session_id);
-    let mut model = config.model.clone();
-    let mut effort = config.reasoning_effort.clone();
     let mut queue: VecDeque<AgentInput> = VecDeque::new();
 
     'session: loop {
@@ -804,7 +802,8 @@ async fn driver_task(
                 }
                 req = control_rx.recv() => {
                     match req {
-                        Some(req) => apply_idle_control(req, &mut model, &mut effort),
+                        // Nothing runs, so an interrupt has nothing to stop.
+                        Some(ControlRequest::Interrupt) => {}
                         None => break 'session,
                     }
                 }
@@ -819,8 +818,6 @@ async fn driver_task(
         let outcome = run_turn(
             &config,
             &mut tracker,
-            &mut model,
-            &mut effort,
             input,
             &events_tx,
             &mut input_rx,
@@ -842,20 +839,6 @@ async fn driver_task(
         exit: AgentExitFacts::default(),
     });
     // events_tx drops here — channel closes, consumer sees None.
-}
-
-/// Apply a control request while no turn is running. Interrupt at idle is a
-/// no-op (nothing to interrupt); model/effort updates take effect next turn.
-fn apply_idle_control(
-    req: ControlRequest,
-    model: &mut Option<String>,
-    effort: &mut Option<String>,
-) {
-    match req {
-        ControlRequest::Interrupt => {}
-        ControlRequest::SetModel { model: m } => *model = Some(m),
-        ControlRequest::SetReasoningEffort { effort: e } => *effort = Some(e),
-    }
 }
 
 /// What one turn forwards from the child's stdout. The first line is the
@@ -885,15 +868,10 @@ impl TurnOutput<'_> {
 }
 
 /// Run one `codex exec` child to completion, forwarding events.
-/// `model` / `effort` are `&mut` because a mid-turn `SetModel` /
-/// `SetReasoningEffort` control request lands here and must take effect on
-/// the NEXT per-turn child.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn(
     config: &CodexConfig,
     tracker: &mut TurnTracker,
-    model: &mut Option<String>,
-    effort: &mut Option<String>,
     input: AgentInput,
     events_tx: &mpsc::UnboundedSender<AgentEvent>,
     input_rx: &mut mpsc::UnboundedReceiver<AgentInput>,
@@ -902,7 +880,9 @@ async fn run_turn(
     cancel: &CancellationToken,
 ) -> TurnOutcome {
     // The same validated effort goes to the command and to the `Usage`.
-    let turn_effort = validate_codex_effort(model.as_deref(), effort.as_deref()).map(String::from);
+    let turn_effort =
+        validate_codex_effort(config.model.as_deref(), config.reasoning_effort.as_deref())
+            .map(String::from);
     tracker.begin_turn(turn_effort.clone());
     let turn_start = std::time::Instant::now();
 
@@ -924,10 +904,9 @@ async fn run_turn(
         text
     };
 
-    let turn_model = model.clone();
     let mut cmd = build_codex_turn_command(
         config,
-        turn_model.as_deref(),
+        config.model.as_deref(),
         turn_effort.as_deref(),
         resume_sid.as_deref(),
         &image_paths,
@@ -1002,8 +981,6 @@ async fn run_turn(
                         interrupted = true;
                         break 'turn;
                     }
-                    Some(ControlRequest::SetModel { model: m }) => *model = Some(m),
-                    Some(ControlRequest::SetReasoningEffort { effort: e }) => *effort = Some(e),
                     None => {
                         shutdown = true;
                         break 'turn;

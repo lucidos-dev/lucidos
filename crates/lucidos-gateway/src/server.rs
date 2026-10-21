@@ -3284,6 +3284,7 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
             }),
         };
     crate::log!("[Gateway] build id: {}", GATEWAY_BUILD_ID);
+    state.release_check().log_update_address();
     // What else is installed, and whether anything contends for a port. One
     // pass at boot, so a support log carries the answer without anybody asking
     // for it. The loud arm fires only on contention, never on coexistence.

@@ -46,4 +46,16 @@ describe('revealDashboard', () => {
     expect(openHomeThread).not.toHaveBeenCalled();
     expect(focusedThreadId.value).toBe('thread-a');
   });
+
+  it('on a phone brings the bars back, since the sheet hangs below the header', () => {
+    viewportIsMobile.value = true;
+    const reveal = vi.fn();
+    document.addEventListener('reveal-mobile-bars', reveal);
+    try {
+      revealDashboard();
+    } finally {
+      document.removeEventListener('reveal-mobile-bars', reveal);
+    }
+    expect(reveal).toHaveBeenCalledTimes(1);
+  });
 });

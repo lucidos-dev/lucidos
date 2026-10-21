@@ -4563,6 +4563,7 @@ dependencies = [
  "lucidos-local-token",
  "lucidos-owner-lock",
  "lucidos-tailscale",
+ "lucidos-update-address",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -4612,6 +4613,7 @@ dependencies = [
  "lucidos-installs",
  "lucidos-local-token",
  "lucidos-tailscale",
+ "lucidos-update-address",
  "qrcode",
  "reqwest 0.12.28",
  "serde",
@@ -4802,6 +4804,7 @@ dependencies = [
  "lucidos-owner-lock",
  "lucidos-pg-url",
  "lucidos-tailscale",
+ "lucidos-update-address",
  "mach2",
  "qrcode",
  "rcgen",
@@ -4867,6 +4870,13 @@ name = "lucidos-tailscale"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "lucidos-update-address"
+version = "0.1.0"
+dependencies = [
+ "url",
 ]
 
 [[package]]

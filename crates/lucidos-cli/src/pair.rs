@@ -11,22 +11,14 @@
 //! hostname comes from Tailscale or from `--host`, and the gateway builds and
 //! encodes the URL.
 //!
-//! It reaches the gateway rather than a workspace engine, so it resolves its
-//! own target instead of going through `crate::workspace`.
+//! It reaches the gateway rather than a workspace engine, so it finds it
+//! through `crate::gateway`.
 
+use crate::gateway::{self, FoundGateway};
 use crate::workspace::BoxError;
-
-/// Gateway ports to try, in order: the packaged gateway's, then the dev one's.
-/// They differ so both can run at once. Probing beats asking the user, since
-/// most people have exactly one.
-const DEFAULT_PORTS: [u16; 2] = [
-    lucidos_installs::DEFAULT_GATEWAY_PORT,
-    lucidos_installs::DEFAULT_DEV_GATEWAY_PORT,
-];
 
 /// Where the gateway's own surface lives, behind the reserved sigil namespace.
 const PAIRING_CODE_PATH: &str = "/~/api/v1/auth/pairing-code";
-const HEALTH_PATH: &str = "/~/api/v1/health";
 
 /// How long to wait for the MagicDNS reverse lookup. Short: a name we cannot
 /// resolve promptly is one we fall back from, and the tailnet address works.
@@ -46,21 +38,17 @@ pub struct PairArgs<'a> {
 }
 
 pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
-    let client = reqwest::blocking::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+    let client = gateway::client()?;
 
     let base = match args.port {
-        Some(p) => find_gateways(&client, &[p])
+        Some(p) => gateway::find_gateways(&client, &[p])
             .into_iter()
             .next()
             .map(|g| g.base)
-            .ok_or_else(|| -> BoxError { format!("no gateway answered on port {p}").into() })?,
+            .ok_or_else(|| gateway::no_gateway_on(p))?,
         None => {
-            let found = find_gateways(&client, &candidate_ports());
-            choose_gateway(&found, dev_port_override())?
+            let found = gateway::find_gateways(&client, &gateway::candidate_ports());
+            choose_gateway(&found, gateway::dev_port_override())?
         }
     };
 
@@ -217,7 +205,7 @@ fn qr_origin_candidates(base: &str, host: &str) -> Vec<String> {
 /// address is the ordinary answer rather than the exceptional one.
 fn answers_health(client: &reqwest::blocking::Client, origin: &str) -> bool {
     client
-        .get(format!("{origin}{HEALTH_PATH}"))
+        .get(format!("{origin}{}", gateway::HEALTH_PATH))
         .timeout(PROBE_TIMEOUT)
         .send()
         .is_ok_and(|r| r.status().is_success())
@@ -278,70 +266,6 @@ fn colorize(block: &str, plain: bool) -> String {
     out
 }
 
-/// Ports to probe: the dev override from the environment, then the defaults.
-fn candidate_ports() -> Vec<u16> {
-    candidate_ports_from(dev_port_override())
-}
-
-/// The port `LUCIDOS_DEV_GATEWAY_PORT` names, when it names a valid one.
-///
-/// Setting it is a deliberate pick, so [`choose_gateway`] takes that gateway
-/// even with another one answering beside it.
-fn dev_port_override() -> Option<u16> {
-    std::env::var("LUCIDOS_DEV_GATEWAY_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-}
-
-/// The pure half, so the ordering is table-tested without touching the
-/// environment. `set_var` is process-global and Rust runs tests in parallel
-/// threads, so two tests sharing one variable race each other.
-fn candidate_ports_from(override_port: Option<u16>) -> Vec<u16> {
-    let mut ports = Vec::new();
-    if let Some(p) = override_port {
-        ports.push(p);
-    }
-    for p in DEFAULT_PORTS {
-        if !ports.contains(&p) {
-            ports.push(p);
-        }
-    }
-    ports
-}
-
-/// One gateway that answered its health endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FoundGateway {
-    port: u16,
-    base: String,
-}
-
-/// Every gateway that answers, in probe order.
-///
-/// Both schemes are tried per port. The dev gateway serves TLS and the packaged
-/// one serves plain HTTP, and this command cannot know which it faces. All of
-/// them rather than the first, because [`choose_gateway`] has to see a second
-/// one to refuse it.
-fn find_gateways(client: &reqwest::blocking::Client, ports: &[u16]) -> Vec<FoundGateway> {
-    let mut found = Vec::new();
-    for &port in ports {
-        for scheme in ["https", "http"] {
-            let base = format!("{scheme}://127.0.0.1:{port}");
-            if client
-                .get(format!("{base}{HEALTH_PATH}"))
-                .send()
-                .is_ok_and(|r| r.status().is_success())
-            {
-                found.push(FoundGateway { port, base });
-                // One gateway per port. The other scheme is the same process
-                // refusing a handshake, never a second gateway.
-                break;
-            }
-        }
-    }
-    found
-}
-
 /// Pure: which gateway to mint on, or why the caller has to say.
 ///
 /// Ambiguity is refused rather than guessed. A code and the device it enrols
@@ -352,11 +276,11 @@ fn find_gateways(client: &reqwest::blocking::Client, ports: &[u16]) -> Vec<Found
 /// `preferred` is a port the caller chose, through `--port` or the dev
 /// override. It wins whenever it answered.
 fn choose_gateway(found: &[FoundGateway], preferred: Option<u16>) -> Result<String, BoxError> {
-    if let Some(hit) = preferred.and_then(|p| found.iter().find(|g| g.port == p)) {
+    if let Some(hit) = gateway::preferred(found, preferred) {
         return Ok(hit.base.clone());
     }
     match found {
-        [] => Err("no gateway found. Start one, or pass --port if it is on an unusual port".into()),
+        [] => Err(gateway::NO_GATEWAY.into()),
         [only] => Ok(only.base.clone()),
         many => {
             let ports: Vec<String> = many.iter().map(|g| g.port.to_string()).collect();
@@ -374,27 +298,6 @@ fn choose_gateway(found: &[FoundGateway], preferred: Option<u16>) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lucidos_installs::{DEFAULT_DEV_GATEWAY_PORT as DEV, DEFAULT_GATEWAY_PORT as PACKAGED};
-
-    #[test]
-    fn an_explicit_dev_override_is_probed_before_the_defaults() {
-        // Set on a dev machine that also runs a packaged install, where probing
-        // the packaged port first would pair the wrong gateway.
-        assert_eq!(candidate_ports_from(Some(5999)), vec![5999, PACKAGED, DEV]);
-    }
-
-    #[test]
-    fn an_override_equal_to_a_default_is_not_listed_twice() {
-        assert_eq!(candidate_ports_from(Some(DEV)), vec![DEV, PACKAGED]);
-        assert_eq!(candidate_ports_from(Some(PACKAGED)), vec![PACKAGED, DEV]);
-    }
-
-    #[test]
-    fn the_defaults_are_probed_when_nothing_is_set() {
-        // Packaged first: it is the one an ordinary install has.
-        assert_eq!(candidate_ports_from(None), vec![PACKAGED, DEV]);
-    }
-
     fn found(ports: &[u16]) -> Vec<FoundGateway> {
         ports
             .iter()

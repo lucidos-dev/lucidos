@@ -1,19 +1,11 @@
 //! The inputs a coding agent was sent and never read.
 //!
-//! Two stops can end a session before its agent read its input. A process
-//! that exits before its session began leaves the user's message unread at
-//! the end of the thread ([`undelivered_input`]). An effort pick that
-//! interrupts the turn first records the discard in the store
-//! ([`discarded_input`]): a message, a child's report or an engine prompt.
-//! The resume then carries the input itself. A bare "Continue from where you
-//! left off" would ask the agent to resume work it was never told about.
+//! A process that exits before its session began leaves the user's message
+//! unread at the end of the thread ([`undelivered_input`]). The resume then
+//! carries the input itself. A bare "Continue from where you left off" would
+//! ask the agent to resume work it was never told about.
 
 use uuid::Uuid;
-
-use crate::core::EventRow;
-use crate::engine::agent_session::stranded_follow_ups::{
-    rebuilt_inputs, DISCARDED_AND_OWED, OWED_ROW_COLUMNS,
-};
 
 /// What a coding agent was owed and never read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,38 +69,6 @@ pub(crate) async fn undelivered_input(
         Vec::new()
     });
     undelivered_input_from(&rows)
-}
-
-/// The inputs an effort restart discarded that no agent has read since, oldest
-/// first, or `None` when there are none.
-pub(crate) async fn discarded_input(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-) -> Option<UndeliveredInput> {
-    let sql = format!(
-        "SELECT {OWED_ROW_COLUMNS} FROM events m \
-          WHERE m.thread_id = $1 AND {} \
-          ORDER BY m.sequence ASC",
-        *DISCARDED_AND_OWED
-    );
-    let rows: Vec<EventRow> = sqlx::query_as(&sql)
-        .bind(thread_id)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_else(|e| {
-            crate::log!(
-                "[Recovery] Could not read thread {} for a discarded input: {}",
-                thread_id,
-                e
-            );
-            Vec::new()
-        });
-    let inputs = rebuilt_inputs(pool, rows).await;
-    joined(
-        inputs
-            .iter()
-            .map(|input| (input.row.id, input.text.as_str(), &input.row.payload)),
-    )
 }
 
 /// [`undelivered_input`] over events, newest first.

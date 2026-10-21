@@ -578,6 +578,29 @@
     color: var(--accent-yellow);
 }
 
+.plugin-affected-trigger,
+.plugin-affected-trigger-path {
+    display: flex;
+    flex-direction: column;
+}
+
+.plugin-affected-trigger {
+    gap: 0.125rem;
+}
+
+.plugin-affected-trigger-name {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-strong);
+}
+
+.plugin-affected-trigger-file {
+    font-family: monospace;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
 .plugin-install-note {
     margin: 0;
     color: var(--text-secondary);

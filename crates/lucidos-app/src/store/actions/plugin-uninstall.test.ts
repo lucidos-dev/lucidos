@@ -91,6 +91,21 @@ describe('markPluginUninstalled', () => {
     expect(receipt.request.plugin_name).toBe('Habit Tracker');
   });
 
+  it('carries the triggers that rely on a file the uninstall deleted', () => {
+    const form = openPending();
+    const affected = [{
+      trigger_id: 't-1',
+      trigger_name: 'Daily habit check',
+      paths: [{ path: 'apps/habit-tracker/manifest.json', reason: 'named-in-run' as const }],
+    }];
+
+    markPluginUninstalled(form, { ...engineResult, affected_triggers: affected });
+
+    const receipt = activeInlineForm.value;
+    if (receipt?.type !== 'plugin-uninstall') throw new Error('expected a receipt');
+    expect(receipt.removed?.affected_triggers).toEqual(affected);
+  });
+
   it('replaces the panel history entry instead of pushing a second one', () => {
     const form = openPending();
     pushNavState.mockClear();

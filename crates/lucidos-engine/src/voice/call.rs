@@ -1439,7 +1439,7 @@ impl Call<'_> {
             // `SupersededByFollowup` is the caller talking over the answer,
             // which is how people talk. The turn that replaced it is already
             // running, so "that did not finish" would talk over the real answer
-            // on its way. An effort restart resumes the same way. A Stop is the
+            // on its way. A Stop is the
             // other half: nothing is coming, and a caller left waiting in
             // silence is the failure this reports.
             ThreadEvent::ResponseCanceled { cause, .. } if !cause.is_redirect() => {

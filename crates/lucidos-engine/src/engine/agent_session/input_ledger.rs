@@ -39,8 +39,6 @@ pub(crate) struct InputLedger {
     awaiting_tombstone: HashSet<Uuid>,
     /// Completions of the inputs the current turn read, answered at its end.
     read_this_turn: Vec<InputCompletion>,
-    /// Whether the current turn has read any input, with a completion or not.
-    turn_read_input: bool,
 }
 
 type InputCompletion = tokio::sync::oneshot::Sender<InputAnswered>;
@@ -160,7 +158,6 @@ impl InputLedger {
             return Settled::Rejected;
         }
         self.read_this_turn.extend(settled.completion.take());
-        self.turn_read_input = true;
         let verbatim = settled.verbatim;
         Settled::Read(
             settled
@@ -176,22 +173,6 @@ impl InputLedger {
         for completion in self.read_this_turn.drain(..) {
             let _ = completion.send(InputAnswered::TurnEnded);
         }
-        self.turn_read_input = false;
-    }
-
-    /// An interrupt ended the current turn, before its `Result` is accounted.
-    /// One that came before the turn read anything discarded the input that
-    /// opened it, so the agent never reads that input. Inputs queued behind it
-    /// stay owed, because the agent reads its queue after an interrupt.
-    /// Returns the events that carried the discarded input.
-    pub(crate) fn turn_interrupted(&mut self) -> Vec<Uuid> {
-        if self.turn_read_input {
-            return Vec::new();
-        }
-        self.unread
-            .pop_front()
-            .map(|discarded| discarded.event_ids)
-            .unwrap_or_default()
     }
 
     pub(crate) fn owed(&self) -> u32 {
@@ -220,27 +201,6 @@ pub(crate) async fn announce_reads(
                 meta: meta.clone(),
             },
             "[AgentSession] CodingAgentInputRead",
-        )
-        .await;
-    }
-}
-
-/// Record each event of an input the agent will never read, from
-/// [`InputLedger::turn_interrupted`], so the next session delivers it.
-pub(crate) async fn announce_discards(
-    bus: &EventBus,
-    thread_id: Uuid,
-    meta: &EventMeta,
-    discarded: Vec<Uuid>,
-) {
-    for input_event_id in discarded {
-        bus.emit_or_log(
-            BusEvent::Thread {
-                thread_id,
-                event: ThreadEvent::CodingAgentInputDiscarded { input_event_id },
-                meta: meta.clone(),
-            },
-            "[AgentSession] CodingAgentInputDiscarded",
         )
         .await;
     }

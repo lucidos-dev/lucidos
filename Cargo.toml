@@ -20,6 +20,7 @@ members = [
     "crates/lucidos-owner-lock",
     "crates/lucidos-pg-url",
     "crates/lucidos-tailscale",
+    "crates/lucidos-update-address",
 ]
 # Third-party source carried for a patch, never linted or formatted as ours.
 # A temporary measure: docs/temporary-measures.md, "chromiumoxide is vendored

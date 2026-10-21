@@ -764,6 +764,42 @@ This applies to every shape of change:
 
 If you truly need a different trigger (a different *workflow*, not a tweak), give it a clearly different name. Two live triggers with the same name are a UX trap: no picker tells them apart.
 
+## Know-how a plugin removed
+
+A plugin update or uninstall can delete knowhow a trigger relies on. The trigger
+is then an *affected trigger*. The usual case is one an agent made with
+`create_trigger` during a plugin's setup: it carries no plugin id, so the plugin
+cannot update it. The engine never edits, pauses or deletes it. It warns instead:
+in the plugin panel, on its receipt, and in one notification
+(`system-knowhow/plugins.md` § "Affected triggers").
+
+**Each later fire carries a `[REMOVED KNOW-HOW]` block** in its first message:
+
+```
+[REMOVED KNOW-HOW]
+A plugin removed know-how this trigger relied on:
+- `apps/token-cost/knowhow/daily-price-check.md`, removed by the Token Cost update to v0.6.0
+Do not invent a replacement recipe silently. ...
+[END REMOVED KNOW-HOW]
+```
+
+When your fire carries it, do what it says. Look for current knowhow with
+`load_knowhow`, and say in your result that this trigger's knowhow was removed.
+Suggest the user edit the trigger. The run still goes ahead.
+
+The block stops when either holds:
+
+- **The trigger is edited after the removal**, with `update_trigger`. Pause,
+  resume and a plugin re-registering its own trigger do not count, because
+  nobody looked at the knowhow.
+- **Every listed path exists again**, for example after a reinstall.
+
+To fix one, find where the recipe went (the new version may have moved it), and
+point the intent at it with `update_trigger`. Never recreate the trigger (see
+"Edit, don't recreate" above). A removal from before Lucidos recorded affected
+triggers raises no block. The workspace audit checks for those
+(`system-knowhow/workspace-audit/triggers.md`).
+
 ## Running an existing trigger once, off-schedule
 
 **`triggers(action="run", trigger_id)`.** That is the whole answer for a cron trigger. The CLI is `lucidos triggers run --id <uuid>`, the SDK is `lucidos.triggers.run(id)`, and the trigger's row in the panel has a **Run once** button. (Not to be confused with the Thread Queue panel's **Run now**, which force-admits an entry that is *already queued* and cannot create a fire.)
@@ -923,6 +959,7 @@ candidate in the path-resolution fallback, not the configured path, which
 - **Hand-editing `trigger.toml`.** The scheduler never reads it, so the edit no-ops and the next trigger event or restart overwrites it. Change the config with `update_trigger`, then verify against `list_triggers`. See "On-disk trigger definition" above.
 - **Resuming a paused trigger to "run it now", or hand-rolling the run.** Resume runs nothing by itself. Use `triggers(action="run")`, or emit the subscribed event for an event-only trigger. See "Running an existing trigger once, off-schedule" above.
 - **A trigger that manages another trigger.** Refused at fire time, and nothing catches it earlier. See § "What a trigger fire may not do to other triggers".
+- **Patching around a `[REMOVED KNOW-HOW]` block.** Rewriting the missing recipe from memory hides the removal and drifts each run. Find the current knowhow, tell the user, and suggest they edit the trigger. See § "Know-how a plugin removed".
 - **Recipe-in-text.** Procedure in `run.intent` instead of knowhow, almost always because the knowhow file was never written first. See "Write the knowhow file FIRST, then the intent" above.
 - **A webhook condition without the `payload.` prefix.** `{"action": "completed"}` matches nothing, and nothing warns you. See § "The envelope: a webhook's body lands under `payload`".
 - **An MCP server the intent uses but the trigger does not list.** Every call to it is refused in the fire, with a notification. See § "MCP servers the fires use: `mcp_servers`".

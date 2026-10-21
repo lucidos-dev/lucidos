@@ -125,7 +125,7 @@ async fn update_replaces_media_and_uninstall_removes_it() {
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
-    uninstall_with_bus(&scratch, &MockEventBus::new(), &pending, None)
+    uninstall_with_bus(&scratch, &MockEventBus::new(), &pending, &[], None)
         .await
         .expect("uninstall");
     assert!(!copy.exists());

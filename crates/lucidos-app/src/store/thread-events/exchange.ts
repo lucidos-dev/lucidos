@@ -313,24 +313,28 @@ function extractResponseField(
   return undefined;
 }
 
+/** A `CodingAgentSettingsChanged` the engine wrote at spawn, never a user's
+ *  pick. A pick carries an `actor`: it is a selection for the next turn, and
+ *  it lands among the steps of the exchange before it (ADR 0542). */
+function spawnSettings(event: StoredEvent): Extract<StoredEvent, { type: 'CodingAgentSettingsChanged' }> | undefined {
+  return event.type === 'CodingAgentSettingsChanged' && !(event as { actor?: unknown }).actor ? event : undefined;
+}
+
+/** The model the exchange's calls ran on. Mid-turn that is the settings the
+ *  engine wrote at spawn, else the model stamped on the turn's starter. */
 export function exchangeResponseModel(exchange: Exchange): string | undefined {
-  return extractResponseField(exchange, 'model', (event) =>
-    event.type === 'CodingAgentSettingsChanged' ? event.model || undefined : undefined);
+  return extractResponseField(exchange, 'model', (event) => spawnSettings(event)?.model || undefined);
 }
 
 /** The effort the exchange's calls ran at, its *effort in force*. Mid-turn that
  *  is the newest main-session capture, or the settings the engine wrote at
- *  spawn. A user's pick carries an `actor` and is skipped: it is a selection,
- *  and a Claude Code call runs at its session's spawn effort. */
+ *  spawn. */
 export function exchangeReasoningEffort(exchange: Exchange): string | undefined {
   return extractResponseField(exchange, 'reasoning_effort', (event) => {
     if (event.type === 'ContextCaptured') {
       return parentToolUseIdOf(event) ? undefined : event.reasoning_effort || undefined;
     }
-    if (event.type === 'CodingAgentSettingsChanged' && !(event as { actor?: unknown }).actor) {
-      return event.reasoning_effort || undefined;
-    }
-    return undefined;
+    return spawnSettings(event)?.reasoning_effort || undefined;
   });
 }
 

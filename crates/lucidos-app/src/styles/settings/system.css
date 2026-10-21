@@ -252,3 +252,37 @@
     flex-shrink: 0;
     flex-wrap: nowrap;
 }
+
+/* Settings → System → Maintenance: the update address. The banner's lead words
+   carry the warning colour, since an override changes where every update comes
+   from and must not read as one more routine notice. */
+.update-address-flag {
+    color: var(--accent-yellow);
+}
+
+/* A free-text field stacks under its label, as base.css does for a bare
+   .settings-text-input. Here the field shares a line with its Save button, so
+   the row matches on its own class rather than on the field. */
+.update-address-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-xs);
+}
+
+.update-address-row > .settings-row-label {
+    padding-top: 0;
+    flex: none;
+}
+
+.update-address-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+/* A URL reads as code, and the field takes what the button leaves. */
+.update-address-input {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-mono);
+}

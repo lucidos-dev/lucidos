@@ -58,6 +58,8 @@ function gateway(over: Partial<ReleaseCheck> = {}): ReleaseCheck {
     checked_at: null,
     last_error: null,
     latest: null,
+    update_address: null,
+    update_address_error: null,
     ...over,
   };
 }

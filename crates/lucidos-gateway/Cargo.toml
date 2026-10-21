@@ -33,6 +33,7 @@ lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
 # Enumerating the machine's Lucidos installs, shared with `lucidos-app` so the
 # control plane and the client cannot describe one machine two ways.
 lucidos-installs = { path = "../lucidos-installs" }
+lucidos-update-address = { path = "../lucidos-update-address" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

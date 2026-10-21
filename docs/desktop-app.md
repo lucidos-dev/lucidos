@@ -322,6 +322,53 @@ The build/upload split lives in `build-dmg.sh`: `--release-build` (build + stage
 no upload) and `--release-attach` (verify staging + upload, no rebuild); the kept
 `--release` runs both back-to-back for the one-shot path (which has no rc gate).
 
+### Test an update before publishing
+
+Between Phase A and Phase B you can update an installed Lucidos to the staged
+build, through the real in-app updater. The tool is the **update address**, a
+gateway setting that points the update check at another `latest.json`. The
+local **rc channel** serves one (ADR 0543). This is optional and by hand.
+
+You need:
+
+- a packaged Lucidos on this Mac that already carries the update address
+  setting (see the note below);
+- a dev workspace whose engine runs on plain http, which is the default.
+
+Steps:
+
+1. Run Phase A as usual: `scripts/release.sh --verify-build <version> …`.
+2. Publish the staged build to the rc channel:
+
+   ```bash
+   scripts/publish-rc-channel.sh <version> --workspace ~/workspaces/dev
+   ```
+
+   It verifies the staging and copies the `.app.tar.gz` and its `.sig` into
+   `data/artifacts/releases/rc/` in that workspace. Then it writes a
+   `latest.json` and prints its URL, of the form
+   `http://127.0.0.1:<API_PORT>/api/v1/data/artifacts/releases/rc/latest.json`.
+   `--workspace` defaults to `$LUCIDOS_WORKSPACE`. The folder carries a
+   `.gitignore` of `*`, so the bundle stays out of the workspace history.
+3. Point the installed app at it, with the command the script printed
+   (`lucidos update-address set <url>`). You can also paste the URL in
+   **Settings > System > Overview > Maintenance > Update address**. Settings
+   now shows a banner naming the address.
+4. Click **Check for Updates**. The app offers `<version>`. Install it and let
+   it relaunch. The bundle carries the real release signature, and the app
+   checks it with its baked key as always.
+5. Check the updated app, then go back to the published channel with
+   **Use default** in the banner, or `lucidos update-address reset`.
+6. Run Phase B as usual.
+
+A publish replaces the previous rc. The script writes nothing outside the rc
+folder: not the staging, not `~/.lucidos`, not the app's data.
+
+**The first testable hop.** A release older than the update address setting has
+its address baked in and cannot be pointed anywhere. So the first test starts
+from the first release that carries the setting. For example, install that
+release, then stage the next one and test the update to it.
+
 ### The updater payload is repacked from the SIGNED app (the v0.19.0 bug)
 
 `cargo tauri build` packs `Lucidos.app.tar.gz` from the `.app` as the bundler

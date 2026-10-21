@@ -251,6 +251,12 @@ export interface ReleaseCheck {
    *  caller reads the unchanged snapshot as "you are up to date". */
   last_error: string | null;
   latest: ReleaseOffer | null;
+  /** The *update address*: the `latest.json` URL checks read instead of the
+   *  published release. `null` when unset. A refused stored value is reported
+   *  here as written, beside `update_address_error`. */
+  update_address: string | null;
+  /** Why the stored address is refused. While set, every check fails. */
+  update_address_error: string | null;
 }
 
 /** Build id of the running gateway + whether a newer binary is on disk (the dev
@@ -324,6 +330,9 @@ export async function requestUpdateCheck(force = false): Promise<ReleaseCheck> {
  *  value. Takes effect on the next tick, with no restart. */
 export async function setReleaseCheckConfig(body: {
   enabled?: boolean;
+  /** A `latest.json` URL, or `''` for the published release. A refused one
+   *  is a 400 whose reason names the rule. */
+  update_address?: string;
 }): Promise<ReleaseCheck> {
   return controlJson<ReleaseCheck>('/release-check', {
     method: 'PUT',

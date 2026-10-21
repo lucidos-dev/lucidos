@@ -32,6 +32,9 @@ lucidos-local-token = { path = "../lucidos-local-token" }
 # with no subprocess. It picks a name to print and never touches the auth
 # decision (ADR 0094).
 lucidos-tailscale = { path = "../lucidos-tailscale" }
+# The update address rule and its gateway routes, so `lucidos update-address`
+# refuses what the gateway would refuse, before any request.
+lucidos-update-address = { path = "../lucidos-update-address" }
 # The same encoder the gateway uses, so the two QRs cannot differ. No default
 # features: `image` is the crate's only dependency and it is gated off, and the
 # unicode renderer this needs is behind no feature at all.

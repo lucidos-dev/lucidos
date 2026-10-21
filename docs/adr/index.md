@@ -548,3 +548,5 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0539: A successor's context comes from the old agent only while its prompt cache is warm; a cold cache starts the successor from a handoff brief](0539-successor-context-by-cache-warmth.md)
 - [0540: A cache keep-alive run leaves one turnless card in the transcript, not an end-of-feed divider](0540-a-keep-alive-run-leaves-one-card.md)
 - [0541: A refused local e2e run gives up at once with exit 75; /harden reads it as SKIP and the main check runs the specs; nothing waits for the e2e lock; supersedes 0057's subscribe-and-wait](0541-a-busy-e2e-lock-is-given-up.md)
+- [0542: A coding-agent thread's model and effort lock while a turn runs; a pick between turns is recorded at once](0542-coding-agent-rung-locks-during-a-turn.md)
+- [0543: The update address is one gateway setting; a local rc channel tests an update before publishing](0543-update-address-is-a-gateway-setting.md)

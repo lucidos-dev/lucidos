@@ -491,225 +491,119 @@ async fn stop_on_an_entry_no_loop_listens_to_takes_the_no_session_fallback() {
     );
 }
 
-fn running_session(
-    agent: crate::runtime::CodingAgent,
-    in_flight: bool,
-) -> (
-    crate::engine::AgentSession,
-    tokio::sync::mpsc::UnboundedReceiver<crate::engine::AgentUserInput>,
-    tokio::sync::mpsc::UnboundedReceiver<crate::runtime::ControlRequest>,
-) {
+/// A turn runs while it starts, works, or waits on a question, and a pick
+/// waits for it to end (ADR 0542). Between turns a pick is free.
+#[test]
+fn the_rung_locks_while_a_turn_runs() {
+    use super::control::{awaits_idle_exit, rung_locked};
+    use crate::engine::thread_lifecycle::ThreadStatus;
+
+    for status in ThreadStatus::ALL {
+        let open = matches!(
+            status,
+            ThreadStatus::Running | ThreadStatus::WaitingForUserAnswer | ThreadStatus::Paused
+        );
+        assert_eq!(
+            rung_locked(status, None),
+            open,
+            "{status:?} with no session"
+        );
+    }
+
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut session = make_test_session(msg_tx, !in_flight);
-    session.coding_agent = agent;
-    let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
-    session.phase = crate::engine::SessionPhase::Running { control_tx };
-    (session, msg_rx, control_rx)
-}
-
-fn low_effort() -> crate::runtime::ControlRequest {
-    crate::runtime::ControlRequest::SetReasoningEffort {
-        effort: "low".into(),
-    }
-}
-
-fn picker() -> Option<crate::engine::thread_events::MessageOrigin> {
-    Some(crate::engine::thread_events::MessageOrigin::Device {
-        device_id: "ios-1".into(),
-    })
-}
-
-/// Deliver a request and restart for it, as `send_agent_control_request` does
-/// around its settings event.
-fn deliver_and_restart(
-    session: &mut crate::engine::AgentSession,
-    request: crate::runtime::ControlRequest,
-    parked_on_question: bool,
-    actor: Option<crate::engine::thread_events::MessageOrigin>,
-) -> Result<crate::runtime::TakesEffect, &'static str> {
-    use super::control::{deliver_control_request, restart_for_control_request};
-    let (takes_effect, reach) = deliver_control_request(session, request, parked_on_question)?;
-    restart_for_control_request(session, reach, parked_on_question, actor);
-    Ok(takes_effect)
-}
-
-/// Claude Code takes effort only at spawn, so a pick restarts a live session
-/// and takes effect now. A turn that runs on unchanged says it takes effect
-/// next turn. Codex takes the pick on its control channel, at its next turn.
-#[test]
-fn an_effort_pick_restarts_claude_code_and_reaches_codex_on_its_channel() {
-    use super::control::{effort_restart, EffortRestart};
-    use crate::engine::types::ConflictBinding;
-    use crate::engine::StopReason;
-    use crate::runtime::{CodingAgent, TakesEffect};
-
-    let merge = Some(ConflictBinding::Detached {
-        change_id: uuid::Uuid::new_v4(),
-    });
-    let tier_one = Some(ConflictBinding::InPlace {
-        change_id: uuid::Uuid::new_v4(),
-    });
-    let stopping = Some(StopReason::UserStop);
-    let (cc, codex) = (CodingAgent::ClaudeCode, CodingAgent::Codex);
-    let (none, interrupt, keep) = (
-        EffortRestart::NotNeeded,
-        EffortRestart::InterruptTurn,
-        EffortRestart::KeepQuestion,
+    let mut live = make_test_session(msg_tx, false);
+    assert!(
+        rung_locked(ThreadStatus::Idle, Some(&live)),
+        "a live process would take a follow-up on its old rung"
     );
-    let (now, next) = (TakesEffect::Now, TakesEffect::NextTurn);
-    #[rustfmt::skip]
-    let cases = [
-        ("idle", cc, false, false, None, None, none, now),
-        ("running", cc, true, false, None, None, interrupt, now),
-        ("parked", cc, true, true, None, None, keep, now),
-        ("a Tier-1 merge turn", cc, true, false, tier_one, None, none, next),
-        ("a merge session", cc, true, false, merge, None, none, next),
-        ("stopping", cc, true, false, None, stopping, none, next),
-        ("Codex running", codex, true, false, None, None, none, next),
-        ("Codex idle", codex, false, false, None, None, none, now),
-    ];
-    for (case, agent, in_flight, parked, conflict, stop, restart, takes_effect) in cases {
-        let (mut session, _msg_rx, mut control_rx) = running_session(agent, in_flight);
-        session.conflict = conflict;
-        session.pending_stop = stop;
+    assert!(
+        awaits_idle_exit(&live),
+        "its turn may have just ended, so a pick waits for the idle exit"
+    );
+    live.change_claim = Some(crate::engine::types::ChangeClaim::Apply);
+    assert!(
+        !awaits_idle_exit(&live),
+        "an apply holds the process, so no idle exit comes"
+    );
+    live.change_claim = None;
 
-        let reach = agent.control_reach(&low_effort());
-        assert_eq!(effort_restart(&session, reach, parked), restart, "{case}");
-        let outcome = deliver_and_restart(&mut session, low_effort(), parked, picker());
+    let mut keep_alive = live;
+    keep_alive.keep_alive = true;
+    assert!(
+        !rung_locked(ThreadStatus::Idle, Some(&keep_alive)),
+        "a keep-alive records no rung over the pick"
+    );
+    assert!(!awaits_idle_exit(&keep_alive));
 
-        assert_eq!(outcome, Ok(takes_effect), "{case}");
-        assert_eq!(
-            control_rx.try_recv().is_ok(),
-            agent == codex,
-            "{case}: only Codex takes effort on its channel"
+    drop(msg_rx);
+    let mut exited = keep_alive;
+    exited.keep_alive = false;
+    assert!(
+        !rung_locked(ThreadStatus::Idle, Some(&exited)),
+        "an entry whose loop is gone runs nothing"
+    );
+}
+
+/// A spawn still starting runs a turn, so its rung is locked too.
+#[test]
+fn a_starting_session_locks_the_rung() {
+    use super::control::rung_locked;
+
+    let mut sessions = std::collections::HashMap::new();
+    let thread_id = uuid::Uuid::new_v4();
+    let _claim = crate::engine::agent_session::spawn_claim::claim_thread_for(
+        &mut sessions,
+        thread_id,
+        crate::runtime::CodingAgent::ClaudeCode,
+        crate::engine::agent_session::spawn_claim::ClaimFor::Run,
+    )
+    .unwrap();
+    assert!(rung_locked(
+        crate::engine::thread_lifecycle::ThreadStatus::Idle,
+        sessions.get(&thread_id)
+    ));
+}
+
+/// The control endpoint's body: the two picks the picker offers, and nothing
+/// else. A mode switch or an interrupt sent over HTTP never parses. A model
+/// pick carries its effort, so a turn starting between two requests cannot
+/// split the pair.
+#[test]
+fn a_rung_pick_parses_only_a_model_or_an_effort() {
+    use super::control::RungPick;
+    assert_eq!(
+        serde_json::from_str::<RungPick>(r#"{"subtype":"set_model","model":"haiku"}"#).unwrap(),
+        RungPick::SetModel {
+            model: "haiku".into(),
+            effort: None,
+        }
+    );
+    assert_eq!(
+        serde_json::from_str::<RungPick>(
+            r#"{"subtype":"set_model","model":"haiku","effort":"high"}"#
+        )
+        .unwrap(),
+        RungPick::SetModel {
+            model: "haiku".into(),
+            effort: Some("high".into()),
+        }
+    );
+    assert_eq!(
+        serde_json::from_str::<RungPick>(r#"{"subtype":"set_reasoning_effort","effort":"low"}"#)
+            .unwrap(),
+        RungPick::SetReasoningEffort {
+            effort: "low".into()
+        }
+    );
+    for refused in [
+        r#"{"subtype":"set_permission_mode","mode":"plan"}"#,
+        r#"{"subtype":"interrupt"}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<RungPick>(refused).is_err(),
+            "{refused}"
         );
-        assert_eq!(
-            session.current_reasoning_effort.as_deref(),
-            Some("low"),
-            "{case}: the next spawn reads the picked effort"
-        );
     }
-}
-
-/// A pick mid-turn interrupts the turn as a redirect, which owes it a resume.
-/// The turn then reads as superseded, not as the user's Stop.
-#[test]
-fn an_effort_pick_mid_turn_interrupts_as_a_redirect_and_owes_a_resume() {
-    use crate::engine::types::EffortResume;
-    use crate::runtime::CodingAgent;
-
-    let (mut session, _msg_rx, _control_rx) = running_session(CodingAgent::ClaudeCode, true);
-    deliver_and_restart(&mut session, low_effort(), false, picker()).unwrap();
-
-    assert_eq!(
-        session.redirect_cause,
-        Some(crate::engine::thread_events::CancelCause::EffortRestart),
-        "the interrupt is an effort restart, not a Stop"
-    );
-    assert_eq!(
-        session.cancel_actor,
-        picker(),
-        "the canceled turn names who picked"
-    );
-    assert_eq!(
-        session.effort_resume,
-        Some(EffortResume { actor: picker() })
-    );
-    assert!(
-        futures::FutureExt::now_or_never(session.interrupt.notified()).is_some(),
-        "the run loop is told to interrupt"
-    );
-    assert!(
-        session.pending_stop.is_none(),
-        "the process stops at the turn's end, not now"
-    );
-    assert!(session.is_live());
-}
-
-/// A pick while the turn waits on a question stops the process at once and
-/// keeps the card. An interrupt would reject the question. The entry reads as
-/// exited, so an answer that lands meanwhile resumes a new session.
-#[test]
-fn an_effort_pick_on_a_parked_question_stops_the_process_and_keeps_the_card() {
-    use crate::engine::StopReason;
-    use crate::runtime::CodingAgent;
-
-    let (mut session, _msg_rx, _control_rx) = running_session(CodingAgent::ClaudeCode, true);
-    deliver_and_restart(&mut session, low_effort(), true, picker()).unwrap();
-
-    assert_eq!(session.pending_stop, Some(StopReason::EffortRestart));
-    assert!(
-        !session.is_live(),
-        "an answer takes the no-live-session path"
-    );
-    assert!(
-        futures::FutureExt::now_or_never(session.stop.notified()).is_some(),
-        "the run loop is told to stop"
-    );
-    assert!(
-        futures::FutureExt::now_or_never(session.interrupt.notified()).is_none(),
-        "an interrupt would reject the question"
-    );
-    assert_eq!(
-        session.effort_resume,
-        Some(crate::engine::types::EffortResume { actor: picker() }),
-        "owed in case the question was answered before the stop"
-    );
-}
-
-/// An idle pick restarts nothing: the process exits at idle, and the next
-/// spawn carries the pick.
-#[test]
-fn an_idle_effort_pick_restarts_nothing() {
-    use crate::runtime::CodingAgent;
-
-    let (mut session, _msg_rx, _control_rx) = running_session(CodingAgent::ClaudeCode, false);
-    deliver_and_restart(&mut session, low_effort(), false, picker()).unwrap();
-
-    assert!(session.pending_stop.is_none());
-    assert!(session.effort_resume.is_none());
-    assert!(session.redirect_cause.is_none());
-    assert!(futures::FutureExt::now_or_never(session.interrupt.notified()).is_none());
-    assert!(futures::FutureExt::now_or_never(session.stop.notified()).is_none());
-}
-
-/// A cache keep-alive's hidden turn is not the user's. Its process exits at
-/// idle, so the pick takes effect now, with no interrupt and no resume.
-#[test]
-fn an_effort_pick_during_a_keep_alive_turn_restarts_nothing() {
-    use crate::runtime::{CodingAgent, TakesEffect};
-
-    let (mut session, _msg_rx, _control_rx) = running_session(CodingAgent::ClaudeCode, true);
-    session.keep_alive = true;
-
-    assert_eq!(
-        deliver_and_restart(&mut session, low_effort(), false, picker()),
-        Ok(TakesEffect::Now)
-    );
-    assert!(session.effort_resume.is_none());
-    assert!(session.redirect_cause.is_none());
-    assert!(futures::FutureExt::now_or_never(session.interrupt.notified()).is_none());
-}
-
-/// Claude Code takes a model switch live, so it still goes down the channel.
-#[test]
-fn a_model_change_reaches_a_running_claude_code_turn() {
-    use crate::runtime::{ControlRequest, TakesEffect};
-
-    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut session = make_test_session(msg_tx, false);
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-    session.phase = crate::engine::SessionPhase::Running { control_tx };
-
-    let request = ControlRequest::SetModel {
-        model: "haiku".into(),
-    };
-    assert_eq!(
-        deliver_and_restart(&mut session, request, false, None),
-        Ok(TakesEffect::Now)
-    );
-    assert!(control_rx.try_recv().is_ok());
-    assert_eq!(session.current_model.as_deref(), Some("haiku"));
 }
 
 /// A stop request with no thread id reaches every session. One that a change
@@ -976,28 +870,4 @@ fn run_merge_session_tier2_routes_through_start_merge_and_get_prompt() {
          so the panel shows real numbers. Body was:\n{}",
         body
     );
-}
-
-/// A starting agent has no runtime to take the request. Recording it anyway
-/// would report a model switch that never reaches the process.
-#[test]
-fn a_starting_agent_refuses_a_control_request() {
-    use super::control::deliver_control_request;
-    use crate::runtime::ControlRequest;
-
-    let mut sessions = std::collections::HashMap::new();
-    let thread_id = uuid::Uuid::new_v4();
-    let _claim = crate::engine::agent_session::spawn_claim::claim_thread_for(
-        &mut sessions,
-        thread_id,
-        crate::runtime::CodingAgent::ClaudeCode,
-        crate::engine::agent_session::spawn_claim::ClaimFor::Run,
-    )
-    .unwrap();
-    let session = sessions.get_mut(&thread_id).unwrap();
-    let request = ControlRequest::SetModel {
-        model: "haiku".into(),
-    };
-    assert!(deliver_control_request(session, request, false).is_err());
-    assert_eq!(session.current_model, None, "nothing is recorded");
 }

@@ -15,7 +15,7 @@
     --header-mark-size: 1.6rem;      /* the glyph, inside its tap target */
     --header-mark-tap: 2.1rem;       /* the tap target */
     --header-nav-gap: 0.35rem;       /* minimum chevron to mark, see the span */
-    --header-mark-pair-gap-max: 1rem; /* Home to mark at most, see .header-mark-pair */
+    --header-mark-group-gap-max: 1rem; /* each side of the mark at most, see .header-mark-group */
     /* How much of its own viewBox the mark's artwork fills. `LucidosMarkIcon`
        draws inside a `translate(13 13) scale(0.74)` group, so the ink is inset
        by 13% on every side and the glyph reads smaller than a stroke icon given
@@ -40,9 +40,10 @@
          narrower and could spare more, but spending it there is what would
          break the two panes' placements matching.
        - min span: the floor, the thread row's narrowest width. That is two
-         chevrons around the Home and mark pair with no gap inside the pair, so
-         no control in it squeezes. It engages past ~140% ui-scale on a 375px
-         phone, where the row cannot fit the cluster and both edge clusters. */
+         chevrons around the Home, mark and dashboard group with no gap inside
+         the group, so no control in it squeezes. It engages past ~126% ui-scale
+         on a 375px phone, where the row cannot fit the cluster and both edge
+         clusters. */
     /* Arithmetic on the button box, never a rem constant, so retuning the
        button moves the chevrons with it. That is also why
        --mobile-header-icon-box is declared for every width (styles/mobile.css)
@@ -53,7 +54,7 @@
        cluster's own gap. */
     --header-nav-edge-reserve: calc(2 * var(--mobile-header-icon-box) + 0.25rem);
     --header-nav-min-span: calc(
-        3 * var(--mobile-header-icon-box) + var(--header-mark-tap)
+        4 * var(--mobile-header-icon-box) + var(--header-mark-tap)
         + 2 * var(--header-nav-gap)
     );
     /* The two above, resolved into the one width every cluster takes. Named
@@ -245,34 +246,47 @@
     pointer-events: none;
 }
 
-/* The chevrons and the mark hold their size; only a title, or the gap inside
-   the Home and mark pair, may shrink. Without this, the flex default
+/* The chevrons and the mark hold their size; only a title, or the gaps inside
+   the Home, mark and dashboard group, may shrink. Without this, the flex default
    (shrink: 1) lets a long title squeeze a chevron. That moves the very thing
    the fixed span exists to hold still. */
 .header-nav-cluster > .icon-btn,
 .header-nav-cluster > .brand-mark-slot,
-.header-nav-cluster > .header-mark-pair {
+.header-nav-cluster > .header-mark-group {
     flex: 0 0 auto;
 }
 
-/* The thread row's middle member: Home and the mark as one box. The chevrons
-   are equal width, so `space-between` centres the PAIR on the row. The mark
-   then sits right of the axis by half of Home's box plus the gap. Without a
-   home thread the pair is the mark alone, back on the axis. */
-.header-nav-cluster > .header-mark-pair {
-    display: flex;
+/* The thread row's middle member: Home, the mark and the dashboard toggle as
+   one box. The chevrons are equal width, so `space-between` centres the GROUP
+   on the row, and the group's two equal side columns centre the mark on it.
+   Without a home thread the leading column stands empty and the mark holds
+   the axis.
+
+   It asks for the max gap on each side and may shrink, down to its members
+   touching, which is the floor --header-nav-min-span counts. So a roomy row
+   spaces the group out, and a narrow phone or a high ui-scale closes it up
+   before anything else gives. */
+.header-nav-cluster > .header-mark-group {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
     align-items: center;
+    flex: 0 1 calc(
+        2 * var(--mobile-header-icon-box) + var(--header-mark-tap) + 2 * var(--header-mark-group-gap-max)
+    );
 }
 
-/* With Home in it, the pair asks for the max gap and may shrink. It shrinks
-   only once the chevrons reach it, down to no gap at all, which is the floor
-   --header-nav-min-span counts. So a roomy row spaces the pair out, and a
-   narrow phone or a high ui-scale closes it up before anything else gives. */
-.header-nav-cluster > .header-mark-pair:has(> .home-thread-btn) {
-    flex: 0 1 calc(
-        var(--mobile-header-icon-box) + var(--header-mark-tap) + var(--header-mark-pair-gap-max)
-    );
-    justify-content: space-between;
+.header-mark-group > .home-thread-btn {
+    grid-column: 1;
+    justify-self: start;
+}
+
+.header-mark-group > .brand-mark-slot {
+    grid-column: 2;
+}
+
+.header-mark-group > .dashboard-sheet-toggle {
+    grid-column: 3;
+    justify-self: end;
 }
 
 /* Each chevron's tap target reaches past its button into the empty space
@@ -295,10 +309,10 @@
     bottom: calc(-1 * var(--nav-chevron-reach));
 }
 
-/* The chevrons' neighbours inside the cluster: the mark (alone, or paired
-   with Home) and the content title. */
+/* The chevrons' neighbours inside the cluster: the mark (alone, or in the
+   thread row's group) and the content title. */
 .header-nav-cluster > .brand-mark-slot,
-.header-nav-cluster > .header-mark-pair,
+.header-nav-cluster > .header-mark-group,
 .header-title-cluster > .mobile-content-title {
     position: relative;
     z-index: 1;

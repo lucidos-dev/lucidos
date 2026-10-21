@@ -877,6 +877,11 @@ impl LucidosEngine {
                     (Some(pre.event_id()), kind)
                 } else {
                     use crate::engine::thread_events::EventMeta;
+                    // The live run's rung, which no pick changes mid-turn.
+                    let coding_agent = self.thread_coding_agent(thread_id).await;
+                    let (rung_model, rung_effort) = self
+                        .coding_agent_rung(thread_id, coding_agent, None, None)
+                        .await;
                     let emit_result = self
                         .event_bus
                         .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -890,8 +895,8 @@ impl LucidosEngine {
                                 spawning_event_id,
                                 wake_mode,
                                 mode,
-                                None,
-                                None,
+                                rung_model.as_deref(),
+                                rung_effort.as_deref(),
                                 None,
                                 origin.clone(),
                                 voice_session_id,
@@ -1209,10 +1214,21 @@ impl LucidosEngine {
                 )
             } else {
                 let is_cc = use_coding_agent == Some(true);
-                let (req_model, req_effort) = if is_cc {
-                    (None, None)
-                } else {
-                    (model_override, reasoning_effort)
+                // A coding-agent turn names the rung its spawn will resolve.
+                let (req_model, req_effort) = match spawn_claim.as_ref().filter(|_| is_cc) {
+                    Some(claim) => {
+                        self.coding_agent_rung(
+                            thread_id,
+                            claim.entry.coding_agent,
+                            cc_model.map(String::from),
+                            reasoning_effort.map(String::from),
+                        )
+                        .await
+                    }
+                    None => (
+                        model_override.map(String::from),
+                        reasoning_effort.map(String::from),
+                    ),
                 };
                 (
                     make_message_received(
@@ -1224,8 +1240,8 @@ impl LucidosEngine {
                         spawning_event_id,
                         wake_mode,
                         mode,
-                        req_model,
-                        req_effort,
+                        req_model.as_deref(),
+                        req_effort.as_deref(),
                         provider_override,
                         origin.clone(),
                         voice_session_id,
@@ -1809,15 +1825,47 @@ impl LucidosEngine {
         };
         let client_url_block = super::turn_tail::client_url_block(&self.client_url());
 
-        // This trigger's own docs, named in the fire's message rather than the
-        // system block so every fire and chat turn shares that block. Empty on
-        // a chat turn.
-        let trigger_knowhow_context = trigger.as_ref().map_or_else(String::new, |t| {
-            super::super::process_helpers::build_trigger_knowhow_section(
-                &self.workspace_path.join(crate::core::TRIGGERS_DIR),
-                &t.slug,
-            )
-        });
+        // This trigger's own docs, and any a plugin removed. They ride in the
+        // fire's message rather than the system block so every fire and chat
+        // turn shares that block. Empty on a chat turn.
+        let trigger_knowhow_context = match trigger.as_ref() {
+            None => String::new(),
+            Some(t) => {
+                let listing = super::super::process_helpers::build_trigger_knowhow_section(
+                    &self.workspace_path.join(crate::core::TRIGGERS_DIR),
+                    &t.slug,
+                );
+                let Some(removed) = until_canceled(
+                    &cancel_token,
+                    crate::triggers::affected::removed_knowhow(
+                        &self.pool,
+                        &self.workspace_path.join(crate::core::DATA_DIR),
+                        &t.trigger_id,
+                    ),
+                )
+                .await
+                else {
+                    return Ok(self
+                        .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                        .await);
+                };
+                let removed = removed.unwrap_or_else(|e| {
+                    log!(
+                        "[Chat] removed know-how lookup failed for trigger {}: {}",
+                        t.trigger_id,
+                        e
+                    );
+                    Vec::new()
+                });
+                let removed =
+                    super::super::process_helpers::build_removed_knowhow_section(&removed);
+                [listing, removed]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            }
+        };
 
         // Trim expendable context sections if the initial message would exceed budget
         let fixed_size = profile_context.len()

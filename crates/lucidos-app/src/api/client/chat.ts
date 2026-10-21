@@ -5,7 +5,7 @@ import type { DiffFile } from '../../store/store';
 import type { AnswerKind, AllowScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
 import type { Band, ChatRequestBody, CodingAgent } from '../types';
-import { SIDE_QUESTION_TIMEOUT_MS, type TAKES_EFFECT_VALUES } from '@lucidos/engine-constants';
+import { SIDE_QUESTION_TIMEOUT_MS } from '@lucidos/engine-constants';
 import type { ComposeReportWire } from '../../store/composeReport';
 
 // --- Health ---
@@ -174,12 +174,8 @@ export async function cancelThreadEventWait(threadId: string, waitId: string): P
   await throwIfNotOk(res);
 }
 
-/** When a control change takes effect: the engine's `TakesEffect`. */
-export type ControlTakesEffect = typeof TAKES_EFFECT_VALUES[number];
-
 export interface ControlResponse {
   ok: true;
-  takes_effect: ControlTakesEffect;
 }
 
 export async function sendControlRequest(threadId: string, request: Record<string, string>): Promise<ControlResponse> {

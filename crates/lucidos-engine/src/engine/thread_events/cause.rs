@@ -27,10 +27,9 @@ pub enum CancelCause {
     /// frontend renders this neutrally — like the chat/CC follow-up — instead of
     /// the "Canceled ✕" + "Response canceled" panel that `UserStop` gets.
     SupersededByFollowup,
-    /// The user picked a new reasoning effort on a Claude Code session, which
-    /// takes effort only at spawn. The engine interrupted the turn and resumes
-    /// it at the new effort (`claude_code::control::effort_restart`). A redirect,
-    /// so it renders neutrally, like `SupersededByFollowup`.
+    /// An older event: a reasoning effort pick interrupted a Claude Code turn
+    /// and resumed it at the new effort. Never emitted since the rung locks
+    /// for a turn (ADR 0542). Still a redirect, so old rows render neutrally.
     EffortRestart,
     /// Pre-typed-cause legacy event, or a now-removed cause string (e.g. the
     /// retired `stale_settle` cancel cause that's now an abort cause). Catches

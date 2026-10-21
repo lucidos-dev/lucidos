@@ -1,4 +1,4 @@
-use super::completion::{idle_exit, resumes_after_effort_restart, IdleExit};
+use super::completion::{idle_exit, IdleExit};
 use super::idle_change_state::{resolve_idle_change_state, IdleChangeStateInput};
 use super::idle_snapshot::CodingAgentIdleSnapshot;
 use super::spawn_context::SpawnWorktreeContext;
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::engine::agent_session::input_ledger::{
-    announce_discards, announce_reads, forwards_verbatim, InputLedger, Settled,
+    announce_reads, forwards_verbatim, InputLedger, Settled,
 };
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
@@ -330,18 +330,17 @@ impl CallModels {
 
 /// The reasoning effort a coding-agent call ran at. `spawn_effort` is the one
 /// this subprocess was started with, and `reported_effort` the one the driver
-/// sent with the call's turn. A backend that takes effort only at spawn runs
-/// every call at the spawn value.
+/// sent with the call's turn.
 fn effort_in_force(
     coding_agent: CodingAgent,
     spawn_effort: Option<&str>,
     reported_effort: Option<String>,
 ) -> Option<String> {
-    match coding_agent.effort_reach() {
-        crate::runtime::ControlReach::Spawn => spawn_effort.map(String::from),
-        crate::runtime::ControlReach::NextTurn | crate::runtime::ControlReach::RunningTurn => {
-            reported_effort
-        }
+    match coding_agent {
+        // Claude Code takes effort only at spawn, as `CLAUDE_CODE_EFFORT_LEVEL`.
+        CodingAgent::ClaudeCode => spawn_effort.map(String::from),
+        // Codex reports the effort it validated for each turn.
+        CodingAgent::Codex => reported_effort,
     }
 }
 
@@ -682,37 +681,25 @@ impl LucidosEngine {
         if claim.entry.agent_cancel.is_cancelled() {
             claim.entry.agent_cancel = tokio_util::sync::CancellationToken::new();
         }
-        // Model and effort: the request's, else the claim's carry-over from the
-        // previous session, else the thread's events, else the backend's
-        // default implementer (`intelligence_ladder::fill_pick`). Resolved
-        // before the spawn so the process starts with them, and the shadowed
-        // `cc_model` tells the Init handler a model was picked.
-        let (event_model, event_effort) = if cc_model.is_none() || cc_reasoning_effort.is_none() {
-            self.cc_thread_settings(thread_id).await
-        } else {
-            (None, None)
-        };
-        let default_implementer = crate::runtime::intelligence_ladder::default_implementer(
-            self.pool(),
-            claim.entry.coding_agent,
-        )
-        .await;
+        // Resolved before the spawn so the process starts with them, and the
+        // shadowed `cc_model` tells the Init handler a model was picked. A
+        // pick between turns is in the thread's settings (ADR 0542).
+        let (model, effort) = self
+            .coding_agent_rung(
+                thread_id,
+                claim.entry.coding_agent,
+                cc_model,
+                cc_reasoning_effort,
+            )
+            .await;
+        // A keep-alive's spawn takes no lock against a pick, so its settings
+        // emits carry no rung: a pick made meanwhile stays the newest.
+        let records_rung = !self.event_bus.in_keep_alive_turn(thread_id);
         let (cc_model, pinned_effort) = {
             let mut sessions = self.agent_sessions.lock().await;
             let session = sessions
                 .get_mut(&thread_id)
                 .filter(|s| s.msg_tx.same_channel(&claim.entry.msg_tx));
-            let (prev_model, prev_effort) = session
-                .as_ref()
-                .map(|s| (s.current_model.clone(), s.current_reasoning_effort.clone()))
-                .unwrap_or_default();
-            let (model, effort) = crate::runtime::intelligence_ladder::fill_pick(
-                claim.entry.coding_agent,
-                cc_model.or(prev_model).or(event_model),
-                cc_reasoning_effort.or(prev_effort).or(event_effort),
-                default_implementer.as_ref(),
-                |model| crate::llm::model_registry::default_effort(self.model_registry(), model),
-            );
             // Published at once: the commands API reads the entry while the
             // worktree is still being set up.
             if let Some(session) = session {
@@ -1505,7 +1492,7 @@ impl LucidosEngine {
         // Persist initial model/effort so cc_thread_settings() can restore them
         // after the session exits. Without this, the frontend loses the model
         // selection when viewing idle threads (no live session to query).
-        if normalized_model.is_some() || cc_reasoning_effort.is_some() {
+        if records_rung && (normalized_model.is_some() || cc_reasoning_effort.is_some()) {
             if let Err(e) = self
                 .event_bus
                 .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -1578,7 +1565,7 @@ impl LucidosEngine {
                                                 // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
         let mut user_hit_stop = false;
         // redirect_cause: set alongside user_hit_stop when a redirect (a
-        // follow-up, an effort restart) sent the interrupt. The Result then
+        // follow-up) sent the interrupt. The Result then
         // renders neutrally, not as a user Stop. Cleared at the turn boundary
         // in lockstep with user_hit_stop.
         let mut redirect_cause = None;
@@ -1703,7 +1690,6 @@ impl LucidosEngine {
                             log!("[AgentSession] CC process exited while idle, releasing thread {}", thread_id);
                             // Save slash commands to cache now the session is gone.
                             // Model/effort are persisted via CodingAgentSettingsChanged events.
-                            let effort_resume = entry.as_ref().and_then(|s| s.effort_resume.clone());
                             let cache_snapshot = entry.and_then(|s| {
                                 s.repo_root.as_ref().map(|r| {
                                     (r.to_string_lossy().to_string(), s.to_commands_info())
@@ -1738,21 +1724,6 @@ impl LucidosEngine {
                                 false,
                             )
                             .await;
-                            // The turn an effort pick interrupted, from the same
-                            // position for the same reasons.
-                            let discarded_owed = self
-                                .effort_discard_owed(thread_id, effort_resume.is_some())
-                                .await;
-                            if resumes_after_effort_restart(
-                                effort_resume.is_some(),
-                                false,
-                                &last_terminal_kind,
-                                false,
-                                !orphans.is_empty(),
-                                discarded_owed,
-                            ) {
-                                self.resume_after_effort_restart(thread_id, effort_resume.and_then(|r| r.actor)).await;
-                            }
 
                             return Ok(ProcessResult {
                                 response: String::new(),
@@ -1886,8 +1857,8 @@ impl LucidosEngine {
                             if let Err(e) = self.event_bus.emit(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentSettingsChanged {
-                                    model: normalized_model.clone(),
-                                    reasoning_effort: cc_reasoning_effort.clone(),
+                                    model: normalized_model.clone().filter(|_| records_rung),
+                                    reasoning_effort: cc_reasoning_effort.clone().filter(|_| records_rung),
                                     coding_agent,
                                     cc_session_id: Some(cc_sid.clone()),
                                     // Pin the session-to-config-dir pairing at
@@ -2532,16 +2503,6 @@ impl LucidosEngine {
                                                 s.idle_notify.notify_waiters();
                                             }
                                         }
-                                        // An effort pick that beat the agent's
-                                        // read leaves that input unread for
-                                        // good. Owing it would keep this process
-                                        // up, and the effort resume runs only
-                                        // once it exits. The store records the
-                                        // discard, so the next session delivers it.
-                                        if matches!(last_terminal_kind, Some(TerminalKind::Canceled(crate::engine::thread_events::CancelCause::EffortRestart))) {
-                                            let discarded = inputs.turn_interrupted();
-                                            announce_discards(&self.event_bus, thread_id, &meta, discarded).await;
-                                        }
                                         // A prompt waiting on its own turn is
                                         // answered here, and only by the turn
                                         // that read it.
@@ -3029,9 +2990,7 @@ impl LucidosEngine {
 
                 _ = stop.notified() => {
                     // Apply, Discard and Archive emit their own lifecycle
-                    // terminator. An effort restart keeps a parked question
-                    // and lands nothing. If the question was answered before
-                    // the stop, the running turn it cuts ends as a redirect.
+                    // terminator.
                     let is_shutdown = self
                         .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     let pending_stop = self.pending_stop_reason(thread_id).await;
@@ -3039,15 +2998,13 @@ impl LucidosEngine {
                         pending_stop,
                         Some(StopReason::Apply | StopReason::Discard | StopReason::Archive),
                     );
-                    let stop_redirect = (pending_stop == Some(StopReason::EffortRestart))
-                        .then_some(crate::engine::thread_events::CancelCause::EffortRestart);
                     self.emit_stop_terminal(
                         "stop",
                         thread_id,
                         is_waiting,
                         is_shutdown,
                         suppress_user_terminal,
-                        stop_redirect,
+                        None, // a stop is never a redirect
                         &agent_cancel,
                         &mut claude_text_buf,
                         &meta,

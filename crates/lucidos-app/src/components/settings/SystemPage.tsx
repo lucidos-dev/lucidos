@@ -58,6 +58,7 @@ import { DebuggingSection } from './DebuggingSection';
 import { CommunicationSurfacesPage } from './CommunicationSurfacesPage';
 import { WhatsNewPage } from './WhatsNewPage';
 import { ReleaseNoticesPage } from './ReleaseNoticesPage';
+import { UpdateAddressBanner, UpdateAddressRow } from './UpdateAddressSetting';
 import { restartControlHome } from './restartControl';
 import { Explainer } from '../shared/Explainer';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
@@ -325,6 +326,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
 
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="system:maintenance">Maintenance</div>
+          <UpdateAddressBanner check={check} />
           {restart && (
             <div class="system-notice">
               {hasEngineUpdate
@@ -497,6 +499,11 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
                 <span class="toggle-slider" />
               </label>
             </div>
+          )}
+          {/* Every gateway on the machine shares the setting, so a dev gateway
+              offers it too. An older gateway sends no field, and gets no row. */}
+          {check && check.update_address !== undefined && (
+            <UpdateAddressRow key={check.update_address ?? ''} stored={check.update_address ?? ''} />
           )}
         </div>
       </>

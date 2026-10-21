@@ -20,6 +20,8 @@ function check(current: string, latest: string | null = '1.3.0'): ReleaseCheck {
     checked_at: null,
     last_error: null,
     latest: latest ? { version: latest, notes: null, install: 'desktop-app', command: null } : null,
+    update_address: null,
+    update_address_error: null,
   };
 }
 

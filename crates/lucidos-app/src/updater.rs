@@ -21,13 +21,21 @@
 //! exist only in memory, so abandoning them changes nothing on disk. The
 //! [`AppUpdateRun`] state machine makes that structural, and ADR 0073 covers a
 //! swap that fails anyway.
+//!
+//! **Every check reads the update address first** ([`update_source`]). The
+//! gateway holds it, so a change in Settings needs no relaunch. An address
+//! only replaces where `latest.json` comes from: the bundle is still verified
+//! with `plugins.updater.pubkey` from `tauri.conf.json`, so this module never
+//! sets a key of its own.
 
+use lucidos_update_address::{check_bundle_url, UpdateAddress, GATEWAY_STATUS_PATH};
 use serde::Serialize;
+use serde_json::Value;
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::sync::Mutex;
 use tauri::async_runtime::JoinHandle;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Runtime, State};
 use tauri_plugin_updater::{Update, Updater, UpdaterExt};
 
 /// Tauri event carrying [`AppUpdateProgress`] frames to the page. Emitted with
@@ -351,7 +359,89 @@ pub struct AppUpdateOffer {
     notes: Option<String>,
 }
 
-/// Check GitHub Releases for a newer signed build. Returns the offer when one is
+/// Where an update check reads `latest.json` from.
+#[derive(Debug, PartialEq)]
+enum UpdateSource {
+    /// `plugins.updater.endpoints` in `tauri.conf.json`: the published release.
+    Published,
+    /// The update address set in the gateway.
+    Address(UpdateAddress),
+}
+
+/// Ask the gateway which address this check reads. Fails closed: when the
+/// gateway is silent or refused its stored address, the check stops with an
+/// error. It never quietly checks the published release instead.
+async fn update_source() -> Result<UpdateSource, String> {
+    let port = crate::desktop::engine_port();
+    let status = tauri::async_runtime::spawn_blocking(move || {
+        crate::desktop::gateway_body(port, "GET", GATEWAY_STATUS_PATH, None)
+    })
+    .await
+    .map_err(|e| format!("update address lookup: {e}"))?;
+    let source = resolve_update_source(status.as_deref());
+    match &source {
+        Ok(UpdateSource::Published) => eprintln!("[updater] checking the published release"),
+        Ok(UpdateSource::Address(address)) => {
+            eprintln!("[updater] update address overridden: checking {address}")
+        }
+        Err(e) => eprintln!("[updater] {e}"),
+    }
+    source
+}
+
+/// Read the update address out of a gateway status body (`None`: the gateway
+/// did not answer). A gateway older than the setting carries no
+/// `update_address` key and means the published release.
+fn resolve_update_source(status: Option<&str>) -> Result<UpdateSource, String> {
+    let status = status.ok_or(
+        "The update check did not run: the Lucidos gateway did not answer, \
+         so the update address is unknown",
+    )?;
+    let status: Value = serde_json::from_str(status)
+        .map_err(|e| format!("The update check did not run: unreadable gateway status, {e}"))?;
+    let check = &status["release_check"];
+    if let Some(refused) = check["update_address_error"].as_str() {
+        return Err(format!("The update check did not run: {refused}"));
+    }
+    match check.get("update_address") {
+        None | Some(Value::Null) => Ok(UpdateSource::Published),
+        Some(Value::String(raw)) => match UpdateAddress::parse(raw) {
+            Ok(Some(address)) => Ok(UpdateSource::Address(address)),
+            Ok(None) => Ok(UpdateSource::Published),
+            Err(refused) => Err(format!("The update check did not run: {refused}")),
+        },
+        Some(other) => Err(format!(
+            "The update check did not run: the gateway reported update_address {other}"
+        )),
+    }
+}
+
+/// The updater for one check. An address replaces only the endpoints; the
+/// key stays the one `tauri.conf.json` bakes in.
+fn updater_for<R: Runtime>(app: &AppHandle<R>, source: &UpdateSource) -> Result<Updater, String> {
+    let builder = app.updater_builder();
+    let builder = match source {
+        UpdateSource::Published => builder,
+        UpdateSource::Address(address) => builder
+            .endpoints(vec![address.url().clone()])
+            .map_err(|e| e.to_string())?,
+    };
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// Ask for an offer, refusing one whose bundle breaks the address's transport
+/// rule. `dangerousInsecureTransportProtocol` would let the plugin fetch a
+/// plain-http bundle from any host, so the check here is what limits it.
+async fn check_offer(updater: &Updater) -> Result<Option<Update>, String> {
+    let update = updater.check().await.map_err(|e| e.to_string())?;
+    if let Some(update) = &update {
+        check_bundle_url(&update.download_url)?;
+    }
+    Ok(update)
+}
+
+/// Check for a newer signed build, at the update address when one is set and
+/// else at the published release. Returns the offer when one is
 /// available, else `None`. The packaged workspace UI polls this (gated on running
 /// in the Tauri client) to drive the in-app update toast.
 /// No-op (`None`) in development.
@@ -370,8 +460,8 @@ pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateOffer>, 
     if tauri::is_dev() {
         return Ok(None);
     }
-    let updater = app.updater().map_err(|e| e.to_string())?;
-    let update = updater.check().await.map_err(|e| e.to_string())?;
+    let updater = updater_for(&app, &update_source().await?)?;
+    let update = check_offer(&updater).await?;
     Ok(update.map(|u| AppUpdateOffer {
         version: u.version.clone(),
         // Blank is absent. An empty-string body would otherwise render as an
@@ -396,10 +486,9 @@ async fn check_and_download(
     narrator: &Narrator,
     updater: Updater,
 ) -> Result<(Update, Vec<u8>), UpdateFailure> {
-    let update = updater
-        .check()
+    let update = check_offer(&updater)
         .await
-        .map_err(|e| UpdateFailure::new(None, e.to_string()))?
+        .map_err(|e| UpdateFailure::new(None, e))?
         .ok_or_else(|| UpdateFailure::new(None, "No update available".to_string()))?;
     let version = update.version.clone();
 
@@ -693,7 +782,10 @@ pub(crate) async fn run_app_update(
         run.release();
         return Err(narrator.fail(None, blocker));
     }
-    let updater = match narrator.app.updater() {
+    let updater = match update_source()
+        .await
+        .and_then(|source| updater_for(&narrator.app, &source))
+    {
         Ok(updater) => updater,
         Err(e) => {
             run.release();
@@ -824,6 +916,10 @@ pub(crate) async fn run_app_update(
 pub fn cancel_app_update(run: State<'_, AppUpdateRun>) {
     run.cancel();
 }
+
+#[cfg(test)]
+#[path = "updater_address_tests.rs"]
+mod address_tests;
 
 #[cfg(test)]
 mod tests {

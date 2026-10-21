@@ -871,7 +871,8 @@ export type ThreadEvent =
       mode?: ActorMode;
       /** Model the engine will use to answer this message. Stamped at request
        *  time so the route tooltip can display it before ResponseGenerated
-       *  fires. Coding-agent sessions still rely on CodingAgentSettingsChanged. */
+       *  fires. A coding-agent turn stamps the rung its spawn resolves
+       *  (`coding_agent_rung`), which no pick changes mid-turn (ADR 0542). */
       model?: string;
       /** Reasoning effort the engine will use to answer this message. */
       reasoning_effort?: string;

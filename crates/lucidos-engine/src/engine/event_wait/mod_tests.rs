@@ -2805,6 +2805,7 @@ async fn seed_plugin_install(bus: &EventBus, id: &str, version: &str) {
         }),
         files: vec![format!("apps/{id}/index.html")],
         files_removed: Vec::new(),
+        affected_triggers: Vec::new(),
         installed_at: "2026-08-25T15:12:00+00:00".to_string(),
         source_type: "git".to_string(),
         actor: None,

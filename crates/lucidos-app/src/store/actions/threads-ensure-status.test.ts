@@ -33,7 +33,7 @@ import { fetchThreads, fetchThreadById } from '../../api/threads';
 import { getThreadQueue } from '../../api/client';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { awaitedThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
+import { awaitedThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
 import { _resetThreadEventsFailuresForTesting, clearThreadFetchGuards, ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';
 import { focusSpawnedThread, focusThread, focusThreadOrBootstrap, focusThreadOrBootstrapResult, unfocusThread } from './threads';
 import { _resetRowIntentsForTesting } from '../rowIntents';
@@ -79,7 +79,6 @@ beforeEach(() => {
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
-  resetCodingAgentPendingPreferences();
   generatedTitleIds.clear();
   _resetRowIntentsForTesting();
   localStorage.removeItem('lucidos-focused-thread');

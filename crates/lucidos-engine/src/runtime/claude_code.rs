@@ -287,22 +287,16 @@ pub fn cc_command_definitions() -> serde_json::Value {
 }
 
 /// Serialize a `ControlRequest` to the JSON line that CC expects on stdin.
-/// `None` for a request CC refuses: see [`crate::runtime::CodingAgent::control_reach`].
-pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) -> Option<String> {
+pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) -> String {
     let body = match request {
         ControlRequest::Interrupt => serde_json::json!({ "subtype": "interrupt" }),
-        ControlRequest::SetModel { model } => {
-            serde_json::json!({ "subtype": "set_model", "model": model })
-        }
-        ControlRequest::SetReasoningEffort { .. } => return None,
     };
-    let line = serde_json::to_string(&serde_json::json!({
+    serde_json::to_string(&serde_json::json!({
         "type": "control_request",
         "request_id": request_id,
         "request": body,
     }))
-    .expect("ControlRequest serialization cannot fail");
-    Some(line)
+    .expect("ControlRequest serialization cannot fail")
 }
 
 /// The one stream-json line a side question writes: the instructions and the
@@ -1874,10 +1868,7 @@ async fn driver_task(
             req = control_rx.recv() => {
                 let Some(req) = req else { break };
                 let request_id = uuid::Uuid::new_v4().to_string();
-                let Some(mut line) = cc_control_request_to_json(&req, &request_id) else {
-                    log!("[ClaudeCode] Dropped a control request Claude Code refuses: {:?}", req);
-                    continue;
-                };
+                let mut line = cc_control_request_to_json(&req, &request_id);
                 line.push('\n');
                 if !write_stdin_line(&mut stdin, &line, "control_request").await {
                     break;

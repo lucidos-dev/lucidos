@@ -1,4 +1,4 @@
-import { showToast, showConfirm, threadMap, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
+import { showToast, showConfirm, threadMap, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
 import { appliedThreadFilter } from '../appliedThreadFilter';
 import { closeDashboardSheet } from '../dashboards';
 import { revealThreadPane } from './pane';
@@ -83,7 +83,6 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // so a drafted prompt in the open thread is not hidden behind it.
   closeDashboardSheet();
   rememberOpenedViewRows(threadId);
-  resetCodingAgentPendingPreferences();
   // Focusing a thread does NOT position its transcript. `useScrollMemory` owns
   // that: a saved position is restored, and a thread with none opens at the top
   // of what is rendered (see ThreadView's `resetOnEmpty`). A deep-link target
@@ -358,7 +357,6 @@ export function unfocusThread(opts?: { revealPane?: boolean }): void {
   setFocusedThread(null);
   openedViewRows = null;
   revealOnFocus.value = false;
-  resetCodingAgentPendingPreferences();
   // Same rule as `focusThread`'s retire, for the surface it forgot: the compose
   // view has its own scroll container and registers itself as the active one
   // (`CreateThreadView`'s `useScrollObservers`), so a follow armed in a thread

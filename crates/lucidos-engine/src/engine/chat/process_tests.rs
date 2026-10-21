@@ -1,8 +1,8 @@
 use super::super::process_helpers::{
-    build_system_knowhow_section, build_trigger_knowhow_section, build_trigger_started_event,
-    classify_or_fallback, forced_classification, summarize_or_none, summary_is_too_thin,
-    TriggerContext, APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE,
-    FORCE_QUERY_CLASSIFICATION_ENV,
+    build_removed_knowhow_section, build_system_knowhow_section, build_trigger_knowhow_section,
+    build_trigger_started_event, classify_or_fallback, forced_classification, summarize_or_none,
+    summary_is_too_thin, TriggerContext, APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE,
+    ENGINE_RESTART_RULE, FORCE_QUERY_CLASSIFICATION_ENV,
 };
 use super::{
     assemble_turn_text, build_capture_sections, build_knowhow_retention_block,
@@ -2275,6 +2275,36 @@ fn a_trigger_knowhow_listing_rides_in_the_volatile_text() {
         text.volatile
     );
     assert!(!text.stable.contains("nightly-build"), "{}", text.stable);
+}
+
+/// Removed know-how rides in the fire's volatile text and names what removed it.
+#[test]
+fn a_removed_knowhow_block_rides_in_the_volatile_text() {
+    let removed = [crate::triggers::affected::RemovedKnowhow {
+        path: "apps/token-cost/knowhow/daily-price-check.md".to_string(),
+        removed_by: "the Token Cost update to v0.6.0".to_string(),
+    }];
+    let block = build_removed_knowhow_section(&removed);
+    assert_eq!(
+        block,
+        "[REMOVED KNOW-HOW]\nA plugin removed know-how this trigger relied on:\n\
+         - `apps/token-cost/knowhow/daily-price-check.md`, removed by the Token Cost update \
+         to v0.6.0\nDo not invent a replacement recipe silently. Look for current know-how \
+         with `load_knowhow`. Say in your result that this trigger's know-how was removed, \
+         and suggest the user edit the trigger.\n[END REMOVED KNOW-HOW]"
+    );
+    let text = assemble_turn_text(&TurnSections {
+        trigger_knowhow: &block,
+        request: "fire",
+        ..TurnSections::default()
+    });
+    assert!(
+        text.volatile.contains("[REMOVED KNOW-HOW]"),
+        "{}",
+        text.volatile
+    );
+    assert!(!text.stable.contains("REMOVED"), "{}", text.stable);
+    assert_eq!(build_removed_knowhow_section(&[]), "");
 }
 
 use super::run::trigger_model_override;

@@ -2,36 +2,11 @@ use super::*;
 
 #[test]
 fn cc_control_request_interrupt_serializes() {
-    let json = cc_control_request_to_json(&ControlRequest::Interrupt, "test-id-123").unwrap();
+    let json = cc_control_request_to_json(&ControlRequest::Interrupt, "test-id-123");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed["type"], "control_request");
     assert_eq!(parsed["request_id"], "test-id-123");
     assert_eq!(parsed["request"]["subtype"], "interrupt");
-}
-
-#[test]
-fn cc_control_request_set_model_serializes() {
-    let json = cc_control_request_to_json(
-        &ControlRequest::SetModel {
-            model: "claude-sonnet-4-6".to_string(),
-        },
-        "test-id-456",
-    )
-    .unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed["type"], "control_request");
-    assert_eq!(parsed["request"]["subtype"], "set_model");
-    assert_eq!(parsed["request"]["model"], "claude-sonnet-4-6");
-}
-
-/// Claude Code answers `set_reasoning_effort` with `Unsupported control
-/// request subtype`, so no line for it is ever written.
-#[test]
-fn cc_control_request_never_serializes_a_reasoning_effort() {
-    let request = ControlRequest::SetReasoningEffort {
-        effort: "low".to_string(),
-    };
-    assert_eq!(cc_control_request_to_json(&request, "test-id"), None);
 }
 
 /// The mode is chosen once, in Settings, and passed at spawn. A mid-session
@@ -46,16 +21,6 @@ fn command_definitions_offer_no_permission_mode() {
         .map(|d| d["subtype"].as_str().expect("subtype"))
         .collect();
     assert_eq!(subtypes, ["set_model", "set_reasoning_effort"]);
-}
-
-/// The control endpoint deserializes the body into `ControlRequest`, so this is
-/// what refuses a mode switch sent over HTTP.
-#[test]
-fn control_request_refuses_set_permission_mode() {
-    let parsed = serde_json::from_str::<ControlRequest>(
-        r#"{"subtype":"set_permission_mode","mode":"plan"}"#,
-    );
-    assert!(parsed.is_err(), "got {parsed:?}");
 }
 
 fn assert_command_options(
@@ -200,29 +165,6 @@ fn the_model_rows_run_newest_version_first() {
             );
         }
         previous = Some(version);
-    }
-}
-
-#[test]
-fn control_request_deserializes_all_variants() {
-    let cases = [
-        (r#"{"subtype":"interrupt"}"#, Some("interrupt")),
-        (
-            r#"{"subtype":"set_model","model":"claude-sonnet-4-6"}"#,
-            Some("set_model"),
-        ),
-        (
-            r#"{"subtype":"set_reasoning_effort","effort":"high"}"#,
-            None,
-        ),
-    ];
-    for (json, expected_subtype) in cases {
-        let req: ControlRequest = serde_json::from_str(json).unwrap();
-        let subtype = cc_control_request_to_json(&req, "test-id").map(|line| {
-            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
-            parsed["request"]["subtype"].as_str().unwrap().to_string()
-        });
-        assert_eq!(subtype.as_deref(), expected_subtype, "Failed for: {json}");
     }
 }
 

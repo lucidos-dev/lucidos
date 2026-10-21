@@ -179,8 +179,8 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
   test('titles sit on the row middle and never overlap the leading cluster', async ({ page }) => {
     await navigateToApp(page);
 
-    // Thread header: the nav cluster holds the back chevron, the Home and mark
-    // pair, and the forward chevron. It is centered on the row middle and
+    // Thread header: the nav cluster holds the back chevron, the Home, mark
+    // and dashboard group, and the forward chevron. It is centered on the row middle and
     // clears both edge controls: the drawer toggle and the hamburger.
     //
     // This cluster is FIXED WIDTH, unlike the title it replaced: it cannot

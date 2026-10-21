@@ -1071,8 +1071,7 @@ fn coding_agent_idled_engine_restart_interrupt_roundtrips() {
 fn continue_resume_exchange_gate_opens_for_user_continue_and_auto_recovery() {
     use super::{
         continue_should_open_resume_exchange, ANSWERED_AFTER_IDLE_REASON,
-        AUTO_RECOVERY_AFTER_HANG_REASON, EFFORT_RESTART_REASON, HARDEN_REQUESTED_REASON,
-        USER_CLICKED_CONTINUE_REASON,
+        AUTO_RECOVERY_AFTER_HANG_REASON, HARDEN_REQUESTED_REASON, USER_CLICKED_CONTINUE_REASON,
     };
     assert!(continue_should_open_resume_exchange(Some(
         USER_CLICKED_CONTINUE_REASON
@@ -1084,10 +1083,6 @@ fn continue_resume_exchange_gate_opens_for_user_continue_and_auto_recovery() {
     assert!(
         continue_should_open_resume_exchange(Some(AUTO_RECOVERY_AFTER_HANG_REASON)),
         "watchdog-triggered auto-resume must open a fresh boundary so the timeline shows the user that work was interrupted and resumed"
-    );
-    assert!(
-        continue_should_open_resume_exchange(Some(EFFORT_RESTART_REASON)),
-        "the turn an effort pick interrupted already ended, so its resume is a new exchange"
     );
     assert!(!continue_should_open_resume_exchange(Some(
         ANSWERED_AFTER_IDLE_REASON

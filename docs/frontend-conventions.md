@@ -12,8 +12,8 @@ Draft content is per-draft (`composeDrafts[id]`). So are the dropdowns: target a
 
 - Model, agent and reasoning resolve as the draft's override, else the account default. `effectiveSendMode` has the same shape.
 - Scope has no account preference. `resolveScope` falls back to `selectedScope` (localStorage, last used) only for the no-draft compose view. An existing draft resolves `override.scope ?? {kind:'lucidos'}`.
-- Reading a mutable global such as `selectedScope` or `codingAgentPending*` in a compose surface is a bug. One draft's change would leak to every other draft. That was the original regression.
-- Coding-agent model and effort have no account default. `resolveCcModel` and `resolveCcReasoningEffort` return the override or `null`. A `null` makes the send omit the field, so the backend applies its default. They never read `codingAgentPending*`.
+- Reading a mutable global such as `selectedScope` in a compose surface is a bug. One draft's change would leak to every other draft. That was the original regression.
+- Coding-agent model and effort have no account default. `resolveCcModel` and `resolveCcReasoningEffort` return the override or `null`. A `null` makes the send omit the field, so the backend applies its default.
 
 ### Persistence
 
@@ -36,8 +36,8 @@ A draft is created on the first keystroke. So the fresh compose view often has n
 - Scope writes through `applyDestination`, which also updates `selectedScope`.
 - The control menus tell compose context from an active thread. The coding-agent menu reads it as `!threadId`, since active threads pass the active-session id. The Lucidos menu takes a `composeContext` prop.
 - At promotion, `sendCompose` binds the selections onto the send. Scope becomes `meta.repoId`, `codingAgentKind`, `codingAgentFolder` and `codingAgent`. Model, effort, cc-model and cc-effort go to `sendMessage` as `*Override` options. Then `clearComposeSelection(id)` runs.
-- `sendMessage` uses an option when present and the global otherwise. So raw-new sends and active-thread follow-ups read the globals, because no draft carries an override.
-- The active-thread menus are unchanged. The Lucidos picker writes the global `chat_model`. The coding-agent menu uses `codingAgentPending*`, reconciled per thread by `loadCommands`. Only the composing branch is per-draft. `CodingAgentControlMenu` takes `composeThreadId` for that.
+- `sendMessage` uses an option when present. Otherwise a chat send reads the globals, and a coding-agent send carries no model or effort, because no draft carries an override.
+- The active-thread menus are unchanged. The Lucidos picker writes the global `chat_model`. A coding-agent thread's pick is recorded on the engine, and locked while a turn runs (ADR 0542). Only the composing branch is per-draft. `CodingAgentControlMenu` takes `composeThreadId` for that.
 
 ## Loading and skeletons
 

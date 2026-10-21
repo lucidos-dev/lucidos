@@ -985,13 +985,13 @@
 
     /* The title's menu holds in-place actions on the current thread, not a
        navigation. Keep it tappable while the keyboard is up, since iOS Safari
-       has no fallback click path. The dashboard button is the same kind of
-       control: it opens over the thread and leaves it where it is. */
+       has no fallback click path. The header's dashboard button is the same
+       kind of control: it opens over the thread and leaves it where it is. */
     :root[data-keyboard-active] .mobile-thread-title-row .thread-title-menu {
         pointer-events: auto;
     }
 
-    :root[data-keyboard-active] .mobile-thread-title-row .dashboard-sheet-toggle {
+    :root[data-keyboard-active] .mobile-thread-header .dashboard-sheet-toggle {
         pointer-events: auto;
     }
 

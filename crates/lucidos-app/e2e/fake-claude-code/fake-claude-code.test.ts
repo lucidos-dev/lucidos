@@ -91,7 +91,7 @@ describe('the fake Claude Code', () => {
     expect(seen.result - seen.control_response).toBeGreaterThanOrEqual(300);
   });
 
-  it('reports the effort it was spawned with, also to the effort restart note', () => {
+  it('reports the effort it was spawned with', () => {
     const lines = execFileSync(process.execPath, [FAKE], {
       input: `${JSON.stringify(user('Report your reasoning effort.'))}\n`,
       encoding: 'utf8',
@@ -99,9 +99,6 @@ describe('the fake Claude Code', () => {
     }).trim().split('\n').map((l) => JSON.parse(l));
     expect(lines.at(-1)?.result).toBe('effort: high');
     expect(runFake([], [user('Report your reasoning effort.')]).at(-1)?.result).toBe(`effort: ${NO_EFFORT}`);
-    // The engine's own note is pinned by the effort restart e2e, which reads
-    // this reply after the restart.
-    expect(replyTo('the user changed your reasoning effort. Continue.', 'low')).toBe('effort: low');
   });
 
   it('lasts as long as a turn asks', () => {

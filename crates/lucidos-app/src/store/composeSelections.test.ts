@@ -21,8 +21,6 @@ import {
   takePendingComposeSelection,
 } from './composeSelections';
 import {
-  codingAgentPendingModel,
-  codingAgentPendingReasoningEffort,
   currentModel,
   preferences,
   selectedCodingAgent,
@@ -34,8 +32,6 @@ afterEach(() => {
   // Restore globals to their module defaults so tests don't bleed into each other.
   selectedScope.value = { kind: 'lucidos' };
   selectedCodingAgent.value = 'claude-code';
-  codingAgentPendingModel.value = null;
-  codingAgentPendingReasoningEffort.value = null;
 });
 
 describe('resolve* falls back to the current global default', () => {
@@ -147,28 +143,22 @@ describe('editing a draft never writes the globals', () => {
     expect(selectedCodingAgent.value).toBe('claude-code');
     expect(currentModel.value).toBe('g-model');
     expect(preferences.value).toBe(account);
-    expect(codingAgentPendingModel.value).toBeNull();
-    expect(codingAgentPendingReasoningEffort.value).toBeNull();
   });
 });
 
-describe('resolveCc* is draft-only (never inherits the active-thread global pending)', () => {
-  it('no draft override → null (no pick), even when the global pending is set', () => {
-    // The global pending is the ACTIVE-thread mechanism; a fresh compose draft
-    // must not inherit it. null → the send omits the field → backend default.
-    codingAgentPendingModel.value = 'haiku';
+describe('resolveCc* is draft-only', () => {
+  it('no draft override → null (no pick)', () => {
+    // null → the send omits the field → backend default.
     expect(resolveCcModel('t-1')).toBeNull();
     expect(resolveCcReasoningEffort('t-1')).toBeNull();
   });
 
   it('explicit null override → the default pick (null)', () => {
-    codingAgentPendingModel.value = 'haiku';
     patchComposeSelection('t-1', { ccModel: null });
     expect(resolveCcModel('t-1')).toBeNull();
   });
 
   it('an explicit draft override is what resolves', () => {
-    codingAgentPendingModel.value = 'haiku';
     patchComposeSelection('t-1', { ccModel: 'sonnet', ccReasoningEffort: 'low' });
     expect(resolveCcModel('t-1')).toBe('sonnet');
     expect(resolveCcReasoningEffort('t-1')).toBe('low');
