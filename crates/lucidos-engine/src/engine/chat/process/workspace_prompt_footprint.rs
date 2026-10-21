@@ -216,7 +216,7 @@ pub(crate) fn build_apps_section(apps: &[App]) -> String {
     let mut section = String::from("\n\n## Available Apps\n\n");
     section.push_str(
         "Apps are interactive UIs. Use navigate_ui to open them. Some apps have \
-         intents: use execute_intent(intent_id) to fulfill a stored intent.\n\n",
+         intents: to run one, load_knowhow its id and do its steps in this turn.\n\n",
     );
     for app in apps {
         section.push_str(&app_line(app));
@@ -231,8 +231,10 @@ pub(crate) fn build_intents_section(intents: &[crate::core::Intent]) -> String {
     }
     let mut section = String::from("\n\n## Available Intents\n\n");
     section.push_str(
-        "Stored descriptions of what the user wants. Use execute_intent(intent_id) to \
-         fulfill one. Each intent is paired with knowhow that tells you how to achieve it.\n\n",
+        "Stored descriptions of what the user wants. To run one, load_knowhow its id: \
+         that returns the intent with its knowhow. Then do its steps in this turn. Use \
+         run_thread only when the work truly needs its own context. Never re-load the \
+         procedure the current trigger fire already runs.\n\n",
     );
     for intent in intents {
         section.push_str(&intent_line(intent));
@@ -934,6 +936,48 @@ mod tests {
         }];
         assert!(build_apps_section(&apps)
             .contains("- **Documents** (id: `documents`): Browse and search saved documents.\n"));
+    }
+
+    /// The intent sub-loop is gone, so both lists route an intent through
+    /// `load_knowhow` in the same turn.
+    #[test]
+    fn the_apps_and_intents_sections_run_an_intent_through_load_knowhow() {
+        let apps = vec![App {
+            id: "documents".to_string(),
+            name: "Documents".to_string(),
+            description: "Browse saved documents.".to_string(),
+            icon: None,
+            reveal: AppReveal::OnLoad,
+            kind: AppKind::App,
+            origin: None,
+            reusable: false,
+            params: Default::default(),
+            built_in: false,
+            sizes: Vec::new(),
+            transparent: false,
+        }];
+        let intents = vec![crate::core::Intent {
+            id: "weekly-review".to_string(),
+            name: "Weekly review".to_string(),
+            knowhow: Vec::new(),
+            content: String::new(),
+        }];
+        let apps_section = build_apps_section(&apps);
+        let intents_section = build_intents_section(&intents);
+        for section in [&apps_section, &intents_section] {
+            assert!(!section.contains("execute_intent"), "got: {section}");
+            assert!(section.contains("load_knowhow"), "got: {section}");
+            assert!(section.contains("in this turn"), "got: {section}");
+        }
+        for rule in [
+            "run_thread only when the work truly needs its own context",
+            "Never re-load the procedure the current trigger fire already runs",
+        ] {
+            assert!(
+                intents_section.contains(rule),
+                "missing {rule:?}: {intents_section}"
+            );
+        }
     }
 
     #[tokio::test]

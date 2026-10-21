@@ -8,6 +8,9 @@
 //! changes the `thinking` value and the beta header, and forwards everything
 //! else untouched.
 //!
+//! Each call also feeds the prompt-cache probe in `vertex_relay_probe.rs`,
+//! which only reads.
+//!
 //! A temporary measure: `docs/temporary-measures.md` § "Claude Code's Vertex
 //! calls go through the Vertex relay". The design and its alternatives are in
 //! `docs/plans/2026-09-23-coding-agent-notes-hidden-on-opus-5-5.md`.
@@ -21,9 +24,11 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
+use futures::StreamExt;
 use serde_json::value::RawValue;
 use uuid::Uuid;
 
+use super::vertex_relay_probe::{self, CallProbe};
 use crate::llm::anthropic_wire::{
     thinking_mode, ThinkingMode, ANTHROPIC_BETA_THINKING_DISPLAY_UPDATES, DISPLAY_PROGRESS_UPDATES,
 };
@@ -89,11 +94,6 @@ pub(crate) fn relay_base_url(
 ) -> Option<String> {
     let token = mint_token(thread_id, user_base.and_then(usable_override))?;
     Some(format!("http://127.0.0.1:{port}{ROUTE_PREFIX}/{token}"))
-}
-
-/// Whether `url` is a relay URL this module built.
-pub(crate) fn is_relay_url(url: &str) -> bool {
-    url.starts_with("http://127.0.0.1:") && url.contains(ROUTE_PREFIX)
 }
 
 /// A user's Vertex base URL the relay can forward to. A relay URL is refused:
@@ -319,6 +319,14 @@ async fn relay(
     let rewritten = ask_for_progress_notes(&body, call.model);
     let forwarded_headers = forwarded_request_headers(&headers, rewritten.is_some());
     let forwarded_body = rewritten.map(Bytes::from).unwrap_or(body);
+    let probe = CallProbe::of(
+        grant.thread_id,
+        call.model,
+        call.location,
+        &url,
+        &forwarded_headers,
+        &forwarded_body,
+    );
     let upstream = match client
         .post(&url)
         .headers(forwarded_headers)
@@ -345,8 +353,17 @@ async fn relay(
             response = response.header(name, value);
         }
     }
+    let mut watch = probe.watch(
+        upstream.status().as_u16(),
+        upstream.headers(),
+        vertex_relay_probe::log_line,
+    );
+    let chunks = upstream.bytes_stream().map(move |chunk| {
+        watch.see(&chunk);
+        chunk
+    });
     response
-        .body(Body::from_stream(upstream.bytes_stream()))
+        .body(Body::from_stream(chunks))
         .unwrap_or_else(|e| {
             relay_error(
                 StatusCode::BAD_GATEWAY,

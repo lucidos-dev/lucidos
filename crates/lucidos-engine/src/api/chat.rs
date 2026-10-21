@@ -272,6 +272,29 @@ pub(crate) fn require_input_to_create(
     Err(ApiError::bad_request(NOTHING_TO_START_THE_THREAD_WITH))
 }
 
+/// Refuse a `cc_model` the backend does not offer, when the request starts a
+/// coding-agent thread.
+///
+/// The check is the one `run_coding_agent` runs, so the tool and `lucidos
+/// spawn-thread` refuse the same ids with the same text. A thread that has
+/// started is not checked: one pinned to a model the list later dropped keeps
+/// running (ADR 0488). A draft's first send is a create, as in
+/// [`require_input_to_create`].
+pub(crate) fn require_offered_coding_agent_model(
+    has_started: bool,
+    use_coding_agent: Option<bool>,
+    coding_agent: Option<crate::runtime::CodingAgent>,
+    cc_model: Option<&str>,
+) -> Result<(), ApiError> {
+    if has_started || use_coding_agent != Some(true) {
+        return Ok(());
+    }
+    let agent = coding_agent.unwrap_or(crate::runtime::CodingAgent::ClaudeCode);
+    crate::runtime::validate_coding_agent_model(agent, cc_model)
+        .map(drop)
+        .map_err(ApiError::bad_request)
+}
+
 /// Announce every orphan in `batch` as `PromptInjected`, anchored on the
 /// batch's first message (the turn the re-process runs under).
 ///
@@ -800,7 +823,8 @@ async fn remove_queued_message(
         .await
         .map_err(ApiError::db)?
     {
-        // The session records the tombstone itself, once the agent confirms.
+        // The engine records the tombstone itself, once the agent drops the
+        // message or no live process can hold it.
         return match state
             .engine
             .withdraw_coding_agent_input(thread_id, message_id, actor)
@@ -1145,6 +1169,36 @@ pub(super) async fn chat_submit(
     if coding_agent.is_some() && use_coding_agent != Some(true) {
         log!("[Chat] chat_submit received `coding_agent` without `use_coding_agent=true` — rejecting");
         return Err(StatusCode::BAD_REQUEST.into());
+    }
+    require_offered_coding_agent_model(
+        has_started,
+        use_coding_agent,
+        coding_agent,
+        cc_model.as_deref(),
+    )?;
+    // An agent starting a thread picks a rung on its surface's ladder, a
+    // coding agent's or chat's. A person picks anything the picker offers
+    // (ADR 0500, ADR 0525).
+    if !has_started && super::intelligence_ladder::is_agent_caller(&headers, origin.as_ref()) {
+        let (surface, picked_model) = match use_coding_agent {
+            Some(true) => (
+                coding_agent
+                    .unwrap_or(crate::runtime::CodingAgent::ClaudeCode)
+                    .into(),
+                cc_model.as_deref(),
+            ),
+            _ => (
+                crate::runtime::intelligence_ladder::LadderSurface::Chat,
+                model.as_deref(),
+            ),
+        };
+        super::intelligence_ladder::refuse_off_ladder(
+            &state,
+            surface,
+            picked_model,
+            reasoning_effort.as_deref(),
+        )
+        .await?;
     }
     let event_id = request.event_id;
     // Re-bind the value parsed above for the subprocess-origin gate.

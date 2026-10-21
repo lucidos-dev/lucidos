@@ -33,14 +33,6 @@ let fixture: { dir: string; cleanup: () => void } | undefined;
 test.use({ launchOptions: { args: ['--site-per-process'] } });
 
 test.describe('an app frame cannot starve the shell', () => {
-  // The flag above is Chromium's, and Playwright's WebKit models neither it nor
-  // Safari's own process assignment: the same app blocks the shell there at
-  // 20 ticks of 100. That is the harness, not the product, and asserting a
-  // property this browser cannot produce would only pin the harness. The
-  // property is measured in Chromium; Safari's is unverified.
-  test.skip(({ browserName }) => browserName === 'webkit',
-    'Playwright WebKit does not model Safari process assignment for a sandboxed frame');
-
   test.beforeAll(() => {
     fixture = createIframeAppFixture(APP_ID, {
       manifest: { id: APP_ID, name: 'Busy app', description: 'e2e fixture' },

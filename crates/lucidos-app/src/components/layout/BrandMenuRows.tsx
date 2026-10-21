@@ -9,8 +9,7 @@ import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEve
 import type { ConnectionStatus } from '../../store/types';
 import { hasUnreadWhatsNew } from '../../store/actions/whatsNew';
 import { unfocusThread } from '../../store/actions/threads';
-import { homeThreadId } from '../../store/actions/homeThread';
-import { openHome } from '../../store/actions/homeBoardNav';
+import { homeThreadId, openHomeThread } from '../../store/actions/homeThread';
 import { openWhatsNew } from '../../store/actions/menu';
 import { connectionNotice } from '../../utils/connectionNotice';
 import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosVersion';
@@ -66,7 +65,7 @@ export function HomeMenuGroup({ onClose }: { onClose: () => void }) {
         type="button"
         class="brand-menu-item home-thread-btn"
         role="menuitem"
-        onClick={() => { onClose(); openHome(); }}
+        onClick={() => { onClose(); openHomeThread(); }}
       >
         <HomeIcon />
         Home

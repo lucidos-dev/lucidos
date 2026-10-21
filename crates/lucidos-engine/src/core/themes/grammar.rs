@@ -64,6 +64,8 @@ pub enum Grammar {
     Spacing { unit: Unit, min: f64, max: f64 },
     /// One length between `min` and `max`.
     Length { unit: Unit, min: f64, max: f64 },
+    /// `normal`, or a plain number between `min` and `max`, with no unit.
+    Weight { min: f64, max: f64 },
     /// One of `values`.
     Keyword { values: Vec<String> },
     /// `none`, or a `repeating-linear-gradient` of literal stops running top
@@ -173,6 +175,8 @@ pub fn canonical(slot: &Slot, value: &str) -> Result<String, String> {
         Grammar::Spacing { unit, min, max } | Grammar::Length { unit, min, max } => {
             bounded_length(slot, &value, *unit, *min, *max)
         }
+        Grammar::Weight { .. } if value == "normal" => Ok(value),
+        Grammar::Weight { min, max } => bounded_weight(&value, *min, *max),
         Grammar::Keyword { values } => {
             if values.contains(&value) {
                 Ok(value)
@@ -208,6 +212,22 @@ fn bounded_length(
         ));
     }
     Ok(shown)
+}
+
+fn bounded_weight(value: &str, min: f64, max: f64) -> Result<String, String> {
+    if value.contains('(') {
+        return Err(not_allowed(value));
+    }
+    let Some(v) = plain_number(value) else {
+        return Err(format!("'{value}' is not a weight."));
+    };
+    if v > max {
+        return Err(format!("{} is over the {} cap.", num(v), num(max)));
+    }
+    if v < min {
+        return Err(format!("{} is under the {} floor.", num(v), num(min)));
+    }
+    Ok(num(v))
 }
 
 fn is_angle(token: &str) -> bool {

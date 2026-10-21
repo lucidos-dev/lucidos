@@ -83,20 +83,21 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
   URL-encoded and hash-form taps are **out of scope**. The engine and the service worker own that channel, not any workspace file.
 
-  § Remediation below carries the old-to-new mapping a fix thread needs.
+  § Remediation below carries the old-to-new mapping a fix needs.
 
 ## Remediation
 
-Fixes run only on request, as the root's § Remediation says. A fix thread gets
-the table for its finding.
+Fixes run only on request, as the root's § Remediation says. A fix gets the
+table for its finding, and the root's § Inline or a coding agent picks its
+route.
 
 ### Listing an MCP server a trigger uses
 
-Add the server to the trigger's `mcp_servers` with `update_trigger`. The field is a full replacement, so send the existing list plus the new id. It is reversible, so it may join "Do all suggested fixes". A server the fire enabled once and never called is not worth listing: report it, and leave the choice to the user.
+**Route: inline**, one `update_trigger` call. Add the server to the trigger's `mcp_servers`. The field is a full replacement, so send the existing list plus the new id. It is reversible, so it may join "Do all suggested fixes". A server the fire enabled once and never called is not worth listing: report it, and leave the choice to the user.
 
 ### Rewriting an old-form `tap`
 
-Hand a fix thread this mapping:
+**Route: a coding agent, one per trigger.** The rewrite builds new fields from computed siblings and flags the sites it cannot fill, which takes judgment. Hand it this mapping:
 
 | Old | New |
 |---|---|

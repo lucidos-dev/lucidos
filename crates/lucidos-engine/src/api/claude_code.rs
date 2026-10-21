@@ -297,6 +297,25 @@ pub(super) struct ControlRequestBody {
     request: crate::runtime::ControlRequest,
 }
 
+/// A `set_reasoning_effort` names a tier the thread's backend offers for its
+/// model, as every other effort entry point requires. Otherwise the next
+/// spawn would read a string it cannot run at.
+async fn refuse_unoffered_effort(
+    engine: &SharedEngine,
+    thread_id: uuid::Uuid,
+    request: &crate::runtime::ControlRequest,
+) -> Result<(), String> {
+    let crate::runtime::ControlRequest::SetReasoningEffort { effort } = request else {
+        return Ok(());
+    };
+    let agent = engine.thread_coding_agent(thread_id).await;
+    let (model, _) = engine.cc_thread_settings(thread_id).await;
+    match crate::runtime::validate_coding_agent_effort(agent, model.as_deref(), Some(effort))? {
+        Some(_) => Ok(()),
+        None => Err("reasoning_effort must name a level".to_string()),
+    }
+}
+
 pub(super) async fn claude_code_control(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -324,6 +343,14 @@ pub(super) async fn claude_code_control(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
     })?;
+    refuse_unoffered_effort(&state.engine, thread_id, &body.request)
+        .await
+        .map_err(|message| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+        })?;
     let actor = super::actor::user_actor(&headers, None);
     state
         .engine
@@ -364,6 +391,19 @@ pub(super) async fn claude_code_commands(
             .coding_agent
             .unwrap_or(crate::runtime::CodingAgent::ClaudeCode),
     };
+    // What a spawn with no pick runs on, for the picker's Default row.
+    let default_implementer =
+        crate::runtime::intelligence_ladder::default_implementer(&state.pool, coding_agent)
+            .await
+            .map(|d| serde_json::json!({"model": d.model, "effort": d.effort}));
+    // The rung control lists these and nothing else.
+    let ladder_rungs = crate::runtime::intelligence_ladder::load(
+        &state.pool,
+        &state.engine.model_routes(),
+        coding_agent.into(),
+    )
+    .await
+    .on_intelligence_rungs();
     if coding_agent == crate::runtime::CodingAgent::Codex {
         // Codex has no slash commands / skills surface — only the control
         // menu. Model/effort still come from the session settings events so
@@ -386,6 +426,8 @@ pub(super) async fn claude_code_commands(
             "current_model": current_model,
             "current_reasoning_effort": current_effort,
             "has_active_session": has_active_session,
+            "default_implementer": default_implementer,
+            "ladder_rungs": ladder_rungs,
         })));
     }
     let res = if let Some(tid) = tid {
@@ -418,6 +460,8 @@ pub(super) async fn claude_code_commands(
         "current_model": res.current_model,
         "current_reasoning_effort": res.current_reasoning_effort,
         "has_active_session": res.has_active_session,
+        "default_implementer": default_implementer,
+        "ladder_rungs": ladder_rungs,
         "models_provenance": crate::runtime::cc_model_discovery::provenance(),
     })))
 }

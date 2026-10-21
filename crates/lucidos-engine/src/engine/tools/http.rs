@@ -140,14 +140,19 @@ impl LucidosEngine {
             }
         };
         if let Some(cred) = stored_credential {
+            // An unreadable secret reference stops the call: sent without its
+            // credential, it would fail as if the key were wrong.
+            let secret = match cred.secret(&self.pool).await {
+                Ok(secret) => secret,
+                Err(reason) => return Ok(format!("Error: {reason}. The request was not sent.")),
+            };
             let auth_value = match cred.auth_type {
-                AuthType::Bearer => format!("Bearer {}", cred.auth_value),
-                AuthType::Basic => format!("Basic {}", cred.auth_value),
+                AuthType::Bearer => format!("Bearer {secret}"),
+                AuthType::Basic => format!("Basic {secret}"),
                 AuthType::Password => {
                     // Password credentials store {"username":"...","password":"..."} —
                     // inject as Basic auth (base64 of username:password).
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cred.auth_value)
-                    {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&secret) {
                         let user = parsed["username"].as_str().unwrap_or("");
                         let pass = parsed["password"].as_str().unwrap_or("");
                         use base64::Engine as _;
@@ -155,10 +160,10 @@ impl LucidosEngine {
                             .encode(format!("{}:{}", user, pass));
                         format!("Basic {}", encoded)
                     } else {
-                        cred.auth_value.clone()
+                        secret
                     }
                 }
-                _ => cred.auth_value.clone(), // api_key: use raw value
+                _ => secret, // api_key: use raw value
             };
             if let Ok(header_name) =
                 reqwest::header::HeaderName::from_bytes(cred.auth_header.as_bytes())

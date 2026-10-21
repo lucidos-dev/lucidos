@@ -28,13 +28,13 @@ export function openBridgedEventStream(handlers: EventStreamHandlers, types: rea
     const relayed = payload as Relayed;
     if (relayed?.kind === 'frame') handlers.onFrame(relayed.data);
     else if (relayed?.kind === 'open') handlers.onOpen();
-    else if (relayed?.kind === 'error') handlers.onError();
+    else if (relayed?.kind === 'error') handlers.onError({ reason: 'error' });
   });
 
   // Fire and forget. The host answers with nothing, and a failed subscribe is
   // reported by the absence of frames rather than by a rejection nobody reads.
   void callHost('sse.open', { types }).catch(() => {
-    handlers.onError();
+    handlers.onError({ reason: 'error' });
   });
 
   return {
@@ -49,5 +49,8 @@ export function openBridgedEventStream(handlers: EventStreamHandlers, types: rea
     // An app has no presence voice and never answers a `PresenceCheck`, which
     // is why `sse.connect` passes `pongs: false` for one. Nothing to submit.
     submitPong() {},
+    // The host holds the upstream and revalidates it on its own resume. It
+    // relays a drop as an `error` frame, so this side has nothing to restart.
+    revalidate: () => 'live',
   };
 }

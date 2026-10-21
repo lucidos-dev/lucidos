@@ -4,7 +4,7 @@ import { OverflowMenu, type OverflowMenuOpener } from '../shared/OverflowMenu';
 import { renderMenuAction } from '../layout/headerActions';
 import { filePreviewContentActions } from '../layout/ContentHeaderActions';
 import { shouldOpenFilePreviewMenu } from './filePreviewContextMenuPolicy';
-import { selectionCovers, opensContextMenu } from '../../utils/nativeContextMenu';
+import { selectionCovers, opensContextMenu } from '@lucidos/context-menu';
 
 /** Wraps the file-preview body in a right-click menu. It offers the SAME
  *  actions the header toolbar does (`filePreviewContentActions`), so the two

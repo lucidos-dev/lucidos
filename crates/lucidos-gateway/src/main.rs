@@ -139,15 +139,17 @@ fn boot() -> Result<server::RunOutcome, BoxError> {
         return Ok(server::RunOutcome::Stopped);
     }
 
-    // Above the runtime build: it sets process env, which is sound only while
-    // this process is single-threaded. A test below pins the order.
+    // Above the runtime build: both set process env, which is sound only while
+    // this process is single-threaded. The take comes first, so the login shell
+    // inherits no lock. A test below pins the order.
+    let inherited_lock_fd = server::take_inherited_lock_fd();
     shell_env::hydrate_login_shell_env();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
         .build()?;
-    rt.block_on(server::run())
+    rt.block_on(server::run(inherited_lock_fd))
 }
 
 #[cfg(test)]
@@ -170,21 +172,33 @@ mod tests {
         assert_eq!(line.lines().count(), 1);
     }
 
+    /// Pinned on the source, because the property is an ordering inside `boot`.
     #[test]
-    fn boot_hydrates_the_shell_env_before_it_starts_any_threads() {
+    fn boot_sets_process_env_before_it_starts_any_threads() {
         let source = include_str!("main.rs");
         let boot_start = source.find("fn boot()").expect("boot() exists");
         let boot_end = boot_start + source[boot_start..].find("\n}\n").expect("boot() ends");
         let boot = &source[boot_start..boot_end];
-        let hydrate = boot
-            .find("shell_env::hydrate_login_shell_env();")
-            .expect("boot() hydrates the login-shell env for both shipped installs");
         let runtime = boot
             .find("tokio::runtime::Builder")
             .expect("boot() builds the runtime");
+        let [take, hydrate] = [
+            "server::take_inherited_lock_fd();",
+            "shell_env::hydrate_login_shell_env();",
+        ]
+        .map(|env_writer| {
+            let at = boot
+                .find(env_writer)
+                .unwrap_or_else(|| panic!("boot() calls {env_writer}"));
+            assert!(
+                at < runtime,
+                "{env_writer} writes process env, so it must run before the runtime spawns threads"
+            );
+            at
+        });
         assert!(
-            hydrate < runtime,
-            "hydration calls set_var, so it must run before the runtime spawns threads"
+            take < hydrate,
+            "hydration spawns the login shell, which must not inherit the reload's lock"
         );
     }
 }

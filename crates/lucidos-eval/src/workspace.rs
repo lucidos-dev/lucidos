@@ -327,15 +327,15 @@ pub async fn read_seed_rows(pool: &PgPool) -> Fallible<Vec<SeedRow>> {
     }
 
     let models = sqlx::query(
-        "SELECT id, label, routes::text AS routes, sort_order::text AS sort_order, source, \
-         enabled::text AS enabled FROM models",
+        "SELECT id, label, routes::text AS routes, sort_order::text AS sort_order, source \
+         FROM models",
     )
     .fetch_all(pool)
     .await?;
     for row in models {
         let id: String = row.try_get("id")?;
         let mut value = String::new();
-        for column in ["label", "routes", "sort_order", "source", "enabled"] {
+        for column in ["label", "routes", "sort_order", "source"] {
             let cell: String = row.try_get(column)?;
             value.push_str(&cell);
             value.push('\u{1d}');

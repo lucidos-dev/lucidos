@@ -1,20 +1,18 @@
 import { test, expect } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
-  sendMessage, waitForCCToStart, waitForActionPanel, dismissCCSession,
-  waitForActiveSession, waitAndClick, waitForVisibleElement, pickModelPair,
-  openCurrentModelTiers,
+  sendMessageCapturingThreadId, waitForCCToStart, waitForActionPanel, dismissCCSession,
+  waitForActiveSession, openRungList, readRungRows, pickRung, currentRungValue,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
 /**
- * Bug: when a user selects reasoning effort before starting a CC session
- * (via the CC menu's "Next Session" settings), the backend ignored the
- * reasoning_effort field in the chat request. The CC process always used
+ * Bug: when a user selects reasoning effort before starting a CC session,
+ * the backend ignored the reasoning_effort field in the chat request. The CC process always used
  * the default effort from CC config files.
  *
- * This test selects "Max" reasoning effort via the CC menu before starting
- * a session and verifies the commands API reflects it after session start.
+ * This test picks the top ladder rung before starting a session. It checks
+ * the commands API reflects that rung's effort after session start.
  */
 
 test.describe('CC reasoning effort pre-session selection', () => {
@@ -28,42 +26,28 @@ test.describe('CC reasoning effort pre-session selection', () => {
     await newThread(page);
     await pickComposeDestination(page);
 
-    await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
-    // One entry, not two: the tier is the picker's second step. With no
-    // session and no pick, the model in force is Default.
-    await waitAndClick(page, '.control-item', 'Model');
-    await pickModelPair(page, 'default', 'max');
+    // The last rung. A tap commits its model and its effort together.
+    await openRungList(page);
+    const rungs = await readRungRows(page);
+    const picked = rungs[rungs.length - 1];
+    expect(picked.effort).toBeTruthy();
+    await pickRung(page, picked.value);
 
-    let sentThreadId: string | null = null;
-    page.on('request', (req) => {
-      if (req.url().includes('/api/v1/chat/stream') && req.method() === 'POST') {
-        try {
-          const body = req.postDataJSON();
-          sentThreadId = body?.thread_id ?? null;
-        } catch { /* ignore */ }
-      }
-    });
-
-    await sendMessage(page, 'Say exactly: "reasoning-preselect-ok". Do not create any files.');
+    const sentThreadId = await sendMessageCapturingThreadId(
+      page, 'Say exactly: "reasoning-preselect-ok". Do not create any files.',
+    );
 
     await waitForCCToStart(page, 60_000);
-    expect(sentThreadId).toBeTruthy();
 
     // === Core bug assertion ===
-    const cmdData = await waitForActiveSession(page, sentThreadId!);
-    expect(cmdData.current_reasoning_effort).toBe('max');
+    const cmdData = await waitForActiveSession(page, sentThreadId);
+    expect(cmdData.current_reasoning_effort).toBe(picked.effort);
 
     await waitForActionPanel(page, 'Archive', 120_000);
 
-    await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
-    await waitAndClick(page, '.control-item', 'Model');
-    await waitForVisibleElement(page, '.control-option');
-
-    // The session's own model at Max is now the checked pair, one step in.
-    await openCurrentModelTiers(page);
-    const currentTier = page.locator('.control-option-current:visible').first();
-    await expect(currentTier).toBeVisible({ timeout: 5_000 });
-    expect(await currentTier.getAttribute('data-value')).toMatch(/\|max$/);
+    // The rung at that effort is the checked row once the session runs on it.
+    await openRungList(page);
+    expect(await currentRungValue(page)).toBe(picked.value);
 
     // Cleanup
     await page.keyboard.press('Escape');

@@ -935,17 +935,10 @@ mod tests {
     // outcome as the thing a set exists to stop.
 
     fn stored(base_urls: &[&str]) -> Credential {
-        Credential {
-            id: uuid::Uuid::nil(),
-            service_name: "github".to_string(),
-            base_urls: scope(base_urls),
-            auth_type: AuthType::Bearer,
-            auth_value: "ghp_secret".to_string(),
-            auth_header: "Authorization".to_string(),
-            env_var_name: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
+        let mut credential = Credential::fixture("github", AuthType::Bearer, "ghp_secret");
+        credential.id = uuid::Uuid::nil();
+        credential.base_urls = scope(base_urls);
+        credential
     }
 
     #[test]
@@ -1156,7 +1149,7 @@ mod tests {
     fn a_widening_payload_never_carries_the_stored_secret() {
         let existing = stored(&["https://api.github.com"]);
         let payload = widen_scope_request(&existing, &scope(&["https://github.com"]));
-        assert!(!payload.contains(&existing.auth_value), "{payload}");
+        assert!(!payload.contains(existing.stored_value()), "{payload}");
         assert!(parse_payload(&payload).get("auth_value").is_none());
     }
 

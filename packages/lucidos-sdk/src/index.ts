@@ -3,6 +3,7 @@ import { data } from './data';
 import { events } from './events';
 import { triggers } from './triggers';
 import { preferences } from './preferences';
+import { priceTable } from './priceTable';
 import { notifications } from './notifications';
 import { apps } from './apps';
 import { threads } from './threads';
@@ -34,6 +35,8 @@ export const lucidos = {
   events,
   triggers,
   preferences,
+  // The model price table, merged with the workspace override (ADR 0525).
+  priceTable,
   notifications,
   apps,
   threads,
@@ -47,7 +50,7 @@ export const lucidos = {
   storage,
   // A widget's params for the place it shows (ADR 0415).
   params,
-  // Where a widget shows, and its size as a Home board tile (ADR 0432).
+  // Where a widget shows, and its size as a dashboard tile (ADR 0432).
   widget,
   _capture: capture,
 };
@@ -74,4 +77,4 @@ export * from './appStorage';
 // Generated navigation contract (source of truth: the engine `navigate_ui`
 // tool). Exposed as runtime values so the host app can cross-check them against
 // its own renderable nav set — see `crates/lucidos-engine/src/llm/tools/misc.rs`.
-export { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from './generated/navigate-targets';
+export { CODING_AGENT_TARGETS, NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from './generated/navigate-targets';

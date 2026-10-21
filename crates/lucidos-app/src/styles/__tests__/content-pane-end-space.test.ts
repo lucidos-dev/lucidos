@@ -7,7 +7,7 @@
  *   and leaves the spacer stranded at the pane's bottom edge;
  * - a new full-bleed opt-out nobody reviewed.
  *
- * `e2e/content-pane-end-space.spec.ts` measures the rendered result.
+ * `e2e/content-pane-end-space-all.spec.ts` measures the rendered result.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project

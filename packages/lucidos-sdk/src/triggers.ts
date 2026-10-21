@@ -30,6 +30,9 @@ export type SideEffectCategory =
 export interface Trigger {
   id: string;
   name: string;
+  /** Stable kebab-case id, the directory of its knowhow at
+   *  `data/triggers/<slug>/knowhow/`. */
+  slug: string;
   cron_expressions: string[];
   timezone: string;
   paused: boolean;
@@ -61,6 +64,8 @@ export interface Trigger {
 
 export interface CreateTrigger {
   name: string;
+  /** Stable kebab-case id. Omit to derive it from `name`. */
+  slug?: string;
   run: TriggerRun;
   cron_expressions: string[];
   on?: EventSubscription[];

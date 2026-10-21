@@ -16,6 +16,7 @@ import type { TriggerInfo } from '../../../store/types';
 const LOOSE: TriggerInfo = {
   id: 'loose',
   name: 'Morning digest',
+  slug: 'morning-digest',
   cron_expressions: ['0 9 * * *'],
   timezone: 'UTC',
   paused: false,

@@ -44,6 +44,7 @@ lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
 lucidos-pg-url = { path = "../lucidos-pg-url" }
 lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
 lucidos-capabilities = { path = "../lucidos-capabilities" }
+lucidos-claude-code-managed = { path = "../lucidos-claude-code-managed" }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
 # pg-embed removed - using Docker PostgreSQL with pgvector
 # `vendored-openssl` statically links OpenSSL into the binary for the
@@ -114,6 +115,9 @@ tokio-native-tls = "0.3"
 native-tls = "0.2"
 mail-parser = "0.9"
 aes-gcm = "0.10"
+# Seals backup archives to the workspace's backup recipient (age X25519).
+# Default features only: no plugins, no ssh keys, no armor.
+age = "0.12"
 tar = "0.4"
 zstd = "0.13"
 tokio-util = { version = "0.7", features = ["io"] }
@@ -131,6 +135,11 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # carries a codegen derive.
 syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
 proc-macro2 = "1"
+
+# The macOS Keychain, through the library rather than the `security` command,
+# holds the workspace key on the packaged app (ADR 0509).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [dev-dependencies]
 # Enables `#[tokio::test(start_paused = true)]` for time-mocked tests.

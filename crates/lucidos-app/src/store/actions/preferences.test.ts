@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts, llmConfigured } from '../store';
+import { currentComposerEnterKey, setComposerEnterKey } from './preferences';
+import { PREF_COMPOSER_ENTER_KEY } from '@lucidos/preference-catalog';
 import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import { MEMORY_MODULE_WHILE_UNSET } from '@lucidos/engine-constants';
@@ -1828,10 +1830,10 @@ describe('a stored background selection', () => {
   it('reads what is stored', () => {
     preferences.value = {
       status: 'loaded',
-      data: { model_summary_compaction: 'claude-sonnet-5-5', reasoning_summary_compaction: 'medium' },
+      data: { model_summary_compaction: 'claude-fable-5-1', reasoning_summary_compaction: 'medium' },
     };
     expect(storedBackgroundSelection('model_summary_compaction', 'reasoning_summary_compaction'))
-      .toEqual({ model: 'claude-sonnet-5-5', effort: 'medium' });
+      .toEqual({ model: 'claude-fable-5-1', effort: 'medium' });
   });
 
   it('ignores a stored tier the catalog does not accept', () => {
@@ -1965,6 +1967,71 @@ describe('notification_toasts: the mirror that survives a cold start', () => {
     vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
     void setNotificationToasts(false);
     expect(localStorage.getItem(KEY)).toBe('false');
+  });
+});
+
+/**
+ * What Enter does in the composer. A send cannot be taken back either, so a
+ * user who chose a new line must keep it before preferences load.
+ */
+describe('composer_enter_key: Enter-to-send or a new line', () => {
+  const KEY = 'lucidos-composer-enter-key';
+
+  beforeEach(() => {
+    localStorage.clear();
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('defaults to the catalog value with neither a preference nor a mirror', () => {
+    expect(currentComposerEnterKey()).toBe(PREF_COMPOSER_ENTER_KEY.fallback);
+  });
+
+  it('answers from the mirror while preferences are still loading', () => {
+    localStorage.setItem(KEY, 'newline');
+    preferences.value = { status: 'loading' };
+    expect(currentComposerEnterKey()).toBe('newline');
+  });
+
+  it('answers from the mirror when the load failed', () => {
+    localStorage.setItem(KEY, 'newline');
+    preferences.value = { status: 'failed', error: 'unreachable' };
+    expect(currentComposerEnterKey()).toBe('newline');
+  });
+
+  it('lets the served value beat the mirror', () => {
+    localStorage.setItem(KEY, 'newline');
+    preferences.value = { status: 'loaded', data: { composer_enter_key: 'send' } };
+    expect(currentComposerEnterKey()).toBe('send');
+  });
+
+  it('ignores a stored value the catalog does not accept', () => {
+    preferences.value = { status: 'loaded', data: { composer_enter_key: 'shift-enter' } };
+    expect(currentComposerEnterKey()).toBe(PREF_COMPOSER_ENTER_KEY.fallback);
+  });
+
+  it('takes the mirror from what the engine served', async () => {
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
+      preferences: { composer_enter_key: 'newline' },
+    });
+    await loadPreferences();
+    expect(localStorage.getItem(KEY)).toBe('newline');
+  });
+
+  it('clears the mirror when the engine serves no value', async () => {
+    localStorage.setItem(KEY, 'newline');
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
+    await loadPreferences();
+    expect(localStorage.getItem(KEY)).toBeNull();
+  });
+
+  it('writes the mirror on the user pick, before the round trip', () => {
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    void setComposerEnterKey('newline');
+    expect(localStorage.getItem(KEY)).toBe('newline');
   });
 });
 

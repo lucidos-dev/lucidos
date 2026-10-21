@@ -210,8 +210,8 @@ describe('pickerFocusTarget', () => {
 
 /** A row with a real choice of backend. OpenRouter has no `xhigh`. */
 const DUAL: ModelRow = {
-  value: 'claude-opus-5-5',
-  label: 'Opus 5.5',
+  value: 'claude-opus-5-6',
+  label: 'Opus 5.6',
   tiers: [
     { value: 'high', label: 'High' },
     { value: 'xhigh', label: 'X-High' },
@@ -236,8 +236,8 @@ describe('the provider step', () => {
   });
 
   it('snaps the held effort onto what the picked backend accepts', () => {
-    expect(providerStepCommit(DUAL, 'openrouter', 'xhigh')).toBe('claude-opus-5-5|high');
-    expect(providerStepCommit(DUAL, 'vertex', 'xhigh')).toBe('claude-opus-5-5|xhigh');
+    expect(providerStepCommit(DUAL, 'openrouter', 'xhigh')).toBe('claude-opus-5-6|high');
+    expect(providerStepCommit(DUAL, 'vertex', 'xhigh')).toBe('claude-opus-5-6|xhigh');
   });
 
   it('opens a step rather than committing, for a model with a choice of backend', () => {

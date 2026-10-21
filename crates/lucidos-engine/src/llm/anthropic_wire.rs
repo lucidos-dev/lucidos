@@ -199,24 +199,36 @@ pub(crate) fn thinking_mode(model: &str) -> Option<ThinkingMode> {
     adaptive_model(model).map(|entry| entry.mode)
 }
 
+/// One message's content as Claude takes it, with the places a cache marker
+/// may go. The indexes are computed where the emitted array is built. The
+/// filter in [`message_content_to_claude_value`] drops blocks, so an emitted
+/// index is not a source index.
+struct ClaudeContent {
+    /// Text → JSON string, Blocks → JSON array of content block objects.
+    value: serde_json::Value,
+    /// Where this message's own marker belongs: the last block that is not an
+    /// engine tail block, or `None` for string content.
+    anchor: Option<usize>,
+    /// Each memory view block, where a view's own breakpoint may go.
+    views: Vec<usize>,
+    /// The stable context block, where its own breakpoint may go.
+    stable: Option<usize>,
+}
+
 /// Convert MessageContent to the serde_json::Value format Claude expects.
-/// Text → JSON string, Blocks → JSON array of content block objects.
-///
-/// Also reports where this message's cache marker belongs: the index of the
-/// last block that is not an engine tail block, or `None` for string content.
-/// And it reports each memory view block's index, where a view's own
-/// breakpoint may go. Both are computed here because this is where the
-/// emitted array is built. The filter below drops blocks, so an emitted index
-/// is not a source index.
-fn message_content_to_claude_value(
-    content: &MessageContent,
-) -> (serde_json::Value, Option<usize>, Vec<usize>) {
+fn message_content_to_claude_value(content: &MessageContent) -> ClaudeContent {
     match content {
-        MessageContent::Text(s) => (serde_json::Value::String(s.clone()), None, Vec::new()),
+        MessageContent::Text(s) => ClaudeContent {
+            value: serde_json::Value::String(s.clone()),
+            anchor: None,
+            views: Vec::new(),
+            stable: None,
+        },
         MessageContent::Blocks(blocks) => {
             let mut json_blocks: Vec<serde_json::Value> = Vec::with_capacity(blocks.len());
             let mut anchor: Option<usize> = None;
             let mut views: Vec<usize> = Vec::new();
+            let mut stable: Option<usize> = None;
             // Every text form is filtered. They emit the same `type: "text"`
             // below, and the API rejects an empty one.
             for block in blocks.iter().filter(|block| {
@@ -225,6 +237,7 @@ fn message_content_to_claude_value(
                     ContentBlock::Text { text }
                         | ContentBlock::EngineTail { text }
                         | ContentBlock::MemoryView { text }
+                        | ContentBlock::StableContext { text }
                         if text.is_empty()
                 )
             }) {
@@ -234,10 +247,14 @@ fn message_content_to_claude_value(
                 if matches!(block, ContentBlock::MemoryView { .. }) {
                     views.push(json_blocks.len());
                 }
+                if matches!(block, ContentBlock::StableContext { .. }) {
+                    stable = Some(json_blocks.len());
+                }
                 json_blocks.push(match block {
                     ContentBlock::Text { text }
                     | ContentBlock::EngineTail { text }
-                    | ContentBlock::MemoryView { text } => {
+                    | ContentBlock::MemoryView { text }
+                    | ContentBlock::StableContext { text } => {
                         serde_json::json!({
                             "type": "text",
                             "text": text,
@@ -280,7 +297,12 @@ fn message_content_to_claude_value(
                     }),
                 });
             }
-            (serde_json::Value::Array(json_blocks), anchor, views)
+            ClaudeContent {
+                value: serde_json::Value::Array(json_blocks),
+                anchor,
+                views,
+                stable,
+            }
         }
     }
 }
@@ -413,16 +435,18 @@ pub(crate) fn build_claude_request(
     }
 
     let mut view_blocks: Vec<(usize, usize)> = Vec::new();
+    let mut stable_block: Option<(usize, usize)> = None;
     let mut claude_messages: Vec<ClaudeMessage> = messages
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let (content, cache_anchor, views) = message_content_to_claude_value(&m.content);
-            view_blocks.extend(views.into_iter().map(|block| (i, block)));
+            let content = message_content_to_claude_value(&m.content);
+            view_blocks.extend(content.views.into_iter().map(|block| (i, block)));
+            stable_block = stable_block.or(content.stable.map(|block| (i, block)));
             ClaudeMessage {
                 role: m.role.clone(),
-                content,
-                cache_anchor,
+                content: content.value,
+                cache_anchor: content.anchor,
             }
         })
         .collect();
@@ -455,6 +479,9 @@ pub(crate) fn build_claude_request(
     let mark_system = breakpoints < MAX_CACHE_BREAKPOINTS;
     let system = system_block(system_prompt, mark_system);
     breakpoints += usize::from(mark_system && system.is_some());
+    if let Some((message, block)) = stable_block.filter(|_| breakpoints < MAX_CACHE_BREAKPOINTS) {
+        breakpoints += usize::from(mark_block_for_cache(&mut claude_messages[message], block));
+    }
     if breakpoints < MAX_CACHE_BREAKPOINTS {
         if let Some(tools) = claude_tools.as_mut() {
             apply_cache_control_to_last_tool(tools);
@@ -499,6 +526,7 @@ pub(crate) fn build_claude_request(
         output_config,
         anthropic_beta,
         tool_choice: None,
+        stable_prefix_end: view_blocks.last().copied(),
     };
 
     crate::llm::cache_probe::log_request(&request, model, request_url, provider_tag);
@@ -741,8 +769,12 @@ pub(crate) async fn parse_claude_stream(
         output_tokens: turn_meta.output_tokens,
         input_tokens: turn_meta.input_tokens,
         cache_creation_tokens: turn_meta.cache_creation_tokens,
+        cache_creation_1h_tokens: turn_meta.cache_creation_1h_tokens,
         cache_read_tokens: turn_meta.cache_read_tokens,
         served_model: turn_meta.served_model,
+        provider: None,
+        // The provider stamps it, since only the request knows it.
+        stable_prefix_fingerprint: None,
         thinking_chars: Some(thinking_chars),
         thinking_blocks: Some(thinking_blocks),
         unknown_sse_dropped: turn_meta.unknown_sse_dropped,
@@ -951,6 +983,7 @@ fn process_sse_data(
             return Ok(data["index"].as_u64().map(|index| index as usize));
         }
         "content_block_delta" => {
+            crate::llm::call_trace::content_arrived();
             let index = data["index"].as_u64().unwrap_or(0) as usize;
             if let Some(block) = blocks.get_mut(index) {
                 let delta = &data["delta"];
@@ -1029,6 +1062,9 @@ fn process_sse_data(
                     provider_tag,
                 ));
             }
+            meta.cache_creation_1h_tokens = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                .as_u64()
+                .map(|n| crate::llm::clamp_provider_token_count(n, provider_tag));
             meta.served_model = crate::llm::served_model::served_model_of(&data["message"]);
         }
         "message_delta" => {
@@ -1066,8 +1102,8 @@ pub(crate) const MAX_CACHE_BREAKPOINTS: usize = 4;
 ///
 /// Markers go in priority order until [`MAX_CACHE_BREAKPOINTS`] are spent:
 /// the last message, the one before it, each memory view block, the system
-/// block, then tools[-1]. A Classic request holds no memory view block, so it
-/// marks tools, system and the two messages, as it always has.
+/// block, the stable context block, then tools[-1]. The system entry's prefix
+/// already holds the tools, so the tools marker is the one that gives way.
 ///
 /// A Tree turn's first round marks the snapshot's last whole block and both
 /// thread view rungs. Later rounds keep the snapshot and the first rung.
@@ -1229,6 +1265,11 @@ pub(crate) struct ClaudeRequest {
     /// the choice to the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ClaudeToolChoice>,
+    /// The last memory view block, as `(message, block)` in the emitted
+    /// arrays: where the *stable prefix* ends. `None` ends it at the system
+    /// block. See `llm::stable_prefix`.
+    #[serde(skip)]
+    pub stable_prefix_end: Option<(usize, usize)>,
 }
 
 /// A `tool_choice` naming the one tool the model must call.
@@ -1352,6 +1393,9 @@ pub(crate) struct TurnMeta {
     pub input_tokens: Option<u32>,
     pub cache_read_tokens: Option<u32>,
     pub cache_creation_tokens: Option<u32>,
+    /// `usage.cache_creation.ephemeral_1h_input_tokens`. `None` when the
+    /// usage block carries no lifetime split.
+    pub cache_creation_1h_tokens: Option<u32>,
     /// The model `message_start` names: the *served model*.
     pub served_model: Option<String>,
     /// Count of SSE shapes the parser saw but couldn't classify — unknown
@@ -1847,7 +1891,7 @@ mod tests {
                 data: "AAAA".to_string(),
             },
         ]);
-        let (value, _, _) = message_content_to_claude_value(&content);
+        let value = message_content_to_claude_value(&content).value;
         let arr = value.as_array().unwrap();
         // Empty text block should be filtered out, leaving only the image
         assert_eq!(arr.len(), 1);
@@ -1866,7 +1910,7 @@ mod tests {
                 data: "AAAA".to_string(),
             },
         ]);
-        let (value, _, _) = message_content_to_claude_value(&content);
+        let value = message_content_to_claude_value(&content).value;
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], "text");
@@ -1894,6 +1938,26 @@ mod tests {
         assert_eq!(meta.cache_read_tokens, Some(500));
         // The same event names the model that served the turn.
         assert_eq!(meta.served_model.as_deref(), Some("claude-opus-4-7"));
+        // No lifetime split in this usage block, so none is invented.
+        assert_eq!(meta.cache_creation_1h_tokens, None);
+    }
+
+    /// The usage block splits a write by lifetime. The 1-hour part bills at
+    /// 2x, so it is kept beside the total, and a zero is a real answer.
+    #[test]
+    fn process_sse_reads_the_cache_write_lifetime_split() {
+        let event = |one_hour: u32| {
+            format!(
+                r#"{{"type":"message_start","message":{{"model":"claude-opus-5-5","usage":{{"input_tokens":3,"cache_creation_input_tokens":1200,"cache_read_input_tokens":0,"cache_creation":{{"ephemeral_5m_input_tokens":{},"ephemeral_1h_input_tokens":{one_hour}}},"output_tokens":1}}}}}}"#,
+                1200 - one_hour
+            )
+        };
+        for one_hour in [0, 800] {
+            let mut meta = TurnMeta::default();
+            process_sse_data(&event(one_hour), &mut Vec::new(), &mut meta, "Test").unwrap();
+            assert_eq!(meta.cache_creation_tokens, Some(1200));
+            assert_eq!(meta.cache_creation_1h_tokens, Some(one_hour));
+        }
     }
 
     #[test]
@@ -2018,12 +2082,11 @@ mod tests {
     /// A message built the way `build_claude_request` builds one, so the anchor
     /// is derived from the block types rather than asserted into place.
     fn from_blocks(role: &str, blocks: Vec<ContentBlock>) -> ClaudeMessage {
-        let (content, cache_anchor, _) =
-            message_content_to_claude_value(&MessageContent::Blocks(blocks));
+        let content = message_content_to_claude_value(&MessageContent::Blocks(blocks));
         ClaudeMessage {
             role: role.into(),
-            content,
-            cache_anchor,
+            content: content.value,
+            cache_anchor: content.anchor,
         }
     }
 
@@ -2541,6 +2604,7 @@ mod tests {
             output_config: None,
             anthropic_beta: None,
             tool_choice: None,
+            stable_prefix_end: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();
@@ -3677,39 +3741,55 @@ mod tests {
         ]
     }
 
-    /// A Tree turn's opening message in the shape `TurnMemoryViews::lead`
-    /// gives it: the snapshot's marked block, the thread view's two rungs, the
-    /// view's rest, then the message.
-    fn tree_message(snapshot: bool) -> Message {
-        let mut blocks = Vec::new();
-        if snapshot {
-            blocks.push(ContentBlock::MemoryView {
-                text: "[WORKSPACE MEMORY VIEW]\n[w/0+4] shared\n".into(),
-            });
+    /// The stable context block, in the shape `TurnMemoryViews::lead` gives it.
+    fn stable_block() -> ContentBlock {
+        ContentBlock::StableContext {
+            text: "[USER PROFILE]\n...\n[LOADED KNOWHOW]\n...".into(),
         }
-        blocks.extend([
-            ContentBlock::MemoryView {
-                text: "[THREAD MEMORY VIEW]\n[0+8] old\n".into(),
-            },
-            ContentBlock::MemoryView {
-                text: "[8+4] middle\n".into(),
-            },
-            ContentBlock::Text {
-                text: "[12+1] new\n[END THREAD MEMORY VIEW]".into(),
-            },
-            ContentBlock::Text {
-                text: "Request: hello".into(),
-            },
-        ]);
+    }
+
+    fn text_block(text: &str) -> ContentBlock {
+        ContentBlock::Text { text: text.into() }
+    }
+
+    fn user_blocks(blocks: Vec<ContentBlock>) -> Message {
         Message {
             role: "user".into(),
             content: MessageContent::Blocks(blocks),
         }
     }
 
-    /// A Tree turn after `rounds` rounds.
-    fn tree_turn(snapshot: bool, rounds: usize) -> ClaudeRequest {
-        let mut messages = vec![tree_message(snapshot)];
+    /// A Tree turn's opening message in the shape `TurnMemoryViews::lead`
+    /// gives it: the snapshot's marked block, the stable block, the thread
+    /// view's `rungs` marked rungs, the view's rest, then the message.
+    fn tree_message(snapshot: bool, rungs: usize) -> Message {
+        let mut blocks = Vec::new();
+        if snapshot {
+            blocks.push(ContentBlock::MemoryView {
+                text: "[WORKSPACE MEMORY VIEW]\n[w/0+4] shared\n".into(),
+            });
+        }
+        blocks.push(stable_block());
+        if rungs > 0 {
+            blocks.push(ContentBlock::MemoryView {
+                text: "[THREAD MEMORY VIEW]\n[0+8] old\n".into(),
+            });
+        }
+        if rungs > 1 {
+            blocks.push(ContentBlock::MemoryView {
+                text: "[8+4] middle\n".into(),
+            });
+        }
+        if rungs > 0 {
+            blocks.push(text_block("[12+1] new\n[END THREAD MEMORY VIEW]"));
+        }
+        blocks.push(text_block("Request: hello"));
+        user_blocks(blocks)
+    }
+
+    /// `rounds` rounds of a turn, the first message being `opening`.
+    fn turn_of(opening: Message, rounds: usize) -> ClaudeRequest {
+        let mut messages = vec![opening];
         for _ in 1..rounds {
             messages.push(Message {
                 role: "assistant".into(),
@@ -3721,6 +3801,16 @@ mod tests {
             });
         }
         request_for(messages)
+    }
+
+    /// A Tree turn after `rounds` rounds, with two thread view rungs.
+    fn tree_turn(snapshot: bool, rounds: usize) -> ClaudeRequest {
+        turn_of(tree_message(snapshot, 2), rounds)
+    }
+
+    /// A Classic turn's opening message: the stable block, then the rest.
+    fn classic_message() -> Message {
+        user_blocks(vec![stable_block(), text_block("Request: hello")])
     }
 
     /// Where each marker sits: `tools`, `system`, or `m<message>b<block>`.
@@ -3750,13 +3840,14 @@ mod tests {
     }
 
     /// A Tree turn's first round writes the snapshot and both thread view
-    /// marks, so the next turn reads the view's stable start. The system
-    /// marker gives way: every view prefix already holds the system block.
+    /// marks, so the next turn reads the view's stable start. The system and
+    /// stable markers give way: every view prefix already holds the system
+    /// block, and the rungs' prefixes hold the stable block.
     #[test]
     fn a_tree_first_round_marks_the_snapshot_and_both_thread_marks() {
         assert_eq!(
             marked(&tree_turn(true, 1)),
-            ["m0b0", "m0b1", "m0b2", "m0b4"]
+            ["m0b0", "m0b2", "m0b3", "m0b5"]
         );
     }
 
@@ -3766,7 +3857,69 @@ mod tests {
     fn a_later_tree_round_keeps_the_snapshot_and_the_first_thread_mark() {
         assert_eq!(
             marked(&tree_turn(true, 2)),
-            ["m0b0", "m0b1", "m1b0", "m2b0"]
+            ["m0b0", "m0b2", "m1b0", "m2b0"]
+        );
+    }
+
+    /// A new thread has no thread view yet. The free markers go to the system
+    /// block and to the stable block, so the next turn reads both.
+    #[test]
+    fn a_new_tree_thread_marks_the_system_and_the_stable_block() {
+        assert_eq!(
+            marked(&turn_of(tree_message(true, 0), 1)),
+            ["system", "m0b0", "m0b1", "m0b2"]
+        );
+    }
+
+    /// A trigger's later round keeps both messages and the snapshot. The system
+    /// block takes the last marker, so a fire still reads it across fires.
+    #[test]
+    fn a_later_tree_trigger_round_marks_the_snapshot_and_the_system_block() {
+        assert_eq!(
+            marked(&turn_of(tree_message(true, 0), 2)),
+            ["system", "m0b0", "m1b0", "m2b0"]
+        );
+    }
+
+    /// A Classic turn marks the stable block, the system block, the message,
+    /// and the tools: the system entry reads them whole on the next turn.
+    #[test]
+    fn a_classic_first_round_marks_the_stable_block_and_the_tools() {
+        assert_eq!(
+            marked(&turn_of(classic_message(), 1)),
+            ["tools", "system", "m0b0", "m0b1"]
+        );
+    }
+
+    /// With an earlier message, whether resumed tool blocks or a second round,
+    /// the penultimate marker takes a slot and the tools marker gives way.
+    #[test]
+    fn a_classic_turn_with_an_earlier_message_drops_the_tools_marker() {
+        assert_eq!(
+            marked(&turn_of(classic_message(), 2)),
+            ["system", "m0b0", "m1b0", "m2b0"]
+        );
+        let resumed = request_for(vec![
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("earlier work".into()),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("[tool result]".into()),
+            },
+            classic_message(),
+        ]);
+        assert_eq!(marked(&resumed), ["system", "m1b0", "m2b0", "m2b1"]);
+    }
+
+    /// A message with no stable block, which is every request the engine sent
+    /// before it, keeps its markers: tools, system, and the message.
+    #[test]
+    fn a_message_without_a_stable_block_keeps_the_old_markers() {
+        assert_eq!(
+            marked(&turn_of(user_blocks(vec![text_block("Request: hello")]), 1)),
+            ["tools", "system", "m0b0"]
         );
     }
 
@@ -3819,7 +3972,7 @@ mod tests {
     fn a_tree_turn_with_no_snapshot_marks_the_system_block() {
         assert_eq!(
             marked(&tree_turn(false, 1)),
-            ["system", "m0b0", "m0b1", "m0b3"]
+            ["system", "m0b1", "m0b2", "m0b4"]
         );
     }
 
@@ -3827,16 +3980,34 @@ mod tests {
     #[test]
     fn no_tree_request_carries_more_than_four_breakpoints() {
         for snapshot in [true, false] {
-            for rounds in 1..5 {
-                let req = tree_turn(snapshot, rounds);
-                assert_eq!(breakpoints(&req), 4, "snapshot {snapshot}, {rounds} rounds");
+            for rungs in 0..3 {
+                for rounds in 1..5 {
+                    let req = turn_of(tree_message(snapshot, rungs), rounds);
+                    assert!(
+                        breakpoints(&req) <= MAX_CACHE_BREAKPOINTS,
+                        "snapshot {snapshot}, {rungs} rungs, {rounds} rounds"
+                    );
+                }
             }
         }
     }
 
-    /// I2 of the tree memory plan: a Classic request is byte-identical to the
-    /// one the engine sent before the Tree module existed. The fixture was
-    /// written by the pre-Tree build, so regenerating it to pass is the failure.
+    /// Nor does a Classic one, with or without a stable block.
+    #[test]
+    fn no_classic_request_carries_more_than_four_breakpoints() {
+        for rounds in 1..5 {
+            for opening in [classic_message(), user_blocks(vec![text_block("hi")])] {
+                assert!(breakpoints(&turn_of(opening, rounds)) <= MAX_CACHE_BREAKPOINTS);
+            }
+        }
+    }
+
+    /// I2 of the tree memory plan: this input, a message with no stable block,
+    /// goes out byte for byte as the pre-Tree build sent it. The fixture pins
+    /// what the wire writes for a fixed input, not what the engine assembles:
+    /// a Classic turn's assembled message now opens with a stable block. The
+    /// fixture was written by the pre-Tree build, so regenerating it to pass is
+    /// the failure.
     #[test]
     fn a_classic_request_is_byte_identical_to_the_pre_tree_build() {
         let body = serde_json::to_string_pretty(&request_for(classic_round_two()))

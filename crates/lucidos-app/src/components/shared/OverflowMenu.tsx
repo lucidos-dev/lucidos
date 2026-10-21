@@ -1,12 +1,20 @@
-import type { ComponentChildren } from 'preact';
+import type { ComponentChildren, JSX } from 'preact';
 import { useState, useRef, useEffect } from 'preact/hooks';
 import { Overlay } from './Overlay';
-import { useAnchoredPosition, pointAnchor, type AnchorAlign, type AnchorBox, type ViewportPoint } from '../../hooks/useAnchoredPopover';
-import { useLongPress } from '../../hooks/useLongPress';
-import { viewportIsMobile } from '../../utils/viewport';
+import { useAnchoredPosition, pointAnchor, type AnchorAlign, type AnchorBox, type AnchorPosition, type ViewportPoint } from '../../hooks/useAnchoredPopover';
+import { useObjectMenu } from './useObjectMenu';
 import { MoreIcon } from './icons';
 import type { ChunkGate } from '../../utils/lazyComponent';
 import { usePendingOpen } from '../../hooks/usePendingOpen';
+
+/** Places the menu once measured. `--anchor-room` is the room on the side it
+ *  opens. `.thread-overflow-menu` caps its height to it, so a long menu
+ *  scrolls instead of running off the screen. */
+export function overflowMenuPanelStyle(pos: Pick<AnchorPosition, 'top' | 'left' | 'maxHeight'> | null): JSX.CSSProperties {
+  return pos
+    ? { position: 'fixed', top: `${pos.top}px`, left: `${pos.left}px`, '--anchor-room': `${pos.maxHeight}px` }
+    : { visibility: 'hidden' };
+}
 
 /** What counts as a row for roving focus and for the keyboard-open focus. */
 const MENU_ITEM_ROLES = '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]';
@@ -286,9 +294,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
         panelRole="menu"
         panelRef={menuRef}
         panelProps={{ onKeyDown: handleMenuKeyDown }}
-        panelStyle={pos
-          ? { position: 'fixed', top: `${pos.top}px`, left: `${pos.left}px` }
-          : { visibility: 'hidden' }}
+        panelStyle={overflowMenuPanelStyle(pos)}
       >
         {menu && items({ run, anchor: menu.anchor })}
       </Overlay>
@@ -307,10 +313,8 @@ function FaceTrigger({ face, open, triggerRef, onTap, onGesture }: {
   onTap: (e: MouseEvent) => void;
   onGesture: OverflowMenuOpener;
 }) {
-  const press = useLongPress(
-    (el, at) => onGesture(el, viewportIsMobile.value ? undefined : at),
-    onTap,
-  );
+  const menu = useObjectMenu({ onTap });
+  menu.opener.current = onGesture;
   return (
     <button
       ref={triggerRef}
@@ -320,13 +324,8 @@ function FaceTrigger({ face, open, triggerRef, onTap, onGesture }: {
       data-tooltip={face.label}
       aria-haspopup="menu"
       aria-expanded={open}
-      onPointerDown={press.onPointerDown}
-      onPointerMove={press.onPointerMove}
-      onPointerUp={press.onPointerUp}
-      onPointerLeave={press.onPointerLeave}
-      onPointerCancel={press.onPointerCancel}
-      onContextMenu={(e) => { if (!e.altKey) press.onContextMenu(e); }}
-      onClick={press.onClick}
+      {...menu.press}
+      onClick={menu.onClick}
     >
       {face.children}
     </button>

@@ -93,7 +93,7 @@ fn every_copy_of_the_wait_cap_states_the_engine_constant() {
 
 /// A coding agent's shell holds none of the workspace's secrets. A task it
 /// starts through the engine must not either, or the route hands them over:
-/// the chat tool's env carries every `CRED_*` and `OAUTH_*` value.
+/// the chat tool's env carries each `CRED_*` and `OAUTH_*` value its text names.
 #[test]
 fn a_coding_agents_background_task_never_gets_the_workspace_secrets() {
     use crate::test_support::source_scan::{read_production_source, src_root};

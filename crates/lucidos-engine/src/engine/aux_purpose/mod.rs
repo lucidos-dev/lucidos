@@ -32,7 +32,8 @@ use sqlx::PgPool;
 
 use crate::core::prefs::{self, Optional, Pref, Text};
 use crate::engine::ContextPurpose;
-use crate::llm::model_registry::{default_effort, ModelRegistry, ProviderKind};
+use crate::llm::model_registry::{default_effort, Generation, ModelRegistry, ProviderKind};
+use crate::llm::not_served::NotServedLedger;
 use crate::llm::LlmProvider;
 
 use crate::engine::event_bus::EventBus;
@@ -40,7 +41,7 @@ use crate::llm::AuxProvider;
 pub use default::ModelSource;
 pub(crate) use default::{asks_no_model, recommended, recommended_effort, select as select_model};
 use not_served_report::NotServedRecorder;
-pub(crate) use reach::{NotServed, Reach};
+pub(crate) use reach::{seed_not_served, Reach};
 
 /// The preference pair one auxiliary purpose reads.
 ///
@@ -70,6 +71,44 @@ pub(crate) const SUMMARY_COMPACTION_PREFS: ProviderResolvedPrefs = ProviderResol
     reasoning: &prefs::REASONING_SUMMARY_COMPACTION,
 };
 
+/// What runs instead of the named model, and why. `None` on a selection means
+/// the named model runs as it is.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum GenerationStep {
+    /// The named model was retired, and its successor `model` runs.
+    Successor { model: String },
+    /// Nothing from the named model on is reachable, so the earlier `model`
+    /// runs.
+    Predecessor { model: String },
+    /// The named model was retired to `successor`, which is not reachable, so
+    /// the named model keeps running.
+    Held { successor: String },
+}
+
+impl GenerationStep {
+    /// The step a call naming `model` under `source` takes, as the router
+    /// resolves it.
+    fn of(
+        registry: &ModelRegistry,
+        reach: &Reach,
+        model: &str,
+        source: ModelSource,
+    ) -> Option<Self> {
+        let resolved = reach.resolve(registry, model, source.generation_rule());
+        match resolved.generation {
+            Generation::Named => None,
+            Generation::Successor => Some(Self::Successor {
+                model: resolved.model,
+            }),
+            Generation::Predecessor => Some(Self::Predecessor {
+                model: resolved.model,
+            }),
+            Generation::Held { successor } => Some(Self::Held { successor }),
+        }
+    }
+}
+
 /// A resolved *model selection* for one auxiliary call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AuxSelection {
@@ -79,10 +118,13 @@ pub(crate) struct AuxSelection {
     /// else no effort at all.
     pub(crate) reasoning: Option<String>,
     pub(crate) source: ModelSource,
-    /// Whether a configured provider serves `model` and has not answered
-    /// not-found for it. Only a stored pick or the chat model can be
-    /// unreachable, and their calls then fail naming why.
+    /// Whether a configured provider serves `model`, or a generation of it
+    /// the call may move to, and has not answered not-found for it. Only a
+    /// stored pick or the chat model can be unreachable, and their calls then
+    /// fail naming why.
     pub(crate) reachable: bool,
+    /// What runs instead of `model` within its *lineage*, and why.
+    pub(crate) generation: Option<GenerationStep>,
     /// Where a default call moves when `model` answers not-found. `None` for a
     /// stored pick or the chat model, which move nowhere (ADR 0403).
     pub(crate) fallback: Option<String>,
@@ -271,11 +313,7 @@ pub(crate) async fn resolve_selection(
     router: &dyn LlmProvider,
     purpose: ContextPurpose,
 ) -> AuxSelection {
-    // An unfiltered router (`None`) answers for every provider.
-    let configured = router
-        .configured_providers()
-        .unwrap_or_else(|| ProviderKind::ALL.to_vec());
-    let reach = Reach::new(configured, NotServed::recent(pool).await);
+    let reach = Reach::of(pool, router).await;
     let recommended = recommended(purpose, registry);
     // The model turns run on: the stored one, else the router's own default,
     // which already carries `LUCIDOS_MODEL`.
@@ -330,6 +368,7 @@ pub(crate) async fn resolve_selection(
             reasoning,
             source: ModelSource::ChatModel,
             reachable: true,
+            generation: None,
             fallback: None,
             not_served: Vec::new(),
             needs_vision: needs_vision(purpose),
@@ -345,7 +384,8 @@ pub(crate) async fn resolve_selection(
         _ => None,
     };
     AuxSelection {
-        reachable: reach.serves(registry, &model),
+        reachable: reach.serves(registry, &model, source.generation_rule()),
+        generation: GenerationStep::of(registry, &reach, &model, source),
         not_served: default::passed_over(&model, source, &recommended, registry, &reach),
         fallback,
         needs_vision: needs_vision(purpose),
@@ -555,7 +595,7 @@ impl AuxCall {
             bus: bus.clone(),
             pool: pool.clone(),
             registry: registry.clone(),
-            reach: Reach::new(configured, NotServed::default()),
+            reach: Reach::new(configured, NotServedLedger::default()),
             purpose,
             source: self.selection.source,
         }));
@@ -576,6 +616,7 @@ impl AuxCall {
                 reasoning,
                 source: ModelSource::Default,
                 reachable: true,
+                generation: None,
                 fallback: None,
                 not_served: Vec::new(),
                 needs_vision: needs_vision(purpose),
@@ -594,7 +635,8 @@ impl AuxCall {
             self.router.clone(),
             self.selection.model.clone(),
             self.budget.attempt_timeout,
-        );
+        )
+        .with_generation_rule(self.selection.source.generation_rule());
         Arc::new(match &self.report {
             Some(report) => provider.reporting(report.clone(), self.selection.fallback.clone()),
             None => provider,
@@ -605,8 +647,15 @@ impl AuxCall {
         &self.selection
     }
 
-    pub(crate) fn model(&self) -> &str {
-        &self.selection.model
+    /// The model the router sends: the selected model, or the generation of it
+    /// that runs instead.
+    pub(crate) fn running_model(&self) -> &str {
+        match &self.selection.generation {
+            Some(GenerationStep::Successor { model } | GenerationStep::Predecessor { model }) => {
+                model
+            }
+            Some(GenerationStep::Held { .. }) | None => &self.selection.model,
+        }
     }
 
     pub(crate) fn reasoning(&self) -> Option<&str> {

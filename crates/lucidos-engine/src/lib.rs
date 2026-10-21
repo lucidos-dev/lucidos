@@ -77,6 +77,9 @@ pub mod memory;
 mod migration_tests;
 pub mod net_config;
 pub mod paths;
+pub mod preflight;
+#[cfg(test)]
+mod rung_vocabulary_tests;
 pub mod runtime;
 pub mod scheduler;
 #[cfg(test)]

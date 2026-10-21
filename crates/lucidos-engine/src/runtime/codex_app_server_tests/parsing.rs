@@ -71,7 +71,7 @@ fn thread_started_emits_init_once() {
 #[test]
 fn agent_message_deltas_stream_and_completed_emits_only_remainder() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "item/agentMessage/delta",
@@ -106,7 +106,7 @@ fn agent_message_deltas_stream_and_completed_emits_only_remainder() {
 #[test]
 fn only_the_first_delta_of_an_agent_message_opens_a_block() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let mut delta = |item: &str, text: &str| {
         note(
             &mut t,
@@ -128,7 +128,7 @@ fn only_the_first_delta_of_an_agent_message_opens_a_block() {
 #[test]
 fn a_completed_remainder_continues_its_block_but_an_unstreamed_message_opens_one() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     note(
         &mut t,
         "item/agentMessage/delta",
@@ -162,7 +162,7 @@ fn a_completed_remainder_continues_its_block_but_an_unstreamed_message_opens_one
 #[test]
 fn plan_update_emits_normalized_todo_list_pair() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "turn/plan/updated",
@@ -207,13 +207,13 @@ fn plan_update_dedupes_identical_snapshots_across_turns() {
         "plan": [{"step": "a", "status": "inProgress"}],
     });
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     assert_eq!(note(&mut t, "turn/plan/updated", plan.clone()).len(), 2);
     // Identical snapshot — nothing new to show.
     assert!(note(&mut t, "turn/plan/updated", plan.clone()).is_empty());
     // The plan persists across turns: a new turn re-announcing the unchanged
     // list must not re-emit a card (dedup state survives begin_turn).
-    t.begin_turn();
+    t.begin_turn(None);
     assert!(note(&mut t, "turn/plan/updated", plan).is_empty());
     // A changed snapshot emits a fresh pair with a distinct id.
     let evs = note(
@@ -248,7 +248,7 @@ fn plan_update_dedupes_identical_snapshots_across_turns() {
 #[test]
 fn reasoning_deltas_emit_thoughts() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "item/reasoning/textDelta",
@@ -275,7 +275,7 @@ fn reasoning_deltas_emit_thoughts() {
 #[test]
 fn fully_streamed_agent_message_emits_nothing_at_completion() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     note(
         &mut t,
         "item/agentMessage/delta",
@@ -295,7 +295,7 @@ fn unstreamed_agent_message_emits_full_text_at_completion() {
     // No deltas at all (codex may batch) — the completed item is the only
     // carrier of the text and must emit it whole.
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "item/completed",
@@ -307,7 +307,7 @@ fn unstreamed_agent_message_emits_full_text_at_completion() {
 #[test]
 fn command_execution_pairs_tool_use_and_result() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "item/started",
@@ -343,7 +343,7 @@ fn a_missing_exit_code_reads_as_unknown_not_success() {
     // A killed command carries no `exitCode` key at all. Reporting `0` here
     // would tell the model the command succeeded.
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     note(
         &mut t,
         "item/started",
@@ -372,7 +372,7 @@ fn a_missing_exit_code_reads_as_unknown_not_success() {
 fn declined_command_maps_to_error_status() {
     // `declined` = the user denied the approval; the command never ran.
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     note(
         &mut t,
         "item/started",
@@ -398,7 +398,7 @@ fn declined_command_maps_to_error_status() {
 #[test]
 fn approval_gated_command_started_waits_until_acceptance() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     t.note_approval_request(&ApprovalRequest {
         item_id: "i7".into(),
         tool_name: "command_execution".into(),
@@ -444,7 +444,7 @@ fn approval_gated_command_started_waits_until_acceptance() {
 #[test]
 fn approval_gated_command_decline_suppresses_deferred_step_and_result() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     t.note_approval_request(&ApprovalRequest {
         item_id: "i8".into(),
         tool_name: "command_execution".into(),
@@ -479,7 +479,7 @@ fn approval_gated_command_decline_suppresses_deferred_step_and_result() {
 #[test]
 fn mcp_tool_call_uses_cc_compatible_name() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "item/started",
@@ -503,7 +503,7 @@ fn mcp_tool_call_uses_cc_compatible_name() {
 #[test]
 fn turn_completed_closes_open_tools_then_emits_result() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     note(
         &mut t,
         "item/started",
@@ -532,7 +532,7 @@ fn turn_completed_closes_open_tools_then_emits_result() {
 #[test]
 fn failed_turn_carries_the_error_message() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "turn/completed",
@@ -552,7 +552,7 @@ fn interrupted_turn_emits_error_free_result() {
     // The engine's user_hit_stop latch turns this into ResponseCanceled —
     // an error here would mislabel a user cancel as a failure.
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "turn/completed",
@@ -564,7 +564,7 @@ fn interrupted_turn_emits_error_free_result() {
 #[test]
 fn turn_started_records_the_interrupt_target() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     note(
         &mut t,
         "turn/started",
@@ -602,7 +602,7 @@ fn token_usage_maps_to_uncached_input_convention() {
 #[test]
 fn error_notification_is_recorded_not_terminal() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "error",
@@ -616,7 +616,7 @@ fn error_notification_is_recorded_not_terminal() {
 #[test]
 fn file_change_strips_diffs_from_the_persisted_input() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let evs = note(
         &mut t,
         "item/started",
@@ -668,7 +668,7 @@ fn file_change_approval_is_given_the_paths_from_its_item() {
     // permission card reads as a bare "file_change" and the user is asked to
     // authorize a write they cannot see.
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     started_file_change(&mut t, "i6", "/Users/me/notes.txt");
 
     let mut approval = file_change_approval("i6");
@@ -690,7 +690,7 @@ fn file_change_approvals_never_borrow_another_items_paths() {
     // Two concurrent patches each get their own card (the item id is in the
     // input for exactly that reason); enriching one must not leak the other.
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     started_file_change(&mut t, "i1", "/one.txt");
     started_file_change(&mut t, "i2", "/two.txt");
 
@@ -709,7 +709,7 @@ fn an_unknown_item_leaves_the_approval_exactly_as_it_arrived() {
     // Degrade, never block: a reordered or dropped notification on some future
     // codex must cost the card its detail, not the approval its round-trip.
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     let mut approval = file_change_approval("never-announced");
     let before = approval.input.clone();
     t.attach_known_file_changes(&mut approval);
@@ -729,7 +729,7 @@ fn an_unknown_item_leaves_the_approval_exactly_as_it_arrived() {
 #[test]
 fn remembered_file_changes_do_not_outlive_their_item_or_their_turn() {
     let mut t = AppServerTracker::new(Some("t-1".into()));
-    t.begin_turn();
+    t.begin_turn(None);
     started_file_change(&mut t, "i6", "/Users/me/notes.txt");
     note(
         &mut t,
@@ -746,11 +746,35 @@ fn remembered_file_changes_do_not_outlive_their_item_or_their_turn() {
     );
 
     started_file_change(&mut t, "i7", "/Users/me/other.txt");
-    t.begin_turn();
+    t.begin_turn(None);
     let mut approval = file_change_approval("i7");
     t.attach_known_file_changes(&mut approval);
     assert!(
         approval.input.get("changes").is_none(),
         "a new turn starts with no remembered items"
+    );
+}
+
+/// The usage names the effort the driver sent with its turn, so the capture
+/// records what the call ran at.
+#[test]
+fn token_usage_carries_the_effort_the_turn_was_sent_with() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn(Some("low".into()));
+    let evs = note(
+        &mut t,
+        "thread/tokenUsage/updated",
+        serde_json::json!({"threadId": "t-1", "turnId": "u1", "tokenUsage": {
+            "last": {"inputTokens": 100, "cachedInputTokens": 60, "outputTokens": 5,
+                     "reasoningOutputTokens": 0, "totalTokens": 105}
+        }}),
+    );
+
+    assert!(
+        matches!(
+            &evs[..],
+            [AgentEvent::Usage { reasoning_effort: Some(effort), .. }] if effort == "low"
+        ),
+        "{evs:?}"
     );
 }

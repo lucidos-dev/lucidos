@@ -1,10 +1,10 @@
 import { computed, effect, signal, untracked } from '@preact/signals';
-import { clampHomeRailWidth } from '../homeRail';
+import { clampDashboardRailWidth } from '../dashboardRail';
 import { preferences, showToast, removeToast, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, currentModel, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured, welcomeDismissed, type NotificationsFilter } from '../store';
 import type { CodingAgent } from '../../api/types';
 import type { ThreadState } from '../thread-events';
 import { failedIfFresh } from '../types';
-import { getPreferences, setPreference, isTransientFetchError, retryTransientRead, getTheme, ApiError } from '../../api/client';
+import { getPreferences, setPreference, isTransientFetchError, retryTransient, getTheme, ApiError } from '../../api/client';
 import { resolvedHexColor } from '../../utils/cssColor';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
@@ -278,7 +278,7 @@ function deliverOrPark(key: string, write: PendingPreferenceWrite): Promise<void
  *
  *  Two attempts rather than one because the two transient causes need different
  *  medicine. A radio handoff or a stale connection heals within milliseconds, so
- *  the immediate re-send usually lands (this is `retryTransientRead`'s bargain,
+ *  the immediate re-send usually lands (this is `retryTransient`'s bargain,
  *  applied to the most idempotent write in the app). A suspended page does not,
  *  so the second failure hands off to the resume flush instead of burning more
  *  attempts against a webview that is not running.
@@ -377,13 +377,13 @@ let scaleMeasurementPending = false;
  *  is authored in rem. Un-remeasured, the composer stops lining up with the
  *  transcript at any scale but the one live at boot. The thread drawer's floor
  *  is what its rem-authored header row needs, so scaling up can leave a settled
- *  drawer narrower than its own header. The Home board's rail is two board
+ *  drawer narrower than its own header. The dashboard's rail is two dashboard
  *  cells at least, by the same rule. */
 function measureScaleDerivedValues(): void {
   scaleMeasurementPending = false;
   publishScrollbarGutter();
   clampThreadDrawerWidth();
-  clampHomeRailWidth();
+  clampDashboardRailWidth();
 }
 
 /** Owe one measurement pass, on the next frame, however many callers ask.
@@ -1040,6 +1040,26 @@ export function setNotificationToasts(enabled: boolean): Promise<void> {
   });
 }
 
+// --- Composer Enter key ---
+
+/** Device-local mirror of `composer_enter_key`, for the same reason the toasts
+ *  switch keeps one. A send cannot be taken back, so the window before
+ *  preferences load must not hand Enter-to-send to a user who chose a new line. */
+const COMPOSER_ENTER_KEY_STORAGE_KEY = 'lucidos-composer-enter-key';
+
+export type ComposerEnterKey = PreferenceValues<'composer_enter_key'>;
+
+/** What Enter does in the composer on a desktop layout. */
+export function currentComposerEnterKey(): ComposerEnterKey {
+  return currentPreference('composer_enter_key', COMPOSER_ENTER_KEY_STORAGE_KEY);
+}
+
+export function setComposerEnterKey(mode: ComposerEnterKey): Promise<void> {
+  return savePreference('composer_enter_key', mode, () => {
+    localStorage.setItem(COMPOSER_ENTER_KEY_STORAGE_KEY, mode);
+  });
+}
+
 // --- Autocorrect ---
 
 /** Whether this device's prose fields autocorrect. A stored value wins on any
@@ -1120,6 +1140,21 @@ export function accountChatEffort(modelId: string): string | null {
   return stored === undefined ? modelDefaultEffort(modelId) : clampEffortFor(stored, modelId);
 }
 
+/** Store the tier for `model` in `chat_reasoning_efforts`. The list is written
+ *  whole, so writing it unread would drop every other model's tier. `null`
+ *  removes the model's entry, so it runs at its default effort. */
+async function saveModelEffort(model: string, effort: string | null): Promise<void> {
+  if (preferences.value.status !== 'loaded') {
+    if (effort !== null) {
+      showToast('Preferences have not loaded, so the reasoning effort was not saved', 'error');
+    }
+    return;
+  }
+  const stored = storedChatEfforts();
+  const next = withChatEffort(stored, model, effort);
+  if (next !== (stored ?? '')) await savePreference('chat_reasoning_efforts', next);
+}
+
 /** Persist the chat *model selection*, both halves.
  *
  *  One pick sets the pair, and the tier is stored for that model alone, so
@@ -1129,17 +1164,22 @@ export async function setChatModelSelection(
   patch: { model: string; reasoningEffort: string | null },
 ): Promise<void> {
   await savePreference('chat_model', patch.model, () => { currentModel.value = patch.model; });
-  // The list is written whole, so writing it unread would drop every other
-  // model's tier.
-  if (preferences.value.status !== 'loaded') {
-    if (patch.reasoningEffort !== null) {
-      showToast('Preferences have not loaded, so the reasoning effort was not saved', 'error');
-    }
-    return;
-  }
-  const stored = storedChatEfforts();
-  const next = withChatEffort(stored, patch.model, patch.reasoningEffort);
-  if (next !== (stored ?? '')) await savePreference('chat_reasoning_efforts', next);
+  await saveModelEffort(patch.model, patch.reasoningEffort);
+}
+
+/** The model an intent trigger with no pin runs on: the stored `trigger_model`,
+ *  else its catalog default. Open like `currentChatModel`: any registry id. */
+export function currentTriggerModel(): string {
+  return currentPreference('trigger_model');
+}
+
+/** Persist the *trigger model* selection, both halves. The tier lands in the
+ *  same per-model list chat uses, so it follows the model into either place. */
+export async function setTriggerModelSelection(
+  patch: { model: string; reasoningEffort: string | null },
+): Promise<void> {
+  await savePreference('trigger_model', patch.model);
+  await saveModelEffort(patch.model, patch.reasoningEffort);
 }
 
 // --- Response style ---
@@ -1315,7 +1355,7 @@ async function loadPreferencesAs(mySeq: number): Promise<void> {
     // load once it fails (SSE only re-fires an already-`loaded` value): a
     // single cancelled startup fetch would otherwise paint every setting at
     // its default for the rest of the page load.
-    const res = await retryTransientRead(() => getPreferences(getDeviceId()));
+    const res = await retryTransient(() => getPreferences(getDeviceId()));
     // A newer call was issued while this one was in flight: its outcome
     // wins, so applying this stale one would overwrite fresher data.
     if (mySeq !== preferencesLoadSeq) return newestPreferencesLoad;
@@ -1335,6 +1375,7 @@ async function loadPreferencesAs(mySeq: number): Promise<void> {
     currentModel.value = currentChatModel();
     notificationsFilter.value = currentNotificationsFilter();
     cacheServedValue('notification_toasts', NOTIFICATION_TOASTS_KEY);
+    cacheServedValue('composer_enter_key', COMPOSER_ENTER_KEY_STORAGE_KEY);
     // The cache first: a stale mirror would otherwise answer for an unset key.
     cacheServedValue('autocorrect', AUTOCORRECT_STORAGE_KEY);
     setProseAutocorrect(currentAutocorrect());
@@ -1381,6 +1422,13 @@ export function setLocalBaseUrl(url: string): Promise<void> {
   return savePreference('local_base_url', url.trim());
 }
 
+/** The `claude_gateway_url` preference, or '' when none is set. Written only
+ *  through a gateway sign-in, which stores the URL it signs in to. */
+export function currentClaudeGatewayUrl(): string {
+  if (preferences.value.status !== 'loaded') return '';
+  return preferences.value.data['claude_gateway_url'] || '';
+}
+
 // --- OpenCode Free (keyless) ---
 
 /** Whether the keyless OpenCode Free tier is on. Off by default, because
@@ -1397,12 +1445,13 @@ export function setOpenCodeFreeEnabled(enabled: boolean): Promise<void> {
 
 /** Providers whose switch is the `provider_enabled_<id>` preference. OpenCode
  *  Free is deliberately absent: it is opt-IN under its own key (ADR 0104),
- *  where these six are opt-OUT. Ids match the engine's `ProviderKind`. */
+ *  where these seven are opt-OUT. Ids match the engine's `ProviderKind`. */
 export type SwitchableProvider =
-  | 'vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' | 'local';
+  | 'vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' | 'local' | 'claude-gateway';
 
+/** The kebab-case provider id becomes the snake_case key suffix. */
 function providerEnabledKey(id: SwitchableProvider): string {
-  return `provider_enabled_${id}`;
+  return `provider_enabled_${id.replace('-', '_')}`;
 }
 
 /** Whether the user has explicitly switched this provider OFF.
@@ -1429,7 +1478,7 @@ export function setProviderEnabled(
  *  TypeSafe (Jev), Cloudflare Workers AI (Clef and Clef-flash), and a custom
  *  endpoint.
  *
- *  Same key family and same absent-means-on rule as the six, and deliberately
+ *  Same key family and same absent-means-on rule as the seven, and deliberately
  *  outside `SwitchableProvider`. A System One model answers typed questions
  *  rather than holding a conversation, so it has no `ProviderKind` and never
  *  appears in `/health.configured_providers` (ADR 0220). Nothing keyed on that
@@ -1470,7 +1519,7 @@ export function switchValueReadsAsOff(raw: string | undefined): boolean {
 }
 
 /** Switch one System One provider on or off, by its switch key. Off leaves
- *  the stored credential alone, exactly as the six do: the switch parks the
+ *  the stored credential alone, exactly as the seven do: the switch parks the
  *  provider, and Remove is what deletes the key. */
 export function setSystemOneEnabled(switchKey: string, enabled: boolean): Promise<void> {
   return savePreference(switchKey, enabled ? 'true' : 'false');
@@ -1486,6 +1535,17 @@ export function currentCaptureContext(): boolean {
 
 export function setCaptureContext(enabled: boolean): Promise<void> {
   return savePreference('capture_context', enabled ? 'true' : 'false');
+}
+
+// --- Cache-warm line ---
+
+/** Whether a thread waiting on the user draws the cache-warm line. */
+export function currentCacheWarmLine(): boolean {
+  return currentPreference('cache_warm_line') === 'true';
+}
+
+export function setCacheWarmLine(enabled: boolean): Promise<void> {
+  return savePreference('cache_warm_line', enabled ? 'true' : 'false');
 }
 
 // --- Experimental: in-app browser (Tauri native webview) ---

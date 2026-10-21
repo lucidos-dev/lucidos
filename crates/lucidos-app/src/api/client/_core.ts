@@ -119,19 +119,20 @@ export function isTransientFetchError(err: unknown): boolean {
   return isTransportError(err);
 }
 
-/** Run an idempotent read once more when the first attempt fails transiently.
- *  For `Loadable`-backed loaders, where a single cancelled fetch would otherwise
- *  stick as a visible failure until something else happens to refetch. The
+/** Run an idempotent request once more when the first attempt fails
+ *  transiently. A transient failure says nothing about the request, so one
+ *  dropped fetch should not stick as a visible failure. That covers a
+ *  `Loadable`-backed loader and an idempotent write such as a mark-read. The
  *  second failure (or any non-transient one) propagates unchanged.
  *
- *  Only for reads with no caller-supplied `AbortSignal` — a deliberate cancel
+ *  Only for requests with no caller-supplied `AbortSignal` — a deliberate cancel
  *  would be retried with the same, already-aborted signal. */
-export async function retryTransientRead<T>(read: () => Promise<T>): Promise<T> {
+export async function retryTransient<T>(request: () => Promise<T>): Promise<T> {
   try {
-    return await read();
+    return await request();
   } catch (err) {
     if (!isTransientFetchError(err)) throw err;
-    return read();
+    return request();
   }
 }
 

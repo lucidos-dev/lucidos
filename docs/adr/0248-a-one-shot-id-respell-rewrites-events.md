@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-22
+- **Amended**: 2026-10-19 (a known served model may be filled in)
 
 ## Context
 
@@ -77,3 +78,18 @@ silently loses its remembered model, with nothing saying so.
 **Rewrite every event type carrying a `model` field.** Simplest rule to state.
 Rejected: it falsifies the cost ledger, and it corrupts the Claude Code picker's
 own vocabulary, where the old spelling is still right.
+
+## Amendment: a known served model may be filled in
+
+Retiring the `[1m]` twins of Fable 5.1, Opus 5.5 and Sonnet 5.5 split the
+Token Cost app's rows. It groups by model, and the cost ledger names the twin
+id that was sent.
+
+The provider answers a twin call with the bare id, so the reply id is known.
+`20261019180742_retire_the_redundant_1m_twins.sql` writes it as `served_model`
+on each `ContextCaptured` row that names a twin and records no reply id.
+
+This keeps the rule above. `model` still says what Lucidos sent, and a reply id
+already recorded is never replaced. The backfill adds only a fact the ledger
+lacked: what answered. A future backfill must meet the same bar: the value is
+certain, and the field was absent.

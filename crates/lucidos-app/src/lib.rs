@@ -473,6 +473,10 @@ fn restart_service() -> Result<(), String> {
     desktop::restart_service()
 }
 
+/// The menu item that really quits. Cmd+Q only closes to the menu bar, so any
+/// text that tells the user to quit names this item.
+pub(crate) const QUIT_AND_STOP_SERVICE: &str = "Quit and Stop Background Service";
+
 /// Full teardown: confirm with the user, then stop the always-on gateway
 /// service and exit the client. This is the ONLY path that stops the service.
 /// Closing the window merely hides the client, so triggers, scheduled tasks,
@@ -492,7 +496,7 @@ fn quit_lucidos(app: tauri::AppHandle) {
              until you open Lucidos again.\n\nTo keep them running, close the window instead. \
              Lucidos stays in the menu bar.",
         )
-        .title("Quit and Stop Background Service")
+        .title(QUIT_AND_STOP_SERVICE)
         .buttons(MessageDialogButtons::OkCancelCustom(
             "Quit and Stop Service".to_string(),
             "Cancel".to_string(),
@@ -947,7 +951,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(
         app,
         "tray_quit_stop",
-        "Quit and Stop Background Service",
+        QUIT_AND_STOP_SERVICE,
         true,
         None::<&str>,
     )?;
@@ -1426,7 +1430,7 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
             let quit = MenuItem::with_id(
                 app,
                 "quit_lucidos",
-                "Quit and Stop Background Service",
+                QUIT_AND_STOP_SERVICE,
                 true,
                 None::<&str>,
             )?;

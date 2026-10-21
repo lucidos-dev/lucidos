@@ -693,6 +693,22 @@ pub const NOT_THE_OWNERS_DEVICE: &str =
      If the owner asked you to delete something, tell them it is theirs to do and where the \
      action is. Archive is the one an agent can reach.";
 
+/// [`require_owner_device`], with a refusal that names this route's act
+/// instead of thread deletion.
+pub(crate) async fn require_owner_device_for(
+    headers: &axum::http::HeaderMap,
+    pool: &PgPool,
+    refusal: &'static str,
+) -> Result<MessageOrigin, super::error::ApiError> {
+    require_owner_device(headers, pool).await.map_err(|e| {
+        if e.status == axum::http::StatusCode::FORBIDDEN {
+            super::error::ApiError::new(e.status, refusal)
+        } else {
+            e
+        }
+    })
+}
+
 /// [`require_user_actor`], narrowed to the workspace owner at one of their own
 /// registered devices.
 ///

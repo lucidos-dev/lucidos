@@ -145,7 +145,7 @@ mod tests {
         for (kind, read) in [
             ("trigger-nothing", false),
             ("trigger-pushed", false),
-            ("trigger-pushed-more", true),
+            ("trigger-pushed-failure", true),
             ("trigger-found", true),
             ("trigger-failure", true),
         ] {

@@ -1,3 +1,4 @@
+pub mod agent_role;
 pub mod announced_surfaces;
 pub mod apps;
 pub mod artifacts;
@@ -40,10 +41,13 @@ pub use preference_catalog as prefs;
 pub mod preferences;
 pub mod repositories;
 pub mod response_style;
+pub mod secret_reference;
+pub mod secret_store;
 pub mod shell;
 pub mod shipped_dir;
 pub mod slug;
 pub mod store;
+pub mod subprocess_secrets;
 pub mod system_knowhow;
 pub mod system_widgets;
 pub mod technical_literacy;
@@ -88,23 +92,25 @@ pub fn scrub_database_url_from_process_env() {
 /// default. A name no libpq tool or ORM reads unasked (ADR 0481).
 pub const LUCIDOS_DATABASE_URL: &str = "LUCIDOS_DATABASE_URL";
 
+/// The agent role's read-only URL, set once at boot (ADR 0509).
+static AGENT_DATABASE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the URL [`agent_role::provision`] returned, for every later spawn.
+pub fn set_agent_database_url(url: String) {
+    let _ = AGENT_DATABASE_URL.set(url);
+}
+
 /// The `LUCIDOS_DATABASE_URL` pair for an agent-facing subprocess: coding-agent
 /// sessions, chat `run_bash` / `run_python`, scripts, triggers and background
 /// tasks. Nothing else gets it.
 ///
 /// The command then names the variable, so the password never enters a
-/// persisted tool-call argv. `None` when the boot URL does not parse.
+/// persisted tool-call argv. `None` until boot set up the agent role: a
+/// subprocess never gets the engine's own role instead.
 pub fn lucidos_database_url_env() -> Option<(String, String)> {
-    static URL: std::sync::LazyLock<Option<String>> =
-        std::sync::LazyLock::new(|| read_only_database_url(&database_url()));
-    URL.clone()
-        .map(|url| (LUCIDOS_DATABASE_URL.to_string(), url))
-}
-
-pub(crate) fn read_only_database_url(database_url: &str) -> Option<String> {
-    lucidos_pg_url::PgUrl::parse(database_url)
-        .map(|url| url.read_only_url())
-        .ok()
+    AGENT_DATABASE_URL
+        .get()
+        .map(|url| (LUCIDOS_DATABASE_URL.to_string(), url.clone()))
 }
 
 /// Convert a credential `service_name` or an OAuth provider name into the
@@ -207,42 +213,6 @@ pub fn redact_secret_values(text: &str, secrets: &[String]) -> String {
     out
 }
 
-/// The secret VALUES among a spawned tool's injected environment, ready for
-/// [`redact_secret_values`].
-///
-/// `build_script_env_vars` injects every credential and OAuth token into a
-/// child whose output becomes a tool result, a persisted event, or a trigger
-/// summary. So this is where `system-knowhow/best-practices.md`'s promise that
-/// a credential is "kept out of the event log" is won or lost. A verbose curl
-/// and `env` both echo it. Selecting by value covers a credential's custom
-/// env-var alias for free, since the alias carries the same string.
-///
-/// Every caller handing a child's output on masks with this, except
-/// `api::proxy_script_runner`, which builds its own wider list. Masking by
-/// value has three holes, none closable here. A token can split across two
-/// drain windows, or be cut by `Stream::push` trimming its front. And
-/// `runtime::python` writes a raw copy under `.lucidos/exhaust/` first.
-///
-/// A `CRED_*_USERNAME` and an `OAUTH_*_EMAIL` are deliberately not secrets.
-/// Masking by value is safe only while the value is unique. So the whole
-/// `LUCIDOS_DATABASE_URL` is masked, never its password alone: every dev
-/// workspace's password is the literal `lucidos`, also the user, the database
-/// and every path. [`redact_postgres_secrets`] covers a password elsewhere.
-pub fn injected_secret_values(env_vars: &[(String, String)]) -> Vec<String> {
-    env_vars
-        .iter()
-        .filter(|(key, _)| {
-            (key.starts_with("CRED_") && !key.ends_with("_USERNAME"))
-                || (key.starts_with("OAUTH_") && key.ends_with("_ACCESS_TOKEN"))
-                // Engine-minted, thread-bound, and accepted on every mutating
-                // route, so it is a credential in the sense that matters here.
-                || key == crate::api::actor::ENV_AGENT_ORIGIN_TOKEN
-                || key == LUCIDOS_DATABASE_URL
-        })
-        .map(|(_, value)| value.clone())
-        .collect()
-}
-
 /// Directory structure within workspace/data/
 pub const DATA_DIR: &str = "data";
 pub const ARTIFACTS_DIR: &str = "data/artifacts";
@@ -305,7 +275,7 @@ pub use credentials::{
 };
 pub use data_prefixes::{is_known_data_prefix, known_data_prefixes_text};
 pub use devices::DeviceStore;
-pub use email::{EmailAccount, EmailAccountInfo, EmailStore};
+pub use email::{EmailAccount, EmailAccountInfo, EmailStore, MailPassword};
 pub use environment_variables::{
     apply_to_subprocess_env, inherited_env_var, EnvironmentVariable, EnvironmentVariableStore,
 };
@@ -316,6 +286,11 @@ pub use oauth::{OAuthAccount, OAuthAccountInfo, OAuthStore};
 pub use oauth_registry::OAuthProviderRow;
 pub use pinned_apps::{PinnedAppStore, PinnedAppUi};
 pub use shell::{command_shell, TaskOutcome};
+pub use subprocess_secrets::{
+    inherited_secret_env, is_secret_env_name, redact_subprocess_output,
+    redact_subprocess_output_in_json, subprocess_secret_values, InheritedSecretEnv,
+    InheritedSecrets,
+};
 pub use system_knowhow::{is_system_knowhow_path, resolve_system_knowhow_dir, SystemKnowhowStore};
 pub use system_widgets::{resolve_system_widgets_dir, BUILT_IN_WIDGET_PREFIX};
 
@@ -468,8 +443,8 @@ pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::i
 }
 
 /// Keep `<workspace>/.lucidos` out of Time Machine and every other file-level
-/// backup (ADR 0153). It holds `backup.key`, which decrypts every archive this
-/// workspace ever uploaded.
+/// backup (ADR 0153). It can still hold a legacy `backup.key`, which decrypts
+/// every archive this workspace uploaded before the key store (ADR 0509).
 ///
 /// The gateway marks the same directory when it spawns an engine, so this
 /// covers the launch that skips the gateway: e2e, a test harness, an engine
@@ -488,7 +463,7 @@ pub fn ensure_state_dir_excluded_from_file_backup(
 
 pub use device_presence::DevicePresenceStore;
 pub use events::EventRow;
-pub use mcp_servers::{McpServer, McpServerStore};
+pub use mcp_servers::{McpEnvValue, McpServer, McpServerStore};
 pub use models::{validate_routes, Model, ModelFields, ModelStore, Route};
 pub use preferences::{ModelDefaults, PreferenceStore, ResolvedModelSelection};
 pub use store::{
@@ -670,7 +645,7 @@ pub fn commit_data_paths_added(
     data_relative_paths: &[String],
     message: &str,
 ) -> Result<String, git2::Error> {
-    commit_data_paths_with_overrides(workspace_path, data_relative_paths, &[], message)
+    commit_data_paths_with_overrides(workspace_path, data_relative_paths, &[], &[], message)
 }
 
 /// [`commit_data_paths_added`], but recording chosen paths from a buffer
@@ -690,15 +665,20 @@ pub fn commit_data_paths_added(
 ///
 /// An override for a path not listed in `data_relative_paths` is ignored: the
 /// list decides what the commit covers.
+///
+/// `removals` are paths already deleted from disk, staged as deletions in the
+/// same commit. A plugin update drops files this way. One that was never
+/// committed has no entry to remove and is skipped.
 pub fn commit_data_paths_with_overrides(
     workspace_path: &std::path::Path,
     data_relative_paths: &[String],
     overrides: &[(String, Vec<u8>, u32)],
+    removals: &[String],
     message: &str,
 ) -> Result<String, git2::Error> {
     // Validate before the retry loop: a rejected path is the caller's answer,
     // not contention, so re-checking it on every attempt buys nothing.
-    for p in data_relative_paths {
+    for p in data_relative_paths.iter().chain(removals) {
         if is_path_traversal(p) {
             return Err(git2::Error::from_str(&format!(
                 "Path traversal not allowed: {}",
@@ -718,6 +698,13 @@ pub fn commit_data_paths_with_overrides(
                     bytes,
                 )?,
                 None => add_path_unless_ignored(&repo, &mut index, &repo_relative)?,
+            }
+        }
+        for p in removals {
+            let repo_relative = format!("data/{}", p);
+            let path = std::path::Path::new(&repo_relative);
+            if index.get_path(path, 0).is_some() {
+                index.remove_path(path)?;
             }
         }
         index.write()?;
@@ -1642,10 +1629,8 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Unloading know-how '{}'...",
             args["id"].as_str().unwrap_or("knowhow")
         ),
-        "execute_intent" => format!(
-            "Executing intent {}...",
-            args["intent_id"].as_str().unwrap_or("intent")
-        ),
+        // Retired: the dispatch refuses it and names `load_knowhow` instead.
+        "execute_intent" => "Refusing the retired intent tool...".to_string(),
         "refresh_app" => format!(
             "Refreshing {}...",
             args.get("app_name")
@@ -1944,8 +1929,14 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                 Some("unpin") => format!("Unpinning widget '{}' from the shelf...", widget),
                 Some("make_reusable") => format!("Making widget '{}' reusable...", widget),
                 Some("stop_reusing") => format!("Stopping reuse of widget '{}'...", widget),
-                Some("board") => "Reading the Home board...".to_string(),
-                Some("arrange") => "Arranging the Home board...".to_string(),
+                Some("dashboard") => "Reading the dashboard...".to_string(),
+                Some("add_to_dashboard") => {
+                    format!("Adding widget '{}' to the dashboard...", widget)
+                }
+                Some("remove_from_dashboard") => {
+                    format!("Removing widget '{}' from the dashboard...", widget)
+                }
+                Some("arrange") => "Arranging the dashboard...".to_string(),
                 _ => "Listing reusable widgets...".to_string(),
             }
         }

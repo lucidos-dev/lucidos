@@ -1,35 +1,25 @@
 import { Overlay } from './Overlay';
 import { SurfaceHead } from './Surface';
-import { ReleaseNoticeBody } from './ReleaseNoticeBody';
 import {
-  acknowledgeReleaseNotice,
   dismissReleaseNoticeModal,
-  takeReleaseNoticeAction,
+  openReleaseNoticesPanel,
 } from '../../store/actions/releaseNotices';
-import {
-  modalActionLabel,
-  owedReleaseNotice,
-  owedReleaseNoticeCount,
-  releaseNoticeDismissed,
-} from '../../store/releaseNotices';
+import { owedReleaseNoticeTitles, releaseNoticeDismissed } from '../../store/releaseNotices';
 
 /**
- * The one *release notice* this workspace still owes an answer to.
+ * Announces the *release notices* this workspace still owes, and points at the
+ * Release Notices panel, where they are read and answered.
  *
- * A stepper, not a list. Got it answers the notice on screen and the next one
- * takes its place, so several are read in one sitting and always in order. A
- * later notice cannot be acted on early, because it is not drawn yet.
+ * Not the place to answer them. An action starts a thread, and a modal would
+ * have to close to show it, taking the notices behind it along. The panel
+ * stays put.
  *
- * Escape, the X and an outside click all close WITHOUT answering, so the notice
- * returns on the next open. That is the whole reason the dismissal is a
- * page-local signal rather than a write.
+ * Every way of closing answers nothing, so the modal returns on the next open
+ * until each notice is answered.
  */
 export function ReleaseNoticeModal() {
-  const notice = owedReleaseNotice();
-  if (!notice || releaseNoticeDismissed.value) return null;
-
-  const remaining = owedReleaseNoticeCount();
-  const actionLabel = modalActionLabel(notice);
+  const titles = owedReleaseNoticeTitles();
+  if (titles.length === 0 || releaseNoticeDismissed.value) return null;
 
   return (
     <Overlay
@@ -41,41 +31,31 @@ export function ReleaseNoticeModal() {
       ariaModal
     >
       <SurfaceHead
-        title={notice.title}
+        title={titles.length === 1 ? '1 release notice' : `${titles.length} release notices`}
         onClose={dismissReleaseNoticeModal}
-        closeLabel="Close, and show this notice again later"
+        closeLabel="Close, and show the release notices again later"
       />
       <div class="surface-body dialog-body" tabIndex={-1}>
-        <div class="release-notice-meta">
-          <span>Since Lucidos {notice.since}</span>
-          {/* Only worth saying when there is a queue behind this one. "1 of 1"
-              invents a sequence the reader is not in. */}
-          {remaining > 1 && <span class="release-notice-step">1 of {remaining}</span>}
-        </div>
-        <ReleaseNoticeBody body={notice.body} onLinkClick={dismissReleaseNoticeModal} />
-        {notice.action_deferred && notice.action_label && (
-          <p class="release-notice-deferred">
-            {notice.action_label} comes with a later notice, so you do it once.
-          </p>
-        )}
+        <p>This upgrade changed things you may need to act on.</p>
+        <ul class="release-notice-titles">
+          {titles.map((title) => <li key={title}>{title}</li>)}
+        </ul>
       </div>
       <div class="surface-foot">
         <button
-          class={`action-btn${actionLabel ? ' action-btn-secondary' : ''}`}
-          data-role="release-notice-ack"
-          onClick={() => void acknowledgeReleaseNotice(notice)}
+          class="action-btn action-btn-secondary"
+          data-role="release-notice-later"
+          onClick={dismissReleaseNoticeModal}
         >
-          Got it
+          Later
         </button>
-        {actionLabel && (
-          <button
-            class="action-btn"
-            data-role="release-notice-action"
-            onClick={() => void takeReleaseNoticeAction(notice)}
-          >
-            {actionLabel}
-          </button>
-        )}
+        <button
+          class="action-btn"
+          data-role="release-notice-open"
+          onClick={openReleaseNoticesPanel}
+        >
+          Read them
+        </button>
       </div>
     </Overlay>
   );

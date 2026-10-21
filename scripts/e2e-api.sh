@@ -2,11 +2,13 @@
 # Run Rust API e2e tests against the e2e-test workspace.
 #
 # Usage:
-#   ./scripts/e2e-api.sh [options] [-- cargo test args]   # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e-api.sh [options] [-- cargo test args]   # a whole suite on GitHub's runners, ADR 0386
+#   ./scripts/e2e-api.sh -f <filter> [options]            # a filtered run on this host
 #   ./scripts/e2e-api.sh --local [options]                # on this host
 #
 # Options:
 #   --local          Run on this host, not on GitHub. Local-only flags imply it.
+#   --github         Run on GitHub, even a filtered run.
 #   -f <filter>      Filter tests by name (passed to cargo test as filter)
 #   --no-reset       Skip DB reset AND leave the workspace running for the next
 #                    invocation. Use for fast iteration on a single test.
@@ -16,6 +18,9 @@
 #   ./scripts/e2e-api.sh                               # All API tests
 #   ./scripts/e2e-api.sh -f health                      # Run only health tests
 #   ./scripts/e2e-api.sh -- --nocapture                 # Show test output
+#
+# A local run takes a free e2e slot (scripts/lib/e2e_lock.sh), so two runs
+# from two worktrees run side by side. ADR 0536.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -11,6 +11,7 @@
 use crate::engine::thread_events::WakeMode;
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
+use crate::runtime::agent_runtime::CodingAgent;
 use serde_json::json;
 
 /// The `reasoning_effort` values `run_coding_agent` advertises: the union of
@@ -72,12 +73,12 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     "wake_mode": wake_mode_property(),
                     "model": {
                         "type": "string",
-                        "description": "Chat model id, e.g. 'claude-sonnet-5'. Omit for the account default; a mechanical subtask wants a cheaper one and less thinking."
+                        "description": "Model id; with reasoning_effort, a Lucidos Agent rung, else REFUSED. Omit to run on this turn's model. Routine: lower; hard: higher."
                     },
                     "reasoning_effort": {
                         "type": "string",
                         "enum": crate::llm::EFFORT_LADDER,
-                        "description": "Thinking budget. Omit for the account default."
+                        "description": "Thinking budget. Omit to keep this turn's, or the new model's default if you name another model."
                     }
                 },
                 "required": ["prompt"]
@@ -95,7 +96,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "coding_agent": {
                         "type": "string",
-                        "enum": ["claude-code", "codex"],
+                        "enum": CodingAgent::ALL.map(CodingAgent::as_str),
                         "description": "Use \"codex\" when the user asks for Codex; omit for Claude Code."
                     },
                     "folder": {
@@ -120,7 +121,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     // chat request. The spawn validates against the live picker.
                     "model": {
                         "type": "string",
-                        "description": "A picker id ('default', 'opus', 'sonnet') or the model a thread reports. Others are REFUSED with the valid list, never swapped for default. Omit to inherit. A one-file edit wants Sonnet, not Opus."
+                        "description": "A picker id or a thread's reported model. With reasoning_effort, one rung of the backend's intelligence ladder; an off-ladder pick is REFUSED, listing the rungs. Omit both if unsure. Settled: lower; hard: higher."
                     },
                     // Deliberately silent about the per-model restriction on a
                     // tier. `validate_coding_agent_effort` refuses the pairing
@@ -131,7 +132,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     "reasoning_effort": {
                         "type": "string",
                         "enum": coding_agent_effort_vocabulary(),
-                        "description": "Thinking budget. Omit for the backend default."
+                        "description": "The rung's other half."
                     },
                     "images": {
                         "type": "array",
@@ -379,7 +380,7 @@ mod tests {
     }
 
     /// Both route pins are optional and neither may join `required`: a caller
-    /// that names only one still inherits the account default for the other.
+    /// that names only one still inherits the other from its own turn.
     /// The effort enum is the ladder itself rather than a copy, so the schema
     /// cannot offer a tier `validate_trigger_reasoning_effort` would reject.
     #[test]

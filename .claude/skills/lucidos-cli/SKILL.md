@@ -1,6 +1,6 @@
 ---
 name: lucidos-cli
-description: Use whenever you need to write a file under the parent workspace's data/ directory (artifacts/, knowhow/, apps/, triggers/), emit/query a domain event, apply a pending change (`lucidos changes apply <id>`), or spawn a new Lucidos thread (sub-thread in this workspace, or task in another workspace) from a Claude Code subprocess running in a Lucidos worktree. Prefer this CLI over Write/Edit for any path that should land at <workspace>/data/... — using Write/Edit puts the file inside the worktree, where the dev server cannot serve it and links 404. Triggers include phrases like "write to artifacts/", "write the report", "save to data/", "emit AnalysisCompleted", "emit a domain event", "query events", "send to dev", "run in another workspace", "apply the change", "apply pending change", "apply this change for me". Do NOT load this skill just because a related bug surfaced mid-task — fix it in the current thread by default; only spawn a sub-thread when it's cross-repo, cross-workspace, or the user explicitly asks for a separate thread.
+description: Write files under the workspace data/ directory (artifacts/, knowhow/, apps/, triggers/). Also emit or query a domain event, apply a pending change, or spawn a thread, from a Lucidos worktree. Prefer it over Write/Edit for <workspace>/data/ paths: a file written in the worktree 404s. Triggers: "write to artifacts/", "write the report", "save to data/". More: "emit AnalysisCompleted", "query events", "send to dev", "run in another workspace", "apply the change". Skip it for mid-task bugs.
 ---
 
 # `lucidos` CLI — talking back to the parent workspace
@@ -24,6 +24,7 @@ The `lucidos` CLI is on your `PATH`. Use it whenever you need to:
 | Look up prior events | `lucidos events query` |
 | Apply a pending change | `lucidos changes apply <id>` |
 | Spawn a sub-thread or hand a task to another workspace | `lucidos spawn-thread` |
+| See which model and effort an agent may pick for a coding agent | `lucidos intelligence-ladder` |
 | Wait on something the engine will emit, without polling | `lucidos await-event` |
 | End every turn with the read decision: `yes` for an answer with no change to apply, else `no` | `lucidos request-read yes\|no` |
 | As a sub-thread with no *wake mode*, say whether your report wakes your parent: `yes` when it must act now, else `no` | `lucidos wake-parent yes\|no` |

@@ -63,8 +63,8 @@ them.
   diffs on both models.
 - **Codex as the only reviewer.** In the sample it caught 3 real bugs, against
   14 for the two Claude bug passes. It suits low-risk diffs only.
-- **No Codex.** It costs about nothing under a ChatGPT plan and is the only
-  reviewer from another model family. Dropping it saves no money.
+- **No Codex.** It is the only reviewer from another model family, so
+  dropping it loses catches the Claude passes miss.
 - **Keep the bug agent as a second pass.** Safer on catches, at about $1 more
   per iteration. The user chose the single pass.
 - **A fresh hardening session first.** Its estimated saving is 5 to 11% of

@@ -475,6 +475,7 @@ async fn a_queued_child_holds_a_slot() {
         title: None,
         model: None,
         reasoning_effort: None,
+        provider: None,
         pre_emitted_origin: None,
         origin: None,
     };

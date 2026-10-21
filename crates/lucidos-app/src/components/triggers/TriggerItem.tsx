@@ -48,7 +48,7 @@ export function TriggerItem({ trigger }: Partial<Props>) {
           label,
           tooltip: trigger.reasoning_effort
             ? `Runs on ${label}, reasoning ${trigger.reasoning_effort}`
-            : `Runs on ${label} instead of the default chat model`,
+            : `Runs on ${label} instead of the trigger default model`,
         };
       })()
     : null;

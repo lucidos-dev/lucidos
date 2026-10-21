@@ -2,7 +2,8 @@ import type { ComponentChildren, RefObject } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { batch, computed, effect, signal, useSignal } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerGrouping, setDrawerGrouping, selectedOngoingGroup, setSelectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, isSplitOngoingGroup, type OngoingFilter, type OngoingPart, type SplitOngoingGroup, ONGOING_GROUPS, type OngoingGroup, type DrawerGrouping, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
+import { threadMap, focusedThreadId, threadsLoaded, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerGrouping, setDrawerGrouping, selectedOngoingGroup, setSelectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, isSplitOngoingGroup, type OngoingFilter, type OngoingPart, type SplitOngoingGroup, ONGOING_GROUPS, type OngoingGroup, type DrawerGrouping, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
+import { drawnDrawerShown, drawnDrawerWidth } from '../layout/drawnLayout';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { composeDraftContextName } from '../../store/composeDestination';
@@ -758,10 +759,10 @@ export function handleDrawerKeyDown(e: KeyboardEvent): void {
 }
 
 export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) {
-    // The drawer overlay (`threadDrawerOpen`) is desktop-only. Mobile has a
-    // dedicated threads pane keeping dots, header and content in sync via
-    // `mobileView`.
-    const visible = forceVisible || (threadDrawerOpen.value && splitRatio.value > 0);
+    // The drawer overlay is desktop-only, and draws what the layout draws for
+    // `threadDrawerOpen`. Mobile has a dedicated threads pane keeping dots,
+    // header and content in sync via `mobileView`.
+    const visible = forceVisible || drawnDrawerShown.value;
     // Keep the list mounted through the width-collapse transition. Unmounting
     // at close start blanks the drawer body while it is still sliding shut.
     // Scaled by the Animation speed slider, as the transition it outlives is;
@@ -830,7 +831,7 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
         setThreadFilterPaneVisible(visible);
     }, [visible]);
 
-    const openWidth = `${threadDrawerWidth.value}px`;
+    const openWidth = `${drawnDrawerWidth.value}px`;
     return (
         <div class={`thread-drawer${visible ? '' : ' thread-drawer-collapsed'}`}
              // The desktop drawer slides open and shut by its width. Its body

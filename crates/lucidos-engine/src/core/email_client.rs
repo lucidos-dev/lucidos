@@ -514,7 +514,10 @@ impl EmailClient {
             )
         } else {
             (
-                Credentials::new(account.username.clone(), account.password.clone()),
+                Credentials::new(
+                    account.username.clone(),
+                    account.password.to_sign_in(&account.name)?.to_string(),
+                ),
                 None,
             )
         };

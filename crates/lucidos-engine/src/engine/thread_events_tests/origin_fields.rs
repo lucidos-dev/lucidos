@@ -222,3 +222,65 @@ fn message_received_no_mode_defaults_to_human() {
         other => panic!("expected MessageReceived, got {:?}", other),
     }
 }
+
+// ---- the cause of a plugin setup update ----
+
+fn setup_occasion(json: &str) -> PluginSetupOccasion {
+    serde_json::from_str(json).unwrap()
+}
+
+/// Every `plugin_setup` origin stored before the cause existed means the
+/// instructions changed, so it must decode to exactly that.
+#[test]
+fn a_legacy_plugin_setup_update_decodes_as_instructions_changed() {
+    for json in [
+        r#"{"kind":"update","from_version":"0.1.3"}"#,
+        r#"{"kind":"update"}"#,
+    ] {
+        match setup_occasion(json) {
+            PluginSetupOccasion::Update { cause, .. } => {
+                assert_eq!(cause, PluginSetupCause::InstructionsChanged, "{json}")
+            }
+            other => panic!("expected an update, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_plugin_setup_cause_round_trips_with_its_revision_and_reason() {
+    for cause in [
+        PluginSetupCause::InstructionsChanged,
+        PluginSetupCause::RevisionRaised {
+            revision: 2,
+            reason: Some("The skill changed.".into()),
+        },
+        PluginSetupCause::RevisionRaised {
+            revision: 2,
+            reason: None,
+        },
+        PluginSetupCause::Both {
+            revision: 3,
+            reason: Some("Moved the install folder.".into()),
+        },
+    ] {
+        let occasion = PluginSetupOccasion::Update {
+            from_version: Some("0.1.0".into()),
+            cause,
+        };
+        let back: PluginSetupOccasion =
+            serde_json::from_value(serde_json::to_value(&occasion).unwrap()).unwrap();
+        assert_eq!(back, occasion);
+    }
+}
+
+#[test]
+fn a_plugin_setup_revision_cause_uses_snake_case_kinds() {
+    let json = serde_json::to_value(PluginSetupCause::RevisionRaised {
+        revision: 2,
+        reason: Some("Why.".into()),
+    })
+    .unwrap();
+    assert_eq!(json["kind"], "revision_raised");
+    assert_eq!(json["revision"], 2);
+    assert_eq!(json["reason"], "Why.");
+}

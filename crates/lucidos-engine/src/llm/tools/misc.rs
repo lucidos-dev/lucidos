@@ -1,6 +1,6 @@
 //! LLM-facing schemas for cross-cutting tools that do not belong to a
 //! single domain family: navigate_ui, git_clone, get_backup_status,
-//! request_credential, connect_oauth_account, execute_intent,
+//! request_credential, connect_oauth_account,
 //! ask_user_question, await_event, list_event_waits, cancel_event_wait,
 //! request_read, todo_write.
 //!
@@ -9,6 +9,7 @@
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
+use crate::runtime::agent_runtime::CodingAgent;
 use serde_json::json;
 
 /// Single source of truth for the `navigate_ui` `target` enum — the top-level
@@ -16,7 +17,7 @@ use serde_json::json;
 /// list into `packages/lucidos-sdk/src/generated/navigate-targets.ts`, so the
 /// LLM tool schema and the SDK can never drift. To change the set, edit here.
 const NAVIGATE_TARGETS: &[&str] = &[
-    "home-board",
+    "dashboard",
     "files",
     "apps",
     "app-store",
@@ -51,6 +52,7 @@ const NAVIGATE_TARGETS: &[&str] = &[
 /// nothing has asked to link these: `webhooks` and `communication-surfaces`.
 pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "models",
+    "intelligence",
     "permissions",
     "mcp",
     "coding-agents",
@@ -139,6 +141,15 @@ pub(super) fn get_navigate_ui_tool() -> ToolDefinition {
                 "prompt": {
                     "type": "string",
                     "description": "Draft text for the compose box. 'new-chat' only."
+                },
+                "coding_agent": {
+                    "type": "string",
+                    "enum": CodingAgent::ALL.map(CodingAgent::as_str),
+                    "description": "'new-chat' only."
+                },
+                "folder": {
+                    "type": "string",
+                    "description": "Repository name or id, or `data/apps/<id>`. 'new-chat' only."
                 },
                 "device": {
                     "type": "string",
@@ -268,7 +279,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::REQUEST_CREDENTIAL.to_string(),
-            description: "Request an API credential through a secure modal, keeping the secret out of the conversation and the event log. ONE at a time: wait for each to resolve before requesting the next. Refused when a configured builtin provider proxy holds its key (e.g. 'openai', 'gpt'): call proxy_request instead. A non-token auth_type, or a host outside the proxy's base, proceeds.".to_string(),
+            description: "Request an API credential through a secure modal that keeps the secret out of the conversation and event log. ONE at a time: wait for each to resolve. Refused when a configured builtin provider proxy holds its key (e.g. 'openai', 'gpt'): call proxy_request instead. A non-token auth_type, or a host outside the proxy's base, proceeds.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": with_oauth_endpoints(json!({
@@ -288,11 +299,11 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     "auth_type": {
                         "type": "string",
                         "enum": crate::core::AuthType::agent_requestable_values(),
-                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. 'secret' is signed with rather than sent: no base_url, no host, read by scripts as CRED_<NAME>. PREFER connect_oauth_account over 'oauth_client', which does the same modal plus the authorize in one call. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
+                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. 'secret' is signed with rather than sent: no base_url, no host, read by scripts as CRED_<NAME>. PREFER connect_oauth_account over 'oauth_client': same modal plus the authorize, in one call. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
                     },
                     "env_var_name": {
                         "type": "string",
-                        "description": "Extra env var name for the secret, alongside the default CRED_<NAME>. Must match [A-Z_][A-Z0-9_]* and not clobber an engine-owned name. Single-value auth types only."
+                        "description": "Extra env var besides CRED_<NAME>, given only to a command naming it (`gh pr list  # GITHUB_TOKEN`). Must match [A-Z_][A-Z0-9_]*, not engine-owned. Single-value auth types only."
                     }
                 }), "oauth_client: "),
                 // `base_urls` is required for every type but `secret`, which is
@@ -326,29 +337,6 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
                     }
                 }), ""),
                 "required": ["provider", "scopes"]
-            }),
-        },
-    ]
-}
-
-pub(super) fn execute_intent_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: tn::EXECUTE_INTENT.to_string(),
-            description: "Execute a stored intent: what the user wants, paired with the knowhow for achieving it, both loaded automatically. It runs its own tool calls internally and returns only the final result.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "intent_id": {
-                        "type": "string",
-                        "description": "Intent id, e.g. 'job-search/find-jobs'."
-                    },
-                    "task": {
-                        "type": "string",
-                        "description": "What to do, e.g. 'Log today's sleep data'."
-                    }
-                },
-                "required": ["intent_id"]
             }),
         },
     ]
@@ -513,7 +501,7 @@ pub(crate) const READ_ARG: &str = "read";
 pub(super) fn request_read_tools() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: tn::REQUEST_READ.to_string(),
-        description: "Your read decision on this turn's reply, when sure. read: true when it holds what the user asked for (findings, what a trigger run found) or they will read it later: Review lists it until seen. read: false for small talk, a confirmation, a ready or applied change, a kickoff, or progress while sub-threads or event waits run. Unsure, skip it: Lucidos decides. It does not notify.".to_string(),
+        description: "Your read decision on this turn's reply, when sure. read: true when it holds what the user asked for (findings) or they will read it later: Review lists it until seen. read: false for small talk, a confirmation, a ready or applied change, a kickoff, or progress while sub-threads or event waits run. Unsure or asking a question: skip it. It does not notify.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -701,6 +689,13 @@ pub(crate) mod navigate_targets_codegen {
             "SettingsViewTarget",
             NAVIGABLE_SETTINGS_VIEWS,
         );
+        out.push('\n');
+        push_const(
+            &mut out,
+            "CODING_AGENT_TARGETS",
+            "CodingAgentTarget",
+            &CodingAgent::ALL.map(CodingAgent::as_str),
+        );
         out
     }
 
@@ -724,6 +719,23 @@ pub(crate) mod navigate_targets_codegen {
                 serde_json::json!(NAVIGABLE_SETTINGS_VIEWS),
                 "navigate_ui settings_view enum drifted from NAVIGABLE_SETTINGS_VIEWS"
             );
+        }
+
+        /// A new-chat navigate preselects the destination with the same field
+        /// names and backend values as `run_coding_agent`.
+        #[test]
+        fn new_chat_destination_args_match_run_coding_agent() {
+            let navigate = get_navigate_ui_tool();
+            let spawn = crate::llm::tools::threads::spawn_tools()
+                .into_iter()
+                .find(|t| t.name == tn::RUN_CODING_AGENT)
+                .expect("run_coding_agent is registered");
+            let (nav, run) = (
+                &navigate.parameters["properties"],
+                &spawn.parameters["properties"],
+            );
+            assert_eq!(nav["coding_agent"]["enum"], run["coding_agent"]["enum"]);
+            assert_eq!(nav["folder"]["type"], run["folder"]["type"]);
         }
     }
 }

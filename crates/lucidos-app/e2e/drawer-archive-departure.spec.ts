@@ -3,6 +3,9 @@ import { randomUUID } from 'crypto';
 import { navigateToApp, openThreadDrawer, assertHealthy } from './helpers';
 import { psql, clearAllThreads, seedThreadRow } from './db-helpers';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 /** One frame after the Archive tap: every copy standing in for the row. */
 interface Frame { t: number; copies: { top: number; bottom: number; left: number; opacity: number }[] }
 

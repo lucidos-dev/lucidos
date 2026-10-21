@@ -217,27 +217,19 @@ mod sentinel_redaction_tests {
         );
     }
 
-    /// The main loop and the intent sub-loop share the handler. A second
-    /// caller that forgot the form request would bring back a form that
-    /// never opens, with its raw JSON handed to the model.
+    /// A loop that forgot the form request would bring back a form that never
+    /// opens, with its raw JSON handed to the model.
     #[test]
-    fn both_agentic_loops_route_sentinels_through_the_form_request_emitter() {
-        for (name, source) in [
-            ("run.rs", include_str!("../agentic_loop/run.rs")),
-            (
-                "agentic_loop_special_tool.rs",
-                include_str!("../agentic_loop_special_tool.rs"),
-            ),
-        ] {
-            assert!(
-                source.contains("match_sentinel("),
-                "{name} must match sentinels"
-            );
-            assert!(
-                source.contains("form_requests::emit_request("),
-                "{name} must emit through the form-request emitter"
-            );
-        }
+    fn the_agentic_loop_routes_sentinels_through_the_form_request_emitter() {
+        let source = include_str!("../agentic_loop/run.rs");
+        assert!(
+            source.contains("match_sentinel("),
+            "run.rs must match sentinels"
+        );
+        assert!(
+            source.contains("form_requests::emit_request("),
+            "run.rs must emit through the form-request emitter"
+        );
     }
 
     #[test]

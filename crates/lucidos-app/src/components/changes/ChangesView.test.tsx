@@ -198,6 +198,24 @@ describe('pendingSections: Ready, then Not finished', () => {
     expect(pendingSections([parked], none, true).showApplyAll).toBe(true);
   });
 
+  // The lane owns a laned change, and an apply owns one in flight. Neither is
+  // Ready, so Apply All never offers it (ADR 0463).
+  it('moves a change an apply or the lane holds to Applying, out of Ready', () => {
+    const other = makeChange({ id: 'f', thread_id: 't-f' });
+    const s = pendingSections([settled, other, settling], none, false, new Set(['a', 'b']));
+    expect(s.applying.map((c) => c.id)).toEqual(['a', 'b']);
+    expect(s.ready.map((c) => c.id)).toEqual(['f']);
+    expect(s.notFinished).toEqual([]);
+    expect(s.armable).toEqual([]);
+  });
+
+  it('offers no Apply All while every ready change is already applying', () => {
+    const s = pendingSections([settled], none, false, new Set(['a']));
+    expect(s.canApplyNow).toBe(false);
+    expect(s.showApplyAll).toBe(false);
+    expect(s.showDiscardAll).toBe(false);
+  });
+
   // A parked arm drops at once, and a conflict being resolved already applies.
   it('arms only the settling changes, never a parked or resolving one', () => {
     expect(pendingSections([settling, parked, resolving], none).armable.map((c) => c.id)).toEqual(['b']);

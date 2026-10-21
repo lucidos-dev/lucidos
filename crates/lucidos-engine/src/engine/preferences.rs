@@ -184,6 +184,12 @@ fn refuse_bad_value(key: &str, value: &str, side_effect: PrefSideEffect) -> Resu
         }
     }
 
+    // A bearer credential follows this URL, so it must be a gateway origin:
+    // https, or loopback http for tests. An empty value clears it.
+    if key == prefs::CLAUDE_GATEWAY_URL.key() && !value.trim().is_empty() {
+        crate::llm::claude_gateway::GatewayOrigin::parse(value)?;
+    }
+
     // A `backup_schedule` write re-registers the backup cron via the
     // scheduler's `PreferencesChanged` subscriber. A bad expression is refused
     // here, on the path every writer shares, rather than failing to register
@@ -236,6 +242,27 @@ mod tests {
         )
         .expect_err("a public host must not become the local model host");
         assert!(err.contains("attacker.example"), "{err}");
+    }
+
+    /// A Claude gateway URL must be an https origin, whoever writes it, and an
+    /// empty value clears it.
+    #[test]
+    fn the_claude_gateway_url_must_be_an_https_origin() {
+        let key = prefs::CLAUDE_GATEWAY_URL.key();
+        for url in [
+            "http://gateway.example",
+            "https://gateway.example/v1",
+            "https://api.anthropic.com",
+            "gateway.example",
+        ] {
+            let err =
+                refuse_bad_value(key, url, PrefSideEffect::None).expect_err("not a gateway origin");
+            assert!(err.contains("Claude gateway URL"), "{url}: {err}");
+        }
+        for url in ["https://gateway.example", "http://127.0.0.1:4100", ""] {
+            refuse_bad_value(key, url, PrefSideEffect::None)
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
     }
 
     /// Settings saving a real local setup still works, and so does clearing the

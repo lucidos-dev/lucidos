@@ -6,7 +6,8 @@
 //!
 //! - [`source`] — install-source detection + fetching.
 //! - [`registry`] — installed-plugin projection / query / update-check.
-//! - [`merge`]: three-way merge of an update against the user's local edits.
+//! - [`merge`]: what an update does to the files on disk: the three-way merge
+//!   against the user's local edits, and the removal of dropped files.
 //! - [`marketplaces`]: the single write path for the marketplace registry,
 //!   shared with `api::plugins` and announcing every mutation.
 //!
@@ -18,12 +19,15 @@ use std::path::{Path, PathBuf};
 use crate::core::git_auth::GitCredentials;
 use crate::core::plugins::{
     check_engine_requirement, check_font_room, compare_versions, detect_conflicts,
-    engine_requirement_of, validate_tree, PlannedFile, UpdateDecision, AUTH_MODULES_DIR,
+    engine_requirement_of, validate_tree, PlannedFile, PluginManifest, UpdateDecision,
+    AUTH_MODULES_DIR,
 };
 use crate::core::{plugin_media, DATA_DIR};
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
 use crate::engine::release_notices::running_release;
-use crate::engine::thread_events::{EngineReason, MessageOrigin, PluginSetupOccasion};
+use crate::engine::thread_events::{
+    EngineReason, MessageOrigin, PluginSetupCause, PluginSetupOccasion,
+};
 use crate::engine::tools::agent_tool_actor;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::engine::LucidosEngine;
@@ -33,10 +37,10 @@ mod merge;
 mod registry;
 mod source;
 
-use merge::{LocalChangeOutcome, MergePlan, ResolvedChange};
+use merge::{LocalChangeOutcome, ResolvedChange, UpdatePlan};
 use registry::{
     check_plugin_updates_impl, fetch_remote_manifest, latest_install, not_installed_error,
-    project_installed_plugins, resolve_plugin_query, InstalledPlugins, PluginBaseline,
+    project_installed_plugins, resolve_plugin_query, InstalledPlugins, PluginBaseline, PriorSetup,
 };
 use source::{
     copy_atomic, credentials_for_source, detect_source, fetch_source, git_file_mode, write_atomic,
@@ -108,15 +112,60 @@ pub struct PendingInstall {
     pub(crate) plugin_id: String,
     pub(crate) plugin_version: String,
     pub(crate) plugin_name: String,
-    /// The manifest's `setup` field, trimmed and normalized to `None` when
-    /// empty. On confirm, a non-`None` value spawns a Lucidos Agent thread to
-    /// walk the user through the author's setup instructions.
-    pub(crate) setup: Option<String>,
-    /// What this install would do to files the user has locally edited, decided
-    /// at staging time so the confirm panel can state it per file. Empty for a
-    /// fresh install and for an untouched plugin.
-    pub(crate) merge: MergePlan,
+    /// The setup the staged version asks for. On confirm, [`setup_occasion`]
+    /// decides from it whether a Lucidos Agent thread walks the user through
+    /// the author's setup instructions.
+    pub(crate) setup: StagedSetup,
+    /// What this install would do to the user's edited files, and which files
+    /// it would remove. Decided at staging time, so the confirm panel can state
+    /// it per file. Empty for a fresh install.
+    pub(crate) plan: UpdatePlan,
+    /// Every installed plugin's recorded paths as the plan saw them, `None`
+    /// when they could not be read. See [`check_records_still_match`].
+    pub(crate) recorded_files: Option<RecordedFiles>,
     pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Recorded paths per installed plugin id: [`InstalledPlugins::files`].
+type RecordedFiles = std::collections::BTreeMap<String, Vec<String>>;
+
+/// Refuse a confirm whose plan the install records no longer support. A newer
+/// version of this plugin may record files the plan never saw, and another
+/// install may now record a path the plan removes. Acting on the old plan
+/// would orphan the first and delete the second.
+///
+/// A failed read is unknown, so it refuses only a confirm that deletes.
+pub(crate) fn check_records_still_match(
+    plugin_id: &str,
+    staged: Option<&RecordedFiles>,
+    now: &InstalledPluginsRead,
+    removals: &[String],
+) -> Result<(), String> {
+    let Some(staged) = staged else {
+        return Ok(());
+    };
+    match now {
+        Ok(now) => {
+            let others = now.recorded_by_others(plugin_id);
+            if now.files.get(plugin_id) == staged.get(plugin_id)
+                && !removals.iter().any(|rel| others.contains(rel.as_str()))
+            {
+                return Ok(());
+            }
+            Err(
+                "The installed plugins changed after you reviewed this update. Run the \
+                 update again to see what it would do now."
+                    .to_string(),
+            )
+        }
+        Err(e) if !removals.is_empty() => Err(format!(
+            "Could not re-read the installed plugins' records, so Lucidos cannot tell whether \
+             this update would delete another plugin's files. Nothing was changed. Try again \
+             in a moment. Cause: {}",
+            e
+        )),
+        Err(_) => Ok(()),
+    }
 }
 
 impl LucidosEngine {
@@ -306,22 +355,59 @@ pub(crate) fn normalize_setup(setup: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Decide whether confirming an install/update should spawn a setup thread.
-/// `new` is the staged version's `setup`; `prior` is the currently-installed
-/// version's `setup` (`None` on a fresh install). Both are normalized here, so
-/// callers may pass raw or pre-normalized text. Setup runs only when the new
-/// version has setup work the installed version didn't already cover:
-/// - no `setup` in the new version → never.
-/// - fresh install (or the installed version had no setup) with a `setup` → yes.
-/// - update whose `setup` differs from the installed version's → yes.
-/// - update whose `setup` is identical (after normalization) → no (re-running
-///   identical setup on every version bump is noise — the user refinement).
-pub(crate) fn setup_is_new(new: Option<&str>, prior: Option<&str>) -> bool {
-    match (normalize_setup(new), normalize_setup(prior)) {
-        (None, _) => false,
-        (Some(_), None) => true,
-        (Some(n), Some(p)) => n != p,
+/// The setup a staged plugin version asks for, as the manifest states it.
+/// `text` is normalized; `revision` is 0 when the manifest has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedSetup {
+    pub(crate) text: Option<String>,
+    pub(crate) revision: u64,
+    pub(crate) reason: Option<String>,
+}
+
+impl StagedSetup {
+    fn from_manifest(manifest: &PluginManifest) -> Self {
+        Self {
+            text: normalize_setup(manifest.setup.as_deref()),
+            revision: manifest.setup_revision,
+            reason: manifest.setup_reason.clone(),
+        }
     }
+}
+
+/// Decide whether confirming an install or update spawns a setup thread, and
+/// why. Staging (the panel's note) and confirm (the spawn) both call this, so
+/// the panel never promises a thread confirm would skip. `prior` is the
+/// installed version's setup state, `None` on a fresh install.
+///
+/// - no `setup` in the staged version: no thread.
+/// - no prior record: a fresh install.
+/// - text differs from the installed version's: an update, instructions changed.
+/// - revision greater than the installed one: an update, revision raised.
+/// - both: an update for both reasons.
+/// - neither: no thread. Re-running identical setup on every version bump is
+///   noise, and a revision carried unchanged into the next release or lowered
+///   asks for nothing.
+pub(crate) fn setup_occasion(
+    staged: &StagedSetup,
+    prior: Option<&PriorSetup>,
+) -> Option<PluginSetupOccasion> {
+    let text = staged.text.as_ref()?;
+    let Some(prior) = prior else {
+        return Some(PluginSetupOccasion::FreshInstall);
+    };
+    let changed = prior.text.as_ref() != Some(text);
+    let raised = staged.revision > prior.revision;
+    let (revision, reason) = (staged.revision, staged.reason.clone());
+    let cause = match (changed, raised) {
+        (true, true) => PluginSetupCause::Both { revision, reason },
+        (true, false) => PluginSetupCause::InstructionsChanged,
+        (false, true) => PluginSetupCause::RevisionRaised { revision, reason },
+        (false, false) => return None,
+    };
+    Some(PluginSetupOccasion::Update {
+        from_version: prior.version.clone(),
+        cause,
+    })
 }
 
 /// Stage `source_str` into a temp dir, validate the manifest + tree, register
@@ -370,22 +456,37 @@ pub(crate) fn prepare_install_request(
     // Normalize the author's setup instructions once: trimmed, with empty
     // collapsed to `None`. The same value feeds the panel preview AND the
     // pending entry that decides whether confirm spawns a setup thread.
-    let setup = normalize_setup(manifest.setup.as_deref());
+    let setup = StagedSetup::from_manifest(&manifest);
 
     let is_update = installed
         .as_ref()
-        .is_ok_and(|installed| installed.ids.contains(&manifest.id));
+        .is_ok_and(|installed| installed.contains(&manifest.id));
+    // The same decision confirm makes, so the panel states what confirm does.
+    // Confirm re-decides from the live record, which stays the authority.
+    let setup_run = setup_occasion(
+        &setup,
+        installed
+            .as_ref()
+            .ok()
+            .and_then(|installed| installed.setups.get(&manifest.id)),
+    );
 
-    // An update over a plugin the user has edited: work out per file whether
-    // their edit merges, conflicts, or is simply lost, so the panel can say so
-    // before they confirm. A fresh install has no baseline and no plan.
+    // An update: work out per file whether the user's edit merges, conflicts,
+    // or is lost, and which files the new version dropped. The panel then says
+    // so before they confirm. A fresh install has no plan.
     // Unreadable install records refuse any staging that would overwrite a
     // file: the panel could not name the user's edits, and confirm would not
     // save them.
-    let merge = match installed {
-        Ok(installed) => match installed.baselines.get(&manifest.id) {
-            Some(baseline) => merge::plan_local_changes(workspace_path, baseline, &planned),
-            None => MergePlan::default(),
+    let plan = match installed {
+        Ok(installed) => match installed.files.get(&manifest.id) {
+            Some(recorded) => merge::plan_update(
+                workspace_path,
+                recorded,
+                installed.baselines.get(&manifest.id),
+                &planned,
+                &installed.recorded_by_others(&manifest.id),
+            ),
+            None => UpdatePlan::default(),
         },
         Err(e) if !overwrites.is_empty() => {
             return format!(
@@ -395,7 +496,7 @@ pub(crate) fn prepare_install_request(
                 manifest.id, e
             );
         }
-        Err(_) => MergePlan::default(),
+        Err(_) => UpdatePlan::default(),
     };
 
     let preview = serde_json::json!({
@@ -408,9 +509,11 @@ pub(crate) fn prepare_install_request(
             .map(|p| p.data_relative.clone())
             .collect::<Vec<_>>(),
         "overwrites": overwrites,
+        "removes": plan.removes(),
         "is_update": is_update,
-        "local_changes": merge.preview_json(),
-        "setup": setup,
+        "local_changes": plan.preview_json(),
+        "setup": setup.text,
+        "setup_run": setup_run,
         "plugin_id": manifest.id,
         "plugin_version": manifest.version,
         "plugin_name": manifest.name,
@@ -426,7 +529,8 @@ pub(crate) fn prepare_install_request(
         plugin_version: manifest.version.clone(),
         plugin_name: manifest.name.clone(),
         setup,
-        merge,
+        plan,
+        recorded_files: installed.as_ref().ok().map(|i| i.files.clone()),
         created_at: chrono::Utc::now(),
     };
 
@@ -616,6 +720,14 @@ fn is_safe_data_path(data_relative: &str) -> bool {
     }
     let first = data_relative.split(['/', '\\']).next().unwrap_or("");
     crate::core::plugins::CONTENT_DIRS.contains(&first)
+}
+
+/// Whether an update may delete a recorded path the new version dropped.
+/// Checked at staging and again at confirm. A trigger definition never
+/// qualifies: it is a gitignored projection, and the trigger re-sync deletes
+/// it together with the trigger.
+fn update_may_remove(data_relative: &str) -> bool {
+    is_safe_data_path(data_relative) && plugin_trigger_slug(data_relative).is_none()
 }
 
 /// Walk parents of a deleted file up to (but NOT including) the `data/<first
@@ -872,6 +984,8 @@ pub(crate) struct LocalChangeWrites {
     /// back. Kept apart from `replaced`: there is no saved copy for these, and
     /// lumping them in would make `saved_aside` look short by that many.
     restored: Vec<String>,
+    /// Edited files the new version dropped, saved aside and then removed.
+    removed: Vec<String>,
 }
 
 impl LocalChangeWrites {
@@ -893,6 +1007,7 @@ impl LocalChangeWrites {
                 LocalChangeOutcome::Conflict => writes.conflicted.push(path),
                 LocalChangeOutcome::Replaced => writes.replaced.push(path),
                 LocalChangeOutcome::Restored => writes.restored.push(path),
+                LocalChangeOutcome::Removed => writes.removed.push(path),
             }
         }
         writes
@@ -903,6 +1018,7 @@ impl LocalChangeWrites {
             && self.conflicted.is_empty()
             && self.replaced.is_empty()
             && self.restored.is_empty()
+            && self.removed.is_empty()
     }
 
     fn merged_paths(&self) -> Vec<String> {
@@ -919,6 +1035,8 @@ pub struct LocalChangeReport {
     /// Files the user had deleted that upstream still ships, so they returned.
     /// Nothing is saved aside for these: a deletion has no content to keep.
     pub restored: Vec<String>,
+    /// Edited files the new version no longer ships. Each has a saved copy.
+    pub removed: Vec<String>,
     /// `data/`-relative copies of every edit the update discarded.
     pub saved_paths: Vec<String>,
     /// The commit holding the merged working tree plus those copies.
@@ -932,6 +1050,8 @@ pub struct LocalChangeReport {
 pub struct ConfirmedInstall {
     pub summary: String,
     pub installed_files: Vec<String>,
+    /// Files the previous version shipped and this one dropped, now deleted.
+    pub removed_files: Vec<String>,
     /// Set when the install met local edits to the files it ships.
     pub local_changes: Option<LocalChangeReport>,
     /// The Lucidos Agent thread spawned to walk the user through the plugin's
@@ -1160,25 +1280,18 @@ pub async fn confirm_pending_install(
             .ok_or_else(|| format!("no pending install with id '{}'", install_id))?
     };
 
-    // Pre-allocate the setup thread id only when this confirm has *new* setup
-    // work to run: a fresh install with a `setup` field, or an update whose
-    // `setup` instructions differ from the currently-installed version's. A
-    // version bump that left `setup` unchanged re-runs nothing (no thread, no
-    // navigation) — re-doing identical setup on every update is noise. The
-    // recorded id is what lets the Plugins panel card resolve the right thread for
-    // its Setup→Open state after a reload.
+    // Pre-allocate the setup thread id only when this confirm has setup work
+    // to run: see [`setup_occasion`]. A version bump with nothing to run
+    // spawns no thread and navigates nowhere. The recorded id is what lets the
+    // Plugins panel card resolve the right thread for its Setup→Open state
+    // after a reload.
     //
-    // `latest_install` here still sees the *previous* version — the new
-    // `PluginInstalled` event isn't emitted until `install_from_unpacked_with_bus`
-    // below. A read error is non-fatal: fall back to treating the staged setup
-    // as new (spawn) so a transient DB hiccup never silently skips real setup.
-    // One lookup answers two questions: whether the setup text is new, and
-    // whether this is a re-run. A record at all is what makes it a re-run, and
-    // the setup thread's seed says so. A failed read costs both answers, so an
-    // update then seeds the first-install line. That is the same direction as
-    // the fallback above: run the setup in full rather than half of it.
+    // `latest_install` here still sees the *previous* version, since the new
+    // `PluginInstalled` event is not emitted until `install_from_unpacked_with_bus`
+    // below. A failed read costs the prior record, so the install reads as a
+    // fresh one: run the setup in full rather than skip real work.
     let prior = match latest_install(&engine.pool, &pending.plugin_id).await {
-        Ok(rec) => rec,
+        Ok(rec) => rec.map(|rec| rec.prior_setup()),
         Err(e) => {
             log!(
                 "[Plugins] prior-install lookup failed for '{}' (treating setup as new): {}",
@@ -1188,30 +1301,33 @@ pub async fn confirm_pending_install(
             None
         }
     };
-    let prior_setup = prior.as_ref().and_then(|r| r.setup()).map(str::to_string);
-    let occasion = match &prior {
-        Some(rec) => PluginSetupOccasion::Update {
-            from_version: rec.version().map(str::to_string),
-        },
-        None => PluginSetupOccasion::FreshInstall,
-    };
-    let setup_thread_id =
-        setup_is_new(pending.setup.as_deref(), prior_setup.as_deref()).then(uuid::Uuid::new_v4);
+    let occasion = setup_occasion(&pending.setup, prior.as_ref());
+    let setup_thread_id = occasion.as_ref().map(|_| uuid::Uuid::new_v4());
 
-    let (summary, installed_files, local_changes) = {
+    let (write, local_changes) = {
         let _repo_guard = engine.lock_workspace_repo().await;
 
-        // The panel stated an outcome per edited file. If one of those files
-        // moved since, the staged plan describes content that no longer
-        // exists, and writing it would clobber the newer edit unseen.
-        if let Some(path) = pending.merge.detect_drift(&engine.workspace_path) {
+        // The panel stated an outcome per edited or removed file. If one of
+        // those moved since, the staged plan describes content that is gone,
+        // and acting on it would clobber the newer edit unseen.
+        if let Some(path) = pending.plan.detect_drift(&engine.workspace_path) {
             return Err(format!(
                 "'{}' changed after you reviewed this update. Run the update \
                  again to see what it would do now.",
                 path
             ));
         }
-        let resolved = pending.merge.resolve(keep_local_changes);
+        let removals = pending.plan.removes();
+        let records_now = project_installed_plugins(&engine.pool)
+            .await
+            .map_err(|e| e.to_string());
+        check_records_still_match(
+            &pending.plugin_id,
+            pending.recorded_files.as_ref(),
+            &records_now,
+            &removals,
+        )?;
+        let resolved = pending.plan.resolve(keep_local_changes);
         // Before a single byte is overwritten, so a failure past this point
         // cannot take the user's work with it.
         let saved_aside = merge::save_discarded(
@@ -1228,6 +1344,7 @@ pub async fn confirm_pending_install(
             conflicted: writes.conflicted.clone(),
             replaced: writes.replaced.clone(),
             restored: writes.restored.clone(),
+            removed: writes.removed.clone(),
             saved_paths: writes.saved_aside.clone(),
             commit: None,
         });
@@ -1240,6 +1357,7 @@ pub async fn confirm_pending_install(
                 actor: actor.clone(),
                 setup_thread_id,
                 local: writes,
+                removals,
                 ..InstallContext::plain(pending.source_type, true)
             },
         )
@@ -1247,12 +1365,23 @@ pub async fn confirm_pending_install(
         if let Some(report) = report.as_mut() {
             report.commit = write.local_changes_commit.clone();
         }
-        (write.summary, write.installed_files, report)
+        (write, report)
     };
+    let InstallWrite {
+        summary,
+        installed_files,
+        removed_files,
+        ..
+    } = write;
 
     announce_local_changes(engine, &pending, local_changes.as_ref(), actor.clone()).await;
 
-    reload_auth_modules_if_needed(engine, &installed_files, "install").await;
+    let touched: Vec<String> = installed_files
+        .iter()
+        .chain(&removed_files)
+        .cloned()
+        .collect();
+    reload_auth_modules_if_needed(engine, &touched, "install").await;
 
     // Auto-register the plugin's shipped event-driven triggers (ADR 0019),
     // stamped with the plugin id. On an update this re-syncs against the prior
@@ -1265,9 +1394,8 @@ pub async fn confirm_pending_install(
     // actually happens (the thread references the instructions via
     // `system-knowhow/plugin-setup`, see `build_setup_thread_request`); the id
     // flows back so the frontend can navigate the user straight to it.
-    // `setup_thread_id` is minted only when `setup_is_new` said yes, and that
-    // is already false for an absent or blank `setup`.
-    if let Some(thread_id) = setup_thread_id {
+    // `occasion` is `None` for an absent or blank `setup`.
+    if let (Some(thread_id), Some(occasion)) = (setup_thread_id, occasion) {
         let plugin = SeededPlugin {
             id: pending.plugin_id.clone(),
             name: pending.plugin_name.clone(),
@@ -1279,6 +1407,7 @@ pub async fn confirm_pending_install(
     Ok(ConfirmedInstall {
         summary,
         installed_files,
+        removed_files,
         local_changes,
         setup_thread_id,
     })
@@ -1312,6 +1441,7 @@ async fn announce_local_changes(
                 conflicted: report.conflicted.clone(),
                 replaced: report.replaced.clone(),
                 restored: report.restored.clone(),
+                removed: report.removed.clone(),
                 saved_paths: report.saved_paths.clone(),
                 commit: report.commit.clone(),
                 actor: actor.clone(),
@@ -1476,6 +1606,7 @@ fn build_upstream_patch_thread_request(
         title: Some(format!("Propose {plugin_name} patch upstream")),
         model: None,
         reasoning_effort: None,
+        provider: None,
         pre_emitted_origin: None,
         origin: Some(MessageOrigin::engine(
             EngineReason::PluginUpstreamProposal {
@@ -1557,7 +1688,8 @@ async fn spawn_plugin_setup_thread(
 /// Two words are load-bearing across layers. Every seed keeps the verb `set
 /// up`, which the system-prompt route and the knowhow's `description` key on.
 /// Every update seed says `again`, which is how the knowhow tells the two
-/// occasions apart.
+/// occasions apart. An update seed's wording also names its cause, which the
+/// knowhow branches on.
 ///
 /// The engine wrote the seed, so its origin is `EngineReason::PluginSetup`.
 /// The confirming device is secondary attribution, never the origin: a device
@@ -1571,16 +1703,10 @@ fn build_setup_thread_request(
     let plugin_name = &plugin.name;
     let (prompt, title) = match &occasion {
         PluginSetupOccasion::Update {
-            from_version: Some(prior),
+            from_version,
+            cause,
         } => (
-            format!(
-                "Set up {plugin_name} again: its setup instructions changed \
-                 since version {prior}."
-            ),
-            format!("Update {plugin_name} setup"),
-        ),
-        PluginSetupOccasion::Update { from_version: None } => (
-            format!("Set up {plugin_name} again: this update changed its setup instructions."),
+            update_seed(plugin, from_version.as_deref(), cause),
             format!("Update {plugin_name} setup"),
         ),
         PluginSetupOccasion::FreshInstall => (
@@ -1600,6 +1726,7 @@ fn build_setup_thread_request(
         title: Some(title),
         model: None,
         reasoning_effort: None,
+        provider: None,
         pre_emitted_origin: None,
         origin: Some(MessageOrigin::engine(EngineReason::PluginSetup {
             plugin_id: plugin.id.clone(),
@@ -1609,6 +1736,47 @@ fn build_setup_thread_request(
             confirmed_on_device_id: confirming_device_id(actor),
         })),
     }
+}
+
+/// The seed line for a setup update. The wording says which cause ran it, so
+/// the agent knows whether the setup text changed or only the author asked.
+fn update_seed(plugin: &SeededPlugin, prior: Option<&str>, cause: &PluginSetupCause) -> String {
+    let name = &plugin.name;
+    let since = prior.map(|v| format!(" since version {v}"));
+    let (line, reason) = match cause {
+        PluginSetupCause::InstructionsChanged => (
+            match &since {
+                Some(since) => format!("its setup instructions changed{since}."),
+                None => "this update changed its setup instructions.".to_string(),
+            },
+            None,
+        ),
+        PluginSetupCause::RevisionRaised { reason, .. } => (
+            match &since {
+                Some(since) => format!(
+                    "version {} asks to run its setup again{since}.",
+                    plugin.version
+                ),
+                None => "this update asks to run its setup again.".to_string(),
+            },
+            reason.as_deref(),
+        ),
+        PluginSetupCause::Both { reason, .. } => (
+            match &since {
+                Some(since) => format!(
+                    "its setup instructions changed{since}, and the author asks to run it again."
+                ),
+                None => "this update changed its setup instructions, \
+                         and the author asks to run it again."
+                    .to_string(),
+            },
+            reason.as_deref(),
+        ),
+    };
+    let note = reason
+        .map(|r| format!(" Author's note: {r}"))
+        .unwrap_or_default();
+    format!("Set up {name} again: {line}{note}")
 }
 
 /// Reload the proxy's WASM signer map when `touched_files` reaches into
@@ -1729,10 +1897,14 @@ pub(crate) struct InstallContext {
     /// writes every path straight from the staged tree, as a fresh install and
     /// every pre-merge caller always did.
     pub(crate) local: LocalChangeWrites,
+    /// `data/`-relative paths the previous version shipped and this one
+    /// dropped, deleted after the writes. Edited ones are already saved aside.
+    pub(crate) removals: Vec<String>,
 }
 
 impl InstallContext {
-    /// An install with no local edits to weigh, and nobody to attribute it to.
+    /// An install with no local edits to weigh, nothing to remove, and nobody
+    /// to attribute it to.
     pub(crate) fn plain(source_type: SourceType, overwrite: bool) -> Self {
         Self {
             source_type,
@@ -1740,6 +1912,7 @@ impl InstallContext {
             actor: None,
             setup_thread_id: None,
             local: LocalChangeWrites::default(),
+            removals: Vec::new(),
         }
     }
 }
@@ -1751,9 +1924,36 @@ pub(crate) struct InstallWrite {
     /// Every `data/`-relative path written. The confirm uses it verbatim (no
     /// re-walk) for the auto-reload decision and the HTTP response.
     pub(crate) installed_files: Vec<String>,
+    /// Every `data/`-relative path deleted because this version dropped it.
+    pub(crate) removed_files: Vec<String>,
     /// The second commit, recording the merged working tree plus any
     /// saved-aside copies. `None` when the install met no local edits.
     pub(crate) local_changes_commit: Option<String>,
+}
+
+/// Delete the files the previous version shipped and this one dropped, and
+/// prune the folders that leaves empty. Returns the paths deleted.
+///
+/// Runs after the writes, so a failed write deletes nothing. The guard is
+/// re-checked here, whatever the staging decided.
+fn remove_dropped_files(data_dir: &Path, removals: &[String]) -> Result<Vec<String>, String> {
+    let mut removed = Vec::with_capacity(removals.len());
+    for rel in removals.iter().filter(|rel| update_may_remove(rel)) {
+        match std::fs::remove_file(data_dir.join(rel)) {
+            Ok(()) => {
+                prune_empty_parents(data_dir, rel);
+                removed.push(rel.clone());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "remove {} (the new files are already written): {}",
+                    rel, e
+                ))
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Install a plugin from an already-unpacked directory. Pure orchestration:
@@ -1770,6 +1970,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
         actor,
         setup_thread_id,
         local,
+        removals,
     } = ctx;
     let (manifest, planned) = validate_tree(plugin_root).map_err(|e| e.to_string())?;
     let data_dir = workspace_path.join(DATA_DIR);
@@ -1818,6 +2019,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
         })?;
         installed_files.push(data_relative.clone());
     }
+    let removed_files = remove_dropped_files(&data_dir, &removals)?;
 
     // Commit the freshly-written files into the workspace git repo BEFORE
     // emitting PluginInstalled — every other data-writing path (write_file /
@@ -1854,10 +2056,13 @@ pub(crate) async fn install_from_unpacked_with_bus(
         .map(|(path, _)| upstream_bytes(path))
         .collect::<Result<_, _>>()?;
 
+    // The deletions land in the same commit, so it holds exactly what this
+    // version ships and nothing an older one left behind.
     let install_commit = crate::core::commit_data_paths_with_overrides(
         workspace_path,
         &installed_files,
         &pristine,
+        &removed_files,
         &format!("Install plugin: {} v{}", manifest.id, manifest.version),
     )
     .map_err(|e| format!("commit installed plugin files: {}", e))?;
@@ -1910,6 +2115,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
         id: manifest.id.clone(),
         manifest: serde_json::Value::Object(payload),
         files: installed_files.clone(),
+        files_removed: removed_files.clone(),
         installed_at,
         source_type: source_type.as_str().to_string(),
         actor,
@@ -1922,16 +2128,23 @@ pub(crate) async fn install_from_unpacked_with_bus(
     // markdown section below, so setup text here shows the user the same wall
     // twice. No LLM reads it either: `install_plugin` returns the staging
     // sentinel, and the confirm reaching here arrives over HTTP.
+    let removed_note = match removed_files.len() {
+        0 => String::new(),
+        1 => " Removed 1 file this version no longer ships.".to_string(),
+        n => format!(" Removed {n} files this version no longer ships."),
+    };
     let result = format!(
-        "Installed {} v{} ({} files).{}",
+        "Installed {} v{} ({} files).{}{}",
         manifest.name,
         manifest.version,
         installed_files.len(),
+        removed_note,
         media_note.unwrap_or_default()
     );
     Ok(InstallWrite {
         summary: result,
         installed_files,
+        removed_files,
         local_changes_commit,
     })
 }

@@ -452,6 +452,7 @@ impl LucidosEngine {
             workspace_path: self.workspace_path(),
             allowed_tools: Some(&copy.allowed_tools),
             system_prompt: copy.system_prompt.as_deref(),
+            session_context: None,
             resume_session_id: Some(&copy.session_id),
             model: copy.model.as_deref(),
             reasoning_effort: copy.effort.as_deref(),
@@ -465,6 +466,7 @@ impl LucidosEngine {
             permission_mode: copy.permission_mode.as_deref(),
             additional_directories: &copy.additional_directories,
             auto_compact: None,
+            notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
             agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
         };
         let reply =

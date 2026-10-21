@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { toasts, applyingChangeIds, applyAllInProgress, applyAllCanceling, threadMap } from '../store';
+import { toasts, applyingChangeIds, applyAllInProgress, applyAllCanceling, threadMap, changes } from '../store';
+import { loadedOr } from '../types';
+import type { Change } from '../../api/client';
 
 // Mock the API module before importing the action
 vi.mock('../../api/client', () => ({
@@ -77,6 +79,43 @@ describe('applySingleChange feedback', () => {
 
     // Should not track as applying
     expect(applyingChangeIds.value.has('change-2')).toBe(false);
+  });
+
+  // The engine broadcasts ChangesUpdated before it replies, but the frame
+  // travels on the SSE connection and can land after the reply. Until it does,
+  // a still-listed row would draw Apply again.
+  it.each(['applied', 'noop'] as const)('an %s reply drops the change from the pending list', async (status) => {
+    changes.value = { status: 'loaded', data: [{ id: 'change-5' } as Change, { id: 'change-6' } as Change] };
+    mockedApply.mockResolvedValue({
+      status,
+      change_id: 'change-5',
+      thread_id: 'thread-5',
+      message: 'Change applied.',
+      restart_required: false,
+      commits_applied: 0,
+      files_changed: 0,
+    });
+
+    await applySingleChange('change-5');
+
+    expect(loadedOr(changes.value, []).map((c) => c.id)).toEqual(['change-6']);
+  });
+
+  it('a queued reply keeps the change pending', async () => {
+    changes.value = { status: 'loaded', data: [{ id: 'change-7' } as Change] };
+    mockedApply.mockResolvedValue({
+      status: 'queued',
+      change_id: 'change-7',
+      thread_id: 'thread-7',
+      message: 'Queued.',
+      restart_required: false,
+      commits_applied: 0,
+      files_changed: 0,
+    });
+
+    await applySingleChange('change-7');
+
+    expect(loadedOr(changes.value, []).map((c) => c.id)).toEqual(['change-7']);
   });
 
   it('does NOT show an HTTP-response toast on conflict — SSE handler covers it', async () => {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { promptState, settlePrompt, showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
@@ -35,7 +35,9 @@ export function PromptDialog() {
   // The native panel webview paints over the dialog; hold it hidden while open.
   useHidePanelWebviewWhile(state.visible);
 
-  useEffect(() => {
+  // A layout effect seeds the field before it paints. A passive one runs after,
+  // and overwrites whatever the user typed into the drawn field meanwhile.
+  useLayoutEffect(() => {
     setSuggesting(false);
     if (!state.visible) return;
 

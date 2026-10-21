@@ -30,6 +30,7 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { PENDING_TITLE_PLACEHOLDER, type ThreadState } from '../thread-events';
 import { fetchThreads, fetchThreadById } from '../../api/threads';
+import { getThreadQueue } from '../../api/client';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
 import { awaitedThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
@@ -64,6 +65,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
   deleteThread: vi.fn().mockResolvedValue(undefined),
+  getThreadQueue: vi.fn(),
 }));
 
 // ---------------------------------------------------------------------------
@@ -317,6 +319,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     threadMap.value = new Map();
     awaitedThreadId.value = null;
     (fetchThreadById as any).mockReset();
+    vi.mocked(getThreadQueue).mockResolvedValue({ entries: [], policy: {} as any });
   });
 
   it('focuses the target and flags the bootstrap BEFORE the metadata arrives', async () => {
@@ -355,6 +358,56 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
 
     expect(outcome.kind).toBe('not-found');
     // Not left staring at a skeleton for a thread that will never arrive.
+    expect(focusedThreadId.value).toBe('was-here');
+    expect(awaitedThreadId.value).toBeNull();
+  });
+
+  it('holds the focus on a spawn the thread queue still holds', async () => {
+    // A queued spawn owns no summary row yet, so the by-id read 404s on a
+    // thread that is about to exist. Opening one is not a dead link.
+    threadMap.value = new Map([['was-here', makeThreadState('was-here')]]);
+    focusedThreadId.value = 'was-here';
+    (fetchThreadById as any).mockResolvedValue(null);
+    vi.mocked(getThreadQueue).mockResolvedValue({
+      entries: [{ id: 'e1', kind: 'coding-agent', thread_id: 'queued', summary: 'Next', status: 'queued', queued_at: '2026-01-01T00:00:00Z' }],
+      policy: {} as any,
+    });
+    toasts.value = [];
+
+    const outcome = await focusThreadOrBootstrapResult('queued');
+    focusThreadOrBootstrap('queued');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(outcome.kind).toBe('awaiting');
+    expect(focusedThreadId.value).toBe('queued');
+    expect(awaitedThreadId.value).toBe('queued');
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('focuses a spawn the queue admitted between the two reads', async () => {
+    // The by-id read 404s while the spawn is queued. The queue then admits it
+    // before its own read answers, so the queue no longer lists it either.
+    threadMap.value = new Map([['was-here', makeThreadState('was-here')]]);
+    focusedThreadId.value = 'was-here';
+    (fetchThreadById as any).mockResolvedValueOnce(null).mockResolvedValue(summary('admitted'));
+    vi.mocked(getThreadQueue).mockResolvedValue({ entries: [], policy: {} as any });
+
+    const outcome = await focusThreadOrBootstrapResult('admitted');
+
+    expect(outcome.kind).toBe('focused');
+    expect(focusedThreadId.value).toBe('admitted');
+    expect(awaitedThreadId.value).toBeNull();
+  });
+
+  it('reports a failed queue read as a failure, not as a missing thread', async () => {
+    threadMap.value = new Map([['was-here', makeThreadState('was-here')]]);
+    focusedThreadId.value = 'was-here';
+    (fetchThreadById as any).mockResolvedValue(null);
+    vi.mocked(getThreadQueue).mockRejectedValue(new Error('network down'));
+
+    const outcome = await focusThreadOrBootstrapResult('unknown');
+
+    expect(outcome.kind).toBe('failed');
     expect(focusedThreadId.value).toBe('was-here');
     expect(awaitedThreadId.value).toBeNull();
   });

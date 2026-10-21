@@ -196,7 +196,10 @@ impl ScriptHandshakeLayer {
                 // on this layer, so an `oauth_client` must still inject. The
                 // list version's skip is about the blanket every-secret fan-out
                 // into every subprocess, which this is not.
-                crate::core::credentials::credential_env_vars_for(cred)
+                let resolver = crate::core::secret_reference::engine_resolver(&self.pool);
+                crate::core::credentials::credential_env_vars_for(cred, &resolver)
+                    .await
+                    .map_err(|reason| (StatusCode::BAD_GATEWAY, reason))?
             }
             None => Vec::new(),
         };

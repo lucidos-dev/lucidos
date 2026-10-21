@@ -565,9 +565,11 @@ _ensure_shared_postgres_container() {
     # way every real client connects — the temporary init server does not listen
     # on TCP at all, which is exactly what makes it distinguishable. A run that
     # briefly satisfies the probe and then drops resets the streak.
-    local ready_streak=0 ready_needed=3
+    # Probes five times a second, so a server that is already up costs well
+    # under a second rather than three. Prints one dot a second.
+    local ready_streak=0 ready_needed=3 tick
     echo -n "Waiting for shared PostgreSQL"
-    for _ in {1..90}; do
+    for tick in $(seq 1 450); do
         if docker exec "$container" pg_isready -U lucidos -d postgres -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
             ready_streak=$((ready_streak + 1))
             if [ "$ready_streak" -ge "$ready_needed" ]; then
@@ -580,8 +582,8 @@ _ensure_shared_postgres_container() {
             # away. Start the count over rather than proceeding on a stale yes.
             ready_streak=0
         fi
-        echo -n "."
-        sleep 1
+        [ $((tick % 5)) -ne 0 ] || echo -n "."
+        sleep 0.2
     done
     echo ""
     echo "ERROR: shared PostgreSQL did not become ready" >&2
@@ -1426,9 +1428,17 @@ engine_build_variant_slug() {
     echo "$slug"
 }
 
-# `release` when the caller asked for a release build, else `debug`.
+# The cargo profile directory the build lands in: ENGINE_CARGO_PROFILE when a
+# caller names one (GitHub e2e builds use `e2e`), else `release` when the caller
+# asked for a release build, else `debug`.
 engine_build_profile() {
-    if [ -n "${RELEASE:-}" ]; then echo "release"; else echo "debug"; fi
+    if [ -n "${ENGINE_CARGO_PROFILE:-}" ]; then
+        echo "$ENGINE_CARGO_PROFILE"
+    elif [ -n "${RELEASE:-}" ]; then
+        echo "release"
+    else
+        echo "debug"
+    fi
 }
 
 # Directory the launch binaries for a (profile, variant) pair are published to.
@@ -1437,8 +1447,9 @@ engine_build_profile() {
 # (ADR 0022 originally put it at `target/<profile>/launch/<variant>`; ADR 0063
 # amending that records why). `cargo clean` removes `target/` wholesale, and the
 # launch dir is where the running system's `lucidos` CLI lives: the engine finds
-# it by walking up from its own exe (`find_lucidos_cli_dir`) and prepends that
-# dir to PATH for every spawned coding-agent session and trigger subprocess. So
+# it by walking up from its own exe (`find_lucidos_cli_dir`), pins a copy into
+# `<workspace>/.lucidos/cli` (ADR 0512), and prepends that to PATH for every
+# spawned coding-agent session and trigger subprocess. So
 # a single `cargo clean` used to take the CLI out from under a running engine.
 # On 2026-08-13 the nightly orchestrator ran one inline, and for the next eight
 # hours every trigger that shells out to `lucidos` died with "No such file or
@@ -1648,17 +1659,17 @@ run_engine_cargo_build() {
         -p lucidos-engine "${feature_args[@]}" -p lucidos-gateway -p lucidos-cli
 }
 
-# `cargo build --locked <args>` under a build slot, in the profile RELEASE
-# picks. The label names the build in the slot's queue.
+# `cargo build --locked <args>` under a build slot, in the profile
+# engine_build_profile picks. The label names the build in the slot's queue.
 cargo_build_in_slot() {
-    local label="$1"
+    local label="$1" profile
     shift
     local slot="$PROJECT_DIR/scripts/with-build-slot.sh"
-    if [ -n "${RELEASE:-}" ]; then
-        "$slot" --label "$label (release)" -- cargo build --locked "$@" --release
-    else
-        "$slot" --label "$label" -- cargo build --locked "$@"
-    fi
+    profile="$(engine_build_profile)"
+    case "$profile" in
+        debug) "$slot" --label "$label" -- cargo build --locked "$@" ;;
+        *) "$slot" --label "$label ($profile)" -- cargo build --locked "$@" --profile "$profile" ;;
+    esac
 }
 
 # Compile every launch binary: the engine, gateway and CLI, then the dev window
@@ -1686,11 +1697,70 @@ publish_all_launch_binaries() {
     fi
 }
 
+# Boot the built engine against a throwaway copy of this workspace's database
+# (`lucidos-engine preflight`), so a binary that cannot boot is never published.
+# Every later spawn, including a crash respawn, runs the published binary, so
+# this is the only place a failure is cheap. Skipped when the workspace has no
+# database. Skipped with a WARNING when Postgres does not answer, since the
+# binary is then unchecked.
+preflight_built_engine() {
+    local engine="$1" ports_file="${WORKSPACE:-}/.lucidos/ports" port db found probe=0
+    if [ -z "${WORKSPACE:-}" ] || [ ! -f "$ports_file" ]; then
+        echo "Preflight skipped: no database is recorded for this workspace."
+        return 0
+    fi
+    port="$(sed -n 's/^PG_PORT=//p' "$ports_file" | head -n 1)"
+    db="$(sed -n 's/^PG_DATABASE=//p' "$ports_file" | head -n 1)"
+    if [ -z "$port" ] || [ -z "$db" ]; then
+        echo "Preflight skipped: no database is recorded for this workspace."
+        return 0
+    fi
+    found="$(shared_pg_psql postgres -tAc \
+        "SELECT 1 FROM pg_database WHERE datname=$(_shared_pg_literal "$db")" 2>/dev/null)" || probe=$?
+    if [ "$probe" -ne 0 ]; then
+        echo "WARNING: Preflight skipped: Postgres did not answer, so this engine is unchecked against $db."
+        return 0
+    fi
+    if [ "$found" != 1 ]; then
+        echo "Preflight skipped: the workspace database $db does not exist yet."
+        return 0
+    fi
+    echo "Preflight: booting the built engine on a copy of $db..."
+    # The URL carries the password, so it goes only into the child's environment.
+    local output status=0
+    output="$(DATABASE_URL="postgres://$PG_USER:$(shared_pg_password)@localhost:$port/$db" \
+        LUCIDOS_WORKSPACE="$WORKSPACE" "$engine" preflight 2>&1)" || status=$?
+    printf '%s\n' "$output"
+    if [ "$status" -ne 0 ]; then
+        # A line starting `ERROR:` is what the engine's build-failure toast shows.
+        echo "ERROR: the built engine cannot boot on this workspace's data: $(
+            printf '%s\n' "$output" | sed -n 's/^Error: //p' | tail -n 1)"
+        echo "The previous engine binary stays published, so nothing restarts onto this build."
+        return 1
+    fi
+}
+
+# Publish the launch binaries only when the built engine passes the preflight,
+# and only if the preflight tested the binary that gets published. The uplift
+# path is shared, so another build can replace the binary while a copy of a big
+# database restores.
+publish_after_preflight() {
+    local uplift_dir="$1" launch_dir="$2" with_window="$3"
+    local engine="$uplift_dir/lucidos-engine" tested
+    tested="$(cksum < "$engine" 2>/dev/null)"
+    preflight_built_engine "$engine" || return 1
+    if [ "$(cksum < "$engine" 2>/dev/null)" != "$tested" ]; then
+        echo "ERROR: the built engine changed while the preflight ran, so it was not published. Build again."
+        return 1
+    fi
+    publish_all_launch_binaries "$uplift_dir" "$launch_dir" "$with_window"
+}
+
 # Locate already-built binaries for the no-build path. Prefers the published
 # launch dir; falls back to cargo's shared uplift path with a warning (a fresh
 # checkout, or a hand-run `cargo build`, has no published dir yet). Profile
-# order mirrors the historical behavior: a release request falls back to debug,
-# a debug request does not reach for release. Sets ENGINE_BIN + GATEWAY_BIN as a
+# order mirrors the historical behavior: a release or e2e request falls back to
+# debug, a debug request reaches for nothing else. Sets ENGINE_BIN + GATEWAY_BIN as a
 # pair so they can never come from different builds; returns non-zero when
 # nothing is on disk.
 locate_launch_binaries() {
@@ -1705,8 +1775,10 @@ locate_launch_binaries() {
     # that the published dir is `.launch/`, so every published launch would have
     # printed the "no published engine binary yet" warning.
     local -a dirs=() published=()
-    if [ -n "${RELEASE:-}" ]; then
-        dirs+=("$(launch_bin_dir release "$variant")" "$PROJECT_DIR/target/release")
+    local profile
+    profile="$(engine_build_profile)"
+    if [ "$profile" != debug ]; then
+        dirs+=("$(launch_bin_dir "$profile" "$variant")" "$PROJECT_DIR/target/$profile")
         published+=("1" "")
     fi
     dirs+=("$(launch_bin_dir debug "$variant")" "$PROJECT_DIR/target/debug")
@@ -1761,7 +1833,7 @@ build_or_find_engine() {
     # must fail here, or the uplift fallback below serves a stale binary.
     run_launch_cargo_builds "$with_window" || return 1
     prune_stale_debug_objects "$uplift_dir/deps"
-    publish_all_launch_binaries "$uplift_dir" "$launch_dir" "$with_window" || return 1
+    publish_after_preflight "$uplift_dir" "$launch_dir" "$with_window" || return 1
 
     # Did this build actually produce a binary for the source on disk now? If
     # HEAD moved while cargo was running, it didn't — rebuild ONCE against the
@@ -1777,7 +1849,7 @@ build_or_find_engine() {
         echo "or another build clobbered the shared uplift path) — rebuilding once..."
         run_launch_cargo_builds "$with_window" || return 1
         prune_stale_debug_objects "$uplift_dir/deps"
-        publish_all_launch_binaries "$uplift_dir" "$launch_dir" "$with_window" || return 1
+        publish_after_preflight "$uplift_dir" "$launch_dir" "$with_window" || return 1
         state="$(published_build_state "$launch_dir/lucidos-engine")"
     fi
     if [ "$state" = "stale" ]; then
@@ -2106,9 +2178,11 @@ start_engine() {
     # Ready means the engine of THIS launch owns the workspace and answers. The
     # engine publishes engine.pid itself once it holds the owner lock, so until
     # then the file may still name a predecessor that is draining (ADR 0438).
+    # Polls five times a second, so a boot of a second or two is not rounded
+    # up to the next whole second. Prints one dot a second.
     echo -n "Waiting for engine"
-    local engine_ready=""
-    for _ in {1..90}; do
+    local engine_ready="" tick
+    for tick in $(seq 1 450); do
         if ! kill -0 "$ENGINE_SUPERVISOR_PID" 2>/dev/null; then
             break
         fi
@@ -2119,8 +2193,8 @@ start_engine() {
             engine_ready="yes"
             break
         fi
-        echo -n "."
-        sleep 1
+        [ $((tick % 5)) -ne 0 ] || echo -n "."
+        sleep 0.2
     done
 
     if [ -z "$engine_ready" ]; then
@@ -2130,6 +2204,9 @@ start_engine() {
         kill -KILL "$ENGINE_SUPERVISOR_PID" 2>/dev/null || true
         exit 1
     fi
+    # The engine's own account of where its boot went.
+    grep -E "\[pid:$ENGINE_PID\].*(Migrations checked|Boot stages)" "$ENGINE_LOG" 2>/dev/null | tail -n 2 \
+        | sed -E 's/^.*\[Startup\] /Engine: /' || true
 }
 
 # ── Workspace gateway (ADR 0014) ──────────────────────────────────────────
@@ -2755,6 +2832,9 @@ ensure_frontend_deps() {
 # engine serves (/api/v1/sdk.js and the scripts beside it). Runs after
 # build_or_find_engine. When that just compiled, a codegen cache miss renders
 # with the lucidos-codegen it built beside the engine, for free.
+#
+# REUSED_CODEGEN_BIN names a lucidos-codegen the e2e engine cache matched to
+# this tree, for a caller that reused a build rather than compiling one.
 generate_build_outputs() {
     # SDK deps are hoisted to root node_modules by npm workspaces
     ensure_npm_deps "$PROJECT_DIR" "workspace dependencies"
@@ -2762,7 +2842,9 @@ generate_build_outputs() {
     local codegen_bin
     codegen_bin="$PROJECT_DIR/target/$(engine_build_profile)/lucidos-codegen"
     local -a bin_args=()
-    if [ -n "${BUILD:-}" ] && [ -x "$codegen_bin" ]; then
+    if [ -n "${REUSED_CODEGEN_BIN:-}" ]; then
+        bin_args=(--reused-bin "$REUSED_CODEGEN_BIN")
+    elif [ -n "${BUILD:-}" ] && [ -x "$codegen_bin" ]; then
         bin_args=(--bin "$codegen_bin")
     fi
     "$PROJECT_DIR/scripts/codegen.sh" ${bin_args[@]+"${bin_args[@]}"}

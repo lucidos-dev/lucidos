@@ -1,6 +1,7 @@
 import type {
   AbortCause,
   ActorMode,
+  CancelCause,
   EventSubscription,
   MessageOrigin,
   ThreadEvent,
@@ -28,6 +29,8 @@ export type {
   EventWaitCancelCause,
   FormRequestOutcome,
   MessageOrigin,
+  PluginSetupCause,
+  PluginSetupOccasion,
   QuestionOption,
   SessionEndReason,
   SubThreadPendingChange,
@@ -43,6 +46,7 @@ import {
   AUTO_RECOVERY_AFTER_HANG_REASON,
   AUTO_RESUME_AFTER_API_ERROR_REASON,
   AUTO_RESUME_AFTER_SWITCH_REASON,
+  EFFORT_RESTART_REASON,
   ENGINE_RESTART_INTERRUPT_REASON,
   HARDEN_REQUESTED_REASON,
   USER_CLICKED_CONTINUE_REASON,
@@ -99,14 +103,6 @@ export type WidgetEvent = Extract<ThreadEvent, { type: (typeof WIDGET_EVENT_TYPE
 
 export function isWidgetEvent(event: { type: string }): event is WidgetEvent {
   return (WIDGET_EVENT_TYPES as readonly string[]).includes(event.type);
-}
-
-/** The home thread's events the Home board folds (ADR 0432): its pins, its
- *  unpins and its arrangements. */
-export const HOME_BOARD_EVENT_TYPES = [...WIDGET_SHELF_CHANGE_TYPES, 'HomeBoardArranged'] as const;
-
-export function isHomeBoardEvent(event: { type: string }): boolean {
-  return (HOME_BOARD_EVENT_TYPES as readonly string[]).includes(event.type);
 }
 
 export type ThreadInitiator = 'user' | 'system';
@@ -281,17 +277,19 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
  *  continues out of it. Grouping opens an exchange for it and hands the
  *  running turn straight back, and the panel draws its header alone.
  *
- *  Four qualify. The user's Stop waiting (`isUserStoppedWait`). A
+ *  Five qualify. The user's Stop waiting (`isUserStoppedWait`). A
  *  `ChildThreadStopped` on a parent (ADR 0252): a user Stop paused one of its
  *  children. A `ChildThreadDetached` on a parent (ADR 0278): one of its
- *  children moved to top level. And a `ChildReportFiled`: a child's report its
- *  child said needs no action now. None wakes the parent, so no response
- *  follows. */
+ *  children moved to top level. A `ChildReportFiled`: a child's report its
+ *  child said needs no action now. And a `CacheKeepAliveStatusChanged`, the
+ *  record of one keep-alive run (ADR 0540). None wakes the parent, so no
+ *  response follows. */
 export function isTurnlessBoundary(event: { type: string; cause?: string }): boolean {
   return isUserStoppedWait(event)
     || event.type === 'ChildThreadStopped'
     || event.type === 'ChildThreadDetached'
-    || event.type === 'ChildReportFiled';
+    || event.type === 'ChildReportFiled'
+    || event.type === 'CacheKeepAliveStatusChanged';
 }
 
 /** The wait's `reason` as a bare subject, for a label that already said "wait".
@@ -361,6 +359,22 @@ export function eventWaitStoppedSummary(reason: string | undefined): string {
  *  cancel cause is surfaced in the Initiator info popover instead. */
 export const RESPONSE_CANCELED_SUMMARY = 'Response canceled';
 
+/** Which cancels the engine made to carry the work on, rather than the user
+ *  abandoning it: a follow-up, or an effort restart. Rust's
+ *  `CancelCause::is_redirect`. A `Record`, so tsc asks about a new cause. */
+const REDIRECT_CANCEL: Record<CancelCause, boolean> = {
+  user_stop: false,
+  user_action: false,
+  superseded_by_followup: true,
+  effort_restart: true,
+  unknown: false,
+};
+
+/** Whether a `ResponseCanceled` is a redirect, which renders neutrally. */
+export function isRedirectCancel(cause: CancelCause | undefined): boolean {
+  return cause !== undefined && REDIRECT_CANCEL[cause];
+}
+
 /** ContinuationStarted.reason emitted when the engine auto-resumes a coding
  *  agent after its subprocess died WITHOUT an engine restart — a hung-API
  *  watchdog fire OR a stray signal-kill (e.g. another workspace's `cargo check`
@@ -385,6 +399,11 @@ export const CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON = AUTO_RESUME_AFTER_SW
 /** ContinuationStarted.reason emitted when the user pressed **Harden** on the
  *  Not ready strip, and the thread resumed to run `/harden`. */
 export const CONTINUATION_HARDEN_REQUESTED_REASON = HARDEN_REQUESTED_REASON;
+
+/** ContinuationStarted.reason emitted when the user picked a new reasoning
+ *  effort on a Claude Code thread. Claude Code takes effort only at spawn, so
+ *  the engine stopped the session and resumed it at the new effort. */
+export const CONTINUATION_EFFORT_RESTART_REASON = EFFORT_RESTART_REASON;
 
 /** ContinuationStarted.reason emitted when the engine resumes a coding-agent
  *  turn the backend ended on a TRANSIENT upstream failure it reported itself
@@ -426,6 +445,7 @@ export function continuationStartedSummary(
     return 'Resumed after the model connection dropped';
   }
   if (reason === CONTINUATION_HARDEN_REQUESTED_REASON) return 'Hardening the work';
+  if (reason === CONTINUATION_EFFORT_RESTART_REASON) return 'Restarted at the new reasoning effort';
   return originMode(actor) === 'human' ? 'Continued the response' : 'Resumed after engine restart';
 }
 
@@ -438,6 +458,7 @@ export function continuationCause(
   if (reason === CONTINUATION_AUTO_RECOVERY_REASON) return 'Stopped responding';
   if (reason === CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON) return 'Connection dropped';
   if (reason === CONTINUATION_HARDEN_REQUESTED_REASON) return 'You asked to harden';
+  if (reason === CONTINUATION_EFFORT_RESTART_REASON) return 'You changed effort';
   return originMode(actor) === 'human' ? 'You continued' : 'After restart';
 }
 

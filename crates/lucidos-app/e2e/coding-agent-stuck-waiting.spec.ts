@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import {
-  navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForVisibleInput, hideHomeRail,
+  navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForVisibleInput, hideDashboardRail,
 } from './helpers';
 import {
   psql, createCCThreadWithChange, cleanupCCThread, cleanupFileFromMain,
@@ -140,7 +140,7 @@ test.describe('CC stuck-in-waiting regression', () => {
       }, threadId);
       // The drawer opens beside the thread below, and the rail would squeeze
       // the pane until its actions fold into the overflow menu.
-      await hideHomeRail(page);
+      await hideDashboardRail(page);
       await navigateToApp(page);
 
       await applyAndDismiss(page, threadId);

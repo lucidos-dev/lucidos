@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { currentAutocorrect, currentCaptureContext, setAutocorrect, setCaptureContext } from '../../store/actions/preferences';
+import { currentAutocorrect, currentCacheWarmLine, currentCaptureContext, setAutocorrect, setCacheWarmLine, setCaptureContext } from '../../store/actions/preferences';
 import { isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
 import { isIOS } from '../../utils/platform';
 import { animationSpeed, enginePackaged, preferences, speedMultiplier } from '../../store/store';
@@ -17,6 +17,8 @@ import { LoadableToggle } from '../shared/LoadableToggle';
  *    moved here from the former Models → Debugging group so all diagnostics share
  *    one home. Calling `currentCaptureContext()` in render subscribes to
  *    preference updates (it reads `preferences.value`), same as LocaleSection.
+ *  - "Cache-warm line" is the server preference `cache_warm_line`, on by default.
+ *    It hides the line that counts down a waiting thread's warm prompt cache.
  *  - "Perf instrumentation" toggles the per-device `lucidos:perf` localStorage
  *    flag that gates `recordPerfSample` (see utils/perfQueue.ts). It's NOT a
  *    server preference — device-local by design, read live, takes effect on the
@@ -88,6 +90,24 @@ export function DebuggingSection() {
           />
           <span class="toggle-slider" />
         </label>
+      </div>
+      <div class="settings-row" data-search-anchor="debugging:cache-warm-line">
+        <span class="settings-row-label">
+          Cache-warm line
+          <Explainer title="Cache-warm line">
+            <p>
+              Closes the feed of a thread waiting on you with how long its prompt
+              cache stays warm. Reply before the time runs out and the next turn
+              reads the cache cheaply.
+            </p>
+            <p>On by default. Turn it off to hide the line.</p>
+          </Explainer>
+        </span>
+        <LoadableToggle
+          loaded={preferences.value.status === 'loaded'}
+          checked={currentCacheWarmLine()}
+          onChange={(c) => void setCacheWarmLine(c)}
+        />
       </div>
       <div class="settings-row" data-search-anchor="debugging:perf">
         <span class="settings-row-label">

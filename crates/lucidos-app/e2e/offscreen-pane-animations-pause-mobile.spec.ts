@@ -4,6 +4,9 @@ import { randomUUID } from 'crypto';
 import { assertHealthy, ensureMobileView, navigateToApp } from './helpers';
 import { psql } from './db-helpers';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 // Every mobile pane stays mounted, and an infinite animation in one off screen
 // still restyles and repaints it on every frame. On an iPhone, that work shares
 // the main thread with typing. The drawer's running shimmer and spinners

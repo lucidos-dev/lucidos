@@ -8,7 +8,8 @@ use serde::Serialize;
 
 use super::AppState;
 use crate::engine::aux_purpose::{
-    asks_no_model, model_key, recommended, recommended_effort, ModelSource, BACKGROUND_ROWS,
+    asks_no_model, model_key, recommended, recommended_effort, GenerationStep, ModelSource,
+    BACKGROUND_ROWS,
 };
 use crate::engine::ContextPurpose;
 use crate::llm::model_registry::ModelRegistry;
@@ -19,10 +20,14 @@ pub(crate) struct BackgroundModel {
     pub(crate) model: String,
     pub(crate) effort: Option<String>,
     pub(crate) source: ModelSource,
-    /// Whether a configured provider serves `model` and has not answered
-    /// not-found for it. Only a stored pick or the chat model can be
-    /// unreachable; its calls then fail naming why.
+    /// Whether a configured provider serves `model`, or a generation of it
+    /// the task may move to, and has not answered not-found for it. Only a
+    /// stored pick or the chat model can be unreachable; its calls then fail
+    /// naming why.
     pub(crate) reachable: bool,
+    /// What runs instead of `model` within its lineage, and why. `None` when
+    /// `model` runs as it is.
+    pub(crate) generation: Option<GenerationStep>,
     /// The models this row would run on ahead of `model`, plus `model`, whose
     /// provider answered not-found within the window (ADR 0403).
     pub(crate) not_served: Vec<String>,
@@ -80,6 +85,7 @@ async fn get_background_models(
                 effort: selection.reasoning.clone(),
                 source: selection.source,
                 reachable: selection.reachable,
+                generation: selection.generation.clone(),
                 not_served: selection.not_served.clone(),
                 needs_vision: selection.needs_vision,
                 vision: selection.vision,

@@ -25,7 +25,8 @@
 
 import type { Scope } from './store';
 import type { ComposeMode } from './actions/compose';
-import type { ComposeChannelMode } from './thread-events';
+import type { ComposeChannelMode, ThreadMeta } from './thread-events';
+import { appIdFromFolder } from '../utils/appIdFromFolder';
 
 export type ComposeDestination =
   | { kind: 'lucidos-agent' }
@@ -101,6 +102,23 @@ export function scopeRepoName(
     case 'lucidos': return LUCIDOS_SOURCE_REPO_NAME;
     case 'external': return repos.find(r => r.id === scope.repoId)?.name || undefined;
     case 'app': return undefined;
+  }
+}
+
+/** The coding target a started coding-agent thread runs on: the inverse of
+ *  the binding `sendCompose` writes onto its meta. A legacy row with no kind is
+ *  a Lucidos-source thread. `null` when the meta names a target it cannot
+ *  locate, so the caller leaves the compose view's own pick alone. */
+export function threadScope(
+  meta: Pick<ThreadMeta, 'codingAgentKind' | 'repoId' | 'codingAgentFolder'>,
+): Scope | null {
+  switch (meta.codingAgentKind ?? 'lucidos') {
+    case 'lucidos': return { kind: 'lucidos' };
+    case 'external': return meta.repoId ? { kind: 'external', repoId: meta.repoId } : null;
+    case 'app': {
+      const appId = appIdFromFolder(meta.codingAgentFolder);
+      return appId ? { kind: 'app', appId } : null;
+    }
   }
 }
 

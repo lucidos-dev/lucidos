@@ -10,6 +10,8 @@
 
 use crate::core::prefs::{self, parse_flag, Flag, Pref};
 use crate::core::{AuthType, CredentialStore};
+use crate::llm::claude_gateway::account::ClaudeGatewayAccountStore;
+use crate::llm::claude_gateway::{GatewayAccessFactory, GatewayOrigin};
 use crate::llm::web_search::{
     AnthropicServerToolSearch, OpenAiResponsesSearch, VertexGroundingSearch, WebSearchChain,
     WebSearchProvider,
@@ -17,7 +19,7 @@ use crate::llm::web_search::{
 use crate::llm::{
     resolve_anthropic_auth, resolve_bearer_key, resolve_openai_api_key, select_provider,
     AnthropicAuth, AnthropicAuthSource, AnthropicProvider, LlmProvider, OpenAiKeySource,
-    OpenAiProvider, ProviderSelection, ProviderSelectionInputs, RoutingProvider,
+    OpenAiProvider, ProviderSelection, ProviderSelectionInputs, RoutingBackends, RoutingProvider,
     UnconfiguredProvider, VertexProvider, OPENAI_DEFAULT_BASE_URL, OPENCODE_FREE_BASE_URL,
     OPENROUTER_BASE_URL, XAI_BASE_URL,
 };
@@ -31,36 +33,39 @@ use std::sync::Arc;
 pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 5] =
     ["openai", "anthropic", "openrouter", "xai", "local"];
 
-/// The six per-provider enable switches, in the order [`ProviderSwitches`]
+/// The seven per-provider enable switches, in the order [`ProviderSwitches`]
 /// declares them.
 ///
 /// [`PROVIDER_PREFERENCE_KEYS`] is built from this list, so the config
 /// subscriber cannot end up watching a subset of it.
-pub(crate) const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 6] = [
+pub(crate) const PROVIDER_ENABLED_SWITCHES: [&Pref<Flag>; 7] = [
     &prefs::PROVIDER_ENABLED_VERTEX,
     &prefs::PROVIDER_ENABLED_ANTHROPIC,
     &prefs::PROVIDER_ENABLED_OPENAI,
     &prefs::PROVIDER_ENABLED_OPENROUTER,
     &prefs::PROVIDER_ENABLED_XAI,
     &prefs::PROVIDER_ENABLED_LOCAL,
+    &prefs::PROVIDER_ENABLED_CLAUDE_GATEWAY,
 ];
 
 /// Preference keys that, when changed, change which LLM provider is installed.
 /// The same subscriber that watches [`PROVIDER_CREDENTIAL_SERVICES`] filters on
 /// this set, so a provider configured by a preference hot-swaps exactly like one
 /// configured by a credential. `opencode-free` has no credential at all, and the
-/// local base URL used to need a restart. The six per-provider switches are here
-/// for the same reason: a switch that needed a restart is a switch the user
-/// reads as broken.
-pub const PROVIDER_PREFERENCE_KEYS: [&str; 8] = [
+/// local base URL used to need a restart. The Claude gateway URL decides which
+/// sign-in counts. The per-provider switches are here for the same reason: a
+/// switch that needed a restart is a switch the user reads as broken.
+pub const PROVIDER_PREFERENCE_KEYS: [&str; 10] = [
     prefs::OPENCODE_FREE_ENABLED.key(),
     prefs::LOCAL_BASE_URL.key(),
+    prefs::CLAUDE_GATEWAY_URL.key(),
     PROVIDER_ENABLED_SWITCHES[0].key(),
     PROVIDER_ENABLED_SWITCHES[1].key(),
     PROVIDER_ENABLED_SWITCHES[2].key(),
     PROVIDER_ENABLED_SWITCHES[3].key(),
     PROVIDER_ENABLED_SWITCHES[4].key(),
     PROVIDER_ENABLED_SWITCHES[5].key(),
+    PROVIDER_ENABLED_SWITCHES[6].key(),
 ];
 
 /// Whether `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
@@ -89,6 +94,7 @@ pub struct ProviderSwitches {
     pub openrouter: bool,
     pub xai: bool,
     pub local: bool,
+    pub claude_gateway: bool,
 }
 
 impl Default for ProviderSwitches {
@@ -100,11 +106,12 @@ impl Default for ProviderSwitches {
             openrouter: prefs::PROVIDER_ENABLED_OPENROUTER.default_flag(),
             xai: prefs::PROVIDER_ENABLED_XAI.default_flag(),
             local: prefs::PROVIDER_ENABLED_LOCAL.default_flag(),
+            claude_gateway: prefs::PROVIDER_ENABLED_CLAUDE_GATEWAY.default_flag(),
         }
     }
 }
 
-/// Read the six switches, defaulting any unreadable one to its default (on).
+/// Read the seven switches, defaulting any unreadable one to its default (on).
 /// The handle read logs a failed read. Losing a provider over a transient query
 /// error is worse than honouring the veto one build late.
 pub(crate) async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
@@ -115,6 +122,7 @@ pub(crate) async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
         openrouter: prefs::PROVIDER_ENABLED_OPENROUTER.read(pool).await,
         xai: prefs::PROVIDER_ENABLED_XAI.read(pool).await,
         local: prefs::PROVIDER_ENABLED_LOCAL.read(pool).await,
+        claude_gateway: prefs::PROVIDER_ENABLED_CLAUDE_GATEWAY.read(pool).await,
     }
 }
 
@@ -136,8 +144,18 @@ pub struct ProviderBuildContext {
     pub vertex_location: crate::llm::vertex::LocationHandle,
     pub vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
     pub model_registry: crate::llm::model_registry::ModelRegistry,
+    /// The not-found answers the router has seen. A shared handle, so a
+    /// rebuilt router keeps the window.
+    pub not_served: crate::llm::not_served::NotServedLedger,
     pub boot_without_provider: bool,
+    /// Makes the Claude gateway access. `None` at boot, before the
+    /// event bus exists: a signed-in gateway then counts as configured but is
+    /// left out, and the engine rebuilds once it can supply one.
+    pub claude_gateway_access: Option<GatewayAccessFactory>,
 }
+
+/// Why a boot stops when [`ProviderBuildOutcome::FailFast`] comes back.
+pub const NO_PROVIDER_AT_BOOT: &str = "No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter / xAI credential (Settings → Models → Providers) or OPENAI_API_KEY / ANTHROPIC_API_KEY / LUCIDOS_OPENROUTER_API_KEY / LUCIDOS_XAI_API_KEY, set a local OpenAI-compatible base URL (Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL), turn on the keyless OpenCode Free tier (Settings → Models → Providers or LUCIDOS_OPENCODE_FREE=1), LUCIDOS_BOOT_WITHOUT_PROVIDER=1 (boot into provider onboarding), or LUCIDOS_MODEL=mock (for testing).";
 
 /// What [`build_active_provider`] resolved to.
 pub enum ProviderBuildOutcome {
@@ -171,6 +189,9 @@ struct DirectProviders {
     xai: Option<OpenAiProvider>,
     opencode_free: Option<OpenAiProvider>,
     local: Option<OpenAiProvider>,
+    claude_gateway: Option<AnthropicProvider>,
+    /// A signed-in gateway is configured, whether or not it could be built yet.
+    claude_gateway_signed_in: bool,
     /// Search backends in chain order — Anthropic before OpenAI. Vertex is
     /// prepended by the caller, which owns the Vertex config.
     search_backends: Vec<Arc<dyn WebSearchProvider>>,
@@ -198,19 +219,24 @@ async fn read_credential_pair(
     service: &str,
     display_name: &str,
 ) -> Result<Option<(AuthType, String)>, CredentialUnreadable> {
-    match CredentialStore::get(pool, service).await {
-        Ok(cred) => Ok(cred.map(|c| (c.auth_type, c.auth_value))),
-        Err(e) => {
-            crate::log!(
-                "[Startup] WARNING: could not read the {} credential ({}). \
-                 Falling back to the environment, which may name a different \
-                 account than the stored one.",
-                display_name,
-                e
-            );
-            Err(CredentialUnreadable)
-        }
-    }
+    // A secret reference that cannot be read is a failed read too, never
+    // "nothing stored": it gets the same warning before the fallback.
+    let read = match CredentialStore::get(pool, service).await {
+        Ok(Some(c)) => match c.secret(pool).await {
+            Ok(secret) => return Ok(Some((c.auth_type, secret))),
+            Err(reason) => reason,
+        },
+        Ok(None) => return Ok(None),
+        Err(e) => e.to_string(),
+    };
+    crate::log!(
+        "[Startup] WARNING: could not read the {} credential ({}). \
+         Falling back to the environment, which may name a different \
+         account than the stored one.",
+        display_name,
+        read
+    );
+    Err(CredentialUnreadable)
 }
 
 /// The stored half of the provider material: credentials and preferences.
@@ -233,6 +259,9 @@ struct StoredInputs {
     opencode_free_pref: Option<String>,
     local_base: Option<String>,
     local_key: Option<StoredLocalKey>,
+    claude_gateway_url: Option<String>,
+    /// The gateway origin the stored sign-in came from.
+    claude_gateway_issuer: Option<String>,
     switches: ProviderSwitches,
 }
 
@@ -285,12 +314,16 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
         }
     }
     match CredentialStore::get(pool, "local").await {
-        Ok(cred) => {
-            stored.local_key = cred.map(|c| StoredLocalKey {
-                value: c.auth_value,
-                base_urls: c.base_urls,
-            })
+        Ok(Some(c)) => {
+            stored.local_key =
+                c.secret_or_log(pool, "[Startup]")
+                    .await
+                    .map(|value| StoredLocalKey {
+                        value,
+                        base_urls: c.base_urls,
+                    })
         }
+        Ok(None) => stored.local_key = None,
         Err(e) => {
             crate::log!(
                 "[Startup] Failed to read local provider credential, omitting local: {}",
@@ -298,6 +331,23 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
             );
             switches.local = false;
         }
+    }
+
+    // The Claude gateway: its URL and the stored sign-in's issuer, never its
+    // tokens. Either read failing leaves the gateway out, with nothing sent.
+    match prefs::CLAUDE_GATEWAY_URL.try_stored(pool).await {
+        Ok(url) => stored.claude_gateway_url = url,
+        Err(e) => crate::log!(
+            "[Startup] Failed to read claude_gateway_url preference, omitting the Claude gateway: {}",
+            e
+        ),
+    }
+    match ClaudeGatewayAccountStore::get(pool).await {
+        Ok(account) => stored.claude_gateway_issuer = account.map(|a| a.issuer),
+        Err(e) => crate::log!(
+            "[Startup] Failed to read the Claude gateway sign-in, omitting the Claude gateway: {}",
+            e
+        ),
     }
 
     stored.switches = switches;
@@ -315,6 +365,17 @@ fn if_enabled<T>(enabled: bool, build: impl FnOnce() -> Option<T>) -> Option<T> 
     } else {
         None
     }
+}
+
+/// The keys found outside the stored credentials, each below its stored one.
+#[derive(Default)]
+struct EnvFallbacks {
+    /// `OPENAI_API_KEY`.
+    openai: Option<String>,
+    /// The Codex CLI's auth file (apikey login), below `OPENAI_API_KEY`.
+    openai_codex: Option<String>,
+    /// `ANTHROPIC_API_KEY`.
+    anthropic: Option<String>,
 }
 
 /// Resolve the direct (OpenAI-wire + Anthropic) providers from credentials +
@@ -339,11 +400,15 @@ async fn resolve_direct_providers(
     pool: Option<&PgPool>,
     default_model: &str,
     registry: &crate::llm::model_registry::ModelRegistry,
-    openai_env_key: Option<String>,
-    openai_codex_key: Option<String>,
-    anthropic_env_key: Option<String>,
+    env: EnvFallbacks,
     switches: ProviderSwitches,
+    claude_gateway_access: Option<&GatewayAccessFactory>,
 ) -> DirectProviders {
+    let EnvFallbacks {
+        openai: openai_env_key,
+        openai_codex: openai_codex_key,
+        anthropic: anthropic_env_key,
+    } = env;
     let StoredInputs {
         anthropic: anthropic_credential,
         openai: openai_credential,
@@ -352,6 +417,8 @@ async fn resolve_direct_providers(
         opencode_free_pref,
         local_base,
         local_key,
+        claude_gateway_url,
+        claude_gateway_issuer,
         switches,
     } = match pool {
         Some(pool) => read_stored_inputs(pool, switches).await,
@@ -405,6 +472,15 @@ async fn resolve_direct_providers(
         build_local_provider(local_base, local_key, default_model)
     });
 
+    // The Claude gateway serves no web search: it promises no server tools.
+    let claude_gateway_origin = if_enabled(switches.claude_gateway, || {
+        signed_in_gateway(claude_gateway_url, claude_gateway_issuer)
+    });
+    let claude_gateway_signed_in = claude_gateway_origin.is_some();
+    let claude_gateway = claude_gateway_origin.and_then(|origin| {
+        build_claude_gateway_provider(origin, claude_gateway_access, default_model)
+    });
+
     // Chain order: Anthropic before OpenAI, because Anthropic's server tool has
     // no per-call fee while OpenAI's Responses web search bills per call on top
     // of the tokens the results consume.
@@ -421,6 +497,8 @@ async fn resolve_direct_providers(
         xai,
         opencode_free,
         local,
+        claude_gateway,
+        claude_gateway_signed_in,
         search_backends,
     }
 }
@@ -428,10 +506,10 @@ async fn resolve_direct_providers(
 /// Last-resort search model per provider, used when the configured chat model
 /// belongs to a *different* provider. Small, current, broadly-available ids —
 /// the search call is a short summary over the results, so the cheapest capable
-/// model is the right tier. `gpt-5.5` additionally satisfies OpenAI's
+/// model is the right tier. `gpt-6.1-sol` additionally satisfies OpenAI's
 /// `uses_responses_api` check, which the `web_search` tool requires.
-const ANTHROPIC_FALLBACK_SEARCH_MODEL: &str = "claude-haiku-4-5";
-const OPENAI_FALLBACK_SEARCH_MODEL: &str = "gpt-5.5";
+const ANTHROPIC_FALLBACK_SEARCH_MODEL: &str = "claude-haiku-5-5";
+const OPENAI_FALLBACK_SEARCH_MODEL: &str = "gpt-6.1-sol";
 
 /// A model id valid for `provider`, for the one-shot search call.
 ///
@@ -595,15 +673,17 @@ pub async fn build_active_provider(
         None
     };
 
-    let openai_env_key = std::env::var(crate::llm::OPENAI_API_KEY_ENV).ok();
-    // Lowest-precedence OpenAI key: auto-detected from the Codex CLI's auth file
-    // (apikey login), the parallel of Vertex reading the gcloud ADC file. Read
-    // fresh each build (boot + credential-subscriber hot-swap); never persisted.
-    let openai_codex_key = crate::llm::openai::codex_detect::load();
-    // The Anthropic env fallback, below a stored `anthropic` credential. Read
-    // here (not inside the resolver) so the precedence stays pure over its
-    // inputs and unit-testable without touching process env.
-    let anthropic_env_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let env = EnvFallbacks {
+        openai: std::env::var(crate::llm::OPENAI_API_KEY_ENV).ok(),
+        // Lowest-precedence OpenAI key: auto-detected from the Codex CLI's auth
+        // file, the parallel of Vertex reading the gcloud ADC file. Read fresh
+        // each build (boot + credential-subscriber hot-swap); never persisted.
+        openai_codex: crate::llm::openai::codex_detect::load(),
+        // The Anthropic env fallback, below a stored `anthropic` credential.
+        // Read here (not inside the resolver) so the precedence stays pure over
+        // its inputs and unit-testable without touching process env.
+        anthropic: std::env::var("ANTHROPIC_API_KEY").ok(),
+    };
     let DirectProviders {
         openai,
         anthropic,
@@ -611,15 +691,16 @@ pub async fn build_active_provider(
         xai,
         opencode_free,
         local,
+        claude_gateway,
+        claude_gateway_signed_in,
         search_backends,
     } = resolve_direct_providers(
         pool,
         &ctx.default_model,
         &ctx.model_registry,
-        openai_env_key,
-        openai_codex_key,
-        anthropic_env_key,
+        env,
         switches,
+        ctx.claude_gateway_access.as_ref(),
     )
     .await;
 
@@ -632,6 +713,7 @@ pub async fn build_active_provider(
         has_xai: xai.is_some(),
         has_opencode_free: opencode_free.is_some(),
         has_local: local.is_some(),
+        has_claude_gateway: claude_gateway_signed_in,
         boot_without_provider: ctx.boot_without_provider,
     });
 
@@ -692,17 +774,23 @@ pub async fn build_active_provider(
                 selection: ProviderSelection::Mock,
             });
         }
-        ProviderSelection::Real => Arc::new(RoutingProvider::new(
-            vertex,
-            openai,
-            anthropic,
-            openrouter,
-            xai,
-            opencode_free,
-            local,
-            ctx.model_registry.clone(),
-            ctx.default_model.clone(),
-        )),
+        ProviderSelection::Real => Arc::new(
+            RoutingProvider::new(
+                RoutingBackends {
+                    vertex,
+                    openai,
+                    anthropic,
+                    openrouter,
+                    xai,
+                    opencode_free,
+                    local,
+                    claude_gateway,
+                },
+                ctx.model_registry.clone(),
+                ctx.default_model.clone(),
+            )
+            .observing(ctx.not_served.clone()),
+        ),
         ProviderSelection::Unconfigured => Arc::new(UnconfiguredProvider::new()),
         ProviderSelection::FailFast => return Ok(ProviderBuildOutcome::FailFast),
     };
@@ -736,6 +824,73 @@ fn build_anthropic_provider(
         }
         Err(e) => {
             crate::log!("[Startup] Failed to build Anthropic provider: {}", e);
+            None
+        }
+    }
+}
+
+/// The configured Claude gateway's origin, when Lucidos is signed in to it.
+///
+/// The `claude_gateway_url` preference must parse as a gateway origin, and the
+/// stored sign-in must come from that origin. A sign-in to another gateway is
+/// left out rather than presented: its token belongs to its issuer only.
+fn signed_in_gateway(url: Option<String>, issuer: Option<String>) -> Option<GatewayOrigin> {
+    let url = url.filter(|url| !url.trim().is_empty())?;
+    let origin = match GatewayOrigin::parse(&url) {
+        Ok(origin) => origin,
+        Err(reason) => {
+            crate::log!("[Startup] Omitting the Claude gateway: {}", reason);
+            return None;
+        }
+    };
+    match issuer {
+        Some(issuer) if issuer == origin.as_str() => Some(origin),
+        Some(issuer) => {
+            crate::log!(
+                "[Startup] Omitting the Claude gateway: signed in to {}, not the configured {}",
+                issuer,
+                origin
+            );
+            None
+        }
+        None => {
+            crate::log!(
+                "[Startup] Claude gateway {} is configured but not signed in to",
+                origin
+            );
+            None
+        }
+    }
+}
+
+/// Build the Claude gateway provider for a signed-in `origin`. `None` while no
+/// gateway access can be made yet (the boot build), or if the client fails.
+fn build_claude_gateway_provider(
+    origin: GatewayOrigin,
+    access: Option<&GatewayAccessFactory>,
+    default_model: &str,
+) -> Option<AnthropicProvider> {
+    let Some(access) = access else {
+        crate::log!(
+            "[Startup] Claude gateway {} joins once the engine's event bus exists",
+            origin
+        );
+        return None;
+    };
+    match AnthropicProvider::claude_gateway(
+        origin.clone(),
+        access(origin.clone()),
+        default_model.to_string(),
+    ) {
+        Ok(p) => {
+            crate::log!("[Startup] Claude gateway provider configured ({})", origin);
+            Some(p)
+        }
+        Err(e) => {
+            crate::log!(
+                "[Startup] Failed to build the Claude gateway provider: {}",
+                e
+            );
             None
         }
     }
@@ -868,10 +1023,7 @@ fn opencode_free_headers() -> Vec<(String, String)> {
             "https://lucidos.dev".to_string(),
         ),
         ("X-Title".to_string(), "Lucidos".to_string()),
-        (
-            "User-Agent".to_string(),
-            format!("Lucidos/{}", env!("CARGO_PKG_VERSION")),
-        ),
+        ("User-Agent".to_string(), crate::llm::lucidos_user_agent()),
     ]
 }
 
@@ -1033,7 +1185,8 @@ fn local_key_in_scope(
 mod tests {
     use super::*;
     use crate::test_support::{
-        delete_credential, seed_credential, seed_preference, setup_test_db, teardown_test_db,
+        delete_credential, seed_claude_gateway_sign_in, seed_credential, seed_preference,
+        setup_test_db, teardown_test_db,
     };
 
     /// Build a non-mock context with no Vertex and the boot-without-provider gate
@@ -1047,7 +1200,9 @@ mod tests {
             vertex_location: crate::llm::vertex::location_handle("europe-west1".to_string()),
             vertex_token_cache: None,
             model_registry: crate::llm::model_registry::empty(),
+            not_served: Default::default(),
             boot_without_provider,
+            claude_gateway_access: None,
         }
     }
 
@@ -1267,10 +1422,12 @@ mod tests {
             Some(&pool),
             prefs::CHAT_MODEL.default_text(),
             &registry,
-            None,
-            None,
-            Some("sk-ant-env".to_string()),
+            EnvFallbacks {
+                anthropic: Some("sk-ant-env".to_string()),
+                ..EnvFallbacks::default()
+            },
             ProviderSwitches::default(),
+            None,
         )
         .await;
         assert!(
@@ -1300,10 +1457,9 @@ mod tests {
             None,
             prefs::CHAT_MODEL.default_text(),
             &registry,
-            None,
-            None,
-            None,
+            EnvFallbacks::default(),
             ProviderSwitches::default(),
+            None,
         )
         .await;
         assert!(
@@ -1316,10 +1472,12 @@ mod tests {
             None,
             prefs::CHAT_MODEL.default_text(),
             &registry,
-            None,
-            None,
-            Some("sk-ant-env".to_string()),
+            EnvFallbacks {
+                anthropic: Some("sk-ant-env".to_string()),
+                ..EnvFallbacks::default()
+            },
             ProviderSwitches::default(),
+            None,
         )
         .await;
         assert!(
@@ -1381,11 +1539,6 @@ mod tests {
 
     /// A stored `xai` credential alone configures the provider and reports it,
     /// so the picker stops hiding every Grok row as "not set up".
-    ///
-    /// This also pins the ARGUMENT ORDER into `RoutingProvider::new`, whose
-    /// `openrouter`, `xai` and `local` arguments are three consecutive
-    /// `Option<OpenAiProvider>`. Swap two and the compiler stays silent, but the
-    /// kind reported here is the wrong one.
     #[tokio::test]
     async fn an_xai_credential_configures_and_reports_the_xai_backend() {
         let (pool, db) = setup_test_db().await;
@@ -1684,10 +1837,12 @@ mod tests {
             Some(&pool),
             prefs::CHAT_MODEL.default_text(),
             &registry,
-            None,
-            None,
-            Some("sk-ant-env".to_string()),
+            EnvFallbacks {
+                anthropic: Some("sk-ant-env".to_string()),
+                ..EnvFallbacks::default()
+            },
             ProviderSwitches::default(),
+            None,
         )
         .await;
         assert!(
@@ -1705,10 +1860,12 @@ mod tests {
             Some(&pool),
             prefs::CHAT_MODEL.default_text(),
             &registry,
-            None,
-            None,
-            Some("sk-ant-env".to_string()),
+            EnvFallbacks {
+                anthropic: Some("sk-ant-env".to_string()),
+                ..EnvFallbacks::default()
+            },
             ProviderSwitches::default(),
+            None,
         )
         .await;
         assert!(
@@ -1813,6 +1970,159 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
+    // ---- Claude gateway ----------------------------------------------------
+
+    const GATEWAY: &str = "https://gateway.example";
+
+    struct FixedTokens;
+
+    #[async_trait::async_trait]
+    impl crate::llm::claude_gateway::GatewayAccess for FixedTokens {
+        async fn bearer(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Ok("gw-token".to_string())
+        }
+
+        async fn renew_rejected(
+            &self,
+            _rejected: &str,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            self.bearer().await
+        }
+
+        async fn managed_settings(
+            &self,
+        ) -> Result<
+            Option<crate::llm::claude_gateway::gateway_managed_settings::GatewayManagedSettings>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+    }
+
+    /// A context that can make a gateway access, as the engine's is.
+    fn gateway_ctx() -> ProviderBuildContext {
+        ProviderBuildContext {
+            claude_gateway_access: Some(Arc::new(|_| Arc::new(FixedTokens))),
+            ..unconfigured_ctx(true)
+        }
+    }
+
+    async fn configured(
+        pool: &PgPool,
+        ctx: &ProviderBuildContext,
+    ) -> Vec<crate::llm::ProviderKind> {
+        let (provider, _) = install(build_active_provider(Some(pool), ctx).await.unwrap());
+        provider
+            .configured_providers()
+            .expect("a provider set is reported")
+    }
+
+    /// The gateway serves once its URL is set and Lucidos is signed in to that
+    /// gateway. It adds no web search backend: it promises no server tools.
+    #[tokio::test]
+    async fn a_signed_in_claude_gateway_configures_and_reports_its_backend() {
+        let (pool, db) = setup_test_db().await;
+        seed_preference(&pool, prefs::CLAUDE_GATEWAY_URL.key(), GATEWAY)
+            .await
+            .unwrap();
+        seed_claude_gateway_sign_in(&pool, GATEWAY).await;
+
+        let outcome = build_active_provider(Some(&pool), &gateway_ctx())
+            .await
+            .unwrap();
+        let ProviderBuildOutcome::Install {
+            llm,
+            web_search,
+            selection,
+        } = outcome
+        else {
+            panic!("expected Install");
+        };
+        assert_eq!(selection, ProviderSelection::Real);
+        let providers = llm.configured_providers().expect("a provider set");
+        assert!(providers.contains(&crate::llm::ProviderKind::ClaudeGateway));
+        // An ambient key on this machine adds its own backend and search.
+        if !ambient_provider_env() {
+            assert_eq!(providers, vec![crate::llm::ProviderKind::ClaudeGateway]);
+            assert!(web_search.backend_ids().is_empty());
+        }
+        teardown_test_db(&db).await;
+    }
+
+    /// Each missing half leaves the gateway out: no sign-in, a sign-in from
+    /// another gateway, a URL that is not a gateway origin, or the switch off.
+    #[tokio::test]
+    async fn a_claude_gateway_missing_any_half_is_left_out() {
+        let (pool, db) = setup_test_db().await;
+        let ctx = gateway_ctx();
+        let gateway = crate::llm::ProviderKind::ClaudeGateway;
+        seed_preference(&pool, prefs::CLAUDE_GATEWAY_URL.key(), GATEWAY)
+            .await
+            .unwrap();
+        assert!(
+            !configured(&pool, &ctx).await.contains(&gateway),
+            "not signed in"
+        );
+
+        seed_claude_gateway_sign_in(&pool, "https://other-gateway.example").await;
+        assert!(
+            !configured(&pool, &ctx).await.contains(&gateway),
+            "signed in to another gateway"
+        );
+
+        seed_claude_gateway_sign_in(&pool, GATEWAY).await;
+        assert!(configured(&pool, &ctx).await.contains(&gateway));
+
+        seed_preference(&pool, prefs::PROVIDER_ENABLED_CLAUDE_GATEWAY.key(), "false")
+            .await
+            .unwrap();
+        assert!(
+            !configured(&pool, &ctx).await.contains(&gateway),
+            "switched off"
+        );
+
+        seed_preference(&pool, prefs::PROVIDER_ENABLED_CLAUDE_GATEWAY.key(), "true")
+            .await
+            .unwrap();
+        seed_preference(
+            &pool,
+            prefs::CLAUDE_GATEWAY_URL.key(),
+            "http://gateway.example",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !configured(&pool, &ctx).await.contains(&gateway),
+            "a plain http gateway URL"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// The boot build has no gateway access yet. A signed-in gateway still counts
+    /// there, so a gateway-only workspace boots rather than failing fast. The
+    /// engine then rebuilds with the gateway in.
+    #[tokio::test]
+    async fn a_signed_in_gateway_counts_at_boot_before_it_can_be_built() {
+        if ambient_provider_env() {
+            // An ambient key selects Real on its own, so it proves nothing here.
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        seed_preference(&pool, prefs::CLAUDE_GATEWAY_URL.key(), GATEWAY)
+            .await
+            .unwrap();
+        seed_claude_gateway_sign_in(&pool, GATEWAY).await;
+
+        let (provider, selection) = install(
+            build_active_provider(Some(&pool), &unconfigured_ctx(false))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(selection, ProviderSelection::Real);
+        assert_eq!(provider.configured_providers(), Some(Vec::new()));
+        teardown_test_db(&db).await;
+    }
+
     // ---- Per-provider enable switches -------------------------------------
 
     /// Absent means enabled, and only an explicit off turns a switch off. This
@@ -1866,10 +2176,9 @@ mod tests {
             Some(&pool),
             prefs::CHAT_MODEL.default_text(),
             &registry,
-            None,
-            None,
-            None,
+            EnvFallbacks::default(),
             ProviderSwitches::default(),
+            None,
         )
         .await;
         assert!(
@@ -1882,13 +2191,12 @@ mod tests {
             Some(&pool),
             prefs::CHAT_MODEL.default_text(),
             &registry,
-            None,
-            None,
-            None,
+            EnvFallbacks::default(),
             ProviderSwitches {
                 anthropic: false,
                 ..ProviderSwitches::default()
             },
+            None,
         )
         .await;
         assert!(off.anthropic.is_none(), "the switch must veto the provider");
@@ -1921,10 +2229,9 @@ mod tests {
             Some(&pool),
             prefs::CHAT_MODEL.default_text(),
             &registry,
-            None,
-            None,
-            None,
+            EnvFallbacks::default(),
             read_provider_switches(&pool).await,
+            None,
         )
         .await;
         assert!(
@@ -1950,6 +2257,7 @@ mod tests {
                     openrouter: true,
                     xai: true,
                     local: true,
+                    claude_gateway: true,
                 }
             ),
             "a workspace with no rows must resolve every switch on"
@@ -1960,14 +2268,20 @@ mod tests {
         }
         let s = read_provider_switches(&pool).await;
         assert!(
-            !s.vertex && !s.anthropic && !s.openai && !s.openrouter && !s.xai && !s.local,
+            !s.vertex
+                && !s.anthropic
+                && !s.openai
+                && !s.openrouter
+                && !s.xai
+                && !s.local
+                && !s.claude_gateway,
             "every key must reach its own field: {s:?}"
         );
         teardown_test_db(&db).await;
     }
 
     /// A switch that needed a restart is a switch the user reads as broken, so
-    /// the config subscriber has to watch all six.
+    /// the config subscriber has to watch every one.
     #[test]
     fn every_switch_hot_swaps() {
         for switch in PROVIDER_ENABLED_SWITCHES {

@@ -172,6 +172,9 @@ mod snapshot_compression_test;
 #[path = "api_support/events_paging_test.rs"]
 mod events_paging_test;
 
+#[path = "api_support/events_count_test.rs"]
+mod events_count_test;
+
 #[path = "api_support/summary_version_test.rs"]
 mod summary_version_test;
 
@@ -183,6 +186,12 @@ mod script_trigger_in_place_test;
 
 #[path = "api_support/trigger_run_test.rs"]
 mod trigger_run_test;
+
+#[path = "api_support/trigger_route_pins_test.rs"]
+mod trigger_route_pins_test;
+
+#[path = "api_support/pinned_trigger_route_test.rs"]
+mod pinned_trigger_route_test;
 
 #[path = "api_support/trigger_event_type_test.rs"]
 mod trigger_event_type_test;
@@ -225,11 +234,17 @@ mod oauth_connect_test;
 
 #[path = "api_support/background_models_test.rs"]
 mod background_models_test;
+#[path = "api_support/model_prices_test.rs"]
+mod model_prices_test;
+
 #[path = "api_support/models_test.rs"]
 mod models_test;
 
 #[path = "api_support/response_styles_test.rs"]
 mod response_styles_test;
+
+#[path = "api_support/claude_gateway_test.rs"]
+mod claude_gateway_test;
 
 #[path = "api_support/backup_key_test.rs"]
 mod backup_key_test;
@@ -293,3 +308,6 @@ mod text_search_test;
 
 #[path = "api_support/successor_test.rs"]
 mod successor_test;
+
+#[path = "api_support/intelligence_ladder_test.rs"]
+mod intelligence_ladder_test;

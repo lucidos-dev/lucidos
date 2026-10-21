@@ -70,7 +70,7 @@ const DESKTOP: VisitLocation = {
   settingsSubview: 'main',
   mobile: false,
   mobileView: 'thread',
-  splitRatio: 0.4,
+  drawnSplitRatio: 0.4,
 };
 
 function at(patch: Partial<VisitLocation>): VisitLocation {
@@ -100,10 +100,10 @@ describe('which panes are on screen', () => {
   });
 
   it('hides the pane a desktop collapse zeroed', () => {
-    expect(threadPaneOnScreen(at({ splitRatio: 0 }))).toBe(false);
-    expect(contentPaneOnScreen(at({ splitRatio: 0 }))).toBe(true);
-    expect(threadPaneOnScreen(at({ splitRatio: 1 }))).toBe(true);
-    expect(contentPaneOnScreen(at({ splitRatio: 1 }))).toBe(false);
+    expect(threadPaneOnScreen(at({ drawnSplitRatio: 0 }))).toBe(false);
+    expect(contentPaneOnScreen(at({ drawnSplitRatio: 0 }))).toBe(true);
+    expect(threadPaneOnScreen(at({ drawnSplitRatio: 1 }))).toBe(true);
+    expect(contentPaneOnScreen(at({ drawnSplitRatio: 1 }))).toBe(false);
   });
 
   it('shows one pane at a time on mobile', () => {

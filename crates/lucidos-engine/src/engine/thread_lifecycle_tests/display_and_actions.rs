@@ -854,7 +854,7 @@ fn a_subscribed_thread_is_idle_and_offers_archive() {
 // a parent with a running child still reads Apply.
 
 /// The headline case: a coding-agent thread that proposed a change and then
-/// parked on an event wait. This is the `e2e-lock-wait` shape.
+/// parked on an event wait.
 ///
 /// It offers exactly what a Running thread offers: no close action, plus the
 /// standing apply. A wait ends by itself, so a standing apply waits it out

@@ -1037,3 +1037,58 @@ fn next_occurrences_multi_is_the_source_of_truth_for_the_single_form() {
             .next()
     );
 }
+
+// -- update_trigger route pins --
+
+fn pinned_trigger() -> crate::triggers::TriggerConfig {
+    crate::triggers::TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t-pins", "name": "Pinned", "schedule": ["0 0 8 * * *"],
+        "timezone": "UTC", "run": { "type": "intent", "intent": "x" },
+        "model": "claude-sonnet-5", "reasoning_effort": "low", "provider": "vertex",
+    }))
+    .unwrap()
+}
+
+fn all_cleared() -> RoutePinUpdate {
+    RoutePinUpdate {
+        model: Some(None),
+        reasoning_effort: Some(None),
+        provider: Some(None),
+    }
+}
+
+#[test]
+fn update_trigger_json_null_clears_every_pin() {
+    let registry = crate::llm::model_registry::empty();
+    let args = json!({ "model": null, "reasoning_effort": null, "provider": null });
+    assert_eq!(
+        route_pin_update(&registry, &pinned_trigger(), &args),
+        Ok(all_cleared())
+    );
+}
+
+/// A model sometimes writes JSON null as the string "null", and it must clear
+/// every pin rather than name one.
+#[test]
+fn update_trigger_null_string_clears_every_pin() {
+    let registry = crate::llm::model_registry::empty();
+    let args = json!({ "model": "null", "reasoning_effort": "null", "provider": "null" });
+    assert_eq!(
+        route_pin_update(&registry, &pinned_trigger(), &args),
+        Ok(all_cleared())
+    );
+}
+
+/// The load-bearing case: a rename-only update keeps every pin.
+#[test]
+fn update_trigger_without_pin_args_leaves_them_alone() {
+    let registry = crate::llm::model_registry::empty();
+    assert_eq!(
+        route_pin_update(&registry, &pinned_trigger(), &json!({ "name": "x" })),
+        Ok(RoutePinUpdate {
+            model: None,
+            reasoning_effort: None,
+            provider: None,
+        })
+    );
+}

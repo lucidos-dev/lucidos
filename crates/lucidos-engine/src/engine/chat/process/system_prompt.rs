@@ -8,9 +8,8 @@ use crate::engine::LucidosEngine;
 use std::path::Path;
 
 use super::super::process_helpers::{
-    build_system_knowhow_section, build_trigger_knowhow_section, TriggerContext,
-    APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE, LOOK_BEFORE_ASSESSING_RULE,
-    MEMORY_LOOKUP_CLASSIC, MEMORY_LOOKUP_TREE,
+    build_system_knowhow_section, TriggerContext, APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE,
+    ENGINE_RESTART_RULE, LOOK_BEFORE_ASSESSING_RULE, MEMORY_LOOKUP_CLASSIC, MEMORY_LOOKUP_TREE,
 };
 
 /// What this install lets a coding agent edit, when the engine WAS launched
@@ -509,7 +508,7 @@ __TRIGGER_VS_EVENT_WAIT_RULE__
 
 TRIGGERS:
 - Cron is 6 fields (sec min hour dom month dow) in the user's LOCAL timezone; DST is handled automatically.
-- In a trigger thread, always call request_read: true only for findings the user would otherwise miss, false when the run found nothing new or your notification carried the news. send_notification when the user should hear now. Errors are reported automatically.
+- In a trigger thread, always call request_read: true only for findings the user would otherwise miss, false when the run found nothing new or you sent a notification, unless the reply holds a failure it left out. send_notification when the user should hear now. Errors are reported automatically.
 
 IMPORTING DATA & CREDENTIALS:
 - API data: check credentials and the builtin provider proxies (proxy_request), request_credential only if neither has it, http_request, write_file to imported/<service>/. A local file is import_file with the full path.
@@ -683,7 +682,12 @@ fn static_prompt_body(
         // expand, so "injected verbatim" would stop being true.
         .replace("__RESPONSE_STYLE_RULE__", response_style);
 
-    format!("{}{}", body, coding_surface_section(has_lucidos_source))
+    format!(
+        "{}{}{}",
+        body,
+        coding_surface_section(has_lucidos_source),
+        crate::scheduler::user_tasks::TRIGGER_SYSTEM_ADDENDUM
+    )
 }
 
 /// A mandatory preference's handle. The two kinds read their stored row the
@@ -904,10 +908,7 @@ impl LucidosEngine {
             }
         };
 
-        // The SAME snapshot the `execute_intent` gate was derived from, not a
-        // second scan of `data/`. Two scans can disagree inside one turn, and
-        // one direction is harmful: an intent created between them lists here
-        // while the tool to run it was never offered.
+        // The turn's own capability snapshot, not a second scan of `data/`.
         let intents_section =
             super::workspace_prompt_footprint::build_intents_section(&capabilities.intents);
 
@@ -949,24 +950,6 @@ impl LucidosEngine {
                 );
             }
             section
-        };
-
-        // Appended last so the unconditional sections above stay byte-identical
-        // between trigger fires and regular chats. That shared prefix is what
-        // the provider's prompt cache keys on. The per-trigger knowhow listing
-        // is trigger-only for the same reason, so it lives here rather than in
-        // the unconditional knowhow section above.
-        let system_prompt = match trigger {
-            Some(t) => {
-                let triggers_dir = self.workspace_path.join(crate::core::TRIGGERS_DIR);
-                format!(
-                    "{}{}{}",
-                    system_prompt,
-                    build_trigger_knowhow_section(&triggers_dir, &t.slug),
-                    crate::scheduler::user_tasks::TRIGGER_SYSTEM_ADDENDUM
-                )
-            }
-            None => system_prompt,
         };
 
         // ADR 0085 decision 8: the standing re-read rule belongs in the cached
@@ -1680,7 +1663,7 @@ mod tests {
     /// parent that believed every report re-opens it would wait for a wake
     /// that never comes.
     ///
-    /// Raised by 847 to a measured 131,168 for the Home board (ADR 0432): the
+    /// Raised by 847 to a measured 131,168 for the board (ADR 0432): the
     /// `widgets` tool's board and arrange actions, `create_app`'s `sizes`, the
     /// `home-board` navigate target, each listed widget's sizes, and one
     /// `## Widgets` sentence. It says to arrange Home only when the user asks,
@@ -1691,7 +1674,42 @@ mod tests {
     /// now asks every trigger run for its own read decision, which keeps
     /// routine runs out of Review. Its wording was cut first, and
     /// `request_read`'s description dropped the duplicate clause.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 131_198;
+    ///
+    /// Raised by 975 to a measured 132,173 for the trigger rules. The 975-char
+    /// `TRIGGER_SYSTEM_ADDENDUM` joined the static body of every turn, where
+    /// a trigger fire's system block now equals a chat turn's. Fires and chat
+    /// turns then share one cache entry for the tools and the system block.
+    /// Before, only a trigger's own system block carried the text.
+    ///
+    /// Raised by 132 to a measured 132,305 for ADR 0496: the `widgets` tool
+    /// gained `add_to_dashboard` and `remove_from_dashboard`, since each
+    /// dashboard now holds its own tiles and every UI change needs an agent
+    /// path. Its summaries and schema text were cut first.
+    ///
+    /// Raised by 177 to a measured 132,482 for ADR 0505: the routing line of
+    /// `system-knowhow/coding-agent-flows`, which wires a repository's handoff
+    /// checkpoints. Its description was cut to one clause first, and the two
+    /// default flows sit in its folder, where they cost no line.
+    ///
+    /// Raised by 30 to a measured 132,512 for ADR 0508: the eighth provider
+    /// name, `claude-gateway`, in the `triggers` and `manage_models` enums.
+    /// The tools validate against those enums, so leaving it out would make
+    /// them lie.
+    ///
+    /// Raised by 207 to a measured 132,719 for ADR 0525: the routing line of
+    /// `system-knowhow/model-price-check`, the recipe the Keep prices current
+    /// trigger routes on. Its description was cut to one clause first.
+    ///
+    /// Raised by 4 to a measured 132,723 for `request_read`: a turn that
+    /// asks the user a question skips the read decision.
+    ///
+    /// Lowered by 413 to a measured 132,310: the `execute_intent` schema left
+    /// the tools array with its sub-loop.
+    ///
+    /// Raised by 201 to a measured 132,511 for the `coding_agent` and `folder`
+    /// args of `navigate_ui`'s `new-chat` target. Both descriptions were cut
+    /// to one clause first.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 132_511;
 
     /// The gate set the ratchet bills.
     ///
@@ -1716,7 +1734,6 @@ mod tests {
     /// for, so the meter bills the mode OFF, which is the larger array.
     const BILLED: ToolCapabilities = ToolCapabilities {
         email_account: true,
-        intent: true,
         image_provider: false,
         judgment_provider: false,
         context_mode: false,
@@ -1817,17 +1834,19 @@ mod tests {
             1_583,
             "it makes both kinds, so it carries the app-only scaffold guidance \
              and the widget-only args together. Past the shared ceiling by \
-             `sizes` (ADR 0432): a widget's Home board sizes are chosen while \
+             `sizes` (ADR 0432): a widget's tile sizes are chosen while \
              writing the call that creates it, and its enum is the frozen size \
              contract plugins build on",
         ),
         (
             "widgets",
-            1_571,
-            "the Home board's arrange action (ADR 0432) takes a list of tiles, \
+            1_715,
+            "a dashboard's arrange action (ADR 0432) takes a list of tiles, \
              which no scalar arg can express, so it carries its own schema with \
-             the frozen size and layout enums. Arranging is prompt-first: every \
-             change the board's edit mode makes has this one agent path",
+             the frozen size and dashboard enums. Arranging is prompt-first: \
+             every change a dashboard's edit mode makes has this one agent path. \
+             Its add and remove actions are the agent's path to the two \
+             dashboards' own tiles (ADR 0496)",
         ),
         (
             "await_event",
@@ -1858,7 +1877,7 @@ mod tests {
         ),
         (
             "triggers",
-            3_401,
+            3_418,
             "seven actions, each contributing its own summary line and its own \
              `(requires: …)` clause, plus the create schema's union shapes for \
              `cron` and `on`. system-knowhow/triggers.md deliberately does NOT \
@@ -1871,15 +1890,16 @@ mod tests {
              0119: `on` carries the condition operator set, so three new names \
              and the field-path rule land here rather than in the knowhow. \
              Raised from 2,980 by the trigger `provider` pin: a null-union over \
-             the seven provider names, declared once on create like `model`. \
+             the provider names, declared once on create like `model`, and \
+             from 3,401 by the eighth, `claude-gateway` (ADR 0508). \
              Raised from 3,250 by `mcp_servers` (ADR 0430): a null-union over a \
              string array, since a trigger's fires may call only the MCP servers \
              it lists",
         ),
         (
             "manage_models",
-            1_970,
-            "six actions, the seven-value provider enum, and `routes`: an array \
+            1_986,
+            "six actions, the eight-value provider enum, and `routes`: an array \
              of objects whose item shape (provider, wire id, window) is what \
              the model writes a multi-backend model from. The context-window \
              warning stays, because an omitted window silently budgets a large \
@@ -1888,9 +1908,9 @@ mod tests {
         ),
         (
             "navigate_ui",
-            2_607,
-            "the two frozen enums the SDK is generated from (18 targets, 21 \
-             settings views) are 447 chars before a word of prose; the settings \
+            2_822,
+            "the two frozen enums the SDK is generated from (18 targets, 22 \
+             settings views) are about 460 chars before a word of prose; the settings \
              gloss is routing information available on no other surface, and \
              it names only the views whose own value does not (`mcp` is not \
              glossed, because the value already says what the page is). Raised \
@@ -1903,8 +1923,12 @@ mod tests {
              the model used to reach there now need their own value. Raised \
              from 2,494 by `device`: a navigate reaches one device, and the \
              user asking from the phone to open it on the laptop is chosen \
-             while writing the call. Raised from 2,595 by the `home-board` \
-             target (ADR 0432), the one value that lands the Home board",
+             while writing the call. Raised from 2,595 by the `dashboard` \
+             target (ADR 0432), the one value that lands a dashboard. Raised \
+             from 2,607 by `intelligence` (ADR 0525): the ladders left Models \
+             and Coding Agents for a page of their own. Raised from 2,621 by \
+             `coding_agent` and `folder`: a new chat preselects its \
+             destination, and the model chooses both while writing the call",
         ),
         (
             "request_credential",
@@ -2089,10 +2113,9 @@ mod tests {
                 ToolCapabilities::all_open(),
             ),
             (
-                "no email account, no intent, image provider on",
+                "no email account, image provider on",
                 ToolCapabilities {
                     email_account: false,
-                    intent: false,
                     image_provider: true,
                     judgment_provider: false,
                     context_mode: false,
@@ -2204,6 +2227,23 @@ mod tests {
              largest tool schemas:\n{}",
             largest_tool_schemas(10)
         );
+    }
+
+    /// I12: the trigger rules stay system-tier, where an injected intent body
+    /// cannot outweigh them. They ride in the static body, which every chat and
+    /// trigger turn shares, so a fire's system block equals a chat turn's.
+    #[test]
+    fn the_trigger_rules_ride_in_the_static_body_of_every_turn() {
+        for source in [true, false] {
+            for memory_tree in [true, false] {
+                let body =
+                    static_prompt_body(source, 500, CHILD_CAP, ContextMode::Off, memory_tree, "");
+                assert!(
+                    body.contains(crate::scheduler::user_tasks::TRIGGER_SYSTEM_ADDENDUM),
+                    "source {source}, memory tree {memory_tree}"
+                );
+            }
+        }
     }
 
     /// Every `system-knowhow/<id>` the resident context routes to must resolve
@@ -3405,7 +3445,7 @@ mod tests {
     }
 
     /// A trigger run makes its own read decision. A routine run that found
-    /// nothing, or repeats its own push, stays out of Review (ADR 0472).
+    /// nothing, or that sent a notification, stays out of Review (ADR 0472).
     #[test]
     fn the_trigger_rule_has_the_run_decide_its_own_read() {
         let rule = SYSTEM_PROMPT_BASE
@@ -3414,7 +3454,7 @@ mod tests {
             .expect("the TRIGGERS block states the trigger-run rule");
         for must in [
             "always call request_read: true only for findings the user would otherwise miss",
-            "false when the run found nothing new or your notification carried the news",
+            "false when the run found nothing new or you sent a notification, unless the reply holds a failure it left out",
         ] {
             assert!(rule.contains(must), "missing {must:?}:\n{rule}");
         }

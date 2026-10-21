@@ -192,13 +192,15 @@ describe('NotReadyStrip', () => {
   });
 
   describe('for a handed-off thread', () => {
-    const successor = { thread_id: 's1', title: 'Fix the drawer (continued)' };
+    const successor = { thread_id: 's1', title: 'Fix the drawer (2)' };
     const handedOff = { kind: 'unproposed', reason: 'carried_by_successor' } as const;
 
-    it('draws a quiet link, not the amber strip', () => {
+    it('draws a framed note with an arrow, not the amber strip', () => {
       const host = mount(handedOff, { successor });
       expect(host.querySelector('.not-ready-strip')).toBeNull();
-      expect(host.querySelector('[data-role="continued-here"]')?.textContent).toBe('Continued here');
+      const note = host.querySelector('[data-role="continued-here"]');
+      expect(note?.textContent).toBe('Continued here');
+      expect(note?.querySelector('.continued-here-icon')).not.toBeNull();
     });
 
     it('opens the successor thread from "here"', () => {

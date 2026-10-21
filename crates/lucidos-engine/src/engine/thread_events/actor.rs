@@ -65,6 +65,8 @@ pub enum EngineReason {
     MergeConflict,
     /// A red *main check* opened its *fix thread* (ADR 0464).
     MainCheckRed,
+    /// A *main check* that passed with flaky tests opened a *flaky fix thread*.
+    MainCheckFlaky,
     /// Engine detected the harden marker is missing: before an apply, or at a
     /// turn end whose proposal it held and told the agent to harden.
     MissingHardening,
@@ -140,7 +142,7 @@ pub enum EventWaitOutcome {
 }
 
 /// Why a plugin setup thread runs: a first install, or an update that changed
-/// the setup instructions.
+/// the setup instructions or whose author asked to run setup again.
 ///
 /// A separate fact from the version, because a legacy install record can name
 /// no version at all. Folding the two would seed such an update as a first
@@ -154,6 +156,32 @@ pub enum PluginSetupOccasion {
     Update {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_version: Option<String>,
+        /// Why this update runs setup. A row written before the cause existed
+        /// decodes as `InstructionsChanged`, which is what it meant.
+        #[serde(default)]
+        cause: PluginSetupCause,
+    },
+}
+
+/// What made a plugin update run setup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginSetupCause {
+    /// The `setup` text differs from the installed version's.
+    #[default]
+    InstructionsChanged,
+    /// The manifest raised its `setup_revision` and the text is the same.
+    /// `reason` is the author's `setup_reason`.
+    RevisionRaised {
+        revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// The text differs and the revision rose.
+    Both {
+        revision: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 

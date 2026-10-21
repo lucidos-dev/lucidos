@@ -10,6 +10,9 @@ import {
   assertHealthy, disableMobileDynamicBars, enableMobileDynamicBars, ensureMobileView, gotoWithRetry,
 } from './helpers';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 const APP_ID = 'e2e-dynamic-bars-app';
 const FRAME = '.mobile-swipe-pane [data-role="app-ui-panel"] iframe[data-role="app-ui-frame"]';
 let fixture: { cleanup: () => void };

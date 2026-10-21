@@ -4,7 +4,7 @@ import { API, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from 
 import type { DiffFile } from '../../store/store';
 import type { AnswerKind, AllowScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
-import type { ChatRequestBody, CodingAgent } from '../types';
+import type { Band, ChatRequestBody, CodingAgent } from '../types';
 import { SIDE_QUESTION_TIMEOUT_MS, type TAKES_EFFECT_VALUES } from '@lucidos/engine-constants';
 import type { ComposeReportWire } from '../../store/composeReport';
 
@@ -258,9 +258,28 @@ export interface CodingAgentCommandsResponse {
   current_model: string | null;
   current_reasoning_effort: string | null;
   has_active_session: boolean;
+  /** What a spawn with no pick runs on: the `model_*` and `reasoning_*`
+   *  preferences. Null when the backend has none, as Codex ships. */
+  default_implementer?: { model: string; effort: string | null } | null;
+  /** The effective ladder's on rungs, in order. The rung control lists these
+   *  and nothing else. */
+  ladder_rungs?: CodingAgentLadderRung[];
   /** Claude Code only: where its model options came from. Mirrors
    *  `runtime::cc_model_discovery::Provenance`. */
   models_provenance?: CodingAgentModelsProvenance;
+}
+
+/** One on rung of the intelligence ladder: a model at an effort, with the
+ *  model's picker label. Mirrors `runtime::intelligence_ladder::OnRung`. */
+export interface CodingAgentLadderRung {
+  model: string;
+  effort: string;
+  label: string;
+  /** The pair has an estimate. An unestimated rung lists last. */
+  estimated: boolean;
+  intelligence: Band | null;
+  cost: Band | null;
+  time: Band | null;
 }
 
 /** `discovered` once Claude Code has listed its models, `fallback` before. */

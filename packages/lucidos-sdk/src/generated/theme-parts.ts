@@ -12,6 +12,7 @@ export type PartGrammar =
   | { grammar: 'drop-shadow'; unit: PartUnit; maxOffset: number; maxBlur: number }
   | { grammar: 'spacing'; unit: PartUnit; min: number; max: number }
   | { grammar: 'length'; unit: PartUnit; min: number; max: number }
+  | { grammar: 'weight'; min: number; max: number }
   | { grammar: 'keyword'; values: readonly string[] }
   | { grammar: 'scanlines'; maxAlpha: number; maxPeriod: number; maxStops: number };
 
@@ -33,6 +34,7 @@ export const PART_PROPERTIES: Record<string, PartGrammar> = {
   'caret-shape': { grammar: 'keyword', values: ['auto', 'bar', 'block', 'underscore'] },
   'color': { grammar: 'colour', minAlpha: 0.6 },
   'filter': { grammar: 'drop-shadow', unit: 'px', maxOffset: 2, maxBlur: 6 },
+  'font-weight': { grammar: 'weight', min: 400, max: 600 },
   'letter-spacing': { grammar: 'spacing', unit: 'em', min: -0.02, max: 0.12 },
   'text-decoration-color': { grammar: 'colour' },
   'text-shadow': { grammar: 'shadow', unit: 'em', maxLayers: 2, maxOffset: 0.1, maxBlur: 0.6 },
@@ -58,6 +60,7 @@ export const PART_TOKENS: Record<string, PartTokenSpec> = {
   '--part-header-icon-filter': { part: 'header-icon', property: 'filter', insetOnly: false, frames: false },
   '--part-header-title-text-shadow': { part: 'header-title', property: 'text-shadow', insetOnly: false, frames: false },
   '--part-header-title-letter-spacing': { part: 'header-title', property: 'letter-spacing', insetOnly: false, frames: false },
+  '--part-drawer-title-font-weight': { part: 'drawer-title', property: 'font-weight', insetOnly: false, frames: false },
   '--part-composer-background-color': { part: 'composer', property: 'background-color', insetOnly: false, frames: false },
   '--part-composer-border-color': { part: 'composer', property: 'border-color', insetOnly: false, frames: false },
   '--part-composer-box-shadow': { part: 'composer', property: 'box-shadow', insetOnly: true, frames: false },

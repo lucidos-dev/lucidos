@@ -1,7 +1,10 @@
-use super::completion::{idle_exit, IdleExit};
+use super::completion::{idle_exit, resumes_after_effort_restart, IdleExit};
 use super::idle_change_state::{resolve_idle_change_state, IdleChangeStateInput};
 use super::idle_snapshot::CodingAgentIdleSnapshot;
 use super::spawn_context::SpawnWorktreeContext;
+use crate::engine::agent_context::{
+    prepend_user_device_preferences_context, ContextFingerprint, DeviceBlock, SentDeviceContexts,
+};
 use crate::engine::agent_session::start_failure::AgentStartFailure;
 use crate::engine::agent_session::text_buffer::CodingAgentTextBuffer;
 use crate::engine::agentic_loop::should_flush;
@@ -17,11 +20,12 @@ use crate::engine::thread_events::{
 use crate::engine::{AgentUserInput, LucidosEngine, ProcessResult, StopReason};
 use crate::runtime::{AgentEvent, AgentExitFacts, AgentInput, CodingAgent};
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::engine::agent_session::input_ledger::{
-    announce_reads, forwards_verbatim, InputLedger, Settled,
+    announce_discards, announce_reads, forwards_verbatim, InputLedger, Settled,
 };
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
@@ -33,6 +37,7 @@ use crate::engine::agent_session::lifecycle::{
     TurnTerminal, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS,
     WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
+use crate::engine::agent_session::prompts::standing_instruction_section;
 use crate::engine::agent_session::resume::{
     change_description_fallback, default_claude_config_dir, live_claude_config_dir,
     resolve_resume_context,
@@ -229,6 +234,7 @@ struct ReportedUsage {
     parent_tool_use_id: Option<String>,
     api_call_id: Option<String>,
     duration_ms: Option<u64>,
+    reasoning_effort: Option<String>,
 }
 
 /// How long a stopped session waits for Claude Code's driver to flush a
@@ -257,6 +263,7 @@ async fn usage_flushed_at_stop(
                 parent_tool_use_id,
                 api_call_id,
                 duration_ms,
+                reasoning_effort,
             })) => flushed.push((
                 model,
                 ReportedUsage {
@@ -268,6 +275,7 @@ async fn usage_flushed_at_stop(
                     parent_tool_use_id,
                     api_call_id,
                     duration_ms,
+                    reasoning_effort,
                 },
             )),
             Ok(Some(AgentEvent::OutputEnded | AgentEvent::Exited { .. })) | Ok(None) => break,
@@ -320,73 +328,120 @@ impl CallModels {
     }
 }
 
+/// The reasoning effort a coding-agent call ran at. `spawn_effort` is the one
+/// this subprocess was started with, and `reported_effort` the one the driver
+/// sent with the call's turn. A backend that takes effort only at spawn runs
+/// every call at the spawn value.
+fn effort_in_force(
+    coding_agent: CodingAgent,
+    spawn_effort: Option<&str>,
+    reported_effort: Option<String>,
+) -> Option<String> {
+    match coding_agent.effort_reach() {
+        crate::runtime::ControlReach::Spawn => spawn_effort.map(String::from),
+        crate::runtime::ControlReach::NextTurn | crate::runtime::ControlReach::RunningTurn => {
+            reported_effort
+        }
+    }
+}
+
+/// The `ContextCaptured` that records one coding-agent API call. Sections
+/// stay empty, because the agent does not expose its system prompt or tool
+/// schemas.
+fn coding_agent_capture(
+    coding_agent: CodingAgent,
+    models: CallModels,
+    context_window: usize,
+    reported: ReportedUsage,
+    reasoning_effort: Option<String>,
+) -> crate::engine::thread_events::ThreadEvent {
+    // Anthropic reports `input_tokens` as the uncached portion only.
+    // `ApiUsage.input_tokens` stores the TOTAL prompt size, the same
+    // convention `vertex.rs` uses. So the budget bar shows real context
+    // use, and the modal's cache-miss formula recovers the uncached count.
+    let total_input = reported
+        .input_tokens
+        .saturating_add(reported.cache_read_tokens)
+        .saturating_add(reported.cache_creation_tokens);
+    let estimated_total_tokens = (total_input as usize) + (reported.output_tokens as usize);
+    let usage = crate::engine::ApiUsage {
+        input_tokens: total_input,
+        output_tokens: reported.output_tokens,
+        cache_read_tokens: reported.cache_read_tokens,
+        cache_creation_tokens: reported.cache_creation_tokens,
+        // A coding agent reports one blended total per direction.
+        modality: None,
+        service_tier: None,
+        cache_creation_1h_tokens: reported.cache_creation_1h_tokens,
+    };
+    crate::engine::thread_events::ThreadEvent::ContextCaptured {
+        producer: crate::engine::ContextProducer::from_coding_agent(coding_agent),
+        model: models.model,
+        context_window,
+        sections: Vec::new(),
+        tools: Vec::new(),
+        estimated_total_tokens,
+        usage: Some(usage),
+        trimmed: false,
+        // This path never runs the trimmer, so no pass can have fired.
+        trim_passes: Vec::new(),
+        purpose: crate::engine::ContextPurpose::Turn,
+        reconstructed: false,
+        parent_tool_use_id: reported.parent_tool_use_id,
+        api_call_id: reported.api_call_id,
+        reasoning_effort,
+        duration_ms: reported.duration_ms,
+        served_model: models.served_model,
+        provider: None,
+        stable_prefix_fingerprint: None,
+        ttft_ms: None,
+        request_id: None,
+    }
+}
+
 impl LucidosEngine {
     /// Record one coding-agent API call as a `ContextCaptured` carrying its
-    /// usage. The two models are read as [`CallModels::of`] reads them.
+    /// usage and the effort it ran at. A main-session call also sets the
+    /// session's effort in force, which `token` names as this run's.
+    #[allow(clippy::too_many_arguments)]
     async fn record_coding_agent_usage(
         &self,
         thread_id: Uuid,
+        token: &std::sync::atomic::AtomicBool,
         meta: &crate::engine::thread_events::EventMeta,
         coding_agent: CodingAgent,
-        session_model: Option<&str>,
-        reported_model: Option<&str>,
-        reported: ReportedUsage,
+        models: CallModels,
+        mut reported: ReportedUsage,
+        spawn_effort: Option<&str>,
     ) {
-        // Sections stay empty, because CC does not expose its system prompt
-        // or tool schemas.
-        let CallModels {
-            model: snapshot_model,
-            served_model,
-        } = CallModels::of(session_model, reported_model);
+        let reasoning_effort =
+            effort_in_force(coding_agent, spawn_effort, reported.reasoning_effort.take());
+        if reported.parent_tool_use_id.is_none() {
+            super::completion::note_effort_in_force(
+                &mut *self.agent_sessions.lock().await,
+                thread_id,
+                token,
+                reasoning_effort.as_deref(),
+            );
+        }
         // The backend's own window wins, because this capture REPORTS a call
         // the engine did not make. `context_window_for` answers for a Lucidos
         // request, where 1M mode is gated on our `[1m]` suffix. A coding agent
         // picks its own mode, so a bare Sonnet 5 id really does run 1M there.
         let context_window =
-            crate::runtime::coding_agent_context_window(coding_agent, &snapshot_model)
-                .unwrap_or_else(|| self.context_window_for(&snapshot_model, None));
-        // Anthropic reports `input_tokens` as the uncached portion only.
-        // `ApiUsage.input_tokens` stores the TOTAL prompt size, the same
-        // convention `vertex.rs` uses. So the budget bar shows real context
-        // use, and the modal's cache-miss formula recovers the uncached count.
-        let total_input = reported
-            .input_tokens
-            .saturating_add(reported.cache_read_tokens)
-            .saturating_add(reported.cache_creation_tokens);
-        let estimated_total_tokens = (total_input as usize) + (reported.output_tokens as usize);
-        let usage = crate::engine::ApiUsage {
-            input_tokens: total_input,
-            output_tokens: reported.output_tokens,
-            cache_read_tokens: reported.cache_read_tokens,
-            cache_creation_tokens: reported.cache_creation_tokens,
-            // A coding agent reports one blended total per direction.
-            modality: None,
-            service_tier: None,
-            cache_creation_1h_tokens: reported.cache_creation_1h_tokens,
-        };
+            crate::runtime::coding_agent_context_window(coding_agent, &models.model)
+                .unwrap_or_else(|| self.context_window_for(&models.model, None));
         self.event_bus
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::Thread {
                     thread_id,
-                    event: crate::engine::thread_events::ThreadEvent::ContextCaptured {
-                        producer: crate::engine::ContextProducer::from_coding_agent(coding_agent),
-                        model: snapshot_model,
+                    event: coding_agent_capture(
+                        coding_agent,
+                        models,
                         context_window,
-                        sections: Vec::new(),
-                        tools: Vec::new(),
-                        estimated_total_tokens,
-                        usage: Some(usage),
-                        trimmed: false,
-                        // This path never runs the trimmer, so no pass can have fired.
-                        trim_passes: Vec::new(),
-                        purpose: crate::engine::ContextPurpose::Turn,
-                        reconstructed: false,
-                        parent_tool_use_id: reported.parent_tool_use_id,
-                        api_call_id: reported.api_call_id,
-                        reasoning_effort: None,
-                        duration_ms: reported.duration_ms,
-                        served_model,
-                    },
+                        reported,
+                        reasoning_effort,
+                    ),
                     meta: meta.clone(),
                 },
                 "[AgentSession] ContextCaptured",
@@ -449,13 +504,16 @@ impl LucidosEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_usage_flushed_at_stop(
         &self,
         events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
         thread_id: Uuid,
+        token: &std::sync::atomic::AtomicBool,
         meta: &crate::engine::thread_events::EventMeta,
         coding_agent: CodingAgent,
         session_model: Option<&str>,
+        spawn_effort: Option<&str>,
     ) {
         if coding_agent != CodingAgent::ClaudeCode {
             return;
@@ -463,11 +521,12 @@ impl LucidosEngine {
         for (model, reported) in usage_flushed_at_stop(events_rx, USAGE_FLUSH_WAIT).await {
             self.record_coding_agent_usage(
                 thread_id,
+                token,
                 meta,
                 coding_agent,
-                session_model,
-                model.as_deref(),
+                CallModels::of(session_model, model.as_deref()),
                 reported,
+                spawn_effort,
             )
             .await;
         }
@@ -521,6 +580,9 @@ impl LucidosEngine {
         user_message: &str,
         user_images: Option<&[crate::api::ChatImage]>,
         origin_id: Uuid,
+        // More events the first prompt carries beside its origin, such as the
+        // messages a resume delivers. Its read settles each one.
+        carried_event_ids: &[Uuid],
         spawning_event_id: Option<Uuid>,
         cancel_token: &tokio_util::sync::CancellationToken,
         // A conflict-resolution session holds the change's apply claim for
@@ -562,6 +624,7 @@ impl LucidosEngine {
                 user_message,
                 user_images,
                 origin_id,
+                carried_event_ids,
                 spawning_event_id,
                 cancel_token,
                 conflict,
@@ -599,6 +662,7 @@ impl LucidosEngine {
         user_message: &str,
         user_images: Option<&[crate::api::ChatImage]>,
         origin_id: Uuid,
+        carried_event_ids: &[Uuid],
         spawning_event_id: Option<Uuid>,
         cancel_token: &tokio_util::sync::CancellationToken,
         conflict: Option<&crate::engine::change_ops::apply_claim::ApplyClaim>,
@@ -619,14 +683,20 @@ impl LucidosEngine {
             claim.entry.agent_cancel = tokio_util::sync::CancellationToken::new();
         }
         // Model and effort: the request's, else the claim's carry-over from the
-        // previous session, else the thread's events. Resolved before the spawn
-        // so the process starts with them, and the shadowed `cc_model` tells
-        // the Init handler a model was picked.
+        // previous session, else the thread's events, else the backend's
+        // default implementer (`intelligence_ladder::fill_pick`). Resolved
+        // before the spawn so the process starts with them, and the shadowed
+        // `cc_model` tells the Init handler a model was picked.
         let (event_model, event_effort) = if cc_model.is_none() || cc_reasoning_effort.is_none() {
             self.cc_thread_settings(thread_id).await
         } else {
             (None, None)
         };
+        let default_implementer = crate::runtime::intelligence_ladder::default_implementer(
+            self.pool(),
+            claim.entry.coding_agent,
+        )
+        .await;
         let (cc_model, pinned_effort) = {
             let mut sessions = self.agent_sessions.lock().await;
             let session = sessions
@@ -636,8 +706,13 @@ impl LucidosEngine {
                 .as_ref()
                 .map(|s| (s.current_model.clone(), s.current_reasoning_effort.clone()))
                 .unwrap_or_default();
-            let model = cc_model.or(prev_model).or(event_model);
-            let effort = cc_reasoning_effort.or(prev_effort).or(event_effort);
+            let (model, effort) = crate::runtime::intelligence_ladder::fill_pick(
+                claim.entry.coding_agent,
+                cc_model.or(prev_model).or(event_model),
+                cc_reasoning_effort.or(prev_effort).or(event_effort),
+                default_implementer.as_ref(),
+                |model| crate::llm::model_registry::default_effort(self.model_registry(), model),
+            );
             // Published at once: the commands API reads the entry while the
             // worktree is still being set up.
             if let Some(session) = session {
@@ -857,6 +932,7 @@ impl LucidosEngine {
         let SpawnWorktreeContext {
             cwd,
             system_prompt,
+            mut session_context,
             mut branch_name,
             worktree_path,
             interactive_session,
@@ -904,25 +980,69 @@ impl LucidosEngine {
 
         // A resolution session works for the batch or the change, never as the
         // integrated thread itself.
-        let system_prompt = if integrated && !is_resolution_session {
-            format!(
-                "{system_prompt}{}",
-                crate::engine::agent_session::prompts::integrated_section(self.pool(), thread_id)
-                    .await
-            )
-        } else {
-            system_prompt
-        };
+        if integrated && !is_resolution_session {
+            session_context.push(
+                &crate::engine::agent_session::prompts::integrated_section(self.pool(), thread_id)
+                    .await,
+            );
+        }
 
-        // Append thread history as context so new coding-agent sessions in an existing thread
-        // can see what was discussed/done previously.
-        let system_prompt = {
-            let thread_messages = self.event_store.get_thread_messages(&thread_id_str).await?;
-            let lines = thread_messages
-                .iter()
-                .map(|m| (m.role.as_str(), m.channel.as_deref(), m.content.as_str()));
-            format!("{}{}", system_prompt, thread_history_block(lines))
+        // Asked before the process starts, so a failed lookup costs no work.
+        // This session's `SessionStarted` closes the window, so it must not be
+        // recorded over a lookup that failed. A keep-alive must not act.
+        let first_prompt_events: Vec<Uuid> = std::iter::once(origin_id)
+            .chain(carried_event_ids.iter().copied())
+            .collect();
+        let stranded = if self.event_bus.in_keep_alive_turn(thread_id) {
+            Vec::new()
+        } else {
+            crate::engine::agent_session::stranded_follow_ups::stranded_follow_ups(
+                &self.pool,
+                self.workspace_path(),
+                thread_id,
+                &first_prompt_events,
+            )
+            .await
+            .map_err(|e| {
+                format!("Could not check for messages the previous session never read: {e}")
+            })?
         };
+        // A new session in an existing thread sees what was discussed and done
+        // before this message, and the images no agent has seen yet. A stranded
+        // follow-up is redelivered with its own images, so it brings none here.
+        {
+            let thread_messages = self.event_store.get_thread_messages(&thread_id_str).await?;
+            let (prior, current_at) = before_current_message(
+                thread_messages.iter().map(HistoryLine::of).collect(),
+                user_message,
+            );
+            let redelivered: Vec<String> =
+                stranded.iter().map(|f| f.event_id.to_string()).collect();
+            let mut attached = Vec::new();
+            let mut images = Vec::new();
+            for hash in unanswered_image_hashes(&prior[..current_at], &redelivered) {
+                match crate::core::blobs::read_blob_as_base64(self.workspace_path(), hash) {
+                    Some((base64, mime_type)) => {
+                        attached.push(hash);
+                        images.push(crate::api::ChatImage { base64, mime_type });
+                    }
+                    None => log!(
+                        "[AgentSession] Image {} of thread {} is gone; the fresh session goes without it",
+                        hash,
+                        thread_id
+                    ),
+                }
+            }
+            session_context.push(&thread_history_block(&prior, &attached));
+            session_context.attach_images(images);
+        }
+        // A keep-alive carries no notes: the agent must not act on anything.
+        let first_prompt = if self.event_bus.in_keep_alive_turn(thread_id) {
+            PromptFor::KeepAlive(user_message)
+        } else {
+            PromptFor::Turn(user_message)
+        };
+        let session_context = session_context.render();
 
         // The startup semaphore limits concurrent process initializations. Hold
         // the permit until Init, when the process is up and mostly idle.
@@ -940,11 +1060,13 @@ impl LucidosEngine {
         }
         let agent_cancel = claim.entry.agent_cancel.clone();
         let allowed_tools = crate::engine::claude_code::cc_allowed_tools(&self.grants_dir());
-        // User-managed env vars injected into the coding-agent subprocess
-        // alongside the CRED_*/OAUTH_* the script path already gets. Applied
-        // first in `apply_lucidos_env`, so engine-owned vars still win.
+        // User-managed env vars injected into the coding-agent subprocess.
+        // Applied first in `apply_lucidos_env`, so engine-owned vars still win.
         let user_env_vars =
             crate::core::EnvironmentVariableStore::spawn_pairs(&self.pool, "AgentSession").await;
+        // Masked out of every tool result this session stores.
+        let tool_result_secrets =
+            crate::runtime::spawn_env::session_secret_values(thread_id, &user_env_vars);
         // The account pin this session runs under. A CC session's transcript
         // lives at `$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`, and the
         // thread is pinned to the profile of its FIRST session.
@@ -963,8 +1085,9 @@ impl LucidosEngine {
             )
         });
         // CC's defaults, resolved as the spawned CC will resolve them. The
-        // settings files are a CC-only fallback: their effort vocabulary must
-        // not leak into other backends.
+        // settings files are a CC-only fallback, reached only for a model the
+        // registry has no default effort for: their effort vocabulary must not
+        // leak into other backends.
         let cc_defaults = (coding_agent == CodingAgent::ClaudeCode).then(|| {
             crate::runtime::claude_code::CcSettingsScope {
                 env: &user_env_vars,
@@ -991,6 +1114,29 @@ impl LucidosEngine {
             crate::runtime::CodingAgent::Codex => &crate::core::prefs::CODING_AGENT_CODEX_PATH,
         };
         let binary_override = binary_override_pref.read(self.pool()).await;
+        // Whether the text the model writes before a tool call reaches the
+        // user. Decided once per spawn, so the prompt stays fixed and the
+        // stream parser agrees with it. Claude Code only: Codex streams its
+        // own summary.
+        let notes = match coding_agent {
+            crate::runtime::CodingAgent::ClaudeCode => {
+                crate::runtime::claude_code_provider::notes_visibility(
+                    &crate::runtime::claude_code_provider::ProviderInputs {
+                        binary_override: binary_override.as_deref(),
+                        user_env_vars: &user_env_vars,
+                        account_pin: injected_pin.as_ref(),
+                        worktree_path: &cwd,
+                        thread_id,
+                    },
+                )
+                .await
+            }
+            crate::runtime::CodingAgent::Codex => {
+                crate::runtime::claude_code_provider::NotesVisibility::Shown
+            }
+        };
+        let system_prompt =
+            crate::engine::agent_session::prompts::with_notes_visibility(system_prompt, notes);
         // Which of Claude Code's permission modes this session runs in. Read
         // only for Claude Code: Codex has no equivalent and ignores the field.
         // An unreadable preference means the default, so a DB hiccup costs the
@@ -1046,6 +1192,7 @@ impl LucidosEngine {
                 workspace_path: self.workspace_path(),
                 allowed_tools: Some(&allowed_tools),
                 system_prompt: Some(&system_prompt),
+                session_context: Some(&session_context),
                 resume_session_id: resume_session_id.as_deref(),
                 model: cc_model.as_deref(),
                 reasoning_effort: cc_reasoning_effort.as_deref(),
@@ -1058,6 +1205,7 @@ impl LucidosEngine {
                 permission_mode: permission_mode.as_deref(),
                 account_pin: injected_pin.as_ref(),
                 additional_directories: &repo_directory_grants,
+                notes,
                 auto_compact,
                 agent_run: crate::runtime::agent_run_marker::AgentRun::for_thread(
                     self.workspace_path(),
@@ -1122,32 +1270,39 @@ impl LucidosEngine {
         // Failures inside the helper degrade silently to "no note", matching
         // the rest of the resume code's tolerance for best-effort git
         // introspection.
+        let first = first_prompt_for_agent(
+            &self.pool,
+            &self.event_store,
+            thread_id,
+            origin_id,
+            first_prompt,
+            ResumeSpawnContext {
+                worktree_path: worktree_path.as_deref(),
+                last_idle_sha: last_idle_sha.as_deref(),
+                adoption_note: adoption_note.as_deref(),
+                session_branch: Some(branch_name.as_str()),
+            },
+            HeldBlocks::for_agent(
+                &self.sent_device_contexts,
+                coding_agent,
+                resume_session_id.as_deref(),
+                &[],
+            ),
+        )
+        .await;
         let first_input = AgentInput {
-            text: first_prompt_for_agent(
-                &self.pool,
-                &self.event_store,
-                thread_id,
-                origin_id,
-                // A keep-alive carries no notes: the agent must not act on anything.
-                if self.event_bus.in_keep_alive_turn(thread_id) {
-                    PromptFor::KeepAlive(user_message)
-                } else {
-                    PromptFor::Turn(user_message)
-                },
-                ResumeSpawnContext {
-                    worktree_path: worktree_path.as_deref(),
-                    last_idle_sha: last_idle_sha.as_deref(),
-                    adoption_note: adoption_note.as_deref(),
-                    session_branch: Some(branch_name.as_str()),
-                },
-            )
-            .await,
+            text: first.text,
             images,
             uuid: Uuid::new_v4(),
         };
+        // Inputs carrying the device block, until the agent reads them.
+        let mut blocks_in_flight: HashMap<Uuid, ContextFingerprint> = HashMap::new();
+        if let Some(fingerprint) = first.device_block {
+            blocks_in_flight.insert(first_input.uuid, fingerprint);
+        }
         // The first prompt is the first owed input.
         let mut inputs = InputLedger::new();
-        inputs.forwarded(vec![origin_id], &first_input, None);
+        inputs.forwarded(first_prompt_events, &first_input, None);
         if agent_input_tx.send(first_input).is_err() {
             // Same contract as the spawn_or_resume failure arm above: remove
             // ONLY what this attempt created: a resumed worktree/branch holds
@@ -1250,6 +1405,7 @@ impl LucidosEngine {
                 session.repo_root = Some(repo_root.clone());
                 session.current_model = normalized_model.clone();
                 session.current_reasoning_effort = cc_reasoning_effort.clone();
+                session.reasoning_effort_in_force = cc_reasoning_effort.clone();
                 session
                     .last_event_at
                     .store(now_epoch_millis(), std::sync::atomic::Ordering::Relaxed);
@@ -1274,6 +1430,9 @@ impl LucidosEngine {
             withdraw_rx,
             ..
         } = &mut claim.entry;
+
+        self.redeliver_stranded_follow_ups(thread_id, &msg_tx, msg_rx, stranded)
+            .await;
 
         let chat_cancel = cancel_token.clone();
         let images: Vec<String> = Vec::new();
@@ -1418,11 +1577,11 @@ impl LucidosEngine {
                                                 // user_hit_stop: when true, the next Result emits ResponseCanceled (exchange:
                                                 // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
         let mut user_hit_stop = false;
-        // interrupt_is_redirect: set alongside user_hit_stop when the interrupt
-        // came from a Codex mid-turn follow-up redirect, so the Result renders
-        // neutrally instead of as a user Stop. Cleared at the turn boundary in
-        // lockstep with user_hit_stop.
-        let mut interrupt_is_redirect = false;
+        // redirect_cause: set alongside user_hit_stop when a redirect (a
+        // follow-up, an effort restart) sent the interrupt. The Result then
+        // renders neutrally, not as a user Stop. Cleared at the turn boundary
+        // in lockstep with user_hit_stop.
+        let mut redirect_cause = None;
         // last_emitted_idle: true iff the most recent in-loop event was
         // CodingAgentIdled. The post-loop relies on this flag to decide whether to
         // synthesize an idle event before SessionEnded.
@@ -1544,6 +1703,7 @@ impl LucidosEngine {
                             log!("[AgentSession] CC process exited while idle, releasing thread {}", thread_id);
                             // Save slash commands to cache now the session is gone.
                             // Model/effort are persisted via CodingAgentSettingsChanged events.
+                            let effort_resume = entry.as_ref().and_then(|s| s.effort_resume.clone());
                             let cache_snapshot = entry.and_then(|s| {
                                 s.repo_root.as_ref().map(|r| {
                                     (r.to_string_lossy().to_string(), s.to_commands_info())
@@ -1578,6 +1738,21 @@ impl LucidosEngine {
                                 false,
                             )
                             .await;
+                            // The turn an effort pick interrupted, from the same
+                            // position for the same reasons.
+                            let discarded_owed = self
+                                .effort_discard_owed(thread_id, effort_resume.is_some())
+                                .await;
+                            if resumes_after_effort_restart(
+                                effort_resume.is_some(),
+                                false,
+                                &last_terminal_kind,
+                                false,
+                                !orphans.is_empty(),
+                                discarded_owed,
+                            ) {
+                                self.resume_after_effort_restart(thread_id, effort_resume.and_then(|r| r.actor)).await;
+                            }
 
                             return Ok(ProcessResult {
                                 response: String::new(),
@@ -1640,7 +1815,7 @@ impl LucidosEngine {
                             &mut last_emitted_idle,
                             &mut emitted_terminal_event,
                             &mut user_hit_stop,
-                            &mut interrupt_is_redirect,
+                            &mut redirect_cause,
                             TurnTerminal {
                                 kind: &mut last_terminal_kind,
                                 withheld_api_error: &mut withheld_api_error,
@@ -1896,11 +2071,10 @@ impl LucidosEngine {
                                 // which would double-surface the question, no
                                 // kill, and no session removal.
                             } else {
-                                // Safety net. `$LUCIDOS_DATABASE_URL` keeps the
-                                // password out of `psql` argv in the common case.
-                                // A hardcoded URI in a Bash command can still
-                                // slip through, so mask every string in `args`
-                                // before the event reaches the store.
+                                // Safety net: a command can carry a token the
+                                // agent read from its env, or a hardcoded
+                                // database URI. So mask every string in `args`,
+                                // with the tool-result mask, before the store.
                                 //
                                 // BEFORE the description, not after: the step row
                                 // renders the description exactly as it renders
@@ -1908,7 +2082,7 @@ impl LucidosEngine {
                                 // redacted copy. `agentic_loop::run` orders it
                                 // the same way.
                                 let mut input = input;
-                                crate::core::redact_postgres_secrets_in_json(&mut input);
+                                crate::core::redact_subprocess_output_in_json(&mut input, &tool_result_secrets);
                                 let description = crate::core::describe_cc_tool(&name, &input);
                                 self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
@@ -1948,7 +2122,7 @@ impl LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentToolResult {
                                     name: tool_names.take(&id),
-                                    result: super::super::tool_output::stored_tool_output(&output),
+                                    result: super::super::tool_output::stored_tool_output(&output, &tool_result_secrets),
                                     coding_agent,
                                     tool_use_id: id,
                                     parent_tool_use_id,
@@ -1966,6 +2140,7 @@ impl LucidosEngine {
                             parent_tool_use_id,
                             api_call_id,
                             duration_ms,
+                            reasoning_effort,
                         } => {
                             // A usage frame reaches us only for a real API call
                             // (the parser drops all-zero ones), so this is the
@@ -1973,10 +2148,10 @@ impl LucidosEngine {
                             api_calls_seen = api_calls_seen.saturating_add(1);
                             self.record_coding_agent_usage(
                                 thread_id,
+                                &external_terminal_emitted,
                                 &meta,
                                 coding_agent,
-                                normalized_model.as_deref(),
-                                cc_msg_model.as_deref(),
+                                CallModels::of(normalized_model.as_deref(), cc_msg_model.as_deref()),
                                 ReportedUsage {
                                     input_tokens,
                                     output_tokens,
@@ -1986,11 +2161,15 @@ impl LucidosEngine {
                                     parent_tool_use_id,
                                     api_call_id,
                                     duration_ms,
+                                    reasoning_effort,
                                 },
+                                cc_reasoning_effort.as_deref(),
                             )
                             .await;
                         }
                         AgentEvent::Compacted { trigger, pre_tokens, post_tokens } => {
+                            // The summary may have dropped the device block.
+                            self.sent_device_contexts.forget(thread_id);
                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::CodingAgentCompacted {
@@ -2011,8 +2190,19 @@ impl LucidosEngine {
                         // Nothing to persist: the complete text or tool call
                         // arrives separately.
                         AgentEvent::StreamActivity => {}
-                        // Accounted for at the top of this arm.
-                        AgentEvent::InputRead { .. } | AgentEvent::InputRejected { .. } => {}
+                        // The ledger accounted for both at the top of this arm.
+                        // A block counts as sent once the agent has read it.
+                        AgentEvent::InputRead { input } => {
+                            let block = blocks_in_flight.remove(&input);
+                            if let (true, Some(fingerprint), Some(conversation)) =
+                                (read_owed_input, block, init_session_id.as_deref())
+                            {
+                                self.sent_device_contexts.record(thread_id, conversation, fingerprint);
+                            }
+                        }
+                        AgentEvent::InputRejected { input } => {
+                            blocks_in_flight.remove(&input);
+                        }
                         AgentEvent::Exited { .. } => unreachable!("Exited handled above"),
                         AgentEvent::Result { text, error: cc_error, .. } => {
                                         let err_suffix = cc_error.as_deref().map(|e| format!(" (error: {})", e)).unwrap_or_default();
@@ -2220,7 +2410,7 @@ impl LucidosEngine {
                                         );
                                         let (terminal_kind, emit_idle) = classify_result(
                                             user_hit_stop,
-                                            interrupt_is_redirect,
+                                            redirect_cause,
                                             is_shutdown,
                                             cc_error,
                                             buffered_text_empty && result_text_empty,
@@ -2253,7 +2443,7 @@ impl LucidosEngine {
                                         let clears = terminal_clears_user_hit_stop(&terminal_kind);
                                         if clears {
                                             user_hit_stop = false;
-                                            interrupt_is_redirect = false;
+                                            redirect_cause = None;
                                         }
                                         if !crate::engine::agent_session::runtime_helpers::external_terminal_already_emitted(&self.pool, &external_terminal_emitted, thread_id, meta.request_event_id, is_shutdown, "Result classify").await {
                                             let (model, reasoning_effort) = self
@@ -2341,6 +2531,16 @@ impl LucidosEngine {
                                                 // boundary.
                                                 s.idle_notify.notify_waiters();
                                             }
+                                        }
+                                        // An effort pick that beat the agent's
+                                        // read leaves that input unread for
+                                        // good. Owing it would keep this process
+                                        // up, and the effort resume runs only
+                                        // once it exits. The store records the
+                                        // discard, so the next session delivers it.
+                                        if matches!(last_terminal_kind, Some(TerminalKind::Canceled(crate::engine::thread_events::CancelCause::EffortRestart))) {
+                                            let discarded = inputs.turn_interrupted();
+                                            announce_discards(&self.event_bus, thread_id, &meta, discarded).await;
                                         }
                                         // A prompt waiting on its own turn is
                                         // answered here, and only by the turn
@@ -2650,7 +2850,7 @@ impl LucidosEngine {
                         &mut last_emitted_idle,
                         &mut emitted_terminal_event,
                         &mut user_hit_stop,
-                        &mut interrupt_is_redirect,
+                        &mut redirect_cause,
                         TurnTerminal {
                             kind: &mut last_terminal_kind,
                             withheld_api_error: &mut withheld_api_error,
@@ -2682,13 +2882,13 @@ impl LucidosEngine {
                     claude_text_buf.clear();
 
                     let images = user_input.images.clone().unwrap_or_default();
-                    // `ReentryFromEngine` suppresses this emit, see `AgentInputKind`
-                    // docs; the parent's `ChildThreadCompleted` is the start. It
+                    // Only some kinds write this, see `writes_prompt_sent`; a
+                    // child wake's own `ChildThreadCompleted` is the start. It
                     // goes out BEFORE the forward because the turn-gap note ends
                     // at it. It claims no delivery: it bounds the next note only
                     // once the agent's read names it (`turn_gap`).
-                    let prompt_sent = match user_input.kind {
-                        crate::engine::AgentInputKind::User => self
+                    let prompt_sent = if user_input.kind.writes_prompt_sent() {
+                        self
                             .event_bus
                             .emit(crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
@@ -2707,22 +2907,35 @@ impl LucidosEngine {
                                 log!("[EventBus] [AgentSession] CodingAgentPromptSent emit failed: {}", e);
                                 None
                             })
-                            .map(|emitted| emitted.event_id),
-                        crate::engine::AgentInputKind::ReentryFromEngine => None,
+                            .map(|emitted| emitted.event_id)
+                    } else {
+                        None
                     };
+                    blocks_in_flight.retain(|uuid, _| inputs.owes(*uuid));
+                    let unread: Vec<ContextFingerprint> = blocks_in_flight.values().cloned().collect();
+                    let follow_up = follow_up_for_agent(
+                        &self.pool,
+                        &self.event_store,
+                        thread_id,
+                        &user_input,
+                        prompt_sent,
+                        Some(branch_name.as_str()),
+                        HeldBlocks::for_agent(
+                            &self.sent_device_contexts,
+                            coding_agent,
+                            init_session_id.as_deref(),
+                            &unread,
+                        ),
+                    )
+                    .await;
                     let agent_input = AgentInput {
-                        text: follow_up_for_agent(
-                            &self.pool,
-                            &self.event_store,
-                            thread_id,
-                            &user_input,
-                            prompt_sent,
-                            Some(branch_name.as_str()),
-                        )
-                        .await,
+                        text: follow_up.text,
                         images,
                         uuid: Uuid::new_v4(),
                     };
+                    if let Some(fingerprint) = follow_up.device_block {
+                        blocks_in_flight.insert(agent_input.uuid, fingerprint);
+                    }
                     inputs.forwarded(
                         owed_input_event_ids(user_input.origin_event_id, prompt_sent),
                         &agent_input,
@@ -2738,7 +2951,7 @@ impl LucidosEngine {
                             .partition(|w| w.input_event_id == id);
                         withdraws_awaiting_forward = still_waiting;
                         for withdraw in now_forwarded {
-                            begin_withdraw(&inputs, agent_withdraw_tx.as_ref(), withdraw, &mut pending_withdraws);
+                            begin_withdraw(&inputs, agent_withdraw_tx.as_ref(), &self.pool, thread_id, withdraw, &mut pending_withdraws);
                         }
                     }
                 }
@@ -2755,7 +2968,7 @@ impl LucidosEngine {
                     if on_its_way {
                         withdraws_awaiting_forward.push(withdraw);
                     } else {
-                        begin_withdraw(&inputs, agent_withdraw_tx.as_ref(), withdraw, &mut pending_withdraws);
+                        begin_withdraw(&inputs, agent_withdraw_tx.as_ref(), &self.pool, thread_id, withdraw, &mut pending_withdraws);
                     }
                 }
 
@@ -2786,14 +2999,12 @@ impl LucidosEngine {
                     // after restart via recover_orphaned_worktrees.
                     if !is_waiting {
                         user_hit_stop = true;
-                        // Distinguish a follow-up redirect (set by
-                        // `arm_followup_redirect`) from a real Stop click: the
-                        // former classifies as SupersededByFollowup (neutral),
-                        // the latter as UserStop ("Canceled ✕"). Drained on read;
-                        // cleared at the Result turn boundary below alongside
-                        // user_hit_stop.
-                        interrupt_is_redirect =
-                            self.take_session_redirect_followup(thread_id).await;
+                        // Distinguish a redirect (a follow-up, an effort
+                        // restart) from a real Stop click: the former carries
+                        // its own neutral cause, the latter is UserStop
+                        // ("Canceled ✕"). Drained on read; cleared at the Result
+                        // turn boundary below alongside user_hit_stop.
+                        redirect_cause = self.take_session_redirect_cause(thread_id).await;
                         // Drain the device that clicked Cancel (stamped by
                         // `interrupt_agent`) onto `meta` so the terminal
                         // `ResponseCanceled` records it — the popover's Device row.
@@ -2818,21 +3029,25 @@ impl LucidosEngine {
 
                 _ = stop.notified() => {
                     // Apply, Discard and Archive emit their own lifecycle
-                    // terminator. Only a real `UserStop`, or no reason at all,
-                    // lets `ResponseCanceled` through.
+                    // terminator. An effort restart keeps a parked question
+                    // and lands nothing. If the question was answered before
+                    // the stop, the running turn it cuts ends as a redirect.
                     let is_shutdown = self
                         .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
+                    let pending_stop = self.pending_stop_reason(thread_id).await;
                     let suppress_user_terminal = matches!(
-                        self.pending_stop_reason(thread_id).await,
+                        pending_stop,
                         Some(StopReason::Apply | StopReason::Discard | StopReason::Archive),
                     );
+                    let stop_redirect = (pending_stop == Some(StopReason::EffortRestart))
+                        .then_some(crate::engine::thread_events::CancelCause::EffortRestart);
                     self.emit_stop_terminal(
                         "stop",
                         thread_id,
                         is_waiting,
                         is_shutdown,
                         suppress_user_terminal,
-                        false, // the stop channel is never a redirect (redirects use `interrupt`)
+                        stop_redirect,
                         &agent_cancel,
                         &mut claude_text_buf,
                         &meta,
@@ -2841,7 +3056,7 @@ impl LucidosEngine {
                     ).await;
                     emitted_terminal_event = true;
                     self.record_usage_flushed_at_stop(
-                        &mut events_rx, thread_id, &meta, coding_agent, normalized_model.as_deref(),
+                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(),
                     ).await;
                     break;
                 }
@@ -2865,11 +3080,7 @@ impl LucidosEngine {
                         thread_id
                     );
                     last_terminal_kind = Some(TerminalKind::Canceled(
-                        if interrupt_is_redirect {
-                            crate::engine::thread_events::CancelCause::SupersededByFollowup
-                        } else {
-                            crate::engine::thread_events::CancelCause::UserStop
-                        },
+                        redirect_cause.unwrap_or(crate::engine::thread_events::CancelCause::UserStop),
                     ));
                     // In lockstep, because the two describe one terminal. A
                     // cancel is nobody's auto-resume, and carrying an earlier
@@ -2883,7 +3094,7 @@ impl LucidosEngine {
                         is_waiting,
                         is_shutdown,
                         false, // suppress: a real Cancel — not Apply/Discard/Archive
-                        interrupt_is_redirect, // redirect → SupersededByFollowup cause
+                        redirect_cause, // a redirect keeps its own cause
                         &agent_cancel,
                         &mut claude_text_buf,
                         &meta,
@@ -2892,7 +3103,7 @@ impl LucidosEngine {
                     ).await;
                     emitted_terminal_event = true;
                     self.record_usage_flushed_at_stop(
-                        &mut events_rx, thread_id, &meta, coding_agent, normalized_model.as_deref(),
+                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(),
                     ).await;
                     break;
                 }
@@ -2908,7 +3119,7 @@ impl LucidosEngine {
                         is_waiting,
                         is_shutdown,
                         false,
-                        false, // chat_cancel is engine shutdown / request abort, not a redirect
+                        None, // chat_cancel is engine shutdown / request abort, not a redirect
                         &agent_cancel,
                         &mut claude_text_buf,
                         &meta,
@@ -2917,7 +3128,7 @@ impl LucidosEngine {
                     ).await;
                     emitted_terminal_event = true;
                     self.record_usage_flushed_at_stop(
-                        &mut events_rx, thread_id, &meta, coding_agent, normalized_model.as_deref(),
+                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(),
                     ).await;
                     break;
                 }
@@ -3086,9 +3297,90 @@ pub(super) enum PromptFor<'a> {
     KeepAlive(&'a str),
 }
 
+/// Text for the agent's input channel.
+pub(super) struct AgentPrompt {
+    pub(super) text: String,
+    /// Set when `text` leads with the device block. The block counts as sent
+    /// once the agent reads the input, not when it is queued: a withdrawn or
+    /// rejected input never reaches the transcript.
+    pub(super) device_block: Option<ContextFingerprint>,
+}
+
+impl AgentPrompt {
+    fn without_block(text: String) -> Self {
+        Self {
+            text,
+            device_block: None,
+        }
+    }
+
+    /// `text` goes first, then the block when the conversation lacks it.
+    fn with_block(text: String, block: Option<DeviceBlock>) -> Self {
+        match block {
+            Some(block) => Self {
+                text: prepend_user_device_preferences_context(&block.text, &text),
+                device_block: Some(block.fingerprint),
+            },
+            None => Self::without_block(text),
+        }
+    }
+}
+
+/// What the conversation a prompt goes to already holds of the device block.
+#[derive(Clone, Copy)]
+pub(super) struct HeldBlocks<'a> {
+    pub(super) sent: &'a SentDeviceContexts,
+    /// The backend session id the agent reported at `Init`, or the one a resume
+    /// reattaches. A spawn has none, so its first prompt always carries the
+    /// block.
+    pub(super) conversation: Option<&'a str>,
+    /// Blocks queued to the agent and not yet read.
+    pub(super) unread: &'a [ContextFingerprint],
+}
+
+impl<'a> HeldBlocks<'a> {
+    /// Only Claude Code reports a compaction, which can drop the block from
+    /// the summary. Another backend holds no conversation, so every message
+    /// carries the block.
+    pub(super) fn for_agent(
+        sent: &'a SentDeviceContexts,
+        coding_agent: CodingAgent,
+        conversation: Option<&'a str>,
+        unread: &'a [ContextFingerprint],
+    ) -> Self {
+        Self {
+            sent,
+            conversation: conversation.filter(|_| coding_agent == CodingAgent::ClaudeCode),
+            unread,
+        }
+    }
+}
+
+impl HeldBlocks<'_> {
+    /// The device block, unless the conversation holds an equal one already.
+    async fn block_for_origin(
+        self,
+        pool: &sqlx::PgPool,
+        event_store: &crate::core::EventStore,
+        thread_id: Uuid,
+        origin_id: Uuid,
+    ) -> Option<DeviceBlock> {
+        let context =
+            crate::engine::agent_context::build_user_device_preferences_context_for_origin(
+                pool,
+                event_store,
+                thread_id,
+                origin_id,
+            )
+            .await;
+        self.sent
+            .block_for(thread_id, self.conversation, self.unread, &context)
+    }
+}
+
 /// The first prompt a spawn or resume sends: the resume notes, then the device
-/// block. A slash command goes verbatim ([`forwards_verbatim`]), and so does a
-/// keep-alive's nudge.
+/// block unless the resumed conversation holds it already. A slash command goes
+/// verbatim ([`forwards_verbatim`]), and so does a keep-alive's nudge.
 pub(super) async fn first_prompt_for_agent(
     pool: &sqlx::PgPool,
     event_store: &crate::core::EventStore,
@@ -3096,32 +3388,39 @@ pub(super) async fn first_prompt_for_agent(
     origin_id: Uuid,
     prompt: PromptFor<'_>,
     spawn: ResumeSpawnContext<'_>,
-) -> String {
+    held: HeldBlocks<'_>,
+) -> AgentPrompt {
     let user_message = match prompt {
-        PromptFor::KeepAlive(nudge) => return nudge.to_string(),
+        PromptFor::KeepAlive(nudge) => return AgentPrompt::without_block(nudge.to_string()),
         PromptFor::Turn(message) => message,
     };
     if forwards_verbatim(user_message) {
-        return user_message.to_string();
+        return AgentPrompt::without_block(user_message.to_string());
     }
-    let text = build_resume_prompt_text(pool, thread_id, origin_id, user_message, spawn).await;
-    let device_context =
-        crate::engine::agent_context::build_user_device_preferences_context_for_origin(
-            pool,
-            event_store,
-            thread_id,
-            origin_id,
-        )
+    let standing_note = standing_instruction_section(pool, thread_id).await;
+    let text = build_resume_prompt_text(
+        pool,
+        thread_id,
+        origin_id,
+        user_message,
+        standing_note,
+        spawn,
+    )
+    .await;
+    let block = held
+        .block_for_origin(pool, event_store, thread_id, origin_id)
         .await;
-    crate::engine::agent_context::prepend_user_device_preferences_context(&device_context, &text)
+    AgentPrompt::with_block(text, block)
 }
 
 /// A follow-up to a live session: the turn-gap note, then the device block of
-/// the user who sent it. A slash command goes verbatim ([`forwards_verbatim`]).
+/// the user who sent it, unless the conversation holds an equal one already. A
+/// slash command goes verbatim ([`forwards_verbatim`]).
 ///
-/// The block is built per follow-up, not at spawn: the session outlives many
-/// messages, and each may come from another device. Only the agent sees it,
-/// never the `CodingAgentPromptSent` audit event.
+/// The block is judged per follow-up, not at spawn: the session outlives many
+/// messages, and each may come from another device or after a preference
+/// change. Only the agent sees it, never the `CodingAgentPromptSent` audit
+/// event.
 pub(super) async fn follow_up_for_agent(
     pool: &sqlx::PgPool,
     event_store: &crate::core::EventStore,
@@ -3129,32 +3428,38 @@ pub(super) async fn follow_up_for_agent(
     input: &AgentUserInput,
     prompt_sent: Option<Uuid>,
     session_branch: Option<&str>,
-) -> String {
+    held: HeldBlocks<'_>,
+) -> AgentPrompt {
     if forwards_verbatim(&input.text) {
-        return input.text.clone();
+        return AgentPrompt::without_block(input.text.clone());
     }
+    let standing_note = standing_instruction_section(pool, thread_id).await;
+    let late_note = match input.kind {
+        crate::engine::AgentInputKind::Redelivered { sent_at, input } => Some(
+            crate::engine::agent_session::stranded_follow_ups::late_delivery_note(input, sent_at),
+        ),
+        _ => None,
+    };
     let text = build_followup_prompt_text(
         pool,
         thread_id,
         input.origin_event_id,
         prompt_sent,
         &input.text,
+        FollowUpNotes {
+            late: late_note.as_deref(),
+            standing: standing_note,
+        },
         session_branch,
     )
     .await;
-    match input.user_origin() {
-        Some(origin) => crate::engine::agent_context::prepend_user_device_preferences_context(
-            &crate::engine::agent_context::build_user_device_preferences_context_for_origin(
-                pool,
-                event_store,
-                thread_id,
-                origin,
-            )
-            .await,
-            &text,
-        ),
-        None => text,
-    }
+    let Some(origin) = input.user_origin() else {
+        return AgentPrompt::without_block(text);
+    };
+    let block = held
+        .block_for_origin(pool, event_store, thread_id, origin)
+        .await;
+    AgentPrompt::with_block(text, block)
 }
 
 /// Build the text handed to the resumed agent's input channel: the user's
@@ -3166,6 +3471,9 @@ pub(super) async fn follow_up_for_agent(
 /// 2. **turn gap**: the user or the engine resolved one of the agent's changes,
 ///    or the cleanup worker reclaimed the worktree,
 /// 3. **external edits**: the worktree changed under the agent.
+///
+/// The `standing_note` ([`standing_instruction_section`]) leads them, since it
+/// is about this turn rather than the gap before it.
 ///
 /// The turn-gap note is computed FIRST because it decides whether the
 /// external-edit note may report a HEAD move as unexplained. An Apply, a
@@ -3184,6 +3492,7 @@ pub(super) async fn build_resume_prompt_text(
     thread_id: Uuid,
     current_origin_id: Uuid,
     user_message: &str,
+    standing_note: &str,
     spawn: ResumeSpawnContext<'_>,
 ) -> String {
     if user_message.is_empty() {
@@ -3224,6 +3533,7 @@ pub(super) async fn build_resume_prompt_text(
     // observation: the gap note explains a reset the edit note can only see the
     // effects of.
     let combined: Vec<&str> = [
+        turn_note(standing_note),
         adoption_note,
         gap_note.as_ref().map(|n| n.note.as_str()),
         edit_note.as_deref(),
@@ -3234,9 +3544,24 @@ pub(super) async fn build_resume_prompt_text(
     prepend_resume_notes(thread_id, &combined, user_message)
 }
 
-/// The text a follow-up to a live session carries: the message, behind the
-/// turn-gap note when the gap holds one. A kept-alive session spawns nothing,
-/// so without this an event from its previous turn reaches no prompt.
+/// A per-turn section as a note, or `None` when it is empty.
+fn turn_note(section: &str) -> Option<&str> {
+    Some(section.trim()).filter(|note| !note.is_empty())
+}
+
+/// The notes a follow-up carries besides the turn-gap note.
+#[derive(Clone, Copy, Default)]
+pub(super) struct FollowUpNotes<'a> {
+    /// The message is a redelivery a dead process never read.
+    pub late: Option<&'a str>,
+    /// [`standing_instruction_section`].
+    pub standing: &'a str,
+}
+
+/// The text a follow-up to a live session carries: the message, behind its
+/// `notes` and the turn-gap note when there are any. A kept-alive session
+/// spawns nothing, so without this an event from its previous turn reaches no
+/// prompt.
 ///
 /// `prompt_sent` is the `CodingAgentPromptSent` this forward wrote before it
 /// computed the note. Only a user-kind input writes one. See
@@ -3247,22 +3572,32 @@ pub(super) async fn build_followup_prompt_text(
     origin: Option<Uuid>,
     prompt_sent: Option<Uuid>,
     message: &str,
+    notes: FollowUpNotes<'_>,
     session_branch: Option<&str>,
 ) -> String {
     // Unlike a spawn, no empty-message skip: the forward runs either way, and
     // an image-only follow-up still writes the boundary this note ends at.
-    let Some((anchor, until)) = followup_gap_bounds(origin, prompt_sent) else {
-        return message.to_string();
+    let gap_note = match followup_gap_bounds(origin, prompt_sent) {
+        Some((anchor, until)) => {
+            crate::engine::agent_session::turn_gap::compute_turn_gap_note_until(
+                pool,
+                thread_id,
+                anchor,
+                until,
+                session_branch,
+            )
+            .await
+        }
+        None => None,
     };
-    let gap_note = crate::engine::agent_session::turn_gap::compute_turn_gap_note_until(
-        pool,
-        thread_id,
-        anchor,
-        until,
-        session_branch,
-    )
-    .await;
-    let notes: Vec<&str> = gap_note.iter().map(|n| n.note.as_str()).collect();
+    let notes: Vec<&str> = [
+        notes.late,
+        turn_note(notes.standing),
+        gap_note.as_ref().map(|n| n.note.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     prepend_resume_notes(thread_id, &notes, message)
 }
 
@@ -3309,31 +3644,121 @@ fn prepend_resume_notes(thread_id: Uuid, notes: &[&str], message: &str) -> Strin
 /// Longest a message may run inside the thread-history block.
 const HISTORY_MESSAGE_MAX_BYTES: usize = 2000;
 
-/// Budget for the whole thread-history block. It rides in one argv string
-/// with the system prompt, and Linux refuses to exec any single argument over
-/// 128 KiB. History only grows, so an uncapped block kills the thread for good.
+/// Budget for the whole thread-history block. History only grows, and an
+/// uncapped block would grow every fresh session's first message with it.
 const HISTORY_BLOCK_MAX_BYTES: usize = 48 * 1024;
 
-/// The thread history a new coding-agent session sees, from `(role, channel,
-/// content)` lines. The newest messages are kept when the whole thread
-/// exceeds [`HISTORY_BLOCK_MAX_BYTES`]. Empty when no message has content.
-fn thread_history_block<'a>(
-    messages: impl IntoIterator<Item = (&'a str, Option<&'a str>, &'a str)>,
-) -> String {
+/// Most images of unanswered messages a fresh session's first message
+/// carries. The newest are kept, so a run of stopped turns cannot push the
+/// request past a provider's image or size limit.
+const UNANSWERED_IMAGES_MAX: usize = 8;
+
+/// One thread message as the thread-history block reads it.
+#[derive(Debug, Clone, PartialEq)]
+struct HistoryLine<'a> {
+    role: &'a str,
+    channel: Option<&'a str>,
+    content: &'a str,
+    image_hashes: &'a [String],
+    event_id: Option<&'a str>,
+}
+
+impl<'a> HistoryLine<'a> {
+    fn of(message: &'a crate::core::store::SessionMessage) -> Self {
+        Self {
+            role: &message.role,
+            channel: message.channel.as_deref(),
+            content: &message.content,
+            image_hashes: &message.user_image_hashes,
+            event_id: message.event_id.as_deref(),
+        }
+    }
+
+    /// A coding agent wrote it. An `[ERROR]` line or an `[Asked for you]`
+    /// note carries no channel: no agent read the message before it.
+    fn is_reply(&self) -> bool {
+        self.role == "assistant"
+            && self.channel == Some("claude_code")
+            && !self.content.trim().is_empty()
+    }
+}
+
+/// `messages` without the one being sent, and where it stood: the last user
+/// message reading `current`, else the end. That message follows the session
+/// context, so the history must not repeat it.
+fn before_current_message<'a>(
+    mut messages: Vec<HistoryLine<'a>>,
+    current: &str,
+) -> (Vec<HistoryLine<'a>>, usize) {
+    match messages
+        .iter()
+        .rposition(|line| line.role == "user" && line.content.trim() == current.trim())
+    {
+        Some(at) => {
+            messages.remove(at);
+            (messages, at)
+        }
+        None => {
+            let end = messages.len();
+            (messages, end)
+        }
+    }
+}
+
+/// Where the messages no agent answered begin: just after the last reply.
+/// A message stopped before any session started has no reply, so a fresh
+/// session is the first agent to read it.
+fn first_unanswered(messages: &[HistoryLine<'_>]) -> usize {
+    messages
+        .iter()
+        .rposition(HistoryLine::is_reply)
+        .map_or(0, |at| at + 1)
+}
+
+/// The newest [`UNANSWERED_IMAGES_MAX`] images on the messages no agent
+/// answered, oldest first. `redelivered` names messages that reach the
+/// session again with their own images, so they bring none here.
+fn unanswered_image_hashes<'a>(
+    messages: &[HistoryLine<'a>],
+    redelivered: &[String],
+) -> Vec<&'a str> {
+    let mut hashes: Vec<&str> = messages[first_unanswered(messages)..]
+        .iter()
+        .filter(|line| line.role == "user")
+        .filter(|line| {
+            line.event_id
+                .is_none_or(|id| !redelivered.iter().any(|r| r == id))
+        })
+        .flat_map(|line| line.image_hashes.iter().map(String::as_str))
+        .collect();
+    hashes.drain(..hashes.len().saturating_sub(UNANSWERED_IMAGES_MAX));
+    hashes
+}
+
+/// The thread history a new coding-agent session sees. Each message's
+/// images are counted as `attached` to the first message or not shown. The
+/// newest messages are kept when the whole thread exceeds
+/// [`HISTORY_BLOCK_MAX_BYTES`]. Empty when no message has content.
+fn thread_history_block(messages: &[HistoryLine<'_>], attached: &[&str]) -> String {
     let entries: Vec<String> = messages
-        .into_iter()
-        .filter_map(|(role, channel, content)| {
-            let content = content.trim();
-            if content.is_empty() {
+        .iter()
+        .filter_map(|line| {
+            let content = line.content.trim();
+            let images = if line.role == "user" {
+                line.image_hashes
+            } else {
+                &[]
+            };
+            if content.is_empty() && images.is_empty() {
                 return None;
             }
-            let label = match role {
+            let label = match line.role {
                 "user" => "User",
-                "assistant" if channel == Some("claude_code") => "Coding agent",
+                "assistant" if line.channel == Some("claude_code") => "Coding agent",
                 "assistant" => "Assistant",
                 other => other,
             };
-            let body = if content.len() > HISTORY_MESSAGE_MAX_BYTES {
+            let mut body = if content.len() > HISTORY_MESSAGE_MAX_BYTES {
                 let end = content.floor_char_boundary(HISTORY_MESSAGE_MAX_BYTES);
                 format!(
                     "{}…\n[truncated, {} chars total]",
@@ -3343,7 +3768,22 @@ fn thread_history_block<'a>(
             } else {
                 content.to_string()
             };
-            Some(format!("**{}:** {}\n\n", label, body))
+            let shown = images
+                .iter()
+                .filter(|hash| attached.contains(&hash.as_str()))
+                .count();
+            if shown > 0 {
+                body.push_str(&format!(
+                    "\n[{shown} image(s), attached to the message after this context]"
+                ));
+            }
+            if images.len() > shown {
+                body.push_str(&format!(
+                    "\n[{} image(s), not shown to this session]",
+                    images.len() - shown
+                ));
+            }
+            Some(format!("**{}:** {}\n\n", label, body.trim_start()))
         })
         .collect();
     if entries.is_empty() {
@@ -3360,7 +3800,8 @@ fn thread_history_block<'a>(
         .count();
     let omitted = entries.len() - kept;
     let mut history = String::from(
-        "\n\nTHREAD HISTORY: This session continues an existing thread. Here is the conversation so far:\n\n",
+        "THREAD HISTORY: This session continues an existing thread. Here is the conversation \
+         before this message:\n\n",
     );
     if omitted > 0 {
         history.push_str(&format!("[{omitted} earlier messages omitted]\n\n"));
@@ -3368,7 +3809,6 @@ fn thread_history_block<'a>(
     for entry in &entries[omitted..] {
         history.push_str(entry);
     }
-    history.push_str("---\nEnd of thread history. The user's new message follows.\n");
     history
 }
 
@@ -3376,15 +3816,32 @@ fn thread_history_block<'a>(
 mod thread_history_block_tests {
     use super::*;
 
-    /// A long thread fit in one argv string only until it outgrew 128 KiB,
-    /// and then every later spawn failed with E2BIG. The block stays under
-    /// budget and keeps the newest messages.
+    fn line<'a>(role: &'a str, channel: Option<&'a str>, content: &'a str) -> HistoryLine<'a> {
+        HistoryLine {
+            role,
+            channel,
+            content,
+            image_hashes: &[],
+            event_id: None,
+        }
+    }
+
+    fn with_images<'a>(line: HistoryLine<'a>, image_hashes: &'a [String]) -> HistoryLine<'a> {
+        HistoryLine {
+            image_hashes,
+            ..line
+        }
+    }
+
+    /// A long thread's history stays under budget and keeps the newest
+    /// messages.
     #[test]
     fn a_long_thread_keeps_the_newest_messages_within_budget() {
         let contents: Vec<String> = (0..400)
             .map(|i| format!("message {i:03} {}", "x".repeat(1500)))
             .collect();
-        let block = thread_history_block(contents.iter().map(|c| ("user", None, c.as_str())));
+        let lines: Vec<_> = contents.iter().map(|c| line("user", None, c)).collect();
+        let block = thread_history_block(&lines, &[]);
         assert!(
             block.len() < HISTORY_BLOCK_MAX_BYTES + 1024,
             "{} bytes",
@@ -3403,14 +3860,140 @@ mod thread_history_block_tests {
 
     #[test]
     fn a_short_thread_is_kept_whole() {
-        let block = thread_history_block([
-            ("user", None, "hello"),
-            ("assistant", Some("claude_code"), "hi there"),
-        ]);
+        let block = thread_history_block(
+            &[
+                line("user", None, "hello"),
+                line("assistant", Some("claude_code"), "hi there"),
+            ],
+            &[],
+        );
         assert!(block.contains("**User:** hello"));
         assert!(block.contains("**Coding agent:** hi there"));
         assert!(!block.contains("omitted"));
-        assert_eq!(thread_history_block([("user", None, "  ")]), "");
+        assert_eq!(thread_history_block(&[line("user", None, "  ")], &[]), "");
+    }
+
+    /// The message being sent follows the session context, so the history
+    /// holds only what came before it.
+    #[test]
+    fn the_history_leaves_out_the_message_being_sent() {
+        let lines = vec![
+            line("user", None, "fix the drawer"),
+            line("assistant", Some("claude_code"), "fixed"),
+            line("user", None, "fix the drawer"),
+        ];
+        let (prior, at) = before_current_message(lines, " fix the drawer\n");
+        assert_eq!(
+            prior,
+            vec![
+                line("user", None, "fix the drawer"),
+                line("assistant", Some("claude_code"), "fixed"),
+            ],
+            "only the newest copy is the message being sent"
+        );
+        assert_eq!(at, 2);
+        let block = thread_history_block(&prior, &[]);
+        assert_eq!(block.matches("fix the drawer").count(), 1, "{block}");
+    }
+
+    /// A turn no user message opened (a child's report, an engine prompt)
+    /// leaves the history whole.
+    #[test]
+    fn a_turn_without_a_matching_message_keeps_the_whole_history() {
+        let lines = vec![line("user", None, "hello"), line("assistant", None, "hi")];
+        assert_eq!(
+            before_current_message(lines.clone(), "Your child thread finished."),
+            (lines, 2)
+        );
+    }
+
+    /// A fresh session gets the images of messages no agent answered, not
+    /// only their text. An error line is no answer.
+    #[test]
+    fn a_fresh_session_gets_the_images_no_agent_answered() {
+        let answered = ["old".to_string()];
+        let stopped = ["shot".to_string()];
+        let lines = vec![
+            with_images(line("user", None, "look at this"), &answered),
+            line("assistant", Some("claude_code"), "done"),
+            with_images(line("user", None, "drop the descriptions here"), &stopped),
+            line("assistant", None, "[ERROR] **Error:** startup failed"),
+            line("user", None, "continue"),
+        ];
+        let (prior, at) = before_current_message(lines, "continue");
+        let hashes = unanswered_image_hashes(&prior[..at], &[]);
+        assert_eq!(hashes, ["shot"]);
+        let block = thread_history_block(&prior, &hashes);
+        assert!(
+            block.contains("look at this\n[1 image(s), not shown to this session]"),
+            "{block}"
+        );
+        assert!(
+            block.contains(
+                "drop the descriptions here\n[1 image(s), attached to the message after this context]"
+            ),
+            "{block}"
+        );
+    }
+
+    /// A stranded follow-up and a message after the current one each reach
+    /// the session with their own images. Neither brings them into the block.
+    #[test]
+    fn redelivered_and_later_messages_bring_no_images() {
+        let stranded = ["stranded".to_string()];
+        let queued = ["queued".to_string()];
+        let lines = vec![
+            HistoryLine {
+                event_id: Some("evt-stranded"),
+                ..with_images(line("user", None, "and this"), &stranded)
+            },
+            line("user", None, "go on"),
+            with_images(line("user", None, "one more"), &queued),
+        ];
+        let (prior, at) = before_current_message(lines, "go on");
+        assert!(unanswered_image_hashes(&prior[..at], &["evt-stranded".to_string()]).is_empty());
+    }
+
+    /// Only the newest images ride along, so a run of stopped turns stays
+    /// within a provider's limits.
+    #[test]
+    fn the_newest_unanswered_images_are_kept() {
+        let hashes: Vec<String> = (0..UNANSWERED_IMAGES_MAX + 3)
+            .map(|i| format!("img{i:02}"))
+            .collect();
+        let lines = vec![with_images(line("user", None, "many"), &hashes)];
+        let kept = unanswered_image_hashes(&lines, &[]);
+        assert_eq!(kept.len(), UNANSWERED_IMAGES_MAX);
+        assert_eq!(kept.first(), Some(&"img03"));
+        assert_eq!(kept.last(), Some(&hashes.last().unwrap().as_str()));
+    }
+
+    /// An image that could not be read is not called attached.
+    #[test]
+    fn an_image_that_failed_to_load_reads_as_not_shown() {
+        let hashes = ["here".to_string(), "gone".to_string()];
+        let block = thread_history_block(
+            &[with_images(line("user", None, "two"), &hashes)],
+            &["here"],
+        );
+        assert!(
+            block.contains(
+                "two\n[1 image(s), attached to the message after this context]\n[1 image(s), not shown to this session]"
+            ),
+            "{block}"
+        );
+    }
+
+    /// A message of only images still shows in the history.
+    #[test]
+    fn an_image_only_message_is_kept() {
+        let hashes = ["shot".to_string()];
+        let block =
+            thread_history_block(&[with_images(line("user", None, ""), &hashes)], &["shot"]);
+        assert!(
+            block.contains("**User:** [1 image(s), attached to the message after this context]"),
+            "{block}"
+        );
     }
 }
 
@@ -3665,6 +4248,7 @@ mod usage_flushed_at_stop_tests {
             parent_tool_use_id: None,
             api_call_id: None,
             duration_ms: None,
+            reasoning_effort: None,
         }
     }
 
@@ -3708,6 +4292,7 @@ mod usage_flushed_at_stop_tests {
             parent_tool_use_id: Some("toolu_agent".into()),
             api_call_id: None,
             duration_ms: None,
+            reasoning_effort: None,
         })
         .expect("send");
         drop(tx);
@@ -3818,5 +4403,79 @@ mod call_models_tests {
                 }
             );
         }
+    }
+}
+
+/// A coding-agent `ContextCaptured` names the effort the call ran at, under
+/// the field the main-LLM rows use, so one rollup groups every producer.
+#[cfg(test)]
+mod coding_agent_capture_tests {
+    use super::{coding_agent_capture, effort_in_force, CallModels, ReportedUsage};
+    use crate::runtime::CodingAgent;
+
+    fn reported() -> ReportedUsage {
+        ReportedUsage {
+            input_tokens: 2,
+            output_tokens: 4,
+            cache_read_tokens: 8,
+            cache_creation_tokens: 0,
+            cache_creation_1h_tokens: None,
+            parent_tool_use_id: None,
+            api_call_id: None,
+            duration_ms: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn captured_payload(effort: Option<String>) -> serde_json::Value {
+        let event = coding_agent_capture(
+            CodingAgent::ClaudeCode,
+            CallModels::of(Some("claude-opus-5-5"), Some("claude-opus-5-5")),
+            200_000,
+            reported(),
+            effort,
+        );
+        serde_json::to_value(&event).expect("serializes")
+    }
+
+    #[test]
+    fn a_claude_code_capture_carries_the_effort_the_session_ran_at() {
+        let payload = captured_payload(Some("high".into()));
+
+        assert_eq!(payload["producer"], "claude_code");
+        assert_eq!(payload["reasoning_effort"], "high");
+    }
+
+    /// An unknown effort is left out, never guessed.
+    #[test]
+    fn an_unknown_effort_is_omitted() {
+        let payload = captured_payload(None);
+
+        assert!(payload.get("reasoning_effort").is_none(), "{payload}");
+    }
+
+    /// Claude Code takes effort only at spawn, so every call runs at the
+    /// spawn effort.
+    #[test]
+    fn claude_code_runs_at_its_spawn_effort() {
+        assert_eq!(
+            effort_in_force(CodingAgent::ClaudeCode, Some("medium"), Some("max".into())),
+            Some("medium".into())
+        );
+    }
+
+    /// Codex applies an effort change at its next turn, so the effort its
+    /// driver sent with the call's turn is the one in force. A turn sent
+    /// with none ran at an effort the driver cannot name.
+    #[test]
+    fn codex_runs_at_the_effort_its_driver_sent() {
+        assert_eq!(
+            effort_in_force(CodingAgent::Codex, Some("medium"), Some("high".into())),
+            Some("high".into())
+        );
+        assert_eq!(
+            effort_in_force(CodingAgent::Codex, Some("medium"), None),
+            None
+        );
     }
 }

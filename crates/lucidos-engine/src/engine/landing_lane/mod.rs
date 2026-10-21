@@ -90,6 +90,35 @@ pub(crate) async fn queued_changes(
         .collect())
 }
 
+/// The changes among `change_ids` the lane holds: their latest lane event is
+/// `ChangeQueued`, waiting or in the open batch, and they are still pending.
+/// Read from events, so it answers before the lane restores after a restart.
+pub(crate) async fn lane_held_changes(
+    pool: &sqlx::PgPool,
+    change_ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
+    if change_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let ids: Vec<String> = change_ids.iter().map(Uuid::to_string).collect();
+    let held: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT c.id FROM ( \
+             SELECT DISTINCT ON (payload->>'change_id') \
+                    payload->>'change_id' AS change_id, event_type \
+             FROM events \
+             WHERE event_type IN ('ChangeQueued', 'ChangeUnqueued') \
+               AND payload->>'change_id' = ANY($1) \
+             ORDER BY payload->>'change_id', sequence DESC \
+         ) q \
+         JOIN changes c ON c.id::text = q.change_id AND c.status = 'pending' \
+         WHERE q.event_type = 'ChangeQueued'",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(held.into_iter().map(|(id,)| id).collect())
+}
+
 /// The snapshot `change_id` waits at, when it is queued.
 pub(crate) async fn queued_snapshot(
     pool: &sqlx::PgPool,

@@ -9,7 +9,7 @@ use crate::engine::LucidosEngine;
 use uuid::Uuid;
 
 use super::super::process_helpers::TriggerContext;
-use super::super::title::{emit_generated_title, title_call};
+use super::super::title::{name_untitled_thread, title_call, TITLE_RETRY_DELAYS};
 
 impl LucidosEngine {
     /// Emit thread titles for this turn as needed: a caller-provided title
@@ -87,41 +87,33 @@ impl LucidosEngine {
             let bus = self.event_bus.clone();
             let tid_str = thread_id_str.to_string();
             tokio::spawn(async move {
+                // Held through every retry, so a later follow-up cannot start
+                // a second namer while this one waits.
                 let _slot = slot;
-                match event_store.thread_has_title(&tid_str).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        // Logged, like the sibling arm below. The
-                        // title still generates, just without the
-                        // image description.
-                        let image_desc = match event_store.get_thread_first_message(&tid_str).await
-                        {
-                            Ok(found) => found.and_then(|(_, desc, _)| desc),
-                            Err(e) => {
-                                log!(
-                                    "[Thread] First-message read failed for the title of {}: {}",
-                                    tid_str,
-                                    e
-                                );
-                                None
-                            }
-                        };
-                        emit_generated_title(
-                            &pool,
-                            &bus,
-                            &call,
-                            thread_id,
-                            &msg,
-                            image_desc.as_deref(),
-                            None,
-                            attached_images,
-                        )
-                        .await;
-                    }
+                // Logged and carried on. The title still generates, just
+                // without the image description.
+                let image_desc = match event_store.get_thread_first_message(&tid_str).await {
+                    Ok(found) => found.and_then(|(_, desc, _)| desc),
                     Err(e) => {
-                        log!("[Thread] Failed to check title existence: {}", e);
+                        log!(
+                            "[Thread] First-message read failed for the title of {}: {}",
+                            tid_str,
+                            e
+                        );
+                        None
                     }
-                }
+                };
+                name_untitled_thread(
+                    &pool,
+                    &bus,
+                    &call,
+                    thread_id,
+                    &msg,
+                    image_desc.as_deref(),
+                    attached_images,
+                    &TITLE_RETRY_DELAYS,
+                )
+                .await;
             });
         }
 

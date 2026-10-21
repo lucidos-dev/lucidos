@@ -79,7 +79,7 @@ async function landThreadHash(threadId: string): Promise<void> {
     for (let attempt = 0; ; attempt++) {
       const outcome = await focusThreadOrBootstrapResult(threadId);
       if (token !== landingToken) return; // superseded by a newer landing
-      if (outcome.kind === 'focused') {
+      if (outcome.kind === 'focused' || outcome.kind === 'awaiting') {
         postClientLog('deeplink', 'route_thread_hash_landed', {
           thread: threadId,
           attempts: attempt + 1,

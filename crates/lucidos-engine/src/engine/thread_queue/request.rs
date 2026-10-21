@@ -74,6 +74,11 @@ pub enum ThreadQueueRequest {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
+        /// The backend the child runs on, inherited from the caller's turn.
+        /// Absent on a request queued before the field existed, which lets
+        /// the model's own preferred provider decide.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
         /// Set by the executor's prepare step once the eager
         /// `MessageReceived` is emitted (admission time), so execution does
         /// not re-emit it.
@@ -442,6 +447,7 @@ mod tests {
             title: None,
             model: None,
             reasoning_effort: None,
+            provider: None,
             pre_emitted_origin: None,
             origin: origin.clone(),
         };
@@ -620,6 +626,7 @@ mod tests {
             title: None,
             model: None,
             reasoning_effort: None,
+            provider: None,
             pre_emitted_origin: None,
             origin,
         }
@@ -670,14 +677,21 @@ mod tests {
     /// survive the jsonb round-trip in every occasion.
     #[test]
     fn a_plugin_setup_origin_round_trips_through_the_request() {
-        use crate::engine::thread_events::{EngineReason, PluginSetupOccasion};
+        use crate::engine::thread_events::{EngineReason, PluginSetupCause, PluginSetupOccasion};
 
         for occasion in [
             PluginSetupOccasion::FreshInstall,
             PluginSetupOccasion::Update {
                 from_version: Some("0.1.3".into()),
+                cause: PluginSetupCause::InstructionsChanged,
             },
-            PluginSetupOccasion::Update { from_version: None },
+            PluginSetupOccasion::Update {
+                from_version: None,
+                cause: PluginSetupCause::RevisionRaised {
+                    revision: 2,
+                    reason: Some("The skill changed.".into()),
+                },
+            },
         ] {
             let origin = Some(MessageOrigin::engine(EngineReason::PluginSetup {
                 plugin_id: "habit-tracker".into(),
@@ -718,6 +732,7 @@ mod tests {
             title: None,
             model: None,
             reasoning_effort: None,
+            provider: None,
             pre_emitted_origin: None,
             origin: None,
         };

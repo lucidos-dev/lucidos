@@ -27,6 +27,8 @@ pub struct ProviderSelectionInputs {
     pub has_opencode_free: bool,
     /// A local OpenAI-compatible provider (base URL) is configured.
     pub has_local: bool,
+    /// Lucidos is signed in to the configured Claude gateway.
+    pub has_claude_gateway: bool,
     /// `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
     /// engine boot before any provider is configured (instead of crashing).
     pub boot_without_provider: bool,
@@ -41,6 +43,7 @@ impl ProviderSelectionInputs {
             || self.has_xai
             || self.has_opencode_free
             || self.has_local
+            || self.has_claude_gateway
     }
 }
 
@@ -92,6 +95,7 @@ mod tests {
             has_xai: false,
             has_opencode_free: false,
             has_local: false,
+            has_claude_gateway: false,
             boot_without_provider: false,
         }
     }
@@ -127,6 +131,7 @@ mod tests {
             |i: &mut ProviderSelectionInputs| i.has_xai = true,
             |i: &mut ProviderSelectionInputs| i.has_opencode_free = true,
             |i: &mut ProviderSelectionInputs| i.has_local = true,
+            |i: &mut ProviderSelectionInputs| i.has_claude_gateway = true,
         ] {
             let mut i = none();
             set(&mut i);

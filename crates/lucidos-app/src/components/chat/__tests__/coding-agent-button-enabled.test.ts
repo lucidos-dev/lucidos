@@ -10,102 +10,48 @@
 import { describe, it, expect } from 'vitest';
 
 /**
- * Mirrors codingAgentSlashCommandsReady() in CodingAgentControlMenu.tsx.
- * Returns true when CC has reported builtin or skill commands (CC binary
- * connected). It gates the slash-command CACHE update and the empty-response
- * retry, NOT the button's visual state, which is hasAnyCommands below.
+ * Mirrors hasAnyCommands() in CodingAgentControlMenu.tsx, which is BOTH the
+ * openMenu guard and the `commands-btn-active` condition. One predicate, so the
+ * button cannot look ready while the menu refuses to open. It also gates the
+ * slash-command CACHE update and the empty-response retry. The model and effort
+ * are the rung control's, so they never count here.
  */
-function codingAgentSlashCommandsReady(
-  builtinCommands: unknown[],
-  skillCommands: unknown[],
-): boolean {
+function menuOpens(builtinCommands: unknown[], skillCommands: unknown[]): boolean {
   return builtinCommands.length > 0 || skillCommands.length > 0;
 }
 
-/**
- * Mirrors hasAnyCommands() in CodingAgentControlMenu.tsx, which is BOTH the
- * openMenu guard and the `commands-btn-active` condition. One predicate, so the
- * button cannot look ready while the menu refuses to open. Any commands
- * (control, builtin, or skill) count; control commands are always present from
- * the backend for CC threads.
- */
-function menuOpens(
-  controlCommands: unknown[],
-  builtinCommands: unknown[],
-  skillCommands: unknown[],
-): boolean {
-  return controlCommands.length > 0 || codingAgentSlashCommandsReady(builtinCommands, skillCommands);
-}
-
 describe('Control menu opens (openMenu guard)', () => {
-  const controlCmds = [{ subtype: 'set_model' }];
-
-  it('opens when only control commands exist (no builtin/skill yet)', () => {
-    expect(menuOpens(controlCmds, [], [])).toBe(true);
-  });
-
   it('opens when builtinCommands are present', () => {
-    expect(menuOpens(controlCmds, ['help', 'model', 'status'], [])).toBe(true);
+    expect(menuOpens(['help', 'model', 'status'], [])).toBe(true);
   });
 
   it('opens when skillCommands are present', () => {
-    expect(menuOpens(controlCmds, [], ['commit', 'review-pr'])).toBe(true);
+    expect(menuOpens([], ['commit', 'review-pr'])).toBe(true);
   });
 
   it('opens when both builtin and skill commands are present', () => {
-    expect(menuOpens(controlCmds, ['help'], ['commit'])).toBe(true);
+    expect(menuOpens(['help'], ['commit'])).toBe(true);
   });
 
   it('does NOT open when no commands at all (not yet loaded)', () => {
-    expect(menuOpens([], [], [])).toBe(false);
-  });
-});
-
-describe('codingAgentSlashCommandsReady (CC binary connected)', () => {
-  it('is false when no builtin or skill commands', () => {
-    expect(codingAgentSlashCommandsReady([], [])).toBe(false);
-  });
-
-  it('is true when builtinCommands are present', () => {
-    expect(codingAgentSlashCommandsReady(['help', 'status'], [])).toBe(true);
-  });
-
-  it('is true when skillCommands are present', () => {
-    expect(codingAgentSlashCommandsReady([], ['commit'])).toBe(true);
-  });
-
-  it('is true when both are present', () => {
-    expect(codingAgentSlashCommandsReady(['help'], ['commit'])).toBe(true);
+    expect(menuOpens([], [])).toBe(false);
   });
 });
 
 describe('button visual state', () => {
-  const controlCmds = [{ subtype: 'set_model' }];
-
-  /** Mirrors the button's class expression in CodingAgentControlMenu.tsx.
-   *  Built from `menuOpens` (the hasAnyCommands mirror) on purpose: deriving it
-   *  from the slash-commands predicate instead is how this block drifted from
-   *  production and came to claim a control-only session stays dimmed. */
-  function buttonClass(control: unknown[], builtin: unknown[], skill: unknown[]): string {
-    const ready = menuOpens(control, builtin, skill);
+  /** Mirrors the button's class expression in CodingAgentControlMenu.tsx. */
+  function buttonClass(builtin: unknown[], skill: unknown[]): string {
+    const ready = menuOpens(builtin, skill);
     return `icon-btn header-icon commands-btn${ready ? ' commands-btn-active' : ''}`;
   }
 
   it('is dimmed while nothing has loaded, because clicking it opens nothing', () => {
-    expect(menuOpens([], [], [])).toBe(false);
-    expect(buttonClass([], [], [])).not.toContain('commands-btn-active');
-  });
-
-  it('is undimmed as soon as control commands exist, even with no slash commands', () => {
-    // The dim means "clicking me is a no-op", so it has to lift the moment the
-    // menu will open, which control commands alone are enough for.
-    expect(codingAgentSlashCommandsReady([], [])).toBe(false);
-    expect(menuOpens(controlCmds, [], [])).toBe(true);
-    expect(buttonClass(controlCmds, [], [])).toContain('commands-btn-active');
+    expect(menuOpens([], [])).toBe(false);
+    expect(buttonClass([], [])).not.toContain('commands-btn-active');
   });
 
   it('is undimmed when coding-agent slash commands are cached', () => {
-    expect(buttonClass([], ['help', 'status'], ['commit'])).toContain('commands-btn-active');
+    expect(buttonClass(['help', 'status'], ['commit'])).toContain('commands-btn-active');
   });
 
   it('carries header-icon, so it wears the prompt row\'s shared icon box', () => {
@@ -113,12 +59,12 @@ describe('button visual state', () => {
     // the todo / subscription / attach buttons beside it use. Dropping it puts
     // the agent mark back at 1rem in a 1.5rem box, a size out of step with
     // every other icon in the cluster.
-    expect(buttonClass(controlCmds, [], [])).toContain('header-icon');
+    expect(buttonClass([], [])).toContain('header-icon');
   });
 
   it('button is always clickable even when nothing loaded yet', () => {
     // Menu won't open (openMenu guard), but button itself is never disabled
-    expect(menuOpens([], [], [])).toBe(false);
+    expect(menuOpens([], [])).toBe(false);
     // The button has no disabled attribute — it's always in the DOM without disabled
   });
 });
@@ -298,7 +244,7 @@ describe('loadCommands retry on empty response', () => {
   it('should retry when commands are empty (CC Init may not have arrived)', () => {
     let retryCalled = false;
     const scheduleRetry = (commands: string[], skills: string[]) => {
-      if (!codingAgentSlashCommandsReady(commands, skills)) {
+      if (!menuOpens(commands, skills)) {
         retryCalled = true;
       }
     };
@@ -309,7 +255,7 @@ describe('loadCommands retry on empty response', () => {
   it('should NOT retry when commands are present', () => {
     let retryCalled = false;
     const scheduleRetry = (commands: string[], skills: string[]) => {
-      if (!codingAgentSlashCommandsReady(commands, skills)) {
+      if (!menuOpens(commands, skills)) {
         retryCalled = true;
       }
     };
@@ -347,48 +293,5 @@ describe('openMenu resets retry counter for fresh retries', () => {
     // Without openMenu resetting the counter, no retries possible
     const canRetry = retryCount < MAX_EMPTY_RETRIES;
     expect(canRetry).toBe(false); // this is the bug — should be true after opening menu
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Control commands filtered by active session state
-// ---------------------------------------------------------------------------
-
-describe('control commands hidden when no active session', () => {
-  const controlCmds = [
-    { subtype: 'set_model', label: 'Model', params: [] },
-    { subtype: 'set_reasoning_effort', label: 'Reasoning Effort', params: [] },
-  ];
-
-  /**
-   * Mirrors the filtering logic in CodingAgentControlMenu.tsx:
-   * const activeControlCommands = hasActiveSession.value ? controlCommands.value : [];
-   */
-  function activeControlCommands(
-    controlCommands: typeof controlCmds,
-    hasActiveSession: boolean,
-  ) {
-    return hasActiveSession ? controlCommands : [];
-  }
-
-  it('returns control commands when session is active', () => {
-    const result = activeControlCommands(controlCmds, true);
-    expect(result).toEqual(controlCmds);
-  });
-
-  it('returns empty when no active session', () => {
-    const result = activeControlCommands(controlCmds, false);
-    expect(result).toEqual([]);
-  });
-
-  it('menu still opens with slash commands even without active session', () => {
-    // Control commands hidden, but slash commands still available
-    const active = activeControlCommands(controlCmds, false);
-    expect(menuOpens(active, ['help', 'status'], ['commit'])).toBe(true);
-  });
-
-  it('menu does NOT open when no session and no slash commands', () => {
-    const active = activeControlCommands(controlCmds, false);
-    expect(menuOpens(active, [], [])).toBe(false);
   });
 });

@@ -378,8 +378,9 @@ fn an_installed_plugin_stages_an_update_even_with_its_files_gone() {
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_fixture_archive(&archive_dir, "v1");
     let installed = InstalledPlugins {
-        ids: ["fixture-plugin".to_string()].into(),
+        files: [("fixture-plugin".to_string(), Vec::new())].into(),
         baselines: Default::default(),
+        setups: Default::default(),
     };
 
     let result = prepare_install_request(
@@ -393,6 +394,240 @@ fn an_installed_plugin_stages_an_update_even_with_its_files_gone() {
     let payload = parse_sentinel_payload(&result);
     assert!(payload["overwrites"].as_array().unwrap().is_empty());
     assert_eq!(payload["is_update"], true);
+}
+
+/// A staged fixture archive whose manifest carries `extra` lines after `source`.
+fn stage_with_setup(scratch: &Path, extra: &str, installed: InstalledPlugins) -> serde_json::Value {
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let manifest = format!("{FIXTURE_MANIFEST}{extra}");
+    let archive = build_archive(
+        &archive_dir,
+        "fixture.lucidos-plugin",
+        &manifest,
+        &[("knowhow/fixture.md", b"body")],
+    );
+    let result = prepare_install_request(
+        scratch,
+        &fresh_pending_map(),
+        archive.to_str().unwrap(),
+        &Ok(installed),
+        &GitCredentials::none(),
+        &running(),
+    );
+    parse_sentinel_payload(&result)
+}
+
+fn installed_with_setup(prior: PriorSetup) -> InstalledPlugins {
+    InstalledPlugins {
+        files: [("fixture-plugin".to_string(), Vec::new())].into(),
+        setups: [("fixture-plugin".to_string(), prior)].into(),
+        ..Default::default()
+    }
+}
+
+/// The preview carries the occasion confirm would seed, decided by the same
+/// function, so the panel never promises a thread confirm would skip.
+#[test]
+fn the_preview_states_whether_an_update_runs_setup_again() {
+    let (_tmp, scratch) = fresh_workspace();
+    let setup = "setup = \"copy the skill\"\n";
+    let prior = |text: &str, revision| {
+        installed_with_setup(PriorSetup {
+            text: Some(text.into()),
+            revision,
+            version: Some("0.0.9".into()),
+        })
+    };
+
+    let raised = stage_with_setup(
+        &scratch,
+        &format!("{setup}setup_revision = 2\nsetup_reason = \"The skill changed.\"\n"),
+        prior("copy the skill", 1),
+    );
+    assert_eq!(
+        raised["setup_run"],
+        serde_json::json!({
+            "kind": "update",
+            "from_version": "0.0.9",
+            "cause": {
+                "kind": "revision_raised",
+                "revision": 2,
+                "reason": "The skill changed.",
+            },
+        })
+    );
+
+    let carried = stage_with_setup(
+        &scratch,
+        &format!("{setup}setup_revision = 2\n"),
+        prior("copy the skill", 2),
+    );
+    assert!(carried["setup_run"].is_null(), "{carried}");
+
+    let changed = stage_with_setup(&scratch, setup, prior("an older text", 0));
+    assert_eq!(
+        changed["setup_run"]["cause"]["kind"],
+        "instructions_changed"
+    );
+
+    let fresh = stage_with_setup(&scratch, setup, InstalledPlugins::default());
+    assert_eq!(fresh["setup_run"]["kind"], "fresh_install");
+
+    let none = stage_with_setup(&scratch, "", InstalledPlugins::default());
+    assert!(none["setup_run"].is_null());
+}
+
+/// The preview lists every file the confirm will delete, before the user
+/// confirms. A legacy record has no baseline, so its dropped file also gets a
+/// "Your edits" row: no edit to it can be ruled out.
+#[test]
+fn staging_an_update_lists_the_files_it_will_remove() {
+    let (_tmp, scratch) = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_fixture_archive(&archive_dir, "v2");
+    std::fs::create_dir_all(scratch.join("data/knowhow")).unwrap();
+    std::fs::write(scratch.join("data/knowhow/fixture.md"), "v1").unwrap();
+    std::fs::write(scratch.join("data/knowhow/old.md"), "dropped in v2").unwrap();
+    let recorded = vec![
+        "knowhow/fixture.md".to_string(),
+        "knowhow/old.md".to_string(),
+    ];
+    let installed = InstalledPlugins {
+        files: [("fixture-plugin".to_string(), recorded)].into(),
+        baselines: Default::default(),
+        setups: Default::default(),
+    };
+
+    let result = prepare_install_request(
+        &scratch,
+        &fresh_pending_map(),
+        archive.to_str().unwrap(),
+        &Ok(installed),
+        &GitCredentials::none(),
+        &running(),
+    );
+    let payload = parse_sentinel_payload(&result);
+    assert_eq!(payload["removes"], serde_json::json!(["knowhow/old.md"]));
+    assert_eq!(
+        payload["local_changes"],
+        serde_json::json!([{ "path": "knowhow/old.md", "outcome": "removed" }])
+    );
+    assert!(
+        scratch.join("data/knowhow/old.md").exists(),
+        "nothing is deleted before the user confirms"
+    );
+}
+
+/// Staging reads the other plugins' records itself. A dropped path another
+/// plugin still records is never offered for removal.
+#[test]
+fn staging_never_removes_a_path_another_plugin_records() {
+    let (_tmp, scratch) = fresh_workspace();
+    let archive_dir = scratch.join("archive");
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let archive = build_fixture_archive(&archive_dir, "v2");
+    std::fs::create_dir_all(scratch.join("data/knowhow")).unwrap();
+    std::fs::write(scratch.join("data/knowhow/fixture.md"), "v1").unwrap();
+    std::fs::write(scratch.join("data/knowhow/shared.md"), "both ship this").unwrap();
+    let shared = "knowhow/shared.md".to_string();
+    let installed = InstalledPlugins {
+        files: [
+            (
+                "fixture-plugin".to_string(),
+                vec!["knowhow/fixture.md".to_string(), shared.clone()],
+            ),
+            ("other-plugin".to_string(), vec![shared]),
+        ]
+        .into(),
+        baselines: Default::default(),
+        setups: Default::default(),
+    };
+
+    let result = prepare_install_request(
+        &scratch,
+        &fresh_pending_map(),
+        archive.to_str().unwrap(),
+        &Ok(installed),
+        &GitCredentials::none(),
+        &running(),
+    );
+    let payload = parse_sentinel_payload(&result);
+    assert_eq!(payload["removes"], serde_json::json!([]));
+    assert_eq!(payload["local_changes"], serde_json::json!([]));
+}
+
+fn records(entries: &[(&str, &[&str])]) -> InstalledPlugins {
+    InstalledPlugins {
+        files: entries
+            .iter()
+            .map(|(id, files)| {
+                (
+                    id.to_string(),
+                    files.iter().map(|f| f.to_string()).collect(),
+                )
+            })
+            .collect(),
+        baselines: Default::default(),
+        setups: Default::default(),
+    }
+}
+
+/// The confirm acts on records read up to an hour earlier. It refuses only
+/// when they no longer support the plan.
+#[test]
+fn a_confirm_refuses_when_the_records_no_longer_support_its_plan() {
+    let staged = records(&[("demo", &["knowhow/a.md", "knowhow/old.md"])]).files;
+    let removals = vec!["knowhow/old.md".to_string()];
+    let check = |now: InstalledPluginsRead, removals: &[String]| {
+        check_records_still_match("demo", Some(&staged), &now, removals)
+    };
+
+    assert!(check(
+        Ok(records(&[("demo", &["knowhow/a.md", "knowhow/old.md"])])),
+        &removals
+    )
+    .is_ok());
+    assert!(
+        check(
+            Ok(records(&[
+                ("demo", &["knowhow/a.md", "knowhow/old.md"]),
+                ("other", &["knowhow/b.md"]),
+            ])),
+            &removals,
+        )
+        .is_ok(),
+        "an unrelated install leaves the plan valid"
+    );
+    assert!(
+        check(
+            Ok(records(&[
+                ("demo", &["knowhow/a.md", "knowhow/old.md"]),
+                ("other", &["knowhow/old.md"]),
+            ])),
+            &removals,
+        )
+        .is_err(),
+        "another plugin now records a path the plan removes"
+    );
+    assert!(
+        check(
+            Ok(records(&[("demo", &["knowhow/a.md", "knowhow/new.md"])])),
+            &[]
+        )
+        .is_err(),
+        "a newer version of this plugin confirmed first"
+    );
+    assert!(
+        check(Err("db down".to_string()), &removals).is_err(),
+        "an unknown never authorizes a delete"
+    );
+    assert!(check(Err("db down".to_string()), &[]).is_ok());
+    assert!(
+        check_records_still_match("demo", None, &Err("db down".to_string()), &[]).is_ok(),
+        "staging could not read them either, so there is nothing to compare"
+    );
 }
 
 #[test]
@@ -602,37 +837,179 @@ fn normalize_setup_trims_and_collapses_empty() {
     assert_eq!(normalize_setup(Some("  do x  ")), Some("do x".to_string()));
 }
 
-#[test]
-fn setup_is_new_skips_when_new_version_has_no_setup() {
-    // No setup in the new version → never spawn, regardless of prior.
-    assert!(!setup_is_new(None, None));
-    assert!(!setup_is_new(None, Some("wire up the key")));
-    assert!(!setup_is_new(Some("   "), Some("wire up the key")));
+fn staged(text: Option<&str>, revision: u64, reason: Option<&str>) -> StagedSetup {
+    StagedSetup {
+        text: normalize_setup(text),
+        revision,
+        reason: reason.map(str::to_string),
+    }
+}
+
+fn prior(text: Option<&str>, revision: u64, version: Option<&str>) -> PriorSetup {
+    PriorSetup {
+        text: normalize_setup(text),
+        revision,
+        version: version.map(str::to_string),
+    }
+}
+
+fn update_from(from: Option<&str>, cause: PluginSetupCause) -> PluginSetupOccasion {
+    PluginSetupOccasion::Update {
+        from_version: from.map(str::to_string),
+        cause,
+    }
+}
+
+fn update(from: Option<&str>, cause: PluginSetupCause) -> Option<PluginSetupOccasion> {
+    Some(update_from(from, cause))
+}
+
+fn revision_raised() -> PluginSetupCause {
+    PluginSetupCause::RevisionRaised {
+        revision: 2,
+        reason: Some("The skill changed.".into()),
+    }
+}
+
+fn both_causes() -> PluginSetupCause {
+    PluginSetupCause::Both {
+        revision: 2,
+        reason: Some("The skill changed.".into()),
+    }
 }
 
 #[test]
-fn setup_is_new_spawns_on_fresh_install_with_setup() {
-    // Fresh install (no prior) or prior had no setup → new setup work.
-    assert!(setup_is_new(Some("wire up the key"), None));
-    assert!(setup_is_new(Some("wire up the key"), Some("   ")));
+fn no_setup_in_the_staged_version_never_runs_setup() {
+    let key = Some("wire up the key");
+    assert_eq!(setup_occasion(&staged(None, 0, None), None), None);
+    assert_eq!(
+        setup_occasion(&staged(None, 0, None), Some(&prior(key, 0, Some("0.1.0")))),
+        None
+    );
+    assert_eq!(
+        setup_occasion(
+            &staged(Some("   "), 0, None),
+            Some(&prior(key, 0, Some("0.1.0")))
+        ),
+        None
+    );
 }
 
 #[test]
-fn setup_is_new_skips_unchanged_update_but_spawns_on_change() {
-    // Identical setup (incl. whitespace-only diffs) → no re-run on update.
-    assert!(!setup_is_new(
-        Some("wire up the key"),
-        Some("wire up the key")
-    ));
-    assert!(!setup_is_new(
-        Some("  wire up the key  "),
-        Some("wire up the key")
-    ));
-    // Genuinely-changed setup → spawn.
-    assert!(setup_is_new(
-        Some("wire up the key AND the secret"),
-        Some("wire up the key")
-    ));
+fn a_fresh_install_with_setup_runs_it_whatever_the_revision() {
+    let key = Some("wire up the key");
+    let fresh = Some(PluginSetupOccasion::FreshInstall);
+    assert_eq!(setup_occasion(&staged(key, 0, None), None), fresh);
+    assert_eq!(setup_occasion(&staged(key, 5, None), None), fresh);
+    // A prior record that shipped no setup text has nothing to compare, so
+    // this version's setup is new work.
+    assert_eq!(
+        setup_occasion(&staged(key, 0, None), Some(&prior(None, 0, Some("0.1.0")))),
+        update(Some("0.1.0"), PluginSetupCause::InstructionsChanged)
+    );
+}
+
+#[test]
+fn an_update_that_changed_the_setup_text_runs_setup_for_that_reason() {
+    let old = prior(Some("wire up the key"), 0, Some("0.1.0"));
+    assert_eq!(
+        setup_occasion(
+            &staged(Some("wire up the key AND the secret"), 0, None),
+            Some(&old)
+        ),
+        update(Some("0.1.0"), PluginSetupCause::InstructionsChanged)
+    );
+}
+
+#[test]
+fn an_update_with_the_same_text_and_no_revision_change_runs_nothing() {
+    let old = prior(Some("wire up the key"), 0, Some("0.1.0"));
+    // Whitespace-only differences do not count as a change.
+    assert_eq!(
+        setup_occasion(&staged(Some("  wire up the key  "), 0, None), Some(&old)),
+        None
+    );
+    let old = prior(Some("wire up the key"), 3, Some("0.1.0"));
+    assert_eq!(
+        setup_occasion(
+            &staged(Some("wire up the key"), 3, Some("Same.")),
+            Some(&old)
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_raised_revision_runs_setup_when_the_text_is_unchanged() {
+    let old = prior(Some("copy the skill"), 0, Some("0.1.0"));
+    assert_eq!(
+        setup_occasion(
+            &staged(Some("copy the skill"), 1, Some("The skill changed.")),
+            Some(&old)
+        ),
+        update(
+            Some("0.1.0"),
+            PluginSetupCause::RevisionRaised {
+                revision: 1,
+                reason: Some("The skill changed.".into()),
+            }
+        )
+    );
+    // No reason is fine: the author's note is optional.
+    assert_eq!(
+        setup_occasion(&staged(Some("copy the skill"), 1, None), Some(&old)),
+        update(
+            Some("0.1.0"),
+            PluginSetupCause::RevisionRaised {
+                revision: 1,
+                reason: None,
+            }
+        )
+    );
+}
+
+#[test]
+fn a_raised_revision_and_changed_text_run_setup_for_both_reasons() {
+    let old = prior(Some("copy the skill"), 1, Some("0.1.0"));
+    assert_eq!(
+        setup_occasion(
+            &staged(Some("copy the skill to the new folder"), 2, Some("Moved.")),
+            Some(&old)
+        ),
+        update(
+            Some("0.1.0"),
+            PluginSetupCause::Both {
+                revision: 2,
+                reason: Some("Moved.".into()),
+            }
+        )
+    );
+}
+
+/// A revision the author carries unchanged into the next release re-runs setup
+/// once, on the release that raised it.
+#[test]
+fn a_revision_carried_across_two_releases_runs_setup_once() {
+    let text = Some("copy the skill");
+    let raised = setup_occasion(
+        &staged(text, 2, Some("Changed.")),
+        Some(&prior(text, 1, Some("0.1.0"))),
+    );
+    assert!(raised.is_some(), "0.1.0 to 0.2.0 raises 1 to 2");
+    let carried = setup_occasion(
+        &staged(text, 2, Some("Changed.")),
+        Some(&prior(text, 2, Some("0.2.0"))),
+    );
+    assert_eq!(carried, None, "0.2.0 to 0.3.0 keeps 2");
+}
+
+/// "Greater", not "differs": removing the field or rolling back never re-runs.
+#[test]
+fn a_lowered_or_removed_revision_runs_nothing() {
+    let text = Some("copy the skill");
+    let old = prior(text, 3, Some("0.3.0"));
+    assert_eq!(setup_occasion(&staged(text, 2, None), Some(&old)), None);
+    assert_eq!(setup_occasion(&staged(text, 0, None), Some(&old)), None);
 }
 
 fn super_slides() -> SeededPlugin {
@@ -660,10 +1037,10 @@ fn setup_seed_origin(
 fn every_setup_occasion_seeds_a_typed_engine_origin() {
     let occasions = [
         PluginSetupOccasion::FreshInstall,
-        PluginSetupOccasion::Update {
-            from_version: Some("0.5.1".to_string()),
-        },
-        PluginSetupOccasion::Update { from_version: None },
+        update_from(Some("0.5.1"), PluginSetupCause::InstructionsChanged),
+        update_from(None, PluginSetupCause::InstructionsChanged),
+        update_from(Some("0.5.1"), revision_raised()),
+        update_from(None, both_causes()),
     ];
     for occasion in occasions {
         let origin = setup_seed_origin(occasion.clone(), None);
@@ -798,9 +1175,7 @@ fn an_update_seeds_a_re_run_rather_than_a_first_install() {
     let req = build_setup_thread_request(
         tid,
         &super_slides(),
-        PluginSetupOccasion::Update {
-            from_version: Some("0.5.1".to_string()),
-        },
+        update_from(Some("0.5.1"), PluginSetupCause::InstructionsChanged),
         None,
     );
     match req {
@@ -826,6 +1201,60 @@ fn an_update_seeds_a_re_run_rather_than_a_first_install() {
             );
         }
         other => panic!("setup thread must be a SubThread, got: {other:?}"),
+    }
+}
+
+/// Every cause words its own seed and keeps the title. The origin, which the
+/// popover reads, carries the same cause.
+#[test]
+fn each_update_cause_seeds_its_own_wording() {
+    let cases = [
+        (
+            update_from(Some("0.5.1"), revision_raised()),
+            "Set up Super Slides again: version 0.6.0 asks to run its setup again \
+             since version 0.5.1. Author's note: The skill changed.",
+        ),
+        (
+            update_from(None, revision_raised()),
+            "Set up Super Slides again: this update asks to run its setup again. \
+             Author's note: The skill changed.",
+        ),
+        (
+            update_from(
+                Some("0.5.1"),
+                PluginSetupCause::RevisionRaised {
+                    revision: 2,
+                    reason: None,
+                },
+            ),
+            "Set up Super Slides again: version 0.6.0 asks to run its setup again \
+             since version 0.5.1.",
+        ),
+        (
+            update_from(Some("0.5.1"), both_causes()),
+            "Set up Super Slides again: its setup instructions changed since version \
+             0.5.1, and the author asks to run it again. Author's note: The skill changed.",
+        ),
+        (
+            update_from(None, both_causes()),
+            "Set up Super Slides again: this update changed its setup instructions, \
+             and the author asks to run it again. Author's note: The skill changed.",
+        ),
+    ];
+    for (occasion, expected) in cases {
+        match build_setup_thread_request(uuid::Uuid::new_v4(), &super_slides(), occasion, None) {
+            crate::engine::thread_queue::ThreadQueueRequest::SubThread {
+                title,
+                prompt,
+                origin,
+                ..
+            } => {
+                assert_eq!(prompt, expected);
+                assert_eq!(title.as_deref(), Some("Update Super Slides setup"));
+                assert!(origin.is_some());
+            }
+            other => panic!("setup thread must be a SubThread, got: {other:?}"),
+        }
     }
 }
 
@@ -884,13 +1313,20 @@ fn both_setup_seeds_route_to_the_plugin_setup_knowhow() {
 
     let occasions = [
         PluginSetupOccasion::FreshInstall,
-        PluginSetupOccasion::Update {
-            from_version: Some("0.5.1".to_string()),
-        },
-        PluginSetupOccasion::Update { from_version: None },
+        update_from(Some("0.5.1"), PluginSetupCause::InstructionsChanged),
+        update_from(None, PluginSetupCause::InstructionsChanged),
+        update_from(Some("0.5.1"), revision_raised()),
+        update_from(None, revision_raised()),
+        update_from(Some("0.5.1"), both_causes()),
+        update_from(None, both_causes()),
     ];
     for occasion in occasions {
+        let again = matches!(occasion, PluginSetupOccasion::Update { .. });
         let prompt = seed(occasion);
+        assert!(
+            !again || prompt.contains("again"),
+            "an update seed drops the word the knowhow keys on: {prompt:?}"
+        );
         assert!(
             prompt.contains("set up"),
             "the seed drops the verb every route keys on: {prompt:?}"
@@ -919,7 +1355,7 @@ fn an_update_from_a_versionless_record_still_seeds_a_re_run() {
     let req = build_setup_thread_request(
         tid,
         &super_slides(),
-        PluginSetupOccasion::Update { from_version: None },
+        update_from(None, PluginSetupCause::InstructionsChanged),
         None,
     );
     match req {

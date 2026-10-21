@@ -4,7 +4,7 @@
 //! `lucidos events query` without knowing where the binary lives.
 
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 #[cfg(windows)]
 pub(crate) const LUCIDOS_BIN_NAME: &str = "lucidos.exe";
@@ -17,11 +17,122 @@ static CLI_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
     resolve_cli_dir(std::env::var_os("LUCIDOS_CLI_BIN"), exe_parent)
 });
 
-/// Directory containing the bundled `lucidos` binary. The engine's exe path
-/// is immutable for the process lifetime, so the lookup is memoized.
+/// The workspace's pinned CLI directory, set once by `pin_cli_for_workspace`.
+static PINNED_CLI_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Directory containing the `lucidos` binary that spawned processes run. It is
+/// the engine's pinned copy when startup made one, else the resolved
+/// directory. Both are fixed for the process lifetime.
 /// Returns None when the binary isn't reachable — caller skips CLI wiring.
 pub fn lucidos_cli_dir() -> Option<&'static Path> {
-    CLI_DIR.as_deref()
+    PINNED_CLI_DIR
+        .get()
+        .map(PathBuf::as_path)
+        .or(CLI_DIR.as_deref())
+}
+
+/// Where a workspace keeps the CLI its engine pinned.
+pub(crate) fn pinned_cli_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".lucidos").join("cli")
+}
+
+/// Identity of a file on disk: it changes when a rename replaces the path.
+pub type FileId = (u64, u64);
+
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_path: &Path) -> Option<FileId> {
+    None
+}
+
+/// The identity of the file this engine was launched from. Take it as the
+/// first act of `main`, before any wait, so it names the binary that started.
+pub fn launch_file_id() -> Option<FileId> {
+    std::env::current_exe().ok().and_then(|exe| file_id(&exe))
+}
+
+/// Pin the CLI this engine was published with. A later publish into the launch
+/// directory then cannot hand its subprocesses a newer CLI than the engine.
+/// Call once at startup, after the workspace is known. `launched_as` is
+/// `launch_file_id()` as taken at the start of `main`.
+///
+/// A pin failure never blocks startup: it logs and leaves `lucidos_cli_dir`
+/// on the resolved directory. Packaged builds name their CLI through
+/// `LUCIDOS_CLI_BIN` and are not pinned, because an update replaces the bundle
+/// and restarts the engine together.
+pub fn pin_cli_for_workspace(workspace: &Path, launched_as: Option<FileId>) {
+    if std::env::var_os("LUCIDOS_CLI_BIN").is_some_and(|bin| Path::new(&bin).is_file()) {
+        return;
+    }
+    let Some(source_dir) = CLI_DIR.as_deref() else {
+        return;
+    };
+    let pinned = match launched_as {
+        Some(launched_as) => pin_cli(
+            source_dir,
+            &pinned_cli_dir(workspace),
+            launched_as,
+            launch_file_id,
+        ),
+        None => Err("the engine's launch path could not be probed at startup".into()),
+    };
+    match pinned {
+        Ok(pin_dir) => {
+            crate::log!("[LucidosCLI] pinned the CLI into {}", pin_dir.display());
+            // A second call keeps the first pin, the one already handed out.
+            let _ = PINNED_CLI_DIR.set(pin_dir);
+        }
+        Err(e) => crate::log!(
+            "[LucidosCLI] CLI not pinned, using {}: {}",
+            source_dir.display(),
+            e
+        ),
+    }
+}
+
+/// Put `source_dir/lucidos` at `pin_dir/lucidos` through a hardlink, or a copy
+/// when the two sit on different filesystems. The write goes to a temp name,
+/// then a rename, so a CLI process already running from the old pin keeps its
+/// inode.
+///
+/// A build publishes the engine before the CLI. So a CLI newer than this
+/// engine always comes with a replaced engine file. `launched_as` is that
+/// file's identity at launch, and `launch_id_now` probes it again after the
+/// link. A probe that differs or fails means a publish may have preceded the
+/// pin. The pin then never lands, and the caller falls back to the published
+/// directory.
+pub(crate) fn pin_cli(
+    source_dir: &Path,
+    pin_dir: &Path,
+    launched_as: FileId,
+    launch_id_now: impl Fn() -> Option<FileId>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let source = source_dir.join(LUCIDOS_BIN_NAME);
+    let pin = pin_dir.join(LUCIDOS_BIN_NAME);
+    // One fixed name: a crash between the link and the rename leaves a file
+    // the next start overwrites, so none accumulates.
+    let temp = pin_dir.join(format!("{LUCIDOS_BIN_NAME}.pin-tmp"));
+    std::fs::create_dir_all(pin_dir)?;
+
+    let _ = std::fs::remove_file(&temp);
+    if std::fs::hard_link(&source, &temp).is_err() {
+        std::fs::copy(&source, &temp)?;
+    }
+    if launch_id_now() != Some(launched_as) {
+        let _ = std::fs::remove_file(&temp);
+        return Err("a publish replaced the engine before the CLI was pinned".into());
+    }
+    std::fs::rename(&temp, &pin)?;
+    // Renaming onto a hardlink of the same inode does nothing, and leaves the
+    // temp name behind.
+    let _ = std::fs::remove_file(&temp);
+    Ok(pin_dir.to_path_buf())
 }
 
 /// Resolve the directory containing the bundled `lucidos` CLI.

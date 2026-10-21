@@ -121,6 +121,8 @@ export interface MainCheck {
   run_url?: string;
   /** The one fix thread a red check opened. */
   fix_thread_id?: string;
+  /** The open flaky fix thread, in whatever state the check is. */
+  flaky_fix_thread_id?: string;
   /** What failed when red; why the check cannot run when unavailable. */
   summary?: string;
 }

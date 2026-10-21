@@ -52,11 +52,6 @@ pub(crate) const DEFAULT_AGENT_TYPE: &str = "general-purpose";
 /// (`runtime::claude_code::CC_ADDITIONAL_DIRECTORIES_ENV`).
 const ADDITIONAL_DIRECTORIES_ENV: &str = "LUCIDOS_CC_ADDITIONAL_DIRECTORIES";
 
-#[cfg(target_os = "macos")]
-const MANAGED_DIR: &str = "/Library/Application Support/ClaudeCode";
-#[cfg(not(target_os = "macos"))]
-const MANAGED_DIR: &str = "/etc/claude-code";
-
 /// The places Claude Code reads agent definitions from.
 pub(crate) struct AgentSources {
     /// The session's working directory, from the hook payload.
@@ -82,7 +77,7 @@ impl AgentSources {
             cwd,
             home,
             config_dir,
-            managed_dir: PathBuf::from(MANAGED_DIR),
+            managed_dir: PathBuf::from(lucidos_claude_code_managed::MANAGED_DIR),
             additional_dirs: parse_additional_dirs(
                 std::env::var(ADDITIONAL_DIRECTORIES_ENV).ok().as_deref(),
             ),
@@ -176,7 +171,9 @@ impl AgentSources {
         }
         settings_files.push(self.project_root().join(".claude/settings.json"));
         settings_files.push(self.project_root().join(".claude/settings.local.json"));
-        settings_files.push(self.managed_dir.join("managed-settings.json"));
+        settings_files.push(lucidos_claude_code_managed::managed_settings_path(
+            &self.managed_dir,
+        ));
 
         let mut enabled = HashMap::new();
         for settings in settings_files.iter().filter_map(|path| read_json(path)) {

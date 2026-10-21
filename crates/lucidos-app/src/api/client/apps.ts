@@ -1,4 +1,4 @@
-import { API, API_BASE, json, mutatingFetch, retryTransientRead, throwIfNotOk, throwIfRefused } from './_core';
+import { API, API_BASE, json, mutatingFetch, retryTransient, throwIfNotOk, throwIfRefused } from './_core';
 import { readDeviceId } from '../../utils/deviceIdHeader';
 import { lucidos, WIDGET_PARAMS_QUERY } from '@lucidos/sdk';
 import { canonicalWidgetParams, hasWidgetParams, type WidgetParams } from '../../utils/widgetParams';
@@ -62,6 +62,9 @@ export interface PluginLocalChangesResult {
   /** Paths the user had deleted that upstream still ships, so they came back.
    *  These have no saved copy: a deletion has no content to keep. */
   restored: string[];
+  /** Edited paths the new version no longer ships, saved aside and then
+   *  deleted. Absent from an engine older than the field. */
+  removed?: string[];
   /** `data/`-relative copies of every edit the update discarded. */
   saved_paths: string[];
 }
@@ -69,6 +72,9 @@ export interface PluginLocalChangesResult {
 export interface PluginConfirmInstallResponse {
   summary: string;
   installed_files: string[];
+  /** Paths the previous version shipped and this one dropped, which the update
+   *  deleted. Absent when it deleted none. */
+  removed_files?: string[];
   /** Set when the plugin shipped `setup` instructions: the Lucidos Agent thread
    *  spawned to walk the user through them. The frontend navigates here. */
   setup_thread_id?: string;
@@ -285,7 +291,7 @@ export async function unpinAppApi(appId: string, deviceId: string): Promise<ApiR
  *  dropped fetch would otherwise render "Failed to load event types". A 4xx or
  *  5xx is a real verdict and is not retried. */
 export function fetchEventTypes(): Promise<string[]> {
-  return retryTransientRead(() => json(`${API}/events/types`));
+  return retryTransient(() => json(`${API}/events/types`));
 }
 
 // --- Knowhow ---

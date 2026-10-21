@@ -35,7 +35,7 @@ function registryRow(id: string, label: string, efforts: string[]): ModelInfo {
     successor: null,
     sort_order: 0,
     source: 'builtin',
-    enabled: true,
+    on_chat_ladder: true,
     created_at: '2026-01-01T00:00:00Z',
   };
 }
@@ -56,6 +56,7 @@ function resolvedTo(row: Partial<BackgroundModel>): BackgroundRows {
       effort: null,
       source: 'default',
       reachable: true,
+      generation: null,
       not_served: [],
       needs_vision: false,
       asks_no_model: false,

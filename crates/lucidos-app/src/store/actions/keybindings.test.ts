@@ -150,6 +150,19 @@ describe('recordChord', () => {
     });
   });
 
+  // Those chords send or add a new line in the composer, in either mode of
+  // composer_enter_key, so a shortcut on one would strand the send.
+  it('refuses Enter, Shift+Enter and Cmd/Ctrl+Enter, which the composer owns', () => {
+    for (const mods of [{}, { shiftKey: true }, { metaKey: true }, { ctrlKey: true }]) {
+      expect(recordChord(evt({ ...mods, key: 'Enter' }), 'renameThread')).toEqual({ kind: 'composer' });
+    }
+  });
+
+  it('still lets ⌥↵ and ⌘⇧↵ be recorded, since the composer never uses them', () => {
+    expect(recordChord(evt({ altKey: true, key: 'Enter' }), 'askSideQuestion').kind).toBe('ok');
+    expect(recordChord(evt({ ctrlKey: true, shiftKey: true, key: 'Enter' }), 'maximizePaneGroup').kind).toBe('ok');
+  });
+
   it('re-recording a shortcut to its own current binding is not a conflict', () => {
     expect(recordChord(evt({ ctrlKey: true, key: 'k' }), 'searchEverywhere')).toEqual({
       kind: 'ok',

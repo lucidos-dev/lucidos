@@ -5,15 +5,31 @@ description: Use when a thread asks to set up a newly installed plugin, or to se
 
 # Plugin Setup
 
-This thread finishes setting up a plugin that was **just installed or updated** in this workspace. The opening request names the plugin and says which. "Set up the newly installed Super Slides plugin" is a first install. "Set up Super Slides again" is an update whose setup instructions changed. Your job is to carry out the author's setup instructions with the user, who is reading this thread now.
+This thread finishes setting up a plugin that was **just installed or updated** in this workspace. The opening request names the plugin and says which. "Set up the newly installed Super Slides plugin" is a first install. "Set up Super Slides again" is an update whose setup instructions changed, or whose author asked to run setup again. Your job is to carry out the author's setup instructions with the user, who is reading this thread now.
 
 ## 1. On an update, start from what the last run already did
 
 **Skip this section on a first install.** There is nothing to reuse, so start at § 2.
 
-On an update, the user has been here before. Do not ask them everything again. Work out what is new first:
+On an update, the user has been here before. Do not ask them everything again. Work out what is new first.
 
-- **Diff the author's two setup texts.** Query `PluginInstalled` for this plugin and take the newest two. Each `setup` value sits at `payload.data.manifest.manifest.setup` (see § 2). What the author changed is the work. The rest is done.
+### Read the seed: why does setup run again?
+
+The opening request names the cause. Match the seed on its cause wording. The `since version <prior>` part can be absent when the old record named no version.
+
+| The seed says | Cause | What it means for the diff |
+|---|---|---|
+| `changed its setup instructions` and nothing about the author | Instructions changed | The two `setup` texts differ. The diff is the work. |
+| `asks to run its setup again` | Revision raised | The author raised `setup_revision`. The two texts are the same, so **the diff is empty by design**. |
+| `changed its setup instructions`, then `and the author asks to run it again` | Both | The texts differ and the revision rose. Do both jobs. |
+
+An `Author's note:` at the end of the seed is the author's `setup_reason`. Read it first. It names what changed outside the setup text, such as a shipped file the setup copies elsewhere.
+
+**When the revision was raised, re-run the steps that install or copy shipped files.** A Claude Code skill that setup copies to `~/.claude/skills/<name>/` is the usual case. The files in `data/` updated already, but the copy outside `data/` is stale. Keep the setup text's own guards, such as asking before you overwrite a local edit. Verify everything else with the table below. Reuse the `PluginSetupCompleted` choices, and do not re-interview the user.
+
+Then use these sources:
+
+- **Diff the author's two setup texts.** Query `PluginInstalled` for this plugin and take the newest two. Each `setup` value sits at `payload.data.manifest.manifest.setup` (see § 2). When they differ, what the author changed is the work. The rest is done. The revision sits beside it, at `payload.data.manifest.manifest.setup_revision`.
 - **Read the record of the last run.** Query `PluginSetupCompleted` and take the newest whose `plugin` matches. It holds the user's choices and what they skipped, which the author's text cannot recover.
 - **Fall back to the earlier thread only when there is no record.** The previous `PluginInstalled` event holds its setup thread's id at `payload.data.manifest.setup_thread_id`, one level above the raw manifest. `query_events` reads that thread by `thread_id`. It is a whole transcript, so read it last, and only for questions the diff leaves open.
 
@@ -25,7 +41,7 @@ On an update, the user has been here before. Do not ask them everything again. W
 |---|---|
 | a trigger | `lucidos triggers list` |
 | a webhook | `lucidos webhooks list` |
-| a credential | `run_bash`, looking for a `CRED_<NAME>` entry in `env`, never printing it |
+| a credential | `lucidos credentials list`, which prints names, never values |
 | a config entry | read the file, e.g. `data/config/apis.json` |
 
 The plugin may have been uninstalled and reinstalled, or the user may have deleted a trigger. A plugin set up before records existed has no record at all. When the record says "done" and the workspace disagrees, the workspace is right.

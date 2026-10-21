@@ -32,14 +32,14 @@
  * of them changes the title and the cluster together.
  *
  * Desktop-only: the mobile row has its own centred cluster and its own spec
- * (mobile-content-title-overlap.spec.ts). The arithmetic behind the reserve the
+ * (mobile-content-title-overlap-all.spec.ts). The arithmetic behind the reserve the
  * box clears is pinned by source scan in
  * src/styles/__tests__/content-header-title-centring.test.ts, which is where a
  * regression at a ui-scale this viewport never renders would show up.
  */
 import { test, expect, type Page } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
-import { assertHealthy, gotoWithRetry, clickVisibleElement, hideHomeRail } from './helpers';
+import { assertHealthy, gotoWithRetry, clickVisibleElement, hideDashboardRail } from './helpers';
 
 const APP_ID = 'e2e-desktop-title-position';
 const APP_NAME = 'Half Marathon';
@@ -182,7 +182,7 @@ test.describe('the desktop content title holds its position across views', () =>
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    await hideHomeRail(page);
+    await hideDashboardRail(page);
   });
 
   test('the chevrons land on the same x for a short and a long title', async ({ page }) => {
@@ -284,8 +284,7 @@ test.describe('the desktop content title holds its position across views', () =>
 
   test('the box still clears the cluster with the Canvas pane near its floor', async ({ page }) => {
     // The narrowest this pane legally gets, where the box has given up the most
-    // width to the two side reserves. The reserve is sized for the widest
-    // cluster that can stand on the middle arm, so the clearance holds here too.
+    // width to the two side reserves.
     //
     // The pane width is SEEDED, not dragged. `splitRatio` is read straight out
     // of localStorage with no load-time clamp (store/store.ts), so a ratio IS a
@@ -313,33 +312,31 @@ test.describe('the desktop content title holds its position across views', () =>
     );
     expect(paneWidth, 'the seeded ratio did not narrow the Canvas pane').toBeLessThan(400);
     expect(paneWidth, 'the seeded ratio went under the Canvas pane floor').toBeGreaterThan(360);
-    // On the RESERVE arm, all the way down to the pane's floor, which is the
-    // shape that makes the clearance structural. The min-span arm is what the
-    // box would fall back to, and it cannot be reached above this floor:
-    // `2 * --content-side-reserve + --desktop-nav-min-span` is 22.1rem, inside
-    // MIN_CONTENT_PANE_REM. So assert the arm rather than the number, and
-    // assert the floor stays under it (store/__tests__/conversation-pane-floor
-    // .test.ts owns that inequality at every ui-scale).
+    // Which arm the box rests on depends on the dashboard rail's toggle. Docked, it
+    // widens the reserve by a box, and `2 * --content-side-reserve +
+    // --desktop-nav-min-span` outgrows MIN_CONTENT_PANE_REM. The box then
+    // rests on its min-span arm here, and the actions fold into ⋯ to clear it.
+    // Undocked, the reserve arm holds down to the floor
+    // (store/__tests__/conversation-pane-floor.test.ts). Either way the box is
+    // the clamp's answer, and the clearance below is what must hold.
+    const clampArm = Math.max(narrow.minSpan, narrow.rowWidth - 2 * narrow.sideReserve);
     expect(
       narrow.boxWidth,
-      `the box is ${narrow.boxWidth.toFixed(1)} wide, not the reserve arm's `
-        + `${(narrow.rowWidth - 2 * narrow.sideReserve).toFixed(1)}`,
-    ).toBeCloseTo(narrow.rowWidth - 2 * narrow.sideReserve, 0);
-    expect(
-      narrow.boxWidth,
-      `the box fell to its ${narrow.minSpan} min-span floor above the pane's own floor`,
-    ).toBeGreaterThan(narrow.minSpan);
-    // Near the floor the three actions no longer fit, so two fold into ⋯.
-    // The cluster is then three boxes, which is what the reserve is sized for.
+      `the box is ${narrow.boxWidth.toFixed(1)} wide, not the clamp's ${clampArm.toFixed(1)}`,
+    ).toBeCloseTo(clampArm, 0);
+    // Near the floor the three actions no longer fit, so at least two fold
+    // into ⋯. The cluster is then three boxes at most.
     expect(narrow.trailingIcons, 'the narrow app view outgrew the reserve').toBeLessThanOrEqual(3);
     expect(narrow.hasRefresh, 'Refresh still leads the narrow row').toBe(true);
     expectCentredAndClear(narrow, 'canvas pane near its floor');
   });
 
   test('a wide Canvas pane grows the title box, up to its cap', async ({ page }) => {
-    // The ratio seeds the pane width, as in the test above. At 1920px, 0.5
-    // leaves the Canvas pane ~960px: past the width where the box starts to
-    // grow, short of its cap. 0.3 leaves ~1340px, past the cap.
+    // The ratio seeds the pane width, as in the test above. At 1920px, 0.45
+    // leaves the Canvas pane ~1050px: past the width where the box starts to
+    // grow, short of its cap. 0.3 leaves ~1340px, past the cap. The docked Home
+    // rail toggle widens the unfolded reserve by a box, so the box starts to
+    // grow near a 980px pane.
     await page.setViewportSize({ width: 1920, height: 1000 });
     const atRatio = async (ratio: string): Promise<HeaderMetrics> => {
       await page.evaluate(({ r, id }) => {
@@ -355,7 +352,7 @@ test.describe('the desktop content title holds its position across views', () =>
     // One load first, to put the page on the app's origin for localStorage.
     await gotoWithRetry(page, '/');
 
-    const growing = await atRatio('0.5');
+    const growing = await atRatio('0.45');
     expect(growing.boxWidth, 'the box did not grow past the shared span').toBeGreaterThan(growing.span + 1);
     expect(
       growing.boxWidth,

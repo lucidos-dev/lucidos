@@ -330,7 +330,7 @@
    - A spacer, not padding, so a view's own padding cannot cancel it, and
      WebKit honours it at the end of a scroller.
    - `FillSkeleton` subtracts it, so a full-pane skeleton still fits.
-   Pinned by e2e/content-pane-end-space.spec.ts. */
+   Pinned by e2e/content-pane-end-space-all.spec.ts. */
 .content-pane-body > :not(.content-view-full-bleed)::after {
     content: '';
     display: block;

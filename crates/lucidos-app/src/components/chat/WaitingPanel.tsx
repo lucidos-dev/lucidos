@@ -32,6 +32,8 @@ import { eventConditionBody, eventConditionTitle } from './eventConditionBody';
 import { ThreadStatusIcon } from '../shared/ThreadStatusIcon';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
 import type { HeaderActionSpec } from '../layout/headerActions';
+import type { CacheKeepAliveStatus } from '../../generated/thread-event-wire';
+import { KeepAliveSection, shownKeepAliveStatus } from './CacheKeepAlive';
 
 /** What the panel is positioned against, or null while it is closed.
  *
@@ -183,7 +185,8 @@ export function waitingIndicatorAction(): HeaderActionSpec | null {
 export function WaitingPanelHost() {
   const panelRef = useRef<HTMLDivElement>(null);
   const id = focusedThreadId.value;
-  const meta = id ? threadMap.value.get(id)?.meta : undefined;
+  const thread = id ? threadMap.value.get(id) : undefined;
+  const meta = thread?.meta;
   const waits = meta?.liveEventWaits ?? [];
   const anchor = waitingPanelAnchor.value;
   // Gated on the panel being OPEN, and not as a micro-optimisation. The walk is
@@ -264,6 +267,7 @@ export function WaitingPanelHost() {
             threadId: id ?? '',
             waits,
             subThreads,
+            keepAlive: shownKeepAliveStatus(thread),
             condition,
             onBack: backToWaitingList,
             onClose: closeWaitingPanel,
@@ -351,7 +355,8 @@ function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? '' : 's'}`;
 }
 
-/** One section per kind of wait, each rendered only when it has rows.
+/** One section per kind of wait, each rendered only when it has rows, then
+ *  what the keep-alive does with the prompt cache meanwhile.
  *
  *  Returns the panel's CONTENTS, not its box: the box is the `<Overlay>` panel
  *  itself, which is what `useAnchoredPosition` measures and positions.
@@ -364,6 +369,7 @@ export function waitingPanelBody({
   threadId,
   waits,
   subThreads,
+  keepAlive = null,
   condition = null,
   onBack = backToWaitingList,
   onClose,
@@ -371,6 +377,7 @@ export function waitingPanelBody({
   threadId: string;
   waits: EventWaitSummary[];
   subThreads: SubThreadWait;
+  keepAlive?: CacheKeepAliveStatus | null;
   condition?: EventCondition | null;
   onBack?: () => void;
   onClose: () => void;
@@ -428,6 +435,7 @@ export function waitingPanelBody({
             </ul>
           </section>
         ) : null}
+        {keepAlive ? <KeepAliveSection status={keepAlive} subThreadCount={subThreadCount(subThreads)} /> : null}
       </div>
     </>
   );

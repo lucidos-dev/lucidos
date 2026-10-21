@@ -1,12 +1,12 @@
 import type { CodingAgentExit } from '../../store/thread-events';
 import type { CodingAgent } from '../../api/types';
 
-const AGENT_NAME: Record<CodingAgent, string> = { 'claude-code': 'Claude Code', codex: 'Codex' };
+export const CODING_AGENT_NAME: Record<CodingAgent, string> = { 'claude-code': 'Claude Code', codex: 'Codex' };
 
 /** What the failure card says about a coding agent that exited on its own. The
  *  CLI's own words are shown apart, in `.exchange-error-output`. */
 export function agentExitCopy(exit: CodingAgentExit, agent: CodingAgent): { heading: string; reason: string } {
-  const name = AGENT_NAME[agent];
+  const name = CODING_AGENT_NAME[agent];
   const exited = exit.code === undefined ? 'It exited' : `It exited with code ${exit.code}`;
   if (exit.stage === 'startup') {
     return {

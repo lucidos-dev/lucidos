@@ -62,7 +62,7 @@ pub struct TriggerDefinition {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<String>,
     /// The **trigger model** this trigger's intent fires on. Omitted (None) =
-    /// the account `chat_model` preference. Scalar, so it must stay above the
+    /// the account `trigger_model` preference. Scalar, so it must stay above the
     /// table fields below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

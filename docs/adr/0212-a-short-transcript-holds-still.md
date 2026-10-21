@@ -81,7 +81,7 @@ gets one line from re-enabling it.
   container, and neither rule reads follow or liveness state.
 - Every check in that scan asserts an ABSENCE, so it carries a liveness
   tripwire. Otherwise a reader that finds nothing passes it without reading CSS.
-- `e2e/transcript-ends-where-its-content-ends.spec.ts` branches again on whether
+- `e2e/transcript-ends-where-its-content-ends-all.spec.ts` branches again on whether
   the transcript overflows. The scrollable rounds keep the air assertion, and
   the short rounds assert three things: the turns start at the top of their box,
   the transcript does not scroll, and a drawn turn does not travel across a

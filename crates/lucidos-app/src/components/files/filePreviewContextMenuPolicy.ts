@@ -7,7 +7,7 @@
 // here, because the preview IS the object with its own menu. The two never
 // overlap, since this one never touches chrome outside the preview body.
 
-import { NATIVE_MENU_ELEMENTS, type ContextMenuFacts } from '../../utils/nativeContextMenu';
+import { NATIVE_MENU_ELEMENTS, type ContextMenuFacts } from '@lucidos/context-menu';
 
 /** Whether this right-click should open the file-preview context menu.
  *
@@ -17,7 +17,7 @@ import { NATIVE_MENU_ELEMENTS, type ContextMenuFacts } from '../../utils/nativeC
  *  selection at event time cannot tell a fresh auto-select from one the user
  *  made on purpose.
  *
- *  Unlike that module's `shouldSuppressContextMenu`, there is no text-region
+ *  Unlike the shared `shouldSuppressContextMenu`, there is no text-region
  *  carve-out here. An ordinary word with no selection still opens THIS menu:
  *  that is the whole point, the Obsidian-style right-click. Only a selection
  *  already under the pointer, or a native-menu element (a link, an image, an

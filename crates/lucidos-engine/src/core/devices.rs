@@ -253,6 +253,18 @@ impl DeviceStore {
         Ok(rows.into_iter().map(SeenDevice::from).collect())
     }
 
+    /// The user agent a device registered with. `None` when no such device
+    /// exists, or it registered none.
+    pub async fn user_agent(pool: &PgPool, id: &str) -> Result<Option<String>, sqlx::Error> {
+        Ok(
+            sqlx::query_scalar::<_, Option<String>>("SELECT user_agent FROM devices WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+                .flatten(),
+        )
+    }
+
     /// One device, seen the same way as [`Self::recently_seen`]. `None` when
     /// no such device exists.
     pub async fn seen(pool: &PgPool, id: &str) -> Result<Option<SeenDevice>, sqlx::Error> {
@@ -1181,9 +1193,12 @@ mod tests {
             .unwrap();
         sqlx::query(
             "INSERT INTO push_subscriptions (endpoint, p256dh, auth, device_id)
-             VALUES ('https://push.example/sub', 'k', 'a', $1)",
+             VALUES ('https://push.example/sub', 'k', $2, $1)",
         )
         .bind(id)
+        .bind(crate::core::secret_store::Secret::<
+            crate::core::secret_store::PushAuth,
+        >::new("a"))
         .execute(pool)
         .await
         .unwrap();
@@ -1498,8 +1513,11 @@ mod tests {
         seed_one_off(&pool, &bus, "push-sub").await;
         sqlx::query(
             "INSERT INTO push_subscriptions (endpoint, p256dh, auth, device_id)
-             VALUES ('https://push.example/one-off', 'k', 'a', 'push-sub')",
+             VALUES ('https://push.example/one-off', 'k', $1, 'push-sub')",
         )
+        .bind(crate::core::secret_store::Secret::<
+            crate::core::secret_store::PushAuth,
+        >::new("a"))
         .execute(&pool)
         .await
         .unwrap();

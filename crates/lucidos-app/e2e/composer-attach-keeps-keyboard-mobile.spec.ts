@@ -25,6 +25,9 @@ test.describe('the composer image button keeps the keyboard up', () => {
     await input.focus();
     await input.fill('a caption for the photo');
     await expect(page.locator('html')).toHaveAttribute('data-keyboard-active', '');
+    // A compose row folds attach into the ⋯ before the rung pill, and this
+    // spec is about the row's own button. A smaller UI scale gives it room.
+    await page.evaluate(() => document.documentElement.style.setProperty('--user-ui-scale', '75%'));
 
     const attach = page.locator('.prompt-actions-row button[data-role="attach-image"]:visible').first();
     await expect(attach).toBeVisible({ timeout: 10_000 });

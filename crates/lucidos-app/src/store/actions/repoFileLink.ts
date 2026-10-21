@@ -33,7 +33,7 @@ export function matchRepository(repos: readonly Repository[], ref: string): Repo
  *  report a live repository as unregistered. The read is a fresh request,
  *  since a load already in flight can predate that registration. A failed
  *  re-read keeps the previous list for every other surface. */
-async function rereadAndMatch(ref: string): Promise<RepositoryMatch | { kind: 'failed'; error: string }> {
+export async function rereadAndMatch(ref: string): Promise<RepositoryMatch | { kind: 'failed'; error: string }> {
   const snapshot = repositories.value;
   await refreshRepositories();
   const reread = repositories.value;

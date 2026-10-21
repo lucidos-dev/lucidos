@@ -35,6 +35,7 @@ function credential(over: Partial<CredentialInfo>): CredentialInfo {
     auth_type: 'secret',
     auth_header: 'Authorization',
     created_at: '2026-08-01T00:00:00Z',
+    secret_reference: false,
     ...over,
   };
 }

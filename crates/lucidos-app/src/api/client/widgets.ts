@@ -1,6 +1,6 @@
 import { API, json } from './_core';
-import type { App, AppReveal, WidgetSize } from '../../store/types';
-import type { ArrangedTile, LayoutClass } from '../../generated/thread-event-wire';
+import type { App, AppReveal, TileSize, WidgetSize } from '../../store/types';
+import type { Dashboard } from '../../generated/thread-event-wire';
 import type { WidgetParams } from '../../utils/widgetParams';
 
 /** One widget instance in a thread, chip or not (`engine::widgets::ThreadWidget`). */
@@ -22,7 +22,7 @@ export interface ThreadWidget {
   reveal: AppReveal;
   /** Its *widget sizes*, first the default (ADR 0432). */
   sizes: WidgetSize[];
-  /** Its Home board tile is see-through, so it draws its own shape. */
+  /** Its dashboard tile is see-through, so it draws its own shape. */
   transparent?: boolean;
   /** Pinned to the shelf, so it has a chip there. The inline widget shows
    *  either way. */
@@ -32,30 +32,54 @@ export interface ThreadWidget {
   shown_event_id?: string;
 }
 
-/** One tile on the Home board (`engine::home_board::HomeBoardTile`): the widget
- *  as the shelf reads it, at the size it shows at on this layout. */
-export interface HomeBoardTile extends ThreadWidget {
+/** A widget tile (`engine::dashboard::DashboardTile::Widget`): the widget as a
+ *  shelf chip reads it, at the size it shows at there. It always names a
+ *  reusable widget, so no thread holds it. */
+export interface WidgetDashboardTile extends ThreadWidget {
+  kind: 'widget';
   size: WidgetSize;
-  hidden?: boolean;
 }
 
-/** The Home board of one layout class (`engine::home_board::HomeBoard`). */
-export interface HomeBoard {
-  thread_id: string;
-  layout: LayoutClass;
-  tiles: HomeBoardTile[];
+/** An *app shortcut* (`engine::dashboard::AppShortcut`): an app's icon and
+ *  name, always a quarter tile. It takes no params. */
+export interface AppDashboardTile {
+  kind: 'app';
+  app_id: string;
+  name: string;
+  /** The app's icon, as `App.icon`. */
+  icon?: string;
+  /** The shortcut's label. Absent means the app's name. */
+  label?: string;
+  size: 'quarter';
 }
 
-export function fetchHomeBoard(layout: LayoutClass): Promise<HomeBoard> {
-  return json(`${API}/home-board?layout=${layout}`);
+/** One tile on a dashboard (`engine::dashboard::DashboardTile`). */
+export type DashboardTile = WidgetDashboardTile | AppDashboardTile;
+
+/** One dashboard's tiles, in order (`engine::dashboard::DashboardView`). */
+export interface DashboardView {
+  dashboard: Dashboard;
+  tiles: DashboardTile[];
 }
 
-/** Write one `HomeBoardArranged` and answer the board it gives (ADR 0432). */
-export function arrangeHomeBoardApi(layout: LayoutClass, tiles: ArrangedTile[]): Promise<HomeBoard> {
+/** One tile of an arrangement: a widget instance or an app, and the size it
+ *  shows at. */
+export interface ArrangedTile {
+  app_id: string;
+  params?: WidgetParams;
+  size: TileSize;
+}
+
+export function fetchDashboard(dashboard: Dashboard): Promise<DashboardView> {
+  return json(`${API}/dashboard?dashboard=${dashboard}`);
+}
+
+/** Write one `DashboardArranged` and answer the dashboard it gives. */
+export function arrangeDashboardApi(dashboard: Dashboard, tiles: ArrangedTile[]): Promise<DashboardView> {
   return json(`${API}/widgets/arrange`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ layout, tiles }),
+    body: JSON.stringify({ dashboard, tiles }),
   });
 }
 
@@ -101,6 +125,24 @@ export function pinWidgetApi(instance: WidgetInstanceRef, shownEventId?: string)
 /** "Unpin from shelf": one thread event, no file change. */
 export function unpinWidgetApi(instance: WidgetInstanceRef): Promise<unknown> {
   return post('/widgets/unpin', instanceBody(instance));
+}
+
+/** One widget instance on a dashboard, as add and remove name it. */
+export interface DashboardTileRef {
+  appId: string;
+  params?: WidgetParams;
+  label?: string;
+}
+
+/** "Add to dashboard". A widget that belongs to a thread is made reusable
+ *  first, and `made_reusable` says so. */
+export function addToDashboardApi(dashboard: Dashboard, { appId, params, label }: DashboardTileRef): Promise<{ made_reusable: boolean }> {
+  return post('/widgets/dashboard-add', { app_id: appId, params, label, dashboard }) as Promise<{ made_reusable: boolean }>;
+}
+
+/** "Remove from dashboard": the tile goes, the widget stays. */
+export function removeFromDashboardApi(dashboard: Dashboard, { appId, params }: DashboardTileRef): Promise<unknown> {
+  return post('/widgets/dashboard-remove', { app_id: appId, params, dashboard });
 }
 
 export function makeWidgetReusableApi(appId: string): Promise<unknown> {

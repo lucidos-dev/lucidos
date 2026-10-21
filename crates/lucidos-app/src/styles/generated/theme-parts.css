@@ -233,7 +233,7 @@
 @property --header-divider {
     syntax: '<color>';
     inherits: true;
-    initial-value: rgba(0, 0, 0, 0);
+    initial-value: #2c456a;
 }
 
 @property --header-badge-bg {
@@ -342,6 +342,7 @@
     --part-header-icon-filter: initial;
     --part-header-title-text-shadow: initial;
     --part-header-title-letter-spacing: initial;
+    --part-drawer-title-font-weight: initial;
     --part-composer-background-color: initial;
     --part-composer-border-color: initial;
     --part-composer-box-shadow: initial;
@@ -369,6 +370,7 @@
     caret-color: auto;
     caret-shape: auto;
     color: var(--text-primary);
+    font-weight: normal;
     letter-spacing: normal;
     text-shadow: none;
 }
@@ -415,6 +417,7 @@ html[data-theme-parts="off"] body {
     --part-header-icon-filter: initial;
     --part-header-title-text-shadow: initial;
     --part-header-title-letter-spacing: initial;
+    --part-drawer-title-font-weight: initial;
     --part-composer-background-color: initial;
     --part-composer-border-color: initial;
     --part-composer-box-shadow: initial;

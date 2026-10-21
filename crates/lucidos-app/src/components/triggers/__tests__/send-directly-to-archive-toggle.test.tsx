@@ -26,6 +26,7 @@ function trigger(goToReview: boolean): TriggerInfo {
   return {
     id: TRIGGER_ID,
     name: 'Daily digest',
+    slug: 'daily-digest',
     cron_expressions: ['0 0 9 * * *'],
     timezone: 'UTC',
     paused: false,

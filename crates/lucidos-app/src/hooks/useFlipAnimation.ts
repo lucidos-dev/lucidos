@@ -5,6 +5,7 @@ import { isMobile } from '../utils/viewport';
 import { EASING_DISCLOSURE, FADE_REACH, disclosureDurationMs } from '../utils/disclosureMotion';
 
 interface Rect { top: number; left: number; width: number; height: number }
+interface Motion { keyframes: Keyframe[]; timing: KeyframeAnimationOptions }
 
 const EASING_DESKTOP = 'cubic-bezier(0.22, 0, 0, 1)';
 const EASING_MOBILE = 'cubic-bezier(0.25, 0.1, 0.25, 1)'; // simpler ease for mobile perf
@@ -198,6 +199,10 @@ function placeCopies(box: HTMLElement, rows: DisclosureRow[], top: number, left:
  *  render delays the first paint by most of an exit. A shared start also keeps
  *  copies in step with the rows sliding below them. `live` says whether this
  *  batch still owns the drawer. */
+function sameOrder(a: readonly string[], b: readonly string[]): boolean {
+    return a.length === b.length && a.every((id, i) => id === b[i]);
+}
+
 export function startTogetherOnNextFrame(anims: Animation[], live: () => boolean) {
     if (anims.length === 0) return;
     for (const a of anims) a.pause();
@@ -252,6 +257,9 @@ export function ghostOf(row: HTMLElement): HTMLElement {
  * one fades in there. The copy finishes its exit even when a newer render
  * starts another batch.
  *
+ * A row a windowed list mounts a commit late joins the running batch. It moves
+ * with the nearest measured row above it.
+ *
  * Speed setting: slider 0 = normal (1x), +10 = 10x faster, -10 = 10x slower.
  */
 export function useFlipTransitions(
@@ -278,6 +286,9 @@ export function useFlipTransitions(
     // Each thread whose copy is still leaving, that copy's exit, and the
     // section it left.
     const departing = useRef(new Map<string, { ghost: HTMLElement; exit: Animation; from: string }>());
+    // Watches the running batch for rows that mount late.
+    const lateRows = useRef<MutationObserver | null>(null);
+    useLayoutEffect(() => () => lateRows.current?.disconnect(), []);
 
     // ── Build flat ordered list and section map ──
     const currentOrder: string[] = [];
@@ -391,10 +402,18 @@ export function useFlipTransitions(
     }
 
     // ── Update refs for next render ──
+    const priorOrder = prevOrder.current;
     prevSections.current = currentSections;
     prevOrder.current = currentOrder;
 
     useLayoutEffect(() => {
+        // A commit that reshapes the list ends the running batch's watch. The
+        // rows it mounts are not part of that batch.
+        if (lateRows.current && (resetted || hasChanges || !sameOrder(priorOrder, currentOrder))) {
+            lateRows.current.disconnect();
+            lateRows.current = null;
+        }
+
         const el = containerRef.current;
         if (!el || !hasChanges || oldRects.size === 0) return;
 
@@ -640,55 +659,61 @@ export function useFlipTransitions(
             playOutDeparture(layer, exits);
         }
 
-        for (const row of rows) {
-            const id = row.dataset.flipId!;
-            if (revealed.has(id)) continue;
-            const isNew = newItems.has(id);
-            const isMoved = transitioned.has(id);
-            const isAffected = affectedSiblings.has(id);
-
-            if (isNew) {
-                row.classList.add('flip-animating');
-                touched.push(row);
+        const play = (row: HTMLElement, motion: Motion): Animation => {
+            row.classList.add('flip-animating');
+            touched.push(row);
+            const anim = row.animate(motion.keyframes, motion.timing);
+            newAnims.push(anim);
+            return anim;
+        };
+        // A row that arrived, or changed sections, regardless of where it was.
+        const arrival = (id: string): Motion | null => {
+            if (newItems.has(id)) {
                 const isSection = id.startsWith('__section_');
                 // On mobile: simpler fade-in without scale bounce
-                const newItemKeyframes = (isSection || mobile)
+                const keyframes = (isSection || mobile)
                     ? [{ opacity: '0' }, { opacity: '1' }]
                     : [
                         { opacity: '0', transform: 'scale(0.95)', transformOrigin: 'center' },
                         { opacity: '1', transform: 'scale(1.03)', transformOrigin: 'center', offset: 0.6 },
                         { opacity: '1', transform: 'scale(1)', transformOrigin: 'center' },
                     ];
-                const anim = row.animate(
-                    newItemKeyframes,
-                    { duration: (isSection ? 350 : 450) * scale, easing, fill: 'none' },
-                );
-                newAnims.push(anim);
+                return { keyframes, timing: { duration: (isSection ? 350 : 450) * scale, easing, fill: 'none' } };
+            }
+            // A thread that changed sections fades in at its new place,
+            // while its copy folds away where it stood.
+            if (transitioned.has(id) && !settled.has(id)) {
+                return { keyframes: [{ opacity: '0' }, { opacity: '1' }], timing: { duration: MIN_MS * scale, easing, fill: 'none' } };
+            }
+            return null;
+        };
+
+        // Each sibling this batch measured, and its slide, or null where it
+        // holds still. A row that mounts late moves with these.
+        const slides = new Map<string, Motion | null>();
+        for (const row of rows) {
+            const id = row.dataset.flipId!;
+            if (revealed.has(id)) continue;
+            const arriving = arrival(id);
+            if (arriving) {
+                play(row, arriving);
                 continue;
             }
-
-            if (isMoved) {
-                if (settled.has(id)) continue;
-                // A thread that changed sections fades in at its new place,
-                // while its copy folds away where it stood.
-                row.classList.add('flip-animating');
-                touched.push(row);
-                newAnims.push(row.animate(
-                    [{ opacity: '0' }, { opacity: '1' }],
-                    { duration: MIN_MS * scale, easing, fill: 'none' },
-                ));
-                continue;
-            }
-
-            if (!isAffected || belowStill(id)) continue;
-
-            const newRect = row.getBoundingClientRect();
+            if (!affectedSiblings.has(id)) continue;
             const oldRect = oldRects.get(id);
             if (!oldRect) continue;
+            if (belowStill(id)) {
+                slides.set(id, null);
+                continue;
+            }
 
+            const newRect = row.getBoundingClientRect();
             const deltaX = oldRect.left - newRect.left;
             const deltaY = oldRect.top - newRect.top;
-            if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) continue;
+            if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) {
+                slides.set(id, null);
+                continue;
+            }
 
             // A row a disclosure pushed moves in lockstep with the block.
             const pushed = disclosureDuration > 0;
@@ -697,14 +722,58 @@ export function useFlipTransitions(
                 : flightDurationMs(Math.sqrt(deltaX * deltaX + deltaY * deltaY)) * scale;
 
             // A displaced sibling slides to its new position.
-            row.classList.add('flip-animating');
-            touched.push(row);
             const { start, end } = cutBelow(id);
-            newAnims.push(row.animate([
-                { transform: `translate(${deltaX}px, ${deltaY + start}px)` },
-                { transform: `translate(0, ${end}px)` },
-            ], { duration, easing: pushed ? EASING_DISCLOSURE : easing, fill: 'none' }));
+            const slide: Motion = {
+                keyframes: [
+                    { transform: `translate(${deltaX}px, ${deltaY + start}px)` },
+                    { transform: `translate(0, ${end}px)` },
+                ],
+                timing: { duration, easing: pushed ? EASING_DISCLOSURE : easing, fill: 'none' },
+            };
+            slides.set(id, slide);
+            play(row, slide);
         }
+
+        // A sibling that was not mounted (a windowed list's gap) stood where it
+        // stands now, relative to the nearest measured row above it. That holds
+        // only while nothing between the two came, went or moved section. A
+        // mounted row with no known slide between them breaks the chain too.
+        const priorIndex = new Map(priorOrder.map((id, i) => [id, i]));
+        const inheritedSlide = (id: string): Motion | null => {
+            const at = orderIndex.get(id);
+            const was = priorIndex.get(id);
+            if (at === undefined || was === undefined) return null;
+            for (let i = at - 1; i >= 0; i--) {
+                const above = currentOrder[i];
+                if (!affectedSiblings.has(above)) return null;
+                if (slides.has(above)) return priorIndex.get(above) === was - (at - i) ? slides.get(above)! : null;
+                if (rowById.has(above)) return null;
+            }
+            return null;
+        };
+        // A row the window unmounts and mounts again mid-batch is a new
+        // element, and resumes its own motion.
+        const lateMotion = (id: string): Motion | null => {
+            const arriving = arrival(id);
+            if (arriving || !affectedSiblings.has(id)) return arriving;
+            if (slides.has(id)) return slides.get(id)!;
+            const inherited = inheritedSlide(id);
+            if (inherited) slides.set(id, inherited);
+            return inherited;
+        };
+        const joinLate = (row: HTMLElement) => {
+            const id = row.dataset.flipId!;
+            if (rowById.get(id) === row || revealed.has(id)) return;
+            rowById.set(id, row);
+            const motion = lateMotion(id);
+            if (!motion) return;
+            const anim = play(row, motion);
+            // Before the batch's first frame, that frame starts it with the
+            // rest. After it, it takes the batch's start time.
+            const lead = newAnims[0];
+            if (lead.playState === 'paused') anim.pause();
+            else if (lead.startTime !== null) anim.startTime = lead.startTime;
+        };
 
         runningAnims.current = newAnims;
         startTogetherOnNextFrame(newAnims, () => runningAnims.current === newAnims);
@@ -712,14 +781,35 @@ export function useFlipTransitions(
         hiddenEls.current = hidden;
         overlays.current = created;
 
-        // Cleanup after all animations finish
+        // A windowed list re-plans after this commit, once it sees where its
+        // section moved, so rows it brings into view mount a commit late.
         if (newAnims.length > 0) {
-            Promise.allSettled(newAnims.map(a => a.finished)).then(() => {
+            const observer = new MutationObserver((records) => {
+                for (const record of records) {
+                    for (const node of record.addedNodes) {
+                        if (!(node instanceof HTMLElement)) continue;
+                        if (node.dataset.flipId !== undefined) joinLate(node);
+                        for (const row of node.querySelectorAll<HTMLElement>('[data-flip-id]')) joinLate(row);
+                    }
+                }
+            });
+            observer.observe(el, { childList: true, subtree: true });
+            lateRows.current = observer;
+
+            // Cleanup after all animations finish, the late rows' included.
+            const allFinished = (): Promise<void> => {
+                const count = newAnims.length;
+                return Promise.allSettled(newAnims.map(a => a.finished))
+                    .then(() => (newAnims.length > count ? allFinished() : undefined));
+            };
+            allFinished().then(() => {
                 // A newer batch cancelled these, which is what settled us, and
                 // its takeover above already did this batch's cleanup. Running
                 // it again would un-hide a row whose new copy is still sliding,
                 // and would wipe the refs the NEXT batch cancels through.
                 if (runningAnims.current !== newAnims) return;
+                lateRows.current?.disconnect();
+                lateRows.current = null;
                 for (const r of touched) {
                     r.classList.remove('flip-animating');
                 }

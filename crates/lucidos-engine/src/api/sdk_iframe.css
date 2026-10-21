@@ -164,10 +164,18 @@ html[data-theme-mode="light"] {
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
 }
 
-/* No WebKit grey flash under a finger, as on the host's root (base.css). */
+/* No WebKit grey flash under a finger, as on the host's root (base.css).
+
+   An app page never scrolls sideways (ADR 0530): a too-wide child is cut off at
+   the page edge rather than dragging the whole app with it. A deliberate
+   sideways scroller is an `overflow-x: auto` element of its own. `hidden` is
+   the fallback for an engine without `clip`; on <html> it moves to the
+   viewport, so it adds no scroll container. */
 html {
     font-size: var(--user-ui-scale, 100%);
     -webkit-tap-highlight-color: transparent;
+    overflow-x: hidden;
+    overflow-x: clip;
 }
 
 *, *::before, *::after {
@@ -190,13 +198,31 @@ body {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+    /* `clip` only, never `hidden`. With <html> already non-visible, a `hidden`
+       body becomes the page's scroller, which breaks window scrolling and
+       `position: sticky`. `clip` makes no scroll container. */
+    max-width: 100%;
+    overflow-x: clip;
 }
 
-/* A Home board tile sets the widget's box and draws its surface (ADR 0432).
+/* Images and video fit the page by default. Zero specificity, so any width an
+   app sets wins. Not SVG or canvas: a percentage cap lets a flex row or table
+   cell squash an icon or a chart below its set size. */
+:where(img, video) {
+    max-width: 100%;
+}
+
+/* A lone `height` attribute keeps sizing the image: an author rule outranks
+   the attribute, so `auto` here would drop it. */
+:where(img, video):where(:not([height]), [width]) {
+    height: auto;
+}
+
+/* A dashboard tile sets the widget's box and draws its surface (ADR 0432).
    The page is see-through, so a transparent widget's own drawing is its shape.
    The SDK keeps it from scrolling inside the tile. */
-html[data-widget-place="home"],
-html[data-widget-place="home"] body {
+html[data-widget-place="dashboard"],
+html[data-widget-place="dashboard"] body {
     background: transparent;
 }
 

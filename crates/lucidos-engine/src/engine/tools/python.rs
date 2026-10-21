@@ -59,26 +59,35 @@ impl LucidosEngine {
             return Err(format!("installing packages: {}", e).into());
         }
 
-        let env_vars = self.build_tool_env_vars(thread_id).await;
-        // Captured before the env is moved into the run. Both the output and
-        // the error below reach the `ToolResult` event verbatim. A script that
-        // echoes an injected credential would put it there for good. See
-        // `core::injected_secret_values`.
-        let secrets = crate::core::injected_secret_values(&env_vars);
+        let env = self
+            .build_tool_env_vars(
+                thread_id,
+                &crate::core::credentials::SecretMentions::of_command(code, self.workspace_path()),
+            )
+            .await;
+        // Both the output and the error below reach the `ToolResult` event
+        // verbatim. A script that echoes an injected credential would put it
+        // there for good. See `core::subprocess_secret_values`.
+        let secrets =
+            crate::core::subprocess_secret_values(&env.vars, crate::core::inherited_secret_env());
         let run_id = uuid::Uuid::new_v4().to_string();
         let staging_dir = self.workspace_path().join(".lucidos/staging").join(&run_id);
 
         let output = match execute_staged_and_clean_up_on_failure(
             &self.python_runtime,
             code,
-            env_vars,
+            env.vars.clone(),
             &staging_dir,
         )
         .await
         {
             Ok(output) => output,
             Err(e) => {
-                return Err(crate::core::redact_secret_values(&e.to_string(), &secrets).into())
+                return Err(crate::core::redact_subprocess_output(
+                    &env.with_note(e.to_string()),
+                    &secrets,
+                )
+                .into())
             }
         };
 
@@ -162,7 +171,10 @@ impl LucidosEngine {
             }
         }
 
-        Ok(crate::core::redact_secret_values(&response, &secrets))
+        Ok(crate::core::redact_subprocess_output(
+            &env.with_note(response),
+            &secrets,
+        ))
     }
 
     /// `run_python_background(code, description, packages?, timeout_secs?)`: install
@@ -244,7 +256,12 @@ impl LucidosEngine {
             ));
         }
 
-        let env_vars = self.build_tool_env_vars(thread_id).await;
+        let env = self
+            .build_tool_env_vars(
+                thread_id,
+                &crate::core::credentials::SecretMentions::of_command(code, self.workspace_path()),
+            )
+            .await;
         let command =
             build_python_background_command(self.python_runtime.python_bin(), &script_path);
 
@@ -255,11 +272,14 @@ impl LucidosEngine {
                 thread_id,
                 &command,
                 self.workspace_path(),
-                &env_vars,
+                &env.vars,
                 TaskSpec {
                     timeout_secs,
                     description: args.get("description").and_then(|v| v.as_str()),
                     delivery: CompletionDelivery::EventWait,
+                    inherited: crate::core::InheritedSecrets::Strip(
+                        crate::core::inherited_secret_env(),
+                    ),
                 },
             )
             .await
@@ -281,12 +301,12 @@ impl LucidosEngine {
             }
         };
 
-        Ok(serde_json::json!({
-            "task_id": task_id,
-            "started_at": started_at,
-            "timeout_secs": timeout_secs,
-        })
-        .to_string())
+        Ok(super::bash::background_start_result(
+            &task_id,
+            started_at,
+            timeout_secs,
+            &env,
+        ))
     }
 
     /// Walk staging directory and classify files as created or updated.
@@ -521,8 +541,8 @@ mod tests {
     ///
     /// The Ok path returns the script's stdout, and the Err path returns its
     /// stderr. Both are persisted verbatim in `ToolResult`, and every
-    /// credential and OAuth token is in this child's environment. The
-    /// composition is covered in `core::mod_tests`; this is the wiring.
+    /// secret it names is in this child's environment. The composition is
+    /// covered in `core::subprocess_secrets`; this is the wiring.
     #[test]
     fn both_python_tool_exits_leave_through_the_secret_redaction() {
         let src = production_src();
@@ -534,13 +554,13 @@ mod tests {
             .expect("execute_python_tool is still followed by the background tool");
         let body = &src[at..at + end];
         assert_eq!(
-            body.matches("redact_secret_values(").count(),
+            body.matches("redact_subprocess_output(").count(),
             2,
             "both the Ok and the Err exit of execute_python_tool must go through \
-             `core::redact_secret_values`. A traceback carries the script's stderr, \
+             `core::redact_subprocess_output`. A traceback carries the script's stderr, \
              which is where an echoed credential lands."
         );
-        assert!(body.contains("injected_secret_values(&env_vars)"));
+        assert!(body.contains("subprocess_secret_values(&env.vars,"));
     }
     use crate::runtime::python::PythonRuntime;
     use std::path::PathBuf;

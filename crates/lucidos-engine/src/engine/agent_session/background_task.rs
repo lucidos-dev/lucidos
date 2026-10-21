@@ -19,8 +19,8 @@ use crate::engine::LucidosEngine;
 use crate::llm::tools::BG_MAX_TIMEOUT_SECS;
 
 /// The longest one `lucidos background-task wait` blocks, in seconds. The
-/// Claude Code prompt cache lives 5 minutes from the start of the last
-/// request, so the agent's next request lands inside it (ADR 0470).
+/// Claude Code prompt cache lives 5 minutes or 1 hour from the last request's
+/// start, so the next request lands inside either (ADR 0470).
 pub(crate) const AGENT_WAIT_MAX_SECS: u64 = 230;
 
 /// What starting a background task did.
@@ -193,6 +193,7 @@ impl LucidosEngine {
             timeout_secs,
             description,
             delivery,
+            inherited: crate::core::InheritedSecrets::Keep,
         };
         let (task_id, _started_at) = self
             .start_background_task(thread_id, command, &cwd, &env_vars, spec)

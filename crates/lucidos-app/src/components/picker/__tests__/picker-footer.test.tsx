@@ -121,7 +121,7 @@ describe('the restore form explains itself', () => {
     // Reported as "the button is disabled, is it because the PWA is running?".
     // Nothing on screen said "choose a file".
     const text = render({ mode: 'restore' });
-    expect(text).toContain('Choose the .enc backup file to restore.');
+    expect(text).toContain('Choose the .age or .enc backup file to restore.');
   });
 
   it('drops the hint and enables Restore once the draft is complete', () => {

@@ -30,7 +30,7 @@ impl VertexProvider {
         (String, Option<crate::llm::usage_wire::ProviderUsage>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let model = "gemini-2.5-flash-lite";
+        let model = super::GROUNDING_MODEL;
         let request = serde_json::json!({
             "system_instruction": {
                 // Shared with the other web-search backends so all three ask for
@@ -377,9 +377,12 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         // prompt cache). Keep both fields None to avoid conflating the two
         // until the cost UI explicitly grows a Gemini-cached lane.
         cache_creation_tokens: None,
+        cache_creation_1h_tokens: None,
+        stable_prefix_fingerprint: None,
         cache_read_tokens: None,
         // The reply's own field, which `parse_gemini_reply` reads.
         served_model: None,
+        provider: None,
         thinking_chars: (thinking_chars > 0).then_some(thinking_chars),
         // Proof the model thought, which keeps a billed but textless thinking
         // turn out of the dropped-output branch of `classify_empty_completion`.
@@ -551,7 +554,8 @@ fn message_content_to_parts(
                 // and Anthropic's cache anchor care who wrote it.
                 ContentBlock::Text { text }
                             | ContentBlock::EngineTail { text }
-                            | ContentBlock::MemoryView { text } => Ok(VertexPart {
+                            | ContentBlock::MemoryView { text }
+                            | ContentBlock::StableContext { text } => Ok(VertexPart {
                     text: Some(text),
                     ..Default::default()
                 }),

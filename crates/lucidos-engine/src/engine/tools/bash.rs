@@ -271,6 +271,25 @@ pub(super) fn finalize_drain(text: &str, already_dropped: usize) -> String {
     truncate_output_tail(&sanitized, MAX_OUTPUT_BYTES, already_dropped)
 }
 
+/// The result a background start returns: the task's handle, plus the note
+/// for any secret name its text mentioned that nothing set.
+pub(super) fn background_start_result(
+    task_id: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    timeout_secs: u64,
+    env: &crate::engine::engine_impl::ScriptEnv,
+) -> String {
+    let mut result = serde_json::json!({
+        "task_id": task_id,
+        "started_at": started_at,
+        "timeout_secs": timeout_secs,
+    });
+    if let Some(note) = &env.secret_note {
+        result["note"] = serde_json::Value::String(note.clone());
+    }
+    result.to_string()
+}
+
 impl LucidosEngine {
     pub(crate) async fn execute_bash_tool(
         &self,
@@ -288,7 +307,16 @@ impl LucidosEngine {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
 
-        let env_vars = self.build_tool_env_vars(thread_id).await;
+        let env = self
+            .build_tool_env_vars(
+                thread_id,
+                &crate::core::credentials::SecretMentions::of_command(
+                    command,
+                    self.workspace_path(),
+                ),
+            )
+            .await;
+        let env_vars = &env.vars;
 
         // `pipefail` shell — see `core::shell`. A `cmd | tee log` would
         // otherwise report tee's 0 and hide the real failure.
@@ -303,7 +331,11 @@ impl LucidosEngine {
             // Without kill_on_drop both leak the shell child. With it set,
             // both paths SIGKILL the child correctly.
             .kill_on_drop(true);
-        crate::core::apply_to_subprocess_env(&mut cmd, &env_vars);
+        crate::core::apply_to_subprocess_env(
+            &mut cmd,
+            env_vars,
+            crate::core::InheritedSecrets::Strip(crate::core::inherited_secret_env()),
+        );
 
         let log_command = redact_postgres_secrets(command);
         log!(
@@ -381,11 +413,10 @@ impl LucidosEngine {
         }
 
         // Last thing before the result leaves: the caller persists it into the
-        // `ToolResult` event verbatim, and every secret in it came from the
-        // env we just injected. See `core::injected_secret_values`.
-        Ok(crate::core::redact_secret_values(
-            &response,
-            &crate::core::injected_secret_values(&env_vars),
+        // `ToolResult` event verbatim. See `core::subprocess_secret_values`.
+        Ok(crate::core::redact_subprocess_output(
+            &env.with_note(response),
+            &crate::core::subprocess_secret_values(env_vars, crate::core::inherited_secret_env()),
         ))
     }
 
@@ -411,27 +442,38 @@ impl LucidosEngine {
             .unwrap_or(BG_DEFAULT_TIMEOUT_SECS)
             .min(BG_MAX_TIMEOUT_SECS);
 
-        let env_vars = self.build_tool_env_vars(thread_id).await;
+        let env = self
+            .build_tool_env_vars(
+                thread_id,
+                &crate::core::credentials::SecretMentions::of_command(
+                    command,
+                    self.workspace_path(),
+                ),
+            )
+            .await;
         let (task_id, started_at) = self
             .start_background_task(
                 thread_id,
                 command,
                 self.workspace_path(),
-                &env_vars,
+                &env.vars,
                 TaskSpec {
                     timeout_secs,
                     description: args.get("description").and_then(|v| v.as_str()),
                     delivery: CompletionDelivery::EventWait,
+                    inherited: crate::core::InheritedSecrets::Strip(
+                        crate::core::inherited_secret_env(),
+                    ),
                 },
             )
             .await?;
 
-        Ok(serde_json::json!({
-            "task_id": task_id,
-            "started_at": started_at,
-            "timeout_secs": timeout_secs,
-        })
-        .to_string())
+        Ok(background_start_result(
+            &task_id,
+            started_at,
+            timeout_secs,
+            &env,
+        ))
     }
 
     /// Spawn a background task for a thread, record `BackgroundBashStarted`,
@@ -849,12 +891,13 @@ mod tests {
         )
     }
 
-    /// The result leaves through the redaction, not around it.
+    /// The result leaves through the redaction, not around it, and the child
+    /// inherits none of the engine's own secrets.
     ///
-    /// Every credential and OAuth token sits in this child's environment. The
-    /// string returned here is persisted verbatim in `ToolResult` and read
-    /// back by the agent. The composition is covered in `core::mod_tests`; this
-    /// is the wiring, which a helper test cannot see.
+    /// The string returned here is persisted verbatim in `ToolResult` and read
+    /// back by the agent. The composition is covered in
+    /// `core::subprocess_secrets`; this is the wiring, which a helper test
+    /// cannot see.
     #[test]
     fn the_bash_tool_result_leaves_through_the_secret_redaction() {
         let src = production_src();
@@ -866,11 +909,15 @@ mod tests {
             .expect("execute_bash_tool is still followed by the background tool");
         let body = &src[at..at + end];
         assert!(
-            body.contains("redact_secret_values(")
-                && body.contains("injected_secret_values(&env_vars)"),
-            "execute_bash_tool must return through `core::redact_secret_values` \
-             over `core::injected_secret_values(&env_vars)`. A verbose curl or an \
-             `env` dump otherwise writes a credential into the events table."
+            body.contains("redact_subprocess_output(")
+                && body.contains("subprocess_secret_values(env_vars,"),
+            "execute_bash_tool must return through `core::redact_subprocess_output` \
+             over `core::subprocess_secret_values`. A verbose curl or an `env` dump \
+             otherwise writes a credential into the events table."
+        );
+        assert!(
+            body.contains("InheritedSecrets::Strip("),
+            "a chat shell must not inherit the engine's secrets"
         );
     }
 

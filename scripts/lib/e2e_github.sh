@@ -14,6 +14,9 @@
 #
 # Sourced by scripts/e2e-github.sh. Tested by scripts/lib/e2e_github_test.sh.
 
+# shellcheck source=scripts/lib/touched_specs.sh
+source "$(dirname "${BASH_SOURCE[0]}")/touched_specs.sh"
+
 E2E_GITHUB_REPO="lucidos-dev/lucidos"
 E2E_GITHUB_REMOTE="lucidos"
 E2E_GITHUB_WORKFLOW="e2e.yml"
@@ -22,6 +25,10 @@ E2E_GITHUB_REQUEST_PATH=".github/e2e-request.json"
 E2E_GITHUB_AUTHOR_NAME="Lucidos e2e"
 E2E_GITHUB_AUTHOR_EMAIL="lucidos-e2e@users.noreply.github.com"
 E2E_GITHUB_SWEEP_AGE_SECS=86400
+# The line naming a run once it is found: "<mark><run url> <branch>". The main
+# check reads it, and needs both to reattach after an engine restart.
+# shellcheck disable=SC2034 # read by scripts/e2e-github.sh and scripts/lib/main_check.sh
+E2E_GITHUB_LINKED_MARK="[e2e-github] linked "
 # A run that never produced a verdict: a refused push, a workflow that never
 # started, a cancelled run, a shard with no output. Distinct from 71, 72, 75.
 E2E_GITHUB_NO_VERDICT_EXIT=76
@@ -50,6 +57,60 @@ e2e_github_is_spec_arg() {
 # Flags that only mean something on this host, so they keep a run here.
 E2E_GITHUB_LOCAL_ONLY_FLAGS=(--no-reset -h --headed --ios --device --screenshot --pwa --packaged)
 
+# Options whose next argument is their value, never a filter: the e2e scripts'
+# own before `--`, Playwright's and cargo test's after it.
+E2E_GITHUB_VALUE_FLAGS=(-f --device --commit --attach --branch)
+E2E_GITHUB_TAIL_VALUE_FLAGS=(-c --config --output --reporter --shard -j --workers --project
+    --repeat-each --retries --timeout --max-failures --skip --test-threads --format --color)
+
+# e2e_github_is_filtered <arg>...: whether a run selects a subset of its suite.
+# Filtered means -f, a positional argument, or after `--` a Playwright --grep,
+# -g or --grep-invert, or any positional. Filtered runs stay on this host.
+e2e_github_is_filtered() {
+    local arg past_dashes="" skip=""
+    for arg in "$@"; do
+        if [ -n "$skip" ]; then
+            skip=""
+            continue
+        fi
+        if [ -z "$past_dashes" ]; then
+            case "$arg" in
+                --) past_dashes=1 ;;
+                -f) return 0 ;;
+                -*) [[ " ${E2E_GITHUB_VALUE_FLAGS[*]} " != *" $arg "* ]] || skip=1 ;;
+                *) return 0 ;;
+            esac
+            continue
+        fi
+        case "$arg" in
+            -g | --grep | --grep=* | --grep-invert | --grep-invert=*) return 0 ;;
+            -*) [[ " ${E2E_GITHUB_TAIL_VALUE_FLAGS[*]} " != *" $arg "* ]] || skip=1 ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# e2e_github_lean_local <suite>: shape a filtered run that stays here, editing
+# E2E_ARGS. It builds a debug engine, which compiles incrementally, and skips
+# mobile-webkit. `--webkit`, or a `--project` for Playwright, keeps WebKit and
+# the release engine. An explicit LUCIDOS_E2E_DEBUG or RELEASE wins.
+e2e_github_lean_local() {
+    local suite="$1" arg
+    for arg in ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}; do
+        case "$arg" in
+            --webkit | --project | --project=*) return 0 ;;
+        esac
+    done
+    if [ -z "${LUCIDOS_E2E_DEBUG+x}" ] && [ -z "${RELEASE+x}" ]; then
+        export LUCIDOS_E2E_DEBUG=1
+    fi
+    if [ "$suite" = browser ] && [[ " ${E2E_ARGS[*]} " != *" --no-webkit "* ]]; then
+        E2E_ARGS=(--no-webkit "${E2E_ARGS[@]}")
+        echo "[e2e] mobile-webkit is skipped on this host. Pass --webkit to run it." >&2
+    fi
+}
+
 # e2e_github_local_only_env: name the first set environment variable that
 # changes what a run tests or produces. The driver forwards no environment, so
 # GitHub would silently ignore it. Any `*_SHOTS` switch counts.
@@ -67,14 +128,16 @@ e2e_github_local_only_env() {
     done
 }
 
-# e2e_github_handoff <suite> "$@": GitHub is the default. Replace this process
-# with the driver unless the run must stay here: --local, a local-only flag or
-# variable, an inherited LUCIDOS_E2E_LOCAL, or an unmet precondition. Only flags before
-# any `--` count. Staying here exports LUCIDOS_E2E_LOCAL=1, so every nested e2e
-# script stays too. Each e2e script calls this first, before the e2e lock, and
-# then parses E2E_ARGS: its arguments minus --local and --github.
+# e2e_github_handoff <suite> "$@": GitHub is the default for a whole suite.
+# Replace this process with the driver unless the run must stay here: --local,
+# a filtered run, a local-only flag or variable, an inherited
+# LUCIDOS_E2E_LOCAL, or an unmet precondition. Only flags before any `--`
+# count, except for the filter test. Staying here exports LUCIDOS_E2E_LOCAL=1,
+# so every nested e2e script stays too. Each e2e script calls this first,
+# before the e2e lock, and then parses E2E_ARGS: its arguments minus --local
+# and --github, plus what e2e_github_lean_local adds.
 e2e_github_handoff() {
-    local suite="$1" arg github="" local_run="" past_dashes="" reason="" env_name
+    local suite="$1" arg github="" local_run="" past_dashes="" reason="" env_name lean=""
     shift
     E2E_ARGS=()
     for arg in "$@"; do
@@ -103,6 +166,10 @@ e2e_github_handoff() {
     fi
     if [ "${LUCIDOS_E2E_LOCAL:-}" = 1 ]; then
         local_run=1
+    elif [ -z "$github" ] && e2e_github_is_filtered ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}; then
+        [ -n "$local_run" ] || echo "[e2e] running on this host: a filtered run. Pass --github to run it on GitHub." >&2
+        local_run=1
+        lean=1
     elif [ -z "$local_run" ] && [ -z "$github" ]; then
         reason="$(e2e_github_unavailable_reason "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)")"
         if [ -n "$reason" ]; then
@@ -111,6 +178,7 @@ e2e_github_handoff() {
         fi
     fi
     if [ -n "$local_run" ]; then
+        [ -z "$lean" ] || e2e_github_lean_local "$suite"
         export LUCIDOS_E2E_LOCAL=1
         return 0
     fi
@@ -286,18 +354,6 @@ $(release_mirror_ls_remote "$repo" "$E2E_GITHUB_REMOTE" "refs/heads/$E2E_GITHUB_
 EOF
 }
 
-# e2e_github_e2e_lock_holder: name the live holder of this host's e2e lock, or
-# print nothing when it is free or its holder is dead. Needs e2e_lock.sh.
-e2e_github_e2e_lock_holder() {
-    _e2e_read_lock_file "$(_e2e_lock_path)" || return 0
-    [ -n "$_E2E_LK_PID" ] && kill -0 "$_E2E_LK_PID" 2>/dev/null || return 0
-    if [ -n "$_E2E_LK_THREAD" ]; then
-        printf 'thread %s\n' "$_E2E_LK_THREAD"
-    else
-        printf 'pid %s\n' "$_E2E_LK_PID"
-    fi
-}
-
 # e2e_github_find_run <branch> <commit>: print the workflow run the push
 # started. Waits up to E2E_GITHUB_START_WAIT_SECS (default 180).
 e2e_github_find_run() {
@@ -332,25 +388,83 @@ print("run %s: %d queued, %d running, %d/%d jobs done, %d failed" % (
 ' "$1"
 }
 
+e2e_github_run_url() { printf 'https://github.com/%s/actions/runs/%s\n' "$E2E_GITHUB_REPO" "$1"; }
+
+# e2e_github_run_state <run-id>: one JSON object with the run's status,
+# conclusion and jobs, plus `rate_remaining`, the lower X-RateLimit-Remaining
+# of the two answers. Fails when either call fails.
+e2e_github_run_state() {
+    local run jobs
+    run="$(gh api --include "repos/$E2E_GITHUB_REPO/actions/runs/$1" 2>/dev/null)" || return 1
+    jobs="$(gh api --include "repos/$E2E_GITHUB_REPO/actions/runs/$1/jobs?per_page=100" 2>/dev/null)" || return 1
+    python3 -c '
+import json, sys
+
+def split(raw):
+    head, _, body = raw.replace("\r\n", "\n").partition("\n\n")
+    headers = {}
+    for line in head.split("\n")[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return headers, json.loads(body)
+
+run_headers, run = split(sys.argv[1])
+jobs_headers, jobs = split(sys.argv[2])
+remaining = [int(h["x-ratelimit-remaining"]) for h in (run_headers, jobs_headers)
+             if h.get("x-ratelimit-remaining", "").isdigit()]
+keep = ("name", "status", "conclusion", "created_at", "started_at", "completed_at")
+print(json.dumps({
+    "status": run.get("status"),
+    "conclusion": run.get("conclusion"),
+    "updated_at": run.get("updated_at"),
+    "jobs": [{k: j.get(k) for k in keep} for j in jobs.get("jobs") or []],
+    "rate_remaining": min(remaining) if remaining else None,
+}))
+' "$run" "$jobs"
+}
+
+# Poll intervals in seconds: before the test jobs start, once they have, and
+# the rate-limit floor that sends a wait back to the slow interval.
+E2E_GITHUB_POLL_SLOW_SECS=30
+E2E_GITHUB_POLL_FAST_SECS=5
+E2E_GITHUB_RATE_FLOOR=500
+
+# e2e_github_poll_secs <run-state>: how long to sleep before the next poll. A
+# test job is any job but plan and the build-* jobs.
+e2e_github_poll_secs() {
+    python3 -c '
+import json, sys
+state, slow, fast, floor = json.loads(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+remaining = state.get("rate_remaining")
+started = any(j.get("status") in ("in_progress", "completed")
+              for j in state.get("jobs") or []
+              if j.get("name") != "plan" and not (j.get("name") or "").startswith("build-"))
+print(fast if started and (remaining is None or remaining >= floor) else slow)
+' "$1" "$E2E_GITHUB_POLL_SLOW_SECS" "$E2E_GITHUB_POLL_FAST_SECS" "$E2E_GITHUB_RATE_FLOOR"
+}
+
 # e2e_github_wait <run-id>: block until the run completes, printing progress
-# whenever it changes. Prints the conclusion on the last line of stdout.
-# Gives up after E2E_GITHUB_RUN_WAIT_SECS (default 6 hours) with the no-verdict
-# exit. The default sits above the longest chain of timeout-minutes in e2e.yml,
-# with room for queueing. A gh that keeps failing must still end the wait.
+# whenever it changes. Prints the final run state as JSON on the last line of
+# stdout. Polls adaptively (e2e_github_poll_secs), and a failed gh call waits
+# the slow interval. Gives up after E2E_GITHUB_RUN_WAIT_SECS (default 6 hours)
+# with the no-verdict exit. The default sits above the longest chain of
+# timeout-minutes in e2e.yml, with room for queueing.
 e2e_github_wait() {
-    local run_id="$1" poll="${E2E_GITHUB_POLL_SECS:-30}" limit="${E2E_GITHUB_RUN_WAIT_SECS:-21600}"
-    local json status line last="" deadline
+    local run_id="$1" limit="${E2E_GITHUB_RUN_WAIT_SECS:-21600}"
+    local state status line last="" deadline poll
     deadline=$(($(e2e_github_now) + limit))
-    echo "[e2e-github] watching https://github.com/$E2E_GITHUB_REPO/actions/runs/$run_id" >&2
+    echo "[e2e-github] watching $(e2e_github_run_url "$run_id")" >&2
     while :; do
-        if json="$(gh run view "$run_id" --repo "$E2E_GITHUB_REPO" --json status,conclusion,jobs 2>/dev/null)"; then
-            line="$(e2e_github_run_progress "$json")"
+        poll="$E2E_GITHUB_POLL_SLOW_SECS"
+        if state="$(e2e_github_run_state "$run_id")"; then
+            line="$(e2e_github_run_progress "$state")"
             [ "$line" = "$last" ] || { echo "[e2e-github] $line" >&2; last="$line"; }
-            status="$(printf '%s' "$json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])')"
+            status="$(printf '%s' "$state" | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])')"
             if [ "$status" = "completed" ]; then
-                printf '%s' "$json" | python3 -c 'import json, sys; print(json.load(sys.stdin)["conclusion"] or "")'
+                printf '%s\n' "$state"
                 return 0
             fi
+            poll="$(e2e_github_poll_secs "$state")"
         fi
         if [ "$(e2e_github_now)" -ge "$deadline" ]; then
             echo "ERROR: run $run_id did not complete within ${limit}s, so it produced no verdict." >&2
@@ -360,17 +474,106 @@ e2e_github_wait() {
     done
 }
 
+# e2e_github_conclusion <run-state>: the run's conclusion, or nothing.
+e2e_github_conclusion() {
+    printf '%s' "$1" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("conclusion") or "")'
+}
+
+# e2e_github_timings_log: the one log every run appends its timing record to,
+# a JSON line each, shared by every worktree on this host.
+e2e_github_timings_log() {
+    printf '%s\n' "${LUCIDOS_E2E_TIMINGS_LOG:-$HOME/.lucidos/e2e-github/timings.jsonl}"
+}
+
+# e2e_github_record_timings <out-dir> <run-db-id> <suite> <pushed-at> <rc> <run-state>:
+# write <out-dir>/timings.json, append it to the timings log, and print one
+# summary line. <pushed-at> is the epoch second of the push, and the verdict is
+# now. The plan's engines file names, per platform, the run whose engine a test
+# job reused, or "-" for one this run built. A record that cannot be written
+# is one line and never changes the verdict.
+e2e_github_record_timings() {
+    local dir="$1" run_db_id="$2" suite="$3" pushed_at="$4" rc="$5" state="$6" log
+    log="$(e2e_github_timings_log)"
+    mkdir -p "$(dirname "$log")" 2>/dev/null
+    python3 -I - "$dir" "$run_db_id" "$suite" "$pushed_at" "$(e2e_github_now)" "$rc" "$state" \
+        "$(e2e_github_run_url "$run_db_id")" "$log" <<'PY' || echo "[e2e-github] timings not recorded" >&2
+import json, os, sys
+from datetime import datetime, timezone
+
+dir, run_db_id, suite, pushed_at, now, rc, state, url, log = sys.argv[1:10]
+state, pushed_at, now = json.loads(state), int(pushed_at), int(now)
+
+
+def epoch(stamp):
+    return int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()) if stamp else None
+
+
+def span(a, b):
+    return b - a if a is not None and b is not None else None
+
+
+def clock(secs):
+    return "?" if secs is None else f"{secs // 60}m{secs % 60:02d}s"
+
+
+engines = {}
+try:
+    for line in open(os.path.join(dir, "e2e-plan", "engines")):
+        parts = line.split()
+        if len(parts) == 2:
+            engines[parts[0]] = None if parts[1] == "-" else parts[1]
+except OSError:
+    pass
+jobs = [{
+    "name": j.get("name"),
+    "conclusion": j.get("conclusion"),
+    "queue_secs": span(epoch(j.get("created_at")), epoch(j.get("started_at"))),
+    "run_secs": span(epoch(j.get("started_at")), epoch(j.get("completed_at"))),
+} for j in state.get("jobs") or [] if j.get("conclusion") != "skipped"]
+record = {
+    "run": url,
+    "run_id": int(run_db_id),
+    "suite": suite,
+    "rc": int(rc),
+    "pushed_at": datetime.fromtimestamp(pushed_at, timezone.utc).isoformat(),
+    "push_to_complete_secs": span(pushed_at, epoch(state.get("updated_at"))),
+    "push_to_verdict_secs": now - pushed_at,
+    "engine_reused_from": engines,
+    "jobs": jobs,
+}
+with open(os.path.join(dir, "timings.json"), "w") as f:
+    json.dump(record, f, indent=2)
+with open(log, "a") as f:
+    f.write(json.dumps(record) + "\n")
+reuse = "; ".join(f"{os_} engine {'reused from run ' + run if run else 'built'}"
+                  for os_, run in sorted(engines.items()))
+slowest = max((j for j in jobs if j["run_secs"] is not None), key=lambda j: j["run_secs"], default=None)
+parts = [f"push to verdict {clock(record['push_to_verdict_secs'])}",
+         f"run finished at {clock(record['push_to_complete_secs'])}"]
+if reuse:
+    parts.append(reuse)
+if slowest:
+    parts.append(f"slowest job {slowest['name']} {clock(slowest['run_secs'])}")
+print("[e2e-github] timings: " + ", ".join(parts), file=sys.stderr)
+PY
+}
+
 e2e_github_cancel() {
     gh run cancel "$1" --repo "$E2E_GITHUB_REPO" >/dev/null 2>&1 || true
 }
 
-# e2e_github_stop_run <repo> <branch> <unfinished-run-id> <pushed>: on the way
-# out, cancel a run that has not finished and delete the branch once pushed.
-# It often runs after a SIGTERM that took the reader of stderr too, so it
-# ignores SIGPIPE: a broken pipe must not stop it before either call.
+# e2e_github_stop_run <repo> <branch> <unfinished-run-id> <pushed> [<detached>]:
+# on the way out, cancel a run that has not finished and delete the branch once
+# pushed. A detached driver leaves both for a later --attach. It often runs
+# after a signal that took the reader of stderr too, so it ignores SIGPIPE: a
+# broken pipe must not stop it before either call.
 e2e_github_stop_run() {
-    local repo="$1" branch="$2" run_db_id="$3" pushed="$4"
+    local repo="$1" branch="$2" run_db_id="$3" pushed="$4" detached="${5:-}"
     trap '' PIPE
+    if [ -n "$detached" ]; then
+        echo "[e2e-github] detached: run ${run_db_id:-(finished)} and $branch stay for --attach" >&2
+        return 0
+    fi
     if [ -n "$run_db_id" ]; then
         echo "[e2e-github] cancelling run $run_db_id" >&2
         e2e_github_cancel "$run_db_id"
@@ -380,10 +583,72 @@ e2e_github_stop_run() {
     fi
 }
 
+# e2e_github_trap_detach: SIGUSR2 ends the driver with no verdict. Once the run
+# is found ($run_db_id) it sets $detached, so cleanup leaves the run going.
+# Before that there is nothing to leave going, so the cleanup cancels.
+e2e_github_trap_detach() {
+    trap '[ -z "$run_db_id" ] || detached=1; exit "$E2E_GITHUB_NO_VERDICT_EXIT"' USR2
+}
+
+# A detached driver may have downloaded part of the run already, and gh fails
+# rather than extract over a file it finds. So each download starts empty.
 e2e_github_download() {
     local run_id="$1" dir="$2"
     mkdir -p "$dir"
+    rm -rf "$dir"/e2e-out-* "$dir"/e2e-plan
     gh run download "$run_id" --repo "$E2E_GITHUB_REPO" -D "$dir" -p 'e2e-out-*' -p 'e2e-plan'
+}
+
+# e2e_github_record_coverage_map <root> <out-dir> <commit> <run-url>: merge the
+# Chromium shards' coverage files into the coverage map (ADR 0502, as amended).
+# Replaces the map atomically, and only when every Chromium shard reported. A
+# refusal is one line and never changes the run's verdict.
+e2e_github_record_coverage_map() {
+    local root="$1" dir="$2" commit="$3" run_url="$4" map
+    map="$(ts_coverage_map_path "$root")" || {
+        echo "[e2e-github] coverage map not updated: no git dir under $root" >&2
+        return 0
+    }
+    python3 -I - "$dir" "$map" "$commit" "$run_url" <<'PY' || true
+import glob, json, os, sys, tempfile
+
+dir, map_path, commit, run_url = sys.argv[1:5]
+CHROMIUM = {"chromium", "mobile"}
+
+
+def refuse(why):
+    print(f"[e2e-github] coverage map not updated: {why}", file=sys.stderr)
+    sys.exit(0)
+
+
+try:
+    entries = [line.split() for line in open(os.path.join(dir, "e2e-plan", "entries"))]
+except OSError:
+    refuse("the run has no shard plan")
+shards = [e[0] for e in entries if len(e) == 5 and e[1] == "browser" and e[2] in CHROMIUM]
+if not shards:
+    refuse("the run had no Chromium shard")
+specs, missing = {}, []
+for shard in shards:
+    files = glob.glob(os.path.join(dir, f"e2e-out-{shard}", "coverage", "*.json"))
+    if not files:
+        missing.append(shard)
+    for path in files:
+        try:
+            record = json.load(open(path))
+            specs.setdefault(record["spec"], set()).update(record["files"])
+        except (OSError, ValueError, KeyError, TypeError):
+            refuse(f"{os.path.relpath(path, dir)} is unreadable")
+if missing:
+    refuse(f"{len(missing)} Chromium shard(s) recorded no coverage: {' '.join(missing)}")
+os.makedirs(os.path.dirname(map_path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(map_path), prefix=".e2e-coverage-map.")
+with os.fdopen(fd, "w") as f:
+    json.dump({"commit": commit, "run": run_url,
+               "specs": {k: sorted(v) for k, v in sorted(specs.items())}}, f)
+os.replace(tmp, map_path)
+print(f"[e2e-github] coverage map updated: {len(specs)} specs, from {commit}", file=sys.stderr)
+PY
 }
 
 # ── The report ───────────────────────────────────────────────────────────

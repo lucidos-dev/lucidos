@@ -114,7 +114,7 @@ pub(crate) fn always_reasons(model: &str) -> bool {
 /// from the request path it will actually take.
 pub fn supported_efforts(provider: ProviderKind, model: &str) -> &'static [&'static str] {
     match provider {
-        ProviderKind::Anthropic => claude_tiers(model),
+        ProviderKind::Anthropic | ProviderKind::ClaudeGateway => claude_tiers(model),
         ProviderKind::Vertex => {
             if VertexProvider::is_claude_model(model) {
                 claude_tiers(model)
@@ -287,6 +287,24 @@ mod tests {
                 supported_efforts(ProviderKind::Anthropic, fable),
                 LOW_THROUGH_MAX,
                 "{fable} accepts every tier but `none` through output_config.effort"
+            );
+        }
+    }
+
+    /// A Claude gateway speaks the direct Anthropic wire, so a Claude model
+    /// offers the same tiers on both.
+    #[test]
+    fn a_claude_gateway_offers_the_direct_anthropic_tiers() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5[1m]",
+            "claude-haiku-4-5",
+            "claude-fable-5-1",
+        ] {
+            assert_eq!(
+                supported_efforts(ProviderKind::ClaudeGateway, model),
+                supported_efforts(ProviderKind::Anthropic, model),
+                "{model}"
             );
         }
     }

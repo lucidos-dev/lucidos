@@ -1,19 +1,13 @@
 //! Engine-side tool dispatch: `handle_special_tool` covers tools that need
 //! more than `execute_tool()` can give them (capture/refresh app UI,
-//! run_thread, resume_thread, run_coding_agent, …) and `run_intent_loop` runs
-//! the intent sub-loop for the open-ended verbs.
+//! run_thread, resume_thread, run_coding_agent, …).
 
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{build_intent_tools, derive_call_key};
-use crate::engine::context::trim_context_if_needed;
-use crate::engine::event_bus::BusEvent;
 use crate::engine::http::workspace_client::cross_workspace_http_client;
-use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent, WakeMode};
+use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, WakeMode};
 use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
-use crate::llm::{ContentBlock, Message, MessageContent};
 use crate::triggers::{normalize_route_setting, validate_trigger_reasoning_effort};
 
 /// How a thread spawned by `run_thread` / `run_coding_agent` relates to the
@@ -105,9 +99,11 @@ pub(crate) fn parse_coding_agent(
     }
 }
 
-/// Resolve the model and reasoning effort a `run_thread` child runs on: a
-/// caller-supplied pin wins. Unpinned, the model is the account's `chat_model`
-/// and the effort stays `None`, for the caller to resolve for that model.
+/// The route a `run_thread` child asks for, before the account fills its gaps.
+///
+/// The child inherits the calling turn's model, effort and provider, and an
+/// explicit pin wins per field. A pinned model other than the caller's drops
+/// the inherited effort and provider, which belong to the caller's model.
 ///
 /// Validation follows the trigger route pins, the other place a chat model and
 /// effort are pinned per spawn. The model id passes through unchecked
@@ -115,13 +111,26 @@ pub(crate) fn parse_coding_agent(
 /// caller read it, and a bad id surfaces as an ordinary thread failure. The
 /// tier vocabulary is ours, so a typo there is rejected by name
 /// (`validate_trigger_reasoning_effort`), never swapped for the default.
-pub(crate) fn resolve_sub_thread_model_and_effort(
+pub(crate) fn sub_thread_route_overrides(
     args: &serde_json::Value,
-    pref_model: Option<String>,
-) -> Result<(Option<String>, Option<String>), String> {
-    let model = normalize_route_setting(optional_string_arg(args, "model")?).or(pref_model);
-    let effort = validate_trigger_reasoning_effort(optional_string_arg(args, "reasoning_effort")?)?;
-    Ok((model, effort))
+    caller: &crate::core::ResolvedModelSelection,
+) -> Result<crate::core::ResolvedModelSelection, String> {
+    let pinned_model = normalize_route_setting(optional_string_arg(args, "model")?);
+    let pinned_effort =
+        validate_trigger_reasoning_effort(optional_string_arg(args, "reasoning_effort")?)?;
+    let inherited = match pinned_model {
+        Some(model) if caller.model.as_ref() != Some(&model) => {
+            crate::core::ResolvedModelSelection {
+                model: Some(model),
+                ..Default::default()
+            }
+        }
+        _ => caller.clone(),
+    };
+    Ok(crate::core::ResolvedModelSelection {
+        reasoning_effort: pinned_effort.or(inherited.reasoning_effort),
+        ..inherited
+    })
 }
 
 /// Read an optional string tool argument, rejecting a non-string instead of
@@ -366,6 +375,9 @@ impl LucidosEngine {
         // Cancel token for the response — lets a blocking MCP permission card
         // resolve as canceled when the user clicks Stop, instead of dangling.
         cancel_token: &tokio_util::sync::CancellationToken,
+        // The model, effort and provider this turn runs on. A `run_thread`
+        // child inherits it.
+        caller_route: &crate::core::ResolvedModelSelection,
     ) -> Option<String> {
         if tool_name == tn::ASK_USER_QUESTION {
             return Some(
@@ -475,6 +487,19 @@ impl LucidosEngine {
                     Ok(e) => e,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
+                // The Lucidos Agent is an agent: its pick must be a rung. A
+                // cross-workspace spawn is checked by the target's chat route.
+                if let Err(e) = crate::runtime::intelligence_ladder::check_agent_pick(
+                    self.pool(),
+                    &self.model_routes(),
+                    coding_agent.into(),
+                    spawn_model.as_deref(),
+                    spawn_effort.as_deref(),
+                )
+                .await
+                {
+                    return Some(format!("Error: {e}"));
+                }
                 let (parent_thread_id, spawning_event_id) =
                     relation.spawn_linkage(thread_id, tool_called_event_id);
                 let origin = spawn_origin(thread_id, tool_called_event_id);
@@ -677,6 +702,18 @@ impl LucidosEngine {
                     Ok(r) => r,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
+                // The Lucidos Agent is an agent: its chat pick must be a rung.
+                if let Err(e) = crate::runtime::intelligence_ladder::check_agent_pick(
+                    self.pool(),
+                    &self.model_routes(),
+                    crate::runtime::intelligence_ladder::LadderSurface::Chat,
+                    normalize_route_setting(tool_args["model"].as_str()).as_deref(),
+                    normalize_route_setting(tool_args["reasoning_effort"].as_str()).as_deref(),
+                )
+                .await
+                {
+                    return Some(format!("Error: {e}"));
+                }
                 let (parent_thread_id, spawning_event_id) =
                     relation.spawn_linkage(thread_id, tool_called_event_id);
                 let origin = spawn_origin(thread_id, tool_called_event_id);
@@ -696,37 +733,28 @@ impl LucidosEngine {
                         Err(guard_err) => format!("Error: {}", guard_err),
                         Ok(_) => {
                             let child_thread_id = uuid::Uuid::new_v4();
-                            // Without this the spawned loop defaults to LUCIDOS_MODEL
-                            // instead of the user's chat-mode preference.
-                            let chat_model =
-                                crate::core::PreferenceStore::user_chat_model(&self.pool).await;
-                            let (model, reasoning_effort) =
-                                match resolve_sub_thread_model_and_effort(tool_args, chat_model) {
-                                    Ok(pins) => pins,
+                            let overrides =
+                                match sub_thread_route_overrides(tool_args, caller_route) {
+                                    Ok(overrides) => overrides,
                                     Err(e) => return Some(format!("Error: {}", e)),
                                 };
-                            // An unpinned tier resolves for the child's model now,
-                            // so its eager MessageReceived stamps the tier it runs at.
-                            let reasoning_effort = match reasoning_effort {
-                                Some(effort) => Some(effort),
-                                None => {
-                                    crate::core::PreferenceStore::resolve_chat_overrides_for_thread(
-                                        &self.pool,
-                                        crate::core::ModelDefaults {
-                                            registry: self.model_registry(),
-                                            fallback_model: self.current_provider().default_model(),
-                                        },
-                                        None,
-                                        None,
-                                        crate::core::ResolvedModelSelection {
-                                            model: model.clone(),
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .await
-                                    .reasoning_effort
-                                }
-                            };
+                            // Resolved and clamped now, so the child's eager
+                            // MessageReceived stamps the route it runs on.
+                            let provider = self.current_provider();
+                            let configured = provider.configured_providers();
+                            let route = crate::engine::chat::process::resolve_route_overrides(
+                                &self.pool,
+                                crate::core::ModelDefaults {
+                                    registry: self.model_registry(),
+                                    fallback_model: provider.default_model(),
+                                },
+                                |kind| configured.as_ref().is_none_or(|set| set.contains(&kind)),
+                                None,
+                                None,
+                                None,
+                                overrides,
+                            )
+                            .await;
                             let caller_title = tool_args["title"].as_str();
                             // The eager MessageReceived (a Child relation child's
                             // active_children_count must increment before the parent
@@ -743,8 +771,9 @@ impl LucidosEngine {
                                     spawning_event_id,
                                     wake_mode: relation.wake_mode(),
                                     title: caller_title.map(str::to_string),
-                                    model,
-                                    reasoning_effort,
+                                    model: route.model,
+                                    reasoning_effort: route.reasoning_effort,
+                                    provider: route.provider,
                                     pre_emitted_origin: None,
                                     origin,
                                 };
@@ -1026,334 +1055,6 @@ impl LucidosEngine {
         let result = serde_json::to_string(&answers).unwrap_or_else(|_| answers.to_string());
         with_answer_images(result, &answer_kinds)
     }
-
-    /// Run an isolated agentic loop for intent execution.
-    /// This is a simplified version of run_agentic_loop with its own system prompt,
-    /// no conversation history, and all tools except execute_intent (no recursion).
-    /// Returns only the final response text.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn run_intent_loop(
-        &self,
-        system_prompt: &str,
-        task: &str,
-        request_id: Uuid,
-        extraction_ctx: &str,
-        device_id: Option<&str>,
-        cancel_token: &CancellationToken,
-        thread_id: Uuid,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Context mode is forced OFF here, and it is the one gate this loop
-        // overrides. The mode is an agreement between a chat turn's prompt and
-        // its `notes` block, and this sub-loop assembles neither: it runs on
-        // its own system prompt with no history and no notes block. Leaving the
-        // gate open would offer a `notes` field pointing at a section of the
-        // instructions that this prompt does not have.
-        let tools = build_intent_tools(&crate::llm::ToolCapabilities {
-            context_mode: false,
-            ..self.read_turn_capabilities().await.gates
-        });
-
-        // Pin ONE provider Arc for this whole intent sub-loop — a runtime swap
-        // (credential added/removed) must not change the in-flight provider.
-        let provider = self.current_provider();
-        let capture = crate::engine::AuxCapture::new(
-            &self.event_bus,
-            thread_id,
-            crate::engine::ContextPurpose::IntentLoop,
-        );
-
-        let mut messages = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(format!("Task: {}", task)),
-        }];
-
-        const MAX_INTENT_ITERATIONS: usize = 100;
-        let mut iterations = 0;
-        let mut last_tool_call: Option<(String, String)> = None;
-        let mut consecutive_same_call = 0;
-
-        loop {
-            iterations += 1;
-
-            if cancel_token.is_cancelled() {
-                return Ok("Intent execution canceled.".to_string());
-            }
-
-            if iterations > MAX_INTENT_ITERATIONS {
-                return Ok("Intent execution reached iteration limit.".to_string());
-            }
-
-            // Trim context if needed. Intent sub-loops have no user message to
-            // pin, because the special-tool dispatcher synthesized the seed
-            // messages rather than a user typing them. So removal runs freely
-            // and there is no current-turn image to keep.
-            // ~266k tokens at the 1.5 chars/token the budget assumes. (The old
-            // comment here said "~100k tokens" — that was the retired chars/4
-            // ratio; the value itself is unchanged.)
-            let message_budget = 400_000;
-            // The intent sub-loop runs no context mode. Nothing is protected,
-            // nothing is held open, and a stub names its own way back exactly
-            // as the control arm's does.
-            trim_context_if_needed(
-                &mut messages,
-                message_budget,
-                None,
-                &[],
-                crate::engine::context::TrimGuards {
-                    protected: &Default::default(),
-                    held_open: &Default::default(),
-                    recovery: crate::engine::context::RecoveryClause::State,
-                },
-            );
-
-            // One row per round, up to `MAX_INTENT_ITERATIONS` of them on the
-            // agent's own model. No streaming: the sub-loop shows no text.
-            let response = capture
-                .chat(
-                    provider.as_ref(),
-                    messages.clone(),
-                    tools.clone(),
-                    // No model, provider or effort pick: the sub-loop runs on
-                    // the agent's own default.
-                    crate::llm::ModelSelection::default(),
-                    Some(system_prompt),
-                    None,
-                )
-                .await?;
-
-            // No tool calls → final answer
-            if response.tool_calls.is_empty() {
-                return Ok(response.content.unwrap_or_else(|| "Done.".to_string()));
-            }
-
-            // Build assistant message with tool_use blocks
-            let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-            if let Some(ref text) = response.content {
-                // Surface the sub-loop's narrative to the parent thread. We are
-                // past the empty-tool-calls early return above, so this response
-                // ALSO carries tool calls — meaning `text` is the connective prose
-                // the intent Director wrote to set up the call, most importantly
-                // the world-building that motivates an `ask_user_question` card.
-                // The sub-loop runs with no token-stream callback, so without this
-                // that prose is dropped and the user sees only disconnected
-                // question cards referencing lore that was never written to the
-                // chat (the "evig vinter never mentioned in the chat" bug). Emit
-                // BEFORE the ToolCalled events below so the prose renders above the
-                // card it introduces — mirroring how this loop already surfaces its
-                // ToolCalled / ToolResult events to `thread_id` with EventMeta::NONE.
-                if let Some(surface) = intent_narration_to_surface(Some(text)) {
-                    self.event_bus
-                        .emit_or_log(
-                            BusEvent::Thread {
-                                thread_id,
-                                event: ThreadEvent::TextStreamed {
-                                    text: surface.to_string(),
-                                },
-                                meta: EventMeta::NONE,
-                            },
-                            "[IntentLoop] TextStreamed",
-                        )
-                        .await;
-                }
-            }
-            // `history_text`, not `content`. The surfacing above is the
-            // user-facing half and stays on `content`, so Gemini's unprintable
-            // narration reaches nobody. History still takes the model's own
-            // words, or the next round forgets what this one decided.
-            if let Some(text) = response.history_text() {
-                assistant_blocks.push(ContentBlock::Text {
-                    text: text.to_string(),
-                });
-            }
-            for tc in &response.tool_calls {
-                assistant_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    input: tc.arguments.clone(),
-                    thought_signature: tc.thought_signature.clone(),
-                });
-            }
-            messages.push(Message {
-                role: "assistant".to_string(),
-                content: MessageContent::Blocks(assistant_blocks),
-            });
-
-            // Circuit breaker for consecutive duplicate calls
-            if response.tool_calls.len() == 1 {
-                let tc = &response.tool_calls[0];
-                let call_key = derive_call_key(&tc.name, &tc.arguments);
-                let current_call = (tc.name.clone(), call_key);
-                if Some(&current_call) == last_tool_call.as_ref() {
-                    consecutive_same_call += 1;
-                } else {
-                    consecutive_same_call = 1;
-                    last_tool_call = Some(current_call);
-                }
-
-                if consecutive_same_call >= 4 {
-                    // Force break — add tool results and stop
-                    let result_blocks: Vec<ContentBlock> = response
-                        .tool_calls
-                        .iter()
-                        .map(|tc| ContentBlock::ToolResult {
-                            tool_use_id: tc.id.clone(),
-                            content: "STOP: Repeated tool call. Give your final answer now."
-                                .to_string(),
-                        })
-                        .collect();
-                    messages.push(Message {
-                        role: "user".to_string(),
-                        content: MessageContent::Blocks(result_blocks),
-                    });
-                    continue;
-                }
-            } else {
-                consecutive_same_call = 0;
-                last_tool_call = None;
-            }
-
-            // Execute each tool call. Images a question answer carried follow
-            // every tool result, as the main loop's block builder places them.
-            let mut result_blocks: Vec<ContentBlock> = Vec::new();
-            let mut answer_images: Vec<crate::api::ChatImage> = Vec::new();
-            for tc in &response.tool_calls {
-                // Emit ToolCalled via bus. Capture the event_id so spawn-style tools
-                // can record it as the spawning_event_id of the new thread. Redact
-                // first, then build BOTH the description and the args from the
-                // redacted copy — the description renders in the steps UI, so a
-                // postgres password in a bash command must not survive in it.
-                let mut redacted_args = tc.arguments.clone();
-                crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
-                let description = self.describe_tool(&tc.name, &redacted_args);
-                let tool_called_event_id = self
-                    .event_bus
-                    .emit_for_id(BusEvent::Thread {
-                        thread_id,
-                        event: ThreadEvent::ToolCalled {
-                            name: tc.name.clone(),
-                            description,
-                            args: redacted_args,
-                        },
-                        meta: EventMeta::NONE,
-                    })
-                    .await;
-
-                let outcome: crate::engine::tools::ToolOutcome = if let Some(r) = self
-                    .handle_special_tool(
-                        &tc.name,
-                        &tc.arguments,
-                        thread_id,
-                        None,
-                        device_id,
-                        tool_called_event_id,
-                        &tc.id,
-                        // Intent sub-loops expose only `build_intent_tools()`
-                        // (no dynamically-discovered MCP tools), so the MCP
-                        // permission branch is unreachable here — NONE is safe.
-                        &EventMeta::NONE,
-                        cancel_token,
-                    )
-                    .await
-                {
-                    crate::engine::tools::lift_legacy_string(r)
-                } else {
-                    super::run_tool_with_cancel(
-                        self.execute_tool(
-                            &tc.name,
-                            &tc.arguments,
-                            extraction_ctx,
-                            request_id,
-                            device_id,
-                            cancel_token,
-                            thread_id,
-                        ),
-                        cancel_token,
-                    )
-                    .await
-                };
-
-                let (mut result, is_error) = match outcome {
-                    Ok(text) => (text, false),
-                    Err(text) => (text, true),
-                };
-                let (answered, hashes) =
-                    crate::engine::agentic_loop::take_answer_images(&tc.name, result);
-                result = answered;
-                answer_images.extend(crate::engine::agentic_loop::load_attached_images(
-                    &self.workspace_path,
-                    &hashes,
-                ));
-                // The same form-request handling as the main loop. Without it a
-                // form this sub-loop asks for never opens, and its raw JSON
-                // reaches the model as if the call had returned.
-                let form_request =
-                    super::match_sentinel(&tc.name, &tc.arguments, &result).map(|m| {
-                        if let Some(redacted) = m.redacted_text {
-                            result = redacted;
-                        }
-                        (m.label, m.event)
-                    });
-                self.event_bus
-                    .emit_or_log(
-                        BusEvent::Thread {
-                            thread_id,
-                            event: ThreadEvent::ToolResult {
-                                name: tc.name.clone(),
-                                result: crate::core::sanitize_for_jsonb(&result),
-                                images: vec![],
-                                success: !is_error,
-                                // Same pairing contract as the main agentic
-                                // loop: without the call's event id the
-                                // frontend cannot route this result to its
-                                // originating exchange, so an intent sub-loop
-                                // that asks a question left the caller's
-                                // "Executing ..." spinner pending forever.
-                                tool_called_event_id,
-                            },
-                            meta: EventMeta::NONE,
-                        },
-                        "[IntentLoop] ToolResult",
-                    )
-                    .await;
-                if let Some((label, event)) = form_request {
-                    crate::engine::form_requests::emit_request(
-                        &self.pool,
-                        &self.event_bus,
-                        thread_id,
-                        event,
-                        EventMeta::NONE,
-                        label,
-                    )
-                    .await;
-                }
-
-                result_blocks.push(ContentBlock::ToolResult {
-                    tool_use_id: tc.id.clone(),
-                    content: result,
-                });
-            }
-
-            result_blocks.extend(answer_images.into_iter().map(|image| ContentBlock::Image {
-                source_type: "base64".to_string(),
-                media_type: image.mime_type,
-                data: image.base64,
-            }));
-            messages.push(Message {
-                role: "user".to_string(),
-                content: MessageContent::Blocks(result_blocks),
-            });
-        }
-    }
-}
-
-/// Decide whether an intent sub-loop LLM response carries narrative prose worth
-/// surfacing to the parent thread as a `TextStreamed` event. Returns the text to
-/// emit, or `None` for absent / whitespace-only content (a turn that is a pure
-/// tool call with no prose must not emit an empty bubble). The text is returned
-/// verbatim — the model's own paragraph breaks are preserved so it renders as
-/// markdown; only the empty-content decision is made here.
-fn intent_narration_to_surface(content: Option<&str>) -> Option<&str> {
-    content.filter(|text| !text.trim().is_empty())
 }
 
 /// `repo` was a deprecated alias for `folder` on `run_coding_agent`, now
@@ -1373,31 +1074,6 @@ fn removed_repo_alias_error(tool_args: &serde_json::Value) -> Option<&'static st
 mod tests {
     use super::*;
     use serde_json::json;
-
-    /// The sub-loop resends its whole tool set every round, so a request sized
-    /// on the messages alone would under-report a short prompt several times
-    /// over. The capture counts all three parts, as a turn's own does.
-    #[test]
-    fn a_sub_loop_request_is_sized_including_its_tools() {
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text("Task: tidy the inbox".to_string()),
-        }];
-        let tools = build_intent_tools(&crate::llm::ToolCapabilities::default());
-        let sized =
-            crate::engine::context::request_chars("You are the Director.", &messages, &tools);
-
-        let without_tools =
-            crate::engine::context::request_chars("You are the Director.", &messages, &[]);
-        assert!(
-            sized > without_tools,
-            "the tool schemas are part of what was sent"
-        );
-        assert!(
-            without_tools > "You are the Director.".chars().count(),
-            "the messages are counted too"
-        );
-    }
 
     /// `repo` was removed as an alias for `folder`. A straggler still passing
     /// it must get a loud rename error, never a silent misroute.
@@ -1441,22 +1117,6 @@ mod tests {
     }
 
     #[test]
-    fn intent_narration_surfaces_real_prose() {
-        // The world-building the Director writes before an ask_user_question is
-        // exactly what must reach the chat.
-        let prose = "Et evig vinterlandskap ligger over fjordriket.\n\nHvem er fienden?";
-        assert_eq!(intent_narration_to_surface(Some(prose)), Some(prose));
-    }
-
-    #[test]
-    fn intent_narration_skips_absent_and_whitespace_only() {
-        // A pure tool-call turn (no prose) must not emit an empty TextStreamed.
-        assert_eq!(intent_narration_to_surface(None), None);
-        assert_eq!(intent_narration_to_surface(Some("")), None);
-        assert_eq!(intent_narration_to_surface(Some("  \n\t  ")), None);
-    }
-
-    #[test]
     fn parse_coding_agent_defaults_to_claude_code() {
         assert_eq!(
             parse_coding_agent(&json!({})).unwrap(),
@@ -1493,54 +1153,72 @@ mod tests {
         assert!(!text.contains("Claude Code"), "{text}");
     }
 
-    // --- run_thread route pins ----------------------------------------------
+    // --- run_thread route inheritance ---------------------------------------
 
-    /// The account's chat model, as `user_chat_model` hands it over.
-    fn chat_prefs() -> (Option<String>, Option<String>) {
-        (Some("claude-opus-5".to_string()), None)
+    /// The calling turn's route: a trigger pinned to Sonnet at `low`, on
+    /// Anthropic.
+    fn caller() -> crate::core::ResolvedModelSelection {
+        route(Some("claude-sonnet-5"), Some("low"), Some("anthropic"))
     }
 
-    fn resolved(args: serde_json::Value) -> (Option<String>, Option<String>) {
-        resolve_sub_thread_model_and_effort(&args, chat_prefs().0).expect("valid pins")
+    fn route(
+        model: Option<&str>,
+        effort: Option<&str>,
+        provider: Option<&str>,
+    ) -> crate::core::ResolvedModelSelection {
+        crate::core::ResolvedModelSelection {
+            model: model.map(str::to_string),
+            reasoning_effort: effort.map(str::to_string),
+            provider: provider.map(str::to_string),
+        }
     }
 
-    /// A spawn that pins nothing runs on the account's chat model, and leaves
-    /// the tier to be resolved for that model.
+    fn overrides(args: serde_json::Value) -> crate::core::ResolvedModelSelection {
+        sub_thread_route_overrides(&args, &caller()).expect("valid pins")
+    }
+
+    /// The incident: an unpinned child ran on the account model, not on the
+    /// route its pinned parent paid for.
     #[test]
-    fn run_thread_without_pins_inherits_the_chat_model_alone() {
-        assert_eq!(resolved(json!({"prompt": "summarize this"})), chat_prefs());
+    fn run_thread_without_pins_inherits_the_whole_caller_route() {
+        assert_eq!(overrides(json!({"prompt": "summarize this"})), caller());
     }
 
-    /// Naming the model leaves the tier unpinned, so the child runs that
-    /// model at its own tier rather than the account model's.
+    /// The caller's effort and provider belong to the caller's model, so a
+    /// different model resolves its own.
     #[test]
-    fn run_thread_model_pin_leaves_the_effort_to_the_model() {
+    fn run_thread_model_pin_drops_the_inherited_effort_and_provider() {
         assert_eq!(
-            resolved(json!({"prompt": "p", "model": "claude-sonnet-5"})),
-            (Some("claude-sonnet-5".to_string()), None)
+            overrides(json!({"prompt": "p", "model": "claude-opus-5"})),
+            route(Some("claude-opus-5"), None, None)
         );
     }
 
     #[test]
-    fn run_thread_effort_pin_leaves_the_preference_model_inherited() {
+    fn run_thread_pinning_the_callers_own_model_keeps_its_route() {
         assert_eq!(
-            resolved(json!({"prompt": "p", "reasoning_effort": "low"})),
-            (Some("claude-opus-5".to_string()), Some("low".to_string()))
+            overrides(json!({"prompt": "p", "model": "claude-sonnet-5"})),
+            caller()
+        );
+    }
+
+    #[test]
+    fn run_thread_effort_pin_wins_over_the_inherited_effort() {
+        assert_eq!(
+            overrides(json!({"prompt": "p", "reasoning_effort": "high"})),
+            route(Some("claude-sonnet-5"), Some("high"), Some("anthropic"))
         );
     }
 
     #[test]
     fn run_thread_takes_both_pins_together() {
         assert_eq!(
-            resolved(json!({
+            overrides(json!({
                 "prompt": "p",
-                "model": "claude-sonnet-5",
+                "model": "claude-opus-5",
                 "reasoning_effort": "none",
             })),
-            (
-                Some("claude-sonnet-5".to_string()),
-                Some("none".to_string())
-            )
+            route(Some("claude-opus-5"), Some("none"), None)
         );
     }
 
@@ -1549,9 +1227,9 @@ mod tests {
     /// caller believes it asked for something cheaper.
     #[test]
     fn run_thread_rejects_an_unknown_reasoning_effort_and_names_it() {
-        let err = resolve_sub_thread_model_and_effort(
+        let err = sub_thread_route_overrides(
             &json!({"prompt": "p", "reasoning_effort": "cheap"}),
-            None,
+            &caller(),
         )
         .unwrap_err();
         assert!(err.contains("cheap"), "error names the bad value: {err}");
@@ -1567,7 +1245,7 @@ mod tests {
     #[test]
     fn run_thread_passes_an_unknown_model_id_through_unchecked() {
         assert_eq!(
-            resolved(json!({"prompt": "p", "model": "claude-imaginary-9"})).0,
+            overrides(json!({"prompt": "p", "model": "claude-imaginary-9"})).model,
             Some("claude-imaginary-9".to_string())
         );
     }
@@ -1576,30 +1254,25 @@ mod tests {
     /// form's Default option travels through. `Some("")` must never reach the
     /// provider as a model id.
     #[test]
-    fn run_thread_reads_a_blank_or_null_pin_as_the_account_default() {
-        assert_eq!(
-            resolved(json!({"prompt": "p", "model": "   "})),
-            chat_prefs()
-        );
-        assert_eq!(
-            resolved(json!({"prompt": "p", "model": null, "reasoning_effort": null})),
-            chat_prefs()
-        );
-        assert_eq!(
-            resolved(json!({"prompt": "p", "reasoning_effort": "  "})),
-            chat_prefs()
-        );
+    fn run_thread_reads_a_blank_or_null_pin_as_inheriting() {
+        for args in [
+            json!({"prompt": "p", "model": "   "}),
+            json!({"prompt": "p", "model": null, "reasoning_effort": null}),
+            json!({"prompt": "p", "reasoning_effort": "  "}),
+        ] {
+            assert_eq!(overrides(args.clone()), caller(), "{args}");
+        }
     }
 
     /// A wrong-typed pin is refused rather than read as absent: silently
-    /// substituting the account default would tell the caller its pin applied.
+    /// inheriting would tell the caller its pin applied.
     #[test]
     fn run_thread_rejects_a_non_string_pin() {
         for args in [
             json!({"prompt": "p", "model": 5}),
             json!({"prompt": "p", "reasoning_effort": ["low"]}),
         ] {
-            let err = resolve_sub_thread_model_and_effort(&args, None)
+            let err = sub_thread_route_overrides(&args, &caller())
                 .expect_err("a non-string pin must be refused");
             assert!(
                 err.contains("must be a string"),

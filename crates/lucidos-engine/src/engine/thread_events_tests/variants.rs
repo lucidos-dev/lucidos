@@ -145,6 +145,10 @@ fn context_captured_event_type_and_persistence() {
         reasoning_effort: None,
         duration_ms: None,
         served_model: Some("claude-opus-4-7-20260101".to_string()),
+        provider: None,
+        stable_prefix_fingerprint: None,
+        ttft_ms: None,
+        request_id: None,
     };
     assert_eq!(event.event_type(), "ContextCaptured");
     assert!(event.is_persisted());
@@ -242,6 +246,7 @@ fn a_capture_row_without_the_new_keys_reads_as_a_turn() {
         reconstructed,
         sections,
         served_model,
+        provider,
         ..
     } = parsed
     else {
@@ -250,6 +255,7 @@ fn a_capture_row_without_the_new_keys_reads_as_a_turn() {
     assert_eq!(purpose, crate::engine::ContextPurpose::Turn);
     assert!(!reconstructed, "a recorded row is not a reconstruction");
     assert_eq!(served_model, None, "an old row names no served model");
+    assert_eq!(provider, None, "an old row names no provider");
     // The stored value always was the delta, so the alias puts it where a
     // delta belongs. Nobody measured the region, so that stays unknown.
     assert_eq!(sections[0].budget_delta_chars, 500);
@@ -306,11 +312,84 @@ fn a_turn_capture_writes_neither_new_key() {
         reasoning_effort: None,
         duration_ms: None,
         served_model: None,
+        provider: None,
+        stable_prefix_fingerprint: None,
+        ttft_ms: None,
+        request_id: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert!(json.get("purpose").is_none());
     assert!(json.get("reconstructed").is_none());
     assert!(json.get("served_model").is_none());
+    assert!(json.get("provider").is_none());
+    assert!(json.get("ttft_ms").is_none());
+    assert!(json.get("request_id").is_none());
+}
+
+/// A row written before `ttft_ms` and `request_id` existed still reads, and
+/// one that carries them keeps both.
+#[test]
+fn a_capture_reads_with_or_without_the_transport_facts() {
+    let with = |fields: &str| {
+        format!(
+            r#"{{"type":"ContextCaptured","producer":"main_llm","model":"m","context_window":0,
+            "sections":[],"estimated_total_tokens":0{fields}}}"#
+        )
+    };
+    let facts = |event: ThreadEvent| match event {
+        ThreadEvent::ContextCaptured {
+            ttft_ms,
+            request_id,
+            ..
+        } => (ttft_ms, request_id),
+        other => panic!("expected ContextCaptured, got {other:?}"),
+    };
+    let old: ThreadEvent = serde_json::from_str(&with("")).unwrap();
+    assert_eq!(facts(old), (None, None));
+    let new: ThreadEvent =
+        serde_json::from_str(&with(r#","ttft_ms":412,"request_id":"req_abc""#)).unwrap();
+    assert_eq!(facts(new), (Some(412), Some("req_abc".to_string())));
+}
+
+/// A failed call's row names facts and enums only. Its wire shape is the
+/// contract the exporter and `system-knowhow/thread-events.md` read.
+#[test]
+fn a_model_call_failed_row_carries_facts_and_no_text() {
+    let event = ThreadEvent::ModelCallFailed {
+        model: "claude-opus-5-5".to_string(),
+        purpose: crate::engine::ContextPurpose::Turn,
+        provider: Some("claude-gateway".to_string()),
+        reasoning_effort: None,
+        duration_ms: 900,
+        attempts: 4,
+        failure: crate::llm::call_trace::CallFailure::Http,
+        status_code: Some(529),
+        request_id: None,
+    };
+    assert_eq!(event.event_type(), "ModelCallFailed");
+    assert!(event.is_persisted());
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "ModelCallFailed");
+    assert_eq!(json["failure"], "http");
+    assert_eq!(json["status_code"], 529);
+    assert!(json.get("purpose").is_none(), "a turn writes no purpose");
+    assert!(json.get("request_id").is_none(), "absent stays absent");
+    assert!(json.get("reasoning_effort").is_none());
+    let strings: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|_| key.as_str()))
+        .collect();
+    assert_eq!(strings, ["failure", "model", "provider", "type"]);
+    let ThreadEvent::ModelCallFailed {
+        failure, attempts, ..
+    } = serde_json::from_value(json).unwrap()
+    else {
+        panic!("expected ModelCallFailed");
+    };
+    assert_eq!(failure, crate::llm::call_trace::CallFailure::Http);
+    assert_eq!(attempts, 4);
 }
 
 /// An auxiliary row does write the key, which is what the transcript filter

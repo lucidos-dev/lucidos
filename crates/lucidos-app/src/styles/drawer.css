@@ -577,8 +577,10 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     min-width: 0;
 }
 
+/* The weight is the `drawer-title` theme part. A heavier one wraps sooner, so
+ * nothing here may cap the title's height. */
 .thread-row-title {
-    font-weight: 400;
+    font-weight: var(--part-drawer-title-font-weight, 400);
     overflow-wrap: break-word;
     word-break: break-word;
 }

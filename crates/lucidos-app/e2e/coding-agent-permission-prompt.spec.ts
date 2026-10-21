@@ -1,5 +1,5 @@
 import { test, expect, request as pwRequest } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, getBaseUrl, isMobileViewport } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, getBaseUrl } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -203,7 +203,6 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
   // because it is always ringed, so this test asserts the ring as hard as it
   // asserts the resolution.
   test('Allow once takes visible keyboard focus, arrows step, Enter resolves', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'choice-card keyboard focus is desktop-only (no hardware keyboard on mobile)');
     await assertHealthy(page);
 
     const suffix = randomUUID().slice(0, 8);

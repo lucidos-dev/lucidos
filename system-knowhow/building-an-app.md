@@ -26,7 +26,7 @@ When unsure, ask one question, then act: "Do you want to open this regularly, or
 
 A *widget* is an app that lives in the thread that made it. It is not in the apps list. `create_app` with `kind: "widget"` makes one and records this thread as its origin. Embed it in your reply, `![Name](app:<id>)`, and it shows there as an *inline widget*: a bar with its name and menu, and the widget under it. The frame is as tall as the content, so it never scrolls inside. Past about one phone screen, it clips with a fade and an Expand button that opens the widget full size in Canvas.
 
-A widget has a chip on the thread's *widget shelf*, under the title, only once pinned. Embedding one adds no chip. The *home thread* draws no shelf: a widget pinned to Home is a tile on the *Home board*. That board stays in view in a rail beside everything on desktop, and on Home's board face on a phone. So a tile may sit beside any screen, at the width of two board cells.
+A widget has a chip on the thread's *widget shelf*, under the title, only once pinned. Embedding one adds no chip. The *home thread* draws no shelf: a widget the user wants in view goes on one of the two *dashboards*, each with its own tiles. The desktop dashboard stays in view in a rail beside everything, and the phone one is a sheet the user opens over any thread. So a tile may sit beside any screen, at the width of two cells.
 
 **When to choose one.**
 - A comparison or a dataset that is easier to scan and click than to read: a fare comparison, a week's trend, a chart with a toggle.
@@ -77,7 +77,7 @@ const { clip } = lucidos.params();   // {} when the widget was given none
 
 The host carries them in the frame URL, so they are visible there. Never put a credential in a param. Params over 2 KB are refused: put large data in a file and pass its path.
 
-**Sizes: how big its Home board tile may be.** A widget pinned to Home is a tile on the *Home board*, at one of three *widget sizes*: `small` (one square cell), `medium` (two cells wide, one high) or `large` (two by two). A widget that declares none takes all three and starts medium, so draw for each. Declare `sizes` only to drop one the widget cannot draw well, default first, with `create_app`'s `sizes` or in the manifest. Only a widget takes sizes, and each name may appear once.
+**Sizes: how big its dashboard tile may be.** A widget on a *dashboard* is a tile at one of three *widget sizes*: `small` (one square cell), `medium` (two cells wide, one high) or `large` (two by two). A widget that declares none takes all three and starts medium, so draw for each. Declare `sizes` only to drop one the widget cannot draw well, default first, with `create_app`'s `sizes` or in the manifest. Only a widget takes sizes, and each name may appear once.
 
 ```json
 { "name": "Clock", "kind": "widget", "sizes": ["small", "medium"], "transparent": true }
@@ -85,13 +85,13 @@ The host carries them in the frame URL, so they are visible there. Never put a c
 
 **Transparent: a widget with its own shape.** A tile draws a rounded surface behind the widget. Set `"transparent": true` for a widget that draws its own shape, such as a round clock: its tile and page are then see-through. Give the shape a fill of its own.
 
-**The size contract on the Home board.** Five rules:
+**The size contract on a dashboard.** Five rules:
 
 1. The tile sets the box, and the frame fills it exactly. A content-size report never sizes a tile.
 2. Draw for the size you are told, under `html[data-widget-size="small"]` and its siblings or with `lucidos.widget.size()`. Never scroll inside a tile.
 3. Content past the tile is clipped under a fade. The tile's menu offers Open in Canvas, which opens the widget full size.
-4. A layout may ask for a size the widget no longer declares, as after an update. The tile then shows the nearest smaller declared size, else the nearest larger.
-5. Sizes are names, never pixels. A cell is one size in rem at every board width, and a narrower board shows fewer columns.
+4. A dashboard may ask for a size the widget no longer declares, as after an update. The tile then shows the nearest smaller declared size, else the nearest larger.
+5. Sizes are names, never pixels. A cell is one size in rem at every dashboard width, and a narrower dashboard shows fewer columns.
 
 **A tap leads into the work.** A tile is a way in: tapping a row opens its thread or app with `lucidos.ui.navigate` (`system-knowhow/js-sdk.md` § lucidos.ui). Keep a tile live from data the workspace holds: a trigger fetches, writes to `data/` and emits an event, and the widget re-reads on that event. A tile that polls on a timer keeps a renderer busy for nothing, so stop timers when `lucidos.widget.onVisibility` says it is hidden.
 
@@ -112,17 +112,24 @@ The host carries them in the frame URL, so they are visible there. Never put a c
 | Open in Canvas, full size (Expand does the same) | `navigate_ui` to the widget's id |
 | Make reusable, offering it to every thread | `widgets(action="make_reusable")` |
 | Show a widget in this thread | Embed it in your reply: `![Name](app:<id>)` |
-| Pin to shelf, for a widget the user will come back to in this thread (Pin to Home in the home thread) | `widgets(action="pin")` |
-| Pin to Home from another thread: a tile on the Home board. A widget that belongs to its thread is made reusable first | `widgets(action="pin", thread_id=<the home thread>)` |
-| Arrange the Home board: order, size, hide on phone or desktop. Only when the user asks in this turn | `widgets(action="arrange")`, after `widgets(action="board")` |
-| Unpin from shelf (the inline widget stays; Unpin from Home in the home thread) | `widgets(action="unpin")` |
+| Pin to shelf, for a widget the user will come back to in this thread. Not in the home thread, which has no shelf | `widgets(action="pin")` |
+| Add to dashboard, from any thread: a tile on the phone or desktop dashboard. A widget that belongs to its thread is made reusable first | `widgets(action="add_to_dashboard")`, with `dashboard` when the user names one |
+| Remove from dashboard: that dashboard only | `widgets(action="remove_from_dashboard")` |
+| Arrange a dashboard: order and size. Only when the user asks in this turn | `widgets(action="arrange")`, after `widgets(action="dashboard")` |
+| Unpin from shelf (the inline widget stays) | `widgets(action="unpin")` |
 | Make app | Build a new app with `create_app`, reading the widget's files. The widget stays as it is. |
 
 An embed, a pin and an unpin take params and a label too: one set of params is one *widget instance*, with its own inline widget and chip. `![Marin](app:lucidos-sound-player?params={"clip":"artifacts/voices/marin.mp3"})` shows that player with that clip.
 
 `widgets(action="thread")` lists the *thread widgets*: every instance pinned in a thread, or shown there by an old `WidgetShown`, and which are pinned.
 
+The four dashboard actions take an optional `dashboard`, `phone` or `desktop`. Leave it out and they use the *last used device*'s dashboard. A turn with no device, such as a trigger run, must name one.
+
 Deleting the thread deletes its own widgets. A reusable widget, and an app made from a widget, stay.
+
+**Put an app on a dashboard as a shortcut.** Any app, not only a widget, can sit on a dashboard as an *app shortcut*. It shows the app's icon and name on the rail with no border, and a tap opens the app in the Canvas. The user adds one from the dashboard's Add, which lists apps under the widgets. An app row's Add to dashboard in the Apps panel does the same.
+
+You add one with `widgets(action="add_to_dashboard")` and the app's id. A shortcut is a quarter tile: four fill one small cell. It never runs the app in the tile, takes no `params`, and cannot be resized. `widgets(action="dashboard")` lists each tile with its `kind`, `widget` or `app`. A deleted app's shortcut drops off.
 
 ## Questions to settle with the user before creating
 
@@ -201,7 +208,8 @@ Don't design on paper. Scaffold the smallest thing that shows the idea (`create_
           border-radius: var(--radius-md);
           padding: var(--space-lg);
         }
-        .row { display: flex; gap: var(--space-sm); margin-top: var(--space-md); }
+        /* sdk-iframe.css stops sideways page scroll; rows still wrap. */
+        .row { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-md); }
       </style>
     </head>
     <body>
@@ -248,7 +256,16 @@ Lucidos renders the icon as an `<img>`, so script inside an SVG never runs.
 
 ## Responsive by default: a phone is a first-class target
 
-An app opens in the *content pane*. On a laptop that is one column of a split layout; on a phone it is a full-width swipe pane. The same markup serves both, so build for the narrow case and let it grow. **The shared stylesheet does not do this for you**: `sdk-iframe.css` has exactly two width breakpoints, both for markdown tables. An app that reads well only at desk width is a defect, like a hardcoded hex.
+An app opens in the *content pane*. On a laptop that is one column of a split layout; on a phone it is a full-width swipe pane. The same markup serves both, so build for the narrow case and let it grow. **The shared stylesheet does not lay it out for you**: `sdk-iframe.css` has exactly two width breakpoints, both for markdown tables. An app that reads well only at desk width is a defect, like a hardcoded hex.
+
+**The page never scrolls sideways.** `sdk-iframe.css` clips `<html>` and `<body>` on the x axis and caps images and video at `max-width: 100%`. So a too-wide element is **cut off** at the right edge, not scrollable. The clip hides the bug; it does not fix it. When something is cut off, find the element and fix it:
+
+- **Text that can grow wraps or shrinks.** Never put `flex: none` and `white-space: nowrap` on text that holds user data or a free-text note: it grows to the text's width. Use `flex: 0 1 auto; min-width: 0;` and let it wrap, or ellipsize it with `overflow: hidden; text-overflow: ellipsis`.
+- **A flex or grid child that should shrink takes `min-width: 0`.** Its default minimum is its content width, so one long word holds the whole row open.
+- **Never size with `100vw`.** It ignores the pane's padding. Use `width: 100%`.
+- **A sideways scroller is its own element.** A chip row or a wide table goes in a container with `overflow-x: auto`, and only that container scrolls.
+- **Lock page scroll on `<html>`, never `<body>`.** For a modal, set `document.documentElement.style.overflow = 'hidden'`. A `body { overflow: hidden }` lock no longer reaches the page, so the page scrolls on behind the modal.
+- **Check at 320px.** That is the narrowest phone. Look for anything cut off at the right edge.
 
 Six rules cover almost every app:
 
@@ -539,6 +556,7 @@ While the app coding-agent thread is open, the user can preview the in-flight ap
 - **Hardcoding a `font-family` stack on `body`.** It looks like ordinary boilerplate, but it replaces the user's chosen font with the system one, with no error. **Delete the declaration; don't fix the stack.** See *Scaffolding defaults* item 3.
 - **Sizing in `px`, or picking magic `font-size` numbers instead of the type scale.** `px` ignores the user's UI-scale preference. A hand-dialed `0.95rem` drifts off the shared scale, so a title ends up subtly off from the same element elsewhere. See *Scaffolding defaults* item 5.
 - **Building for the desktop pane only, and never checking phone width.** A fixed multi-column layout looks fine in a wide preview pane and overflows on a phone, where the user meets it just as often. See *Responsive by default*.
+- **A `flex: none` nowrap pill holding free text.** The page cannot scroll sideways, so the pill is cut off at the right edge instead. Let it shrink and wrap. See *Responsive by default*.
 - **Putting a control in the top-right corner, or pinning one to a side edge.** The exit-fullscreen button covers the corner, and it is the user's only way out on iOS. On mobile, the back-gesture guards take edge taps first. See *The host paints over a fullscreen app*.
 - **Hand-rolling a secondary button, *or* writing `.action-btn-secondary` without the base class.** Don't invent an outlined or ghost button with `var(--accent)`. Write `class="action-btn action-btn-secondary"`: a lone variant falls back to a plain grey browser button. See *Scaffolding defaults* item 4.
 - **Showing the current sort, filter or view as a blue `.action-btn`.** Users read it as a button to press. Use `.segmented-control` or `.pill-bar`. See *Scaffolding defaults* item 4.

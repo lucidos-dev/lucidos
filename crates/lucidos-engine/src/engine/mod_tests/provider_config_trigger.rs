@@ -3,6 +3,7 @@
 use crate::core::prefs;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::provider_config_trigger;
+use crate::llm::claude_gateway::account::ClaudeGatewaySignOutReason;
 
 fn pref(key: &str) -> BusEvent {
     BusEvent::System(SystemEvent::PreferencesChanged {
@@ -58,6 +59,29 @@ fn a_provider_preference_triggers_a_rebuild() {
     }
 }
 
+/// A Claude gateway sign-in or sign-out installs or drops the gateway. A
+/// token refresh announces nothing, so it rebuilds nothing.
+#[test]
+fn a_claude_gateway_sign_in_or_out_triggers_a_rebuild() {
+    let issuer = "https://gateway.example".to_string();
+    for event in [
+        SystemEvent::ClaudeGatewaySignedIn {
+            issuer: issuer.clone(),
+            email: None,
+            actor: None,
+        },
+        SystemEvent::ClaudeGatewaySignedOut {
+            issuer: issuer.clone(),
+            reason: ClaudeGatewaySignOutReason::Rejected,
+            actor: None,
+        },
+    ] {
+        let trigger = provider_config_trigger(&BusEvent::System(event));
+        assert!(trigger.is_some_and(|t| t.contains("Claude gateway")));
+    }
+    assert!(provider_config_trigger(&pref(prefs::CLAUDE_GATEWAY_URL.key())).is_some());
+}
+
 /// Every other preference leaves the provider alone. The bus carries one on
 /// almost every settings change, and rebuilding on each would discard warm
 /// Vertex tokens for nothing.
@@ -67,6 +91,7 @@ fn an_unrelated_preference_does_not_trigger_a_rebuild() {
         prefs::THEME_MODE.key(),
         prefs::TIMEZONE.key(),
         prefs::CHAT_MODEL.key(),
+        prefs::TRIGGER_MODEL.key(),
         prefs::UI_SCALE.key(),
     ] {
         assert!(provider_config_trigger(&pref(key)).is_none(), "{key}");

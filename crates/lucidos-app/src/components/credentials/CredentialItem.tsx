@@ -20,6 +20,7 @@ function formatAuthType(authType: AuthType): string {
     case 'oauth_client': return 'OAuth Client';
     case 'email_password': return 'Email Password';
     case 'secret': return 'Secret';
+    case 'onepassword_service_account': return '1Password service account';
     default: return authType;
   }
 }
@@ -76,6 +77,8 @@ const COPY_TARGETS: Record<AuthType, CopyTarget[]> = {
   ],
   email_password: [{ label: 'Password' }],
   secret: [{ label: 'Secret' }],
+  // Never copied or revealed: the engine refuses it with a 403 anyway.
+  onepassword_service_account: [],
 };
 
 async function copyCredential(id: string, target: CopyTarget) {
@@ -116,6 +119,7 @@ export function CredentialItem({ credential }: Props) {
             <span class="list-row-url" key={url}>{url}</span>
           ))}
           <span class="list-row-type">{formatAuthType(credential.auth_type)}</span>
+          {credential.secret_reference && <span class="list-row-type">1Password reference</span>}
         </div>
         {/* A sentence, so `.list-row-details-prose` (the bare class is a flex
             row of FIELDS and would blow holes through it). */}

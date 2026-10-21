@@ -39,6 +39,7 @@ const LAZY = [
   'store/actions/find-targets.ts',
   'store/actions/transcript-find.ts',
   'components/chat/CodingAgentControlMenu.tsx',
+  'components/chat/RungControl.tsx',
   'components/chat/LucidosControlMenu.tsx',
   'components/chat/MicrophonePicker.tsx',
   'components/widgets/WidgetMenu.tsx',

@@ -17,7 +17,7 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy } from './he
 /* Three things make the measurement mean what it says.
  *
  * It measures a DELTA. How much space a transcript leaves under its last turn
- * is ADR 0212's decision, and `transcript-ends-where-its-content-ends.spec.ts`
+ * is ADR 0212's decision, and `transcript-ends-where-its-content-ends-all.spec.ts`
  * owns it. This owns only that a hidden label changes neither number.
  *
  * It splices the LABEL alone, never the `.spoken-reply-who` wrapper. That

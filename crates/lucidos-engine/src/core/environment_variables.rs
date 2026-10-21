@@ -366,8 +366,15 @@ fn startup_env_vars() -> &'static [(String, String)] {
 /// that once at startup. Without the removal, a variable deleted since then
 /// still reaches every spawn until the engine restarts. `pairs` is the full env
 /// the caller injects, so an engine-owned var it sets later still wins.
-pub fn apply_to_subprocess_env(cmd: &mut tokio::process::Command, pairs: &[(String, String)]) {
-    apply_env_over_startup(cmd, startup_env_vars(), pairs);
+///
+/// `inherited` also removes the engine's inherited secrets, for a chat or
+/// script subprocess. A name `pairs` sets is kept either way.
+pub fn apply_to_subprocess_env(
+    cmd: &mut tokio::process::Command,
+    pairs: &[(String, String)],
+    inherited: super::InheritedSecrets<'_>,
+) {
+    apply_env_over_startup(cmd, startup_env_vars(), pairs, inherited);
 }
 
 /// What a subprocess inherits for `name` from the engine's own env, when the
@@ -392,10 +399,19 @@ fn apply_env_over_startup(
     cmd: &mut tokio::process::Command,
     startup: &[(String, String)],
     pairs: &[(String, String)],
+    inherited: super::InheritedSecrets<'_>,
 ) {
     let current: std::collections::HashSet<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
-    for (name, _) in startup {
-        if !current.contains(name.as_str()) {
+    let stripped = match inherited {
+        super::InheritedSecrets::Keep => None,
+        super::InheritedSecrets::Strip(snapshot) => Some(snapshot.names()),
+    };
+    let removed = startup
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .chain(stripped.into_iter().flatten());
+    for name in removed {
+        if !current.contains(name) {
             cmd.env_remove(name);
         }
     }
@@ -559,6 +575,9 @@ pub async fn migrate_env_file_to_db(
 /// tool and agent subprocess, deletions included, which is why the pairs are
 /// recorded here.
 pub async fn apply_to_process_env(pool: &PgPool) {
+    // Before any row lands in the process env, so the snapshot holds only
+    // what the engine inherited.
+    super::inherited_secret_env();
     let pairs = match EnvironmentVariableStore::env_pairs(pool).await {
         Ok(pairs) => pairs,
         Err(e) => {
@@ -587,6 +606,7 @@ pub async fn apply_to_process_env(pool: &PgPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{InheritedSecretEnv, InheritedSecrets};
 
     #[test]
     fn valid_names_accepted() {
@@ -763,7 +783,7 @@ mod tests {
         let startup = pairs(&[("ANTHROPIC_MODEL", "old"), ("MY_FLAG", "1")]);
         let current = pairs(&[("MY_FLAG", "2"), ("ADDED_LATER", "x")]);
         let mut cmd = tokio::process::Command::new("true");
-        apply_env_over_startup(&mut cmd, &startup, &current);
+        apply_env_over_startup(&mut cmd, &startup, &current, InheritedSecrets::Keep);
 
         let env: std::collections::HashMap<String, Option<String>> = cmd
             .as_std()
@@ -778,6 +798,46 @@ mod tests {
         assert_eq!(env.get("ANTHROPIC_MODEL"), Some(&None), "deleted: removed");
         assert_eq!(env.get("MY_FLAG"), Some(&Some("2".to_string())));
         assert_eq!(env.get("ADDED_LATER"), Some(&Some("x".to_string())));
+    }
+
+    /// The env a real child prints, after `cmd` inherited `SLACK_USER_TOKEN`
+    /// and `GITHUB_TOKEN` and `inherited` was applied over it.
+    async fn child_env_after(inherited: InheritedSecrets<'_>) -> String {
+        let mut cmd = tokio::process::Command::new("env");
+        // Stands in for the engine's own env, which the child inherits.
+        cmd.env("SLACK_USER_TOKEN", "xoxp-from-the-launch-shell")
+            .env("GITHUB_TOKEN", "inherited-gh-value");
+        let spawn_pairs = pairs(&[("GITHUB_TOKEN", "row-gh-value")]);
+        apply_env_over_startup(&mut cmd, &[], &spawn_pairs, inherited);
+        let output = cmd.output().await.expect("env runs");
+        String::from_utf8(output.stdout).expect("utf-8 env")
+    }
+
+    fn launch_shell_snapshot() -> InheritedSecretEnv {
+        InheritedSecretEnv::capture(pairs(&[
+            ("SLACK_USER_TOKEN", "xoxp-from-the-launch-shell"),
+            ("GITHUB_TOKEN", "inherited-gh-value"),
+        ]))
+    }
+
+    /// A chat or script subprocess loses what the engine inherited, except a
+    /// name its own pairs set: there the spawn's value wins.
+    #[tokio::test]
+    async fn a_stripped_spawn_inherits_no_secret_it_does_not_set() {
+        let snapshot = launch_shell_snapshot();
+        let env = child_env_after(InheritedSecrets::Strip(&snapshot)).await;
+        assert!(!env.contains("SLACK_USER_TOKEN"), "{env}");
+        assert!(env.contains("GITHUB_TOKEN=row-gh-value"), "{env}");
+    }
+
+    /// A coding agent keeps them, since it may authenticate through one.
+    #[tokio::test]
+    async fn a_kept_spawn_still_inherits_the_engine_secrets() {
+        let env = child_env_after(InheritedSecrets::Keep).await;
+        assert!(
+            env.contains("SLACK_USER_TOKEN=xoxp-from-the-launch-shell"),
+            "{env}"
+        );
     }
 
     /// The engine records the config dir a session runs under. A deleted

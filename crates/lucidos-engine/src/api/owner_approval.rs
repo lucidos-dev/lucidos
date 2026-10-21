@@ -14,6 +14,10 @@
 //! - **One act, once, this turn.** The verb and target must match. A unique
 //!   index refuses a second spend. A newer turn start ends an unspent approval.
 //!
+//! One more pick counts, for `spawn-successor` alone: a device's pick of a
+//! plan card's `Implement in a new thread` option (ADR 0493). It follows the
+//! same four properties.
+//!
 //! A question card belongs to the turn that asks it, so the card rides the
 //! agent's own blocking question tool. `lucidos ask-owner-approval` records
 //! the request and prints its id. The agent then asks `AskUserQuestion` with
@@ -31,13 +35,20 @@ use crate::api::thread_reach::{authority_held, ThreadReachVerb};
 use crate::api::AppState;
 use crate::engine::agent_question::is_owner_approval_card;
 use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::engine::thread_events::{EventMeta, MessageOrigin, OwnerApproval, ThreadEvent};
+use crate::engine::thread_events::{
+    AnswerKind, EventMeta, MessageOrigin, OwnerApproval, ThreadEvent,
+};
 
 /// The label of the option whose selection, by a registered device, is the
 /// approval. Matched by label because the engine writes it and the owner
 /// reads it, while an option's id is the question parser's own numbering.
 pub(crate) const ALLOW_ONCE_LABEL: &str = "Allow once";
 pub(crate) const DONT_ALLOW_LABEL: &str = "Don't allow";
+
+/// What a plan card's option label starts with when picking it hands the build
+/// to a successor thread. A device's pick of such an option is the owner's
+/// consent to that one successor. `lucidos planned` offers the label.
+const NEW_THREAD_LABEL_PREFIX: &str = "Implement in a new thread";
 
 /// Every request id starts with this, so the ask route can tell an approval
 /// ask from an ordinary question by its text alone.
@@ -109,6 +120,10 @@ pub(super) async fn spend_owner_approval(
 
 /// The newest live approval on `thread_id` for this verb and target, by card
 /// id. Live means allowed by a device, unspent, and raised in the current turn.
+///
+/// Two picks count. One is Allow once on an engine-worded card for this exact
+/// act. The other, for a successor only, is the pick of a plan card's new
+/// thread option, whose label names the act itself.
 async fn live_owner_approval(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -125,13 +140,16 @@ async fn live_owner_approval(
               AND a.event_type = 'UserQuestionAnswered' \
               AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
          WHERE q.aggregate_id = $1 AND q.event_type = 'UserQuestionAsked' \
-           AND q.payload->'owner_approval'->>'verb' = $2 \
-           AND q.payload->'owner_approval'->>'target_thread_id' IS NOT DISTINCT FROM $3::text \
            AND a.payload->'answer'->>'kind' = 'Selected' \
            AND a.payload->'actor'->>'kind' = 'device' \
            AND EXISTS ( \
                  SELECT 1 FROM jsonb_array_elements(q.payload->'options') o \
-                 WHERE o->>'id' = a.payload->'answer'->>'option_id' AND o->>'label' = $4) \
+                 WHERE o->>'id' = a.payload->'answer'->>'option_id' \
+                   AND ((q.payload->'owner_approval'->>'verb' = $2 \
+                         AND q.payload->'owner_approval'->>'target_thread_id' \
+                             IS NOT DISTINCT FROM $3::text \
+                         AND o->>'label' = $4) \
+                        OR ($5 AND starts_with(o->>'label', $6)))) \
            AND q.sequence > COALESCE(( \
                  SELECT MAX(sequence) FROM events WHERE aggregate_id = $1 AND {opens} \
                ), 0) \
@@ -147,6 +165,8 @@ async fn live_owner_approval(
         .bind(verb_wire(verb))
         .bind(target.map(|t| t.to_string()))
         .bind(ALLOW_ONCE_LABEL)
+        .bind(verb == ThreadReachVerb::SpawnSuccessor)
+        .bind(NEW_THREAD_LABEL_PREFIX)
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
@@ -422,31 +442,73 @@ const OWNER_APPROVAL_IS_THE_OWNERS: &str =
      own devices. Its Allow lets a thread act outside its subtree, so no agent may press \
      it, including the one that raised it.";
 
-/// Who is answering this card. On an owner approval card, anyone but the
-/// owner at a registered device is refused, because its Allow is spendable
-/// authority. A card that cannot be classified is refused rather than read as
-/// an ordinary one.
+/// What an agent is told when it tries to pick a plan card's new-thread option.
+const NEW_THREAD_PICK_IS_THE_OWNERS: &str =
+    "Picking an `Implement in a new thread` option lets the thread start its successor, so \
+     only the workspace owner may pick it, from one of their own devices.";
+
+/// Is this answer the pick of an option whose label opens with the new-thread
+/// prefix? Only a `Selected` answer can be one.
+async fn picks_new_thread_option(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    tool_use_id: &str,
+    answer: &AnswerKind,
+) -> Result<bool, sqlx::Error> {
+    let AnswerKind::Selected { option_id } = answer else {
+        return Ok(false);
+    };
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM events q, jsonb_array_elements(q.payload->'options') o \
+           WHERE q.aggregate_id = $1 AND q.event_type = 'UserQuestionAsked' \
+             AND q.payload->>'tool_use_id' = $2 \
+             AND o->>'id' = $3 AND starts_with(o->>'label', $4))",
+    )
+    .bind(thread_id.to_string())
+    .bind(tool_use_id)
+    .bind(option_id)
+    .bind(NEW_THREAD_LABEL_PREFIX)
+    .fetch_one(pool)
+    .await
+}
+
+/// Who is answering this card. An answer that can grant authority is refused
+/// to anyone but the owner at a registered device. Those are any answer to an
+/// owner approval card, and a pick of a new-thread option. A card that cannot
+/// be classified is refused rather than read as an ordinary one.
 pub(in crate::api) async fn answering_actor(
     pool: &sqlx::PgPool,
     headers: &HeaderMap,
     thread_id: Uuid,
     tool_use_id: &str,
+    answer: &AnswerKind,
 ) -> Result<Option<MessageOrigin>, ApiError> {
-    let approval_card = is_owner_approval_card(pool, thread_id, tool_use_id)
+    let unreadable = |e: sqlx::Error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not read the question card: {e}"),
+        )
+    };
+    let refusal = if is_owner_approval_card(pool, thread_id, tool_use_id)
         .await
-        .map_err(|e| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not read the question card: {e}"),
-            )
-        })?;
-    if !approval_card {
+        .map_err(unreadable)?
+    {
+        Some(OWNER_APPROVAL_IS_THE_OWNERS)
+    } else if picks_new_thread_option(pool, thread_id, tool_use_id, answer)
+        .await
+        .map_err(unreadable)?
+    {
+        Some(NEW_THREAD_PICK_IS_THE_OWNERS)
+    } else {
+        None
+    };
+    let Some(refusal) = refusal else {
         return Ok(crate::api::actor::user_actor(headers, None));
-    }
+    };
     crate::api::actor::require_owner_device(headers, pool)
         .await
         .map(Some)
-        .map_err(|_| ApiError::new(StatusCode::FORBIDDEN, OWNER_APPROVAL_IS_THE_OWNERS))
+        .map_err(|_| ApiError::new(StatusCode::FORBIDDEN, refusal))
 }
 
 pub(super) fn router() -> axum::Router<AppState> {

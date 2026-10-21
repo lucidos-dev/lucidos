@@ -177,6 +177,19 @@ impl LucidosEngine {
                                 match engine.claim_thread_for_spawn(thread_id, None).await {
                                     Ok(Some(claim)) => break Ok(claim),
                                     Err(e) => break Err(e),
+                                    Ok(None) if continue_reason.as_deref()
+                                        == Some(crate::engine::agent_recovery::EFFORT_RESTART_REASON) =>
+                                    {
+                                        // The live run started after the pick, so
+                                        // it already runs at the new effort, and
+                                        // its start delivered any discarded input.
+                                        crate::log!(
+                                            "[SpawnConsumer] Effort resume thread={} event={} found a live run, nothing to resume",
+                                            thread_id,
+                                            event_id
+                                        );
+                                        return;
+                                    }
                                     Ok(None) => {
                                         // A live run holds the thread, and reads
                                         // the input as a follow-up.
@@ -333,19 +346,33 @@ impl LucidosEngine {
                             //
                             // Try again after a start failure delivers the
                             // message the agent never read, with its images.
-                            // The agent saw nothing of it, so the bare
-                            // continue message would leave the request lost.
-                            let undelivered = if continue_reason.as_deref()
-                                == Some(crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON)
-                            {
-                                crate::engine::agent_recovery::undelivered_input_after_start_failure(
-                                    engine.pool(),
-                                    thread_id,
-                                )
-                                .await
-                            } else {
-                                None
+                            // The effort resume delivers what the store says
+                            // the pick discarded. The agent saw nothing of it,
+                            // so the bare continue message would leave the
+                            // request lost. The first prompt carries the
+                            // inputs' ids, so its read settles them.
+                            let undelivered = match continue_reason.as_deref() {
+                                Some(
+                                    crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON,
+                                ) => {
+                                    crate::engine::agent_recovery::undelivered_input(
+                                        engine.pool(),
+                                        thread_id,
+                                    )
+                                    .await
+                                }
+                                Some(crate::engine::agent_recovery::EFFORT_RESTART_REASON) => {
+                                    crate::engine::agent_recovery::discarded_input(
+                                        engine.pool(),
+                                        thread_id,
+                                    )
+                                    .await
+                                }
+                                _ => None,
                             };
+                            let carried_event_ids = undelivered
+                                .as_ref()
+                                .map_or(&[][..], |u| u.event_ids.as_slice());
                             let continue_images = undelivered
                                 .as_ref()
                                 .and_then(|u| engine.resolve_queued_image_hashes(&u.image_hashes));
@@ -371,6 +398,7 @@ impl LucidosEngine {
                                             &continue_input,
                                             continue_images.as_deref(),
                                             event_id,
+                                            carried_event_ids,
                                             None,
                                             &cancel_token,
                                             conflict_claim.as_ref(),
@@ -436,6 +464,7 @@ impl LucidosEngine {
                                                 &retry_text,
                                                 continue_images.as_deref(),
                                                 event_id,
+                                                carried_event_ids,
                                                 None,
                                                 &cancel_token,
                                                 conflict_claim.as_ref(),
@@ -759,20 +788,12 @@ impl LucidosEngine {
         .await;
     }
 
-    // Boot wiring with ONE call site (`main.rs`), and no two parameters share a
-    // type — so the argument-swap mistake this lint guards against is a compile
-    // error here, not a runtime bug. Bundling them into a params struct would
-    // buy nothing the type checker isn't already enforcing.
-    #[allow(clippy::too_many_arguments)]
+    /// Builds the LLM provider from `provider_ctx` only after the secret store
+    /// key loads, because a stored provider key is a sealed secret (ADR 0509).
     pub async fn new(
         workspace_path: PathBuf,
         database_url: &str,
-        llm: Arc<dyn LlmProvider>,
-        web_search: Arc<crate::llm::WebSearchChain>,
-        vertex_project_id: String,
-        vertex_location: crate::llm::vertex::LocationHandle,
-        vertex_token_cache: Option<crate::llm::vertex::TokenCache>,
-        model_registry: crate::llm::model_registry::ModelRegistry,
+        provider_ctx: crate::llm::ProviderBuildContext,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Install the subprocess-origin token before anything spawns a
         // subprocess. See `api::actor` module docs.
@@ -796,8 +817,8 @@ impl LucidosEngine {
             );
         }
 
-        // `.lucidos/` holds `backup.key`, so it must not reach a Time Machine
-        // snapshot beside the credential database (ADR 0153). Runs on every
+        // `.lucidos/` can still hold a legacy `backup.key` (ADR 0509), so it
+        // must not reach a Time Machine snapshot (ADR 0153). Runs on every
         // boot, which is what converges a workspace created before the ADR.
         // Silent once correct, and never fatal.
         match crate::core::ensure_state_dir_excluded_from_file_backup(&workspace_path) {
@@ -911,13 +932,48 @@ impl LucidosEngine {
                 env!("CARGO_PKG_VERSION"),
             ) {
                 crate::boot_failure::report(&message).await;
+                return Err(message.into());
             }
             return Err(e.into());
         }
         crate::core::migration_marker::record_migrated(&workspace_path, database_url, &pool).await;
+        // Every stored secret is sealed. Without its key the engine refuses to
+        // serve, because serving would lose them (ADR 0509).
+        match crate::core::secret_store::boot::load_workspace_key(&pool, database_url).await {
+            Ok(None) => {}
+            Ok(Some(message)) => {
+                crate::boot_failure::report(&message).await;
+                return Err(message.into());
+            }
+            Err(e) => {
+                if let Some(message) = e.downcast_ref::<sqlx::Error>().and_then(|db| {
+                    crate::boot_failure::terminal_database_error_message(
+                        db,
+                        "the secret check at boot",
+                        env!("CARGO_PKG_VERSION"),
+                    )
+                }) {
+                    crate::boot_failure::report(&message).await;
+                    return Err(message.into());
+                }
+                return Err(e);
+            }
+        }
+        // Every user-entered secret lives only in `credentials`. Older rows
+        // move there now that the key can open them.
+        crate::core::secret_store::one_home::move_at_boot(&pool).await?;
+        crate::core::backup::key::move_legacy_file_at_boot(&workspace_path);
+        // Subprocesses sign in as the agent role, which cannot read a secret
+        // column. Without it, boot fails rather than hand out this role.
+        crate::core::set_agent_database_url(
+            crate::core::agent_role::provision(&pool, database_url).await?,
+        );
         // The boot load in main.rs ran before this migrator. On a fresh database
         // it found no `models` table, and every model would read as unknown.
-        crate::llm::model_registry::reload(&model_registry, &pool).await;
+        crate::llm::model_registry::reload(&provider_ctx.model_registry, &pool).await;
+        // The router reads it from its first call, so a restart keeps the
+        // not-found window (ADR 0403).
+        crate::engine::aux_purpose::seed_not_served(&pool, &provider_ctx.not_served).await;
 
         let event_store = EventStore::new(pool.clone());
 
@@ -925,6 +981,7 @@ impl LucidosEngine {
         // backfill can route through `replay_historical_event` instead of
         // bypassing the bus.
         let (event_bus, parent_callback_rx) = event_bus::EventBus::new(pool.clone());
+        crate::core::secret_reference::install_notice_bus(&event_bus);
 
         // One-shot, idempotent: convert legacy base64 image payloads
         // (MessageReceived.user_images, thread_summaries.compose_images) to
@@ -1300,6 +1357,37 @@ impl LucidosEngine {
         // states that migrations sit outside the announcement rule.
         crate::core::grants::migration::run(user_dir.as_deref(), &workspace_path);
 
+        // One factory, so every gateway access shares one refresh lock. The
+        // runtime credential subscriber rebuilds from the same context, so a
+        // hot-swapped provider matches a fresh boot.
+        let claude_gateway_access = claude_gateway_access_factory(pool.clone(), event_bus.clone());
+        let provider_build_ctx = crate::llm::ProviderBuildContext {
+            claude_gateway_access: Some(claude_gateway_access.clone()),
+            ..provider_ctx
+        };
+        let crate::llm::ProviderBuildContext {
+            vertex_project_id,
+            vertex_location,
+            vertex_token_cache,
+            model_registry,
+            ..
+        } = provider_build_ctx.clone();
+
+        let (llm, web_search) =
+            match crate::llm::build_active_provider(Some(&pool), &provider_build_ctx).await? {
+                crate::llm::ProviderBuildOutcome::Install {
+                    llm,
+                    web_search,
+                    selection,
+                } => {
+                    log!("[Startup] LLM provider installed: {:?}", selection);
+                    (llm, web_search)
+                }
+                crate::llm::ProviderBuildOutcome::FailFast => {
+                    return Err(crate::llm::NO_PROVIDER_AT_BOOT.into())
+                }
+            };
+
         // Wrap the active provider in the swappable handle BEFORE the struct is
         // assembled, so the credential subscriber below shares the very handle
         // stored on `Self.llm` and its writes are seen by every read site.
@@ -1309,24 +1397,6 @@ impl LucidosEngine {
         // subscriber, so a credential change reaches every read site.
         let web_search_handle: Arc<std::sync::RwLock<Arc<crate::llm::WebSearchChain>>> =
             Arc::new(std::sync::RwLock::new(web_search));
-
-        // Inputs the runtime credential subscriber needs to rebuild a provider
-        // identical to a fresh boot. Env-stable and mirror `main.rs`; the shared
-        // handles (Vertex location/token cache, model registry) are cloned so the
-        // rebuilt provider tracks live region/registry updates and reuses warm
-        // Vertex tokens. Clone everything here — the originals are moved into the
-        // other subscribers / `Self` below.
-        let default_model = std::env::var("LUCIDOS_MODEL")
-            .unwrap_or_else(|_| crate::core::prefs::CHAT_MODEL.default_text().to_string());
-        let provider_build_ctx = crate::llm::ProviderBuildContext {
-            model_is_mock: default_model == crate::llm::MOCK_MODEL,
-            default_model,
-            vertex_project_id: vertex_project_id.clone(),
-            vertex_location: vertex_location.clone(),
-            vertex_token_cache: vertex_token_cache.clone(),
-            model_registry: model_registry.clone(),
-            boot_without_provider: crate::llm::boot_without_provider_enabled(),
-        };
 
         // Kept out of the ctx move below: the engine holds its own handle to the
         // same shared map so the context trimmer can read each model's declared
@@ -1339,6 +1409,23 @@ impl LucidosEngine {
             pool.clone(),
         );
         spawn_models_registry_subscriber(event_bus.subscribe(), model_registry, pool.clone());
+        crate::engine::claude_gateway_sign_in::spawn_url_change_sign_out(
+            event_bus.subscribe(),
+            pool.clone(),
+            event_bus.clone(),
+        );
+        crate::llm::claude_gateway::gateway_managed_settings::spawn_refresh_task(
+            event_bus.subscribe(),
+            pool.clone(),
+            event_bus.clone(),
+            claude_gateway_access.clone(),
+        );
+        crate::llm::claude_gateway::telemetry::exporter::spawn_exporter(
+            event_bus.subscribe(),
+            pool.clone(),
+            claude_gateway_access,
+        )
+        .await;
 
         // Hot-swap the active LLM provider when a provider credential or a
         // provider preference changes at runtime, which is the whole point of
@@ -1502,10 +1589,12 @@ impl LucidosEngine {
             proxy_token_cache: Arc::new(crate::api::proxy_token_cache::ProxyTokenCache::new()),
             wasm_engine,
             pending_captures: Arc::default(),
+            claude_gateway_sign_in: Arc::default(),
             pending_installs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_uninstalls: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             frontend_origin: std::sync::Mutex::new(None),
             agent_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sent_device_contexts: Arc::default(),
             apply_claims: Arc::default(),
             view_snapshots: Default::default(),
             find_cache: Default::default(),

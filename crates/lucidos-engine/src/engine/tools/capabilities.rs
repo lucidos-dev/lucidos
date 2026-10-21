@@ -1,22 +1,16 @@
 //! Resolving the workspace's [`ToolCapabilities`], the gate inputs the tool
 //! registry reads (ADR 0088).
 //!
-//! One resolver, used by the chat turn and by the intent sub-loop, so the two
-//! cannot disagree about what this workspace can do. It reads workspace
-//! configuration and nothing thread-shaped, which is what keeps every thread
-//! in the workspace on one byte-identical tools array.
+//! One resolver, read once per turn. It reads workspace configuration and
+//! nothing thread-shaped, which is what keeps every thread in the workspace on
+//! one byte-identical tools array.
 
 use crate::core::{EmailStore, Intent, IntentStore};
 use crate::engine::LucidosEngine;
 use crate::llm::ToolCapabilities;
 
 /// One turn's capability read: the gates the tool registry needs, and the
-/// intent snapshot the `Intent` gate was derived from.
-///
-/// The snapshot travels with the gate deliberately. The prompt's "Available
-/// Intents" listing and the `execute_intent` tool must agree, and two separate
-/// scans of `data/` can disagree inside one turn. An intent created between
-/// them leaves the prompt telling the model to call a tool it was not offered.
+/// intent snapshot the prompt's "Available Intents" listing renders.
 pub(crate) struct TurnCapabilities {
     pub gates: ToolCapabilities,
     pub intents: Vec<Intent>,
@@ -67,7 +61,6 @@ impl LucidosEngine {
         TurnCapabilities {
             gates: ToolCapabilities {
                 email_account,
-                intent: !intents.is_empty(),
                 image_provider: self.current_image_provider().await.is_some(),
                 judgment_provider: crate::llm::judgment::judgment_available(&self.pool).await,
                 context_mode,

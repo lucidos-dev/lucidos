@@ -1,5 +1,5 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, hideHomeRail, minThreadPane, navigateToApp, newThread, waitForVisibleInput, isMobileViewport } from './helpers';
+import { assertHealthy, hideDashboardRail, minThreadPane, navigateToApp, newThread, waitForVisibleInput } from './helpers';
 
 /** The composer's height is only ever right for the width it was measured at.
  *  Narrow the Conversation pane and the same paragraph needs more lines; widen
@@ -65,12 +65,11 @@ test.describe('the composer re-measures when its pane changes width', () => {
       localStorage.setItem('lucidos-split-ratio', '0.4');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
     });
-    await hideHomeRail(page);
+    await hideDashboardRail(page);
     await navigateToApp(page);
   });
 
   test('a draft is neither clipped when narrowed nor left tall when widened', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'the split layout is desktop-only');
 
     await newThread(page);
     const input = await waitForVisibleInput(page);
@@ -100,7 +99,6 @@ test.describe('the composer re-measures when its pane changes width', () => {
   // has to end at the composer's own height, never at the `max-height: 40vh`
   // cap a per-character measurement lands on.
   test('collapsing the pane and reopening it leaves the composer its own height', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'the split layout is desktop-only');
 
     await newThread(page);
     const input = await waitForVisibleInput(page);

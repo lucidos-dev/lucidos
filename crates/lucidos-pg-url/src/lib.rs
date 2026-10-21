@@ -14,11 +14,45 @@
 //! persisted in tool-call payloads and shown in the steps UI.
 //!
 //! [`PgUrl::read_only_url`] renders the URL the engine hands its agents as
-//! `LUCIDOS_DATABASE_URL` (ADR 0481).
+//! `LUCIDOS_DATABASE_URL` (ADR 0481), signed in as the database's
+//! [`agent_role`] (ADR 0509).
 
 use std::path::PathBuf;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The group every agent role belongs to. The packaged cluster's `pg_hba.conf`
+/// lets its members sign in with a password over the socket.
+pub const AGENT_ROLE_GROUP: &str = "lucidos_agents";
+
+/// The longest name Postgres keeps whole (`NAMEDATALEN - 1`). It cuts a
+/// longer one short, silently.
+pub const PG_MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// The role agents, scripts and triggers use for `database`: it reads and
+/// writes everything but the secret columns (ADR 0509). The engine creates it
+/// at boot; the gateway drops it with the database.
+///
+/// A name too long for Postgres keeps a prefix of the database name and a
+/// hash of the whole. So two long names never share a role.
+pub fn agent_role(database: &str) -> String {
+    const SUFFIX: &str = "_agent";
+    let whole = format!("{database}{SUFFIX}");
+    if whole.len() <= PG_MAX_IDENTIFIER_BYTES {
+        return whole;
+    }
+    let hash = format!("_{:016x}", fnv1a(database.as_bytes()));
+    let room = PG_MAX_IDENTIFIER_BYTES - SUFFIX.len() - hash.len();
+    let prefix = &database[..database.floor_char_boundary(room)];
+    format!("{prefix}{hash}{SUFFIX}")
+}
+
+/// 64-bit FNV-1a: stable across releases, which a role name must be.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
 
 /// The port libpq assumes when a URL names none.
 pub const DEFAULT_PORT: u16 = 5432;
@@ -272,6 +306,19 @@ fn parse_port(text: &str, url: &str) -> Result<u16, BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_role_always_fits_and_never_collides() {
+        assert_eq!(agent_role("lucidos_e2e-test"), "lucidos_e2e-test_agent");
+        let longest = format!("lucidos_{}", "a".repeat(55));
+        let sibling = format!("lucidos_{}b", "a".repeat(54));
+        for long in [&longest, &sibling] {
+            let role = agent_role(long);
+            assert_eq!(role.len(), PG_MAX_IDENTIFIER_BYTES, "{role}");
+            assert!(role.ends_with("_agent"));
+        }
+        assert_ne!(agent_role(&longest), agent_role(&sibling));
+    }
 
     fn env_map(url: &str) -> std::collections::HashMap<&'static str, String> {
         PgUrl::parse(url).unwrap().env().into_iter().collect()

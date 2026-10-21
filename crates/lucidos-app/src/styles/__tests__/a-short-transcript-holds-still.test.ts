@@ -6,7 +6,7 @@
  *
  * A source scan, because what it pins is which declarations are ABSENT. Where
  * the turns actually come to rest is measured instead, on every project, by
- * e2e/transcript-ends-where-its-content-ends.spec.ts.
+ * e2e/transcript-ends-where-its-content-ends-all.spec.ts.
  */
 
 /* The rules banned here were live for one day, as `min-height: 100%` plus

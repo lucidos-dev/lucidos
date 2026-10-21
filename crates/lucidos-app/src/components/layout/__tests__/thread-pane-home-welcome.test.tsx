@@ -16,6 +16,7 @@ import { ThreadPane } from '../ThreadPane';
 import { focusedThreadId, preferences, threadMap } from '../../../store/store';
 import type { StoredEvent } from '../../../store/thread-events';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
+import { viewportIsMobile } from '../../../utils/viewport';
 
 let host: HTMLDivElement;
 
@@ -40,6 +41,7 @@ afterEach(() => {
   focusedThreadId.value = null;
   threadMap.value = new Map();
   preferences.value = { status: 'not-loaded' };
+  viewportIsMobile.value = false;
 });
 
 describe('ThreadPane on Home', () => {
@@ -50,6 +52,17 @@ describe('ThreadPane on Home', () => {
     expect(drawn('home-title')).toBe(true);
     expect(drawn('compose-view')).toBe(true);
     expect(drawn('thread-view')).toBe(false);
+  });
+
+  it('draws Home on a phone as any thread: no face, no home pane', () => {
+    viewportIsMobile.value = true;
+    seedHome();
+    render(<ThreadPane />, host);
+    expect(host.querySelector('.home-pane')).toBeNull();
+    expect(host.querySelector('[data-home-face]')).toBeNull();
+    expect(host.querySelector('.thread-pane')?.classList.contains('compose-empty')).toBe(true);
+    expect(host.querySelectorAll('[data-stub="home-title"]')).toHaveLength(1);
+    expect(drawn('compose-view')).toBe(true);
   });
 
   it('draws a Home with a message as an ordinary thread view', () => {

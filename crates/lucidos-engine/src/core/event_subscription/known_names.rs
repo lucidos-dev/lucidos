@@ -80,7 +80,7 @@ pub fn pascal_tokens(name: &str) -> Vec<String> {
 }
 
 /// Levenshtein edit distance between two names.
-fn levenshtein(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let b_chars: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
     let mut cur = vec![0usize; b_chars.len() + 1];

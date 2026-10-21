@@ -12,6 +12,13 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
+import type { StreamDrop, StreamHealth } from '@lucidos/event-stream';
+import { gapClearedProgress, gapRefreshedVersion } from '../eventGap';
+
+const postClientLog = vi.fn();
+vi.mock('../../utils/clientLog', () => ({ postClientLog }));
+
+const ERROR: StreamDrop = { reason: 'error' };
 
 const refreshThreadEvents = vi.fn(async (_id: string) => {});
 const markLoadedThreadsStale = vi.fn();
@@ -23,19 +30,32 @@ vi.mock('./thread-list-refresh', () => ({ refreshThreadList }));
 /** The transport the shell opened, captured so the test can drive its
  *  handlers. Standing in for a browser the unit test does not have. */
 let opened: {
-  handlers: { onFrame: (d: string) => void; onOpen: () => void; onError: () => void };
+  handlers: { onFrame: (d: string) => void; onOpen: () => void; onError: (drop: StreamDrop) => void };
   opts: { pongs: boolean };
-  stream: { close: ReturnType<typeof vi.fn>; ownsReconnect: boolean; submitPong: ReturnType<typeof vi.fn> };
+  stream: {
+    close: ReturnType<typeof vi.fn>;
+    ownsReconnect: boolean;
+    submitPong: ReturnType<typeof vi.fn>;
+    revalidate: ReturnType<typeof vi.fn>;
+  };
 } | null = null;
 
 /** Whether the next transport claims to retry for itself. */
 let nextOwnsReconnect = false;
 
+/** What the next transport answers when asked to revalidate. */
+let nextHealth: StreamHealth = 'live';
+
 /** The targets the shell asked for, so the URL construction is covered too. */
 let openedTargets: { streamUrl: string; pongUrl: string; workerUrl: string } | null = null;
 
 const openEventStream = vi.fn((targets, handlers, opts) => {
-  const stream = { close: vi.fn(), ownsReconnect: nextOwnsReconnect, submitPong: vi.fn() };
+  const stream = {
+    close: vi.fn(),
+    ownsReconnect: nextOwnsReconnect,
+    submitPong: vi.fn(),
+    revalidate: vi.fn(() => nextHealth),
+  };
   openedTargets = targets;
   opened = { handlers, opts, stream };
   return stream;
@@ -56,8 +76,8 @@ vi.mock('./app-bridge', async (importOriginal) => ({
 
 const threadMap = signal(new Map<string, { meta: { id: string }; eventsLoaded: boolean }>());
 const focusedThreadId = signal<string | null>(null);
-const recommendedCleanupProgress = signal<{ done: number; total: number } | null>(null);
-const diskUsageVersion = signal(0);
+const recommendedCleanupProgress = gapClearedProgress<{ done: number; total: number }>();
+const diskUsageVersion = gapRefreshedVersion();
 vi.mock('../store', () => ({
   threadMap,
   focusedThreadId,
@@ -139,7 +159,7 @@ vi.mock('./entityReferences', () => ({
   PROVIDER_PREFERENCE_KEYS: new Set(['opencode_free_enabled', 'provider_enabled_openai']),
 }));
 
-const { connectThreadEvents, disconnectThreadEvents } = await import('./thread-sync');
+const { connectThreadEvents, disconnectThreadEvents, reviveThreadEvents } = await import('./thread-sync');
 const { NO_BACKFILL_PROGRESS, applyTreeBackfillProgress, treeBackfill } = await import('./treeBackfill');
 
 /** What the shell reports to the DOM, which is the only thing telling a user
@@ -152,6 +172,7 @@ describe('the shell attaching to a transport', () => {
     vi.useFakeTimers();
     opened = null;
     nextOwnsReconnect = false;
+    nextHealth = 'live';
     threadMap.value = new Map();
     focusedThreadId.value = null;
   });
@@ -195,7 +216,7 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onOpen();
     expect(status()).toBe('connected');
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     expect(status()).toBe('disconnected');
   });
 
@@ -215,6 +236,43 @@ describe('the shell attaching to a transport', () => {
     expect(fanOutEventStreamStatus).toHaveBeenLastCalledWith('open');
   });
 
+  describe('reviving the stream on a resume', () => {
+    it('opens a stream when there is none', () => {
+      reviveThreadEvents();
+      expect(openEventStream).toHaveBeenCalledTimes(1);
+    });
+
+    it.each<StreamHealth>(['live', 'checking'])('keeps a %s stream, so a frame emitted meanwhile still arrives', (health) => {
+      connectThreadEvents();
+      opened?.handlers.onOpen();
+      const first = opened!;
+      nextHealth = health;
+      fanOutEventStreamStatus.mockClear();
+
+      reviveThreadEvents();
+
+      expect(first.stream.close).not.toHaveBeenCalled();
+      expect(openEventStream).toHaveBeenCalledTimes(1);
+      expect(fanOutEventStreamStatus).not.toHaveBeenCalled();
+      first.handlers.onFrame('{"type":"NotificationCreated","data":{"id":"n-2"}}');
+      expect(processSSEForReferences).toHaveBeenCalledWith('NotificationCreated', { id: 'n-2' });
+    });
+
+    it('replaces a stale stream with a fresh one', () => {
+      connectThreadEvents();
+      opened?.handlers.onOpen();
+      const first = opened!;
+      first.stream.revalidate.mockReturnValue('stale');
+
+      reviveThreadEvents();
+
+      expect(first.stream.close).toHaveBeenCalledTimes(1);
+      expect(openEventStream).toHaveBeenCalledTimes(2);
+      first.handlers.onFrame('{"type":"NotificationCreated","data":{"id":"n-3"}}');
+      expect(processSSEForReferences).not.toHaveBeenCalledWith('NotificationCreated', { id: 'n-3' });
+    });
+  });
+
   it('reconciles on the open that follows an error, not on the first one', async () => {
     // The first open is a page load, where startClient has already read state.
     // Every later one follows a gap whose frames nobody replayed.
@@ -222,7 +280,7 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onOpen();
     expect(refreshThreadList).not.toHaveBeenCalled();
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
     await vi.runAllTimersAsync();
 
@@ -251,7 +309,7 @@ describe('the shell attaching to a transport', () => {
       opened?.handlers.onOpen();
       applyTreeBackfillProgress(at(40, 0));
 
-      opened?.handlers.onError();
+      opened?.handlers.onError(ERROR);
       vi.runOnlyPendingTimers();
       opened?.handlers.onOpen();
       applyTreeBackfillProgress(at(1, 1));
@@ -277,7 +335,7 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onOpen();
     expect(syncClientUpdateFromBuild).not.toHaveBeenCalled();
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
     expect(syncClientUpdateFromBuild).toHaveBeenCalledTimes(1);
   });
@@ -290,7 +348,7 @@ describe('the shell attaching to a transport', () => {
     recommendedCleanupProgress.value = { done: 4, total: 10 };
     const before = diskUsageVersion.value;
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
 
     expect(recommendedCleanupProgress.value).toBeNull();
@@ -305,7 +363,7 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onOpen();
     expect(refreshArtifacts).toHaveBeenCalledTimes(1);
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
     expect(refreshArtifacts).toHaveBeenCalledTimes(2);
   });
@@ -318,7 +376,7 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onOpen();
     expect(loadUnreadNotifications).toHaveBeenCalledTimes(1);
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
     expect(loadUnreadNotifications).toHaveBeenCalledTimes(2);
   });
@@ -331,7 +389,7 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onOpen();
     expect(loadPreferences).toHaveBeenCalledTimes(1);
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
     expect(loadPreferences).toHaveBeenCalledTimes(2);
   });
@@ -344,7 +402,7 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onOpen();
     expect(syncPendingFormRequests).toHaveBeenCalledTimes(1);
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
     expect(syncPendingFormRequests).toHaveBeenCalledTimes(2);
   });
@@ -363,7 +421,7 @@ describe('the shell attaching to a transport', () => {
     expect(refreshChangesState).not.toHaveBeenCalled();
     expect(loadThreadQueue).not.toHaveBeenCalled();
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
     expect(refreshChangesState).toHaveBeenCalledTimes(1);
     expect(loadThreadQueue).toHaveBeenCalledTimes(1);
@@ -376,6 +434,80 @@ describe('the shell attaching to a transport', () => {
     opened?.handlers.onFrame('{"type":"Lagged","data":{"count":12}}');
     expect(refreshChangesState).toHaveBeenCalledTimes(1);
     expect(loadThreadQueue).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the one repair after an event gap', () => {
+  // Registered by the test, so these hold for any signal a future change adds.
+  const version = gapRefreshedVersion();
+  const progress = gapClearedProgress<{ done: number }>();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    opened = null;
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+    progress.value = { done: 1 };
+  });
+
+  afterEach(() => {
+    disconnectThreadEvents();
+    vi.useRealTimers();
+  });
+
+  it('repairs on the open that follows an error, once', () => {
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    const before = version.value;
+    expect(progress.value).not.toBeNull();
+
+    opened?.handlers.onError(ERROR);
+    opened?.handlers.onOpen();
+
+    expect(version.value).toBe(before + 1);
+    expect(progress.value).toBeNull();
+  });
+
+  it('leaves the first open alone', () => {
+    const before = version.value;
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+
+    expect(version.value).toBe(before);
+    expect(progress.value).not.toBeNull();
+  });
+
+  it('repairs when the broadcast lags, with the stream still open', () => {
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    const before = version.value;
+
+    opened?.handlers.onFrame('{"type":"Lagged","data":{"count":12}}');
+
+    expect(version.value).toBe(before + 1);
+    expect(progress.value).toBeNull();
+  });
+
+  it('serves a lag the way it serves a reconnect', async () => {
+    // One list of repairs, so neither path can lack what the other has.
+    const repairs = [markLoadedThreadsStale, refreshChangesState, loadThreadQueue, syncPendingFormRequests, syncClientUpdateFromBuild, refreshArtifacts, loadUnreadNotifications, loadPreferences];
+    const callCounts = () => repairs.map((fn) => fn.mock.calls.length);
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    await vi.runAllTimersAsync();
+
+    vi.clearAllMocks();
+    opened?.handlers.onFrame('{"type":"Lagged","data":{"count":12}}');
+    await vi.runAllTimersAsync();
+    const afterLag = callCounts();
+
+    opened?.handlers.onError(ERROR);
+    vi.clearAllMocks();
+    opened?.handlers.onOpen();
+    await vi.runAllTimersAsync();
+
+    expect(afterLag).toEqual(callCounts());
   });
 });
 
@@ -400,7 +532,7 @@ describe('who retries after a drop', () => {
     connectThreadEvents();
     const first = opened!.stream;
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     expect(first.close).toHaveBeenCalledOnce();
 
     vi.advanceTimersByTime(3000);
@@ -414,7 +546,7 @@ describe('who retries after a drop', () => {
     connectThreadEvents();
     const only = opened!.stream;
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
 
     expect(only.close).not.toHaveBeenCalled();
     vi.advanceTimersByTime(10_000);
@@ -428,13 +560,75 @@ describe('who retries after a drop', () => {
     connectThreadEvents();
     opened?.handlers.onOpen();
 
-    opened?.handlers.onError();
+    opened?.handlers.onError(ERROR);
     expect(status()).toBe('disconnected');
 
     opened?.handlers.onOpen();
     await vi.runAllTimersAsync();
 
     expect(status()).toBe('connected');
+    expect(refreshThreadList).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('a stalled stream', () => {
+  const stalled: StreamDrop = { reason: 'stalled', silentMs: 35_000, transport: 'direct' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    opened = null;
+    nextOwnsReconnect = false;
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+  });
+
+  afterEach(() => {
+    disconnectThreadEvents();
+    vi.useRealTimers();
+  });
+
+  it('posts one log line with the silence length and the transport', () => {
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+
+    opened?.handlers.onError(stalled);
+
+    expect(postClientLog).toHaveBeenCalledOnce();
+    expect(postClientLog).toHaveBeenCalledWith('event-stream', 'stalled', { silentMs: 35_000, transport: 'direct' });
+  });
+
+  it('posts nothing for a plain error', () => {
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+
+    opened?.handlers.onError(ERROR);
+
+    expect(postClientLog).not.toHaveBeenCalled();
+  });
+
+  it('posts nothing from a handler a newer connection replaced', () => {
+    connectThreadEvents();
+    const stale = opened!.handlers;
+    disconnectThreadEvents();
+    connectThreadEvents();
+
+    stale.onError(stalled);
+
+    expect(postClientLog).not.toHaveBeenCalled();
+  });
+
+  it('arms the resync, so the next open re-reads loaded threads', async () => {
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+    await vi.runAllTimersAsync();
+    expect(refreshThreadList).not.toHaveBeenCalled();
+
+    opened?.handlers.onError(stalled);
+    expect(status()).toBe('disconnected');
+    opened?.handlers.onOpen();
+    await vi.runAllTimersAsync();
+
     expect(refreshThreadList).toHaveBeenCalledTimes(1);
   });
 });

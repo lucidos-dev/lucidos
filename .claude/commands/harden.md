@@ -30,6 +30,27 @@ run's iterations may read it (§ Later iterations review only the fix):
 rm -f .lucidos/harden-review-head
 ```
 
+Then run the handoff checkpoint. It is Lucidos's copy of the default hardening
+flow (`system-knowhow/coding-agent-flows/hardening`), and
+`./scripts/check-default-flows.sh` keeps the two identical:
+
+<!-- default-flow: hardening -->
+#### Handoff checkpoint
+
+At this flow's first entry, before any review, run
+`lucidos successor offer --at pre-harden` and follow what it prints. Only the
+first entry runs it: a later pass returns to the review, never here. A
+successor this checkpoint started skips it too, and starts at the review.
+<!-- /default-flow: hardening -->
+
+It is automatic. It asks the owner at most once, and only when a handoff pays
+but needs their approval. On "carry on", or when the command fails, continue
+below. On a handoff, end your turn: the successor runs `/harden` from the start, but
+skips this checkpoint.
+On an ask, follow what it prints: Allow once hands off, Don't allow carries on.
+A later iteration returns to Phase 1, so a handoff never lands in the middle of
+the loop.
+
 Then read the tier this branch runs (ADR 0465):
 
 ```bash
@@ -207,11 +228,14 @@ before Phase 5.
 
 ```bash
 lucidos events emit HardenRunCompleted --summary "harden iteration <n>: <pass|fail>" \
-  --payload "{\"thread_id\": \"$LUCIDOS_THREAD_ID\", \"branch\": \"$(git branch --show-current)\", \"head_sha\": \"$(git rev-parse HEAD)\", \"iteration\": <n>, \"verdict\": \"<pass|fail>\", \"failed_phase\": \"<phase, or empty on pass>\", \"tier\": \"<full|fast>\", \"findings\": {\"code_review\": <n>, \"codex\": <n>, \"fixed\": <n>}}"
+  --payload "{\"thread_id\": \"$LUCIDOS_THREAD_ID\", \"branch\": \"$(git branch --show-current)\", \"head_sha\": \"$(git rev-parse HEAD)\", \"iteration\": <n>, \"verdict\": \"<pass|fail>\", \"failed_phase\": \"<phase, or empty on pass>\", \"tier\": \"<full|fast>\", \"findings\": {\"code_review\": <n>, \"codex\": <n>, \"fixed\": <n>}, \"suites\": $(./scripts/harden-suites.sh timings)}"
 ```
 
 - `failed_phase` names the gate that failed, such as `4.5 prose` or
   `4.5 engine tests`.
+- `suites` is each suite's start, end and exit code in epoch seconds. It also
+  says whether the round was a full run or a retry of what failed. The next
+  round of tuning reads per-suite time from it.
 - `findings` counts this iteration's findings by source. `code_review` is what
   the review returned, and `codex` what Codex returned (0 when it did not
   run). `fixed` is how many of them led to a fix. A re-measure compares yield
@@ -259,7 +283,16 @@ steps below and run the review inline, with the angles Phase 0.5 names.
 ### Phase 1 kickoff: start the early suite run (Claude Code only)
 
 The Phase 4.5 test suites start now and run alongside the review phases
-(ADR 0292). Format first, so the start commit is the one the suites test:
+(ADR 0292). The cheap gates run first, in the foreground with
+`timeout: 240000`. Each takes seconds, and a failure they catch should not
+cost a suite run:
+
+```bash
+./scripts/harden-gates.sh
+```
+
+On a FAIL, read the log it names, fix, commit, and run it again before the
+suites start. Then format, so the start commit is the one the suites test:
 
 ```bash
 ./scripts/harden-suites.sh stop
@@ -288,8 +321,9 @@ mkdir -p .lucidos && ./scripts/harden-suites.sh start --early > .lucidos/harden-
 **While the early run is going, two rules hold until the Phase 4.5 join:**
 
 - **Stop it before the first fix outside `HARDEN_SAFE_PATHS`.** That regex
-  in `scripts/lib/harden_suites.sh` names the plans and ADR folders, the priors
-  ledger and the temporary-measures registry. Run
+  in `scripts/lib/harden_suites.sh` names every markdown file under `docs/`
+  except the glossary, which tests read, and all of the plans and ADR folders.
+  A fix to those docs alone keeps the suites running. Run
   `./scripts/harden-suites.sh stop` before editing anything else. Tests read
   the tree while they run, so an edit mid-run tests a mix of old and new code.
   Each suite records what changed when it exits, so the verdict voids a run
@@ -303,8 +337,7 @@ mkdir -p .lucidos && ./scripts/harden-suites.sh start --early > .lucidos/harden-
 
 Before running the `code-review` skill, kick off a Codex review of the branch
 diff **in the background**. It overlaps Phases 1 to 3 and adds almost no wall
-clock. The 25 recorded runs on this repo took a median 97s, with a tail out to
-11 min.
+clock.
 
 It is the second reviewer beside `code-review`, and the only one from another
 model family. A later iteration launches it only for a fix over 60 lines (§ Later
@@ -379,12 +412,9 @@ report, the `ReportFindings` tool, or an in-band list with an explicit
 `No findings.` in the empty case. Translate the result into one sentence of
 prose, such as "Phase 1: no findings" or "Phase 1 flagged N issues: …".
 
-**Never paste a findings array into your reply**: not empty `[]`/`{}`, not
-populated, not fenced, not inline. A bare `[]` in the chat is meaningless
-noise, and preventing it is why the handoff is structured. The fix is
-deliberately at the **source** (the repo-owned skill), NOT a frontend
-content-filter. See `docs/temporary-measures.md` § "code-review findings array
-leaking into chat".
+**Never paste a findings array into your reply**: not empty `[]`/`{}`, not populated, not fenced, not inline. The fix
+sits at the source (the repo-owned skill), not in a frontend filter. See
+`docs/temporary-measures.md` § "code-review findings array leaking into chat".
 
 ## Phase 2.5: Packaged-Runtime Dependency & Fail-Fast Check
 
@@ -395,7 +425,7 @@ leaking into chat".
 - adds or reads a `LUCIDOS_*_DIR` / `*_BIN` env var, or a `current_exe()`-relative path walk;
 - edits the packaging / delivery / install contract: `scripts/lib/resource_contract.sh` (`resource_contract_names`, the one `RESOURCE_NAMES` source), `scripts/lib/stage_runtime.sh` (`stage_runtime_assemble`), `scripts/build-dmg.sh`, `scripts/build-headless.sh`, `scripts/lib/service.sh`, `install.sh`, `crates/lucidos-app/src/desktop.rs` (`spawn_gateway` env, the `*_RESOURCE_NAME` constants), or the gateway's engine / embedded-Postgres provisioning.
 
-**Why:** the packaged macOS `.app` / headless tarball / `install.sh` service run under a minimal launchd/Finder PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) and stage only a fixed `RESOURCE_NAMES` set — NOT the dev `target/{debug,release}/` tree with every binary side-by-side and a rich shell PATH. A dependency that resolves in dev can be absent or unreachable when packaged, and the failure typically surfaces as a cryptic mid-stream tool error or an indefinite boot-splash hang instead of a clear message. (The triggering incident: the `lucidos` CLI — needed for CC's permission MCP server — was not staged, so the first tool call died with `MCP tool … not found`. Worked catalog of this whole class: `data/artifacts/audits/packaged-app-bundle-and-failfast-audit.md`.)
+**Why:** the packaged `.app`, tarball and `install.sh` service run under a minimal launchd PATH and stage only the fixed `RESOURCE_NAMES` set. A dependency that resolves in dev can be absent when packaged, and the failure shows as a cryptic tool error or a boot hang. The worked catalog is `data/artifacts/audits/packaged-app-bundle-and-failfast-audit.md`.
 
 For each runtime dependency the diff adds or changes, confirm BOTH:
 
@@ -415,12 +445,7 @@ If you launched a background Codex review in Phase 1, join it now: `.lucidos/cod
 - **`NO VERDICT`:** the reviewer started and failed twice. That is a lost review angle, never a pass and never "unavailable". Say so now, and quote the status line verbatim in the Phase 4 report, upstream cause included. It is still advisory, so proceed.
 - **`unavailable`, or abandoned after the wait:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
 
-**A reviewer that returns nothing is configuration, not weather.** The companion
-folds the real cause into one generic sentence. The status line quotes it back
-from the reviewer's stderr, its JSON payload, or Codex's own log. This has
-bitten once. The CLI moved its default model to one the local login could not
-reach, and every review then 403'd. `codex login status` names the login, and a
-reachable `model` in `~/.codex/config.toml` fixes it.
+**A reviewer that returns nothing is configuration, not weather.** The status line quotes the cause (`docs/harden-notes.md` § A silent Codex review is configuration).
 
 Then validate the findings that no verifier has checked, per the rest of this
 phase.
@@ -461,7 +486,7 @@ don't need an entry; recurring-shaped ones do.
 
 On the fast tier, merge no `main`. Note the failure for the parent, whose run merges it.
 
-Commit any fixes from this phase before proceeding to Phase 4.5, naming the files. A fix outside `HARDEN_SAFE_PATHS` stops the early suite run first (`./scripts/harden-suites.sh stop`), per the Phase 1 kickoff rules. A new entry in `docs/code-review-priors.md` needs no stop.
+Commit any fixes from this phase before proceeding to Phase 4.5, naming the files. A fix outside `HARDEN_SAFE_PATHS` stops the early suite run first (`./scripts/harden-suites.sh stop`), per the Phase 1 kickoff rules. A fix to a doc on that list, such as a new entry in `docs/code-review-priors.md`, needs no stop.
 
 Then record the review head. Every line up to it has had this iteration's
 review, so a later iteration starts from it (§ Later iterations review only the fix):
@@ -472,15 +497,28 @@ mkdir -p .lucidos && git rev-parse HEAD > .lucidos/harden-review-head
 
 ## Phase 4.5: Verify Tests Pass
 
-### Always first: the em-dash gate
+### Always first: the cheap gates
+
+```bash
+./scripts/harden-gates.sh
+```
+
+One command runs every gate below, side by side, and prints a PASS or FAIL
+line per gate. It runs for **every** diff, with no fast path. The kickoff ran
+it before the suites started; it runs again here because review fixes may
+have added lines. On a FAIL, read the gate's section below, fix, commit, and
+return to Phase 1. Each section's command runs its gate alone, to check a fix.
+
+### The em-dash gate
 
 ```bash
 ./scripts/check-em-dashes.sh
 ```
 
-Runs for **every** diff, with no fast path: the docs-only skip below does NOT apply to it, because prose is exactly where unspaced em dashes come from. It is diff-scoped and added-lines-only, so the ~29,000 pre-existing ones in the tree never fire it (see `.claude/rules/em-dashes.md`). A non-zero exit is a hardening failure like any other: fix the flagged lines, commit, and return to Phase 1.
-
-This is also the layer that covers **Codex**, which has no `PreToolUse` hooks and therefore never met the write-time gate.
+Runs for **every** diff, with no docs-only skip, and is diff-scoped to added lines
+(`.claude/rules/em-dashes.md`). A non-zero exit is a hardening failure: fix the
+flagged lines, commit, and return to Phase 1. It also covers Codex, which has no
+write-time hooks.
 
 ### Also always: the prose gate
 
@@ -488,222 +526,31 @@ This is also the layer that covers **Codex**, which has no `PreToolUse` hooks an
 ./scripts/check-prose.sh
 ```
 
-Runs for **every** diff, with no fast path, for the same reason as the em-dash gate above: prose is what it measures, so a docs-only skip would exempt the diff it exists for.
+Runs for **every** diff, with no docs-only skip, over added lines only. The four
+limits (20-line comment block, 25-word sentence, 6-sentence paragraph, no ISO date
+in a comment) are in `.claude/rules/prose.md`. A non-zero exit is a hardening
+failure: fix, commit, return to Phase 1. The unchecked rules (20-word imperative
+step, active voice, 3-word noun clusters) are a `code-review` angle in Phase 1.
 
-Four limits, all diff-scoped and added-lines-only (see `.claude/rules/prose.md`):
+### Also always: the whole-tree gates
 
-- a comment block of at most 20 lines
-- a sentence of at most 25 words
-- a paragraph of at most 6 sentences
-- no ISO date inside a comment (a dated *path* is fine, and linking a plan is what the rule asks for)
+Each one runs for **every** diff, docs-only included. Each is a few milliseconds,
+and a merge can break one with no edit on the branch (`docs/harden-notes.md`
+§ Why a gate is unconditional). Fix a failure at its source, never by loosening
+the check. Each script header holds the mechanism.
 
-The tree's 143,575 existing comment lines never fire it. A non-zero exit is a hardening failure like any other: fix the flagged lines, commit, and return to Phase 1.
-
-Three further rules in that file are **not** machine-checked, because each needs part-of-speech tagging: a 20-word limit for an imperative step, active voice, and 3-word noun clusters. Those are a `code-review` angle, so Phase 1 covers them and this gate does not pretend to.
-
-This is also the layer that covers **Codex**, which has no `PreToolUse` hooks and therefore never met the write-time gate.
-
-### Also always: the ADR gate
-
-```bash
-./scripts/check-adrs.sh
-```
-
-Also runs for **every** diff, not only ones touching `docs/adr/`. It is a
-whole-tree consistency check costing milliseconds, and running it
-unconditionally is what catches a duplicate ADR number that arrived through a
-**merge** rather than through this branch's own edits.
-
-`docs/adr/index.md` merges through the keyed `lucidos-sorted-lines` driver
-(ADR 0460), which keeps concurrent lines sorted and one per number. This gate
-covers the rest:
-
-- a duplicate number, silent because two ADRs with different filenames merge
-  clean;
-- an ADR with no index line, or an index line with no ADR;
-- an index out of order after a hand edit or a merge without the driver;
-- a missing required section.
-
-Out of order is the one it can repair: `./scripts/check-adrs.sh --fix`. A
-duplicate number is reported with both paths and the next free number, never
-auto-renumbered, because deciding which references are live and which are
-historical narration needs judgment. New ADRs come from `./scripts/adr-new.sh`,
-which allocates across `main`, every unmerged branch, and the working tree, and
-therefore cannot collide.
-
-### Also always: the context-budget gate
-
-```bash
-./scripts/check-context-budget.sh
-```
-
-Also runs for **every** diff, and docs-only diffs least of all are exempt: a
-docs-only diff is exactly the change that grows this set, so skipping it there
-would exempt the only change that can break it.
-
-Two arms, both hard. **Size**: the always-loaded instruction set (`CLAUDE.md`
-plus every unscoped `.claude/rules/*.md`) must stay at or under
-`CONTEXT_BUDGET_CEILING`. Every byte is paid on every request of every session,
-before the agent has read a line of code, and the set grew 98% in the seven
-weeks to 2026-08-06 because everyone appends and nobody deletes.
-**Membership**: the resident set must be exactly the declared list. That arm is
-the regression detector for a rule meant to be path-scoped that silently is
-not, which is not a hypothetical: every rule file used the `globs:` key (a
-Cursor convention Claude Code ignores) until 2026-07-25, so the whole set was
-resident in every session and nothing said so.
-
-Whole-tree, not diff-scoped, unlike the em-dash gate above. What a session
-loads today does not depend on which branch grew it, so a merge that pushes the
-total over is caught by the next branch to run the gate, the same reasoning as
-`check-adrs.sh`.
-
-`./scripts/check-context-budget.sh --report` prints the set without failing.
-Fixing a size failure means moving content, not raising the number: reference
-material to a skill (loads on invocation), a convention to a path-scoped rule
-(loads on a matching Read), maintainer prose to `docs/agent-config.md` (never
-loads). Raising `CONTEXT_BUDGET_CEILING` is allowed and is a deliberate act:
-say in the commit message what became worth paying for on every request.
-
-### Also always: the mirrored-rule gate
-
-```bash
-./scripts/check-prompt-mirror.sh
-```
-
-Also whole-tree and also unconditional, and a docs-only diff is again the one
-that can break it.
-
-Two instruction surfaces reach every coding-agent session, and
-`docs/agent-config.md` § Which surface owns a rule splits them so a rule lands
-on exactly one. Exactly one rule cannot: the process-safety prohibition
-(ADR 0025) binds both a session with no Lucidos checkout, which only the engine
-system prompt reaches, and a hand-run `claude`, which only `CLAUDE.md` reaches.
-So it is stated on both surfaces on purpose, and this gate fails if either half
-loses the prohibition.
-
-Shell rather than a Rust test because the failure mode is a `CLAUDE.md`-only
-edit, which never triggers `cargo test`. It also reaches Codex, which has no
-hooks. Fix a failure by restoring the missing half, never by deleting the other
-one. Adding a *second* mirror needs the proof spelled out in
-`scripts/lib/prompt_mirror_scan.sh`.
-
-### Also always: no build script bakes a checkout path
-
-```bash
-./scripts/check-build-script-paths.sh
-```
-
-Whole-tree and unconditional, like the two gates above. Milliseconds, and a
-merge is a way this regresses without any edit on the branch.
-
-A cargo build script that reads `env!("CARGO_MANIFEST_DIR")` remembers the
-checkout it was COMPILED in. Two checkouts of one package share a `-C metadata`
-hash, so a shared `CARGO_TARGET_DIR` hands the artifact to whichever builds
-next. The baked path then names another tree, or a deleted one (ADR 0079).
-
-Deterministic rather than a review habit because two of the three failures are
-**silent**: a frozen `GATEWAY_BUILD_ID`, and an app stamped `0000.00.00.0`. Only
-the engine's panics, which is how this was found at all. Fix a failure by
-reading the variable at run time, never by exempting the file. The gate is
-scoped to a `build.rs` beside a `Cargo.toml`, so ordinary source keeping
-compile-time `env!` (`crates/lucidos-engine/src/paths.rs`) is untouched.
-
-### Also always: the e2e workflow keeps its limits
-
-```bash
-./scripts/check-e2e-workflow.sh
-```
-
-Whole-tree, unconditional, milliseconds. `.github/workflows/e2e.yml` runs a
-stripped tree on the public mirror (ADR 0382), so its limits are security
-limits: no secret, `contents: read` only, triggers only on `e2e/**` and `main`,
-caches saved only on `main`, one-day artifacts, and `mobile-webkit` on macOS.
-It also fails when another workflow starts triggering on `e2e/`. Fix a failure
-by restoring the limit, never by loosening the check.
-
-### Also always: the public mirror has one door
-
-```bash
-./scripts/mirror-push-gate.sh
-./scripts/check-mirror-pushers.sh
-```
-
-Whole-tree, unconditional, under a second. The first line installs the
-mirror's refusing push URL in the shared git config. A bare `git push lucidos`
-then fails from a machine's first hardening run.
-
-Only `release_tree_push`
-(`scripts/lib/release_tree.sh`) may write to the public mirror, because it
-scans the tree and checks the ancestry first (ADR 0462). The gate fails when a
-tracked script, workflow or Rust source runs a git push outside its short
-allowlist, or names the mirror's git URL. The allowlist and its reasons are in
-the script header. Fix a failure by routing the push through
-`release_tree_push`, never by widening the allowlist.
-
-### Also always: system-knowhow points at things that exist
-
-```bash
-./scripts/check-knowhow-refs.sh
-```
-
-Whole-tree and unconditional, like the gates above, and milliseconds.
-
-`system-knowhow/` ships to every install, and the engine LLM reads it as fact
-rather than as a link it can shrug off. Four arms:
-
-- a backtick-quoted repo path that does not exist
-- a sibling knowhow file or id that does not resolve
-- an event name in the audit or learning recipe that no engine enum has
-- a severity word in `workspace-audit.md` or one of its audit sections outside the root's legend
-
-Unconditional because the usual author of this drift is the OTHER side of the
-diff. A module becomes a directory, an event gets renamed, and a knowhow file
-nobody edited starts lying. Two module renames sat stale in three files that
-way, and `workspace-audit.md` spent months calling `ContextAssembled` a retired
-event rename. It never was one.
-
-Fix a failure by correcting the pointer or the name. Arm 3 keeps a short list
-of PascalCase names in those recipes that are genuinely not engine events. A
-recipe naming another real Rust type belongs on it. A name the recipe calls an
-EVENT never does: widening the list to silence one is the single misuse.
-
-The rule this backs is `.claude/rules/system-knowhow.md`, which also owns the
-half no script can see: a check whose names all resolve but whose meaning has
-gone stale.
-
-### Also always: the workspace audit's scans catch what they must
-
-```bash
-./scripts/check-audit-scans.sh
-```
-
-Whole-tree, unconditional, milliseconds. It evaluates every `scan` line under
-`system-knowhow/workspace-audit/` the way the audit's `scan()` does. It then
-runs each pattern through `grep -E` against the hit and miss rows in its
-`FIXTURES` block.
-
-A scan that misses a form reports zero hits, and the audit reads zero as clean.
-The `db-defaults` scan once needed whitespace after `psql`, so an argv list
-(`["psql",...]`) never matched. A real audit missed two broken callers that way.
-
-Fix a failure in the pattern. Change a fixture only when the form it pins is
-genuinely not the scan's concern. A new scan needs a hit row.
-
-### Also always: registered hooks can actually run
-
-```bash
-./scripts/lib/hooks_registered_test.sh
-```
-
-Asserts `.claude/settings.json` is valid JSON and that every hook it registers
-resolves to a file that exists and is executable. Milliseconds, and
-unconditional for the same reason as the two gates above.
-
-It exists because a hook committed at mode 100644 is invisible when it fails:
-several events ignore the hook's exit code by design, and hook stdout never
-reaches the transcript, so a permission error goes nowhere. That shipped on
-2026-08-06 with `log-instructions-loaded.sh`. A hook that silently never runs
-looks exactly like a hook that was never added.
+| Command | Fails on | Fix |
+|---|---|---|
+| `./scripts/check-adrs.sh` | A duplicate ADR number, an ADR with no index line or the reverse, an index out of order, a missing required section (ADR 0460). | `--fix` repairs order only. Never auto-renumber a duplicate. Create ADRs with `./scripts/adr-new.sh`. |
+| `./scripts/check-context-budget.sh` | The always-loaded set over `CONTEXT_BUDGET_CEILING`, a resident set that differs from the declared list, a path-scoped rule over its ceiling (`--report` prints the set). | Move content: reference to a skill, a convention to a scoped rule, maintainer prose to `docs/agent-config.md`. Raising a ceiling needs a reason in the commit message. |
+| `./scripts/check-prompt-mirror.sh` | The process-safety prohibition (ADR 0025) missing from `CLAUDE.md` or the engine system prompt. | Restore the missing half, never delete the other. A second mirror needs the proof in `scripts/lib/prompt_mirror_scan.sh`. |
+| `./scripts/check-build-script-paths.sh` | A `build.rs` that reads `env!("CARGO_MANIFEST_DIR")` and bakes a checkout path (ADR 0079). | Read the variable at run time, never exempt the file. |
+| `./scripts/check-e2e-workflow.sh` | `e2e.yml` losing a security limit (ADR 0382): no secret, `contents: read`, triggers only on `e2e/**` and `main`, cache saved on `main` only, one-day artifacts. | Restore the limit. |
+| `./scripts/mirror-push-gate.sh` then `./scripts/check-mirror-pushers.sh` | A tracked script, workflow or Rust source that pushes outside the allowlist or names the mirror's git URL (ADR 0462). The first command installs the refusing push URL. | Route the push through `release_tree_push`, never widen the allowlist. |
+| `./scripts/check-knowhow-refs.sh` | A `system-knowhow/` path, sibling id, event name or severity word that does not resolve (`.claude/rules/system-knowhow.md`). | Correct the pointer. Never widen arm 3's non-event list to silence an event name. |
+| `./scripts/check-default-flows.sh` | A copy of a default coding-agent flow that differs from its knowhow block (ADR 0505). | Copy the block back, or change the default and every copy together. Lucidos's own steps stay outside the markers. |
+| `./scripts/check-audit-scans.sh` | A workspace-audit `scan` line that misses a hit row in its `FIXTURES` block. | Fix the pattern. A new scan needs a hit row. |
+| `./scripts/lib/hooks_registered_test.sh` | A `.claude/settings.json` hook that is not valid, missing or not executable. | Fix the mode or path. |
 
 ### Then the test suites: join, and read the verdict
 
@@ -724,8 +571,26 @@ is routine: re-issue it. Act on its exit status:
 |---|---|---|
 | 0 | PASS | Proceed to Phase 5. |
 | 1 | FAIL | Read the named log, fix, commit, return to Phase 1. |
-| 2 | RERUN | Format, start a normal run, and `wait` again (below). |
+| 2 | RERUN | Format, start a normal run, and `wait` again (below). After a retry round that passed, this run is the full set. |
 | 3 | still running | Re-issue `wait`. It says if the Codex review or the driver tests are what it waits on. |
+
+**Join inline, never in a subagent.** Run `wait` yourself and follow the table.
+Add `--codex-abandoned` when Phase 3 abandoned the Codex review. Each `wait`
+ends inside the prompt cache, so polling costs one cache read per call. A
+subagent join blocks you for the whole run, usually past the cache. You then
+write your whole context again when it returns (ADR 0517).
+
+Run tests only through `harden-suites.sh`. Never call `cargo test`, `make test`
+or `./scripts/test-engine.sh` directly: the script's one cargo lane keeps two
+cargo runs from overlapping. On FAIL, fix the root cause, never weaken or skip
+a test.
+
+**A FAIL makes the next round a retry of what failed** (ADR 0536). The verdict records the failed
+engine tests and browser specs by name in `.lucidos/harden-retry`, and any
+other failed suite whole. The next `start`, early or normal, runs only those
+and says `a retry of what failed`. Its PASS still reads RERUN: the full set
+then runs once more, and only that run can pass the harden. Never delete the
+record to skip the retry.
 
 **A start that refused shows up as MISSING.** `start` writes to
 `.lucidos/harden-suites-start.log`, so read that log before starting again.
@@ -748,145 +613,66 @@ check printed, in this change. Otherwise every later early run voids on it too.
 **Codex-backend and docs-only runs start here.** They have no early run, so
 they format, run `start` (Codex in the foreground), then `wait`.
 
-**rustfmt runs before every start** (ADR 0270). `make lint` only checks it,
-and `make test` is chained after it, so one rewrapped line otherwise skips the
-whole engine suite. A `style: rustfmt` commit does not send you back to Phase
-1: rustfmt changes no behaviour, so there is nothing to re-review.
+**rustfmt runs before every start** (ADR 0270). `make lint` only checks it, and
+`make test` is chained after it, so one rewrapped line otherwise skips the whole
+engine suite. A `style: rustfmt` commit does not send you back to Phase 1,
+because rustfmt changes no behaviour.
 
-**The Codex driver tests run alone, after the Codex review is joined.** Both
-driver modules spawn a `/bin/sh` stub and share no state with a Codex review.
-But their 30 s and 60 s timeouts fail under load. On 2026-08-10 a run that
-overlapped the two took 539s against the usual 82s. Twelve driver tests
-failed, and every one passed alone moments later.
-
-So the early run skips both modules, and `wait` starts them by themselves. If
-Phase 3 abandoned the Codex review, re-issue
+**The Codex driver tests run alone, after the Codex review is joined.** The early
+run skips both driver modules, and `wait` starts them by themselves. If Phase 3
+abandoned the Codex review, re-issue
 `./scripts/harden-suites.sh wait --codex-abandoned`. Never treat a driver-test
-failure as a finding until that module has run alone on a quiet host.
+failure as a finding until that module has run alone on a quiet host
+(`docs/harden-notes.md` § Timeouts under load).
 
-**The fast tier is the script's call, not yours.** `start` asks the engine
-for the tier and records it, and an integrated sub-thread's run prints
-`fast tier` beside its suites. No variable overrides the engine's answer. The fast tier keeps `make lint` (clippy and
-rustfmt, in place of the engine suite), tsc, Vitest, `vite build` and the
-script tests. It drops every crate's test suite, the installer, the release
-path and the first-paint check: the integrating parent runs them all.
+**The fast tier is the script's call, not yours.** `start` asks the engine for the
+tier and records it, and no variable overrides the answer. It keeps `make lint`
+in place of the engine suite, plus tsc, Vitest, `vite build` and the script tests.
+It drops every crate's test suite, the installer, the release path, the
+first-paint check and the touched browser specs. The integrating parent runs
+them all.
 
-**Suite selection lives in code.** `hs_select_suites` maps the branch's
-changed paths to suites, and `hs_suite_command` holds each suite's command.
-Both are in `scripts/lib/harden_suites.sh`, and its test pins every row.
-Change a row there, never in prose. Cargo suites run one after another in one
-lane, and every other suite runs in parallel beside them. The paragraphs below
-explain the rows a reader would not guess.
+**Suite selection lives in code.** `hs_select_suites` maps the branch's changed
+paths to suites, and `hs_suite_command` holds each command, both in
+`scripts/lib/harden_suites.sh`. Its test pins every row, so change a row there,
+never in prose. Cargo suites run one after another in one lane. Every other suite
+runs in parallel beside them. `docs/harden-notes.md` § Suite rows explains the
+rows a reader would not guess.
 
-**The piped installer needs a row: `make lint` cannot see its one hard
-constraint.** macOS `/bin/sh` IS bash 3.2, so `install.sh`'s re-exec guard
-deliberately does not fire there. Everything a `curl … | sh` reaches must stay
-inside the bash-3.2 posix subset. ShellCheck reads those files as bash, their
-shebang rather than their runtime, so it passes the process substitution that
-broke the one-liner. `install_test.sh` holds the line instead: it scans for
-constructs bash 3.2 cannot run, then parses each file under bash-as-sh. Nothing
-else in the local gate runs it.
+These matter when you read a verdict:
 
-**The release path needs a row for the same reason: nothing else runs its
-suites.** `make lint` parses those scripts and says nothing about what they do.
-The two suites are offline and take seconds, driving stubbed `gh` state that no
-other gate models: the DMG-gate dispatch and its failure classification, and the
-draft wait that decides whether Phase B adopts the rc build's tarballs or
-rebuilds all four. Both halves are release-only code, so a regression there is
-invisible until someone is mid-release.
-
-**A file a crate compiles in selects the Rust suite, whatever its extension.**
-The script lists every compile input at `start`: cargo's dep-info after any
-build, plus every `include_str!` and `include_bytes!` literal in source. So an
-edit that touches only `CHANGELOG.md`, `VERSION`, a menu JSON, `sdk_iframe.css`,
-`LocaleSection.tsx` or `preferences.ts` still runs `make lint && make test`. A
-compile input under `crates/lucidos-app/` also runs the app's own tests.
-
-The guard behind such a file often lives on the other side of the diff. For
-example, `voice/language.rs` `include_str!`s `LocaleSection.tsx` to check the
-dropdown against its ISO-639-1 codes. A language added to the dropdown alone is
-a frontend-only diff, and `tsc` and Vitest never compile that guard. Hand-kept
-rows for such files missed `CHANGELOG.md` and the skill file this way, which is
-why the rule reads the compiler's own list.
-
-**Any file the CLI source includes is a CLI-row trigger, even an ENGINE path.**
-`crates/lucidos-cli` owns no engine code, so nothing ran its tests: `make test`
-is the engine crate alone, and `make lint` compiles the CLI tests without
-running them. Yet CLI tests `include_str!` engine files to pin the CLI against
-them: the two menu JSONs for `--reasoning-effort`, and `api/data_api.rs` plus
-the frontend's `dataPathPrefixes.ts` for the data prefixes. An edit to one of those
-is a diff outside `crates/lucidos-cli/`. So `start` records the CLI's own
-includes in `cli-inputs`, and a listed path selects the CLI row. A hand-kept menu-JSON row once let the guard miss the change it
-watches.
-
-**A `system-knowhow/**` edit is not a docs-only skip.** Its frontmatter `name`
-and `description` are spliced into the chat agent's routing list, which is
-billed on every request of every thread. Two Rust tests own that cost:
-`system_knowhow_descriptions_stay_routing_sized` caps each description, and
-`always_loaded_context_stays_under_budget` caps the total against the
-`ALWAYS_LOADED_BUDGET_CHARS` ratchet. Neither runs when the suites are skipped.
-
-Until 2026-08-17 this table skipped them, so a knowhow file added or reworded by
-a docs-only diff paid nothing at review time. The ceiling drifted 794 chars over
-that way, and the next branch to touch a `.rs` file inherited a red suite it did
-not cause. The filtered run costs one compile of an already-warm crate, against a
-budget breach nobody sees until it lands on somebody else.
-
-**CSS is not a skip.** Until 2026-08-05 this table said "CSS-only → skip", and
-nothing else in the gate parses CSS: `tsc` ignores it, Vitest never built it.
-So a syntax error passed every phase and landed on `main`, where it kills the
-checkout-shared build-watch's `vite build`. The watch keeps serving the previous
-`dist/` and republishes nothing, so the next frontend-only Apply times out in
-`engine::frontend_refresh` and the user gets "Frontend change applied but not
-served yet", naming the build-watch instead of the CSS file that broke it, for a
-change that may not touch CSS at all. `npx vite build` is sub-second and is the
-exact command the build-watch runs, so it fails on precisely what the watch will
-fail on. The script runs it beside the other suites.
-
-The two CSS surfaces need **different** gates, which is why they are separate
-rows. `sdk_iframe.css` is `include_str!`d by `api/sdk.rs` and served to every
-app iframe, so it is outside the Vite graph and `vite build` never reads it; a
-syntax error there ships silently as app chrome that stops being styled. It is
-covered instead by `styles/__tests__/engine-served-css-parses.test.ts`, a
-postcss parse under the ordinary Vitest run. Neither gate subsumes the other:
-`vite build` resolves `@import` (which a per-file parse cannot), and the guard
-reaches a file `vite build` cannot see.
-
-**A first-paint input runs the growth check** (ADR 0454). The row selects on a
-coarse path superset, and `first-paint-growth.mjs` decides precisely. It builds
-the merge base with main and this tree, and fails growth over 2 kB raw that
-carries no `First-paint-growth:` trailer. This phase merges main first, so the
-base is recent. On FAIL, move what the first frame does not draw behind a
-dynamic import. Otherwise add the trailer, saying why the first frame needs it.
-
-**`make lint`, not `cargo check` — this is THE per-change lint gate.** Lucidos is
-not PR-based: Apply merges the branch into `main` directly, so there is no CI
-stage between a change and `main`. `/harden` *is* that stage — it runs before
-every push (`.claude/hooks/pre-push.sh`) and synchronously at Apply when the
-marker is missing. Until 2026-07-29 this table said `cargo check`, which
-compiles but runs **no clippy lints**, so the only thing that ever ran the
-warnings-as-errors gate was the nightly — and the 2026-07-26 nightly duly found
-NINETEEN lints accumulated across three weeks of ordinary commits. `make lint`
-(ShellCheck, then `cargo fmt --all --check`, then clippy with `CLIPPY_FLAGS`;
-see the `Makefile`) strictly supersedes `cargo check`: same compile, plus the
-lint set, plus every tracked `*.sh`, plus a rustfmt-clean tree. It is the single
-canonical invocation; never restate its flags here.
+- **A file a crate compiles in selects the Rust suite, whatever its extension.**
+  `CHANGELOG.md` and `sdk_iframe.css` both do.
+- **A `system-knowhow/**` edit is never a docs-only skip.**
+- **CSS is never a skip.** The script runs `npx vite build` beside the other suites.
+- **A first-paint input runs the growth check** (ADR 0454). On FAIL, move what the
+  first frame skips behind a dynamic import. Otherwise add a
+  `First-paint-growth:` trailer saying why the first frame needs it.
+- **A frontend change runs the browser specs it can break** (ADR 0502).
+  `e2e-touched` runs them here on the debug engine in an e2e slot, without
+  mobile-webkit. `e2e-touched-webkit` sends the mobile-webkit ones to GitHub,
+  pinned to the start commit (ADR 0536). On FAIL, read the log the FAIL line
+  names. Either the spec follows the UI change, or the UI change was
+  wrong.
+- **A busy e2e lock is a `SKIP`, and a `SKIP` passes** (ADR 0541). Every e2e
+  slot was held, so the specs did not run here. The main check runs them after
+  landing. Never wait for the lock and never rerun on a timer. Name the skipped
+  specs in your summary.
+- **`make lint` is the per-change lint gate, never `cargo check`.** `/harden` is
+  the only stage between a change and `main`. Never restate its flags.
 
 **`/harden` finishes in one turn.** Apply sends "Run /harden now", waits for the next idle, and then refuses a branch with no marker. So do NOT hand the suites to `lucidos background-task run` and end your turn here, as the general rule suggests for long work: that idle would read as a finished `/harden`. Claude Code has no blocking wait tool. So `start` runs behind a shell `&`, and each suite writes an exit file under `.lucidos/harden-suites/` when it ends. `wait` joins on those files in the foreground.
 
 Each exit file holds the suite's real exit code: redirecting is not piping. `wait` and `verdict` print a few lines, so the logs never flood your context. Read the detail from the log a FAIL line names, with `tail -40` or `grep -nE "^error|test result:"`.
 
-**A jsdom test that times out at exactly the vitest default is contention, not
-a finding.** The engine suite saturates every core for minutes, and a Vitest
-case awaiting async work starves under it. The tell is a round 5000ms against
-a file the diff never touched. Re-run those files alone before believing them,
-exactly as the Codex note above says for `runtime::codex::driver_tests`. Two
-settings and trigger cases failed that way on 2026-09-15 and passed instantly
-on their own.
+**A jsdom test that times out at exactly 5000 ms is contention, not a finding.**
+Re-run those files alone before believing them.
 
-**Never pipe the test command through `| tail` / `| head` / `| grep` to trim output.** Under zsh / bash a pipeline reports the *last* command's exit code, not cargo's. So `cargo test ... | tail` exits 0 even when a Rust test failed, and Phase 4.5 reports a false PASSED on a red run. This has shipped a failing nightly.
-
-Run each suite un-piped: the exit-file pattern above already preserves the real exit. If you must trim, redirect to a log and capture `$?` first (`make test > /tmp/t.log 2>&1; echo "EXIT: $?"`), then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line. See `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
+**Never pipe the test command through `| tail`, `| head` or `| grep`.** A pipeline
+reports the last command's exit code, so a red cargo run reads as PASS
+(`docs/harden-notes.md` § Never pipe a test command). Run each suite un-piped. To
+trim output, redirect to a log, capture `$?` first, then read the log. A "tests
+pass" claim needs the real exit code and the `test result: ok.` line.
 
 Either way, record the iteration first (§ Every iteration records its verdict).
 

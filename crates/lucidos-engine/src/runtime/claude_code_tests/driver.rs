@@ -4,6 +4,25 @@ use super::*;
 /// integration-test the channel plumbing without requiring the `claude`
 /// CLI to be installed.
 async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, CancellationToken) {
+    spawn_driver_owing(program, args, SessionContextDue::default()).await
+}
+
+/// [`spawn_driver_for_test`] for a session that owes `session_context`.
+async fn spawn_driver_owing(
+    program: &str,
+    args: &[&str],
+    session_context: SessionContextDue,
+) -> (RunningAgent, CancellationToken) {
+    spawn_driver_checking(program, args, session_context, None).await
+}
+
+/// [`spawn_driver_owing`] for a session that owes a startup follow-up.
+async fn spawn_driver_checking(
+    program: &str,
+    args: &[&str],
+    session_context: SessionContextDue,
+    startup_follow_up: Option<StartupFollowUp>,
+) -> (RunningAgent, CancellationToken) {
     let mut child = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::piped())
@@ -30,7 +49,9 @@ async fn spawn_driver_for_test(program: &str, args: &[&str]) -> (RunningAgent, C
         withdraw_rx,
         cancel.clone(),
         None,
+        session_context,
         CcStreamState::default(),
+        startup_follow_up,
     ));
     (
         RunningAgent {
@@ -125,6 +146,48 @@ async fn driver_task_parses_stdout_into_typed_events() {
     assert!(agent.events_rx.recv().await.is_none());
 }
 
+/// A fresh session's first input that takes a prefix carries the session
+/// context block, and only that one (ADR 0491). A slash command goes first,
+/// verbatim, and passes the block on.
+#[tokio::test]
+async fn only_the_first_input_carries_the_owed_session_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("stdin.jsonl");
+    let script = format!("head -n 3 > '{}'", out.display());
+    let (agent, _cancel) = spawn_driver_owing(
+        "sh",
+        &["-c", &script],
+        SessionContextDue::for_spawn(None, Some(&"SESSION CONTEXT: branch `b`".into())),
+    )
+    .await;
+    for text in ["/cost", "first", "second"] {
+        agent
+            .input_tx
+            .send(AgentInput {
+                text: text.to_string(),
+                images: Vec::new(),
+                uuid: uuid::Uuid::new_v4(),
+            })
+            .unwrap();
+    }
+    let mut events_rx = agent.events_rx;
+    output_ended_then_exited(&mut events_rx, std::time::Duration::from_secs(5)).await;
+
+    let written = std::fs::read_to_string(&out).unwrap();
+    let texts: Vec<String> = written
+        .lines()
+        .map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            v["message"]["content"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        ["/cost", "SESSION CONTEXT: branch `b`\n\nfirst", "second"],
+        "{written}"
+    );
+}
+
 #[tokio::test]
 async fn driver_task_cancellation_terminates_process() {
     // Spawn a long-running sleep — driver must kill it when cancel fires.
@@ -203,7 +266,9 @@ async fn driver_task_flags_stray_signal_kill() {
         withdraw_rx,
         cancel,
         None,
+        SessionContextDue::default(),
         CcStreamState::default(),
+        None,
     ));
 
     // External kill — the engine did NOT cancel. SAFETY: kill with a positive
@@ -1075,4 +1140,148 @@ async fn an_engine_cancel_reports_no_exit_code() {
         panic!("Exited is last");
     };
     assert_eq!(exit.code, None);
+}
+
+/// The first turn's result starts the check, with the session id Init named.
+/// Its verdict reaches the ledger, and a later session with that key moves.
+#[tokio::test]
+async fn the_first_result_checks_the_startup_files_against_the_transcript() {
+    let workspace = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    std::fs::write(worktree.path().join("CLAUDE.md"), "# Rules\n").unwrap();
+    let decide = || {
+        startup_instructions::decide(
+            workspace.path(),
+            worktree.path(),
+            config.path(),
+            None,
+            Some("2.1.300"),
+            None,
+        )
+    };
+    let StartupDecision::Keep(Some(check)) = decide() else {
+        panic!("a new key asks for a check");
+    };
+    let cwd = std::fs::canonicalize(worktree.path()).unwrap();
+    let transcripts = config.path().join("projects").join(
+        cwd.to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>(),
+    );
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let recorded = serde_json::json!({
+        "type": "attachment",
+        "attachment": {"type": "instructions", "files": [
+            {"type": "Project", "path": cwd.join("CLAUDE.md"), "content": "# Rules"},
+        ]},
+    });
+    std::fs::write(transcripts.join("sess-1.jsonl"), recorded.to_string()).unwrap();
+    let script = format!(
+        "printf '{}\\n{}\\n'",
+        r#"{"type":"system","subtype":"init","session_id":"sess-1"}"#,
+        r#"{"type":"result","result":"done","duration_ms":1}"#,
+    );
+    let (mut agent, _cancel) = spawn_driver_checking(
+        "sh",
+        &["-c", &script],
+        SessionContextDue::default(),
+        Some(StartupFollowUp::Check(check)),
+    )
+    .await;
+    output_ended_then_exited_after_results(&mut agent.events_rx).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if matches!(decide(), StartupDecision::Move(_)) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the verified key never reached the ledger"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A session whose files ride the system prompt is recorded as moved, under the
+/// id Init named. A later resume then moves it again.
+#[tokio::test]
+async fn the_first_result_records_a_moved_session() {
+    let workspace = tempfile::tempdir().unwrap();
+    let script = format!(
+        "printf '{}\\n{}\\n'",
+        r#"{"type":"system","subtype":"init","session_id":"sess-moved"}"#,
+        r#"{"type":"result","result":"done","duration_ms":1}"#,
+    );
+    let (mut agent, _cancel) = spawn_driver_checking(
+        "sh",
+        &["-c", &script],
+        SessionContextDue::default(),
+        Some(StartupFollowUp::moved(workspace.path())),
+    )
+    .await;
+    output_ended_then_exited_after_results(&mut agent.events_rx).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !startup_instructions::StartupLedger::session_moved(workspace.path(), "sess-moved") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the moved session never reached the ledger"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Every stdout path forwards through one function. Lines read while the child
+/// exits (the drain after `child.wait()`) still name the session and owe the
+/// ledger. This feeds that function two lines directly, with no race.
+#[tokio::test]
+async fn lines_forwarded_after_the_child_exits_still_settle_the_startup_follow_up() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut state = CcStreamState::default();
+    let mut pending = PendingReplies::new();
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+    let mut session_id = None;
+    let mut follow_up = Some(StartupFollowUp::moved(workspace.path()));
+    for line in [
+        r#"{"type":"system","subtype":"init","session_id":"sess-drained"}"#,
+        r#"{"type":"result","result":"done","duration_ms":1}"#,
+    ] {
+        let events = route_stdout_line(&mut state, &mut pending, line);
+        assert!(forward_stdout_events(
+            events,
+            &mut session_id,
+            &mut follow_up,
+            &events_tx
+        ));
+    }
+    assert_eq!(session_id.as_deref(), Some("sess-drained"));
+    assert!(follow_up.is_none(), "the result settles the follow-up once");
+    assert!(events_rx.recv().await.is_some());
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !startup_instructions::StartupLedger::session_moved(workspace.path(), "sess-drained") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the drained session never reached the ledger"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Drain events until the driver ends.
+async fn output_ended_then_exited_after_results(
+    events_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Some(event) = tokio::time::timeout_at(deadline, events_rx.recv())
+        .await
+        .expect("the driver ends its stream in time")
+    {
+        if matches!(event, AgentEvent::Exited { .. }) {
+            return;
+        }
+    }
 }

@@ -201,7 +201,7 @@
  * fact `useHeaderActionCollapse` used to MEASURE for; it is expressible here
  * only because the trailing cluster is now bounded, see ContentHeaderActions.)
  *
- * `e2e/mobile-threads-title-alignment.spec.ts` pins both the cross-pane
+ * `e2e/mobile-threads-title-alignment-all.spec.ts` pins both the cross-pane
  * agreement and the clearance; any control added to either edge spends the
  * reserve.
  *
@@ -215,7 +215,7 @@
  * saw it as the chevrons hopping as they swiped between panes. Spanning the row
  * takes the box's own height out of the placement entirely, so flexbox centres
  * the members against one identical box on all three rows. Pinned by
- * e2e/mobile-threads-title-alignment.spec.ts. */
+ * e2e/mobile-threads-title-alignment-all.spec.ts. */
 .header-nav-cluster {
     position: absolute;
     /* Placed by `left` rather than `translateX(-50%)`: same spot, no
@@ -359,7 +359,7 @@
    icon run beside Search, where its position was whatever that run's width left
    over: about 45px right of the chevron column at 375px, so the one glyph
    present on all three rows was the one that moved as the user swiped between
-   them. Pinned by e2e/mobile-threads-title-alignment.spec.ts.
+   them. Pinned by e2e/mobile-threads-title-alignment-all.spec.ts.
    `flex-end` rather than `space-between`, which puts a lone member at the
    START. */
 .header-mark-end-cluster {
@@ -706,7 +706,7 @@
    the rule is scoped to it: on the phone layout the calc would be invalid and
    the base viewport centring is what the phone wants anyway.
    The panel is `position: fixed` and portaled to <body>, so it reads the
-   divider in the window's frame, which leaves out the Home rail's room. */
+   divider in the window's frame, which leaves out the dashboard rail's room. */
 @media (--desktop-layout) {
     .brand-menu {
         left: calc((var(--co) + var(--ddo) + var(--divider-x-in-window)) / 2);

@@ -43,7 +43,10 @@ The Claude Code parser then renders each note as the agent's message.
   so it needs no certificate and never sees the LAN. Routes still sit under
   `/api/v1/`.
 - **The user's Google token crosses the relay.** The relay stores no
-  credential, forwards `Authorization` unchanged and logs no header.
+  credential and forwards `Authorization` unchanged. It logs no credential. The
+  temporary prompt-cache probe logs the values of standard and routing
+  response headers only, other response header names, and the request's
+  `anthropic-beta` header.
 - **Every session gets a signed relay token** in its base URL. It is an HMAC
   under the per-start origin secret, in its own domain, so it never passes as
   an origin token. It names the thread and any Vertex base URL the user had set.

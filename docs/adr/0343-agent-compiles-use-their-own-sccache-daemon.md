@@ -36,6 +36,10 @@ own daemon:** `SCCACHE_SERVER_PORT=4227` and
 agent spawn and an agent's background task take this env from one helper,
 `runtime::spawn_env::agent_compile_env`.
 
+The agents' cache is capped at 50 GiB (`SCCACHE_CACHE_SIZE=50G`). At sccache's
+default 10 GiB it was full and held under 12 hours of builds, so a dependency
+built yesterday was built again today. The daemon reads the cap when it starts.
+
 The default daemon on port 4226 is left to builds that are not agents': the
 Apply rebuild and terminals.
 

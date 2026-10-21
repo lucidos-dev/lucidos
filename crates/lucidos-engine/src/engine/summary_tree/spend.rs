@@ -247,7 +247,7 @@ mod tests {
             output: 100.0,
         };
         let sol = priced("gpt-6.1-sol").expect("Sol is priced");
-        let share = sol.flex.expect("Sol has a Flex rate");
+        let share = sol.price().flex.expect("Sol has a Flex rate");
         let standard = sol.usd(call, None);
         assert!((sol.usd(call, Some(ServiceTier::Flex)) - standard * share).abs() < 1e-12);
         let flash = priced("gemini-3.8-flash").expect("Flash is priced");

@@ -43,13 +43,13 @@ pub(crate) const LOOKBACK_BLOCKS: usize = 20;
 
 /// The recent block's cap in lines. A rollover with no batch appends the
 /// recent lines to the snapshot. Fewer than a lookback of blocks keeps the new
-/// snapshot's rung within reach of the old one.
+/// snapshot's cache rung within reach of the old one.
 pub(crate) const RECENT_LINES: usize = (LOOKBACK_BLOCKS - 1) * BLOCK_LINES;
 
 /// Cache marks per view. The snapshot is frozen per epoch and needs one. A
 /// thread view takes two, so one turn may add twice the lookback.
-const SNAPSHOT_RUNGS: usize = 1;
-pub(crate) const THREAD_RUNGS: usize = 2;
+const SNAPSHOT_CACHE_RUNGS: usize = 1;
+pub(crate) const THREAD_CACHE_RUNGS: usize = 2;
 
 pub(crate) const WORKSPACE_VIEW_OPEN: &str = "[WORKSPACE MEMORY VIEW]\n\
 Summary lines over every thread turn and artifact write in this workspace, oldest first. \
@@ -140,18 +140,18 @@ pub(crate) struct ViewBlocks {
     pub(crate) text: String,
     /// Byte offsets into `text` where each whole block ends, ascending.
     pub(crate) ends: Vec<usize>,
-    /// The ends that take a cache mark, ascending: see [`rungs`].
+    /// The ends that take a cache mark, ascending: see [`cache_rungs`].
     pub(crate) marks: Vec<usize>,
 }
 
 impl ViewBlocks {
     /// `lines` framed by `open` and `close`, or empty when there are none.
-    /// `rungs` names the marked prefixes from the count of whole blocks.
+    /// `cache_rungs` names the marked prefixes from the count of whole blocks.
     pub(crate) fn render(
         open: &str,
         lines: impl IntoIterator<Item = String>,
         close: &str,
-        rungs: impl Fn(usize) -> Vec<usize>,
+        cache_rungs: impl Fn(usize) -> Vec<usize>,
     ) -> Self {
         let mut view = Self {
             text: open.to_string(),
@@ -167,7 +167,7 @@ impl ViewBlocks {
             return Self::default();
         }
         view.text.push_str(close);
-        view.marks = rungs(view.ends.len())
+        view.marks = cache_rungs(view.ends.len())
             .into_iter()
             .map(|blocks| view.ends[blocks - 1])
             .collect();
@@ -207,21 +207,21 @@ impl ViewBlocks {
 /// Which prefixes of a view's `blocks` whole blocks take a cache mark,
 /// ascending, as block counts: the last block, then every
 /// [`LOOKBACK_BLOCKS`]th before it, `count` at most. The last turn's mark sits
-/// a few blocks back, where some rung's lookback finds it.
-pub(crate) fn rungs(blocks: usize, count: usize) -> Vec<usize> {
-    let mut rungs: Vec<usize> = (0..count)
+/// a few blocks back, where some cache rung's lookback finds it.
+pub(crate) fn cache_rungs(blocks: usize, count: usize) -> Vec<usize> {
+    let mut cache_rungs: Vec<usize> = (0..count)
         .map_while(|i| blocks.checked_sub(i * LOOKBACK_BLOCKS))
         .filter(|&b| b > 0)
         .collect();
-    rungs.reverse();
-    rungs
+    cache_rungs.reverse();
+    cache_rungs
 }
 
 /// Which prefixes take a cache mark where a read needs a mark at the very
 /// same place: the last `count` block ends, ascending. A request that grew
 /// the view by fewer blocks still marks an earlier request's last end. So it
 /// reads what that request wrote there.
-pub(crate) fn trailing_rungs(blocks: usize, count: usize) -> Vec<usize> {
+pub(crate) fn trailing_cache_rungs(blocks: usize, count: usize) -> Vec<usize> {
     (blocks.saturating_sub(count) + 1..=blocks).collect()
 }
 
@@ -330,7 +330,7 @@ impl ViewSnapshots {
                 .iter()
                 .filter_map(|tile| Some(render_line(&id(*tile), &nodes.get(tile)?.text))),
             WORKSPACE_VIEW_CLOSE,
-            |blocks| rungs(blocks, SNAPSHOT_RUNGS),
+            |blocks| cache_rungs(blocks, SNAPSHOT_CACHE_RUNGS),
         );
         let last_event = end
             .checked_sub(1)
@@ -446,7 +446,7 @@ pub(crate) fn render_thread_view(
             .iter()
             .map(|tile| render_line(&tile.to_string(), &lines[tile])),
         THREAD_VIEW_CLOSE,
-        |blocks| rungs(blocks, THREAD_RUNGS),
+        |blocks| cache_rungs(blocks, THREAD_CACHE_RUNGS),
     )
 }
 

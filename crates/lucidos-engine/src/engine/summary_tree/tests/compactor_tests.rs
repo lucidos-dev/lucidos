@@ -2024,7 +2024,7 @@ async fn an_outgrown_merge_over_an_agent_prompt_is_rebuilt() {
 
 // ── The backfill episode and its spending cap ─────────────────────────
 
-/// A model the catalog prices, so the compactor counts what it spends.
+/// A model the price table prices, so the compactor counts what it spends.
 const PRICED_MODEL: &str = "gpt-6.1-sol";
 
 /// What one [`EchoProvider`] call costs on [`PRICED_MODEL`] on `tier`, from

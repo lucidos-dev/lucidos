@@ -22,16 +22,21 @@ import { WidgetFrame, DEFAULT_WIDGET_HEIGHT_PX, OFF_SCREEN_HOLD_MS, _resetWidget
 import { APP_FRAME_SANDBOX, APP_FRAME_ALLOW } from '../../apps/appFrameSandbox';
 import { APP_FRAME_SIZE_EVENT } from '../../../store/actions/widget-frame-bridge';
 import { appFrameFor, appIdForFrame, isCanvasAppFrame } from '../../../utils/appFrame';
+import { reloadWidgetFrames, widgetRefreshKeys } from '../../../store/widgets';
 
 let host: HTMLElement;
 
 beforeEach(() => {
   _resetWidgetHeightsForTesting();
+  widgetRefreshKeys.value = new Map();
+  // A frame applies a report on the next animation frame. Run it at once.
+  vi.stubGlobal('requestAnimationFrame', (run: FrameRequestCallback) => { run(performance.now()); return 0; });
   host = document.createElement('div');
   document.body.appendChild(host);
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   render(null, host);
   host.remove();
 });
@@ -117,6 +122,34 @@ describe('WidgetFrame', () => {
     act(() => { render(null, host); });
     act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="inline" />, host); });
     expect(frames(), 'off screen after the remount').toHaveLength(0);
+    expect(frameBox().style.height).toBe('312px');
+  });
+
+  it('locks a frame whose content creeps after its height, and never remembers the runaway', () => {
+    const report = (px: number) => frames()[0].dispatchEvent(
+      new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: px }, bubbles: true }),
+    );
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" />, host); });
+    // A `100vh` body with an 8px margin each side reports 16px past the frame.
+    for (let px = DEFAULT_WIDGET_HEIGHT_PX + 16; px < 1200; px += 16) act(() => { report(px); });
+    expect(frameBox().style.height, 'back where the creep began').toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
+
+    act(() => { render(null, host); });
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" />, host); });
+    expect(frameBox().style.height).toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
+  });
+
+  it('releases a lock when the widget reloads, so a fixed widget sizes again', () => {
+    const report = (px: number) => frames()[0].dispatchEvent(
+      new CustomEvent(APP_FRAME_SIZE_EVENT, { detail: { height: px }, bubbles: true }),
+    );
+    act(() => { render(<WidgetFrame appId="fare-grid" reveal="on-load" place="shelf" />, host); });
+    for (let px = DEFAULT_WIDGET_HEIGHT_PX + 16; px < 1200; px += 16) act(() => { report(px); });
+    act(() => { report(312); });
+    expect(frameBox().style.height, 'still locked').toBe(`${DEFAULT_WIDGET_HEIGHT_PX}px`);
+
+    act(() => { reloadWidgetFrames('fare-grid'); });
+    act(() => { report(312); });
     expect(frameBox().style.height).toBe('312px');
   });
 

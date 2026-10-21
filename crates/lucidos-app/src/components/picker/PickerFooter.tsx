@@ -140,8 +140,8 @@ export function pickerFooter(p: PickerFooterProps): VNode {
       {p.mode === 'restore' && (
         <div class="ws-picker-restore-form">
           <p class="ws-picker-lead">
-            Restore a workspace from an encrypted backup. You need the <code>.enc</code> file and
-            the backup key you saved when you set backups up.
+            Restore a workspace from an encrypted backup. You need the <code>.age</code> or{' '}
+            <code>.enc</code> file and the backup key you saved when you set backups up.
           </p>
 
           <div class="ws-picker-field">
@@ -173,10 +173,10 @@ export function pickerFooter(p: PickerFooterProps): VNode {
                   the event land, and it must stay inside this label so the tap
                   reaches it as one native gesture.
 
-                  No `accept`: `.enc` has no registered UTI, so an accept filter
-                  greys out every file in the iOS/iPadOS Files picker. The gateway
-                  validates the archive, and a non-.enc pick is called out below
-                  without being blocked. */}
+                  No `accept`: `.age` and `.enc` have no registered UTI, so an
+                  accept filter greys out every file in the iOS/iPadOS Files
+                  picker. The gateway validates the archive, and any other pick
+                  is called out below without being blocked. */}
               <HiddenFileInput
                 onChange={(e) => {
                   const input = e.target as HTMLInputElement;
@@ -186,7 +186,7 @@ export function pickerFooter(p: PickerFooterProps): VNode {
                   input.value = '';
                 }}
               />
-              <span>{p.draft.file ? p.draft.file.name : 'Drop a .enc backup here, or click to choose'}</span>
+              <span>{p.draft.file ? p.draft.file.name : 'Drop a .age or .enc backup here, or click to choose'}</span>
             </label>
           </div>
 

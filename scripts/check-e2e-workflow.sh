@@ -5,11 +5,13 @@
 #   ./scripts/check-e2e-workflow.sh [<e2e.yml> [<workflows-dir>]]
 #
 # The limits:
-#   1. No secret is referenced, and the only permission is contents: read.
+#   1. No secret is referenced, and the only permissions are contents: read
+#      and actions: read, which finds and downloads an earlier run's engine.
 #   2. It triggers only on push to e2e/** and main.
 #   3. Every job checks it runs on the mirror itself.
-#   4. Only the seed-cache job saves a cache.
-#   5. Every artifact lives one day.
+#   4. Only the seed-cache job saves a cache, by save-if or actions/cache/save.
+#   5. Every artifact lives one day, except what a later run reuses: an
+#      engine and its manifest live seven days, target/ state two.
 #   6. mobile-webkit runs on macOS: the macos job runs on macos-15 and takes
 #      the plan's macOS matrix.
 #   7. No other workflow triggers on e2e/**.
@@ -67,8 +69,8 @@ code = [l for l in lines if not l.lstrip().startswith("#")]
 if any("secrets." in l for l in code):
     errors.append("references a secret; the e2e workflow holds none")
 perms = [l for l in code if re.match(r"^\s*permissions:", l)]
-if len(perms) != 1 or perms[0] != "permissions:" or top_block("permissions") != ["  contents: read"]:
-    errors.append("permissions must be one top-level block granting only contents: read")
+if len(perms) != 1 or perms[0] != "permissions:" or top_block("permissions") != ["  contents: read", "  actions: read"]:
+    errors.append("permissions must be one top-level block granting only contents: read and actions: read")
 
 on = top_block("on")
 if on != ["  push:", f"    branches: ['{prefix}**', 'main']"]:
@@ -84,11 +86,27 @@ for name, body in all_jobs.items():
         errors.append(f"job {name} may save a cache; only seed-cache saves")
     if any("actions/cache@" in l for l in body):
         errors.append(f"job {name} uses actions/cache, which saves by default")
+    if name != "seed-cache" and any("actions/cache/save@" in l for l in body):
+        errors.append(f"job {name} saves a cache with actions/cache/save; only seed-cache saves")
 
-uploads = sum(1 for l in code if "actions/upload-artifact@" in l)
-retentions = [l.split(":", 1)[1].strip() for l in code if re.match(r"^\s*retention-days:", l)]
-if len(retentions) != uploads or any(r != "1" for r in retentions):
-    errors.append(f"every artifact must set retention-days: 1 ({uploads} uploads, retentions {retentions})")
+# The artifacts a later run reuses, by name prefix, and how many days each
+# lives. Every other artifact lives one day.
+REUSED = {"e2e-engine-": "7", "e2e-manifest-": "7", "e2e-target-": "2"}
+for i, l in enumerate(code):
+    if "actions/upload-artifact@" not in l:
+        continue
+    indent = len(l) - len(l.lstrip(" -"))
+    step = []
+    for nxt in code[i + 1:]:
+        if nxt.strip() and (nxt.lstrip().startswith("- ") and len(nxt) - len(nxt.lstrip()) < indent
+                            or len(nxt) - len(nxt.lstrip()) < indent - 2):
+            break
+        step.append(nxt.strip())
+    name = next((x.split(":", 1)[1].strip() for x in step if x.startswith("name:")), "")
+    days = next((x.split(":", 1)[1].strip() for x in step if x.startswith("retention-days:")), None)
+    want = next((d for p, d in REUSED.items() if name.startswith(p)), "1")
+    if days != want:
+        errors.append(f"artifact {name or '(unnamed)'} must set retention-days: {want}, found {days}")
 
 def job_if(name):
     ifs = [l for l in all_jobs.get(name, []) if re.match(r"^    if:", l)]

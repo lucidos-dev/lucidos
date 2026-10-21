@@ -6,7 +6,7 @@
  * Source-pattern checks for PromptInput, as its sibling tests do: mounting it
  * drags in every chat signal. The routing decision itself is unit-tested in
  * `store/sideQuestions.test.ts`, and the browser flow in
- * `e2e/side-question.spec.ts`.
+ * `e2e/side-question-all.spec.ts`.
  */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project

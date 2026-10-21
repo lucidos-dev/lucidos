@@ -17,9 +17,9 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: tn::RUN_PYTHON.to_string(),
             description: format!(
-                "Create and process data files. Write to data/artifacts/ with open(); changes are staged and committed atomically, so apps see the old files until the commit. Print freely for debugging, since stdout is never captured as file content. Declare third-party packages in `packages` and they are auto-installed. \
+                "Create and process data files. Write to data/artifacts/ with open(); changes commit atomically, so apps see the old files until then. Print freely; stdout is not file content. \
                 Hard {MAX_TIMEOUT_SECS}s ceiling: use run_python_background for slower work. \
-                Credentials arrive as env vars: CRED_{{NAME}} for an api_key, bearer, basic or secret credential, CRED_{{NAME}}_USERNAME and CRED_{{NAME}}_PASSWORD for a password one (which has no bare CRED_{{NAME}}), and OAUTH_{{PROVIDER}}_ACCESS_TOKEN plus OAUTH_{{PROVIDER}}_EMAIL for a connected account, auto-refreshed. The name is uppercased with hyphens, spaces and dots replaced by underscores."
+                A credential env var is set only when the code, or a workspace script it runs, names it: CRED_{{NAME}} (api_key, bearer, basic, secret), CRED_{{NAME}}_USERNAME and CRED_{{NAME}}_PASSWORD (password), a custom alias like GITHUB_TOKEN, and OAUTH_{{PROVIDER}}_ACCESS_TOKEN and OAUTH_{{PROVIDER}}_EMAIL (OAuth account, auto-refreshed). NAME is uppercased; hyphens, spaces and dots become _. A name built at run time needs a `# lucidos-credentials: CRED_A` comment. `lucidos credentials list` shows every name. Secret output is masked."
             ),
             parameters: json!({
                 "type": "object",

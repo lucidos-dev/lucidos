@@ -27,7 +27,7 @@ const drawerCss = styles('drawer.css');
  * inherits nothing the list reserves.
  *
  * A browser e2e covers the rendered geometry
- * (`e2e/mobile-threads-top-clipping.spec.ts`). This scan covers the same
+ * (`e2e/mobile-threads-top-clipping-all.spec.ts`). This scan covers the same
  * contract in the fast suite, which matters because the symptom is invisible
  * on a desktop viewport and the e2e suite is not what runs per change.
  */

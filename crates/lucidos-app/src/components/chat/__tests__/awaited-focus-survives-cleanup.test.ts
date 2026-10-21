@@ -75,6 +75,8 @@ describe('an awaited focus survives ThreadView stale-pointer cleanup', () => {
   it('every non-focused exit from the bootstrap releases the flag', () => {
     // A leaked flag would exempt a genuinely stale pointer from cleanup forever.
     expect(threads).toMatch(/catch \(error\) \{\s*releaseAwait\(threadId, previousFocus\);/);
+    // A miss keeps the flag only for a spawn the thread queue still holds.
+    expect(threads).toMatch(/if \(await threadQueueHolds\(threadId\)\) return \{ kind: 'awaiting' \};/);
     expect(threads).toMatch(/if \(!found\) \{\s*releaseAwait\(threadId, previousFocus\);/);
     expect(threads).toMatch(/if \(awaitedThreadId\.value === threadId\) awaitedThreadId\.value = null;/);
   });

@@ -26,6 +26,10 @@ pub enum CodingAgent {
 }
 
 impl CodingAgent {
+    /// Every backend, in picker order. The LLM tool schemas read their enum
+    /// from here.
+    pub const ALL: [Self; 2] = [Self::ClaudeCode, Self::Codex];
+
     /// Wire/DB string for this backend — same kebab-case values serde uses
     /// (`claude-code`, `codex`), so the `thread_summaries.coding_agent`
     /// column, event payloads, and HTTP request bodies all share one root.
@@ -58,16 +62,19 @@ impl CodingAgent {
     pub fn control_reach(self, request: &ControlRequest) -> ControlReach {
         match (self, request) {
             (_, ControlRequest::Interrupt) => ControlReach::RunningTurn,
+            (_, ControlRequest::SetReasoningEffort { .. }) => self.effort_reach(),
             (Self::ClaudeCode, ControlRequest::SetModel { .. }) => ControlReach::RunningTurn,
+            (Self::Codex, ControlRequest::SetModel { .. }) => ControlReach::NextTurn,
+        }
+    }
+
+    /// When a reasoning-effort change reaches this backend's agent.
+    pub fn effort_reach(self) -> ControlReach {
+        match self {
             // Claude Code refuses `set_reasoning_effort` on stream-json. Effort
             // reaches it only as `CLAUDE_CODE_EFFORT_LEVEL` at spawn.
-            (Self::ClaudeCode, ControlRequest::SetReasoningEffort { .. }) => {
-                ControlReach::NextSpawn
-            }
-            (
-                Self::Codex,
-                ControlRequest::SetModel { .. } | ControlRequest::SetReasoningEffort { .. },
-            ) => ControlReach::NextTurn,
+            Self::ClaudeCode => ControlReach::Spawn,
+            Self::Codex => ControlReach::NextTurn,
         }
     }
 }
@@ -80,17 +87,18 @@ pub enum ControlReach {
     /// The control channel carries it, and the backend applies it when its
     /// next turn starts.
     NextTurn,
-    /// The backend takes it only at spawn, so it is never sent. The session
-    /// records it, and the next spawn carries it.
-    NextSpawn,
+    /// The backend takes it only at spawn, so it is never sent. The engine
+    /// restarts a live session to apply it (`claude_code::control::effort_restart`).
+    Spawn,
 }
 
 impl ControlReach {
-    /// When the user sees the change take effect. With no turn in flight the
-    /// next turn is the next message, so every reach takes effect now.
-    pub fn takes_effect(self, turn_in_flight: bool) -> TakesEffect {
+    /// When the user sees the change take effect. `turn_runs_on` says a turn
+    /// in flight keeps running without the change. With none, the next turn
+    /// is the next message, so every reach takes effect now.
+    pub fn takes_effect(self, turn_runs_on: bool) -> TakesEffect {
         match self {
-            Self::NextTurn | Self::NextSpawn if turn_in_flight => TakesEffect::NextTurn,
+            Self::NextTurn | Self::Spawn if turn_runs_on => TakesEffect::NextTurn,
             _ => TakesEffect::Now,
         }
     }
@@ -234,6 +242,10 @@ pub enum AgentEvent {
         /// lands when the call ends, so this dates when it began. `None` from
         /// Codex and for a sub-agent's call.
         duration_ms: Option<u64>,
+        /// The effort Codex's driver sent with this call's turn. `None` when
+        /// it sent none, and always from Claude Code, which takes effort only
+        /// at spawn.
+        reasoning_effort: Option<String>,
     },
     /// Claude Code compacted the session's context (its `compact_boundary`
     /// message). `trigger` is Claude Code's own word, `auto` or `manual`.
@@ -322,7 +334,7 @@ pub enum ControlRequest {
 /// one set to its default path. The two read different keychain entries and
 /// different `.claude.json` files, so only one of them holds the user's login.
 /// A pinned spawn therefore replays exactly what turn 1 ran with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AccountPin {
     /// `CLAUDE_CONFIG_DIR` was unset. `dir` is Claude Code's default,
     /// `$HOME/.claude`, where the transcripts live.
@@ -388,6 +400,10 @@ pub struct SpawnArgs<'a> {
     pub workspace_path: &'a Path,
     pub allowed_tools: Option<&'a str>,
     pub system_prompt: Option<&'a str>,
+    /// The *session context block* (ADR 0491). The runtime puts it ahead of
+    /// the first input of a session it starts fresh, including a resume that
+    /// fell back to a fresh session. A resumed session never sees it.
+    pub session_context: Option<&'a SessionContextBlock>,
     pub resume_session_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub reasoning_effort: Option<&'a str>,
@@ -459,6 +475,11 @@ pub struct SpawnArgs<'a> {
     /// `engine::repo_directory_grants::resolve`. Each becomes one
     /// `--add-dir`. Claude Code only: Codex does not read those settings.
     pub additional_directories: &'a [PathBuf],
+    /// Whether the text this session's model writes before a tool call reaches
+    /// the user (`claude_code_provider`). The stream parser reads it. Claude
+    /// Code only: Codex ignores it. A probe or side question parses no notes
+    /// and passes `Hidden`.
+    pub notes: super::claude_code_provider::NotesVisibility,
     /// The auto-compact trial's setting for this spawn, from
     /// `engine::auto_compact_trial::resolve`. `None` when the trial is off.
     /// Claude Code only: Codex compacts on its own terms and ignores it.
@@ -466,6 +487,90 @@ pub struct SpawnArgs<'a> {
     /// The agent run marker the spawn stamps, and what the driver's end does
     /// with the processes carrying it (ADR 0391, 0478).
     pub(crate) agent_run: super::agent_run_marker::AgentRun,
+}
+
+impl SpawnArgs<'_> {
+    /// The session context this spawn owes its first input.
+    pub(crate) fn owed_session_context(&self) -> SessionContextDue {
+        SessionContextDue::for_spawn(self.resume_session_id, self.session_context)
+    }
+}
+
+/// The session context block a driver still owes its session (ADR 0491). It
+/// leads the first input that takes a prefix: one that goes verbatim, such as
+/// a slash command, passes it on to the next.
+#[derive(Debug, Default)]
+pub(crate) struct SessionContextDue(Option<SessionContextBlock>);
+
+impl SessionContextDue {
+    /// A fresh session owes `context`. A resumed one owes nothing: its
+    /// transcript already holds the block.
+    pub(crate) fn for_spawn(
+        resume_session_id: Option<&str>,
+        context: Option<&SessionContextBlock>,
+    ) -> Self {
+        match resume_session_id {
+            Some(_) => Self::default(),
+            None => Self(context.cloned()),
+        }
+    }
+
+    /// `input` behind the block, when the block is owed and `input` takes a
+    /// prefix. The block stays owed until [`Self::delivered`].
+    pub(crate) fn led(&self, input: AgentInput) -> AgentInput {
+        match &self.0 {
+            Some(block) if !crate::engine::agent_session::forwards_verbatim(&input.text) => {
+                block.lead(input)
+            }
+            _ => input,
+        }
+    }
+
+    /// The agent took `input`, as [`Self::led`] shaped it. A verbatim input
+    /// carried no block, so the block stays owed.
+    pub(crate) fn delivered(&mut self, input: &AgentInput) {
+        if !crate::engine::agent_session::forwards_verbatim(&input.text) {
+            self.0 = None;
+        }
+    }
+
+    /// [`Self::led`], then [`Self::delivered`]: for a driver that hands the
+    /// input over as it writes it.
+    pub(crate) fn lead(&mut self, input: AgentInput) -> AgentInput {
+        let input = self.led(input);
+        self.delivered(&input);
+        input
+    }
+}
+
+/// The *session context block* (ADR 0491): the text a fresh session reads
+/// ahead of its first input, and the images of earlier messages it attaches.
+#[derive(Debug, Clone, Default)]
+pub struct SessionContextBlock {
+    pub text: String,
+    pub images: Vec<crate::api::ChatImage>,
+}
+
+impl SessionContextBlock {
+    /// `input` behind the block: the block's text and images come first.
+    pub(crate) fn lead(&self, mut input: AgentInput) -> AgentInput {
+        input.text = if input.text.is_empty() {
+            self.text.clone()
+        } else {
+            format!("{}\n\n{}", self.text, input.text)
+        };
+        input.images.splice(0..0, self.images.iter().cloned());
+        input
+    }
+}
+
+impl From<&str> for SessionContextBlock {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            images: Vec::new(),
+        }
+    }
 }
 
 /// An in-band permission request raised by the agent's own protocol — the
@@ -530,7 +635,69 @@ pub trait AgentRuntime: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountPin, CodingAgent, ControlReach, ControlRequest, TakesEffect};
+    use super::{
+        AccountPin, AgentInput, CodingAgent, ControlReach, ControlRequest, SessionContextBlock,
+        SessionContextDue, TakesEffect,
+    };
+    use crate::api::ChatImage;
+
+    fn input(text: &str) -> AgentInput {
+        AgentInput {
+            text: text.into(),
+            images: Vec::new(),
+            uuid: uuid::Uuid::new_v4(),
+        }
+    }
+
+    fn image(name: &str) -> ChatImage {
+        ChatImage {
+            base64: name.into(),
+            mime_type: "image/png".into(),
+        }
+    }
+
+    /// ADR 0491: a fresh spawn owes the block, a resumed one owes nothing.
+    #[test]
+    fn only_a_fresh_spawn_owes_the_session_context() {
+        let mut fresh = SessionContextDue::for_spawn(None, Some(&"CTX".into()));
+        assert_eq!(fresh.lead(input("go")).text, "CTX\n\ngo");
+        assert_eq!(fresh.lead(input("next")).text, "next");
+        let mut resumed = SessionContextDue::for_spawn(Some("sid"), Some(&"CTX".into()));
+        assert_eq!(resumed.lead(input("go")).text, "go");
+    }
+
+    /// The block's images reach a fresh session ahead of the input's own,
+    /// and only with the input that carries the block.
+    #[test]
+    fn the_block_images_lead_the_first_input_only() {
+        let block = SessionContextBlock {
+            text: "CTX".into(),
+            images: vec![image("earlier")],
+        };
+        let mut fresh = SessionContextDue::for_spawn(None, Some(&block));
+        let mut first = input("go");
+        first.images.push(image("current"));
+        let first = fresh.lead(first);
+        let names: Vec<&str> = first.images.iter().map(|i| i.base64.as_str()).collect();
+        assert_eq!(names, ["earlier", "current"]);
+        assert!(fresh.lead(input("next")).images.is_empty());
+        let mut resumed = SessionContextDue::for_spawn(Some("sid"), Some(&block));
+        assert!(resumed.lead(input("go")).images.is_empty());
+    }
+
+    /// A slash command goes verbatim and passes the block to the next input,
+    /// and an input the agent never took leaves it owed.
+    #[test]
+    fn the_block_waits_for_an_input_that_takes_it() {
+        let mut due = SessionContextDue::for_spawn(None, Some(&"CTX".into()));
+        assert_eq!(due.lead(input("/cost")).text, "/cost");
+        let rejected = due.led(input("go"));
+        assert_eq!(rejected.text, "CTX\n\ngo");
+        let taken = due.led(input("again"));
+        assert_eq!(taken.text, "CTX\n\nagain");
+        due.delivered(&taken);
+        assert_eq!(due.lead(input("later")).text, "later");
+    }
 
     const HOME_CLAUDE: &str = "/home/u/.claude";
 
@@ -551,11 +718,11 @@ mod tests {
     #[test]
     fn each_backend_names_when_a_control_request_reaches_its_agent() {
         use CodingAgent::{ClaudeCode, Codex};
-        use ControlReach::{NextSpawn, NextTurn, RunningTurn};
+        use ControlReach::{NextTurn, RunningTurn, Spawn};
         let cases = [
             (ClaudeCode, ControlRequest::Interrupt, RunningTurn),
             (ClaudeCode, model(), RunningTurn),
-            (ClaudeCode, effort(), NextSpawn),
+            (ClaudeCode, effort(), Spawn),
             (Codex, ControlRequest::Interrupt, RunningTurn),
             (Codex, model(), NextTurn),
             (Codex, effort(), NextTurn),
@@ -570,14 +737,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_turn_in_flight_defers_a_change() {
-        use ControlReach::{NextSpawn, NextTurn, RunningTurn};
-        for reach in [RunningTurn, NextTurn, NextSpawn] {
+    fn only_a_turn_that_runs_on_defers_a_change() {
+        use ControlReach::{NextTurn, RunningTurn, Spawn};
+        for reach in [RunningTurn, NextTurn, Spawn] {
             assert_eq!(reach.takes_effect(false), TakesEffect::Now, "{reach:?}");
         }
         assert_eq!(RunningTurn.takes_effect(true), TakesEffect::Now);
         assert_eq!(NextTurn.takes_effect(true), TakesEffect::NextTurn);
-        assert_eq!(NextSpawn.takes_effect(true), TakesEffect::NextTurn);
+        assert_eq!(Spawn.takes_effect(true), TakesEffect::NextTurn);
     }
 
     /// Wire contract: the control endpoint's `takes_effect` values.

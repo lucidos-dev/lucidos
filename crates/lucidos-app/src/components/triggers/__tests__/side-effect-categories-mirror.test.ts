@@ -49,7 +49,10 @@ function snake(name: string): string {
   return name.replace(/(?<!^)([A-Z])/g, '_$1').toLowerCase();
 }
 
-/** The enum's variants, in wire form. */
+/**
+ * The enum's variants with a wire form. A `#[serde(skip)]` variant has none:
+ * no grant can carry it, so the UI never offers it.
+ */
 function rustValues(): string[] {
   const src = source(COMMAND_GUARD);
   const start = declarationAt(src, COMMAND_GUARD, 'pub enum SideEffectCategory {');
@@ -62,18 +65,20 @@ function rustValues(): string[] {
     .split('\n')
     .filter((line) => !line.trim().startsWith('//'))
     .join('\n');
-  return [...body.matchAll(/^\s{4}([A-Z][A-Za-z0-9]*)\s*,/gm)].map((m) => snake(m[1]));
+  return [...body.matchAll(/^(\s{4}#\[serde\(skip\)\]\n)?\s{4}([A-Z][A-Za-z0-9]*)\s*,/gm)]
+    .filter((m) => m[1] === undefined)
+    .map((m) => snake(m[2]));
 }
 
-/** Each variant's user-facing label, read off the `label()` match arms. */
+/** Each wire variant's user-facing label, read off the `label()` match arms. */
 function rustLabels(): [string, string][] {
   const src = source(COMMAND_GUARD);
   const start = declarationAt(src, COMMAND_GUARD, "pub fn label(&self) -> &'static str {");
   const body = src.slice(start, src.indexOf('\n    }', start));
-  return [...body.matchAll(/Self::([A-Za-z0-9]+)\s*=>\s*"([^"]+)"/g)].map((m) => [
-    snake(m[1]),
-    m[2],
-  ]);
+  const wire = new Set(rustValues());
+  return [...body.matchAll(/Self::([A-Za-z0-9]+)\s*=>\s*"([^"]+)"/g)]
+    .map((m): [string, string] => [snake(m[1]), m[2]])
+    .filter(([value]) => wire.has(value));
 }
 
 /** The value and label pairs the trigger editor offers as checkboxes. */

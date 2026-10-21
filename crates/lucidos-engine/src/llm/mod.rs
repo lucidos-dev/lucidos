@@ -4,11 +4,14 @@ mod aux_provider;
 /// Temporary diagnostic, off unless `LUCIDOS_CACHE_PROBE` is set. Tracked in
 /// `docs/temporary-measures.md`.
 pub(crate) mod cache_probe;
+pub mod call_trace;
+pub mod claude_gateway;
 pub mod image;
 pub mod judgment;
 pub mod metered;
 pub mod mock;
 pub use mock::MOCK_MODEL;
+pub mod model_prices;
 pub mod model_registry;
 pub mod not_served;
 pub mod openai;
@@ -18,6 +21,7 @@ pub mod provider_selection;
 pub mod reasoning;
 pub mod routing;
 pub mod served_model;
+pub(crate) mod stable_prefix;
 pub mod tool_names;
 pub mod tools;
 pub mod unconfigured;
@@ -47,14 +51,15 @@ pub use provider::{
 };
 pub use provider_build::{
     boot_without_provider_enabled, build_active_provider, ProviderBuildContext,
-    ProviderBuildOutcome, PROVIDER_CREDENTIAL_SERVICES, PROVIDER_PREFERENCE_KEYS,
+    ProviderBuildOutcome, NO_PROVIDER_AT_BOOT, PROVIDER_CREDENTIAL_SERVICES,
+    PROVIDER_PREFERENCE_KEYS,
 };
 pub use provider_selection::{select_provider, ProviderSelection, ProviderSelectionInputs};
 // `clamp_effort` is deliberately NOT re-exported: it is the wire-side rule and
 // its only caller is `RoutingProvider`, inside this module. Anything outside
 // `llm` wanting to know a model's tiers wants `supported_efforts`.
 pub use reasoning::{supported_efforts, EFFORT_LADDER};
-pub use routing::RoutingProvider;
+pub use routing::{RoutingBackends, RoutingProvider};
 pub use tools::{
     chat_tail_tools, get_default_tools, get_image_generation_tool, get_notification_tool,
     get_save_thread_image_tool, get_view_image_tool, ToolCapabilities,
@@ -88,6 +93,12 @@ pub const OPENCODE_FREE_BASE_URL: &str = "https://opencode.ai/zen/v1";
 /// LLM provider (`anthropic::chat`) and the builtin `anthropic` proxy
 /// (`api::proxy_builtin`).
 pub const ANTHROPIC_API_BASE_URL: &str = "https://api.anthropic.com/v1";
+
+/// The `User-Agent` Lucidos sends where a service should tell it apart from
+/// another client, such as the Claude gateway and the OpenCode relay.
+pub(crate) fn lucidos_user_agent() -> String {
+    format!("Lucidos/{}", env!("CARGO_PKG_VERSION"))
+}
 
 /// Max retry attempts for LLM API calls (shared across providers).
 pub const MAX_RETRIES: u32 = 3;
@@ -341,18 +352,37 @@ async fn send_streaming_request_with_timeout(
     attempt: u32,
     header_timeout: Duration,
 ) -> StreamSend {
+    call_trace::attempt_began();
     let err: Box<dyn std::error::Error + Send + Sync> =
         match tokio::time::timeout(header_timeout, builder.send()).await {
-            Ok(Ok(resp)) => return StreamSend::Got(resp),
-            Ok(Err(e)) => Box::new(e),
-            // Keep "error sending request" + "timed out" in the message so
-            // `is_transient_error` classifies it retryable (suppresses noisy
-            // trigger failure notifications) exactly like a real transport stall.
-            Err(_elapsed) => format!(
+            Ok(Ok(resp)) => {
+                call_trace::response_received(
+                    resp.status().as_u16(),
+                    resp.headers()
+                        .get("request-id")
+                        .and_then(|value| value.to_str().ok()),
+                );
+                return StreamSend::Got(resp);
+            }
+            Ok(Err(e)) => {
+                call_trace::transport_failed(if e.is_timeout() {
+                    call_trace::CallFailure::Timeout
+                } else {
+                    call_trace::CallFailure::Connection
+                });
+                Box::new(e)
+            }
+            // The message keeps "error sending request" and "timed out". So
+            // `is_transient_error` calls it retryable, like a real transport stall,
+            // and trigger failure notifications stay quiet.
+            Err(_elapsed) => {
+                call_trace::transport_failed(call_trace::CallFailure::Timeout);
+                format!(
                 "error sending request: stream timed out after {:?} waiting for response headers",
                 header_timeout
             )
-            .into(),
+                .into()
+            }
         };
     if attempt <= MAX_RETRIES {
         let delay = retry_delay(attempt, 1);

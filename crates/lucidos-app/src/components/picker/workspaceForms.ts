@@ -15,7 +15,7 @@
  * when the only workspace on screen is called "personaal").
  */
 
-import { parseWorkspaceNameFromArchive, type WorkspaceStatus } from '../../api/client/control';
+import { ARCHIVE_SUFFIXES, parseWorkspaceNameFromArchive, type WorkspaceStatus } from '../../api/client/control';
 import type { Loadable } from '../../store/types';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { slugifyWorkspaceName, uniqueWorkspaceSlug } from '../../utils/slug';
@@ -98,7 +98,7 @@ export function restoreBlocker(
   workspaces: readonly WorkspaceStatus[],
 ): RestoreBlocker | null {
   if (!draft.file) {
-    return { kind: 'file', message: 'Choose the .enc backup file to restore.' };
+    return { kind: 'file', message: 'Choose the .age or .enc backup file to restore.' };
   }
   if (!draft.key.trim()) {
     return { kind: 'key', message: 'Enter the backup key you saved when you set up backups.' };
@@ -128,8 +128,8 @@ export function restoreBlocker(
  *  and a user who renamed their download must still be able to restore it. */
 export function restoreFileNote(file: File | null): string | null {
   if (!file) return null;
-  if (file.name.toLowerCase().endsWith('.enc')) return null;
-  return `“${file.name}” doesn’t look like a .enc backup. Restore will fail if it isn’t one.`;
+  if (ARCHIVE_SUFFIXES.some((suffix) => file.name.toLowerCase().endsWith(suffix))) return null;
+  return `“${file.name}” doesn’t look like a backup archive. Restore will fail if it isn’t one.`;
 }
 
 /** Apply a file the user chose or dropped. An EMPTY selection is a no-op, never

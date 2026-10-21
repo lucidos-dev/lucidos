@@ -4,13 +4,26 @@
 # `/harden` Phase 4.5 test suites and owns the early suite run (ADR 0292).
 # Sourced by that script and by harden_suites_test.sh. Defines functions only.
 #
-# Six rules live here and nowhere else:
-#   - which suites a list of changed paths selects (hs_select_suites);
+# Seven rules live here and nowhere else:
+#   - which suites a list of changed paths selects (hs_select_suites), the
+#     two touched-spec suites among them (the specs come from touched_specs.sh);
 #   - whether the branch changes what codegen renders (hs_generated_drift);
 #   - what the fast tier drops from that selection (hs_fast_tier_suite);
-#   - the command each suite runs (hs_suite_command);
+#   - the command each suite runs, whole or for its failed tests alone
+#     (hs_suite_command);
+#   - which tests a failed suite names, so the next round reruns those first
+#     (hs_failed_tests);
 #   - HARDEN_SAFE_PATHS, the paths no suite reads (hs_is_safe_path);
 #   - the read check that turns that list off when a source may read it.
+
+# shellcheck source=scripts/lib/touched_specs.sh
+source "$(dirname "${BASH_SOURCE[0]}")/touched_specs.sh"
+# shellcheck source=scripts/lib/e2e_projects.sh
+source "$(dirname "${BASH_SOURCE[0]}")/e2e_projects.sh"
+# shellcheck source=scripts/lib/e2e_flaky.sh
+source "$(dirname "${BASH_SOURCE[0]}")/e2e_flaky.sh"
+# shellcheck source=scripts/lib/e2e_lock.sh
+source "$(dirname "${BASH_SOURCE[0]}")/e2e_lock.sh"
 
 # The two Codex driver modules. An early run skips them and `wait` starts them
 # alone once the Codex review is joined: their timeouts fail under load.
@@ -52,7 +65,8 @@ hs_resolve_tier() { # <engine-answer> <HARDEN_TIER>
 # What the fast tier runs in place of a full-tier suite, or nothing for a
 # suite it drops. The fast tier keeps the lint, the frontend checks and the
 # script tests. It drops every crate's test suite, the installer, the release
-# path and the first-paint check: the integrating parent runs them all once.
+# path, the first-paint check and the touched browser specs: the integrating
+# parent runs them all once.
 hs_fast_tier_suite() { # <suite>
     case "$1" in
         rust) echo lint ;;
@@ -61,14 +75,20 @@ hs_fast_tier_suite() { # <suite>
     return 0
 }
 
-# Files no suite reads, at compile time or at run time, as an extended regex.
-# A change to anything else voids an early result. Widen it only with proof that
-# no test reads the new path. hs_read_check and the dep-info check in
-# hs_unsafe_paths are the floor under that proof.
-HARDEN_SAFE_PATHS="docs/(plans|adr)/[^\"'\`[:space:]]*|docs/code-review-priors\.md|docs/temporary-measures\.md"
+# Files no suite reads, at compile time or at run time, as an extended regex:
+# every markdown file under docs/, and anything under the plans and ADR folders.
+# A change to anything else voids an early result, so a fix to those docs alone
+# never restarts the suites. Widen it only with proof that no test reads the new
+# path. hs_read_check and the dep-info check in hs_unsafe_paths are the floor
+# under that proof.
+HARDEN_SAFE_PATHS="docs/[^\"'\`[:space:]]*\.md|docs/(plans|adr)/[^\"'\`[:space:]]*"
+
+# The docs a test does read, which HARDEN_SAFE_PATHS would otherwise cover.
+HARDEN_READ_DOCS='docs/glossary\.md'
 
 hs_is_safe_path() {
-    printf '%s\n' "$1" | grep -q -x -E "$HARDEN_SAFE_PATHS"
+    printf '%s\n' "$1" | grep -q -x -E "$HARDEN_SAFE_PATHS" \
+        && ! printf '%s\n' "$1" | grep -q -x -E "$HARDEN_READ_DOCS"
 }
 
 # Filtered cargo runs. One that matches no test passes vacuously, so each must
@@ -85,17 +105,21 @@ HS_ANCHOR_RE='CARGO_MANIFEST_DIR|repo_root\(|include_str!|include_bytes!|__dirna
 
 # Files that name a safe path beside an anchor without reading it, and how many
 # such lines each has. A new file, or a higher count, trips the read check.
-HS_READ_CHECK_KNOWN='crates/lucidos-app/e2e/markdown-table-columns.spec.ts 1
+HS_READ_CHECK_KNOWN='crates/lucidos-app/e2e/markdown-table-columns-all.spec.ts 1
 crates/lucidos-app/src/components/chat/__tests__/chat-link-click.test.ts 1
+crates/lucidos-app/src/components/plugins/__tests__/plugin-detail-page.test.tsx 1
 crates/lucidos-app/src/styles/__tests__/iframe-css-no-shared-component-restyle.test.ts 1
 crates/lucidos-engine/src/core/changes.rs 1
+crates/lucidos-engine/src/engine/agent_session/lifecycle_tests/propose.rs 1
+crates/lucidos-engine/src/engine/agent_session/prompts.rs 6
 crates/lucidos-engine/src/engine/change_ops_withheld_work_tests.rs 2
 crates/lucidos-engine/src/engine/event_bus_tests/proposed_apply_cycle.rs 1
 crates/lucidos-engine/src/engine/frontend_refresh.rs 1
 crates/lucidos-engine/src/engine/git_ops/plan_marker.rs 1
-crates/lucidos-engine/src/engine/successor_tests.rs 2
+crates/lucidos-engine/src/engine/successor_tests.rs 3
 crates/lucidos-engine/src/engine/thread_events_tests/ts_codegen.rs 1
-crates/lucidos-engine/src/engine/thread_lifecycle_tests/invariants.rs 1'
+crates/lucidos-engine/src/engine/thread_lifecycle_tests/invariants.rs 1
+crates/lucidos-engine/src/runtime/startup_instructions/tests.rs 3'
 
 # Print "path count" for each source file that may read a safe path and is not
 # in HS_READ_CHECK_KNOWN at that count. Returns 1 when it prints anything, and
@@ -114,10 +138,14 @@ hs_read_check() { # <root>
     fi
     while IFS= read -r f; do
         [ -n "$f" ] || continue
+        # A doc on HARDEN_READ_DOCS is off the allowlist already, so naming it
+        # is no read of a safe path.
         if grep -q -E "$HS_ANCHOR_RE" "$root/$f"; then
-            n=$(grep -v -E '^[[:space:]]*(//|\*|/\*)' "$root/$f" | grep -c -E "$HARDEN_SAFE_PATHS")
+            n=$(grep -v -E '^[[:space:]]*(//|\*|/\*)' "$root/$f" | sed -E "s#$HARDEN_READ_DOCS##g" \
+                | grep -c -E "$HARDEN_SAFE_PATHS")
         else
-            n=$(grep -v -E '^[[:space:]]*(//|\*|/\*)' "$root/$f" | grep -c -E "\.\./[^\"'\`]*($HARDEN_SAFE_PATHS)")
+            n=$(grep -v -E '^[[:space:]]*(//|\*|/\*)' "$root/$f" | sed -E "s#$HARDEN_READ_DOCS##g" \
+                | grep -c -E "\.\./[^\"'\`]*($HARDEN_SAFE_PATHS)")
         fi
         [ "$n" -gt 0 ] || continue
         known=$(printf '%s\n' "$HS_READ_CHECK_KNOWN" | awk -v f="$f" '$1 == f { print $2 }')
@@ -299,22 +327,24 @@ hs_generated_drift() { # <root>
 # A path in the cli-inputs file also selects the CLI tests. The CLI pins engine
 # files that way, and `make test` never runs its tests. A path in the
 # vitest-inputs file (hs_vitest_inputs) selects the Vitest suite. A non-empty
-# drift file (hs_generated_drift) selects the TS suite. The `fast` tier narrows
-# the selection through hs_fast_tier_suite.
-hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [tier]
+# drift file (hs_generated_drift) selects the TS suite. A non-empty
+# touched-specs file (ts_touched_specs) selects the e2e-touched suite, and a
+# spec mobile-webkit runs among them selects e2e-touched-webkit too. The
+# `fast` tier narrows the selection through hs_fast_tier_suite.
+hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [tier] [touched-specs-file]
     local suite
     if [ "$(hs_normalize_tier "${5:-}")" = fast ]; then
-        hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" | while IFS= read -r suite; do
+        hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${6:-}" | while IFS= read -r suite; do
             hs_fast_tier_suite "$suite"
         done
         return 0
     fi
-    hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}"
+    hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${6:-}"
 }
 
 # The full tier's selection, which hs_select_suites narrows for the fast tier.
-hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file]
-    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} p rust="" shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" codex="" paths=""
+hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [touched-specs-file]
+    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} touched=${5:-/dev/null} p rust="" shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" codex="" paths=""
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         paths="$paths$p
@@ -342,7 +372,8 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
             install.sh | uninstall.sh | scripts/lib/service.sh | scripts/lib/stage_runtime.sh | \
                 scripts/lib/headless_tarball.sh | scripts/lib/install_common.sh) install=1 ;;
             scripts/release.sh | scripts/lib/release_draft.sh) release=1 ;;
-            scripts/harden-suites.sh | scripts/lib/harden_suites*.sh | scripts/lib/proc_tree.sh) self=1 ;;
+            scripts/harden-suites.sh | scripts/lib/harden_suites*.sh | scripts/lib/proc_tree.sh | scripts/lib/touched_specs*.sh | \
+                scripts/lib/e2e_projects.sh | scripts/lib/e2e_flaky.sh) self=1 ;;
             scripts/harden-scope.sh | scripts/lib/harden_scope_test.sh) scope=1 ;;
             scripts/harden-codex-review.sh | scripts/lib/harden_codex_review_test.sh) codex=1 ;;
         esac
@@ -381,6 +412,8 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
         [ -n "$vitest" ] && echo vitest
     fi
     [ -n "$firstpaint" ] && echo first-paint
+    [ -s "$touched" ] && echo e2e-touched
+    [ -n "$(hs_webkit_specs < "$touched")" ] && echo e2e-touched-webkit
     [ -n "$install" ] && echo install
     [ -n "$release" ] && echo release
     [ -n "$self" ] && echo harden-suites
@@ -389,13 +422,65 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
     return 0
 }
 
-# Print the shell command a suite runs. HS_STUB_CMD, when set, replaces every
-# command with "<stub> <suite>", so the tests never start a real suite.
-hs_suite_command() { # <suite> <early|normal> <changed-paths-file>
-    local suite=$1 mode=$2 paths_file=$3 skips="" m
+# Read spec names on stdin and print the ones mobile-webkit runs.
+hs_webkit_specs() {
+    local spec
+    while IFS= read -r spec; do
+        [ -n "$spec" ] && project_runs_spec mobile-webkit "$spec" && echo "$spec"
+    done
+    return 0
+}
+
+# The e2e-browser.sh command for a list of specs: one -f each, after <flags>.
+hs_specs_command() { # <specs-file> [flags]
+    local spec cmd="./scripts/e2e-browser.sh${2:+ $2}"
+    while IFS= read -r spec; do
+        [ -n "$spec" ] && cmd="$cmd -f $(printf '%q' "$spec")"
+    done < "$1"
+    echo "$cmd"
+}
+
+# The engine tests a failed round named, by exact name.
+hs_engine_tests_command() { # <names-file>
+    echo "./scripts/test-engine.sh -- -- --exact $(tr '\n' ' ' < "$1" | sed 's/ *$//')"
+}
+
+# The suites whose failed tests hs_failed_tests can name.
+hs_is_e2e_suite() {
+    case "$1" in
+        e2e-touched | e2e-touched-webkit) return 0 ;;
+    esac
+    return 1
+}
+
+hs_names_engine_tests() {
+    case "$1" in
+        rust | engine-filtered | driver) return 0 ;;
+    esac
+    return 1
+}
+
+# Print the shell command a suite runs, from the run's state directory: its
+# changed paths, its touched specs, its start commit, and <suite>.retry. A
+# non-empty <suite>.retry names the tests a failed round left, and the suite
+# then runs those alone. HS_STUB_CMD, when set, replaces every command with
+# "<stub> <suite>", so the tests never start a real suite.
+#
+# e2e-touched runs on this host, a filtered run without mobile-webkit
+# (e2e_github_handoff). e2e-touched-webkit sends the specs mobile-webkit runs
+# to GitHub as the run starts, pinned to its start commit.
+hs_suite_command() { # <suite> <early|normal> <state-dir>
+    local suite=$1 mode=$2 state=$3 skips="" m specs
     if [ -n "${HS_STUB_CMD:-}" ]; then
         printf '%q %q\n' "$HS_STUB_CMD" "$suite"
         return 0
+    fi
+    if [ -s "$state/$suite.retry" ]; then
+        if hs_names_engine_tests "$suite"; then
+            hs_engine_tests_command "$state/$suite.retry"
+            return 0
+        fi
+        hs_is_e2e_suite "$suite" && specs="$state/$suite.retry"
     fi
     case "$suite" in
         rust)
@@ -410,15 +495,23 @@ hs_suite_command() { # <suite> <early|normal> <changed-paths-file>
         app-lib) echo "cargo test --locked -p lucidos-app --lib" ;;
         cli) echo "cargo test --locked -p lucidos-cli" ;;
         gateway) echo "cargo test --locked -p lucidos-gateway" ;;
-        engine-filtered) echo "./scripts/test-engine.sh -- -- $(hs_engine_filters < "$paths_file")" ;;
+        engine-filtered) echo "./scripts/test-engine.sh -- -- $(hs_engine_filters < "$state/paths")" ;;
         driver) echo "./scripts/test-engine.sh -- -- $HS_DRIVER_MODULES" ;;
         ts) echo "cd crates/lucidos-app && npm run typecheck && npm test && npx vite build" ;;
         vite) echo "cd crates/lucidos-app && npx vite build" ;;
         vitest) echo "cd crates/lucidos-app && npm test" ;;
         first-paint) echo "cd crates/lucidos-app && node first-paint-growth.mjs check" ;;
+        e2e-touched) hs_specs_command "${specs:-$state/touched-specs}" ;;
+        e2e-touched-webkit)
+            if [ -z "${specs:-}" ]; then
+                specs="$state/webkit-specs"
+                hs_webkit_specs < "$state/touched-specs" > "$specs"
+            fi
+            hs_specs_command "$specs" "--github --webkit --commit $(cat "$state/start-sha")"
+            ;;
         install) echo "bash scripts/lib/install_test.sh" ;;
         release) echo "bash scripts/lib/release_draft_test.sh && bash scripts/lib/release_rc_gate_test.sh" ;;
-        harden-suites) echo "bash scripts/lib/harden_suites_test.sh" ;;
+        harden-suites) echo "bash scripts/lib/harden_suites_test.sh && bash scripts/lib/touched_specs_test.sh" ;;
         harden-scope) echo "bash scripts/lib/harden_scope_test.sh" ;;
         harden-codex-review) echo "bash scripts/lib/harden_codex_review_test.sh" ;;
         *)
@@ -426,4 +519,52 @@ hs_suite_command() { # <suite> <early|normal> <changed-paths-file>
             return 1
             ;;
     esac
+}
+
+# Read a failure record on stdin ("<suite>" or "<suite> <test>" lines) and plan
+# a retry round: write each suite's tests to <state>/<suite>.retry and print the
+# suites to run. A spec the branch no longer has is dropped, and so is a
+# touched-spec suite left with none.
+hs_retry_plan() { # <root> <state-dir>
+    local root=$1 state=$2 suite name suites=""
+    while read -r suite name; do
+        [ -n "$suite" ] || continue
+        if [ -n "$name" ]; then
+            if hs_is_e2e_suite "$suite" && [ ! -f "$root/crates/lucidos-app/e2e/$name" ]; then
+                continue
+            fi
+            echo "$name" >> "$state/$suite.retry"
+        elif hs_is_e2e_suite "$suite"; then
+            continue
+        fi
+        case $'\n'"$suites" in
+            *$'\n'"$suite"$'\n'*) ;;
+            *) suites="$suites$suite"$'\n' ;;
+        esac
+    done
+    printf '%s' "$suites"
+}
+
+# Print the tests a failed suite's log names, one per line: engine tests by
+# their full name, browser specs by file. Prints "?" for a failure it cannot
+# name, such as a test in another crate, so the caller reruns the whole suite.
+# Prints nothing for a suite whose tests it never names.
+hs_failed_tests() { # <suite> <log>
+    if hs_names_engine_tests "$1"; then
+        # A failure belongs to the test binary named by the last "Running" line.
+        # test-engine.sh reruns only the engine library's tests.
+        if awk '/^ *Running /{ engine = ($0 ~ /unittests src\/lib\.rs/ && $0 ~ /\/lucidos_engine-[0-9a-f]+\)/) }
+            /^test .* \.\.\. FAILED$/ && !engine { found = 1 }
+            END { exit !found }' "$2" 2>/dev/null; then
+            echo "?"
+        else
+            e2e_failed_engine_tests "$2" 2>/dev/null
+        fi
+    elif hs_is_e2e_suite "$1"; then
+        # Playwright's closing summary lists each failed test under "N failed".
+        awk '/^ *[0-9]+ failed$/ { listing = 1; next }
+            listing && /^ *\[[^]]+\] › / { sub(/^ *\[[^]]+\] › /, ""); sub(/:.*/, ""); n = split($0, part, "/"); print part[n]; next }
+            { listing = 0 }' "$2" 2>/dev/null | sort -u
+    fi
+    return 0
 }

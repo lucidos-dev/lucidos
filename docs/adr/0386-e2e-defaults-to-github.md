@@ -2,6 +2,8 @@
 
 - **Status**: Accepted. Amends ADR 0382, which made GitHub mode opt-in.
 - **Date**: 2026-10-07
+- **Amended by**: [0536](0536-fast-test-loop.md): a filtered run stays
+  on this host unless `--github` is passed.
 
 ## Context
 

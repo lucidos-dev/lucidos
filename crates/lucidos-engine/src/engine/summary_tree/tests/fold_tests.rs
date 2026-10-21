@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::engine::summary_tree::fold::{built_cover, built_prefix_end, fold, Budget, Fold};
 use crate::engine::summary_tree::shape::complete_addresses;
-use crate::engine::summary_tree::view::{rungs, BLOCK_LINES, LOOKBACK_BLOCKS, THREAD_RUNGS};
+use crate::engine::summary_tree::view::{
+    cache_rungs, BLOCK_LINES, LOOKBACK_BLOCKS, THREAD_CACHE_RUNGS,
+};
 use crate::engine::summary_tree::NodeAddr;
 
 fn addr(start: u64, span: u64) -> NodeAddr {
@@ -256,8 +258,8 @@ fn a_replay_from_zero_equals_the_live_view() {
 /// `samples` turns of `turn` entries each, from a log of `entries`.
 ///
 /// It models Anthropic's cache. The last turn wrote an entry at each of its
-/// rungs. This turn reads the longest of those its view still starts with,
-/// if one of its own rungs lies at most a lookback after it.
+/// cache rungs. This turn reads the longest of those its view still starts
+/// with, if one of its own lies at most a lookback after it.
 fn uncached_share(entries: u64, turn: u64, samples: u64) -> f64 {
     let size = |a: NodeAddr| Some(synthetic(a));
     let mut live = Fold::default();
@@ -267,7 +269,8 @@ fn uncached_share(entries: u64, turn: u64, samples: u64) -> f64 {
         }
         live.addrs()
     };
-    let rungs_of = |tiles: &[NodeAddr]| rungs(tiles.len() / BLOCK_LINES, THREAD_RUNGS);
+    let cache_rungs_of =
+        |tiles: &[NodeAddr]| cache_rungs(tiles.len() / BLOCK_LINES, THREAD_CACHE_RUNGS);
     let mut previous = view(entries);
     let (mut uncached, mut sent) = (0, 0);
     for step in 1..=samples {
@@ -277,8 +280,8 @@ fn uncached_share(entries: u64, turn: u64, samples: u64) -> f64 {
             .zip(&current)
             .take_while(|(a, b)| a == b)
             .count();
-        let ours = rungs_of(&current);
-        let read = rungs_of(&previous)
+        let ours = cache_rungs_of(&current);
+        let read = cache_rungs_of(&previous)
             .into_iter()
             .filter(|&r| r * BLOCK_LINES <= same)
             .filter(|&r| ours.iter().any(|&n| n >= r && n - r <= LOOKBACK_BLOCKS))
@@ -293,7 +296,7 @@ fn uncached_share(entries: u64, turn: u64, samples: u64) -> f64 {
 }
 
 /// Consecutive turns read most of the view from the prompt cache. Between
-/// batches a view only appends, and a rung a few blocks on finds the last
+/// batches a view only appends, and a cache rung a few blocks on finds the last
 /// turn's entry. A batch rewrites the view once. The table goes to the log;
 /// the plan for OptChat revision 3c190e06 holds the numbers it replaced.
 #[test]

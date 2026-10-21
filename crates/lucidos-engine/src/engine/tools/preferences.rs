@@ -355,6 +355,7 @@ impl LucidosEngine {
         // a per-thread value, not this account default.)
         let effect_note = match key {
             k if k == prefs::CHAT_MODEL.key() => " This is the default for NEW Lucidos Agent threads. A thread that's already running — including this one — keeps its current model (whatever it last used), so this preference change does NOT switch the current thread's model on its next turn. To change a running thread's model, use its in-thread model picker.",
+            k if k == prefs::TRIGGER_MODEL.key() => " This is the default for intent triggers that pin no model. It applies from the trigger's next fire, and a trigger's own model still wins. It does not change any chat thread.",
             k if k == prefs::CHAT_REASONING_EFFORTS.key() => " These are the defaults for NEW Lucidos Agent threads. A thread that's already running, including this one, keeps its current reasoning effort while it stays on the same model, so this change does NOT move the current thread's effort on its next turn. To change a running thread's effort, use its in-thread picker.",
             // A turn builds its system prompt once, at setup. So the style the
             // user just asked for lands on their NEXT message, and claiming

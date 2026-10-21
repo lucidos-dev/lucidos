@@ -2,6 +2,7 @@ import { changeWork, EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS } from '../../ge
 import type { ChangeWork, EventChannel, ThreadStatus } from '../../generated/thread-lifecycle';
 import type { EventWaitSummary, StoredEvent, ThreadInitiator, ThreadSection, TodoItem } from './thread-event-types';
 import type { CodingAgentChangeState, SuccessorLink } from '../../api/threads';
+import type { CacheKeepAliveStatus } from '../../generated/thread-event-wire';
 
 /** Post-event projection snapshot carried on persisted SSE thread events
  *  (`data.aggregate`) and on `fetchThreadEvents` HTTP responses
@@ -68,6 +69,9 @@ export type ThreadAggregate = {
    *  Optional only so a partial test aggregate needn't supply it; the backend
    *  always sends it. Absence leaves the list alone, `[]` clears it. */
   liveEventWaits?: EventWaitSummary[];
+  /** See `ThreadMeta.cacheKeepAliveStatus`. The backend always sends it, `null`
+   *  when there is none. Optional only so a partial test aggregate needn't. */
+  cacheKeepAliveStatus?: CacheKeepAliveStatus | null;
   /** What the coding-agent branch holds. See `ThreadMeta.codingAgentChangeState`. */
   codingAgentChangeState: CodingAgentChangeState;
   /** Whether the Claude Code session is bound to an external repo. External repos
@@ -140,6 +144,12 @@ export function applySummaryVersion(meta: ThreadMeta, version: number, status: T
   return true;
 }
 
+/** Whether two keep-alive statuses say the same. Each is a flat object built
+ *  by one serializer, so its JSON text is a sufficient identity. */
+function sameKeepAliveStatus(a: CacheKeepAliveStatus | null | undefined, b: CacheKeepAliveStatus | null): boolean {
+  return JSON.stringify(a ?? null) === JSON.stringify(b);
+}
+
 /** Apply an aggregate snapshot to a thread's meta. Used by live SSE (per-event
  *  aggregate) and historical replay (fetchThreadEvents.currentAggregate).
  *  Nullable fields propagate cleared values; trigger/repo fields are omitted
@@ -168,6 +178,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (!!meta.applyInFlight !== !!agg.applyInFlight) { meta.applyInFlight = !!agg.applyInFlight; changed = true; }
   if (meta.liveEventWaitCount !== agg.liveEventWaitCount) { meta.liveEventWaitCount = agg.liveEventWaitCount; changed = true; }
   if (agg.liveEventWaits !== undefined && !sameWaits(meta.liveEventWaits, agg.liveEventWaits)) { meta.liveEventWaits = agg.liveEventWaits; changed = true; }
+  if (agg.cacheKeepAliveStatus !== undefined && !sameKeepAliveStatus(meta.cacheKeepAliveStatus, agg.cacheKeepAliveStatus)) { meta.cacheKeepAliveStatus = agg.cacheKeepAliveStatus; changed = true; }
   if (!sameChangeState(meta.codingAgentChangeState, agg.codingAgentChangeState)) { meta.codingAgentChangeState = agg.codingAgentChangeState; changed = true; }
   if (meta.codingAgentIsExternalRepo !== agg.codingAgentIsExternalRepo) { meta.codingAgentIsExternalRepo = agg.codingAgentIsExternalRepo; changed = true; }
   if (meta.saved !== agg.isSaved) { meta.saved = agg.isSaved; changed = true; }
@@ -371,6 +382,11 @@ export type ThreadMeta = {
    *  forever, still counting down. The fold is idempotent by `wait_id`, so it
    *  and the snapshots converge rather than fight. */
   liveEventWaits: EventWaitSummary[];
+  /** The *cache keep-alive status*: what the engine does to keep this waiting
+   *  thread's prompt cache warm, or why it does not. Server-owned: the thread
+   *  summary and every per-event aggregate overwrite it. Absent or `null`
+   *  when there is nothing to keep warm. */
+  cacheKeepAliveStatus?: CacheKeepAliveStatus | null;
 };
 
 /** Compose state machine — mirrors the Rust `ThreadState` enum. The archive

@@ -1149,6 +1149,25 @@ async fn a_verified_agent_origin_token_may_not_delete() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+/// The backup key and 1Password routes reuse the gate with their own words.
+/// So an agent hears about the act it tried, not about thread deletion.
+#[tokio::test]
+async fn a_route_specific_owner_refusal_names_its_own_act() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    init_agent_origin_secret("owner-device-gate-secret".into());
+    let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None)
+        .expect("the secret is installed, so a token mints");
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
+
+    let refusal = require_owner_device_for(&h, &pool, "The backup key is the owner's")
+        .await
+        .expect_err("no agent may change the backup recipient");
+    assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(refusal.message, "The backup key is the owner's");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 /// A subprocess that also presents a device header is still a subprocess:
 /// `build_message_origin` puts the origin token first. So the obvious way round
 /// the gate does not work.

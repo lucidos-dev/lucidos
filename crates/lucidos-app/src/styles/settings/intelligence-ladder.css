@@ -1,0 +1,325 @@
+/* Settings → Intelligence: the intelligence ladders (IntelligencePage). */
+
+/* Short of room, the controls drop under the title as one right-packed line.
+   Neither side squeezes, so no label breaks and no button overlaps another. */
+.ladder-title {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--space-sm) var(--space-md);
+}
+
+.ladder-title-controls {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-sm);
+    margin-left: auto;
+}
+
+.ladder-title-controls > *,
+.ladder-small-btn {
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+/* The title is an uppercase eyebrow; its controls read as ordinary text. */
+.ladder-show-off {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    margin-right: var(--space-xs);
+    font-size: var(--font-size-sm);
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-secondary);
+}
+
+.ladder-show-off input {
+    accent-color: var(--accent);
+}
+
+.ladder-small-btn {
+    font-size: var(--font-size-sm);
+    padding: 0.125rem var(--space-sm);
+}
+
+/* The head and each row are separate grids, so their tracks must resolve to
+   the same lengths. Both grids set the same font size, which every `ch` track
+   is measured against. A track is never narrower than its head word or its
+   control. A band track fits "estimated", and Intelligence fits all of
+   "not estimated". */
+.ladder-grid {
+    display: grid;
+    grid-template-columns:
+        1rem minmax(0, 1fr) 13ch 9ch 9ch
+        max(7ch, 1.5rem) max(2ch, 2.25rem);
+    align-items: center;
+    column-gap: var(--space-md);
+    width: 100%;
+    font-size: var(--font-size-sm);
+}
+
+.ladder-head {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    padding: 0 var(--space-lg);
+    margin: var(--space-sm) 0 var(--space-xs);
+}
+
+.ladder-row {
+    padding-top: 0.375rem;
+    padding-bottom: 0.375rem;
+}
+
+.ladder-row .title {
+    font-size: var(--font-size-md);
+}
+
+.ladder-band {
+    font-size: var(--font-size-sm);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+}
+
+/* Default and on each take a column of their own, centred under the head
+   that names it. */
+.ladder-actions {
+    display: contents;
+}
+
+.ladder-control-head,
+.ladder-actions > * {
+    justify-self: center;
+    text-align: center;
+}
+
+/* The grip is what a mouse drags. It stays quiet until the row is hovered. */
+.ladder-grip {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    opacity: 0.55;
+    transition: opacity var(--duration-fast), color var(--duration-fast);
+}
+
+/* Only a rung that is on can be dragged, so only its grip takes the press. */
+.ladder-grip-live {
+    cursor: grab;
+    touch-action: none;
+}
+
+@media (hover: hover) {
+    .ladder-row:hover .ladder-grip {
+        opacity: 1;
+        color: var(--text-secondary);
+    }
+}
+
+.ladder-row-lifted,
+.ladder-row-lifted .ladder-grip {
+    cursor: grabbing;
+}
+
+/* The arrows are the keyboard's way to reorder. Each stays out of sight until
+   it takes keyboard focus, and then shows in the grip's place. */
+.ladder-move:not(:focus-visible) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+}
+
+.ladder-order {
+    position: absolute;
+    inset-block: 0;
+    left: var(--space-lg);
+    width: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* It lies over the grip, so only a shown arrow may take the pointer. */
+    pointer-events: none;
+}
+
+.ladder-move:focus-visible {
+    pointer-events: auto;
+}
+
+.ladder-row:has(.ladder-move:focus-visible) .ladder-grip {
+    visibility: hidden;
+}
+
+.ladder-default {
+    color: var(--accent);
+}
+
+/* An off rung stays in its place, dimmed, with its switch at full strength so
+   turning it back on reads as the obvious action. */
+.ladder-row-off .ladder-grid > :not(.ladder-actions),
+.ladder-row-off .ladder-actions > :not(.toggle-switch) {
+    opacity: 0.45;
+}
+
+.ladder-note {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    margin: var(--space-sm) 0 var(--space-xs);
+}
+
+.ladder-share-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.ladder-share-controls input[type="range"] {
+    width: 8rem;
+}
+
+/* Fits "100%", so dragging never moves the slider. */
+.ladder-share-value {
+    min-width: 5ch;
+    text-align: right;
+}
+
+/* The Reset buttons sit flush right, so the section keeps tap reach there
+   and hands it back, rather than scroll sideways on a phone. */
+.ladder-section {
+    container: ladder / inline-size;
+    padding-right: var(--tap-reach-inline);
+    margin-right: calc(-1 * var(--tap-reach-inline));
+}
+
+/* The cell label shows only where the column heads are gone. */
+.ladder-cell-label {
+    display: none;
+}
+
+/* A rung in flight: it follows the pointer, and the row it would land on
+   shows an accent edge. */
+.ladder-row {
+    position: relative;
+}
+
+.ladder-row-lifted {
+    transform: translateY(var(--ladder-drag-dy));
+    z-index: 2;
+    background: var(--bg-hover);
+    box-shadow: var(--shadow-md);
+}
+
+.ladder-row-drop-before::before,
+.ladder-row-drop-after::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--accent);
+}
+
+.ladder-row-drop-before::before { top: -1px; }
+.ladder-row-drop-after::after { bottom: -1px; }
+
+/* Too narrow for the columns, as on a phone. The rung name takes the first
+   line with its star and switch at the right, and the three bands sit under
+   it in equal columns, each under its own label. The grip gives way to press
+   and drag on the whole row. `--ladder-compact` tells the drag code it is on. */
+@container ladder (max-width: 36rem) {
+    .ladder-head {
+        display: none;
+    }
+
+    .ladder-row {
+        --ladder-compact: 1;
+        -webkit-touch-callout: none;
+        -webkit-user-select: none;
+        user-select: none;
+    }
+
+    .ladder-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-areas:
+            "rung rung actions"
+            "intelligence cost time";
+        column-gap: var(--space-sm);
+        row-gap: var(--space-xs);
+    }
+
+    .ladder-grip {
+        display: none;
+    }
+
+    .ladder-grid > :nth-child(2) { grid-area: rung; }
+    .ladder-grid > :nth-child(3) { grid-area: intelligence; }
+    .ladder-grid > :nth-child(4) { grid-area: cost; }
+    .ladder-grid > :nth-child(5) { grid-area: time; }
+    .ladder-grid > :nth-child(6) { grid-area: actions; }
+
+    .ladder-actions {
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        gap: var(--space-xs);
+    }
+
+    .ladder-actions .toggle-switch {
+        margin-left: 0.375rem;
+    }
+
+    /* A focused arrow shows beside the star, and the hidden ones open no gap. */
+    .ladder-order {
+        display: contents;
+    }
+
+    .ladder-cell {
+        display: flex;
+        flex-direction: column;
+        gap: 0.0625rem;
+        min-width: 0;
+    }
+
+    .ladder-cell-label {
+        display: block;
+        font-size: var(--font-size-2xs);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--text-muted);
+    }
+}
+
+/* The title is an uppercase eyebrow; the mark reads as ordinary text. */
+.ladder-customised {
+    display: inline-block;
+    margin-left: var(--space-sm);
+    padding: 0 var(--space-sm);
+    border-radius: var(--radius-round);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-2xs);
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    vertical-align: middle;
+}
+
+.ladder-notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-sm) var(--space-md);
+    margin: var(--space-sm) 0;
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-surface);
+    background: var(--bg-tertiary);
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}

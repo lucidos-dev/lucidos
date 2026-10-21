@@ -36,6 +36,7 @@ function trigger(): TriggerInfo {
   return {
     id: TRIGGER_ID,
     name: 'Scheduled CI result',
+    slug: 'scheduled-ci-result',
     cron_expressions: [],
     timezone: 'UTC',
     paused: false,

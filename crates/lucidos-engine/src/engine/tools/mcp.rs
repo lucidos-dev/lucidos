@@ -3,16 +3,6 @@ use crate::engine::thread_events::{EventMeta, McpEnablementSource};
 use crate::mcp::McpStopOutcome;
 use std::collections::HashMap;
 
-/// Whether the calling loop re-reads its tool array each round.
-///
-/// `run_agentic_loop` refreshes the MCP slice per round, so a server started
-/// mid-turn is callable at once. `run_intent_loop` builds its array once from
-/// `build_intent_tools`, which never carries the MCP surface. The same promise
-/// there would send the model after tools it does not have.
-fn tool_array_refreshes() -> bool {
-    super::apps::INTENT_DEPTH.try_with(|d| *d).unwrap_or(0) == 0
-}
-
 impl LucidosEngine {
     /// `thread_id` is the calling thread: `enable`, `disable`, `start` and
     /// `setup` act on its own enabled servers (ADR 0430).
@@ -42,14 +32,14 @@ impl LucidosEngine {
                 // EVERY variable, so the server was registered and started without
                 // its API key and the failure surfaced much later as an opaque
                 // upstream auth error. Reject it here where the cause is obvious.
-                let env: HashMap<String, String> = match args.get("env") {
+                let env: HashMap<String, crate::core::McpEnvValue> = match args.get("env") {
                     None => HashMap::new(),
                     Some(v) if v.is_null() => HashMap::new(),
                     Some(v) => match serde_json::from_value(v.clone()) {
                         Ok(m) => m,
                         Err(e) => {
                             return Ok(format!(
-                                "Error: 'env' must be an object of string to string pairs (quote every value, e.g. {{\"PORT\": \"3000\"}}): {}",
+                                "Error: each 'env' value must be a quoted string (e.g. {{\"PORT\": \"3000\"}}) or a credential name as {{\"credential\": \"<name>\"}}: {}",
                                 e
                             ))
                         }
@@ -61,15 +51,7 @@ impl LucidosEngine {
                 }
 
                 self.mcp_manager
-                    .setup_server(
-                        thread_id,
-                        id,
-                        server_name,
-                        command,
-                        &tool_args,
-                        &env,
-                        tool_array_refreshes(),
-                    )
+                    .setup_server(thread_id, id, server_name, command, &tool_args, &env)
                     .await
                     .map_err(|e| format!("Failed to set up MCP server: {}", e).into())
             }
@@ -167,7 +149,7 @@ impl LucidosEngine {
                     .enable_for_thread(thread_id, id, McpEnablementSource::Agent, EventMeta::NONE)
                     .await
                 {
-                    Ok(outcome) => Ok(outcome.describe(id, tool_array_refreshes())),
+                    Ok(outcome) => Ok(outcome.describe(id)),
                     Err(e) => Err(format!("Failed to enable MCP server: {}", e).into()),
                 }
             }

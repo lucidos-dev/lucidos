@@ -83,6 +83,7 @@ export function drawsResponseRow(event: ResponseEvent, showSteps: boolean): bool
     case 'held_message':
     case 'form_request':
     case 'spoken_reply':
+    case 'restart':
     case 'empty':
       return true;
     // Drawn somewhere else, or not at all. A question and a permission are
@@ -240,6 +241,7 @@ export function responseBody(
       case 'held_message':
       case 'form_request':
       case 'spoken_reply':
+      case 'restart':
       case 'empty':
         run = null;
         if (index >= from) section.rows.push({ kind: 'marker', key: index, event });

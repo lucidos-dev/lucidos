@@ -1,17 +1,45 @@
 use crate::llm::anthropic::AnthropicProvider;
 use crate::llm::model_registry::{
-    current_model, default_effort, resolve_route, ModelRegistry, ProviderKind, RouteEntry,
-    Unconfigured,
+    default_effort, reaches, resolve_generation, resolve_route, vision_flag, Generation,
+    ModelRegistry, ProviderKind, RouteEntry, Unconfigured,
 };
+use crate::llm::not_served::{ModelNotServed, NotServedLedger};
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::{
-    LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
+    forward, replace_image_blocks, LlmProvider, LlmResponse, Message, MessageContent,
+    ModelSelection, SharedCallback, TokenCallback, ToolDefinition,
 };
 use crate::llm::reasoning::clamp_effort;
 use crate::llm::served_model::served_as_sent;
 use crate::llm::vertex::VertexProvider;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Every backend a [`RoutingProvider`] can hold, each present only when
+/// configured. One field per [`ProviderKind`].
+#[derive(Default)]
+pub struct RoutingBackends {
+    pub vertex: Option<VertexProvider>,
+    pub openai: Option<OpenAiProvider>,
+    pub anthropic: Option<AnthropicProvider>,
+    /// OpenRouter — an [`OpenAiProvider`] pointed at `openrouter.ai/api/v1`.
+    pub openrouter: Option<OpenAiProvider>,
+    /// xAI, an [`OpenAiProvider`] pointed at `api.x.ai/v1`, serving Grok.
+    pub xai: Option<OpenAiProvider>,
+    /// OpenCode's keyless free tier, an [`OpenAiProvider`] pointed at
+    /// `opencode.ai/zen/v1` with no credential. Present only when the user
+    /// turned it on.
+    pub opencode_free: Option<OpenAiProvider>,
+    /// A generic OpenAI-compatible local server — an [`OpenAiProvider`] pointed
+    /// at the configured local base URL (default Ollama).
+    pub local: Option<OpenAiProvider>,
+    /// A Claude gateway, an [`AnthropicProvider`] on the gateway's origin with
+    /// its signed-in bearer.
+    pub claude_gateway: Option<AnthropicProvider>,
+}
 
 /// Routes LLM requests to the correct provider for the requested model. The
 /// model → provider mapping comes from the database-backed [`ModelRegistry`]
@@ -21,34 +49,28 @@ pub struct RoutingProvider {
     vertex: Option<Arc<VertexProvider>>,
     openai: Option<Arc<OpenAiProvider>>,
     anthropic: Option<Arc<AnthropicProvider>>,
-    /// OpenRouter — an [`OpenAiProvider`] pointed at `openrouter.ai/api/v1`.
     openrouter: Option<Arc<OpenAiProvider>>,
-    /// xAI, an [`OpenAiProvider`] pointed at `api.x.ai/v1`, serving Grok.
     xai: Option<Arc<OpenAiProvider>>,
-    /// OpenCode's keyless free tier, an [`OpenAiProvider`] pointed at
-    /// `opencode.ai/zen/v1` with no credential. Present only when the user
-    /// turned it on.
     opencode_free: Option<Arc<OpenAiProvider>>,
-    /// A generic OpenAI-compatible local server — an [`OpenAiProvider`] pointed
-    /// at the configured local base URL (default Ollama).
     local: Option<Arc<OpenAiProvider>>,
+    claude_gateway: Option<Arc<AnthropicProvider>>,
     registry: ModelRegistry,
     default_model: String,
+    not_served: NotServedLedger,
 }
 
 impl RoutingProvider {
-    #[allow(clippy::too_many_arguments)] // one argument per backend, plus the registry and default
-    pub fn new(
-        vertex: Option<VertexProvider>,
-        openai: Option<OpenAiProvider>,
-        anthropic: Option<AnthropicProvider>,
-        openrouter: Option<OpenAiProvider>,
-        xai: Option<OpenAiProvider>,
-        opencode_free: Option<OpenAiProvider>,
-        local: Option<OpenAiProvider>,
-        registry: ModelRegistry,
-        default_model: String,
-    ) -> Self {
+    pub fn new(backends: RoutingBackends, registry: ModelRegistry, default_model: String) -> Self {
+        let RoutingBackends {
+            vertex,
+            openai,
+            anthropic,
+            openrouter,
+            xai,
+            opencode_free,
+            local,
+            claude_gateway,
+        } = backends;
         Self {
             vertex: vertex.map(Arc::new),
             openai: openai.map(Arc::new),
@@ -57,9 +79,18 @@ impl RoutingProvider {
             xai: xai.map(Arc::new),
             opencode_free: opencode_free.map(Arc::new),
             local: local.map(Arc::new),
+            claude_gateway: claude_gateway.map(Arc::new),
             registry,
             default_model,
+            not_served: NotServedLedger::default(),
         }
+    }
+
+    /// Route around the not-found answers in `ledger`, and record new ones
+    /// there. A shared ledger outlives this router, so a rebuild keeps it.
+    pub fn observing(mut self, ledger: NotServedLedger) -> Self {
+        self.not_served = ledger;
+        self
     }
 
     /// The backend instance serving `kind`, or `None` when it is not configured.
@@ -78,6 +109,10 @@ impl RoutingProvider {
                 self.opencode_free.as_deref().map(|p| p as &dyn LlmProvider)
             }
             ProviderKind::Local => self.local.as_deref().map(|p| p as &dyn LlmProvider),
+            ProviderKind::ClaudeGateway => self
+                .claude_gateway
+                .as_deref()
+                .map(|p| p as &dyn LlmProvider),
         }
     }
 
@@ -132,6 +167,38 @@ impl RoutingProvider {
         Some(clamped)
     }
 
+    /// `messages` as `model` may see them. A row whose *vision flag* is off
+    /// gets a note in place of each image, so it is never sent one it would
+    /// refuse. A model with no row keeps its images, and its provider decides
+    /// (ADR 0504).
+    ///
+    /// **This is the chokepoint** for every image producer: a chat turn's
+    /// attachments and history, tool results, and special-tool answers.
+    fn messages_for_model(&self, model: &str, mut messages: Vec<Message>) -> Vec<Message> {
+        if vision_flag(&self.registry, model) != Some(false) {
+            return messages;
+        }
+        let note = || {
+            format!(
+                "[Image not sent: {model} does not read images. Turn on its vision flag in Settings → Models to send images.]"
+            )
+        };
+        let withheld: usize = messages
+            .iter_mut()
+            .filter_map(|message| match &mut message.content {
+                MessageContent::Blocks(blocks) => Some(blocks),
+                MessageContent::Text(_) => None,
+            })
+            .map(|blocks| replace_image_blocks(blocks, note))
+            .sum();
+        if withheld > 0 {
+            crate::log!(
+                "[Routing] '{model}' does not read images; withheld {withheld} base64 bytes of images"
+            );
+        }
+        messages
+    }
+
     /// Resolve which backend serves `model` and what id to send it, or say what
     /// the user has to configure.
     ///
@@ -150,20 +217,109 @@ impl RoutingProvider {
     }
 }
 
+/// The model a call is sent as, how it relates to the named one, and its route.
+struct Resolved {
+    model: String,
+    generation: Generation,
+    route: RouteEntry,
+}
+
 impl RoutingProvider {
-    /// The model a selection is sent as, and the route that serves it. A
-    /// retired model is sent as its successor, never as the id a provider
-    /// might route elsewhere (ADR 0418).
-    fn resolve(
+    /// The model a selection is sent as, and the route that serves it: the
+    /// newest reachable generation in the named model's *lineage*. A retired
+    /// model goes out as its successor wherever the successor answers (ADR
+    /// 0418), and never as an id its successor's provider has refused.
+    fn resolve(&self, selection: &ModelSelection<'_>) -> Result<Resolved, BoxError> {
+        self.resolve_refusing(selection, None)
+    }
+
+    /// [`Self::resolve`], as if `also_refused` had answered not-found too.
+    fn resolve_refusing(
         &self,
         selection: &ModelSelection<'_>,
-    ) -> Result<(String, RouteEntry), Box<dyn std::error::Error + Send + Sync>> {
-        let model = current_model(
-            &self.registry,
-            selection.model.unwrap_or(&self.default_model),
-        );
-        let route = self.route_for(&model, selection.provider)?;
-        Ok((model, route))
+        also_refused: Option<(ProviderKind, &str)>,
+    ) -> Result<Resolved, BoxError> {
+        let named = selection.model.unwrap_or(&self.default_model);
+        let refused = |provider, model: &str| {
+            also_refused == Some((provider, model)) || self.not_served.refused(provider, model)
+        };
+        let resolved = resolve_generation(&self.registry, named, selection.generation_rule, |m| {
+            reaches(
+                &self.registry,
+                m,
+                selection.provider,
+                |kind| self.is_configured(kind),
+                refused,
+            )
+        });
+        let route = self.route_for(&resolved.model, selection.provider)?;
+        Ok(Resolved {
+            model: resolved.model,
+            generation: resolved.generation,
+            route,
+        })
+    }
+
+    /// Say why a call goes out on another model than the one it named.
+    fn log_generation(named: &str, resolved: &Resolved) {
+        let model = &resolved.model;
+        match &resolved.generation {
+            Generation::Named => {}
+            Generation::Successor => {
+                crate::log!("[Routing] '{named}' is retired; sending its successor '{model}'")
+            }
+            Generation::Predecessor => crate::log!(
+                "[Routing] nothing from '{named}' on is reachable; sending the earlier '{model}'"
+            ),
+            Generation::Held { successor } => crate::log!(
+                "[Routing] '{named}' is retired, but '{successor}' is not reachable; keeping '{named}'"
+            ),
+        }
+    }
+
+    /// One request to the leaf serving `resolved`.
+    async fn send(
+        &self,
+        resolved: &Resolved,
+        (messages, tools): (Vec<Message>, Vec<ToolDefinition>),
+        selection: &ModelSelection<'_>,
+        system_prompt: Option<&str>,
+        on_token: Option<TokenCallback>,
+        call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, BoxError> {
+        let Resolved { model, route, .. } = resolved;
+        // `route_for` already refused an unconfigured backend, so the miss here
+        // is unreachable. It resolves through the same `backend`, and saying
+        // what to configure beats an `expect` if the two ever part company.
+        let provider = self
+            .backend(route.provider)
+            .ok_or_else(|| unconfigured_message(route.provider))?;
+        // The leaf serves ONE backend, so it is handed the resolved route: its
+        // own wire id, and the effort snapped onto what that backend accepts.
+        let leaf = ModelSelection::model(&route.wire_id)
+            .with_effort(self.effort_for_route(model, route, selection.reasoning_effort))
+            .with_attempt_timeout(selection.attempt_timeout)
+            .with_forced_tool(selection.forced_tool)
+            .with_service_tier(selection.service_tier)
+            .with_cache_mode(selection.cache_mode);
+        let messages = self.messages_for_model(model, messages);
+        crate::llm::call_trace::routed_to(route.provider);
+        let outcome = provider
+            .chat(messages, tools, leaf, system_prompt, on_token, call)
+            .await;
+        outcome.map_err(|err| self.record_refusal(err, route.provider, model))
+    }
+
+    /// Mark a not-found answer in the ledger and stamp who refused it. Any
+    /// other error passes through untouched.
+    fn record_refusal(&self, err: BoxError, provider: ProviderKind, model: &str) -> BoxError {
+        match err.downcast::<ModelNotServed>() {
+            Ok(refusal) => {
+                self.not_served.mark(provider, model);
+                Box::new(refusal.refused_by(provider, model))
+            }
+            Err(other) => other,
+        }
     }
 }
 
@@ -182,6 +338,7 @@ fn unconfigured_message(kind: ProviderKind) -> &'static str {
         ProviderKind::XAi => "xAI model requested but no xAI credential is configured (Settings → Models → Providers) and LUCIDOS_XAI_API_KEY is not set",
         ProviderKind::OpenCodeFree => "Free model requested but the keyless OpenCode Free tier is turned off (Settings → Models → Providers)",
         ProviderKind::Local => "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Models → Providers)",
+        ProviderKind::ClaudeGateway => "Claude gateway model requested but Lucidos is not signed in to a Claude gateway (Settings → Models → Providers)",
     }
 }
 
@@ -195,29 +352,68 @@ impl LlmProvider for RoutingProvider {
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
         call: crate::llm::metered::CallToken,
-    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let (model, route) = self.resolve(&selection)?;
-        let requested = selection.model.unwrap_or(&self.default_model);
-        if requested != model {
-            crate::log!("[Routing] '{requested}' is retired; sending its successor '{model}'");
-        }
-        // `route_for` already refused an unconfigured backend, so the miss here
-        // is unreachable. It resolves through the same `backend`, and saying
-        // what to configure beats an `expect` if the two ever part company.
-        let provider = self
-            .backend(route.provider)
-            .ok_or_else(|| unconfigured_message(route.provider))?;
-        // The leaf serves ONE backend, so it is handed the resolved route: its
-        // own wire id, and the effort snapped onto what that backend accepts.
-        let resolved = ModelSelection::model(&route.wire_id)
-            .with_effort(self.effort_for_route(&model, &route, selection.reasoning_effort))
-            .with_attempt_timeout(selection.attempt_timeout)
-            .with_forced_tool(selection.forced_tool)
-            .with_service_tier(selection.service_tier)
-            .with_cache_mode(selection.cache_mode);
-        let response = provider
-            .chat(messages, tools, resolved, system_prompt, on_token, call)
-            .await?;
+    ) -> Result<LlmResponse, BoxError> {
+        let named = selection.model.unwrap_or(&self.default_model);
+        let first = self.resolve(&selection)?;
+        Self::log_generation(named, &first);
+        // A retry needs the request again. Keep a copy only when a refusal
+        // here would resolve to another model, so a turn's images are cloned
+        // only when they could be resent.
+        let retry_on = self
+            .resolve_refusing(&selection, Some((first.route.provider, &first.model)))
+            .ok()
+            .filter(|next| next.model != first.model);
+        let kept = retry_on.as_ref().map(|_| (messages.clone(), tools.clone()));
+        let streamed = Arc::new(AtomicBool::new(false));
+        let shared: Option<SharedCallback> = on_token.map(|cb| {
+            let streamed = streamed.clone();
+            Arc::new(move |token: &str| {
+                streamed.store(true, Ordering::SeqCst);
+                cb(token)
+            }) as SharedCallback
+        });
+        let outcome = self
+            .send(
+                &first,
+                (messages, tools),
+                &selection,
+                system_prompt,
+                forward(&shared),
+                call,
+            )
+            .await;
+        let (outcome, resolved) = match (outcome, kept) {
+            (Err(err), Some(request))
+                if err.is::<ModelNotServed>() && !streamed.load(Ordering::SeqCst) =>
+            {
+                // The ledger now holds the refusal, so this resolves afresh.
+                let next = self.resolve(&selection)?;
+                if next.model == first.model {
+                    return Err(err);
+                }
+                crate::log!(
+                    "[Routing] {} does not serve '{}'; retrying once on '{}'",
+                    first.route.provider.as_str(),
+                    first.model,
+                    next.model
+                );
+                let outcome = self
+                    .send(
+                        &next,
+                        request,
+                        &selection,
+                        system_prompt,
+                        forward(&shared),
+                        call,
+                    )
+                    .await;
+                (outcome, next)
+            }
+            (outcome, _) => (outcome, first),
+        };
+        let mut response = outcome?;
+        let route = resolved.route;
+        response.provider = Some(route.provider);
         if let Some(served) = response.served_model.as_deref() {
             if !served_as_sent(&route.wire_id, served) {
                 crate::log!(
@@ -232,7 +428,9 @@ impl LlmProvider for RoutingProvider {
 
     fn effort_sent(&self, selection: &ModelSelection<'_>) -> Option<String> {
         match self.resolve(selection) {
-            Ok((model, route)) => self.effort_for_route(&model, &route, selection.reasoning_effort),
+            Ok(Resolved { model, route, .. }) => {
+                self.effort_for_route(&model, &route, selection.reasoning_effort)
+            }
             Err(_) => selection.reasoning_effort,
         }
         .map(str::to_string)
@@ -250,10 +448,15 @@ impl LlmProvider for RoutingProvider {
                 .collect(),
         )
     }
+
+    fn not_served_ledger(&self) -> Option<NotServedLedger> {
+        Some(self.not_served.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::lineage_stub::lineage_router;
     use super::*;
     use crate::llm::model_registry::ModelRouting;
     use std::collections::HashMap;
@@ -268,13 +471,7 @@ mod tests {
                 .collect::<HashMap<_, _>>(),
         ));
         RoutingProvider::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            RoutingBackends::default(),
             registry,
             "claude-opus-5".to_string(),
         )
@@ -368,6 +565,100 @@ mod tests {
         assert!(err.contains("Settings → Models → Providers"), "{err}");
     }
 
+    struct NoTokens;
+
+    #[async_trait::async_trait]
+    impl crate::llm::claude_gateway::GatewayAccess for NoTokens {
+        async fn bearer(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            Err("not signed in".into())
+        }
+
+        async fn renew_rejected(
+            &self,
+            _rejected: &str,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            self.bearer().await
+        }
+
+        async fn managed_settings(
+            &self,
+        ) -> Result<
+            Option<crate::llm::claude_gateway::gateway_managed_settings::GatewayManagedSettings>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Err("not signed in".into())
+        }
+    }
+
+    /// A router holding only a Claude gateway, for a Claude model routed to
+    /// Vertex, direct Anthropic and the gateway, in that order.
+    fn gateway_only_router() -> RoutingProvider {
+        let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
+            "claude-opus-5-5".to_string(),
+            ModelRouting {
+                routes: vec![
+                    RouteEntry::new(ProviderKind::Vertex, "claude-opus-5-5"),
+                    RouteEntry::new(ProviderKind::Anthropic, "claude-opus-5-5"),
+                    RouteEntry::new(ProviderKind::ClaudeGateway, "claude-opus-5-5"),
+                ],
+                preferred: None,
+                vision: false,
+                default_effort: None,
+                successor: None,
+            },
+        )])));
+        let gateway = AnthropicProvider::claude_gateway(
+            crate::llm::claude_gateway::GatewayOrigin::parse("https://gateway.example").unwrap(),
+            Arc::new(NoTokens),
+            "claude-opus-5-5".to_string(),
+        )
+        .expect("build the gateway provider");
+        RoutingProvider::new(
+            RoutingBackends {
+                claude_gateway: Some(gateway),
+                ..RoutingBackends::default()
+            },
+            registry,
+            "claude-opus-5-5".to_string(),
+        )
+    }
+
+    /// With only the gateway signed in, a Claude model runs there. Pinned to
+    /// direct Anthropic, the turn is refused naming Anthropic, never moved.
+    #[test]
+    fn a_claude_model_runs_on_the_gateway_and_a_pin_elsewhere_is_refused() {
+        let router = gateway_only_router();
+        assert_eq!(
+            router.configured_providers(),
+            Some(vec![ProviderKind::ClaudeGateway])
+        );
+        let route = router
+            .route_for("claude-opus-5-5", None)
+            .expect("the gateway serves it");
+        assert_eq!(route.provider, ProviderKind::ClaudeGateway);
+        let Err(err) = router.route_for("claude-opus-5-5", Some(ProviderKind::Anthropic)) else {
+            panic!("a pin to an unconfigured backend must refuse");
+        };
+        assert!(err.to_string().contains("Anthropic credential"), "{err}");
+    }
+
+    /// A turn pinned to the gateway while it is not signed in says where to
+    /// sign in, rather than running on another configured backend.
+    #[test]
+    fn a_pin_to_a_gateway_not_signed_in_says_where_to_sign_in() {
+        let router = router(&[("claude-opus-5-5", ProviderKind::ClaudeGateway)]);
+        let Err(err) = router.route_for("claude-opus-5-5", Some(ProviderKind::ClaudeGateway))
+        else {
+            panic!("no gateway is configured");
+        };
+        let err = err.to_string();
+        assert!(err.contains("not signed in to a Claude gateway"), "{err}");
+        assert!(
+            err.contains(crate::llm::claude_gateway::SIGN_IN_LOCATION),
+            "{err}"
+        );
+    }
+
     /// The honoured-or-refused rule, at the layer that enforces it.
     ///
     /// A model routed to both Vertex and Anthropic, with only Anthropic
@@ -389,19 +680,16 @@ mod tests {
             },
         )])));
         let router = RoutingProvider::new(
-            None,
-            None,
-            Some(
-                AnthropicProvider::new(
-                    crate::llm::AnthropicAuth::ApiKey("k".to_string()),
-                    "claude-opus-5".to_string(),
-                )
-                .expect("build the anthropic provider"),
-            ),
-            None,
-            None,
-            None,
-            None,
+            RoutingBackends {
+                anthropic: Some(
+                    AnthropicProvider::new(
+                        crate::llm::AnthropicAuth::ApiKey("k".to_string()),
+                        "claude-opus-5".to_string(),
+                    )
+                    .expect("build the anthropic provider"),
+                ),
+                ..RoutingBackends::default()
+            },
             registry,
             "claude-opus-5".to_string(),
         );
@@ -467,13 +755,10 @@ mod tests {
             ModelRouting::single(ProviderKind::Local, "local-model"),
         )])));
         let router = RoutingProvider::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(local),
+            RoutingBackends {
+                local: Some(local),
+                ..RoutingBackends::default()
+            },
             registry,
             "local-model".to_string(),
         );
@@ -532,15 +817,52 @@ mod tests {
         (provider, hits)
     }
 
-    /// The router rebuilds the selection for the leaf field by field, so a
-    /// requested service tier and cache mode must cross it. The backend
-    /// records the body it was sent and refuses, which ends the call.
+    /// The response names the backend the router chose, so the capture can
+    /// record which backend served the call.
     #[tokio::test]
-    async fn the_service_tier_and_cache_mode_cross_the_router_to_the_leaf() {
+    async fn the_response_names_the_route_that_served_it() {
+        let (local, _hits) = answering_backend(
+            "200 OK",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],"#,
+                r#""usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+                "\n\ndata: [DONE]\n\n"
+            ),
+        )
+        .await;
+        let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
+            "local-model".to_string(),
+            ModelRouting::single(ProviderKind::Local, "local-model"),
+        )])));
+        let router = RoutingProvider::new(
+            RoutingBackends {
+                local: Some(local),
+                ..RoutingBackends::default()
+            },
+            registry,
+            "local-model".to_string(),
+        );
+        let response = router
+            .chat(
+                vec![],
+                vec![],
+                ModelSelection::model("local-model"),
+                None,
+                None,
+                crate::llm::metered::CallToken::for_test(),
+            )
+            .await
+            .expect("the backend answers");
+        assert_eq!(response.provider, Some(ProviderKind::Local));
+    }
+
+    /// An OpenAI backend at a local port that records each request it is sent
+    /// and refuses it, which ends the call.
+    async fn recording_openai() -> (OpenAiProvider, tokio::sync::mpsc::UnboundedReceiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (sent, mut bodies) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (sent, bodies) = tokio::sync::mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut request = vec![0u8; 256 * 1024];
@@ -557,24 +879,153 @@ mod tests {
         });
         let openai = OpenAiProvider::new_with_base_url(
             "k".to_string(),
-            "gpt-6.1-sol".to_string(),
+            "unused".to_string(),
             &format!("http://{addr}/v1"),
             Vec::new(),
             false,
         )
         .expect("build the stub provider");
+        (openai, bodies)
+    }
+
+    /// A user message carrying one image, the shape a chat turn sends.
+    fn message_with_an_image() -> Message {
+        Message {
+            role: "user".to_string(),
+            content: crate::llm::MessageContent::Blocks(vec![
+                crate::llm::ContentBlock::Text {
+                    text: "what is in this picture?".to_string(),
+                },
+                crate::llm::ContentBlock::Image {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "iVBORw0KGgo".to_string(),
+                },
+            ]),
+        }
+    }
+
+    /// The request body `router` sends for one image-bearing turn on `model`.
+    async fn body_sent(
+        router: &RoutingProvider,
+        bodies: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+        model: &str,
+    ) -> String {
+        let outcome = router
+            .chat(
+                vec![message_with_an_image()],
+                vec![],
+                ModelSelection::model(model),
+                None,
+                None,
+                crate::llm::metered::CallToken::for_test(),
+            )
+            .await;
+        assert!(outcome.is_err(), "the backend refuses");
+        bodies.recv().await.expect("the leaf sent a request")
+    }
+
+    /// A router over one recording OpenAI backend, holding `rows` as
+    /// `(id, vision, successor)`.
+    async fn vision_router(
+        rows: &[(&str, bool, Option<&str>)],
+    ) -> (
+        RoutingProvider,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (openai, bodies) = recording_openai().await;
+        let registry: ModelRegistry = Arc::new(RwLock::new(
+            rows.iter()
+                .map(|(id, vision, successor)| {
+                    let routing = ModelRouting {
+                        vision: *vision,
+                        successor: successor.map(str::to_string),
+                        ..ModelRouting::single(ProviderKind::OpenAi, *id)
+                    };
+                    (id.to_string(), routing)
+                })
+                .collect::<HashMap<_, _>>(),
+        ));
+        let router = RoutingProvider::new(
+            RoutingBackends {
+                openai: Some(openai),
+                ..RoutingBackends::default()
+            },
+            registry,
+            "gpt-4.1".to_string(),
+        );
+        (router, bodies)
+    }
+
+    fn carries_the_image(request: &str) -> bool {
+        request.contains(r#""type":"image_url""#) && request.contains("iVBORw0KGgo")
+    }
+
+    /// The vision flag decides, at the router, whether a model sees images. A
+    /// text-only row gets the note in each image's place. A flagged row and a
+    /// model with no row keep the image, and the provider decides.
+    #[tokio::test]
+    async fn only_a_text_only_row_has_its_images_withheld() {
+        let (router, mut bodies) = vision_router(&[
+            ("gpt-4.1-looker", true, None),
+            ("gpt-4.1-text", false, None),
+        ])
+        .await;
+        for model in ["gpt-4.1-looker", "gpt-4.1"] {
+            let request = body_sent(&router, &mut bodies, model).await;
+            assert!(carries_the_image(&request), "{model}: {request}");
+            assert!(!request.contains("Image not sent"), "{model}: {request}");
+        }
+        let request = body_sent(&router, &mut bodies, "gpt-4.1-text").await;
+        assert!(!request.contains("image_url"), "{request}");
+        assert!(!request.contains("iVBORw0KGgo"), "{request}");
+        assert!(
+            request.contains("[Image not sent: gpt-4.1-text does not read images."),
+            "{request}"
+        );
+        assert!(
+            request.contains("what is in this picture?"),
+            "the text around the image survives: {request}"
+        );
+    }
+
+    /// The gate reads the model the call is SENT as. A retired text-only model
+    /// whose successor reads images keeps its images, and the reverse loses
+    /// them.
+    #[tokio::test]
+    async fn the_gate_reads_the_successor_not_the_retired_id() {
+        let (router, mut bodies) = vision_router(&[
+            ("gpt-4.1-old-text", false, Some("gpt-4.1-new-looker")),
+            ("gpt-4.1-new-looker", true, None),
+            ("gpt-4.1-old-looker", true, Some("gpt-4.1-new-text")),
+            ("gpt-4.1-new-text", false, None),
+        ])
+        .await;
+        let request = body_sent(&router, &mut bodies, "gpt-4.1-old-text").await;
+        assert!(carries_the_image(&request), "{request}");
+        let request = body_sent(&router, &mut bodies, "gpt-4.1-old-looker").await;
+        assert!(!carries_the_image(&request), "{request}");
+        assert!(
+            request.contains("gpt-4.1-new-text does not read images"),
+            "{request}"
+        );
+    }
+
+    /// The router rebuilds the selection for the leaf field by field, so a
+    /// requested service tier and cache mode must cross it. The backend
+    /// records the body it was sent and refuses, which ends the call.
+    #[tokio::test]
+    async fn the_service_tier_and_cache_mode_cross_the_router_to_the_leaf() {
+        let (openai, mut bodies) = recording_openai().await;
         let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
             "gpt-6.1-sol".to_string(),
             ModelRouting::single(ProviderKind::OpenAi, "gpt-6.1-sol"),
         )])));
         let router = RoutingProvider::new(
-            None,
-            Some(openai),
-            None,
-            None,
-            None,
-            None,
-            None,
+            RoutingBackends {
+                openai: Some(openai),
+                ..RoutingBackends::default()
+            },
             registry,
             "gpt-6.1-sol".to_string(),
         );
@@ -627,13 +1078,11 @@ mod tests {
             },
         )])));
         let router = RoutingProvider::new(
-            None,
-            None,
-            None,
-            Some(openrouter),
-            None,
-            None,
-            Some(local),
+            RoutingBackends {
+                openrouter: Some(openrouter),
+                local: Some(local),
+                ..RoutingBackends::default()
+            },
             registry,
             "some-model".to_string(),
         );
@@ -651,6 +1100,96 @@ mod tests {
         assert!(err.is::<crate::llm::ModelNotServed>(), "{err}");
         assert_eq!(refused.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(untouched.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    async fn chat_on(
+        router: &RoutingProvider,
+        selection: ModelSelection<'_>,
+    ) -> Result<LlmResponse, BoxError> {
+        let message = Message {
+            role: "user".to_string(),
+            content: MessageContent::Text("hi".to_string()),
+        };
+        router
+            .chat(
+                vec![message],
+                vec![],
+                selection,
+                None,
+                None,
+                crate::llm::metered::CallToken::for_test(),
+            )
+            .await
+    }
+
+    fn requests(seen: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        seen.lock().unwrap().clone()
+    }
+
+    /// The reported failure: the successor answers not-found and the retired
+    /// model still serves. The call retries once on the retired model and
+    /// stays whole, and the next call skips the successor inside the window.
+    #[tokio::test]
+    async fn a_refused_successor_falls_back_within_the_call_and_is_then_skipped() {
+        let (router, seen) = lineage_router(&["new"]).await;
+        chat_on(&router, ModelSelection::model("old"))
+            .await
+            .expect("the retired model serves the retry");
+        assert_eq!(requests(&seen), ["new", "old"]);
+        chat_on(&router, ModelSelection::model("old"))
+            .await
+            .expect("the retired model serves");
+        assert_eq!(requests(&seen), ["new", "old", "old"]);
+        assert!(router
+            .not_served_ledger()
+            .expect("the router keeps a ledger")
+            .refused(ProviderKind::Local, "new"));
+    }
+
+    /// A reachable successor still wins (ADR 0418).
+    #[tokio::test]
+    async fn a_reachable_successor_still_wins() {
+        let (router, seen) = lineage_router(&[]).await;
+        chat_on(&router, ModelSelection::model("old"))
+            .await
+            .expect("the successor serves");
+        assert_eq!(requests(&seen), ["new"]);
+    }
+
+    /// A stored pick on the successor steps back to the model it replaced. A
+    /// default never does, and its refusal names who refused.
+    #[tokio::test]
+    async fn only_a_stored_pick_steps_back() {
+        let (router, seen) = lineage_router(&["new"]).await;
+        let default = ModelSelection::model("new")
+            .with_generation_rule(crate::llm::model_registry::GenerationRule::NamedOrNewer);
+        let err = chat_on(&router, default)
+            .await
+            .expect_err("a default does not step back");
+        let refusal = err
+            .downcast_ref::<ModelNotServed>()
+            .expect("the refusal stays typed");
+        assert_eq!(refusal.refusal(), Some((ProviderKind::Local, "new")));
+        assert_eq!(requests(&seen), ["new"]);
+        chat_on(&router, ModelSelection::model("new"))
+            .await
+            .expect("the stored pick steps back to the retired model");
+        assert_eq!(requests(&seen), ["new", "old"]);
+    }
+
+    /// A call retries at most once, and the refusal names the model the
+    /// retry was sent, never the one the caller named.
+    #[tokio::test]
+    async fn a_call_retries_at_most_once() {
+        let (router, seen) = lineage_router(&["new", "old"]).await;
+        let err = chat_on(&router, ModelSelection::model("old"))
+            .await
+            .expect_err("nothing in the lineage serves");
+        let refusal = err
+            .downcast_ref::<ModelNotServed>()
+            .expect("the refusal stays typed");
+        assert_eq!(refusal.refusal(), Some((ProviderKind::Local, "old")));
+        assert_eq!(requests(&seen), ["new", "old"]);
     }
 
     /// A retired model is sent as its successor, at an effort the successor
@@ -671,23 +1210,24 @@ mod tests {
             ),
         ])));
         let router = RoutingProvider::new(
-            Some(
-                VertexProvider::new("my-project".into(), "eu".into(), "gemini-3.8-flash".into())
+            RoutingBackends {
+                vertex: Some(
+                    VertexProvider::new(
+                        "my-project".into(),
+                        "eu".into(),
+                        "gemini-3.8-flash".into(),
+                    )
                     .expect("build the vertex provider"),
-            ),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+                ),
+                ..RoutingBackends::default()
+            },
             registry,
             "claude-opus-5".to_string(),
         );
         let selection = ModelSelection::model("gemini-3.5-flash").with_effort(Some("none"));
-        let (model, route) = router.resolve(&selection).expect("vertex serves it");
-        assert_eq!(model, "gemini-3.8-flash");
-        assert_eq!(route.wire_id, "gemini-3.8-flash");
+        let resolved = router.resolve(&selection).expect("vertex serves it");
+        assert_eq!(resolved.model, "gemini-3.8-flash");
+        assert_eq!(resolved.route.wire_id, "gemini-3.8-flash");
         assert_eq!(router.effort_sent(&selection).as_deref(), Some("low"));
     }
 
@@ -709,22 +1249,19 @@ mod tests {
             },
         )])));
         let router = RoutingProvider::new(
-            None,
-            None,
-            None,
-            Some(
-                OpenAiProvider::new_with_base_url(
-                    "k".to_string(),
-                    "x".to_string(),
-                    crate::llm::OPENROUTER_BASE_URL,
-                    Vec::new(),
-                    true,
-                )
-                .expect("build the openrouter provider"),
-            ),
-            None,
-            None,
-            None,
+            RoutingBackends {
+                openrouter: Some(
+                    OpenAiProvider::new_with_base_url(
+                        "k".to_string(),
+                        "x".to_string(),
+                        crate::llm::OPENROUTER_BASE_URL,
+                        Vec::new(),
+                        true,
+                    )
+                    .expect("build the openrouter provider"),
+                ),
+                ..RoutingBackends::default()
+            },
             registry,
             "claude-opus-5-5".to_string(),
         );
@@ -776,13 +1313,10 @@ mod tests {
             row,
         )])));
         let router = RoutingProvider::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(local),
+            RoutingBackends {
+                local: Some(local),
+                ..RoutingBackends::default()
+            },
             registry,
             "local-model".to_string(),
         );
@@ -837,5 +1371,105 @@ mod tests {
                 "{junk:?}"
             );
         }
+    }
+}
+
+/// A real router over a local stub backend, for tests across the crate that
+/// need the router's lineage resolution and ledger.
+#[cfg(test)]
+pub(crate) mod lineage_stub {
+    use super::*;
+    use crate::llm::model_registry::ModelRouting;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    /// A local backend that answers not-found for the models in `refused` and
+    /// streams a reply for any other. It records the model of each request.
+    pub(crate) async fn lineage_backend(
+        refused: &'static [&'static str],
+    ) -> (OpenAiProvider, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0u8; 64 * 1024];
+                let n = stream.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let model = request
+                    .split(r#""model":""#)
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap_or_default()
+                    .to_string();
+                let (status, body) = match refused.contains(&model.as_str()) {
+                    true => (
+                        "404 Not Found",
+                        format!(r#"{{"error":{{"message":"model \"{model}\" not found"}}}}"#),
+                    ),
+                    false => (
+                        "200 OK",
+                        concat!(
+                            r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],"#,
+                            r#""usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+                            "\n\ndata: [DONE]\n\n"
+                        )
+                        .to_string(),
+                    ),
+                };
+                log.lock().unwrap().push(model);
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        let provider = OpenAiProvider::new_with_base_url(
+            String::new(),
+            "unused".to_string(),
+            &format!("http://{addr}/v1"),
+            Vec::new(),
+            true,
+        )
+        .expect("build the stub provider");
+        (provider, seen)
+    }
+
+    /// A router over [`lineage_backend`], holding `old` retired to `new`.
+    pub(crate) async fn lineage_router(
+        refused: &'static [&'static str],
+    ) -> (RoutingProvider, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (local, seen) = lineage_backend(refused).await;
+        let router = RoutingProvider::new(
+            RoutingBackends {
+                local: Some(local),
+                ..RoutingBackends::default()
+            },
+            lineage_registry(),
+            "old".to_string(),
+        );
+        (router, seen)
+    }
+
+    /// A registry holding the local model `old`, retired to `new`. A clone
+    /// shares nothing with the router's, but resolves the same way.
+    pub(crate) fn lineage_registry() -> ModelRegistry {
+        Arc::new(RwLock::new(HashMap::from([
+            (
+                "old".to_string(),
+                ModelRouting {
+                    successor: Some("new".to_string()),
+                    ..ModelRouting::single(ProviderKind::Local, "old")
+                },
+            ),
+            (
+                "new".to_string(),
+                ModelRouting::single(ProviderKind::Local, "new"),
+            ),
+        ])))
     }
 }

@@ -1230,7 +1230,7 @@ describe('makeDismissHandlers', () => {
   });
 
   it('an overlay opened with NO press down still dismisses on a synthetic click', () => {
-    // The canary the fix must not break: `e2e/overlay-dismiss-swallow.spec.ts`
+    // The canary the fix must not break: `e2e/overlay-dismiss-swallow-all.spec.ts`
     // opens the same menu with dispatched (untrusted) pointer events, which
     // the browser pairs no click with, and then dismisses it synthetically.
     const panel = elWith();
@@ -1295,7 +1295,7 @@ describe('installPairedSwallow', () => {
   });
 
   it.each(['touchcancel', 'pointercancel'])('a %s names the swallow, so no button serves the press', (type) => {
-    // A constructive face serves a tap the system cancels. A dismissing tap
+    // A composer face serves a tap the system cancels. A dismissing tap
     // must still only close the overlay, so the cancel is claimed. It still
     // propagates: the swipe and scroll trackers reset on it.
     takePressOutcome(1000);

@@ -19,6 +19,15 @@ export async function loadThreadQueue(): Promise<void> {
   }
 }
 
+/** Whether the thread queue holds a spawn for `threadId`, read fresh from the
+ *  engine. Such a thread owns no summary row until it starts. Throws when the
+ *  queue cannot be read, so a caller never mistakes that for "not queued". */
+export async function threadQueueHolds(threadId: string): Promise<boolean> {
+  const data = await getThreadQueue();
+  threadQueue.value = { status: 'loaded', data };
+  return data.entries.some(entry => entry.thread_id === threadId);
+}
+
 /** Force-admit a queued entry, ignoring capacity caps (panel "Run now"). */
 export async function runQueueEntryNow(entryId: string): Promise<void> {
   try {

@@ -10,11 +10,7 @@ use async_trait::async_trait;
 
 use super::{WebSearchProvider, WebSearchResult};
 use crate::llm::metered::CallToken;
-use crate::llm::vertex::{LocationHandle, TokenCache, VertexProvider};
-
-/// Model the grounded search runs on. Only used to construct the provider —
-/// [`VertexProvider::search_with_grounding`] names its own model per request.
-const GROUNDING_MODEL: &str = "gemini-2.5-flash-lite";
+use crate::llm::vertex::{LocationHandle, TokenCache, VertexProvider, GROUNDING_MODEL};
 
 pub struct VertexGroundingSearch {
     provider: VertexProvider,

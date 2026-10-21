@@ -48,9 +48,10 @@ describe('the submit paths read the draft, the one copy of the message', () => {
     // message nor a toast is the whole bug. It stays quiet only for Enter on a
     // genuinely empty desktop composer. A side question speaks through its
     // card, and a send held or refused by an image upload through the
-    // composer's upload line (`uploadSendNotice`).
+    // composer's upload line (`uploadSendNotice`). A send the rung switch
+    // check cancels speaks through its dialog or its toast.
     const before = submitBody().split(/\breturn;/).slice(0, -1);
-    const speaks = /showToast\(|ask\w*SideQuestion\(|queueUploadSend\(|markUploadBlockedSend\(/;
+    const speaks = /showToast\(|ask\w*SideQuestion\(|queueUploadSend\(|markUploadBlockedSend\(|passSendGate\(/;
     const silent = before.filter((seg) => !speaks.test(seg.slice(-400)));
     expect(silent).toHaveLength(0);
   });

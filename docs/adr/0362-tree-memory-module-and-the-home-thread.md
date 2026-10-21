@@ -578,3 +578,11 @@ it. Plan: `docs/plans/2026-10-12-tree-memory-is-the-default.md`.
 [ADR 0483](0483-a-new-workspace-asks-for-its-memory-module.md) replaces the
 2026-10-12 default. `memory_module` has no default: unset runs Classic, and the
 memory choice asks the user, with what Tree costs a month.
+
+## Amendment, 2026-10-16: a stable context block sits between the views
+
+[ADR 0490](0490-stable-first-turn-context-block.md) adds one block to the
+request order. A Tree turn now sends the snapshot, the stable context block, the
+thread memory view, the recent workspace entries and the message. The snapshot
+is still first and still shared byte for byte. The thread view's rungs read the
+stable block through their own prefix.

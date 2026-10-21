@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /**
  * The thread ⋯ menu's Add widget (ADR 0466): a step in the same menu that
- * lists the reusable widgets, the picker the Home board's Add shows. A pick
+ * lists the reusable widgets, the picker a dashboard's Add shows. A pick
  * pins the widget to that thread's shelf. Home and a draft offer none.
  */
 import { beforeAll, describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
@@ -76,7 +76,7 @@ describe('Add widget in the thread overflow menu', () => {
     expect(widgetRow('clock')).toBeNull();
   });
 
-  it('offers none in Home, whose board has its own Add, or on a draft', () => {
+  it('offers none in Home, whose dashboard has its own Add, or on a draft', () => {
     threadMap.value = new Map([['t', makeThreadState('t', { meta: { home: true } })]]);
     openMenu();
     expect(row('Add widget…')).toBeUndefined();

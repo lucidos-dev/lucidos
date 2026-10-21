@@ -151,12 +151,25 @@
 }
 
 /* Where the not-ready strip would be for a handed-off thread. A hand-off is
-   no warning, so it is a quiet line on the prompt's text edge. */
+   no warning, so it takes the Successor card's neutral frame. */
 .continued-here {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
     margin: 0 0 0.375rem;
-    padding-inline: var(--turn-surface-inset);
+    padding: 0.375rem 0.75rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.75);
     font-size: var(--font-size-xs);
     font-family: var(--font-ui);
+    color: var(--text-secondary);
+}
+
+.continued-here-icon {
+    width: 0.875rem;
+    height: 0.875rem;
+    flex-shrink: 0;
     color: var(--text-muted);
 }
 
@@ -165,7 +178,7 @@
     border: none;
     background: none;
     font-size: inherit;
-    color: inherit;
+    color: var(--text-primary);
     text-decoration: underline;
     text-underline-offset: 0.15em;
     cursor: pointer;
@@ -173,37 +186,15 @@
 
 @media (hover: hover) {
     .continued-here-link:hover {
-        color: var(--text-secondary);
+        color: var(--accent);
     }
 }
 
-/* Above the prompt box like the not-ready strip, and neutral: an offer to
-   continue a large thread in a successor thread, not a warning. */
-.successor-strip {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
+/* Above the prompt box like the not-ready strip. It is a question card in the
+   composer: an offer to continue a large thread in a successor thread, not a
+   warning. */
+.successor-card {
     margin-bottom: 0.375rem;
-    padding: 0.375rem 0.375rem 0.375rem 0.75rem;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.75);
-    font-size: var(--font-size-xs);
-    font-family: var(--font-ui);
-}
-
-.successor-strip-label {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-primary);
-    font-weight: 500;
-}
-
-.successor-strip .action-btn {
-    flex-shrink: 0;
 }
 
 .url-context-pill {
@@ -435,7 +426,7 @@
    flex context itself stays, because `.prompt-row .prompt-textarea` is
    `flex: 1`, and so does the wrapper: every composer-specific textarea rule
    (this file's two below, mobile.css's iOS-zoom font-size floor,
-   e2e/prompt-transcript-alignment.spec.ts's selector) keys off `.prompt-row` to
+   e2e/prompt-transcript-alignment-all.spec.ts's selector) keys off `.prompt-row` to
    miss the trigger form's Intent field, which is a `.prompt-box` without one. */
 .prompt-row {
     display: flex;
@@ -870,8 +861,9 @@
     align-items: center;
 }
 
-/* The composer's leading control button wears the destination's mark: the
-   Lucidos mark, the Claude mark, or the Codex mark. It is one of the prompt
+/* The composer's leading control button wears the coding agent's mark: the
+   Claude mark or the Codex mark. A Lucidos Agent thread has no such button,
+   since its model pick is the rung control's. It is one of the prompt
    bar's icons, not a brand badge, so it carries `.icon-btn.header-icon` like
    the todo / subscription / attach buttons beside it and inherits their box
    (2.25rem), their glyph size (--icon-size-lg), their baseline nudge and their
@@ -889,11 +881,9 @@
    is not the same SIZE. The row's other glyphs are drawn to one grid and each
    paints exactly 0.75 of its own viewBox (measured painted extent, stroke
    included: todo, the subscription clock and attach are 0.750 to three
-   decimals). The three agent marks are foreign artwork and are not: Claude
-   fills 0.997 of its box, Codex 0.880, and the Lucidos mark only 0.525, because
-   `LucidosMarkIcon` draws inside a `translate(13 13) scale(0.74)` group. So
-   handing all six `--icon-size-lg` painted Claude a third larger than the
-   checkbox beside it and the mark a third smaller, which is exactly how it
+   decimals). The agent marks are foreign artwork and are not: Claude fills
+   0.997 of its box and Codex 0.880. So handing them `--icon-size-lg` painted
+   Claude a third larger than the checkbox beside it, which is exactly how it
    looked and what it was reported as.
 
    Each mark is therefore sized by its OWN fill fraction, to land the ink the
@@ -901,18 +891,10 @@
    run's own 0.75, so a glyph nobody has measured just gets the run's box back.
 
    Scoped to this row on purpose. The same artwork keeps its own treatment
-   everywhere else it appears, and the header's copy of the mark already carries
-   its own compensation for this identical inset (`--header-mark-size`,
-   styles/header-mark.css). Its `--header-mark-art-scale: 0.74` is NOT this
-   0.525 and the two must not be folded into one: that number is the group's
-   transform, this one is the painted extent, and they differ because the shapes
-   do not fill their own 0..100 grid either. The taller run is y 12 to 83, so
-   the ink is 0.74 * 0.71.
+   everywhere else it appears.
 
    The fractions are pinned beside the formula in
-   `__tests__/prompt-mark-optical-size.test.ts`, which also re-derives the
-   mark's from the geometry in `icons.tsx`, so redrawing it without re-measuring
-   fails there rather than shipping the wrong size a second time. */
+   `__tests__/prompt-mark-optical-size.test.ts`. */
 .commands-btn {
     --run-ink: calc(var(--icon-size-lg) * 0.75);
     --mark-art-fill: 0.75;
@@ -932,10 +914,6 @@
     --mark-art-fill: 0.88;
 }
 
-.commands-btn .lucidos-mark-icon {
-    --mark-art-fill: 0.525;
-}
-
 /* Three classes, so this beats `.icon-btn.header-icon svg` (two) outright
    rather than on the order the two sheets happen to be imported in. */
 .icon-btn.header-icon.commands-btn svg {
@@ -945,10 +923,8 @@
 
 /* `.commands-btn-active` is set once the backend answers with a command list,
    which is also when the button starts opening something (openMenu bails until
-   then). Until then the mark is dim, and it never moves. Only the coding-agent
-   control has the state at all, hence the exclusion: the Lucidos model picker
-   never carries the class and is always ready. */
-.commands-btn:not(.lucidos-commands-btn):not(.commands-btn-active) {
+   then). Until then the mark is dim, and it never moves. */
+.commands-btn:not(.commands-btn-active) {
     opacity: 0.45;
 }
 
@@ -971,10 +947,10 @@
     z-index: calc(var(--z-popover) + 1);
 }
 
-/* The Lucidos Agent picker (LucidosControlMenu) reuses the coding-agent
-   control-menu styles, but it holds one list rather than a filter box over
-   several sections, so a fixed 20rem height would leave a large empty panel on
-   a short registry. Size to content, capped so a long list still scrolls. */
+/* The Lucidos Agent's rung list reuses the control-menu styles, but it holds
+   one list rather than a filter box over several sections. A fixed 20rem
+   height would leave a large empty panel on a short ladder. Size to content,
+   capped so a long list still scrolls. */
 .control-dropdown-auto {
     height: auto;
     max-height: min(24rem, calc(var(--app-height, 100dvh) - 8rem));
@@ -1721,6 +1697,35 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
    in" closes it, on the turns' content edge like the notice above. */
 .successor-notice {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
+}
+
+/* The cache-warm line closes the feed of a thread waiting on the user: a
+   dashed rule either side of one muted sentence, on the turns' content edge. */
+.cache-keep-alive-divider {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    font-variant-numeric: tabular-nums;
+}
+
+.cache-keep-alive-divider::before,
+.cache-keep-alive-divider::after {
+    content: '';
+    flex: 1 1 auto;
+    border-top: 1px dashed var(--border-color);
+}
+
+.cache-keep-alive-divider > span {
+    flex: 0 1 auto;
+    text-align: center;
+}
+
+.cache-keep-alive-divider strong {
+    color: var(--text-secondary);
+    font-weight: 500;
 }
 
 /* Side-question answers (ADR 0320) sit where they were asked. Each is a nested

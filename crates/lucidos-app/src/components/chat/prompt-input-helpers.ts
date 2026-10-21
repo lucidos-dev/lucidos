@@ -3,6 +3,9 @@ import { focusedThreadId, isMidTurn } from '../../store/store';
 import { computeExchanges, findQuestionAnswer, hasContentEvents } from '../../store/thread-events';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { uploadsGate, type PendingUpload } from '../../store/pendingUploads';
+import { matchShortcut } from '../../store/actions/keybindings';
+import type { ComposerEnterKey } from '../../store/actions/preferences';
+import { isImeComposingKey } from '../../utils/ime';
 
 // Pure prompt-input logic + the optimistic-send signal. Extracted from
 // PromptInput.tsx (re-exported there); imported directly by *.test.ts.
@@ -391,6 +394,24 @@ export function promptPlaceholder(
   if (sideQuestionMode) return PLACEHOLDER_SIDE_QUESTION;
   if (answeringQuestionCard) return PLACEHOLDER_ANSWERING;
   return hasConversation ? PLACEHOLDER_FOLLOW_UP : PLACEHOLDER_NEW_THREAD;
+}
+
+type ComposerKeyEvent = Pick<
+  KeyboardEvent,
+  'key' | 'shiftKey' | 'metaKey' | 'ctrlKey' | 'altKey' | 'isComposing' | 'keyCode'
+>;
+
+/** Whether this keydown in the composer sends. Every other key, and every
+ *  Enter this declines, is left to the browser, which inserts the newline.
+ *
+ *  The IME, the phone layout and a bound shortcut decline in both modes.
+ *  Cmd/Ctrl+Enter sends in both modes, so one chord always sends. */
+export function composerEnterSends(e: ComposerKeyEvent, mode: ComposerEnterKey, mobile: boolean): boolean {
+  if (e.key !== 'Enter' || isImeComposingKey(e) || mobile) return false;
+  // ⌘⇧↵ maximizes and ⌥↵ toggles side-question mode: the shortcut acts instead.
+  if (matchShortcut(e) !== null) return false;
+  if (mode === 'send') return !e.shiftKey;
+  return e.shiftKey || e.metaKey || e.ctrlKey;
 }
 
 // Stamp cancelTargetId BEFORE invoking send. sendCompose's sync prefix

@@ -71,7 +71,7 @@ pub struct TriggerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
     /// The **trigger model** this trigger's intent fires on. Absent = the
-    /// account `chat_model` preference (the "Default" option in the form).
+    /// account `trigger_model` preference (the "Default" option in the form).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Reasoning effort for this trigger's intent fires. Absent = the account's
@@ -189,8 +189,7 @@ pub struct CreateTriggerCronRequest {
     #[serde(default)]
     pub mcp_servers: Vec<String>,
     /// The **trigger model** this trigger's intent fires on. Omitted, null, or
-    /// blank = the account `chat_model` preference, which is what every trigger
-    /// did before the field existed. Not checked against the model registry:
+    /// blank = the account `trigger_model` preference. Not checked against the model registry:
     /// see [`normalize_route_setting`].
     #[serde(default)]
     pub model: Option<String>,
@@ -246,8 +245,8 @@ pub struct UpdateTriggerCronRequest {
     #[serde(default)]
     pub mcp_servers: Option<Vec<String>>,
     /// None = field absent (don't change), Some(None) = explicitly null (back to
-    /// the account `chat_model` preference), Some(Some(v)) = set. A blank string
-    /// clears too: blank is how the form's "Default" option travels.
+    /// the account `trigger_model` preference), Some(Some(v)) = set. A blank or
+    /// `"null"` string clears too, per [`normalize_route_setting`].
     #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub model: Option<Option<String>>,
     /// Same triple state as [`Self::model`], validated against
@@ -353,6 +352,28 @@ pub(super) async fn list_historical_triggers(
 }
 
 /// Create a new trigger
+/// Refuse an agent's trigger model pick off the chat intelligence ladder,
+/// judged as the trigger will fire on it. The owner's pick passes (ADR 0525).
+async fn refuse_agent_chat_pick(
+    state: &AppState,
+    headers: &HeaderMap,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), String> {
+    let origin = crate::api::actor::user_actor(headers, None);
+    if !super::intelligence_ladder::is_agent_caller(headers, origin.as_ref()) {
+        return Ok(());
+    }
+    crate::runtime::intelligence_ladder::check_agent_pick(
+        &state.pool,
+        &state.engine.model_routes(),
+        crate::runtime::intelligence_ladder::LadderSurface::Chat,
+        model,
+        effort,
+    )
+    .await
+}
+
 pub(super) async fn create_trigger(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -504,6 +525,16 @@ pub(super) async fn create_trigger(
         Ok(Some(provider)) => payload["provider"] = serde_json::json!(provider),
         Ok(None) => {}
         Err(e) => return ApiResult::err(e),
+    }
+    if let Err(e) = refuse_agent_chat_pick(
+        &state,
+        &headers,
+        payload["model"].as_str(),
+        payload["reasoning_effort"].as_str(),
+    )
+    .await
+    {
+        return ApiResult::err(e);
     }
 
     // Through the trigger write chokepoint: the registry must hold the new
@@ -681,6 +712,21 @@ pub(super) async fn update_trigger(
             Err(e) => return ApiResult::err(e),
         }
     }
+    if request.model.is_some() || request.reasoning_effort.is_some() {
+        let model = match &request.model {
+            Some(v) => normalize_route_setting(v.as_deref()),
+            None => existing.model.clone(),
+        };
+        let effort = match &request.reasoning_effort {
+            Some(v) => normalize_route_setting(v.as_deref()),
+            None => existing.reasoning_effort.clone(),
+        };
+        if let Err(e) =
+            refuse_agent_chat_pick(&state, &headers, model.as_deref(), effort.as_deref()).await
+        {
+            return ApiResult::err(e);
+        }
+    }
     match resolve_trigger_provider_update(
         state.engine.model_registry(),
         &existing,
@@ -830,6 +876,21 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A secret read has no wire form, so a create or update naming it 4xxs.
+    #[test]
+    fn a_grant_naming_a_secret_read_is_refused() {
+        let grant = serde_json::json!({ "side_effect_grant": ["secret_read"] });
+        assert!(serde_json::from_value::<UpdateTriggerCronRequest>(grant.clone()).is_err());
+        let mut create = serde_json::json!({
+            "name": "T",
+            "run": { "type": "intent", "intent": "x" },
+            "cron_expressions": ["0 0 8 * * *"],
+        });
+        assert!(serde_json::from_value::<CreateTriggerCronRequest>(create.clone()).is_ok());
+        create["side_effect_grant"] = grant["side_effect_grant"].clone();
+        assert!(serde_json::from_value::<CreateTriggerCronRequest>(create).is_err());
+    }
 
     // --- Script paths at the create / update boundary ---
 

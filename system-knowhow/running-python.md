@@ -226,7 +226,7 @@ Lucidos provisions one Python venv per workspace at `.lucidos/runtime/python/ven
 
 - **Packages**: declare in the tool call's `packages: ["numpy", "pandas", ...]` arg. They're installed into the workspace venv before the script runs; already-installed packages are no-ops. Give PyPI names with an optional version (`numpy>=1.26`, `requests[socks]`). A URL, a path, an archive file or a pip flag is refused. A call with packages goes to the guard's judge, because installing one runs its build code. Don't `pip install` from inside `code`.
 - **Working directory**: scripts execute with cwd = workspace root. So `open("data/artifacts/foo.csv")` is correct; `open("/Users/.../data/...")` is brittle.
-- **Env vars**: `LUCIDOS_WORKSPACE` (workspace root, absolute), `CRED_*` for credentials, `OAUTH_*_ACCESS_TOKEN` for connected OAuth accounts. All are auto-injected.
+- **Env vars**: `LUCIDOS_WORKSPACE` (workspace root, absolute) is always set. A `CRED_*` credential or an `OAUTH_*_ACCESS_TOKEN` is set only when `code`, or a workspace script it runs, names it: write `os.environ["CRED_GITHUB"]`, not a name built at run time. See `best-practices` § Credentials in subprocesses.
 
 ## Importing from `data/apps/<x>/scripts/`
 

@@ -103,7 +103,7 @@ export function connectionBannerBody(props: {
  * It is a bar under the header row rather than text beside the mark because the
  * mark sits in `.header-nav-cluster`, a fixed-width box centred on the row's
  * axis whose clearance from both edge clusters is a structural guarantee pinned
- * by `e2e/mobile-threads-title-alignment.spec.ts`. Text added there would push
+ * by `e2e/mobile-threads-title-alignment-all.spec.ts`. Text added there would push
  * the mark off that axis and spend clearance the spec measures, and it would
  * have to be short enough to say nothing. A bar costs the row's width budget
  * nothing at any viewport.

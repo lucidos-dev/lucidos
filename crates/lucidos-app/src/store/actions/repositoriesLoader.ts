@@ -14,7 +14,7 @@
 import { repositories } from '../store';
 import type { Repository } from '../store';
 import { setLoadingIfFresh, toFailed } from '../types';
-import { API, json as apiJson, retryTransientRead } from '../../api/client';
+import { API, json as apiJson, retryTransient } from '../../api/client';
 
 // Shared in-flight load so concurrent callers await the SAME fetch instead of
 // racing duplicate GETs: the compose destination picker's render-path kick-off
@@ -47,7 +47,7 @@ async function loadRepositoriesInner(): Promise<void> {
     // already-`loaded` list), so a single cancelled fetch or a deadline that
     // fired while the engine was still booting would otherwise paint a
     // permanent "Failed to load repositories" row.
-    const data = await retryTransientRead(() => apiJson<Repository[]>(`${API}/repositories`));
+    const data = await retryTransient(() => apiJson<Repository[]>(`${API}/repositories`));
     repositories.value = { status: 'loaded', data };
   } catch (e) {
     repositories.value = toFailed(e);

@@ -580,12 +580,19 @@ pub(super) struct ApplyAllQuery {
 /// What Apply All says when nothing could be applied now and the sweep was not
 /// asked for. Pure, so each refusal names the real reason rather than one blanket
 /// message.
-pub(super) fn empty_apply_all_refusal(total_pending: usize, not_ready: usize) -> &'static str {
+pub(super) fn empty_apply_all_refusal(
+    total_pending: usize,
+    not_ready: usize,
+    already_applying: usize,
+) -> &'static str {
     if total_pending == 0 {
         "No pending changes"
     } else if not_ready == total_pending {
         "No pending change is ready: each thread is still working or waiting for something, \
          or its work is not hardened. Use \"Apply all on settle\", or wait for them to finish."
+    } else if already_applying > 0 {
+        "Every ready change is already applying or has no file changes left. \
+         Each outcome arrives when its apply finishes."
     } else {
         "None of the ready changes can be applied: each has no file changes left."
     }
@@ -634,13 +641,14 @@ pub(super) async fn apply_all_changes(
         .await
         .map_err(ApiError::db)?;
 
-    let (total_pending, not_ready, armed) = match &outcome {
+    let (total_pending, not_ready, already_applying, armed) = match &outcome {
         ApplyAllOutcome::NothingToApply {
             total_pending,
             not_ready,
+            already_applying,
             armed,
-        } => (*total_pending, *not_ready, *armed),
-        ApplyAllOutcome::Started { .. } => (0, 0, 0),
+        } => (*total_pending, *not_ready, *already_applying, *armed),
+        ApplyAllOutcome::Started { .. } => (0, 0, 0, 0),
     };
     if let ApplyAllOutcome::NothingToApply { .. } = outcome {
         // Asked for the sweep, arming IS the action.
@@ -648,6 +656,7 @@ pub(super) async fn apply_all_changes(
             return Err(ApiError::bad_request(empty_apply_all_refusal(
                 total_pending,
                 not_ready,
+                already_applying,
             )));
         }
         state.engine.broadcast_changes_updated().await;
@@ -1029,9 +1038,18 @@ mod tests {
     /// The refusal names the control the Changes panel draws.
     #[test]
     fn a_refusal_with_nothing_ready_points_at_apply_all_on_settle() {
-        let msg = empty_apply_all_refusal(2, 2);
+        let msg = empty_apply_all_refusal(2, 2, 0);
         assert!(msg.contains("\"Apply all on settle\""), "{msg}");
         assert!(!msg.contains("Keep going"), "{msg}");
+    }
+
+    /// Ready changes the lane holds are named as applying, never as emptied.
+    #[test]
+    fn a_refusal_with_every_ready_change_applying_says_so() {
+        let msg = empty_apply_all_refusal(3, 0, 3);
+        assert!(msg.contains("already applying"), "{msg}");
+        let emptied = empty_apply_all_refusal(3, 0, 0);
+        assert!(!emptied.contains("already applying"), "{emptied}");
     }
 
     /// Pin the wire format so wire-breaking changes (renamed fields,

@@ -181,6 +181,108 @@ fn setup_is_none_when_absent() {
     assert_eq!(m.setup, None);
 }
 
+const SETUP_LINE: &str = "setup = \"Copy the skill to the skills folder.\"\n";
+
+fn parse_with(extra: &str) -> Result<PluginManifest, ValidationError> {
+    parse_manifest(&format!("{VALID_MANIFEST}{SETUP_LINE}{extra}"))
+}
+
+#[test]
+fn setup_revision_and_reason_default_to_absent() {
+    let m = parse_manifest(VALID_MANIFEST).unwrap();
+    assert_eq!(m.setup_revision, 0);
+    assert_eq!(m.setup_reason, None);
+}
+
+#[test]
+fn parses_setup_revision_and_reason() {
+    let m = parse_with("setup_revision = 2\nsetup_reason = \"The skill changed.\"\n").unwrap();
+    assert_eq!(m.setup_revision, 2);
+    assert_eq!(m.setup_reason.as_deref(), Some("The skill changed."));
+}
+
+#[test]
+fn setup_revision_alone_is_valid() {
+    let m = parse_with("setup_revision = 1\n").unwrap();
+    assert_eq!(m.setup_revision, 1);
+    assert_eq!(m.setup_reason, None);
+}
+
+#[test]
+fn setup_reason_is_trimmed() {
+    let m = parse_with("setup_revision = 1\nsetup_reason = \"  Fixed a path.  \"\n").unwrap();
+    assert_eq!(m.setup_reason.as_deref(), Some("Fixed a path."));
+}
+
+#[test]
+fn malformed_setup_revision_is_refused_by_field_name() {
+    for bad in [
+        "setup_revision = 0",
+        "setup_revision = -1",
+        "setup_revision = 1.5",
+        "setup_revision = \"2\"",
+        "setup_revision = true",
+    ] {
+        let err = parse_with(&format!("{bad}\n")).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidSetupField(field, _) if *field == "setup_revision"),
+            "{bad}: {err:?}"
+        );
+        assert!(err.to_string().contains("setup_revision"), "{bad}");
+    }
+}
+
+#[test]
+fn setup_revision_without_setup_is_refused() {
+    for extra in ["", "setup = \"   \"\n"] {
+        let err =
+            parse_manifest(&format!("{VALID_MANIFEST}{extra}setup_revision = 1\n")).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidSetupField(field, _) if *field == "setup_revision"),
+            "{err:?}"
+        );
+    }
+}
+
+#[test]
+fn malformed_setup_reason_is_refused_by_field_name() {
+    let too_long = format!(
+        "setup_reason = \"{}\"",
+        "x".repeat(MAX_SETUP_REASON_LEN + 1)
+    );
+    for bad in [
+        "setup_reason = \"two\\nlines\"",
+        "setup_reason = \"   \"",
+        "setup_reason = 3",
+        too_long.as_str(),
+    ] {
+        let err = parse_with(&format!("setup_revision = 1\n{bad}\n")).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidSetupField(field, _) if *field == "setup_reason"),
+            "{bad}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn setup_reason_at_the_cap_is_accepted() {
+    let at_cap = "x".repeat(MAX_SETUP_REASON_LEN);
+    let m = parse_with(&format!(
+        "setup_revision = 1\nsetup_reason = \"{at_cap}\"\n"
+    ))
+    .unwrap();
+    assert_eq!(m.setup_reason.as_deref(), Some(at_cap.as_str()));
+}
+
+#[test]
+fn setup_reason_without_setup_revision_is_refused() {
+    let err = parse_with("setup_reason = \"Why.\"\n").unwrap_err();
+    assert!(
+        matches!(&err, ValidationError::InvalidSetupField(field, _) if *field == "setup_reason"),
+        "{err:?}"
+    );
+}
+
 #[test]
 fn rejects_missing_id() {
     let toml = r#"

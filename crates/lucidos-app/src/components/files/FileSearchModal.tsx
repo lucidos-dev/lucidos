@@ -84,7 +84,7 @@ function FileSearchPanel() {
   const resultsRef = useRef<HTMLDivElement>(null);
 
   // A switch to another panel while it is open closes it. It opens from any
-  // panel, the Home board included, so the panel it opened over keeps it.
+  // panel, the dashboard included, so the panel it opened over keeps it.
   const active = activeMenuItem.value;
   const openedOver = useRef(active);
   useEffect(() => {

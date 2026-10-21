@@ -21,7 +21,7 @@ import type { ModelInfo } from '../../api/types';
 function model(
   id: string,
   label: string,
-  enabled = true,
+  onChatLadder = true,
   provider = 'anthropic',
   reasoning_efforts?: string[],
 ): ModelInfo {
@@ -35,7 +35,7 @@ function model(
     successor: null,
     sort_order: 0,
     source: 'user',
-    enabled,
+    on_chat_ladder: onChatLadder,
     created_at: '2026-01-01T00:00:00Z',
   };
 }
@@ -70,12 +70,12 @@ describe('chatModelOptions', () => {
   it('falls back to the static MODELS list before the registry loads', () => {
     chatModels.value = { status: 'not-loaded' };
     expect(chatModelOptions()).toBe(MODELS);
-    // The fallback includes Fable 5 so the picker is never empty pre-load.
-    expect(MODELS.some((m) => m.value === 'claude-fable-5')).toBe(true);
+    // The fallback includes Fable 5.1 so the picker is never empty pre-load.
+    expect(MODELS.some((m) => m.value === 'claude-fable-5-1')).toBe(true);
   });
 
-  // The registry filters on `enabled`; the fallback cannot, so it must already
-  // BE the enabled set. A retired model left here is offered for the moment
+  // The registry filters on the chat ladder; the fallback cannot, so it must
+  // already BE a current set. A retired model left here is offered for the moment
   // before `/models` lands, then disappears under the user's cursor.
   it('offers no model a disable migration has retired', () => {
     const retired = [
@@ -100,16 +100,16 @@ describe('chatModelOptions', () => {
   // credential is an Anthropic key therefore got the Fable rows and nothing
   // else from the Claude family.
   it('offers a dual-routed model when ANY of its backends is configured', () => {
-    const opus = dualRouted('claude-opus-5-5', 'Opus 5.5', ['vertex', 'anthropic']);
+    const opus = dualRouted('claude-opus-5-6', 'Opus 5.6', ['vertex', 'anthropic']);
     chatModels.value = { status: 'loaded', data: [opus] };
 
     configuredProviders.value = ['anthropic'];
-    expect(chatModelOptions()).toEqual([{ value: 'claude-opus-5-5', label: 'Opus 5.5' }]);
-    expect(resolvedRoute('claude-opus-5-5')?.provider).toBe('anthropic');
+    expect(chatModelOptions()).toEqual([{ value: 'claude-opus-5-6', label: 'Opus 5.6' }]);
+    expect(resolvedRoute('claude-opus-5-6')?.provider).toBe('anthropic');
 
     // Vertex is listed first, so a workspace holding both keeps Vertex.
     configuredProviders.value = ['vertex', 'anthropic'];
-    expect(resolvedRoute('claude-opus-5-5')?.provider).toBe('vertex');
+    expect(resolvedRoute('claude-opus-5-6')?.provider).toBe('vertex');
 
     // Neither configured: the model leaves the picker, as it always did.
     configuredProviders.value = [];
@@ -121,26 +121,26 @@ describe('chatModelOptions', () => {
   // can fix it. Hiding the model would be a dead end.
   it('keeps a model listed when its preferred backend is parked', () => {
     const opus = dualRouted(
-      'claude-opus-5-5',
-      'Opus 5.5',
+      'claude-opus-5-6',
+      'Opus 5.6',
       ['vertex', 'anthropic'],
       'anthropic',
     );
     chatModels.value = { status: 'loaded', data: [opus] };
     configuredProviders.value = ['vertex'];
 
-    expect(chatModelOptions()).toEqual([{ value: 'claude-opus-5-5', label: 'Opus 5.5' }]);
+    expect(chatModelOptions()).toEqual([{ value: 'claude-opus-5-6', label: 'Opus 5.6' }]);
     // And the picker names the PARKED backend, not the one that happens to be
     // configured, so what it shows is what the turn will do: refuse.
-    expect(resolvedRoute('claude-opus-5-5')?.provider).toBe('anthropic');
+    expect(resolvedRoute('claude-opus-5-6')?.provider).toBe('anthropic');
   });
 
   // The refusal is fixable without leaving the picker: the provider step lists
   // every backend, marks the parked one, and shows it as the one in force.
   it('offers the parked backend in a provider step beside the configured one', () => {
     const opus = dualRouted(
-      'claude-opus-5-5',
-      'Opus 5.5',
+      'claude-opus-5-6',
+      'Opus 5.6',
       ['vertex', 'anthropic'],
       'anthropic',
     );
@@ -163,7 +163,7 @@ describe('chatModelOptions', () => {
   it('offers no provider step when only one backend is configured', () => {
     chatModels.value = {
       status: 'loaded',
-      data: [dualRouted('claude-opus-5-5', 'Opus 5.5', ['vertex', 'anthropic'])],
+      data: [dualRouted('claude-opus-5-6', 'Opus 5.6', ['vertex', 'anthropic'])],
     };
     configuredProviders.value = ['anthropic'];
     const [row] = modelRows(lucidosModelChoices(), LUCIDOS_TIER_VOCABULARY);
@@ -183,27 +183,29 @@ describe('chatModelOptions', () => {
     expect(MODELS).toContainEqual({ value: 'gpt-6-astra', label: 'GPT-6 Astra' });
   });
 
-  // The newest Anthropic builtin, and the top of the list: its seed carries a
-  // negative sort_order so it outranks Fable 5.
-  it('offers Fable 5.1 above Fable 5', () => {
-    expect(MODELS).toContainEqual({ value: 'claude-fable-5-1', label: 'Fable 5.1' });
-    expect(MODELS).toContainEqual({ value: 'claude-fable-5-1[1m]', label: 'Fable 5.1 (1M)' });
-    expect(MODELS.findIndex((m) => m.value === 'claude-fable-5-1')).toBeLessThan(
-      MODELS.findIndex((m) => m.value === 'claude-fable-5'),
-    );
+  // Fable 5.1, Opus 5.6 and Sonnet 5.5 run 1M natively, so their `[1m]` twins
+  // retired to the bare rows.
+  it('offers no 1M twin of a model that only runs at 1M', () => {
+    for (const twin of ['claude-fable-5-1[1m]', 'claude-opus-5-5[1m]', 'claude-sonnet-5-5[1m]']) {
+      expect(MODELS.some((m) => m.value === twin)).toBe(false);
+    }
   });
 
-  // Seeded at sort_order 2/3, between Fable 5 and Opus 5, so the newest Opus
-  // surfaces first while Opus 5 stays enabled below it.
-  it('offers Opus 5.5 above Opus 5', () => {
-    expect(MODELS).toContainEqual({ value: 'claude-opus-5-5', label: 'Opus 5.5' });
-    expect(MODELS).toContainEqual({ value: 'claude-opus-5-5[1m]', label: 'Opus 5.5 (1M)' });
-    expect(MODELS.findIndex((m) => m.value === 'claude-opus-5-5[1m]')).toBeLessThan(
-      MODELS.findIndex((m) => m.value === 'claude-opus-5[1m]'),
-    );
+  // The newest Anthropic builtin heads the list.
+  it('offers Fable 5.1 first and not the retired Fable 5', () => {
+    expect(MODELS[0]).toEqual({ value: 'claude-fable-5-1', label: 'Fable 5.1' });
+    expect(MODELS.some((m) => m.value.startsWith('claude-fable-5['))).toBe(false);
+    expect(MODELS.some((m) => m.value === 'claude-fable-5')).toBe(false);
   });
 
-  it('returns only enabled models, mapped to {value,label}, when loaded', () => {
+  // Opus 5 retired to Opus 5.6 (ADR 0418), so only the successor is offered.
+  it('offers Opus 5.6 and not the retired Opus 5', () => {
+    expect(MODELS).toContainEqual({ value: DEFAULT_CHAT_MODEL, label: 'Opus 5.5' });
+    expect(MODELS.some((m) => m.value === 'claude-opus-5' || m.value === 'claude-opus-5[1m]'))
+      .toBe(false);
+  });
+
+  it('returns only models on the chat ladder, mapped to {value,label}, when loaded', () => {
     chatModels.value = {
       status: 'loaded',
       data: [model('a', 'A'), model('b', 'B', false), model('c', 'C')],
@@ -289,12 +291,12 @@ describe('modelReasoningEfforts', () => {
       status: 'loaded',
       data: [
         {
-          ...model('claude-opus-5-5', 'Opus 5.5'),
+          ...model('claude-opus-5-6', 'Opus 5.6'),
           routes: [
-            { provider: 'vertex', id: 'claude-opus-5-5', reasoning_efforts: ALL_TIERS },
+            { provider: 'vertex', id: 'claude-opus-5-6', reasoning_efforts: ALL_TIERS },
             {
               provider: 'openrouter',
-              id: 'anthropic/claude-opus-5-5',
+              id: 'anthropic/claude-opus-5-6',
               reasoning_efforts: LOCAL_TIERS,
             },
           ],
@@ -303,7 +305,7 @@ describe('modelReasoningEfforts', () => {
       ],
     };
     configuredProviders.value = ['vertex', 'openrouter'];
-    expect(modelReasoningEfforts('claude-opus-5-5')).toEqual(LOCAL_TIERS);
+    expect(modelReasoningEfforts('claude-opus-5-6')).toEqual(LOCAL_TIERS);
   });
 });
 
@@ -414,7 +416,7 @@ describe('displayModelName', () => {
   // pair sets.
   it('tells the two Opus 5 generations apart', () => {
     chatModels.value = { status: 'not-loaded' };
-    expect(displayModelName('claude-opus-5-5')).toBe('Opus 5.5');
+    expect(displayModelName(DEFAULT_CHAT_MODEL)).toBe('Opus 5.5');
     expect(displayModelName('claude-opus-5-5[1m]')).toBe('Opus 5.5 (1M)');
     expect(displayModelName('claude-opus-5[1m]')).toBe('Opus 5 (1M)');
   });
@@ -431,7 +433,7 @@ describe('displayModelName', () => {
 });
 
 describe('the route editor', () => {
-  const opus = dualRouted('claude-opus-5-5', 'Opus 5.5', ['vertex', 'anthropic']);
+  const opus = dualRouted('claude-opus-5-6', 'Opus 5.6', ['vertex', 'anthropic']);
 
   it('reads a wire id equal to the model id as blank', () => {
     expect(routeDrafts(opus)).toEqual([
@@ -441,14 +443,14 @@ describe('the route editor', () => {
   });
 
   it('sends only what differs from the defaults', () => {
-    expect(buildRoutes('claude-opus-5-5', [
+    expect(buildRoutes('claude-opus-5-6', [
       { provider: 'vertex', id: '', contextWindow: '' },
-      { provider: 'openrouter', id: 'anthropic/claude-opus-5-5', contextWindow: '200000' },
+      { provider: 'openrouter', id: 'anthropic/claude-opus-5-6', contextWindow: '200000' },
     ])).toEqual({
       ok: true,
       routes: [
         { provider: 'vertex' },
-        { provider: 'openrouter', id: 'anthropic/claude-opus-5-5', context_window: 200000 },
+        { provider: 'openrouter', id: 'anthropic/claude-opus-5-6', context_window: 200000 },
       ],
     });
   });

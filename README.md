@@ -282,7 +282,7 @@ Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen ba
 | `LUCIDOS_WORKSPACE` | (none) | Workspace directory |
 | `LUCIDOS_VITE_PORT` | `5173` | Base direct engine port, overrides per-workspace offset + `lucidos.toml`. |
 | `LUCIDOS_DEV_GATEWAY_PORT` | `5251` | Shared dev gateway port for `/<slug>/` and `/~/` (`5251` keeps dev clear of the packaged app's `5252`). |
-| `LUCIDOS_MODEL` | `claude-opus-5@default` | LLM model name |
+| `LUCIDOS_MODEL` | `claude-opus-5-5@default` | LLM model name |
 | `VERTEX_PROJECT_ID` | (none) | GCP project (for `claude-*`/`gemini-*`) |
 | `VERTEX_REGION` | `europe-west1` | Vertex AI region |
 | `OPENAI_API_KEY` | (none) | OpenAI key (for `gpt-*` models). Fallback below a stored `openai` credential; if unset too, the engine auto-detects a key from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` (`apikey` login only). |

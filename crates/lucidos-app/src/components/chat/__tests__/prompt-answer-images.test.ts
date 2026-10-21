@@ -7,6 +7,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { createTapGate, touchActivated } from '../../../utils/tapGesture';
+import { composerEnterSends } from '../prompt-input-helpers';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
@@ -176,7 +177,11 @@ describe('the Side question shortcut', () => {
     );
   });
 
+  // The full rule and its cases live in composer-enter-key.test.ts.
   it('keeps its chord from also sending the draft', () => {
-    expect(promptSource).toMatch(/e\.key === 'Enter' && !e\.shiftKey && !isMobile\(\) && matchShortcut\(e\) === null/);
+    expect(promptSource).toMatch(/if \(composerEnterSends\(e, currentComposerEnterKey\(\), isMobile\(\)\)\)/);
+    const altEnter = { key: 'Enter', altKey: true, shiftKey: false, metaKey: false, ctrlKey: false, isComposing: false, keyCode: 13 };
+    expect(composerEnterSends(altEnter, 'send', false)).toBe(false);
+    expect(composerEnterSends(altEnter, 'newline', false)).toBe(false);
   });
 });

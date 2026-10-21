@@ -43,7 +43,7 @@ pins that shape.
 ## Consequences
 
 - A press holds its control to layout precision. The browser spec
-  `turn-control-holds-the-reader-still.spec.ts` bounds drift at 0.05px, at
+  `turn-control-holds-the-reader-still-all.spec.ts` bounds drift at 0.05px, at
   105%, 112.5% and 137.5%.
 - The spacer persists between presses, at most 1px. Nothing else writes or
   reads it, and it is harmless when a transcript is reused for another thread.

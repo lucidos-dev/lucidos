@@ -55,6 +55,9 @@ done
     )
 }
 
+/// The session context every stub session is spawned with.
+const STUB_SESSION_CONTEXT: &str = "SESSION CONTEXT: branch `stub-branch`";
+
 fn stub_driver(turn_body: &str, resume: Option<&str>) -> StubSession {
     stub_driver_scripted(&stub_script(turn_body), resume)
 }
@@ -76,6 +79,7 @@ fn stub_driver_scripted(stub: &str, resume: Option<&str>) -> StubSession {
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
         system_prompt: Some("SYSPROMPT".into()),
+        session_context: Some(STUB_SESSION_CONTEXT.into()),
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
@@ -218,6 +222,10 @@ async fn handshake_turn_streams_deltas_and_results_then_exits_on_close() {
         .find(|r| r.contains(r#""method":"turn/start""#))
         .expect("turn/start sent");
     assert!(turn_req.contains("ping"));
+    assert!(
+        turn_req.contains(STUB_SESSION_CONTEXT),
+        "a fresh thread's first turn carries the session context"
+    );
 }
 
 #[tokio::test]
@@ -245,6 +253,10 @@ async fn resume_uses_thread_resume_with_stored_id() {
             .iter()
             .any(|r| r.contains(r#""method":"thread/start""#)),
         "resume must not start a fresh thread"
+    );
+    assert!(
+        !requests.iter().any(|r| r.contains(STUB_SESSION_CONTEXT)),
+        "a resumed thread already holds its session context"
     );
     s.cancel.cancel();
 }
@@ -485,8 +497,8 @@ async fn cancellation_kills_session_and_emits_exited() {
 /// to a FRESH thread instead of wedging the session permanently — the
 /// engine keeps resolving the same dead sid from the thread's branch
 /// context, so without this one-shot fallback every follow-up would fail
-/// with "handshake failed" forever. Context still arrives via the THREAD
-/// HISTORY block the engine appends to the system prompt.
+/// with "handshake failed" forever. The fresh thread's first turn carries the
+/// session context, history included (ADR 0491).
 #[tokio::test]
 async fn stale_resume_falls_back_to_fresh_thread() {
     // Stub: thread/resume errors (unknown thread id); thread/start succeeds.
@@ -529,6 +541,7 @@ done
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
         system_prompt: Some("SYSPROMPT".into()),
+        session_context: Some(STUB_SESSION_CONTEXT.into()),
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
@@ -591,6 +604,14 @@ done
             .any(|r| r.contains(r#""method":"thread/start""#)),
         "fallback must start a fresh thread"
     );
+    let turn_req = requests
+        .iter()
+        .find(|r| r.contains(r#""method":"turn/start""#))
+        .expect("turn/start sent");
+    assert!(
+        turn_req.contains(&format!("{STUB_SESSION_CONTEXT}\\n\\ncontinue please")),
+        "the fallen-back thread's first turn carries the session context: {turn_req}"
+    );
     cancel.cancel();
 }
 
@@ -643,6 +664,28 @@ done
         }
     }
     assert!(named, "the rejected input is named before the Result");
+
+    // The rejected turn delivered nothing, so the next one still owes the
+    // session context.
+    s.input_tx
+        .send(AgentInput {
+            text: "again".into(),
+            images: vec![],
+            uuid: uuid::Uuid::new_v4(),
+        })
+        .expect("send input");
+    while !matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Result { .. }
+    ) {}
+    let turns: Vec<String> = logged_requests(&s.requests_log)
+        .into_iter()
+        .filter(|r| r.contains(r#""method":"turn/start""#))
+        .collect();
+    assert_eq!(turns.len(), 2, "{turns:?}");
+    for turn in &turns {
+        assert!(turn.contains(STUB_SESSION_CONTEXT), "{turn}");
+    }
     s.cancel.cancel();
 }
 
@@ -698,6 +741,7 @@ async fn the_stderr_tail_masks_the_spawns_injected_secrets() {
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
         system_prompt: None,
+        session_context: None,
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),

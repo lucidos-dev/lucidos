@@ -48,6 +48,7 @@ fn request(tools: Vec<ClaudeTool>, messages: Vec<ClaudeMessage>) -> ClaudeReques
         output_config: None,
         anthropic_beta: None,
         tool_choice: None,
+        stable_prefix_end: None,
     }
 }
 

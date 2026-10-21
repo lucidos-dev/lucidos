@@ -22,7 +22,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
 
-use crate::planned::{card_shape, query_state, PlannedState};
+use crate::planned::{query_state, PlannedState};
 use crate::workspace::{resolve_from_env, BoxError};
 
 #[derive(Debug, Deserialize)]
@@ -101,22 +101,29 @@ pub(crate) fn build_deny_json(file_path: &str) -> String {
 /// type what I want changed": the dead-end shape the prompts' NEVER AUTHOR AN
 /// "OTHER" OPTION rule bans.
 ///
-/// `shape` is [`card_shape`]'s answer for this thread's measured context, the
-/// same text `lucidos planned mark` printed.
-pub(crate) fn build_awaiting_approval_json(file_path: &str, shape: &str) -> String {
+/// The card's options come from the skill's approval checkpoint, which this
+/// text points at rather than restating.
+pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
     let reason = format!(
         "Edit blocked: the implementation plan on this branch is awaiting the user's approval. \
-         Do NOT re-run the `implementation-plan` skill: the plan is already recorded. Summarize \
-         the plan in your message, then ASK FOR APPROVAL WITH THE `AskUserQuestion` TOOL. The \
-         card's question is one short line that never repeats the summary. {shape} Approval is a \
-         DECISION question, not a post-work confirmation: \
+         Do NOT re-run the `implementation-plan` skill: the plan is already recorded. ASK FOR \
+         APPROVAL WITH THE `AskUserQuestion` TOOL. Put the plan summary on the card's question \
+         itself, in short markdown with the ask on its last line: the user never sees a message \
+         that also calls a tool. Run the approval checkpoint in the `implementation-plan` skill \
+         (§ Asking for approval) and offer the options it prints. With no new thread to offer, \
+         that is `Approve` / `Request changes`, a floor: if the plan offers a real fork, that \
+         fork takes the second slot and `Request changes` is dropped rather than carried as a \
+         third. Approval is a DECISION question, not a post-work confirmation: \
          this very hook is blocking your edits until it is answered, so asking in plain prose \
-         leaves the thread idle. Once the user approves, run `lucidos planned approve` to unblock \
-         implementation, then retry your edit to `{path}`. Picking a fork is an approval too: \
-         revise the plan file to that variant, re-commit, then run `lucidos planned approve`. If \
-         the user requests changes instead, revise the plan file under docs/plans/, re-commit, \
-         and ask again: the new message names only what changed, and the plan file holds the rest \
-         (the marker stays `proposed` until approved).",
+         leaves the thread idle. Once the user taps an approving option, run `lucidos planned \
+         approve` to unblock implementation, then retry your edit to `{path}`. A tapped fork is \
+         an approval: revise the plan file to that variant, re-commit, then run `lucidos planned \
+         approve`. A fork pick does not re-mark. A typed reply that asks, suggests or questions \
+         is a request for changes, not an approval: the engine refuses `lucidos planned approve` \
+         until the user taps an approving option or types a plain approval. For changes, revise \
+         the plan file under docs/plans/, run `lucidos planned mark --plan <path>` again, \
+         re-commit, and ask again: the card carries what changed, and the plan file holds the \
+         rest (the marker stays `proposed` until approved).",
         path = file_path,
     );
     deny_envelope(&reason)
@@ -182,10 +189,9 @@ pub(crate) fn run() -> Result<(), BoxError> {
     match query_state(&ws) {
         Ok(PlannedState::Satisfied) => Ok(()),
         Ok(PlannedState::Proposed) => {
-            let shape = card_shape(crate::successor::read_own_context(&ws));
             println!(
                 "{}",
-                build_awaiting_approval_json(&payload.tool_input.file_path, &shape)
+                build_awaiting_approval_json(&payload.tool_input.file_path)
             );
             Ok(())
         }
@@ -270,12 +276,7 @@ mod tests {
 
     #[test]
     fn awaiting_approval_json_directs_to_approve_not_replan() {
-        let small = crate::successor::ContextReading::Read {
-            input_tokens: Some(40_000),
-            offer: false,
-            implementer: None,
-        };
-        let out = build_awaiting_approval_json("/tmp/x.rs", &card_shape(small));
+        let out = build_awaiting_approval_json("/tmp/x.rs");
         let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -315,10 +316,14 @@ mod tests {
             // changed" (2026-08-04). A fork answer is an approval, so this text
             // must also say the marker can be flipped after revising the plan.
             "that fork takes the second slot",
-            "Picking a fork is an approval too",
-            // The card renders under the agent's message. A card restating the
-            // summary makes the user read the plan twice.
-            "never repeats the summary",
+            "A tapped fork is an approval",
+            "A fork pick does not re-mark",
+            // A typed question is a request for changes, never an approval: an
+            // agent read one as a fork pick and approved its own plan.
+            "A typed reply that asks, suggests or questions is a request for changes",
+            // The user never sees a message that also calls a tool, so the plan
+            // summary rides on the card.
+            "Put the plan summary on the card's question itself",
         ] {
             assert!(
                 reason.contains(needle),
@@ -328,56 +333,13 @@ mod tests {
         }
     }
 
-    /// I11: the number decides the shape, never the agent. A large thread
-    /// leads with the successor; a small or unreadable one gets today's pair.
-    /// The implementer on a large card is the agent's pick, named beside this
-    /// thread's own, within the question tool's 4 options.
+    /// The card's options live with the skill's approval checkpoint, so the
+    /// gate points there rather than reading the context itself.
     #[test]
-    fn the_card_shape_follows_the_measured_context() {
-        use crate::successor::{ContextReading, Implementer};
-        let large = card_shape(ContextReading::Read {
-            input_tokens: Some(240_000),
-            offer: true,
-            implementer: Some(Implementer {
-                coding_agent: "claude-code".into(),
-                model: Some("claude-opus-5-5".into()),
-                reasoning_effort: Some("high".into()),
-            }),
-        });
-        for needle in [
-            "240k tokens",
-            "This thread runs on claude-code with model claude-opus-5-5 at high effort.",
-            "`Implement in a new thread: <implementer> (Recommended)`",
-            "only when it differs; `Approve here`",
-            "never more than 4 options, and never `Request changes`",
-            "by your judgement of the plan",
-            "lucidos successor spawn --narrative <file>`",
-            "Add only the flags that differ from this thread's implementer",
-            "`--coding-agent-model <model id>`",
-            "picking this thread's implementer adds none",
-            "without asking again",
-        ] {
-            assert!(large.contains(needle), "missing {needle:?}: {large}");
-        }
-        let unread = card_shape(ContextReading::Read {
-            input_tokens: Some(240_000),
-            offer: true,
-            implementer: None,
-        });
-        assert!(
-            unread.contains("could not read this thread's implementer"),
-            "{unread}"
-        );
-        let small = card_shape(ContextReading::Read {
-            input_tokens: Some(240_000),
-            offer: false,
-            implementer: None,
-        });
-        assert!(small.contains("`Approve` / `Request changes`"));
-        assert!(!small.contains("new thread"), "the engine said no: {small}");
-        let unknown = card_shape(ContextReading::Unknown);
-        assert!(unknown.contains("`Approve` / `Request changes`"));
-        assert!(unknown.contains("could not read this thread's context size"));
+    fn awaiting_approval_points_at_the_skills_checkpoint() {
+        let out = build_awaiting_approval_json("/tmp/x.rs");
+        assert!(out.contains("approval checkpoint in the `implementation-plan` skill"));
+        assert!(!out.contains("lucidos successor spawn"), "{out}");
     }
 
     #[test]

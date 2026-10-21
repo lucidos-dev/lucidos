@@ -63,9 +63,9 @@ fn making_guidance(automatic: bool) -> String {
          border inside the widget. Keep the accent for the one thing that matters. Animate what \
          a tap changes, on the --duration-* tokens, and stay calm under data-motion=\"reduce\". \
          Read data through lucidos.* and listen on lucidos.sse instead of baking it into the \
-         HTML. Pinned to Home it is a Home board tile of any size; \
-         create_app sizes narrows that. Arrange the board only when the \
-         user asks in this turn, and never choose a new pin's size.\n\n",
+         HTML. On a dashboard it is a tile of any size; create_app sizes \
+         narrows that. Arrange a dashboard only when the user asks in this \
+         turn, and never choose a new tile's size.\n\n",
     );
     text
 }
@@ -95,7 +95,7 @@ pub fn widgets_list(widgets: &[App]) -> String {
     text
 }
 
-/// One widget as the list carries it: its line, naming its Home board sizes
+/// One widget as the list carries it: its line, naming its tile sizes
 /// only when it narrows them from all three, then one line per param.
 pub fn widget_line(widget: &App) -> String {
     let built_in = if widget.built_in { ", built in" } else { "" };
@@ -200,13 +200,13 @@ mod tests {
         assert!(widget_line(&clock).contains("built in, sizes small, large):"));
     }
 
-    /// The chat agent arranges Home only when asked, and never sizes a new pin
-    /// (ADR 0432).
+    /// The chat agent arranges a dashboard only when asked, and never sizes a
+    /// new tile (ADR 0432).
     #[test]
-    fn the_chat_agent_arranges_home_only_when_asked() {
+    fn the_chat_agent_arranges_a_dashboard_only_when_asked() {
         let chat = build_widgets_section(&[player()], WidgetAudience::Chat { automatic: true });
-        assert!(chat.contains("Arrange the board only when the user asks in this turn"));
-        assert!(chat.contains("never choose a new pin's size"));
+        assert!(chat.contains("Arrange a dashboard only when the user asks in this turn"));
+        assert!(chat.contains("never choose a new tile's size"));
     }
 
     /// Both prompts build the section here: the chat agent through its apps

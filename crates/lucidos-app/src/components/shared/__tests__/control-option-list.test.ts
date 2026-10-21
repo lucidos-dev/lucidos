@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import { wrapHighlight, selectedOptionIndex, sectionHeadingAt } from '../ControlOptionList';
-import { offeredControlCommands } from '../../chat/CodingAgentControlMenu';
 
 describe('wrapHighlight', () => {
   it('steps down within bounds', () => {
@@ -41,28 +40,6 @@ describe('selectedOptionIndex', () => {
 
   it('falls back to 0 for an empty option list', () => {
     expect(selectedOptionIndex([], 'a')).toBe(0);
-  });
-});
-
-describe('offeredControlCommands', () => {
-  const pick = (key: string) => [{ key, options: [{ value: 'a', label: 'A', description: '' }] }];
-  const COMMANDS = [
-    { subtype: 'set_model', label: 'Model', params: pick('model') },
-    { subtype: 'set_reasoning_effort', label: 'Reasoning Effort', params: pick('effort') },
-    { subtype: 'set_output_style', label: 'Output Style', params: pick('style') },
-  ];
-
-  it('never offers the effort command on its own', () => {
-    // A model selection is one pick, so the tier rides on the `set_model`
-    // rows. The command still exists on the wire for the reconciling request.
-    expect(offeredControlCommands(COMMANDS).map((c) => c.subtype))
-      .toEqual(['set_model', 'set_output_style']);
-  });
-
-  it('never offers a command that asks for free text', () => {
-    const freeText = { subtype: 'set_something', label: 'Something', params: [{ key: 'mode' }] };
-    expect(offeredControlCommands([...COMMANDS, freeText]).map((c) => c.subtype))
-      .toEqual(['set_model', 'set_output_style']);
   });
 });
 

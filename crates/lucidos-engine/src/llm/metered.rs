@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 
+use crate::llm::call_trace::{self, CallFailure};
 use crate::llm::image::{ImageProvider, ImageResult, ImageSize};
 use crate::llm::judgment::{Judgment, JudgmentProvider, Question};
 use crate::llm::provider::{
@@ -69,6 +70,14 @@ impl Reported<'_> {
             Self::Judgment(_) | Self::Image { .. } | Self::Usage(_) => None,
         }
     }
+
+    /// The backend a routed chat call went to. Every other shape names none.
+    pub(crate) fn provider(&self) -> Option<crate::llm::ProviderKind> {
+        match self {
+            Self::Chat(response) => response.provider,
+            Self::Judgment(_) | Self::Image { .. } | Self::Usage(_) => None,
+        }
+    }
 }
 
 /// What one call cost.
@@ -84,12 +93,36 @@ pub(crate) struct CallCost<'a> {
     pub(crate) reasoning_effort: Option<&'a str>,
     /// How long the call took, wall clock.
     pub(crate) duration_ms: Option<u64>,
+    /// Time to the first content delta of the stream that answered, from the
+    /// same start as `duration_ms`. `None` when no delta was seen.
+    pub(crate) ttft_ms: Option<u64>,
+    /// The `request-id` header of the response that answered, when it had one.
+    pub(crate) request_id: Option<&'a str>,
+}
+
+/// How a metered chat call failed, as facts. Never the error message: a
+/// provider's error body can echo request content.
+pub(crate) struct CallFailed<'a> {
+    pub(crate) model: &'a str,
+    pub(crate) reasoning_effort: Option<&'a str>,
+    /// How long the call ran before it failed, wall clock.
+    pub(crate) duration_ms: u64,
+    pub(crate) attempts: u32,
+    pub(crate) failure: CallFailure,
+    pub(crate) status_code: Option<u16>,
+    pub(crate) request_id: Option<&'a str>,
+    /// The backend the router sent the call to, when one chose.
+    pub(crate) provider: Option<crate::llm::ProviderKind>,
 }
 
 /// Where a call's cost goes. Every metered function takes one.
 #[async_trait]
 pub(crate) trait CostSink: Send + Sync {
     async fn record(&self, cost: CallCost<'_>);
+
+    /// Note a chat call that failed. It spent nothing a rollup should bill, so
+    /// a sink that keeps no failures leaves this as is.
+    async fn record_failure(&self, _failure: CallFailed<'_>) {}
 
     /// When the provider must have answered. It bounds the provider call
     /// alone, so a call that answered in time is never lost to its record.
@@ -117,7 +150,8 @@ async fn within<T>(
 /// The cost names the model the selection pins, else the provider's default,
 /// and the tier the call went out at and the time it took. Both are read after
 /// the call, since an auxiliary call can move off a not-served model. A failed
-/// call reported nothing, so it records nothing.
+/// call reported no cost, so it records a [`CostSink::record_failure`] and
+/// returns its error untouched.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat<P: LlmProvider + ?Sized>(
     sink: &dyn CostSink,
@@ -138,18 +172,40 @@ pub(crate) async fn chat<P: LlmProvider + ?Sized>(
         on_token,
         CallToken::mint(),
     );
-    let response = within(sink, call).await?;
+    let (outcome, trace) = call_trace::scoped(within(sink, call)).await;
     let model = selection
         .model
         .unwrap_or(provider.default_model())
         .to_string();
     let effort = provider.effort_sent(&selection);
+    let response = match outcome {
+        Ok(response) => response,
+        Err(error) => {
+            let timed_out = error.is::<tokio::time::error::Elapsed>();
+            sink.record_failure(CallFailed {
+                model: &model,
+                reasoning_effort: effort.as_deref(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                attempts: trace.attempts,
+                failure: trace.failure(timed_out),
+                status_code: trace.status,
+                request_id: trace.request_id.as_deref(),
+                provider: trace.provider,
+            })
+            .await;
+            return Err(error);
+        }
+    };
     sink.record(CallCost {
         model: &model,
         request_chars,
         reported: Reported::Chat(&response),
         reasoning_effort: effort.as_deref(),
         duration_ms: Some(started.elapsed().as_millis() as u64),
+        ttft_ms: trace
+            .first_delta
+            .map(|first| first.saturating_duration_since(started).as_millis() as u64),
+        request_id: trace.request_id.as_deref(),
     })
     .await;
     Ok(response)
@@ -170,6 +226,8 @@ pub(crate) async fn judge<J: JudgmentProvider + ?Sized>(
         reported: Reported::Judgment(&judgment),
         reasoning_effort: None,
         duration_ms: None,
+        ttft_ms: None,
+        request_id: None,
     })
     .await;
     Ok(judgment)
@@ -196,6 +254,8 @@ pub(crate) async fn generate<I: ImageProvider + ?Sized>(
         },
         reasoning_effort: None,
         duration_ms: None,
+        ttft_ms: None,
+        request_id: None,
     })
     .await;
     Ok(result)
@@ -216,6 +276,8 @@ pub(crate) async fn search(
         reported: Reported::Usage(usage),
         reasoning_effort: None,
         duration_ms: None,
+        ttft_ms: None,
+        request_id: None,
     })
     .await;
     Ok(text)

@@ -1,7 +1,8 @@
 import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, threadListFetched, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
 import { checkHealth } from '../../api/client';
 import type { HealthInfo } from '../../api/client';
-import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
+import { connectThreadEvents, reviveThreadEvents } from './thread-sync';
+import { repairGapState } from '../eventGap';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, retryStaleOpenThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -182,6 +183,9 @@ function runResumeSync(): void {
   // `clearThreadFetchGuards` deliberately does NOT reset the marks, or the call
   // above would undo this one.
   markLoadedThreadsStale();
+  // A wake is an event gap, and a stream replaced below opens as a first open,
+  // so the gap reconcile never runs. Repair the signals only frames move here.
+  repairGapState();
 
   void loadUnreadNotifications();
   // Preferences have no SSE re-trigger beyond `PreferencesChanged` /
@@ -201,8 +205,7 @@ function runResumeSync(): void {
   // desktop client, or a phone that stayed awake through the outage), where no
   // resume event ever fires. Idempotent, and a no-op when nothing is parked.
   flushUndeliveredComposeDrafts();
-  disconnectThreadEvents();
-  connectThreadEvents();
+  reviveThreadEvents();
   refreshChangesState();
   // The queue panel reads a signal that only queue events move. A device that
   // slept through those events wakes holding entries that have since drained.

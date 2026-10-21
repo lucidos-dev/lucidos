@@ -57,7 +57,7 @@ export function updateModel(
     label?: string;
     provider?: string;
     sort_order?: number;
-    enabled?: boolean;
+    on_chat_ladder?: boolean;
     context_window?: number | null;
     routes?: RouteInput[];
     preferred_provider?: string | null;

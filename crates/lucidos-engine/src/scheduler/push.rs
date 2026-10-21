@@ -11,6 +11,7 @@ use super::push_test_log;
 
 use super::notification_plain_text::plain_text_body;
 use crate::api::SharedEngine;
+use crate::core::secret_store::{PushAuth, Secret, VapidPrivateKey};
 
 /// Spec §3: the engine waits this long for pongs before deciding push.
 ///
@@ -83,7 +84,7 @@ impl PushSubscriptionStore {
         )
         .bind(&sub.endpoint)
         .bind(&sub.p256dh)
-        .bind(&sub.auth)
+        .bind(Secret::<PushAuth>::new(sub.auth.as_str()))
         .bind(&sub.device_id)
         .bind(&sub.scope_url)
         .execute(pool)
@@ -118,7 +119,7 @@ impl PushSubscriptionStore {
             (
                 String,
                 String,
-                String,
+                Secret<PushAuth>,
                 Option<String>,
                 Option<String>,
                 Option<String>,
@@ -140,7 +141,7 @@ impl PushSubscriptionStore {
                         PushSubscription {
                             endpoint,
                             p256dh,
-                            auth,
+                            auth: auth.into_inner(),
                             device_id,
                             scope_url,
                         },
@@ -159,7 +160,16 @@ impl PushSubscriptionStore {
         pool: &PgPool,
         device_id: &str,
     ) -> Result<Vec<PushSubscription>, Box<dyn std::error::Error + Send + Sync>> {
-        let rows = sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Secret<PushAuth>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
             "SELECT ps.endpoint, ps.p256dh, ps.auth, ps.device_id, ps.scope_url
              FROM push_subscriptions ps
              LEFT JOIN devices d ON ps.device_id = d.id
@@ -176,7 +186,7 @@ impl PushSubscriptionStore {
                 |(endpoint, p256dh, auth, device_id, scope_url)| PushSubscription {
                     endpoint,
                     p256dh,
-                    auth,
+                    auth: auth.into_inner(),
                     device_id,
                     scope_url,
                 },
@@ -185,18 +195,17 @@ impl PushSubscriptionStore {
     }
 }
 
-/// Get or create VAPID keys, stored in the preferences table
+/// The workspace's VAPID keypair, generated on first use. The private key is
+/// sealed at rest (ADR 0509).
 pub async fn get_or_create_vapid_keys(
     pool: &PgPool,
 ) -> Result<VapidKeys, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::core::{prefs, PreferenceStore};
     use base64::Engine;
     use p256::ecdsa::SigningKey;
     use p256::elliptic_curve::rand_core::OsRng;
     use p256::pkcs8::EncodePrivateKey;
 
-    if let Some(keys_json) = prefs::VAPID_KEYS.try_stored(pool).await? {
-        let keys: VapidKeys = serde_json::from_str(&keys_json)?;
+    if let Some(keys) = stored_vapid_keys(pool).await? {
         return Ok(keys);
     }
 
@@ -211,16 +220,36 @@ pub async fn get_or_create_vapid_keys(
     let pub_bytes = verifying_key.to_encoded_point(false);
     let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pub_bytes.as_bytes());
 
-    let keys = VapidKeys {
-        private_key_pem,
+    // A concurrent first use may have stored its pair already. Its pair wins,
+    // so every subscription keeps one signer.
+    let created = sqlx::query(
+        "INSERT INTO vapid_keys (public_key, private_key_pem) VALUES ($1, $2) \
+         ON CONFLICT (singleton) DO NOTHING",
+    )
+    .bind(&public_key)
+    .bind(Secret::<VapidPrivateKey>::new(private_key_pem))
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if created > 0 {
+        log!("[Push] Generated new VAPID key pair");
+    }
+    stored_vapid_keys(pool)
+        .await?
+        .ok_or_else(|| "the VAPID key pair was not stored".into())
+}
+
+async fn stored_vapid_keys(
+    pool: &PgPool,
+) -> Result<Option<VapidKeys>, Box<dyn std::error::Error + Send + Sync>> {
+    let row: Option<(String, Secret<VapidPrivateKey>)> =
+        sqlx::query_as("SELECT public_key, private_key_pem FROM vapid_keys")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(public_key, private_key_pem)| VapidKeys {
+        private_key_pem: private_key_pem.into_inner(),
         public_key,
-    };
-
-    let keys_json = serde_json::to_string(&keys)?;
-    PreferenceStore::set_silent(pool, prefs::VAPID_KEYS.key(), &keys_json).await?;
-
-    log!("[Push] Generated new VAPID key pair");
-    Ok(keys)
+    }))
 }
 
 /// Send a push notification to all registered subscriptions. With a

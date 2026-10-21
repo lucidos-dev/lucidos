@@ -49,7 +49,8 @@ pub const MOCK_RUN_PYTHON_SENTINEL: &str = "MOCK_RUN_PYTHON:";
 pub const MOCK_READ_FILES_SENTINEL: &str = "MOCK_READ_FILES:";
 
 /// Sentinel that makes the mock issue one call to any tool:
-/// `MOCK_TOOL_CALL: <tool name> <JSON arguments>`, to the end of the line.
+/// `MOCK_TOOL_CALL: <tool name> <JSON arguments>`, to the end of the line or
+/// the next sentinel. Several on one request run in order, one per round.
 ///
 /// For a test whose subject is what one tool does when a real model calls
 /// it, such as where `write_file` lands a path. The sentinels above stay
@@ -233,16 +234,45 @@ pub fn scripted_read_files(messages: &[Message]) -> Option<Vec<String>> {
 }
 
 /// Decide whether this turn should call a named tool, and with what arguments.
-/// Same two halves as [`scripted_await_event`]: the request line only, and
-/// never twice. A line whose arguments are not a JSON object scripts nothing.
+///
+/// The request line may script several calls, one sentinel each. They run in
+/// order, one per round: the next is the first whose call the array does not
+/// yet carry. Rounds after the first end on a tool result, so the request is
+/// read from the turn's latest message carrying a request line. A call whose
+/// arguments are not a JSON object scripts nothing.
 pub fn scripted_tool_call(messages: &[Message]) -> Option<(String, serde_json::Value)> {
-    let line = sentinel_line(messages, MOCK_TOOL_CALL_SENTINEL)?;
-    let (name, args) = line.split_once(char::is_whitespace)?;
-    if already_called(messages, name) {
-        return None;
+    let request = messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "user")
+        .find_map(request_text)?;
+    let mut scripted_per_name = std::collections::HashMap::<&str, usize>::new();
+    for segment in request.split(MOCK_TOOL_CALL_SENTINEL).skip(1) {
+        let (name, args) = segment
+            .lines()
+            .next()?
+            .trim()
+            .split_once(char::is_whitespace)?;
+        let nth = scripted_per_name.entry(name).or_default();
+        *nth += 1;
+        if calls_to(messages, name) >= *nth {
+            continue;
+        }
+        let args: serde_json::Value = serde_json::from_str(args.trim()).ok()?;
+        return args.is_object().then(|| (name.to_string(), args));
     }
-    let args: serde_json::Value = serde_json::from_str(args.trim()).ok()?;
-    args.is_object().then(|| (name.to_string(), args))
+    None
+}
+
+/// The request line of `message`, when it carries one.
+fn request_text(message: &Message) -> Option<String> {
+    match &message.content {
+        MessageContent::Text(text) => request_line(text).map(str::to_string),
+        MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+            ContentBlock::Text { text } => request_line(text).map(str::to_string),
+            _ => None,
+        }),
+    }
 }
 
 /// What this turn's reply ends on, when it was scripted to end on a question.
@@ -302,12 +332,21 @@ fn sentinel_line_in(message: &Message, sentinel: &str) -> Option<String> {
 /// finish. Without this the mock would re-issue the same call every iteration
 /// and the turn would never end.
 fn already_called(messages: &[Message], tool_name: &str) -> bool {
-    messages.iter().any(|m| match &m.content {
-        MessageContent::Blocks(blocks) => blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == tool_name)),
-        MessageContent::Text(_) => false,
-    })
+    calls_to(messages, tool_name) > 0
+}
+
+/// How many calls to `tool_name` the array carries.
+fn calls_to(messages: &[Message], tool_name: &str) -> usize {
+    messages
+        .iter()
+        .map(|m| match &m.content {
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == tool_name))
+                .count(),
+            MessageContent::Text(_) => 0,
+        })
+        .sum()
 }
 
 impl MockProvider {
@@ -378,8 +417,11 @@ impl LlmProvider for MockProvider {
                 output_tokens: None,
                 input_tokens: None,
                 cache_creation_tokens: None,
+                cache_creation_1h_tokens: None,
+                stable_prefix_fingerprint: None,
                 cache_read_tokens: None,
                 served_model: None,
+                provider: None,
                 thinking_chars: None,
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
@@ -404,8 +446,11 @@ impl LlmProvider for MockProvider {
                 output_tokens: None,
                 input_tokens: None,
                 cache_creation_tokens: None,
+                cache_creation_1h_tokens: None,
+                stable_prefix_fingerprint: None,
                 cache_read_tokens: None,
                 served_model: None,
+                provider: None,
                 thinking_chars: None,
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
@@ -434,8 +479,11 @@ impl LlmProvider for MockProvider {
                 output_tokens: None,
                 input_tokens: None,
                 cache_creation_tokens: None,
+                cache_creation_1h_tokens: None,
+                stable_prefix_fingerprint: None,
                 cache_read_tokens: None,
                 served_model: None,
+                provider: None,
                 thinking_chars: None,
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
@@ -460,8 +508,11 @@ impl LlmProvider for MockProvider {
                 output_tokens: None,
                 input_tokens: None,
                 cache_creation_tokens: None,
+                cache_creation_1h_tokens: None,
+                stable_prefix_fingerprint: None,
                 cache_read_tokens: None,
                 served_model: None,
+                provider: None,
                 thinking_chars: None,
                 thinking_blocks: None,
                 unknown_sse_dropped: 0,
@@ -517,8 +568,11 @@ impl LlmProvider for MockProvider {
             output_tokens: None,
             input_tokens: None,
             cache_creation_tokens: None,
+            cache_creation_1h_tokens: None,
+            stable_prefix_fingerprint: None,
             cache_read_tokens: None,
             served_model: None,
+            provider: None,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
@@ -843,6 +897,44 @@ mod tests {
             }]),
         });
         assert_eq!(scripted_tool_call(&msgs), None, "never twice");
+    }
+
+    /// Each round after the first ends on a tool result, not on the request.
+    #[test]
+    fn scripted_tool_calls_run_in_order_one_per_round() {
+        let mut msgs = assembled(
+            "",
+            r#"MOCK_TOOL_CALL: load_knowhow {"id":"a"} MOCK_TOOL_CALL: run_thread {"prompt":"p"} MOCK_TOOL_CALL: load_knowhow {"id":"b"}"#,
+        );
+        let mut made = Vec::new();
+        while let Some((name, args)) = scripted_tool_call(&msgs) {
+            let id = format!("toolu_{}", made.len());
+            made.push((name.clone(), args.clone()));
+            msgs.push(Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: id.clone(),
+                    name,
+                    input: args,
+                    thought_signature: None,
+                }]),
+            });
+            msgs.push(Message {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content: "ok".to_string(),
+                }]),
+            });
+        }
+        assert_eq!(
+            made,
+            [
+                ("load_knowhow".to_string(), serde_json::json!({"id": "a"})),
+                ("run_thread".to_string(), serde_json::json!({"prompt": "p"})),
+                ("load_knowhow".to_string(), serde_json::json!({"id": "b"})),
+            ]
+        );
     }
 
     #[test]

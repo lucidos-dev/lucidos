@@ -7,11 +7,11 @@ use crate::core::event_subscription::EventSubscription;
 use crate::runtime::CodingAgent;
 
 use super::{
-    AbortCause, ActorMode, AnswerKind, ApplyNowOutcome, ArrangedTile, CancelCause, CaptureFormat,
-    ChildCompletionStatus, CodingAgentExit, EventWaitCancelCause, FormRequestOutcome, LayoutClass,
-    McpEnablementSource, MessageOrigin, OwnerApproval, QuestionOption, RecalledMemory,
-    SessionEndReason, TodoItem, TriggerInvocation, UnproposedReason, UnqueueReason,
-    VoiceSessionEndReason, WakeMode,
+    AbortCause, ActorMode, AnswerKind, ApplyNowOutcome, CacheKeepAliveStatus, CancelCause,
+    CaptureFormat, ChildCompletionStatus, CodingAgentExit, Dashboard, EventWaitCancelCause,
+    FormRequestOutcome, HandoffConsent, LegacyArrangedTile, McpEnablementSource, MessageOrigin,
+    OwnerApproval, QuestionOption, RecalledMemory, SessionEndReason, TodoItem, TriggerInvocation,
+    UnproposedReason, UnqueueReason, VoiceSessionEndReason, WakeMode,
 };
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -245,17 +245,23 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_call_id: Option<String>,
         /// The reasoning tier this call ran at, where the caller has one to
-        /// report. Absent for every purpose but the compactor today, and for
-        /// every row written before the field existed. Lets a cost estimate
-        /// split measured usage by tier instead of treating all history as
-        /// one baseline.
+        /// report. Set on a chat turn and on every metered chat call. Lets a
+        /// cost estimate split measured usage by tier instead of treating all
+        /// history as one baseline.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
         /// How long the call took, wall clock, where the caller timed it.
-        /// Absent for every purpose but the compactor today. The Tree
-        /// backfill estimate reads it as a model's seconds per call at a tier.
+        /// Set on a chat turn and on every metered chat call. It spans the
+        /// provider's retries, so `created` minus this is when the first
+        /// attempt started. The Tree backfill estimate reads it as a model's
+        /// seconds per call at a tier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// The *stable-prefix fingerprint* of a chat turn's first round, on
+        /// Anthropic and Vertex Claude. A later round of the same turn sends
+        /// the same prefix, so only round 1 carries it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stable_prefix_fingerprint: Option<String>,
         /// The *served model*: the model id the provider's reply named,
         /// verbatim. `model` is the one Lucidos asked for. Absent when the
         /// reply named none, and on every row written before the field
@@ -264,6 +270,56 @@ pub enum ThreadEvent {
         /// sending a retired model's successor (ADR 0418).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_model: Option<String>,
+        /// The backend that served the call, as the router resolved its route
+        /// (`claude-gateway`, `vertex`, ...). Absent when no router chose one,
+        /// as for a coding agent's own call, and on every row written before
+        /// the field existed. The gateway telemetry exporter selects on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        /// Time to the first content delta of the stream that answered, from
+        /// the same start as `duration_ms`, so never above it. Absent when
+        /// no delta arrived or the provider's send loop does not trace it,
+        /// and on every row written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttft_ms: Option<u64>,
+        /// The provider's id for the response that answered (the
+        /// `request-id` header). Absent when the response had none, and on
+        /// every row written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+    /// A metered chat call that failed. It is **never a `ContextCaptured`**: a
+    /// capture binds to a transcript step and every usage rollup sums it, while
+    /// a failed call has no context to show and no spend. Written for any
+    /// provider. The gateway telemetry exporter selects on `provider`.
+    ///
+    /// Carries facts only. A provider's error body can echo request content, so
+    /// no message is stored here: a turn's `ResponseFailed` keeps its own.
+    ModelCallFailed {
+        /// The model the call asked for.
+        model: String,
+        /// Which call this was. Absent for a turn, like `ContextCaptured`.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::engine::ContextPurpose::is_turn"
+        )]
+        purpose: crate::engine::ContextPurpose,
+        /// The backend the router sent the call to, when one chose.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// How long the call ran before it failed, retries included.
+        duration_ms: u64,
+        /// HTTP sends made across the call's retries and model fallback.
+        attempts: u32,
+        failure: crate::llm::call_trace::CallFailure,
+        /// The last attempt's HTTP status, when a response arrived.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_code: Option<u16>,
+        /// The `request-id` header of the failing response, when it had one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// The engine's automatic pre-turn recall: `retrieve_context` vector-searched
     /// long-term memory with classifier-derived `queries` and injected the hits
@@ -526,6 +582,54 @@ pub enum ThreadEvent {
     SuccessorThreadSpawned {
         successor_thread_id: uuid::Uuid,
         base_sha: String,
+        /// The successor is the builder of a *build chain*: a `no-wake`
+        /// child of this thread, which stays open (ADR 0503).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        starts_build_chain: bool,
+        /// The authority that let a successor placed under a parent start,
+        /// which it inherits for its own automatic handoffs (ADR 0507).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_consent: Option<HandoffConsent>,
+    },
+    /// The agent ran a *handoff checkpoint* a flow names (ADR 0505). It
+    /// records what the *handoff estimate* read, so a later run of the same
+    /// checkpoint can pool on it. `offered` marks a `--ask` run.
+    HandoffCheckpointReached {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<crate::engine::handoff_estimate::CheckpointProgress>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        offered: bool,
+        /// The verdict. `None` when the engine could not make a reading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pays: Option<bool>,
+    },
+    /// The user chose *Stay here* on the Successor card. `input_tokens` is the
+    /// context size at that moment: the card stays hidden until the thread
+    /// holds 100k more.
+    SuccessorOfferDeclined {
+        input_tokens: u64,
+    },
+    /// The user chose *Continue with context* while the prompt cache was warm,
+    /// so the agent writes the *handoff narrative*. The successor, once the
+    /// agent spawns it, opens with `message` and runs on the implementer named
+    /// here. Pending until the thread's turn ends.
+    SuccessorRequested {
+        /// The user's first request for the successor, when they typed one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coding_agent: Option<CodingAgent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coding_agent_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
     /// The coding agent compacted its own context mid-session: Claude Code's
     /// `compact_boundary`. The context counter drops at this step.
@@ -656,6 +760,14 @@ pub enum ThreadEvent {
         /// not count it.
         #[serde(default, skip_serializing_if = "is_false")]
         verbatim: bool,
+    },
+    /// An effort restart interrupted the turn before the coding agent read
+    /// the input that opened it, so the agent never will. The input stays
+    /// owed until a later `CodingAgentInputRead` names it, and the next
+    /// session to start delivers it (`agent_session::stranded_follow_ups`).
+    CodingAgentInputDiscarded {
+        /// The event that carried the input, as on `CodingAgentInputRead`.
+        input_event_id: uuid::Uuid,
     },
     /// Emitted when the engine detects that a coding-agent session ended without
     /// running the required hardening. A recovery hardening session is spawned
@@ -1713,6 +1825,15 @@ pub enum ThreadEvent {
         reason: String,
     },
 
+    /// The *cache keep-alive status* of this thread changed. Only the
+    /// keep-alive tick writes it, and only on a change. It projects into
+    /// `thread_summaries.cache_keep_alive_status`, opens no turn, wakes
+    /// nobody and moves no recency (ADR 0529).
+    CacheKeepAliveStatusChanged {
+        /// Absent once the thread has nothing to keep warm.
+        status: Option<CacheKeepAliveStatus>,
+    },
+
     /// A voice session opened on this thread (ADR 0148).
     ///
     /// Voice is a mode of a thread, so this changes no `source` and opens no
@@ -1907,13 +2028,12 @@ pub enum ThreadEvent {
         server_id: String,
         by: McpEnablementSource,
     },
-    /// The Home board of one layout class was arranged: its tiles in order,
-    /// each with its size and whether it is hidden (ADR 0432). Written on the
-    /// home thread only. The newest one per layout wins, whole. The tiles stay
-    /// Home's pins, so an entry for an unpinned instance is ignored.
+    /// Legacy, read only: the home thread's arrangement of one layout, from
+    /// before each dashboard had its own tiles (ADR 0432). Nothing writes it
+    /// now. With Home's old pins it seeds each dashboard (ADR 0496).
     HomeBoardArranged {
-        layout: LayoutClass,
-        tiles: Vec<ArrangedTile>,
+        layout: Dashboard,
+        tiles: Vec<LegacyArrangedTile>,
     },
 
     // ---- Transient — never persisted ----

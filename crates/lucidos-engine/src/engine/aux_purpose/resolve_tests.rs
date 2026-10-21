@@ -7,7 +7,8 @@ use async_trait::async_trait;
 
 use super::*;
 use crate::engine::event_bus::EventBus;
-use crate::llm::model_registry::{load_from_db, ProviderKind};
+use crate::llm::model_registry::{load_from_db, GenerationRule, ProviderKind};
+use crate::llm::not_served::NotServedLedger;
 use crate::llm::provider::{LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition};
 use crate::test_support::{aux_captures, setup_test_db, teardown_test_db};
 
@@ -19,6 +20,10 @@ struct StubRouter {
     /// Models it answers not-found for, as a retired model's provider does.
     refusing: Vec<&'static str>,
     seen: Mutex<Vec<(Option<String>, Option<Duration>)>>,
+    /// The generation rule each request carried.
+    rules: Mutex<Vec<GenerationRule>>,
+    /// Marked on each refusal, as the router marks its own.
+    ledger: NotServedLedger,
 }
 
 impl StubRouter {
@@ -33,6 +38,8 @@ impl StubRouter {
             default_model: model,
             refusing: Vec::new(),
             seen: Mutex::default(),
+            rules: Mutex::default(),
+            ledger: NotServedLedger::default(),
         })
     }
 
@@ -43,6 +50,8 @@ impl StubRouter {
             default_model: "claude-opus-5-5",
             refusing: models.to_vec(),
             seen: Mutex::default(),
+            rules: Mutex::default(),
+            ledger: NotServedLedger::default(),
         })
     }
 }
@@ -62,10 +71,14 @@ impl LlmProvider for StubRouter {
             selection.model.map(str::to_string),
             selection.attempt_timeout,
         ));
+        self.rules.lock().unwrap().push(selection.generation_rule);
         if let Some(model) = selection.model.filter(|m| self.refusing.contains(m)) {
-            return Err(Box::new(crate::llm::ModelNotServed::new(format!(
-                "Vertex has no `{model}`"
-            ))));
+            let provider = self.configured[0];
+            self.ledger.mark(provider, model);
+            return Err(Box::new(
+                crate::llm::ModelNotServed::new(format!("Vertex has no `{model}`"))
+                    .refused_by(provider, model),
+            ));
         }
         Ok(LlmResponse {
             content: Some("A summary.".to_string()),
@@ -82,6 +95,10 @@ impl LlmProvider for StubRouter {
     fn configured_providers(&self) -> Option<Vec<ProviderKind>> {
         Some(self.configured.clone())
     }
+
+    fn not_served_ledger(&self) -> Option<NotServedLedger> {
+        Some(self.ledger.clone())
+    }
 }
 
 /// An Anthropic-only install: no Vertex, no extractor. The summary still runs,
@@ -94,7 +111,7 @@ async fn an_install_without_vertex_runs_and_records_the_model_it_ran() {
     let purpose = ContextPurpose::ConversationSummary;
 
     let call = AuxCall::resolve(&pool, &registry, router.clone(), purpose).await;
-    assert_eq!(call.model(), "claude-sonnet-5-5");
+    assert_eq!(call.selection().model, "claude-sonnet-5-5");
     assert_eq!(call.selection().source, ModelSource::Default);
     assert!(call.selection().reachable);
 
@@ -125,22 +142,23 @@ async fn an_install_without_vertex_runs_and_records_the_model_it_ran() {
     teardown_test_db(&db_name).await;
 }
 
-/// Vertex retiring the judge's default: the call that hits the 404 retries on
-/// the next model and records it, and the next call starts there (I4, I6).
+/// A Vertex project refusing the background default: the call that hits the
+/// 404 retries on the next model and records it, and the next call starts
+/// there (I4, I6).
 #[tokio::test]
 async fn a_retired_default_moves_on_and_the_next_call_starts_there() {
     let (pool, db_name) = setup_test_db().await;
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
-    let (gemini, haiku) = ("gemini-3-flash-preview", "claude-haiku-4-5");
-    let router = StubRouter::refusing(&[ProviderKind::Vertex], &[gemini]);
-    let purpose = ContextPurpose::CommandJudge;
+    let (refused, next) = (prefs::BACKGROUND_MODEL, "gemini-3.1-flash-lite");
+    let router = StubRouter::refusing(&[ProviderKind::Vertex], &[refused]);
+    let purpose = ContextPurpose::Title;
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let call = AuxCall::resolve(&pool, &registry, router.clone(), purpose)
         .await
         .reporting_to(&bus, &pool, &registry, purpose);
-    assert_eq!(call.model(), gemini);
-    assert_eq!(call.selection().fallback.as_deref(), Some(haiku));
+    assert_eq!(call.selection().model, refused);
+    assert_eq!(call.selection().fallback.as_deref(), Some(next));
 
     let thread_id = uuid::Uuid::new_v4();
     let capture = crate::engine::AuxCapture::new(&bus, thread_id, purpose);
@@ -154,10 +172,19 @@ async fn a_retired_default_moves_on_and_the_next_call_starts_there() {
         .iter()
         .map(|s| s.0.clone())
         .collect();
-    assert_eq!(seen, [Some(gemini.to_string()), Some(haiku.to_string())]);
-    let captures = aux_captures(&pool, thread_id, "command_judge").await;
+    assert_eq!(seen, [Some(refused.to_string()), Some(next.to_string())]);
+    assert!(
+        router
+            .rules
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|rule| *rule == GenerationRule::NamedOrNewer),
+        "a default never steps back"
+    );
+    let captures = aux_captures(&pool, thread_id, "title").await;
     assert_eq!(
-        captures[0]["model"], haiku,
+        captures[0]["model"], next,
         "the cost names the model that ran"
     );
     let moved: Option<String> = sqlx::query_scalar(
@@ -167,26 +194,29 @@ async fn a_retired_default_moves_on_and_the_next_call_starts_there() {
     .fetch_one(&pool)
     .await
     .expect("the observation");
-    assert_eq!(moved.as_deref(), Some(haiku));
+    assert_eq!(moved.as_deref(), Some(next));
 
-    let next = AuxCall::resolve(&pool, &registry, router.clone(), purpose).await;
-    assert_eq!(next.model(), haiku);
-    assert_eq!(next.selection().source, ModelSource::Default);
-    assert_eq!(next.selection().not_served, [gemini]);
+    // Haiku 4.5, which Haiku 5.5 retired, is still reachable on Vertex. A
+    // default never steps back to it (I4).
+    let following = AuxCall::resolve(&pool, &registry, router.clone(), purpose).await;
+    assert_eq!(following.selection().model, next);
+    assert_eq!(following.selection().source, ModelSource::Default);
+    assert_eq!(following.selection().not_served, [refused]);
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// A stored pick its provider refuses fails, and nothing moves it (I2).
+/// A stored pick its provider refuses fails, and nothing moves it to another
+/// recommended model (I2). The router may move it only within its lineage.
 #[tokio::test]
 async fn a_retired_stored_pick_fails_without_moving() {
     let (pool, db_name) = setup_test_db().await;
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
-    let haiku = "claude-haiku-4-5";
-    crate::core::PreferenceStore::set_row_for_test(&pool, prefs::MODEL_COMMAND_JUDGE.key(), haiku)
+    let lite = "gemini-3.1-flash-lite";
+    crate::core::PreferenceStore::set_row_for_test(&pool, prefs::MODEL_COMMAND_JUDGE.key(), lite)
         .await
         .unwrap();
-    let router = StubRouter::refusing(&[ProviderKind::Vertex], &[haiku]);
+    let router = StubRouter::refusing(&[ProviderKind::Vertex], &[lite]);
     let purpose = ContextPurpose::CommandJudge;
     let (bus, _rx) = EventBus::new(pool.clone());
     let call = AuxCall::resolve(&pool, &registry, router.clone(), purpose)
@@ -200,12 +230,67 @@ async fn a_retired_stored_pick_fails_without_moving() {
         .expect_err("a stored pick is refused, not substituted");
     assert!(err.is::<crate::llm::ModelNotServed>(), "{err}");
     assert_eq!(router.seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        router.rules.lock().unwrap().as_slice(),
+        [GenerationRule::AnyGeneration]
+    );
     let notified: i64 =
         sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'NotificationCreated'")
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(notified, 1);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The migration moved a judge stored on `old` to its successor `new`, which
+/// this install's provider refuses. The judge runs `old` rather than failing,
+/// and the next selection names what runs: the model the router sends (I1,
+/// I6, I7).
+#[tokio::test]
+async fn a_judge_on_a_refused_successor_runs_the_earlier_generation() {
+    use crate::llm::routing::lineage_stub::{lineage_registry, lineage_router};
+    let (pool, db_name) = setup_test_db().await;
+    let registry = lineage_registry();
+    crate::core::PreferenceStore::set_row_for_test(&pool, prefs::MODEL_COMMAND_JUDGE.key(), "new")
+        .await
+        .unwrap();
+    let (router, seen) = lineage_router(&["new"]).await;
+    let router: Arc<dyn LlmProvider> = Arc::new(router);
+    let purpose = ContextPurpose::CommandJudge;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let judge = || async {
+        let call = AuxCall::resolve(&pool, &registry, router.clone(), purpose)
+            .await
+            .reporting_to(&bus, &pool, &registry, purpose);
+        let capture = crate::engine::AuxCapture::new(&bus, uuid::Uuid::new_v4(), purpose);
+        crate::memory::summarize_conversation(call.provider().as_ref(), "t", None, &capture)
+            .await
+            .expect("the earlier generation answers");
+        (call.selection().clone(), call.running_model().to_string())
+    };
+
+    let (first, first_runs) = judge().await;
+    assert_eq!(first_runs, "new");
+    assert_eq!(
+        (first.model.as_str(), first.source),
+        ("new", ModelSource::Preference)
+    );
+    let (second, second_runs) = judge().await;
+    assert_eq!(second_runs, "old", "the compactor's lane follows what runs");
+    assert!(second.reachable);
+    assert_eq!(
+        second.generation,
+        Some(GenerationStep::Predecessor {
+            model: "old".to_string()
+        })
+    );
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["new", "old", "old"],
+        "one refusal, then the earlier generation directly"
+    );
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -232,8 +317,8 @@ async fn a_swapped_router_moves_the_next_call() {
         purpose,
     )
     .await;
-    assert_eq!(before.model(), "gpt-5.4-mini");
-    assert_eq!(after.model(), "gemini-3-flash-preview");
+    assert_eq!(before.selection().model, "gpt-6-luna");
+    assert_eq!(after.selection().model, prefs::BACKGROUND_MODEL);
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -256,7 +341,11 @@ async fn a_mock_engine_runs_on_its_mock() {
         ContextPurpose::ImageDescribe,
     ] {
         let call = AuxCall::resolve(&pool, &registry, mock.clone(), purpose).await;
-        assert_eq!(call.model(), crate::llm::MOCK_MODEL, "{purpose:?}");
+        assert_eq!(
+            call.selection().model,
+            crate::llm::MOCK_MODEL,
+            "{purpose:?}"
+        );
         assert_eq!(call.selection().source, ModelSource::ChatModel);
         assert_eq!(call.provider().default_model(), crate::llm::MOCK_MODEL);
         assert_eq!(call.selection().refusal(), None, "{purpose:?}");
@@ -274,7 +363,7 @@ async fn the_last_resort_is_the_model_turns_run_on() {
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
     let router = StubRouter::defaulting_to(&[ProviderKind::XAi], "grok-4.6");
     let call = AuxCall::resolve(&pool, &registry, router, ContextPurpose::Title).await;
-    assert_eq!(call.model(), "grok-4.6");
+    assert_eq!(call.selection().model, "grok-4.6");
     assert_eq!(call.selection().source, ModelSource::ChatModel);
     assert!(call.selection().reachable);
     pool.close().await;
@@ -295,7 +384,7 @@ async fn image_description_refuses_a_text_only_chat_model() {
         ContextPurpose::ImageDescribe,
     )
     .await;
-    assert_eq!(call.model(), "grok-4.6");
+    assert_eq!(call.selection().model, "grok-4.6");
     assert_eq!(call.selection().source, ModelSource::ChatModel);
     assert!(!call.selection().vision);
     let refusal = call.selection().refusal().expect("refused");
@@ -325,7 +414,7 @@ async fn image_description_runs_on_a_chat_model_that_reads_images() {
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
     let router = StubRouter::defaulting_to(&[ProviderKind::Local], "local-looker");
     let call = AuxCall::resolve(&pool, &registry, router, ContextPurpose::ImageDescribe).await;
-    assert_eq!(call.model(), "local-looker");
+    assert_eq!(call.selection().model, "local-looker");
     assert_eq!(call.selection().source, ModelSource::ChatModel);
     assert_eq!(call.selection().refusal(), None);
     pool.close().await;
@@ -347,7 +436,7 @@ async fn a_stored_text_only_pick_is_refused_by_name() {
     .unwrap();
     let router = StubRouter::holding(&[ProviderKind::OpenRouter]);
     let call = AuxCall::resolve(&pool, &registry, router, ContextPurpose::ImageDescribe).await;
-    assert_eq!(call.model(), "z-ai/glm-5.2");
+    assert_eq!(call.selection().model, "z-ai/glm-5.2");
     assert_eq!(call.selection().source, ModelSource::Preference);
     assert!(call.selection().reachable);
     let refusal = call.selection().refusal().expect("refused");
@@ -367,7 +456,7 @@ async fn a_stored_default_reads_as_unset() {
         .unwrap();
     let router = StubRouter::holding(&[ProviderKind::Anthropic]);
     let call = AuxCall::resolve(&pool, &registry, router, ContextPurpose::Title).await;
-    assert_eq!(call.model(), "claude-haiku-4-5");
+    assert_eq!(call.selection().model, prefs::BACKGROUND_MODEL);
     assert_eq!(call.selection().source, ModelSource::Default);
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -410,7 +499,13 @@ async fn a_stored_memory_pair_binds_extraction_alone() {
             selection.model,
             recommended(purpose, &registry)
                 .into_iter()
-                .find(|m| Reach::configured(&[ProviderKind::Vertex]).serves(&registry, m))
+                .find(|m| {
+                    Reach::configured(&[ProviderKind::Vertex]).serves(
+                        &registry,
+                        m,
+                        ModelSource::Default.generation_rule(),
+                    )
+                })
                 .expect("Vertex serves a recommended model"),
             "{purpose:?}"
         );

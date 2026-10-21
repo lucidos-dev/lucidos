@@ -2,7 +2,7 @@ import { test, expect, Page } from './fixtures';
 import {
   apiRequest, assertHealthy, blurActiveElement, clickVisibleElement, ensureOnThreadPane,
   getHeaderTop, navigateToApp, newThread, pickComposeDestination, pickDropdownOption,
-  sendMessage, uniqueMessage, waitForActionPanel, waitForVisibleInput,
+  ensureSlashCommandsReported, openRungList, sendMessage, uniqueMessage, waitForActionPanel, waitForVisibleInput,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -61,17 +61,17 @@ test.describe('Coding-agent control menu', () => {
     await navigateToApp(page);
     await newThread(page);
 
-    // In Lucidos mode — no coding-agent controls button. The Lucidos Agent
-    // model picker shares the `commands-btn` base style class (distinguished
-    // by `lucidos-commands-btn`), so exclude it to target only the control button.
-    expect(await hasVisibleElement(page, '.commands-btn:not(.lucidos-commands-btn)')).toBe(false);
+    // In Lucidos mode — no coding-agent controls button. The Lucidos Agent's
+    // model pick is the rung control's.
+    expect(await hasVisibleElement(page, '.commands-btn')).toBe(false);
 
     // Toggle to Claude mode — control button appears
     await pickComposeDestination(page);
-    expect(await hasVisibleElement(page, '.commands-btn:not(.lucidos-commands-btn)')).toBe(true);
+    expect(await hasVisibleElement(page, '.commands-btn')).toBe(true);
   });
 
   test('"/" opens control command dropdown in compose view', async ({ page }) => {
+    await ensureSlashCommandsReported(page);
     await navigateToApp(page);
     await newThread(page);
     await pickComposeDestination(page);
@@ -97,9 +97,8 @@ test.describe('Coding-agent control menu', () => {
     let sentBody: Record<string, unknown> | null = null;
     let chatRequestFulfilled = false;
 
-    // Chromium hits the route stub, keeping the test from spawning a real
-    // backend session. Mobile WebKit can let this POST through, so the request
-    // event is the assertion source and the route is a best-effort fast path.
+    // The route stub keeps the test from spawning a real backend session. The
+    // request event is the assertion source.
     page.on('request', (req) => {
       const url = req.url();
       if (url.includes('/api/v1/claude-code/commands')) commandUrls.push(url);
@@ -133,9 +132,14 @@ test.describe('Coding-agent control menu', () => {
       page.locator('.compose-coding-agent-chip .dropdown-sizer > :first-child:visible').first(),
     ).toHaveText('Codex');
 
-    const codexControls = page.locator('.commands-btn-active[aria-label="Codex controls"]:visible').first();
+    // Codex has no slash commands, so its `/` button is drawn but inert, and
+    // its model pick is the rung control's.
+    const codexControls = page.locator('.commands-btn[aria-label="Codex controls"]:visible').first();
     await expect(codexControls).toBeVisible({ timeout: 15_000 });
+    await expect(codexControls).not.toHaveClass(/commands-btn-active/);
     await expect(page.locator('.commands-btn[aria-label="Claude Code controls"]:visible')).toHaveCount(0);
+    await openRungList(page);
+    await page.keyboard.press('Escape');
     await expect.poll(() => commandUrls.some((u) => {
       const url = new URL(u);
       return url.searchParams.get('repo_id') === ''
@@ -143,11 +147,8 @@ test.describe('Coding-agent control menu', () => {
     })).toBe(true);
 
     await codexControls.click();
-    await waitForVisible(page, '.control-dropdown');
-    await expect(page.locator('.control-section-label:visible', { hasText: 'Session' }).first()).toBeVisible();
-    await expect(page.locator('.control-section-label:visible', { hasText: 'Commands' })).toHaveCount(0);
-    await expect(page.locator('.control-section-label:visible', { hasText: 'Skills' })).toHaveCount(0);
-    await codexControls.click();
+    await page.waitForTimeout(250);
+    await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
 
     await typeSlash(page);
     await page.waitForTimeout(250);
@@ -168,6 +169,7 @@ test.describe('Coding-agent control menu', () => {
     test.use({ viewport: { width: 375, height: 812 } });
 
     test('header visible after opening and closing coding-agent commands menu', async ({ page }) => {
+      await ensureSlashCommandsReported(page);
       await navigateToApp(page);
       await newThread(page);
       await pickComposeDestination(page);

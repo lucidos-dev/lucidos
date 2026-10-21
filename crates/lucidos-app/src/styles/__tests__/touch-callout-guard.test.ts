@@ -45,6 +45,8 @@ const ALLOWED: ReadonlyArray<readonly [selector: string, why: string]> = [
     'thread-drawer rows: whole-row tap targets; ThreadDrawer.tsx renders no anchor'],
   ['.app-row',
     'apps panel rows: whole-row tap targets with a long-press menu; AppCard.tsx renders no anchor'],
+  ['.ladder-row',
+    'intelligence ladder rows, compact layout only: press and drag reorders; renders text, buttons and a switch, no anchors'],
 ];
 
 /** Every selector whose block sets `-webkit-touch-callout: none`, normalized to

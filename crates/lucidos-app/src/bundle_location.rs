@@ -36,9 +36,20 @@ impl BundleLocation {
     }
 }
 
-/// The one instruction every unstable-location message ends on.
-const MOVE_TO_APPLICATIONS: &str =
+/// The launch refusal's instruction. Its dialog's own Quit button exits for
+/// real, so "Quit Lucidos" is true there.
+const QUIT_THEN_MOVE: &str =
     "Quit Lucidos, drag it into your Applications folder, and open it from there.";
+
+/// The update blocker's instruction. In a running app Cmd+Q only closes to the
+/// menu bar, and the service keeps running from the old path.
+fn stop_service_then_move() -> String {
+    format!(
+        "Choose \"{}\" from the Lucidos menu or the menu bar icon. Then drag Lucidos into \
+         your Applications folder, and open it from there.",
+        crate::QUIT_AND_STOP_SERVICE
+    )
+}
 
 /// Classify a bundle path. Pure: the caller reads the mount flags, so every
 /// case is testable without a real mount.
@@ -63,7 +74,7 @@ pub fn launch_refusal(location: &BundleLocation) -> Option<String> {
     location.problem().map(|problem| {
         format!(
             "{problem} From there it cannot keep its background service running or update \
-             itself.\n\n{MOVE_TO_APPLICATIONS}"
+             itself.\n\n{QUIT_THEN_MOVE}"
         )
     })
 }
@@ -75,15 +86,16 @@ pub fn launch_refusal(location: &BundleLocation) -> Option<String> {
 /// That also catches a writable external disk, which is stable for the
 /// service but not updatable.
 pub fn update_blocker(location: &BundleLocation, same_device_as_temp: bool) -> Option<String> {
+    let instruction = stop_service_then_move();
     if let Some(problem) = location.problem() {
         return Some(format!(
-            "{problem} It cannot replace itself there. {MOVE_TO_APPLICATIONS}"
+            "{problem} It cannot replace itself there. {instruction}"
         ));
     }
     (!same_device_as_temp).then(|| {
         format!(
             "Lucidos can only update itself on your startup disk, and it is on another disk. \
-             {MOVE_TO_APPLICATIONS}"
+             {instruction}"
         )
     })
 }
@@ -236,20 +248,41 @@ mod tests {
         assert_eq!(launch_refusal(&BundleLocation::Stable), None);
     }
 
+    // The launch dialog's own Quit button exits for real, so "Quit Lucidos" is
+    // true there.
     #[test]
-    fn every_unstable_message_ends_on_the_same_instruction() {
+    fn every_launch_refusal_ends_on_quit_then_move() {
         for location in [BundleLocation::Translocated, BundleLocation::ReadOnlyVolume] {
-            for message in [
-                launch_refusal(&location),
-                update_blocker(&location, true),
-                update_blocker(&location, false),
-            ] {
-                let message = message.unwrap_or_default();
-                assert!(
-                    message.ends_with(MOVE_TO_APPLICATIONS),
-                    "{location:?}: {message}"
-                );
-            }
+            let message = launch_refusal(&location).unwrap_or_default();
+            assert!(message.ends_with(QUIT_THEN_MOVE), "{location:?}: {message}");
+        }
+    }
+
+    // A running app hears Cmd+Q as "Close to Menu Bar", and the service keeps
+    // running from the old path. So every update blocker names the menu item
+    // that really stops it.
+    #[test]
+    fn every_update_blocker_names_the_real_quit() {
+        for (location, same_device) in [
+            (BundleLocation::Translocated, true),
+            (BundleLocation::Translocated, false),
+            (BundleLocation::ReadOnlyVolume, true),
+            (BundleLocation::ReadOnlyVolume, false),
+            (BundleLocation::Stable, false),
+        ] {
+            let message = update_blocker(&location, same_device).unwrap_or_default();
+            assert!(
+                message.ends_with(&stop_service_then_move()),
+                "{location:?}, same device {same_device}: {message}"
+            );
+            assert!(
+                message.contains(crate::QUIT_AND_STOP_SERVICE),
+                "{location:?}, same device {same_device}: {message}"
+            );
+            assert!(
+                !message.contains(QUIT_THEN_MOVE),
+                "{location:?}, same device {same_device}: {message}"
+            );
         }
     }
 
@@ -264,7 +297,6 @@ mod tests {
     fn a_stable_bundle_on_another_disk_cannot_update() {
         let message = update_blocker(&BundleLocation::Stable, false).unwrap_or_default();
         assert!(message.contains("another disk"), "{message}");
-        assert!(message.ends_with(MOVE_TO_APPLICATIONS), "{message}");
     }
 
     #[test]

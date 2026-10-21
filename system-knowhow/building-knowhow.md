@@ -64,7 +64,7 @@ names it, nothing can find it.
 
 ## Lifecycle: loaded while in use
 
-When the engine LLM calls `load_knowhow` on a doc, the body comes back as the tool result. From the next turn on, it rides in the `[LOADED KNOWHOW]` block of the user message instead. The block is built once per turn and never changes inside one, so a doc loaded mid-turn joins it on the next turn.
+When the engine LLM calls `load_knowhow` on a doc, the body comes back as the tool result. From the next turn on, it rides in the `[LOADED KNOWHOW]` block of the user message instead. The block is built once per turn and never changes inside one, so a doc loaded mid-turn joins it on the next turn. How many turns each doc has left rides in a separate `[KNOWHOW RETENTION]` block, so the doc bodies stay byte-identical from turn to turn.
 
 A doc leaves when it is no longer in use (ADR 0425):
 

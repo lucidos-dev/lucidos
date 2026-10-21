@@ -6,7 +6,6 @@ use crate::core::store::with_event_address;
 use crate::engine::{InjectedPrompt, InjectedPromptKind};
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
-use crate::llm::{get_default_tools, get_notification_tool, ToolCapabilities};
 use crate::llm::{ContentBlock, Message, MessageContent};
 use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
@@ -57,7 +56,7 @@ pub(crate) fn meta_with_cancel_actor(
 /// Drains the flag on read, like `meta_with_cancel_actor` drains the actor and
 /// for the same reason: a stale flag must not relabel the next turn on this
 /// thread. Call it exactly once per terminated turn. The Lucidos Agent analog
-/// of `take_session_redirect_followup`.
+/// of `take_session_redirect_cause`.
 pub(crate) fn cancel_cause_for_turn(
     engine: &LucidosEngine,
     thread_id: Uuid,
@@ -267,7 +266,6 @@ impl LucidosEngine {
                 extraction_ctx,
                 request_id,
                 device_id,
-                cancel_token,
                 thread_id,
             );
             let (result, is_error) = match run_tool_with_cancel(work, cancel_token).await {
@@ -333,7 +331,7 @@ pub(crate) enum InjectedPromptGroup {
     /// exchange-starter is already on the wire, so the text is projected inline
     /// and no `PromptInjected` is emitted. Which re-entry it is stays on
     /// [`InjectedPromptKind`], which is what the log line reads.
-    Standalone(InjectedPrompt),
+    Standalone(Box<InjectedPrompt>),
 }
 
 /// Keep each engine re-entry as a standalone user-channel block, but batch
@@ -351,7 +349,7 @@ pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<Inject
                     &mut user_batch,
                 )));
             }
-            groups.push(InjectedPromptGroup::Standalone(prompt));
+            groups.push(InjectedPromptGroup::Standalone(Box::new(prompt)));
         } else {
             user_batch.push(prompt);
         }
@@ -835,31 +833,6 @@ pub(crate) fn effective_flush_text<'a>(
         return raw;
     }
     content.unwrap_or("")
-}
-
-/// Build the tool list for intent sub-loops.
-/// Notification tools must be included explicitly — they're not in get_default_tools().
-///
-/// `caps` is the caller's workspace gates, so a sub-loop is offered the same
-/// families the chat turn above it was (ADR 0088).
-pub(crate) fn build_intent_tools(caps: &ToolCapabilities) -> Vec<ToolDefinition> {
-    // `await_event` is dropped alongside `execute_intent`, and for a sharper
-    // reason than recursion: an intent sub-loop runs INSIDE the caller's turn
-    // and returns a string, so a subscription registered here outlives the only
-    // thing that wanted it. It would be recorded against the OUTER thread and
-    // re-open it, hours later, with an event nobody on that thread ever asked
-    // to wait for. (Before subscriptions became non-blocking this was refused for
-    // a different reason, a park with no turn to end; that one is gone, this
-    // one is not.)
-    let mut tools: Vec<_> = get_default_tools(caps)
-        .into_iter()
-        .filter(|t| t.name != tn::EXECUTE_INTENT && t.name != tn::AWAIT_EVENT)
-        .collect();
-    tools.push(get_notification_tool());
-    // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
-    // any other manifest-declared LLM tools — single source of truth.
-    tools.extend(crate::capability_manifest::llm_tools_for(caps));
-    tools
 }
 
 /// Derive the "target" key for the consecutive-tool-call circuit breaker.
@@ -2525,7 +2498,8 @@ pub(crate) fn serialize_messages_for_capture(messages: &[Message]) -> String {
                     match block {
                         ContentBlock::Text { text }
                         | ContentBlock::EngineTail { text }
-                        | ContentBlock::MemoryView { text } => out.push_str(text),
+                        | ContentBlock::MemoryView { text }
+                        | ContentBlock::StableContext { text } => out.push_str(text),
                         ContentBlock::ToolUse {
                             name, input, id, ..
                         } => {

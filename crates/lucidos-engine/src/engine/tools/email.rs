@@ -38,8 +38,11 @@ impl LucidosEngine {
         };
 
         // Only require password if no OAuth account is linked
-        if account.oauth_account_id.is_none() && account.password.is_empty() {
-            return Err(format!("Error: Email account '{}' has no password configured. Either enter an app password or connect an OAuth account.", account.name));
+        if account.oauth_account_id.is_none() {
+            account
+                .password
+                .to_sign_in(&account.name)
+                .map_err(|reason| format!("Error: {reason}"))?;
         }
 
         Ok(account)
@@ -69,7 +72,8 @@ impl LucidosEngine {
                     return None;
                 }
             };
-        let config: serde_json::Value = serde_json::from_str(&credential.auth_value).ok()?;
+        // `token_url` is no secret, so the stored value serves.
+        let config: serde_json::Value = serde_json::from_str(credential.stored_value()).ok()?;
         oauth::provider_for_url(config["token_url"].as_str()?)
     }
 
@@ -218,7 +222,7 @@ impl LucidosEngine {
 
                 // An account that already holds a password or OAuth link keeps it.
                 if let Some(existing) = existing {
-                    if !existing.password.is_empty() || existing.oauth_account_id.is_some() {
+                    if existing.password.is_on_file() || existing.oauth_account_id.is_some() {
                         EmailStore::upsert(
                             &self.pool,
                             name,
@@ -266,7 +270,7 @@ impl LucidosEngine {
                     // longer carries an `email:` prefix to say the same thing
                     // (`20260805134838_drop_credential_name_prefixes_use_auth_type.sql`).
                     // It must match `email_accounts.name` byte for byte, which
-                    // is how `update_password` finds the row.
+                    // is how `EmailStore::get` finds the password.
                     name,
                     &format!("Enter the app password for {}", email_address),
                     &[format!("smtp://{}", smtp_host)],
@@ -646,7 +650,7 @@ fn secret_redirect_refusal(
 ) -> Option<String> {
     let holds = if existing.oauth_account_id.is_some() {
         "a linked OAuth account"
-    } else if !existing.password.is_empty() {
+    } else if existing.password.is_on_file() {
         "a saved password"
     } else {
         return None;
@@ -733,9 +737,13 @@ fn oauth_link_refusal(
 #[cfg(test)]
 mod tests {
     use super::{oauth_link_refusal, secret_redirect_refusal, MailDestination};
-    use crate::core::EmailAccount;
+    use crate::core::{EmailAccount, MailPassword};
 
-    fn account(password: &str, oauth: bool) -> EmailAccount {
+    fn saved(password: &str) -> MailPassword {
+        MailPassword::Saved(password.into())
+    }
+
+    fn account(password: MailPassword, oauth: bool) -> EmailAccount {
         EmailAccount {
             id: uuid::Uuid::new_v4(),
             name: "Work".into(),
@@ -745,7 +753,7 @@ mod tests {
             smtp_host: "smtp.example.com".into(),
             smtp_port: 587,
             username: "me@example.com".into(),
-            password: password.into(),
+            password,
             use_tls: true,
             require_send_confirmation: true,
             oauth_account_id: oauth.then(uuid::Uuid::new_v4),
@@ -798,7 +806,14 @@ mod tests {
                 ..same()
             },
         ];
-        for acct in [account("app-password", false), account("", true)] {
+        // A reference that cannot be read now is still a password on file:
+        // reading it as none would let an outage open the redirect.
+        let unreadable = MailPassword::Unreadable("1Password is unreachable".into());
+        for acct in [
+            account(saved("app-password"), false),
+            account(unreadable, false),
+            account(MailPassword::Missing, true),
+        ] {
             for to in moves {
                 let refusal = secret_redirect_refusal(&acct, to())
                     .expect("a move of a stored secret was allowed");
@@ -812,14 +827,14 @@ mod tests {
     /// case, and turning TLS on.
     #[test]
     fn a_change_that_keeps_the_destination_is_allowed() {
-        let acct = account("app-password", false);
+        let acct = account(saved("app-password"), false);
         assert!(secret_redirect_refusal(&acct, same()).is_none());
         let recased = MailDestination {
             imap_host: "IMAP.Example.com ",
             ..same()
         };
         assert!(secret_redirect_refusal(&acct, recased).is_none());
-        let mut plain = account("app-password", false);
+        let mut plain = account(saved("app-password"), false);
         plain.use_tls = false;
         assert!(secret_redirect_refusal(&plain, same()).is_none());
     }
@@ -828,7 +843,7 @@ mod tests {
     /// to the credential form, which names the host it saves the password for.
     #[test]
     fn an_account_without_a_secret_can_be_repointed() {
-        let acct = account("", false);
+        let acct = account(MailPassword::Missing, false);
         let other = MailDestination {
             imap_host: "imap.other.example",
             ..same()

@@ -75,6 +75,7 @@ pub(crate) fn eager_sub_thread_message(
         wake_mode,
         model,
         reasoning_effort,
+        provider,
         origin,
         ..
     } = request
@@ -92,7 +93,7 @@ pub(crate) fn eager_sub_thread_message(
         MessageOrigin::mode_or(origin.as_ref(), ActorMode::Agent),
         model.as_deref(),
         reasoning_effort.as_deref(),
-        None,
+        provider.as_deref(),
         origin.clone(),
         None,
     ))
@@ -409,6 +410,7 @@ impl LucidosEngine {
                 title,
                 model,
                 reasoning_effort,
+                provider,
                 pre_emitted_origin,
                 origin,
             } => {
@@ -420,8 +422,11 @@ impl LucidosEngine {
                     child_thread_id,
                     pre_emitted_origin,
                     title.as_deref(),
-                    model,
-                    reasoning_effort,
+                    crate::core::ResolvedModelSelection {
+                        model,
+                        reasoning_effort,
+                        provider,
+                    },
                     origin,
                 ) {
                     Ok((_, handle)) => {
@@ -629,6 +634,7 @@ mod tests {
             title: None,
             model: None,
             reasoning_effort: None,
+            provider: None,
             pre_emitted_origin: None,
             origin: spawning_thread_link(spawning_thread),
         };
@@ -673,6 +679,7 @@ mod tests {
             title: None,
             model: None,
             reasoning_effort: None,
+            provider: None,
             pre_emitted_origin: None,
             origin: origin.clone(),
         };

@@ -5,11 +5,12 @@
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-use super::reach::{Reach, NOT_SERVED_EVENT, NOT_SERVED_WINDOW};
+use super::reach::{Reach, NOT_SERVED_EVENT};
 use super::ModelSource;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::ContextPurpose;
-use crate::llm::model_registry::ModelRegistry;
+use crate::llm::model_registry::{ModelRegistry, ProviderKind};
+use crate::llm::not_served::NOT_SERVED_WINDOW;
 use crate::llm::{ModelNotServed, NotServedReport};
 use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
 
@@ -58,6 +59,21 @@ impl NotServedRecorder {
         })
     }
 
+    /// Who refused: the provider and model the router stamped, which differ
+    /// from `requested` when the router sent another generation. An unstamped
+    /// refusal falls back to the route `requested` takes.
+    fn refused_by<'a>(
+        &self,
+        requested: &'a str,
+        refusal: &'a ModelNotServed,
+    ) -> Option<(ProviderKind, &'a str)> {
+        refusal.refusal().or_else(|| {
+            self.reach
+                .route(&self.registry, requested)
+                .map(|route| (route.provider, requested))
+        })
+    }
+
     async fn notify(&self, provider: &str, model: &str, refusal: &ModelNotServed) {
         let task = task_name(self.purpose);
         self.bus
@@ -92,10 +108,10 @@ impl NotServedRecorder {
 #[async_trait]
 impl NotServedReport for NotServedRecorder {
     async fn not_served(&self, model: &str, refusal: &ModelNotServed, moved_to: Option<&str>) {
-        let Some(route) = self.reach.route(&self.registry, model) else {
+        let Some((provider, model)) = self.refused_by(model, refusal) else {
             return;
         };
-        let provider = route.provider.as_str();
+        let provider = provider.as_str();
         crate::log!(
             "[AuxPurpose] {} does not serve {} for {:?}; {}",
             provider,

@@ -17,7 +17,7 @@
 
 use super::fold::{Budget, Fold};
 use super::prompt::flatten;
-use super::view::{trailing_rungs, ViewBlocks};
+use super::view::{trailing_cache_rungs, ViewBlocks};
 use super::NodeAddr;
 
 /// Where the sawtooth of the built prefix peaks; it drops to half.
@@ -34,7 +34,7 @@ pub(crate) const MAX_BYTES: usize = COMPACTION_VIEW_BYTES + TAIL_BYTES;
 /// Marks on a compaction view's last block ends: what an explicit-mode GPT
 /// request takes, less the one at its prefix's end. GPT reads an entry only
 /// at a mark in the very place an earlier request wrote it.
-const TRAILING_RUNGS: usize = crate::llm::openai::MAX_EXPLICIT_BREAKPOINTS - 1;
+const TRAILING_CACHE_RUNGS: usize = crate::llm::openai::MAX_EXPLICIT_BREAKPOINTS - 1;
 
 const OPEN: &str = "<chat>\n";
 const CLOSE: &str = "</chat>\n";
@@ -78,7 +78,7 @@ impl CompactionView {
 /// as block counts: the last whole block of its first `prefix_lines` lines,
 /// then its last block ends.
 pub(crate) fn mark_blocks(blocks: usize, prefix_lines: usize) -> Vec<usize> {
-    let mut marks = trailing_rungs(blocks, TRAILING_RUNGS);
+    let mut marks = trailing_cache_rungs(blocks, TRAILING_CACHE_RUNGS);
     let prefix = prefix_lines / super::view::BLOCK_LINES;
     if prefix > 0 && !marks.contains(&prefix) {
         marks.insert(0, prefix);

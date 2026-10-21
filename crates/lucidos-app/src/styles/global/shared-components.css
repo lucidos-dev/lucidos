@@ -1002,7 +1002,7 @@ html[data-font-bold="none"] .markdown-content :is(strong, b) {
      * this file is `include_str!`d into /api/v1/sdk-iframe.css, so an app's
      * own hand-written table lands here with NO .table-scroll-wrapper and
      * therefore nothing to absorb an overflow. Growth would widen the iframe
-     * body outright. Pinned by markdown-table-columns.spec.ts. */
+     * body outright. Pinned by markdown-table-columns-all.spec.ts. */
     width: 100%;
     border-collapse: collapse;
     font-size: var(--font-size-sm);

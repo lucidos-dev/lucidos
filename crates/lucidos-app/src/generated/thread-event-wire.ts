@@ -113,9 +113,10 @@ export interface ApiUsage {
    *  Its rates differ, so a price reads it beside the four counts. */
   service_tier?: ServiceTier;
   /** Part of `cache_creation_tokens`: the tokens written to the 1-hour
-   *  cache, billed at 2x base input rather than 1.25x. Only a Claude Code
-   *  session's usage block splits a write by lifetime, so it is absent
-   *  everywhere else. The cache keep-alive reads the session's TTL from it. */
+   *  cache, billed at 2x base input rather than 1.25x. A Claude Code
+   *  session and a Claude chat call on Anthropic or Vertex split a write by
+   *  lifetime, and every other producer leaves it absent. The cache
+   *  keep-alive reads the session's TTL from it. */
   cache_creation_1h_tokens?: number;
 }
 
@@ -125,22 +126,63 @@ export type ApplyNowOutcome =
   | 'interrupted'
   | 'unknown';
 
-/** One tile of an arrangement: a widget instance pinned to Home, the size it
- *  shows at, and whether this layout class hides it. */
-export interface ArrangedTile {
-  app_id: string;
-  /** The instance's *widget params*. Absent means none. */
-  params?: Record<string, unknown>;
-  size: WidgetSize;
-  /** Hidden on this layout class, so it mounts no frame there. */
-  hidden?: boolean;
-}
-
 /** Which arm of the trial a session ran in. */
 export type AutoCompactArm =
   | 'control'
   | 'window'
   | 'override';
+
+/** Why a waiting thread gets no keep-alive. */
+export type CacheKeepAliveNotKeptReason =
+  | 'no_wake_children'
+  | 'children_awaiting_user';
+
+/** The keep-alive's state for one thread. Absent when the thread has nothing
+ *  to keep warm. */
+export type CacheKeepAliveStatus =
+  /** The engine pings the session, within its break-even budget. */
+  | {
+      state: 'warming';
+      /** When the wait it keeps warm began. */
+      since: string;
+      /** The pings sent since then. */
+      beats: number;
+      /** The pings that cost as much as one cache rewrite. */
+      budget_beats: number;
+      /** How often a ping goes out, in seconds. */
+      beat_every_secs: number;
+      /** What those pings cost, in USD. */
+      cost_usd: number;
+      /** The context a wake-up would reread if the cache expired. */
+      context_tokens: number;
+      /** When the next ping is due. Absent before the session's first request. */
+      next_beat_at?: string;
+      /** When the engine stops pinging. */
+      give_up_at: string;
+    }
+  /** The engine stopped pinging: more pings would cost more than a rewrite. */
+  | {
+      state: 'stopped';
+      at: string;
+      beats: number;
+      cost_usd: number;
+      /** The context the wake-up rereads instead. */
+      context_tokens: number;
+    }
+  /** The thread waits, and the engine does not keep it warm. */
+  | {
+      state: 'not_kept';
+      reason: CacheKeepAliveNotKeptReason;
+    };
+
+/** How a failed call failed, from what the trace saw. Never the message: a
+ *  provider's error body can echo request content. */
+export type CallFailure =
+  | 'http'
+  | 'connection'
+  | 'timeout'
+  | 'stream'
+  | 'other';
 
 /** Why a `ResponseCanceled` was emitted. Cancellation is always a user-driven
  *  action that interrupts a *real* in-flight response. The actor on
@@ -152,6 +194,7 @@ export type CancelCause =
   | 'user_stop'
   | 'user_action'
   | 'superseded_by_followup'
+  | 'effort_restart'
   | 'unknown';
 
 /** The file format a saved app capture is encoded in. The save path's
@@ -160,6 +203,12 @@ export type CaptureFormat =
   | 'png'
   | 'jpeg'
   | 'webp';
+
+/** How far a flow's work has come at a checkpoint: `done` units of `total`. */
+export interface CheckpointProgress {
+  done: number;
+  total: number;
+}
 
 /** Outcome of a child thread that just completed, surfaced to the parent via
  *  `ThreadEvent::ChildThreadCompleted`. Replaces the prose discriminator
@@ -270,6 +319,12 @@ export interface ContextSection {
   group?: string;
 }
 
+/** One of the two dashboards. The phone's swipe layout shows `phone`; the
+ *  split layout shows `desktop`, a tablet included. */
+export type Dashboard =
+  | 'phone'
+  | 'desktop';
+
 /** Why the engine itself spawned a piece of work without a human or agent prompting it.
  *  Surfaced in the route popover so users can see "Engine · auto-resumed after restart". */
 export type EngineReason =
@@ -308,6 +363,8 @@ export type EngineReason =
   | { kind: 'merge_conflict' }
   /** A red *main check* opened its *fix thread* (ADR 0464). */
   | { kind: 'main_check_red' }
+  /** A *main check* that passed with flaky tests opened a *flaky fix thread*. */
+  | { kind: 'main_check_flaky' }
   /** Engine detected the harden marker is missing: before an apply, or at a
    *  turn end whose proposal it held and told the agent to harden. */
   | { kind: 'missing_hardening' }
@@ -404,6 +461,13 @@ export type FormRequestOutcome =
   | 'expired'
   | 'unknown';
 
+/** The *handoff consent* that let a child's successor start under its parent
+ *  (ADR 0507). The successor inherits it for its own automatic handoffs. */
+export type HandoffConsent =
+  | 'owner'
+  | 'owner-approval'
+  | 'carried';
+
 /** The branch an integrated sub-thread hands up to its parent, named on the
  *  child's report. Set only when the child's work is hardened and waits for
  *  the parent's agent to merge it. */
@@ -413,11 +477,14 @@ export interface IntegratedBranch {
   head_sha: string;
 }
 
-/** Which arrangement of the Home board a screen shows. The phone's swipe
- *  layout is `phone`; the split layout is `desktop`, a tablet included. */
-export type LayoutClass =
-  | 'phone'
-  | 'desktop';
+/** One tile of a legacy `HomeBoardArranged`, written before the two
+ *  dashboards had their own tiles. A hidden tile seeds nothing. */
+export interface LegacyArrangedTile {
+  app_id: string;
+  params?: Record<string, unknown>;
+  size: WidgetSize;
+  hidden?: boolean;
+}
 
 /** Who enabled or disabled an MCP server in a thread. */
 export type McpEnablementSource =
@@ -554,8 +621,26 @@ export interface OwnerApproval {
   target_thread_id?: string;
 }
 
+/** What made a plugin update run setup. */
+export type PluginSetupCause =
+  /** The `setup` text differs from the installed version's. */
+  | { kind: 'instructions_changed' }
+  /** The manifest raised its `setup_revision` and the text is the same.
+   *  `reason` is the author's `setup_reason`. */
+  | {
+      kind: 'revision_raised';
+      revision: number;
+      reason?: string;
+    }
+  /** The text differs and the revision rose. */
+  | {
+      kind: 'both';
+      revision: number;
+      reason?: string;
+    };
+
 /** Why a plugin setup thread runs: a first install, or an update that changed
- *  the setup instructions.
+ *  the setup instructions or whose author asked to run setup again.
  *  Full reasoning is on the Rust variant. */
 export type PluginSetupOccasion =
   | { kind: 'fresh_install' }
@@ -564,6 +649,9 @@ export type PluginSetupOccasion =
   | {
       kind: 'update';
       from_version?: string;
+      /** Why this update runs setup. A row written before the cause existed
+       *  decodes as `InstructionsChanged`, which is what it meant. */
+      cause?: PluginSetupCause;
     };
 
 /** One option offered by CC's AskUserQuestion tool. Persisted inside
@@ -638,6 +726,15 @@ export type ThreadReachVerb =
   | 'create-top-thread'
   | 'detach-child'
   | 'spawn-successor';
+
+/** The size of any dashboard tile. A widget shows at one of its three
+ *  `WidgetSize`s, and an *app shortcut* is always a quarter: half a small
+ *  cell's edge on each side. */
+export type TileSize =
+  | 'quarter'
+  | 'small'
+  | 'medium'
+  | 'large';
 
 /** One row of a *Todo list*. `content` is the imperative form ("Run tests");
  *  `active_form` is the present-continuous form ("Running tests") shown only
@@ -736,8 +833,8 @@ export interface WidgetEmbed {
   label?: string;
 }
 
-/** One of the three sizes a widget takes as a tile on the Home board: one
- *  cell, two cells wide, or two by two (ADR 0432). */
+/** One of the three sizes a widget takes as a tile on a dashboard: one cell,
+ *  two cells wide, or two by two (ADR 0432). */
 export type WidgetSize =
   | 'small'
   | 'medium'
@@ -909,15 +1006,20 @@ export type ThreadEvent =
        *  the capture binds to each of them. Absent for every other capture. */
       api_call_id?: string;
       /** The reasoning tier this call ran at, where the caller has one to
-       *  report. Absent for every purpose but the compactor today, and for
-       *  every row written before the field existed. Lets a cost estimate
-       *  split measured usage by tier instead of treating all history as
-       *  one baseline. */
+       *  report. Set on a chat turn and on every metered chat call. Lets a
+       *  cost estimate split measured usage by tier instead of treating all
+       *  history as one baseline. */
       reasoning_effort?: string;
       /** How long the call took, wall clock, where the caller timed it.
-       *  Absent for every purpose but the compactor today. The Tree
-       *  backfill estimate reads it as a model's seconds per call at a tier. */
+       *  Set on a chat turn and on every metered chat call. It spans the
+       *  provider's retries, so `created` minus this is when the first
+       *  attempt started. The Tree backfill estimate reads it as a model's
+       *  seconds per call at a tier. */
       duration_ms?: number;
+      /** The *stable-prefix fingerprint* of a chat turn's first round, on
+       *  Anthropic and Vertex Claude. A later round of the same turn sends
+       *  the same prefix, so only round 1 carries it. */
+      stable_prefix_fingerprint?: string;
       /** The *served model*: the model id the provider's reply named,
        *  verbatim. `model` is the one Lucidos asked for. Absent when the
        *  reply named none, and on every row written before the field
@@ -925,8 +1027,52 @@ export type ThreadEvent =
        *  means another model answered: a provider reroute, or the router
        *  sending a retired model's successor (ADR 0418). */
       served_model?: string;
+      /** The backend that served the call, as the router resolved its route
+       *  (`claude-gateway`, `vertex`, ...). Absent when no router chose one,
+       *  as for a coding agent's own call, and on every row written before
+       *  the field existed. The gateway telemetry exporter selects on it. */
+      provider?: string;
+      /** Time to the first content delta of the stream that answered, from
+       *  the same start as `duration_ms`, so never above it. Absent when
+       *  no delta arrived or the provider's send loop does not trace it,
+       *  and on every row written before the field existed. */
+      ttft_ms?: number;
+      /** The provider's id for the response that answered (the
+       *  `request-id` header). Absent when the response had none, and on
+       *  every row written before the field existed. */
+      request_id?: string;
       /** Server dropped `sections` and `tools` here. The modal lazy-fetches them. */
       sections_stripped?: boolean;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A metered chat call that failed. It is **never a `ContextCaptured`**: a
+   *  capture binds to a transcript step and every usage rollup sums it, while
+   *  a failed call has no context to show and no spend. Written for any
+   *  provider. The gateway telemetry exporter selects on `provider`.
+   *  Full reasoning is on the Rust variant. */
+  | {
+      type: 'ModelCallFailed';
+      /** The model the call asked for. */
+      model: string;
+      /** Which call this was. Absent for a turn, like `ContextCaptured`. */
+      purpose?: ContextPurpose;
+      /** The backend the router sent the call to, when one chose. */
+      provider?: string;
+      reasoning_effort?: string;
+      /** How long the call ran before it failed, retries included. */
+      duration_ms: number;
+      /** HTTP sends made across the call's retries and model fallback. */
+      attempts: number;
+      failure: CallFailure;
+      /** The last attempt's HTTP status, when a response arrived. */
+      status_code?: number;
+      /** The `request-id` header of the failing response, when it had one. */
+      request_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1225,6 +1371,63 @@ export type ThreadEvent =
       type: 'SuccessorThreadSpawned';
       successor_thread_id: string;
       base_sha: string;
+      /** The successor is the builder of a *build chain*: a `no-wake`
+       *  child of this thread, which stays open (ADR 0503). */
+      starts_build_chain?: boolean;
+      /** The authority that let a successor placed under a parent start,
+       *  which it inherits for its own automatic handoffs (ADR 0507). */
+      handoff_consent?: HandoffConsent;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The agent ran a *handoff checkpoint* a flow names (ADR 0505). It
+   *  records what the *handoff estimate* read, so a later run of the same
+   *  checkpoint can pool on it. `offered` marks a `--ask` run. */
+  | {
+      type: 'HandoffCheckpointReached';
+      name: string;
+      progress?: CheckpointProgress;
+      context_tokens?: number;
+      model?: string;
+      reasoning_effort?: string;
+      offered?: boolean;
+      /** The verdict. `None` when the engine could not make a reading. */
+      pays?: boolean;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The user chose *Stay here* on the Successor card. `input_tokens` is the
+   *  context size at that moment: the card stays hidden until the thread
+   *  holds 100k more. */
+  | {
+      type: 'SuccessorOfferDeclined';
+      input_tokens: number;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The user chose *Continue with context* while the prompt cache was warm,
+   *  so the agent writes the *handoff narrative*. The successor, once the
+   *  agent spawns it, opens with `message` and runs on the implementer named
+   *  here. Pending until the thread's turn ends. */
+  | {
+      type: 'SuccessorRequested';
+      /** The user's first request for the successor, when they typed one. */
+      message?: string;
+      coding_agent?: CodingAgent;
+      coding_agent_model?: string;
+      reasoning_effort?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1388,6 +1591,21 @@ export type ThreadEvent =
        *  nothing in front. It carried no turn-gap note, so the turn gap does
        *  not count it. */
       verbatim?: boolean;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** An effort restart interrupted the turn before the coding agent read
+   *  the input that opened it, so the agent never will. The input stays
+   *  owed until a later `CodingAgentInputRead` names it, and the next
+   *  session to start delivers it (`agent_session::stranded_follow_ups`). */
+  | {
+      type: 'CodingAgentInputDiscarded';
+      /** The event that carried the input, as on `CodingAgentInputRead`. */
+      input_event_id: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2673,6 +2891,21 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The *cache keep-alive status* of this thread changed. Only the
+   *  keep-alive tick writes it, and only on a change. It projects into
+   *  `thread_summaries.cache_keep_alive_status`, opens no turn, wakes
+   *  nobody and moves no recency (ADR 0529). */
+  | {
+      type: 'CacheKeepAliveStatusChanged';
+      /** Absent once the thread has nothing to keep warm. */
+      status: CacheKeepAliveStatus;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** A voice session opened on this thread (ADR 0148).
    *  Full reasoning is on the Rust variant. */
   | {
@@ -2878,14 +3111,13 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The Home board of one layout class was arranged: its tiles in order,
-   *  each with its size and whether it is hidden (ADR 0432). Written on the
-   *  home thread only. The newest one per layout wins, whole. The tiles stay
-   *  Home's pins, so an entry for an unpinned instance is ignored. */
+  /** Legacy, read only: the home thread's arrangement of one layout, from
+   *  before each dashboard had its own tiles (ADR 0432). Nothing writes it
+   *  now. With Home's old pins it seeds each dashboard (ADR 0496). */
   | {
       type: 'HomeBoardArranged';
-      layout: LayoutClass;
-      tiles: ArrangedTile[];
+      layout: Dashboard;
+      tiles: LegacyArrangedTile[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3071,6 +3303,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   TextStreamed: true,
   ThoughtStreamed: true,
   ContextCaptured: true,
+  ModelCallFailed: true,
   MemoryRecalled: true,
   ToolCalled: true,
   ToolResult: true,
@@ -3085,6 +3318,9 @@ const THREAD_EVENT_TYPE_FLAGS = {
   SessionStarted: true,
   SessionEnded: true,
   SuccessorThreadSpawned: true,
+  HandoffCheckpointReached: true,
+  SuccessorOfferDeclined: true,
+  SuccessorRequested: true,
   CodingAgentCompacted: true,
   CodingAgentTextStreamed: true,
   CodingAgentThoughtStreamed: true,
@@ -3093,6 +3329,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   CodingAgentUserMessageSent: true,
   CodingAgentPromptSent: true,
   CodingAgentInputRead: true,
+  CodingAgentInputDiscarded: true,
   MissingHardeningDetected: true,
   CodingAgentIdled: true,
   ContinuationRequested: true,
@@ -3168,6 +3405,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   EventWaitDelivered: true,
   EventWaitExpired: true,
   EventWaitCanceled: true,
+  CacheKeepAliveStatusChanged: true,
   VoiceSessionStarted: true,
   VoiceSessionEnded: true,
   SpokenReplyGenerated: true,

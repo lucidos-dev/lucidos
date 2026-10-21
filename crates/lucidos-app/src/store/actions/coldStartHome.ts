@@ -1,8 +1,8 @@
 import { effect } from '@preact/signals';
-import { focusedThreadId, threadsLoaded } from '../store';
+import { focusedThreadId, showToast, threadsLoaded } from '../store';
+import { formatThreadLabel } from './thread-label';
 import { homeThreadId } from './homeThread';
-import { focusThread } from './threads';
-import { landNextHomeOnBoard } from '../homeBoard';
+import { focusThread, focusThreadOrBootstrap } from './threads';
 
 /** Which thread a cold start opens, or `null` to leave the focus alone.
  *
@@ -34,11 +34,24 @@ export function openHomeOnColdStart(storedFocus: boolean): () => void {
     });
     // Bookkeeping, not a navigation: the cold start already shows the thread
     // pane, and a reveal would swipe a phone that opened somewhere else.
-    if (target) {
-      // A phone lands on Home's board face (ADR 0432).
-      landNextHomeOnBoard();
-      focusThread(target, { revealPane: false });
-    }
+    if (target) focusThread(target, { revealPane: false });
   });
   return stop;
+}
+
+/** Offer, once, the thread the restore guard withheld at this launch. The
+ *  label waits for the thread list, which holds the title. "Open" focuses the
+ *  thread, and that focus arms the guard again. Returns the stop function. */
+export function offerWithheldThread(threadId: string | null): () => void {
+  if (threadId === null) return () => {};
+  let offered = false;
+  return effect(() => {
+    if (offered || !threadsLoaded.value) return;
+    offered = true;
+    showToast(
+      `Lucidos closed while ${formatThreadLabel(threadId)} was open, so it started on Home.`,
+      'info',
+      { title: 'Started on Home', action: { label: 'Open', onClick: () => focusThreadOrBootstrap(threadId) } },
+    );
+  });
 }

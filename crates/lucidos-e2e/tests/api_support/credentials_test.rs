@@ -1,6 +1,6 @@
 //! E2E coverage for credential editing: the full-field update path, the
-//! `email_password` sync into `email_accounts` that IMAP/SMTP read from, and
-//! the *credential scope* set.
+//! `email_password` server-settings sync into `email_accounts`, and the
+//! *credential scope* set.
 //!
 //! The first two tests deliberately POST and PUT the singular `base_url`. That
 //! is the permanent back-compat shape, so a script written before the scope
@@ -97,9 +97,9 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
     delete_credential(&client, &api, &id).await;
 }
 
-/// Editing an `email_password` credential must propagate the password AND the
-/// server settings to the `email_accounts` row — the table IMAP/SMTP read from.
-/// This is the regression an email-account edit surfaced.
+/// Editing an `email_password` credential must propagate the server settings to
+/// the `email_accounts` row IMAP/SMTP read from. The password lives only in the
+/// credential: `email_accounts` has no password column.
 #[tokio::test]
 async fn update_email_credential_syncs_email_accounts_row() {
     let client = user_client().await;
@@ -111,10 +111,10 @@ async fn update_email_credential_syncs_email_accounts_row() {
     // `email_accounts.name` the sync resolves.
     let service = name.clone();
 
-    // Seed an email account (the row IMAP reads), as `configure_email` would.
+    // Seed an email account (the row IMAP reads).
     sqlx::query(
-        "INSERT INTO email_accounts (name, email_address, imap_host, imap_port, smtp_host, smtp_port, username, password, use_tls, require_send_confirmation) \
-         VALUES ($1, $2, 'imap.old.example.com', 993, 'smtp.old.example.com', 587, $2, 'oldpass', true, true)",
+        "INSERT INTO email_accounts (name, email_address, imap_host, imap_port, smtp_host, smtp_port, username, use_tls, require_send_confirmation) \
+         VALUES ($1, $2, 'imap.old.example.com', 993, 'smtp.old.example.com', 587, $2, true, true)",
     )
     .bind(&name)
     .bind(format!("{}@old.example.com", name))
@@ -167,24 +167,20 @@ async fn update_email_credential_syncs_email_accounts_row() {
         true
     );
 
-    // The email_accounts row IMAP reads must carry the new password + settings.
-    let row: (String, String, String, String, i32, bool) = sqlx::query_as(
-        "SELECT password, email_address, imap_host, smtp_host, smtp_port, require_send_confirmation \
+    // The email_accounts row IMAP reads must carry the new settings.
+    let row: (String, String, String, i32, bool) = sqlx::query_as(
+        "SELECT email_address, imap_host, smtp_host, smtp_port, require_send_confirmation \
          FROM email_accounts WHERE name = $1",
     )
     .bind(&name)
     .fetch_one(&pool)
     .await
     .expect("fetch email account");
-    assert_eq!(
-        row.0, "newpass",
-        "email_accounts.password must be updated on edit"
-    );
-    assert_eq!(row.1, new_email);
-    assert_eq!(row.2, "imap.new.example.com");
-    assert_eq!(row.3, "smtp.new.example.com");
-    assert_eq!(row.4, 465);
-    assert!(!row.5, "require_send_confirmation must be updated");
+    assert_eq!(row.0, new_email);
+    assert_eq!(row.1, "imap.new.example.com");
+    assert_eq!(row.2, "smtp.new.example.com");
+    assert_eq!(row.3, 465);
+    assert!(!row.4, "require_send_confirmation must be updated");
 
     // The credential's base_url is derived from the SMTP host, and its secret synced.
     let listed = find_credential(&client, &api, &service).await;

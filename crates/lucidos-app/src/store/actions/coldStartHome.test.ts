@@ -4,11 +4,11 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('./threads', () => ({ focusThread: vi.fn() }));
+vi.mock('./threads', () => ({ focusThread: vi.fn(), focusThreadOrBootstrap: vi.fn() }));
 
-import { coldStartFocus, openHomeOnColdStart } from './coldStartHome';
-import { focusThread } from './threads';
-import { focusedThreadId, threadMap, threadsLoaded } from '../store';
+import { coldStartFocus, offerWithheldThread, openHomeOnColdStart } from './coldStartHome';
+import { focusThread, focusThreadOrBootstrap } from './threads';
+import { focusedThreadId, threadMap, threadsLoaded, toasts } from '../store';
 import { makeThreadState } from './threads-test-helpers';
 
 describe('coldStartFocus', () => {
@@ -64,5 +64,51 @@ describe('openHomeOnColdStart', () => {
     stop = openHomeOnColdStart(true);
     threadsLoaded.value = true;
     expect(focusThread).not.toHaveBeenCalled();
+  });
+});
+
+describe('offerWithheldThread', () => {
+  let stop: (() => void) | null = null;
+
+  beforeEach(() => {
+    vi.mocked(focusThread).mockClear();
+    vi.mocked(focusThreadOrBootstrap).mockClear();
+    toasts.value = [];
+    threadsLoaded.value = false;
+    threadMap.value = new Map([
+      ['t1', makeThreadState('t1', { meta: { title: 'Widget layout' } })],
+    ]);
+  });
+
+  afterEach(() => {
+    stop?.();
+    stop = null;
+    toasts.value = [];
+    threadsLoaded.value = false;
+    threadMap.value = new Map();
+  });
+
+  it('offers the withheld thread once, by title, as the list lands', () => {
+    stop = offerWithheldThread('t1');
+    expect(toasts.value).toHaveLength(0);
+    threadsLoaded.value = true;
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain('“Widget layout”');
+    threadsLoaded.value = false;
+    threadsLoaded.value = true;
+    expect(toasts.value).toHaveLength(1);
+  });
+
+  it('opens the thread from the offer, revealing its pane', () => {
+    stop = offerWithheldThread('t1');
+    threadsLoaded.value = true;
+    toasts.value[0].action?.onClick();
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t1');
+  });
+
+  it('offers nothing when the launch withheld nothing', () => {
+    stop = offerWithheldThread(null);
+    threadsLoaded.value = true;
+    expect(toasts.value).toHaveLength(0);
   });
 });

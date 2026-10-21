@@ -4,6 +4,9 @@
 - **Date**: 2026-08-13
 - **Amends**: [ADR 0022](0022-launch-binaries-are-published-per-build-variant.md) (the
   location only; its per-variant decision stands unchanged)
+- **Amended by**: [0512: The engine pins the lucidos CLI it was published with](0512-engine-pins-its-cli.md)
+  (spawned processes now run the CLI the engine pinned, not whatever the launch dir
+  holds later)
 
 ## Context
 

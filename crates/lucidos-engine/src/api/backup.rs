@@ -3,7 +3,7 @@ use super::secret_reveal::{
     RevealTokenResponse,
 };
 use super::*;
-use crate::core::backup::{self, crypto};
+use crate::core::backup::{self, key::BackupKeyStore, recipient};
 use crate::core::{prefs, PreferenceStore};
 use crate::engine::thread_events::MessageOrigin;
 
@@ -37,12 +37,43 @@ pub struct ProviderInfo {
 #[derive(Serialize)]
 pub struct KeyResponse {
     pub key: String,
-    pub is_new: bool,
+}
+
+/// What seals this workspace's backups, without revealing any key.
+#[derive(Serialize)]
+pub struct BackupKeysResponse {
+    /// The backup recipient new archives are sealed to, or null before the
+    /// switch. An age public key, not a secret.
+    pub recipient: Option<String>,
+    /// Whether a minted key pair waits for its backup key to be pasted back.
+    pub pending: bool,
+    /// Whether a legacy key exists. Until the switch, it seals backups.
+    pub legacy_key: bool,
+    /// Seconds since the user last proved they hold the backup key.
+    pub secs_since_verified: Option<i64>,
+}
+
+/// A freshly minted backup key, shown once.
+#[derive(Serialize)]
+pub struct BackupKeySetupResponse {
+    pub backup_key: String,
+}
+
+/// A backup key the user pasted, for a check that forgets it.
+#[derive(Deserialize)]
+pub struct BackupKeyRequest {
+    pub backup_key: String,
+}
+
+/// An age public key the user made themselves.
+#[derive(Deserialize)]
+pub struct OwnRecipientRequest {
+    pub recipient: String,
 }
 
 #[derive(Serialize)]
-pub struct KeyExistsResponse {
-    pub exists: bool,
+pub struct VerifyResponse {
+    pub matches: bool,
 }
 
 /// The stored provider id for a spelling that arrived either way.
@@ -127,7 +158,8 @@ fn resolve_provider(
 /// document's own `Referer` (ADR 0156). The token is what gates this step.
 const READ_REFERER_RULE: RefererRule = RefererRule::WhenPresent;
 
-/// The `Referer` rule the two `POST`s run: the mint, and the generate.
+/// The `Referer` rule every `POST` and `PUT` here runs: the reveal-token
+/// mint and the recipient routes.
 ///
 /// `sw.js` returns early for any non-GET, so a `POST` reaches the engine as the
 /// browser sent it and always carries a `Referer`. A page that suppressed its
@@ -189,11 +221,9 @@ pub struct BackupKeyQuery {
     pub token: Option<String>,
 }
 
-/// Refuse this request unless it may see the backup key, and say who is asking.
-///
-/// Both key-bearing routes run it, so the two cannot drift apart. The `rule`
-/// differs by method and the reasoning is ADR 0117's: a `GET` is re-issued by
-/// the service worker on iOS and may lose its `Referer`, a `POST` is not.
+/// Refuse this request unless it may see the legacy backup key, and say who
+/// is asking. The reasoning behind `rule` is ADR 0117's: a `GET` is re-issued
+/// by the service worker on iOS and may lose its `Referer`, a `POST` is not.
 ///
 /// The caller identifies itself BEFORE the reveal token is redeemed. A token is
 /// one-shot, so refusing after the redeem would spend it on a request that
@@ -222,28 +252,24 @@ async fn check_key_access(
 }
 
 /// Record that the key left the engine, naming the actor and never the key.
-async fn audit_key_revealed(state: &AppState, actor: MessageOrigin, minted: bool) {
+async fn audit_key_revealed(state: &AppState, actor: MessageOrigin) {
     state
         .engine
         .event_bus
         .emit_or_log(
             crate::engine::event_bus::BusEvent::System(
-                crate::engine::event_bus::SystemEvent::BackupKeyRevealed {
-                    minted,
-                    actor: Some(actor),
-                },
+                crate::engine::event_bus::SystemEvent::BackupKeyRevealed { actor: Some(actor) },
             ),
             "[Backup] BackupKeyRevealed",
         )
         .await;
 }
 
-/// POST /api/v1/backup/key/reveal-token: mint a one-shot token for the two
-/// routes below.
+/// POST /api/v1/backup/key/reveal-token: mint a one-shot token for the legacy
+/// key's reveal below.
 ///
 /// Step one of two, matching the credential reveal (ADR 0117). It takes no id:
-/// a workspace has exactly one backup key. It does not check that a key exists,
-/// because the generate route spends a token precisely when one does not.
+/// a workspace has at most one legacy key.
 pub(super) async fn mint_backup_key_reveal_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -260,18 +286,13 @@ pub(super) async fn mint_backup_key_reveal_token(
     Ok(Json(RevealTokenResponse::new(token)))
 }
 
-/// GET /api/v1/backup/key — reveal the EXISTING key. Read-only: returns 404 when
-/// no key has been generated yet (the page then offers "Generate new backup
-/// key"). It must NEVER mint a key as a side effect — the old behavior silently
-/// generated one here, which orphaned prior backups (encrypted with the now-lost
-/// key) and surfaced as a misleading "New backup key generated" toast when a
-/// user only meant to view their key. Generation now lives behind the explicit
-/// POST below.
+/// GET /api/v1/backup/key: reveal the legacy key, so the user can keep it for
+/// the `.enc` archives it sealed. The switch screen shows it one last time.
+/// Answers 404 when the workspace holds none. Nothing mints one any more.
 ///
-/// The key decrypts every archive this workspace uploaded. App UIs are
-/// same-origin with the engine, so this route sat one bare GET away from any
-/// installed app. It now takes a one-shot token, refuses an app `Referer`, and
-/// records the read. See `api::secret_reveal`.
+/// The key decrypts every legacy archive this workspace uploaded. App UIs are
+/// same-origin with the engine, so the route takes a one-shot token, refuses
+/// an app `Referer`, and records the read. See `api::secret_reveal`.
 pub async fn get_backup_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -279,17 +300,15 @@ pub async fn get_backup_key(
 ) -> Result<Json<KeyResponse>, ApiError> {
     let actor =
         check_key_access(&state, &headers, query.token.as_deref(), READ_REFERER_RULE).await?;
-    let key_path = backup::key_file_path(&state.workspace_path);
-    match crypto::load_key_file(&key_path) {
+    match BackupKeyStore::for_engine(&state.workspace_path).and_then(|keys| keys.load()) {
         Ok(Some(key)) => {
-            audit_key_revealed(&state, actor, false).await;
+            audit_key_revealed(&state, actor).await;
             Ok(Json(KeyResponse {
-                key: crypto::key_to_base64(&key),
-                is_new: false,
+                key: key.to_base64(),
             }))
         }
         Ok(None) => Err(ApiError::not_found(
-            "No backup key exists yet. Generate one to enable encrypted backups.",
+            "This workspace holds no legacy backup key.",
         )),
         Err(e) => Err(ApiError::internal(format!(
             "Failed to read backup key: {e}"
@@ -297,41 +316,149 @@ pub async fn get_backup_key(
     }
 }
 
-/// POST /api/v1/backup/key — generate the key if absent, then return it. This is
-/// the only path that mints a key onto the user's screen. The backup paths mint
-/// through `scheduler::ensure_backup_key`, which notifies the user instead.
-/// Idempotent: if a key already exists it's returned unchanged
-/// with `is_new: false`, so a double-click — or a race with a scheduled backup —
-/// can never overwrite the key that protects existing backups.
+/// Refuse a recipient route to an app document, and say who is asking.
 ///
-/// That idempotence is why this route is gated exactly like the GET: on a
-/// workspace that already has a key, it hands back the same plaintext. It takes
-/// the strict `Referer` rule because a `POST` reaches the engine unmediated, so
-/// a browser here always has a `Referer` to present.
-pub async fn generate_backup_key(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<BackupKeyQuery>,
-) -> Result<Json<KeyResponse>, ApiError> {
-    let actor =
-        check_key_access(&state, &headers, query.token.as_deref(), WRITE_REFERER_RULE).await?;
-    let (key, is_new) = crypto::ensure_key(&state.workspace_path)
-        .map_err(|e| ApiError::internal(format!("Failed to generate backup key: {e}")))?;
-    audit_key_revealed(&state, actor, is_new).await;
-    Ok(Json(KeyResponse {
-        key: crypto::key_to_base64(&key),
-        is_new,
-    }))
+/// The setup hands a fresh backup key to the caller, and a confirm or own key
+/// decides what seals every later backup. Neither is for an app.
+async fn check_recipient_access(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<MessageOrigin, ApiError> {
+    if !reveal_request_allowed(headers, WRITE_REFERER_RULE) {
+        log!("[Backup] refused a backup recipient change from an app document");
+        let (status, message) = forbidden(KEY_SUBJECT_LABEL);
+        return Err(ApiError::new(status, message));
+    }
+    crate::api::actor::require_owner_device_for(headers, &state.pool, RECIPIENT_OWNER_ONLY).await
 }
 
-/// GET /api/v1/backup/key/exists — whether a key is already on disk, WITHOUT
-/// revealing it. The page calls this on load to label its button correctly
-/// ("Show backup key" vs "Generate new backup key") without pulling the secret
-/// into the page or minting one.
-pub async fn backup_key_exists(State(state): State<AppState>) -> Json<KeyExistsResponse> {
-    Json(KeyExistsResponse {
-        exists: crypto::key_exists(&state.workspace_path),
+/// What an agent or the engine's own token is told by the routes above.
+const RECIPIENT_OWNER_ONLY: &str = "The backup key is the workspace owner's to set up, \
+     verify and rotate, in Settings, System, Backup. No agent may change it.";
+
+/// A pasted backup key, or a 400 that never repeats it.
+fn parse_pasted_key(text: &str) -> Result<age::x25519::Identity, ApiError> {
+    backup::crypto::parse_backup_key(text)
+        .map_err(|e| ApiError::bad_request(e.to_string()).with_reason("not-a-backup-key"))
+}
+
+async fn backup_keys(state: &AppState) -> Result<BackupKeysResponse, ApiError> {
+    let stored = recipient::load(&state.pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to read the backup recipient: {e}")))?;
+    Ok(BackupKeysResponse {
+        recipient: stored.recipient,
+        pending: stored.pending_recipient.is_some(),
+        legacy_key: BackupKeyStore::for_engine(&state.workspace_path)
+            .is_ok_and(|keys| keys.exists()),
+        secs_since_verified: stored.secs_since_verified,
     })
+}
+
+/// GET /api/v1/backup/recipient: what seals this workspace's backups. Reveals
+/// no key, so the page reads it on load.
+pub async fn get_backup_recipient(
+    State(state): State<AppState>,
+) -> Result<Json<BackupKeysResponse>, ApiError> {
+    backup_keys(&state).await.map(Json)
+}
+
+/// POST /api/v1/backup/recipient/setup: mint a key pair and show its backup
+/// key once. Backups keep their current key until the confirm below. A second
+/// setup replaces a pending pair, which is how rotation starts.
+pub async fn start_recipient_setup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<BackupKeySetupResponse>, ApiError> {
+    check_recipient_access(&state, &headers).await?;
+    let backup_key = recipient::start_setup(&state.pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to create a backup key: {e}")))?;
+    Ok(Json(BackupKeySetupResponse { backup_key }))
+}
+
+/// POST /api/v1/backup/recipient/confirm: the paste-back gate. When the pasted
+/// backup key matches the pending recipient, that recipient seals every later
+/// backup and the legacy key is forgotten. The pasted key is never stored.
+pub async fn confirm_backup_recipient(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<BackupKeyRequest>,
+) -> Result<Json<BackupKeysResponse>, ApiError> {
+    let actor = check_recipient_access(&state, &headers).await?;
+    let pasted = parse_pasted_key(&req.backup_key)?;
+    let check = recipient::confirm(&state.pool, &state.engine.event_bus, &pasted, Some(actor))
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to confirm the backup key: {e}")))?;
+    match check {
+        recipient::KeyCheck::Matches => {
+            recipient::forget_legacy_key(&state.workspace_path);
+            backup_keys(&state).await.map(Json)
+        }
+        recipient::KeyCheck::Differs => Err(ApiError::bad_request(
+            "That is not the backup key shown. Paste the whole key you saved.",
+        )
+        .with_reason("key-mismatch")),
+        recipient::KeyCheck::NothingToCheck => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "No backup key is waiting to be confirmed. Start the setup again.",
+        )
+        .with_reason("nothing-pending")),
+    }
+}
+
+/// PUT /api/v1/backup/recipient: use an age public key the user made. No
+/// paste-back, because the user already holds its backup key.
+pub async fn set_own_backup_recipient(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<OwnRecipientRequest>,
+) -> Result<Json<BackupKeysResponse>, ApiError> {
+    let actor = check_recipient_access(&state, &headers).await?;
+    let own = backup::crypto::parse_recipient(&req.recipient)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    recipient::use_own(&state.pool, &state.engine.event_bus, &own, Some(actor))
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to set the backup recipient: {e}")))?;
+    recipient::forget_legacy_key(&state.workspace_path);
+    backup_keys(&state).await.map(Json)
+}
+
+/// POST /api/v1/backup/recipient/verify: check that the user still holds the
+/// backup key. The pasted key is compared and forgotten.
+pub async fn verify_backup_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<BackupKeyRequest>,
+) -> Result<Json<VerifyResponse>, ApiError> {
+    check_recipient_access(&state, &headers).await?;
+    let pasted = parse_pasted_key(&req.backup_key)?;
+    match recipient::verify(&state.pool, &pasted)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to check the backup key: {e}")))?
+    {
+        recipient::KeyCheck::Matches => Ok(Json(VerifyResponse { matches: true })),
+        recipient::KeyCheck::Differs => Ok(Json(VerifyResponse { matches: false })),
+        recipient::KeyCheck::NothingToCheck => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "This workspace has no backup recipient to check against.",
+        )
+        .with_reason("nothing-to-check")),
+    }
+}
+
+/// What seals the next backup, or the refusal when nothing can.
+async fn require_sealing_key(state: &AppState) -> Result<backup::crypto::SealingKey, ApiError> {
+    recipient::sealing_key(&state.pool, &state.workspace_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to load the backup key: {e}")))?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                crate::scheduler::backups_not_set_up_message(),
+            )
+            .with_reason("backups-not-set-up")
+        })
 }
 
 /// Queues a backup and returns 202 immediately; terminal state arrives via
@@ -347,9 +474,7 @@ pub async fn create_backup(
 
     // Validate sync — guard drops on early return so the flag is released.
     let provider = resolve_provider(&req.provider, &state.pool)?;
-    let key = crate::scheduler::ensure_backup_key(&state.engine, &state.workspace_path)
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to get backup key: {e}")))?;
+    let key = require_sealing_key(&state).await?;
 
     let engine = state.engine.clone();
     let pool = state.pool.clone();
@@ -363,7 +488,7 @@ pub async fn create_backup(
             &pool,
             &workspace,
             &database_url,
-            &key,
+            key,
             provider.as_ref(),
         )
         .await;
@@ -597,11 +722,9 @@ pub async fn set_schedule(
     // Validate provider exists
     let _ = resolve_provider(&req.provider, &state.pool)?;
 
-    // Ensure a backup key exists before enabling a schedule
+    // A schedule never turns on before something can seal its backups.
     if backup::is_schedule_active(&req.schedule) {
-        crate::scheduler::ensure_backup_key(&state.engine, &state.workspace_path)
-            .await
-            .map_err(|e| ApiError::internal(format!("Failed to ensure backup key: {e}")))?;
+        require_sealing_key(&state).await?;
     }
 
     let active = backup::is_schedule_active(&req.schedule);
@@ -686,12 +809,18 @@ pub(super) fn router() -> Router<AppState> {
         .route("/backup/list", get(list_backups))
         .route("/backup/status", get(get_backup_status))
         .route("/backup/last-successful", get(get_last_successful_backup))
-        .route("/backup/key", get(get_backup_key).post(generate_backup_key))
+        .route("/backup/key", get(get_backup_key))
         .route(
             "/backup/key/reveal-token",
             post(mint_backup_key_reveal_token),
         )
-        .route("/backup/key/exists", get(backup_key_exists))
+        .route(
+            "/backup/recipient",
+            get(get_backup_recipient).put(set_own_backup_recipient),
+        )
+        .route("/backup/recipient/setup", post(start_recipient_setup))
+        .route("/backup/recipient/confirm", post(confirm_backup_recipient))
+        .route("/backup/recipient/verify", post(verify_backup_key))
         .route("/backup/providers", get(list_providers))
         .route("/backup/schedule", get(get_schedule).put(set_schedule))
         .route("/backup/retention", get(get_retention).put(set_retention))
@@ -778,11 +907,11 @@ mod tests {
         // caller with no fetch metadata at all is the CLI, not a page.
         assert!(
             !reveal_request_allowed(&browser_no_referer, WRITE_REFERER_RULE),
-            "a browser hiding its Referer must not mint or generate"
+            "a browser hiding its Referer must not mint or change the recipient"
         );
         assert!(
             reveal_request_allowed(&HeaderMap::new(), WRITE_REFERER_RULE),
-            "the CLI and the API e2e suite must still generate"
+            "the CLI and the API e2e suite must still reach the write routes"
         );
     }
 
@@ -827,8 +956,8 @@ mod tests {
     /// it. An app frame inside the shell cannot reach the route at all.
     #[test]
     fn an_app_document_cannot_reach_any_key_route() {
-        // Both rules, because the mint, the read and the generate between them
-        // use both. No route can be the one that forgets.
+        // Both rules, because the mint, the read and the recipient routes
+        // between them use both. No route can be the one that forgets.
         for rule in [READ_REFERER_RULE, WRITE_REFERER_RULE] {
             for referer in [
                 "https://host/app/demo-director/index.html",
@@ -882,29 +1011,19 @@ mod tests {
             keys
         };
 
-        for minted in [true, false] {
-            let event = SystemEvent::BackupKeyRevealed {
-                minted,
-                actor: None,
-            };
-            assert_eq!(event.event_type(), "BackupKeyRevealed");
-            assert!(event.is_persisted(), "an audit row has to be durable");
-            assert_eq!(fields(&event), vec!["minted".to_string()]);
-            assert_eq!(event.to_payload()["data"]["minted"], minted);
-        }
+        let anonymous = SystemEvent::BackupKeyRevealed { actor: None };
+        assert_eq!(anonymous.event_type(), "BackupKeyRevealed");
+        assert!(anonymous.is_persisted(), "an audit row has to be durable");
+        assert!(fields(&anonymous).is_empty());
 
         // With an actor the row grows exactly one field, so the timeline can
         // attribute the read and still nothing else rides along.
         let attributed = SystemEvent::BackupKeyRevealed {
-            minted: false,
             actor: Some(MessageOrigin::Device {
                 device_id: "device-1".to_string(),
             }),
         };
-        assert_eq!(
-            fields(&attributed),
-            vec!["actor".to_string(), "minted".to_string()]
-        );
+        assert_eq!(fields(&attributed), vec!["actor".to_string()]);
     }
 
     /// The page and the agent both read `missing_scopes` off this response, so

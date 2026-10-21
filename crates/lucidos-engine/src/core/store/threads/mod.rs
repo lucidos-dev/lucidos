@@ -2,6 +2,7 @@ use super::types::SessionMessage;
 use super::EventStore;
 use crate::core::event_subscription::EventSubscription;
 use crate::core::EventRow;
+use crate::engine::thread_events::CacheKeepAliveStatus;
 use crate::engine::thread_lifecycle::{
     ArchiveState, ChangeStateKind, CodingAgentChangeState, ThreadStatus,
 };
@@ -154,6 +155,10 @@ pub struct ThreadSummary {
     /// The two columns are written by one `UPDATE` per projection arm, and the
     /// count is derived from this array's length, so they cannot disagree.
     pub live_event_waits: Vec<EventWaitSummary>,
+    /// The *cache keep-alive status*: what the keep-alive does for this
+    /// waiting thread. Absent when it has nothing to keep warm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_keep_alive_status: Option<CacheKeepAliveStatus>,
     /// Count of descendants (transitive) currently in a state that blocks this
     /// thread from being archived (per `is_blocking` in `thread_lifecycle.rs`).
     /// Maintained by EventBus on `thread_summaries.blocking_descendant_count`.
@@ -409,6 +414,7 @@ struct ThreadRow {
     /// `sqlx::types::Json` rather than a bare `Vec`, because that is what
     /// decodes a JSONB column into a typed value.
     live_event_waits: sqlx::types::Json<Vec<EventWaitSummary>>,
+    cache_keep_alive_status: Option<sqlx::types::Json<CacheKeepAliveStatus>>,
     status: String,
     summary_version: i64,
     /// The three columns `CodingAgentChangeState::from_columns` reads.
@@ -511,6 +517,9 @@ pub struct ThreadAggregate {
     /// `handleEvent`'s seq-dedup guard, so even a re-delivered event repairs a
     /// stranded list. That is the one path that could not repair it before.
     pub live_event_waits: Vec<EventWaitSummary>,
+    /// See `ThreadSummary::cache_keep_alive_status`. Carried on the per-event
+    /// SSE aggregate, so the status arrives with the event that changed it.
+    pub cache_keep_alive_status: Option<CacheKeepAliveStatus>,
     /// See `ThreadSummary::coding_agent_change_state`.
     pub coding_agent_change_state: CodingAgentChangeState,
     pub coding_agent_is_external_repo: bool,
@@ -601,6 +610,7 @@ fn row_to_thread_aggregate(
         apply_in_flight: r.apply_in_flight,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
+        cache_keep_alive_status: r.cache_keep_alive_status.map(|s| s.0),
         coding_agent_change_state: CodingAgentChangeState::from_columns(
             &r.coding_agent_change_state,
             r.coding_agent_unproposed_reason.as_deref(),
@@ -661,7 +671,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.waiting_children_count::bigint, {a}.total_children_count::bigint, \
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, {a}.read_requested, {a}.apply_in_flight, \
-        {a}.live_event_wait_count::bigint, {a}.live_event_waits, \
+        {a}.live_event_wait_count::bigint, {a}.live_event_waits, {a}.cache_keep_alive_status, \
         {a}.status, {a}.summary_version, {a}.coding_agent_change_state, {a}.coding_agent_unproposed_reason, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.last_revived_at, \
         {a}.is_saved, {a}.is_home, {a}.has_response, \
@@ -758,6 +768,7 @@ fn row_to_thread_summary(
         apply_in_flight: r.apply_in_flight,
         live_event_wait_count: r.live_event_wait_count,
         live_event_waits: r.live_event_waits.0,
+        cache_keep_alive_status: r.cache_keep_alive_status.map(|s| s.0),
         status: ThreadStatus::parse(&r.status),
         summary_version: r.summary_version,
         coding_agent_change_state: CodingAgentChangeState::from_columns(

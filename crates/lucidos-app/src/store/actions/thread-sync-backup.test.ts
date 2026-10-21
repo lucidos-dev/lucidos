@@ -3,6 +3,7 @@ import { signal } from '@preact/signals-core';
 
 const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
 const backupStatusVersion = signal(0);
+const backupRecipientVersion = signal(0);
 const recommendedCleanupProgress = signal<{ done: number; total: number } | null>(null);
 const diskUsageVersion = signal(0);
 const showToast = vi.fn();
@@ -25,6 +26,7 @@ vi.mock('../store', () => ({
   backupProgress,
   backupStatusVersion,
   backupPreferencesVersion: signal(0),
+  backupRecipientVersion,
   recommendedCleanupProgress,
   diskUsageVersion,
   recoveryProgress: signal(null),
@@ -221,5 +223,15 @@ describe('handleGlobalEvent: ProxyConfigRejected', () => {
     handleGlobalEvent('ProxyConfigRejected', { rejected: [] });
     handleGlobalEvent('ProxyConfigRejected', {});
     expect(showToast).not.toHaveBeenCalled();
+  });
+});
+
+describe('handleGlobalEvent: BackupRecipientSet', () => {
+  it('bumps the recipient version, so the Backup page re-reads its key status', () => {
+    backupRecipientVersion.value = 0;
+    backupStatusVersion.value = 0;
+    handleGlobalEvent('BackupRecipientSet', { recipient: 'age1example', own_key: false });
+    expect(backupRecipientVersion.value).toBe(1);
+    expect(backupStatusVersion.value).toBe(0);
   });
 });

@@ -136,7 +136,7 @@ fn blocks_conflicts_only_on_the_entry_both_sides_edited() {
 
 #[test]
 fn blocks_merges_edits_to_different_lines_of_one_entry() {
-    // db.md shape: two threads each add a sub-bullet to one long entry.
+    // docs/system-events.md shape: two threads each add a sub-bullet to one long entry.
     let base =
         "## Events\n\n- **Changes:** a list.\n  - first\n  - second\n  - third\n  - fourth\n";
     let ours = base.replace("  - first\n", "  - first\n  - ours\n");

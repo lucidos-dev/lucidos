@@ -414,12 +414,35 @@ mod tests {
         );
     }
 
+    /// An app page never scrolls sideways (ADR 0530). Body takes `clip` and
+    /// never `hidden`: with `<html>` non-visible, a `hidden` body becomes the
+    /// page's scroller and breaks window scrolling and sticky.
+    #[test]
+    fn iframe_page_never_scrolls_sideways() {
+        let html = rule_body(SDK_IFRAME_BASE_CSS, "html")
+            .expect("sdk_iframe.css must carry a top-level `html {` rule");
+        assert!(
+            html.contains("overflow-x: clip;"),
+            "<html> must clip sideways. Found:\n{html}"
+        );
+        let body = rule_body(SDK_IFRAME_BASE_CSS, "body")
+            .expect("sdk_iframe.css must carry a top-level `body {` rule");
+        assert!(
+            body.contains("overflow-x: clip;") && body.contains("max-width: 100%;"),
+            "<body> must clip sideways and fit the page. Found:\n{body}"
+        );
+        assert!(
+            !body.contains("overflow-x: hidden"),
+            "<body> must not take `hidden`: it would become the page's scroller"
+        );
+    }
+
     /// A control inherits NOTHING from `body`: the UA stylesheet applies the
     /// `font` shorthand to it, which resets the family too. `input, textarea,
     /// select` always named `--font-ui` here; `button` did not, so an app's
     /// buttons painted in the system UI face while its own inputs painted in
     /// the workspace font, inside the same app. Same defect the host shell had
-    /// at `.welcome-dismiss`, found by `e2e/type-scale.spec.ts` on 2026-08-13.
+    /// at `.welcome-dismiss`, found by `e2e/type-scale-all.spec.ts`.
     #[test]
     fn iframe_controls_name_the_ui_font() {
         for selector in ["button", "input, textarea, select"] {

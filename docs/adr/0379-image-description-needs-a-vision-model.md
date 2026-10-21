@@ -48,6 +48,8 @@ without it is refused before the call and reported in Settings, never replaced.
   of the Image description picker until someone flips them.
 - An existing workspace whose stored pick lacks the flag stops getting
   descriptions it was already failing to get, and now sees why in Settings.
+- A chat turn now reads the flag too, with a different answer for a model
+  with no row: ADR 0504.
 
 ## Alternatives considered
 

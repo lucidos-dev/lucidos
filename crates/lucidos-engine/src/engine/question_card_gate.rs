@@ -50,18 +50,36 @@ macro_rules! card_message_hint {
 #[cfg(test)]
 const CARD_MESSAGE_HINT: &str = card_message_hint!();
 
-/// The tool result a card gets after unreported tool work, after the marker
-/// and the quoted input. Every agent's notes between tool calls arrive as
-/// text, so it asks for prose.
-const OWES_WORDS: &str = concat!(
-    "Since the user's last input you have not told them what your tools found. They read only \
-     your text and your cards, never your tool results or your reasoning. Say what you found in \
-     plain prose now, or ",
-    card_message_hint!(),
-    ". If they asked something, answer it the same way. Then ask your question again, and keep \
-     everything already on the card, pictures and links included. If there is truly nothing to \
-     say, send the same question again unchanged: it will not be refused twice."
-);
+/// How much of what the user read a refusal quotes.
+const QUOTED_READ_CHARS: usize = 600;
+
+/// What every refusal says the user read since their last input: the words
+/// themselves, or that they read nothing. The agent's own context holds more
+/// than that, since the API hands it back its hidden reasoning.
+fn what_they_read(words: &str) -> String {
+    match words.trim() {
+        "" => "they have read nothing from you".to_string(),
+        words => match words.char_indices().nth(QUOTED_READ_CHARS) {
+            Some((cut, _)) => format!(
+                "what they have read from you is longer than fits here. It begins: \"{}...\"",
+                &words[..cut]
+            ),
+            None => format!("all they have read from you is this: \"{words}\""),
+        },
+    }
+}
+
+/// How a refusal ends. Each question is one the agent can answer from what the
+/// refusal quoted, never one about the user's screen.
+fn send_again_unchanged(words: &str) -> &'static str {
+    if words.trim().is_empty() {
+        "If they need nothing more from you, send the same question again unchanged: it will not \
+         be refused twice."
+    } else {
+        "If the words quoted above already give them everything, send the same question again \
+         unchanged: it will not be refused twice."
+    }
+}
 
 /// A refusal that quotes the user's input reads like news of a new message.
 /// An agent once asked the user to resend a reply it had already acted on.
@@ -81,14 +99,15 @@ const NOTE_SIZED_CHARS: usize = 600;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
     /// Tool work went unreported. `input` is the user's last input, quoted so
-    /// it never reads as new.
-    OwesWords { input: LastInput },
+    /// it never reads as new. `words` is all the user read since.
+    OwesWords { input: LastInput, words: String },
     /// The card points "above", and all the user read since their last input
     /// is `words`, too short to hold what it points at.
     PointsAboveAtNothing { words: String },
     /// The agent saved these artifacts since the user's last input, and
-    /// neither its words nor the card show or link them.
-    ArtifactNotShown { paths: Vec<String> },
+    /// neither its words nor the card show or link them. `words` is all the
+    /// user read since.
+    ArtifactNotShown { paths: Vec<String>, words: String },
     /// The last words before the card were a progress note: `note` is all the
     /// user read of what the agent wrote there.
     NoteShownAsSummary { note: String },
@@ -97,34 +116,43 @@ pub(crate) enum Refusal {
 impl Refusal {
     pub(crate) fn text(&self) -> String {
         match self {
-            Self::OwesWords { input } => match input.quoted() {
-                Some(quoted) => format!(
-                    "{REFUSAL_MARKER} The user's last input is {quoted}. You already received \
-                     it. {NOTHING_NEW} {OWES_WORDS}"
-                ),
-                None => format!("{REFUSAL_MARKER} {OWES_WORDS}"),
-            },
-            Self::PointsAboveAtNothing { words } => {
-                let seen = match words.trim() {
-                    "" => "they have read nothing from you".to_string(),
-                    words => format!("all they have read from you is this: \"{words}\""),
-                };
-                format!(
+            Self::OwesWords { input, words } => {
+                let owed = format!(
                     concat!(
-                        "{REFUSAL_MARKER} Your card points at something \"above\", but since \
-                         the user's last input {seen}. Nothing else you drafted reached them. \
-                         They never see your reasoning, and before a tool call your prose may \
-                         reach them only as a short note. Write out what the card refers to as \
-                         your reply, or put it on the card itself: ",
+                        "Since the user's last input, {seen}. You have not told them what your \
+                         tools found. They read only your text and your cards, never your tool \
+                         results or your reasoning, and nothing else you wrote reached them. Say \
+                         what you found in plain prose now, or ",
                         card_message_hint!(),
-                        ", or else in the question or the option descriptions. Then ask again. \
-                         If it truly is on their screen, send the same question again \
-                         unchanged: it will not be refused twice."
+                        ". If they asked something, answer it the same way. Then ask your \
+                         question again, and keep everything already on the card, pictures and \
+                         links included. {again}"
                     ),
-                    REFUSAL_MARKER = REFUSAL_MARKER,
-                    seen = seen
-                )
+                    seen = what_they_read(words),
+                    again = send_again_unchanged(words)
+                );
+                match input.quoted() {
+                    Some(quoted) => format!(
+                        "{REFUSAL_MARKER} The user's last input is {quoted}. You already \
+                         received it. {NOTHING_NEW} {owed}"
+                    ),
+                    None => format!("{REFUSAL_MARKER} {owed}"),
+                }
             }
+            Self::PointsAboveAtNothing { words } => format!(
+                concat!(
+                    "{REFUSAL_MARKER} Your card points at something \"above\", but since the \
+                     user's last input, {seen}. Nothing else you drafted reached them. They never \
+                     see your reasoning. Write out what the card refers to as your reply, or put \
+                     it on the card itself: ",
+                    card_message_hint!(),
+                    ", or else in the question or the option descriptions. Then ask again. \
+                     {again}"
+                ),
+                REFUSAL_MARKER = REFUSAL_MARKER,
+                seen = what_they_read(words),
+                again = send_again_unchanged(words)
+            ),
             Self::NoteShownAsSummary { note } => format!(
                 concat!(
                     "{REFUSAL_MARKER} The text you wrote just before this card was longer than \
@@ -140,7 +168,7 @@ impl Refusal {
                 REFUSAL_MARKER = REFUSAL_MARKER,
                 note = quote(note)
             ),
-            Self::ArtifactNotShown { paths } => {
+            Self::ArtifactNotShown { paths, words } => {
                 let paths = paths
                     .iter()
                     .map(|p| format!("`{p}`"))
@@ -149,9 +177,8 @@ impl Refusal {
                 format!(
                     concat!(
                         "{REFUSAL_MARKER} {ARTIFACT_REFUSAL_LEAD} {paths}, and they cannot see \
-                         it. Saving shows nothing. Words written just before a tool call may \
-                         reach them only as a short summary, which drops a picture or a link. \
-                         Put the line `lucidos data write` printed ON the card. A picture's \
+                         it. Saving shows nothing. Since then, {seen}. Put the line `lucidos data \
+                         write` printed ON the card. A picture's \
                          `![...]` line goes ",
                         card_message_hint!(),
                         ", or in the question. An option's picture goes in its `preview` or \
@@ -162,12 +189,13 @@ impl Refusal {
                          asked something, answer it in plain prose or ",
                         card_message_hint!(),
                         ". If you ran other tools, say what you found. Then ask again. If it \
-                         truly is on their screen, or is not meant for them, send the same \
-                         question again unchanged: it will not be refused twice."
+                         is not meant for them, send the same question again unchanged: it will \
+                         not be refused twice."
                     ),
                     REFUSAL_MARKER = REFUSAL_MARKER,
                     ARTIFACT_REFUSAL_LEAD = ARTIFACT_REFUSAL_LEAD,
-                    paths = paths
+                    paths = paths,
+                    seen = what_they_read(words)
                 )
             }
         }
@@ -441,7 +469,10 @@ pub(crate) fn should_refuse(s: &SinceLastInput, card: &str) -> Option<Refusal> {
             .cloned()
             .collect();
         if !unseen.is_empty() {
-            return Some(Refusal::ArtifactNotShown { paths: unseen });
+            return Some(Refusal::ArtifactNotShown {
+                paths: unseen,
+                words: s.words.trim().to_string(),
+            });
         }
     }
     if s.refused {
@@ -457,6 +488,7 @@ pub(crate) fn should_refuse(s: &SinceLastInput, card: &str) -> Option<Refusal> {
     if s.unreported_tool_calls > 0 {
         return Some(Refusal::OwesWords {
             input: s.last_input.clone(),
+            words: s.words.trim().to_string(),
         });
     }
     let words = s.words.trim();

@@ -1,6 +1,7 @@
 //! The main check rebuilt from events after a restart. It keeps no table: its
 //! own events and the landings between them are the whole state.
 
+use super::runner::RunLink;
 use super::state::{CheckRange, MainCheck, Verdict};
 use uuid::Uuid;
 
@@ -8,6 +9,10 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum MainCheckRecord {
     Started(CheckRange),
+    RunLinked {
+        check_id: Uuid,
+        link: RunLink,
+    },
     Ended {
         check_id: Uuid,
         verdict: Verdict,
@@ -25,9 +30,12 @@ pub(super) enum MainCheckRecord {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Recovered {
     pub(super) check: MainCheck,
-    /// The check that was running when the engine stopped. Its runner died
-    /// with the engine, so it is abandoned.
+    /// The check that was running when the engine stopped, before its run
+    /// was on record. Its runner cancelled the run, so it is abandoned.
     pub(super) interrupted: Option<CheckRange>,
+    /// The check that was running when the engine stopped, with its run on
+    /// record. It stays running, and the next start reattaches to the run.
+    pub(super) reattach: Option<(CheckRange, RunLink)>,
     /// The open red whose fix landed before a restart cut its close off.
     pub(super) fix_landed: Option<Uuid>,
 }
@@ -36,9 +44,13 @@ pub(super) struct Recovered {
 pub(super) fn fold(records: &[MainCheckRecord]) -> Recovered {
     let mut check = MainCheck::default();
     let mut fix_landed = None;
+    let mut linked: Option<(Uuid, RunLink)> = None;
     for record in records {
         match record {
             MainCheckRecord::Started(range) => check.replay_started(range.clone()),
+            MainCheckRecord::RunLinked { check_id, link } => {
+                linked = Some((*check_id, link.clone()));
+            }
             MainCheckRecord::Ended { check_id, verdict } => {
                 check.replay_ended(*check_id, verdict.clone());
             }
@@ -47,6 +59,9 @@ pub(super) fn fold(records: &[MainCheckRecord]) -> Recovered {
                 fix_landed = fix_landed.filter(|red| red != check_id);
             }
             MainCheckRecord::Landed { thread_id, pre_sha } => {
+                if let Some(thread) = thread_id {
+                    check.close_flaky_for(*thread);
+                }
                 if let Some(red) = check.red() {
                     if *thread_id == Some(red.fix_thread_id) {
                         fix_landed = Some(red.range.check_id);
@@ -56,11 +71,20 @@ pub(super) fn fold(records: &[MainCheckRecord]) -> Recovered {
             }
         }
     }
-    let interrupted = check.take_interrupted();
+    let reattach = check.running().cloned().and_then(|range| {
+        let (_, link) = linked.filter(|(id, _)| *id == range.check_id)?;
+        Some((range, link))
+    });
+    let interrupted = if reattach.is_some() {
+        None
+    } else {
+        check.take_interrupted()
+    };
     let fix_landed = fix_landed.filter(|red| check.red().is_some_and(|r| r.range.check_id == *red));
     Recovered {
         check,
         interrupted,
+        reattach,
         fix_landed,
     }
 }
@@ -99,6 +123,7 @@ mod tests {
         Verdict::Failed {
             summary: "Failed: engine.".into(),
             tail: String::new(),
+            failures: Vec::new(),
             run_url: None,
             fix_thread_id: id(fix),
         }
@@ -116,6 +141,50 @@ mod tests {
         let recovered = fold(&[landed(None, "a"), started(1, "a", "b")]);
         assert_eq!(recovered.interrupted.map(|r| r.check_id), Some(id(1)));
         assert!(recovered.check.running().is_none());
+    }
+
+    fn run_linked(n: u8) -> MainCheckRecord {
+        MainCheckRecord::RunLinked {
+            check_id: id(n),
+            link: RunLink {
+                run_url: format!("https://r/{n}"),
+                branch: format!("e2e/{n}"),
+            },
+        }
+    }
+
+    /// A restart after the run was on record keeps the check running and
+    /// names the run to reattach to. What landed meanwhile stays owed.
+    #[test]
+    fn a_check_whose_run_is_on_record_is_reattached() {
+        let recovered = fold(&[
+            landed(None, "a"),
+            started(1, "a", "b"),
+            run_linked(1),
+            landed(None, "b"),
+        ]);
+        let (range, link) = recovered.reattach.expect("reattach");
+        assert_eq!(range.check_id, id(1));
+        assert_eq!(link.branch, "e2e/1");
+        assert!(recovered.interrupted.is_none());
+        assert_eq!(recovered.check.running().map(|r| r.check_id), Some(id(1)));
+        assert!(
+            recovered.check.dirty(),
+            "the landing during the run is owed"
+        );
+    }
+
+    /// A link to an earlier check never reattaches a later one.
+    #[test]
+    fn an_earlier_checks_link_does_not_reattach_the_running_one() {
+        let recovered = fold(&[
+            started(1, "a", "b"),
+            run_linked(1),
+            ended(1, Verdict::Passed),
+            started(2, "b", "c"),
+        ]);
+        assert!(recovered.reattach.is_none());
+        assert_eq!(recovered.interrupted.map(|r| r.check_id), Some(id(2)));
     }
 
     #[test]
@@ -164,6 +233,34 @@ mod tests {
         ]);
         assert_eq!(recovered.check.passed().map(|r| r.check_id), Some(id(2)));
         assert!(recovered.interrupted.is_none());
+    }
+
+    fn passed_flaky(fix: u8) -> Verdict {
+        Verdict::PassedWithFlakyFix {
+            run_url: None,
+            flaky: Vec::new(),
+            fix_thread_id: id(fix),
+        }
+    }
+
+    /// An open flaky fix thread survives a restart, and a landing from it
+    /// closes it in the replay.
+    #[test]
+    fn a_flaky_fix_thread_rebuilds_open_until_a_landing_from_it() {
+        let open = vec![started(1, "a", "b"), ended(1, passed_flaky(8))];
+        let recovered = fold(&open);
+        assert_eq!(
+            recovered.check.flaky_fix().map(|f| f.fix_thread_id),
+            Some(id(8))
+        );
+        let mut closed = open.clone();
+        closed.push(landed(Some(7), "b"));
+        assert!(
+            fold(&closed).check.flaky_fix().is_some(),
+            "another thread's landing"
+        );
+        closed.push(landed(Some(8), "c"));
+        assert!(fold(&closed).check.flaky_fix().is_none());
     }
 
     #[test]

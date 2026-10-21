@@ -10,11 +10,18 @@
 #                   [--budget <seconds>]       #   how long to wait (default 230)
 #   ./scripts/harden-suites.sh verdict         # the verdict alone
 #   ./scripts/harden-suites.sh start           # a normal run, when the verdict says RERUN
+#   ./scripts/harden-suites.sh timings         # each suite's start, end and exit, as JSON
 #
 # `start` selects suites from `git diff main...HEAD`, runs them, and records
 # the start commit. An early run skips the two Codex driver modules. Once the
 # Codex review is joined, `wait` starts them alone in the background and joins
 # them like any suite, so no `wait` blocks past its budget.
+#
+# The touched-spec selection is slow on a loaded host, and only the
+# `e2e-touched` suite reads it. So `start` launches every other suite first,
+# selects the specs while they run, and launches whatever the specs add. A
+# failed selection stops the suites it launched and fails the start. The
+# `suites` file is written last, so a run still selecting is never a verdict.
 #
 # `start` also records the tier. An integrated sub-thread's branch runs the
 # fast tier, which the engine names (`lucidos hardened expected-tier`); every
@@ -22,9 +29,20 @@
 # the tier only when no engine answers. HS_LUCIDOS_CMD replaces the CLI in
 # the tests, which must never ask a real engine.
 #
-# The verdict prints one line per suite: PASS, FAIL, VOID <reason>, RUNNING or
-# MISSING. An early result stays valid only while every path changed since the
-# start commit is on HARDEN_SAFE_PATHS (scripts/lib/harden_suites.sh). Each
+# A FAIL verdict records what failed in .lucidos/harden-retry: engine tests and
+# browser specs by name, any other failed suite whole. The next `start` is then
+# a retry round, which runs only those. A retry round never passes the harden:
+# once its tests pass it clears the record and says RERUN, so the full set runs
+# once more (ADR 0536).
+#
+# The touched specs mobile-webkit runs go to GitHub in their own suite,
+# e2e-touched-webkit, as the run starts. The rest run on this host.
+#
+# The verdict prints one line per suite: PASS, SKIP <reason>, FAIL, VOID
+# <reason>, RUNNING or MISSING. A touched-spec suite refused by a busy e2e lock
+# is a SKIP, and a SKIP passes (ADR 0541). An early result stays valid only
+# while every path changed since the start commit is on HARDEN_SAFE_PATHS
+# (scripts/lib/harden_suites.sh). Each
 # suite also stamps the changed paths when it exits, so an edit made while it
 # ran voids it even if the edit was later undone.
 #
@@ -41,7 +59,7 @@
 #
 # State and logs: .lucidos/harden-suites/ in the worktree (gitignored).
 #
-# Exit status: 0 every suite PASS, 1 a FAIL or bad usage, 2 RERUN needed
+# Exit status: 0 every suite PASS or SKIP, 1 a FAIL or bad usage, 2 RERUN needed
 # (a VOID or MISSING line, and no FAIL), 3 still running.
 
 set -uo pipefail
@@ -57,6 +75,8 @@ if ! ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
     exit 1
 fi
 STATE="$ROOT/.lucidos/harden-suites"
+# Outside STATE, which every start clears: the record outlives the run.
+RETRY_FILE="$ROOT/.lucidos/harden-retry"
 CODEX_OUT="$ROOT/.lucidos/codex-review.out"
 CODEX_DONE="$ROOT/.lucidos/codex-review.done"
 
@@ -101,9 +121,19 @@ recorded_tier() {
     hs_normalize_tier "$(cat "$STATE/tier" 2>/dev/null)"
 }
 
+# The browser specs a branch can break (touched_specs.sh), against main. What
+# the selector says about the coverage map goes to the e2e-touched suite's log.
+# HS_TOUCHED_SPECS_CMD replaces the selector in the tests.
+select_touched_specs() { # <paths-file> <out-file> [<note-file>]
+    "${HS_TOUCHED_SPECS_CMD:-ts_touched_specs}" "$ROOT" "$(git -C "$ROOT" merge-base main HEAD)" "$1" \
+        "$(ts_coverage_map_path "$ROOT")" > "$2" 2> "${3:-/dev/null}"
+}
+
+retry_round() { [ -f "$STATE/retry" ]; }
+
 selected_suites() {
     cat "$STATE/suites" 2>/dev/null
-    if [ "$(cat "$STATE/mode" 2>/dev/null)" = early ] && grep -q -x rust "$STATE/suites" 2>/dev/null; then
+    if [ "$(cat "$STATE/mode" 2>/dev/null)" = early ] && ! retry_round && grep -q -x rust "$STATE/suites" 2>/dev/null; then
         echo driver
     fi
 }
@@ -124,26 +154,45 @@ memory_gate() { # <label>
 # the suite's result, exit 72, and its command never runs.
 run_suite() { # <suite>
     local suite=$1 cmd rc=0 passed_at=""
-    if ! cmd="$(hs_suite_command "$suite" "$(cat "$STATE/mode")" "$STATE/paths")"; then
+    if ! cmd="$(hs_suite_command "$suite" "$(cat "$STATE/mode")" "$STATE")"; then
         echo 1 > "$STATE/$suite.exit"
         return
     fi
-    : > "$STATE/$suite.log"
+    cat "$STATE/$suite.note" > "$STATE/$suite.log" 2>/dev/null || : > "$STATE/$suite.log"
     if hs_is_cargo_suite "$suite"; then
         memory_gate "the /harden $suite suite" >> "$STATE/$suite.log" 2>&1 || rc=$?
         passed_at="$(date +%s)"
     fi
     if [ "$rc" = 0 ]; then
+        date +%s > "$STATE/$suite.start"
         (cd "$ROOT" && LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$passed_at" bash -c "$cmd") >> "$STATE/$suite.log" 2>&1
         rc=$?
     fi
+    date +%s > "$STATE/$suite.end"
     changed_now > "$STATE/$suite.changed"
     # The exit file goes last: its presence is what marks the suite done.
     echo "$rc" > "$STATE/$suite.exit"
 }
 
+# Start each suite in the background: the cargo suites one after another in
+# one lane (two cargo runs in one worktree can OOM the host), the rest at once.
+launch_suites() { # <newline-separated suites>
+    local s cargo_lane="" other=""
+    for s in $1; do
+        if hs_is_cargo_suite "$s"; then
+            cargo_lane="$cargo_lane $s"
+        else
+            other="$other $s"
+        fi
+    done
+    if [ -n "$cargo_lane" ]; then
+        (for s in $cargo_lane; do run_suite "$s"; done) &
+    fi
+    for s in $other; do run_suite "$s" & done
+}
+
 cmd_start() {
-    local mode=normal suites cargo_lane="" other="" s disabled tier label
+    local mode=normal suites early added="" s disabled tier label
     case "${1:-}" in
         --early) mode=early ;;
         "") ;;
@@ -178,8 +227,42 @@ cmd_start() {
         echo "Safe-path allowlist disabled for this run, so any change voids it. These files may read a safe path:"
         printf '  %s\n' "$disabled"
     fi
+    label="$mode"
+    if [ "$tier" = fast ]; then label="$mode, fast tier"; fi
 
-    suites="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" < "$STATE/paths")"
+    if [ -s "$RETRY_FILE" ]; then
+        suites="$(hs_retry_plan "$ROOT" "$STATE" < "$RETRY_FILE")"
+        if [ -n "$suites" ]; then
+            cp "$RETRY_FILE" "$STATE/retry"
+            printf '%s\n' "$suites" > "$STATE/suites"
+            echo "Suites ($label, a retry of what failed): $(tr '\n' ' ' < "$STATE/suites")"
+            # A failed driver run reruns alone, once `wait` has joined the Codex review.
+            launch_suites "$(printf '%s\n' "$suites" | grep -v -x driver)"
+            wait
+            return 0
+        fi
+        rm -f "$RETRY_FILE"
+        echo "Nothing the last round failed is left to rerun, so this is a full run."
+    fi
+
+    # Only e2e-touched reads the specs, and it is no cargo suite, so the cargo
+    # lane starts once, before the slow selection.
+    early="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" /dev/null < "$STATE/paths" | sed '/^$/d')"
+    launch_suites "$early"
+    if ! select_touched_specs "$STATE/paths" "$STATE/touched-specs.tmp" "$STATE/e2e-touched.note"; then
+        stop_tree "$(descendants $$ | grep -v -x $$)"
+        echo "Could not select the touched browser specs." >&2
+        return 1
+    fi
+    mv "$STATE/touched-specs.tmp" "$STATE/touched-specs"
+
+    suites="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" "$STATE/touched-specs" < "$STATE/paths" | sed '/^$/d')"
+    for s in $suites; do
+        case $'\n'"$early"$'\n' in
+            *$'\n'"$s"$'\n'*) ;;
+            *) added="$added $s" ;;
+        esac
+    done
     # The suites file goes last: until it exists, the run is still setting up.
     printf '%s\n' "$suites" | sed '/^$/d' > "$STATE/suites.tmp"
     mv "$STATE/suites.tmp" "$STATE/suites"
@@ -187,42 +270,37 @@ cmd_start() {
         echo "No suites selected for this diff."
         return 0
     fi
-    label="$mode"
-    if [ "$tier" = fast ]; then label="$mode, fast tier"; fi
     echo "Suites ($label): $(tr '\n' ' ' < "$STATE/suites")"
 
-    for s in $suites; do
-        if hs_is_cargo_suite "$s"; then
-            cargo_lane="$cargo_lane $s"
-        else
-            other="$other $s"
-        fi
-    done
-    (for s in $cargo_lane; do run_suite "$s"; done) &
-    for s in $other; do run_suite "$s" & done
+    launch_suites "$added"
     wait
     return 0
 }
 
-cmd_stop() {
+# Stop each pid and every process it left behind, TERM first and KILL for a
+# survivor. The snapshot carries start times: once a parent dies its children
+# belong to launchd, and a fresh walk would miss them.
+stop_tree() { # <newline-separated pids>
     local p snapshot="" survivors
-    if ! runner_alive; then
-        echo "No suite run is going."
-        return 0
-    fi
-    # Snapshot the tree with start times first. Once the runner dies, its
-    # children belong to launchd and a fresh walk would miss them.
-    for p in $(descendants "$(cat "$STATE/pid")"); do
+    for p in $1; do
         snapshot="$snapshot$p $(started_at "$p")
 "
     done
-    for p in $(printf '%s' "$snapshot" | cut -d' ' -f1); do kill -TERM "$p" 2>/dev/null; done
+    for p in $(still_running "$snapshot"); do kill -TERM "$p" 2>/dev/null; done
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         survivors="$(still_running "$snapshot")"
         [ -z "$survivors" ] && break
         sleep 1
     done
     for p in $survivors; do kill -KILL "$p" 2>/dev/null; done
+}
+
+cmd_stop() {
+    if ! runner_alive; then
+        echo "No suite run is going."
+        return 0
+    fi
+    stop_tree "$(descendants "$(cat "$STATE/pid")")"
     touch "$STATE/stopped"
     echo "Stopped the suite run."
 }
@@ -276,7 +354,7 @@ start_driver() {
 
 driver_due() {
     selected_suites | grep -q -x driver && [ ! -f "$STATE/driver.started" ] && [ ! -f "$STATE/stopped" ] \
-        && [ "$(suite_state rust)" = PASS ]
+        && { ! grep -q -x rust "$STATE/suites" || [ "$(suite_state rust)" = PASS ]; }
 }
 
 cmd_wait() {
@@ -325,7 +403,8 @@ allowlist_off_note() { # <path>
         "$(cut -d' ' -f1 "$STATE/allowlist-disabled" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 }
 
-# Print the state of one suite: PASS, FAIL, VOID <reason>, RUNNING or MISSING.
+# Print the state of one suite: PASS, SKIP <reason>, FAIL, VOID <reason>,
+# RUNNING or MISSING.
 suite_state() { # <suite>
     local suite=$1 disabled=0 unsafe
     if [ ! -f "$STATE/$suite.exit" ]; then
@@ -347,9 +426,13 @@ suite_state() { # <suite>
         grep -q '^ERROR: build refused on host memory' "$STATE/$suite.log" 2>/dev/null; then
         # A gate nested inside `make` refuses with 72, and make exits 2.
         echo "VOID refused by the build memory gate, see $STATE/$suite.log"
+    elif hs_is_e2e_suite "$suite" && [ "$(cat "$STATE/$suite.exit")" = "$E2E_LOCK_BUSY_EXIT" ]; then
+        # ADR 0541: a busy e2e lock is given up, and the main check runs the specs.
+        echo "SKIP every e2e slot was busy; the main check runs these specs after landing"
     elif [ "$(cat "$STATE/$suite.exit")" != 0 ]; then
         echo "FAIL see $STATE/$suite.log"
-    elif hs_is_filtered_suite "$suite" && ! grep -q -E '^running [1-9]' "$STATE/$suite.log"; then
+    elif { hs_is_filtered_suite "$suite" || { hs_names_engine_tests "$suite" && [ -s "$STATE/$suite.retry" ]; }; } \
+        && ! grep -q -E '^running [1-9]' "$STATE/$suite.log"; then
         echo "FAIL ran no tests"
     else
         echo PASS
@@ -366,32 +449,93 @@ cmd_verdict() {
         echo "MISSING: no suite run recorded"
         return 2
     fi
-    # A fix can widen the selection, and no recorded suite would notice.
-    hs_generated_drift "$ROOT" > "$STATE/generated-drift-now"
-    now="$(branch_paths | sort -u | hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift-now" "$(recorded_tier)")"
-    if [ "$now" != "$(cat "$STATE/suites")" ]; then
-        echo "selection VOID the diff now selects: $(printf '%s' "$now" | tr '\n' ' ')"
-        rerun=1
+    # A fix can widen the selection, and no recorded suite would notice. A
+    # retry round runs a subset by design, and the full run after it selects.
+    if ! retry_round; then
+        hs_generated_drift "$ROOT" > "$STATE/generated-drift-now"
+        branch_paths | sort -u > "$STATE/paths-now"
+        select_touched_specs "$STATE/paths-now" "$STATE/touched-specs-now" \
+            || echo "(the touched specs could not be selected)" > "$STATE/touched-specs-now"
+        now="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift-now" "$(recorded_tier)" "$STATE/touched-specs-now" < "$STATE/paths-now")"
+        if [ "$now" != "$(cat "$STATE/suites")" ]; then
+            echo "selection VOID the diff now selects: $(printf '%s' "$now" | tr '\n' ' ')"
+            rerun=1
+        fi
     fi
+    : > "$STATE/failed"
     for s in $(selected_suites); do
         state="$(suite_state "$s")"
         echo "$s $state"
         case "$state" in
-            PASS) ;;
-            FAIL*) fail=1 ;;
+            PASS | SKIP*) ;;
+            FAIL*) fail=1; failure_record "$s" >> "$STATE/failed" ;;
             RUNNING) return 3 ;;
             *) rerun=1 ;;
         esac
     done
     if [ "$fail" = 1 ]; then
-        echo "verdict: FAIL. Fix, commit, and return to Phase 1."
+        mv "$STATE/failed" "$RETRY_FILE"
+        echo "verdict: FAIL. Fix, commit, and return to Phase 1. The next start reruns what failed first."
         return 1
     elif [ "$rerun" = 1 ]; then
         echo "verdict: RERUN. Start a normal run: ./scripts/harden-suites.sh start"
         return 2
     fi
+    rm -f "$RETRY_FILE"
+    if retry_round; then
+        echo "verdict: RERUN. What failed now passes. Start a normal run for the full set: ./scripts/harden-suites.sh start"
+        return 2
+    fi
     echo "verdict: PASS"
     return 0
+}
+
+# The specs a touched-spec suite ran.
+suite_specs() { # <suite>
+    if [ -s "$STATE/$1.retry" ]; then
+        cat "$STATE/$1.retry"
+    elif [ "$1" = e2e-touched-webkit ]; then
+        hs_webkit_specs < "$STATE/touched-specs"
+    else
+        cat "$STATE/touched-specs"
+    fi
+}
+
+# The record lines for one failed suite: "<suite> <test>" for each test its log
+# names, or "<suite>" alone to rerun it whole. A touched-spec suite whose log
+# names no spec reruns every spec it ran.
+failure_record() { # <suite>
+    local names
+    names="$(hs_failed_tests "$1" "$STATE/$1.log")"
+    if [ -z "$names" ] && hs_is_e2e_suite "$1"; then
+        names="$(suite_specs "$1" 2>/dev/null)"
+    fi
+    if [ -z "$names" ] || printf '%s\n' "$names" | grep -q -x -F '?'; then
+        echo "$1"
+    else
+        printf '%s\n' "$names" | sed '/^$/d' | sed "s/^/$1 /"
+    fi
+}
+
+# Each suite's start, end and exit code, as one JSON object for the
+# HardenRunCompleted payload. A suite that never started has nulls.
+cmd_timings() {
+    local s first=1 start end rc round=full
+    if [ ! -f "$STATE/suites" ]; then
+        echo '{}'
+        return 0
+    fi
+    retry_round && round=retry
+    printf '{"round": "%s", "mode": "%s", "suites": {' "$round" "$(cat "$STATE/mode")"
+    for s in $(running_suites); do
+        start="$(cat "$STATE/$s.start" 2>/dev/null)"
+        end="$(cat "$STATE/$s.end" 2>/dev/null)"
+        rc="$(cat "$STATE/$s.exit" 2>/dev/null)"
+        [ "$first" = 1 ] || printf ', '
+        first=0
+        printf '"%s": {"start": %s, "end": %s, "exit": %s}' "$s" "${start:-null}" "${end:-null}" "${rc:-null}"
+    done
+    echo '}}'
 }
 
 case "${1:-}" in
@@ -400,6 +544,7 @@ case "${1:-}" in
     wait) shift; cmd_wait "$@" ;;
     run-driver) run_suite driver ;;
     verdict) cmd_verdict ;;
+    timings) cmd_timings ;;
     -h | --help) usage ;;
     *) usage >&2; exit 1 ;;
 esac

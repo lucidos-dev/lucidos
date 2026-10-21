@@ -40,7 +40,7 @@ import { CheckIcon, ChevronRightIcon, CloseIcon } from '../shared/icons';
 /** Which of the four surfaces this is. Carried as `data-kind` for tests and
  *  for any kind-specific CSS; the row's LOOK never branches on it, which is
  *  what keeps the four coherent. */
-export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form' | 'change' | 'resume' | 'boundary';
+export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form' | 'change' | 'resume' | 'boundary' | 'cache';
 
 /** How the state WORD is tinted. The tint groups the word, it never replaces
  *  it: every state is legible as text, so the row survives a colourblind reader

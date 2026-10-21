@@ -144,6 +144,8 @@ impl ResolvedModelSelection {
             service_tier: None,
             // A turn's next request reads what its end write stored.
             cache_mode: crate::llm::CacheMode::Implicit,
+            // A turn's model may step back within its lineage.
+            generation_rule: crate::llm::model_registry::GenerationRule::AnyGeneration,
         }
     }
 }
@@ -1143,11 +1145,11 @@ mod tests {
     async fn set_silent_writes_internal_keys_and_refuses_real_preferences() {
         let (pool, db_name) = setup_test_db().await;
 
-        PreferenceStore::set_silent(&pool, prefs::VAPID_KEYS.key(), "{}")
+        PreferenceStore::set_silent(&pool, prefs::BACKUP_LAST_RUN.key(), "{}")
             .await
             .expect("a listed internal key writes");
         assert_eq!(
-            PreferenceStore::get(&pool, prefs::VAPID_KEYS.key())
+            PreferenceStore::get(&pool, prefs::BACKUP_LAST_RUN.key())
                 .await
                 .unwrap(),
             Some("{}".to_string())

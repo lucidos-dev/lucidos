@@ -93,6 +93,7 @@ pub const CONNECT_OAUTH_ACCOUNT: &str = "connect_oauth_account";
 // Apps (successor to Skills)
 pub const CREATE_APP: &str = "create_app";
 pub const LIST_APPS: &str = "list_apps";
+/// Retired. Kept so a call to it is refused with its replacement.
 pub const EXECUTE_INTENT: &str = "execute_intent";
 pub const LOAD_KNOWHOW: &str = "load_knowhow";
 pub const UNLOAD_KNOWHOW: &str = "unload_knowhow";

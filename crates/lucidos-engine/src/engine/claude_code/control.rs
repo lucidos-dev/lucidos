@@ -19,25 +19,106 @@ pub(crate) fn record_control_request(
     }
 }
 
-/// Record a control request on the session, and send it to the runtime unless
-/// the backend takes it only at spawn. Returns when the change takes effect.
+/// How a change the backend takes only at spawn reaches a live session. Every
+/// restart puts it in force on the session's next call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffortRestart {
+    /// Nothing restarts. A session with no user turn running exits at idle,
+    /// so the next spawn carries the change. A session that is ending, or
+    /// that runs a merge turn, runs on without it.
+    NotNeeded,
+    /// Interrupt the turn as a redirect. Its end resumes the session.
+    InterruptTurn,
+    /// The turn waits on a question: stop the process and keep the card. The
+    /// answer resumes the session.
+    KeepQuestion,
+}
+
+/// A turn of the user's own runs. A cache keep-alive's hidden turn is not one:
+/// its process exits at idle, so the next real turn spawns anyway.
+fn user_turn_in_flight(session: &crate::engine::AgentSession) -> bool {
+    session.is_in_flight() && !session.keep_alive
+}
+
+/// Decide how a control request with `reach` restarts `session`. A merge turn
+/// is never interrupted, because a canceled merge aborts its Apply.
+pub(crate) fn effort_restart(
+    session: &crate::engine::AgentSession,
+    reach: crate::runtime::ControlReach,
+    parked_on_question: bool,
+) -> EffortRestart {
+    let runs_on = reach != crate::runtime::ControlReach::Spawn
+        || !user_turn_in_flight(session)
+        || session.pending_stop.is_some()
+        || session.conflict.is_some();
+    if runs_on {
+        EffortRestart::NotNeeded
+    } else if parked_on_question {
+        EffortRestart::KeepQuestion
+    } else {
+        EffortRestart::InterruptTurn
+    }
+}
+
+fn restart_session(
+    session: &mut crate::engine::AgentSession,
+    restart: EffortRestart,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) {
+    match restart {
+        EffortRestart::NotNeeded => return,
+        EffortRestart::InterruptTurn => {
+            session.redirect_cause = Some(crate::engine::thread_events::CancelCause::EffortRestart);
+            session.cancel_actor = actor.clone();
+            session.interrupt.notify_one();
+        }
+        EffortRestart::KeepQuestion => {
+            // Exited from here on, so an answer that lands while the process
+            // stops takes the no-live-session path, which resumes the session.
+            session.process_exited = true;
+            session.idle_notify.notify_waiters();
+            session.pending_stop = Some(StopReason::EffortRestart);
+            session.stop.notify_one();
+        }
+    }
+    session.effort_resume = Some(crate::engine::types::EffortResume { actor });
+}
+
+/// Record a control request on the session, and send it to the runtime when
+/// the backend takes it live. Returns when the change takes effect, and the
+/// request's reach. A change the backend takes only at spawn waits for
+/// [`restart_for_control_request`].
 pub(crate) fn deliver_control_request(
     session: &mut crate::engine::AgentSession,
     request: crate::runtime::ControlRequest,
-) -> Result<crate::runtime::TakesEffect, &'static str> {
+    parked_on_question: bool,
+) -> Result<(crate::runtime::TakesEffect, crate::runtime::ControlReach), &'static str> {
     let crate::engine::SessionPhase::Running { control_tx } = &session.phase else {
         return Err("The coding agent is still starting. Try again in a moment.");
     };
     let control_tx = control_tx.clone();
     let reach = session.coding_agent.control_reach(&request);
-    let takes_effect = reach.takes_effect(session.is_in_flight());
+    let turn_runs_on = user_turn_in_flight(session)
+        && effort_restart(session, reach, parked_on_question) == EffortRestart::NotNeeded;
     record_control_request(session, &request);
-    if reach != crate::runtime::ControlReach::NextSpawn {
+    if reach != crate::runtime::ControlReach::Spawn {
         control_tx
             .send(request)
             .map_err(|_| "Control channel closed")?;
     }
-    Ok(takes_effect)
+    Ok((reach.takes_effect(turn_runs_on), reach))
+}
+
+/// Restart `session` for a delivered request the backend takes only at spawn.
+/// Call it once the change is persisted, because the replacement reads it.
+pub(crate) fn restart_for_control_request(
+    session: &mut crate::engine::AgentSession,
+    reach: crate::runtime::ControlReach,
+    parked_on_question: bool,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) {
+    let restart = effort_restart(session, reach, parked_on_question);
+    restart_session(session, restart, actor);
 }
 
 /// The thread-less half of `stop_agent`: stop every session in the map that
@@ -240,20 +321,20 @@ impl LucidosEngine {
             .and_then(|s| s.cancel_actor.take())
     }
 
-    /// Read and clear the redirect flag set by `arm_followup_redirect` when a
-    /// follow-up interrupts a mid-turn coding-agent turn. The run_session interrupt arm
-    /// calls this so the interrupted turn's `ResponseCanceled` carries
-    /// `CancelCause::SupersededByFollowup` (neutral render) rather than
-    /// `UserStop`. Drained on read — a resumed session must not carry a stale
-    /// redirect flag into its next turn. The redirect analog of
-    /// `take_session_cancel_actor`.
-    pub(crate) async fn take_session_redirect_followup(&self, thread_id: Uuid) -> bool {
+    /// Read and clear the session's `redirect_cause`. The run_session interrupt
+    /// arm calls this so the interrupted turn's `ResponseCanceled` carries the
+    /// redirect's cause (neutral render) rather than `UserStop`. Drained on
+    /// read, so a resumed session carries no stale cause into its next turn.
+    /// The redirect analog of `take_session_cancel_actor`.
+    pub(crate) async fn take_session_redirect_cause(
+        &self,
+        thread_id: Uuid,
+    ) -> Option<crate::engine::thread_events::CancelCause> {
         self.agent_sessions
             .lock()
             .await
             .get_mut(&thread_id)
-            .map(|s| std::mem::take(&mut s.redirect_followup))
-            .unwrap_or(false)
+            .and_then(|s| s.redirect_cause.take())
     }
 
     /// Interrupt a running Claude Code session — sends control_request:interrupt to stop
@@ -341,6 +422,9 @@ impl LucidosEngine {
 
     /// Apply a control request to a thread's live coding-agent session, through
     /// [`deliver_control_request`]. Returns when the change takes effect.
+    ///
+    /// The restart comes after the settings event, in a second lock hold. A
+    /// replacement spawned before the event lands would run on the old effort.
     pub async fn send_agent_control_request(
         &self,
         thread_id: Uuid,
@@ -351,12 +435,26 @@ impl LucidosEngine {
             &request,
             self.thread_coding_agent(thread_id).await,
         );
-        let takes_effect = {
+        // Read before the lock. A question answered after this read leaves the
+        // stopped session to resume itself (`finalize_direct_agent`).
+        let parked_on_question = match request {
+            crate::runtime::ControlRequest::SetReasoningEffort { .. } => {
+                crate::engine::agent_recovery::thread_parked_on_question(self.pool(), thread_id)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Could not read whether thread {thread_id} waits on a question: {e}"
+                        )
+                    })?
+            }
+            _ => false,
+        };
+        let (takes_effect, reach) = {
             let mut guard = self.agent_sessions.lock().await;
             let session = guard
                 .get_mut(&thread_id)
                 .ok_or("No Claude Code session found for this thread")?;
-            deliver_control_request(session, request)?
+            deliver_control_request(session, request, parked_on_question)?
         };
         if let Some(ev) = event {
             if let Err(e) = self
@@ -366,7 +464,7 @@ impl LucidosEngine {
                     event: ev,
                     meta: crate::engine::thread_events::EventMeta {
                         channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
-                        actor,
+                        actor: actor.clone(),
                         ..crate::engine::thread_events::EventMeta::NONE
                     },
                 })
@@ -378,6 +476,10 @@ impl LucidosEngine {
                     e
                 );
             }
+        }
+        // A session gone by now restarts nothing: its next spawn reads the event.
+        if let Some(session) = self.agent_sessions.lock().await.get_mut(&thread_id) {
+            restart_for_control_request(session, reach, parked_on_question, actor);
         }
         Ok(takes_effect)
     }
@@ -427,6 +529,20 @@ impl LucidosEngine {
             }
         }
         (model, effort)
+    }
+
+    /// The model and effort a coding-agent thread runs on. The model is its
+    /// latest setting, because the agent applies a model pick to the running
+    /// session. The effort is its *effort in force*, never a pick no call ran
+    /// at.
+    pub(crate) async fn cc_thread_runs_on(
+        &self,
+        thread_id: Uuid,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        let (model, _) = self.cc_thread_settings(thread_id).await;
+        let effort =
+            crate::engine::handoff_estimate::thread_effort_in_force(self.pool(), thread_id).await?;
+        Ok((model, effort))
     }
 
     pub async fn cc_categorized_commands(&self, thread_id: Uuid) -> CcCommandsResult {

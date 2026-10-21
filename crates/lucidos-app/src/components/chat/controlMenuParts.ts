@@ -12,8 +12,8 @@ const parts = () => import('./controlMenuPanelParts');
 
 export const ControlFilter = lazyComponent(() => parts().then((m) => m.ControlFilter));
 export const ControlOptionList = lazyComponent(() => parts().then((m) => m.ControlOptionList));
-export const ModelSelectionPicker = lazyComponent(() => parts().then((m) => m.ModelSelectionPicker));
+export const RungPicker = lazyComponent(() => parts().then((m) => m.RungPicker));
 export const FrontendPreviewSection = lazyComponent(() => parts().then((m) => m.FrontendPreviewSection));
 
-export const controlMenuParts = chunkGroup(ControlFilter, ControlOptionList, ModelSelectionPicker, FrontendPreviewSection);
+export const controlMenuParts = chunkGroup(ControlFilter, ControlOptionList, RungPicker, FrontendPreviewSection);
 prefetchWhenIdle(controlMenuParts);

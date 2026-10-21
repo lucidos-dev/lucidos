@@ -16,8 +16,9 @@ impl LucidosEngine {
     /// title model out. None leaves the naming to the model.
     /// `pre_emitted_origin` — Some skips re-emitting MessageReceived (the
     /// caller already emitted it and incremented active_children_count).
-    /// `model` / `reasoning_effort` — chat-mode prefs to inherit; `None` falls
-    /// through to the engine's `LUCIDOS_MODEL` env default.
+    /// `route`: the model, effort and provider the child runs on, already
+    /// resolved by the spawning tool. A `None` field resolves as a fresh chat
+    /// turn's would.
     /// `origin`: who launched this thread, for the route popover. Only used on
     /// the fallback path where the eager emit failed and this call emits the
     /// MessageReceived itself, so it must match what the eager emit would have
@@ -37,8 +38,7 @@ impl LucidosEngine {
         child_thread_id: Uuid,
         pre_emitted_origin: Option<Uuid>,
         caller_title: Option<&str>,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
+        route: crate::core::ResolvedModelSelection,
         origin: Option<MessageOrigin>,
     ) -> Result<(Uuid, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
         // `process_message_with_steps` does the naming, once the child's row
@@ -64,11 +64,11 @@ impl LucidosEngine {
                 if let Err(e) = engine
                     .process_message_with_steps(
                         &prompt_owned,
-                        model.as_deref(),
+                        route.model.as_deref(),
                         None,
                         None,
-                        reasoning_effort.as_deref(),
-                        None, // provider_override
+                        route.reasoning_effort.as_deref(),
+                        route.provider.as_deref(),
                         None,
                         None,
                         None,

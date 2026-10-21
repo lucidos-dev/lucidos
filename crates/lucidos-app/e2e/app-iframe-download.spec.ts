@@ -2,7 +2,7 @@ import { writeFileSync } from 'fs';
 import { resolve } from 'path';
 import { test, expect } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
-import { gotoWithRetry, ensureMobileView, waitForPaneAtRest } from './helpers';
+import { gotoWithRetry } from './helpers';
 
 // Regression for the bug where every app-UI download was silently blocked.
 // AppUiInline.tsx rendered the app iframe with no `allow-downloads`. Chrome
@@ -68,20 +68,9 @@ document.getElementById('blob-download').addEventListener('click', function () {
     }, APP_ID);
   }
 
-  test('same-origin, blob:, and data: downloads all fire from inside the app iframe', async ({ page }, testInfo) => {
-    // WebKit's Playwright driver does not reliably fire a `download` event for
-    // ANY anchor inside a sandboxed iframe, fix or no fix (verified: the
-    // same-origin case times out identically on mobile-webkit either way).
-    // That's a WebKit/Playwright gap, not the Chrome sandbox bug this spec
-    // guards against, so it's out of scope here.
-    testInfo.skip(testInfo.project.name === 'mobile-webkit', 'WebKit does not fire download events from inside a sandboxed iframe');
-
+  test('same-origin, blob:, and data: downloads all fire from inside the app iframe', async ({ page }) => {
     await openAppOnLoad(page);
     await gotoWithRetry(page, '/');
-    // A tap has to land on the app, so the app has to be the pane on screen.
-    // No-op on desktop, where both panes are.
-    await ensureMobileView(page, 'content');
-    await waitForPaneAtRest(page);
 
     const iframeLoc = page.locator('iframe[data-role="app-ui-frame"]:visible');
     await expect(iframeLoc).toBeVisible({ timeout: 10_000 });

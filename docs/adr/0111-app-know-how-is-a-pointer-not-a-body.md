@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-23
+- **Amended by**: [0534: An intent runs in the thread that asks for it](0534-intents-run-in-the-asking-thread.md)
 
 ## Context
 
@@ -76,6 +77,8 @@ round trip is now paid by the turns that need it, rather than by all of them.
 bodies to the isolated intent sub-loop's prompt. That is a sub-loop the user
 explicitly asked for, not every round of every chat turn, so the economics
 differ. The double-billing there is known and deliberately left alone.
+*Superseded by ADR 0534: the sub-loop is gone, and `load_knowhow` on an app
+intent appends the app's bodies in the asking turn.*
 
 **A local file still overrides an app doc.** `load_with_fallback` tries
 `data/knowhow/` before the app-scoped path, so a workspace file at

@@ -572,6 +572,10 @@ pub(super) async fn upload_archive(
 pub(super) struct ConfirmInstallResponse {
     pub summary: String,
     pub installed_files: Vec<String>,
+    /// Files the previous version shipped and this one dropped, which the
+    /// update deleted. Absent when it deleted none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_files: Vec<String>,
     /// Set when the installed plugin shipped `setup` instructions: the id of
     /// the Lucidos Agent thread spawned to walk the user through them. The
     /// frontend navigates the user to this thread after a successful install.
@@ -591,6 +595,7 @@ pub(super) struct LocalChangesResponse {
     pub conflicted: Vec<String>,
     pub replaced: Vec<String>,
     pub restored: Vec<String>,
+    pub removed: Vec<String>,
     pub saved_paths: Vec<String>,
 }
 
@@ -601,6 +606,7 @@ impl From<LocalChangeReport> for LocalChangesResponse {
             conflicted: r.conflicted,
             replaced: r.replaced,
             restored: r.restored,
+            removed: r.removed,
             saved_paths: r.saved_paths,
         }
     }
@@ -696,6 +702,7 @@ pub(super) async fn confirm_install(
         Ok(outcome) => Ok(Json(ConfirmInstallResponse {
             summary: outcome.summary,
             installed_files: outcome.installed_files,
+            removed_files: outcome.removed_files,
             setup_thread_id: outcome.setup_thread_id,
             local_changes: outcome.local_changes.map(Into::into),
         })),

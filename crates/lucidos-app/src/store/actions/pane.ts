@@ -4,17 +4,22 @@ import {
   MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, type MobileView,
   focusedPane, type FocusedPane,
   activeMenuItem, panelOverlay, settingsSubview,
-  drawerGrouping, setDrawerGrouping,
+  drawerGrouping, setDrawerGrouping, showToast,
 } from '../store';
+import { setDashboardRailShown } from '../dashboardRail';
 import { contentViewKey } from '../../components/layout/contentViewKey';
 import { minDrawerWidth, minThreadPanePx, minContentPanePx, splitBounds } from '../paneMinimums';
 import { forceCloseDrawer } from '../../components/layout/drawerState';
 import {
   setSplitRatio, DEFAULT_SPLIT_RATIO,
   computeStepRatio, computeDrawerStepWidth,
-  toggleThreadPaneRatio, toggleContentPaneRatio,
+  contentShownRatio, toggleThreadPaneRatio, toggleContentPaneRatio,
   KEYBOARD_RESIZE_STEP_PX,
 } from '../../components/layout/splitHelpers';
+import {
+  drawnDrawerShown, drawnDrawerWidth, drawnRailShown, drawnSplitRatio, dashboardRailCanShow, dashboardRailFitsBesideDrawer, splitFitsBoth,
+  threadListCanShow,
+} from '../../components/layout/drawnLayout';
 import { isMobile } from '../../utils/viewport';
 import { focusPaneMainControl, paneHolding, reconcilePaneFocus } from '../../components/layout/paneFocus';
 import { isTextInput } from '../../utils/dom';
@@ -82,7 +87,8 @@ export function navigateToPane(view: MobileView) {
  *  focus. Always call this after setting `panelOverlay.value` so a click on a content
  *  link is never silently absorbed when the pane is closed. The one exception
  *  to the marker move is an agent navigation while the reader types
- *  (`holdFocusedPaneWhileTyping`). */
+ *  (`holdFocusedPaneWhileTyping`). That one also leaves a yielded Canvas
+ *  collapsed. */
 export function revealContentPane() {
   if (isMobile()) {
     // `navigateToPane` stamps the mark for this one. Mobile reveals ARE pane
@@ -102,8 +108,12 @@ export function revealContentPane() {
     performance.now(),
     contentViewKey(activeMenuItem.value, panelOverlay.value, settingsSubview.value),
   );
-  if (!takeTypingHold()) focusedPane.value = 'content';
-  if (splitRatio.value >= 1) setSplitRatio(DEFAULT_SPLIT_RATIO);
+  const typing = takeTypingHold();
+  if (!typing) focusedPane.value = 'content';
+  // A held reveal never swaps the panes, which would hide the field being edited.
+  if (drawnSplitRatio.value >= 1 && (!typing || splitFitsBoth())) {
+    setSplitRatio(contentShownRatio(splitFitsBoth()));
+  }
   reconcilePaneFocus('content');
 }
 
@@ -172,7 +182,7 @@ export function revealThreadPane(): void {
   // take it: the mark would sit until some later content navigation read the
   // idle gap as its own span. `thread-render` already measures this edge, and
   // its `warm` flag is what marks thread-to-thread back and forth.
-  const wasCollapsed = splitRatio.value <= 0;
+  const wasCollapsed = drawnSplitRatio.value <= 0;
   if (wasCollapsed) setSplitRatio(DEFAULT_SPLIT_RATIO);
   if (wasCollapsed || focusedPane.value === 'content') {
     focusedPane.value = 'thread';
@@ -196,17 +206,33 @@ export function focusPane(pane: FocusedPane): void {
   reconcilePaneFocus(pane);
 }
 
+/** Why a side pane's toggle is disabled, and what a shortcut that cannot show
+ *  it says. The window cannot hold the pane beside the Conversation's floor
+ *  even with every other side pane yielded. */
+export const THREAD_LIST_TOO_NARROW = 'The window is too narrow for the thread list';
+export const DASHBOARD_TOO_NARROW = 'The window is too narrow for the dashboard';
+
+/** Hide the thread drawer for real, and keep the focused pane off a hidden one:
+ *  a hidden pane must never stay the focused pane or the marker strands on an
+ *  invisible region. `reconcilePaneFocus` moves DOM keyboard focus (which was in
+ *  the now-hidden drawer) into the thread pane so the two stay in sync. */
+function closeThreadDrawer(): void {
+  threadDrawerOpen.value = false;
+  if (focusedPane.value === 'drawer') {
+    focusedPane.value = 'thread';
+    reconcilePaneFocus('thread');
+  }
+}
+
 /** Show or hide the thread list (drawer). A plain visibility toggle — unlike the
  *  pane toggles below it does NOT move pane focus: opening the drawer reveals it
  *  without stealing keyboard focus, so the icon is purely show/hide.
  *
  *  - **Mobile**: navigates to the threads pane (pane 0) so dots, header, and
  *    pane content all update atomically via the `mobileView` signal.
- *  - **Desktop**: flips `threadDrawerOpen`. When hiding a drawer that currently
- *    holds focus, the focused pane falls back to the thread pane — a hidden pane
- *    must never stay the focused pane or the marker strands on an invisible
- *    region — and `reconcilePaneFocus` moves DOM keyboard focus (which
- *    was in the now-hidden drawer) into the thread pane so the two stay in sync.
+ *  - **Desktop**: reads what is DRAWN. A drawn drawer closes (`closeThreadDrawer`).
+ *    Anything else shows (`showThreadList`), which a window too narrow for the
+ *    drawer cannot do, so the toggle is disabled there.
  *
  *  This is the ONLY correct way for UI elements to show/hide the thread list.
  *  Never toggle `threadDrawerOpen` directly on mobile — it bypasses mobileView
@@ -216,23 +242,19 @@ export function toggleThreads() {
     navigateToPane('threads');
     return;
   }
-  threadDrawerOpen.value = !threadDrawerOpen.value;
-  if (!threadDrawerOpen.value && focusedPane.value === 'drawer') {
-    focusedPane.value = 'thread';
-    reconcilePaneFocus('thread');
-  }
+  if (drawnDrawerShown.value) closeThreadDrawer();
+  else showThreadList();
 }
 
 export type DrawerShortcutAction = 'open-focus' | 'focus' | 'close';
 
-/** Pure decision for the focus-aware drawer shortcut (⌘⇧1). Visibility means the
- *  drawer is open AND the Conversation side isn't collapsed (`splitRatio > 0`).
+/** Pure decision for the focus-aware drawer shortcut (⌘⇧1). `visible` is what
+ *  the layout draws, which a yield and a collapsed Conversation both clear.
  *  Hidden → open + focus; visible but unfocused → focus; visible + focused →
  *  close. Mirrors the three-stage toggleThreadPane/toggleContentPane shape. */
 export function computeDrawerShortcutAction(
-  open: boolean, splitR: number, drawerFocused: boolean,
+  visible: boolean, drawerFocused: boolean,
 ): DrawerShortcutAction {
-  const visible = open && splitR > 0;
   if (!visible) return 'open-focus';
   if (!drawerFocused) return 'focus';
   return 'close';
@@ -246,34 +268,62 @@ export function computeDrawerShortcutAction(
  *  Desktop-only; on mobile it navigates to the threads pane. */
 export function focusOrToggleThreadDrawer(): boolean {
   if (isMobile()) { navigateToPane('threads'); return false; }
-  const action = computeDrawerShortcutAction(
-    threadDrawerOpen.value, splitRatio.value, focusedPane.value === 'drawer',
-  );
+  const action = computeDrawerShortcutAction(drawnDrawerShown.value, focusedPane.value === 'drawer');
   if (action === 'close') {
     // The drawer is open + focused here, so toggleThreads closes it and drops
     // focus back to the thread pane — the single source of that close behavior.
     toggleThreads();
     return false;
   }
-  if (action === 'open-focus') showThreadList();
+  if (action === 'open-focus' && !showThreadList()) return false;
   focusPaneAndControl('drawer');
   return true;
 }
 
-/** Make the thread list visible without moving focus. Mobile navigates to the
- *  threads pane. Desktop opens the drawer and re-expands a collapsed
- *  Conversation side, which would otherwise keep the open drawer hidden. */
-export function showThreadList(): void {
-  if (isMobile()) { navigateToPane('threads'); return; }
-  threadDrawerOpen.value = true;
-  if (splitRatio.value <= 0) setSplitRatio(DEFAULT_SPLIT_RATIO);
+/** Whether the window can show the thread list, saying so when it cannot. */
+function threadListHasRoom(): boolean {
+  if (threadListCanShow()) return true;
+  showToast(THREAD_LIST_TOO_NARROW, 'info');
+  return false;
 }
 
-/** Whether the thread list is on screen: the threads pane on mobile, and an
- *  open drawer on an expanded Conversation side on desktop. */
+/** Make the thread list visible without moving focus. Mobile navigates to the
+ *  threads pane. Desktop opens the drawer and re-expands a collapsed
+ *  Conversation side, which would otherwise keep the open drawer hidden. The
+ *  rail yields to it, drawn-only. A window too narrow for the drawer says so,
+ *  and returns false. */
+export function showThreadList(): boolean {
+  if (isMobile()) { navigateToPane('threads'); return true; }
+  if (!threadListHasRoom()) return false;
+  threadDrawerOpen.value = true;
+  if (drawnSplitRatio.value <= 0) setSplitRatio(DEFAULT_SPLIT_RATIO);
+  return true;
+}
+
+/** Whether the thread list is on screen: the threads pane on mobile, and the
+ *  drawer as the layout draws it on desktop. */
 export function threadListShown(): boolean {
   if (isMobile()) return mobileView.value === 'threads';
-  return threadDrawerOpen.value && splitRatio.value > 0;
+  return drawnDrawerShown.value;
+}
+
+/** Show the dashboard's rail. The drawer outranks the rail, so a rail that
+ *  does not fit beside the drawn drawer closes the drawer for real, as the one
+ *  swap. A window too narrow for the rail even alone says so. */
+export function showDashboardRail(): void {
+  if (!dashboardRailCanShow()) {
+    showToast(DASHBOARD_TOO_NARROW, 'info');
+    return;
+  }
+  if (!dashboardRailFitsBesideDrawer()) closeThreadDrawer();
+  setDashboardRailShown(true);
+}
+
+/** The rail's toggle reads what is DRAWN: a drawn rail hides, and anything else
+ *  shows, which a window too narrow for the rail cannot do. */
+export function toggleDashboardRail(): void {
+  if (drawnRailShown.value) setDashboardRailShown(false);
+  else showDashboardRail();
 }
 
 /** The filter shortcut. A hidden thread list comes back with its filters up,
@@ -283,12 +333,13 @@ export function threadListShown(): boolean {
  *  thread search away, as the reverse does. */
 export function toggleThreadFilter(): void {
   if (drawerGrouping.value === 'ongoing') {
+    if (!threadListHasRoom()) return;
     setDrawerGrouping('folders');
     showThreadList();
     openThreadFilterPanel();
   } else if (threadListShown()) toggleThreadFilterPanel();
   else {
-    showThreadList();
+    if (!showThreadList()) return;
     openThreadFilterPanel();
   }
   if (threadFilterPanelOpen.value) closeThreadSearch();
@@ -298,7 +349,7 @@ export function toggleThreadFilter(): void {
 /** The thread search shortcut: show the thread list, open its search bar and
  *  put the caret in it once the bar has rendered. */
 export function startThreadSearch(): void {
-  showThreadList();
+  if (!showThreadList()) return;
   openThreadSearch();
   if (!isMobile()) focusedPane.value = 'drawer';
   requestAnimationFrame(() => focusThreadSearchInput());
@@ -309,9 +360,9 @@ export function startThreadSearch(): void {
  *  leaves a pane that collapses, as `toggleThreadPane` does. A collapsed pane
  *  is `visibility: hidden`, so a marker left on it turns every Tab dead. */
 export function toggleSplitFromDivider(): void {
-  const ratio = splitRatio.value;
+  const ratio = drawnSplitRatio.value;
   if (ratio === 0 || ratio >= 1) {
-    setSplitRatio(DEFAULT_SPLIT_RATIO);
+    setSplitRatio(ratio === 0 ? DEFAULT_SPLIT_RATIO : contentShownRatio(splitFitsBoth()));
     return;
   }
   setSplitRatio(0);
@@ -330,13 +381,14 @@ export function toggleThreadPane(): void {
     navigateToPane('thread');
     return;
   }
-  if (splitRatio.value === 0) {
-    setSplitRatio(toggleThreadPaneRatio(splitRatio.value)); // expand
+  const ratio = drawnSplitRatio.value;
+  if (ratio === 0) {
+    setSplitRatio(toggleThreadPaneRatio(ratio)); // expand
     focusPaneAndControl('thread');
   } else if (focusedPane.value !== 'thread') {
     focusPaneAndControl('thread');
   } else {
-    setSplitRatio(toggleThreadPaneRatio(splitRatio.value)); // collapse
+    setSplitRatio(toggleThreadPaneRatio(ratio)); // collapse
     focusPaneAndControl('content');
   }
 }
@@ -350,13 +402,14 @@ export function toggleContentPane(): void {
     navigateToPane('content');
     return;
   }
-  if (splitRatio.value >= 1) {
-    setSplitRatio(toggleContentPaneRatio(splitRatio.value)); // expand
+  const ratio = drawnSplitRatio.value;
+  if (ratio >= 1) {
+    setSplitRatio(toggleContentPaneRatio(ratio, splitFitsBoth())); // expand
     focusPaneAndControl('content');
   } else if (focusedPane.value !== 'content') {
     focusPaneAndControl('content');
   } else {
-    setSplitRatio(toggleContentPaneRatio(splitRatio.value)); // collapse
+    setSplitRatio(toggleContentPaneRatio(ratio, splitFitsBoth())); // collapse
     focusPaneAndControl('thread');
   }
 }
@@ -367,15 +420,18 @@ export function toggleContentPane(): void {
  *  fills via 0. When already maximized for the focused group, restore the
  *  remembered pre-maximize ratio (or the default if none was remembered, e.g.
  *  after a reload). Returns the next ratio and the ratio to remember next (null
- *  once restored). Pure — exported for unit testing. */
+ *  once restored). Pure — exported for unit testing.
+ *
+ *  `drawn` decides what is on screen, `stored` is what a restore returns to. A
+ *  Conversation drawn full only because the Canvas yielded is already
+ *  maximized, and there is no split to restore: null, a no-op. */
 export function computeMaximizeRatio(
-  pane: FocusedPane, currentRatio: number, prevRatio: number | null,
-): { next: number; newPrev: number | null } {
+  pane: FocusedPane, drawn: number, stored: number, prevRatio: number | null,
+): { next: number; newPrev: number | null } | null {
   const target = pane === 'content' ? 0 : 1;
-  if (currentRatio === target) {
-    return { next: prevRatio ?? DEFAULT_SPLIT_RATIO, newPrev: null };
-  }
-  return { next: target, newPrev: currentRatio };
+  if (drawn !== target) return { next: target, newPrev: stored };
+  if (stored !== target) return null;
+  return { next: prevRatio ?? DEFAULT_SPLIT_RATIO, newPrev: null };
 }
 
 /** Remembers the pre-maximize split ratio so the second ⌘⇧↵ restores it.
@@ -388,11 +444,12 @@ let prevMaximizeRatio: number | null = null;
  *  where panes are navigated, not focused. */
 export function toggleMaximizeFocusedPaneGroup(): void {
   if (isMobile()) return;
-  const { next, newPrev } = computeMaximizeRatio(
-    focusedPane.value, splitRatio.value, prevMaximizeRatio,
+  const step = computeMaximizeRatio(
+    focusedPane.value, drawnSplitRatio.value, splitRatio.value, prevMaximizeRatio,
   );
-  prevMaximizeRatio = newPrev;
-  setSplitRatio(next);
+  if (!step) return;
+  prevMaximizeRatio = step.newPrev;
+  setSplitRatio(step.next);
 }
 
 /** Keyboard resize: move the split divider by one KEYBOARD_RESIZE_STEP_PX step.
@@ -403,7 +460,7 @@ export function stepThreadPaneWidth(direction: 1 | -1): void {
   if (isMobile()) return;
   const layout = document.querySelector('.split-layout') as HTMLElement | null;
   const next = computeStepRatio(
-    splitRatio.value,
+    drawnSplitRatio.value,
     layout?.offsetWidth ?? 0,
     direction * KEYBOARD_RESIZE_STEP_PX,
     splitBounds(),
@@ -413,14 +470,16 @@ export function stepThreadPaneWidth(direction: 1 | -1): void {
 
 /** Keyboard resize for the thread drawer: ±KEYBOARD_RESIZE_STEP_PX, clamped to
  *  [minDrawerWidth(), row width minus the visible split panes' minimums].
- *  No-op while the drawer is hidden (closed, or thread pane collapsed). */
+ *  Steps from the width drawn, which a smaller window holds below the stored one.
+ *  No-op while the drawer is hidden (closed, yielded, or thread pane collapsed). */
 export function stepThreadDrawerWidth(direction: 1 | -1): void {
   if (isMobile()) return;
-  if (!threadDrawerOpen.value || splitRatio.value <= 0) return;
+  const ratio = drawnSplitRatio.value;
+  if (!drawnDrawerShown.value) return;
   const row = document.querySelector('.content-row') as HTMLElement | null;
-  const reserved = minThreadPanePx() + (splitRatio.value >= 1 ? 0 : minContentPanePx());
+  const reserved = minThreadPanePx() + (ratio >= 1 ? 0 : minContentPanePx());
   const next = computeDrawerStepWidth(
-    threadDrawerWidth.value,
+    drawnDrawerWidth.value,
     direction * KEYBOARD_RESIZE_STEP_PX,
     minDrawerWidth(),
     (row?.offsetWidth ?? 0) - reserved,

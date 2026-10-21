@@ -1403,7 +1403,7 @@ describe('renderMarkdown images', () => {
  * laid out narrower than its longest word) is a LAYOUT property with no
  * observable in this suite, since vitest runs against the stub `document` in
  * test-setup.ts with no layout engine. It lives in
- * e2e/markdown-table-columns.spec.ts instead.
+ * e2e/markdown-table-columns-all.spec.ts instead.
  */
 describe('renderMarkdown tables', () => {
   const mdRow = (cells: string[]) => `| ${cells.join(' | ')} |`;

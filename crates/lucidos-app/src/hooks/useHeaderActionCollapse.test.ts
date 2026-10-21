@@ -296,7 +296,7 @@ describe('measuredCollapseInput', () => {
     expect(computeHeaderCollapse(measuredCollapseInput({ ...row, trailingPadding: 0 })).collapsed).toBe(0);
   });
 
-  it('folds sooner while the docked Home rail toggle holds the trailing padding', () => {
+  it('folds sooner while the docked dashboard rail toggle holds the trailing padding', () => {
     const docked = measuredCollapseInput({ ...row, trailingPadding: ICON + GAP });
     // The centred box still sits on the whole row, so only the actions give way.
     expect(docked.leadingWidth).toBe((570 - 320) / 2);

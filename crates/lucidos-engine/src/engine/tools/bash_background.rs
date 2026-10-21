@@ -109,6 +109,9 @@ pub struct TaskSpec<'a> {
     /// The agent's name for the work, shown on the wait.
     pub description: Option<&'a str>,
     pub delivery: CompletionDelivery,
+    /// The chat agent's tasks strip the engine's inherited secrets. A coding
+    /// agent's keep them, as its own shell does.
+    pub inherited: crate::core::InheritedSecrets<'a>,
 }
 
 #[derive(Clone)]
@@ -213,7 +216,7 @@ struct BackgroundTask {
     /// the task by this, and by its command only in its absence.
     description: Option<String>,
     /// The secret VALUES this task's environment carries, from
-    /// [`crate::core::injected_secret_values`]. Both exits redact against it.
+    /// [`crate::core::subprocess_secret_values`]. Both exits redact against it.
     /// So a child that echoes its own environment cannot put a credential in
     /// the model's context or in the persisted `BackgroundBashCompleted`.
     ///
@@ -510,6 +513,7 @@ impl BackgroundBashRegistry {
             timeout_secs,
             description,
             delivery: CompletionDelivery::EventWait,
+            inherited: crate::core::InheritedSecrets::Keep,
         };
         self.spawn_task(command, cwd, env, thread_id, spec).await
     }
@@ -546,6 +550,7 @@ impl BackgroundBashRegistry {
             timeout_secs,
             description,
             delivery,
+            inherited,
         } = spec;
         let task_id = Uuid::new_v4().to_string();
 
@@ -558,7 +563,7 @@ impl BackgroundBashRegistry {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        crate::core::apply_to_subprocess_env(&mut cmd, env);
+        crate::core::apply_to_subprocess_env(&mut cmd, env, inherited);
 
         let mut child = crate::runtime::spawn_env::spawn_below_engine(&mut cmd)?;
         // Read now: `id()` goes `None` once the child is reaped, and the group
@@ -578,7 +583,8 @@ impl BackgroundBashRegistry {
         // Read off the env we just injected, for the same reason and at the
         // same moment. The child can echo any of these, and its output becomes
         // both a tool result and a persisted event.
-        let secrets = crate::core::injected_secret_values(env);
+        let secrets =
+            crate::core::subprocess_secret_values(env, crate::core::inherited_secret_env());
 
         {
             let mut tasks = self.locked().await;
@@ -1009,9 +1015,9 @@ impl BackgroundBashRegistry {
         // is permanent. Redact over the whole retained buffer, so no drain
         // boundary can split a token here. `Stream::push` can still have
         // trimmed the front mid-token on a chatty task, which no call site can
-        // undo. `core::injected_secret_values` records both gaps.
-        let stdout = crate::core::redact_secret_values(&stdout, &task.secrets);
-        let stderr = crate::core::redact_secret_values(&stderr, &task.secrets);
+        // undo. `core::subprocess_secret_values` records both gaps.
+        let stdout = crate::core::redact_subprocess_output(&stdout, &task.secrets);
+        let stderr = crate::core::redact_subprocess_output(&stderr, &task.secrets);
         Some(CompletionRecord {
             started_at: task.started_at,
             finished_at,
@@ -1248,10 +1254,10 @@ fn drain_snapshot(task: &mut BackgroundTask) -> OutputSnapshot {
     // This window is a tool result the agent reads, so redact it the way the
     // synchronous `run_bash` result is. A drain carries only the bytes
     // buffered since the last cursor, so a token straddling two windows stops
-    // matching and its tail survives. `core::injected_secret_values` records
+    // matching and its tail survives. `core::subprocess_secret_values` records
     // that gap and the trim gap beside it.
-    let stdout = crate::core::redact_secret_values(&stdout, &task.secrets);
-    let stderr = crate::core::redact_secret_values(&stderr, &task.secrets);
+    let stdout = crate::core::redact_subprocess_output(&stdout, &task.secrets);
+    let stderr = crate::core::redact_subprocess_output(&stderr, &task.secrets);
     // Measure to `finished_at` once the task is done so a late drain reports
     // the task's runtime, not "how long ago it was spawned".
     let until = task.finished_at.unwrap_or_else(Utc::now);
@@ -1307,6 +1313,23 @@ async fn drain_pipe<R: AsyncRead + Unpin + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both exits, the drain window and the completion record, leave through
+    /// the one mask. Sibling of the scans in `bash.rs` and `python.rs`.
+    #[test]
+    fn both_background_exits_leave_through_the_secret_redaction() {
+        let src = crate::test_support::source_scan::read_production_source(
+            &crate::test_support::source_scan::src_root().join("engine/tools/bash_background.rs"),
+        );
+        assert!(src.contains("subprocess_secret_values(env,"));
+        assert_eq!(
+            src.matches("crate::core::redact_subprocess_output(")
+                .count(),
+            4,
+            "stdout and stderr, at the drain and at the completion record"
+        );
+        assert!(!src.contains("redact_secret_values("));
+    }
 
     #[tokio::test]
     async fn spawn_returns_task_id_and_output_is_drainable() {
@@ -2944,6 +2967,7 @@ mod tests {
             timeout_secs: 60,
             description: None,
             delivery,
+            inherited: crate::core::InheritedSecrets::Keep,
         };
         let (polled, _rx1) = reg
             .spawn_task(

@@ -1,9 +1,14 @@
-//! Three-way merge of a plugin update against the user's local edits.
+//! What a plugin update does to the files on disk: a three-way merge against
+//! the user's local edits, and the removal of files the new version dropped.
 //!
 //! An update overwrites every file the plugin ships. When the user has edited
 //! one of those files, the three inputs a merge needs are all in hand at
 //! staging time: **base** is the file at the install commit, **ours** is what
 //! is on disk now, and **theirs** is the staged new version.
+//!
+//! A file the previous version recorded, and the new one no longer ships, is
+//! removed. A moved file then leaves no stale copy behind. An edited one is
+//! saved aside first.
 //!
 //! What counts as "modified" is not decided here. This consumes
 //! [`registry::modification_status_for`], the same function behind the Plugins
@@ -27,10 +32,10 @@ use super::registry::{modification_status_for, PluginBaseline};
 /// the merge.
 const MAX_MERGE_BYTES: usize = 1024 * 1024;
 
-/// What the confirm will do with one shipped path the user has locally edited.
-/// A path the user has NOT edited never becomes a [`LocalChange`] at all, and
-/// neither does one whose copy already equals the staged version. Both are
-/// overwritten exactly as they always were.
+/// What the confirm will do with one path the user has locally edited. A path
+/// the user has NOT edited never becomes a [`LocalChange`] at all, and neither
+/// does one whose copy already equals the staged version. Both are overwritten,
+/// or removed, exactly as an unedited file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalChangeOutcome {
     /// Upstream's edits and the user's combined cleanly. The merged content
@@ -48,6 +53,9 @@ pub(crate) enum LocalChangeOutcome {
     /// back. Its own outcome rather than a `Replaced`, because there is no
     /// content to save aside and saying otherwise would be a false promise.
     Restored,
+    /// The new version no longer ships the file. It is removed, so a stale
+    /// copy cannot keep loading, and the user's version is saved aside first.
+    Removed,
 }
 
 impl LocalChangeOutcome {
@@ -58,6 +66,7 @@ impl LocalChangeOutcome {
             Self::Conflict => "conflict",
             Self::Replaced => "replaced",
             Self::Restored => "restored",
+            Self::Removed => "removed",
         }
     }
 
@@ -65,11 +74,11 @@ impl LocalChangeOutcome {
     /// `Merged` keeps the edit in the file, and `Restored` has no content to
     /// keep: the user deleted it.
     fn discards_local_work(self) -> bool {
-        matches!(self, Self::Conflict | Self::Replaced)
+        matches!(self, Self::Conflict | Self::Replaced | Self::Removed)
     }
 }
 
-/// One shipped path the user edited, and what the update will do with it.
+/// One path the user edited, and what the update will do with it.
 ///
 /// A plan sits in the pending-install map for up to an hour, so it holds file
 /// content only where it must. The merged bytes and the patch are needed at
@@ -94,11 +103,11 @@ pub(crate) struct LocalChange {
     ours_oid: Option<git2::Oid>,
 }
 
-/// Every locally-edited path an update would overwrite. Empty for a fresh
-/// install, for a plugin nobody has touched, and for a legacy record with no
-/// baseline commit to diff against.
+/// Every locally-edited path an update would overwrite or remove, and every
+/// unedited path it would remove. Empty for a fresh install, and for an update
+/// that drops nothing over a plugin nobody has touched.
 #[derive(Default)]
-pub(crate) struct MergePlan {
+pub(crate) struct UpdatePlan {
     pub(crate) changes: Vec<LocalChange>,
     /// Edited paths whose copy already equalled the staged version, with the
     /// hash that made them equal. No decision, so the panel never lists them
@@ -106,9 +115,30 @@ pub(crate) struct MergePlan {
     /// edits these files, and one edited inside the staging window is real
     /// work the confirm would otherwise overwrite unseen.
     unchanged: Vec<(String, git2::Oid)>,
+    /// Unedited paths the new version dropped, with the hash they had at
+    /// staging. Removed with no copy, since the install commit holds them.
+    removals: Vec<(String, git2::Oid)>,
 }
 
-impl MergePlan {
+impl UpdatePlan {
+    /// Every path the confirm will delete, edited or not: the staged preview's
+    /// `removes`, and the writer's list.
+    pub(crate) fn removes(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .removals
+            .iter()
+            .map(|(path, _)| path.clone())
+            .chain(
+                self.changes
+                    .iter()
+                    .filter(|c| c.outcome == LocalChangeOutcome::Removed)
+                    .map(|c| c.data_relative.clone()),
+            )
+            .collect();
+        paths.sort();
+        paths
+    }
+
     /// The `local_changes` block of the staged preview: what the panel lists
     /// before the user confirms.
     pub(crate) fn preview_json(&self) -> serde_json::Value {
@@ -130,14 +160,20 @@ impl MergePlan {
     /// The confirm then refuses, rather than writing a merge computed against
     /// content that is gone. Returns the first drifted path.
     ///
-    /// Over every edited path, listed or not. A path dropped for already
-    /// matching upstream is silent in the panel, never in here.
+    /// Over every edited path, listed or not, and every path it would remove.
+    /// A path dropped for already matching upstream is silent in the panel,
+    /// never in here. Nothing is deleted on a judgment the user did not see.
     pub(crate) fn detect_drift(&self, workspace_path: &Path) -> Option<String> {
         let data_dir = workspace_path.join(DATA_DIR);
         self.changes
             .iter()
             .map(|c| (&c.data_relative, c.ours_oid))
-            .chain(self.unchanged.iter().map(|(path, oid)| (path, Some(*oid))))
+            .chain(
+                self.unchanged
+                    .iter()
+                    .chain(&self.removals)
+                    .map(|(path, oid)| (path, Some(*oid))),
+            )
             .find_map(|(path, staged)| {
                 (hash_on_disk(&data_dir.join(path)) != staged).then(|| path.clone())
             })
@@ -151,11 +187,15 @@ impl MergePlan {
             .iter()
             .map(|c| ResolvedChange {
                 change: c,
-                // A restore is untouched by the keep control: the user
-                // deleted the file, so there is no edit to keep or drop.
+                // The keep control cannot touch a restore or a removal. A
+                // restore has no edit to keep, and keeping a dropped file in
+                // place is the stale copy the removal exists to prevent.
                 outcome: match (keep_local_changes, c.outcome) {
                     (true, outcome) => outcome,
-                    (false, LocalChangeOutcome::Restored) => LocalChangeOutcome::Restored,
+                    (
+                        false,
+                        outcome @ (LocalChangeOutcome::Restored | LocalChangeOutcome::Removed),
+                    ) => outcome,
                     (false, _) => LocalChangeOutcome::Replaced,
                 },
             })
@@ -204,9 +244,9 @@ pub(crate) const SAVED_CHANGES_ROOT: &str = "artifacts/plugin-local-changes";
 /// the version it was written on. Returns the `data/`-relative paths written,
 /// for the caller to commit and announce.
 ///
-/// A conflict, an unmergeable file and a switched-off keep control all land
-/// here. A clean merge does not: the edit survives in the file itself, so a
-/// copy would be clutter.
+/// A conflict, an unmergeable file, a switched-off keep control and an edited
+/// file the new version dropped all land here. A clean merge does not: the edit
+/// survives in the file itself, so a copy would be clutter.
 pub(crate) fn save_discarded(
     workspace_path: &Path,
     plugin_id: &str,
@@ -278,7 +318,8 @@ fn saved_changes_readme(plugin_id: &str, version: &str, dir: &str) -> String {
         "# Local changes to {plugin_id}, kept from the update to v{version}\n\
          \n\
          Updating the {plugin_id} plugin could not keep these edits, so Lucidos \
-         saved them here instead of losing them.\n\
+         saved them here instead of losing them. A file the new version no \
+         longer ships was removed from where it lived, and its copy is here.\n\
          \n\
          Each file appears twice. One copy is your version exactly as it stood. \
          The matching `.patch` is the same edit as a diff against the version \
@@ -315,11 +356,7 @@ pub(crate) fn local_patch(workspace_path: &Path, baseline: &PluginBaseline) -> O
         return None;
     }
     let repo = git2::Repository::open(workspace_path).ok()?;
-    let tree = repo
-        .revparse_single(&baseline.commit)
-        .and_then(|obj| obj.peel_to_commit())
-        .and_then(|c| c.tree())
-        .ok()?;
+    let tree = install_tree(&repo, &baseline.commit)?;
     let data_dir = workspace_path.join(DATA_DIR);
 
     let mut out = String::new();
@@ -335,11 +372,7 @@ pub(crate) fn local_patch(workspace_path: &Path, baseline: &PluginBaseline) -> O
         if !is_mergeable_text(&ours) {
             continue;
         }
-        let base = tree
-            .get_path(Path::new(&format!("data/{}", rel)))
-            .ok()
-            .and_then(|entry| repo.find_blob(entry.id()).ok())
-            .map(|blob| blob.content().to_vec());
+        let base = blob_at(&repo, &tree, rel);
         if base.as_deref().is_some_and(|b| !is_mergeable_text(b)) {
             continue;
         }
@@ -350,46 +383,74 @@ pub(crate) fn local_patch(workspace_path: &Path, baseline: &PluginBaseline) -> O
     (!out.is_empty()).then_some(out)
 }
 
+/// The version on disk, opened for reading: its install commit's tree, and the
+/// paths the user has changed since.
+struct OpenedBaseline<'r> {
+    repo: &'r git2::Repository,
+    tree: git2::Tree<'r>,
+    modified: BTreeSet<String>,
+}
+
+/// Plan what an update does to the files on disk. `recorded` is every path the
+/// version on disk recorded, and `baseline` its install commit, `None` for a
+/// legacy record. `planned` is what the staged version ships.
+/// `recorded_by_others` holds paths other installed plugins record.
+///
+/// Best-effort for the shipped paths: an unopenable repo, an unresolvable
+/// commit or an unreadable file plan no merge, so those files are replaced. A
+/// merge improves on overwriting. It is never a reason to fail an install.
+///
+/// The dropped paths fail the other way. One counts as unedited only when the
+/// install commit holds its exact bytes. Any other is saved aside first.
+pub(crate) fn plan_update(
+    workspace_path: &Path,
+    recorded: &[String],
+    baseline: Option<&PluginBaseline>,
+    planned: &[PlannedFile],
+    recorded_by_others: &BTreeSet<&str>,
+) -> UpdatePlan {
+    let repo = git2::Repository::open(workspace_path).ok();
+    let opened = baseline.zip(repo.as_ref()).and_then(|(baseline, repo)| {
+        let tree = install_tree(repo, &baseline.commit)?;
+        let status = modification_status_for(workspace_path, &baseline.commit, &baseline.files);
+        Some(OpenedBaseline {
+            repo,
+            tree,
+            modified: status.modified_paths.into_iter().collect(),
+        })
+    });
+
+    let mut plan = UpdatePlan::default();
+    if let Some(opened) = &opened {
+        plan_shipped(workspace_path, opened, planned, &mut plan);
+    }
+    plan_dropped(
+        workspace_path,
+        opened.as_ref(),
+        recorded,
+        planned,
+        recorded_by_others,
+        &mut plan,
+    );
+    plan
+}
+
 /// Classify every path the update would overwrite, merging the ones the user
-/// has edited. `baseline` is the version they are on; `planned` is what the
-/// staged version ships.
+/// has edited.
 ///
 /// Two questions per path, not one. "Did this change since the install
 /// commit?" makes it a candidate; "is ours already theirs?" drops it again. A
 /// user who published their own edit upstream meets the second on every file
 /// they sent.
-///
-/// Best-effort by construction: an unopenable repo, an unresolvable commit or
-/// an unreadable file all yield an empty plan, which is exactly today's
-/// behaviour (replace everything). A merge improves on overwriting. It is never
-/// a reason to fail an install.
-pub(crate) fn plan_local_changes(
+fn plan_shipped(
     workspace_path: &Path,
-    baseline: &PluginBaseline,
+    baseline: &OpenedBaseline<'_>,
     planned: &[PlannedFile],
-) -> MergePlan {
-    let status = modification_status_for(workspace_path, &baseline.commit, &baseline.files);
-    if !status.modified {
-        return MergePlan::default();
-    }
-    let modified: BTreeSet<&str> = status.modified_paths.iter().map(String::as_str).collect();
-
-    let Ok(repo) = git2::Repository::open(workspace_path) else {
-        return MergePlan::default();
-    };
-    let Ok(tree) = repo
-        .revparse_single(&baseline.commit)
-        .and_then(|obj| obj.peel_to_commit())
-        .and_then(|c| c.tree())
-    else {
-        return MergePlan::default();
-    };
-
+    plan: &mut UpdatePlan,
+) {
     let data_dir = workspace_path.join(DATA_DIR);
-    let mut changes = Vec::new();
-    let mut unchanged = Vec::new();
     for pf in planned {
-        if !modified.contains(pf.data_relative.as_str()) {
+        if !baseline.modified.contains(&pf.data_relative) {
             continue;
         }
         let live = data_dir.join(&pf.data_relative);
@@ -408,38 +469,113 @@ pub(crate) fn plan_local_changes(
         // stop the confirm seeing an edit that lands after it.
         if let Some(ours) = ours_oid {
             if Some(ours) == hash_on_disk(&pf.source) {
-                unchanged.push((pf.data_relative.clone(), ours));
+                plan.unchanged.push((pf.data_relative.clone(), ours));
                 continue;
             }
         }
-        let base = tree
-            .get_path(Path::new(&format!("data/{}", pf.data_relative)))
-            .ok()
-            .and_then(|entry| repo.find_blob(entry.id()).ok())
-            .map(|blob| blob.content().to_vec());
+        let base = blob_at(baseline.repo, &baseline.tree, &pf.data_relative);
         let ours = read_mergeable(&live);
         let theirs = read_mergeable(&pf.source);
 
         let (outcome, merged) = classify(
-            &repo,
+            baseline.repo,
             pf,
             base.as_deref(),
             ours.as_deref(),
             theirs.as_deref(),
             ours_oid.is_some(),
         );
-        changes.push(LocalChange {
+        plan.changes.push(LocalChange {
             data_relative: pf.data_relative.clone(),
             outcome,
             merged,
-            patch: ours
-                .as_deref()
-                .filter(|o| diffable(o, base.as_deref()))
-                .and_then(|o| unified_diff(&pf.data_relative, base.as_deref(), o)),
+            patch: patch_of(&pf.data_relative, base.as_deref(), ours.as_deref()),
             ours_oid,
         });
     }
-    MergePlan { changes, unchanged }
+}
+
+/// Classify every path the previous version recorded and the new one dropped.
+/// An unedited one is a plain removal. An edited one is a
+/// [`LocalChangeOutcome::Removed`] change, so it is saved aside first.
+///
+/// Only a recorded path is a candidate, so a file the user added is never
+/// touched. A path is skipped when another plugin records it, when it fails
+/// the update's removal guard, or when it is already gone.
+///
+/// The new version may ship a path under another case. A case-insensitive
+/// volume, the macOS default, sees one file, so removing the old spelling
+/// would delete the new one. Such a path is skipped too.
+fn plan_dropped(
+    workspace_path: &Path,
+    baseline: Option<&OpenedBaseline<'_>>,
+    recorded: &[String],
+    planned: &[PlannedFile],
+    recorded_by_others: &BTreeSet<&str>,
+    plan: &mut UpdatePlan,
+) {
+    let data_dir = workspace_path.join(DATA_DIR);
+    let shipped: BTreeSet<String> = planned
+        .iter()
+        .map(|pf| pf.data_relative.to_lowercase())
+        .collect();
+    let dropped = recorded.iter().filter(|rel| {
+        !shipped.contains(&rel.to_lowercase())
+            && !recorded_by_others.contains(rel.as_str())
+            && super::update_may_remove(rel)
+    });
+    for rel in dropped {
+        let live = data_dir.join(rel);
+        let Some(ours_oid) = hash_on_disk(&live) else {
+            continue;
+        };
+        // Only a committed copy makes a removal undoable. So the bytes on disk
+        // must be the install commit's, not merely absent from the Modified set.
+        if baseline.is_some_and(|b| oid_at(&b.tree, rel) == Some(ours_oid)) {
+            plan.removals.push((rel.clone(), ours_oid));
+            continue;
+        }
+        // No baseline means no diff, so the whole-file copy is the only one.
+        let patch = baseline.and_then(|b| {
+            let base = blob_at(b.repo, &b.tree, rel);
+            patch_of(rel, base.as_deref(), read_mergeable(&live).as_deref())
+        });
+        plan.changes.push(LocalChange {
+            data_relative: rel.clone(),
+            outcome: LocalChangeOutcome::Removed,
+            merged: None,
+            patch,
+            ours_oid: Some(ours_oid),
+        });
+    }
+}
+
+/// The install commit's tree, or `None` when the commit no longer resolves.
+fn install_tree<'r>(repo: &'r git2::Repository, commit: &str) -> Option<git2::Tree<'r>> {
+    repo.revparse_single(commit)
+        .and_then(|obj| obj.peel_to_commit())
+        .and_then(|c| c.tree())
+        .ok()
+}
+
+/// The blob id the install commit recorded for a `data/`-relative path.
+fn oid_at(tree: &git2::Tree<'_>, data_relative: &str) -> Option<git2::Oid> {
+    tree.get_path(Path::new(&format!("{}/{}", DATA_DIR, data_relative)))
+        .ok()
+        .map(|entry| entry.id())
+}
+
+/// The bytes the install commit recorded for a `data/`-relative path.
+fn blob_at(repo: &git2::Repository, tree: &git2::Tree<'_>, data_relative: &str) -> Option<Vec<u8>> {
+    oid_at(tree, data_relative)
+        .and_then(|id| repo.find_blob(id).ok())
+        .map(|blob| blob.content().to_vec())
+}
+
+/// The patch filed beside a saved-aside copy, when both sides are text.
+fn patch_of(data_relative: &str, base: Option<&[u8]>, ours: Option<&[u8]>) -> Option<String> {
+    ours.filter(|o| diffable(o, base))
+        .and_then(|o| unified_diff(data_relative, base, o))
 }
 
 /// Decide one path's outcome, and produce the merged bytes when it merges.

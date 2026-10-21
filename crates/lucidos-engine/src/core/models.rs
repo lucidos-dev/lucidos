@@ -2,9 +2,11 @@
 //!
 //! Plain config table (authoritative), mirroring the `mcp_servers` / `credentials`
 //! store pattern: the migration seeds builtins, the HTTP API mutates user rows,
-//! and CRUD emits audit `Model*` SystemEvents. The table drives the chat model
-//! picker and `RoutingProvider`'s provider selection. The Claude Code `/model`
-//! picker is separate, discovered from Claude Code (`runtime::cc_model_discovery`).
+//! and CRUD emits audit `Model*` SystemEvents. The table is the catalogue the
+//! chat intelligence ladder picks from, and drives `RoutingProvider`'s provider
+//! selection. Which models the chat picker lists is the ladder's call
+//! (`runtime::chat_ladder`). The Claude Code `/model` picker is separate,
+//! discovered from Claude Code (`runtime::cc_model_discovery`).
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -12,7 +14,7 @@ use sqlx::PgPool;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
-/// `source = 'builtin'` rows are seeded by migration: disable-only, never
+/// `source = 'builtin'` rows are seeded by migration: never
 /// deletable (deleting one could orphan a user's saved `chat_model` pref).
 pub const SOURCE_BUILTIN: &str = "builtin";
 /// `source = 'user'` rows are added in Settings: fully editable and deletable.
@@ -29,7 +31,7 @@ pub const SOURCE_USER: &str = "user";
 pub struct Route {
     /// Backend that serves the model on this route:
     /// "vertex" | "anthropic" | "openai" | "openrouter" | "xai" |
-    /// "opencode-free" | "local".
+    /// "opencode-free" | "local" | "claude-gateway".
     pub provider: String,
     /// The id sent on the wire. `None` means the row's own id, which is the
     /// common case: a first-party Claude id is byte-identical on Vertex and on
@@ -91,7 +93,6 @@ pub struct Model {
     pub sort_order: i32,
     /// [`SOURCE_BUILTIN`] or [`SOURCE_USER`].
     pub source: String,
-    pub enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -109,10 +110,6 @@ impl Model {
 }
 
 /// The editable shape of a model row, shared by the create and update paths.
-///
-/// `enabled` is deliberately absent: create always lands enabled, and update
-/// takes it as its own argument. A field nobody reads on one of the two paths
-/// is a state that looks settable and is not.
 #[derive(Debug, Clone)]
 pub struct ModelFields {
     pub label: String,
@@ -159,7 +156,7 @@ pub fn validate_routes(routes: &[Route]) -> Result<(), String> {
 }
 
 /// Raw DB row: (id, label, routes, preferred_provider, vision,
-/// default_effort, successor, sort_order, source, enabled, created_at).
+/// default_effort, successor, sort_order, source, created_at).
 type ModelRow = (
     String,
     String,
@@ -170,12 +167,11 @@ type ModelRow = (
     Option<String>,
     i32,
     String,
-    bool,
     chrono::DateTime<chrono::Utc>,
 );
 
 const SELECT_COLS: &str = "id, label, routes, preferred_provider, vision, default_effort, \
-     successor, sort_order, source, enabled, created_at";
+     successor, sort_order, source, created_at";
 
 fn row_to_model(row: ModelRow) -> Model {
     let (
@@ -188,7 +184,6 @@ fn row_to_model(row: ModelRow) -> Model {
         successor,
         sort_order,
         source,
-        enabled,
         created_at,
     ) = row;
     Model {
@@ -201,15 +196,14 @@ fn row_to_model(row: ModelRow) -> Model {
         successor,
         sort_order,
         source,
-        enabled,
         created_at,
     }
 }
 
 /// The chat model registry.
 ///
-/// **No caller can skip the event.** [`Self::create`], [`Self::update`],
-/// [`Self::set_enabled`] and [`Self::delete`] are the only reachable mutators;
+/// **No caller can skip the event.** [`Self::create`], [`Self::update`] and
+/// [`Self::delete`] are the only reachable mutators;
 /// the raw row writes are private to this module. `Model{Created,Updated,
 /// Deleted}` is what makes the in-memory `ModelRegistry` reload
 /// (`spawn_models_registry_subscriber`) and the picker update without a
@@ -221,9 +215,8 @@ fn row_to_model(row: ModelRow) -> Model {
 pub struct ModelStore;
 
 impl ModelStore {
-    /// All models, ordered for display (sort_order, then label). Includes
-    /// disabled rows — the picker filters to `enabled`, the registry needs all
-    /// so routing resolves a model even if it was disabled after being saved.
+    /// All models, ordered for display (sort_order, then label). The registry
+    /// needs every row, so a saved pick off the chat ladder still routes.
     pub async fn list(pool: &PgPool) -> Result<Vec<Model>, sqlx::Error> {
         let rows: Vec<ModelRow> = sqlx::query_as(&format!(
             "SELECT {SELECT_COLS} FROM models ORDER BY sort_order ASC, label ASC"
@@ -251,8 +244,8 @@ impl ModelStore {
     ) -> Result<Model, sqlx::Error> {
         let row: ModelRow = sqlx::query_as(&format!(
             "INSERT INTO models \
-               (id, label, routes, preferred_provider, vision, sort_order, source, enabled) \
-             VALUES ($1, $2, $3, $4, $5, $6, '{SOURCE_USER}', TRUE) \
+               (id, label, routes, preferred_provider, vision, sort_order, source) \
+             VALUES ($1, $2, $3, $4, $5, $6, '{SOURCE_USER}') \
              RETURNING {SELECT_COLS}"
         ))
         .bind(id)
@@ -275,11 +268,10 @@ impl ModelStore {
         pool: &PgPool,
         id: &str,
         fields: &ModelFields,
-        enabled: bool,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             "UPDATE models SET label = $2, routes = $3, preferred_provider = $4, \
-             vision = $5, sort_order = $6, enabled = $7, updated_at = NOW() WHERE id = $1",
+             vision = $5, sort_order = $6, updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
         .bind(&fields.label)
@@ -287,33 +279,9 @@ impl ModelStore {
         .bind(&fields.preferred_provider)
         .bind(fields.vision)
         .bind(fields.sort_order)
-        .bind(enabled)
         .execute(pool)
         .await?;
         Ok(result.rows_affected() > 0)
-    }
-
-    /// Toggle a model's enabled flag without touching its other fields. Works on
-    /// builtin rows too (the disable-only path).
-    /// Returns `None` when no such model exists, `Some(changed)` otherwise.
-    /// `rows_affected` cannot answer "changed": Postgres writes a new tuple
-    /// version even when the value is identical. The self-join reads the
-    /// pre-update value in the same statement.
-    async fn set_enabled_row(
-        pool: &PgPool,
-        id: &str,
-        enabled: bool,
-    ) -> Result<Option<bool>, sqlx::Error> {
-        sqlx::query_scalar(
-            "UPDATE models AS m SET enabled = $2, updated_at = NOW() \
-             FROM (SELECT id, enabled FROM models WHERE id = $1) AS prior \
-             WHERE m.id = prior.id \
-             RETURNING (prior.enabled IS DISTINCT FROM $2)",
-        )
-        .bind(id)
-        .bind(enabled)
-        .fetch_optional(pool)
-        .await
     }
 
     /// Delete a model row. **Private on purpose**: [`Self::delete`] is the
@@ -360,36 +328,13 @@ impl ModelStore {
         event_bus: &EventBus,
         id: &str,
         fields: &ModelFields,
-        enabled: bool,
         actor: Option<MessageOrigin>,
     ) -> Result<bool, sqlx::Error> {
-        let updated = Self::update_row(pool, id, fields, enabled).await?;
+        let updated = Self::update_row(pool, id, fields).await?;
         if updated {
             Self::announce_update(event_bus, id, actor).await;
         }
         Ok(updated)
-    }
-
-    /// Toggle a model's enabled flag and announce it, without touching its other
-    /// fields. Works on builtin rows too (the disable-only path).
-    ///
-    /// Returns whether the model exists (callers report "no model '<id>' in the
-    /// registry" on `false`), but announces only when the flag actually MOVED:
-    /// `ModelUpdated` makes the in-memory ModelRegistry rebuild, and a retrying
-    /// agent re-asserting the current value would rebuild it once per call for
-    /// no state change.
-    pub async fn set_enabled(
-        pool: &PgPool,
-        event_bus: &EventBus,
-        id: &str,
-        enabled: bool,
-        actor: Option<MessageOrigin>,
-    ) -> Result<bool, sqlx::Error> {
-        let outcome = Self::set_enabled_row(pool, id, enabled).await?;
-        if outcome == Some(true) {
-            Self::announce_update(event_bus, id, actor).await;
-        }
-        Ok(outcome.is_some())
     }
 
     /// Remove a model and announce it. The caller guards against deleting
@@ -415,9 +360,7 @@ impl ModelStore {
         Ok(removed)
     }
 
-    /// Shared by the two edit paths, which differ only in which columns they
-    /// touch: the registry reloads wholesale on `ModelUpdated`, so both say the
-    /// same thing.
+    /// The registry reloads wholesale on `ModelUpdated`.
     async fn announce_update(event_bus: &EventBus, id: &str, actor: Option<MessageOrigin>) {
         event_bus
             .emit_or_log(
@@ -483,11 +426,10 @@ mod tests {
             "Fable 5 builtin must be seeded on the anthropic provider"
         );
         assert!(
-            models.iter().any(|m| m.id == "claude-fable-5-1"
-                && routes_to(m, "anthropic")
-                && m.is_builtin()
-                && m.enabled),
-            "Fable 5.1 builtin must be seeded on the anthropic provider, enabled"
+            models
+                .iter()
+                .any(|m| m.id == "claude-fable-5-1" && routes_to(m, "anthropic") && m.is_builtin()),
+            "Fable 5.1 builtin must be seeded on the anthropic provider"
         );
         assert!(
             models
@@ -496,27 +438,25 @@ mod tests {
             "existing Vertex builtins must be seeded"
         );
         assert!(
-            models.iter().any(|m| m.id == "claude-opus-5-5"
-                && routes_to(m, "vertex")
-                && m.is_builtin()
-                && m.enabled),
-            "Opus 5.5 builtin must be seeded on the vertex provider, enabled"
+            models
+                .iter()
+                .any(|m| m.id == "claude-opus-5-5" && routes_to(m, "vertex") && m.is_builtin()),
+            "Opus 5.5 builtin must be seeded on the vertex provider"
         );
         for id in ["claude-sonnet-5-5", "claude-sonnet-5-5[1m]"] {
             assert!(
                 models.iter().any(|m| m.id == id
                     && routes_to(m, "vertex")
                     && routes_to(m, "anthropic")
-                    && m.is_builtin()
-                    && m.enabled),
-                "{id} builtin must be seeded on vertex and anthropic, enabled"
+                    && m.is_builtin()),
+                "{id} builtin must be seeded on vertex and anthropic"
             );
         }
         let haiku55 = models
             .iter()
             .find(|m| m.id == "claude-haiku-5-5")
             .expect("Haiku 5.5 builtin must be seeded");
-        assert!(haiku55.is_builtin() && haiku55.enabled && haiku55.vision);
+        assert!(haiku55.is_builtin() && haiku55.vision);
         assert_eq!(
             haiku55
                 .routes
@@ -526,6 +466,7 @@ mod tests {
             [
                 ("vertex", None, Some(1_000_000)),
                 ("anthropic", None, Some(1_000_000)),
+                ("claude-gateway", None, Some(1_000_000)),
                 (
                     "openrouter",
                     Some("anthropic/claude-haiku-5.5"),
@@ -534,25 +475,23 @@ mod tests {
             ],
             "first party first, so a configured one never leaves for OpenRouter"
         );
-        assert!(
-            models.iter().any(|m| m.id == "claude-opus-5"
-                && routes_to(m, "vertex")
-                && m.is_builtin()
-                && m.enabled),
-            "Opus 5 builtin must be seeded on the vertex provider, enabled"
-        );
-        assert!(
-            models.iter().any(|m| m.id == "claude-sonnet-5"
-                && routes_to(m, "vertex")
-                && m.is_builtin()
-                && m.enabled),
-            "Sonnet 5 builtin must be seeded on the vertex provider, enabled"
-        );
+        for (id, successor) in [
+            ("claude-opus-5", "claude-opus-5-5"),
+            ("claude-sonnet-5", "claude-sonnet-5-5"),
+        ] {
+            assert!(
+                models.iter().any(|m| m.id == id
+                    && routes_to(m, "vertex")
+                    && m.is_builtin()
+                    && m.successor.as_deref() == Some(successor)),
+                "{id} keeps its vertex row, retired to {successor}"
+            );
+        }
         assert!(
             models
                 .iter()
-                .any(|m| m.id == "claude-sonnet-4-6" && m.is_builtin() && !m.enabled),
-            "Sonnet 4.6 is still SEEDED, and switched off by the prior-generation prune"
+                .any(|m| m.id == "claude-sonnet-4-6" && m.is_builtin()),
+            "Sonnet 4.6 is still SEEDED"
         );
         // Ordered by sort_order, newest first: Fable 5.1 (-2), Fable 5 (0),
         // Opus 5.5 (2), Sonnet 5.5 (4), Opus 5 (5), Sonnet 5 (7), Haiku 5.5
@@ -606,6 +545,85 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// Every builtin the direct Anthropic API serves is served by a Claude
+    /// gateway too: a copy of its `anthropic` route, placed right after it. A
+    /// row with no `anthropic` route gets none.
+    #[tokio::test]
+    async fn migration_routes_every_anthropic_builtin_to_the_claude_gateway() {
+        let (pool, db_name) = setup_test_db().await;
+        let models = ModelStore::list(&pool).await.unwrap();
+        let mut routed = 0;
+        for m in models.iter().filter(|m| m.is_builtin()) {
+            let at = |provider: &str| m.routes.iter().position(|r| r.provider == provider);
+            match (at("anthropic"), at("claude-gateway")) {
+                (Some(anthropic), Some(gateway)) => {
+                    assert_eq!(gateway, anthropic + 1, "{}: right after anthropic", m.id);
+                    let (a, g) = (&m.routes[anthropic], &m.routes[gateway]);
+                    assert_eq!(
+                        (&a.id, a.context_window),
+                        (&g.id, g.context_window),
+                        "{}",
+                        m.id
+                    );
+                    routed += 1;
+                }
+                (None, None) => {}
+                (anthropic, gateway) => {
+                    panic!("{}: anthropic {anthropic:?}, gateway {gateway:?}", m.id)
+                }
+            }
+        }
+        assert!(
+            routed > 0,
+            "the current Claude builtins route to the gateway"
+        );
+        teardown_test_db(&db_name).await;
+    }
+
+    /// GPT-6 Luna and Gemini 3.1 Flash-Lite head the background fallbacks, so
+    /// each routes first party first, then through OpenRouter.
+    #[tokio::test]
+    async fn migration_seeds_the_newest_small_models_with_an_openrouter_route() {
+        let (pool, db_name) = setup_test_db().await;
+        for (id, first_party, openrouter_id, window, effort) in [
+            (
+                "gpt-6-luna",
+                "openai",
+                "openai/gpt-6-luna",
+                1_050_000,
+                "medium",
+            ),
+            (
+                "gemini-3.1-flash-lite",
+                "vertex",
+                "google/gemini-3.1-flash-lite",
+                1_048_576,
+                "low",
+            ),
+        ] {
+            let m = ModelStore::get(&pool, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must be seeded"));
+            assert!(m.is_builtin() && m.vision, "{id}");
+            assert_eq!(m.successor, None, "{id}");
+            assert_eq!(m.default_effort.as_deref(), Some(effort), "{id}");
+            assert_eq!(
+                m.routes
+                    .iter()
+                    .map(|r| (r.provider.as_str(), r.id.as_deref(), r.context_window))
+                    .collect::<Vec<_>>(),
+                [
+                    (first_party, None, Some(window)),
+                    ("openrouter", Some(openrouter_id), Some(window)),
+                ],
+                "{id}"
+            );
+        }
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     #[tokio::test]
     async fn migration_seeds_glm_5_2_on_openrouter() {
         let (pool, db_name) = setup_test_db().await;
@@ -615,8 +633,7 @@ mod tests {
             .expect("GLM 5.2 builtin must be seeded");
         assert!(routes_to(&m, "openrouter"));
         assert_eq!(m.label, "GLM 5.2");
-        assert!(m.is_builtin(), "GLM 5.2 must be a builtin (disable-only)");
-        assert!(m.enabled, "GLM 5.2 builtin is enabled by default");
+        assert!(m.is_builtin(), "GLM 5.2 must be a builtin");
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -625,18 +642,17 @@ mod tests {
     /// DECLARED. The id-shape fallback has no rule for a `grok-` id, so an
     /// undeclared row would budget a 2M model at 200k.
     ///
-    /// The window is asserted on all four, including the two the
-    /// prior-generation prune switched off. A disabled row still has to carry a
-    /// true window: routing loads it, so a saved `chat_model` naming one is
-    /// budgeted from this column.
+    /// The window is asserted on all four, including the two of the prior
+    /// generation. Such a row still has to carry a true window: routing loads
+    /// it, so a saved `chat_model` naming one is budgeted from this column.
     #[tokio::test]
     async fn migration_seeds_the_grok_family_on_xai_with_declared_windows() {
         let (pool, db_name) = setup_test_db().await;
-        for (id, label, window, enabled) in [
-            ("grok-4.6", "Grok 4.6", 500_000, true),
-            ("grok-4.5", "Grok 4.5", 500_000, false),
-            ("grok-4.20", "Grok 4.20", 2_000_000, true),
-            ("grok-4.3", "Grok 4.3", 1_000_000, false),
+        for (id, label, window) in [
+            ("grok-4.6", "Grok 4.6", 500_000),
+            ("grok-4.5", "Grok 4.5", 500_000),
+            ("grok-4.20", "Grok 4.20", 2_000_000),
+            ("grok-4.3", "Grok 4.3", 1_000_000),
         ] {
             let m = ModelStore::get(&pool, id)
                 .await
@@ -644,8 +660,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} must be seeded"));
             assert!(routes_to(&m, "xai"), "{id}");
             assert_eq!(m.label, label, "{id}");
-            assert!(m.is_builtin(), "{id} must be a builtin (disable-only)");
-            assert_eq!(m.enabled, enabled, "{id}");
+            assert!(m.is_builtin(), "{id} must be a builtin");
             assert_eq!(declared_window(&m), Some(window), "{id}");
         }
 
@@ -695,8 +710,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} must be seeded"));
             assert!(routes_to(&m, "opencode-free"), "{id}");
             assert_eq!(m.label, label, "{id}");
-            assert!(m.is_builtin(), "{id} must be a builtin (disable-only)");
-            assert!(m.enabled, "{id} is enabled by default");
+            assert!(m.is_builtin(), "{id} must be a builtin");
             assert_eq!(declared_window(&m), Some(window), "{id}");
         }
 
@@ -713,14 +727,12 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The prior generation of every family is switched off, and KEPT.
-    ///
-    /// Both halves matter. A retired model leaves the picker, and its row has to
-    /// survive, because `model_registry::load_from_db` loads disabled rows so a
-    /// saved `chat_model` naming one still routes. Delete instead, and a bare
-    /// `grok-4.5` falls to the id-shape guess and lands on Vertex.
+    /// The prior generation of every family keeps its row, because
+    /// `model_registry::load_from_db` loads every row so a saved `chat_model`
+    /// naming one still routes. Delete instead, and a bare `grok-4.5` falls to
+    /// the id-shape guess and lands on Vertex.
     #[tokio::test]
-    async fn migration_switches_off_the_prior_generation_of_every_family() {
+    async fn migration_keeps_the_prior_generation_of_every_family() {
         let (pool, db_name) = setup_test_db().await;
         for id in [
             "claude-opus-4-8",
@@ -729,8 +741,18 @@ mod tests {
             "claude-opus-4-7[1m]",
             "claude-sonnet-4-6",
             "claude-sonnet-4-6[1m]",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-haiku-4-5",
+            "gemini-3-flash-preview",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5-pro",
             "gpt-5.5",
             "gpt-5.4",
+            "gpt-5.4-mini",
             "gpt-5.3-codex",
             "grok-4.5",
             "grok-4.3",
@@ -738,28 +760,22 @@ mod tests {
             let m = ModelStore::get(&pool, id)
                 .await
                 .unwrap()
-                .unwrap_or_else(|| panic!("{id} must keep its row, disable-only"));
+                .unwrap_or_else(|| panic!("{id} must keep its row"));
             assert!(m.is_builtin(), "{id}");
-            assert!(!m.enabled, "{id} must be switched off");
         }
 
-        // The current lineup, which the prune must not reach. Opus 5 in
-        // particular is the `prefs::CHAT_MODEL` default: switch it off and a
-        // fresh install resolves to a model its own picker will not show.
+        // The current lineup, which no retirement may reach. Opus 5.5 and
+        // Sonnet 5.5 are the chat and trigger defaults.
         for id in [
             "claude-fable-5-1",
-            "claude-fable-5",
             "claude-opus-5-5",
             "claude-sonnet-5-5",
-            "claude-sonnet-5-5[1m]",
-            "claude-opus-5",
-            "claude-sonnet-5",
             "claude-haiku-5-5",
+            "gemini-3.8-flash",
+            "gemini-3.1-flash-lite",
             "gpt-6-astra",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5-pro",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
             "grok-4.6",
             "grok-4.20",
             "z-ai/glm-5.2",
@@ -769,7 +785,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_or_else(|| panic!("{id} must be seeded"));
-            assert!(m.enabled, "{id} must stay on");
+            assert_eq!(m.successor, None, "{id} must stay current");
         }
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -790,7 +806,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(created.source, SOURCE_USER);
-        assert!(created.enabled);
         assert!(!created.is_builtin());
 
         assert!(ModelStore::update(
@@ -798,7 +813,6 @@ mod tests {
             &bus,
             "my-model",
             &fields("Renamed", "vertex", 5, None),
-            false,
             None
         )
         .await
@@ -806,7 +820,6 @@ mod tests {
         let fetched = ModelStore::get(&pool, "my-model").await.unwrap().unwrap();
         assert_eq!(fetched.label, "Renamed");
         assert!(routes_to(&fetched, "vertex"));
-        assert!(!fetched.enabled);
         // source is immutable through update
         assert_eq!(fetched.source, SOURCE_USER);
 
@@ -840,47 +853,24 @@ mod tests {
             .unwrap();
         assert_eq!(emitted(&pool, "ModelCreated").await, 1);
 
-        ModelStore::update(
+        ModelStore::update(&pool, &bus, "m", &fields("M2", "anthropic", 10, None), None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "ModelUpdated").await, 1);
+
+        assert!(!ModelStore::update(
             &pool,
             &bus,
-            "m",
+            "missing",
             &fields("M2", "anthropic", 10, None),
-            true,
             None,
         )
         .await
-        .unwrap();
-        assert_eq!(emitted(&pool, "ModelUpdated").await, 1);
-
-        ModelStore::set_enabled(&pool, &bus, "m", false, None)
-            .await
-            .unwrap();
+        .unwrap());
         assert_eq!(
             emitted(&pool, "ModelUpdated").await,
-            2,
-            "a toggle is an update the registry must reload on"
-        );
-
-        // Re-asserting the current value still reports the model exists, but
-        // must not make the registry rebuild for no state change.
-        assert!(ModelStore::set_enabled(&pool, &bus, "m", false, None)
-            .await
-            .unwrap());
-        assert_eq!(
-            emitted(&pool, "ModelUpdated").await,
-            2,
-            "a no-op toggle must not announce"
-        );
-
-        assert!(
-            !ModelStore::set_enabled(&pool, &bus, "missing", false, None)
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            emitted(&pool, "ModelUpdated").await,
-            2,
-            "a toggle that matched no row must not announce"
+            1,
+            "an edit that matched no row must not announce"
         );
 
         assert!(ModelStore::delete(&pool, &bus, "m", None).await.unwrap());
@@ -941,7 +931,6 @@ mod tests {
             &bus,
             "ctx-model",
             &fields("Ctx", "openrouter", 99, Some(262_144)),
-            true,
             None
         )
         .await
@@ -955,7 +944,6 @@ mod tests {
             &bus,
             "ctx-model",
             &fields("Ctx", "openrouter", 99, None),
-            true,
             None
         )
         .await
@@ -1216,7 +1204,7 @@ mod tests {
             ..looking
         };
         assert!(
-            ModelStore::update(&pool, &bus, "local/looker", &blind, true, None)
+            ModelStore::update(&pool, &bus, "local/looker", &blind, None)
                 .await
                 .unwrap()
         );
@@ -1276,6 +1264,8 @@ mod tests {
             ("gpt-5.6-terra", 1_050_000),
             ("gpt-5.6-luna", 1_050_000),
             ("gpt-6-astra", 1_050_000),
+            ("gpt-6-luna", 1_050_000),
+            ("gemini-3.1-flash-lite", 1_048_576),
         ];
 
         for (id, window) in expected {
@@ -1378,7 +1368,7 @@ mod tests {
     /// It used to run that migration's SQL verbatim through `include_str!`, to
     /// pin its `ON CONFLICT DO UPDATE`. A workspace could already hold the id as
     /// a hand-added `user` row. DO NOTHING would have left that row deletable,
-    /// outside every disable-only builtin protection.
+    /// outside every builtin protection.
     ///
     /// **That re-run is gone, because the statement can no longer execute.** It
     /// writes `provider` and `context_window`, which the routes migration drops
@@ -1398,7 +1388,6 @@ mod tests {
         assert!(m.is_builtin(), "the promotion to builtin must survive");
         assert_eq!(m.label, "GPT-6 Astra");
         assert_eq!(m.sort_order, 36);
-        assert!(m.enabled);
         assert_eq!(
             m.routes,
             vec![Route {
@@ -1408,26 +1397,6 @@ mod tests {
             }],
             "the retired columns must fold into exactly one route"
         );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
-    }
-
-    #[tokio::test]
-    async fn set_enabled_toggles_builtin_without_other_changes() {
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _callback_rx) = EventBus::new(pool.clone());
-        assert!(
-            ModelStore::set_enabled(&pool, &bus, "claude-fable-5", false, None)
-                .await
-                .unwrap()
-        );
-        let m = ModelStore::get(&pool, "claude-fable-5")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!m.enabled);
-        assert_eq!(m.label, "Fable 5", "toggle must not touch the label");
-        assert!(m.is_builtin(), "toggle must not change source");
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -1452,14 +1421,14 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The whole point of the change: the current-generation Claude rows are
-    /// reachable from a workspace holding only an Anthropic key.
+    /// The current-generation Claude rows are reachable from a workspace
+    /// holding only an Anthropic key, or only a Claude gateway sign-in.
     ///
     /// Vertex stays FIRST, so a workspace already on Vertex keeps its backend.
-    /// Both routes leave the id to default, because a first-party Claude id is
-    /// byte-identical on the two backends.
+    /// Every route leaves the id to default, because a first-party Claude id is
+    /// byte-identical on all three backends.
     #[tokio::test]
-    async fn the_current_claude_generation_routes_to_vertex_and_anthropic() {
+    async fn the_current_claude_generation_routes_to_vertex_anthropic_and_the_gateway() {
         let (pool, db_name) = setup_test_db().await;
         for id in [
             "claude-opus-5-5",
@@ -1480,12 +1449,12 @@ mod tests {
                     .iter()
                     .map(|r| r.provider.as_str())
                     .collect::<Vec<_>>(),
-                vec!["vertex", "anthropic"],
-                "{id} must reach both backends, Vertex first"
+                vec!["vertex", "anthropic", "claude-gateway"],
+                "{id} must reach every backend, Vertex first"
             );
             assert!(
                 m.routes.iter().all(|r| r.id.is_none()),
-                "{id} is spelled the same on both backends"
+                "{id} is spelled the same on every backend"
             );
             assert_eq!(
                 m.preferred_provider, None,
@@ -1504,9 +1473,10 @@ mod tests {
                 _ => None,
             };
             assert_eq!(window_on(&m, "anthropic"), expected, "{id}");
+            assert_eq!(window_on(&m, "claude-gateway"), expected, "{id}");
         }
 
-        // Fable is not published on Vertex, so its rows keep one route.
+        // Fable is not published on Vertex, so its rows skip that route.
         for id in ["claude-fable-5-1", "claude-fable-5"] {
             let m = ModelStore::get(&pool, id).await.unwrap().unwrap();
             assert_eq!(
@@ -1514,8 +1484,8 @@ mod tests {
                     .iter()
                     .map(|r| r.provider.as_str())
                     .collect::<Vec<_>>(),
-                vec!["anthropic"],
-                "{id} is Anthropic-only"
+                vec!["anthropic", "claude-gateway"],
+                "{id} is not on Vertex"
             );
         }
 
@@ -1601,11 +1571,11 @@ mod tests {
             // Opus 4.8 renames cleanly. Opus 5 collides with the bare row the
             // first run produced, so its references must stay where they are.
             "DELETE FROM models WHERE id = 'claude-opus-4-8'".to_string(),
-            "INSERT INTO models (id, label, routes, sort_order, source, enabled) VALUES \
+            "INSERT INTO models (id, label, routes, sort_order, source) VALUES \
              ('claude-opus-4-8@default', 'Opus 4.8', '[{\"provider\": \"vertex\"}]', 1, \
-              'builtin', false), \
+              'builtin'), \
              ('claude-opus-5@default', 'Opus 5 (legacy)', '[{\"provider\": \"vertex\"}]', 1, \
-              'user', true)"
+              'user')"
                 .to_string(),
             format!("DELETE FROM preferences WHERE key IN ('{chat}', '{memory}', '{title}')"),
             format!(
@@ -1725,8 +1695,8 @@ mod tests {
             r#"["vertex"]"#,
         ] {
             let inserted = sqlx::query(
-                "INSERT INTO models (id, label, routes, sort_order, source, enabled) \
-                 VALUES ('hand-edited', 'Hand edited', $1::jsonb, 1, 'user', true)",
+                "INSERT INTO models (id, label, routes, sort_order, source) \
+                 VALUES ('hand-edited', 'Hand edited', $1::jsonb, 1, 'user')",
             )
             .bind(bad)
             .execute(&pool)
@@ -1734,10 +1704,10 @@ mod tests {
             assert!(inserted.is_err(), "the CHECK must refuse {bad}");
         }
         sqlx::query(
-            "INSERT INTO models (id, label, routes, sort_order, source, enabled) \
+            "INSERT INTO models (id, label, routes, sort_order, source) \
              VALUES ('hand-edited', 'Hand edited', \
                      '[{\"provider\": \"vertex\", \"id\": \"x\", \"context_window\": 1000, \
-                       \"extra\": null}]'::jsonb, 1, 'user', true)",
+                       \"extra\": null}]'::jsonb, 1, 'user')",
         )
         .execute(&pool)
         .await
@@ -1786,11 +1756,9 @@ mod tests {
             vision: existing.vision,
             sort_order: existing.sort_order,
         };
-        assert!(
-            ModelStore::update(&pool, &bus, &existing.id, &picked, true, None)
-                .await
-                .unwrap()
-        );
+        assert!(ModelStore::update(&pool, &bus, &existing.id, &picked, None)
+            .await
+            .unwrap());
         let after = ModelStore::get(&pool, "claude-opus-5-5")
             .await
             .unwrap()

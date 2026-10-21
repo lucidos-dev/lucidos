@@ -7,7 +7,7 @@
  * when its word no longer fits.
  *
  * These tests pin the DOM the CSS keys on. The frames are covered by
- * `e2e/threads-header-filter-transitions.spec.ts`.
+ * `e2e/threads-header-filter-transitions-all.spec.ts`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';

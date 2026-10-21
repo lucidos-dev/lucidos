@@ -104,6 +104,7 @@ describe('choosing Tree', () => {
         effort: 'low',
         source: 'default',
         reachable: true,
+        generation: null,
         not_served: [],
         needs_vision: false,
         asks_no_model: false,
@@ -111,7 +112,7 @@ describe('choosing Tree', () => {
         recommended: [
           { model: 'gpt-6.1-sol', effort: 'low' },
           { model: 'gemini-3.8-flash', effort: 'low' },
-          { model: 'claude-sonnet-5-5', effort: 'low' },
+          { model: 'claude-fable-5-1', effort: 'low' },
         ],
       },
     });
@@ -256,7 +257,7 @@ describe('choosing Tree', () => {
       costs: [
         ...ESTIMATE.costs,
         {
-          model: 'claude-sonnet-5-5',
+          model: 'claude-fable-5-1',
           by_effort: [{
             effort: 'low',
             usable_secs: ESTIMATE.usable_secs,
@@ -276,7 +277,7 @@ describe('choosing Tree', () => {
     unmount = await mount(host);
     store.preferences.value = {
       status: 'loaded',
-      data: { memory_module: 'classic', model_summary_compaction: 'claude-sonnet-5-5' },
+      data: { memory_module: 'classic', model_summary_compaction: 'claude-fable-5-1' },
     };
 
     button(host, 'Tree').click();
@@ -346,7 +347,7 @@ describe('choosing Tree', () => {
     store.preferences.value = { status: 'loaded', data: { memory_module: 'tree' } };
     await settle();
     const note = host.querySelector('[data-role="memory-compaction-link"]')?.textContent ?? '';
-    expect(note).toContain("gpt-6.1-sol writes Tree's summaries. Change it under");
+    expect(note).toContain("GPT-6.1 Sol writes Tree's summaries. Change it under");
     expect(note).not.toContain('Pick it');
   });
 });

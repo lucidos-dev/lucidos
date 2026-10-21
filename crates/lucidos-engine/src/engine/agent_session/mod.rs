@@ -18,6 +18,7 @@ mod spawn;
 pub(crate) mod spawn_claim;
 pub(crate) mod spawn_dispatcher;
 pub(crate) mod start_failure;
+pub(crate) mod stranded_follow_ups;
 mod text_buffer;
 mod tool_output;
 mod turn_gap;
@@ -37,6 +38,7 @@ pub(crate) use apply_now::{
 pub(crate) use external_edits::git_head_sha as external_edits_for_recovery_head_sha;
 // Engine construction passes the hung-tool ceiling to the external watchdog;
 // `lifecycle` is private, so re-export it here.
+pub(crate) use input_ledger::forwards_verbatim;
 pub(crate) use lifecycle::WATCHDOG_HUNG_TOOL_CEILING_MS;
 pub(crate) use parsing::{
     option_embed_problem, parse_ask_user_question_inputs, question_text, ParsedQuestion,

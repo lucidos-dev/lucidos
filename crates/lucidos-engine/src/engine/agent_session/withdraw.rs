@@ -7,6 +7,12 @@
 //! settles the ledger and records the `QueuedMessageRemoved` tombstone once
 //! the answer lands. The tombstone therefore always matches what Claude Code
 //! did, even when the HTTP caller gave up first.
+//!
+//! For an input this session never forwarded, the store answers
+//! (`stranded_follow_ups::InputFate`). One an earlier session forwarded and no
+//! agent read sat in a dead process's queue, so it is withdrawn. One no session
+//! forwarded may still be on its way to a spawn, so it is refused. With no
+//! session at all, the engine answers while it holds the thread claim.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,6 +25,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::engine::agent_session::input_ledger::InputLedger;
+use crate::engine::agent_session::stranded_follow_ups::{input_fate, InputFate};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::types::AgentSession;
@@ -26,6 +33,10 @@ use crate::engine::LucidosEngine;
 use crate::runtime::{CodingAgent, InputWithdrawal, WithdrawRequest};
 
 pub(crate) const CODEX_UNSUPPORTED: &str = "Codex cannot take back a message it was sent.";
+/// A message no session has forwarded yet may be on its way to a spawn, which
+/// would deliver it over a tombstone.
+pub(crate) const NOT_YET_FORWARDED: &str =
+    "No coding-agent session has been sent this message yet, so it cannot be taken back now.";
 pub(crate) const NO_LIVE_SESSION: &str =
     "The coding agent's session has ended, so the message can no longer be taken back.";
 
@@ -59,6 +70,8 @@ pub(crate) type PendingWithdraws =
 pub(crate) fn begin_withdraw(
     inputs: &InputLedger,
     driver: Option<&mpsc::UnboundedSender<WithdrawRequest>>,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
     request: WithdrawInputRequest,
     pending: &mut PendingWithdraws,
 ) {
@@ -69,6 +82,14 @@ pub(crate) fn begin_withdraw(
             request,
             outcome,
         })));
+        return;
+    }
+    if !inputs.forwarded_here(request.input_event_id) {
+        let pool = pool.clone();
+        pending.push(Box::pin(async move {
+            let outcome = unheld_outcome(&pool, thread_id, request.input_event_id).await;
+            WithdrawAnswered { request, outcome }
+        }));
         return;
     }
     let Some(input_uuid) = inputs.withdrawable(request.input_event_id) else {
@@ -91,6 +112,23 @@ pub(crate) fn begin_withdraw(
         };
         WithdrawAnswered { request, outcome }
     }));
+}
+
+/// The answer for an input this session never forwarded. Never a read of its
+/// own (the plan's first invariant).
+async fn unheld_outcome(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    input_event_id: Uuid,
+) -> InputWithdrawal {
+    match input_fate(pool, thread_id, input_event_id).await {
+        Ok(InputFate::Read) => InputWithdrawal::AlreadyRead,
+        Ok(InputFate::Stranded) => InputWithdrawal::Withdrawn,
+        Ok(InputFate::NeverForwarded) => InputWithdrawal::Refused(NOT_YET_FORWARDED.to_string()),
+        Err(e) => InputWithdrawal::Refused(format!(
+            "Could not check whether the coding agent read the message. Remove it again to retry: {e}"
+        )),
+    }
 }
 
 /// Settle every withdraw Claude Code has already answered. The driver fills an
@@ -118,48 +156,64 @@ pub(crate) async fn finish_withdraw(
 ) {
     let outcome = if outcome == InputWithdrawal::Withdrawn {
         inputs.withdrawn(request.input_event_id);
-        let recorded = bus
-            .emit(BusEvent::Thread {
-                thread_id,
-                event: ThreadEvent::QueuedMessageRemoved {
-                    removed_message_id: request.input_event_id,
-                },
-                meta: EventMeta {
-                    channel: Some(EventChannel::Chat),
-                    actor: request.actor,
-                    ..EventMeta::NONE
-                },
-            })
-            .await;
-        match recorded {
-            Ok(_) => {
-                inputs.tombstone_recorded(request.input_event_id);
-                InputWithdrawal::Withdrawn
-            }
-            Err(e) => InputWithdrawal::Refused(format!(
-                "The agent dropped the message, but its removal could not be recorded. Remove it again to retry: {e}"
-            )),
+        let recorded =
+            record_tombstone(bus, thread_id, request.input_event_id, request.actor).await;
+        if recorded == InputWithdrawal::Withdrawn {
+            inputs.tombstone_recorded(request.input_event_id);
         }
+        recorded
     } else {
         outcome
     };
     let _ = request.reply.send(outcome);
 }
 
+/// Record the `QueuedMessageRemoved` that hides the bubble on every device.
+async fn record_tombstone(
+    bus: &EventBus,
+    thread_id: Uuid,
+    input_event_id: Uuid,
+    actor: Option<MessageOrigin>,
+) -> InputWithdrawal {
+    let recorded = bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::QueuedMessageRemoved {
+                removed_message_id: input_event_id,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::Chat),
+                actor,
+                ..EventMeta::NONE
+            },
+        })
+        .await;
+    match recorded {
+        Ok(_) => InputWithdrawal::Withdrawn,
+        Err(e) => InputWithdrawal::Refused(format!(
+            "The agent dropped the message, but its removal could not be recorded. Remove it again to retry: {e}"
+        )),
+    }
+}
+
 /// Ask the thread's live session to take back `input_event_id`'s message.
+/// `None` when no run loop took the request: no live session, or one that
+/// ended before it answered.
 async fn withdraw_from_session(
     sessions: &Mutex<HashMap<Uuid, AgentSession>>,
     thread_id: Uuid,
     input_event_id: Uuid,
     actor: Option<MessageOrigin>,
     timeout: Duration,
-) -> InputWithdrawal {
+) -> Option<InputWithdrawal> {
     let sender = match sessions.lock().await.get(&thread_id) {
         Some(session) if session.is_live() => match session.coding_agent {
-            CodingAgent::Codex => return InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string()),
+            CodingAgent::Codex => {
+                return Some(InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string()))
+            }
             CodingAgent::ClaudeCode => session.withdraw_tx.clone(),
         },
-        _ => return InputWithdrawal::Refused(NO_LIVE_SESSION.to_string()),
+        _ => return None,
     };
     let (reply, answer) = oneshot::channel();
     let request = WithdrawInputRequest {
@@ -167,16 +221,14 @@ async fn withdraw_from_session(
         actor,
         reply,
     };
-    if sender.send(request).is_err() {
-        return InputWithdrawal::Refused(NO_LIVE_SESSION.to_string());
-    }
+    sender.send(request).ok()?;
     match tokio::time::timeout(timeout, answer).await {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(_loop_ended)) => InputWithdrawal::Refused(NO_LIVE_SESSION.to_string()),
-        Err(_) => InputWithdrawal::Refused(format!(
+        Ok(Ok(outcome)) => Some(outcome),
+        Ok(Err(_loop_ended)) => None,
+        Err(_) => Some(InputWithdrawal::Refused(format!(
             "The coding agent did not answer within {} seconds. If it took the message back, the message disappears.",
             timeout.as_secs()
-        )),
+        ))),
     }
 }
 
@@ -188,15 +240,70 @@ impl LucidosEngine {
         input_event_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> InputWithdrawal {
-        withdraw_from_session(
-            &self.agent_sessions,
+        let ask_session = || {
+            withdraw_from_session(
+                &self.agent_sessions,
+                thread_id,
+                input_event_id,
+                actor.clone(),
+                WITHDRAW_TIMEOUT,
+            )
+        };
+        if let Some(outcome) = ask_session().await {
+            return outcome;
+        }
+        let claim = self.claim_thread_for_spawn(thread_id, None);
+        match withdraw_while_claimed(
+            claim,
+            &self.event_bus,
             thread_id,
             input_event_id,
-            actor,
-            WITHDRAW_TIMEOUT,
+            actor.clone(),
         )
         .await
+        {
+            Some(outcome) => outcome,
+            // A run took the thread meanwhile, so its loop answers.
+            None => ask_session()
+                .await
+                .unwrap_or_else(|| InputWithdrawal::Refused(NO_LIVE_SESSION.to_string())),
+        }
     }
+}
+
+/// Answer a withdraw while holding the thread claim `claim` yields, so no
+/// session can start and forward the message while the tombstone is written.
+/// `None` when a live run holds the thread.
+async fn withdraw_while_claimed<C, E: std::fmt::Display>(
+    claim: impl Future<Output = Result<Option<C>, E>>,
+    bus: &EventBus,
+    thread_id: Uuid,
+    input_event_id: Uuid,
+    actor: Option<MessageOrigin>,
+) -> Option<InputWithdrawal> {
+    let _claim = match tokio::time::timeout(WITHDRAW_TIMEOUT, claim).await {
+        Ok(Ok(Some(claim))) => claim,
+        Ok(Ok(None)) => return None,
+        Ok(Err(e)) => {
+            return Some(InputWithdrawal::Refused(format!(
+                "Could not hold the thread to take the message back: {e}"
+            )))
+        }
+        Err(_) => {
+            return Some(InputWithdrawal::Refused(
+                "The coding agent's session is still winding down. Remove the message again in a moment."
+                    .to_string(),
+            ))
+        }
+    };
+    Some(
+        match unheld_outcome(bus.pool(), thread_id, input_event_id).await {
+            InputWithdrawal::Withdrawn => {
+                record_tombstone(bus, thread_id, input_event_id, actor).await
+            }
+            other => other,
+        },
+    )
 }
 
 #[cfg(test)]

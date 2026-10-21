@@ -11,6 +11,8 @@ import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { StoppedChildNotice } from './StoppedChildNotice';
 import { ContinuedFromNotice, ContinuedInNotice } from './SuccessorNotice';
+import { currentCacheWarmLine } from '../../store/actions/preferences';
+import { CacheWarmLine, cacheWarmLineEligible } from './CacheKeepAlive';
 import { sideQuestionsFor } from '../../store/sideQuestions';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { ThreadTitleMenu, ThreadTitlePin } from './ThreadTitle';
@@ -2005,6 +2007,12 @@ export function ThreadView() {
                             )}
                             <StoppedChildNotice meta={eventThread.meta} />
                             <ContinuedInNotice meta={eventThread.meta} />
+                            <CacheWarmLine
+                                key={threadId}
+                                threadId={threadId!}
+                                eligible={currentCacheWarmLine() && cacheWarmLineEligible(eventThread)}
+                                eventCount={eventThread.events.size}
+                            />
                         </div>
                     ) : (
                         <ThreadEmptyState key={threadId} reason={emptyReason(animating, historyLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />

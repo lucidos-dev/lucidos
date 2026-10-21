@@ -125,7 +125,7 @@ fn bytes(tiles: &[NodeAddr]) -> usize {
 }
 
 /// Mean view bytes per call, and the mean a call sends at full price. Each
-/// call writes an entry at each of its rungs. A call reads only entries that
+/// call writes an entry at each of its cache rungs. A call reads only entries that
 /// calls answered before it launched wrote, since an entry becomes readable
 /// once its writer's response starts.
 fn cost(launches: &[Launch], cache: Cache) -> (f64, f64) {

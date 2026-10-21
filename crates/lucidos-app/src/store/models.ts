@@ -17,26 +17,15 @@ export const DEFAULT_CHAT_MODEL: string = PREFERENCE_CATALOG.chat_model.fallback
  *  while this list still offers a retired id. */
 export const MODELS = [
   { value: 'claude-fable-5-1', label: 'Fable 5.1' },
-  { value: 'claude-fable-5-1[1m]', label: 'Fable 5.1 (1M)' },
-  { value: 'claude-fable-5', label: 'Fable 5' },
-  { value: 'claude-fable-5[1m]', label: 'Fable 5 (1M)' },
   { value: 'claude-opus-5-5', label: 'Opus 5.5' },
-  { value: 'claude-opus-5-5[1m]', label: 'Opus 5.5 (1M)' },
   { value: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
-  { value: 'claude-sonnet-5-5[1m]', label: 'Sonnet 5.5 (1M)' },
-  { value: 'claude-opus-5', label: 'Opus 5' },
-  { value: 'claude-opus-5[1m]', label: 'Opus 5 (1M)' },
-  { value: 'claude-sonnet-5', label: 'Sonnet 5' },
-  { value: 'claude-sonnet-5[1m]', label: 'Sonnet 5 (1M)' },
   { value: 'claude-haiku-5-5', label: 'Haiku 5.5' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
   { value: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
+  { value: 'gemini-3.1-flash-lite', label: 'Gemini 3.1 Flash-Lite' },
   { value: 'gpt-6-astra', label: 'GPT-6 Astra' },
-  { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
-  { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
-  { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
-  { value: 'gpt-5.5-pro', label: 'GPT-5.5 Pro' },
+  { value: 'gpt-6.1-sol', label: 'GPT-6.1 Sol' },
+  { value: 'gpt-6-luna', label: 'GPT-6 Luna' },
 ];
 
 /** Every backend a model route can name, with how the UI names it. Mirrors
@@ -49,6 +38,7 @@ export const PROVIDERS = [
   { value: 'xai', label: 'xAI' },
   { value: 'opencode-free', label: 'OpenCode Free (keyless)' },
   { value: 'local', label: 'Local (OpenAI-compatible)' },
+  { value: 'claude-gateway', label: 'Claude gateway' },
 ];
 
 /** How the UI names a provider, falling back to the raw value. */

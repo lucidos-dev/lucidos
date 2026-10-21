@@ -9,7 +9,9 @@ import {
   CONTINUATION_AUTO_RECOVERY_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
+  CONTINUATION_EFFORT_RESTART_REASON,
   CONTINUATION_USER_CLICKED_REASON,
+  continuationCause,
   continuationStartedSummary,
   type AbortCause,
   type CancelCause,
@@ -37,6 +39,7 @@ const CANCEL_CAUSE_FLAGS = {
   user_stop: true,
   user_action: true,
   superseded_by_followup: true,
+  effort_restart: true,
   unknown: true,
 } satisfies Record<CancelCause, true>;
 const CANCEL_CAUSES = Object.keys(CANCEL_CAUSE_FLAGS) as CancelCause[];
@@ -137,7 +140,7 @@ describe('every explainer is plain', () => {
       ...ABORT_CAUSES.map(describeAbortCause),
       ...CANCEL_CAUSES.map(describeCancelCause),
       ...(['continuation_started', 'session_recovered', 'orphan_recovery', 'harden_retrigger',
-        'stale_session', 'archived_branch_work', 'unmerged_integrated_work', 'successor_residue', 'merge_conflict', 'main_check_red',
+        'stale_session', 'archived_branch_work', 'unmerged_integrated_work', 'successor_residue', 'merge_conflict', 'main_check_red', 'main_check_flaky',
         'missing_hardening', 'missing_plan'] as const)
         .map(kind => describeEngineReason({ kind })),
     ];
@@ -246,6 +249,15 @@ describe('describeContinuationReason', () => {
       .not.toBe(continuationStartedSummary(CONTINUATION_AUTO_RECOVERY_REASON, undefined));
   });
 
+  // The engine resumes an effort restart with no actor, so without its own
+  // branch the header would fall through to "Resumed after engine restart".
+  it('says an effort restart came from the effort pick, not an engine restart', () => {
+    expect(describeContinuationReason(CONTINUATION_EFFORT_RESTART_REASON)).toMatch(/^You picked a new reasoning effort/);
+    expect(continuationStartedSummary(CONTINUATION_EFFORT_RESTART_REASON, undefined))
+      .toBe('Restarted at the new reasoning effort');
+    expect(continuationCause(CONTINUATION_EFFORT_RESTART_REASON, undefined)).toBe('You changed effort');
+  });
+
   it('returns null for an unrecorded or unrecognized reason rather than inventing one', () => {
     expect(describeContinuationReason(undefined)).toBeNull();
     expect(describeContinuationReason('answered_after_idle')).toBeNull();
@@ -258,6 +270,12 @@ describe('describeCancelCause', () => {
   });
   it('mentions apply/discard/archive for user_action', () => {
     expect(describeCancelCause('user_action')).toMatch(/appl|discard|archiv/i);
+  });
+  // The turn an effort pick interrupted must not claim a follow-up nobody sent.
+  it('names the effort pick for effort_restart', () => {
+    const text = describeCancelCause('effort_restart');
+    expect(text).toMatch(/reasoning effort/);
+    expect(text).not.toMatch(/follow-up/);
   });
   it('falls back for unknown / undefined', () => {
     expect(describeCancelCause('unknown')).toMatch(/did not record how/i);

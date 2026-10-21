@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::core::webhook_ingress::{AddressProbe, Family, FamilyVerdict};
 use crate::core::webhook_refusal::{RefusalCause, Resolution};
 use crate::core::{AppKind, AuthType};
-use crate::engine::thread_events::MessageOrigin;
+use crate::engine::thread_events::{ArrangedTile, Dashboard, MessageOrigin};
+use crate::engine::widgets::WidgetParams;
+use crate::llm::claude_gateway::account::ClaudeGatewaySignOutReason;
 use crate::scheduler::notifications::Tap;
 
 /// System events — broadcast to SSE, selectively persisted.
@@ -186,21 +188,30 @@ pub enum SystemEvent {
         /// When it failed (RFC 3339).
         finished_at: chrono::DateTime<chrono::Utc>,
     },
-    /// The workspace backup key was handed to a caller. PERSISTED.
+    /// The workspace's legacy backup key was handed to a caller. PERSISTED.
     ///
-    /// The key decrypts every archive this workspace ever uploaded, so a read
-    /// of it is a bigger fact than a credential reveal. Same secrecy contract
-    /// as `CredentialRevealed`: the row records the act and the actor, never
-    /// the key.
+    /// The key decrypts every `.enc` archive this workspace uploaded, so a
+    /// read of it is a bigger fact than a credential reveal. Same secrecy
+    /// contract as `CredentialRevealed`: the row records the act and the
+    /// actor, never the key. Rows from before the switch to age also carry a
+    /// `minted` flag, which nothing reads.
     ///
     /// The origin check in front of it is defense in depth, not a boundary
     /// (ADR 0117, ADR 0144). So a reveal that should not have happened still
     /// leaves a row somebody can find.
     BackupKeyRevealed {
-        /// True when this call created the key, which is the moment prior
-        /// backups would have been orphaned had one existed. A plain reveal of
-        /// an existing key is `false`.
-        minted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The workspace's backup recipient changed: every new archive is now
+    /// sealed to it. PERSISTED.
+    ///
+    /// The recipient is an age public key and not a secret. `own_key` is true
+    /// when the user brought it, false when Lucidos minted the pair and the
+    /// user pasted its backup key back.
+    BackupRecipientSet {
+        recipient: String,
+        own_key: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -382,6 +393,36 @@ pub enum SystemEvent {
         /// `to_payload` merges it into the wire payload and drops any `actor`
         /// the caller wrote there.
         #[serde(skip_serializing)]
+        actor: Option<MessageOrigin>,
+    },
+    /// A widget instance was added to one dashboard, at the widget's default
+    /// size (ADR 0496). Persisted: the dashboards fold these on read.
+    DashboardTileAdded {
+        dashboard: Dashboard,
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<WidgetParams>,
+        /// The tile's label. Absent means the widget's name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A widget instance left one dashboard. No file changes.
+    DashboardTileRemoved {
+        dashboard: Dashboard,
+        app_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<WidgetParams>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// One dashboard's tiles in order, each at its size. The newest wins,
+    /// whole; a tile no longer on the dashboard is ignored.
+    DashboardArranged {
+        dashboard: Dashboard,
+        tiles: Vec<ArrangedTile>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
     /// App list-refresh hints. `AppCreated` and `AppUpdated` are
@@ -700,11 +741,16 @@ pub enum SystemEvent {
     /// down, which is where `InstalledRecord` still reads it and where rows
     /// written before this field carry it alone. A subscription filtering on
     /// the nested path went dead once, unseen, which is what this field ends.
+    ///
+    /// `files_removed` lists paths the previous version recorded and this one
+    /// dropped, which the update deleted. Empty for a fresh install.
     PluginInstalled {
         #[serde(default)]
         id: String,
         manifest: serde_json::Value,
         files: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files_removed: Vec<String>,
         installed_at: String,
         source_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -733,10 +779,11 @@ pub enum SystemEvent {
     /// could not. `replaced` was never mergeable: a trigger projection, a
     /// binary, or the panel's keep control switched off. `restored` is a file
     /// the user had deleted that upstream still ships, so it came back.
+    /// `removed` is an edited file the new version no longer ships.
     ///
-    /// Everything in `merged` survives in the file. Everything in `conflicted`
-    /// and `replaced` has a copy in `saved_paths`. Nothing in `restored` does,
-    /// because a deletion has no content to save.
+    /// Everything in `merged` survives in the file. Everything in `conflicted`,
+    /// `replaced` and `removed` has a copy in `saved_paths`. Nothing in
+    /// `restored` does, because a deletion has no content to save.
     ///
     /// Emitted right after the `PluginInstalled` it belongs to, and only when
     /// the install met at least one edited file. It exists because the outcome
@@ -758,6 +805,8 @@ pub enum SystemEvent {
         replaced: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         restored: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         saved_paths: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1205,6 +1254,57 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// The workspace signed in to its Claude gateway, `issuer`, replacing any
+    /// earlier sign-in. Carries no token.
+    ClaudeGatewaySignedIn {
+        issuer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The Claude gateway sign-in ended, for `reason`.
+    ClaudeGatewaySignedOut {
+        issuer: String,
+        reason: ClaudeGatewaySignOutReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A device sign-in to the Claude gateway `issuer` began, waiting for the
+    /// user to approve its code. Carries neither the code nor any token.
+    ClaudeGatewaySignInStarted {
+        issuer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A sign-in to the Claude gateway `issuer` in progress was stopped
+    /// before the user approved it. `actor` is who stopped it.
+    ClaudeGatewaySignInCanceled {
+        issuer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A sign-in to the Claude gateway `issuer` ended without tokens: the code
+    /// expired, the user declined, or the gateway refused. `error` says which,
+    /// and `actor` is who started the sign-in.
+    ClaudeGatewaySignInFailed {
+        issuer: String,
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// The *gateway managed settings* `issuer` sets for the signed-in user
+    /// changed. `policy` is false when the gateway now has none for them.
+    /// `telemetry` says whether the policy asks for usage telemetry, and
+    /// `available_models` is its model allowlist. Carries no other setting,
+    /// since one can hold a collector's credential.
+    ClaudeGatewayManagedSettingsChanged {
+        issuer: String,
+        policy: bool,
+        telemetry: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        available_models: Option<Vec<String>>,
+    },
     /// A `PUT /api/v1/data/*path` write committed (file created or replaced).
     /// `commit` is the resulting git sha when the path lives under `artifacts/`
     /// (manager-committed); empty for non-artifact paths that bypass the
@@ -1384,19 +1484,37 @@ pub enum SystemEvent {
         from_sha: String,
         to_sha: String,
     },
-    /// The main check passed: `main` at its `to_sha` is green.
+    /// The running main check's workflow run started: `run_url` is its page
+    /// and `branch` its mirror branch. A restart from here on reattaches to
+    /// the run instead of abandoning the check (ADR 0464).
+    MainCheckRunLinked {
+        check_id: Uuid,
+        run_url: String,
+        branch: String,
+    },
+    /// The main check passed: `main` at its `to_sha` is green. `flaky` names
+    /// the tests that failed once and passed a retry. `flaky_fix_thread_id`
+    /// names the *flaky fix thread* this pass opened, absent when one was
+    /// already open or nothing was flaky.
     MainCheckPassed {
         check_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        flaky: Vec<crate::engine::FailedTest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flaky_fix_thread_id: Option<Uuid>,
     },
     /// The main check failed. Main is red, and `fix_thread_id` names the one
-    /// fix thread it opens. `tail` is the end of the failing output.
+    /// fix thread it opens. `failures` names each failed test with the head
+    /// of its error. `tail` is the end of the failing output.
     MainCheckFailed {
         check_id: Uuid,
         summary: String,
         #[serde(default)]
         tail: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failures: Vec<crate::engine::FailedTest>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_url: Option<String>,
         fix_thread_id: Uuid,
@@ -1662,6 +1780,9 @@ impl SystemEvent {
         "ArtifactDeleted",
         "AppDeleted",
         "AppOpened",
+        "DashboardTileAdded",
+        "DashboardTileRemoved",
+        "DashboardArranged",
         "KnowhowRead",
         "RepositoryImported",
         "TriggerCreated",
@@ -1719,6 +1840,12 @@ impl SystemEvent {
         "PermissionGrantsChanged",
         "OAuthAccountConnected",
         "OAuthAccountDeleted",
+        "ClaudeGatewaySignedIn",
+        "ClaudeGatewaySignedOut",
+        "ClaudeGatewaySignInStarted",
+        "ClaudeGatewaySignInCanceled",
+        "ClaudeGatewaySignInFailed",
+        "ClaudeGatewayManagedSettingsChanged",
         "DataFileWritten",
         "DataFileDeleted",
         "DataFileEdited",
@@ -1731,6 +1858,7 @@ impl SystemEvent {
         "LaneBatchLanded",
         "LaneBatchFailed",
         "MainCheckStarted",
+        "MainCheckRunLinked",
         "MainCheckPassed",
         "MainCheckFailed",
         "MainCheckAbandoned",
@@ -1750,6 +1878,7 @@ impl SystemEvent {
         "BackupCompleted",
         "BackupFailed",
         "BackupKeyRevealed",
+        "BackupRecipientSet",
         "ProxyConfigRejected",
         "ModelNotServedObserved",
         "ThreadsDeleted",
@@ -1807,6 +1936,7 @@ impl SystemEvent {
             Self::BackupCompleted { .. } => "BackupCompleted",
             Self::BackupFailed { .. } => "BackupFailed",
             Self::BackupKeyRevealed { .. } => "BackupKeyRevealed",
+            Self::BackupRecipientSet { .. } => "BackupRecipientSet",
             Self::ProxyConfigRejected { .. } => "ProxyConfigRejected",
             Self::ModelNotServedObserved { .. } => "ModelNotServedObserved",
             Self::ThreadsDeleted { .. } => "ThreadsDeleted",
@@ -1828,6 +1958,9 @@ impl SystemEvent {
             Self::AppUpdated { .. } => "AppUpdated",
             Self::AppDeleted { .. } => "AppDeleted",
             Self::AppOpened { .. } => "AppOpened",
+            Self::DashboardTileAdded { .. } => "DashboardTileAdded",
+            Self::DashboardTileRemoved { .. } => "DashboardTileRemoved",
+            Self::DashboardArranged { .. } => "DashboardArranged",
             Self::KnowhowRead { .. } => "KnowhowRead",
             Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
             Self::FrontendUpdateDeferred { .. } => "FrontendUpdateDeferred",
@@ -1895,6 +2028,14 @@ impl SystemEvent {
             Self::PermissionGrantsChanged { .. } => "PermissionGrantsChanged",
             Self::OAuthAccountConnected { .. } => "OAuthAccountConnected",
             Self::OAuthAccountDeleted { .. } => "OAuthAccountDeleted",
+            Self::ClaudeGatewaySignedIn { .. } => "ClaudeGatewaySignedIn",
+            Self::ClaudeGatewaySignedOut { .. } => "ClaudeGatewaySignedOut",
+            Self::ClaudeGatewaySignInStarted { .. } => "ClaudeGatewaySignInStarted",
+            Self::ClaudeGatewaySignInCanceled { .. } => "ClaudeGatewaySignInCanceled",
+            Self::ClaudeGatewaySignInFailed { .. } => "ClaudeGatewaySignInFailed",
+            Self::ClaudeGatewayManagedSettingsChanged { .. } => {
+                "ClaudeGatewayManagedSettingsChanged"
+            }
             Self::DataFileWritten { .. } => "DataFileWritten",
             Self::DataFileDeleted { .. } => "DataFileDeleted",
             Self::DataFileEdited { .. } => "DataFileEdited",
@@ -1907,6 +2048,7 @@ impl SystemEvent {
             Self::LaneBatchLanded { .. } => "LaneBatchLanded",
             Self::LaneBatchFailed { .. } => "LaneBatchFailed",
             Self::MainCheckStarted { .. } => "MainCheckStarted",
+            Self::MainCheckRunLinked { .. } => "MainCheckRunLinked",
             Self::MainCheckPassed { .. } => "MainCheckPassed",
             Self::MainCheckFailed { .. } => "MainCheckFailed",
             Self::MainCheckAbandoned { .. } => "MainCheckAbandoned",
@@ -1973,6 +2115,7 @@ impl SystemEvent {
         "BackupCompleted",
         "BackupFailed",
         "BackupKeyRevealed",
+        "BackupRecipientSet",
         "ProxyConfigRejected",
         "ModelNotServedObserved",
         "ThreadsDeleted",
@@ -1994,6 +2137,9 @@ impl SystemEvent {
         "AppUpdated",
         "AppDeleted",
         "AppOpened",
+        "DashboardTileAdded",
+        "DashboardTileRemoved",
+        "DashboardArranged",
         "KnowhowRead",
         "AppUiRefreshRequested",
         "FrontendUpdateDeferred",
@@ -2061,6 +2207,12 @@ impl SystemEvent {
         "PermissionGrantsChanged",
         "OAuthAccountConnected",
         "OAuthAccountDeleted",
+        "ClaudeGatewaySignedIn",
+        "ClaudeGatewaySignedOut",
+        "ClaudeGatewaySignInStarted",
+        "ClaudeGatewaySignInCanceled",
+        "ClaudeGatewaySignInFailed",
+        "ClaudeGatewayManagedSettingsChanged",
         "DataFileWritten",
         "DataFileDeleted",
         "DataFileEdited",
@@ -2073,6 +2225,7 @@ impl SystemEvent {
         "LaneBatchLanded",
         "LaneBatchFailed",
         "MainCheckStarted",
+        "MainCheckRunLinked",
         "MainCheckPassed",
         "MainCheckFailed",
         "MainCheckAbandoned",
@@ -2119,6 +2272,7 @@ impl SystemEvent {
             | Self::BackupCompleted { .. }
             | Self::BackupFailed { .. }
             | Self::BackupKeyRevealed { .. }
+            | Self::BackupRecipientSet { .. }
             | Self::ProxyConfigRejected { .. }
             | Self::ModelNotServedObserved { .. }
             | Self::ThreadsDeleted { .. }
@@ -2149,6 +2303,9 @@ impl SystemEvent {
             | Self::AppDeleted { .. }
             | Self::AppOpened { .. }
             | Self::AppUiRefreshRequested { .. } => "app",
+            Self::DashboardTileAdded { .. }
+            | Self::DashboardTileRemoved { .. }
+            | Self::DashboardArranged { .. } => "dashboard",
             Self::KnowhowRead { .. } => "knowhow",
             Self::DomainEvent { .. } => "domain",
             Self::DeviceVisible { .. } | Self::DeviceHidden { .. } => "device_presence",
@@ -2210,6 +2367,12 @@ impl SystemEvent {
             Self::OAuthAccountConnected { .. } | Self::OAuthAccountDeleted { .. } => {
                 "oauth_account"
             }
+            Self::ClaudeGatewaySignedIn { .. }
+            | Self::ClaudeGatewaySignedOut { .. }
+            | Self::ClaudeGatewaySignInStarted { .. }
+            | Self::ClaudeGatewaySignInCanceled { .. }
+            | Self::ClaudeGatewaySignInFailed { .. }
+            | Self::ClaudeGatewayManagedSettingsChanged { .. } => "claude_gateway",
             Self::DataFileWritten { .. }
             | Self::DataFileDeleted { .. }
             | Self::DataFileEdited { .. } => "data_file",
@@ -2227,6 +2390,7 @@ impl SystemEvent {
             | Self::LaneBatchLanded { .. }
             | Self::LaneBatchFailed { .. } => "landing_lane",
             Self::MainCheckStarted { .. }
+            | Self::MainCheckRunLinked { .. }
             | Self::MainCheckPassed { .. }
             | Self::MainCheckFailed { .. }
             | Self::MainCheckAbandoned { .. }
@@ -2277,6 +2441,9 @@ impl SystemEvent {
             | Self::AppDeleted { app_id, .. }
             | Self::AppOpened { app_id, .. }
             | Self::AppUiRefreshRequested { app_id, .. } => app_id.clone(),
+            Self::DashboardTileAdded { dashboard, .. }
+            | Self::DashboardTileRemoved { dashboard, .. }
+            | Self::DashboardArranged { dashboard, .. } => dashboard.as_str().to_string(),
             Self::KnowhowRead { knowhow_id, .. } => knowhow_id.clone(),
             Self::DomainEvent { event_type, .. } => event_type.clone(),
             Self::ChangeDiscarded { change_id } => change_id.clone(),
@@ -2349,6 +2516,12 @@ impl SystemEvent {
             Self::PermissionGrantsChanged { grant_file, .. } => grant_file.file_name().to_string(),
             Self::OAuthAccountConnected { account_id, .. }
             | Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),
+            Self::ClaudeGatewaySignedIn { issuer, .. }
+            | Self::ClaudeGatewaySignedOut { issuer, .. }
+            | Self::ClaudeGatewaySignInStarted { issuer, .. }
+            | Self::ClaudeGatewaySignInCanceled { issuer, .. }
+            | Self::ClaudeGatewaySignInFailed { issuer, .. }
+            | Self::ClaudeGatewayManagedSettingsChanged { issuer, .. } => issuer.clone(),
             Self::DataFileWritten { path, .. }
             | Self::DataFileDeleted { path, .. }
             | Self::DataFileEdited { path, .. }
@@ -2364,6 +2537,7 @@ impl SystemEvent {
             | Self::LaneBatchLanded { batch_id, .. }
             | Self::LaneBatchFailed { batch_id, .. } => batch_id.to_string(),
             Self::MainCheckStarted { check_id, .. }
+            | Self::MainCheckRunLinked { check_id, .. }
             | Self::MainCheckPassed { check_id, .. }
             | Self::MainCheckFailed { check_id, .. }
             | Self::MainCheckAbandoned { check_id, .. }

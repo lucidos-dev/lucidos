@@ -39,7 +39,7 @@ import {
   stagePluginUninstall,
   appUrl,
   postAppCapture,
-  retryTransientRead,
+  retryTransient,
   getAppApi,
   recordAppOpenedApi,
 } from '../../api/client';
@@ -92,7 +92,7 @@ async function loadAppsInner(): Promise<void> {
     // Retry a transient rejection before flipping to `failed` — same reason as
     // `loadRepositoriesInner`: a failed apps list is never refetched on its own,
     // so one cancelled fetch strands every surface that reads it.
-    const apps = await retryTransientRead(() => listAppsApi());
+    const apps = await retryTransient(() => listAppsApi());
     appsList.value = { status: 'loaded', data: apps };
 
     // Restore previously open app window on reload, once per page load (see

@@ -29,7 +29,6 @@
     "--header-gradient": "repeating-linear-gradient(to bottom, #000000 0 2px, #052205 2px 3px)",
     "--titlebar-strip-bg": "#000000",
     "--header-fg": "#33ff33",
-    "--header-divider": "#0f4d0f",
     "--header-badge-bg": "#33ff33",
     "--header-badge-fg": "#000000",
     "--focus-header-tint": "transparent",

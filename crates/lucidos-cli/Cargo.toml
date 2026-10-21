@@ -21,6 +21,7 @@ imagesize = "0.13"
 # scheduling priority, and the whole compile tree inherits it.
 libc = "0.2"
 lucidos-build-slot = { path = "../lucidos-build-slot" }
+lucidos-claude-code-managed = { path = "../lucidos-claude-code-managed" }
 # The two default gateway ports `lucidos pair` probes. Its only dependency is
 # serde, which this crate already takes.
 lucidos-installs = { path = "../lucidos-installs" }

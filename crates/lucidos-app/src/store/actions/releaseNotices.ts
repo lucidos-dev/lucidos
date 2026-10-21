@@ -1,14 +1,14 @@
 /**
  * *Release notices*: the one-time instructions a release hands the reader.
  *
- * The modal is a stepper over what this workspace still owes, oldest first, one
- * at a time. A later notice cannot be acted on early because it is not on
- * screen yet, which is the whole ordering guarantee.
+ * The modal only announces them and points at the Release Notices panel, where
+ * they are read, answered and acted on. The panel stays put while an action's
+ * thread runs, so the notices behind it are not lost.
  *
- * Answering is explicit: the action button, or Got it. Escape and the X close
- * the modal and resolve nothing, so an unanswered notice returns on the next
- * open. `releaseNoticeDismissed` is what makes that possible without lying to
- * the engine, and it deliberately lives only for this page's life.
+ * Answering is explicit: the action button, or Got it. Every way of closing the
+ * modal resolves nothing, so an unanswered notice announces itself again on
+ * the next open. `releaseNoticeDismissed` is what makes that possible without
+ * lying to the engine, and it deliberately lives only for this page's life.
  *
  * The READS live in `store/releaseNotices.ts`, and that file says why they are
  * apart from these actions.
@@ -19,6 +19,7 @@ import { toFailed, setLoadingIfFresh } from '../types';
 import { releaseNotices, resolveReleaseNotice } from '../../api/client';
 import type { ReleaseNotice } from '../../api/client';
 import { sendSeededPrompt } from './compose';
+import { openSettingsSubview } from './menu';
 import { errorDetail } from '../../utils/errorDetail';
 
 export async function loadReleaseNotices(): Promise<void> {
@@ -45,11 +46,6 @@ export async function resolveReleaseNoticeById(id: string): Promise<void> {
 
 /** Act on `notice`: send its sentence as a new message, and answer it.
  *
- *  Closing is not optional. The send lands the reader in a new thread, and an
- *  overlay makes everything behind it inert. A modal left open would cover the
- *  thread they were just sent to. Any notices behind this one return on the
- *  next open, and the What's New panel keeps them reachable meanwhile.
- *
  *  Resolved only when the send actually happened. A failed send leaves the
  *  notice owed, because nothing was started.
  *
@@ -61,21 +57,23 @@ export async function resolveReleaseNoticeById(id: string): Promise<void> {
 export async function takeReleaseNoticeAction(notice: ReleaseNotice): Promise<void> {
   if (!notice.action_prompt) return;
   const sent = await sendSeededPrompt(notice.action_prompt, 'start that from the release notice');
-  if (!sent) return;
-  releaseNoticeDismissed.value = true;
-  if (notice.resolved) return;
+  if (!sent || notice.resolved) return;
   await resolveReleaseNoticeById(notice.id);
 }
 
-/** Got it: answer the notice on screen and step to the next one.
- *
- *  The modal stays up, because the list it reads has already moved on. That is
- *  the stepper: one sitting, in order, rather than one modal per open. */
+/** Got it: answer the notice, and the next one becomes answerable. */
 export async function acknowledgeReleaseNotice(notice: ReleaseNotice): Promise<void> {
   await resolveReleaseNoticeById(notice.id);
 }
 
-/** Escape or the X. Closes without answering, so the notice returns. */
+/** Later, Escape or the X. Closes without answering, so the notices return. */
 export function dismissReleaseNoticeModal(): void {
   releaseNoticeDismissed.value = true;
+}
+
+/** Read them: close the modal and land on the Release Notices panel. Answers
+ *  nothing, so a reader who wanders off still gets the modal next open. */
+export function openReleaseNoticesPanel(): void {
+  releaseNoticeDismissed.value = true;
+  openSettingsSubview('release-notices');
 }

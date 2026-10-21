@@ -22,6 +22,9 @@ import { installUnsentMessageRestore } from './store/actions/unsentMessageRestor
 import { installScaleWheel } from './components/shared/scaleWheelListener';
 import { installSeenTargetWatch } from './store/actions/seen-target';
 import { startPageHealthLog } from './utils/pageHealthLog.report';
+import { installShellScrollGuard } from './utils/shellScrollGuard';
+import { reportShellSnapBack } from './utils/shellScrollProbe';
+import { pushTrafficLightOffset } from './store/actions/trafficLights';
 import * as scrollState from './components/chat/scrollState';
 import { provideScrollState } from './components/chat/scrollStateHandle';
 import { watchTranscriptLiveness } from './store/transcriptLiveness';
@@ -62,6 +65,13 @@ export function startShell(): () => void {
     installScaleWheel(),
     // A diagnostic, not a feature: docs/temporary-measures.md § Page health log.
     startPageHealthLog(),
+    // The desktop shell never scrolls as a whole. A snap-back moves the header
+    // band, so the traffic lights re-centre on it. The report is a diagnostic:
+    // docs/temporary-measures.md § Shell snap-back log.
+    installShellScrollGuard((snap) => {
+      pushTrafficLightOffset();
+      reportShellSnapBack(snap);
+    }),
     // The transcript's follow parks on a scroll unless the thread on screen is
     // live streaming: the agent running, or a call up on it. A call writes no
     // turn, so the projection alone reads it as quiet. See transcriptLiveness.ts.

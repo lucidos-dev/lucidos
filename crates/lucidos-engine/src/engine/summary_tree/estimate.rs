@@ -443,13 +443,13 @@ fn seed(model: &CompactorModel, tier: &str) -> Option<TierSeed> {
 /// The nearest tier at or below `tier` that `figure` knows, else the lowest
 /// above it.
 fn nearest<T>(tier: &str, figure: impl Fn(&str) -> Option<T>) -> Option<(&'static str, T)> {
-    let rung = EFFORT_LADDER.iter().position(|t| *t == tier).unwrap_or(0);
+    let effort_step = EFFORT_LADDER.iter().position(|t| *t == tier).unwrap_or(0);
     let found = |t: &&'static str| figure(t).map(|f| (*t, f));
-    EFFORT_LADDER[..=rung]
+    EFFORT_LADDER[..=effort_step]
         .iter()
         .rev()
         .find_map(found)
-        .or_else(|| EFFORT_LADDER[rung..].iter().find_map(found))
+        .or_else(|| EFFORT_LADDER[effort_step..].iter().find_map(found))
 }
 
 /// What one call at `tier` costs `model`, in tokens and seconds.
@@ -1050,9 +1050,13 @@ mod tests {
     /// apart, in the direction the measurements point.
     #[test]
     fn two_models_at_one_price_are_told_apart_by_their_seeds() {
+        let list_price = |id: &str| {
+            let price = model(id).price();
+            (price.input, price.output)
+        };
         assert_eq!(
-            model("gpt-6.1-sol").price,
-            model("claude-sonnet-5-5").price,
+            list_price("gpt-6.1-sol"),
+            list_price("claude-sonnet-5-5"),
             "the premise: one list price"
         );
         assert_ne!(seed_of("gpt-6.1-sol"), seed_of("claude-sonnet-5-5"));
@@ -1269,7 +1273,10 @@ mod tests {
         };
         let flex = on(&[ProviderKind::OpenAi]);
         let standard = on(&[ProviderKind::OpenRouter]);
-        let share = model("gpt-6.1-sol").flex.expect("Sol has a Flex rate");
+        let share = model("gpt-6.1-sol")
+            .price()
+            .flex
+            .expect("Sol has a Flex rate");
         let expected = standard.backfill_usd_central * share;
         assert!(
             (flex.backfill_usd_central - expected).abs() < 1e-9,
@@ -1675,10 +1682,11 @@ mod tests {
             avg_cache_write: 5_000,
             ..plain
         });
-        let per_token = sol.price.0 / 1_000_000.0 * 1_000.0;
+        let rates = sol.price();
+        let per_token = rates.input / 1_000_000.0 * 1_000.0;
         assert!((price(plain) - 6_000.0 * per_token).abs() < 1e-9);
-        assert!((read - (1_000.0 + 5_000.0 * sol.cache.read) * per_token).abs() < 1e-9);
-        assert!((written - (1_000.0 + 5_000.0 * sol.cache.write) * per_token).abs() < 1e-9);
+        assert!((read - (1_000.0 + 5_000.0 * rates.cache.read) * per_token).abs() < 1e-9);
+        assert!((written - (1_000.0 + 5_000.0 * rates.cache.write_5m) * per_token).abs() < 1e-9);
     }
 
     /// Postgres's `avg(bigint)` is `numeric`, a wire type sqlx cannot decode

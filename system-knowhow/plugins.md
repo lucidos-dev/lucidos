@@ -31,6 +31,7 @@ Other workspaces install what you publish, so get the shape right before scaffol
 3. **Distribution shape?** Single-repo git URL, monorepo subpath, or local `.lucidos-plugin` archive. Drives whether `source` is set in the manifest and where the user will publish.
 4. **Pictures and widgets?** Propose an icon, two to four screenshots and a `media/README.md` for every plugin you package (see "Plugin media"). Ask which of the workspace's reusable widgets should ship with it (see "Shipping widgets").
 5. **Cron triggers, OAuth, personal data?** None of those ship in plugins (see "What doesn't belong in a plugin" below). If the bundle would benefit from a cron trigger, surface that in the manifest `description` so the install-time LLM can offer to set one up. Confirm with the user that this is the intended UX.
+6. **Does `setup` put any shipped file outside `data/`?** A Claude Code skill that setup copies to `~/.claude/skills/<name>/` is the usual case. If so, tell the user that every later release changing such a file must raise `setup_revision`. That makes the update ask setup to run again (see "A release can ask for setup to run again"). Skip the question when setup writes only inside `data/`.
 
 ## Plugin layout
 
@@ -78,7 +79,7 @@ There is no separate install destination. `apps/foo/index.html` in the plugin la
 
 ## `manifest.toml` schema
 
-Four required fields, seven optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest`, so future additive fields stay compatible with old install records.
+Four required fields, nine optional. Unknown extra fields are accepted and round-trip into the `PluginInstalled` event payload's `manifest`, so future additive fields stay compatible with old install records.
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
@@ -89,6 +90,8 @@ Four required fields, seven optional. Unknown extra fields are accepted and roun
 | `source` | no | string | Git remote URL where the plugin lives. Used by `check_plugin_updates` and `update_plugin` to re-fetch the manifest. Omit for archive-only sharing: the plugin still installs and uninstalls, but the update tools return an explanatory error. When present, it must look like a git remote (`https://`, `http://`, `git@`, or ending in `.git`). |
 | `engine` | no | string | Semver requirement on the Lucidos release (e.g. `">=0.46.1"`). **Enforced at install and update**: see "The `engine` requirement" below. Omit it and any release installs the plugin, but Lucidos shows that it declares none. Declare it. |
 | `setup` | no | string | Markdown wiring instructions, written **to the agent about what to do with the user**. It renders in the install confirmation panel before the user confirms, and on confirm it drives a spawned Lucidos Agent setup thread. The engine never interprets it. This is the only way to ship workspace state rather than a file, a webhook above all. See "Install confirmation panel" below and `plugin-setup.md`. |
+| `setup_revision` | no | positive integer | Raise it on a release that needs `setup` to run again although its text is unchanged. An update re-runs setup when this is **greater** than the installed version's. A missing field counts as 0. Needs a non-empty `setup`. See "A release can ask for setup to run again". |
+| `setup_reason` | no | string | One line, at most 200 characters, saying why this revision asks for a re-run. Needs `setup_revision`. It shows in the confirmation panel and in the setup thread's first message. |
 | `icon` | no | string | The plugin icon, a path inside `media/` (`"media/icon.svg"`). See "Plugin media". |
 | `screenshots` | no | array of string | Paths inside `media/`, in the order the plugin detail page shows them. |
 | `videos` | no | array of string | Paths inside `media/`, shown after the screenshots. |
@@ -187,10 +190,10 @@ A plugin may ship *reusable widgets* (ADR 0414). Such a widget's plugin owns it,
 ```
 
 - **`"reusable": true`** and **`"origin_plugin_id"` equal to the plugin's `id`**, with **no `origin_thread_id`**. Any other widget folder fails validation: the scan names the folder in the catalog's errors, and install refuses with `apps/<id>/ is not a widget a plugin can ship`.
-- **Any thread may embed or pin it**, and the agent sees it with the other reusable widgets.
+- **Any thread may embed or pin it, and either dashboard may hold it**, and the agent sees it with the other reusable widgets.
 - **It offers no "Stop reusing"**, and `widgets(action="stop_reusing")` refuses it. Uninstall removes it with the rest of the plugin, and an update replaces it. Deleting a thread never touches it.
 - **Make one from a thread's widget** by copying its folder into the plugin's `apps/` and rewriting the manifest as above: drop `origin_thread_id`, add `origin_plugin_id`, set `reusable`.
-- **Narrow its Home board sizes** with `"sizes"`, default first, only if it cannot draw all three (none declared means all three, starting medium). Set `"transparent": true` for one that draws its own shape (`system-knowhow/building-an-app.md` § Widgets). A bad `sizes` fails validation like a bad origin. The user pins it to Home from the board's Add, and it runs no code until the plugin is installed: Add lists only installed widgets.
+- **Narrow its dashboard tile sizes** with `"sizes"`, default first, only if it cannot draw all three (none declared means all three, starting medium). Set `"transparent": true` for one that draws its own shape (`system-knowhow/building-an-app.md` § Widgets). A bad `sizes` fails validation like a bad origin. The user adds it from a *dashboard*'s own Add, and it runs no code until the plugin is installed: Add lists only installed widgets.
 - **A plugin widget brings work in.** It reads the user's own data through `lucidos.*`, and a tap leads into a thread or an app with `lucidos.ui.navigate`. It never frames another product's interface so the user works there instead: that would be a room, not a ramp (`docs/philosophy.md`).
 
 ## Install confirmation panel
@@ -201,11 +204,12 @@ A plugin may ship *reusable widgets* (ADR 0414). Such a widget's plugin owns it,
 - The `source` (git URL or archive path) and `source_type` (git / archive)
 - When the manifest has no `engine`, the note "This plugin doesn't say which Lucidos version it needs." The staged payload carries `engine_requirement` (as authored, or `null` when undeclared)
 - Every `data/`-relative path the install will write (overwrites called out separately in yellow)
-- The `setup` field rendered as markdown, if present
+- On an update, **Files to remove**: every path the previous version shipped and this one dropped. The staged payload carries them as `removes`. An edited one is listed under **Your edits** instead (see "An update keeps your changes")
+- The `setup` field rendered as markdown, if present. On an update it adds a line saying whether setup runs again after this update, and why. The staged payload carries `setup_run`: `null` when confirming starts no setup thread, otherwise the occasion it would seed
 
 The user clicks **Install** (or **Update**) or **Cancel**. Until they click, no bytes hit `data/`.
 
-- **Install** or **Update** writes the files and **commits them to the workspace git repo in one commit**, `"Install plugin: <id> v<version>"`. It emits `PluginInstalled`, and reloads WASM signers if any `auth-modules/` file changed. The plugin's files are then version-controlled like `write_file`/`edit_file` writes: with history, recoverable on a hard reset, and visible to git-based backups.
+- **Install** or **Update** writes the files and **commits them to the workspace git repo in one commit**, `"Install plugin: <id> v<version>"`. An update also deletes the files under **Files to remove** in that same commit. It emits `PluginInstalled`, and reloads WASM signers if any `auth-modules/` file changed. The plugin's files are then version-controlled like `write_file`/`edit_file` writes: with history, recoverable on a hard reset, and visible to git-based backups.
 - **Cancel** drops the staging and emits `PluginInstallCanceled`.
 
 Uninstall is symmetric: confirming it deletes the recorded files and commits the deletion (`"Uninstall plugin: <id> v<version>"`) before emitting `PluginUninstalled`.
@@ -218,21 +222,46 @@ Uninstall is symmetric: confirming it deletes the recorded files and commits the
 - The agent loads `system-knowhow/plugin-setup` (the chat system prompt nudges it to). It reads your `setup` text from the durable `PluginInstalled` event, at the payload path that knowhow names.
 - It fires for **both** the Plugins panel's Install button and the agent's `install_plugin` tool, since they share the confirm endpoint.
 - The `PluginInstalled` event records the thread's id (`manifest.setup_thread_id`), so the plugin's card can resolve it later.
-- A fresh install spawns it. An **update** spawns it only when the new `setup` text **differs** (after trimming) from the installed version's. Otherwise it re-runs nothing and navigates nowhere.
+- A fresh install spawns it. An **update** spawns it in two cases: the new `setup` text **differs** (after trimming) from the installed version's, or `setup_revision` is **greater** than the installed one. Otherwise it re-runs nothing and navigates nowhere.
 - The background marketplace **update check** never installs, so it never spawns a setup thread.
 
-**The setup thread's first message is the engine's, not yours.** It carries an engine origin with the reason `plugin_setup`: the plugin, the version installed, the occasion (fresh install or update, with the prior version when known) and the device that confirmed. The message route popover shows it as "Plugin install" or "Plugin update".
+**The setup thread's first message is the engine's, not yours.** It carries an engine origin with the reason `plugin_setup`: the plugin, the version installed, the occasion and the device that confirmed. The occasion is a fresh install, or an update with its cause and the prior version when known. The message route popover shows it as "Plugin install" or "Plugin update".
 
-**An update's setup thread starts from the last run, not from scratch.** Its seed says so (`Set up <name> again: its setup instructions changed since version <prior>.`, titled `Update <name> setup`), and `system-knowhow/plugin-setup` § 1 acts on it. That section diffs your two `setup` texts, reads the `PluginSetupCompleted` record the previous run wrote, and verifies what is already wired before asking anything. So a reworded `setup` costs the user a couple of questions, not the whole interview.
+**An update's setup thread starts from the last run, not from scratch.** Its seed says so, and `system-knowhow/plugin-setup` § 1 acts on it. That section reads the `PluginSetupCompleted` record the previous run wrote, and verifies what is already wired before asking anything. So an update costs the user a couple of questions, not the whole interview. The seed is titled `Update <name> setup` and names the cause:
+
+| Cause | Seed |
+|---|---|
+| The `setup` text changed | `Set up <name> again: its setup instructions changed since version <prior>.` |
+| `setup_revision` was raised | `Set up <name> again: version <v> asks to run its setup again since version <prior>.` |
+| Both | `Set up <name> again: its setup instructions changed since version <prior>, and the author asks to run it again.` |
+
+A raised revision with a `setup_reason` adds ` Author's note: <reason>`. A record naming no prior version drops the `since version` clause.
 
 What this means for plugin authors:
 
 - **Lead with `name` and `description`.** They render at the top of the panel. A real description ("Self-healing site knowhow for browser automation. Agents emit observations during tasks…") gives the user enough to decide. A single word ("browser-skills") doesn't.
-- **Use `setup` for wiring instructions the agent should run after install.** The user sees it as markdown before confirming. On confirm, the setup thread's agent reads it, plans it as a todo list and walks the user through it. It asks for what it needs (credentials, choices) and does the wiring it can (e.g. pasting the `apis.json` snippet for a signer plugin). Write `setup` as instructions *to the agent about what to do with the user*, not as a static checklist.
+- **Use `setup` for wiring instructions the agent should run after install.** The panel lists it, folded, under "Agent setup steps", and the user can open it before confirming. On confirm, the setup thread's agent reads it, plans it as a todo list and walks the user through it. It asks for what it needs (credentials, choices) and does the wiring it can (e.g. pasting the `apis.json` snippet for a signer plugin). Write `setup` as instructions *to the agent about what to do with the user*, not as a static checklist.
   This is also the only way to ship anything that is workspace state rather than a file, a webhook above all.
-- **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path. The user reviews the new version's file list (new files, and "would overwrite" for changed ones) before any bytes are written.
+- **Make every setup step that installs a shipped file outside `data/` safe to re-run.** A release can ask for setup to run again, so the step must check what is already there. It asks before it overwrites a local edit. A worked example, for a plugin that ships a Claude Code skill in `knowhow/<name>/skill/`:
+
+  > Copy `data/knowhow/<name>/skill/` to `~/.claude/skills/<name>/`. If that folder already exists, compare it with the shipped copy. When they match, say so and skip the copy. When the user changed their copy, show the difference and ask before you overwrite it.
+
+- **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path. The user reviews the new version's file list before any bytes are written: new files, files to replace, and files to remove.
 - **Staged installs expire after 1 hour.** The user then has to re-call `install_plugin`. Engine restarts also drop in-flight stagings (the staged temp dir is gone).
 - **The panel survives a reload, but not the expiry.** An install staged from a chat is a *form request* (`PluginInstallRequested`, see `system-knowhow/thread-events.md` § Form requests). Its row in the thread stays live until Confirm or Cancel, and `FormRequestResolved` records the outcome. On expiry the request closes as `expired` and the row stops offering Confirm. Uninstall behaves the same.
+
+### A release can ask for setup to run again
+
+Setup can install files that live outside `data/`. A Claude Code skill that setup copies to `~/.claude/skills/<name>/` is the usual case. A release that changes only the skill's files leaves the `setup` text unchanged, so a plain update starts no setup thread. The copy outside `data/` then goes stale without notice. `setup_revision` is the author's way to say so.
+
+- **Raise it by one** on the release that needs the re-run. Adding the field is itself a raise: going from absent to `setup_revision = 1` re-runs setup on that update.
+- **Leave it alone otherwise.** The re-run fires only when the staged revision is **greater** than the installed one. A value carried unchanged into the next release does nothing, so a stale value never nags.
+- **Lowering or removing it never re-runs setup.** Rolling back a release is safe.
+- **Add `setup_reason`** naming what changed, for example "The skill's trigger phrases changed." The user reads it in the panel, and the agent reads it first.
+- **Never reword `setup` to force a re-run.** That turns the instructions into a version stamp, and the user then re-reads steps that did not change.
+- **A fresh install ignores the revision.** It runs setup whenever `setup` exists.
+
+A malformed revision or reason refuses staging, like a bad `engine`, and names the field. The revision must be a positive integer. The reason must be one non-empty line of at most 200 characters, and needs a revision. A revision needs a non-empty `setup`.
 
 ## The Plugins panel and marketplaces
 
@@ -666,8 +695,14 @@ Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugin
 
    Ask because the engine cannot guess. An image in `data/artifacts/foo.png` might be a source of truth the user wants to share, or scratch they want to drop. Auto-bundling risks shipping private workspace artifacts, and auto-dropping risks publishing a broken feature.
 4. **Bump `version` in `manifest.toml` before publishing.** Without a bump, `check_plugin_updates` reports `"Already at latest"` to existing installers, and they never get the new content. Adding `engine` for the first time needs its own bump too (see "The `engine` requirement" above).
-5. **For archive distribution, package as zip and verify.** From inside the plugin tree, run `zip -r ../my-plugin.lucidos-plugin .`. Then check that `unzip -l ../my-plugin.lucidos-plugin` lists every expected file. `file ../my-plugin.lucidos-plugin` must report `Zip archive data`, not `gzip compressed data`.
-6. **Commit and push.** For monorepo plugins, the install URL changes only if the subpath changes. `update_plugin` re-fetches new content under the same path.
+5. **Decide whether this release asks setup to run again.** Do this on every release of a plugin that has a `setup` field. See "A release can ask for setup to run again".
+   - List the files this release changed.
+   - Raise `setup_revision` by one when `setup` installs, copies, registers or builds any of them outside `data/`. A Claude Code skill that setup copies to `~/.claude/skills/<name>/` is the usual case.
+   - Write `setup_reason` naming what changed, in one line.
+   - Otherwise leave both fields alone. Never reword `setup` to force a re-run.
+   - Tell the user which way you decided, and why.
+6. **For archive distribution, package as zip and verify.** From inside the plugin tree, run `zip -r ../my-plugin.lucidos-plugin .`. Then check that `unzip -l ../my-plugin.lucidos-plugin` lists every expected file. `file ../my-plugin.lucidos-plugin` must report `Zip archive data`, not `gzip compressed data`.
+7. **Commit and push.** For monorepo plugins, the install URL changes only if the subpath changes. `update_plugin` re-fetches new content under the same path.
 
 Authors need no manual smoke test: the engine's e2e tests cover install, update and uninstall.
 
@@ -678,6 +713,8 @@ A disk failure during extract (out-of-space, permission denied) returns an error
 ## Versioning and updates
 
 Semver is enforced at parse time: `0.1.0`, `1.4.2-beta.1` parse, `latest` and `1.0` do not.
+
+**A version bump alone does not re-run setup.** An update re-runs it when the new `setup` text differs, or when `setup_revision` is greater than the installed one. Raise the revision on a release that changes a file setup installs outside `data/`. See "A release can ask for setup to run again".
 
 `check_plugin_updates(id?)` (`engine/tools/plugins.rs::execute_check_plugin_updates`):
 
@@ -704,6 +741,16 @@ Semver is enforced at parse time: `0.1.0`, `1.4.2-beta.1` parse, `latest` and `1
 - Otherwise re-runs `install_plugin` with the recorded source and `overwrite=true`. It goes through the same staging, so an unmet `engine` requirement refuses the update just as it refuses an install. Same conflict mechanics, same `PluginInstalled` event variant: updates are installs over existing files.
 
 If the recorded manifest has no `source`, the update returns an error rather than guessing.
+
+**An update removes the files the new version dropped.** The removal set is the previous install's recorded `files` minus what the new version ships. So a file you moved, say from `apps/<app>/knowhow/<topic>.md` to `knowhow/<topic>.md`, ends up only at its new path. The panel lists the removals before the user confirms. The confirm deletes them after writing the new files, prunes the folders that leaves empty, and records the deletion in the install commit. Five kinds of path are never removed:
+
+- a path another installed plugin still records;
+- a path the new version ships under another case, since a case-insensitive volume such as the macOS default sees one file;
+- a path outside the seven content dirs;
+- a `triggers/<slug>/trigger.toml`, which the trigger re-sync deletes together with the trigger (see "Shipping triggers");
+- a file already gone from disk.
+
+Only recorded paths are candidates, so a file the user added beside a dropped one stays, and so does its folder. A dropped file the user edited is saved aside before it goes (see "An update keeps your changes").
 
 A version that fails to parse (`compare_versions` with garbage on either side) counts as needing an update. The engine prefers attempting the install over silently doing nothing on corrupted data.
 
@@ -754,14 +801,21 @@ The staged install panel lists the outcome for each edited file **before** you c
 | `conflict` | Both sides changed the same lines. Writes upstream's version, and saves yours aside. |
 | `replaced` | Never mergeable: a trigger definition, a binary, or a file over 1 MB. Writes upstream's version, and saves yours aside. |
 | `restored` | You had deleted the file and the new version still ships it, so it comes back. Nothing is saved aside, because a deletion has no content to keep. |
+| `removed` | The new version no longer ships the file. Saves yours aside, then deletes it. |
+
+**A `removed` file is never kept in place, whatever the Keep my edits control says.** A stale copy left behind keeps loading, which is the failure the removal exists to prevent. A dropped file counts as unedited only when the install commit holds its exact bytes. A legacy install record has no install commit, so no edit can be ruled out. Every dropped file it still has on disk is then treated as `removed`, and saved aside whole, without a patch.
 
 **A file already identical to the new version is not listed at all.** That is the common case after your own edit was accepted upstream. Those paths are written as shipped, with no row, no count, and nothing saved aside. The comparison is by content hash, so an oversized file is judged like any other.
 
-The panel also carries one **Keep my edits** control, on by default. Clearing it takes a clean update: every file becomes `replaced`, and every edit is saved aside. The choice reaches the engine as `?keep_local_changes=false` on the confirm. An absent flag means keep, so a caller that never showed the control cannot silently discard a patch.
+The panel also carries one **Keep my edits** control, on by default. Clearing it takes a clean update: every file becomes `replaced`, apart from `restored` and `removed` ones, and every edit is saved aside. The choice reaches the engine as `?keep_local_changes=false` on the confirm. An absent flag means keep, so a caller that never showed the control cannot silently discard a patch.
 
 **A discarded edit is never simply deleted.** Before anything is overwritten, the engine writes your version and a `.patch` of it under `data/artifacts/plugin-local-changes/<plugin-id>/v<version>/`, with a `README.md` explaining the folder. That root is git-tracked and never auto-deleted. A clean merge saves nothing, because your edit survives in the file itself.
 
 **The panel never opens blind.** Staging reads every installed plugin's install commit from the event log. When that read fails, the engine cannot tell which files you edited. So staging refuses any install that would overwrite an existing file, and tells you to try again. A fresh install has nothing to lose and stages as usual.
+
+**An edit made after staging refuses the confirm.** The engine hashes every edited file, and every file it would remove, when it stages. If one of them changed by the time you confirm, the confirm refuses and asks you to run the update again. Nothing is overwritten or deleted on a judgment you did not see.
+
+**So does an install record that moved.** The confirm re-reads the install records. It refuses when this plugin's record changed, say a newer version was confirmed first. It also refuses when another plugin now records a path the update would remove.
 
 Installing one version twice is allowed, so a second save of the same version lands in `v<version>-2` rather than replacing the first. The engine never writes over a folder it already saved edits into.
 
@@ -808,7 +862,7 @@ Emitted on every successful install, overwrites and updates included (there is n
     "id": "browser-learning",
     "manifest": {
       "summary": "Installed Browser Learning v0.1.0 from github.com/lucidos-dev/plugins/tree/main/browser-learning",
-      "manifest": { "id": "browser-learning", "version": "0.1.0", "name": "...", "description": "...", "source": "https://github.com/lucidos-dev/plugins/tree/main/browser-learning", "engine": "...", "setup": "..." },
+      "manifest": { "id": "browser-learning", "version": "0.1.0", "name": "...", "description": "...", "source": "https://github.com/lucidos-dev/plugins/tree/main/browser-learning", "engine": "...", "setup": "...", "setup_revision": 2, "setup_reason": "..." },
       "files": ["knowhow/browser-skills.md", "..."],
       "installed_at": "2026-04-29T12:34:56+00:00",
       "source_type": "git",
@@ -816,12 +870,15 @@ Emitted on every successful install, overwrites and updates included (there is n
       "setup_thread_id": "<uuid of the spawned setup thread, when one was spawned>"
     },
     "files": ["knowhow/browser-skills.md", "knowhow/browser-knowhow-reflection.md"],
+    "files_removed": ["apps/browser-learning/knowhow/browser-skills.md"],
     "installed_at": "2026-04-29T12:34:56+00:00",
     "source_type": "git",
     "actor": { ... }
   }
 }
 ```
+
+`files_removed` (at `payload.data.files_removed`) lists the paths this update deleted because the new version dropped them (see "Versioning and updates"). It is omitted when empty, which covers every fresh install.
 
 The two outer wrappers come from how Lucidos persists `SystemEvent`: serde's `tag = "type", content = "data"` adds `{type, data}`, and `install_from_unpacked_with_bus` packs the raw manifest into a payload map under `manifest` before assigning that map to `SystemEvent::PluginInstalled.manifest`. Net effect: the raw manifest fields (`version`, `source`, `setup`, ...) sit at `payload.data.manifest.manifest.*`. `InstalledRecord` reads them at that path; do the same in any new consumer. `setup_thread_id` sits one level up, at `payload.data.manifest.setup_thread_id`, because the engine records it rather than the author.
 
@@ -855,13 +912,17 @@ Emitted right after the `PluginInstalled` it belongs to, and only when the insta
   "merged": ["knowhow/email-triage.md"],
   "conflicted": ["apps/email-triage/index.html"],
   "replaced": ["triggers/email-triage/trigger.toml"],
-  "saved_paths": ["artifacts/plugin-local-changes/email-triage/v0.3.0/apps/email-triage/index.html"],
+  "removed": ["knowhow/email-triage-old.md"],
+  "saved_paths": [
+    "artifacts/plugin-local-changes/email-triage/v0.3.0/apps/email-triage/index.html",
+    "artifacts/plugin-local-changes/email-triage/v0.3.0/knowhow/email-triage-old.md"
+  ],
   "commit": "<sha of the keep-local-changes commit>",
   "actor": { ... }
 }
 ```
 
-This one IS stored, unlike the Modified badge beside it, and the difference is the point. The badge is a pure function of git plus disk, so it can always be recomputed. A merge is not: once the two commits are written, nothing on disk says which files merged and which lost. `saved_paths` names the copies of every discarded edit, each with a `.patch` sibling.
+This one IS stored, unlike the Modified badge beside it, and the difference is the point. The badge is a pure function of git plus disk, so it can always be recomputed. A merge is not: once the two commits are written, nothing on disk says which files merged and which lost. `saved_paths` names the copies of every discarded edit, each with a `.patch` sibling when the edit is text and a baseline exists. Every list is omitted when empty.
 
 ### `PluginUninstalled`
 
@@ -885,14 +946,17 @@ Both events are useful trigger sources. Examples worth considering:
 
 ## Common mistakes to avoid
 
-- **Building the archive with `tar`, `tar -czf`, or `gzip`.** A `.lucidos-plugin` is a renamed PKZip file. See "3. Local archive" and "Authoring loop" step 4.
+- **Building the archive with `tar`, `tar -czf`, or `gzip`.** A `.lucidos-plugin` is a renamed PKZip file. See "3. Local archive" and "Authoring loop" step 6.
 - **Calling the manifest `manifest.json`, `manifest.yaml`, or anything other than `manifest.toml`.** `validate_tree` looks for `manifest.toml` at the archive root and only parses TOML. Other names or formats reject the archive before any file is written. See the schema table above for the fields.
-- **Silently dropping or rewriting external references** (`<img src="../../artifacts/foo.png">`, `<script src="/data/scripts/bar.js">`). Ask the user about each one: see "Authoring loop" step 2.
+- **Silently dropping or rewriting external references** (`<img src="../../artifacts/foo.png">`, `<script src="/data/scripts/bar.js">`). Ask the user about each one: see "Authoring loop" step 3.
 - **Putting a README at the plugin root.** Validation rejects any top-level entry that is not `manifest.toml` or one of the seven content directories. Put your README inside `apps/<id>/` if it is app-specific, or only in the source repo, which install never reads.
 - **Committing `__pycache__/` or `*.pyc` files.** Install skips them (see "Plugin layout"), but they still bloat the repo and add noise to every PR. Give the plugin repo a `.gitignore` that lists `__pycache__/`, `*.pyc` and any other build output your scripts or apps create.
 - **Writing runtime state inside the plugin's own folders.** See "Where a plugin keeps its runtime state".
 - **Using underscores or capitals in `id`.** `browser_learning` and `Browser-Learning` both fail validation. Stick to `[a-z0-9-]+`.
 - **Setting `source` to a `.lucidos-plugin` path.** When present, `source` must be a git URL. For archive-only distribution, omit `source`.
+- **Rewording `setup` to force a re-run.** That turns the instructions into a version stamp. Raise `setup_revision` instead.
+- **Forgetting to raise `setup_revision` when a file setup installs changed.** The `data/` copy updates, but the copy outside `data/` stays stale and no setup thread starts.
+- **Lowering or resetting `setup_revision`.** Only a greater value re-runs setup, so a lowered or removed one does nothing.
 - **Forgetting to bump `version` before publishing a fix.** Existing installers see `"Already at latest"` and never get your change.
 - **Expecting an update to keep every user edit.** An update merges edits, but a conflict, a binary, a `trigger.toml` or a file over 1 MB takes the new shipped version. The user's copy is saved aside (see "An update keeps your changes"). If the user is meant to edit `knowhow/sites/linkedin.com/selectors.md`, ship it as a template they copy elsewhere.
 - **Cross-plugin path collisions.** See "Sharing a path between plugins" under "Uninstall semantics".

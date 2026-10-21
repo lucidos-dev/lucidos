@@ -93,8 +93,11 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             output_tokens: Some(self.output_tokens),
             input_tokens: Some(self.input_tokens),
             cache_creation_tokens: None,
+            cache_creation_1h_tokens: None,
+            stable_prefix_fingerprint: None,
             cache_read_tokens: None,
             served_model: None,
+            provider: None,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
@@ -265,6 +268,16 @@ pub fn test_db_url(db_name: &str) -> String {
         Some(q) => format!("{}?{}", swapped, q),
         None => swapped,
     }
+}
+
+/// The agent role URL unit tests record in place of the one boot provisions.
+pub const AGENT_DATABASE_URL: &str =
+    "postgresql://lucidos_test_agent:pw@localhost:5432/lucidos_test?options=-c%20default_transaction_read_only%3Don";
+
+/// Record [`AGENT_DATABASE_URL`] as boot would. Every caller records the same
+/// value, so the order tests run in does not matter.
+pub fn install_agent_database_url() {
+    crate::core::set_agent_database_url(AGENT_DATABASE_URL.to_string());
 }
 
 pub async fn setup_test_db() -> (PgPool, String) {
@@ -554,6 +567,73 @@ pub async fn start_cc_session(
     .unwrap();
 }
 
+/// A coding-agent thread with a session, a child of `parent` when given.
+pub async fn seed_coding_thread(bus: &EventBus, parent: Option<Uuid>) -> Uuid {
+    let thread_id = Uuid::new_v4();
+    emit_cc(bus, thread_id, message_from_parent("work", parent)).await;
+    start_cc_session(bus, thread_id, &format!("claude-code/{thread_id}"), None).await;
+    thread_id
+}
+
+/// `old` continues in a new *successor thread*, which opens as a child of
+/// `parent` when given. Returns the successor.
+pub async fn seed_handoff(
+    bus: &EventBus,
+    old: Uuid,
+    parent: Option<Uuid>,
+    starts_build_chain: bool,
+) -> Uuid {
+    seed_consented_handoff(bus, old, parent, starts_build_chain, None).await
+}
+
+/// [`seed_handoff`], recording the *handoff consent* that let it through.
+pub async fn seed_consented_handoff(
+    bus: &EventBus,
+    old: Uuid,
+    parent: Option<Uuid>,
+    starts_build_chain: bool,
+    handoff_consent: Option<crate::engine::thread_events::HandoffConsent>,
+) -> Uuid {
+    let successor = Uuid::new_v4();
+    emit_cc(
+        bus,
+        old,
+        ThreadEvent::SuccessorThreadSpawned {
+            successor_thread_id: successor,
+            base_sha: "0123abc".into(),
+            starts_build_chain,
+            handoff_consent,
+        },
+    )
+    .await;
+    emit_cc(bus, successor, message_from_parent("carry on", parent)).await;
+    successor
+}
+
+fn message_from_parent(text: &str, parent: Option<Uuid>) -> ThreadEvent {
+    let mut message = message_received(text);
+    if let ThreadEvent::MessageReceived {
+        parent_thread_id, ..
+    } = &mut message
+    {
+        *parent_thread_id = parent;
+    }
+    message
+}
+
+async fn emit_cc(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event,
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap_or_else(|e| panic!("emit on {thread_id}: {e}"));
+}
+
 /// An `EventWaitStarted` armed now, watching `BackgroundBashCompleted` for an
 /// hour: the wait a coding agent's `lucidos background-task run` arms.
 pub fn event_wait_started(wait_id: Uuid) -> ThreadEvent {
@@ -720,6 +800,22 @@ pub async fn seed_oauth_account_with_desired(
 pub async fn seed_preference(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     crate::core::PreferenceStore::set(pool, &bus, key, value, None).await
+}
+
+/// Store a Claude gateway sign-in from `issuer`, through its store.
+pub async fn seed_claude_gateway_sign_in(pool: &PgPool, issuer: &str) {
+    use crate::llm::claude_gateway::{account::ClaudeGatewayAccountStore, GatewayOrigin};
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let issuer = GatewayOrigin::parse(issuer).expect("a gateway origin");
+    let tokens = crate::llm::claude_gateway::GrantedTokens {
+        access_token: "gw-token".to_string(),
+        refresh_token: None,
+        token_expiry: None,
+        email: None,
+    };
+    ClaudeGatewayAccountStore::sign_in(pool, &bus, &issuer, &tokens, None)
+        .await
+        .expect("store the sign-in");
 }
 
 /// [`seed_preference`], scoped to one device.

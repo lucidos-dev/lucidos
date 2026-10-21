@@ -12,4 +12,5 @@ docs/temporary-measures.md merge=lucidos-blocks
 docs/glossary.md merge=lucidos-blocks
 system-knowhow/glossary.md merge=lucidos-blocks
 CHANGELOG.md merge=lucidos-blocks
-.claude/rules/db.md merge=lucidos-blocks
+docs/system-events.md merge=lucidos-blocks
+docs/database-schema-notes.md merge=lucidos-blocks

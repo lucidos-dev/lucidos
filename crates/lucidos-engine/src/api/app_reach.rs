@@ -64,11 +64,14 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/artifact-preview-capability", Host, &[]),
     ("/backup", Host, &[]),
     ("/backup/key", Host, &[]),
-    ("/backup/key/exists", Host, &[]),
     ("/backup/key/reveal-token", Host, &[]),
     ("/backup/last-successful", Host, &[]),
     ("/backup/list", Host, &[]),
     ("/backup/providers", Host, &[]),
+    ("/backup/recipient", Host, &[]),
+    ("/backup/recipient/confirm", Host, &[]),
+    ("/backup/recipient/setup", Host, &[]),
+    ("/backup/recipient/verify", Host, &[]),
     ("/backup/retention", Host, &[]),
     ("/backup/schedule", Host, &[]),
     ("/backup/status", Host, &[]),
@@ -102,6 +105,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/claude-code/interrupt", Host, &[]),
     ("/claude-code/stop", Host, &[]),
     ("/coding-agents/binaries", Host, &[]),
+    ("/coding-agent/intelligence-ladder", Host, &[]),
     ("/command-checkpoint/diff", Host, &[]),
     ("/command-checkpoint/undo", Host, &[]),
     ("/command-permission/consent", Host, &[]),
@@ -111,6 +115,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/credential-reveal-token", Host, &[]),
     ("/credential-value", Host, &[]),
     ("/credentials", Host, &[]),
+    ("/dashboard", Host, &[]),
     ("/data", App, &["GET"]),
     ("/data/*path", App, &["GET", "PUT", "DELETE"]),
     ("/data/edit", App, &["POST"]),
@@ -161,7 +166,9 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/handshake-scripts/approve", Host, &[]),
     ("/health", App, &["GET"]),
     ("/history", Host, &[]),
-    ("/home-board", Host, &[]),
+    ("/intelligence-ladder", Host, &[]),
+    ("/intelligence-ladder/copy-from-chat", Host, &[]),
+    ("/intelligence-ladder/sort", Host, &[]),
     ("/internal/approve-plan", Agent, &[]),
     ("/internal/ask-user-question", Agent, &[]),
     ("/internal/client-log", Agent, &[]),
@@ -206,6 +213,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/memory/tree-backfill/cap", Host, &[]),
     ("/memory/tree/threads", Host, &[]),
     ("/messages", Host, &[]),
+    ("/model-prices", App, &["GET"]),
     ("/models", App, &["GET"]),
     ("/models/background", Host, &[]),
     ("/network-config", Host, &[]),
@@ -219,6 +227,8 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/oauth/complete", Host, &[]),
     ("/oauth/known-providers", Host, &[]),
     ("/oauth/reauthorize", Host, &[]),
+    ("/onepassword", Host, &[]),
+    ("/onepassword/test", Host, &[]),
     ("/owner-approvals", Agent, &[]),
     ("/pinned-apps", Host, &[]),
     ("/plugins/catalog", Host, &[]),
@@ -244,6 +254,9 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/plugins/upload-archive", Host, &[]),
     ("/preferences", App, &["GET", "PUT"]),
     ("/presence-pong", Host, &[]),
+    ("/providers/claude-gateway", Host, &[]),
+    ("/providers/claude-gateway/sign-in", Host, &[]),
+    ("/providers/claude-gateway/sign-out", Host, &[]),
     ("/proxy-modules/reload", Host, &[]),
     (
         "/proxy/:name",
@@ -318,7 +331,12 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/threads/:thread_id/harden", Host, &[]),
     ("/threads/:thread_id/detach", Host, &[]),
     ("/threads/:thread_id/context", Host, &[]),
+    ("/threads/:thread_id/switch-estimate", Host, &[]),
+    ("/threads/:thread_id/cache-warmth", Host, &[]),
     ("/threads/:thread_id/successor", Host, &[]),
+    ("/threads/:thread_id/successor-offer/decline", Host, &[]),
+    ("/threads/:thread_id/successor-offer/continue", Host, &[]),
+    ("/threads/:thread_id/handoff-checkpoints", Host, &[]),
     ("/threads/:thread_id/event-waits", Agent, &[]),
     (
         "/threads/:thread_id/event-waits/:wait_id/cancel",
@@ -370,6 +388,8 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/webhooks/refusals", Host, &[]),
     ("/widgets", Host, &[]),
     ("/widgets/arrange", Host, &[]),
+    ("/widgets/dashboard-add", Host, &[]),
+    ("/widgets/dashboard-remove", Host, &[]),
     ("/widgets/make-reusable", Host, &[]),
     ("/widgets/pin", Host, &[]),
     ("/widgets/stop-reusing", Host, &[]),
@@ -484,7 +504,7 @@ pub(crate) async fn enforce_app_reach(request: Request, next: Next) -> Response 
 /// local model host. An app is no more trusted than the agent, so it may not
 /// write them either. Every `key` parameter counts, so a repeated one cannot
 /// hide a key. They also include the engine's own bookkeeping, which is no
-/// setting at all: an app overwriting `vapid_keys` stops every push.
+/// setting at all: an app overwriting `backup_last_run` misreports backups.
 ///
 /// [`APP_REFUSED_PREFERENCES`] adds keys the agent may write but an app may not.
 fn human_only_preference(

@@ -1,6 +1,6 @@
 ---
 name: grill
-description: Interview the user relentlessly about a plan or design until reaching shared understanding, resolving each branch of the decision tree by asking each question via the AskUserQuestion tool with multiple-choice options. Default skill when the user wants to stress-test a plan, get grilled on their design, or mentions "grill me". Project-scoped variant for Lucidos — actively uses the project glossaries when phrasing questions and sharpens them in-flight when concepts crystallize, so vocabulary stays aligned across the codebase, UI, and user-facing prose.
+description: Interview the user relentlessly about a plan or design until you share an understanding, asking each decision-tree question via AskUserQuestion with multiple-choice options. Default skill when the user wants to stress-test a plan, get grilled on their design, or says "grill me". Uses and sharpens the project glossaries so vocabulary stays aligned across code, UI and prose.
 ---
 
 # Grill (Lucidos)

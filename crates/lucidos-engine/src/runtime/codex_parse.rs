@@ -243,6 +243,8 @@ pub(super) struct TurnTracker {
     /// positive and permanently disarm its hang watchdog. Drained into
     /// synthetic closing `ToolResult`s at every turn boundary.
     open_tool_ids: Vec<String>,
+    /// The effort the driver sent with this turn, stamped on its `Usage`.
+    turn_effort: Option<String>,
 }
 
 impl TurnTracker {
@@ -254,9 +256,10 @@ impl TurnTracker {
         }
     }
 
-    /// Reset per-turn accumulation. Session-level state (session id, whether
-    /// Init went out) survives.
-    pub fn begin_turn(&mut self) {
+    /// Reset per-turn accumulation for a turn sent with `effort`.
+    /// Session-level state (session id, whether Init went out) survives.
+    pub fn begin_turn(&mut self, effort: Option<String>) {
+        self.turn_effort = effort;
         self.agent_texts.clear();
         self.last_error = None;
         self.turn_terminal_seen = false;
@@ -335,6 +338,7 @@ impl TurnTracker {
                         parent_tool_use_id: None,
                         api_call_id: None,
                         duration_ms: None,
+                        reasoning_effort: self.turn_effort.clone(),
                     });
                 }
                 events.push(AgentEvent::Result {

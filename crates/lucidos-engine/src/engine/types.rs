@@ -103,6 +103,77 @@ fn default_context_role() -> ContextRole {
 mod tests {
     use super::*;
 
+    /// Rows the retired intent sub-loop wrote still read, and still write back
+    /// the same purpose a cost filter matches on.
+    #[test]
+    fn a_retired_intent_loop_capture_still_round_trips() {
+        let purpose: ContextPurpose = serde_json::from_value(serde_json::json!("intent_loop"))
+            .expect("an old intent_loop row reads");
+        assert_eq!(purpose, ContextPurpose::IntentLoop);
+        assert_eq!(
+            serde_json::to_value(purpose).unwrap(),
+            serde_json::json!("intent_loop")
+        );
+    }
+
+    fn usage(input: u32, output: u32, read: u32, written: u32, written_1h: u32) -> ApiUsage {
+        ApiUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: read,
+            cache_creation_tokens: written,
+            modality: None,
+            service_tier: None,
+            cache_creation_1h_tokens: Some(written_1h),
+        }
+    }
+
+    /// A keep-alive ping reads the whole context at the cache read rate.
+    #[test]
+    fn a_call_prices_each_token_class_at_its_rate() {
+        let today = crate::llm::model_prices::today();
+        let table = crate::llm::model_prices::price_table();
+        let rates = table
+            .card_on("claude-opus-5-5", today)
+            .expect("priced")
+            .rates;
+        let usd = |u: &ApiUsage| u.usd_on("claude-opus-5-5[1m]", today).expect("priced");
+        let ping = usage(262_000, 5, 262_000, 0, 0);
+        let expected = (262_000.0 * rates.cache_read + 5.0 * rates.out) / 1e6;
+        assert!((usd(&ping) - expected).abs() < 1e-12);
+        let fresh_and_writes = usage(1_300, 0, 0, 1_200, 200);
+        let write_1h = rates.cache_write_1h.unwrap_or(rates.cache_write);
+        let expected =
+            (100.0 * rates.uncached_in + 1_000.0 * rates.cache_write + 200.0 * write_1h) / 1e6;
+        assert!((usd(&fresh_and_writes) - expected).abs() < 1e-12);
+        assert_eq!(ping.usd_on("my-local-model", today), None);
+    }
+
+    /// A prompt past the card's long threshold prices every token, output
+    /// included, at the long rates.
+    #[test]
+    fn a_long_prompt_prices_at_the_long_tier() {
+        let table = crate::llm::model_prices::price_table();
+        let today = crate::llm::model_prices::today();
+        let (model, card) = table
+            .models
+            .keys()
+            .find_map(|model| {
+                let card = table.card_on(model, today)?;
+                card.long.map(|_| (model.clone(), card.clone()))
+            })
+            .expect("a shipped model with a long tier");
+        let long = card.long.expect("long tier");
+        let past = u32::try_from(long.threshold_tokens + 1).expect("fits");
+        let call = usage(past, 10, 0, 0, 0);
+        let expected = (f64::from(past) * long.rates.uncached_in + 10.0 * long.rates.out) / 1e6;
+        let cost = call.usd_on(&model, today).expect("priced");
+        assert!((cost - expected).abs() < 1e-12, "{cost} vs {expected}");
+        let short = usage(1_000, 10, 0, 0, 0);
+        let base = (1_000.0 * card.rates.uncached_in + 10.0 * card.rates.out) / 1e6;
+        assert!((short.usd_on(&model, today).expect("priced") - base).abs() < 1e-12);
+    }
+
     #[test]
     fn context_section_legacy_payload_deserializes_with_default_role_and_no_group() {
         // Pre-change ContextCaptured events have no `role` or `group` fields.
@@ -356,11 +427,11 @@ pub enum ContextPurpose {
     /// It owns no model preference, because the tool is Jev or nothing. See
     /// `aux_purpose`, which names that case rather than exempting it.
     JudgeTool,
-    /// One round of the `execute_intent` sub-loop.
+    /// Retired: one round of the removed `execute_intent` sub-loop.
     ///
-    /// It runs the agent's own chat model, so it owns no preference either.
-    /// Auxiliary rather than a turn: the row carries no section breakdown, and
-    /// a trigger scoped to `purpose: "turn"` asked for the agent's own turns.
+    /// Nothing produces it now. It stays so old `ContextCaptured` rows still
+    /// read, and so a cost filter on `purpose: "intent_loop"` still matches
+    /// them.
     IntentLoop,
     /// The verdict behind `correct_memory`, which asks which stored entries
     /// carry the fact the user rejected. Runs the agent's own chat model.
@@ -485,11 +556,41 @@ pub struct ApiUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<crate::llm::ServiceTier>,
     /// Part of `cache_creation_tokens`: the tokens written to the 1-hour
-    /// cache, billed at 2x base input rather than 1.25x. Only a Claude Code
-    /// session's usage block splits a write by lifetime, so it is absent
-    /// everywhere else. The cache keep-alive reads the session's TTL from it.
+    /// cache, billed at 2x base input rather than 1.25x. A Claude Code
+    /// session and a Claude chat call on Anthropic or Vertex split a write by
+    /// lifetime, and every other producer leaves it absent. The cache
+    /// keep-alive reads the session's TTL from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_tokens: Option<u32>,
+}
+
+impl ApiUsage {
+    /// What this call cost at `model`'s list price on `day`, in USD. `None`
+    /// for an unpriced model. A prompt that reached the card's long tier
+    /// prices every token at its rates. A Flex call prices as standard.
+    pub(crate) fn usd_on(&self, model: &str, day: chrono::NaiveDate) -> Option<f64> {
+        let table = crate::llm::model_prices::price_table();
+        let card = table.card_on(model, day)?;
+        let prompt = u64::from(self.input_tokens);
+        let rates = match card.long {
+            Some(long)
+                if prompt > long.threshold_tokens
+                    || (long.inclusive && prompt == long.threshold_tokens) =>
+            {
+                long.rates
+            }
+            _ => card.rates,
+        };
+        let read = f64::from(self.cache_read_tokens);
+        let written = f64::from(self.cache_creation_tokens);
+        let written_1h = f64::from(self.cache_creation_1h_tokens.unwrap_or(0)).min(written);
+        let fresh = (f64::from(self.input_tokens) - read - written).max(0.0);
+        let input_usd = fresh * rates.uncached_in
+            + read * rates.cache_read
+            + (written - written_1h) * rates.cache_write
+            + written_1h * rates.cache_write_1h.unwrap_or(rates.cache_write);
+        Some((input_usd + f64::from(self.output_tokens) * rates.out) / 1_000_000.0)
+    }
 }
 
 /// How one call's tokens split across text, audio and image.
@@ -574,8 +675,12 @@ impl AgentUserInput {
     /// A child wake or an engine-made prompt (auto-harden, apply) has none.
     pub fn user_origin(&self) -> Option<uuid::Uuid> {
         match self.kind {
-            AgentInputKind::User => self.origin_event_id,
-            AgentInputKind::ReentryFromEngine => None,
+            AgentInputKind::User
+            | AgentInputKind::Redelivered {
+                input: RedeliveredInput::Message { .. },
+                ..
+            } => self.origin_event_id,
+            AgentInputKind::ReentryFromEngine | AgentInputKind::Redelivered { .. } => None,
         }
     }
 }
@@ -595,6 +700,64 @@ pub enum AgentInputKind {
     /// `PreEmittedOrigin::is_engine_reentry` origin lands here, which is why the
     /// name says engine rather than child.
     ReentryFromEngine,
+    /// An input a session dropped before its agent read it, sent again by the
+    /// next session (`agent_session::stranded_follow_ups`). A message is like
+    /// `User` and the rest like `ReentryFromEngine`, each with a note that it
+    /// is late, who sent it and when.
+    Redelivered {
+        sent_at: chrono::DateTime<chrono::Utc>,
+        input: RedeliveredInput,
+    },
+}
+
+impl AgentInputKind {
+    /// Whether forwarding this input records a `CodingAgentPromptSent`. Any
+    /// other input already renders as the event that started it, and a prompt
+    /// row would show it twice.
+    pub fn writes_prompt_sent(self) -> bool {
+        matches!(
+            self,
+            Self::User
+                | Self::Redelivered {
+                    input: RedeliveredInput::Message { .. },
+                    ..
+                }
+        )
+    }
+}
+
+/// What a redelivered input was, which decides its late note and whether it
+/// writes a `CodingAgentPromptSent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedeliveredInput {
+    /// A `MessageReceived`, from the user, Lucidos or another thread.
+    Message {
+        sender: crate::engine::thread_events::ActorMode,
+    },
+    /// A child's `ChildThreadCompleted` wake or `ChildReportFiled` report.
+    ChildReport,
+    /// A prompt Lucidos sent: a `CodingAgentPromptSent` or a `PromptInjected`.
+    EnginePrompt,
+}
+
+impl RedeliveredInput {
+    /// The kind of an owed input's event row. The kinds match
+    /// `stranded_follow_ups::OWED_KIND`, so a row it admits always has one.
+    pub fn of_row(event_type: &str, payload: &serde_json::Value) -> Option<Self> {
+        use crate::engine::thread_events::ActorMode;
+        match event_type {
+            "MessageReceived" => Some(Self::Message {
+                sender: match payload.get("mode").and_then(|m| m.as_str()) {
+                    Some("engine") => ActorMode::Engine,
+                    Some("agent") => ActorMode::Agent,
+                    _ => ActorMode::Human,
+                },
+            }),
+            "ChildThreadCompleted" | "ChildReportFiled" => Some(Self::ChildReport),
+            "CodingAgentPromptSent" | "PromptInjected" => Some(Self::EnginePrompt),
+            _ => None,
+        }
+    }
 }
 
 /// Cached CC slash commands (builtin + skill).
@@ -641,6 +804,11 @@ pub enum StopReason {
     /// User clicked Archive — `ThreadArchived` is the terminator; no
     /// `ResponseCanceled`.
     Archive,
+    /// A Claude Code effort pick restarts a session parked on a question
+    /// (`claude_code::control::effort_restart`). Nothing lands after the
+    /// question, so its card stays answerable, and the answer resumes the
+    /// session at the new effort.
+    EffortRestart,
 }
 
 impl StopReason {
@@ -660,6 +828,14 @@ pub enum ChangeClaim {
     Apply,
     /// An in-session Discard.
     Discard,
+}
+
+/// A resume an effort pick owes the turn it interrupted
+/// (`AgentSession::effort_resume`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffortResume {
+    /// Who picked the effort. The resume's `ContinuationRequested` carries it.
+    pub actor: Option<crate::engine::thread_events::MessageOrigin>,
 }
 
 /// How a session carries a merge-conflict resolution. The two tiers put the
@@ -742,20 +918,19 @@ pub struct AgentSession {
     /// actor upstream). Drained on read so a stale device can't carry into the
     /// next turn on a resumed session.
     pub cancel_actor: Option<crate::engine::thread_events::MessageOrigin>,
-    /// Set by `arm_followup_redirect` when a follow-up interrupts a mid-turn
-    /// coding-agent turn (the redirect path). The redirect analog of
-    /// `cancel_actor`. The
-    /// run_session interrupt arm drains it (`take_session_redirect_followup`)
-    /// alongside `cancel_actor` and feeds it to `classify_result` so the
-    /// interrupted turn's `ResponseCanceled` carries
-    /// `CancelCause::SupersededByFollowup` (rendered neutrally) instead of
-    /// `UserStop` (rendered "Canceled ✕"). A real Stop click via `interrupt_agent`
-    /// leaves it `false`. Drained on read so a stale flag can't relabel the next
-    /// turn on a resumed session.
-    pub redirect_followup: bool,
-    /// Also set by `arm_followup_redirect`, and deliberately NOT the same flag as
-    /// `redirect_followup` above: the two answer different questions and are
-    /// drained by different arms. `redirect_followup` says "the interrupt about to
+    /// Why the interrupt about to land is a redirect, not a Stop: a follow-up
+    /// (`arm_followup_redirect`, `SupersededByFollowup`) or an effort pick
+    /// (`claude_code::control`, `EffortRestart`). The redirect analog of
+    /// `cancel_actor`. The run_session interrupt arm drains it
+    /// (`take_session_redirect_cause`) and feeds it to `classify_result`. The
+    /// interrupted turn's `ResponseCanceled` then carries it (rendered
+    /// neutrally) instead of `UserStop` (rendered "Canceled ✕"). A real Stop click via
+    /// `interrupt_agent` leaves it `None`. Drained on read so a stale cause can't
+    /// relabel the next turn on a resumed session.
+    pub redirect_cause: Option<crate::engine::thread_events::CancelCause>,
+    /// Also set by `arm_followup_redirect`, and deliberately NOT the same field as
+    /// `redirect_cause` above: the two answer different questions and are
+    /// drained by different arms. `redirect_cause` says "the interrupt about to
     /// land is a redirect, not a Stop" and the interrupt arm takes it before the
     /// turn's `Result` is even parsed. This one says "a follow-up has been promised
     /// to this session but not yet routed", and it has to survive until the idle
@@ -771,6 +946,11 @@ pub struct AgentSession {
     /// routing costs one kept-alive idle, not a subprocess pinned until the engine
     /// restarts.
     pub redirect_followup_pending: bool,
+    /// Set when a Claude Code effort pick restarts the session mid-turn
+    /// (`claude_code::control::effort_restart`). When the run ends, it resumes
+    /// the session at the new effort, unless the work goes on another way
+    /// (`run_session::completion::resumes_after_effort_restart`).
+    pub effort_resume: Option<EffortResume>,
     /// Generic stop signal for the run_session loop. Fired by `stop_agent` for
     /// every user-driven termination (Cancel, Apply, Discard, Archive). The
     /// engine shutdown sweep fires it directly: at once for a thread parked on a
@@ -883,9 +1063,15 @@ pub struct AgentSession {
     pub skill_commands: Vec<String>,
     /// Current model reported by CC (from the system init event's `model` field).
     pub current_model: Option<String>,
-    /// Current reasoning effort level (low/medium/high). Seeded at spawn and
-    /// updated by a control request, because CC's init event does not report it.
+    /// The selected reasoning effort (low/medium/high), which the next spawn
+    /// starts with. Seeded at spawn and updated by a control request, because
+    /// CC's init event does not report it.
     pub current_reasoning_effort: Option<String>,
+    /// The *effort in force*: the one this session's calls run at. Seeded when
+    /// the process starts, and updated from each main-session call. A control
+    /// request never sets it, so a terminal event never reports a pick no call
+    /// ran at.
+    pub reasoning_effort_in_force: Option<String>,
     /// Set by `answer_pending_question` when a user answers an `AskUserQuestion`
     /// on a *live* subprocess (CC continues its turn in-place once the blocked
     /// PreToolUse hook is woken). That resume path does NOT go through `msg_tx`,
@@ -1028,8 +1214,9 @@ impl AgentSession {
             is_waiting: true,
             pending_stop: None,
             cancel_actor: None,
-            redirect_followup: false,
+            redirect_cause: None,
             redirect_followup_pending: false,
+            effort_resume: None,
             stop: Arc::new(tokio::sync::Notify::new()),
             interrupt: Arc::new(tokio::sync::Notify::new()),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
@@ -1052,6 +1239,7 @@ impl AgentSession {
             skill_commands: vec![],
             current_model: None,
             current_reasoning_effort: None,
+            reasoning_effort_in_force: None,
             last_event_at: Arc::new(AtomicI64::new(0)),
             question_resume_pending: false,
             tools_in_flight: Arc::new(AtomicI32::new(0)),

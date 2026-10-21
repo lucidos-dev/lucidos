@@ -20,6 +20,7 @@ import { originPopoverHasContent } from './messageOrigin';
 import { pendingAnswers, unsentPicks } from '../../store/pendingDecisions';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote, pendingVerdicts } from './PermissionCard';
 import { ChildCompletionRow, ChildMovedOutRow, ChildStoppedRow } from './ChildCompletionRow';
+import { KeepAliveRow } from './CacheKeepAlive';
 import { drawsResponseRow, liveStepInBody, responseBody, type BodyRow } from '../../store/event-rendering';
 import { Disclosure } from '../shared/Disclosure';
 import { HELD_CALLBACK_NOTE, statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
@@ -31,7 +32,7 @@ import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { FormRequestRow } from './FormRequestRow';
 import { NO_SIDE_QUESTIONS, SideQuestionGroup, placeInBody } from './SideQuestionCard';
 import type { SideQuestion } from '../../store/sideQuestions';
-import { ChangeEventRow, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, SubAgentStepGroup, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
+import { ChangeEventRow, CheckpointCard, ContinueButton, RestartRow, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, SubAgentStepGroup, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
 import type { BoundaryTurn } from './chat-exchange-parts';
 import { EditIcon, TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
@@ -655,6 +656,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     // audio is kept, and the written answer beside it is a different thing:
     // the talker says what an answer means rather than reading it out.
     if (evt.type === 'spoken_reply') return <SpokenReply key={`sr${k}`} event={evt} />;
+    if (evt.type === 'restart') return <RestartRow key={`rs${k}`} event={evt} />;
     // Ungated, like every other marker. The park is the transcript's only
     // record that the thread subscribed to something. The clock indicator
     // holds the LIVE half and drops the wait as it resolves. A toggle
@@ -1536,6 +1538,16 @@ export function describeInitiator(
             filed
           />
         ),
+      };
+    case 'CacheKeepAliveStatusChanged':
+      // One card per keep-alive run, updated in place by later statuses. The
+      // engine pinged, so it is the actor (ADR 0529).
+      return {
+        variant: 'system',
+        icon: <LucidosGlyph />,
+        label: ENGINE_LABEL,
+        actorClickable: false,
+        details: <KeepAliveRow threadId={threadId} status={ev.status} />,
       };
     case 'ChildThreadStopped':
       // The same fan-in raises this in place of the completion card when a

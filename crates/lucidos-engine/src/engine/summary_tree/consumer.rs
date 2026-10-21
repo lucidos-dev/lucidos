@@ -25,7 +25,6 @@ use super::SummaryScope;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::{ContextPurpose, LucidosEngine};
-use crate::llm::model_registry::ProviderKind;
 use crate::scheduler::notifications::SettingsPage;
 
 /// Run the compactor while the workspace is on the Tree memory module. It
@@ -223,15 +222,6 @@ async fn notify_cap_reached(engine: &LucidosEngine, spent_usd: f64, cap_usd: f64
     }
 }
 
-/// The providers this engine's router holds. A router that reports no list
-/// filters nothing, so every provider counts.
-pub(super) fn configured_providers(engine: &LucidosEngine) -> Vec<ProviderKind> {
-    engine
-        .current_provider()
-        .configured_providers()
-        .unwrap_or_else(|| ProviderKind::ALL.to_vec())
-}
-
 struct EngineDeps(Arc<LucidosEngine>);
 
 #[async_trait::async_trait]
@@ -240,16 +230,16 @@ impl CompactorDeps for EngineDeps {
     /// configured backend serves it.
     async fn model(&self) -> Result<CompactionModel, String> {
         let call = self.0.aux_call(ContextPurpose::SummaryCompaction).await;
-        let configured = configured_providers(&self.0);
+        let configured = self.0.configured_provider_kinds();
         let route = compactor_route(
-            call.model(),
+            call.running_model(),
             call.reasoning(),
             self.0.model_registry(),
             &configured,
         )?;
         Ok(CompactionModel {
             provider: call.provider(),
-            model: call.model().to_string(),
+            model: call.running_model().to_string(),
             effort: route.effort,
             deadline: call.deadline(),
             lane: route.lane,

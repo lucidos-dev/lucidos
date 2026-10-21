@@ -23,39 +23,44 @@ import type { ReleaseNotice } from '../api/client';
  *  an answer, which is the one thing the explicit-resolution rule forbids. */
 export const releaseNoticeDismissed = signal(false);
 
-/** The notice the modal owes an answer for, or `null`. */
+/** The notice the workspace must answer next, or `null`. */
 export function owedReleaseNotice(): ReleaseNotice | null {
   const view = releaseNoticeView.value;
   if (view.status !== 'loaded' || !view.data.next_id) return null;
   return view.data.notices.find((n) => n.id === view.data.next_id) ?? null;
 }
 
-/** The action button the modal draws for `notice`, or `null` for none.
+/** The action button a notice's row draws, or `null` for none.
  *
  *  A deferred action belongs to a later owed notice. The reader runs it once,
- *  at the end, rather than once per notice. */
-export function modalActionLabel(notice: ReleaseNotice): string | null {
-  if (notice.action_deferred) return null;
+ *  at the end, rather than once per notice. An answered notice keeps its
+ *  action, because Got it says "read", never "done". */
+export function releaseNoticeActionLabel(notice: ReleaseNotice): string | null {
+  if (notice.action_deferred && !notice.resolved) return null;
   return notice.action_label ?? null;
 }
 
 /** Should the modal be up?
  *
  *  The App-level slot reads this, so the modal's own chunk is fetched only by a
- *  workspace that owes something. That is a minority of loads. The component
- *  re-checks, because it needs the notice itself anyway. */
+ *  workspace that owes something. That is a minority of loads. */
 export function releaseNoticeModalOpen(): boolean {
   return !releaseNoticeDismissed.value && owedReleaseNotice() !== null;
 }
 
-/** How many notices are still owed, counting the one on screen.
- *
- *  Drives the modal's "1 of 3" and the *System attention badge*. Everything from the
- *  owed one onward is unanswered by construction, so this is a count of the
- *  tail. It answers `0` for every state but `loaded`, so an unknown list is
- *  never reported as work outstanding. */
-export function owedReleaseNoticeCount(): number {
+/** The titles the modal lists: every unanswered notice, in the order the
+ *  panel asks for them. */
+export function owedReleaseNoticeTitles(): string[] {
   const view = releaseNoticeView.value;
-  if (view.status !== 'loaded') return 0;
-  return view.data.notices.filter((n) => !n.resolved).length;
+  if (view.status !== 'loaded') return [];
+  return view.data.notices.filter((n) => !n.resolved).map((n) => n.title);
+}
+
+/** How many notices are still owed.
+ *
+ *  Drives the modal's heading and the *System attention badge*. It answers `0`
+ *  for every state but `loaded`, so an unknown list is never reported as work
+ *  outstanding. */
+export function owedReleaseNoticeCount(): number {
+  return owedReleaseNoticeTitles().length;
 }

@@ -1,7 +1,8 @@
 /** The prompt row's three leading slots, and the order that is their contract.
  *
- *  The control menu anchors the row, the follow toggle is second and the call
- *  toggle third, and each keeps its slot on every thread. The follow toggle
+ *  A coding agent's control menu anchors the row. The follow toggle is next and
+ *  the call toggle after it, and each keeps its slot on every thread. A Lucidos
+ *  Agent thread has no menu, so the follow toggle leads. The follow toggle
  *  once sat after the indicators. It was third on a Lucidos thread, second on a
  *  coding-agent one and fourth with a subscription armed. It is the only
  *  control here rendering in every state, so it is the one that must not move.
@@ -17,7 +18,7 @@ import type { ComponentChildren, VNode } from 'preact';
 import { FollowLiveEdgeIcon } from '../../shared/icons';
 import {
   followLiveEdgeAction, LazyCodingAgentControlMenu as CodingAgentControlMenu,
-  LazyLucidosControlMenu as LucidosControlMenu, PromptRowControls, promptRowToggles,
+  PromptRowControls, promptRowToggles,
 } from '../PromptRowControls';
 import { callIsOffered } from '../../../voice/callOffer';
 import type { ThreadState } from '../../../store/thread-events/thread-meta';
@@ -49,8 +50,6 @@ const row = (codingAgent: 'claude-code' | 'codex' | null) =>
     codingAgent,
     codingAgentThreadId: codingAgent ? 'thread-1' : undefined,
     composeThreadId: undefined,
-    lucidosThreadId: codingAgent ? undefined : 'thread-1',
-    composeContext: false,
     // Nothing folded, which is the state the order contract is about.
     toggles: promptRowToggles(codingAgent, false, undefined).row,
     attrsFor: () => ({}),
@@ -59,18 +58,11 @@ const row = (codingAgent: 'claude-code' | 'codex' | null) =>
 const cluster = (codingAgent: 'claude-code' | 'codex' | null) => componentsIn(row(codingAgent));
 
 describe('PromptRowControls', () => {
-  /** The branch exists for the controls that genuinely belong to one backend.
-   *  A coding-agent thread has no Lucidos model picker to offer. */
-  it('keeps the Lucidos menu off a coding-agent thread', () => {
-    const codingAgent = cluster('claude-code');
-    expect(codingAgent).toContain(CodingAgentControlMenu);
-    expect(codingAgent).not.toContain(LucidosControlMenu);
-  });
-
-  it('keeps the coding-agent menu off a Lucidos Agent thread', () => {
-    const lucidos = cluster(null);
-    expect(lucidos).toContain(LucidosControlMenu);
-    expect(lucidos).not.toContain(CodingAgentControlMenu);
+  /** The `/` menu belongs to a coding agent. A Lucidos Agent thread has no
+   *  slash commands, and its model pick is the rung control's. */
+  it('offers the coding-agent menu to a coding-agent thread alone', () => {
+    expect(cluster('claude-code')).toContain(CodingAgentControlMenu);
+    expect(cluster(null)).not.toContain(CodingAgentControlMenu);
   });
 
   /** `.prompt-actions-row` is a flex row whose children are diffed
@@ -79,10 +71,11 @@ describe('PromptRowControls', () => {
    *  The follow toggle shows up here as its ICON, the one function component
    *  inside the `<button>` this walk can see. The call toggle is its own
    *  component, so it shows up under its own name. */
-  it('puts the menu first and the follow toggle second', () => {
+  it('puts the menu first and the follow toggle after it', () => {
     // Voice ships off, so the call toggle draws nothing here and contributes no
-    // member. Its THIRD slot is the contract, asserted on the fold order below.
-    expect(cluster(null)).toEqual([LucidosControlMenu, FollowLiveEdgeIcon]);
+    // member. Its slot after the follow toggle is the contract, asserted on the
+    // fold order below.
+    expect(cluster(null)).toEqual([FollowLiveEdgeIcon]);
     expect(cluster('claude-code')).toEqual([CodingAgentControlMenu, FollowLiveEdgeIcon]);
   });
 

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::core::secret_store::{OAuthAccessToken, OAuthRefreshToken, Secret};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
@@ -13,7 +14,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 // ---------------------------------------------------------------------------
 
 /// Full OAuth account row including tokens (internal use only)
-#[derive(Clone, sqlx::FromRow)]
+#[derive(Clone)]
 pub struct OAuthAccount {
     pub id: Uuid,
     pub provider: String,
@@ -28,6 +29,30 @@ pub struct OAuthAccount {
     pub desired_scopes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+// Manual `FromRow`: both tokens are sealed at rest, and open as they decode.
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for OAuthAccount {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row as _;
+        Ok(Self {
+            id: row.try_get("id")?,
+            provider: row.try_get("provider")?,
+            email: row.try_get("email")?,
+            display_name: row.try_get("display_name")?,
+            access_token: row
+                .try_get::<Secret<OAuthAccessToken>, _>("access_token")?
+                .into_inner(),
+            refresh_token: row
+                .try_get::<Option<Secret<OAuthRefreshToken>>, _>("refresh_token")?
+                .map(Secret::into_inner),
+            token_expiry: row.try_get("token_expiry")?,
+            scopes: row.try_get("scopes")?,
+            desired_scopes: row.try_get("desired_scopes")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
 }
 
 // Manual `Debug` so an account never leaks its tokens through `{:?}`. Refresh
@@ -395,8 +420,8 @@ impl OAuthStore {
             .bind(provider)
             .bind(email)
             .bind(display_name)
-            .bind(access_token)
-            .bind(refresh_token)
+            .bind(Secret::<OAuthAccessToken>::new(access_token))
+            .bind(refresh_token.map(Secret::<OAuthRefreshToken>::new))
             .bind(token_expiry)
             .bind(scopes)
             .bind(desired_scopes)
@@ -420,8 +445,8 @@ impl OAuthStore {
             )
             .bind(provider)
             .bind(display_name)
-            .bind(access_token)
-            .bind(refresh_token)
+            .bind(Secret::<OAuthAccessToken>::new(access_token))
+            .bind(refresh_token.map(Secret::<OAuthRefreshToken>::new))
             .bind(token_expiry)
             .bind(scopes)
             .bind(desired_scopes)
@@ -507,9 +532,9 @@ impl OAuthStore {
             "#,
         )
         .bind(id)
-        .bind(access_token)
+        .bind(Secret::<OAuthAccessToken>::new(access_token))
         .bind(token_expiry)
-        .bind(usable_refresh_token(refresh_token))
+        .bind(usable_refresh_token(refresh_token).map(Secret::<OAuthRefreshToken>::new))
         .execute(pool)
         .await?;
 
@@ -738,13 +763,20 @@ pub async fn linked_account_token(
 pub fn account_env_vars(accounts: Vec<OAuthAccount>) -> Vec<(String, String)> {
     let mut env_vars = Vec::new();
     for account in accounts {
-        let prefix = format!("OAUTH_{}", crate::core::env_var_segment(&account.provider));
-        env_vars.push((format!("{}_ACCESS_TOKEN", prefix), account.access_token));
+        let [token_name, email_name] = account_env_names(&account.provider);
+        env_vars.push((token_name, account.access_token));
         if let Some(email) = account.email {
-            env_vars.push((format!("{}_EMAIL", prefix), email));
+            env_vars.push((email_name, email));
         }
     }
     env_vars
+}
+
+/// The two `OAUTH_*` names one provider's account can set: its access token
+/// and its email.
+pub fn account_env_names(provider: &str) -> [String; 2] {
+    let prefix = format!("OAUTH_{}", crate::core::env_var_segment(provider));
+    [format!("{prefix}_ACCESS_TOKEN"), format!("{prefix}_EMAIL")]
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,7 +1371,7 @@ pub async fn refresh_oauth_if_needed(
         .await?
         .ok_or_else(|| format!("No client credentials found for {}", cred_service))?;
 
-    let config: serde_json::Value = serde_json::from_str(&client_cred.auth_value)?;
+    let config: serde_json::Value = serde_json::from_str(&client_cred.secret(pool).await?)?;
     let cid = config["client_id"]
         .as_str()
         .map(str::trim)
@@ -1997,8 +2029,9 @@ pub async fn prepare_oauth_flow(
         .await?
         .ok_or_else(|| format!("No OAuth client credentials found for {}", provider))?;
 
-    let client_config: serde_json::Value = serde_json::from_str(&client_cred.auth_value)
-        .map_err(|e| format!("Invalid OAuth client credentials JSON: {}", e))?;
+    let client_config: serde_json::Value =
+        serde_json::from_str(&client_cred.secret(pool).await?)
+            .map_err(|e| format!("Invalid OAuth client credentials JSON: {}", e))?;
     let client_id = client_config["client_id"]
         .as_str()
         .map(str::trim)

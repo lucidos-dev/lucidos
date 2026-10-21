@@ -1212,7 +1212,7 @@ pub(crate) fn handle_trigger_group_event(
 
 mod backup;
 use backup::run_scheduled_backup;
-pub(crate) use backup::{ensure_backup_key, run_backup, BackupGuard};
+pub(crate) use backup::{backups_not_set_up_message, run_backup, BackupGuard};
 use plugin_updates::{
     run_plugin_marketplace_update_check, ScanCause, MARKETPLACE_UPDATE_CHECK_CRON,
 };

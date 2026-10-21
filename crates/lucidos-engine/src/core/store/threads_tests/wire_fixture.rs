@@ -39,6 +39,7 @@ fn fixture_row() -> ThreadRow {
             reason: "the build".into(),
             expires_at: at("2026-01-02T04:00:00Z"),
         }]),
+        cache_keep_alive_status: None,
         status: "waiting_for_user_answer".into(),
         summary_version: 42,
         coding_agent_change_state: "proposed".into(),
@@ -117,6 +118,7 @@ fn thread_aggregate_serializes_to_the_pinned_bytes() {
             r#""waitingChildrenCount":2,"#,
             r#""totalChildrenCount":4,"blockingDescendantCount":5,"attentionDescendantCount":6,"#,
             r#""isStoppedChild":true,"readRequested":true,"applyInFlight":true,"liveEventWaitCount":1,"liveEventWaits":{waits},"#,
+            r#""cacheKeepAliveStatus":null,"#,
             r#""codingAgentChangeState":{{"kind":"proposed","requires_restart":true}},"#,
             r#""codingAgentIsExternalRepo":false,"isSaved":true,"#,
             r#""hasResponse":true,"lastRevivedAt":"2026-01-02T03:04:09Z","#,
@@ -225,4 +227,28 @@ fn only_the_home_threads_aggregate_carries_the_home_key() {
         json.contains(r#""isSaved":true,"home":true,"hasResponse""#),
         "{json}"
     );
+}
+
+/// A status rides both wires as one tagged object, the shape the frontend's
+/// generated `CacheKeepAliveStatus` union reads.
+#[test]
+fn a_keep_alive_status_serializes_to_its_tagged_object() {
+    let row = || ThreadRow {
+        cache_keep_alive_status: Some(sqlx::types::Json(CacheKeepAliveStatus::Stopped {
+            at: at("2026-01-02T05:00:00Z"),
+            beats: 25,
+            cost_usd: 0.5,
+            context_tokens: 262_000,
+        })),
+        ..fixture_row()
+    };
+    let expected = r#""cache_keep_alive_status":{"state":"stopped","at":"2026-01-02T05:00:00Z","beats":25,"cost_usd":0.5,"context_tokens":262000}"#;
+    let summary = EventStore::rows_to_thread_summaries(vec![row()])
+        .unwrap()
+        .remove(0);
+    let summary = serde_json::to_string(&summary).unwrap();
+    assert!(summary.contains(expected), "{summary}");
+    let aggregate = serde_json::to_string(&row_to_thread_aggregate(row()).unwrap()).unwrap();
+    let expected = expected.replace("cache_keep_alive_status", "cacheKeepAliveStatus");
+    assert!(aggregate.contains(&expected), "{aggregate}");
 }

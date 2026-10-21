@@ -1,11 +1,12 @@
 import { useCallback } from 'preact/hooks';
-import { threadDrawerWidth, threadDrawerOpen, splitRatio, THREAD_DRAWER_WIDTH_KEY, SPLIT_RATIO_KEY } from '../../store/store';
+import { threadDrawerWidth, splitRatio, THREAD_DRAWER_WIDTH_KEY, SPLIT_RATIO_KEY } from '../../store/store';
 import { minDrawerWidth, minThreadPanePx, splitBounds } from '../../store/paneMinimums';
-import { beginPaneResize, endPaneResize, clampToRange, clampSplitRatio } from './splitHelpers';
+import { clampToRange, clampSplitRatio } from './splitHelpers';
+import { beginPaneResize, drawnDrawerShown, drawnSplitRatio, endPaneResize } from './drawnLayout';
 import { startDividerDrag } from './dividerDrag';
 
 export function DrawerDivider() {
-  const visible = threadDrawerOpen.value && splitRatio.value > 0;
+  const visible = drawnDrawerShown.value;
 
   const onPointerDown = useCallback((e: PointerEvent) => {
     e.preventDefault();
@@ -16,7 +17,7 @@ export function DrawerDivider() {
 
     // Capture panel pane pixel width before drag starts so we can keep it constant
     const splitLayout = contentRow.querySelector('.split-layout') as HTMLElement | null;
-    const contentPanePx = splitLayout ? splitLayout.offsetWidth * (1 - splitRatio.value) : 0;
+    const contentPanePx = splitLayout ? splitLayout.offsetWidth * (1 - drawnSplitRatio.peek()) : 0;
 
     // CLAMPED drag, both ends (ADR 0056). Narrowing stops at the drawer's own
     // floor, which is what its header row needs. WIDENING stops too, and that

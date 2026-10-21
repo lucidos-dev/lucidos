@@ -1059,7 +1059,7 @@ test_last_nights_boundary_now_runs_on() {
         HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 33/34" >"$OUT/lastnight.out" 2>&1
     rc=$?
-    assert_eq "0" "$rc" "the boundary that lost welcome.spec.ts no longer stops"
+    assert_eq "0" "$rc" "the boundary that lost welcome-all.spec.ts no longer stops"
     assert_silent_about "$OUT/lastnight.out" "STOP" "no stop was announced"
 }
 

@@ -214,6 +214,7 @@ fn sub_thread_request(child_thread_id: Uuid) -> ThreadQueueRequest {
         title: None,
         model: None,
         reasoning_effort: None,
+        provider: None,
         pre_emitted_origin: None,
         origin: Some(MessageOrigin::ThreadLink {
             thread_id: Uuid::new_v4(),

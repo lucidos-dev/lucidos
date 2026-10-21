@@ -31,8 +31,8 @@ into ⋯ with the trailing actions.
 nothing left to open there, and a dead tap reads as broken. This restores what
 a tap in Home did before ADR 0432 gave it the board.
 
-**The phone is unchanged.** Home stays one pane with two faces, and the Home
-icon lands on the board face.
+**The phone was unchanged.** Home stayed one pane with two faces, and the Home
+icon landed on the board face. ADR 0538 later made Home a plain chat there.
 
 ## Rationale
 

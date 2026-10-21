@@ -65,9 +65,11 @@ impl LucidosEngine {
             .await
     }
 
-    /// Build CRED_*, OAUTH_*, LUCIDOS_WORKSPACE, and PATH environment variables
-    /// for script execution. Used by `execute_python_tool` (LLM),
-    /// `execute_bash_tool`, and `execute_script` (scheduled tasks).
+    /// Build the env for script execution: the user's variables, the engine's
+    /// own (`LUCIDOS_WORKSPACE`, `PATH`, the database handle, origin), and the
+    /// `CRED_*` / `OAUTH_*` variables `mentions` names. Used by `run_bash`,
+    /// `run_bash_background`, `run_python`, `run_python_background` and
+    /// `execute_script` (scheduled tasks).
     ///
     /// `LUCIDOS_WORKSPACE` + the `.lucidos/bin` symlink let scripts call
     /// `lucidos data write` / `lucidos events emit` / `lucidos events query`
@@ -80,16 +82,19 @@ impl LucidosEngine {
         &self,
         thread_id: Option<Uuid>,
         emitting_trigger_id: Option<&str>,
-    ) -> Vec<(String, String)> {
-        let mut env_vars = self
+        mentions: &crate::core::credentials::SecretMentions,
+    ) -> ScriptEnv {
+        let mut env = named_secret_env_vars(&self.pool, mentions).await;
+        let mut vars = self
             .build_env_without_secrets(
                 thread_id,
                 crate::scheduler::user_tasks::current_event_trigger_depth(),
                 emitting_trigger_id,
             )
             .await;
-        env_vars.extend(self.secret_env_vars().await);
-        env_vars
+        vars.append(&mut env.vars);
+        env.vars = vars;
+        env
     }
 
     /// Env for a coding agent's *background task*: what the agent's own shell
@@ -139,44 +144,6 @@ impl LucidosEngine {
         env_vars
     }
 
-    /// `CRED_*` and `OAUTH_*` vars, the OAuth tokens refreshed first.
-    async fn secret_env_vars(&self) -> Vec<(String, String)> {
-        use crate::core::oauth;
-        use crate::core::{CredentialStore, OAuthStore};
-        let mut env_vars = Vec::new();
-
-        // Credentials → CRED_* vars
-        match CredentialStore::list_all_with_secrets(&self.pool).await {
-            Ok(creds) => env_vars.extend(crate::core::credentials::credential_env_vars(creds)),
-            Err(e) => log!(
-                "[Python] Failed to load credentials for env injection: {}",
-                e
-            ),
-        }
-
-        // OAuth accounts → OAUTH_* vars (auto-refreshed)
-        match OAuthStore::list_all_with_tokens(&self.pool).await {
-            Ok(mut accounts) => {
-                for account in &mut accounts {
-                    if let Err(e) = oauth::refresh_oauth_if_needed(&self.pool, account).await {
-                        log!(
-                            "[Python] OAuth refresh failed for {}: {}",
-                            account.provider,
-                            e
-                        );
-                    }
-                }
-                env_vars.extend(oauth::account_env_vars(accounts));
-            }
-            Err(e) => log!(
-                "[Python] Failed to load OAuth accounts for env injection: {}",
-                e
-            ),
-        }
-
-        env_vars
-    }
-
     /// Env for a bash or python tool, which is [`Self::build_script_env_vars`]
     /// plus the ambient trigger. The tool runs inside the fire rather than as
     /// work the fire hands off, so the marker travels with it (ADR 0137).
@@ -184,9 +151,13 @@ impl LucidosEngine {
     /// Reading `ACTIVE_TRIGGER_ID` is right for exactly that reason. A spawn
     /// that starts a new thread passes `None` instead, and says so at its own
     /// call site.
-    pub(crate) async fn build_tool_env_vars(&self, thread_id: Uuid) -> Vec<(String, String)> {
+    pub(crate) async fn build_tool_env_vars(
+        &self,
+        thread_id: Uuid,
+        mentions: &crate::core::credentials::SecretMentions,
+    ) -> ScriptEnv {
         let trigger = crate::scheduler::user_tasks::current_trigger_id();
-        self.build_script_env_vars(Some(thread_id), trigger.as_deref())
+        self.build_script_env_vars(Some(thread_id), trigger.as_deref(), mentions)
             .await
     }
 
@@ -220,7 +191,7 @@ impl LucidosEngine {
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        // Script args + shared credentials/OAuth env vars (injected into ALL runtimes)
+        // Script args + the credentials/OAuth vars the script file names
         let mut env_vars = vec![
             ("LUCIDOS_SCRIPT_PATH".to_string(), script_path.to_string()),
             (
@@ -234,15 +205,26 @@ impl LucidosEngine {
         // A scheduled script runs without a thread context, so it has no source
         // thread id to attribute its HTTP callbacks back to. It does carry its
         // trigger: the script IS the fire, not work the fire handed off.
-        env_vars.extend(self.build_script_env_vars(None, emitting_trigger_id).await);
+        let script_env = self
+            .build_script_env_vars(
+                None,
+                emitting_trigger_id,
+                &crate::core::credentials::SecretMentions::of_script_file(&full_path),
+            )
+            .await;
+        if let Some(note) = &script_env.secret_note {
+            log!("[Script] {script_path}: {note}");
+        }
+        env_vars.extend(script_env.vars.iter().cloned());
         env_vars.extend(extra_env.iter().cloned());
 
         // Read before the env is moved into a runtime below. A script's stdout
         // becomes the trigger summary and its stderr becomes the failure
         // notification, so both carry any credential the script echoed. Same
         // treatment the synchronous `run_bash` and `run_python` tools give
-        // their own output. See `core::injected_secret_values`.
-        let secrets = crate::core::injected_secret_values(&env_vars);
+        // their own output. See `core::subprocess_secret_values`.
+        let secrets =
+            crate::core::subprocess_secret_values(&env_vars, crate::core::inherited_secret_env());
 
         let result = match extension {
             // A script runs IN PLACE, from its real on-disk path — never from
@@ -273,9 +255,15 @@ impl LucidosEngine {
         // Both arms, because a failure is the likelier leak: a script that dies
         // mid-request prints the request it was making.
         let output = match result {
-            Ok(output) => crate::core::redact_secret_values(&output, &secrets),
+            Ok(output) => {
+                crate::core::redact_subprocess_output(&script_env.with_note(output), &secrets)
+            }
             Err(e) => {
-                return Err(crate::core::redact_secret_values(&e.to_string(), &secrets).into())
+                return Err(crate::core::redact_subprocess_output(
+                    &script_env.with_note(e.to_string()),
+                    &secrets,
+                )
+                .into())
             }
         };
 
@@ -297,6 +285,7 @@ impl LucidosEngine {
             script_path,
             self.workspace_path(),
             &env_vars,
+            crate::core::inherited_secret_env(),
             std::time::Duration::from_secs(SHELL_SCRIPT_TIMEOUT_SECS),
         )
         .await?;
@@ -354,6 +343,101 @@ impl LucidosEngine {
     }
 }
 
+/// A chat or script subprocess's env, and the note for any secret name its
+/// text mentioned that the workspace does not have.
+#[derive(Debug, Default)]
+pub(crate) struct ScriptEnv {
+    pub(crate) vars: Vec<(String, String)>,
+    pub(crate) secret_note: Option<String>,
+}
+
+impl ScriptEnv {
+    /// `result` with the secret-names note appended, when there is one. The
+    /// one place a tool result or a script output gains it.
+    pub(crate) fn with_note(&self, mut result: String) -> String {
+        if let Some(note) = &self.secret_note {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(note);
+        }
+        result
+    }
+}
+
+/// The `CRED_*` and `OAUTH_*` vars `mentions` names, the OAuth tokens
+/// refreshed first, and the note for any name nothing set.
+///
+/// A text naming no env-shaped word reads no credential, and one naming no
+/// `OAUTH_*` variable loads and refreshes no OAuth account. A failed lookup
+/// is logged and drops the note, which would otherwise call every name
+/// unknown.
+pub(crate) async fn named_secret_env_vars(
+    pool: &sqlx::PgPool,
+    mentions: &crate::core::credentials::SecretMentions,
+) -> ScriptEnv {
+    use crate::core::credentials::NamedSecretVars;
+    use crate::core::credentials::{named_credential_env_vars, secret_names_note};
+    use crate::core::{oauth, CredentialStore, OAuthStore};
+    let mut named = NamedSecretVars::default();
+    let mut lookup_failed = false;
+
+    if mentions.wants_credentials() {
+        match CredentialStore::list_all_with_secrets(pool).await {
+            Ok(creds) => {
+                let resolver = crate::core::secret_reference::engine_resolver(pool);
+                named.extend(named_credential_env_vars(creds, mentions, &resolver).await)
+            }
+            Err(e) => {
+                lookup_failed = true;
+                log!("[Script] Failed to load credentials for env injection: {e}");
+            }
+        }
+    }
+
+    if mentions.wants_oauth() {
+        match OAuthStore::list_all_with_tokens(pool).await {
+            Ok(accounts) => {
+                let mut chosen = Vec::new();
+                for mut account in accounts {
+                    let names = oauth::account_env_names(&account.provider);
+                    named.known_names.extend(names.iter().cloned());
+                    if !names.iter().any(|name| mentions.names(name)) {
+                        continue;
+                    }
+                    if let Err(e) = oauth::refresh_oauth_if_needed(pool, &mut account).await {
+                        log!(
+                            "[Script] OAuth refresh failed for {}: {e}",
+                            account.provider
+                        );
+                    }
+                    chosen.push(account);
+                }
+                named.env_vars.extend(oauth::account_env_vars(chosen));
+            }
+            Err(e) => {
+                lookup_failed = true;
+                log!("[Script] Failed to load OAuth accounts for env injection: {e}");
+            }
+        }
+    }
+
+    let names_note = if lookup_failed {
+        None
+    } else {
+        secret_names_note(mentions, &named.known_names)
+    };
+    let notes: Vec<String> = [names_note, named.unavailable_note()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let secret_note = (!notes.is_empty()).then(|| notes.join("\n"));
+    ScriptEnv {
+        vars: named.env_vars,
+        secret_note,
+    }
+}
+
 /// The engine-owned, secret-free part of a script's env: workspace and PATH,
 /// the database handle, origin attribution and host protection.
 fn engine_owned_script_env(
@@ -403,7 +487,8 @@ fn engine_owned_script_env(
 }
 
 /// Spawn the script under the engine's `pipefail` shell (see `core::shell`) in
-/// `workspace_dir` with `env_vars`, waiting up to `timeout` for it to finish.
+/// `workspace_dir` with `env_vars` and without the `inherited` secrets,
+/// waiting up to `timeout` for it to finish.
 /// `kill_on_drop(true)` is the load-bearing part: on timeout the
 /// `wait_with_output` future is dropped, taking the owned child with it, and
 /// the OS sends SIGKILL — so a hung scheduled script can't leak an orphaned
@@ -414,6 +499,7 @@ async fn run_shell_script_with_timeout(
     script_path: &std::path::Path,
     workspace_dir: &std::path::Path,
     env_vars: &[(String, String)],
+    inherited: &crate::core::InheritedSecretEnv,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, Box<dyn std::error::Error + Send + Sync>> {
     let mut cmd = crate::core::shell::command_shell().script(script_path);
@@ -422,7 +508,11 @@ async fn run_shell_script_with_timeout(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    crate::core::apply_to_subprocess_env(&mut cmd, env_vars);
+    crate::core::apply_to_subprocess_env(
+        &mut cmd,
+        env_vars,
+        crate::core::InheritedSecrets::Strip(inherited),
+    );
 
     let child = cmd
         .spawn()
@@ -444,6 +534,7 @@ mod tests {
     /// (ADR 0481).
     #[test]
     fn a_script_env_gets_the_read_only_handle_and_no_libpq_defaults() {
+        crate::test_support::install_agent_database_url();
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let env = engine_owned_script_env(workspace.path(), Some(Uuid::new_v4()), 0, None);
         for name in [
@@ -474,20 +565,20 @@ mod tests {
     ///
     /// Sibling of `the_bash_tool_result_leaves_through_the_secret_redaction` in
     /// `engine/tools/bash.rs`, and the same invariant. `execute_script` injects
-    /// every credential and OAuth token, then hands stdout to the trigger
+    /// the secrets the script names, then hands stdout to the trigger
     /// summary and stderr to the failure notification. The scheduler persists
     /// both.
     ///
     /// A source scan because driving the composition needs an engine and a
-    /// database, where the wiring is what actually regresses. `core::mod_tests`
-    /// covers the redaction itself.
+    /// database, where the wiring is what actually regresses.
+    /// `core::subprocess_secrets` covers the redaction itself.
     #[test]
     fn a_scheduled_script_result_leaves_through_the_secret_redaction() {
         let src = crate::test_support::source_scan::read_production_source(
             &crate::test_support::source_scan::src_root().join("engine/engine_impl/scripts.rs"),
         );
         let at = src
-            .find("let secrets = crate::core::injected_secret_values(&env_vars);")
+            .find("crate::core::subprocess_secret_values(&env_vars,")
             .expect(
                 "execute_script must read the injected secrets before the env is moved \
                  into a runtime",
@@ -499,11 +590,153 @@ mod tests {
             .expect("execute_script still commits dirty artifacts after the script returns");
         let body = &src[at..at + end];
         assert_eq!(
-            body.matches("crate::core::redact_secret_values(").count(),
+            body.matches("crate::core::redact_subprocess_output(")
+                .count(),
             2,
             "both arms must redact. A script that dies mid-request prints the request it \
              was making, so the error path is the likelier leak of the two."
         );
+        assert!(
+            src.contains("crate::core::InheritedSecrets::Strip(inherited)"),
+            "a scheduled shell script must not inherit the engine's secrets"
+        );
+    }
+
+    use crate::core::credentials::SecretMentions;
+    use crate::core::{AuthType, CredentialStore, OAuthStore};
+    use crate::engine::event_bus::EventBus;
+
+    async fn store_credentials(pool: &sqlx::PgPool, bus: &EventBus) {
+        for (name, value) in [
+            ("github", "gh-secret-value"),
+            ("slack", "slack-secret-value"),
+        ] {
+            CredentialStore::upsert(
+                pool,
+                bus,
+                name,
+                &[],
+                AuthType::Bearer,
+                value,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Run `script` the way a scheduled script runs, with the secrets its own
+    /// file names, and return its stdout.
+    async fn run_script_with_its_secrets(pool: &sqlx::PgPool, script: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("task.sh");
+        std::fs::write(&path, script).unwrap();
+        let env = named_secret_env_vars(pool, &SecretMentions::of_script_file(&path)).await;
+        let output = run_shell_script_with_timeout(
+            &path,
+            dir.path(),
+            &env.vars,
+            &crate::core::InheritedSecretEnv::default(),
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        env.with_note(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The core of path 1: with two credentials stored, a script naming one
+    /// sees that one in its environment and not the other.
+    #[tokio::test]
+    async fn a_subprocess_gets_only_the_credential_it_names() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        store_credentials(&pool, &bus).await;
+
+        let out = run_script_with_its_secrets(
+            &pool,
+            "echo \"github=${CRED_GITHUB:-unset}\"\nenv | grep -c '^CRED_' || true\n",
+        )
+        .await;
+        assert!(out.contains("github=gh-secret-value"), "{out}");
+        assert!(!out.contains("slack-secret-value"), "{out}");
+        assert!(
+            out.lines().any(|line| line == "1"),
+            "exactly one CRED_ variable: {out}"
+        );
+
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
+    /// An unknown name never fails the run. The output carries a note naming
+    /// the real credentials, and no value.
+    #[tokio::test]
+    async fn an_unknown_name_runs_and_notes_the_real_names() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        store_credentials(&pool, &bus).await;
+
+        let out = run_script_with_its_secrets(&pool, "echo \"nope=${CRED_NOPE:-unset}\"\n").await;
+        assert!(out.contains("nope=unset"), "{out}");
+        assert!(
+            out.contains("[lucidos] CRED_NOPE is not a credential in this workspace"),
+            "{out}"
+        );
+        assert!(
+            out.contains("CRED_GITHUB") && out.contains("CRED_SLACK"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("gh-secret-value") && !out.contains("slack-secret-value"),
+            "{out}"
+        );
+
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
+    /// An OAuth account follows the same rule: only a script naming one of
+    /// its variables gets the token.
+    #[tokio::test]
+    async fn an_oauth_token_reaches_only_a_script_naming_it() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        OAuthStore::connect(
+            &pool,
+            &bus,
+            "google",
+            Some("user@example.com"),
+            None,
+            "oauth-access-value",
+            None,
+            None,
+            "",
+            "",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let named = named_secret_env_vars(
+            &pool,
+            &SecretMentions::scan("curl -H \"Bearer $OAUTH_GOOGLE_ACCESS_TOKEN\""),
+        )
+        .await;
+        assert!(named
+            .vars
+            .iter()
+            .any(|(k, v)| k == "OAUTH_GOOGLE_ACCESS_TOKEN" && v == "oauth-access-value"));
+        assert!(named.secret_note.is_none());
+
+        for text in ["ls -la", "echo $CRED_GITHUB"] {
+            let unnamed = named_secret_env_vars(&pool, &SecretMentions::scan(text)).await;
+            assert!(
+                !unnamed.vars.iter().any(|(k, _)| k.starts_with("OAUTH_")),
+                "{text}"
+            );
+        }
+
+        crate::test_support::teardown_test_db(&db).await;
     }
 
     #[tokio::test]
@@ -526,6 +759,7 @@ mod tests {
             &script,
             &dir,
             &[],
+            &crate::core::InheritedSecretEnv::default(),
             std::time::Duration::from_millis(300),
         )
         .await

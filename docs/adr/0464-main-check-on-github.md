@@ -51,8 +51,8 @@ suite plus every e2e suite, on GitHub, against a stripped copy of `main`.
   private release library and the `lucidos` remote. Without them the check
   stays idle and its snapshot says why.
 
-The events are `MainCheckStarted`, `MainCheckPassed`, `MainCheckFailed`,
-`MainCheckAbandoned` and `MainCheckRedClosed`, on aggregate `main_check`
+The events are `MainCheckStarted`, `MainCheckRunLinked`, `MainCheckPassed`,
+`MainCheckFailed`, `MainCheckAbandoned` and `MainCheckRedClosed`, on aggregate `main_check`
 (`.claude/rules/db.md`). The snapshot rides `GET /api/v1/changes`, every
 `ChangesUpdated` and `GET /api/v1/main-check`. `lucidos main-check status`
 prints it, and `/harden` Phase 4 reads it before fixing a failure that also
@@ -79,9 +79,10 @@ fails on `main`.
   check that waits on a clock is a retry with no end condition.
 - **The fix thread owns the red.** A branch `/harden` that meets the same
   failure leaves it alone, so ten branches do not fix one bug ten ways.
-- **The engine owns the dispatch.** Events make the check restartable: a
-  restart folds them back, abandons the check it cut off, and re-prompts a fix
-  thread that never got its prompt.
+- **The engine owns the dispatch.** Events make the check restartable. A
+  restart folds them back and reattaches to the run it left going. It abandons
+  a check whose run was not yet on record, and re-prompts a fix thread that
+  never got its prompt.
 
 ## Consequences
 
@@ -101,13 +102,15 @@ fails on `main`.
 
 - **The run URL rides the verdict events, not `MainCheckStarted`.** The run
   exists only once the push started a workflow, minutes after the check must be
-  recorded. The running snapshot carries it from the script's run line.
+  recorded. The running snapshot carries it from the script's run line, and
+  `MainCheckRunLinked` records it (see the amendment below).
 - **`MainCheckFailed` carries the tail and the run URL.** A red then rebuilds
   whole from events, fix-thread prompt included.
 - **A fix landing closes the red, then the next check runs.** If that check
   fails, it is a new red with its own fix thread.
-- **Recovery never starts a check.** It closes a red whose fix already landed,
-  and abandons the check a restart cut off.
+- **Recovery never starts a check.** It closes a red whose fix already landed.
+  It reattaches to a running check's run when that run is on record, and
+  abandons the check otherwise.
 - **A lagged bus subscriber replays the landings it dropped.** It reads them
   back through `LagReplay`, so a dropped fix landing still closes its red.
 - **A directory module, `engine/main_check/`,** where the plan said one file:
@@ -142,3 +145,30 @@ fails on `main`.
   and both would land fixes the other did not see.
 - **Let the fix thread close its own red.** The red's purpose is to hold checks
   until a fix lands. An agent that could close it could skip the fix.
+
+## Amendment: a restart reattaches to the run
+
+In its first six days 10 of 67 checks died because the engine restarted
+mid-run, each after about 38 minutes of GitHub time
+(`docs/plans/2026-10-19-e2e-efficiency.md`). So a restart no longer ends a
+check whose run has started.
+
+- **The run goes on record first.** When the driver finds the run, it prints
+  `[e2e-github] linked <url> <branch>`, and `main-check.sh` turns that into
+  `main-check run <url> <branch>`. The engine emits `MainCheckRunLinked`
+  before anything treats the run as linked.
+- **Shutdown detaches from a linked run.** `RunnerSlot::stop` sends SIGUSR2 to
+  the check's process group. The driver exits without cancelling the run or
+  deleting its branch. Before the link it still sends SIGTERM, and the driver
+  cancels and deletes as before.
+- **SIGUSR2, never SIGHUP.** The dev gateway's supervisor ignores SIGHUP, and
+  the engine and its children inherit that. Bash cannot trap a signal ignored
+  at its start, so a SIGHUP detach would never arrive.
+- **The next start reattaches.** Recovery keeps a linked check running and
+  spawns `main-check.sh <to_sha> --attach <run-url> <branch>`. That waits for
+  the same run, downloads, reports and cleans up, and pushes nothing. A
+  checkout that can no longer run the check abandons it, naming the run.
+- **Not covered:** an engine killed outright sends no signal. Its child keeps
+  running on its own and cleans up after itself, and the restart reattaches a
+  second watcher to the same run. Both read one verdict, and the second
+  branch delete finds nothing.

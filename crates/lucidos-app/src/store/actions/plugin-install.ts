@@ -80,6 +80,7 @@ export function markPluginInstalled(
         at: new Date().toISOString(),
         summary: result.summary,
         installed_files: result.installed_files,
+        removed_files: result.removed_files,
         local_changes: result.local_changes,
       },
     },

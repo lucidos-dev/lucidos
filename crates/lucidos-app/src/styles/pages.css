@@ -254,6 +254,48 @@
 /* The one raised box every note in this form sits in. Tone and spacing are
    what the three below vary; the box itself is shared, so re-padding it is one
    edit rather than three. */
+/* Settings, 1Password: the service account form, inside its section. */
+.onepassword-form {
+    padding: 0 var(--space-lg);
+}
+
+.onepassword-check {
+    margin: 0 0 0.75rem;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+/* A secret field's label row: the label (or its FieldLabel) on the left, the
+   "From 1Password" switch on the right. */
+.secret-field-label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.375rem;
+}
+
+.secret-field-label-row > label,
+.secret-field-label-row > .form-label-row {
+    margin-bottom: 0;
+}
+
+.secret-field-source {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.secret-field-hint {
+    margin: 0.375rem 0 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+}
+
 .credential-scope-notice,
 .credential-repair-notice,
 .credential-console-help {
@@ -414,6 +456,11 @@
     font-weight: 600;
 }
 
+.plugin-install-label-detail {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
 .plugin-install-section-danger .plugin-install-label {
     color: var(--accent-red);
 }
@@ -508,7 +555,8 @@
 .plugin-install-file-merged,
 .plugin-install-file-conflict,
 .plugin-install-file-replaced,
-.plugin-install-file-restored {
+.plugin-install-file-restored,
+.plugin-install-file-removed {
     display: flex;
     flex-direction: column;
     gap: 0.125rem;
@@ -525,7 +573,8 @@
 }
 
 .plugin-install-file-conflict .plugin-install-outcome,
-.plugin-install-file-replaced .plugin-install-outcome {
+.plugin-install-file-replaced .plugin-install-outcome,
+.plugin-install-file-removed .plugin-install-outcome {
     color: var(--accent-yellow);
 }
 

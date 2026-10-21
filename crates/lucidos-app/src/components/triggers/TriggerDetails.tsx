@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { activeInlineForm, triggers, triggerGroups, showToast, chatModels, currentModel } from '../../store/store';
+import { activeInlineForm, triggers, triggerGroups, showToast, chatModels } from '../../store/store';
 import {
   closeTriggerForm,
   submitTrigger,
@@ -8,7 +8,7 @@ import {
   chatModelOptions, loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY,
   PROVIDER_DEFAULT_EFFORT_LABEL,
 } from '../../store/actions/models';
-import { accountChatEffort } from '../../store/actions/preferences';
+import { accountChatEffort, currentTriggerModel } from '../../store/actions/preferences';
 import type { ModelChoice } from '../../store/modelSelection';
 import { ModelSelectionField } from '../shared/ModelSelectionField';
 import { REASONING_LEVELS } from '../../store/models';
@@ -228,8 +228,8 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       on ? [...sideEffectGrant.filter(c => c !== cat), cat] : sideEffectGrant.filter(c => c !== cat)
     );
   };
-  // '' is the Default option: the trigger inherits the account chat model /
-  // effort, which is what a trigger without a pin has always done. Kept as ''
+  // '' is the Default option: the trigger inherits the account trigger model
+  // and its effort, which is what a trigger without a pin does. Kept as ''
   // rather than null so the <Dropdown> value round-trips as a plain string.
   const [model, setModel] = useServerBackedField(existingTrigger?.model ?? '');
   const [triggerEffort, setTriggerEffort] = useServerBackedField(existingTrigger?.reasoning_effort ?? '');
@@ -436,18 +436,20 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   //
   // Its extra row is Default, which inherits the whole pair. It carries no
   // tiers of its own, so picking it clears both halves. Its label names the
-  // pair the run will actually use. For a legacy trigger that pinned an effort
-  // and no model, that is the pinned tier.
+  // pair the run will actually use: the account's trigger model, not the chat
+  // model. For a legacy trigger that pinned an effort and no model, that is
+  // the pinned tier.
   const tierLabel = (value: string | null) => (value === null
     ? PROVIDER_DEFAULT_EFFORT_LABEL
     : REASONING_LEVELS.find(l => l.value === value)?.label ?? value);
+  const accountModel = currentTriggerModel();
   const accountLabel =
-    chatModelOptions().find(o => o.value === currentModel.value)?.label ?? currentModel.value;
+    chatModelOptions().find(o => o.value === accountModel)?.label ?? accountModel;
   // The account's tier for its model, except on a legacy trigger that pinned an
   // effort and no model. Once a model IS pinned the tier belongs to that pick,
   // and naming it here would claim Default runs on it.
   const inheritedTier = tierLabel(
-    model === '' && triggerEffort ? triggerEffort : accountChatEffort(currentModel.value),
+    model === '' && triggerEffort ? triggerEffort : accountChatEffort(accountModel),
   );
   const modelChoices: ModelChoice[] = [
     { value: '', label: `Default (${accountLabel} · ${inheritedTier})`, reasoningEfforts: [] },

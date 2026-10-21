@@ -15,6 +15,7 @@ vi.mock('../../api/client', () => ({
 vi.mock('../actions/thread-sync', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
+  reviveThreadEvents: vi.fn(),
 }));
 vi.mock('../actions/thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),

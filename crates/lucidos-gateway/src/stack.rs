@@ -266,10 +266,10 @@ pub fn spawn_engine(
     let state_dir = resolved_dir.join(".lucidos");
     std::fs::create_dir_all(&state_dir)?;
 
-    // `backup.key` lives in here, and it decrypts every archive this workspace
-    // ever uploaded (ADR 0153). This one call is both halves of the fix: it
-    // runs the moment the directory is created, and again on every later
-    // spawn, so a workspace predating the ADR converges with no sweep.
+    // A legacy `backup.key` can still live in here (ADR 0509), and it decrypts
+    // every archive it sealed (ADR 0153). This one call is both halves of the
+    // fix: it runs the moment the directory is created, and again on every
+    // later spawn, so a workspace predating the ADR converges with no sweep.
     crate::file_backup::exclude(&state_dir, "workspace state dir");
 
     let mut cmd = Command::new(engine_bin);

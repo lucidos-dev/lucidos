@@ -1,36 +1,5 @@
 use super::super::LucidosEngine;
 
-/// Maximum nesting depth for `execute_intent`. A healthy run never nests at
-/// all: the intent sub-loop's tool set (`build_intent_tools`) deliberately
-/// excludes `execute_intent`. This is a hard backstop — if that exclusion ever
-/// regresses, or a future nested-loop tool re-enters here, we return a clear
-/// error instead of recursing until the worker thread's stack overflows and the
-/// engine aborts (SIGABRT). The actual headroom for the *legitimate* (bounded)
-/// agentic-loop → intent-sub-loop chain comes from the enlarged worker stack
-/// (`WORKER_THREAD_STACK_SIZE` in `main.rs`); this guard exists so a *runaway*
-/// can never silently turn into a stack overflow again.
-const MAX_INTENT_DEPTH: u32 = 4;
-
-const INTENT_EXECUTION_RULES: &str = "\
-[EXECUTION RULES]
-- Fulfill the intent in this run. If a tool is needed, call the tool instead of explaining a future plan.
-- Use cached data in artifacts before making fresh API calls.
-- Emit events for outcomes via emit_event tool. Query past events via query_events tool.
-- Show errors to the user. Never swallow errors silently.
-[END EXECUTION RULES]";
-
-tokio::task_local! {
-    /// Current `execute_intent` nesting depth on this task. Read at the top of
-    /// `handle_execute_intent`; the inner sub-loop runs scoped to `depth + 1`.
-    pub(crate) static INTENT_DEPTH: u32;
-}
-
-/// True when an `execute_intent` call at `current_depth` must be refused to
-/// avoid unbounded intent nesting (and the stack overflow it would cause).
-fn intent_nesting_exceeded(current_depth: u32) -> bool {
-    current_depth >= MAX_INTENT_DEPTH
-}
-
 impl LucidosEngine {
     pub(crate) async fn execute_app_tool(
         &self,
@@ -101,6 +70,7 @@ impl LucidosEngine {
             "load_knowhow" => load_knowhow_impl(
                 &self.knowhow_dirs(),
                 self.system_knowhow_dir(),
+                &self.workspace_path.join(crate::core::DATA_DIR),
                 &self.thread_loaded_knowhow(thread_id).await?,
                 args,
             ),
@@ -109,98 +79,6 @@ impl LucidosEngine {
             }
             _ => Err(format!("Unknown app tool: {}", name).into()),
         }
-    }
-
-    /// Handle the execute_intent tool call.
-    ///
-    /// Loads an intent by ID, builds an isolated system prompt
-    /// with relevant know-how, and runs a sub agentic loop.
-    pub(crate) async fn handle_execute_intent(
-        &self,
-        args: &serde_json::Value,
-        extraction_ctx: &str,
-        request_id: uuid::Uuid,
-        device_id: Option<&str>,
-        cancel_token: &tokio_util::sync::CancellationToken,
-        thread_id: uuid::Uuid,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let intent_id = args["intent_id"]
-            .as_str()
-            .or_else(|| args["prompt_id"].as_str())
-            .ok_or("intent_id is required")?;
-        let task = args["task"].as_str().unwrap_or("");
-
-        // Hard depth guard: refuse before recursing far enough to overflow the
-        // worker stack. `execute_intent` is excluded from the intent sub-loop's
-        // tools, so this should never trip in practice — it's the backstop that
-        // turns a regression into a clear, logged error instead of a SIGABRT.
-        let depth = INTENT_DEPTH.try_with(|d| *d).unwrap_or(0);
-        if intent_nesting_exceeded(depth) {
-            log!(
-                "[Intents] Refusing to execute '{}' — intent nesting depth {} reached limit {}",
-                intent_id,
-                depth,
-                MAX_INTENT_DEPTH
-            );
-            return Err(format!(
-                "Error: refusing to execute intent '{}' — intent execution is already nested {} \
-                 levels deep (limit {}). An intent must not recursively execute intents; this \
-                 limit prevents a stack overflow.",
-                intent_id, depth, MAX_INTENT_DEPTH
-            )
-            .into());
-        }
-
-        // Load from IntentStore (app-scoped + standalone triggers)
-        let data_dir = self.workspace_path.join(crate::core::DATA_DIR);
-        let intent = crate::core::IntentStore::load(&data_dir, intent_id)
-            .ok_or_else(|| format!("Intent '{}' not found", intent_id))?;
-
-        // Load referenced know-how (general + app-specific if this is an app intent)
-        let kh_dirs = self.knowhow_dirs();
-        let system_dir = self.system_knowhow_dir();
-        let mut knowhow_context = crate::core::knowhow::load_knowhow_sections_merged(
-            &kh_dirs,
-            system_dir,
-            &intent.knowhow,
-        );
-
-        // If this is an app intent (id contains '/'), also load that app's knowhow
-        if let Some((app_id, _)) = intent_id.split_once('/') {
-            let app_knowhow_dir = self
-                .workspace_path
-                .join(crate::core::APPS_DIR)
-                .join(app_id)
-                .join("knowhow");
-            let app_knowhow = crate::core::knowhow::load_app_knowhow(&app_knowhow_dir);
-            if !app_knowhow.is_empty() {
-                knowhow_context.push_str(&app_knowhow);
-            }
-        }
-
-        let system_prompt = format!(
-            "{}\n\n[INTENT — {}]\n{}\n[END INTENT]{}",
-            INTENT_EXECUTION_RULES, intent_id, intent.content, knowhow_context
-        );
-
-        // Run isolated sub-loop, scoped one level deeper so a (mis)nested
-        // execute_intent inside it is caught by the depth guard above.
-        let result = INTENT_DEPTH
-            .scope(
-                depth + 1,
-                self.run_intent_loop(
-                    &system_prompt,
-                    task,
-                    request_id,
-                    extraction_ctx,
-                    device_id,
-                    cancel_token,
-                    thread_id,
-                ),
-            )
-            .await?;
-
-        Ok(result)
     }
 }
 
@@ -223,18 +101,22 @@ fn list_apps_text(
 
 /// The `load_knowhow` tool's answer, given the thread's loaded knowhow.
 ///
-/// The full formatted body, or the not-found sentinel for a miss. A doc this
-/// turn's block already holds, unchanged on disk, gets the short kept result
-/// instead (ADR 0425). Either way the recorded pair is what the next turn's
-/// fold reads, so nothing else is written.
+/// The full formatted body, or the not-found sentinel for a miss. An id that
+/// names no doc falls back to an intent, so running an intent is loading it.
+/// A doc wins an id clash. A doc this turn's block already holds, unchanged on
+/// disk, gets the short kept result instead (ADR 0425). Either way the
+/// recorded pair is what the next turn's fold reads, so nothing else is
+/// written.
 pub(crate) fn load_knowhow_impl(
     kh_dirs: &crate::core::knowhow::KnowhowDirs,
     system_dir: Option<&std::path::Path>,
+    data_dir: &std::path::Path,
     loaded: &[crate::engine::loaded_knowhow::LoadedKnowhow],
     args: &serde_json::Value,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let id = required_knowhow_id(args)?;
     let body = crate::core::knowhow::load_one_knowhow_section(kh_dirs, system_dir, id)
+        .or_else(|| load_intent_body(kh_dirs, system_dir, data_dir, id))
         .unwrap_or_else(|| crate::core::knowhow::knowhow_not_found_body(id));
     let held = loaded
         .iter()
@@ -244,6 +126,34 @@ pub(crate) fn load_knowhow_impl(
     } else {
         body
     })
+}
+
+/// An intent as `load_knowhow` returns it: the intent body, then the docs its
+/// `knowhow:` names, then, for an app intent, every doc in its app's knowhow.
+fn load_intent_body(
+    kh_dirs: &crate::core::knowhow::KnowhowDirs,
+    system_dir: Option<&std::path::Path>,
+    data_dir: &std::path::Path,
+    id: &str,
+) -> Option<String> {
+    if id.starts_with(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX) {
+        return None;
+    }
+    let intent = crate::core::IntentStore::load(data_dir, id)?;
+    let mut body = format!(
+        "[INTENT: {}]\n{}\n[END INTENT]",
+        intent.name, intent.content
+    );
+    body.push_str(&crate::core::knowhow::load_knowhow_sections_merged(
+        kh_dirs,
+        system_dir,
+        &intent.knowhow,
+    ));
+    if let Some((app_id, _)) = id.split_once('/') {
+        let app_knowhow_dir = data_dir.join("apps").join(app_id).join("knowhow");
+        body.push_str(&crate::core::knowhow::load_app_knowhow(&app_knowhow_dir));
+    }
+    Some(body)
 }
 
 /// The `unload_knowhow` tool's answer. The recorded pair is the unload.
@@ -289,43 +199,6 @@ mod tests {
         assert!(!text.contains("fare-grid"), "a widget leaked: {text}");
     }
 
-    #[test]
-    fn intent_nesting_guard_boundary() {
-        // The guard must allow normal (un-nested / shallowly nested) execution
-        // and refuse once the nesting reaches the cap — that refusal is what
-        // turns a runaway into a clean error instead of a stack-overflow abort.
-        assert!(
-            !intent_nesting_exceeded(0),
-            "top-level execute_intent allowed"
-        );
-        assert!(
-            !intent_nesting_exceeded(MAX_INTENT_DEPTH - 1),
-            "one below the cap still allowed"
-        );
-        assert!(
-            intent_nesting_exceeded(MAX_INTENT_DEPTH),
-            "at the cap must be refused"
-        );
-        assert!(
-            intent_nesting_exceeded(MAX_INTENT_DEPTH + 1),
-            "above the cap must be refused"
-        );
-    }
-
-    #[test]
-    fn intent_execution_rules_avoid_echo_prone_slogans() {
-        assert!(
-            !INTENT_EXECUTION_RULES.contains("ALWAYS EXECUTE, NEVER DESCRIBE"),
-            "intent execution rules should avoid slogans Gemini may echo"
-        );
-        assert!(
-            !INTENT_EXECUTION_RULES.contains("If you catch yourself"),
-            "intent execution rules should avoid self-referential meta-instructions"
-        );
-        assert!(INTENT_EXECUTION_RULES.contains("emit_event"));
-        assert!(INTENT_EXECUTION_RULES.contains("query_events"));
-    }
-
     fn dirs(local: &std::path::Path) -> KnowhowDirs {
         KnowhowDirs {
             shared: None,
@@ -337,7 +210,112 @@ mod tests {
 
     fn my_doc(local: &std::path::Path) -> String {
         write_knowhow_file(&local.join("my-doc.md"), "My Doc", "Body of my doc.");
-        load_knowhow_impl(&dirs(local), None, &[], &json!({ "id": "my-doc" })).unwrap()
+        load_knowhow_impl(&dirs(local), None, local, &[], &json!({ "id": "my-doc" })).unwrap()
+    }
+
+    /// A workspace `data/` dir whose knowhow dirs resolve app-scoped ids.
+    struct DataDir {
+        _tmp: tempfile::TempDir,
+        data: std::path::PathBuf,
+    }
+
+    impl DataDir {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            std::fs::create_dir_all(data.join("knowhow")).unwrap();
+            Self { _tmp: tmp, data }
+        }
+
+        fn write(&self, rel: &str, text: &str) {
+            let path = self.data.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+
+        fn load(&self, id: &str) -> String {
+            let dirs = KnowhowDirs {
+                shared: None,
+                local: self.data.join("knowhow"),
+                apps: Some(self.data.join("apps")),
+                triggers: Some(self.data.join("triggers")),
+            };
+            load_knowhow_impl(&dirs, None, &self.data, &[], &json!({ "id": id })).unwrap()
+        }
+    }
+
+    #[test]
+    fn load_knowhow_runs_an_app_intent_with_its_docs_and_the_apps_knowhow() {
+        let ws = DataDir::new();
+        ws.write(
+            "apps/habit-tracker/intents/weekly-review.md",
+            "---\nname: Weekly Review\nknowhow: review-style\n---\nReview the week.",
+        );
+        ws.write(
+            "knowhow/review-style.md",
+            "---\nname: Review Style\n---\nKeep it short.",
+        );
+        ws.write(
+            "apps/habit-tracker/knowhow/streaks.md",
+            "---\nname: Streaks\n---\nA streak breaks after one missed day.",
+        );
+        let body = ws.load("habit-tracker/weekly-review");
+        assert!(body.starts_with("[INTENT: Weekly Review]"), "{body}");
+        for part in [
+            "Review the week.",
+            "[KNOW-HOW: Review Style]",
+            "Keep it short.",
+            "[APP KNOW-HOW: Streaks]",
+            "A streak breaks after one missed day.",
+        ] {
+            assert!(body.contains(part), "missing {part:?} in {body}");
+        }
+    }
+
+    #[test]
+    fn load_knowhow_runs_an_app_trigger_procedure() {
+        let ws = DataDir::new();
+        ws.write(
+            "apps/habit-tracker/triggers/daily-check.md",
+            "---\nname: Daily Check\n---\nCheck today's habits.",
+        );
+        let body = ws.load("habit-tracker/daily-check");
+        assert!(body.starts_with("[INTENT: Daily Check]"), "{body}");
+        assert!(body.contains("Check today's habits."), "{body}");
+    }
+
+    #[test]
+    fn load_knowhow_runs_a_standalone_trigger_intent() {
+        let ws = DataDir::new();
+        ws.write(
+            "triggers/morning-brief/morning-brief.md",
+            "---\nname: Morning Brief\n---\nSummarise the calendar.",
+        );
+        let body = ws.load("morning-brief");
+        assert!(body.starts_with("[INTENT: Morning Brief]"), "{body}");
+        assert!(body.contains("Summarise the calendar."), "{body}");
+        assert!(!body.contains("APP KNOW-HOW"), "{body}");
+    }
+
+    #[test]
+    fn an_id_neither_knowhow_nor_intent_returns_the_not_found_sentinel() {
+        let ws = DataDir::new();
+        let body = ws.load("habit-tracker/no-such-intent");
+        assert!(crate::core::knowhow::is_not_found_body(&body), "{body}");
+    }
+
+    /// An id that loads a doc today keeps loading that doc.
+    #[test]
+    fn a_knowhow_doc_wins_over_an_intent_with_the_same_id() {
+        let ws = DataDir::new();
+        ws.write("apps/x/knowhow/foo.md", "---\nname: Foo Doc\n---\nThe doc.");
+        ws.write(
+            "apps/x/intents/foo.md",
+            "---\nname: Foo Intent\n---\nThe intent.",
+        );
+        let body = ws.load("x/foo");
+        assert!(body.contains("The doc."), "{body}");
+        assert!(!body.contains("The intent."), "{body}");
     }
 
     #[test]
@@ -353,8 +331,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("local");
         std::fs::create_dir_all(&local).unwrap();
-        let body =
-            load_knowhow_impl(&dirs(&local), None, &[], &json!({ "id": "no-such-doc" })).unwrap();
+        let body = load_knowhow_impl(
+            &dirs(&local),
+            None,
+            &local,
+            &[],
+            &json!({ "id": "no-such-doc" }),
+        )
+        .unwrap();
         assert!(
             crate::core::knowhow::is_not_found_body(&body),
             "miss must return the not-found sentinel, got: {}",
@@ -367,7 +351,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("local");
         for args in [json!({}), json!({ "id": "" })] {
-            let err = load_knowhow_impl(&dirs(&local), None, &[], &args).unwrap_err();
+            let err = load_knowhow_impl(&dirs(&local), None, &local, &[], &args).unwrap_err();
             assert!(err.to_string().contains("id is required"), "got: {}", err);
             let err = unload_knowhow_impl(&[], &args).unwrap_err();
             assert!(err.to_string().contains("id is required"), "got: {}", err);
@@ -381,7 +365,13 @@ mod tests {
         let local = tmp.path().join("local");
         let body = my_doc(&local);
         let loaded = [LoadedKnowhow::loaded_turns_ago("my-doc", &body, 2)];
-        let again = load_knowhow_impl(&dirs(&local), None, &loaded, &json!({ "id": "my-doc" }));
+        let again = load_knowhow_impl(
+            &dirs(&local),
+            None,
+            &local,
+            &loaded,
+            &json!({ "id": "my-doc" }),
+        );
         assert_eq!(
             again.unwrap(),
             crate::engine::loaded_knowhow::kept_result("my-doc")
@@ -405,7 +395,13 @@ mod tests {
             ),
         ];
         for (case, doc) in cases {
-            let again = load_knowhow_impl(&dirs(&local), None, &[doc], &json!({ "id": "my-doc" }));
+            let again = load_knowhow_impl(
+                &dirs(&local),
+                None,
+                &local,
+                &[doc],
+                &json!({ "id": "my-doc" }),
+            );
             assert_eq!(again.unwrap(), body, "{case}");
         }
     }

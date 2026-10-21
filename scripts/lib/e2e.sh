@@ -90,13 +90,13 @@ export ENGINE_BUILD_FEATURES="${ENGINE_BUILD_FEATURES:-e2e-test-hooks}"
 # `cfg!(any(debug_assertions, feature = "e2e-test-hooks"))` and the e2e build passes
 # that feature (ENGINE_BUILD_FEATURES above). `build_or_find_engine` reads $RELEASE.
 #   - LUCIDOS_E2E_DEBUG=1 → fall back to the fast debug build for local single-spec
-#     iteration (the opt-out is authoritative).
+#     iteration (the opt-out is authoritative). A filtered local run sets it
+#     (e2e_github_lean_local), and `0` keeps the release engine.
 #   - otherwise RELEASE defaults to 1; an explicit caller RELEASE is honored.
-if [ -n "${LUCIDOS_E2E_DEBUG:-}" ]; then
-    export RELEASE=""
-else
-    export RELEASE="${RELEASE:-1}"
-fi
+case "${LUCIDOS_E2E_DEBUG:-}" in
+    '' | 0) export RELEASE="${RELEASE:-1}" ;;
+    *) export RELEASE="" ;;
+esac
 
 # Cap cargo parallelism for the release compile so a full-core release codegen
 # (wasmtime / aws-lc / ravif each eat 1–2 GB) can't blow past RAM into swap and
@@ -122,6 +122,9 @@ source "$_E2E_LIB_DIR/webkit_reaper.sh"
 source "$_E2E_LIB_DIR/host_load_guard.sh"
 source "$_E2E_LIB_DIR/host_memory_guard.sh"
 source "$_E2E_LIB_DIR/e2e_gateway.sh"
+source "$_E2E_LIB_DIR/engine_manifest.sh"
+# shellcheck source=scripts/lib/e2e_projects.sh
+source "$_E2E_LIB_DIR/e2e_projects.sh"
 
 # ── assert_e2e_workspace_is_disposable ──────────────────────────────────
 # Refuse to proceed unless $E2E_WORKSPACE names a disposable e2e workspace.
@@ -187,18 +190,34 @@ e2e_workspace_env() {
 # mid-suite would swap the binary out from under the running tests, so later
 # calls only LOCATE what the first call built. The marker is exported so the
 # sub-scripts the umbrella (scripts/e2e.sh) spawns inherit "already built".
+#
+# A build whose engine input manifest matches this tree's Rust is reused from
+# the local engine cache instead (scripts/lib/engine_manifest.sh), and every
+# build is filed there for the next run, from any checkout on this host.
 build_e2e_engine_once() {
     if [ -n "${LUCIDOS_E2E_ENGINE_BUILT:-}" ]; then
         BUILD=""
         build_or_find_engine
         return 0
     fi
-    BUILD="1"
-    build_or_find_engine || return 1
+    local profile cached
+    profile="$(engine_build_profile)"
+    cached="$(engine_cache_find "$PROJECT_DIR" "$profile" "$ENGINE_BUILD_FEATURES")"
+    if [ -n "$cached" ]; then
+        echo "Engine: REUSED cached build ${cached##*/}, built from this tree's Rust"
+        publish_launch_binaries "$cached" "$(launch_bin_dir)" || return 1
+        BUILD=""
+        build_or_find_engine
+    else
+        BUILD="1"
+        build_or_find_engine || return 1
+        engine_cache_store "$PROJECT_DIR" "$PROJECT_DIR/target/$profile" "$profile" "$ENGINE_BUILD_FEATURES" \
+            || echo "Engine cache: this build was not filed, so the next run compiles again."
+    fi
     # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
     # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
     # The frontend build reads the generated files this writes too.
-    generate_build_outputs || return 1
+    REUSED_CODEGEN_BIN="${cached:+$cached/lucidos-codegen}" generate_build_outputs || return 1
     export LUCIDOS_E2E_ENGINE_BUILT=1
 }
 
@@ -281,6 +300,13 @@ _first_build_input_newer_than() {
     find "${inputs[@]}" -newer "$ref" -print -quit 2>/dev/null || true
 }
 
+# _dist_sourcemap: a sourcemap in dist/, or nothing. Only a coverage build
+# (LUCIDOS_E2E_COVERAGE, vite.config.ts) writes one, so its presence must match
+# the variable.
+_dist_sourcemap() {
+    find "$FRONTEND_DIR/dist" -name '*.map' -print -quit 2>/dev/null || true
+}
+
 # _run_vite_build — the one-shot production build. Its own function purely so the
 # shell test can redefine it (the repo's seam convention — see the measurement
 # seams in scripts/lib/host_load_guard.sh) and assert WHICH branch
@@ -302,6 +328,10 @@ ensure_frontend_built() {
         newer="$(_first_build_input_newer_than "$dist_index")"
         if [ -n "$newer" ]; then
             reason="build input newer than dist/index.html: ${newer#"$_E2E_PROJECT_DIR"/}"
+        elif [ -n "${LUCIDOS_E2E_COVERAGE:-}" ] && [ -z "$(_dist_sourcemap)" ]; then
+            reason="coverage needs sourcemaps, and dist/ has none"
+        elif [ -z "${LUCIDOS_E2E_COVERAGE:-}" ] && [ -n "$(_dist_sourcemap)" ]; then
+            reason="dist/ holds a coverage build's sourcemaps"
         fi
     fi
 
@@ -557,8 +587,7 @@ stop_e2e_background_guards() {
 # Playwright reads a positional argument as an UNANCHORED, case-insensitive
 # REGEX over the test file path, never as a filename. So a bare basename selects
 # every sibling whose path merely CONTAINS it: `chat.spec.ts` also pulls in
-# `app-coding-agent-spawn-from-chat.spec.ts`, `cancel.spec.ts` pulls in
-# `coding-agent-cancel.spec.ts`, and `follow-ups.spec.ts` pulls in
+# `app-coding-agent-spawn-from-chat.spec.ts`, and `follow-ups.spec.ts` pulls in
 # `coding-agent-follow-ups.spec.ts`.
 #
 # This is a correctness fix rather than a tidy-up. The selected specs ran twice
@@ -576,20 +605,18 @@ playwright_file_filter() {
     printf '/%s$' "$escaped"
 }
 
-# ── project_runs_spec ────────────────────────────────────────────────
-# Succeed when a browser project runs the given spec, fail when it ignores it.
-#
-#   project_runs_spec mobile header-desktop.spec.ts   # → fails
-#
-# Mirrors each project's `testIgnore` in crates/lucidos-app/playwright.config.ts.
-# A targeted `-f` run asks every project for the spec. A project that ignores
-# it finds no tests and exits 1, which fails a run that passed.
-project_runs_spec() {
-    case "$1:$2" in
-        chromium:*-mobile.spec.ts) return 1 ;;
-        mobile:*-desktop.spec.ts | mobile-webkit:*-desktop.spec.ts) return 1 ;;
-    esac
-    return 0
+# ── project_runs_any_spec ────────────────────────────────────────────
+# Succeed when a browser project runs at least one of the given specs, or when
+# none is given: an untargeted run asks every project. A project that runs none
+# of a targeted list finds no tests and exits 1.
+project_runs_any_spec() {
+    local project="$1" spec
+    shift
+    [ $# -gt 0 ] || return 0
+    for spec in "$@"; do
+        project_runs_spec "$project" "$spec" && return 0
+    done
+    return 1
 }
 
 # ── e2e_spec_spawns_claude_code ──────────────────────────────────────
@@ -622,15 +649,16 @@ e2e_browser_projects() {
 # The comma-separated projects an e2e-browser.sh run declares in its
 # E2ELockAcquired event ($E2E_LOCK_PROJECTS, read by e2e_lock.sh).
 #
-#   e2e_browser_lock_projects <use-webkit> <skip-webkit> <test-file> [playwright args…]
+#   e2e_browser_lock_projects <use-webkit> <skip-webkit> <test-files> [playwright args…]
 #
+# <test-files> is the spec names a run targets, space separated, or empty.
 # A `--project` passed through to Playwright, and `--webkit`, name the projects
 # outright. Otherwise it is the full list, less mobile-webkit under
-# `--no-webkit`, less any project whose testIgnore drops the test file.
+# `--no-webkit`, less any project whose testIgnore drops every targeted spec.
 # Playwright's split `--project` is variadic: it takes every value up to the
 # next flag, so this does too.
 e2e_browser_lock_projects() {
-    local use_webkit="$1" skip_webkit="$2" test_file="$3"
+    local use_webkit="$1" skip_webkit="$2" test_files="$3"
     shift 3
     local named="" arg project in_project=""
     for arg in "$@"; do
@@ -646,9 +674,10 @@ e2e_browser_lock_projects() {
         printf '%s' "$named"
         return 0
     fi
-    local runs=""
+    local runs="" wanted_specs=()
+    read -r -a wanted_specs <<<"$test_files"
     while IFS= read -r project; do
-        if [ -z "$test_file" ] || project_runs_spec "$project" "$test_file"; then
+        if project_runs_any_spec "$project" ${wanted_specs[@]+"${wanted_specs[@]}"}; then
             runs="${runs:+$runs,}$project"
         fi
     done <<EOF
@@ -938,7 +967,9 @@ setup_e2e_session() {
         return 0
     fi
 
-    acquire_e2e_lock "$label" || exit 1
+    # A run without mobile-webkit shares the host with one other run; one with
+    # it takes every e2e slot ($E2E_LOCK_PROJECTS, from the entry script).
+    acquire_e2e_slots "$label" "$(e2e_lock_kind "${E2E_LOCK_PROJECTS:-}")" || exit $?
     kill_orphan_simulator
 
     # stop_e2e_background_guards leads every branch so the host-memory reaper and
@@ -1129,6 +1160,17 @@ assert_e2e_workspace_tree_clean() {
 # `--fresh-workspace` also resets the workspace TREE, between the engine stop
 # and the boot. A run passes it once, at its start; resets between projects
 # and on a resume do not.
+# Every migration commits, and a commit waits for its WAL flush. The e2e
+# database is thrown away, so it skips that wait, which cuts the boot's
+# migrations about threefold. Set it on this database only: the cluster also
+# holds real workspaces.
+_skip_e2e_commit_flush() {
+    local ident
+    ident="$(_shared_pg_ident "$1")" || return 1
+    shared_pg_psql postgres -v ON_ERROR_STOP=1 -q -c \
+        "ALTER DATABASE $ident SET synchronous_commit = off"
+}
+
 reset_e2e_database() {
     local fresh=""
     case "${1:-}" in
@@ -1153,6 +1195,7 @@ reset_e2e_database() {
     rm -f "$E2E_WORKSPACE/.lucidos/database-migrated"
     _drop_shared_database "$db" || return 1
     _create_shared_database "$db" || return 1
+    _skip_e2e_commit_flush "$db" || return 1
 
     # `psql -c` without ON_ERROR_STOP exits 0 even when the statement errored, so
     # a refused DROP (something still connected) would silently leave the OLD
@@ -1173,7 +1216,7 @@ reset_e2e_database() {
 
     # A new workspace has not chosen its memory module, so the memory choice
     # would cover every spec. Answer it as closing the modal does.
-    # memory-choice.spec.ts deletes the answer to see the modal.
+    # memory-choice-all.spec.ts deletes the answer to see the modal.
     shared_pg_psql "$db" -v ON_ERROR_STOP=1 -q -c \
         "INSERT INTO preferences (key, value) VALUES ('memory_module', 'classic') ON CONFLICT (key, COALESCE(device_id, '')) DO NOTHING;"
 }

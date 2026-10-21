@@ -8,6 +8,7 @@
 //! `main` is `None` when no check can start: git could not read it, or this
 //! checkout cannot run one. That starts nothing and forgets no landing.
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// A check of `to_sha`, covering what landed since `from_sha`.
@@ -18,13 +19,34 @@ pub(crate) struct CheckRange {
     pub(crate) to_sha: String,
 }
 
+/// One failed test, as the check script names it: the suite or browser phase it
+/// ran in, its name, and the head of its error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedTest {
+    pub suite: String,
+    pub name: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
 /// The red check: the last verdict was a failure, and its fix thread owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RedCheck {
     pub(crate) range: CheckRange,
     pub(crate) summary: String,
     pub(crate) tail: String,
+    pub(crate) failures: Vec<FailedTest>,
     pub(crate) run_url: Option<String>,
+    pub(crate) fix_thread_id: Uuid,
+}
+
+/// The open *flaky fix thread*: a check passed, but these tests failed once
+/// and passed a retry. It blocks nothing. At most one is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlakyFix {
+    pub(crate) range: CheckRange,
+    pub(crate) run_url: Option<String>,
+    pub(crate) flaky: Vec<FailedTest>,
     pub(crate) fix_thread_id: Uuid,
 }
 
@@ -32,9 +54,17 @@ pub(crate) struct RedCheck {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Passed,
+    /// Passed, with flaky tests and no flaky fix thread open: this check
+    /// opens one.
+    PassedWithFlakyFix {
+        run_url: Option<String>,
+        flaky: Vec<FailedTest>,
+        fix_thread_id: Uuid,
+    },
     Failed {
         summary: String,
         tail: String,
+        failures: Vec<FailedTest>,
         run_url: Option<String>,
         fix_thread_id: Uuid,
     },
@@ -83,6 +113,8 @@ pub(crate) struct MainCheck {
     red: Option<RedCheck>,
     /// The last verdict, when it passed and nothing has started since.
     passed: Option<CheckRange>,
+    /// The open flaky fix thread. It is independent of every field above.
+    flaky: Option<FlakyFix>,
 }
 
 impl MainCheck {
@@ -96,6 +128,10 @@ impl MainCheck {
 
     pub(crate) fn passed(&self) -> Option<&CheckRange> {
         self.passed.as_ref()
+    }
+
+    pub(crate) fn flaky_fix(&self) -> Option<&FlakyFix> {
+        self.flaky.as_ref()
     }
 
     #[cfg(test)]
@@ -160,14 +196,24 @@ impl MainCheck {
             return false;
         };
         match verdict {
-            Verdict::Passed => {
-                self.base = Some(range.to_sha.clone());
-                self.passed = Some(range);
-                std::mem::take(&mut self.dirty)
+            Verdict::Passed => self.pass(range),
+            Verdict::PassedWithFlakyFix {
+                run_url,
+                flaky,
+                fix_thread_id,
+            } => {
+                self.flaky = Some(FlakyFix {
+                    range: range.clone(),
+                    run_url,
+                    flaky,
+                    fix_thread_id,
+                });
+                self.pass(range)
             }
             Verdict::Failed {
                 summary,
                 tail,
+                failures,
                 run_url,
                 fix_thread_id,
             } => {
@@ -176,6 +222,7 @@ impl MainCheck {
                     range,
                     summary,
                     tail,
+                    failures,
                     run_url,
                     fix_thread_id,
                 });
@@ -187,6 +234,27 @@ impl MainCheck {
                 false
             }
         }
+    }
+
+    /// A pass cleared `range`. True when changes landed meanwhile, so the next
+    /// check is due now.
+    fn pass(&mut self, range: CheckRange) -> bool {
+        self.base = Some(range.to_sha.clone());
+        self.passed = Some(range);
+        std::mem::take(&mut self.dirty)
+    }
+
+    /// A change from `thread_id` landed: that closes the flaky fix thread, if
+    /// it is the one. True when it closed.
+    pub(crate) fn close_flaky_for(&mut self, thread_id: Uuid) -> bool {
+        self.flaky
+            .take_if(|flaky| flaky.fix_thread_id == thread_id)
+            .is_some()
+    }
+
+    /// The flaky fix thread is gone: deleted, or archived by the maintainer.
+    pub(crate) fn forget_flaky(&mut self) {
+        self.flaky = None;
     }
 
     /// The maintainer closes the red. What landed while it was open starts

@@ -470,7 +470,16 @@ export function refreshChangesState(): Promise<void> {
 export async function applySingleChange(id: string): Promise<void> {
   try {
     const result = await apiApply(id);
-    if (result.status === 'hardening') {
+    if (result.status === 'applied' || result.status === 'noop') {
+      // The change has left pending. The engine's ChangesUpdated frame says so
+      // too, but it rides the SSE stream and can land after this reply. The
+      // row's busy face ends with the reply, so without this it would draw
+      // Apply again in between.
+      const pending = changes.value;
+      if (pending.status === 'loaded') {
+        changes.value = { status: 'loaded', data: pending.data.filter((c) => c.id !== id) };
+      }
+    } else if (result.status === 'hardening') {
       // Hardening recovery: backend spawned a hardening session that will auto-apply.
       // Track the change as "applying" so ChangesPanel shows persistent state.
       // The user-facing toast is fired by the MissingHardeningDetected SSE

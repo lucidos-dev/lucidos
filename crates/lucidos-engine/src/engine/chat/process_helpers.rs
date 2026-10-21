@@ -20,7 +20,7 @@ pub(super) struct TriggerContext {
     pub trigger_id: String,
     pub trigger_name: String,
     /// Stable kebab-case slug of the firing trigger, used to scope the
-    /// per-trigger know-how listing in the system prompt to
+    /// per-trigger know-how listing in the fire's message to
     /// `data/triggers/{slug}/knowhow/`.
     pub slug: String,
     pub invocation: TriggerInvocation,
@@ -387,10 +387,14 @@ where
     }
 }
 
-/// Build the per-trigger know-how section for the system prompt of trigger
-/// threads. Lists files under `<workspace>/data/triggers/<slug>/knowhow/`,
+/// Build the `[TRIGGER KNOW-HOW]` block for a trigger fire's user message.
+/// Lists files under `<workspace>/data/triggers/<slug>/knowhow/`,
 /// scoped so threads of OTHER triggers never see this trigger's items.
 /// Returns empty when the trigger has no knowhow files (caller appends nothing).
+///
+/// It names this trigger's own docs, so it differs per trigger. That is why it
+/// rides in the volatile part of the message and not in the system block,
+/// which every fire and chat turn shares.
 ///
 /// IDs use the global `triggers/<slug>/<file>` namespace so the listed
 /// `load_knowhow` calls resolve via the same fallback resolution
@@ -401,7 +405,7 @@ pub(super) fn build_trigger_knowhow_section(triggers_dir: &std::path::Path, slug
         return String::new();
     }
     let mut section = String::from(
-        "\n\n## Trigger Know-how (this trigger only)\n\n\
+        "[TRIGGER KNOW-HOW]\n\
         Files below belong to THIS trigger and are likely relevant. \
         Use `load_knowhow` with the id shown.\n\n",
     );
@@ -417,6 +421,7 @@ pub(super) fn build_trigger_knowhow_section(triggers_dir: &std::path::Path, slug
             super::process::workspace_prompt_footprint::routing_description(&kh.description)
         ));
     }
+    section.push_str("[END TRIGGER KNOW-HOW]");
     section
 }
 
@@ -556,8 +561,8 @@ pub(super) fn arm_followup_redirect(
     // Mark this interrupt as a redirect (not a Stop click) so the run_session
     // interrupt arm classifies the interrupted turn as
     // `CancelCause::SupersededByFollowup` — rendered neutrally — instead of
-    // `UserStop`. Drained by `take_session_redirect_followup`.
-    s.redirect_followup = true;
+    // `UserStop`. Drained by `take_session_redirect_cause`.
+    s.redirect_cause = Some(crate::engine::thread_events::CancelCause::SupersededByFollowup);
     s.interrupt.notify_one();
     Some(s.idle_notify.clone())
 }

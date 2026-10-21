@@ -13,7 +13,7 @@
  */
 
 import type { LandingLane } from '../../api/client';
-import { EMPTY_LANDING_LANE, landingLane, landingLaneCanceling, showToast, type LanePlace } from '../store';
+import { EMPTY_LANDING_LANE, landingLane, landingLaneCanceling, lanePlace, showToast, type LanePlace } from '../store';
 import { focusThread } from './threads';
 
 /** What a change row says about its place in the lane. */
@@ -37,6 +37,20 @@ export function laneWithBatchStarted(
     waiting: lane.waiting.filter((id) => !members.includes(id)),
     gathering: false,
   };
+}
+
+/** The lane after `ChangeQueued` for `changeId`: it waits for the next batch,
+ *  unless the lane already places it. The next snapshot replaces this. */
+export function laneWithChangeQueued(lane: LandingLane, changeId: string): LandingLane {
+  return lanePlace(lane, changeId) ? lane : { ...lane, waiting: [...lane.waiting, changeId] };
+}
+
+/** The lane after `changeId` landed or left it. A batch keeps its members,
+ *  since its own frame closes it. */
+export function laneWithoutWaiting(lane: LandingLane, changeId: string): LandingLane {
+  return lane.waiting.includes(changeId)
+    ? { ...lane, waiting: lane.waiting.filter((id) => id !== changeId) }
+    : lane;
 }
 
 /** The lane after `LaneBatchLanded` or `LaneBatchFailed` for `batchId`. */

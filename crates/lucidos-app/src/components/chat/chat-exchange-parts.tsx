@@ -8,7 +8,7 @@ import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWh
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, eventConditionDoor, eventConditionPopoverOpenFor, findChangeById, lazyChanges, openImagePopupFromGroup, openSubAgentGroups, showToast, stepDetailModal, toggleEventConditionPopover, toggleSubAgentGroup } from '../../store/store';
 import { prefetchStepDetail } from '../../store/stepDetailCache';
-import { LUCIDOS_AGENT_LABEL, awaitedSubject, continuationCause, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, awaitedSubject, continuationCause, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isRedirectCancel, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import { CommitList } from '../shared/CommitList';
@@ -219,6 +219,7 @@ const CANCEL_STATE: Partial<Record<CancelCause, string>> = {
   user_stop: 'You stopped it',
   user_action: 'Stopped by apply, discard or archive',
   superseded_by_followup: 'Replaced',
+  effort_restart: 'Restarted',
 };
 
 interface BoundaryStarter {
@@ -242,6 +243,7 @@ const REASON_PILL: Partial<Record<EngineReason['kind'], string>> = {
   harden_retrigger: 'hardening needed',
   merge_conflict: 'merge conflict',
   main_check_red: 'main is red',
+  main_check_flaky: 'flaky tests',
   stale_session: 'stopped agent tidied up',
   orphan_recovery: 'picked up after a restart',
   archived_branch_work: 'work set aside',
@@ -298,8 +300,8 @@ function boundaryCardParts(
     case 'ResponseAborted':
       return { state: responseAbortedState(ev.actor, ev.cause as AbortCause), tone: 'halted' as const, why: describeAbortCause(ev.cause as AbortCause) };
     case 'ResponseCanceled':
-      // A follow-up that replaced the reply lapsed it, as a replaced form does.
-      return { state: CANCEL_STATE[ev.cause as CancelCause], tone: ev.cause === 'superseded_by_followup' ? 'lapsed' as const : 'halted' as const, why: describeCancelCause(ev.cause as CancelCause) };
+      // A redirect that replaced the reply lapsed it, as a replaced form does.
+      return { state: CANCEL_STATE[ev.cause as CancelCause], tone: isRedirectCancel(ev.cause as CancelCause) ? 'lapsed' as const : 'halted' as const, why: describeCancelCause(ev.cause as CancelCause) };
     case 'EventWaitCanceled':
       return { state: 'You stopped it', tone: 'halted' as const, fact };
     case 'McpConsentRequested':
@@ -406,6 +408,23 @@ export function ResumeCard({ exchange }: { exchange: Exchange }) {
           )}
         </>
       ),
+    },
+  });
+}
+
+/** A restart inside the turn it continued: the engine restarted the agent and
+ *  the work carried on below this row. The resume card's cause and Details,
+ *  under a "Restarted" pill, since this turn never stopped. */
+export function RestartRow({ event }: { event: Extract<ResponseEvent, { type: 'restart' }> }) {
+  return eventRowBody({
+    kind: 'resume',
+    role: 'restart',
+    subject: eventNameChip({ kind: 'chip', name: 'ContinuationStarted', label: 'Restarted', sentenceStart: true }),
+    stateLabel: continuationCause(event.reason, event.actor),
+    tone: 'arrived',
+    fold: {
+      label: 'Details',
+      body: <p>{describeContinuationReason(event.reason) ?? describeEngineReason({ kind: 'continuation_started' })}</p>,
     },
   });
 }

@@ -31,7 +31,9 @@ const { InlineWidget, WIDGET_UNAVAILABLE_TEXT } = await import('../InlineWidget'
 const { _resetWidgetHeightsForTesting, DEFAULT_WIDGET_HEIGHT_PX, OFF_SCREEN_HOLD_MS } = await import('../WidgetFrame');
 const { threadWidgets } = await import('../../../store/widgets');
 const { appsById } = await import('../../../store/appsById');
-const { APP_FRAME_SIZE_EVENT } = await import('../../../store/actions/widget-frame-bridge');
+const { APP_FRAME_MENU_EVENT, APP_FRAME_SIZE_EVENT } = await import('../../../store/actions/widget-frame-bridge');
+const { WidgetMenuItems } = await import('../widgetMenuChunks');
+const { LONG_PRESS_DELAY_MS } = await import('../../../hooks/useLongPress');
 
 const THREAD = 'thread-1';
 /** A stand-in for the clip box's cap, which CSS sets and jsdom cannot read. */
@@ -80,6 +82,8 @@ let host: HTMLElement;
 
 beforeEach(() => {
   _resetWidgetHeightsForTesting();
+  // A frame applies a report on the next animation frame. Run it at once.
+  vi.stubGlobal('requestAnimationFrame', (run: FrameRequestCallback) => { run(performance.now()); return 0; });
   appRead({ id: 'flight-picker', name: 'Flight picker' });
   appRead({ id: 'player', name: 'Sound player', reusable: true });
   openWidgetInCanvas.mockClear();
@@ -88,6 +92,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   render(null, host);
   host.remove();
   threadWidgets.value = new Map();
@@ -218,3 +223,58 @@ describe('InlineWidget', () => {
   });
 });
 
+
+describe('InlineWidget menu', () => {
+  beforeEach(async () => {
+    // The menu opens once its rows are in memory: load them up front.
+    await WidgetMenuItems.preload();
+    threadWidgetsWith({});
+    renderCard();
+  });
+
+  const menuItems = () => [...document.querySelectorAll('.thread-overflow-menu [role="menuitem"]')].map((b) => b.textContent);
+  const bar = () => host.querySelector<HTMLElement>('.widget-bar')!;
+  const rightClick = (target: Element, init: MouseEventInit = {}) => {
+    const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 30, clientY: 40, ...init });
+    act(() => { target.dispatchEvent(e); });
+    return e;
+  };
+
+  it("a right-click on the card opens the widget's own menu, the ⋯ still drawn", () => {
+    expect(rightClick(bar()).defaultPrevented).toBe(true);
+    expect(menuItems()).toEqual(expect.arrayContaining(['Open in CanvasFull size, beside the thread']));
+    expect(host.querySelector('[aria-label="Flight picker widget actions"]')).not.toBeNull();
+  });
+
+  it('Option+right-click leaves the native menu', () => {
+    expect(rightClick(bar(), { altKey: true }).defaultPrevented).toBe(false);
+    expect(menuItems()).toEqual([]);
+  });
+
+  it("the frame's forwarded right-click opens the same menu", () => {
+    act(() => { reportOnScreen?.(true); });
+    act(() => {
+      frames()[0].dispatchEvent(new CustomEvent(APP_FRAME_MENU_EVENT, { detail: { x: 30, y: 40 }, bubbles: true }));
+    });
+    expect(menuItems().length).toBeGreaterThan(0);
+  });
+
+  it('a hold over Open in Canvas opens the menu, and does not also open the Canvas', () => {
+    vi.useFakeTimers();
+    const button = host.querySelector<HTMLButtonElement>('[aria-label="Open Flight picker in Canvas"]')!;
+    act(() => {
+      button.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0 }));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+    });
+    expect(menuItems().length).toBeGreaterThan(0);
+    // Closed first, so only the card can stop the click that follows.
+    act(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+    expect(menuItems()).toEqual([]);
+    // The lift's paired click is swallowed before it reaches the button.
+    act(() => {
+      button.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, button: 0 }));
+      button.click();
+    });
+    expect(openWidgetInCanvas).not.toHaveBeenCalled();
+  });
+});

@@ -73,7 +73,37 @@ async fn wait_until_recorded(pool: &sqlx::PgPool, event_id: Uuid) -> i64 {
     }
 }
 
-/// Open a thread with one input on `chain` at sequence 1, and wait for it.
+/// Wait for the turn that `request` started to end. Its closing events take the
+/// thread append lock, so a test that holds the lock must wait for this first.
+/// Otherwise the turn is the waiter the test's sync point sees, not the request
+/// under test.
+async fn wait_until_turn_ended(pool: &sqlx::PgPool, thread_id: Uuid, request: Uuid) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let ended: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE thread_id = $1 \
+             AND payload->>'request_event_id' = $2 \
+             AND event_type IN ('ResponseGenerated', 'ResponseCompleted', \
+                                'ResponseFailed', 'ResponseCanceled', 'ResponseAborted'))",
+        )
+        .bind(thread_id)
+        .bind(request.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("events query failed");
+        if ended {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the turn for {request} never ended",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Open a thread with one input on `chain` at sequence 1, and wait for it and
+/// for its turn to end.
 async fn open_thread(client: &reqwest::Client, pool: &sqlx::PgPool, chain: Uuid) -> Uuid {
     let thread_id = Uuid::new_v4();
     let opening = Uuid::new_v4();
@@ -93,6 +123,7 @@ async fn open_thread(client: &reqwest::Client, pool: &sqlx::PgPool, chain: Uuid)
         .status();
     assert_eq!(status, 200, "the opening message should be accepted");
     wait_until_recorded(pool, opening).await;
+    wait_until_turn_ended(pool, thread_id, opening).await;
     thread_id
 }
 

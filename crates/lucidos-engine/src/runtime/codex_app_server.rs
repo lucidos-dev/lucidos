@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
     AgentEvent, AgentExitFacts, AgentInput, AgentPermissionRequest, ControlRequest,
+    SessionContextDue,
 };
 use super::claude_code::{format_exit_status, EXIT_AFTER_STDOUT_EOF_GRACE};
 use super::codex::{lucidos_mcp_server_config_json, write_image_files, CodexConfig};
@@ -298,6 +299,14 @@ pub(super) async fn app_server_driver_task(
     let mut thread_ready = false;
     // One-shot guard for the thread/resume → thread/start fallback below.
     let mut tried_fresh_thread_fallback = false;
+    // A fresh thread owes its first turn the session context. The fallback
+    // below re-arms it, and a rejected turn leaves it owed.
+    let mut session_context = SessionContextDue::for_spawn(
+        resume_session_id.as_deref(),
+        config.session_context.as_ref(),
+    );
+    // The turn in flight, as it went out, until Codex takes or rejects it.
+    let mut turn_input: Option<AgentInput> = None;
     let mut turn_in_flight = false;
     let mut turn_start = std::time::Instant::now();
     // Keep the current turn's temp image files alive until the turn ends.
@@ -364,8 +373,13 @@ pub(super) async fn app_server_driver_task(
         // Start the next queued turn whenever the thread is ready and idle.
         if thread_ready && !turn_in_flight {
             if let Some(input) = queue.pop_front() {
+                let input = session_context.led(input);
                 let thread_id = tracker.session_id.clone().unwrap_or_default();
-                tracker.begin_turn();
+                // The same validated effort goes to the turn and to the `Usage`.
+                let turn_effort =
+                    super::codex::validate_codex_effort(model.as_deref(), effort.as_deref())
+                        .map(String::from);
+                tracker.begin_turn(turn_effort.clone());
                 turn_start = std::time::Instant::now();
                 let (image_paths, guards) = write_image_files(&input.images);
                 turn_image_guards = guards;
@@ -374,11 +388,12 @@ pub(super) async fn app_server_driver_task(
                     &input.text,
                     &image_paths,
                     model.as_deref(),
-                    effort.as_deref(),
+                    turn_effort.as_deref(),
                 );
                 let id = next_id;
                 next_id += 1;
                 pending.insert(id, PendingRequest::TurnStart(input.uuid));
+                turn_input = Some(input);
                 let line = request_line(id, "turn/start", params);
                 send_frame!(line);
                 turn_in_flight = true;
@@ -446,6 +461,11 @@ pub(super) async fn app_server_driver_task(
                                         thread_ready = true;
                                     }
                                     (PendingRequest::TurnStart(input), None) => {
+                                        if let Some(sent) =
+                                            turn_input.take().filter(|sent| sent.uuid == input)
+                                        {
+                                            session_context.delivered(&sent);
+                                        }
                                         // Codex took the input. Reported only
                                         // now: a read is the turn gap's proof
                                         // of delivery, so it must not precede
@@ -477,16 +497,19 @@ pub(super) async fn app_server_driver_task(
                                         // Stale resume: the stored Codex thread id
                                         // no longer resolves (~/.codex pruned,
                                         // machine moved). Fall back to a FRESH
-                                        // thread once — conversation context still
-                                        // arrives via the THREAD HISTORY block the
-                                        // engine appends to the system prompt, the
-                                        // same recovery shape CC's stale-resume
-                                        // path uses. Without this, a thread whose
-                                        // rollout is gone wedges permanently on
-                                        // "handshake failed" (the engine keeps
-                                        // resolving the same dead sid from the
-                                        // pending change's branch context).
+                                        // thread once. Its first turn carries the
+                                        // session context, history included, so
+                                        // the conversation survives (ADR 0491).
+                                        // Without this, a thread whose rollout is
+                                        // gone wedges on "handshake failed" for
+                                        // good. The engine keeps resolving the
+                                        // same dead sid from the pending change's
+                                        // branch context.
                                         tried_fresh_thread_fallback = true;
+                                        session_context = SessionContextDue::for_spawn(
+                                            None,
+                                            config.session_context.as_ref(),
+                                        );
                                         log!(
                                             "[CodexAppServer] thread/resume failed ({}) — falling back to a fresh thread",
                                             msg
@@ -507,6 +530,8 @@ pub(super) async fn app_server_driver_task(
                                     }
                                     (PendingRequest::TurnStart(input), Some(msg)) => {
                                         log!("[CodexAppServer] turn/start rejected: {}", msg);
+                                        // The block stays owed to the next turn.
+                                        turn_input = None;
                                         // Named before the `Result`, so the idle
                                         // that follows owes nothing for it.
                                         let _ = events_tx.send(AgentEvent::InputRejected { input });

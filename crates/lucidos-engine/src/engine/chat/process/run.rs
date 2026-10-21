@@ -5,7 +5,7 @@
 //! (`titles`, `history`, `system_prompt`, `context_sections`); this file wires
 //! them together exactly as the original single function did.
 
-use crate::core::PreferenceStore;
+use crate::core::{prefs, PreferenceStore};
 use crate::engine::agentic_loop::{
     cancel_cause_for_turn, meta_with_cancel_actor, terminal_result, until_canceled,
 };
@@ -23,7 +23,10 @@ use super::super::images::{build_user_content_with_images, current_image_handles
 use super::super::process_helpers::{
     build_trigger_started_event, classify_or_fallback, pinned_classification, TriggerContext,
 };
-use super::context_build::{build_capture_sections, build_loaded_knowhow_block};
+use super::context_build::{
+    assemble_turn_text, build_capture_sections, build_knowhow_retention_block,
+    build_loaded_knowhow_block, TurnSections,
+};
 use super::PreEmittedOrigin;
 
 /// How many times a follow-up alternates between "take the thread" and
@@ -34,7 +37,28 @@ use super::PreEmittedOrigin;
 /// backstop for anything stranger, and it has its own timeout.
 const ADMISSION_ATTEMPTS: u32 = 2;
 
-pub(super) async fn resolve_route_overrides(
+/// The model override an intent trigger fires with: its own pin, else the
+/// stored `trigger_model`, else the catalog default. `None` when that default
+/// is on no configured backend. The fire then follows the chat resolver
+/// instead of failing on a model the workspace cannot reach.
+pub(super) async fn trigger_model_override(
+    pool: &sqlx::PgPool,
+    registry: &crate::llm::ModelRegistry,
+    is_configured: impl Fn(crate::llm::ProviderKind) -> bool,
+    pinned: Option<&str>,
+) -> Option<String> {
+    if let Some(pinned) = pinned {
+        return Some(pinned.to_string());
+    }
+    if let Some(stored) = prefs::TRIGGER_MODEL.stored_or_inherited(pool).await {
+        return Some(stored);
+    }
+    let default = prefs::TRIGGER_MODEL.default_text();
+    crate::llm::model_registry::reaches(registry, default, None, is_configured, |_, _| false)
+        .then(|| default.to_string())
+}
+
+pub(crate) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
     defaults: crate::core::ModelDefaults<'_>,
     // Which backends the router holds, so the clamp measures the route the
@@ -1755,6 +1779,7 @@ impl LucidosEngine {
         // this block in both arms. What the mode changes is the live tool
         // results, which is where the bytes actually are.
         let loaded_knowhow_block = build_loaded_knowhow_block(&loaded_knowhow_docs);
+        let knowhow_retention_block = build_knowhow_retention_block(&loaded_knowhow_docs);
 
         // Built here for the same reason: it is unconditional, so it belongs in
         // `fixed_size` rather than in the formatting slack.
@@ -1784,6 +1809,16 @@ impl LucidosEngine {
         };
         let client_url_block = super::turn_tail::client_url_block(&self.client_url());
 
+        // This trigger's own docs, named in the fire's message rather than the
+        // system block so every fire and chat turn shares that block. Empty on
+        // a chat turn.
+        let trigger_knowhow_context = trigger.as_ref().map_or_else(String::new, |t| {
+            super::super::process_helpers::build_trigger_knowhow_section(
+                &self.workspace_path.join(crate::core::TRIGGERS_DIR),
+                &t.slug,
+            )
+        });
+
         // Trim expendable context sections if the initial message would exceed budget
         let fixed_size = profile_context.len()
             + device_preferences_context.len()
@@ -1795,11 +1830,13 @@ impl LucidosEngine {
             + file_context_section.len()
             + url_context_section.len()
             + loaded_knowhow_block.as_deref().map_or(0, str::len)
+            + knowhow_retention_block.as_deref().map_or(0, str::len)
             + todo_list_block.len()
             + engine_build_block.len()
             + client_url_block.len()
             + current_time_block.len()
             + tools.mcp_dropped_notice().map_or(0, str::len)
+            + trigger_knowhow_context.len()
             + user_message.len()
             + memory_views.bytes()
             + 500; // 500 for formatting
@@ -1837,70 +1874,10 @@ impl LucidosEngine {
         // sends them. What the mode curates is the live tool results, which are
         // 33.1% of the bill against the region's 16.3%.
 
-        // Build user message from contextual sections. A Tree turn opens with
-        // the recent workspace entries, right behind the view snapshot and the
-        // thread memory view (`TurnMemoryViews::lead`).
-        let mut user_message_parts: Vec<&str> = Vec::new();
-        if !memory_views.recent.is_empty() {
-            user_message_parts.push(&memory_views.recent);
-        }
-        if !profile_context.is_empty() {
-            user_message_parts.push(&profile_context);
-        }
-        if !device_preferences_context.is_empty() {
-            user_message_parts.push(&device_preferences_context);
-        }
-        if !memory_context.is_empty() {
-            user_message_parts.push(&memory_context);
-        }
-        if !history_context.is_empty() {
-            user_message_parts.push(&history_context);
-        }
-        if !file_list_context.is_empty() {
-            user_message_parts.push(&file_list_context);
-        }
-        if !credentials_context.is_empty() {
-            user_message_parts.push(&credentials_context);
-        }
-        if !email_accounts_context.is_empty() {
-            user_message_parts.push(&email_accounts_context);
-        }
-        if !oauth_context.is_empty() {
-            user_message_parts.push(&oauth_context);
-        }
-        // Phase 3: per-thread loaded knowhow gets a dedicated section between
-        // workspace inventory (oauth/credentials/etc.) and active context
-        // (app/file/url) — the semantic tier between "what exists in this
-        // workspace" and "what the user is currently working with". Phase 4
-        // stubs the matching resume tool blocks so the body isn't billed
-        // twice. The block lives in this turn's user message because the
-        // LLM cannot see across turns without it (the resume blocks no
-        // longer carry the body). Built earlier so its bytes count against
-        // `fixed_size` for the trim-or-not decision.
-        if let Some(block) = loaded_knowhow_block.as_deref() {
-            user_message_parts.push(block);
-        }
-        if !app_context_section.is_empty() {
-            user_message_parts.push(&app_context_section);
-        }
-        if !file_context_section.is_empty() {
-            user_message_parts.push(&file_context_section);
-        }
-        if !url_context_section.is_empty() {
-            user_message_parts.push(&url_context_section);
-        }
-        if !thread_depth_context.is_empty() {
-            user_message_parts.push(&thread_depth_context);
-        }
-        // Empty on every thread with nothing unfinished, which is most of
-        // them, so most turns pay nothing for it.
-        if !todo_list_block.is_empty() {
-            user_message_parts.push(&todo_list_block);
-        }
         // One line per configured MCP server, in this thread's own status, so
         // the model knows what it can enable (ADR 0430). Always a `String`, so
         // `build_capture_sections` below can borrow it; an empty one is
-        // filtered out of both the message parts and the capture rows.
+        // filtered out of both the message text and the capture rows.
         //
         // Read once, and this block is fixed for the turn: rewriting it would
         // forfeit the message-prefix cache. The tool array is NOT fixed (ADR
@@ -1917,39 +1894,52 @@ impl LucidosEngine {
                 )
                 .await,
         );
-        if !mcp_servers_context.is_empty() {
-            user_message_parts.push(&mcp_servers_context);
-        }
-        if let Some(notice) = tools.mcp_dropped_notice() {
-            user_message_parts.push(notice);
-        }
         let setup_reminder = if !missing_pref_keys.is_empty() {
             let missing_list = missing_pref_keys.join(", ");
             format!("CRITICAL: The following preferences are not set: {}. Do NOT proceed with the user's request. Ask the user to configure these first.", missing_list)
         } else {
             String::new()
         };
-        if !setup_reminder.is_empty() {
-            user_message_parts.push(&setup_reminder);
-        }
-        let request_line = format!("Request: {}", user_message);
-        user_message_parts.push(&request_line);
-        // Last, so every per-turn reading sits in the message tier tail rather
-        // than at the front of the cached system block. `super::turn_tail` and
-        // `super::turn_clock` own the rule; the system prose points at each of
-        // these blocks by name.
-        if !engine_build_block.is_empty() {
-            user_message_parts.push(&engine_build_block);
-        }
-        user_message_parts.push(&client_url_block);
-        user_message_parts.push(&current_time_block);
+
+        // The stable context block leads the message and the volatile text
+        // follows, ending with the request and the tail (`assemble_turn_text`
+        // owns the order). A Tree turn's recent workspace entries open the
+        // volatile text, right behind the view snapshot and the thread memory
+        // view (`TurnMemoryViews::lead`).
+        let turn_text = assemble_turn_text(&TurnSections {
+            recent: &memory_views.recent,
+            profile: &profile_context,
+            email_accounts: &email_accounts_context,
+            oauth: &oauth_context,
+            thread_depth: &thread_depth_context,
+            loaded_knowhow: loaded_knowhow_block.as_deref().unwrap_or_default(),
+            device_preferences: &device_preferences_context,
+            memory: &memory_context,
+            history: &history_context,
+            file_list: &file_list_context,
+            credentials: &credentials_context,
+            knowhow_retention: knowhow_retention_block.as_deref().unwrap_or_default(),
+            app_context: &app_context_section,
+            file_context: &file_context_section,
+            url_context: &url_context_section,
+            todo_list: &todo_list_block,
+            mcp_servers: &mcp_servers_context,
+            mcp_dropped_notice: tools.mcp_dropped_notice().unwrap_or_default(),
+            trigger_knowhow: &trigger_knowhow_context,
+            setup_reminder: &setup_reminder,
+            request: user_message,
+            tail: super::turn_tail::TurnTail {
+                engine_build: &engine_build_block,
+                client_url: &client_url_block,
+                current_time: &current_time_block,
+            },
+        });
 
         // Attached images ride inline as base64 image blocks on the user message
         // (`build_user_content_with_images` below) and stay visible for the whole
         // turn. No on-disk path annotation: the chat `read_file` tool is rooted at
         // `data/artifacts/`, so a `.lucidos/tmp/images/…` hint only sent the model
         // chasing a path it can't reach ("the bot can't see my attached image").
-        let user_message_text = user_message_parts.join(super::context_mode::PART_SEPARATOR);
 
         // Built with bodies. The loop drops them per round when
         // `capture_context` is off. Body cap (8 KB) prevents a 100 KB system
@@ -1984,6 +1974,7 @@ impl LucidosEngine {
             &url_context_section,
             &mcp_servers_context,
             tools.mcp_dropped_notice().unwrap_or_default(),
+            &trigger_knowhow_context,
             &setup_reminder,
             &thread_depth_context,
             &todo_list_block,
@@ -1998,15 +1989,18 @@ impl LucidosEngine {
         );
         let capture_model = resolved_model.to_string();
 
-        let user_content = memory_views.lead(build_user_content_with_images(
-            user_message_text,
-            &self.workspace_path,
-            &history_image_hashes,
-            user_images,
-            &user_images
-                .map(|imgs| current_image_handles(&self.workspace_path, imgs))
-                .unwrap_or_default(),
-        ));
+        let user_content = memory_views.lead(
+            turn_text.stable,
+            build_user_content_with_images(
+                turn_text.volatile,
+                &self.workspace_path,
+                &history_image_hashes,
+                user_images,
+                &user_images
+                    .map(|imgs| current_image_handles(&self.workspace_path, imgs))
+                    .unwrap_or_default(),
+            ),
+        );
 
         // Prepend reconstructed (ToolUse, ToolResult) Message pairs for the
         // most recent N tool calls (Phase 3), so the last turn's work does not

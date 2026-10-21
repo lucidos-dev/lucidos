@@ -96,6 +96,67 @@ fn build_resume_tool_blocks_emits_paired_tool_use_and_result_for_recent_tool() {
     }
 }
 
+/// A thread from before `execute_intent` was retired still resumes: its stored
+/// pair replays as a ToolUse and its result, though no array offers the tool.
+#[test]
+fn a_retired_execute_intent_pair_still_replays_on_resume() {
+    use crate::core::EventRow;
+    use crate::llm::{ContentBlock, MessageContent};
+    let now = chrono::Utc::now();
+    let row = |event_type: &str, payload: serde_json::Value, sequence| EventRow {
+        id: uuid::Uuid::new_v4(),
+        event_type: event_type.into(),
+        payload,
+        created: now,
+        thread_id: None,
+        sequence: Some(sequence),
+    };
+    let events = vec![
+        row("MessageReceived", json!({"text": "Check my calendar."}), 1),
+        row(
+            "ToolCalled",
+            json!({"name": "execute_intent", "args": {"intent_id": "calendar/check"}}),
+            2,
+        ),
+        row(
+            "ToolResult",
+            json!({"name": "execute_intent", "result": "Calendar is clear.", "success": true}),
+            3,
+        ),
+        row(
+            "ResponseGenerated",
+            json!({"text": "Your calendar is clear."}),
+            4,
+        ),
+    ];
+    let (blocks, _skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        3,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        blocks.len(),
+        2,
+        "expect assistant ToolUse + user ToolResult"
+    );
+    let MessageContent::Blocks(call) = &blocks[0].content else {
+        panic!("expected Blocks content");
+    };
+    assert!(
+        matches!(&call[0], ContentBlock::ToolUse { name, input, .. }
+            if name == "execute_intent" && input["intent_id"] == "calendar/check"),
+        "{call:?}"
+    );
+    let MessageContent::Blocks(result) = &blocks[1].content else {
+        panic!("expected Blocks content");
+    };
+    assert!(
+        matches!(&result[0], ContentBlock::ToolResult { content, .. }
+            if content.contains("Calendar is clear.")),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn build_resume_tool_blocks_returns_empty_when_no_tools() {
     use crate::core::EventRow;

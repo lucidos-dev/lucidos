@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use std::collections::HashMap;
+
+use crate::core::secret_store::{self, McpServerEnv, SecretColumn as _};
+use crate::core::{AuthType, CredentialStore};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
@@ -10,7 +14,7 @@ pub struct McpServer {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
-    pub env: std::collections::HashMap<String, String>,
+    pub env: HashMap<String, McpEnvValue>,
     pub auto_approve: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// The tool manifest as last observed, verbatim. Only a running server
@@ -26,15 +30,39 @@ pub struct McpServer {
     pub disabled_tools: Vec<String>,
 }
 
+/// One entry of an MCP server's environment: a value, or the name of a
+/// credential the server gets the value of at launch. On the wire a value is
+/// a string and a credential is `{"credential": "<name>"}`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum McpEnvValue {
+    Plain(String),
+    Credential { credential: String },
+}
+
+// Manual `Debug`, so a plain value, often an API key, never reaches a log.
+impl std::fmt::Debug for McpEnvValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plain(_) => f.write_str("Plain(<redacted>)"),
+            Self::Credential { credential } => write!(f, "Credential({credential})"),
+        }
+    }
+}
+
 /// The columns every read selects, in the order [`row_to_server`] unpacks them.
-const SERVER_COLUMNS: &str = "id, name, command, args, env, auto_approve, created_at, \
-                              tools, tools_observed_at, disabled_tools";
+/// A NULL `env_credentials` is a row whose values boot has not moved yet: it
+/// points at nothing so far.
+const SERVER_COLUMNS: &str = "id, name, command, args, env, \
+                              COALESCE(env_credentials, '{}'::jsonb), auto_approve, \
+                              created_at, tools, tools_observed_at, disabled_tools";
 
 /// Raw DB row from mcp_servers, in [`SERVER_COLUMNS`] order.
 type McpServerRow = (
     String,
     String,
     String,
+    serde_json::Value,
     serde_json::Value,
     serde_json::Value,
     bool,
@@ -118,18 +146,29 @@ fn row_to_server(row: McpServerRow) -> Result<McpServer, Box<dyn std::error::Err
         command,
         args,
         env,
+        env_credentials,
         auto_approve,
         created_at,
         tools,
         tools_observed_at,
         disabled_tools,
     ) = row;
+    let pointers = pointers_of(env_credentials)?;
+    let env = secret_store::open_json_values(&McpServerEnv::SPEC, env)?
+        .into_iter()
+        .map(|(var, value)| (var, McpEnvValue::Plain(value)))
+        .chain(
+            pointers
+                .into_iter()
+                .map(|(var, credential)| (var, McpEnvValue::Credential { credential })),
+        )
+        .collect();
     Ok(McpServer {
         id,
         name,
         command,
         args: serde_json::from_value(args)?,
-        env: serde_json::from_value(env)?,
+        env,
         auto_approve,
         created_at,
         tools: serde_json::from_value(tools)?,
@@ -138,7 +177,155 @@ fn row_to_server(row: McpServerRow) -> Result<McpServer, Box<dyn std::error::Err
     })
 }
 
+/// The credential name a server's env variable `var` moves into. Only a
+/// credential with this name is the server's own, to delete with it.
+fn owned_credential_name(server_id: &str, var: &str) -> String {
+    format!("mcp-{server_id}-{var}")
+}
+
+/// A server's stored credential pointers, by env variable.
+fn pointers_of(
+    env_credentials: serde_json::Value,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(serde_json::from_value(env_credentials)?)
+}
+
+/// Serializes every write to credential pointers with the credential cleanup
+/// that reads them. Held from a register's pointer check through its cleanup.
+static POINTER_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Delete each credential in `dropped` that server `server_id` owns and no
+/// server's pointers still name. A credential with any other name stays.
+///
+/// The caller holds [`POINTER_WRITES`], so no register can add a pointer
+/// between the check and the delete.
+async fn delete_owned_credentials(
+    pool: &PgPool,
+    event_bus: &EventBus,
+    server_id: &str,
+    dropped: HashMap<String, String>,
+    actor: Option<MessageOrigin>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for (var, name) in dropped {
+        if name != owned_credential_name(server_id, &var) {
+            continue;
+        }
+        let still_named: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM mcp_servers, \
+             jsonb_each_text(env_credentials) AS pointer(var, name) WHERE pointer.name = $1)",
+        )
+        .bind(&name)
+        .fetch_one(pool)
+        .await?;
+        if still_named {
+            continue;
+        }
+        if let Some(credential) = CredentialStore::get(pool, &name).await? {
+            CredentialStore::delete(pool, event_bus, credential.id, actor.clone()).await?;
+        }
+    }
+    Ok(())
+}
+
+fn missing_credential(var: &str, name: &str) -> String {
+    format!("{var} names credential '{name}', and no credential has that name")
+}
+
+/// The value credential `name` gives env variable `var`, or why it gives none.
+async fn credential_value(
+    pool: &PgPool,
+    var: &str,
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let credential = CredentialStore::get(pool, name)
+        .await?
+        .ok_or_else(|| missing_credential(var, name))?;
+    if credential.auth_type == AuthType::Password {
+        return Err(format!(
+            "{var} names credential '{name}', a username and password pair. \
+             Point it at a credential holding one value, such as a secret or an API key"
+        )
+        .into());
+    }
+    Ok(credential.secret(pool).await?)
+}
+
+/// The environment `server` launches with: each credential it names,
+/// resolved now, so a rotated key reaches the next start.
+pub async fn launch_env(
+    pool: &PgPool,
+    server: &McpServer,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut env = HashMap::new();
+    for (var, value) in &server.env {
+        let value = match value {
+            McpEnvValue::Plain(value) => value.clone(),
+            McpEnvValue::Credential { credential } => {
+                credential_value(pool, var, credential).await?
+            }
+        };
+        env.insert(var.clone(), value);
+    }
+    Ok(env)
+}
+
 impl McpServerStore {
+    /// Move the env values of every server written before credential
+    /// pointers existed into `secret` credentials named `mcp-<id>-<VAR>`,
+    /// leaving a pointer to each. Returns how many values moved.
+    ///
+    /// A boot step (`secret_store::one_home`): it runs before the EventBus
+    /// exists, so it announces nothing. One transaction per server. A NULL
+    /// `env_credentials` marks a server not moved yet, and the move sets it,
+    /// so a value added after the move stays in `env`. A name another
+    /// credential already holds keeps its value in `env`.
+    pub(crate) async fn move_env_into_credentials(
+        pool: &PgPool,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let unmoved: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM mcp_servers WHERE env_credentials IS NULL")
+                .fetch_all(pool)
+                .await?;
+        let mut moved = 0;
+        for id in unmoved {
+            let mut tx = pool.begin().await?;
+            let env: serde_json::Value = sqlx::query_scalar(
+                "SELECT env FROM mcp_servers WHERE id = $1 AND env_credentials IS NULL FOR UPDATE",
+            )
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let mut kept = HashMap::new();
+            let mut pointers = HashMap::new();
+            for (var, value) in secret_store::open_json_values(&McpServerEnv::SPEC, env)? {
+                let name = owned_credential_name(&id, &var);
+                if CredentialStore::insert_moved_secret(
+                    &mut tx,
+                    &name,
+                    AuthType::Secret,
+                    &[],
+                    &value,
+                )
+                .await?
+                {
+                    pointers.insert(var, name);
+                    moved += 1;
+                } else {
+                    log!("[MCP] Kept {var} of server '{id}' in place: a credential is already named {name}");
+                    kept.insert(var, value);
+                }
+            }
+            sqlx::query("UPDATE mcp_servers SET env = $2, env_credentials = $3 WHERE id = $1")
+                .bind(&id)
+                .bind(secret_store::seal_json_values(&McpServerEnv::SPEC, &kept)?)
+                .bind(serde_json::to_value(&pointers)?)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        }
+        Ok(moved)
+    }
+
     pub async fn list(
         pool: &PgPool,
     ) -> Result<Vec<McpServer>, Box<dyn std::error::Error + Send + Sync>> {
@@ -174,18 +361,30 @@ impl McpServerStore {
         name: &str,
         command: &str,
         args: &[String],
-        env: &std::collections::HashMap<String, String>,
+        env: &HashMap<String, McpEnvValue>,
     ) -> Result<McpServer, Box<dyn std::error::Error + Send + Sync>> {
         let args_json = serde_json::to_value(args)?;
-        let env_json = serde_json::to_value(env)?;
+        let mut plain = HashMap::new();
+        let mut pointers = HashMap::new();
+        for (var, value) in env {
+            match value {
+                McpEnvValue::Plain(value) => plain.insert(var.clone(), value.clone()),
+                McpEnvValue::Credential { credential } => {
+                    pointers.insert(var.clone(), credential.clone())
+                }
+            };
+        }
+        let env_json = secret_store::seal_json_values(&McpServerEnv::SPEC, &plain)?;
 
         // RETURNING the whole row, not just what was written: the ON CONFLICT
         // arm leaves auto_approve, the cached manifest and the disabled set
         // alone. A previously auto-approved server must still report `true`, or
         // the caller connects with a flag that disagrees with the DB row.
         let row: McpServerRow = sqlx::query_as(&format!(
-            "INSERT INTO mcp_servers (id, name, command, args, env) VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, command = EXCLUDED.command, args = EXCLUDED.args, env = EXCLUDED.env \
+            "INSERT INTO mcp_servers (id, name, command, args, env, env_credentials) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, command = EXCLUDED.command, \
+             args = EXCLUDED.args, env = EXCLUDED.env, env_credentials = EXCLUDED.env_credentials \
              RETURNING {SERVER_COLUMNS}"
         ))
         .bind(id)
@@ -193,22 +392,28 @@ impl McpServerStore {
         .bind(command)
         .bind(&args_json)
         .bind(&env_json)
+        .bind(serde_json::to_value(&pointers)?)
         .fetch_one(pool)
         .await?;
 
         row_to_server(row)
     }
 
-    /// Delete a server row. **Private on purpose**: [`Self::unregister`] emits.
+    /// Delete a server row, returning the `env_credentials` it held, or
+    /// `None` when no such server exists. **Private on purpose**:
+    /// [`Self::unregister`] emits.
     async fn delete_row(
         pool: &PgPool,
         id: &str,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let result = sqlx::query("DELETE FROM mcp_servers WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let env_credentials: Option<serde_json::Value> = sqlx::query_scalar(
+            "DELETE FROM mcp_servers WHERE id = $1 \
+             RETURNING COALESCE(env_credentials, '{}'::jsonb)",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(env_credentials)
     }
 
     /// Flip auto-approve on a server row. **Private on purpose**:
@@ -329,6 +534,9 @@ impl McpServerStore {
     /// Announces unconditionally, including on a re-registration: the row is
     /// rewritten with a new command / args / env, which changes what the tools
     /// actually do even when the id is unchanged.
+    ///
+    /// A pointer the new env drops takes its credential with it, when the
+    /// server owns it and no server still names it.
     #[allow(clippy::too_many_arguments)] // one arg per server column, plus the bus and actor
     pub async fn register(
         pool: &PgPool,
@@ -337,45 +545,93 @@ impl McpServerStore {
         name: &str,
         command: &str,
         args: &[String],
-        env: &std::collections::HashMap<String, String>,
+        env: &HashMap<String, McpEnvValue>,
         actor: Option<MessageOrigin>,
     ) -> Result<McpServer, Box<dyn std::error::Error + Send + Sync>> {
         validate_server_id(id)?;
+        for (var, value) in env {
+            if let McpEnvValue::Credential { credential } = value {
+                credential_value(pool, var, credential).await?;
+            }
+        }
+        // Resolving a value can wait on 1Password, so the lock comes after it.
+        // A cleanup may have deleted a credential since: check names again.
+        let _pointers = POINTER_WRITES.lock().await;
+        for (var, value) in env {
+            if let McpEnvValue::Credential { credential } = value {
+                if CredentialStore::get(pool, credential).await?.is_none() {
+                    return Err(missing_credential(var, credential).into());
+                }
+            }
+        }
+        let prior: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT COALESCE(env_credentials, '{}'::jsonb) FROM mcp_servers WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        let mut dropped = prior.map(pointers_of).transpose()?.unwrap_or_default();
         let server = Self::upsert_row(pool, id, name, command, args, env).await?;
         event_bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::McpServerRegistered {
                     server_id: server.id.clone(),
                     name: server.name.clone(),
-                    actor,
+                    actor: actor.clone(),
                 }),
                 "[MCP] McpServerRegistered",
             )
             .await;
+        dropped.retain(|var, credential| {
+            server.env.get(var)
+                != Some(&McpEnvValue::Credential {
+                    credential: credential.clone(),
+                })
+        });
+        delete_owned_credentials(pool, event_bus, id, dropped, actor)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Saved MCP server '{id}', but could not delete a credential it dropped: {e}"
+                )
+            })?;
         Ok(server)
     }
 
     /// Unregister a server and announce it. Announces only when a row was
     /// actually removed.
+    ///
+    /// Deletes each credential the server owned (`mcp-<id>-<VAR>`) that no
+    /// other server names, so its secret stops being injectable. The removal
+    /// is announced first: an error here means the server is gone.
     pub async fn unregister(
         pool: &PgPool,
         event_bus: &EventBus,
         id: &str,
         actor: Option<MessageOrigin>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let removed = Self::delete_row(pool, id).await?;
-        if removed {
-            event_bus
-                .emit_or_log(
-                    BusEvent::System(SystemEvent::McpServerRemoved {
-                        server_id: id.to_string(),
-                        actor,
-                    }),
-                    "[MCP] McpServerRemoved",
+        let _pointers = POINTER_WRITES.lock().await;
+        let Some(env_credentials) = Self::delete_row(pool, id).await? else {
+            return Ok(false);
+        };
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::McpServerRemoved {
+                    server_id: id.to_string(),
+                    actor: actor.clone(),
+                }),
+                "[MCP] McpServerRemoved",
+            )
+            .await;
+        let pointers = pointers_of(env_credentials);
+        async { delete_owned_credentials(pool, event_bus, id, pointers?, actor).await }
+            .await
+            .map_err(|e| {
+                format!(
+                    "Removed MCP server '{id}', but could not delete the credentials it owned: {e}"
                 )
-                .await;
-        }
-        Ok(removed)
+            })?;
+        Ok(true)
     }
 
     /// Set a server's auto-approve flag and announce it. This decides whether
@@ -751,6 +1007,245 @@ mod tests {
             3,
             "a write that matched no row must not announce"
         );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A pointer must name a credential holding one value, and the launch
+    /// reads that value then, so a rotated key reaches the next start.
+    #[tokio::test]
+    async fn a_credential_pointer_is_checked_at_registration_and_read_at_launch() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let pointer = |name: &str| {
+            HashMap::from([(
+                "API_KEY".to_string(),
+                McpEnvValue::Credential {
+                    credential: name.to_string(),
+                },
+            )])
+        };
+        let save = |name: &'static str, auth_type: AuthType, value: &'static str| {
+            let (pool, bus) = (pool.clone(), bus.clone());
+            async move {
+                CredentialStore::upsert(&pool, &bus, name, &[], auth_type, value, None, None, None)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        let missing = McpServerStore::register(
+            &pool,
+            &bus,
+            "srv",
+            "Srv",
+            "cmd",
+            &[],
+            &pointer("absent"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            missing.to_string().contains("no credential has that name"),
+            "{missing}"
+        );
+
+        save(
+            "login",
+            AuthType::Password,
+            r#"{"username":"u","password":"p"}"#,
+        )
+        .await;
+        let pair = McpServerStore::register(
+            &pool,
+            &bus,
+            "srv",
+            "Srv",
+            "cmd",
+            &[],
+            &pointer("login"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(pair.to_string().contains("username and password"), "{pair}");
+
+        save("mcp-key", AuthType::Secret, "sk-first").await;
+        let server = McpServerStore::register(
+            &pool,
+            &bus,
+            "srv",
+            "Srv",
+            "cmd",
+            &[],
+            &pointer("mcp-key"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.env, pointer("mcp-key"));
+        save("mcp-key", AuthType::Secret, "sk-rotated").await;
+        let env = launch_env(&pool, &server).await.unwrap();
+        assert_eq!(env.get("API_KEY").map(String::as_str), Some("sk-rotated"));
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    fn pointers(entries: &[(&str, &str)]) -> HashMap<String, McpEnvValue> {
+        entries
+            .iter()
+            .map(|(var, credential)| {
+                (
+                    var.to_string(),
+                    McpEnvValue::Credential {
+                        credential: credential.to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    async fn save_secret(pool: &PgPool, bus: &EventBus, name: &str) {
+        CredentialStore::upsert(
+            pool,
+            bus,
+            name,
+            &[],
+            AuthType::Secret,
+            "sk",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn stored(pool: &PgPool, name: &str) -> bool {
+        CredentialStore::get(pool, name).await.unwrap().is_some()
+    }
+
+    /// Removing a server deletes the credential its value moved into, and
+    /// announces it, so the secret is no longer injectable.
+    #[tokio::test]
+    async fn removing_a_server_deletes_the_credential_it_owns() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        save_secret(&pool, &bus, "mcp-srv-API_KEY").await;
+        let env = pointers(&[("API_KEY", "mcp-srv-API_KEY")]);
+        McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &[], &env, None)
+            .await
+            .unwrap();
+
+        assert!(McpServerStore::unregister(&pool, &bus, "srv", None)
+            .await
+            .unwrap());
+        assert!(!stored(&pool, "mcp-srv-API_KEY").await);
+        let deleted: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'CredentialDeleted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deleted, 1);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A cleanup that fails after the row is gone still announces the
+    /// removal, and its error says the server was removed.
+    #[tokio::test]
+    async fn a_failed_cleanup_still_announces_the_removal() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &[], &HashMap::new(), None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE mcp_servers SET env_credentials = '\"unreadable\"' WHERE id = 'srv'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = McpServerStore::unregister(&pool, &bus, "srv", None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Removed MCP server 'srv'"),
+            "{error}"
+        );
+        assert!(McpServerStore::get(&pool, "srv").await.unwrap().is_none());
+        let removed: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'McpServerRemoved'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(removed, 1);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A credential the user named is theirs, so removing a server that
+    /// points at it leaves it stored.
+    #[tokio::test]
+    async fn removing_a_server_keeps_a_credential_the_user_named() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        save_secret(&pool, &bus, "github-token").await;
+        let env = pointers(&[("API_KEY", "github-token")]);
+        McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &[], &env, None)
+            .await
+            .unwrap();
+
+        McpServerStore::unregister(&pool, &bus, "srv", None)
+            .await
+            .unwrap();
+        assert!(stored(&pool, "github-token").await);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A credential another server still points at stays, or that server
+    /// fails to launch.
+    #[tokio::test]
+    async fn removing_a_server_keeps_a_credential_another_server_names() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        save_secret(&pool, &bus, "mcp-srv-API_KEY").await;
+        let env = pointers(&[("API_KEY", "mcp-srv-API_KEY")]);
+        for id in ["srv", "other"] {
+            McpServerStore::register(&pool, &bus, id, id, "cmd", &[], &env, None)
+                .await
+                .unwrap();
+        }
+
+        McpServerStore::unregister(&pool, &bus, "srv", None)
+            .await
+            .unwrap();
+        assert!(stored(&pool, "mcp-srv-API_KEY").await);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A re-register whose env drops a pointer deletes the credential the
+    /// server owned, and keeps the ones it still names.
+    #[tokio::test]
+    async fn reregistering_without_a_pointer_deletes_its_credential() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        save_secret(&pool, &bus, "mcp-srv-API_KEY").await;
+        save_secret(&pool, &bus, "mcp-srv-TOKEN").await;
+        let both = pointers(&[("API_KEY", "mcp-srv-API_KEY"), ("TOKEN", "mcp-srv-TOKEN")]);
+        McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &[], &both, None)
+            .await
+            .unwrap();
+
+        let one = pointers(&[("TOKEN", "mcp-srv-TOKEN")]);
+        McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &[], &one, None)
+            .await
+            .unwrap();
+        assert!(!stored(&pool, "mcp-srv-API_KEY").await);
+        assert!(stored(&pool, "mcp-srv-TOKEN").await);
 
         crate::test_support::teardown_test_db(&db_name).await;
     }

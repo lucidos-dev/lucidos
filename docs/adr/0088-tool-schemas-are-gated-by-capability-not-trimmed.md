@@ -4,7 +4,9 @@
 - **Date**: 2026-08-18
 - **Amended by**: [0430: An MCP server is enabled per thread](0430-mcp-servers-are-enabled-per-thread.md),
   which makes the MCP slice of part 2 also a function of the thread's enabled
-  servers. Part 4 stands.
+  servers. Part 4 stands. And by [0534: An intent runs in the thread that asks
+  for it](0534-intents-run-in-the-asking-thread.md), which deletes
+  `execute_intent` and its `Intent` gate. The email gate stands.
 
 ## Context
 

@@ -10,8 +10,9 @@ import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ChevronDownIcon, ChevronRightIcon, ImageIcon } from '../shared/icons';
 import {
-  setModelEnabled, setModelVision, deleteModel, submitNewModel, hasConfiguredRoute, resolvedRoute,
+  setModelVision, deleteModel, submitNewModel, hasConfiguredRoute, resolvedRoute,
 } from '../../store/actions/models';
+import { IntelligenceLinkRow } from './IntelligencePage';
 import { formatContextWindow } from '../../utils/formatTokens';
 import { ModelRoutesEditor } from './ModelRoutesEditor';
 import type { ModelInfo } from '../../api/types';
@@ -30,29 +31,15 @@ export interface RouteEditing {
   open: (id: string | null) => void;
 }
 
-/** One registry row: the switch, the model's name and id, then the metadata
- *  cluster, and the route editor under it when open. Shared by the on list and
- *  the collapsed Off group, so a switched-off model keeps its switch and a
- *  switched-off user model keeps its Delete. With no model, inside a
- *  `SkeletonProvider`, it is the list's loading placeholder. */
+/** One registry row: the model's name and id, then the metadata cluster, and
+ *  the route editor under it when open. Shared by the current list and the
+ *  collapsed Retired group, so a retired user model keeps its Delete. With no
+ *  model, inside a `SkeletonProvider`, it is the list's loading placeholder. */
 function modelRow(m?: ModelInfo, editing?: RouteEditing) {
   const editorOpen = !!m && editing?.id === m.id;
   return (
     <Fragment key={m?.id}>
       <div class="model-manager-row">
-        <SkBlock w="2.25rem" h="1.25rem" round>
-          <label class="toggle-switch">
-            <input
-              type="checkbox"
-              checked={m?.enabled}
-              aria-label={`Offer ${m?.label} in the model picker`}
-              onChange={(e) =>
-                m && void setModelEnabled(m.id, (e.currentTarget as HTMLInputElement).checked)
-              }
-            />
-            <span class="toggle-slider" />
-          </label>
-        </SkBlock>
         <div class="model-manager-info">
           <SkText class="model-manager-name" as="div" w="8rem">{m?.label}</SkText>
           <SkText class="model-manager-id" as="div" w="13rem">
@@ -96,8 +83,9 @@ function modelMeta(m: ModelInfo, editorOpen: boolean, editing?: RouteEditing) {
           not set up
         </span>
       )}
-      {/* The *vision flag*. Image description offers and runs only models
-          that read images, so this is where a wrong seed gets fixed. */}
+      {/* The *vision flag*. Chat sends images and image description runs
+          only on models that read images, so this is where a wrong seed gets
+          fixed. */}
       <button
         type="button"
         class="icon-btn model-vision-toggle"
@@ -128,53 +116,53 @@ function modelMeta(m: ModelInfo, editorOpen: boolean, editing?: RouteEditing) {
   );
 }
 
-/** The registry, split into what the picker offers and what it does not.
+/** The registry, split into current models and retired ones.
  *
- *  The off rows sit behind a disclosure because a retired builtin keeps its row
- *  forever: disable-only is the whole reason routing still resolves a saved
- *  `chat_model`. Left flat, the page is mostly models the picker will never
- *  offer. They stay one tap away, with their switch and their Delete intact.
+ *  The retired rows sit behind a disclosure because a retired builtin keeps its
+ *  row forever: that is the whole reason routing still resolves a saved
+ *  `chat_model`. Left flat, the page is mostly models nothing will run. They
+ *  stay one tap away, with their routes and their Delete intact.
  *
  *  A pure function, so the grouping is testable without a DOM. The component
  *  owns the state; this owns the markup. */
 export function modelManagerList(
   models: readonly ModelInfo[],
-  showOff: boolean,
-  onToggleOff: () => void,
+  showRetired: boolean,
+  onToggleRetired: () => void,
   editing?: RouteEditing,
 ) {
-  const on = models.filter((m) => m.enabled);
-  const off = models.filter((m) => !m.enabled);
+  const current = models.filter((m) => m.successor === null);
+  const retired = models.filter((m) => m.successor !== null);
   return (
     <>
-      {on.map((m) => modelRow(m, editing))}
-      {off.length > 0 && (
+      {current.map((m) => modelRow(m, editing))}
+      {retired.length > 0 && (
         <>
           <button
             type="button"
             class="settings-disclosure-toggle"
-            aria-expanded={showOff}
-            onClick={onToggleOff}
+            aria-expanded={showRetired}
+            onClick={onToggleRetired}
           >
-            {showOff ? <ChevronDownIcon size="1rem" /> : <ChevronRightIcon size="1rem" />}
-            Off ({off.length})
+            {showRetired ? <ChevronDownIcon size="1rem" /> : <ChevronRightIcon size="1rem" />}
+            Retired ({retired.length})
           </button>
-          <Disclosure open={showOff}>{off.map((m) => modelRow(m, editing))}</Disclosure>
+          <Disclosure open={showRetired}>{retired.map((m) => modelRow(m, editing))}</Disclosure>
         </>
       )}
     </>
   );
 }
 
-/** Settings → Models manager: list every registry model with a provider badge
- *  and enable toggle (builtins are disable-only; user models can be deleted),
- *  plus an inline "Add Model" form. Drives the DB-backed registry via the model
- *  actions; the chat picker re-reads it on the Model* SSE. */
+/** Settings → Models manager: list every registry model with its provider
+ *  badges (builtins are never deleted; user models can be), plus an inline
+ *  "Add Model" form. Which models the picker lists is the Lucidos Agent's
+ *  intelligence ladder, on Settings → Intelligence. */
 export function ModelsManager() {
   const loadable = chatModels.value;
   const showLoading = useDelayedLoading(loadable);
   const [adding, setAdding] = useState(false);
-  const [showOff, setShowOff] = useState(false);
+  const [showRetired, setShowRetired] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [id, setId] = useState('');
   const [label, setLabel] = useState('');
@@ -197,6 +185,9 @@ export function ModelsManager() {
   return (
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor="models:manage">Manage models</div>
+      <IntelligenceLinkRow>
+        The model picker lists the models with a rung on the Lucidos Agent's intelligence ladder
+      </IntelligenceLinkRow>
       {loadable.status === 'failed' && (
         <LoadableError noun="models" error={loadable.error} />
       )}
@@ -206,7 +197,7 @@ export function ModelsManager() {
       >
         {loadable.status === 'loaded' && (
           <>
-            {modelManagerList(loadable.data, showOff, () => setShowOff((prev) => !prev), {
+            {modelManagerList(loadable.data, showRetired, () => setShowRetired((prev) => !prev), {
               id: editingId,
               open: setEditingId,
             })}

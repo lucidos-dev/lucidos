@@ -14,11 +14,18 @@
 //!   thread, and one a person owes an answer.
 //! - **A child parked on the user keeps nobody warm.** That wait has no bound.
 //!   Its answer restarts the beats only while the parent's cache is still warm.
-//! - **The turn is invisible.** `event_bus_projection_keep_alive` keeps it off
-//!   the summary row, and the run session proposes nothing for it.
+//! - **A `no-wake` child keeps nobody warm.** Its clean finish never wakes the
+//!   parent, so nothing would read the warm cache. A build chain is one.
+//! - **The turn is invisible; the status is not.** `event_bus_projection_keep_alive`
+//!   keeps each ping off the summary row, and the run session proposes nothing
+//!   for it. The tick writes one *cache keep-alive status* per thread instead,
+//!   only on a change (`sync_status`).
+//! - **The budget is break-even.** The engine gives up once the beats spent
+//!   would cost a cache rewrite. The ratio comes from the session's model.
 //!
 //! Why a keep-alive and not the 1-hour TTL: ADR 0470. Why the window follows
-//! the observed TTL: ADR 0479.
+//! the observed TTL: ADR 0479. Why the budget follows the model's prices:
+//! ADR 0489. Why it shows one status and never the pings: ADR 0529.
 
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
@@ -28,17 +35,20 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::LiveWait;
-use crate::engine::event_bus::BusEvent;
+use crate::engine::cache_ttl::CacheTtl;
+use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
-    ActorMode, EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    ActorMode, CacheKeepAliveNotKeptReason, CacheKeepAliveStatus, EngineReason, EventChannel,
+    EventMeta, MessageOrigin, ThreadEvent, WakeMode, CACHE_KEEP_ALIVE_REASON_KIND,
     KEEP_ALIVE_IDLE_REASON,
 };
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::{LucidosEngine, PreEmittedOrigin};
+use crate::llm::model_prices::{cache_shares_of, CacheShares};
 use crate::runtime::CodingAgent;
 
 /// The events whose waits are worth keeping warm, chosen from measured wait
-/// lengths: most end within the cut-off. Any other kind gets no keep-alive.
+/// lengths: most end within a few beats. Any other kind gets no keep-alive.
 pub(crate) const KEEP_WARM_EVENT_TYPES: [&str; 7] = [
     "BackgroundBashCompleted",
     "E2ELockReleased",
@@ -49,39 +59,30 @@ pub(crate) const KEEP_WARM_EVENT_TYPES: [&str; 7] = [
     "ChangeProposed",
 ];
 
-/// How long after the wait began the engine gives up, in seconds. The
-/// measured optimum: past it, the wake pays one re-write, as it would without
-/// a keep-alive. It bounds the wait, so it holds for either TTL.
-const GIVE_UP_AFTER_SECS: f64 = 150.0 * 60.0;
-
-/// How long a session's prompt cache lives, as its latest cache write shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CacheTtl {
-    FiveMinutes,
-    OneHour,
-}
-
 impl CacheTtl {
-    /// The TTL of a write of `written` tokens, `written_1h` of them to the
-    /// 1-hour cache. `None` for no write, or one the provider did not split.
-    /// Any 5-minute token makes it 5 minutes: that part expires first.
-    pub(super) fn observed(written: i64, written_1h: Option<i64>) -> Option<Self> {
-        let written_1h = written_1h.filter(|_| written > 0)?;
-        Some(if written_1h >= written {
-            Self::OneHour
-        } else {
-            Self::FiveMinutes
-        })
-    }
-
     /// When the beat fires, in seconds since the last request started. The
-    /// tick runs every 10 s, and a beat restarts the session cold. So the
-    /// resumed request lands well inside the lifetime: 300 s, or 3600 s.
+    /// tick runs every 10 s, and a beat restarts the session cold: its request
+    /// lands a median 16 s and a p95 30 s later. So the 5-minute beat's request
+    /// lands near 250 s, and by 270 s at p95, inside the 300 s lifetime. ADR 0492.
     pub(super) fn beat_window(self) -> RangeInclusive<f64> {
         match self {
-            Self::FiveMinutes => 200.0..=260.0,
+            Self::FiveMinutes => 230.0..=260.0,
             Self::OneHour => 3300.0..=3360.0,
         }
+    }
+
+    /// How many beats cost as much as one rewrite at this TTL: the write rate
+    /// over the read rate. A beat is a full-context read, and a wake after
+    /// the cache expired is a full-context write.
+    pub(super) fn rewrite_in_beats(self, cache: CacheShares) -> f64 {
+        self.write_share(cache) / cache.read
+    }
+
+    /// How long after the wait began the engine gives up, in seconds: the
+    /// beats that cost one rewrite, at one beat per window. Past it, a wake
+    /// that finds the cache expired pays at most two rewrites in all.
+    pub(super) fn give_up_after_secs(self, cache: CacheShares) -> f64 {
+        self.rewrite_in_beats(cache) * self.beat_window().start()
     }
 }
 
@@ -120,10 +121,13 @@ pub(super) struct Candidate {
     pub secs_since_beat: Option<f64>,
     /// The TTL its latest cache write showed. `None` when none showed one.
     pub cache_ttl: Option<CacheTtl>,
+    /// What the prompt cache of the model that wrote it charges.
+    pub cache: CacheShares,
 }
 
 /// The thread's active child threads, as the keep-alive weighs them. An active
-/// child is `running` or `waiting_for_user_answer`. Only a `running` one works.
+/// child is `running` or `waiting_for_user_answer`, and not `no-wake`. Only a
+/// `running` one works.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum ActiveChildren {
     None,
@@ -134,6 +138,8 @@ pub(super) enum ActiveChildren {
     Working {
         wait_secs: f64,
     },
+    /// Only `no-wake` children work. None of them would wake the thread.
+    OnlyNoWake,
 }
 
 /// The selection's verdict.
@@ -150,6 +156,7 @@ pub(super) enum SkipReason {
     Busy,
     AwaitingUser,
     ChildrenAwaitingUser,
+    OnlyNoWakeChildren,
     NothingToWaitFor,
     PastCutOff,
     NoRequestYet,
@@ -170,29 +177,18 @@ pub(super) fn decide(c: &Candidate) -> Beat {
     if c.awaiting_user {
         return Beat::Skip(AwaitingUser);
     }
-    let children_wait_secs = match c.children {
-        ActiveChildren::Working { wait_secs } => Some(wait_secs),
-        ActiveChildren::None | ActiveChildren::AllAwaitingUser => None,
+    let waiting_secs = match waiting_secs(c) {
+        Ok(secs) => secs,
+        Err(reason) => return Beat::Skip(reason),
     };
-    // The most recent start wins: a fresh wait keeps a thread warm even when
-    // its children have run for hours.
-    let waiting_secs = match (c.keep_warm_wait_secs, children_wait_secs) {
-        (Some(a), Some(b)) => a.min(b),
-        (Some(a), None) | (None, Some(a)) => a,
-        (None, None) if c.children == ActiveChildren::AllAwaitingUser => {
-            return Beat::Skip(ChildrenAwaitingUser)
-        }
-        (None, None) => return Beat::Skip(NothingToWaitFor),
-    };
-    if waiting_secs > GIVE_UP_AFTER_SECS {
+    let ttl = c.ttl();
+    if waiting_secs > ttl.give_up_after_secs(c.cache) {
         return Beat::Skip(PastCutOff);
     }
     let Some(secs) = c.secs_since_request else {
         return Beat::Skip(NoRequestYet);
     };
-    // An unknown TTL beats as 5 minutes. Beating a 1-hour cache that often
-    // wastes reads, but beating a 5-minute one an hour late loses it.
-    let window = c.cache_ttl.unwrap_or(CacheTtl::FiveMinutes).beat_window();
+    let window = ttl.beat_window();
     if !window.contains(&secs) {
         return Beat::Skip(OutsideWindow);
     }
@@ -200,6 +196,113 @@ pub(super) fn decide(c: &Candidate) -> Beat {
         return Beat::Skip(BeatInFlight);
     }
     Beat::Send
+}
+
+/// How long the thread has waited for something worth keeping warm, or why it
+/// waits for nothing that is.
+fn waiting_secs(c: &Candidate) -> Result<f64, SkipReason> {
+    let children_wait_secs = match c.children {
+        ActiveChildren::Working { wait_secs } => Some(wait_secs),
+        ActiveChildren::None | ActiveChildren::AllAwaitingUser | ActiveChildren::OnlyNoWake => None,
+    };
+    // The most recent start wins: a fresh wait keeps a thread warm even when
+    // its children have run for hours.
+    match (c.keep_warm_wait_secs, children_wait_secs) {
+        (Some(a), Some(b)) => Ok(a.min(b)),
+        (Some(a), None) | (None, Some(a)) => Ok(a),
+        (None, None) => Err(match c.children {
+            ActiveChildren::AllAwaitingUser => SkipReason::ChildrenAwaitingUser,
+            ActiveChildren::OnlyNoWake => SkipReason::OnlyNoWakeChildren,
+            ActiveChildren::None | ActiveChildren::Working { .. } => SkipReason::NothingToWaitFor,
+        }),
+    }
+}
+
+impl Candidate {
+    /// An unknown TTL beats as 5 minutes. Beating a 1-hour cache that often
+    /// wastes reads, but beating a 5-minute one an hour late loses it.
+    fn ttl(&self) -> CacheTtl {
+        self.cache_ttl.unwrap_or(CacheTtl::FiveMinutes)
+    }
+}
+
+/// When the times [`status`] reports began, as the database stamped them. The
+/// ages in [`Candidate`] drift by a few milliseconds per tick, so a status built
+/// from them would change on every tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Anchors {
+    /// When the newest keep-warm wait was armed.
+    pub keep_warm_armed_at: Option<DateTime<Utc>>,
+    /// When the agent last went idle for real.
+    pub idle_at: Option<DateTime<Utc>>,
+    /// When the last turn request started.
+    pub request_started_at: Option<DateTime<Utc>>,
+}
+
+/// What the current keep-alive run has spent, read from persisted events.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(super) struct Spent {
+    pub beats: u32,
+    pub cost_usd: f64,
+    /// The context of the session's last turn request.
+    pub context_tokens: u64,
+}
+
+/// The *cache keep-alive status* of one thread. Pure, and it reads the same
+/// inputs as [`decide`], so the two agree on every candidate (I3). A thread
+/// claim never changes it: [`sync_status`] leaves a busy thread's status alone.
+pub(super) fn status(c: &Candidate, at: &Anchors, spent: Spent) -> Option<CacheKeepAliveStatus> {
+    if c.coding_agent != CodingAgent::ClaudeCode || c.awaiting_user {
+        return None;
+    }
+    let waiting_secs = match waiting_secs(c) {
+        Ok(secs) => secs,
+        Err(SkipReason::ChildrenAwaitingUser) => {
+            return Some(CacheKeepAliveStatus::NotKept {
+                reason: CacheKeepAliveNotKeptReason::ChildrenAwaitingUser,
+            })
+        }
+        Err(SkipReason::OnlyNoWakeChildren) => {
+            return Some(CacheKeepAliveStatus::NotKept {
+                reason: CacheKeepAliveNotKeptReason::NoWakeChildren,
+            })
+        }
+        Err(_) => return None,
+    };
+    let since = wait_began_at(c, at)?;
+    let ttl = c.ttl();
+    let give_up_after = ttl.give_up_after_secs(c.cache);
+    let give_up_at = since + chrono::Duration::milliseconds((give_up_after * 1000.0) as i64);
+    if waiting_secs > give_up_after {
+        return Some(CacheKeepAliveStatus::Stopped {
+            at: give_up_at,
+            beats: spent.beats,
+            cost_usd: spent.cost_usd,
+            context_tokens: spent.context_tokens,
+        });
+    }
+    let window_start = chrono::Duration::milliseconds((*ttl.beat_window().start() * 1000.0) as i64);
+    Some(CacheKeepAliveStatus::Warming {
+        since,
+        beats: spent.beats,
+        budget_beats: ttl.rewrite_in_beats(c.cache).floor() as u32,
+        beat_every_secs: *ttl.beat_window().start() as u32,
+        cost_usd: spent.cost_usd,
+        context_tokens: spent.context_tokens,
+        next_beat_at: at.request_started_at.map(|t| t + window_start),
+        give_up_at,
+    })
+}
+
+/// When the wait [`waiting_secs`] measures began: the later start wins there,
+/// so it wins here.
+fn wait_began_at(c: &Candidate, at: &Anchors) -> Option<DateTime<Utc>> {
+    match (c.keep_warm_wait_secs, c.children) {
+        (Some(_), ActiveChildren::Working { .. }) => at.keep_warm_armed_at.max(at.idle_at),
+        (Some(_), _) => at.keep_warm_armed_at,
+        (None, ActiveChildren::Working { .. }) => at.idle_at,
+        (None, _) => None,
+    }
 }
 
 /// The latest `armed_at` among `waits` that watch keep-warm kinds only.
@@ -226,15 +329,27 @@ struct CandidateRow {
     awaiting_user: bool,
     has_active_children: bool,
     has_working_children: bool,
+    has_no_wake_working_children: bool,
     secs_since_request: Option<f64>,
+    request_started_at: Option<DateTime<Utc>>,
     secs_since_idle: Option<f64>,
+    idle_at: Option<DateTime<Utc>>,
     last_write_tokens: Option<i64>,
     last_write_1h_tokens: Option<i64>,
+    last_write_model: Option<String>,
+    stored_status: Option<sqlx::types::Json<CacheKeepAliveStatus>>,
 }
 
 impl CandidateRow {
     fn cache_ttl(&self) -> Option<CacheTtl> {
         CacheTtl::observed(self.last_write_tokens?, self.last_write_1h_tokens)
+    }
+
+    /// The prompt cache prices of the model that wrote the latest cache entry.
+    /// A session with no write yet, or an unpriced model, gets the standard
+    /// shares.
+    fn cache(&self) -> CacheShares {
+        cache_shares_of(self.last_write_model.as_deref().unwrap_or_default())
     }
 
     fn active_children(&self) -> ActiveChildren {
@@ -243,6 +358,7 @@ impl CandidateRow {
             self.has_working_children,
             self.secs_since_idle,
         ) {
+            (false, _, _) if self.has_no_wake_working_children => ActiveChildren::OnlyNoWake,
             (false, _, _) => ActiveChildren::None,
             (true, false, _) => ActiveChildren::AllAwaitingUser,
             (true, true, Some(wait_secs)) => ActiveChildren::Working { wait_secs },
@@ -255,37 +371,56 @@ impl CandidateRow {
 /// Every thread that holds a live wait or active children, with what the
 /// selection reads. Ages of database rows are computed in SQL (ADR 0053). The
 /// latest real idle is the latest `CodingAgentIdled` no keep-alive turn wrote.
-/// [`read_candidates`] binds it. The TTL comes from the latest capture of the
-/// session's own that wrote to the cache. A cache hit keeps an entry's
-/// lifetime, and a sub-agent may run on another TTL. A Codex thread never
-/// writes one, so it skips the look-up rather than scan its whole history.
+/// [`read_candidates`] binds it. The TTL and the model come from the latest
+/// capture of the session's own that wrote to the cache. A cache hit keeps an
+/// entry's lifetime, and a sub-agent may run on another TTL or model. A Codex
+/// thread never writes one, so it skips the look-up rather than scan its whole
+/// history.
 const CANDIDATES_SQL: &str = r#"
 SELECT ts.thread_id,
        ts.coding_agent,
        ts.status = $3 AS awaiting_user,
-       ts.active_children_count > 0 AS has_active_children,
        EXISTS (SELECT 1 FROM thread_summaries c
                 WHERE c.parent_thread_id = ts.thread_id
+                  AND c.wake_mode IS DISTINCT FROM $6
+                  AND c.status IN ($3, $4)) AS has_active_children,
+       EXISTS (SELECT 1 FROM thread_summaries c
+                WHERE c.parent_thread_id = ts.thread_id
+                  AND c.wake_mode IS DISTINCT FROM $6
                   AND c.status = $4) AS has_working_children,
-       (SELECT EXTRACT(EPOCH FROM now() - e.created)::float8
-               + COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000
-          FROM events e
-         WHERE e.thread_id = ts.thread_id
-           AND e.event_type = 'ContextCaptured'
-           AND COALESCE(e.payload->>'purpose', 'turn') = 'turn'
-         ORDER BY e.sequence DESC LIMIT 1) AS secs_since_request,
-       (SELECT EXTRACT(EPOCH FROM now() - e.created)::float8
-          FROM events e
-         WHERE e.thread_id = ts.thread_id
-           AND e.event_type = 'CodingAgentIdled'
-           AND COALESCE(e.payload->>'reason', '') <> $2
-         ORDER BY e.sequence DESC LIMIT 1) AS secs_since_idle,
+       EXISTS (SELECT 1 FROM thread_summaries c
+                WHERE c.parent_thread_id = ts.thread_id
+                  AND c.wake_mode = $6
+                  AND c.status = $4) AS has_no_wake_working_children,
+       EXTRACT(EPOCH FROM now() - r.started)::float8 AS secs_since_request,
+       r.started AS request_started_at,
+       EXTRACT(EPOCH FROM now() - i.created)::float8 AS secs_since_idle,
+       i.created AS idle_at,
        w.written AS last_write_tokens,
-       w.written_1h AS last_write_1h_tokens
+       w.written_1h AS last_write_1h_tokens,
+       w.model AS last_write_model,
+       ts.cache_keep_alive_status AS stored_status
   FROM thread_summaries ts
   LEFT JOIN LATERAL (
+       SELECT e.created
+              - make_interval(secs => COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000)
+              AS started
+         FROM events e
+        WHERE e.thread_id = ts.thread_id
+          AND e.event_type = 'ContextCaptured'
+          AND COALESCE(e.payload->>'purpose', 'turn') = 'turn'
+        ORDER BY e.sequence DESC LIMIT 1) r ON true
+  LEFT JOIN LATERAL (
+       SELECT e.created
+         FROM events e
+        WHERE e.thread_id = ts.thread_id
+          AND e.event_type = 'CodingAgentIdled'
+          AND COALESCE(e.payload->>'reason', '') <> $2
+        ORDER BY e.sequence DESC LIMIT 1) i ON true
+  LEFT JOIN LATERAL (
        SELECT (e.payload->'usage'->>'cache_creation_tokens')::bigint AS written,
-              (e.payload->'usage'->>'cache_creation_1h_tokens')::bigint AS written_1h
+              (e.payload->'usage'->>'cache_creation_1h_tokens')::bigint AS written_1h,
+              e.payload->>'model' AS model
          FROM events e
         WHERE ts.coding_agent IS DISTINCT FROM $5
           AND e.thread_id = ts.thread_id
@@ -298,6 +433,150 @@ SELECT ts.thread_id,
    AND (ts.thread_id = ANY($1) OR ts.active_children_count > 0)
 "#;
 
+/// What the pings since `$2` spent, and the session's last turn context. A
+/// call may record several frames, so each call counts once, at its last
+/// frame, priced on the day of that frame. `$2` is the wait start, from the engine's clock or the database's.
+/// The first ping comes minutes later, so their drift moves no ping across it.
+const SPENT_SQL: &str = r#"
+WITH anchors AS (
+     SELECT e.id::text AS id
+       FROM events e
+      WHERE e.thread_id = $1
+        AND e.event_type = 'PromptInjected'
+        AND e.payload->'origin'->'reason'->>'kind' = $3
+        AND e.created >= $2)
+SELECT (SELECT count(*) FROM anchors) AS beats,
+       COALESCE((
+         SELECT jsonb_agg(jsonb_build_object('model', c.model, 'usage', c.usage, 'created', c.created))
+           FROM (SELECT DISTINCT ON (COALESCE(e.payload->>'api_call_id', e.id::text))
+                        e.payload->>'model' AS model, e.payload->'usage' AS usage,
+                        e.created
+                   FROM events e
+                  WHERE e.thread_id = $1
+                    AND e.event_type = 'ContextCaptured'
+                    AND e.payload->>'request_event_id' IN (SELECT id FROM anchors)
+                    AND e.payload->'usage' IS NOT NULL
+                  ORDER BY COALESCE(e.payload->>'api_call_id', e.id::text), e.sequence DESC) c
+       ), '[]'::jsonb) AS calls,
+       (SELECT (e.payload->'usage'->>'input_tokens')::bigint
+          FROM events e
+         WHERE e.thread_id = $1
+           AND e.event_type = 'ContextCaptured'
+           AND COALESCE(e.payload->>'purpose', 'turn') = 'turn'
+           AND e.payload->>'parent_tool_use_id' IS NULL
+           AND e.payload->'usage' IS NOT NULL
+         ORDER BY e.sequence DESC LIMIT 1) AS context_tokens
+"#;
+
+/// One priced call of a ping turn.
+#[derive(serde::Deserialize)]
+struct SpentCall {
+    model: Option<String>,
+    usage: crate::engine::ApiUsage,
+    created: DateTime<Utc>,
+}
+
+/// Micro-dollars: a summed `f64` and its JSONB round trip then compare equal,
+/// so an unchanged status is never rewritten (I4).
+fn round_usd(usd: f64) -> f64 {
+    (usd * 1e6).round() / 1e6
+}
+
+async fn read_spent(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    since: DateTime<Utc>,
+) -> Result<Spent, sqlx::Error> {
+    let (beats, calls, context_tokens): (i64, sqlx::types::Json<Vec<SpentCall>>, Option<i64>) =
+        sqlx::query_as(SPENT_SQL)
+            .bind(thread_id)
+            .bind(since)
+            .bind(CACHE_KEEP_ALIVE_REASON_KIND)
+            .fetch_one(pool)
+            .await?;
+    Ok(Spent {
+        beats: u32::try_from(beats).unwrap_or(u32::MAX),
+        cost_usd: round_usd(
+            calls
+                .0
+                .iter()
+                .filter_map(|call| {
+                    let day = call.created.with_timezone(&chrono::Local).date_naive();
+                    call.usage
+                        .usd_on(call.model.as_deref().unwrap_or_default(), day)
+                })
+                .sum(),
+        ),
+        context_tokens: context_tokens.map_or(0, |t| u64::try_from(t).unwrap_or(0)),
+    })
+}
+
+/// The threads holding a status that are no longer candidates.
+const STALE_STATUS_SQL: &str = "SELECT thread_id FROM thread_summaries \
+     WHERE cache_keep_alive_status IS NOT NULL AND NOT (thread_id = ANY($1))";
+
+/// Write the thread's *cache keep-alive status* when it changed (I4). A busy
+/// thread keeps the one it has: a beat's own turn holds the thread, and every
+/// call of a real turn moves the request anchor.
+async fn sync_status(
+    bus: &EventBus,
+    thread_id: Uuid,
+    candidate: &Candidate,
+    anchors: &Anchors,
+    stored: Option<CacheKeepAliveStatus>,
+) {
+    if candidate.claim == ThreadClaim::Busy {
+        return;
+    }
+    let spent = match wait_began_at(candidate, anchors) {
+        Some(since) => match read_spent(bus.pool(), thread_id, since).await {
+            Ok(spent) => spent,
+            Err(e) => {
+                crate::log!("[KeepAlive] Could not read the pings of thread {thread_id}: {e}");
+                return;
+            }
+        },
+        None => Spent::default(),
+    };
+    let next = status(candidate, anchors, spent);
+    if next != stored {
+        emit_status(bus, thread_id, next).await;
+    }
+}
+
+/// Clear the status of every thread that stopped being a candidate, so a
+/// finished wait or a restart leaves none behind (I6).
+async fn clear_stale_statuses(bus: &EventBus, candidates: &[Uuid]) {
+    let stale: Vec<Uuid> = match sqlx::query_scalar(STALE_STATUS_SQL)
+        .bind(candidates)
+        .fetch_all(bus.pool())
+        .await
+    {
+        Ok(stale) => stale,
+        Err(e) => {
+            crate::log!("[KeepAlive] Could not read the stale statuses: {e}");
+            return;
+        }
+    };
+    for thread_id in stale {
+        emit_status(bus, thread_id, None).await;
+    }
+}
+
+async fn emit_status(bus: &EventBus, thread_id: Uuid, status: Option<CacheKeepAliveStatus>) {
+    let event = ThreadEvent::CacheKeepAliveStatusChanged { status };
+    if let Err(e) = bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta: EventMeta::NONE,
+        })
+        .await
+    {
+        crate::log!("[KeepAlive] Could not write the status of thread {thread_id}: {e}");
+    }
+}
+
 /// The candidates: `waiting` threads, plus every parent with active children.
 async fn read_candidates(
     pool: &sqlx::PgPool,
@@ -309,6 +588,7 @@ async fn read_candidates(
         .bind(ThreadStatus::WaitingForUserAnswer.as_str())
         .bind(ThreadStatus::Running.as_str())
         .bind(CodingAgent::Codex.as_str())
+        .bind(WakeMode::NoWake.as_str())
         .fetch_all(pool)
         .await
 }
@@ -336,6 +616,7 @@ impl LucidosEngine {
                 return;
             }
         };
+        let candidates: Vec<Uuid> = rows.iter().map(|row| row.thread_id).collect();
         for row in rows {
             let candidate = Candidate {
                 coding_agent: CodingAgent::parse(row.coding_agent.as_deref().unwrap_or("")),
@@ -348,11 +629,23 @@ impl LucidosEngine {
                 secs_since_request: row.secs_since_request,
                 secs_since_beat: self.secs_since_keep_alive_beat(row.thread_id),
                 cache_ttl: row.cache_ttl(),
+                cache: row.cache(),
             };
+            // The beat's own turn now holds the thread, so the next idle tick
+            // writes the status, with the ping priced.
             if decide(&candidate) == Beat::Send {
                 self.send_keep_alive(row.thread_id).await;
+                continue;
             }
+            let anchors = Anchors {
+                keep_warm_armed_at: armed_at.get(&row.thread_id).copied(),
+                idle_at: row.idle_at,
+                request_started_at: row.request_started_at,
+            };
+            let stored = row.stored_status.map(|s| s.0);
+            sync_status(&self.event_bus, row.thread_id, &candidate, &anchors, stored).await;
         }
+        clear_stale_statuses(&self.event_bus, &candidates).await;
     }
 
     /// Busy when a session, a hold or a turn has the thread.

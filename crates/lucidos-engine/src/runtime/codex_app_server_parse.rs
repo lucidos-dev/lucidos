@@ -226,6 +226,8 @@ pub(super) struct AppServerTracker {
     /// Monotonic id source for the synthesized plan tool pairs —
     /// `turn/plan/updated` is a turn-level notification with no item id.
     plan_seq: u64,
+    /// The effort the driver sent with this turn, stamped on its `Usage`.
+    turn_effort: Option<String>,
 }
 
 #[derive(Debug)]
@@ -250,8 +252,10 @@ impl AppServerTracker {
         }
     }
 
-    /// Reset per-turn accumulation. Session-level state survives.
-    pub fn begin_turn(&mut self) {
+    /// Reset per-turn accumulation for a turn sent with `effort`.
+    /// Session-level state survives.
+    pub fn begin_turn(&mut self, effort: Option<String>) {
+        self.turn_effort = effort;
         self.agent_texts.clear();
         self.streamed.clear();
         self.last_error = None;
@@ -487,6 +491,7 @@ impl AppServerTracker {
                     parent_tool_use_id: None,
                     api_call_id: None,
                     duration_ms: None,
+                    reasoning_effort: self.turn_effort.clone(),
                 }]
             }
             "error" => {

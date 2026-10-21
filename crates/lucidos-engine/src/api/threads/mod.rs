@@ -18,6 +18,7 @@ mod actions;
 pub(crate) mod archive;
 pub(crate) mod archive_all;
 mod background_tasks;
+mod cache_warmth;
 mod delete;
 mod detach;
 mod events_snapshot;
@@ -27,6 +28,7 @@ mod list;
 mod read_request;
 mod search;
 mod successor;
+mod switch_estimate;
 mod wake_decision;
 
 // Handler functions consumed by the router and the SearchEverywhere endpoint.
@@ -238,8 +240,28 @@ pub(super) fn router() -> Router<super::AppState> {
             get(successor::thread_context),
         )
         .route(
+            "/threads/:thread_id/cache-warmth",
+            get(cache_warmth::get_cache_warmth),
+        )
+        .route(
+            "/threads/:thread_id/switch-estimate",
+            get(switch_estimate::get_switch_estimate),
+        )
+        .route(
+            "/threads/:thread_id/handoff-checkpoints",
+            post(successor::record_handoff_checkpoint),
+        )
+        .route(
             "/threads/:thread_id/successor",
             post(successor::spawn_successor),
+        )
+        .route(
+            "/threads/:thread_id/successor-offer/decline",
+            post(successor::decline_successor_offer),
+        )
+        .route(
+            "/threads/:thread_id/successor-offer/continue",
+            post(successor::continue_in_successor),
         )
         // Archive on the caller's own authority (ADR 0310). `:thread_id` is
         // the target; an origin token limits it to the caller or one of its

@@ -107,6 +107,7 @@ function makeEvent(url: string, method: string = 'GET', mode?: string) {
   return {
     request: { url, method, ...(mode ? { mode } : {}) },
     respondWith: vi.fn(),
+    waitUntil: vi.fn(),
   };
 }
 
@@ -419,6 +420,41 @@ describe('Service Worker fetch handler — immutable /assets bundle caching', ()
     sw.handlers.fetch(event);
     await event.respondWith.mock.calls[0][0];
     expect(sw.mockCache.put).not.toHaveBeenCalled();
+  });
+
+  // WebKit's import error names no URL, so the worker says which bundle failed.
+  function clientLogBodies(sw: ReturnType<typeof loadSw>) {
+    return sw.mockFetch.mock.calls
+      .filter(([url]) => String(url).endsWith('/api/v1/internal/client-log'))
+      .map(([, init]) => JSON.parse((init as { body: string }).body));
+  }
+
+  it('GET /assets/<hash>.js: logs a bundle it could not serve, naming it', async () => {
+    const sw = loadSw();
+    sw.mockFetch.mockImplementation((url: unknown) => Promise.resolve(
+      String(url).endsWith('/client-log') ? new Response(null, { status: 204 }) : new Response('gone', { status: 404 }),
+    ));
+    const event = makeEvent('https://example.com/assets/missing-000000.js');
+    sw.handlers.fetch(event);
+    expect((await event.respondWith.mock.calls[0][0]).status).toBe(404);
+    // Registered during dispatch, never from a later callback.
+    expect(event.waitUntil).toHaveBeenCalledTimes(1);
+    await event.waitUntil.mock.calls[0][0];
+    expect(clientLogBodies(sw)).toEqual([{
+      category: 'sw',
+      message: 'asset_failed',
+      data: { path: '/assets/missing-000000.js', status: 404, type: 'default', contentType: 'text/plain;charset=UTF-8' },
+    }]);
+  });
+
+  it('GET /assets/<hash>.js: logs nothing for a bundle it served', async () => {
+    const sw = loadSw();
+    sw.mockFetch.mockResolvedValue(new Response('export {};', { headers: { 'content-type': 'text/javascript' } }));
+    const event = makeEvent('https://example.com/assets/App-abc123.js');
+    sw.handlers.fetch(event);
+    await event.respondWith.mock.calls[0][0];
+    await event.waitUntil.mock.calls[0][0];
+    expect(clientLogBodies(sw)).toEqual([]);
   });
 
   // A bundle deleted by a later `vite build --watch` rebuild resolves through the

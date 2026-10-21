@@ -1792,7 +1792,7 @@ export function installDeadPressProbe(): void {
     if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
     const heldMs = Date.now() - press.armedAt;
     const fingersAtLift = e.touches.length;
-    // A task later, as at the lift: a constructive face serves a cancelled tap
+    // A task later, as at the lift: a composer face serves a cancelled tap
     // from its own listener, which runs after this capture one.
     setTimeout(() => {
       const outcome = takePressOutcome(Date.now() - press.armedAt);

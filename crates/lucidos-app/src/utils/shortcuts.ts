@@ -119,7 +119,7 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'renameThread', label: 'Rename thread', category: 'Thread', defaultBinding: B(false, false, false, 'F2'), mnemonic: 'Rename in Windows Explorer and VS Code' },
   { id: 'followLiveEdge', label: 'Follow the live edge (arm or disarm)', category: 'Thread', defaultBinding: B(true, true, false, 'l'), mnemonic: 'L for Live' },
   { id: 'toggleCall', label: 'Start or end a voice call', category: 'Thread', defaultBinding: B(true, true, false, 'h'), mnemonic: 'Slack\'s huddle chord', hostOnly: true },
-  { id: 'openAgentMenu', label: 'Open the agent menu (model and effort)', category: 'Thread', defaultBinding: B(true, true, false, 'g'), mnemonic: 'G for aGent' },
+  { id: 'openAgentMenu', label: 'Open the model and effort list', category: 'Thread', defaultBinding: B(true, true, false, 'g'), mnemonic: 'G for aGent' },
   { id: 'showThreadDiff', label: 'Show what the thread changed', category: 'Thread', defaultBinding: B(true, true, false, 'd'), mnemonic: 'D for Diff' },
   { id: 'applyChange', label: 'Apply the thread\'s change, or apply on settle', category: 'Thread', defaultBinding: B(true, true, false, 'a'), mnemonic: 'A for Apply', hostOnly: true },
   { id: 'toggleThreadDrawer', label: 'Show or hide thread drawer', category: 'Panes', defaultBinding: B(true, true, false, '1'), mnemonic: 'Panes count 1, 2, 3 from the left' },
@@ -200,6 +200,13 @@ export function isBindableChord(b: Binding): boolean {
   if (b.mod || b.alt) return true;
   // No primary modifier: only allow it if the key isn't a lone printable char.
   return b.key.length > 1;
+}
+
+/** Enter, Shift+Enter and Cmd/Ctrl+Enter send or add a new line in the
+ *  composer (`composerEnterSends`), whichever `composer_enter_key` mode is on.
+ *  A shortcut on one would take that away, so the recorder refuses them. */
+export function isComposerEnterChord(b: Binding): boolean {
+  return b.key === 'Enter' && !b.alt && !(b.mod && b.shift);
 }
 
 /** Canonical storage form, e.g. `mod+shift+o`, `mod+k`, `mod+=`. Stable across

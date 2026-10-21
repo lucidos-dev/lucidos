@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-22
+- **Amended by**: [0534: An intent runs in the thread that asks for it](0534-intents-run-in-the-asking-thread.md)
 
 ## Context
 

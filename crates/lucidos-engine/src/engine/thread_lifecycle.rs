@@ -309,6 +309,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // exchange. One that started a turn after a Stop still sets running:
         // see its row in `status_transitions`.
         "CodingAgentInputRead" => EventClass::Metadata,
+        // A discard marks an input already recorded as owed again.
+        "CodingAgentInputDiscarded" => EventClass::Metadata,
         // Compose lifecycle — orthogonal to the section/status machinery.
         "ThreadStarted" | "ThreadDiscarded" | "HomeThreadCreated" => EventClass::Metadata,
         // ImageUploaded — passive bookkeeping for content-addressed blob
@@ -323,7 +325,10 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "ContinuationStarted"
         | "CodingAgentSettingsChanged"
         | "CodingAgentCompacted"
-        | "SuccessorThreadSpawned" => EventClass::Metadata,
+        | "SuccessorThreadSpawned"
+        | "HandoffCheckpointReached"
+        | "SuccessorOfferDeclined"
+        | "SuccessorRequested" => EventClass::Metadata,
         // Voice-session lifecycle. Metadata on BOTH halves, which is the
         // asymmetry against the coding-agent pair above, where the end is
         // Terminal. A live microphone is not a turn: the thread's status
@@ -352,7 +357,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "MergeConflictDetected" | "MissingHardeningDetected" => EventClass::Start,
         // Activity
         "TextStreamed" | "ThoughtStreamed" | "MemoryRecalled" => EventClass::Activity,
-        "ContextCaptured" => EventClass::Metadata,
+        "ContextCaptured" | "ModelCallFailed" => EventClass::Metadata,
         "ToolCalled" | "ToolResult" => EventClass::Activity,
         // Mid-turn snapshot of the Lucidos Agent's todo list — replace-whole-list
         // semantics. Classified as Activity so the thread reads as actively
@@ -377,8 +382,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // A thread's enabled MCP servers change what its next request carries,
         // not what the thread is doing (ADR 0430).
         "ThreadMcpServerEnabled" | "ThreadMcpServerDisabled" => EventClass::Metadata,
-        // Arranging the Home board moves no status and is no activity, so an
-        // unused Home stays where it is (ADR 0432).
+        // A legacy arrangement of Home's old board: no status, no activity.
         "HomeBoardArranged" => EventClass::Metadata,
         "CodingAgentTextStreamed"
         | "CodingAgentThoughtStreamed"
@@ -489,6 +493,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "EventWaitStarted" | "EventWaitDelivered" | "EventWaitExpired" | "EventWaitCanceled" => {
             EventClass::Activity
         }
+        // The keep-alive tick's report on a waiting thread. Nothing happened
+        // on the thread, so it moves no section, status or recency.
+        "CacheKeepAliveStatusChanged" => EventClass::Metadata,
         _ => return None,
     })
 }
@@ -502,6 +509,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "TextStreamed",
         "ThoughtStreamed",
         "ContextCaptured",
+        "ModelCallFailed",
         "MemoryRecalled",
         "ToolCalled",
         "ToolResult",
@@ -521,6 +529,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "CodingAgentUserMessageSent",
         "CodingAgentPromptSent",
         "CodingAgentInputRead",
+        "CodingAgentInputDiscarded",
         "CodingAgentIdled",
         "ContinuationRequested",
         "MissingHardeningDetected",
@@ -572,6 +581,9 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "CodingAgentSettingsChanged",
         "CodingAgentCompacted",
         "SuccessorThreadSpawned",
+        "HandoffCheckpointReached",
+        "SuccessorOfferDeclined",
+        "SuccessorRequested",
         "UserQuestionAsked",
         "UserQuestionAnswered",
         "CodingAgentPermissionRequest",
@@ -607,6 +619,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "EventWaitDelivered",
         "EventWaitExpired",
         "EventWaitCanceled",
+        // The keep-alive status. Persisted because the column projects from it.
+        "CacheKeepAliveStatusChanged",
         // Voice-session lifecycle. Persisted because the pair IS the record:
         // there is no session table, and the boot sweep finds an unpaired
         // start by reading these back.
@@ -635,7 +649,8 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // record: the projection rebuilds from them (ADR 0430).
         "ThreadMcpServerEnabled",
         "ThreadMcpServerDisabled",
-        // The Home board's arrangement, synced across devices (ADR 0432).
+        // Legacy: Home's old board arrangement, which seeds the dashboards
+        // (ADR 0496). Nothing writes it now.
         "HomeBoardArranged",
     ]
 }
@@ -745,10 +760,14 @@ pub fn resolve_transition(
         | "CodingAgentUserMessageSent"
         | "CodingAgentPromptSent"
         | "CodingAgentInputRead"
+        | "CodingAgentInputDiscarded"
         | "MissingHardeningDetected"
         | "CodingAgentSettingsChanged"
         | "CodingAgentCompacted"
         | "SuccessorThreadSpawned"
+        | "HandoffCheckpointReached"
+        | "SuccessorOfferDeclined"
+        | "SuccessorRequested"
         | "ContinuationRequested" => match thread_type {
             ThreadType::CodingAgent => no_change,
             ThreadType::Chat => violation("coding-agent-specific event on Chat thread"),
@@ -847,6 +866,7 @@ pub fn resolve_transition(
         | "TextStreamed"
         | "ThoughtStreamed"
         | "ContextCaptured"
+        | "ModelCallFailed"
         | "MemoryRecalled"
         | "ToolCalled"
         | "ToolResult"
@@ -981,6 +1001,9 @@ pub fn resolve_transition(
         | "EventWaitDelivered"
         | "EventWaitExpired"
         | "EventWaitCanceled"
+        // The keep-alive status reports what the engine does while the thread
+        // waits. It moves nothing.
+        | "CacheKeepAliveStatusChanged"
         // Voice-session lifecycle. Voice is a MODE of a thread (ADR 0148), so
         // neither half moves it: the section and the status belong to the
         // agent's turn, and a live microphone is not a turn. An end that
@@ -1832,6 +1855,11 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
+        // Projection-only exception: a redirect cancel (`CancelCause::is_redirect`)
+        // leaves the status alone, and so do the `CodingAgentIdled` and
+        // `SessionEnded` after it, until the next start event
+        // (`keeping_status_across_redirect`). The coarse rule model has no
+        // cause axis.
         (
             "ResponseCanceled",
             StatusTransition {

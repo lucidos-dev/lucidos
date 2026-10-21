@@ -45,10 +45,15 @@ Per `system-knowhow/best-practices.md` § "The workspace database: `LUCIDOS_DATA
 
 ## Remediation
 
-Fixes run only on request, as the root's § Remediation says. A fix thread gets
-the table for its finding.
+Fixes run only on request, as the root's § Remediation says. A fix gets the
+table for its finding, and the root's § Inline or a coding agent picks its
+route.
 
 ### Pointing database access at `LUCIDOS_DATABASE_URL`
+
+**Route: inline**, except the last row. Each of the others passes the same
+variable to an existing call. Wrapping a write goes to a coding agent, since
+the user should read each write before Apply.
 
 | Old | New |
 |---|---|

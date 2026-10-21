@@ -2,7 +2,7 @@ import { API, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
 import type { ThreadSection, ThreadInitiator, ThreadAggregate, EventWaitSummary, ThreadComposeState } from '../store/thread-events';
 import type { ThreadStatus } from '../generated/thread-lifecycle';
 import type { ComposeSelectionOverride } from '../store/composeSelections';
-import type { UnproposedReason } from '../generated/thread-event-wire';
+import type { CacheKeepAliveStatus, UnproposedReason } from '../generated/thread-event-wire';
 import type { AppKind } from '../store/types';
 
 /** What a coding-agent thread's branch holds, as the engine projects it (ADR
@@ -89,6 +89,8 @@ export interface ThreadSummary {
    *  `upsertThread` leaves an existing list alone when the field is missing and
    *  clears it only on an explicit `[]`. */
   live_event_waits?: EventWaitSummary[];
+  /** The *cache keep-alive status*. The engine omits it when there is none. */
+  cache_keep_alive_status?: CacheKeepAliveStatus;
   /** Thread status computed by the backend. One of the generated `ThreadStatus`
    *  values. Nothing writes 'waiting' any more; historical rows may hold it. */
   status: ThreadStatus;

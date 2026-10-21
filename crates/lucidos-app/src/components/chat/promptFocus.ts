@@ -1,5 +1,6 @@
 import { isElementVisible } from '../../utils/elementVisibility';
 import type { RevealBarsDetail } from '../../hooks/useHideOnScroll';
+import { rungFoldOpenRequest } from './controlMenuRequests';
 
 /** The currently focused prompt textarea, or null if focus is elsewhere.
  *  Reads document.activeElement directly rather than locating the visible
@@ -38,14 +39,19 @@ export function getVisiblePromptInput(): HTMLElement | null {
   return els.length > 0 ? els[els.length - 1] : null;
 }
 
-/** Open the composer's agent menu: the Lucidos model picker, or the coding
- *  agent's control menu. It presses the row's own anchor, which never folds,
- *  so the menu opens exactly as a click would open it. */
+/** Open the composer's model and effort list. It presses the rung control's
+ *  own button, so the list opens exactly as a click would open it. A pill the
+ *  row has folded opens the list against the ⋯ instead. */
 export function openAgentMenu(): void {
-  const buttons = document.querySelectorAll<HTMLElement>('.prompt-actions-row .commands-btn');
-  for (const button of buttons) {
+  for (const button of document.querySelectorAll<HTMLElement>('.prompt-actions-row .rung-trigger')) {
     if (isElementVisible(button)) {
       button.click();
+      return;
+    }
+  }
+  for (const more of document.querySelectorAll<HTMLElement>('.prompt-actions-row [data-fold-key=""]')) {
+    if (isElementVisible(more)) {
+      rungFoldOpenRequest.value = more;
       return;
     }
   }

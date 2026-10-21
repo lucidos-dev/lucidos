@@ -1,7 +1,8 @@
-import { toggleThreads } from '../../store/actions/pane';
+import { THREAD_LIST_TOO_NARROW, toggleThreads } from '../../store/actions/pane';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { shortcutDef } from '../../utils/shortcuts';
-import { blockedThreadCount, mobileView, threadDrawerOpen, type MobileView } from '../../store/store';
+import { blockedThreadCount, mobileView, type MobileView } from '../../store/store';
+import { drawnDrawerShown, threadListCanShow } from '../layout/drawnLayout';
 import { viewportIsMobile } from '../../utils/viewport';
 import { SidebarIcon, ThreadListIcon } from './icons';
 import { GlyphBadge } from './GlyphBadge';
@@ -16,10 +17,10 @@ interface Props {
 const LABEL = shortcutDef('toggleThreadDrawer').label;
 
 /** Whether the thread list is on screen right now: the threads pane on mobile
- *  (where the list is a swipe pane, not a drawer), the thread drawer on desktop.
- *  Pure so the badge rule below is testable without a DOM. */
-export function threadListVisible(mobile: boolean, view: MobileView, drawerOpen: boolean): boolean {
-  return mobile ? view === 'threads' : drawerOpen;
+ *  (where the list is a swipe pane, not a drawer), the thread drawer on desktop,
+ *  as it is drawn. Pure so the badge rule below is testable without a DOM. */
+export function threadListVisible(mobile: boolean, view: MobileView, drawerShown: boolean): boolean {
+  return mobile ? view === 'threads' : drawerShown;
 }
 
 /** The Blocked count the toggle should badge (0 means no badge). It
@@ -30,9 +31,9 @@ export function threadListVisible(mobile: boolean, view: MobileView, drawerOpen:
  *  layouts, which is what makes the mobile thread pane header (where the list is
  *  always a pane away) badge whenever anything needs the user. */
 export function threadToggleBadgeCount(
-  blockedCount: number, mobile: boolean, view: MobileView, drawerOpen: boolean,
+  blockedCount: number, mobile: boolean, view: MobileView, drawerShown: boolean,
 ): number {
-  return threadListVisible(mobile, view, drawerOpen) ? 0 : blockedCount;
+  return threadListVisible(mobile, view, drawerShown) ? 0 : blockedCount;
 }
 
 /** `label` with the Blocked count a badge beside it draws. The badge is
@@ -43,9 +44,10 @@ export function labelWithBlockedCount(label: string, blockedCount: number): stri
 
 export function ThreadToggleButton({ class: cls }: Props) {
   const mobile = viewportIsMobile.value;
-  const badgeCount = threadToggleBadgeCount(
-    blockedThreadCount.value, mobile, mobileView.value, threadDrawerOpen.value,
-  );
+  const drawerShown = drawnDrawerShown.value;
+  const badgeCount = threadToggleBadgeCount(blockedThreadCount.value, mobile, mobileView.value, drawerShown);
+  // A window too narrow for the drawer disables the toggle, with the reason.
+  const blocked = !mobile && !drawerShown && !threadListCanShow();
   // A sidebar glyph where the list IS a sidebar. On a phone the toggle swipes
   // to a whole pane of threads, so it draws the list it takes you to.
   const Glyph = mobile ? ThreadListIcon : SidebarIcon;
@@ -60,9 +62,10 @@ export function ThreadToggleButton({ class: cls }: Props) {
       // stopPropagation is bubble-phase only, so the capture-phase overlay
       // outside-dismiss still closes any open popover (see useAnchoredPopover).
       onPointerDown={(e) => e.stopPropagation()}
-      onClick={(e) => { e.stopPropagation(); toggleThreads(); }}
+      onClick={(e) => { e.stopPropagation(); if (!blocked) toggleThreads(); }}
       aria-label={label}
-      data-tooltip={tooltipWithShortcut(label, 'toggleThreadDrawer')}
+      aria-disabled={blocked || undefined}
+      data-tooltip={blocked ? THREAD_LIST_TOO_NARROW : tooltipWithShortcut(label, 'toggleThreadDrawer')}
     >
       <Glyph />
       {badgeCount > 0 && <GlyphBadge class="badge">{badgeCount}</GlyphBadge>}

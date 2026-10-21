@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-10
+- **Amended by**: [0519](0519-retired-models-follow-reach.md): the router
+  follows the successor only where this install reaches it, and a stored id
+  names a lineage
 
 ## Context
 

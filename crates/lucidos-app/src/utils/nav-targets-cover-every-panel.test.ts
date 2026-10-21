@@ -19,7 +19,7 @@ import { NAVIGATE_TARGETS } from '../../../../packages/lucidos-sdk/src/generated
 
 /** Targets a bare `[Label](name)` link opens on its own. */
 const BARE_PANELS: readonly string[] = [
-  'home-board',
+  'dashboard',
   'files',
   'apps',
   'plugins',

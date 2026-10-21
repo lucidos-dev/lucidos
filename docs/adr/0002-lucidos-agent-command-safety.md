@@ -524,3 +524,70 @@ What is left is a failure the user should hear about.
 Implementation: `engine/command_judge.rs` (`JudgeVerdict::judge_failed`),
 `engine/command_permission.rs` (`judge_or_fallback`). Plan:
 `docs/plans/2026-10-09-haiku-4-5-vertex-retirement.md`.
+
+## Addendum (2026-10-19): Email needs a messaging signal
+
+**Context.** A read-only price check that fetched three public pages with
+`urllib.request.urlopen` was blocked as "May perform an email or messaging
+side-effect". The category question was asked of every command and offered no
+"none" option. `email` was listed first, and an even split reads as the first
+option. The lane fell below the safe bar, so the speculative category was
+used. Nothing checked it against the command text.
+
+**Decision.** Email is impossible without a messaging signal in the command
+text (`command_has_messaging_signal`). A judge answer of Email without one
+reads as `Other`, and the static map applies the same rule to `osascript`. The
+clamp renames the category only, so the lane and the card still ask. The
+category question gains a `none` option, listed first, which also reads as
+`Other` on the irreversible lane. The Python signal list gains `urlopen(`,
+`.request(`, `http.client` and `urllib3`, so more HTTP code reaches the judge.
+
+**Rejected.** A static Safe verdict for a read-only urllib GET. Proving that no
+body is sent needs a Python argument parser, and the substring check should
+not loosen on a heuristic.
+
+Implementation: `engine/command_guard.rs`,
+`engine/command_judge_questions.rs`. Plan:
+`docs/plans/2026-10-19-command-guard-email-needs-a-signal.md`.
+
+## Addendum (2026-10-21): the out-of-workspace marker is evidence, not doubt
+
+**Context.** A trigger that refreshed a workspace config file was blocked as
+destruction outside the workspace. It ran quoted Python in a heredoc, and
+every path in it was relative to the workspace. The judge's
+`target_outside_workspace` marker reused the fast path's test, which reads any
+word it cannot parse as outside. Quoted code is full of such words, so the
+marker was true. The judge saw a file write and a flag that said a path lands
+outside, and it answered `out_of_workspace_destruction`.
+
+**Decision.** The marker reports evidence. `command_names_path_outside` sets
+it only for a path that lands outside: an absolute path not under the root, a
+`~` path, a `..` climb, or a variable in a path. On disk it also counts a path
+that resolves outside through a link. It reads each quoted run as a candidate
+too, so a path literal in quoted code still counts.
+
+A `$` in single quotes cannot expand, so it does not count. The marker does no
+glob expansion, since a `{` or `[` in code is not a glob. The Safe fast path
+and the static fallback keep their own "cannot prove inside" test.
+
+The judge's instructions now say where the command runs: the workspace root,
+with `data/`, `.lucidos/` and every relative path without `..` inside it, and
+`lucidos data write` writing under it. They also say what a false marker does
+not prove.
+
+A blocked trigger's remedy now reads "Check what the command does first". A
+command that does not do what the reason says was misjudged and needs no
+grant, only a re-run. The grant is the answer only to a real need, since a
+grant given for a misjudgement lets every later command of that kind run.
+
+**Rejected.** A clamp that moves an unsupported `out_of_workspace_destruction`
+answer to the checkpoint lane. A path built at run time names no literal, so
+the clamp would run real home-directory destruction behind a checkpoint that
+cannot cover it. Widening the Safe fast path to heredocs or `python3 -c` is
+rejected as well: parsing an embedded program in a shell line is the bypass
+surface the 2026-08-24 addendum tightened.
+
+Implementation: `engine/command_guard.rs` (`command_names_path_outside`),
+`engine/command_judge_questions.rs`, `engine/command_permission.rs`
+(`grantable_remedy`), `eval/command-judge/commands.toml`. Plan:
+`docs/plans/2026-10-21-command-judge-marker-is-evidence.md`.

@@ -1,5 +1,5 @@
 import { splitRatio, scaledDurationMs, SPLIT_RATIO_KEY } from '../../store/store';
-import type { SplitBounds } from '../../store/paneMinimums';
+import type { PaneFloors, SplitBounds } from '../../store/paneMinimums';
 
 export const DEFAULT_SPLIT_RATIO = 0.4;
 
@@ -17,11 +17,6 @@ export const DEFAULT_SPLIT_RATIO = 0.4;
  *  moment the slider leaves centre. */
 export const PANE_TRANSITION_MS = 300;
 
-/** While a divider drag is live. CSS keys off this to disable the header /
- *  drawer geometry transitions so all three panels and their header regions
- *  track the pointer 1:1 instead of easing 300ms behind it. */
-const RESIZING_ATTR = 'data-pane-resizing';
-
 /** Clamp a divider position to a range that may be EMPTY, which is the whole
  *  reason this is a named function rather than a `Math.min(Math.max(...))`.
  *
@@ -30,12 +25,10 @@ const RESIZING_ATTR = 'data-pane-resizing';
  *  at once. A bare min-then-max would silently answer `hi` there, handing the
  *  space to the trailing pane; this keeps the LEADING pane whole instead and
  *  lets the trailing one take what remains. Deterministic either way, which a
- *  drag needs and the old release-time snap never had to decide, since a free
- *  drop was legal by definition.
+ *  drag needs.
  *
- *  Reachable in a real configuration, not just in theory: the three pane floors
- *  are derived from the root font size and stop summing under a 1280px screen
- *  somewhere past 150% ui-scale (see store/paneMinimums.ts). */
+ *  For the split, that remainder shows only while a drag holds the collapse
+ *  state. At rest the Canvas yields instead (`computeDrawnSplitRatio`). */
 export function clampToRange(value: number, lo: number, hi: number): number {
   if (hi < lo) return lo;
   return Math.min(Math.max(value, lo), hi);
@@ -59,55 +52,62 @@ export function clampToRange(value: number, lo: number, hi: number): number {
  *  collapses the content pane under the pointer. The final 1px inset is what the
  *  drag handlers used to carry by hand and is the reason it existed. */
 export function clampSplitRatio(pointerPx: number, totalPx: number, bounds: SplitBounds): number {
-  if (totalPx <= 2) return DEFAULT_SPLIT_RATIO;
+  if (!splitIsSized(totalPx)) return DEFAULT_SPLIT_RATIO;
   const threadPx = clampToRange(pointerPx, bounds.minThreadPx, totalPx - bounds.minContentPx);
   return clampToRange(threadPx, 1, totalPx - 1) / totalPx;
 }
 
-/** The ratio a PERSISTED one has to migrate to at mount. Null when it is
- *  already legal, and must be left exactly where the user put it.
+/** Whether the split, or the window, has been laid out. Its first frame can
+ *  measure 0 while the shell sizes, which says nothing about the room it will
+ *  have. */
+export function splitIsSized(totalPx: number): boolean {
+  return totalPx > 2;
+}
+
+/** Whether a split this wide holds both pane floors side by side. */
+export function splitFitsBothPanes(totalPx: number, bounds: SplitBounds): boolean {
+  return totalPx >= bounds.minThreadPx + bounds.minContentPx;
+}
+
+/** The *drawn split ratio* (docs/glossary.md): what the split draws for the
+ *  stored ratio in a split this wide. The stored ratio is the user's choice and
+ *  is never rewritten for lack of room, so a wider window brings it back.
  *
- *  A stored ratio is a fraction while the floors are px. One legal in the
- *  window it was saved in can be illegal in this one. Raising a floor does the
- *  same to every stored ratio between the old value and the new. Nothing else
- *  re-clamps: `splitRatio` is read straight out of localStorage (`store.ts`),
- *  and only a drag or a keyboard step consults the bounds. So a user upgrades
- *  INTO whatever layout they last left, floors or not. That is how a header
- *  overlap survives the change that fixed it.
+ *  With room for both panes, it is the stored ratio held to both floors. With
+ *  room for one, an open Canvas yields: it is drawn collapsed (1) rather than
+ *  squeezed under its floor, where its header controls overlap (ADR 0056 as
+ *  amended). A collapsed pane is a state, so it draws as stored.
  *
- *  A MIGRATION, not a resize policy. It runs when the split first has a width,
- *  again when Home raises the floor, and once the Home board's rail has slid in
- *  (SplitLayout). It corrects only a ratio
- *  the clamp would already have refused.
- *  Re-clamping on every container resize is a different decision, and a larger
- *  one: it would hold the Conversation floor by squeezing the Canvas pane under
- *  its own, on every window the two no longer fit.
- *
- *  Null rather than the unchanged ratio, so the caller writes (and persists)
- *  nothing in the ordinary case. */
-export function migratedSplitRatio(
-  ratio: number, totalPx: number, bounds: SplitBounds,
-): number | null {
-  // No layout yet, so no width to clamp against. `clampSplitRatio` answers the
-  // DEFAULT ratio here, which as a migration would be a silent reset.
-  if (totalPx <= 2) return null;
-  if (!Number.isFinite(ratio)) return DEFAULT_SPLIT_RATIO;
-  // A collapsed pane is a settled state the user chose, not an illegal width.
-  if (ratio <= 0 || ratio >= 1) return null;
-  const next = clampSplitRatio(ratio * totalPx, totalPx, bounds);
-  return Math.abs(next - ratio) < 1e-6 ? null : next;
+ *  `heldYield` pins the collapse decision for a drag in flight, so no drag
+ *  flips a collapse attribute. Null decides from the room. */
+export function computeDrawnSplitRatio(
+  stored: number, totalPx: number, bounds: SplitBounds, heldYield: boolean | null,
+): number {
+  if (stored <= 0) return 0;
+  if (stored >= 1) return 1;
+  if (!splitIsSized(totalPx)) return stored;
+  const yields = heldYield ?? !splitFitsBothPanes(totalPx, bounds);
+  return yields ? 1 : clampSplitRatio(stored * totalPx, totalPx, bounds);
+}
+
+/** The stored ratio that shows a hidden Canvas: the default split when both
+ *  panes fit, else the Canvas takes the split from the Conversation. The
+ *  default alone would yield again and leave the toggle doing nothing. */
+export function contentShownRatio(fitsBoth: boolean): number {
+  return fitsBoth ? DEFAULT_SPLIT_RATIO : 0;
 }
 
 /** Next ratio for a thread-pane visibility toggle: collapsed (0) restores the
  *  default split, anything else collapses. Shared by the toggleThreadPane
- *  intent and the content-side header double-click. */
+ *  intent and the content-side header double-click. `ratio` is the drawn one. */
 export function toggleThreadPaneRatio(ratio: number): number {
   return ratio === 0 ? DEFAULT_SPLIT_RATIO : 0;
 }
 
-/** Mirror for the content pane: collapsed (>= 1) restores, else collapses. */
-export function toggleContentPaneRatio(ratio: number): number {
-  return ratio >= 1 ? DEFAULT_SPLIT_RATIO : 1;
+/** Mirror for the content pane: drawn collapsed (>= 1) shows it
+ *  (`contentShownRatio`), else collapses. */
+export function toggleContentPaneRatio(ratio: number, fitsBoth: boolean): number {
+  return ratio >= 1 ? contentShownRatio(fitsBoth) : 1;
 }
 
 /** Pixels a keyboard resize (the Narrow/Widen pane shortcuts) moves a divider
@@ -149,41 +149,124 @@ export function computeDrawerStepWidth(
   return next === width ? null : next;
 }
 
-/** The widest the Home board's rail may go. `roomPx` is the split's width plus
+/** The widest the dashboard's rail may go. `roomPx` is the split's width plus
  *  the rail's, the room the two share. The Conversation pane holds its width,
  *  so a wider rail comes out of the Canvas. With one pane collapsed, it comes
  *  out of the other. */
-export function homeRailCeiling(roomPx: number, threadPx: number, ratio: number, bounds: SplitBounds): number {
+export function dashboardRailCeiling(roomPx: number, threadPx: number, ratio: number, bounds: SplitBounds): number {
   if (ratio <= 0) return roomPx - bounds.minContentPx;
   if (ratio >= 1) return roomPx - bounds.minThreadPx;
   return roomPx - threadPx - bounds.minContentPx;
 }
 
-/** The width the rail draws at: the one the user set, held to what leaves the
- *  two split panes their floors in this window, and never below its own. A
- *  width saved on a larger display is kept, and drawn narrower here. */
-export function drawnHomeRailWidth(savedPx: number, viewportPx: number, floorPx: number, bounds: SplitBounds): number {
-  return Math.max(floorPx, Math.min(savedPx, viewportPx - bounds.minThreadPx - bounds.minContentPx));
+/** The room the drawer, the split and the rail share: the window, every floor,
+ *  the drawer divider's band, and the stored split ratio, which says which split
+ *  panes the side panes must leave room for. */
+export interface LayoutRoom {
+  windowPx: number;
+  floors: PaneFloors;
+  dividerPx: number;
+  storedRatio: number;
 }
 
-/** Call on divider pointerdown: switch the layout into 1:1 pointer-tracking
- *  mode. Nothing else to do now that a drag is clamped rather than corrected
- *  afterwards, so there is no pending correction to flush. */
-export function beginPaneResize(): void {
-  document.documentElement.setAttribute(RESIZING_ATTR, '');
+/** A side pane as stored: whether the user wants it, and the width they set. */
+export interface SidePaneState {
+  wanted: boolean;
+  widthPx: number;
 }
 
-/** Call on divider release: transitions come back on. The layout is already
- *  where it belongs, since the drag could not leave it anywhere else. */
-export function endPaneResize(): void {
-  document.documentElement.removeAttribute(RESIZING_ATTR);
+/** The yield each side pane is pinned to for a drag in flight: true is yielded,
+ *  false is drawn. Null decides from the room. */
+export interface HeldSideYields {
+  drawer: boolean | null;
+  rail: boolean | null;
+}
+
+export interface DrawnSidePane {
+  drawn: boolean;
+  /** What it draws at, or would draw at: a yielded pane keeps its width for the
+   *  slide out. */
+  widthPx: number;
+}
+
+export interface DrawnLayout {
+  drawer: DrawnSidePane;
+  rail: DrawnSidePane;
+  /** What is left for the split, the Conversation and the Canvas together. */
+  splitPx: number;
+}
+
+/** The pane the side panes must always leave whole: the Conversation, or the
+ *  Canvas when the stored split shows only that. */
+function keptFloorPx(room: LayoutRoom): number {
+  return room.storedRatio <= 0 ? room.floors.minContentPx : room.floors.minThreadPx;
+}
+
+/** Whether the window holds the kept pane's floor beside these side panes at
+ *  their floors. A drawn drawer takes its divider's band too. */
+export function sidePanesFit(room: LayoutRoom, drawer: boolean, rail: boolean): boolean {
+  const { floors, dividerPx } = room;
+  const neededPx = keptFloorPx(room) + (drawer ? floors.drawerPx + dividerPx : 0) + (rail ? floors.railPx : 0);
+  return neededPx <= room.windowPx;
+}
+
+/** The first set of wanted side panes that fits: both, the drawer alone, the
+ *  rail alone, neither. So the rail yields before the drawer. */
+function fittingSidePanes(room: LayoutRoom, wantDrawer: boolean, wantRail: boolean): [boolean, boolean] {
+  const sets: [boolean, boolean][] = [[wantDrawer, wantRail], [wantDrawer, false], [false, wantRail]];
+  return sets.find(([drawer, rail]) => sidePanesFit(room, drawer, rail)) ?? [false, false];
+}
+
+/** The *drawn layout* (docs/glossary.md): what the window draws for the stored
+ *  drawer and rail. The stored state is the user's choice and is never rewritten
+ *  for lack of room, so a wider window brings a yielded pane back.
+ *
+ *  A pane that does not fit beside the kept pane's floor yields, in the order
+ *  Canvas, rail, drawer. The Canvas yields inside the split
+ *  (`computeDrawnSplitRatio`, ADR 0495), from the `splitPx` returned here.
+ *  A drawn drawer rides the Conversation, so none draws beside a collapsed one.
+ *
+ *  A drawn pane draws at its stored width, held so the panes beside it keep
+ *  their floors, and never below its own. The drawer is held first, for the
+ *  kept pane and a drawn rail's floor. The rail is held for the drawn drawer
+ *  and every split pane the stored ratio shows.
+ *
+ *  `held` pins a yield for a drag in flight, so no drag flips a pane. */
+export function computeDrawnLayout(
+  room: LayoutRoom, drawer: SidePaneState, rail: SidePaneState, held: HeldSideYields,
+): DrawnLayout {
+  const { floors, dividerPx, windowPx } = room;
+  const wantDrawer = drawer.wanted && room.storedRatio > 0;
+  if (!splitIsSized(windowPx)) {
+    return {
+      drawer: { drawn: wantDrawer, widthPx: drawer.widthPx },
+      rail: { drawn: rail.wanted, widthPx: rail.widthPx },
+      splitPx: windowPx,
+    };
+  }
+  const [fitsDrawer, fitsRail] = fittingSidePanes(room, wantDrawer, rail.wanted);
+  const drawerDrawn = wantDrawer && !(held.drawer ?? !fitsDrawer);
+  const railDrawn = rail.wanted && !(held.rail ?? !fitsRail);
+
+  const drawerCeilingPx = windowPx - dividerPx - keptFloorPx(room) - (railDrawn ? floors.railPx : 0);
+  const drawerPx = Math.max(floors.drawerPx, Math.min(drawer.widthPx, drawerCeilingPx));
+  const drawerBlockPx = drawerDrawn ? drawerPx + dividerPx : 0;
+
+  const splitFloorsPx = (room.storedRatio < 1 ? floors.minContentPx : 0) + (room.storedRatio > 0 ? floors.minThreadPx : 0);
+  const railPx = Math.max(floors.railPx, Math.min(rail.widthPx, windowPx - drawerBlockPx - splitFloorsPx));
+
+  return {
+    drawer: { drawn: drawerDrawn, widthPx: drawerPx },
+    rail: { drawn: railDrawn, widthPx: railPx },
+    splitPx: windowPx - drawerBlockPx - (railDrawn ? railPx : 0),
+  };
 }
 
 let paneAnimateTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Add a brief CSS transition for an explicit ratio change: a pane toggle, a
  *  maximize, a keyboard step, a layout reset. NOT for a drag, which tracks the
- *  pointer 1:1 and turns these transitions off (RESIZING_ATTR above).
+ *  pointer 1:1 and turns these transitions off (`beginPaneResize`, drawnLayout.ts).
  *
  *  Named for the animation rather than for the deferred snap it used to serve:
  *  a drag is clamped now and corrects nothing on release, so "snap" described
@@ -196,7 +279,7 @@ let paneAnimateTimer: ReturnType<typeof setTimeout> | null = null;
  *  The 100ms is slack, not animation, and stays OUTSIDE the scaled term: at 0.1x
  *  an unscaled timer would strip `pane-animate` a tenth of the way in and snap a
  *  maximizing pane the rest of the way to full width. */
-function triggerPaneAnimate() {
+export function triggerPaneAnimate(): void {
   const container = document.querySelector('.split-layout') as HTMLElement | null;
   if (!container) return;
   container.classList.add('pane-animate');

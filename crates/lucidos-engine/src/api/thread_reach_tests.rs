@@ -60,7 +60,7 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("changes.rs", CHANGES_RS, "discard_all_changes"),
     ("changes.rs", CHANGES_RS, "remove_from_landing_lane"),
     ("changes.rs", CHANGES_RS, "cancel_lane_batch"),
-    ("threads/successor.rs", SUCCESSOR_RS, "spawn_successor"),
+    ("threads/successor.rs", SUCCESSOR_RS, "start_successor"),
     ("chat.rs", CHAT_RS, "cancel_chat"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_stop"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_apply_now"),
@@ -117,12 +117,13 @@ const MCP_PERMISSION_RS: &str = include_str!("mcp_permission.rs");
 const MCP_RS: &str = include_str!("mcp.rs");
 const THREAD_REACH_RS: &str = include_str!("thread_reach.rs");
 
-/// The gate under any of its names: the header form a route asks, the
-/// thread form an in-process tool asks, and the three local wrappers. Each
-/// wrapper is asserted to reach the real one by the test below, so naming them
-/// here is not a hole.
+/// The gate under any of its names: the header form a route asks, and its
+/// form naming the authority it passed on. Then the thread form an in-process
+/// tool asks, and the three local wrappers. Each wrapper is asserted to reach
+/// the real one by the test below, so naming them here is not a hole.
 const GATE_CALLS: &[&str] = &[
     "refuse_without_authority",
+    "pass_authority",
     "refuse_thread_without_authority",
     "refuse_change_verb",
     "refuse_batch_change_verb",

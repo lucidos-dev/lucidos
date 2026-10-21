@@ -227,8 +227,8 @@ fn a_knowhow_id_resolves_to_its_file_in_load_order() {
     assert_eq!(knowhow_doc_path(&dirs, "missing"), None);
 }
 
-/// `execute_intent` reads these docs with no `load_knowhow` call, so the
-/// unused check must count them as used.
+/// Loading an intent loads these docs with no `load_knowhow` call of their
+/// own, so the unused check must count them as used.
 #[test]
 fn an_intent_loads_its_knowhow_ids_and_its_apps_whole_folder() {
     let intents = vec![

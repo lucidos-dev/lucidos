@@ -51,28 +51,16 @@ pub(super) fn apply_lucidos_env(
     // User-managed env vars FIRST so every engine-owned var below overrides on
     // collision (e.g. a user `LUCIDOS_REPO` is replaced by the spawn's repo
     // context). The pairs are already reserved-name-filtered by `env_pairs`.
-    crate::core::apply_to_subprocess_env(cmd, args.user_env_vars);
+    crate::core::apply_to_subprocess_env(
+        cmd,
+        args.user_env_vars,
+        crate::core::InheritedSecrets::Keep,
+    );
     cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
     for (key, value) in crate::api::actor::host_protection_env_vars() {
         cmd.env(key, value);
     }
-    if let Some((key, value)) = crate::core::lucidos_database_url_env() {
-        cmd.env(key, value);
-    }
-    // A coding-agent session emits from a spawn tree no task-local reaches.
-    // So its chain depth comes from the thread's registration rather than from
-    // the ambient scope. That survives a restart too: a session the recovery
-    // path respawns re-mints at the depth its re-queued entry registered.
-    let chain_depth =
-        crate::scheduler::user_tasks::chain_depth_for_thread(args.thread_id).unwrap_or_default();
-    // The trigger is `None` here, always, and stated rather than inherited.
-    // This spawn starts a coding-agent session, which is work a fire hands off
-    // and not the fire itself. A trigger waiting on the session it started must
-    // still be woken by it. The depth reaches it, the trigger does not: see
-    // ADR 0138 and ADR 0137.
-    for (key, value) in
-        crate::api::actor::subprocess_origin_env_vars(Some(args.thread_id), chain_depth, None)
-    {
+    for (key, value) in engine_credential_env(args.thread_id) {
         cmd.env(key, value);
     }
     // Read by `lucidos spawn-thread` to default `--caller-event-id` so
@@ -124,6 +112,43 @@ pub(super) fn apply_lucidos_env(
             }
         }
     }
+}
+
+/// The engine-owned secrets in an agent's env: the database handle and the
+/// origin attribution.
+fn engine_credential_env(thread_id: uuid::Uuid) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = crate::core::lucidos_database_url_env()
+        .into_iter()
+        .collect();
+    // A coding-agent session emits from a spawn tree no task-local reaches.
+    // So its chain depth comes from the thread's registration rather than from
+    // the ambient scope. That survives a restart too: a session the recovery
+    // path respawns re-mints at the depth its re-queued entry registered.
+    let chain_depth =
+        crate::scheduler::user_tasks::chain_depth_for_thread(thread_id).unwrap_or_default();
+    // The trigger is `None` here, always, and stated rather than inherited.
+    // This spawn starts a coding-agent session, which is work a fire hands off
+    // and not the fire itself. A trigger waiting on the session it started must
+    // still be woken by it. The depth reaches it, the trigger does not: see
+    // ADR 0138 and ADR 0137.
+    env.extend(
+        crate::api::actor::subprocess_origin_env_vars(Some(thread_id), chain_depth, None)
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value)),
+    );
+    env
+}
+
+/// The secret values a coding agent's session env holds, for masking its
+/// stored tool results: the user's own secret-shaped variables, the engine's
+/// credentials, and what the agent inherits from the engine.
+pub(crate) fn session_secret_values(
+    thread_id: uuid::Uuid,
+    user_env_vars: &[(String, String)],
+) -> Vec<String> {
+    let mut env = user_env_vars.to_vec();
+    env.extend(engine_credential_env(thread_id));
+    crate::core::subprocess_secret_values(&env, crate::core::inherited_secret_env())
 }
 
 /// The dirs to prepend to an agent child's PATH: the `lucidos` CLI dir first
@@ -397,6 +422,14 @@ pub(crate) fn terminate_child_process_group(pid: u32) {
     signal_child_process_group(pid, TERM_SIGNAL);
 }
 
+/// SIGUSR2 a child's whole process group, and return at once: the engine is
+/// going away and asks it to detach. Not SIGHUP, which a supervisor may have
+/// ignored for the whole tree, and bash cannot trap a signal ignored at start.
+/// Same reaping caveat as [`kill_child_process_group_now`].
+pub(crate) fn detach_child_process_group(pid: u32) {
+    signal_child_process_group(pid, DETACH_SIGNAL);
+}
+
 /// The process group `pid` belongs to, or `None` when the process is gone or
 /// the pid cannot be named. A read, never a signal.
 #[cfg(unix)]
@@ -422,6 +455,11 @@ const KILL_SIGNAL: i32 = 9;
 const TERM_SIGNAL: i32 = libc::SIGTERM;
 #[cfg(not(unix))]
 const TERM_SIGNAL: i32 = 15;
+/// `SIGUSR2`, named for the same reason.
+#[cfg(unix)]
+const DETACH_SIGNAL: i32 = libc::SIGUSR2;
+#[cfg(not(unix))]
+const DETACH_SIGNAL: i32 = 12;
 
 /// How much of a child's stderr a failure keeps: the last 4 KB.
 pub(crate) const STDERR_TAIL_BYTES: usize = 4096;
@@ -492,7 +530,7 @@ pub(crate) fn command_secret_values(cmd: &tokio::process::Command) -> Vec<String
         .get_envs()
         .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
         .collect();
-    crate::core::injected_secret_values(&env)
+    crate::core::subprocess_secret_values(&env, crate::core::inherited_secret_env())
 }
 
 /// Append `chunk` to `tail`, dropping the oldest bytes past the buffer cap.
@@ -516,8 +554,7 @@ fn tail_text(buffer: &[u8], secrets: &[String]) -> String {
         .position(|b| b & 0xC0 != 0x80)
         .unwrap_or(buffer.len());
     let text = String::from_utf8_lossy(&buffer[start..]);
-    let masked =
-        crate::core::redact_postgres_secrets(&crate::core::redact_secret_values(&text, secrets));
+    let masked = crate::core::redact_subprocess_output(&text, secrets);
     let mut cut = masked.len().saturating_sub(STDERR_TAIL_BYTES);
     while !masked.is_char_boundary(cut) {
         cut += 1;
@@ -556,6 +593,11 @@ pub(super) fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
 /// to the Apply rebuild and to terminals (ADR 0343).
 const AGENT_SCCACHE_PORT: &str = "4227";
 
+/// Size cap of the agents' cache. At sccache's default 10 GiB the cache turns
+/// over in under 12 hours, so a dependency built yesterday is built again today.
+/// The daemon reads this when it starts.
+const AGENT_SCCACHE_CACHE_SIZE: &str = "50G";
+
 /// Directory under [`crate::paths::user_cache_root`] holding the agents' cache.
 /// Two daemons never share one disk cache: sccache does not lock it.
 const AGENT_SCCACHE_DIR_NAME: &str = "sccache-agents";
@@ -580,6 +622,7 @@ pub(crate) fn agent_compile_env_from(
         let dir = root.join(AGENT_SCCACHE_DIR_NAME);
         env.push(("SCCACHE_SERVER_PORT", AGENT_SCCACHE_PORT.to_string()));
         env.push(("SCCACHE_DIR", dir.to_string_lossy().into_owned()));
+        env.push(("SCCACHE_CACHE_SIZE", AGENT_SCCACHE_CACHE_SIZE.to_string()));
     }
     env
 }
@@ -694,6 +737,30 @@ mod tests {
         assert!(!secrets.iter().any(|v| v == "visible-value"));
     }
 
+    /// What the session masks out of its tool results holds the agent's own
+    /// origin token and database handle, and a secret-shaped user variable.
+    #[test]
+    fn session_secret_values_cover_the_agent_credentials_and_user_secrets() {
+        crate::test_support::install_agent_database_url();
+        crate::api::actor::init_agent_origin_secret("spawn-env-test-secret".to_string());
+        let thread_id = uuid::Uuid::new_v4();
+        let user_env = vec![
+            ("GITHUB_TOKEN".to_string(), "user-row-gh-value".to_string()),
+            ("EDITOR".to_string(), "vim-but-long-enough".to_string()),
+        ];
+        let secrets = session_secret_values(thread_id, &user_env);
+        let token = crate::api::actor::subprocess_origin_env_vars(Some(thread_id), 0, None)
+            .into_iter()
+            .find(|(key, _)| *key == crate::api::actor::ENV_AGENT_ORIGIN_TOKEN)
+            .map(|(_, value)| value)
+            .expect("an origin token is minted");
+        assert!(secrets.contains(&token));
+        assert!(secrets.contains(&"user-row-gh-value".to_string()));
+        assert!(!secrets.contains(&"vim-but-long-enough".to_string()));
+        let (_, handle) = crate::core::lucidos_database_url_env().expect("a handle is installed");
+        assert!(secrets.contains(&handle));
+    }
+
     /// A child that writes far more than the pipe holds must not block, and the
     /// tail must end with its last words.
     #[cfg(unix)]
@@ -730,6 +797,7 @@ mod tests {
             workspace_path: workspace,
             allowed_tools: None,
             system_prompt: None,
+            session_context: None,
             resume_session_id: None,
             model: None,
             reasoning_effort: None,
@@ -743,6 +811,7 @@ mod tests {
             permission_mode: None,
             additional_directories: &[],
             auto_compact: None,
+            notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
             agent_run: AgentRun::unrecorded(),
         }
     }
@@ -770,6 +839,7 @@ mod tests {
     /// agent gets only the read-only handle (ADR 0481).
     #[test]
     fn an_agent_spawn_gets_the_read_only_handle_and_no_libpq_defaults() {
+        crate::test_support::install_agent_database_url();
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
         let mut cmd = tokio::process::Command::new("true");
@@ -941,6 +1011,7 @@ mod tests {
                     "SCCACHE_DIR",
                     "/tmp/cache/lucidos/sccache-agents".to_string()
                 ),
+                ("SCCACHE_CACHE_SIZE", "50G".to_string()),
             ],
         );
     }
@@ -1076,15 +1147,24 @@ mod tests {
 
     /// The renice must reach what the agent spawns, not just the agent: a
     /// `make lint` under a session is the load this exists for.
+    ///
+    /// The renice reaches processes present when it runs, and a fork in flight
+    /// at that instant keeps the old nice. The shell therefore waits for a line
+    /// on stdin, sent after the spawn returns, before it forks the grandchild.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_grandchild_runs_below_the_engine_too() {
+        use tokio::io::AsyncWriteExt;
+
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(["-c", "sleep 60 & echo $!; wait"])
+        cmd.args(["-c", "read _; sleep 60 & echo $!; wait"])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true);
         let mut child = spawn_below_engine(&mut cmd).expect("spawn");
         let pgid = child.id().expect("child has a pid");
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin.write_all(b"\n").await.expect("release the shell");
         let mut line = String::new();
         BufReader::new(child.stdout.take().expect("piped stdout"))
             .read_line(&mut line)

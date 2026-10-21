@@ -135,17 +135,21 @@ fn or_unknown_only_moves_the_unknown_arm() {
 
 /// Ties the pure classifier to the real timeout path: an unmeetable ceiling
 /// produces the `Err` that `classify_git_answer` maps to `Unknown`.
+///
+/// The command must outlast the ceiling by construction. A tiny ceiling alone
+/// is not enough: tokio's timer ticks in milliseconds, and a fast git can exit
+/// inside one tick. So the command is a shell alias that sleeps.
 #[tokio::test]
 async fn unmeetable_timeout_errors_and_classifies_unknown() {
     let (_tmp, repo) = make_test_repo().await;
     let result = git_cmd_env_timeout(
-        &["rev-parse", "--verify", "main"],
+        &["-c", "alias.hang=!sleep 5", "hang"],
         &repo,
         &[],
-        Duration::from_nanos(1),
+        Duration::from_millis(10),
     )
     .await;
-    let err = result.expect_err("a 1ns ceiling cannot be met by a process spawn");
+    let err = result.expect_err("a 10ms ceiling cannot be met by a 5s sleep");
     assert!(err.contains("timed out"), "unexpected error: {}", err);
     assert_eq!(classify(Err(err)), GitAnswer::Unknown);
 }

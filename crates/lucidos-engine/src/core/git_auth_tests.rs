@@ -10,24 +10,16 @@ const HTTPS: CredentialType = CredentialType::USER_PASS_PLAINTEXT;
 
 /// A store row, built by hand so a test can name one field at a time.
 fn credential(auth_type: AuthType, auth_value: &str) -> Credential {
-    let now = chrono::Utc::now();
-    Credential {
-        id: uuid::Uuid::new_v4(),
-        service_name: "example-git".to_string(),
-        base_urls: vec!["https://github.com".to_string()],
-        auth_type,
-        auth_value: auth_value.to_string(),
-        auth_header: "Authorization".to_string(),
-        env_var_name: None,
-        created_at: now,
-        updated_at: now,
-    }
+    let mut credential = Credential::fixture("example-git", auth_type, auth_value);
+    credential.base_urls = vec!["https://github.com".to_string()];
+    credential
 }
 
 /// The one entry a single-scope fixture reduces to, or `None` when its type
 /// carries nothing a clone can present.
 fn only_entry(credential: Credential) -> Option<StoredGitCredential> {
-    let mut entries = StoredGitCredential::entries_from_credential(credential);
+    let value = credential.stored_value().to_string();
+    let mut entries = StoredGitCredential::entries_from_credential(credential, &value);
     assert!(entries.len() <= 1, "the fixture declares one base URL");
     entries.pop()
 }
@@ -271,7 +263,10 @@ fn a_credential_declaring_two_hosts_is_offered_at_both_and_no_third() {
         "https://github.com".to_string(),
         "https://git.example.com".to_string(),
     ];
-    let credentials = resolved(StoredGitCredential::entries_from_credential(row));
+    let credentials = resolved(StoredGitCredential::entries_from_credential(
+        row,
+        "ghp-secret",
+    ));
 
     for host in ["https://github.com", "https://git.example.com"] {
         assert_eq!(

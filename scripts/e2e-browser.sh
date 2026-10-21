@@ -2,16 +2,20 @@
 # Run Playwright browser e2e tests against the e2e-test workspace.
 #
 # Usage:
-#   ./scripts/e2e-browser.sh [options] [-- playwright args]   # on GitHub's runners when it can, ADR 0386
+#   ./scripts/e2e-browser.sh [options] [-- playwright args]   # a whole suite on GitHub's runners, ADR 0386
+#   ./scripts/e2e-browser.sh -f <spec> [options]              # a filtered run on this host
 #   ./scripts/e2e-browser.sh --local [options]                # on this host
 #
 # Options:
 #   --local          Run on this host, not on GitHub. Local-only flags imply it.
+#   --github         Run on GitHub, even a filtered run.
 #   -h, --headed     Run with visible browser
-#   -f <file>        Run specific test file (e.g., chat.spec.ts)
+#   -f <file>        Run specific test file (e.g., chat.spec.ts). Repeats: each
+#                    -f adds one file to the run.
 #   --no-reset       Skip DB reset AND leave the workspace running for the next
 #                    invocation. Use for fast iteration on a single spec.
-#   --webkit         Run mobile tests on WebKit (iOS Safari engine)
+#   --webkit         Run mobile tests on WebKit (iOS Safari engine). A local
+#                    filtered run needs it to run mobile-webkit at all.
 #   --no-webkit      Run every browser project EXCEPT mobile-webkit
 #   --ios            Launch iOS Simulator with Safari (requires Xcode)
 #   --               Everything after this is passed to Playwright
@@ -23,6 +27,12 @@
 #   ./scripts/e2e-browser.sh --webkit                  # WebKit mobile tests
 #   ./scripts/e2e-browser.sh --no-webkit               # The cheap projects only
 #   ./scripts/e2e-browser.sh --ios                     # iOS Simulator
+#
+# A local filtered run is lean (ADR 0536). It builds a debug engine, which
+# compiles incrementally, and skips mobile-webkit. It takes a free e2e slot
+# rather than the whole lock, so two worktrees can run side by side.
+# `--webkit` or a Playwright `--project` keeps mobile-webkit, on the release
+# engine, and takes every slot.
 #
 # Environment:
 #   LUCIDOS_E2E_WEBKIT_CHUNK    specs per fresh-browser chunk (default 3)
@@ -45,9 +55,11 @@ set -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 source "$SCRIPT_DIR/lib/e2e.sh"
+# shellcheck source=scripts/lib/e2e_warm.sh
+source "$SCRIPT_DIR/lib/e2e_warm.sh"
 
 HEADED=""
-TEST_FILE=""
+TEST_FILES=()
 NO_RESET=""
 USE_WEBKIT=""
 SKIP_WEBKIT=""
@@ -58,7 +70,7 @@ PW_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--headed) HEADED=1; shift ;;
-        -f) TEST_FILE="$2"; shift 2 ;;
+        -f) TEST_FILES+=("$2"); shift 2 ;;
         --no-reset) NO_RESET=1; shift ;;
         --webkit) USE_WEBKIT=1; shift ;;
         --no-webkit) SKIP_WEBKIT=1; shift ;;
@@ -84,7 +96,7 @@ fi
 # Named in this hold's E2ELockAcquired, so a memory snapshot can tell a WebKit
 # hold from a Chromium one. Ignored under the umbrella, which holds the lock.
 # shellcheck disable=SC2034 # read by _e2e_announce_lock_acquired in scripts/lib/e2e_lock.sh
-E2E_LOCK_PROJECTS="$(e2e_browser_lock_projects "$USE_WEBKIT" "$SKIP_WEBKIT" "$TEST_FILE" \
+E2E_LOCK_PROJECTS="$(e2e_browser_lock_projects "$USE_WEBKIT" "$SKIP_WEBKIT" "${TEST_FILES[*]-}" \
     ${PW_ARGS[@]+"${PW_ARGS[@]}"})"
 setup_e2e_session e2e-browser --cleanup-worktrees-on-teardown
 
@@ -105,19 +117,26 @@ echo "Running browser e2e tests (port $VITE_PORT)"
 
 cd "$PROJECT_DIR/crates/lucidos-app"
 
-# Strict, deterministic install from the committed root lockfile (npm workspaces
-# hoists to the root, so run ci there; subshell keeps cwd at the app dir for
-# Playwright below).
-( cd "$PROJECT_DIR" && npm ci )
+# `npm ci` from the committed root lockfile, skipped when the installed tree's
+# fingerprint already matches it (ensure_npm_deps).
+ensure_npm_deps "$PROJECT_DIR" "workspace dependencies"
 
-# Every Playwright on the host shares one browsers cache, and any `playwright
+# A GitHub shard installed its one browser and the system packages in the
+# background (e2e-github-shard.sh warm), so it waits for them here.
+#
+# Every Playwright on this host shares one browsers cache, and any `playwright
 # install` deletes the builds no live install still registers. Ours registers a
 # worktree path that is later removed, so a foreign install (a workspace Python
 # venv, say) can take our browsers with it. Installing here is a no-op when the
 # build is present, and restores it when it is not.
-PW_BROWSERS=(chromium)
-[ -n "$SKIP_WEBKIT" ] || PW_BROWSERS+=(webkit)
-npx playwright install "${PW_BROWSERS[@]}"
+if e2e_warm_active; then
+    # shellcheck disable=SC2119 # no names means every started task
+    e2e_warm_wait
+else
+    PW_BROWSERS=(chromium)
+    [ -n "$SKIP_WEBKIT" ] || PW_BROWSERS+=(webkit)
+    npx playwright install "${PW_BROWSERS[@]}"
+fi
 
 export E2E_WORKSPACE
 [ -n "$HEADED" ] && export HEADED=1
@@ -236,7 +255,9 @@ CMD=(npx playwright test)
 # as a filename. A bare basename drags in every sibling whose path contains it,
 # so `-f chat.spec.ts` also ran app-coding-agent-spawn-from-chat.spec.ts. See
 # playwright_file_filter in scripts/lib/e2e.sh.
-[ -n "$TEST_FILE" ] && CMD+=("$(playwright_file_filter "$TEST_FILE")")
+for spec_file in ${TEST_FILES[@]+"${TEST_FILES[@]}"}; do
+    CMD+=("$(playwright_file_filter "$spec_file")")
+done
 [ ${#PW_ARGS[@]} -gt 0 ] && CMD+=("${PW_ARGS[@]}")
 
 # Detect whether the caller already pinned a project (via --webkit or `-- --project=`).
@@ -263,7 +284,7 @@ done
 # own subdir under it (set_output_dir) — nothing is wiped mid-run. (These are Playwright's
 # "output artifacts", NOT Lucidos *artifacts* — they're ephemeral, gitignored test
 # output, so the naming here stays on `output` to keep the glossary term clean.)
-if [ -n "$TEST_FILE" ] || [ "${#PW_ARGS[@]}" -gt 0 ]; then
+if [ "${#TEST_FILES[@]}" -gt 0 ] || [ "${#PW_ARGS[@]}" -gt 0 ]; then
     # Targeted repro: clear only its own corner, so a preceding full run's evidence
     # — usually the very thing you're reproducing against — stays intact.
     PW_OUTPUT_ROOT="test-results/targeted"
@@ -562,7 +583,7 @@ webkit_chunk_size() {
 # window rather than ahead of it. That cost is accepted: the split was only ever
 # recovery-frequency reduction rather than a cure, and nav keeps its real
 # defences, which are the context preflight in e2e/fixtures.ts, gotoWithRetry and
-# retries:1. The documented drafts.spec.ts:65 window is NOT evidence against the
+# retries:1. The documented drafts-all.spec.ts:65 window is NOT evidence against the
 # reversal, because both its leak source and its victim are nav specs.
 #
 # CC specs are auto-detected by helper usage (pickComposeDestination, the compose
@@ -755,7 +776,7 @@ _run_browser_project_body() {
     # the whole spec list would OR the filter away (Playwright unions positional
     # filters), running the entire suite instead of the requested subset. Targeted
     # runs fall through to the single-pass call below.
-    if [ "$project" = "mobile-webkit" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
+    if [ "$project" = "mobile-webkit" ] && [ "${#TEST_FILES[@]}" -eq 0 ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
         # WHICH PHASES THIS RUN IS FOR. `both` is the whole project, and the two
         # narrowings exist for one job each: `nav` discharges a nav tail without
         # paying for the CC phase, which three separate measurements put at 93 to
@@ -767,12 +788,10 @@ _run_browser_project_body() {
         for f in e2e/*.spec.ts; do
             [ -e "$f" ] || continue
             base="$(basename "$f")"
-            # Skip *-desktop.spec.ts: the mobile-webkit project testIgnores them
-            # (playwright.config.ts), so they run zero tests here. Including them
-            # was harmless in the single-pass run, but a SHARD landing entirely on
-            # ignored files would make `playwright test` exit "no tests found" (rc 1)
-            # and fail the chunk spuriously. Excluding them keeps every chunk real.
-            case "$base" in *-desktop.spec.ts) continue ;; esac
+            # Skip what the project ignores (project_runs_spec). A SHARD landing
+            # entirely on ignored files would make `playwright test` exit "no
+            # tests found" (rc 1) and fail the chunk spuriously.
+            project_runs_spec "$project" "$base" || continue
             if e2e_spec_spawns_claude_code "$f"; then
                 cc_specs+=("$base")
             else
@@ -860,7 +879,7 @@ _run_browser_project_body() {
     return "$rc"
 }
 
-if [ -n "$USE_WEBKIT" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
+if [ -n "$USE_WEBKIT" ] && [ "${#TEST_FILES[@]}" -eq 0 ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
     # `--webkit` with no filter: route through run_browser_project so a manual
     # webkit run gets the SAME sharding/phase-split as the nightly full run (and so
     # the sharding is validatable in isolation). A filtered `--webkit -f X` (or any
@@ -919,13 +938,13 @@ else
 $(e2e_browser_projects ${SKIP_WEBKIT:+--no-webkit})
 EOF
     # A targeted spec runs only on the projects that do not testIgnore it.
-    if [ -n "$TEST_FILE" ]; then
+    if [ "${#TEST_FILES[@]}" -gt 0 ]; then
         RUNS_SPEC=()
         for project in "${PROJECTS[@]}"; do
-            if project_runs_spec "$project" "$TEST_FILE"; then
+            if project_runs_any_spec "$project" "${TEST_FILES[@]}"; then
                 RUNS_SPEC+=("$project")
             else
-                echo "[e2e] $project ignores $TEST_FILE (playwright.config.ts testIgnore), so it does not run."
+                echo "[e2e] $project ignores ${TEST_FILES[*]} (playwright.config.ts testIgnore), so it does not run."
             fi
         done
         PROJECTS=("${RUNS_SPEC[@]}")

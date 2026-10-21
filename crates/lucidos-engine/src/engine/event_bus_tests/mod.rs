@@ -533,6 +533,7 @@ mod proposed_apply_cycle;
 mod read_request;
 mod recovery_and_pipeline;
 mod recursion_guard;
+mod redirect_status;
 mod repo_names_projection;
 mod review_presence_status;
 mod section_review;

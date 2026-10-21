@@ -2,19 +2,17 @@
 //!
 //! Claude Code answers an `initialize` control request with the models its own
 //! `/model` picker offers, for the account, provider and model pins it runs
-//! under. The engine asks it (`claude_code::probe_cc_models`), keeps only that
-//! list, and serves it as the picker. `cc_menu_options.json` is the fallback
-//! until the first probe succeeds, and the context-window overlay.
-//!
-//! The picker is exactly the discovered list, so a model Claude Code does not
-//! list is not offered. See ADR 0325 for that choice and what it costs.
+//! under. The engine asks it (`claude_code::probe_cc_models`) and offers its
+//! rows first. The offered curated rows of `cc_menu_options.json` follow, for a
+//! model Claude Code accepts but did not list. The curated file is also the
+//! fallback until the first probe succeeds, and the context-window overlay.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 
-use super::claude_code::CcMenuOption;
+use super::claude_code::{offered_cc_model_options, CcMenuOption};
 
 /// How long a discovered list stays fresh when nothing else says it moved.
 pub const CACHE_TTL: chrono::Duration = chrono::Duration::hours(24);
@@ -133,6 +131,7 @@ pub fn menu_options(models: &[DiscoveredModel]) -> Vec<CcMenuOption> {
             supported_models: None,
             context_window: None,
             reasoning_efforts: m.reasoning_efforts(),
+            offered: true,
         })
         .collect()
 }
@@ -193,14 +192,16 @@ fn write() -> std::sync::RwLockWriteGuard<'static, Discovery> {
     DISCOVERY.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The discovered picker rows, or `None` until a probe has succeeded.
-pub fn discovered_options() -> Option<Arc<[CcMenuOption]>> {
+/// The offered rows after a successful probe: Claude Code's list, then the
+/// curated rows it omitted. `None` until a probe has succeeded.
+pub fn offered_options() -> Option<Arc<[CcMenuOption]>> {
     read().options.clone()
 }
 
-/// Make `cache` the picker. Clears any earlier probe error.
+/// Make `cache` the discovered half of the offered list. Clears any earlier
+/// probe error.
 pub fn install(cache: CcModelCache) {
-    let options: Arc<[CcMenuOption]> = menu_options(&cache.models).into();
+    let options = offered_cc_model_options(Some(&menu_options(&cache.models)));
     let mut state = write();
     state.options = Some(options);
     state.cache = Some(cache);

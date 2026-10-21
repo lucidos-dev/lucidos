@@ -132,11 +132,18 @@ pub(crate) const BUILTIN_PROXIES: [BuiltinProxy; 7] = [
 /// lists, so a new provider cannot be forgotten.
 ///
 /// `opencode-free` is out by ADR 0104: nothing may build on an anonymous
-/// endpoint that can vanish without notice.
-pub(crate) const PROVIDERS_WITHOUT_PROXY: [(&str, &str); 1] = [(
-    "opencode-free",
-    "the keyless free tier serves chat only (ADR 0104)",
-)];
+/// endpoint that can vanish without notice. `claude-gateway` is out because
+/// its sign-in is the user's own, granted for chat, and no app may spend it.
+pub(crate) const PROVIDERS_WITHOUT_PROXY: [(&str, &str); 2] = [
+    (
+        "opencode-free",
+        "the keyless free tier serves chat only (ADR 0104)",
+    ),
+    (
+        "claude-gateway",
+        "the Claude gateway sign-in serves chat only",
+    ),
+];
 
 /// A service name with case and separators removed, so `Open-AI`, `open_ai`
 /// and `openai` compare equal.
@@ -321,14 +328,18 @@ fn pinned(what: &str, base_url: &str) -> ScopeBinding {
     }
 }
 
-/// Fetch a stored credential as `(auth_type, auth_value)`. Missing → `None`; a
-/// DB read error is a 500 (not a silent skip).
+/// Fetch a stored credential as `(auth_type, secret)`, or `None` when it is
+/// missing. A DB read error is a 500, not a silent skip. A *secret reference*
+/// that cannot be read is a 502 naming the credential.
 async fn credential_pair(
     pool: &sqlx::PgPool,
     name: &str,
 ) -> Result<Option<(AuthType, String)>, (StatusCode, String)> {
     match CredentialStore::get(pool, name).await {
-        Ok(Some(c)) => Ok(Some((c.auth_type, c.auth_value))),
+        Ok(Some(c)) => match c.secret(pool).await {
+            Ok(secret) => Ok(Some((c.auth_type, secret))),
+            Err(reason) => Err((StatusCode::BAD_GATEWAY, reason)),
+        },
         Ok(None) => Ok(None),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

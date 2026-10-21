@@ -214,7 +214,8 @@ async fn create_webhook(
     let pending = match (body.signing_secret, credential.as_deref()) {
         (Some(secret), Some(name)) => {
             let existing = saved_credential(&state, name).await?;
-            Some(check_signing_secret(secret, name, existing.as_ref(), None)?)
+            let pending = check_signing_secret(secret, name, existing.as_ref(), None)?;
+            Some(pending.resolvable(&state.pool, existing.as_ref()).await?)
         }
         _ => None,
     };
@@ -303,6 +304,20 @@ fn check_signing_secret(
 }
 
 impl PendingSecret {
+    /// Refuse a pasted *secret reference* that does not resolve now, before
+    /// the hook is written, so no hook lands verifying against nothing.
+    async fn resolvable(
+        self,
+        pool: &sqlx::PgPool,
+        existing: Option<&Credential>,
+    ) -> Result<Self, ApiError> {
+        let auth_type = existing.map_or(AuthType::Secret, |c| c.auth_type);
+        crate::core::credentials::check_secret_references(pool, auth_type, &self.value)
+            .await
+            .map_err(ApiError::bad_request)?;
+        Ok(self)
+    }
+
     /// Save the secret, and return it when we minted it.
     ///
     /// **Called only after the webhook write succeeded.** The two rows are not
@@ -574,12 +589,8 @@ async fn update_webhook(
                 .as_ref()
                 .and_then(|h| h.hmac.as_ref())
                 .map(|h| &*h.credential);
-            Some(check_signing_secret(
-                secret,
-                name,
-                existing.as_ref(),
-                may_replace,
-            )?)
+            let pending = check_signing_secret(secret, name, existing.as_ref(), may_replace)?;
+            Some(pending.resolvable(&state.pool, existing.as_ref()).await?)
         }
         None => {
             // No secret came with it, so a new config must already have one.
@@ -703,17 +714,27 @@ async fn stamp_accepted(state: &AppState, hook: &Webhook) {
 /// signs nothing or its credential is gone.
 ///
 /// A failed read is an `Err`, never `None`. `webhooks::verify` reads `None` as
-/// a missing credential and refuses the delivery for it.
+/// a missing credential and refuses the delivery for it. The `Err` carries
+/// the status to answer: a 500 for the database, a 503 for a *secret
+/// reference* that cannot be read now, so the sender retries.
 async fn signing_secret(
     pool: &sqlx::PgPool,
     hmac: Option<&HmacConfig>,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, (StatusCode, String)> {
     let Some(cfg) = hmac else {
         return Ok(None);
     };
-    Ok(CredentialStore::get(pool, &cfg.credential)
-        .await?
-        .map(|c| c.auth_value))
+    let credential = CredentialStore::get(pool, &cfg.credential)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match credential {
+        None => Ok(None),
+        Some(credential) => credential
+            .secret(pool)
+            .await
+            .map(Some)
+            .map_err(|reason| (StatusCode::SERVICE_UNAVAILABLE, reason)),
+    }
 }
 
 /// `POST /api/v1/webhooks/:id/deliver`: verify a delivery, then emit its event.
@@ -771,13 +792,18 @@ async fn deliver(
         Ok(secret) => secret,
         // Unknown, so not stamped: a refusal would tell the page the
         // credential is missing and send the sender a 401 it must not retry.
-        Err(e) => {
-            crate::log!("[Webhook] '{}' credential lookup failed: {e}", hook.name);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
-                .into_response();
+        // Never accepted unsigned either way.
+        Err((status, reason)) => {
+            crate::log!(
+                "[Webhook] '{}' credential lookup failed: {reason}",
+                hook.name
+            );
+            let error = if status == StatusCode::SERVICE_UNAVAILABLE {
+                "the signing secret cannot be read right now"
+            } else {
+                "internal error"
+            };
+            return (status, Json(serde_json::json!({ "error": error }))).into_response();
         }
     };
 
@@ -1167,6 +1193,30 @@ mod tests {
         );
     }
 
+    /// A signing secret held in 1Password that cannot be read now never lets
+    /// a delivery through unsigned. It answers 503, so the sender retries.
+    #[tokio::test]
+    async fn an_unreadable_signing_reference_answers_503() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        crate::test_support::seed_credential(
+            &pool,
+            "example-repo-webhook",
+            "",
+            AuthType::Secret,
+            &format!("op://Engineering/hook-{}/secret", Uuid::new_v4().simple()),
+        )
+        .await;
+
+        let (status, reason) = signing_secret(&pool, Some(&hmac_signed_with("X-Signature")))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reason}");
+        assert!(reason.contains("example-repo-webhook"), "{reason}");
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
     #[test]
     fn a_senders_own_fields_land_under_payload() {
         let payload = delivery_payload(r#"{"action":"opened","number":7}"#, "github", no_headers());
@@ -1326,17 +1376,9 @@ mod tests {
     }
 
     fn saved_as(name: &str, auth_type: AuthType) -> Credential {
-        Credential {
-            id: Uuid::new_v4(),
-            service_name: name.into(),
-            base_urls: vec!["https://api.example.com".into()],
-            auth_type,
-            auth_value: "the-users-live-api-key".into(),
-            auth_header: "Authorization".into(),
-            env_var_name: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        }
+        let mut credential = Credential::fixture(name, auth_type, "the-users-live-api-key");
+        credential.base_urls = vec!["https://api.example.com".into()];
+        credential
     }
 
     /// A signing secret may write a name nothing holds, or rotate the hook's

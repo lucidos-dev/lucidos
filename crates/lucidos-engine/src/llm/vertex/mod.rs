@@ -83,6 +83,9 @@ pub fn vertex_host(location: &str) -> String {
     }
 }
 
+/// The model Google Search grounding runs on, for the provider and the request.
+pub const GROUNDING_MODEL: &str = "gemini-3.1-flash-lite";
+
 /// The global Vertex AI host, which a regional host carries as its suffix.
 const VERTEX_GLOBAL_HOST: &str = "aiplatform.googleapis.com";
 /// What a multi-region Vertex AI host ends with.
@@ -884,8 +887,8 @@ mod tests {
     /// the workspace is pinned to.
     ///
     /// Regression for the 2026-07-03 break: `search_with_grounding` routed its
-    /// `gemini-2.5-flash-lite` call through `endpoint_for_model`, which sends
-    /// any non-`gemini-3*` model to the configured *chat* region. A workspace on
+    /// Gemini 2.5 call through `endpoint_for_model`, which sends any
+    /// non-`gemini-3*` model to the configured *chat* region. A workspace on
     /// `vertex_region = eu` (the correct setting to reach Claude Opus 5 there)
     /// therefore asked a multi-region that publishes no Google models for a
     /// Gemini one, and every search 404'd with `Publisher model
@@ -901,9 +904,11 @@ mod tests {
                 VertexProvider::new("my-project".into(), region.into(), "claude-opus-5".into())
                     .unwrap();
             assert_eq!(
-                provider.global_gemini_endpoint("gemini-2.5-flash-lite"),
-                "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global\
-                 /publishers/google/models/gemini-2.5-flash-lite:generateContent",
+                provider.global_gemini_endpoint(GROUNDING_MODEL),
+                format!(
+                    "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global\
+                     /publishers/google/models/{GROUNDING_MODEL}:generateContent"
+                ),
                 "grounding must ignore the configured region, got region={region}"
             );
         }

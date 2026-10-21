@@ -1,6 +1,8 @@
 pub mod crypto;
 pub mod dropbox;
 pub mod google_drive;
+pub mod key;
+pub mod recipient;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -612,19 +614,21 @@ pub trait BackupProvider: Send + Sync {
     async fn delete(&self, backup_id: &str) -> Result<(), BoxError>;
 }
 
-/// Returns the path to the backup encryption key file for a workspace.
-pub fn key_file_path(workspace: &Path) -> PathBuf {
-    workspace.join(".lucidos").join("backup.key")
-}
+/// The archive entry holding the secret store key the dump's secrets are
+/// sealed with. Restore files it into the key store and never into the
+/// workspace directory.
+pub const SECRET_STORE_KEY_ENTRY: &str = "secret-store.key";
 
-/// A backup archive's filename is `{ARCHIVE_PREFIX}{name}-{timestamp}{ARCHIVE_SUFFIX}`.
-/// The gateway's `registry::parse_workspace_name_from_archive` spells the same
-/// shape and cannot import these.
+/// A backup archive's filename is `{ARCHIVE_PREFIX}{name}-{timestamp}{suffix}`,
+/// where the suffix names the format: `.age` for an archive sealed to the
+/// backup recipient, `.enc` for a legacy one. The gateway's
+/// `registry::parse_workspace_name_from_archive` spells the same shape and
+/// cannot import these.
 const ARCHIVE_PREFIX: &str = "lucidos-backup-";
-const ARCHIVE_SUFFIX: &str = ".enc";
+const ARCHIVE_SUFFIXES: [&str; 2] = [crypto::AGE_SUFFIX, crypto::LEGACY_SUFFIX];
 
 /// The workspace directory name used in backup archive filenames
-/// (`lucidos-backup-{name}-{timestamp}.enc`). Falls back to `"workspace"` when
+/// (`lucidos-backup-{name}-{timestamp}.age`). Falls back to `"workspace"` when
 /// the path has no final component. The upload path and the prune matcher both
 /// derive the name from here, so they can never disagree on which archives are
 /// "this workspace's".
@@ -636,7 +640,8 @@ pub fn workspace_archive_name(workspace: &Path) -> &str {
 }
 
 /// Parse the workspace name a backup archive was produced for, from its
-/// filename. `create_backup` stamps `lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.enc`
+/// filename. `create_backup` stamps `lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.age`
+/// (`.enc` for a legacy archive)
 /// (see [`workspace_archive_name`]); this is the inverse, used by the gateway
 /// picker to derive a default workspace name for a restore. The `{name}` may
 /// itself contain hyphens (`e2e-test`), so we strip the fixed prefix/suffix and
@@ -644,9 +649,10 @@ pub fn workspace_archive_name(workspace: &Path) -> &str {
 /// [`is_backup_timestamp`]). Returns `None` for anything not in that exact shape
 /// — the caller then asks the user for a name.
 pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
-    let rest = filename
-        .strip_prefix(ARCHIVE_PREFIX)?
-        .strip_suffix(ARCHIVE_SUFFIX)?;
+    let rest = filename.strip_prefix(ARCHIVE_PREFIX)?;
+    let rest = ARCHIVE_SUFFIXES
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))?;
     // Split off the trailing `-HHMMSS`, then the `-YYYYMMDD` before it; whatever
     // remains is the workspace name. Both halves must be timestamp-shaped.
     let (before_time, time) = rest.rsplit_once('-')?;
@@ -677,7 +683,7 @@ pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
 pub async fn restore_archive_into(
     workspace_dir: &Path,
     database_url: &str,
-    key: &[u8],
+    key: crypto::OpeningKey,
     encrypted_path: &Path,
     progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
 ) -> Result<(), BoxError> {
@@ -695,13 +701,13 @@ pub async fn restore_archive_into(
 
     // Phases 1-2: decrypt + decompress/untar into staging, then drop user_dir/
     // (blocking I/O on the blocking pool).
-    let staging_dir = {
+    let (staging_dir, secret_key) = {
         let progress = progress.clone();
         let encrypted_path = encrypted_path.to_path_buf();
-        let key = key.to_vec();
         let temp_path = temp_dir.path().to_path_buf();
 
-        tokio::task::spawn_blocking(move || -> Result<PathBuf, BoxError> {
+        type Staged = (PathBuf, Option<crate::core::secret_store::SecretKey>);
+        tokio::task::spawn_blocking(move || -> Result<Staged, BoxError> {
             // Phase 1: decrypt
             progress("decrypting", 0, 100);
             let compressed_path = temp_path.join("backup.tar.zst");
@@ -723,7 +729,7 @@ pub async fn restore_archive_into(
                     },
                 };
                 let mut output = std::fs::File::create(&compressed_path)?;
-                crypto::decrypt(&key, reader, &mut output)?;
+                crypto::open(&key, reader, &mut output)?;
             }
 
             // Phase 2: decompress + untar into staging
@@ -746,7 +752,19 @@ pub async fn restore_archive_into(
                 std::fs::remove_dir_all(&user_dir_staging)?;
             }
 
-            Ok(staging_dir)
+            // The secret store key goes to the key store, never into the
+            // workspace directory. An archive from before ADR 0509 has none.
+            let key_entry = staging_dir.join(SECRET_STORE_KEY_ENTRY);
+            let secret_key = match std::fs::read_to_string(&key_entry) {
+                Ok(text) => {
+                    std::fs::remove_file(&key_entry)?;
+                    Some(crate::core::secret_store::SecretKey::from_base64(&text)?)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+
+            Ok((staging_dir, secret_key))
         })
         .await??
     };
@@ -789,20 +807,37 @@ pub async fn restore_archive_into(
         .await??;
     }
 
+    // The restored secrets open only with the key they were sealed with.
+    // Failing here leaves a database that would refuse to boot, so say so now.
+    if let Some(key) = secret_key {
+        use crate::core::secret_store::key_store;
+        let database = crate::core::secret_store::boot::database_name(database_url)?;
+        let store = key_store::resolve()?;
+        let name = key_store::secrets_key_name(&database);
+        if let Some(parked) = key_store::replace_keeping(store.as_ref(), &name, &key)? {
+            log!(
+                "[Restore] Kept the secret store key the restore replaced as {}",
+                store.describe(&parked)
+            );
+        }
+    }
+
     progress("done", 100, 100);
     Ok(())
 }
 
 /// Create an encrypted backup of a workspace and its database.
 ///
-/// Pipeline: pg_dump -> tar (exclude .lucidos/) -> zstd compress -> AES-256-GCM encrypt -> upload
+/// Pipeline: pg_dump -> tar (exclude .lucidos/) -> zstd compress -> seal -> upload.
+/// `key` seals the archive: the backup recipient, or a legacy key until the
+/// switch.
 ///
 /// Phases 1-3 (pg_dump, compress, encrypt) run in `spawn_blocking` so they don't
 /// starve the tokio runtime — this ensures SSE progress events reach the client.
 pub async fn create_backup(
     workspace: &Path,
     database_url: &str,
-    key: &[u8],
+    key: crypto::SealingKey,
     provider: &dyn BackupProvider,
     progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
 ) -> Result<BackupEntry, BoxError> {
@@ -835,12 +870,12 @@ pub async fn create_backup(
     let temp_dir = tempfile::tempdir()?;
     let progress = Arc::new(progress);
 
+    let suffix = key.archive_suffix();
     // Phases 1-3: blocking I/O — run on the blocking thread pool
     let (encrypted_path, encrypt_end) = {
         let progress = progress.clone();
         let workspace = workspace.to_path_buf();
         let database_url = database_url.to_string();
-        let key = key.to_vec();
         let temp_path = temp_dir.path().to_path_buf();
 
         tokio::task::spawn_blocking(move || -> Result<(PathBuf, usize), BoxError> {
@@ -858,17 +893,30 @@ pub async fn create_backup(
             progress("dumping_db", 1, 100);
             let dump_path = temp_path.join("lucidos_backup.dump");
             pg_dump(&database_url, &dump_path)?;
+            // The dump holds sealed secrets, so the archive carries their key
+            // beside it, inside the same encryption (ADR 0509).
+            let secret_key_path = temp_path.join(SECRET_STORE_KEY_ENTRY);
+            lucidos_local_token::write_owner_only(
+                &secret_key_path,
+                &crate::core::secret_store::key()?.to_base64(),
+            )?;
 
             // Phase 2: tar + zstd compress (dump_end% → compress_end%)
             crate::log!("[Backup] Phase 2/4: tar + zstd compress");
             progress("compressing", dump_end, 100);
             let compressed_path = temp_path.join("backup.tar.zst");
-            tar_and_compress(&workspace, &dump_path, &compressed_path, &ignore)?;
+            tar_and_compress(
+                &workspace,
+                &dump_path,
+                &secret_key_path,
+                &compressed_path,
+                &ignore,
+            )?;
 
             // Phase 3: encrypt with per-chunk progress (compress_end% → encrypt_end%)
             crate::log!("[Backup] Phase 3/4: encrypt");
             progress("encrypting", compress_end, 100);
-            let encrypted_path = temp_path.join("backup.enc");
+            let encrypted_path = temp_path.join(format!("backup{suffix}"));
             {
                 let total_bytes = std::fs::metadata(&compressed_path)?.len();
                 let encrypt_range = encrypt_end - compress_end;
@@ -889,7 +937,7 @@ pub async fn create_backup(
                     },
                 };
                 let mut output = std::fs::File::create(&encrypted_path)?;
-                crypto::encrypt(&key, reader, &mut output)?;
+                crypto::seal(&key, reader, &mut output)?;
             }
 
             Ok((encrypted_path, encrypt_end))
@@ -902,7 +950,7 @@ pub async fn create_backup(
     progress("uploading", encrypt_end, 100);
     let workspace_name = workspace_archive_name(workspace);
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-    let filename = format!("{ARCHIVE_PREFIX}{workspace_name}-{timestamp}{ARCHIVE_SUFFIX}");
+    let filename = format!("{ARCHIVE_PREFIX}{workspace_name}-{timestamp}{suffix}");
 
     let upload_progress = |done: u64, total: u64| {
         let pct = if total > 0 {
@@ -945,8 +993,8 @@ fn is_backup_timestamp(s: &str) -> bool {
 }
 
 /// True when `filename` is an encrypted backup archive produced by THIS
-/// workspace. It must match `lucidos-backup-{workspace_name}-{timestamp}.enc`
-/// exactly, timestamp shape included. This is the guard that keeps pruning off
+/// workspace. It must match `lucidos-backup-{workspace_name}-{timestamp}` and
+/// an archive suffix exactly, timestamp shape included. This is the guard that keeps pruning off
 /// another workspace's archives, and off any unrelated file in the shared
 /// folder.
 pub(crate) fn is_own_backup_archive(filename: &str, workspace_name: &str) -> bool {
@@ -981,7 +1029,7 @@ fn select_prunable(
 /// newest `keep`.
 ///
 /// Lists everything in the provider's shared backup folder, narrows to THIS
-/// workspace's `lucidos-backup-{workspace_name}-*.enc` archives, then deletes
+/// workspace's `lucidos-backup-{workspace_name}-*` archives, then deletes
 /// oldest-first. Another workspace's backups and any unrelated file in the
 /// folder are never touched (see [`select_prunable`]). Returns the number of
 /// backups deleted. A single delete failure is logged and skipped rather than
@@ -1185,7 +1233,10 @@ fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(
 /// if the binary is missing. Make the bundled libpq loadable via
 /// `DYLD_LIBRARY_PATH` or `LD_LIBRARY_PATH` from `LUCIDOS_PG_LIB_DIR`. In dev
 /// neither var is set and we fall back to a bare PATH lookup.
-fn pg_tool_command(name: &str, database_url: &str) -> Result<std::process::Command, BoxError> {
+pub(crate) fn pg_tool_command(
+    name: &str,
+    database_url: &str,
+) -> Result<std::process::Command, BoxError> {
     let bin_dir = std::env::var_os("LUCIDOS_PG_BIN_DIR").map(PathBuf::from);
     let bin = resolve_pg_tool_path(name, bin_dir.as_deref())?;
     let mut cmd = std::process::Command::new(bin);
@@ -1729,6 +1780,7 @@ fn append_file<W: std::io::Write>(
 fn tar_and_compress(
     workspace: &Path,
     sql_dump: &Path,
+    secret_key: &Path,
     output: &Path,
     ignore: &BackupIgnore,
 ) -> Result<(), BoxError> {
@@ -1758,6 +1810,7 @@ fn tar_and_compress(
     // dump is an error: the backup is worthless without it.
     std::fs::metadata(sql_dump)?;
     append_file(&mut builder, sql_dump, Path::new("lucidos_backup.dump"))?;
+    append_file(&mut builder, secret_key, Path::new(SECRET_STORE_KEY_ENTRY))?;
 
     let encoder = builder.into_inner()?;
     encoder.finish()?;

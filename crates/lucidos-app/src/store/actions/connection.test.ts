@@ -3,6 +3,7 @@ import { panelOverlay, activeInlineForm, connectionStatus, focusedThreadId, thre
 import type { CredentialRequest, EmailConfirmRequest } from '../types';
 import { makeThreadState } from './threads-test-helpers';
 import { ApiError } from '../../api/client';
+import { gapRefreshedVersion } from '../eventGap';
 
 // Mock all external dependencies so handleResume can run in isolation.
 vi.mock('../../api/client', async (importActual) => ({
@@ -18,7 +19,7 @@ vi.mock('../../api/client', async (importActual) => ({
 }));
 vi.mock('./thread-sync', () => ({
   connectThreadEvents: vi.fn(),
-  disconnectThreadEvents: vi.fn(),
+  reviveThreadEvents: vi.fn(),
 }));
 vi.mock('./thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),
@@ -49,6 +50,7 @@ vi.mock('./releaseNotices', () => ({
 
 // Import after mocks are set up
 const { handleResume } = await import('./connection');
+const { reviveThreadEvents } = await import('./thread-sync');
 const { loadPreferences } = await import('./preferences');
 const { loadReleaseNotices } = await import('./releaseNotices');
 
@@ -142,6 +144,37 @@ describe('handleResume reloads preferences', () => {
     await handleResume();
 
     expect(loadPreferences).toHaveBeenCalled();
+  });
+});
+
+/**
+ * A resume fires on every window focus, beside the click that raised the window.
+ * Cutting a live stream there drops the frame that click caused, such as an
+ * app's navigate. The resume asks `reviveThreadEvents`, which decides.
+ */
+describe('handleResume keeps the event stream', () => {
+  it('revives the stream instead of tearing it down', async () => {
+    vi.mocked(reviveThreadEvents).mockClear();
+
+    await handleResume();
+
+    expect(reviveThreadEvents).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * A wake that replaces a stale stream opens it as a first open, so its open
+ * runs no gap reconcile. The resume must repair the signals only frames move, or a
+ * backup that finished while the device slept leaves the Backup page stale.
+ */
+describe('handleResume repairs the state a gap leaves behind', () => {
+  it('bumps every registered version counter once', async () => {
+    const version = gapRefreshedVersion();
+    const before = version.value;
+
+    await handleResume();
+
+    expect(version.value).toBe(before + 1);
   });
 });
 

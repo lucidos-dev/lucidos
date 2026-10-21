@@ -25,6 +25,9 @@ fn stub_driver_running(script_tail: &str, resume: Option<&str>) -> StubSession {
     stub_driver_prompted("SYSPROMPT", script_tail, resume)
 }
 
+/// The session context every stub session is spawned with.
+const STUB_SESSION_CONTEXT: &str = "SESSION CONTEXT: branch `stub-branch`";
+
 /// [`stub_driver_running`] under the given engine system prompt.
 fn stub_driver_prompted(
     system_prompt: &str,
@@ -54,6 +57,7 @@ fn stub_driver_prompted(
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
         system_prompt: Some(system_prompt.into()),
+        session_context: Some(STUB_SESSION_CONTEXT.into()),
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
@@ -184,7 +188,11 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
     assert!(!invocations[0].contains("resume"));
     let prompts = logged_invocations(&s.stdin_log);
     assert!(prompts[0].contains("SYSPROMPT"));
-    assert!(prompts[0].ends_with("ping"));
+    assert!(
+        prompts[0].ends_with(&format!("{STUB_SESSION_CONTEXT}  ping")),
+        "a fresh session's first turn carries the session context: {}",
+        prompts[0]
+    );
 }
 
 #[tokio::test]
@@ -437,6 +445,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         codex_bin: script.into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
         system_prompt: None,
+        session_context: None,
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
@@ -619,6 +628,7 @@ async fn a_turn_that_cannot_spawn_rejects_its_input() {
         codex_bin: tmp.path().join("no-such-codex").into_os_string(),
         worktree_path: tmp.path().to_path_buf(),
         system_prompt: Some("SYSPROMPT".into()),
+        session_context: None,
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),

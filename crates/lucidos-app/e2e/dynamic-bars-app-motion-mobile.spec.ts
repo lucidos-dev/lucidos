@@ -23,6 +23,9 @@ import {
   ensureMobileView, gotoWithRetry, navigateToApp, sendMessage, uniqueMessage, waitForResponse,
 } from './helpers';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 const APP_ID = 'e2e-dynamic-bars-motion';
 const PANEL = '.mobile-swipe-pane [data-role="app-ui-panel"]';
 const FRAME = `${PANEL} iframe[data-role="app-ui-frame"]`;

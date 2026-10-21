@@ -49,7 +49,7 @@ export function ThreadOverflowItems({ threadId, title, run, onShowInFolders, onF
   const standingApplyArmed = standingApplyThreadIds.value.has(threadId);
   const movable = canMoveToTopLevel(threadId);
   const exits = exitItems(threadId);
-  // A pin needs a sent thread. Home's Add is its board, so Home has none here.
+  // A pin needs a sent thread. Home takes no pins: its Add is the dashboard's own.
   const addsWidgets = !!liveThread && liveThread.meta.state !== 'composing' && !isHomeThread(threadId);
   const [addingWidget, setAddingWidget] = useState(false);
   const back = useRef<HTMLButtonElement>(null);
@@ -66,7 +66,7 @@ export function ThreadOverflowItems({ threadId, title, run, onShowInFolders, onF
           Add widget
         </button>
         <div class="thread-overflow-divider" role="separator" />
-        <WidgetPickerItems run={run} threadId={threadId} />
+        <WidgetPickerItems run={run} target={{ threadId }} />
       </div>
     );
   }

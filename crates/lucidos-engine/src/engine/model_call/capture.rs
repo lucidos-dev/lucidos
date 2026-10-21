@@ -14,7 +14,7 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::{ApiUsage, ContextProducer, ContextPurpose, ContextRole, ContextSection};
 use crate::llm::judgment::JudgmentUsage;
-use crate::llm::metered::{CallCost, CostSink, Reported};
+use crate::llm::metered::{CallCost, CallFailed, CostSink, Reported};
 use crate::llm::provider::LlmResponse;
 use crate::llm::usage_wire::ProviderUsage;
 use uuid::Uuid;
@@ -58,6 +58,29 @@ pub(crate) struct CallDetail {
     pub(crate) duration_ms: Option<u64>,
     /// The model the reply named, when it named one.
     pub(crate) served_model: Option<String>,
+    /// The backend the router sent the call to.
+    pub(crate) provider: Option<String>,
+    /// Time to the first content delta, from the start `duration_ms` counts from.
+    pub(crate) ttft_ms: Option<u64>,
+    /// The provider's id for the response that answered.
+    pub(crate) request_id: Option<String>,
+}
+
+impl CallDetail {
+    /// What `cost` says about its call beyond the usage.
+    pub(crate) fn of(cost: &CallCost<'_>) -> Self {
+        Self {
+            reasoning_effort: cost.reasoning_effort.map(str::to_string),
+            duration_ms: cost.duration_ms,
+            served_model: cost.reported.served_model().map(str::to_string),
+            provider: cost
+                .reported
+                .provider()
+                .map(|kind| kind.as_str().to_string()),
+            ttft_ms: cost.ttft_ms,
+            request_id: cost.request_id.map(str::to_string),
+        }
+    }
 }
 
 /// [`auxiliary_capture`], with what the caller knows about the call.
@@ -94,6 +117,26 @@ pub(crate) fn auxiliary_capture_detailed(
         reasoning_effort: detail.reasoning_effort,
         duration_ms: detail.duration_ms,
         served_model: detail.served_model,
+        provider: detail.provider,
+        stable_prefix_fingerprint: None,
+        ttft_ms: detail.ttft_ms,
+        request_id: detail.request_id,
+    }
+}
+
+/// The `ModelCallFailed` for one failed call. It holds facts only, never the
+/// provider's message.
+pub(crate) fn model_call_failed(purpose: ContextPurpose, failed: &CallFailed<'_>) -> ThreadEvent {
+    ThreadEvent::ModelCallFailed {
+        model: failed.model.to_string(),
+        purpose,
+        provider: failed.provider.map(|kind| kind.as_str().to_string()),
+        reasoning_effort: failed.reasoning_effort.map(str::to_string),
+        duration_ms: failed.duration_ms,
+        attempts: failed.attempts,
+        failure: failed.failure,
+        status_code: failed.status_code,
+        request_id: failed.request_id.map(str::to_string),
     }
 }
 
@@ -108,7 +151,7 @@ pub(crate) fn usage_from_response(response: &LlmResponse) -> Option<ApiUsage> {
         // Chat providers report one blended total per direction.
         modality: None,
         service_tier: response.service_tier,
-        cache_creation_1h_tokens: None,
+        cache_creation_1h_tokens: response.cache_creation_1h_tokens,
     })
 }
 
@@ -238,7 +281,7 @@ impl AuxCapture {
         }
     }
 
-    /// Emit one capture on its thread.
+    /// Emit one row on its thread.
     ///
     /// The emit runs as its own task, which this call awaits. A caller that
     /// a timeout or a cancel drops mid-record leaves it running. So a deadline
@@ -273,7 +316,7 @@ impl AuxCapture {
                     event,
                     meta: EventMeta::NONE,
                 },
-                "[AuxCapture] ContextCaptured",
+                "[AuxCapture] row",
             )
             .await;
         });
@@ -318,6 +361,7 @@ impl AuxCapture {
 impl CostSink for AuxCapture {
     /// One row per call, before its caller reads the answer.
     async fn record(&self, cost: CallCost<'_>) {
+        let detail = CallDetail::of(&cost);
         let usage = match cost.reported {
             Reported::Chat(response) => usage_from_response(response),
             Reported::Judgment(judgment) => usage_from_judgment(&judgment.usage),
@@ -326,11 +370,6 @@ impl CostSink for AuxCapture {
                 output_tokens,
             } => usage_from_image(input_tokens, output_tokens),
             Reported::Usage(usage) => usage.map(usage_from_provider),
-        };
-        let detail = CallDetail {
-            reasoning_effort: cost.reasoning_effort.map(str::to_string),
-            duration_ms: cost.duration_ms,
-            served_model: cost.reported.served_model().map(str::to_string),
         };
         self.emit(auxiliary_capture_detailed(
             self.purpose,
@@ -341,6 +380,10 @@ impl CostSink for AuxCapture {
             detail,
         ))
         .await;
+    }
+
+    async fn record_failure(&self, failed: CallFailed<'_>) {
+        self.emit(model_call_failed(self.purpose, &failed)).await;
     }
 
     fn deadline(&self) -> Option<tokio::time::Instant> {
@@ -419,8 +462,11 @@ mod tests {
             output_tokens: output,
             input_tokens: input,
             cache_creation_tokens: cache_write,
+            cache_creation_1h_tokens: None,
+            stable_prefix_fingerprint: None,
             cache_read_tokens: cache_read,
             served_model: None,
+            provider: None,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,

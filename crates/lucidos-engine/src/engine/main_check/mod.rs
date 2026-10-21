@@ -23,15 +23,15 @@ pub(crate) use driver::MainCheckMsg;
 pub(crate) use runner::RunnerSlot;
 pub(crate) use snapshot::MainCheckSnapshot;
 pub(crate) use state::CloseRefusal;
+pub use state::FailedTest;
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
-use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope};
-use crate::engine::thread_events::{EngineReason, MessageOrigin, ThreadEvent};
+use crate::engine::thread_events::{MessageOrigin, ThreadEvent};
 use crate::engine::LucidosEngine;
 use driver::{Driver, DriverHooks, DriverSetup};
 use runner::MainCheckCommand;
@@ -146,12 +146,13 @@ impl LucidosEngine {
         let opener = self.clone();
         let publisher = self.clone();
         let hooks = DriverHooks {
-            open_fix_thread: Box::new(move |thread_id: Uuid, prompt, title| {
-                opener.spawn_engine_coding_turn(
-                    thread_id,
-                    prompt,
-                    Some(title),
-                    EngineReason::MainCheckRed,
+            open_fix_thread: Box::new(move |opening| {
+                opener.spawn_engine_coding_turn_as(
+                    opening.thread_id,
+                    opening.prompt,
+                    Some(opening.title),
+                    opening.reason,
+                    opening.implementer,
                 );
             }),
             publish: Box::new(move |snapshot| {
@@ -196,8 +197,8 @@ impl LucidosEngine {
         self.notify_main_check(MainCheckMsg::Restore);
     }
 
-    /// Stop the running check's child at shutdown. The next start abandons
-    /// the check.
+    /// Stop the running check's child at shutdown. The next start reattaches
+    /// to a run on record, and abandons a check whose run is not.
     pub async fn stop_main_check(&self) {
         self.main_check_runner.stop().await;
     }

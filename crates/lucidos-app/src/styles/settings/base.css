@@ -7,6 +7,15 @@
     color: var(--accent-red);
 }
 
+/* The device code a Claude gateway sign-in asks the user to confirm. Large
+   and spaced, since it is read off this screen and checked on another. */
+.claude-gateway-code {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-xl);
+    letter-spacing: 0.1em;
+    color: var(--text-primary);
+}
+
 /* A Search-Everywhere jump to a settings item scrolls to it and applies the
    shared NAVIGATION FOCUS MARKER (.nav-focus-stuck,
    styles/global/host-components.css, via components/shared/focusMarker.ts) — same

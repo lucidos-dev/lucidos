@@ -13,7 +13,7 @@
  * It is NOT the `waitForEventStream` that `POST /api/v1/ui/navigate` needs.
  * That wait works under `mobile-webkit`, as `scroll-memory`, `thread-queue`
  * and `ui-scale-slider-mobile` all show. The engine-agnostic half of the
- * coverage runs on all three projects in `type-scale.spec.ts`: the defaults
+ * coverage runs on all three projects in `type-scale-all.spec.ts`: the defaults
  * themselves, and the thread-view walk. So nothing about the CSS goes
  * unchecked on WebKit.
  */

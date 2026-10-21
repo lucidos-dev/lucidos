@@ -1808,38 +1808,38 @@ async fn fetch_required_credential_resolves_an_oauth_client_by_name() {
     teardown_test_db(&db).await;
 }
 
-/// An explicitly named `oauth_client` DOES inject. The list-taking
-/// `credential_env_vars` skips the type because the blanket fan-out would
-/// broadcast a `client_secret` into every subprocess for no reader; a layer the
-/// user pointed at one credential is the opposite case, and injecting nothing
-/// there would be a configured secret silently going missing.
+/// An explicitly configured `oauth_client` DOES inject. A subprocess naming
+/// `CRED_<NAME>` does not get it, since only the OAuth flow reads the blob. A
+/// layer the user pointed at one credential is the opposite case, and
+/// injecting nothing there would be a configured secret silently going missing.
 #[test]
 fn an_explicitly_named_oauth_client_still_injects_its_env_vars() {
-    use crate::core::credentials::{credential_env_vars, credential_env_vars_for};
+    use crate::core::credentials::{
+        credential_env_vars_for, named_credential_env_vars, SecretMentions,
+    };
     use crate::core::{AuthType, Credential};
 
-    let cred = Credential {
-        id: uuid::Uuid::new_v4(),
-        service_name: "acme".to_string(),
-        base_urls: vec!["https://api.acme.test".to_string()],
-        auth_type: AuthType::OauthClient,
-        auth_value: "{\"client_id\":\"cid\"}".to_string(),
-        auth_header: "Authorization".to_string(),
-        env_var_name: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    };
+    let mut cred = Credential::fixture("acme", AuthType::OauthClient, "{\"client_id\":\"cid\"}");
+    cred.base_urls = vec!["https://api.acme.test".to_string()];
+    let no_references =
+        crate::core::secret_reference::tests::ScriptedResolver::answering(Vec::new());
 
     assert_eq!(
-        credential_env_vars_for(cred.clone()),
+        futures::executor::block_on(credential_env_vars_for(cred.clone(), &no_references)).unwrap(),
         vec![(
             "CRED_ACME".to_string(),
             "{\"client_id\":\"cid\"}".to_string()
         )]
     );
     assert!(
-        credential_env_vars(vec![cred]).is_empty(),
-        "the blanket fan-out still skips it"
+        futures::executor::block_on(named_credential_env_vars(
+            vec![cred],
+            &SecretMentions::scan("echo $CRED_ACME"),
+            &no_references
+        ))
+        .env_vars
+        .is_empty(),
+        "a subprocess naming it still does not get it"
     );
 }
 

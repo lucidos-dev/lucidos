@@ -486,15 +486,15 @@ async fn a_stamped_write_of_the_local_model_host_is_refused() {
     );
 }
 
-/// `vapid_keys` is the Web Push signing keypair. An app replacing it with
-/// garbage makes every later push fail to sign, on every device.
+/// `backup_last_run` is the engine's record of the last backup. An app
+/// replacing it would misreport backups on every device.
 #[tokio::test]
 async fn a_stamped_write_of_engine_bookkeeping_is_refused() {
     use axum::http::StatusCode;
     for query in [
-        "key=vapid_keys",
+        "key=backup_last_run",
         "key=backfill_repo_names_from_changes_done",
-        "key=theme&key=vapid_keys",
+        "key=theme&key=backup_last_run",
     ] {
         assert_eq!(
             status_of(

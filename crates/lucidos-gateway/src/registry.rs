@@ -352,16 +352,17 @@ fn is_backup_timestamp(s: &str) -> bool {
 }
 
 /// Parse the workspace name a backup archive was produced for, from its
-/// filename. A backup is named `lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.enc`; the
-/// `{name}` may contain hyphens, so strip the fixed prefix/suffix then the
+/// filename. A backup is named `lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.age`
+/// (`.enc` for a legacy one); the `{name}` may contain hyphens, so strip the fixed prefix/suffix then the
 /// trailing `-YYYYMMDD-HHMMSS`. Returns `None` for anything not in that exact
 /// shape (the picker then asks the user for a name). Mirrors the engine's
 /// `core::backup::parse_workspace_name_from_archive` (duplicated, ADR 0014 §1) so
 /// the picker can prefill a default restore name without an engine round-trip.
 pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
-    let rest = filename
-        .strip_prefix("lucidos-backup-")?
-        .strip_suffix(".enc")?;
+    let rest = filename.strip_prefix("lucidos-backup-")?;
+    let rest = [".age", ".enc"]
+        .iter()
+        .find_map(|suffix| rest.strip_suffix(suffix))?;
     let (before_time, time) = rest.rsplit_once('-')?;
     let (name, date) = before_time.rsplit_once('-')?;
     if name.is_empty() || !is_backup_timestamp(&format!("{date}-{time}")) {
@@ -426,6 +427,10 @@ mod tests {
             Some("e2e-test")
         );
         // Not archive-shaped → None (picker then requires a typed name).
+        assert_eq!(
+            parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.age").as_deref(),
+            Some("myws")
+        );
         assert!(parse_workspace_name_from_archive("random.enc").is_none());
         assert!(parse_workspace_name_from_archive("lucidos-backup-myws.enc").is_none());
         assert!(parse_workspace_name_from_archive("lucidos-backup-myws-20260601.enc").is_none());

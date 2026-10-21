@@ -151,6 +151,8 @@ pub(super) struct CodexConfig {
     pub(super) codex_bin: std::ffi::OsString,
     pub(super) worktree_path: PathBuf,
     pub(super) system_prompt: Option<String>,
+    /// See `SpawnArgs::session_context`.
+    pub(super) session_context: Option<super::agent_runtime::SessionContextBlock>,
     pub(super) model: Option<String>,
     pub(super) reasoning_effort: Option<String>,
     /// Extra writable roots for the OS sandbox, beyond the session worktree
@@ -265,6 +267,7 @@ impl AgentRuntime for CodexRuntime {
             codex_bin: resolve_codex_binary(home.as_deref(), args.binary_override.map(Path::new)),
             worktree_path: args.worktree_path.to_path_buf(),
             system_prompt: args.system_prompt.map(str::to_string),
+            session_context: args.session_context.cloned(),
             model: args.model.map(str::to_string),
             reasoning_effort: args.reasoning_effort.map(str::to_string),
             sandbox_writable_roots,
@@ -584,8 +587,8 @@ pub const CODEX_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos__ask_user_question"
 /// - `command` is the bare binary name: `apply_lucidos_env` prepends the
 ///   bundled CLI dir to `PATH`, which codex itself uses to find the command.
 ///   The dir resolves via `LUCIDOS_CLI_BIN` in a packaged build (the staged
-///   `<resources>/lucidos`) and via the exe sibling-walk in dev — see
-///   `lucidos_cli::resolve_cli_dir`. A packaged build with the CLI unstaged
+///   `<resources>/lucidos`) and via the engine's pinned copy in dev — see
+///   `lucidos_cli::lucidos_cli_dir`. A packaged build with the CLI unstaged
 ///   fails fast at spawn (`is_packaged()` guard), so this never silently 404s.
 pub(super) fn lucidos_mcp_server_config_json(
     env: &[(std::ffi::OsString, std::ffi::OsString)],
@@ -898,9 +901,16 @@ async fn run_turn(
     queue: &mut VecDeque<AgentInput>,
     cancel: &CancellationToken,
 ) -> TurnOutcome {
-    tracker.begin_turn();
+    // The same validated effort goes to the command and to the `Usage`.
+    let turn_effort = validate_codex_effort(model.as_deref(), effort.as_deref()).map(String::from);
+    tracker.begin_turn(turn_effort.clone());
     let turn_start = std::time::Instant::now();
 
+    let resume_sid = tracker.session_id.clone();
+    let input = match (&resume_sid, &config.session_context) {
+        (None, Some(context)) => context.lead(input),
+        _ => input,
+    };
     let (image_paths, _image_guards) = write_image_files(&input.images);
     let text = if input.text.is_empty() && !image_paths.is_empty() {
         // An empty prompt on stdin gives codex an empty turn.
@@ -908,7 +918,6 @@ async fn run_turn(
     } else {
         input.text
     };
-    let resume_sid = tracker.session_id.clone();
     let prompt = if resume_sid.is_none() {
         compose_first_turn_prompt(config.system_prompt.as_deref(), &text)
     } else {
@@ -916,7 +925,6 @@ async fn run_turn(
     };
 
     let turn_model = model.clone();
-    let turn_effort = effort.clone();
     let mut cmd = build_codex_turn_command(
         config,
         turn_model.as_deref(),

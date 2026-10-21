@@ -11,8 +11,9 @@ import type { ComponentChildren, VNode } from 'preact';
 import {
   PluginInstallReceiptPanel,
   localChangeLabel,
-  plainOverwrites,
+  pathsWithoutOwnRow,
 } from '../PluginInstallPanel';
+import { PluginFileList } from '../PluginFileList';
 import type { PluginInstallForm } from '../../../store/store';
 
 function text(node: ComponentChildren): string {
@@ -24,6 +25,17 @@ function text(node: ComponentChildren): string {
   // would invoke render-time hooks outside a real render.
   if (typeof v.type === 'function') return '';
   return text(v.props?.children);
+}
+
+/** The labelled file lists in a tree, read off their props without rendering
+ *  them, for the same reason `text` stops at function components. */
+function fileLists(node: ComponentChildren): { label: string; files: string[] }[] {
+  if (node === null || node === undefined || typeof node !== 'object') return [];
+  if (Array.isArray(node)) return node.flatMap(fileLists);
+  const v = node as VNode<{ children?: ComponentChildren; label?: string; files?: string[] }>;
+  if (v.type === PluginFileList) return [{ label: v.props.label!, files: v.props.files! }];
+  if (typeof v.type === 'function') return [];
+  return fileLists(v.props?.children);
 }
 
 const request = {
@@ -67,20 +79,30 @@ describe('the keep control rewrites what every row promises', () => {
       expect(localChangeLabel('restored', keep)).not.toContain('saved aside');
     }
   });
+
+  it('leaves a removal alone either way', () => {
+    // The new version dropped the file. Keeping it in place would leave the
+    // stale copy loading, so the control cannot keep it.
+    for (const keep of [true, false]) {
+      expect(localChangeLabel('removed', keep)).toBe(
+        'No longer shipped. Removed, your version is saved aside',
+      );
+    }
+  });
 });
 
-describe('the blunt overwrite list', () => {
-  it('drops paths that have their own outcome row', () => {
+describe('the blunt overwrite and remove lists', () => {
+  it('drop paths that have their own outcome row', () => {
     expect(
-      plainOverwrites(
+      pathsWithoutOwnRow(
         ['knowhow/email-triage.md', 'knowhow/other.md'],
         [{ path: 'knowhow/email-triage.md' }],
       ),
     ).toEqual(['knowhow/other.md']);
   });
 
-  it('keeps everything when nothing was edited', () => {
-    expect(plainOverwrites(['a.md', 'b.md'], [])).toEqual(['a.md', 'b.md']);
+  it('keep everything when nothing was edited', () => {
+    expect(pathsWithoutOwnRow(['a.md', 'b.md'], [])).toEqual(['a.md', 'b.md']);
   });
 });
 
@@ -108,6 +130,41 @@ describe('the receipt', () => {
     expect(body).toContain('Could not merge: triggers/email-triage/intents/triage.md');
     expect(body).toContain('saved under');
     expect(body).toContain('brings them back');
+  });
+
+  it('lists the files the update removed, and the edited ones it saved first', () => {
+    const tree = PluginInstallReceiptPanel({
+      form: receipt({
+        at: '2026-08-19T10:00:00.000Z',
+        summary: 'Installed Email Triage v2.0.0',
+        installed_files: ['knowhow/email-triage.md'],
+        removed_files: ['apps/email-triage/knowhow/old.md', 'knowhow/mine.md'],
+        local_changes: {
+          merged: [],
+          conflicted: [],
+          replaced: [],
+          restored: [],
+          removed: ['knowhow/mine.md'],
+          saved_paths: ['artifacts/plugin-local-changes/email-triage/v2.0.0/knowhow/mine.md'],
+        },
+      }),
+    });
+    expect(fileLists(tree)).toContainEqual({
+      label: 'Files removed',
+      files: ['apps/email-triage/knowhow/old.md', 'knowhow/mine.md'],
+    });
+    expect(text(tree)).toContain('No longer shipped, so removed: knowhow/mine.md');
+  });
+
+  it('shows no removed list when the update removed nothing', () => {
+    const tree = PluginInstallReceiptPanel({
+      form: receipt({
+        at: '2026-08-19T10:00:00.000Z',
+        summary: 'Installed Email Triage v2.0.0',
+        installed_files: ['knowhow/email-triage.md'],
+      }),
+    });
+    expect(fileLists(tree).map((l) => l.label)).not.toContain('Files removed');
   });
 
   it('says nothing about local changes when the install met none', () => {

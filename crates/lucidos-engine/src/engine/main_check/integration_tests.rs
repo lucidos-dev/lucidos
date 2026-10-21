@@ -10,25 +10,34 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use uuid::Uuid;
 
 use super::driver::{Driver, DriverHooks, DriverSetup, MainCheckMsg, ENGINE_RESTARTED};
-use super::runner::{spawn_runner, MainCheckCommand, ReportedVerdict, RunnerSlot};
+use super::fix_thread::{fix_thread_implementer, FixThreadOpening};
+use super::runner::{spawn_runner, MainCheckCommand, ReportedVerdict, RunTarget, RunnerSlot};
 use super::snapshot::{MainCheckSnapshot, MainCheckState};
 use super::{forward_landings, landing_of, CloseRefusal, LANDING_EVENT_TYPES};
 use crate::engine::event_bus::{BusEvent, EventBus, LagReplay, ReplayScope};
 use crate::engine::git_ops::git_cmd;
-use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
+use crate::engine::thread_events::{
+    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+};
 use crate::test_support::{
     flood_past_bus_capacity, setup_test_db, start_cc_session, teardown_test_db,
 };
 
 const RUN_URL: &str = "https://example.invalid/actions/runs/7";
+const RUN_BRANCH: &str = "e2e/20261019-120000-ab12";
 
 /// A check script that names its run, records its sha, and reports `verdict`.
 fn reporting_script(verdict: &str, summary: &str) -> String {
+    reporting_script_with(verdict, summary, "")
+}
+
+/// [`reporting_script`] with `extra`, more JSON fields, after the tail.
+fn reporting_script_with(verdict: &str, summary: &str, extra: &str) -> String {
     format!(
         "#!/bin/bash\necho \"$1\" >>\"$(dirname \"$0\")/shas\"\n\
-         echo \"main-check run {RUN_URL}\"\n\
+         echo \"main-check run {RUN_URL} {RUN_BRANCH}\"\n\
          echo 'main-check verdict {{\"verdict\": \"{verdict}\", \"run_url\": \"{RUN_URL}\", \
-         \"summary\": \"{summary}\", \"tail\": \"test result: FAILED\"}}'\n"
+         \"summary\": \"{summary}\", \"tail\": \"test result: FAILED\"{extra}}}'\n"
     )
 }
 
@@ -43,7 +52,7 @@ struct Fixture {
     pool: sqlx::PgPool,
     db: String,
     bus: EventBus,
-    opened: Arc<Mutex<Vec<(Uuid, String, String)>>>,
+    opened: Arc<Mutex<Vec<FixThreadOpening>>>,
     published: Arc<Mutex<Vec<MainCheckSnapshot>>>,
     runner: Arc<RunnerSlot>,
 }
@@ -123,8 +132,8 @@ impl Fixture {
             runner: self.runner.clone(),
         };
         let hooks = DriverHooks {
-            open_fix_thread: Box::new(move |thread, prompt, title| {
-                opened.lock().unwrap().push((thread, prompt, title));
+            open_fix_thread: Box::new(move |opening| {
+                opened.lock().unwrap().push(opening);
             }),
             publish: Box::new(move |snapshot| published.lock().unwrap().push(snapshot)),
         };
@@ -259,6 +268,31 @@ async fn landings_while_a_check_runs_coalesce_into_the_next_check() {
     teardown_test_db(&fx.db).await;
 }
 
+/// The failed tests the script names reach the event and the fix thread's
+/// prompt, and the raw tail stays out of it.
+#[tokio::test]
+async fn a_red_carries_its_failed_tests_into_the_event_and_the_prompt() {
+    let failures = r#", "failures": [{"suite": "engine", "name": "engine::a::b", "detail": "panicked at a.rs:1"}]"#;
+    let fx = fixture(&reporting_script_with("fail", "Failed: engine.", failures)).await;
+    let (mut driver, mut rx) = fx.driver();
+    let author = Uuid::new_v4();
+    start_cc_session(&fx.bus, author, "lucidos-author", None).await;
+    let (pre, main) = fx.land_commit("a.txt").await;
+    emit_applied(&fx.bus, author, &main, "Fix the parser").await;
+
+    driver.handle(landed(author, &pre)).await;
+    run_to_end(&mut driver, &mut rx).await;
+    let failed = fx.latest("MainCheckFailed").await;
+    assert_eq!(failed["failures"][0]["name"], "engine::a::b");
+    {
+        let opened = fx.opened.lock().unwrap();
+        let prompt = &opened[0].prompt;
+        assert!(prompt.contains("- engine: engine::a::b\n```\npanicked at a.rs:1\n```"));
+        assert!(!prompt.contains("test result: FAILED"), "{prompt}");
+    }
+    teardown_test_db(&fx.db).await;
+}
+
 /// A failure opens exactly one fix thread with what it needs, and no check
 /// starts while red is open. A change from the fix thread closes the red and
 /// starts the next check.
@@ -280,7 +314,15 @@ async fn a_red_opens_one_fix_thread_and_blocks_checks_until_its_fix_lands() {
     {
         let opened = fx.opened.lock().unwrap();
         assert_eq!(opened.len(), 1, "exactly one fix thread");
-        let (thread, prompt, title) = &opened[0];
+        let FixThreadOpening {
+            thread_id: thread,
+            prompt,
+            title,
+            implementer,
+            reason,
+        } = &opened[0];
+        assert_eq!(*implementer, fix_thread_implementer());
+        assert_eq!(*reason, EngineReason::MainCheckRed);
         assert_eq!(*thread, fix_thread);
         assert_eq!(title, "Fix main: Failed: engine.");
         for needle in [
@@ -540,10 +582,10 @@ async fn a_checkout_that_cannot_run_the_check_stays_idle_and_says_why() {
     teardown_test_db(&fx.db).await;
 }
 
-/// Shutdown stops the running check's child, and the next start abandons the
-/// check. Recovery starts nothing by itself.
+/// A shutdown before the run is on record stops the child, and the next start
+/// abandons the check. Recovery starts nothing by itself.
 #[tokio::test]
-async fn a_restart_mid_run_stops_the_child_and_abandons_the_check() {
+async fn a_restart_before_the_run_is_linked_stops_the_child_and_abandons_the_check() {
     let fx = fixture(HANGING_SCRIPT).await;
     let (mut driver, _rx) = fx.driver();
     let (pre, _) = fx.land_commit("a.txt").await;
@@ -571,6 +613,99 @@ async fn a_restart_mid_run_stops_the_child_and_abandons_the_check() {
     teardown_test_db(&fx.db).await;
 }
 
+/// A check script that names its run and then waits. Stopped, it records
+/// whether it was told to detach or to cancel. Started with `--attach`, it
+/// records its arguments and reports a pass.
+const LINKING_SCRIPT: &str = "#!/bin/bash\ndir=\"$(dirname \"$0\")\"\n\
+     echo \"$*\" >>\"$dir/args\"\n\
+     if [ \"${2:-}\" = --attach ]; then\n\
+       echo \"main-check run $3 $4\"\n\
+       echo 'main-check verdict {\"verdict\": \"pass\", \"summary\": \"ok\"}'\n\
+       exit 0\n\
+     fi\n\
+     trap 'echo detached >\"$dir/stopped\"; exit 0' USR2\n\
+     trap 'echo cancelled >\"$dir/stopped\"; exit 0' TERM\n\
+     echo \"main-check run https://example.invalid/actions/runs/7 e2e/20261019-120000-ab12\"\n\
+     while :; do sleep 0.1; done\n";
+
+/// A shutdown after the run is on record detaches from it. The next start
+/// reattaches to the same run and pushes no second one.
+#[tokio::test]
+async fn a_restart_after_the_run_is_linked_reattaches_to_the_same_run() {
+    let fx = fixture(LINKING_SCRIPT).await;
+    let (mut driver, mut rx) = fx.driver();
+    let (pre, main) = fx.land_commit("a.txt").await;
+    driver.handle(landed(Uuid::new_v4(), &pre)).await;
+    let msg = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("the run line came in time")
+        .expect("the runner reports");
+    assert!(matches!(msg, MainCheckMsg::RunLinked { .. }));
+    driver.handle(msg).await;
+    let linked = fx.latest("MainCheckRunLinked").await;
+    assert_eq!(linked["run_url"], RUN_URL);
+    assert_eq!(linked["branch"], RUN_BRANCH);
+    assert_eq!(fx.snapshot().run_url.as_deref(), Some(RUN_URL));
+
+    tokio::time::timeout(Duration::from_secs(15), fx.runner.stop())
+        .await
+        .expect("shutdown stops the child in time");
+    let stopped = std::fs::read_to_string(fx.script_dir.join("stopped")).unwrap();
+    assert_eq!(stopped.trim(), "detached", "a linked run is left going");
+
+    let (mut restarted, mut rx) = fx.driver();
+    restarted.handle(MainCheckMsg::Restore).await;
+    assert_eq!(fx.snapshot().state, MainCheckState::Running);
+    run_to_end(&mut restarted, &mut rx).await;
+    assert_eq!(fx.count("MainCheckAbandoned").await, 0);
+    assert_eq!(fx.count("MainCheckPassed").await, 1);
+    assert_eq!(
+        fx.count("MainCheckStarted").await,
+        1,
+        "no second run starts"
+    );
+    assert_eq!(
+        fx.count("MainCheckRunLinked").await,
+        1,
+        "the same run, once"
+    );
+    let args = std::fs::read_to_string(fx.script_dir.join("args")).unwrap();
+    assert_eq!(
+        args.lines().collect::<Vec<_>>(),
+        vec![
+            main.clone(),
+            format!("{main} --attach {RUN_URL} {RUN_BRANCH}")
+        ]
+    );
+    teardown_test_db(&fx.db).await;
+}
+
+/// A checkout that lost what a check needs abandons a linked check rather
+/// than reattach, and names the run it left.
+#[tokio::test]
+async fn a_linked_check_that_cannot_reattach_is_abandoned_with_its_run() {
+    let fx = fixture(LINKING_SCRIPT).await;
+    let (mut driver, mut rx) = fx.driver();
+    let (pre, _) = fx.land_commit("a.txt").await;
+    driver.handle(landed(Uuid::new_v4(), &pre)).await;
+    let msg = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("the run line came in time")
+        .expect("the runner reports");
+    driver.handle(msg).await;
+    tokio::time::timeout(Duration::from_secs(15), fx.runner.stop())
+        .await
+        .expect("shutdown stops the child in time");
+
+    git(&fx.repo, &["remote", "remove", "lucidos"]).await;
+    let (mut restarted, _rx) = fx.driver();
+    restarted.handle(MainCheckMsg::Restore).await;
+    assert_eq!(fx.count("MainCheckAbandoned").await, 1);
+    assert_eq!(fx.latest("MainCheckAbandoned").await["run_url"], RUN_URL);
+    assert_eq!(fx.snapshot().state, MainCheckState::Unavailable);
+    teardown_test_db(&fx.db).await;
+}
+
 /// Shutdown gives the script time to cancel its run and delete its branch.
 /// It returns once the script exits, not after a fixed sleep.
 #[tokio::test]
@@ -587,7 +722,7 @@ async fn a_stopped_child_finishes_its_cleanup_before_shutdown_returns() {
     spawn_runner(
         &script_command(tmp.path()),
         Uuid::new_v4(),
-        "sha",
+        RunTarget::Commit("sha"),
         tx,
         &slot,
     );
@@ -620,7 +755,7 @@ async fn a_child_that_ignores_the_stop_is_killed_after_its_grace() {
     spawn_runner(
         &script_command(tmp.path()),
         Uuid::new_v4(),
-        "sha",
+        RunTarget::Commit("sha"),
         tx,
         &slot,
     );
@@ -643,14 +778,20 @@ async fn a_second_child_never_starts_beside_a_running_one() {
     spawn_runner(
         &script_command(tmp.path()),
         Uuid::new_v4(),
-        "a",
+        RunTarget::Commit("a"),
         tx.clone(),
         &slot,
     );
     let pid = wait_for_pid(&tmp.path().join("pid")).await;
 
     let second = Uuid::new_v4();
-    spawn_runner(&script_command(tmp.path()), second, "b", tx, &slot);
+    spawn_runner(
+        &script_command(tmp.path()),
+        second,
+        RunTarget::Commit("b"),
+        tx,
+        &slot,
+    );
     match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
         Ok(Some(MainCheckMsg::Ended { check_id, report })) => {
             assert_eq!(check_id, second);
@@ -697,7 +838,7 @@ async fn a_red_survives_a_restart_and_its_fix_thread_opens_once() {
     let (pre, _) = fx.land_commit("a.txt").await;
     driver.handle(landed(Uuid::new_v4(), &pre)).await;
     run_to_end(&mut driver, &mut rx).await;
-    let fix_thread = fx.opened.lock().unwrap()[0].0;
+    let fix_thread = fx.opened.lock().unwrap()[0].thread_id;
 
     let (mut unprompted, _rx) = fx.driver();
     unprompted.handle(MainCheckMsg::Restore).await;
@@ -710,7 +851,7 @@ async fn a_red_survives_a_restart_and_its_fix_thread_opens_once() {
             "a fix thread with no events gets its prompt"
         );
         assert_eq!(
-            opened[1].0, fix_thread,
+            opened[1].thread_id, fix_thread,
             "the same thread, never a second one"
         );
     }
@@ -737,7 +878,7 @@ async fn a_deleted_fix_thread_stays_deleted_across_a_restart() {
     let (pre, _) = fx.land_commit("a.txt").await;
     driver.handle(landed(Uuid::new_v4(), &pre)).await;
     run_to_end(&mut driver, &mut rx).await;
-    let fix_thread = fx.opened.lock().unwrap()[0].0;
+    let fix_thread = fx.opened.lock().unwrap()[0].thread_id;
     fx.bus
         .emit(BusEvent::System(
             crate::engine::event_bus::SystemEvent::ThreadsDeleted {
@@ -810,7 +951,7 @@ async fn a_fix_that_landed_before_a_restart_closes_the_red_on_recovery() {
     let (pre, _) = fx.land_commit("a.txt").await;
     driver.handle(landed(Uuid::new_v4(), &pre)).await;
     run_to_end(&mut driver, &mut rx).await;
-    let fix_thread = fx.opened.lock().unwrap()[0].0;
+    let fix_thread = fx.opened.lock().unwrap()[0].thread_id;
     start_cc_session(&fx.bus, fix_thread, "lucidos-fix", None).await;
     let (_, fixed) = fx.land_commit("fix.txt").await;
     emit_applied(&fx.bus, fix_thread, &fixed, "Fix main").await;
@@ -953,7 +1094,7 @@ async fn a_fix_landing_while_git_cannot_read_main_still_closes_the_red() {
     let (pre, red_to) = fx.land_commit("a.txt").await;
     driver.handle(landed(Uuid::new_v4(), &pre)).await;
     run_to_end(&mut driver, &mut rx).await;
-    let fix_thread = fx.opened.lock().unwrap()[0].0;
+    let fix_thread = fx.opened.lock().unwrap()[0].thread_id;
 
     let (fix_pre, _) = fx.land_commit("fix.txt").await;
     fx.hide_main();
@@ -1098,4 +1239,279 @@ async fn emit_applied(bus: &EventBus, thread: Uuid, landing: &str, title: &str) 
     })
     .await
     .expect("apply");
+}
+
+const FLAKY_TESTS: &str =
+    r#", "flaky": [{"suite": "engine", "name": "engine::a::b", "detail": "panicked at a.rs:1"}]"#;
+
+/// Land one more commit as `thread` and let its check run to its end.
+async fn land_and_check(
+    fx: &Fixture,
+    driver: &mut Driver,
+    rx: &mut UnboundedReceiver<MainCheckMsg>,
+    thread: Uuid,
+    file: &str,
+) {
+    let (pre, _) = fx.land_commit(file).await;
+    driver.handle(landed(thread, &pre)).await;
+    run_to_end(driver, rx).await;
+}
+
+/// A fixture whose checks pass with one flaky test each.
+async fn flaky_fixture() -> Fixture {
+    fixture(&reporting_script_with(
+        "pass",
+        "Every suite passed.",
+        FLAKY_TESTS,
+    ))
+    .await
+}
+
+/// A pass with flaky tests opens one flaky fix thread, framed as flaky, and
+/// holds no check. While it is open, a later pass records its flaky tests and
+/// opens nothing.
+#[tokio::test]
+async fn a_pass_with_flaky_tests_opens_one_flaky_fix_thread_and_blocks_nothing() {
+    let fx = flaky_fixture().await;
+    let (mut driver, mut rx) = fx.driver();
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "a.txt").await;
+
+    let passed = fx.latest("MainCheckPassed").await;
+    assert_eq!(passed["flaky"][0]["name"], "engine::a::b");
+    let flaky_thread: Uuid = serde_json::from_value(passed["flaky_fix_thread_id"].clone()).unwrap();
+    {
+        let opened = fx.opened.lock().unwrap();
+        assert_eq!(opened.len(), 1, "one flaky fix thread");
+        assert_eq!(opened[0].thread_id, flaky_thread);
+        assert_eq!(opened[0].reason, EngineReason::MainCheckFlaky);
+        assert_eq!(opened[0].implementer, fix_thread_implementer());
+        assert!(opened[0].title.starts_with("Fix flaky: engine::a::b"));
+        for needle in [
+            "passed on main",
+            "flaky",
+            "engine: engine::a::b",
+            "panicked at a.rs:1",
+        ] {
+            assert!(
+                opened[0].prompt.contains(needle),
+                "missing {needle:?} in:\n{}",
+                opened[0].prompt
+            );
+        }
+    }
+    let snapshot = fx.snapshot();
+    assert_eq!(snapshot.state, MainCheckState::Passed);
+    assert_eq!(snapshot.flaky_fix_thread_id, Some(flaky_thread));
+
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "b.txt").await;
+    assert_eq!(
+        fx.count("MainCheckStarted").await,
+        2,
+        "a flaky pass holds no check"
+    );
+    let again = fx.latest("MainCheckPassed").await;
+    assert_eq!(again["flaky"][0]["name"], "engine::a::b");
+    assert!(
+        again.get("flaky_fix_thread_id").is_none(),
+        "no second thread: {again}"
+    );
+    assert_eq!(fx.opened.lock().unwrap().len(), 1);
+    teardown_test_db(&fx.db).await;
+}
+
+/// A change from the flaky fix thread closes it. The next flaky pass then
+/// opens a new one.
+#[tokio::test]
+async fn a_landing_from_the_flaky_thread_closes_it() {
+    let fx = flaky_fixture().await;
+    let (mut driver, mut rx) = fx.driver();
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "a.txt").await;
+    let flaky_thread = fx.opened.lock().unwrap()[0].thread_id;
+
+    land_and_check(&fx, &mut driver, &mut rx, flaky_thread, "b.txt").await;
+    assert_eq!(
+        fx.opened.lock().unwrap().len(),
+        2,
+        "the pass after it opens a new one"
+    );
+    assert_ne!(fx.opened.lock().unwrap()[1].thread_id, flaky_thread);
+    assert_eq!(
+        fx.snapshot().flaky_fix_thread_id,
+        Some(fx.opened.lock().unwrap()[1].thread_id)
+    );
+    teardown_test_db(&fx.db).await;
+}
+
+/// A restart opens an unprompted flaky fix thread once, under its own id, and
+/// leaves a prompted one alone. A second flaky thread never appears.
+#[tokio::test]
+async fn a_restart_prompts_an_unprompted_flaky_thread_once() {
+    let fx = flaky_fixture().await;
+    let (mut driver, mut rx) = fx.driver();
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "a.txt").await;
+    let flaky_thread = fx.opened.lock().unwrap()[0].thread_id;
+
+    let (mut unprompted, _rx) = fx.driver();
+    unprompted.handle(MainCheckMsg::Restore).await;
+    {
+        let opened = fx.opened.lock().unwrap();
+        assert_eq!(opened.len(), 2, "no events yet, so it gets its prompt");
+        assert_eq!(opened[1].thread_id, flaky_thread, "the same thread");
+        assert_eq!(opened[1].reason, EngineReason::MainCheckFlaky);
+    }
+    assert_eq!(fx.snapshot().flaky_fix_thread_id, Some(flaky_thread));
+
+    start_cc_session(&fx.bus, flaky_thread, "lucidos-flaky", None).await;
+    let (mut prompted, _rx) = fx.driver();
+    prompted.handle(MainCheckMsg::Restore).await;
+    assert_eq!(
+        fx.opened.lock().unwrap().len(),
+        2,
+        "a prompted thread is left alone"
+    );
+    teardown_test_db(&fx.db).await;
+}
+
+/// Hand `old` off to a new thread, as `lucidos successor spawn` does: the old
+/// thread archives itself and the successor row links back to it.
+async fn hand_off(fx: &Fixture, old: Uuid) -> Uuid {
+    let successor = Uuid::new_v4();
+    start_cc_session(&fx.bus, old, "lucidos-old", None).await;
+    start_cc_session(&fx.bus, successor, "lucidos-successor", None).await;
+    for (row, column, other) in [
+        (successor, "successor_of", old),
+        (old, "successor_thread_id", successor),
+    ] {
+        sqlx::query(&format!(
+            "UPDATE thread_summaries SET {column} = $2 WHERE thread_id = $1"
+        ))
+        .bind(row)
+        .bind(other)
+        .execute(&fx.pool)
+        .await
+        .expect("link");
+    }
+    fx.bus
+        .emit(BusEvent::Thread {
+            thread_id: old,
+            event: ThreadEvent::ThreadArchived,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("archive");
+    successor
+}
+
+/// A fix thread that hands off lands its fix under the successor's id. The
+/// landing still counts for the fix thread, so the red closes.
+#[tokio::test]
+async fn a_fix_landed_by_a_successor_closes_the_red() {
+    let fx = fixture(&reporting_script("fail", "Failed: engine.")).await;
+    let (mut driver, mut rx) = fx.driver();
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "a.txt").await;
+    let fix_thread = fx.opened.lock().unwrap()[0].thread_id;
+    let successor = hand_off(&fx, fix_thread).await;
+
+    let (pre, _) = fx.land_commit("fix.txt").await;
+    driver.handle(landed(successor, &pre)).await;
+    assert_eq!(
+        fx.latest("MainCheckRedClosed").await["reason"],
+        "fix_landed"
+    );
+
+    let (mut restarted, _rx) = fx.driver();
+    restarted.handle(MainCheckMsg::Restore).await;
+    assert_ne!(fx.snapshot().state, MainCheckState::Red);
+    teardown_test_db(&fx.db).await;
+}
+
+/// A flaky fix thread that archived itself for a successor is still open. A
+/// later flaky pass opens nothing, and the successor's landing closes it.
+#[tokio::test]
+async fn a_flaky_fix_thread_that_handed_off_stays_open_until_its_successor_lands() {
+    let fx = flaky_fixture().await;
+    let (mut driver, mut rx) = fx.driver();
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "a.txt").await;
+    let flaky_thread = fx.opened.lock().unwrap()[0].thread_id;
+    let successor = hand_off(&fx, flaky_thread).await;
+
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "b.txt").await;
+    assert_eq!(fx.opened.lock().unwrap().len(), 1, "no second flaky thread");
+
+    let (pre, _) = fx.land_commit("fix.txt").await;
+    driver.handle(landed(successor, &pre)).await;
+    assert!(fx.snapshot().flaky_fix_thread_id.is_none());
+    teardown_test_db(&fx.db).await;
+}
+
+/// A flaky fix thread the maintainer deleted or archived stays closed across a
+/// restart, and the next flaky pass opens another.
+#[tokio::test]
+async fn a_deleted_or_archived_flaky_thread_is_closed() {
+    for archived in [false, true] {
+        let fx = flaky_fixture().await;
+        let (mut driver, mut rx) = fx.driver();
+        land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "a.txt").await;
+        let flaky_thread = fx.opened.lock().unwrap()[0].thread_id;
+        if archived {
+            start_cc_session(&fx.bus, flaky_thread, "lucidos-flaky", None).await;
+            fx.bus
+                .emit(BusEvent::Thread {
+                    thread_id: flaky_thread,
+                    event: ThreadEvent::ThreadArchived,
+                    meta: EventMeta::NONE,
+                })
+                .await
+                .expect("archive");
+        } else {
+            // A delete removes the thread's events, and leaves only this record.
+            fx.bus
+                .emit(BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::ThreadsDeleted {
+                        thread_ids: vec![flaky_thread],
+                        event_count: 0,
+                        memory_count: 0,
+                        worktrees_removed: 0,
+                        widgets_removed: 0,
+                        actor: None,
+                    },
+                ))
+                .await
+                .expect("delete");
+        }
+
+        let (mut restarted, mut rx) = fx.driver();
+        restarted.handle(MainCheckMsg::Restore).await;
+        assert_eq!(fx.opened.lock().unwrap().len(), 1, "it never comes back");
+        assert_eq!(fx.snapshot().flaky_fix_thread_id, None);
+
+        land_and_check(&fx, &mut restarted, &mut rx, Uuid::new_v4(), "b.txt").await;
+        {
+            let opened = fx.opened.lock().unwrap();
+            assert_eq!(opened.len(), 2, "the next flaky pass opens another");
+            assert_ne!(opened[1].thread_id, flaky_thread);
+        }
+        teardown_test_db(&fx.db).await;
+    }
+}
+
+/// A failed check is red as before, flaky tests or not: one fix thread, and no
+/// flaky one.
+#[tokio::test]
+async fn a_red_with_flaky_tests_opens_only_its_fix_thread() {
+    let fx = fixture(&reporting_script_with(
+        "fail",
+        "Failed: engine.",
+        FLAKY_TESTS,
+    ))
+    .await;
+    let (mut driver, mut rx) = fx.driver();
+    land_and_check(&fx, &mut driver, &mut rx, Uuid::new_v4(), "a.txt").await;
+    {
+        let opened = fx.opened.lock().unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].reason, EngineReason::MainCheckRed);
+    }
+    assert_eq!(fx.snapshot().state, MainCheckState::Red);
+    teardown_test_db(&fx.db).await;
 }

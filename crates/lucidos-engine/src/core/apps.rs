@@ -44,8 +44,8 @@ pub struct AppManifest {
     pub transparent: bool,
 }
 
-/// One of the three sizes a widget takes as a tile on the Home board: one
-/// cell, two cells wide, or two by two (ADR 0432).
+/// One of the three sizes a widget takes as a tile on a dashboard: one cell,
+/// two cells wide, or two by two (ADR 0432).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WidgetSize {
@@ -90,6 +90,52 @@ impl WidgetSize {
         let smaller = declared.iter().filter(|s| **s < self).max();
         let larger = declared.iter().filter(|s| **s > self).min();
         smaller.or(larger).copied().unwrap_or(self)
+    }
+}
+
+/// The size of any dashboard tile. A widget shows at one of its three
+/// `WidgetSize`s, and an *app shortcut* is always a quarter: half a small
+/// cell's edge on each side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TileSize {
+    Quarter,
+    Small,
+    Medium,
+    Large,
+}
+
+impl TileSize {
+    /// Smallest first.
+    pub const ALL: [Self; 4] = [Self::Quarter, Self::Small, Self::Medium, Self::Large];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quarter => "quarter",
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    /// The widget size this tile size is, or `None` for a quarter.
+    pub fn widget_size(self) -> Option<WidgetSize> {
+        match self {
+            Self::Quarter => None,
+            Self::Small => Some(WidgetSize::Small),
+            Self::Medium => Some(WidgetSize::Medium),
+            Self::Large => Some(WidgetSize::Large),
+        }
+    }
+}
+
+impl From<WidgetSize> for TileSize {
+    fn from(size: WidgetSize) -> Self {
+        match size {
+            WidgetSize::Small => Self::Small,
+            WidgetSize::Medium => Self::Medium,
+            WidgetSize::Large => Self::Large,
+        }
     }
 }
 

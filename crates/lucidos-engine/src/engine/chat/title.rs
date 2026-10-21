@@ -323,6 +323,83 @@ async fn title_attempts(
     Err(last_err)
 }
 
+/// What one naming attempt left behind.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TitleAttempt {
+    /// The thread got its title, or needs none.
+    Settled,
+    /// No title was written. Another attempt may still name the thread.
+    Failed,
+}
+
+/// How long a thread waits before each retry of a failed title.
+///
+/// A title model that hangs on one call usually answers the next one. Without
+/// a retry, one hung call leaves the thread unnamed until its next message.
+/// A thread that gets none stays unnamed for good.
+pub(crate) const TITLE_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(300),
+];
+
+/// Name a thread that has no title yet, retrying after each of
+/// `retry_delays` while it still has none.
+///
+/// Every attempt reads the thread's row first. A name that arrived in the
+/// meantime ends the loop with no model call, and so does a deleted thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn name_untitled_thread(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+    call: &TitleCall,
+    thread_id: uuid::Uuid,
+    message: &str,
+    image_description: Option<&str>,
+    image_count: usize,
+    retry_delays: &[std::time::Duration],
+) {
+    let waits = std::iter::once(std::time::Duration::ZERO).chain(retry_delays.iter().copied());
+    for (attempt, wait) in waits.enumerate() {
+        if attempt > 0 {
+            log!(
+                "[Title] retrying {} in {:?} (retry {} of {})",
+                thread_id,
+                wait,
+                attempt,
+                retry_delays.len()
+            );
+            tokio::time::sleep(wait).await;
+        }
+        let row: Result<Option<(Option<String>,)>, sqlx::Error> =
+            sqlx::query_as("SELECT title FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_optional(pool)
+                .await;
+        match row {
+            Ok(Some((None,))) => {}
+            Ok(_) => return,
+            Err(e) => {
+                log!("[Title] Could not read the title of {}: {}", thread_id, e);
+                return;
+            }
+        }
+        let outcome = emit_generated_title(
+            pool,
+            bus,
+            call,
+            thread_id,
+            message,
+            image_description,
+            None,
+            image_count,
+        )
+        .await;
+        if outcome == TitleAttempt::Settled {
+            return;
+        }
+    }
+}
+
 /// Generate a thread title via LLM and emit it as a ThreadTitleGenerated event.
 /// Used by scheduled triggers, follow-up threads, and spawn_thread.
 ///
@@ -341,22 +418,22 @@ pub(crate) async fn emit_generated_title(
     image_description: Option<&str>,
     fallback_title: Option<String>,
     image_count: usize,
-) {
+) -> TitleAttempt {
     match crate::engine::home_thread::is_home_thread(pool, thread_id).await {
         Ok(false) => {}
-        Ok(true) => return,
+        Ok(true) => return TitleAttempt::Settled,
         Err(e) => {
             log!(
                 "[Title] Could not check whether {} is home: {}",
                 thread_id,
                 e
             );
-            return;
+            return TitleAttempt::Failed;
         }
     }
     let provider = call.provider();
     let title = match decide_title_path(message, image_description, image_count) {
-        TitleDecision::Skip => return,
+        TitleDecision::Skip => return TitleAttempt::Settled,
         TitleDecision::Image => "Image".to_string(),
         TitleDecision::Images => "Images".to_string(),
         TitleDecision::Llm => {
@@ -386,12 +463,12 @@ pub(crate) async fn emit_generated_title(
                 Ok(t) => t,
                 Err(_) => match fallback_title {
                     Some(name) => name,
-                    None => return,
+                    None => return TitleAttempt::Failed,
                 },
             }
         }
     };
-    if let Err(e) = bus
+    match bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
             thread_id,
             event: crate::engine::thread_events::ThreadEvent::ThreadTitleGenerated { title },
@@ -399,7 +476,11 @@ pub(crate) async fn emit_generated_title(
         })
         .await
     {
-        log!("[Thread] Failed to emit title: {}", e);
+        Ok(_) => TitleAttempt::Settled,
+        Err(e) => {
+            log!("[Thread] Failed to emit title: {}", e);
+            TitleAttempt::Failed
+        }
     }
 }
 
@@ -535,6 +616,157 @@ mod capture_tests {
         assert_eq!(generated_titles(&pool, home).await, 0);
         assert_eq!(aux_captures(&pool, other, "title").await.len(), 1);
         assert_eq!(generated_titles(&pool, other).await, 1);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    async fn insert_untitled_thread(pool: &sqlx::PgPool) -> Uuid {
+        let thread_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO thread_summaries (thread_id, source) VALUES ($1, 'claude_code')")
+            .bind(thread_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        thread_id
+    }
+
+    async fn stored_title(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+        crate::core::store::EventStore::new(pool.clone())
+            .get_thread_title(thread_id)
+            .await
+            .unwrap()
+    }
+
+    /// One failed title call used to leave a thread unnamed until its next
+    /// message. A retry names it without one.
+    #[tokio::test]
+    async fn a_failed_title_is_retried_until_the_thread_is_named() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = insert_untitled_thread(&pool).await;
+        // Both resamples of the first attempt are rejected, so it fails.
+        let provider =
+            ScriptedProvider::new(TITLE_MODEL, vec!["Title", "Title", "Fix the auth bug"]);
+
+        name_untitled_thread(
+            &pool,
+            &bus,
+            &TitleCall::over(std::sync::Arc::new(provider)),
+            thread_id,
+            "the auth handshake breaks",
+            None,
+            0,
+            &[std::time::Duration::ZERO],
+        )
+        .await;
+
+        assert_eq!(
+            stored_title(&pool, thread_id).await.as_deref(),
+            Some("Fix the auth bug")
+        );
+        assert_eq!(aux_captures(&pool, thread_id, "title").await.len(), 3);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A name that lands while a retry waits ends the loop: no model call,
+    /// and the name stays.
+    #[tokio::test]
+    async fn a_retry_never_overwrites_a_name_that_arrived_meanwhile() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = insert_untitled_thread(&pool).await;
+        crate::test_support::seed_thread_event(
+            &bus,
+            thread_id,
+            crate::engine::thread_events::ThreadEvent::ThreadTitleGenerated {
+                title: "Named by hand".to_string(),
+            },
+        )
+        .await;
+
+        // No replies: any model call fails the scripted provider.
+        name_untitled_thread(
+            &pool,
+            &bus,
+            &TitleCall::over(std::sync::Arc::new(ScriptedProvider::new(
+                TITLE_MODEL,
+                vec![],
+            ))),
+            thread_id,
+            "the auth handshake breaks",
+            None,
+            0,
+            &[std::time::Duration::ZERO],
+        )
+        .await;
+
+        assert_eq!(
+            stored_title(&pool, thread_id).await.as_deref(),
+            Some("Named by hand")
+        );
+        assert!(aux_captures(&pool, thread_id, "title").await.is_empty());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A thread deleted before an attempt costs no model call. A retry waits
+    /// minutes, and the user may delete the thread in that time.
+    #[tokio::test]
+    async fn a_deleted_thread_gets_no_title_call() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+
+        // No replies: any model call fails the scripted provider.
+        name_untitled_thread(
+            &pool,
+            &bus,
+            &TitleCall::over(std::sync::Arc::new(ScriptedProvider::new(
+                TITLE_MODEL,
+                vec![],
+            ))),
+            thread_id,
+            "the auth handshake breaks",
+            None,
+            0,
+            &[std::time::Duration::ZERO],
+        )
+        .await;
+
+        assert!(aux_captures(&pool, thread_id, "title").await.is_empty());
+        assert_eq!(generated_titles(&pool, thread_id).await, 0);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The retries are bounded: a model that never answers costs the first
+    /// attempt plus one per delay, then the thread stays unnamed.
+    #[tokio::test]
+    async fn retries_stop_after_the_last_delay() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = insert_untitled_thread(&pool).await;
+        let provider = ScriptedProvider::new(TITLE_MODEL, vec!["Title"; 4]);
+
+        name_untitled_thread(
+            &pool,
+            &bus,
+            &TitleCall::over(std::sync::Arc::new(provider)),
+            thread_id,
+            "the auth handshake breaks",
+            None,
+            0,
+            &[std::time::Duration::ZERO],
+        )
+        .await;
+
+        assert_eq!(stored_title(&pool, thread_id).await, None);
+        assert_eq!(aux_captures(&pool, thread_id, "title").await.len(), 4);
 
         pool.close().await;
         teardown_test_db(&db_name).await;

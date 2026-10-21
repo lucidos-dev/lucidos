@@ -1,4 +1,5 @@
 import { setSplitRatio, toggleContentPaneRatio, toggleThreadPaneRatio } from './splitHelpers';
+import { splitFitsBoth } from './drawnLayout';
 
 /** Which of the header bar's three pane segments a point falls in. The bar spans
  *  all three panes as one band, so a double-click on it has to be attributed
@@ -50,5 +51,5 @@ export function headerDblClickRegion(
  */
 export function resolveHeaderDblClick({ region, ratio }: { region: HeaderRegion; ratio: number }) {
   if (region === 'drawer') return;
-  setSplitRatio(region === 'thread' ? toggleContentPaneRatio(ratio) : toggleThreadPaneRatio(ratio));
+  setSplitRatio(region === 'thread' ? toggleContentPaneRatio(ratio, splitFitsBoth()) : toggleThreadPaneRatio(ratio));
 }

@@ -4,6 +4,10 @@
 - **Date**: 2026-10-14
 - **Amends**: [0470](0470-keep-the-prompt-cache-warm.md). Its keep-alive
   assumed every Claude Code session has a 5-minute cache.
+- **Amended by**: [0489](0489-keep-alive-budget-follows-model-prices.md). The
+  150-minute cut-off below gave way to a budget from the model's prices.
+- **Amended by**: [0492](0492-keep-alive-beat-lands-near-4-5-minutes.md). The
+  5-minute window now starts at 230 s, not 200 s.
 
 ## Context
 

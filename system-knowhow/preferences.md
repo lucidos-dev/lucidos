@@ -42,6 +42,7 @@ locale). Open Lucidos pages live-apply on those events, with no reload, no
 transient event and no restart.
 
 **`chat_model` / `chat_reasoning_efforts` are the default for NEW threads only.**
+(`trigger_model` is the same for intent triggers, applying from their next fire.)
 A Lucidos Agent thread reuses the model and reasoning effort it last ran with
 (*per-thread model memory*). So a running thread keeps its model and effort,
 **including the thread you are in when you make the change**. These keys only
@@ -52,7 +53,7 @@ runs on: explicit per-request override → the thread's last tier on that model
 → that model's entry in `chat_reasoning_efforts` → its *default effort*. A
 model with no default effort sends none. Switching a thread to another model
 never carries the old model's tier. To change a *running* thread's model or
-effort, use its in-thread model picker in the compose bar. That writes a
+effort, use its *rung control* in the compose bar. That writes a
 per-thread value and never touches this account default.
 
 `chat_reasoning_efforts` REPLACES THE WHOLE LIST. Read the current value first
@@ -105,16 +106,17 @@ read decision, the wake decision and the compactor.
 
 - **Unset, a key resolves for the providers the user has.** Its own default
   runs if a configured provider serves it. Otherwise the first of
-  `gemini-3-flash-preview`, `gpt-5.4-mini` and `claude-haiku-4-5` that one
-  serves runs, and with none of those, the chat model. The compactor has its
-  own list (see `model_summary_compaction`).
+  `gpt-6-luna` and `gemini-3.1-flash-lite` that one serves runs, and with
+  neither, the chat model. Most tasks default to `claude-haiku-5-5`, the
+  command judge to `gemini-3.1-flash-lite`. The compactor has its own list
+  (see `model_summary_compaction`).
 - **Four tasks try a measured model before their default.** Fact extraction
-  tries `gpt-5.6-luna` first. The conversation summary tries the compactor's
-  three first. The read decision tries `gemini-3.8-flash`, then
-  `gpt-5.6-luna`. The wake decision tries `gemini-3.8-flash`, `gpt-6.1-sol`
-  and `gpt-5.6-luna`. Each task has its own key, and none follows another.
+  tries `gpt-6-luna` first. The conversation summary tries the compactor's
+  three first. The read decision tries `gemini-3.8-flash`, then `gpt-6-luna`.
+  The wake decision tries `gemini-3.8-flash` and `gpt-6.1-sol`, then its
+  default `gpt-6-luna`. Each task has its own key, and none follows another.
 - **The wake decision runs only on a measured model.** It skips the shared
-  fallbacks and the chat model. With none of its four served, it asks nothing
+  fallbacks and the chat model. With none of its three served, it asks nothing
   and wakes the parent.
 - **A key the user set is never moved to another model.** If no configured
   provider serves it, those calls fail, and Settings says so on the row.
@@ -123,12 +125,18 @@ read decision, the wake decision and the compactor.
   its *successor*, named on its row in `GET /api/v1/models`. A call that still
   names it is sent as the successor. Lucidos never leaves a retired id for the
   provider to reroute.
+- **A retired model's successor runs only where a provider serves it.** A key
+  names its model's whole line of versions. Where the successor is not served,
+  the key runs the newest earlier version that is, never a different model. A
+  task's default never steps back to an earlier version. The task's row in
+  `GET /api/v1/models/background` carries `generation` when another version
+  runs, and Settings names it.
 - **`GET /api/v1/models/background` says which model each task runs on**, and
   why: the preference, the default, or the chat model.
 - **Settings offers every model on every row**, with the task's recommended
   models first. Image description is the exception.
 - **Unset, a task's reasoning tier binds its recommended models.** Title runs
-  at `none` on `gemini-3-flash-preview`, for example. Any other model runs at
+  at `none` on `claude-haiku-5-5`, for example. Any other model runs at
   its own *default effort*, and one with none sends no effort at all. The
   compactor keeps `low` on its three measured models.
 - **Image description runs only on a model that reads images**, by the model's
@@ -222,23 +230,24 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 |---|---|---|---|---|
 | `language` | global | text | (detected from conversation) | Language for responses + session summaries (e.g. "English", "Norwegian"). A *voice session* speaks it. On a Realtime talker it also pins the transcriber to the matching ISO-639-1 code; a Live one has no such setting (ADR 0198). |
 | `timezone` | global | IANA timezone | (unset) | Timezone for triggers + time display (e.g. "Europe/Oslo"). Set before creating triggers. |
-| `chat_model` | global | a model id from the registry | `claude-opus-5` | Default chat model for NEW threads (see "How a write propagates"). `manage_models(action='list')` shows the options. |
+| `chat_model` | global | a model id from the registry | `claude-opus-5-5` | Default chat model for NEW threads (see "How a write propagates"). Triggers have their own, `trigger_model`. `manage_models(action='list')` shows the options. |
+| `trigger_model` | global | a model id from the registry | `claude-sonnet-5-5` | Default model for an intent trigger that pins no model of its own. A trigger's own `model` wins. It never changes a chat thread, and a follow-up in a trigger thread stays on the model the trigger ran on. Its effort is the stored tier in `chat_reasoning_efforts`, else the model's default effort. |
 | `chat_reasoning_efforts` | global | `model=tier` pairs, comma separated | (unset: each model's default effort) | Thinking budget for NEW threads per chat model, for example `claude-opus-5-5=high`. A model not listed runs at its default effort (`manage_models` `list` shows it). Clamped per model. |
 | `response_style` | global | the id of a style in the library | `standard` | The shape of a chat or trigger answer: how much comes back, and what it is for. `standard` adds nothing. Shipped beside it: `concise`, `minimal` (the outcome, not the process) and `learning` (explains the why as it goes). The user can edit those and add their own, so the set is OPEN: read `response_styles` or `GET /api/v1/response-styles` for the ids here. An undefined id falls back to `standard`. |
 | `response_styles` | global | JSON array of `{id, label, instruction}` | (unset: the shipped styles only) | The user's own styles, and their edits to the shipped ones. See "The style library" above. |
 | `technical_literacy` | global | `not-set` \| `non-technical` \| `technical` \| `developer` | `not-set` (adds nothing; set it to clear a level) | How technical the words are in every answer, from plain words with no jargon (`non-technical`, shown as Keep it plain) to engineering terms with no explanation (`developer`). It never sets how much to say. An old `everyday` value reads as `non-technical`. Reaches chat, triggers, coding-agent sessions and voice calls. See "Technical literacy" above. |
 | `image_model` | global | `auto` \| `imagen-4` \| `gpt-image-2.5-flare` \| `gpt-image-2.5-sunburst` \| `gpt-image-2` | `auto` | Model used by `generate_image`. `auto` runs Imagen 4 when a Google Cloud project is configured, else `gpt-image-2.5-flare` on an OpenAI key. Flare is the fast everyday model; Sunburst is for precise edits. OpenAI retired `gpt-image-1` and `gpt-image-1.5`: a write of either is refused, and the engine moves a stored one to `gpt-image-2.5-flare` at startup. |
-| `model_title` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model for thread titles. |
+| `model_title` | global | a model id | `claude-haiku-5-5`, if reachable (see "Background models") | Background model for thread titles. |
 | `reasoning_title` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for title generation. Naming a thread needs none. |
 | `model_change_summary` | global | a model id | (the `model_title` model) | Background model that writes a *change summary*: one line saying what a coding-agent change of several commits does. It heads the change card, the change toasts and the Changes panel. A single-commit change makes no call: its commit subject is the line. Inherits `model_title` while unset. |
 | `reasoning_change_summary` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | (the `reasoning_title` value, else `none`) | Thinking budget for the change summary, which condenses commit subjects into one line. Inherits `reasoning_title` while unset. |
 | `model_summary_compaction` | global | a model id | (resolved from the configured providers) | Background model for the compactor, which writes the summary lines of the Tree memory module. It runs only while `memory_module` is `tree`. While unset, the engine picks the first of `gpt-6.1-sol`, `gemini-3.8-flash` and `claude-sonnet-5-5` that a configured provider serves, and falls back to the chat model. `GET /api/v1/models/background` says which model that is. Settings recommends those three first. |
 | `reasoning_summary_compaction` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | (`low` on the default models, else the model's default effort) | Thinking budget for the compactor. While unset it runs its three default models at `low`, the tier their comparison measured, and any other model at its own default effort. |
-| `model_memory_find` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model the recall tool's `find` asks its yes/no questions on, when `judgment_memory_find` leaves it on chat. Each call judges about 40 summary lines. |
+| `model_memory_find` | global | a model id | `claude-haiku-5-5`, if reachable (see "Background models") | Background model the recall tool's `find` asks its yes/no questions on, when `judgment_memory_find` leaves it on chat. Each call judges about 40 summary lines. |
 | `reasoning_memory_find` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for `find`, which answers short yes/no questions. |
-| `model_read_decision` | global | a model id | `gemini-3-flash-preview`, if reachable, after `gemini-3.8-flash` and `gpt-5.6-luna` (see "Background models") | Background model that makes a turn's *read decision* when the turn ended without one: it sees the turn's message, a question the user answered inside the turn, and the reply, and must answer one forced yes/no question. While unset, the first of `gemini-3.8-flash` and `gpt-5.6-luna` that a configured provider serves runs. A Claude model that always thinks cannot be forced, so with one set here every such reply waits under Review. Settings offers the System One models in the same control, which write `judgment_read_decision` instead. |
+| `model_read_decision` | global | a model id | `claude-haiku-5-5`, if reachable, after `gemini-3.8-flash` and `gpt-6-luna` (see "Background models") | Background model that makes a turn's *read decision* when the turn ended without one: it sees the turn's message, a question the user answered inside the turn, and the reply, and must answer one forced yes/no question. While unset, the first of `gemini-3.8-flash` and `gpt-6-luna` that a configured provider serves runs. A Claude model that always thinks cannot be forced, so with one set here every such reply waits under Review. Settings offers the System One models in the same control, which write `judgment_read_decision` instead. |
 | `reasoning_read_decision` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for the read decision, one yes or no. A forced call on Claude runs without thinking whatever this says. |
-| `model_wake_decision` | global | a model id | `gemini-3-flash-preview`, if reachable, after `gemini-3.8-flash`, `gpt-6.1-sol` and `gpt-5.6-luna` (see "Background models") | Background model that makes a child thread's *wake decision* when its turn ended without one and `judgment_wake_decision` leaves it on chat. It answers one forced yes/no question. It reads the message that opened the child's turn, the parent's latest reply, the child's reply and how many siblings still run. While unset, only those four measured models run: with none served, no chat model is asked and the parent wakes. A Claude model that always thinks cannot be forced, so the parent wakes. Setting it keeps the wake decision on chat even while OpenAI is configured, on the model it names. A failed call wakes the parent. |
+| `model_wake_decision` | global | a model id | `gpt-6-luna`, if reachable, after `gemini-3.8-flash` and `gpt-6.1-sol` (see "Background models") | Background model that makes a child thread's *wake decision* when its turn ended without one and `judgment_wake_decision` leaves it on chat. It answers one forced yes/no question. It reads the message that opened the child's turn, the parent's latest reply, the child's reply and how many siblings still run. While unset, only those three measured models run: with none served, no chat model is asked and the parent wakes. A Claude model that always thinks cannot be forced, so the parent wakes. Setting it keeps the wake decision on chat even while OpenAI is configured, on the model it names. A failed call wakes the parent. |
 | `reasoning_wake_decision` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for the wake decision, one yes or no. A forced call on Claude runs without thinking whatever this says. |
 | `memory_module` | global | `classic` \| `tree` | (unset: Classic runs, and the memory choice asks the user) | How a turn gets its past. See "The memory module" above. Do not choose for the user. Applies from the next turn. |
 | `workspace_view_bytes_home` | global | number 0–262144 | `65536` | Bytes of workspace memory view a home thread turn reads, under the `tree` module. `0` turns the view off there. |
@@ -246,14 +255,14 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `workspace_view_bytes_trigger` | global | number 0–262144 | `16384` | The same for a trigger run. Trigger runs are frequent, so this size costs most. |
 | `workspace_view_bytes_coding_agent` | global | number 0–262144 | `0` | The same for a coding-agent session, in its system prompt at session start. Default off, so a coding agent starts with no memory, like Classic. Set a positive value to opt in. |
 | `thread_view_bytes` | global | number 0–262144 | `65536` | The most bytes of a thread's own past a turn reads, under the `tree` module. Recent entries read verbatim, older ones as summary lines. |
-| `memory_view_model_caps` | global | `model=bytes` pairs, comma separated | (unset) | Caps both memory views for named models, for example `claude-haiku-4-5=8192`. A model id matches with or without its `[1m]` suffix. |
-| `model_image_description` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model that describes uploaded images. It must have the vision flag, or no description runs. |
+| `memory_view_model_caps` | global | `model=bytes` pairs, comma separated | (unset) | Caps both memory views for named models, for example `claude-haiku-5-5=8192`. A model id matches with or without its `[1m]` suffix. |
+| `model_image_description` | global | a model id | `claude-haiku-5-5`, if reachable (see "Background models") | Background model that describes uploaded images. It must have the vision flag, or no description runs. |
 | `reasoning_image_description` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for describing an image. Captioning is perception, so the default spends nothing. |
-| `model_memory` | global | a model id | `gemini-3-flash-preview`, if reachable, after `gpt-5.6-luna` (see "Background models") | Background model that extracts facts from a turn for long-term memory. While unset, `gpt-5.6-luna` runs when a configured provider serves it. It binds extraction only. |
-| `reasoning_memory` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `low` | Thinking budget for fact extraction, which returns short JSON on every turn. At `none`, GPT-5.6 Luna and GPT-5.4 mini missed facts. |
-| `model_conversation_summary` | global | a model id | `gemini-3-flash-preview`, if reachable, after the compactor's three (see "Background models") | Background model that writes a thread's *conversation summary*: the paragraph standing in for its older assistant turns. While unset, the first of `gpt-6.1-sol`, `gemini-3.8-flash` and `claude-sonnet-5-5` that a configured provider serves runs. Its input can be 80k tokens, far larger than any other background call. |
+| `model_memory` | global | a model id | `claude-haiku-5-5`, if reachable, after `gpt-6-luna` (see "Background models") | Background model that extracts facts from a turn for long-term memory. While unset, `gpt-6-luna` runs when a configured provider serves it. It binds extraction only. |
+| `reasoning_memory` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `low` | Thinking budget for fact extraction, which returns short JSON on every turn. At `none`, GPT-6 Luna's predecessors missed facts. |
+| `model_conversation_summary` | global | a model id | `claude-haiku-5-5`, if reachable, after the compactor's three (see "Background models") | Background model that writes a thread's *conversation summary*: the paragraph standing in for its older assistant turns. While unset, the first of `gpt-6.1-sol`, `gemini-3.8-flash` and `claude-sonnet-5-5` that a configured provider serves runs. Its input can be 80k tokens, far larger than any other background call. |
 | `reasoning_conversation_summary` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `low` | Thinking budget for the conversation summary. Raising it is unlikely to help: output length does not track it, and the summariser's failures are calls that never complete. |
-| `model_query_classification` | global | a model id | `gemini-3-flash-preview`, if reachable (see "Background models") | Background model that decides what a turn needs retrieved: long-term memory, the file list, credentials. Settings offers the System One models (Jev, Jev through OpenRouter, Clef, Clef-flash, OpenAI Decisions, a custom endpoint) in the same control, which write `judgment_query_classification` instead. |
+| `model_query_classification` | global | a model id | `claude-haiku-5-5`, if reachable (see "Background models") | Background model that decides what a turn needs retrieved: long-term memory, the file list, credentials. Settings offers the System One models (Jev, Jev through OpenRouter, Clef, Clef-flash, OpenAI Decisions, a custom endpoint) in the same control, which write `judgment_query_classification` instead. |
 | `reasoning_query_classification` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for query classification, which answers three yes/no questions before every turn. |
 | `voice_enabled` | global | `true` \| `false` | `false` | Experimental. `true` puts a call control in the *home thread*'s composer and lets `/api/v1/voice` accept a socket there, so Home can be spoken to. A call runs on the home thread alone, which every workspace has. It rents a speech-to-speech talker and needs the OpenAI provider configured. Every spoken utterance starts an ordinary agent turn, so a short call can cost several. With this off, nothing voice-shaped is reachable and the voice keys below do nothing. |
 | `model_voice_talker` | global | a model id | `gpt-realtime-2.1` | Speech-to-speech model a *voice session* speaks through; the id also picks the call's protocol. It holds the conversation only, so every action goes through the ordinary agent. Settings offers the realtime family newest first: `gpt-realtime-2.1`, `gpt-realtime-2.1-mini`, `gpt-realtime-2` and `gpt-realtime-1.5`. These bill by the token, and the caller can settle a card or ring off out loud. `gpt-live-1` follows: it takes an interruption better, holds no tools, and bills by the minute. A Live caller answers a question out loud, and taps for a permission or to ring off. OpenAI retired `gpt-realtime`, `gpt-realtime-mini` and the `gpt-4o` realtime models: a write of one is refused, and the engine moves a stored one to `gpt-realtime-2.1` (a mini to `gpt-realtime-2.1-mini`) at startup. |
@@ -265,6 +274,7 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `proxy_timeout_secs` | global | number 1–600 | `30` | Seconds the engine proxy waits on one upstream request before it answers 504. Covers every proxied call: `lucidos proxy`, `lucidos.proxy` in an app, the `proxy_request` tool, and the builtin model routes such as `vertex` and `openai`. A streamed reply counts in full, because the proxy reads the whole body first. Raise it when a long model call through the proxy times out. An `apis.json` entry's own `timeout_secs` wins for that entry. Every write path refuses a value outside the range. |
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
 | `notification_toasts` | global | `true` \| `false` | `true` | Whether a notification pops an in-app toast on a device the user is looking at. `false` silences the pop-up only: the notification still counts on the bell badge and waits in the Notifications panel. No OS push replaces it, because a present device never gets one. Unlike `push_notifications`, one write covers every device. |
+| `composer_enter_key` | global | `send` \| `newline` | `send` | What Enter does in the chat composer on a desktop layout. `send`: Enter sends and Shift+Enter adds a new line. `newline`: Enter adds a new line and Shift+Enter sends. Cmd+Enter or Ctrl+Enter sends in both. On a phone, Enter always adds a new line and the Send button sends. Offer `newline` to a user who keeps sending half-written prompts. Found under **Settings → Keyboard Shortcuts → Composer**. |
 | `mobile_dynamic_bars` | global | `true` \| `false` | `false` | *Dynamic bars* on a phone. `true` glides the header, the thread title and the prompt away while scrolling down a thread, and the header while scrolling down an app that loads the SDK. They return on scroll up or a pane swipe. `false` keeps them always visible. |
 | `automatic_widgets` | global | `true` \| `false` | `true` | Whether you may choose a *widget* on your own: a small interactive answer shown inline in the thread as an *inline widget* (`create_app` with `kind="widget"`, then an embed). `false` stops only your own choice, and a widget the user asks for is still made. Set it to `false` when the user tells you to stop making widgets. |
 | `external_link_target` | global | `safari` \| `ask` \| `in-app` | `safari` | Where an external http(s) link goes when tapped in an **installed iOS PWA**. Desktop, Android and a normal Safari tab always open a new tab. `safari` hands it to the Safari app. `ask` opens the OS share sheet, so iOS offers every installed browser, including the user's real default. `in-app` keeps it in the PWA's in-app web view (no address bar, no shared Safari session). |
@@ -336,6 +346,46 @@ and `set_preference` refuses every one with a hint naming the right surface:
   keeps it on the chat model. A System One model there reads the child's
   reply, so only the user decides. Any doubt or failed call still wakes the
   parent.
+- `model_claude_code`, `reasoning_claude_code`, `model_codex`,
+  `reasoning_codex`: the *default implementer*, the pair a coding-agent thread
+  runs on when nobody picked one. Claude Code's ships as `claude-opus-5-5` at
+  `medium`; Codex's ships unset, so Codex's own config decides. Lucidos pins the
+  pair at spawn. A pick that names a model and no effort runs at that model's
+  default effort. Only the owner sets them, with the star in Settings →
+  Intelligence.
+- `intelligence_ladder_chat`: the owner's *intelligence ladder* for the
+  Lucidos Agent, the same shape as the two below. It is the only switch for
+  what the model picker lists: a model with a rung that is on. It also binds an agent's chat
+  pick: `run_thread`'s `model` and a trigger's `model`. Its rungs may name
+  `none`, which no coding agent takes.
+
+  The owner's own picks are never held to it, and only the owner sets it, in
+  Settings → Intelligence. The Lucidos Agent's *rung control* lists its rungs
+  that are on. `manage_models`
+  `enable` / `disable` and
+  `lucidos models update --on-chat-ladder` turn one model on or off it. A
+  workspace upgraded from the old per-model on switch starts with the models it
+  had on. `lucidos intelligence-ladder --surface chat` prints the effective one.
+- `intelligence_ladder_claude_code`, `intelligence_ladder_codex`: the owner's
+  *intelligence ladder* for each backend, as ordered `model=effort` rungs, least
+  to most intelligent. Unset means the shipped ladder's rungs that are on. Set
+  means exactly that list, minus pairs the backend no longer offers. Lucidos
+  refuses an agent's pick off the ladder, so only the owner sets it, in
+  Settings → Intelligence. The editor writes unset when the list equals the
+  shipped one. **Copy from Lucidos Agent** there writes it once from the Lucidos
+  Agent's ladder: the pairs this backend runs, keeping their on and off state, in the
+  backend's own order. **Sort by intelligence** restates it in profile order,
+  keeping what is on, and clears it when that equals the shipped list.
+  `lucidos intelligence-ladder` prints the effective one.
+  - **Building one from your own measurements.** Replay a few settled tasks on
+    the candidate rungs, compare outcome and cost, and list the rungs that earn
+    their place. A rung no other rung beats on both quality and cost belongs on
+    it.
+- `long_prompt_share`: the percentage of coding-agent calls whose prompt
+  passes 100k tokens, from 0 to 100. A model that bills the whole call higher
+  past that line, such as Haiku 5.5, shows its cost *band* at this mix. Unset
+  means the share measured from the last 30 days of Claude Code calls. Only
+  the owner sets it, with the slider in Settings → Intelligence.
 - `backup_last_run`: internal backup state (the last run's outcome), not a
   setting. The backup *schedule*, *provider* and *retention* ARE settable (see
   the table above). `get_backup_status` reads the current schedule, next and
@@ -348,6 +398,9 @@ and `set_preference` refuses every one with a hint naming the right surface:
   your own loop, so never raise it. The `[ENGINE-LIMIT]` prefix is your only signal the cap was hit.
 - `keybindings`: Settings → Keyboard Shortcuts.
 - `capture_context`: a debug-only toggle.
+- `cache_warm_line`: whether a waiting thread draws the cache-warm line (how long
+  its prompt cache stays warm). Default on. The user changes it in Settings →
+  System → Debugging.
 - `voice_input_device`: which microphone a call opens, per device. The value is
   a browser's own opaque handle, meaningless in another browser or on another
   machine. The user picks it by holding the call control in the composer. You
@@ -371,15 +424,16 @@ and `set_preference` refuses every one with a hint naming the right surface:
   notice. It also stamps a workspace with no threads once at startup, so nothing
   lands over its first run. Never via `set_preference`: clearing it re-shows
   every notice the user already read.
-- `vapid_keys`, `backfill_trigger_id_from_events_done`,
+- `backfill_trigger_id_from_events_done`,
   `backfill_trigger_id_v5_to_config_id_done`,
   `backfill_repo_names_from_changes_done`,
   `backfill_cc_repo_id_to_deterministic_done`: engine bookkeeping, never shown
-  by `get_preferences`. The first is the workspace's Web Push signing keypair;
-  the rest are one-shot migration markers.
+  by `get_preferences`. They are one-shot migration markers. `vapid_keys` is
+  retired: the Web Push signing keypair is a sealed secret in its own table now.
 - `provider_enabled_vertex`, `provider_enabled_anthropic`,
   `provider_enabled_openai`, `provider_enabled_openrouter`,
-  `provider_enabled_xai`, `provider_enabled_local`: the per-provider switches on
+  `provider_enabled_xai`, `provider_enabled_local`,
+  `provider_enabled_claude_gateway`: the per-provider switches on
   Settings → Models → Providers. Absent means **on**; only an explicit `false`
   switches a provider off. Off drops it from the model picker and from web
   search, with no restart, and leaves the stored key untouched for later. Never
@@ -394,6 +448,13 @@ and `set_preference` refuses every one with a hint naming the right surface:
   Any other host is refused on save, and one stored earlier is ignored, so the
   local provider drops out. The saved `local` key goes only where its credential
   scope covers this URL.
+- `claude_gateway_url`: the origin of the Claude gateway Lucidos signs in to,
+  unset by default. The user sets it in Settings → Models → Providers, never
+  you: that host receives every prompt sent to a Claude model routed there,
+  with the user's sign-in. It must be an `https` origin with no path, and a
+  write that is not one is refused. A URL that stops naming the signed-in
+  gateway signs Lucidos out of it. The `claude-gateway` provider serves only
+  while this URL is set and Lucidos is signed in to that gateway.
 - `provider_enabled_typesafe`, `provider_enabled_cloudflare_workers_ai`,
   `provider_enabled_system_one_custom`: the same switch for the three System
   One providers, on the same page: TypeSafe's Jev, Cloudflare's Clef and

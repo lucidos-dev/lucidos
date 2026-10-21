@@ -90,9 +90,9 @@ For each finding, capture: **location** (the section id, then the item id),
   yet. Report the count in one line, so nobody reads silence as "all used".
   Deleting a thread deletes the loads, embeds and pins it held, so a
   deletion inside the window leaves knowhow and reusable widgets not judged.
-- **A knowhow doc an intent loads counts as used.** `execute_intent` reads an
-  intent's `knowhow:` docs, and an app intent's whole app folder, with no
-  `load_knowhow` call to record.
+- **A knowhow doc an intent loads counts as used.** `load_knowhow` on an
+  intent reads its `knowhow:` docs, and an app intent's whole app folder, but
+  records a load for the intent id only.
 
 **The largest items go in the report, but they are not findings.** List the
 five largest across every section by `chars`, so the user sees where the
@@ -100,8 +100,9 @@ characters go.
 
 ## Remediation
 
-Fixes run only on request, as the root's § Remediation says. The fixes split
-by whether they can be undone.
+Fixes run only on request, as the root's § Remediation says. Every fix here
+is inline: a file edit, a deletion, a CLI call or an `update_trigger` call.
+None needs a coding agent. The fixes split by whether they can be undone.
 
 | Finding | Fix | In "Do all suggested fixes" |
 |---|---|---|

@@ -98,6 +98,7 @@ pub(super) fn client_url_block(frontend_url: &str) -> String {
 /// Named rather than three positional `&str`s. The consumers pass them
 /// through a long argument list, where two adjacent strings are one typo away
 /// from swapping.
+#[derive(Default)]
 pub(crate) struct TurnTail<'a> {
     pub engine_build: &'a str,
     pub client_url: &'a str,

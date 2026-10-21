@@ -58,6 +58,19 @@ describe('exchangeStatus — full branch coverage', () => {
     expect(exchangeStatus(exchange, '', false)).toBe('done');
   });
 
+  // An effort restart is a redirect too, never the user's Stop. The engine
+  // resumes the work, so the turn reads Working until then
+  // (`an-effort-restart-is-one-turn.test.ts`).
+  it('renders an effort_restart ResponseCanceled as work still owed', () => {
+    const exchange = makeExchange(msg(), [
+      step(1, { type: 'CodingAgentToolCalled', name: 'Bash', args: {} }),
+      step(2, { type: 'ResponseCanceled', cause: 'effort_restart' }),
+      step(3, { type: 'CodingAgentIdled' }),
+    ]);
+    expect(exchangeStatus(exchange, '', true)).toBe('coding-agent-working');
+    expect(exchangeStatus(exchange, '', false)).toBe('done');
+  });
+
   it('superseded_by_followup cancel is terminal "done" even before CodingAgentIdled lands', () => {
     // Brief live window: the cancel arrives before the idle / the follow-up's
     // MessageReceived. It must still be a neutral terminal (done), never a stuck

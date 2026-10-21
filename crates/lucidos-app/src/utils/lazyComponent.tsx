@@ -3,6 +3,7 @@ import { h, type ComponentType } from 'preact';
 import { showToast } from '../store/store';
 import { reloadForStaleChunk } from '../hooks/sw-update';
 import { postClientLog } from './clientLog';
+import { CLIENT_BUILD_ID } from 'virtual:build-id';
 
 /** A code-split component, plus a way to load its chunk before anything mounts it. */
 export type LazyComponent<P> = ComponentType<P> & {
@@ -13,6 +14,36 @@ export type LazyComponent<P> = ComponentType<P> & {
   /** Whether the component is in memory, so a mount renders it at once. */
   isLoaded(): boolean;
 };
+
+/** The chunk a built loader imports, read from its own source, which
+ *  Vite emits as `() => preload(() => import("./Name-hash.js"), …)`. WebKit's
+ *  import error names no URL, so this says which import failed. The file at
+ *  fault may be one of its static imports, which the service worker logs. */
+export function importedChunkOf(load: () => unknown): string | null {
+  return /import\(\s*["'`]([^"'`]+)["'`]\s*\)/.exec(String(load))?.[1] ?? null;
+}
+
+/** Fetch a failed imported chunk again, the way its import did, and log what came
+ *  back. That tells a missing file (a stale build) from a body the browser
+ *  refused. It goes through the service worker and the HTTP cache alike. */
+export async function probeFailedChunk(file: string): Promise<void> {
+  const controlled = typeof navigator !== 'undefined' && !!navigator.serviceWorker?.controller;
+  const base = { importedChunk: file, build: CLIENT_BUILD_ID, controlled };
+  try {
+    // A Vite chunk specifier is relative to the assets directory it sits in.
+    const response = await fetch(new URL(file, new URL('assets/', document.baseURI)));
+    const bytes = (await response.arrayBuffer()).byteLength;
+    postClientLog('chunk', 'probe', {
+      ...base,
+      status: response.status,
+      type: response.type,
+      contentType: response.headers.get('content-type'),
+      bytes,
+    });
+  } catch (err) {
+    postClientLog('chunk', 'probe', { ...base, error: String(err).slice(0, 300) });
+  }
+}
 
 /**
  * Load a chunk once and keep what it holds. Resolves `true` once kept, or
@@ -37,11 +68,14 @@ function chunkLoader<T>(load: () => Promise<T>, keep: (value: T) => void, kept: 
       (err) => {
         loading = null;
         console.error('[lazyComponent] load failed', err);
-        postClientLog('chunk', 'load_failed', { message: String(err).slice(0, 300) });
+        const importedChunk = importedChunkOf(load);
+        postClientLog('chunk', 'load_failed', { message: String(err).slice(0, 300), importedChunk });
         // Almost always a stale chunk after a rebuild, so reload to the new build.
-        // Toast only if the loop guard already reloaded us recently.
+        // Toast only if the loop guard already reloaded us recently. Probe only
+        // then: a reload would cut the probe short, and a healed load needs none.
         if (!reloadForStaleChunk()) {
           showToast('Failed to load. Refresh the page to try again.', 'error');
+          if (importedChunk) void probeFailedChunk(importedChunk);
         }
         return false;
       },

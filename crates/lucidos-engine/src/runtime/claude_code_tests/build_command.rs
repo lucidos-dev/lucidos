@@ -27,6 +27,7 @@ fn test_spawn_args<'a>(
         workspace_path: workspace,
         allowed_tools: None,
         system_prompt: None,
+        session_context: None,
         resume_session_id: None,
         model: None,
         reasoning_effort: None,
@@ -40,6 +41,7 @@ fn test_spawn_args<'a>(
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
+        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
@@ -56,6 +58,7 @@ fn test_spawn_args_with_event<'a>(
         workspace_path: workspace,
         allowed_tools: None,
         system_prompt: None,
+        session_context: None,
         resume_session_id: None,
         model: None,
         reasoning_effort: None,
@@ -69,6 +72,7 @@ fn test_spawn_args_with_event<'a>(
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
+        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
@@ -85,6 +89,7 @@ fn test_spawn_args_with_repo<'a>(
         workspace_path: workspace,
         allowed_tools: None,
         system_prompt: None,
+        session_context: None,
         resume_session_id: None,
         model: None,
         reasoning_effort: None,
@@ -98,6 +103,7 @@ fn test_spawn_args_with_repo<'a>(
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
+        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     }
 }
@@ -119,6 +125,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         workspace_path: p,
         allowed_tools: None,
         system_prompt: None,
+        session_context: None,
         resume_session_id: None,
         model: None,
         reasoning_effort: None,
@@ -132,6 +139,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         permission_mode: None,
         additional_directories: &[],
         auto_compact: None,
+        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
     };
     let cmd = session_command(&args, None);
@@ -862,10 +870,23 @@ fn build_command_skips_path_injection_when_no_cli_dir() {
     let p = std::path::Path::new("/tmp");
     let cmd = session_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
-    assert!(
-        !env.contains_key(std::ffi::OsStr::new("PATH")),
-        "PATH must not be set when lucidos CLI binary is missing — \
-         otherwise we'd shadow the inherited PATH with an empty value"
+    // A host with `LUCIDOS_PG_BIN_DIR` set still prepends that dir, so PATH
+    // may be set. It must never drop the inherited PATH.
+    let Some(path) = env.get(std::ffi::OsStr::new("PATH")) else {
+        return;
+    };
+    let path = std::env::split_paths(path).collect::<Vec<_>>();
+    let pg_bin_dir = std::env::var_os("LUCIDOS_PG_BIN_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let expected = pg_bin_dir
+        .into_iter()
+        .chain(std::env::split_paths(&inherited))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        path, expected,
+        "with no lucidos CLI dir, PATH is at most the Postgres dir before the inherited PATH"
     );
 }
 
@@ -1240,6 +1261,68 @@ fn a_user_env_var_cannot_turn_claude_codes_background_tasks_back_on() {
     );
 }
 
+fn disallowed_tools(argv: &[String]) -> Option<String> {
+    flag_value(argv, "--disallowedTools")
+}
+
+/// A resume and a side question share the session's tool list, so all three
+/// shapes must carry the one list (ADR 0535).
+#[test]
+fn every_spawn_shape_disallows_the_tools_that_promise_later_work() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let worktree = PathBuf::from("/tmp/wt");
+    let mut args = test_spawn_args(&worktree, workspace.path(), uuid::Uuid::new_v4());
+    let fresh = collect_args(&session_command(&args, None));
+    args.resume_session_id = Some("sess-1");
+    let resumed = collect_args(&session_command(&args, None));
+    let settings = PathBuf::from("/tmp/ws/.lucidos/cc-side-question-settings.json");
+    let side_question = collect_args(
+        &build_side_question_command(&args, None, &settings)
+            .unwrap()
+            .cmd,
+    );
+
+    let expected = DISALLOWED_TOOLS.join(",");
+    for (shape, argv) in [
+        ("fresh", &fresh),
+        ("resume", &resumed),
+        ("side question", &side_question),
+    ] {
+        assert_eq!(
+            disallowed_tools(argv).as_deref(),
+            Some(expected.as_str()),
+            "{shape}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--disallowedTools").count(),
+            1,
+            "{shape} carries one list",
+        );
+    }
+}
+
+#[test]
+fn the_disallowed_tools_never_name_a_tool_a_session_needs() {
+    for needed in [
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "Glob",
+        "Grep",
+        "Agent",
+        "AskUserQuestion",
+        "Skill",
+        "ToolSearch",
+        "ReportFindings",
+        "SendMessage",
+        CC_PERMISSION_PROMPT_TOOL,
+        CC_MCP_ASK_USER_QUESTION_TOOL,
+    ] {
+        assert!(!DISALLOWED_TOOLS.contains(&needed), "{needed}");
+    }
+}
+
 // ── The Vertex relay stamp (plan invariants 3 and 9) ───────────────────────
 
 fn vertex_base_url(cmd: &tokio::process::Command) -> Option<String> {
@@ -1260,7 +1343,6 @@ fn a_session_with_a_relay_sends_its_vertex_calls_through_it() {
         url.starts_with("http://127.0.0.1:4321/api/v1/vertex-relay/"),
         "{url}"
     );
-    assert!(relays_vertex_calls(&cmd));
 }
 
 /// A workspace's own Vertex base URL must not bypass the relay. It rides the
@@ -1283,8 +1365,7 @@ fn a_workspace_vertex_url_becomes_the_relays_upstream() {
     assert!(url.contains(&override_hex), "{url}");
 }
 
-/// No relay running leaves the session exactly as it was, and the parser then
-/// treats `thinking` text as reasoning.
+/// No relay running leaves the session exactly as it was.
 #[test]
 fn a_session_without_a_relay_keeps_its_own_vertex_url() {
     let p = std::path::Path::new("/tmp");
@@ -1301,7 +1382,6 @@ fn a_session_without_a_relay_keeps_its_own_vertex_url() {
         vertex_base_url(&cmd).as_deref(),
         Some("https://proxy.example/v1")
     );
-    assert!(!relays_vertex_calls(&cmd));
 }
 
 /// The replay is how the engine learns an input was read (ADR 0268). A spawn
@@ -1483,7 +1563,7 @@ fn a_huge_system_prompt_travels_in_a_private_file_not_argv() {
         .expect("the prompt file is named");
     let file = PathBuf::from(&argv[at + 1]);
     assert!(
-        file.starts_with(system_prompt_dir(p)),
+        file.starts_with(session_files_dir(p)),
         "the workspace owns the file"
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), prompt);
@@ -1513,7 +1593,7 @@ fn no_system_prompt_names_no_prompt_file() {
 #[test]
 fn the_boot_sweep_deletes_only_stale_system_prompt_files() {
     let workspace = tempfile::TempDir::new().unwrap();
-    let dir = system_prompt_dir(workspace.path());
+    let dir = session_files_dir(workspace.path());
     std::fs::create_dir_all(&dir).unwrap();
     let stale = dir.join("system-prompt-old.md");
     let fresh = dir.join("system-prompt-new.md");
@@ -1523,7 +1603,7 @@ fn the_boot_sweep_deletes_only_stale_system_prompt_files() {
         .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
         .unwrap();
 
-    sweep_stale_system_prompt_files(workspace.path());
+    sweep_stale_session_files(workspace.path());
 
     assert!(!stale.exists(), "a leftover file must go");
     assert!(fresh.exists(), "a file this engine may own must stay");
@@ -1533,6 +1613,360 @@ fn the_boot_sweep_deletes_only_stale_system_prompt_files() {
 #[test]
 fn the_boot_sweep_tolerates_a_missing_prompt_dir() {
     let workspace = tempfile::TempDir::new().unwrap();
-    sweep_stale_system_prompt_files(workspace.path());
-    assert!(!system_prompt_dir(workspace.path()).exists());
+    sweep_stale_session_files(workspace.path());
+    assert!(!session_files_dir(workspace.path()).exists());
+}
+
+// ---- startup instructions ride the shared system prompt ----
+
+/// A worktree with a CLAUDE.md, a config directory, a `claude` that prints a
+/// fixed version, and a workspace holding the base settings.
+#[cfg(unix)]
+struct StartupWorkspace {
+    workspace: tempfile::TempDir,
+    worktree: tempfile::TempDir,
+    config: tempfile::TempDir,
+    claude: tempfile::TempDir,
+    env: Vec<(String, String)>,
+}
+
+#[cfg(unix)]
+const LUCIDOS_PROMPT: &str = "THE LUCIDOS PROMPT";
+
+#[cfg(unix)]
+impl StartupWorkspace {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let config = tempfile::tempdir().unwrap();
+        let env = vec![(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            config.path().to_string_lossy().into_owned(),
+        )];
+        let this = Self {
+            workspace: tempfile::tempdir().unwrap(),
+            worktree: tempfile::tempdir().unwrap(),
+            config,
+            claude: tempfile::tempdir().unwrap(),
+            env,
+        };
+        std::fs::write(this.worktree.path().join("CLAUDE.md"), "# Project rules\n").unwrap();
+        let bin = this.claude.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\necho '7.7.7 (Claude Code)'\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let base =
+            crate::engine::cc_settings::cc_settings_path_for_workspace(this.workspace.path());
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::fs::write(
+            &base,
+            crate::engine::cc_settings::build_cc_settings_json(&[]),
+        )
+        .unwrap();
+        this
+    }
+
+    fn bin(&self) -> String {
+        self.claude
+            .path()
+            .join("claude")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The args of a session with the Lucidos prompt. The `claude` path is
+    /// borrowed from `bin`, which the caller keeps alive.
+    fn args<'a>(&'a self, bin: &'a str) -> SpawnArgs<'a> {
+        let mut args = test_spawn_args(
+            self.worktree.path(),
+            self.workspace.path(),
+            uuid::Uuid::new_v4(),
+        );
+        args.system_prompt = Some(LUCIDOS_PROMPT);
+        args.binary_override = Some(bin);
+        args.user_env_vars = &self.env;
+        args
+    }
+
+    fn mirror(&self) -> super::startup_instructions::StartupInstructions {
+        super::startup_instructions::StartupInstructions::mirror(
+            self.worktree.path(),
+            self.config.path(),
+            None,
+        )
+    }
+
+    fn mark(&self, verdict: super::startup_instructions::Verdict) {
+        super::startup_instructions::StartupLedger::record(
+            self.workspace.path(),
+            &self.mirror().key("7.7.7 (Claude Code)"),
+            verdict,
+        );
+    }
+}
+
+#[cfg(unix)]
+fn flag_value(argv: &[String], flag: &str) -> Option<String> {
+    argv.iter()
+        .position(|a| a == flag)
+        .map(|at| argv[at + 1].clone())
+}
+
+/// An unverified key runs as today: Claude Code's own settings file, the
+/// Lucidos prompt alone, and a check owed after the first turn.
+#[cfg(unix)]
+#[test]
+fn an_unverified_key_runs_exactly_as_today() {
+    let ws = StartupWorkspace::new();
+    let bin = ws.bin();
+    let command = build_command(&ws.args(&bin), None).unwrap();
+    let argv = collect_args(&command.cmd);
+    let base = crate::engine::cc_settings::cc_settings_path_for_workspace(ws.workspace.path());
+    assert_eq!(
+        flag_value(&argv, "--settings").unwrap(),
+        base.to_str().unwrap()
+    );
+    let prompt = flag_value(&argv, "--append-system-prompt-file").unwrap();
+    assert_eq!(std::fs::read_to_string(prompt).unwrap(), LUCIDOS_PROMPT);
+    assert!(command.session_settings_file.is_none());
+    assert!(matches!(
+        command.startup_follow_up,
+        Some(StartupFollowUp::Check(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_key_runs_exactly_as_today_and_asks_for_no_check() {
+    let ws = StartupWorkspace::new();
+    ws.mark(super::startup_instructions::Verdict::Failed);
+    let bin = ws.bin();
+    let command = build_command(&ws.args(&bin), None).unwrap();
+    let argv = collect_args(&command.cmd);
+    let prompt = flag_value(&argv, "--append-system-prompt-file").unwrap();
+    assert_eq!(std::fs::read_to_string(prompt).unwrap(), LUCIDOS_PROMPT);
+    assert!(command.session_settings_file.is_none());
+    assert!(command.startup_follow_up.is_none());
+}
+
+/// A verified key moves the files: the block follows the Lucidos prompt, and
+/// the settings exclude exactly the files the block holds.
+#[cfg(unix)]
+#[test]
+fn a_verified_key_appends_the_block_after_the_prompt_and_excludes_the_files() {
+    let ws = StartupWorkspace::new();
+    ws.mark(super::startup_instructions::Verdict::Verified);
+    let bin = ws.bin();
+    let command = build_command(&ws.args(&bin), None).unwrap();
+    let argv = collect_args(&command.cmd);
+
+    let prompt =
+        std::fs::read_to_string(flag_value(&argv, "--append-system-prompt-file").unwrap()).unwrap();
+    assert_eq!(
+        prompt,
+        format!("{LUCIDOS_PROMPT}\n\n{}", ws.mirror().render()),
+        "the Lucidos prompt stays first and unchanged"
+    );
+    assert!(prompt.contains("Contents of CLAUDE.md (project instructions"));
+
+    let settings_path = flag_value(&argv, "--settings").unwrap();
+    let base = crate::engine::cc_settings::cc_settings_path_for_workspace(ws.workspace.path());
+    assert_ne!(settings_path, base.to_str().unwrap());
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    let excluded = settings
+        .as_object_mut()
+        .unwrap()
+        .remove("claudeMdExcludes")
+        .unwrap();
+    assert_eq!(excluded, serde_json::json!(ws.mirror().excluded_paths()));
+    assert_eq!(
+        settings,
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&base).unwrap())
+            .unwrap(),
+        "everything else in the workspace settings carries over"
+    );
+    assert!(
+        matches!(
+            command.startup_follow_up,
+            Some(StartupFollowUp::Moved { .. })
+        ),
+        "a moved session owes the ledger a record of the move"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&settings_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    drop(command);
+    assert!(
+        !Path::new(&settings_path).exists(),
+        "the settings file outlived its command"
+    );
+}
+
+/// Two worktrees at different paths with the same files append the same bytes,
+/// which is what lets the cache serve both.
+#[cfg(unix)]
+#[test]
+fn two_worktrees_with_the_same_files_append_the_same_bytes() {
+    let (a, b) = (StartupWorkspace::new(), StartupWorkspace::new());
+    for ws in [&a, &b] {
+        ws.mark(super::startup_instructions::Verdict::Verified);
+    }
+    let appended = |ws: &StartupWorkspace| {
+        let bin = ws.bin();
+        let command = build_command(&ws.args(&bin), None).unwrap();
+        let argv = collect_args(&command.cmd);
+        std::fs::read_to_string(flag_value(&argv, "--append-system-prompt-file").unwrap()).unwrap()
+    };
+    assert_ne!(a.worktree.path(), b.worktree.path());
+    assert_eq!(appended(&a), appended(&b));
+}
+
+/// A move that cannot write its settings leaves the files to Claude Code, so
+/// no session runs with neither the files nor the block.
+#[cfg(unix)]
+#[test]
+fn a_move_that_cannot_set_up_its_settings_keeps_claude_codes_loading() {
+    let ws = StartupWorkspace::new();
+    ws.mark(super::startup_instructions::Verdict::Verified);
+    let base = crate::engine::cc_settings::cc_settings_path_for_workspace(ws.workspace.path());
+    std::fs::write(&base, "not json").unwrap();
+    let bin = ws.bin();
+    let command = build_command(&ws.args(&bin), None).unwrap();
+    let argv = collect_args(&command.cmd);
+    assert_eq!(
+        flag_value(&argv, "--settings").unwrap(),
+        base.to_str().unwrap()
+    );
+    let prompt = flag_value(&argv, "--append-system-prompt-file").unwrap();
+    assert_eq!(std::fs::read_to_string(prompt).unwrap(), LUCIDOS_PROMPT);
+    assert!(command.session_settings_file.is_none());
+}
+
+/// A spawn with no Lucidos prompt, such as a model probe, has nothing for the
+/// block to follow.
+#[cfg(unix)]
+#[test]
+fn a_spawn_with_no_lucidos_prompt_never_moves() {
+    let ws = StartupWorkspace::new();
+    ws.mark(super::startup_instructions::Verdict::Verified);
+    let bin = ws.bin();
+    let mut args = ws.args(&bin);
+    args.system_prompt = None;
+    let command = build_command(&args, None).unwrap();
+    assert!(command.system_prompt_file.is_none());
+    assert!(command.session_settings_file.is_none());
+    assert!(command.startup_follow_up.is_none());
+}
+
+/// The side question's copy resumes the session. It moves the files exactly
+/// when the session started moved, and keeps its own settings for the rest.
+#[cfg(unix)]
+#[test]
+fn a_side_question_copy_moves_the_files_over_its_own_settings() {
+    let ws = StartupWorkspace::new();
+    super::startup_instructions::StartupLedger::record_moved_session(ws.workspace.path(), "sess-1");
+    let bin = ws.bin();
+    let mut args = ws.args(&bin);
+    args.resume_session_id = Some("sess-1");
+    let own = ws
+        .workspace
+        .path()
+        .join(".lucidos/cc-side-question-settings.json");
+    let own_json = crate::engine::cc_settings::build_cc_side_question_settings_json(&[]);
+    std::fs::write(&own, &own_json).unwrap();
+    let copy = build_side_question_command(&args, None, &own).unwrap();
+    let argv = collect_args(&copy.cmd);
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(flag_value(&argv, "--settings").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["claudeMdExcludes"],
+        serde_json::json!(ws.mirror().excluded_paths())
+    );
+    assert_eq!(
+        settings["hooks"],
+        serde_json::from_str::<serde_json::Value>(&own_json).unwrap()["hooks"]
+    );
+    let prompt =
+        std::fs::read_to_string(flag_value(&argv, "--append-system-prompt-file").unwrap()).unwrap();
+    assert!(prompt.starts_with(LUCIDOS_PROMPT) && prompt.ends_with(&ws.mirror().render()));
+}
+
+/// Claude Code freezes a session's system prompt, so a block appended on resume
+/// is never read. A session that started unmoved must keep Claude Code's
+/// loading, even when its key was verified in between.
+#[cfg(unix)]
+#[test]
+fn a_resumed_session_that_started_unmoved_never_moves() {
+    let ws = StartupWorkspace::new();
+    ws.mark(super::startup_instructions::Verdict::Verified);
+    let bin = ws.bin();
+    let mut args = ws.args(&bin);
+    args.resume_session_id = Some("sess-unmoved");
+    let command = build_command(&args, None).unwrap();
+    let argv = collect_args(&command.cmd);
+    let prompt = flag_value(&argv, "--append-system-prompt-file").unwrap();
+    assert_eq!(std::fs::read_to_string(prompt).unwrap(), LUCIDOS_PROMPT);
+    assert!(command.session_settings_file.is_none());
+    assert!(command.startup_follow_up.is_none());
+}
+
+/// A session recorded as moved resumes moved, whatever its key says now, so
+/// its files never load twice or go missing.
+#[cfg(unix)]
+#[test]
+fn a_resumed_session_that_started_moved_moves_again() {
+    let ws = StartupWorkspace::new();
+    super::startup_instructions::StartupLedger::record_moved_session(
+        ws.workspace.path(),
+        "sess-moved",
+    );
+    let bin = ws.bin();
+    let mut args = ws.args(&bin);
+    args.resume_session_id = Some("sess-moved");
+    let command = build_command(&args, None).unwrap();
+    let argv = collect_args(&command.cmd);
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(flag_value(&argv, "--settings").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["claudeMdExcludes"],
+        serde_json::json!(ws.mirror().excluded_paths())
+    );
+    assert!(matches!(
+        command.startup_follow_up,
+        Some(StartupFollowUp::Moved { .. })
+    ));
+}
+
+/// `claudeMdExcludes` holds glob patterns. A path a pattern might misread
+/// would leave the file loaded twice, so such a worktree keeps Claude Code's
+/// loading.
+#[cfg(unix)]
+#[test]
+fn a_worktree_path_with_glob_syntax_never_moves() {
+    let ws = StartupWorkspace::new();
+    let odd = ws.worktree.path().join("old (copy)");
+    std::fs::create_dir_all(&odd).unwrap();
+    std::fs::write(odd.join("CLAUDE.md"), "# Rules\n").unwrap();
+    let bin = ws.bin();
+    let mut args = ws.args(&bin);
+    args.worktree_path = &odd;
+    let mirror =
+        super::startup_instructions::StartupInstructions::mirror(&odd, ws.config.path(), None);
+    super::startup_instructions::StartupLedger::record(
+        ws.workspace.path(),
+        &mirror.key("7.7.7 (Claude Code)"),
+        super::startup_instructions::Verdict::Verified,
+    );
+    let command = build_command(&args, None).unwrap();
+    assert!(command.session_settings_file.is_none());
 }

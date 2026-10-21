@@ -181,6 +181,11 @@ impl LucidosEngine {
         let model_str = selection.model.unwrap_or(provider.default_model());
         let effective_model = (!model_str.is_empty()).then(|| model_str.to_string());
         let effective_effort = selection.reasoning_effort.map(|s| s.to_string());
+        let caller_route = crate::core::ResolvedModelSelection {
+            model: effective_model.clone(),
+            reasoning_effort: effective_effort.clone(),
+            provider: selection.provider.map(|kind| kind.as_str().to_string()),
+        };
         let capture_window = self.context_window_for(capture_seed.model, selection.provider);
 
         // Command guard (ADR 0002): off unless the workspace turned on the
@@ -784,6 +789,8 @@ impl LucidosEngine {
                 crate::engine::model_call::turn_chat(
                     &self.event_bus,
                     thread_id,
+                    meta.clone(),
+                    rounds,
                     provider.as_ref(),
                     messages.clone(),
                     call_tools,
@@ -1072,26 +1079,30 @@ impl LucidosEngine {
                     .await;
             }
             turn_capture
-                .finish(meta.clone(), |usage, served_model| {
-                    crate::engine::thread_events::ThreadEvent::ContextCaptured {
+                .finish(
+                    |report| crate::engine::thread_events::ThreadEvent::ContextCaptured {
                         producer: crate::engine::ContextProducer::MainLlm,
                         model: capture_seed.model.to_string(),
                         context_window: capture_window,
                         sections: iter_sections,
                         tools: tools.names().to_vec(),
                         estimated_total_tokens,
-                        usage,
+                        usage: report.usage,
                         trimmed,
                         trim_passes: trim_passes.clone(),
                         purpose: crate::engine::ContextPurpose::Turn,
                         reconstructed: false,
                         parent_tool_use_id: None,
                         api_call_id: None,
-                        reasoning_effort: None,
-                        duration_ms: None,
-                        served_model,
-                    }
-                })
+                        reasoning_effort: report.detail.reasoning_effort,
+                        duration_ms: report.detail.duration_ms,
+                        served_model: report.detail.served_model,
+                        provider: report.detail.provider,
+                        stable_prefix_fingerprint: report.stable_prefix_fingerprint,
+                        ttft_ms: report.detail.ttft_ms,
+                        request_id: report.detail.request_id,
+                    },
+                )
                 .await;
 
             // Post-response repair (argument text): the model sometimes
@@ -2402,6 +2413,7 @@ impl LucidosEngine {
                                 &tool_call.id,
                                 &meta,
                                 cancel_token,
+                                &caller_route,
                             )
                             .await
                         {
@@ -2429,7 +2441,6 @@ impl LucidosEngine {
                                     extraction_ctx,
                                     request_id,
                                     device_id,
-                                    cancel_token,
                                     thread_id,
                                 ),
                                 cancel_token,

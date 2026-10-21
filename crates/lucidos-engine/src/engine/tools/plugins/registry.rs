@@ -153,8 +153,8 @@ pub(crate) async fn latest_install(
 /// shipped. The *merge base* side of a three-way merge comes from here.
 ///
 /// Only plugins with a recorded commit appear. A legacy row without one has no
-/// baseline, so its files are plainly replaced. That matches how the Modified
-/// badge already reads such a row as unmodified.
+/// baseline, so its shipped files are plainly replaced. That matches how the
+/// Modified badge already reads such a row as unmodified.
 #[derive(Debug, Clone)]
 pub(crate) struct PluginBaseline {
     pub(crate) commit: String,
@@ -162,12 +162,32 @@ pub(crate) struct PluginBaseline {
 }
 
 /// The installed plugins as the install path needs them, keyed by canonical
-/// plugin id. `ids` holds every installed plugin. `baselines` holds only those
-/// with a recorded commit, so a legacy row is installed yet has no baseline.
+/// plugin id. `files` holds every installed plugin's recorded paths. `baselines`
+/// holds only those with a recorded commit, so a legacy row is installed yet has
+/// no baseline. `setups` holds every installed plugin's setup state.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InstalledPlugins {
-    pub(crate) ids: std::collections::BTreeSet<String>,
+    pub(crate) files: std::collections::BTreeMap<String, Vec<String>>,
     pub(crate) baselines: std::collections::BTreeMap<String, PluginBaseline>,
+    /// Every installed plugin's setup state, so staging can decide whether an
+    /// update runs setup again without a per-id query.
+    pub(crate) setups: std::collections::BTreeMap<String, PriorSetup>,
+}
+
+impl InstalledPlugins {
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        self.files.contains_key(id)
+    }
+
+    /// Every path a plugin other than `id` records. An update of `id` must
+    /// never delete one of these: two plugins may ship the same path.
+    pub(crate) fn recorded_by_others(&self, id: &str) -> BTreeSet<&str> {
+        self.files
+            .iter()
+            .filter(|(other, _)| other.as_str() != id)
+            .flat_map(|(_, files)| files.iter().map(String::as_str))
+            .collect()
+    }
 }
 
 /// Every installed plugin, from one projection scan.
@@ -182,20 +202,31 @@ pub(crate) async fn project_installed_plugins(
     let mut installed = InstalledPlugins::default();
     for (id, payload) in project_installs(pool).await? {
         let rec = InstalledRecord { payload };
+        let files = rec.files();
         if let Some(commit) = rec.commit() {
             let baseline = PluginBaseline {
                 commit: commit.to_string(),
-                files: rec.files(),
+                files: files.clone(),
             };
             installed.baselines.insert(id.clone(), baseline);
         }
-        installed.ids.insert(id);
+        installed.setups.insert(id.clone(), rec.prior_setup());
+        installed.files.insert(id, files);
     }
     Ok(installed)
 }
 
 pub(crate) struct InstalledRecord {
     payload: serde_json::Value,
+}
+
+/// An installed version's setup state: its normalized `setup` text, its
+/// `setup_revision` (0 when absent) and its version when the record names one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PriorSetup {
+    pub(crate) text: Option<String>,
+    pub(crate) revision: u64,
+    pub(crate) version: Option<String>,
 }
 
 impl InstalledRecord {
@@ -243,16 +274,28 @@ impl InstalledRecord {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
     }
-    /// The installed version's raw manifest `setup` instructions (the nested
-    /// `manifest/manifest/setup`, i.e. as the author wrote them — one level
-    /// below the payload map that holds `setup_thread_id`). Read at confirm
-    /// time to decide whether an update introduces *new* setup work or just
-    /// re-runs identical instructions. `None` when the installed version
-    /// shipped no `setup` field.
-    pub(crate) fn setup(&self) -> Option<&str> {
+    /// The installed version's `setup_revision`, read from the raw manifest the
+    /// event round-trips. 0 when the manifest had none, as on every record
+    /// written before the field existed.
+    pub(crate) fn setup_revision(&self) -> u64 {
         self.payload
-            .pointer("/data/manifest/manifest/setup")
-            .and_then(|v| v.as_str())
+            .pointer("/data/manifest/manifest/setup_revision")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    }
+    /// What the installed version's record says about its setup, for deciding
+    /// whether an update runs setup again. The text is the raw manifest
+    /// `setup`, normalized the way staging normalizes the new version's.
+    pub(crate) fn prior_setup(&self) -> PriorSetup {
+        PriorSetup {
+            text: super::normalize_setup(
+                self.payload
+                    .pointer("/data/manifest/manifest/setup")
+                    .and_then(|v| v.as_str()),
+            ),
+            revision: self.setup_revision(),
+            version: self.version().map(str::to_string),
+        }
     }
     /// The workspace-repo commit sha captured when this version was installed
     /// (the "Install plugin: <id> v<version>" commit). The baseline
@@ -915,7 +958,7 @@ mod tests {
 /// Tests for [`plugin_modification_status`] — pure over git + disk, no DB.
 #[cfg(test)]
 mod modification_status_tests {
-    use super::{plugin_modification_status, InstalledRecord};
+    use super::{plugin_modification_status, InstalledRecord, PriorSetup};
     use crate::triggers::config::TriggerRun;
     use crate::triggers::definition::TriggerDefinition;
     use std::path::{Path, PathBuf};
@@ -955,6 +998,40 @@ mod modification_status_tests {
         InstalledRecord {
             payload: serde_json::json!({ "data": { "manifest": manifest, "files": files } }),
         }
+    }
+
+    /// The real `PluginInstalled` shape: the raw manifest sits at
+    /// `data.manifest.manifest`, beside the install's own fields.
+    fn record_with_manifest(manifest: serde_json::Value) -> InstalledRecord {
+        InstalledRecord {
+            payload: serde_json::json!({
+                "data": { "manifest": { "manifest": manifest }, "files": [] }
+            }),
+        }
+    }
+
+    #[test]
+    fn prior_setup_reads_text_revision_and_version_from_the_raw_manifest() {
+        let rec = record_with_manifest(serde_json::json!({
+            "version": "0.2.0",
+            "setup": "  copy the skill  ",
+            "setup_revision": 3,
+        }));
+        assert_eq!(
+            rec.prior_setup(),
+            PriorSetup {
+                text: Some("copy the skill".into()),
+                revision: 3,
+                version: Some("0.2.0".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_revision_counts_as_revision_zero() {
+        let rec = record_with_manifest(serde_json::json!({ "version": "0.1.0" }));
+        assert_eq!(rec.setup_revision(), 0);
+        assert_eq!(rec.prior_setup().text, None);
     }
 
     const TRIGGER_TOML: &str = "name = \"Watcher\"\n\n[[on]]\nevent_type = \"FooHappened\"\n\n[run]\ntype = \"intent\"\nintent = \"do the thing\"\n";

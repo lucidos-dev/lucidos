@@ -105,6 +105,7 @@ pub(in crate::api) async fn answer_thread_question(
         &headers,
         thread_uuid,
         &body.tool_use_id,
+        &body.answer,
     )
     .await?;
     use crate::engine::agent_question::{answer_pending_question_with_event_id, AnswerResult};

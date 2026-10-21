@@ -497,7 +497,7 @@ const ROUNDED = `${DESKTOP} @supports (width: round(1.5px, 1px))`;
 
 describe('the regions holding a badge centre on whole pixels', () => {
   // A fractional translate lets Chrome snap a badge's pill and digit apart, and
-  // on a 1x screen the count sits low (e2e/badge-glyph-centring.spec.ts).
+  // on a 1x screen the count sits low (e2e/badge-glyph-centring-all.spec.ts).
   function roundedRule(selector: string): { rule: CssRule; index: number } {
     const index = shellRules.findIndex(
       r => r.atRules === ROUNDED && selectorList(r.selector).includes(selector),

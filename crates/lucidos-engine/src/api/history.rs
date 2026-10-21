@@ -2,10 +2,14 @@ use super::*;
 use axum::body::Body;
 use tokio::io::AsyncWriteExt;
 
-/// SSE keep-alive cadence — sent as an SSE comment line so the connection
-/// doesn't appear idle to intermediaries / EventSource. Matches the prior
-/// `KeepAlive::new().interval(...)` value so observable behavior is unchanged.
-const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// SSE keep-alive cadence. Clients derive their stall threshold from it
+/// (`generated/engine-constants`), so a stream silent for several intervals
+/// reads as dropped.
+pub(crate) const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Name of the keep-alive SSE event. A named event reaches only a listener
+/// registered for it, so `onmessage` consumers never see it (ADR 0146).
+pub(crate) const SSE_KEEPALIVE_EVENT: &str = "keepalive";
 
 /// Inter-task pipe size between the gzip encoder writer and the response body
 /// reader. Large enough that a burst of small events need not round-trip
@@ -42,25 +46,73 @@ pub(super) async fn global_events(State(state): State<AppState>, headers: Header
     }
 }
 
-/// Plain (uncompressed) SSE response — same shape as the pre-gzip handler.
-/// Used when the client doesn't advertise `gzip` in `Accept-Encoding`.
+/// One frame on the wire. `data:` frames carry an event; the keep-alive frame
+/// is a named event with an empty payload.
+enum Frame {
+    Data(String),
+    Keepalive,
+}
+
+impl Frame {
+    /// The frame's wire bytes, as slices so a writer needs no per-event
+    /// allocation. A `data:` line with no payload is what makes an
+    /// EventSource dispatch the keep-alive.
+    fn chunks(&self) -> [&[u8]; 3] {
+        match self {
+            Frame::Data(json) => [b"data: ", json.as_bytes(), b"\n\n"],
+            Frame::Keepalive => [b"event: ", SSE_KEEPALIVE_EVENT.as_bytes(), b"\ndata:\n\n"],
+        }
+    }
+}
+
+/// The events, with a keep-alive frame in each quiet interval. The first
+/// keep-alive fires at once, so the stream announces itself on open.
+///
+/// Load-bearing on WebKit, which fires `EventSource.onopen` only once body
+/// BYTES arrive, where Chromium fires it on the response headers. Without an
+/// open frame, Safari and the iOS PWA sat at `connecting` for up to
+/// `SSE_KEEPALIVE_INTERVAL` after every page load. Gzip also buffers its own
+/// header until a flush.
+fn with_keepalives<S>(json_stream: S) -> impl Stream<Item = Frame> + Send + 'static
+where
+    S: Stream<Item = String> + Send + 'static,
+{
+    let mut ticks = tokio::time::interval(SSE_KEEPALIVE_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    futures::stream::unfold(
+        (Box::pin(json_stream), ticks),
+        |(mut json, mut ticks)| async {
+            let frame = tokio::select! {
+                item = json.next() => Frame::Data(item?),
+                _ = ticks.tick() => Frame::Keepalive,
+            };
+            Some((frame, (json, ticks)))
+        },
+    )
+}
+
+/// Plain (uncompressed) SSE response, for clients that don't advertise `gzip`
+/// in `Accept-Encoding`.
 fn plain_sse_response<S>(json_stream: S) -> Response
 where
     S: Stream<Item = String> + Send + 'static,
 {
-    let event_stream = json_stream.map(|json| Ok::<_, Infallible>(Event::default().data(json)));
-    Sse::new(event_stream)
-        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
-        .into_response()
+    let body = with_keepalives(json_stream)
+        .map(|frame| Ok::<_, Infallible>(axum::body::Bytes::from(frame.chunks().concat())));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body))
+        .expect("static SSE response builder is infallible")
 }
 
 /// Gzip-compressed SSE response. The streaming `GzipEncoder` gets an explicit
 /// per-event `flush()` (Z_SYNC_FLUSH). Each event therefore reaches the client
 /// as it is emitted, rather than when the encoder fills its window.
 ///
-/// Wire format is identical to plain SSE (`data: <json>\n\n` per event,
-/// `:keepalive\n\n` for keep-alives). Only the transport bytes are compressed,
-/// so every EventSource parser sees the same event stream.
+/// The wire format is identical to the plain response. Only the transport
+/// bytes are compressed, so every EventSource parser sees the same events.
 fn gzipped_sse_response<S>(json_stream: S) -> Response
 where
     S: Stream<Item = String> + Send + 'static,
@@ -73,69 +125,17 @@ where
     let body_stream = ReaderStream::new(reader);
 
     tokio::spawn(async move {
-        // Avoid per-event allocations: write the SSE wire framing in fixed
-        // byte slices around the borrowed JSON payload. The encoder buffers
-        // internally until flush(), so the three writes coalesce into one
-        // Z_SYNC_FLUSH block on the wire.
-        const DATA_PREFIX: &[u8] = b"data: ";
-        const FRAME_SUFFIX: &[u8] = b"\n\n";
-        const KEEPALIVE_FRAME: &[u8] = b":keepalive\n\n";
-
-        enum Frame {
-            Data(String),
-            Keepalive,
-        }
-
         let mut encoder = GzipEncoder::with_quality(writer, Level::Fastest);
-
-        // Open the stream with one comment frame, flushed at once.
-        //
-        // Load-bearing on WebKit, which fires `EventSource.onopen` only once
-        // body BYTES arrive, where Chromium fires it on the response headers.
-        // Nothing else here writes until the first event or the first
-        // keep-alive tick, and gzip buffers its own header until a flush. So
-        // Safari and the iOS PWA sat at `connecting` for up to
-        // `SSE_KEEPALIVE_INTERVAL` after every page load.
-        //
-        // A comment line is ignored by every EventSource parser, so this
-        // changes what a client SEES not at all. If it cannot be written the
-        // client is already gone, and the loop below would exit on its first
-        // write anyway.
-        if encoder.write_all(KEEPALIVE_FRAME).await.is_ok() {
-            let _ = encoder.flush().await;
-        }
-
-        let mut keepalive = tokio::time::interval(SSE_KEEPALIVE_INTERVAL);
-        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // First tick fires immediately, and the open frame above has just
-        // covered it, so skip it.
-        keepalive.tick().await;
-        tokio::pin!(json_stream);
-        loop {
-            // Decide what to write inside the select, with no encoder borrow,
-            // then do the IO sequentially below. Each write's `&mut encoder`
-            // borrow is then released before the next.
-            let frame = tokio::select! {
-                item = json_stream.next() => match item {
-                    Some(json) => Frame::Data(json),
-                    None => break,
-                },
-                _ = keepalive.tick() => Frame::Keepalive,
-            };
+        let frames = with_keepalives(json_stream);
+        tokio::pin!(frames);
+        while let Some(frame) = frames.next().await {
             // Sequential `?` short-circuits on the first IO error (client
             // gone), avoiding extra writes into a half-broken encoder.
             let write_result: std::io::Result<()> = async {
-                match &frame {
-                    Frame::Data(json) => {
-                        encoder.write_all(DATA_PREFIX).await?;
-                        encoder.write_all(json.as_bytes()).await?;
-                        encoder.write_all(FRAME_SUFFIX).await?;
-                    }
-                    Frame::Keepalive => {
-                        encoder.write_all(KEEPALIVE_FRAME).await?;
-                    }
+                for chunk in frame.chunks() {
+                    encoder.write_all(chunk).await?;
                 }
-                // flush() emits a Z_SYNC_FLUSH block — bytes leave the
+                // flush() emits a Z_SYNC_FLUSH block: bytes leave the
                 // encoder immediately so latency stays close to plain SSE.
                 encoder.flush().await
             }
@@ -816,6 +816,10 @@ pub(super) struct EventsCountParams {
     since: Option<String>,
     #[serde(default)]
     until: Option<String>,
+    /// Restrict to one thread. A value that is not a uuid is a 400, never a
+    /// workspace-wide count under a thread's name.
+    #[serde(default)]
+    thread_id: Option<uuid::Uuid>,
 }
 
 /// REST endpoint that mirrors the `count_events` LLM tool: per-type counts +
@@ -836,7 +840,7 @@ pub(super) async fn count_events(
     if let Some(et) = q.event_type.as_deref() {
         let (count, byte_total) = state
             .event_store
-            .count_events(Some(et), since, until)
+            .count_events(Some(et), since, until, q.thread_id)
             .await
             .map_err(|e| {
                 (
@@ -851,7 +855,7 @@ pub(super) async fn count_events(
     } else {
         let rows = state
             .event_store
-            .count_events_by_type(since, until)
+            .count_events_by_type(since, until, q.thread_id)
             .await
             .map_err(|e| {
                 (
@@ -1107,13 +1111,47 @@ mod tests {
     use super::*;
 
     /// A stub `status.sh` with the given body, executable, in its own dir.
+    ///
+    /// A child process installs the executable, so this process never holds a
+    /// write fd on it. A parallel test's fork would inherit such an fd, and
+    /// Linux then refuses the exec with "Text file busy".
     fn stub_status_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("status.src");
+        std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
         let path = dir.path().join("status.sh");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = std::process::Command::new("install")
+            .args(["-m", "755"])
+            .arg(&source)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(installed.success());
         (dir, path)
+    }
+
+    /// Forking threads must not make a freshly written stub unrunnable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stub_runs_while_other_threads_fork() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let forkers: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..100 {
+            let list = list_from(r#"echo '{"workspaces":[]}'"#).await;
+            assert!(list.is_ok(), "{:?}", list.err().map(|e| e.message));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for f in forkers {
+            f.join().unwrap();
+        }
     }
 
     async fn list_from(body: &str) -> Result<serde_json::Value, ApiError> {
@@ -1223,6 +1261,8 @@ mod tests {
         );
     }
 
+    const KEEPALIVE_WIRE: &[u8] = b"event: keepalive\ndata:\n\n";
+
     /// A browser must not wait for an event to learn the stream is open.
     ///
     /// WebKit fires `EventSource.onopen` on the first body BYTES, where
@@ -1231,21 +1271,83 @@ mod tests {
     /// at `connecting` for up to 30 seconds after every page load.
     #[tokio::test]
     async fn the_gzipped_stream_writes_its_first_bytes_before_any_event() {
+        use async_compression::tokio::bufread::GzipDecoder;
+        use tokio::io::{AsyncReadExt, BufReader};
+        use tokio_util::io::StreamReader;
+
         // A stream that never yields: exactly the common case, a page that
         // connects while nothing is happening in the workspace.
         let silent = futures::stream::pending::<String>();
         let response = gzipped_sse_response(silent);
-        let mut body = futures::StreamExt::boxed(response.into_body().into_data_stream());
+        let body = response
+            .into_body()
+            .into_data_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+        let mut wire = GzipDecoder::new(BufReader::new(StreamReader::new(body)));
 
         // Generously under SSE_KEEPALIVE_INTERVAL, and far under the 10s a
         // browser test waits. The open frame makes this immediate.
-        let next = futures::StreamExt::next(&mut body);
-        let first = tokio::time::timeout(std::time::Duration::from_secs(5), next)
-            .await
-            .expect("the stream must announce itself without waiting for an event")
-            .expect("the stream must not end")
-            .expect("the first frame must not be an error");
-        assert!(!first.is_empty(), "an empty frame tells WebKit nothing");
+        let mut first = vec![0u8; KEEPALIVE_WIRE.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wire.read_exact(&mut first),
+        )
+        .await
+        .expect("the stream must announce itself without waiting for an event")
+        .expect("the first frame must decode");
+        assert_eq!(first, KEEPALIVE_WIRE);
+    }
+
+    /// The plain response opens with the same keep-alive event, then relays
+    /// events as bare `data:` frames. A comment line would never reach JS.
+    #[tokio::test]
+    async fn the_plain_stream_opens_with_the_keepalive_event_and_relays_data() {
+        let events = futures::stream::iter(["{\"a\":1}".to_string()])
+            .chain(futures::stream::pending::<String>());
+        let response = plain_sse_response(events);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let mut body = response.into_body().into_data_stream();
+
+        let mut wire = Vec::new();
+        let want = KEEPALIVE_WIRE.len() + b"data: {\"a\":1}\n\n".len();
+        while wire.len() < want {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+                .await
+                .expect("both frames are ready at once")
+                .expect("the stream must not end")
+                .expect("a frame must not be an error");
+            wire.extend_from_slice(&chunk);
+        }
+        let wire = String::from_utf8(wire).unwrap();
+        assert!(wire.contains("event: keepalive\ndata:\n\n"), "{wire:?}");
+        assert!(wire.contains("data: {\"a\":1}\n\n"), "{wire:?}");
+        assert!(
+            wire.lines().all(|line| !line.starts_with(':')),
+            "a comment line never reaches JS: {wire:?}"
+        );
+    }
+
+    /// A quiet stream keeps sending keep-alives, one per interval.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_stream_sends_a_keepalive_every_interval() {
+        let frames = with_keepalives(futures::stream::pending::<String>());
+        tokio::pin!(frames);
+        for _ in 0..3 {
+            assert!(matches!(frames.next().await, Some(Frame::Keepalive)));
+        }
+    }
+
+    /// The generated client constant and the wire agree on the event name.
+    #[test]
+    fn the_keepalive_frame_names_the_exported_event() {
+        let wire = Frame::Keepalive.chunks().concat();
+        assert_eq!(
+            wire,
+            format!("event: {SSE_KEEPALIVE_EVENT}\ndata:\n\n").into_bytes()
+        );
     }
 
     /// Regression: `read_app_version` must read fresh from disk on every call.

@@ -286,3 +286,160 @@ fn resolve_cli_dir_none_when_nothing_resolves() {
     assert!(resolve_cli_dir(None, Some(empty.path())).is_none());
     assert!(resolve_cli_dir(None, None).is_none());
 }
+
+/// A launch dir holding a `lucidos` file with `bytes`, as `publish_launch_binary` leaves it.
+fn launch_dir_with_cli(bytes: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(LUCIDOS_BIN_NAME), bytes).unwrap();
+    dir
+}
+
+/// A publish: write beside the CLI, then rename over it. The old inode lives on.
+fn publish_cli(dir: &Path, bytes: &str) {
+    let temp = dir.join("lucidos.publish");
+    std::fs::write(&temp, bytes).unwrap();
+    std::fs::rename(temp, dir.join(LUCIDOS_BIN_NAME)).unwrap();
+}
+
+fn pinned_bytes(pin_dir: &Path) -> String {
+    std::fs::read_to_string(pin_dir.join(LUCIDOS_BIN_NAME)).unwrap()
+}
+
+const LAUNCHED_AS: FileId = (1, 1);
+
+fn unchanged_launch_id() -> Option<FileId> {
+    Some(LAUNCHED_AS)
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_cli_survives_a_later_publish_into_the_launch_dir() {
+    let launch = launch_dir_with_cli("engine-build-cli");
+    let workspace = tempfile::tempdir().unwrap();
+    let pin_dir = pinned_cli_dir(workspace.path());
+
+    let pinned = pin_cli(launch.path(), &pin_dir, LAUNCHED_AS, unchanged_launch_id).unwrap();
+    publish_cli(launch.path(), "newer-build-cli");
+
+    assert_eq!(pinned, pin_dir);
+    assert_eq!(pinned_bytes(&pin_dir), "engine-build-cli");
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_cli_leaves_a_running_cli_on_its_old_inode_when_it_re_pins() {
+    use std::io::Read;
+    let launch = launch_dir_with_cli("first");
+    let workspace = tempfile::tempdir().unwrap();
+    let pin_dir = pinned_cli_dir(workspace.path());
+    pin_cli(launch.path(), &pin_dir, LAUNCHED_AS, unchanged_launch_id).unwrap();
+    let mut running = std::fs::File::open(pin_dir.join(LUCIDOS_BIN_NAME)).unwrap();
+
+    publish_cli(launch.path(), "second");
+    pin_cli(launch.path(), &pin_dir, LAUNCHED_AS, unchanged_launch_id).unwrap();
+
+    let mut seen = String::new();
+    running.read_to_string(&mut seen).unwrap();
+    assert_eq!(
+        seen, "first",
+        "a re-pin must not write onto the running inode"
+    );
+    assert_eq!(pinned_bytes(&pin_dir), "second");
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_cli_leaves_no_temp_file_behind() {
+    let launch = launch_dir_with_cli("same");
+    let workspace = tempfile::tempdir().unwrap();
+    let pin_dir = pinned_cli_dir(workspace.path());
+    // The second pin renames a hardlink onto its twin, which POSIX makes a no-op.
+    pin_cli(launch.path(), &pin_dir, LAUNCHED_AS, unchanged_launch_id).unwrap();
+    pin_cli(launch.path(), &pin_dir, LAUNCHED_AS, unchanged_launch_id).unwrap();
+
+    let names: Vec<_> = std::fs::read_dir(&pin_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [std::ffi::OsString::from(LUCIDOS_BIN_NAME)]);
+}
+
+#[test]
+fn pin_cli_refuses_when_a_publish_replaced_the_engine_before_it() {
+    let launch = launch_dir_with_cli("maybe-newer");
+    let workspace = tempfile::tempdir().unwrap();
+    let pin_dir = pinned_cli_dir(workspace.path());
+    let replaced_engine = || Some((1, 2));
+
+    let result = pin_cli(launch.path(), &pin_dir, LAUNCHED_AS, replaced_engine);
+
+    assert!(result.is_err());
+    assert!(
+        !pin_dir.join(LUCIDOS_BIN_NAME).exists(),
+        "a raced pin must not land"
+    );
+    assert_eq!(std::fs::read_dir(&pin_dir).unwrap().count(), 0);
+}
+
+#[test]
+fn pin_cli_refuses_when_the_launch_path_cannot_be_probed() {
+    let launch = launch_dir_with_cli("cli");
+    let workspace = tempfile::tempdir().unwrap();
+    let pin_dir = pinned_cli_dir(workspace.path());
+
+    assert!(pin_cli(launch.path(), &pin_dir, LAUNCHED_AS, || None).is_err());
+    assert!(!pin_dir.join(LUCIDOS_BIN_NAME).exists());
+}
+
+#[test]
+fn pin_cli_replaces_a_temp_file_a_crash_left_behind() {
+    let launch = launch_dir_with_cli("cli");
+    let workspace = tempfile::tempdir().unwrap();
+    let pin_dir = pinned_cli_dir(workspace.path());
+    std::fs::create_dir_all(&pin_dir).unwrap();
+    std::fs::write(
+        pin_dir.join(format!("{LUCIDOS_BIN_NAME}.pin-tmp")),
+        "partial",
+    )
+    .unwrap();
+
+    pin_cli(launch.path(), &pin_dir, LAUNCHED_AS, unchanged_launch_id).unwrap();
+
+    assert_eq!(pinned_bytes(&pin_dir), "cli");
+    assert_eq!(std::fs::read_dir(&pin_dir).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn pin_cli_errors_instead_of_panicking_when_the_workspace_is_unwritable() {
+    let launch = launch_dir_with_cli("cli");
+    let workspace = tempfile::tempdir().unwrap();
+    // A file where the `.lucidos` directory should be.
+    std::fs::write(workspace.path().join(".lucidos"), "not a dir").unwrap();
+
+    let result = pin_cli(
+        launch.path(),
+        &pinned_cli_dir(workspace.path()),
+        LAUNCHED_AS,
+        unchanged_launch_id,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn lucidos_cli_dir_is_the_resolved_dir_when_nothing_was_pinned() {
+    assert!(PINNED_CLI_DIR.get().is_none());
+    assert_eq!(lucidos_cli_dir(), CLI_DIR.as_deref());
+}
+
+#[cfg(unix)]
+#[test]
+fn file_id_changes_when_a_rename_replaces_the_path() {
+    let dir = launch_dir_with_cli("a");
+    let path = dir.path().join(LUCIDOS_BIN_NAME);
+    let before = file_id(&path).unwrap();
+    publish_cli(dir.path(), "b");
+    assert_ne!(file_id(&path).unwrap(), before);
+    assert!(file_id(&dir.path().join("missing")).is_none());
+}

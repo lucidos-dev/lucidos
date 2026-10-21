@@ -203,20 +203,12 @@ fn correlation(call: Option<ProbeCall>) -> String {
 /// the only honest input.
 fn segment<T: Serialize + ?Sized>(value: &T) -> (String, usize) {
     match serde_json::to_vec(value) {
-        Ok(bytes) => (short_hash(&bytes), bytes.len()),
+        Ok(bytes) => (super::stable_prefix::short_hash(&bytes), bytes.len()),
         // A sentinel rather than the error text, because every field on this
         // line has to stay whitespace-free for a mechanical diff. The same
         // failure hits the real request moments later, with a full message.
         Err(_) => ("unserializable".to_string(), 0),
     }
-}
-
-/// First 16 hex characters of the SHA-256. Wide enough that a collision
-/// between two consecutive requests is not a practical concern, short enough
-/// to eyeball two log lines side by side.
-fn short_hash(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    crate::api::hex::hex_lower(&Sha256::digest(bytes)[..8])
 }
 
 // ===== Marker census =====

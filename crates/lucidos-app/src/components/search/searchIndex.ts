@@ -77,6 +77,7 @@ const hasStyleOverrides = () => Object.keys(currentStyleOverrides()).length > 0;
 const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Top-level subviews (one per SETTINGS_NAV_ITEMS entry)
   { id: 'models', label: 'Models', subview: 'models', path: 'Settings' },
+  { id: 'intelligence', label: 'Intelligence', subview: 'intelligence', path: 'Settings', keywords: 'intelligence ladder rung model effort default picker cost time band price prices lucidos agent claude code codex' },
   { id: 'permissions', label: 'Permissions', subview: 'permissions', path: 'Settings', keywords: 'permissions security command guard safety allowlist claude code lucidos agent bash python tools' },
   { id: 'mcp', label: 'MCP Servers', subview: 'mcp', path: 'Settings', keywords: 'mcp model context protocol server tools context cost tokens start stop remove disable allowlist' },
   { id: 'coding-agents', label: 'Coding Agents', subview: 'coding-agents', path: 'Settings', keywords: 'coding agent claude code codex binary path cli repository repositories git worktree' },
@@ -93,6 +94,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'system', label: 'System', subview: 'system', path: 'Settings' },
   { id: 'appearance', label: 'Appearance & Behavior', subview: 'appearance', path: 'Settings', keywords: 'appearance interface behavior theme font scale links browser' },
   { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
+  { id: 'keyboard-shortcuts:composer-enter-key', label: 'Enter key', subview: 'keyboard-shortcuts', path: 'Settings → Keyboard Shortcuts → Composer', anchor: 'keyboard-shortcuts:composer-enter-key', keywords: 'enter return key send message new line newline shift enter multi-line multiline prompt composer accidentally sent half-finished' },
 
   // System subpanels
   { id: 'system-overview', label: 'Overview', subview: 'system-overview', path: 'Settings → System', keywords: 'connection status workspace path api versions build uptime restart refresh update' },
@@ -109,6 +111,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
 
   // System → Debugging rows
   { id: 'debugging:capture-context', label: 'Capture context per step', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:capture-context', keywords: 'capture context step debug llm prompt' },
+  { id: 'debugging:cache-warm-line', label: 'Cache-warm line', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:cache-warm-line', keywords: 'cache warm line prompt cache countdown time left hide show' },
   { id: 'debugging:perf', label: 'Perf instrumentation', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:perf', keywords: 'perf performance instrumentation telemetry lag latency profiling thread open render linkify' },
   { id: 'debugging:animation-speed', label: 'Animation speed', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:animation-speed', keywords: 'animation speed transition duration slow motion multiplier' },
   { id: 'debugging:autocorrect', label: 'Autocorrect', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:autocorrect', keywords: 'autocorrect auto-correct autocorrection keyboard typing spelling send button submit button tap dead nothing happens iphone ipad', iosOnly: true },
@@ -136,6 +139,12 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Coding Agents subview
   { id: 'coding-agents:binaries', label: 'Binaries', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:binaries', keywords: 'coding agent claude codex binary path cli override auto-detect' },
   { id: 'coding-agents:permissions', label: 'Permissions', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:permissions', keywords: 'permission mode claude code auto accept edits classifier approve prompt card ask' },
+  { id: 'coding-agents:intelligence', label: 'Intelligence ladders', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:intelligence', keywords: 'intelligence ladder claude code codex link' },
+  { id: 'intelligence:prices', label: 'Prices', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:prices', keywords: 'price prices price table checked keep prices current trigger daily weekly cost' },
+  { id: 'intelligence:ladder-chat', label: 'Intelligence ladder · Lucidos Agent', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:ladder-chat', keywords: 'intelligence ladder rung model effort default picker chat lucidos agent trigger cost time band opus sonnet haiku gpt gemini grok enable disable list customised reset sort order' },
+  { id: 'intelligence:ladder-claude-code', label: 'Intelligence ladder · Claude Code', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:ladder-claude-code', keywords: 'intelligence ladder rung model effort default implementer cost time band claude code opus sonnet haiku copy customised reset sort order' },
+  { id: 'intelligence:ladder-codex', label: 'Intelligence ladder · Codex', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:ladder-codex', keywords: 'intelligence ladder rung model effort default implementer cost time band codex gpt copy customised reset sort order' },
+  { id: 'intelligence:long-prompt-share', label: 'Share of long-prompt calls', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:long-prompt-share', keywords: 'long prompt share 100k tokens slider haiku cost band measured' },
   { id: 'coding-agents:repositories', label: 'Repositories', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:repositories', keywords: 'repository repositories git local clone register external repo' },
 
   // Access subview
@@ -161,7 +170,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // provider a user with no key can turn on. So "free" lands on the switch,
   // rather than on the top of a page they then have to scan.
   { id: 'models:opencode-free', label: 'OpenCode Free (keyless)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:opencode-free', keywords: 'opencode free keyless no key no account zen relay anonymous trial try' },
-  { id: 'models:chat-model', label: 'Model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:chat-model', keywords: 'model reasoning effort thinking tier opus sonnet haiku gpt' },
+  { id: 'models:chat-model', label: 'Chat model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:chat-model', keywords: 'model reasoning effort thinking tier opus sonnet haiku gpt' },
+  { id: 'models:trigger-model', label: 'Trigger model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:trigger-model', keywords: 'trigger model reasoning effort thinking tier opus sonnet haiku gpt scheduled default' },
   { id: 'models:response-style', label: 'Response style', subview: 'models', path: 'Settings → Models', anchor: 'models:response-style', keywords: 'response style brevity verbose verbosity concise minimal short shorter terse length yapping waffle rambling output style tone instruction custom learning teach explain why outcome autopilot' },
   { id: 'models:technical-literacy', label: 'How technical', subview: 'models', path: 'Settings → Models → Response style', anchor: 'models:technical-literacy', keywords: 'technical literacy level jargon plain language simple beginner non-technical developer expert explain vocabulary' },
   { id: 'models:max-tool-calls', label: 'Max tool calls', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:max-tool-calls', keywords: 'max tool calls cap limit turn runaway budget' },
@@ -195,6 +205,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:openrouter', label: 'OpenRouter', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:openrouter', keywords: 'openrouter router api key' },
   { id: 'models:xai', label: 'xAI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:xai', keywords: 'xai grok api key' },
   { id: 'models:local', label: 'Local (OpenAI-compatible)', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:local', keywords: 'local ollama lm studio llama vllm openai compatible base url self-hosted' },
+  { id: 'models:claude-gateway', label: 'Claude gateway', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:claude-gateway', keywords: 'claude gateway organisation organization company sign in device code anthropic' },
   // A provider's "In use by" row sits in its folded body, so it lands on the
   // provider's header, which always renders. A chat provider's header has its
   // own entry above.
@@ -233,9 +244,13 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
 
   // Backup subview (restore moved to the workspace picker — no in-app entry)
   { id: 'backup:provider', label: 'Provider', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:provider' },
+  { id: 'backup:schedule', label: 'Backup schedule', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:schedule', keywords: 'daily weekly scheduled automatic backup time' },
+  { id: 'backup:retention', label: 'Backups to keep', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:retention', keywords: 'retention keep old backups prune' },
+  { id: 'backup:key', label: 'Backup key', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:key', keywords: 'age encryption recipient verify rotate public key restore' },
 
   // Accounts subview
   { id: 'accounts:credentials', label: 'Credentials', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:credentials', keywords: 'api key token password secret oauth client app registration' },
+  { id: 'accounts:1password', label: '1Password', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:1password', keywords: 'onepassword op service account secret reference vault' },
   // Renamed from "OAuth", which named the protocol rather than the thing. The
   // old word stays searchable via keywords so nobody loses the entry.
   { id: 'accounts:connected', label: 'Connected accounts', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:connected', keywords: 'oauth connect sign in google microsoft github dropbox account authorize reconnect disconnect' },

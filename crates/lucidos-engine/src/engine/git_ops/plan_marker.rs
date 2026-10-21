@@ -15,6 +15,7 @@
 //! diagnostic only.
 
 use super::canonical_repo_root;
+use super::plan_approval::{user_approved_plan, PlanApprovalError};
 use std::path::Path;
 
 /// How many files a `BoundedSecurityFix` may name. The lane's whole claim is
@@ -424,11 +425,28 @@ pub(crate) async fn plan_marker_files(
 /// missing, already planned, or simple. Called by the
 /// `/api/v1/internal/approve-plan` endpoint that `lucidos planned approve`
 /// POSTs to.
+///
+/// A proposed row flips only on the user's own approval, which
+/// [`user_approved_plan`] reads from the caller's thread or the branch's.
 pub(crate) async fn approve_plan(
     pool: &sqlx::PgPool,
     repo_root: &Path,
     branch_name: &str,
-) -> Result<Option<ApprovedPlan>, sqlx::Error> {
+    caller_thread: Option<&str>,
+) -> Result<Option<ApprovedPlan>, PlanApprovalError> {
+    let proposed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM planned_branches \
+         WHERE repo_root = $1 AND branch_name = $2 AND state = 'proposed')",
+    )
+    .bind(canonical_repo_root(repo_root))
+    .bind(branch_name)
+    .fetch_one(pool)
+    .await
+    .map_err(PlanApprovalError::Unreadable)?;
+    if !proposed {
+        return Ok(None);
+    }
+    user_approved_plan(pool, repo_root, branch_name, caller_thread).await?;
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "UPDATE planned_branches SET state = 'planned', planned_at = NOW() \
          WHERE repo_root = $1 AND branch_name = $2 AND state = 'proposed' \
@@ -437,7 +455,8 @@ pub(crate) async fn approve_plan(
     .bind(canonical_repo_root(repo_root))
     .bind(branch_name)
     .fetch_optional(pool)
-    .await?;
+    .await
+    .map_err(PlanApprovalError::Unreadable)?;
     Ok(row.map(|(plan_path,)| ApprovedPlan { plan_path }))
 }
 

@@ -46,3 +46,8 @@ fastembed = { version = "4", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# The engine's tests enable this, and cargo then builds tokio with it for any
+# test build that includes the engine. Naming it here makes `cargo test -p
+# lucidos-eval` resolve every shared crate as the engine's tests do, so the two
+# builds share one dependency graph.
+tokio = { version = "1", features = ["test-util"] }

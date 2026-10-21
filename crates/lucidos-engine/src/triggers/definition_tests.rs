@@ -148,6 +148,23 @@ fn default_model_is_omitted_from_the_projection() {
     assert!(!toml.contains("provider"));
 }
 
+/// An update stored before the `null` rule carried `"model": "null"`, which
+/// the projection wrote as `model = "null"`. Rebuilt from those same events, it
+/// now writes no pin at all.
+#[test]
+fn a_stored_null_string_projects_no_pin() {
+    let mut c = TriggerConfig::from_created_payload(&serde_json::json!({
+        "trigger_id": "t-null", "name": "Radar", "schedule": ["0 0 7 * * *"],
+        "timezone": "UTC", "run": { "type": "intent", "intent": "x" },
+        "model": "claude-sonnet-5", "reasoning_effort": "xhigh",
+    }))
+    .unwrap();
+    c.apply_update(&serde_json::json!({ "model": "null", "reasoning_effort": "null" }));
+    let toml = TriggerDefinition::from_config(&c).to_toml().unwrap();
+    assert!(!toml.contains("model"), "{toml}");
+    assert!(!toml.contains("reasoning_effort"), "{toml}");
+}
+
 /// A shipped definition's provider pin survives the trip into the payload the
 /// scheduler parses, like its model pin.
 #[test]

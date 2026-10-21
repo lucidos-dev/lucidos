@@ -10,17 +10,19 @@ use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
     AccountPin, AgentEvent, AgentExitFacts, AgentInput, AgentRuntime, CodingAgent, ControlRequest,
-    InputWithdrawal, RunningAgent, SpawnArgs, WithdrawRequest,
+    InputWithdrawal, RunningAgent, SessionContextDue, SpawnArgs, WithdrawRequest,
 };
+use super::claude_code_provider::NotesVisibility;
 use super::lucidos_cli::{
     ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
     LUCIDOS_CLI_SKILL,
 };
 use super::spawn_env::{apply_lucidos_env, command_secret_values, StderrTail};
+use super::startup_instructions::{self, claude_version, StartupDecision, StartupFollowUp};
 
 /// One `/model` or `/effort` picker entry. Claude Code's model rows come from
-/// discovery (`cc_model_discovery`), with `cc_menu_options.json` as the
-/// fallback. Codex's come from `codex_menu_options.json`.
+/// discovery (`cc_model_discovery`) and `cc_menu_options.json`, merged by
+/// [`offered_cc_model_options`]. Codex's come from `codex_menu_options.json`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct CcMenuOption {
     pub value: String,
@@ -52,6 +54,15 @@ pub struct CcMenuOption {
     /// `None` derives them from the effort rows (`efforts_for_model`).
     #[serde(default)]
     pub reasoning_efforts: Option<Vec<String>>,
+    /// Whether a new spawn may pick this row. A row with `offered: false` is
+    /// overlay only: it keeps its `context_window` for threads already on it,
+    /// and is neither listed nor accepted.
+    #[serde(default = "offered_by_default")]
+    pub offered: bool,
+}
+
+fn offered_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -67,26 +78,43 @@ static CC_MENU_OPTIONS: std::sync::LazyLock<CcMenuOptionsFile> = std::sync::Lazy
         .expect("cc_menu_options.json is malformed — see runtime/cc_menu_options.json")
 });
 
-/// The curated rows in `cc_menu_options.json`: the picker until discovery
-/// succeeds, and the overlay that declares context windows.
+/// Every curated row in `cc_menu_options.json`, offered or not: the fallback
+/// list until discovery succeeds, and the overlay that declares context windows.
 pub fn curated_cc_model_options() -> &'static [CcMenuOption] {
     &CC_MENU_OPTIONS.models
 }
 
-static CURATED_CC_MODEL_OPTIONS: std::sync::LazyLock<std::sync::Arc<[CcMenuOption]>> =
-    std::sync::LazyLock::new(|| curated_cc_model_options().into());
+static OFFERED_CURATED_CC_MODEL_OPTIONS: std::sync::LazyLock<std::sync::Arc<[CcMenuOption]>> =
+    std::sync::LazyLock::new(|| offered_cc_model_options(None));
 
-/// The Claude Code `/model` picker: what Claude Code itself listed, or the
-/// curated rows until it has answered.
+/// The models a new Claude Code spawn may pick, and the picker's source: what
+/// discovery offers once Claude Code has answered, else the offered curated rows.
 pub fn cc_model_options() -> std::sync::Arc<[CcMenuOption]> {
-    pick_cc_model_options(super::cc_model_discovery::discovered_options())
+    super::cc_model_discovery::offered_options()
+        .unwrap_or_else(|| OFFERED_CURATED_CC_MODEL_OPTIONS.clone())
 }
 
-/// The discovered rows when there are any, else the curated ones. Never a mix.
-fn pick_cc_model_options(
-    discovered: Option<std::sync::Arc<[CcMenuOption]>>,
+/// Claude Code's own rows first, then the offered curated rows it did not list.
+///
+/// A model Claude Code accepts through `--model` can be absent from its list, so
+/// the curated rows fill that gap. A discovered row wins on its value, which
+/// keeps Claude Code's label and the `resolvedModel` it reported. A discovered
+/// row whose value a curated `offered: false` row withdraws is dropped, because
+/// a withdrawn model stays withdrawn whatever Claude Code lists.
+pub(super) fn offered_cc_model_options(
+    discovered: Option<&[CcMenuOption]>,
 ) -> std::sync::Arc<[CcMenuOption]> {
-    discovered.unwrap_or_else(|| CURATED_CC_MODEL_OPTIONS.clone())
+    let discovered = discovered.unwrap_or_default();
+    let is_withdrawn = |value: &str| {
+        curated_cc_model_options()
+            .iter()
+            .any(|c| !c.offered && c.value == value)
+    };
+    let kept = discovered.iter().filter(|d| !is_withdrawn(&d.value));
+    let unlisted = curated_cc_model_options()
+        .iter()
+        .filter(|c| c.offered && !discovered.iter().any(|d| d.value == c.value));
+    kept.chain(unlisted).cloned().collect()
 }
 
 pub fn cc_reasoning_effort_options() -> &'static [CcMenuOption] {
@@ -523,6 +551,7 @@ pub async fn ask_side_question(
     }
     let settings =
         crate::engine::cc_settings::write_cc_side_question_settings(args.workspace_path).await?;
+    warm_claude_version(&args).await;
     let mut command = build_side_question_command(&args, lucidos_cli_dir(), &settings)?;
     let child = super::spawn_env::spawn_below_engine(&mut command.cmd)?;
     ask_side_question_of(child, &side_question_message(question, images), deadline).await
@@ -855,12 +884,15 @@ impl AgentRuntime for ClaudeCodeRuntime {
             );
         }
 
+        warm_claude_version(&args).await;
         let CcCommand {
             mut cmd,
             system_prompt_file,
+            session_settings_file,
+            startup_follow_up,
         } = build_command(&args, cli_dir)?;
         let agent_run = args.agent_run.clone();
-        let stream_state = CcStreamState::with_notes_relayed(relays_vertex_calls(&cmd));
+        let stream_state = stream_state_for(args.notes);
         let secrets = command_secret_values(&cmd);
         let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
@@ -876,6 +908,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel::<WithdrawRequest>();
 
         let initial_session_id = args.resume_session_id.map(str::to_string);
+        let session_context = args.owed_session_context();
         tokio::spawn(async move {
             driver_task(
                 child,
@@ -888,10 +921,13 @@ impl AgentRuntime for ClaudeCodeRuntime {
                 withdraw_rx,
                 cancel,
                 initial_session_id,
+                session_context,
                 stream_state,
+                startup_follow_up,
             )
             .await;
             drop(system_prompt_file);
+            drop(session_settings_file);
             agent_run.finish(GROUP_TEARDOWN_GRACE).await;
         });
 
@@ -906,6 +942,13 @@ impl AgentRuntime for ClaudeCodeRuntime {
             withdraw_tx: Some(withdraw_tx),
         })
     }
+}
+
+/// The parser's state for a session whose notes are `notes`: a `thinking`
+/// block is a progress note for the user only when the verdict says it reaches
+/// them. The spawn's prompt follows the same verdict.
+fn stream_state_for(notes: NotesVisibility) -> CcStreamState {
+    CcStreamState::with_notes_relayed(notes == NotesVisibility::Shown)
 }
 
 /// Resolve the `claude` executable for spawn. The user-configured override wins
@@ -1005,42 +1048,163 @@ fn resolve_lucidos_binary(
 /// `docs/investigations/2026-08-02-cc-stream-idle-timeout.md`.
 const CC_BYTE_STREAM_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
-/// A `claude` command and the file that holds its appended system prompt.
+/// A `claude` command and the private files it names.
 ///
 /// The prompt never rides on argv. Linux caps one argv string at 128 KiB, and
 /// a long thread's history outgrows that, so every spawn would fail with
 /// `E2BIG` for good. Argv is also world-readable in `/proc/<pid>/cmdline`.
-/// The file is 0600 and is deleted on drop, so hold this until the child exits.
+/// Each file is 0600 and is deleted on drop, so hold this until the child exits.
 struct CcCommand {
     cmd: tokio::process::Command,
     system_prompt_file: Option<tempfile::TempPath>,
+    /// The settings that exclude the startup files, when they ride in the
+    /// system prompt instead.
+    session_settings_file: Option<tempfile::TempPath>,
+    /// What the driver owes the startup ledger once the session id is known.
+    startup_follow_up: Option<StartupFollowUp>,
 }
 
-/// Where the system prompt files live. Inside the workspace rather than the
-/// shared temp dir, so this engine's boot sweep owns every file in it.
-fn system_prompt_dir(workspace: &Path) -> PathBuf {
+/// Where a session's private files live: its system prompt and its settings.
+/// Inside the workspace rather than the shared temp dir, so this engine's boot
+/// sweep owns every file in it.
+fn session_files_dir(workspace: &Path) -> PathBuf {
     workspace.join(".lucidos/cc-system-prompts")
 }
 
-/// Write `prompt` to a fresh file only its owner can read.
-fn write_system_prompt_file(workspace: &Path, prompt: &str) -> std::io::Result<tempfile::TempPath> {
-    let dir = system_prompt_dir(workspace);
+/// Write `content` to a fresh file only its owner can read.
+fn write_private_file(
+    workspace: &Path,
+    prefix: &str,
+    suffix: &str,
+    content: &str,
+) -> std::io::Result<tempfile::TempPath> {
+    let dir = session_files_dir(workspace);
     std::fs::create_dir_all(&dir)?;
     let mut file = tempfile::Builder::new()
-        .prefix("system-prompt-")
-        .suffix(".md")
+        .prefix(prefix)
+        .suffix(suffix)
         .tempfile_in(&dir)?;
-    std::io::Write::write_all(&mut file, prompt.as_bytes())?;
+    std::io::Write::write_all(&mut file, content.as_bytes())?;
     Ok(file.into_temp_path())
 }
 
-/// Delete the system prompt files an earlier engine left behind. An engine
+/// How a session handles Claude Code's startup instructions
+/// (`startup_instructions`).
+struct StartupPlan {
+    /// The `--settings` file: the base file with the startup files excluded.
+    /// `None` keeps the base file.
+    settings_file: Option<tempfile::TempPath>,
+    /// What follows the Lucidos prompt in the appended file.
+    block: Option<String>,
+    follow_up: Option<StartupFollowUp>,
+}
+
+impl StartupPlan {
+    fn keep(follow_up: Option<StartupFollowUp>) -> Self {
+        Self {
+            settings_file: None,
+            block: None,
+            follow_up,
+        }
+    }
+}
+
+/// Read `claude --version` on a blocking worker, so the probe inside
+/// `plan_startup` finds it cached and never stalls an async worker.
+async fn warm_claude_version(args: &SpawnArgs<'_>) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
+    if let Err(e) = tokio::task::spawn_blocking(move || claude_version(&claude_bin)).await {
+        log!("[ClaudeCode] the version probe did not finish: {}", e);
+    }
+}
+
+/// The directory Claude Code reads its user file and transcripts from.
+fn session_config_dir(args: &SpawnArgs<'_>) -> Option<PathBuf> {
+    use crate::engine::agent_session::resume::{default_claude_config_dir, live_claude_config_dir};
+    match args.account_pin {
+        Some(pin) => Some(pin.dir().to_string()),
+        None => live_claude_config_dir(args.user_env_vars).or_else(default_claude_config_dir),
+    }
+    .map(PathBuf::from)
+}
+
+/// Move the startup instructions into the system prompt when the ledger has
+/// verified their key, else leave them to Claude Code. A move that cannot be
+/// set up leaves them to Claude Code too, so no session runs without them.
+///
+/// A spawn with no Lucidos prompt, such as a model probe, has nothing for the
+/// block to follow, and keeps Claude Code's loading.
+///
+/// Temporary: removable once Claude Code caches CLAUDE.md across sessions
+/// (docs/temporary-measures.md, "Claude Code startup instructions ride the
+/// system prompt").
+fn plan_startup(
+    args: &SpawnArgs<'_>,
+    claude_bin: &std::ffi::OsStr,
+    home: Option<&Path>,
+    base_settings: &Path,
+) -> StartupPlan {
+    let (Some(_), Some(config_dir)) = (args.system_prompt, session_config_dir(args)) else {
+        return StartupPlan::keep(None);
+    };
+    let version = claude_version(claude_bin);
+    let decision = startup_instructions::decide(
+        args.workspace_path,
+        args.worktree_path,
+        &config_dir,
+        home,
+        version.as_deref(),
+        args.resume_session_id,
+    );
+    let moved = match decision {
+        StartupDecision::Move(moved) => moved,
+        StartupDecision::Keep(check) => {
+            return StartupPlan::keep(check.map(StartupFollowUp::Check));
+        }
+    };
+    match write_session_settings(args.workspace_path, base_settings, &moved.excluded) {
+        Ok(file) => StartupPlan {
+            settings_file: Some(file),
+            block: Some(moved.block),
+            follow_up: Some(StartupFollowUp::moved(args.workspace_path)),
+        },
+        Err(e) => {
+            log!(
+                "[ClaudeCode] could not exclude the startup files: {}. Claude Code loads them.",
+                e
+            );
+            StartupPlan::keep(None)
+        }
+    }
+}
+
+/// The base settings plus `claudeMdExcludes`, in a private file.
+fn write_session_settings(
+    workspace: &Path,
+    base: &Path,
+    excluded: &[String],
+) -> Result<tempfile::TempPath, Box<dyn std::error::Error + Send + Sync>> {
+    let mut settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base)?)?;
+    settings
+        .as_object_mut()
+        .ok_or("the settings file is not a JSON object")?
+        .insert("claudeMdExcludes".into(), excluded.into());
+    Ok(write_private_file(
+        workspace,
+        "settings-",
+        ".json",
+        &settings.to_string(),
+    )?)
+}
+
+/// Delete the session files an earlier engine left behind. An engine
 /// that exits never drops its live sessions' file guards.
 ///
 /// Call at boot, before any session spawns. A file younger than a minute may
 /// already belong to this engine, so it waits for the next boot.
-pub fn sweep_stale_system_prompt_files(workspace: &Path) {
-    let Ok(entries) = std::fs::read_dir(system_prompt_dir(workspace)) else {
+pub fn sweep_stale_session_files(workspace: &Path) {
+    let Ok(entries) = std::fs::read_dir(session_files_dir(workspace)) else {
         return;
     };
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
@@ -1082,6 +1246,7 @@ fn build_command_with_settings(
 ) -> std::io::Result<CcCommand> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
+    let startup = plan_startup(args, &claude_bin, home.as_deref(), settings);
     let mut cmd = tokio::process::Command::new(claude_bin);
     // The user's `coding_agent_claude_permission_mode`, defaulting to
     // acceptEdits: in-cwd writes auto-approve, and out-of-cwd writes plus Bash
@@ -1110,7 +1275,7 @@ fn build_command_with_settings(
         .arg("--mcp-config")
         .arg(permission_mcp_config_json(cli_dir))
         .arg("--settings")
-        .arg(settings);
+        .arg(startup.settings_file.as_deref().unwrap_or(settings));
     for dir in args.additional_directories {
         cmd.arg("--add-dir").arg(dir);
     }
@@ -1143,12 +1308,19 @@ fn build_command_with_settings(
     if let Some(tools) = args.allowed_tools {
         cmd.arg("--allowedTools").arg(tools);
     }
+    cmd.arg("--disallowedTools").arg(DISALLOWED_TOOLS.join(","));
     if let Some(m) = args.model {
         cmd.arg("--model").arg(m);
     }
     let system_prompt_file = args
         .system_prompt
-        .map(|prompt| write_system_prompt_file(args.workspace_path, prompt))
+        .map(|prompt| {
+            let appended = match &startup.block {
+                Some(block) => format!("{prompt}\n\n{block}"),
+                None => prompt.to_string(),
+            };
+            write_private_file(args.workspace_path, "system-prompt-", ".md", &appended)
+        })
         .transpose()?;
     if let Some(file) = &system_prompt_file {
         cmd.arg("--append-system-prompt-file").arg(file);
@@ -1186,15 +1358,7 @@ fn build_command_with_settings(
     // unset pin must stay unset: Claude Code reads another keychain entry and
     // another `.claude.json` once the variable exists, even at its default
     // path, and then reports "Not logged in".
-    match args.account_pin {
-        Some(AccountPin::ExplicitConfigDir { dir }) => {
-            cmd.env("CLAUDE_CONFIG_DIR", dir);
-        }
-        Some(AccountPin::DefaultConfigDir { .. }) => {
-            cmd.env_remove("CLAUDE_CONFIG_DIR");
-        }
-        None => {}
-    }
+    apply_account_pin(&mut cmd, args.account_pin);
     // The effort the thread records is the effort CC runs at. So it goes AFTER
     // `apply_lucidos_env`, where a workspace `CLAUDE_CODE_EFFORT_LEVEL` cannot
     // overwrite a pin.
@@ -1235,15 +1399,50 @@ fn build_command_with_settings(
     Ok(CcCommand {
         cmd,
         system_prompt_file,
+        session_settings_file: startup.settings_file,
+        startup_follow_up: startup.follow_up,
     })
 }
 
+/// Replay a thread's account pin onto `cmd`. Shared with the provider check,
+/// which must read the profile the session runs under.
+pub(super) fn apply_account_pin(cmd: &mut tokio::process::Command, pin: Option<&AccountPin>) {
+    match pin {
+        Some(AccountPin::ExplicitConfigDir { dir }) => {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        Some(AccountPin::DefaultConfigDir { .. }) => {
+            cmd.env_remove("CLAUDE_CONFIG_DIR");
+        }
+        None => {}
+    }
+}
+
+/// The relay URL a session for `thread_id` gets as its Vertex base URL. `None`
+/// when this engine runs no relay or has no signing secret yet. A Vertex base
+/// URL the session would otherwise use becomes the relay's upstream.
+pub(super) fn vertex_relay_url(
+    user_env_vars: &[(String, String)],
+    thread_id: uuid::Uuid,
+    relay_port: Option<u16>,
+) -> Option<String> {
+    use super::vertex_relay::{relay_base_url, ENV_VERTEX_BASE_URL};
+    let port = relay_port?;
+    let user_base = user_env_vars
+        .iter()
+        .find(|(name, _)| name == ENV_VERTEX_BASE_URL)
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var(ENV_VERTEX_BASE_URL).ok());
+    relay_base_url(port, thread_id, user_base.as_deref())
+}
+
 /// Point the session's Vertex calls at the engine's relay, so an
-/// always-thinking model's notes come back (`runtime::vertex_relay`). A Vertex
-/// base URL the session would otherwise use becomes the relay's upstream.
+/// always-thinking model's notes come back (`runtime::vertex_relay`).
 ///
 /// Set for every session, not only Vertex ones: Claude Code reads the variable
 /// only on Vertex, and a settings file can switch Vertex on out of our sight.
+/// Whether the notes then reach the user depends on the provider Claude Code
+/// actually uses (`claude_code_provider`).
 ///
 /// A temporary measure: `docs/temporary-measures.md` § "Claude Code's Vertex
 /// calls go through the Vertex relay".
@@ -1252,35 +1451,18 @@ fn stamp_vertex_relay(
     args: &SpawnArgs<'_>,
     relay_port: Option<u16>,
 ) {
-    use super::vertex_relay::{relay_base_url, ENV_VERTEX_BASE_URL};
-    let Some(port) = relay_port else { return };
-    let user_base = args
-        .user_env_vars
-        .iter()
-        .find(|(name, _)| name == ENV_VERTEX_BASE_URL)
-        .map(|(_, value)| value.clone())
-        .or_else(|| std::env::var(ENV_VERTEX_BASE_URL).ok());
-    match relay_base_url(port, args.thread_id, user_base.as_deref()) {
+    if relay_port.is_none() {
+        return;
+    }
+    match vertex_relay_url(args.user_env_vars, args.thread_id, relay_port) {
         Some(url) => {
-            cmd.env(ENV_VERTEX_BASE_URL, url);
+            cmd.env(super::vertex_relay::ENV_VERTEX_BASE_URL, url);
         }
         None => crate::log!(
             "[ClaudeCode] no signing secret, so thread {} runs without the Vertex relay",
             args.thread_id
         ),
     }
-}
-
-/// Whether `cmd` sends its Vertex calls through the relay. Read back off the
-/// command, so the parser's view cannot drift from what the spawn stamped.
-fn relays_vertex_calls(cmd: &tokio::process::Command) -> bool {
-    let name = std::ffi::OsStr::new(super::vertex_relay::ENV_VERTEX_BASE_URL);
-    cmd.as_std().get_envs().any(|(key, value)| {
-        key == name
-            && value
-                .and_then(|v| v.to_str())
-                .is_some_and(super::vertex_relay::is_relay_url)
-    })
 }
 
 /// Which of Claude Code's own permission modes a session runs in, resolved
@@ -1305,6 +1487,17 @@ const AUTO_MODE_OPT_IN_ENV: &str = "CLAUDE_CODE_ENABLE_AUTO_MODE";
 /// Removes `run_in_background` from the `Bash` and `Agent` schemas, and makes a
 /// timed-out command fail rather than move to the background.
 const BACKGROUND_TASKS_OFF_ENV: &str = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS";
+
+/// Claude Code tools that promise later work, in a process the engine ends with
+/// the turn. Every spawn disallows them, side questions included, so the tool
+/// list and the prompt prefix stay shared (ADR 0535).
+pub(crate) const DISALLOWED_TOOLS: [&str; 5] = [
+    "ScheduleWakeup",
+    "Workflow",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+];
 
 /// The session's `--add-dir` list as a JSON array of strings. Claude Code reads
 /// agent definitions from those directories, and the hook payload does not
@@ -1546,6 +1739,38 @@ pub(crate) const GROUP_TEARDOWN_GRACE: std::time::Duration = std::time::Duration
 pub(crate) const EXIT_AFTER_STDOUT_EOF_GRACE: std::time::Duration =
     std::time::Duration::from_secs(1);
 
+/// Forward the events of one stdout line. Every path that reads stdout calls
+/// this, so a line read while the child exits is treated like any other.
+///
+/// Init names the session id. The first turn's result settles what the session
+/// owes the startup ledger: a verdict on its key, or a record that it moved.
+/// That follow-up runs once and off the async workers. Its failure never
+/// reaches the turn. Returns false once the consumer is gone.
+fn forward_stdout_events(
+    events: Vec<AgentEvent>,
+    session_id: &mut Option<String>,
+    startup_follow_up: &mut Option<StartupFollowUp>,
+    events_tx: &mpsc::UnboundedSender<AgentEvent>,
+) -> bool {
+    for ev in events {
+        if let AgentEvent::Init {
+            session_id: sid, ..
+        } = &ev
+        {
+            *session_id = Some(sid.clone());
+        }
+        if let (AgentEvent::Result { .. }, Some(session_id)) = (&ev, session_id.clone()) {
+            if let Some(follow_up) = startup_follow_up.take() {
+                tokio::task::spawn_blocking(move || follow_up.run(&session_id));
+            }
+        }
+        if events_tx.send(ev).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Drive the CC process: forward stdout → events_tx, input/control → stdin,
 /// and react to cancellation. Always emits `AgentEvent::Exited` (best-effort)
 /// before returning so consumers can distinguish a clean close from a panic.
@@ -1561,7 +1786,9 @@ async fn driver_task(
     mut withdraw_rx: mpsc::UnboundedReceiver<WithdrawRequest>,
     cancel: CancellationToken,
     mut session_id: Option<String>,
+    mut session_context: SessionContextDue,
     mut stream_state: CcStreamState,
+    mut startup_follow_up: Option<StartupFollowUp>,
 ) {
     // Capture the child pid before the wait arm consumes the Child:
     // `tokio::process::Child::id()` returns `None` once `wait()` resolves, and
@@ -1602,9 +1829,12 @@ async fn driver_task(
                                 &mut pending_replies,
                                 &String::from_utf8_lossy(&line_buf),
                             );
-                            for ev in events {
-                                let _ = events_tx.send(ev);
-                            }
+                            forward_stdout_events(
+                                events,
+                                &mut session_id,
+                                &mut startup_follow_up,
+                                &events_tx,
+                            );
                         }
                         log!("[ClaudeCode] driver stdout EOF — closing session");
                         stdout_closed = true;
@@ -1616,20 +1846,16 @@ async fn driver_task(
                             &mut pending_replies,
                             &String::from_utf8_lossy(&line_buf),
                         );
-                        for ev in events {
-                            if let AgentEvent::Init { session_id: ref sid, .. } = ev {
-                                session_id = Some(sid.clone());
-                            }
-                            if events_tx.send(ev).is_err() {
-                                // Consumer dropped: stop forwarding this line's
-                                // remaining events. This `break` leaves the
-                                // `for` only; teardown is the `cancel` /
-                                // `child.wait()` arms' job, and dropping the
-                                // receiver goes hand in hand with cancelling.
-                                line_buf.clear();
-                                break;
-                            }
-                        }
+                        // A consumer that dropped stops the forwarding of this
+                        // line only. Teardown is the `cancel` and `child.wait()`
+                        // arms' job, and dropping the receiver goes hand in
+                        // hand with cancelling.
+                        forward_stdout_events(
+                            events,
+                            &mut session_id,
+                            &mut startup_follow_up,
+                            &events_tx,
+                        );
                         line_buf.clear();
                     }
                     Err(e) => {
@@ -1640,7 +1866,7 @@ async fn driver_task(
             }
             input = input_rx.recv() => {
                 let Some(input) = input else { break };
-                let line = format_user_input(&input, session_id.as_deref());
+                let line = format_user_input(&session_context.lead(input), session_id.as_deref());
                 if !write_stdin_line(&mut stdin, &line, "user input").await {
                     break;
                 }
@@ -1664,7 +1890,8 @@ async fn driver_task(
                 // overtaking the message it names.
                 let mut flushed = true;
                 while let Ok(input) = input_rx.try_recv() {
-                    let line = format_user_input(&input, session_id.as_deref());
+                    let line =
+                        format_user_input(&session_context.lead(input), session_id.as_deref());
                     flushed = write_stdin_line(&mut stdin, &line, "user input").await;
                     if !flushed {
                         break;
@@ -1725,12 +1952,12 @@ async fn driver_task(
                                 &mut pending_replies,
                                 &String::from_utf8_lossy(&line_buf),
                             );
-                            for ev in events {
-                                if events_tx.send(ev).is_err() {
-                                    line_buf.clear();
-                                    break;
-                                }
-                            }
+                            forward_stdout_events(
+                                events,
+                                &mut session_id,
+                                &mut startup_follow_up,
+                                &events_tx,
+                            );
                             line_buf.clear();
                         }
                     }
@@ -1742,9 +1969,12 @@ async fn driver_task(
                         &mut pending_replies,
                         &String::from_utf8_lossy(&line_buf),
                     );
-                    for ev in events {
-                        let _ = events_tx.send(ev);
-                    }
+                    forward_stdout_events(
+                        events,
+                        &mut session_id,
+                        &mut startup_follow_up,
+                        &events_tx,
+                    );
                 }
                 break;
             }

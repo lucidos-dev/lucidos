@@ -6,7 +6,9 @@ import {
 } from '../store';
 import { drawerOpen } from '../../components/layout/drawerState';
 import { DEFAULT_SPLIT_RATIO, KEYBOARD_RESIZE_STEP_PX } from '../../components/layout/splitHelpers';
-import { minDrawerWidth, minThreadPanePx, minContentPanePx } from '../paneMinimums';
+import { drawnDrawerWidth, drawnSplitRatio, layoutGeometry } from '../../components/layout/drawnLayout';
+import { dashboardRailShown } from '../dashboardRail';
+import { dividerBandPx, minDrawerWidth, minThreadPanePx, minContentPanePx, paneFloors } from '../paneMinimums';
 import {
   navigateToPane, checkPaneConsistency, toggleThreads, focusPane, revealContentPane, revealThreadPane,
   toggleThreadPane, toggleContentPane, stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
@@ -313,6 +315,58 @@ describe('toggleSplitFromDivider (divider double-click)', () => {
   });
 });
 
+describe('a Canvas that yielded for room: every way to show it shows it', () => {
+  const floors = paneFloors();
+  const layoutAt = (px: number) => ({ windowPx: px, floors, dividerPx: dividerBandPx() });
+  const narrow = floors.minThreadPx + floors.minContentPx - 100;
+  const railWasShown = dashboardRailShown.value;
+
+  beforeEach(() => {
+    resetState(); // focusedPane = 'thread'
+    (globalThis as any).innerWidth = 1024;
+    splitRatio.value = 0.5;
+    dashboardRailShown.value = false;
+    layoutGeometry.value = layoutAt(narrow);
+  });
+  afterEach(() => {
+    layoutGeometry.value = null;
+    dashboardRailShown.value = railWasShown;
+    vi.restoreAllMocks();
+  });
+
+  it('is drawn collapsed while the stored ratio stays put', () => {
+    expect(drawnSplitRatio.value).toBe(1);
+    expect(splitRatio.value).toBe(0.5);
+  });
+
+  it('the Canvas toggle swaps the panes, and its next press swaps back', () => {
+    toggleContentPane();
+    expect(splitRatio.value).toBe(0);
+    expect(drawnSplitRatio.value).toBe(0);
+    expect(focusedPane.value).toBe('content');
+    toggleContentPane();
+    expect(drawnSplitRatio.value).toBe(1);
+    expect(focusedPane.value).toBe('thread');
+  });
+
+  it('a content navigation swaps the panes rather than restoring a split that cannot fit', () => {
+    revealContentPane();
+    expect(drawnSplitRatio.value).toBe(0);
+  });
+
+  it('the divider double-click shows the Canvas', () => {
+    toggleSplitFromDivider();
+    expect(drawnSplitRatio.value).toBe(0);
+  });
+
+  it('a split that has room again restores the default split, as before', () => {
+    layoutGeometry.value = layoutAt(narrow + 400);
+    splitRatio.value = 1;
+    toggleContentPane();
+    expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
+  });
+});
+
 describe('focusPane', () => {
   beforeEach(() => resetState());
   afterEach(() => vi.restoreAllMocks());
@@ -538,6 +592,21 @@ describe('stepThreadDrawerWidth', () => {
     threadDrawerWidth.value = MAX - 10;
     stepThreadDrawerWidth(1);
     expect(threadDrawerWidth.value).toBe(MAX);
+  });
+
+  it('steps from the width drawn, which a smaller window holds below the stored one', () => {
+    const floors = paneFloors();
+    dashboardRailShown.value = false;
+    threadDrawerWidth.value = 900;
+    layoutGeometry.value = { windowPx: floors.minThreadPx + dividerBandPx() + 450, floors, dividerPx: dividerBandPx() };
+    try {
+      const drawnPx = drawnDrawerWidth.value;
+      expect(drawnPx).toBeLessThan(900);
+      stepThreadDrawerWidth(-1);
+      expect(threadDrawerWidth.value).toBe(drawnPx - KEYBOARD_RESIZE_STEP_PX);
+    } finally {
+      layoutGeometry.value = null;
+    }
   });
 
   it('no-ops while the drawer is hidden (closed, or thread pane collapsed)', () => {

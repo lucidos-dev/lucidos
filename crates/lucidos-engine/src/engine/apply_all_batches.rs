@@ -169,6 +169,19 @@ impl BatchProgress {
         advance
     }
 
+    /// Restore a queued member the landing lane holds. It waits off to the
+    /// side as [`Self::park_in_lane`] leaves it, and the lane's terminal
+    /// event resolves it. Recovery never applies it again.
+    pub(crate) fn restore_laned(&mut self, change_id: Uuid) {
+        if let Some(m) = self
+            .member_mut(change_id)
+            .filter(|m| m.status == MemberStatus::Queued)
+        {
+            m.status = MemberStatus::Resolving;
+            m.requeued = true;
+        }
+    }
+
     /// Restore a queued member to the state a restart found it in: a live
     /// or resuming session owns it, resolving a conflict or not.
     ///
@@ -546,6 +559,25 @@ mod tests {
         batch.resolve(ids[0], Ok(()));
         batch.resolve(ids[2], Ok(()));
         assert!(batch.is_submitted(), "a complete press stays submitted");
+    }
+
+    /// A restart finds a member in the landing lane. It is restored beside the
+    /// queue, never re-driven, and it resolves on the lane's terminal event.
+    #[test]
+    fn a_restored_laned_member_waits_beside_the_queue() {
+        let ids = uuids(3);
+        let mut batch = BatchProgress::new(Uuid::new_v4(), ids.clone(), None);
+        batch.restore_laned(ids[0]);
+        assert_eq!(batch.start_next(), Some(ids[1]), "the queue moves on");
+        batch.restore_laned(ids[1]);
+        assert_eq!(
+            batch.start_next(),
+            None,
+            "an applying member is not turned into a laned one"
+        );
+        assert_eq!(batch.resolve(ids[1], Ok(())), Advance::Start(ids[2]));
+        assert_eq!(batch.park(ids[2]), Advance::Wait);
+        assert_eq!(batch.resolve(ids[0], Ok(())), Advance::Wait);
     }
 
     /// A change already in a running batch stays out of a second one, so two

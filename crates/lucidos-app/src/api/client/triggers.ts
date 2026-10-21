@@ -16,6 +16,8 @@ export function listTriggers(): Promise<TriggersListResponse> {
 
 export function createTrigger(body: {
   name: string;
+  /** Stable kebab-case id. Omit to derive it from `name`. */
+  slug?: string;
   run: TriggerRun;
   cron_expressions: string[];
   on?: EventSubscription[];

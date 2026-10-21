@@ -341,7 +341,7 @@ mod tests {
     }
 
     /// Remove emits too, so the list refreshes live on every client. The
-    /// projected name deliberately survives (see `repo_names` in db.md).
+    /// projected name deliberately survives (see `repo_names` in `docs/database-schema-notes.md`).
     #[tokio::test]
     async fn remove_emits_repository_removed_and_retains_the_projected_name() {
         let (pool, db_name) = setup_test_db().await;

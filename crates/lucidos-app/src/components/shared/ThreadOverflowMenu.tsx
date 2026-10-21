@@ -51,9 +51,9 @@ prefetchWhenIdle(ThreadOverflowItemsChunk);
  *  text, so a rename there would change nothing on screen. The dialog carries
  *  the Suggest link, except on the home thread: only the user names it (ADR 0362).
  *
- *  **Add widget… follows Rename… on a sent thread**, except Home, whose board
- *  has its own Add (ADR 0466). It steps the menu into the reusable widgets,
- *  the board's picker, and a pick pins one to this thread's shelf. Escape or
+ *  **Add widget… follows Rename… on a sent thread**, except Home, which takes
+ *  no pins (ADR 0496). It steps the menu into the reusable widgets, the list a
+ *  dashboard's Add shows, and a pick pins one to this thread's shelf. Escape or
  *  its Back row steps out.
  *
  *  **Pin/Unpin shows on every open.** The mobile title row draws no pin, and a

@@ -413,15 +413,6 @@ test.describe('a source line wider than the file preview', () => {
 
     test.skip(process.env.PREVIEW_SHOTS !== '1', 'set PREVIEW_SHOTS=1 to take screenshots');
 
-    /** One project is enough: the subject is the stylesheet, not the engine,
-     *  and the narrow width below covers what a phone would add.
-     *
-     *  Per test rather than on the describe, because a describe-level modifier
-     *  callback is handed the FIXTURES alone. Reaching for `testInfo` there
-     *  throws before any shot is taken. */
-    const chromiumOnly = (testInfo: { project: { name: string } }) =>
-      test.skip(testInfo.project.name !== 'chromium', 'chromium only');
-
     async function frame(page: Page, theme: 'dark' | 'light', width: number) {
       await page.setViewportSize({ width, height: 900 });
       await page.emulateMedia({ colorScheme: theme });
@@ -442,8 +433,7 @@ test.describe('a source line wider than the file preview', () => {
         // seeds `app-window-open` in an init script, and that script re-runs on
         // every navigation. A Files-panel visit afterwards therefore lands with
         // the app reopened over the pane, and never reaches the preview.
-        test(`modal ${theme} ${label}`, async ({ page }, testInfo) => {
-          chromiumOnly(testInfo);
+        test(`modal ${theme} ${label}`, async ({ page }) => {
           await frame(page, theme, width);
           const modal = await openModal(page, true);
           await splashGone(page);
@@ -454,8 +444,7 @@ test.describe('a source line wider than the file preview', () => {
           await modal.screenshot({ path: `${DIR}/modal-pan-${theme}-${label}.png` });
         });
 
-        test(`panel ${theme} ${label}`, async ({ page }, testInfo) => {
-          chromiumOnly(testInfo);
+        test(`panel ${theme} ${label}`, async ({ page }) => {
           await frame(page, theme, width);
           await openInFilesPanel(page, true);
           await splashGone(page);

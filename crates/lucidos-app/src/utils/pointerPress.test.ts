@@ -31,7 +31,7 @@ describe('primaryPointerIsDown', () => {
 
   /** The whole reason the trust check exists. A dispatched PointerEvent gets no
    *  paired click, so an overlay opened by one must keep dismissing on the next
-   *  synthetic click. `e2e/overlay-dismiss-swallow.spec.ts` drives exactly
+   *  synthetic click. `e2e/overlay-dismiss-swallow-all.spec.ts` drives exactly
    *  that. */
   it('ignores an untrusted press', () => {
     dispatch('pointerdown', { isTrusted: false });

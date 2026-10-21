@@ -228,6 +228,11 @@ impl LucidosEngine {
         let ready =
             crate::core::changes::keep_apply_ready_changes(self.pool(), all_pending).await?;
         let not_ready = total_pending - ready.len();
+        // The lane owns a change from `ChangeQueued` until it lands, and an
+        // apply in flight owns its claim. A press that re-submitted either
+        // would open a second batch over the same change (ADR 0463).
+        let (ready, already_applying_ids) = self.drop_changes_already_applying(ready).await?;
+        let already_applying = already_applying_ids.len();
         // Also drop changes with no files left. The per-change endpoint 409s
         // those, and this path would otherwise do what the button refuses:
         // merge no-op commits, possibly spending a harden run on an empty diff.
@@ -238,7 +243,15 @@ impl LucidosEngine {
         // minutes hardening, and an instruction the owner gave must not wait on
         // it.
         let armed = if keep_going {
-            self.sweep_standing_applies(Some(Uuid::new_v4()), actor.clone(), &change_ids)
+            // The sweep skips what this press applies, and must skip what the
+            // lane or another apply already owns: a paused thread's change
+            // would otherwise be applied a second time.
+            let applying_now: Vec<Uuid> = change_ids
+                .iter()
+                .chain(&already_applying_ids)
+                .copied()
+                .collect();
+            self.sweep_standing_applies(Some(Uuid::new_v4()), actor.clone(), &applying_now)
                 .await
         } else {
             0
@@ -249,6 +262,7 @@ impl LucidosEngine {
             return Ok(ApplyAllOutcome::NothingToApply {
                 total_pending,
                 not_ready,
+                already_applying,
                 armed,
             });
         };
@@ -264,6 +278,22 @@ impl LucidosEngine {
             first_branch: first.branch_name.clone(),
             first_result,
         })
+    }
+
+    /// `changes` without those the landing lane holds or an apply has
+    /// claimed, plus the ids it dropped. The lane is read from events, which
+    /// answer before the lane restores after a restart.
+    async fn drop_changes_already_applying(
+        &self,
+        changes: Vec<crate::core::changes::Change>,
+    ) -> Result<(Vec<crate::core::changes::Change>, Vec<Uuid>), sqlx::Error> {
+        let ids: Vec<Uuid> = changes.iter().map(|c| c.id).collect();
+        let mut applying =
+            crate::engine::landing_lane::lane_held_changes(self.pool(), &ids).await?;
+        applying.extend(ids.into_iter().filter(|id| self.apply_claims.is_held(*id)));
+        let kept = crate::core::changes::drop_applying_changes(changes, &applying);
+        applying.retain(|id| !kept.iter().any(|c| c.id == *id));
+        Ok((kept, applying.into_iter().collect()))
     }
 
     /// Apply one member the batch started, and report what the apply cannot
@@ -616,10 +646,31 @@ impl LucidosEngine {
                 continue;
             }
 
-            // Still in progress. Restore who owns each unresolved member, then
-            // start the next one if none of them holds the queue.
-            for change_id in progress.pending_members() {
-                if let Some(resolving) = self.recovered_owner(batch_id, change_id).await {
+            // Still in progress. A member the landing lane holds stays with
+            // the lane: applying it again would take the claim the restored
+            // lane needs (ADR 0463). Restore who owns each other unresolved
+            // member, then start the next one if none of them holds the queue.
+            let pending = progress.pending_members();
+            let laned =
+                match crate::engine::landing_lane::lane_held_changes(self.pool(), &pending).await {
+                    Ok(held) => held,
+                    Err(e) => {
+                        // An unknown lane never authorizes an apply, and parking
+                        // every member would hang the batch. The batch stays
+                        // persisted, so the next boot recovers it.
+                        log!(
+                            "[ApplyAll] recovery: lane lookup for batch {} failed: {} — \
+                             leaving the batch for the next boot",
+                            batch_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+            for change_id in pending {
+                if laned.contains(&change_id) {
+                    progress.restore_laned(change_id);
+                } else if let Some(resolving) = self.recovered_owner(batch_id, change_id).await {
                     progress.restore_owned(change_id, resolving);
                 }
             }
@@ -770,11 +821,13 @@ pub(crate) enum ApplyAllOutcome {
         first_branch: String,
         first_result: Result<crate::engine::ApplyResult, String>,
     },
-    /// Nothing could be applied right now. The two counts are what lets the
+    /// Nothing could be applied right now. The counts are what lets the
     /// caller name the real reason rather than one blanket refusal.
     NothingToApply {
         total_pending: usize,
         not_ready: usize,
+        /// Ready changes the lane holds or an apply has claimed.
+        already_applying: usize,
         armed: usize,
     },
 }

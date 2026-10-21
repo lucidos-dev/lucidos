@@ -132,15 +132,24 @@ function installProbe(autostartKey: string): void {
                 peakRows = Math.max(peakRows, mountedRows());
             };
             const step = list.clientHeight * stepFraction;
+            // A list with no height steps by zero and never reaches its end. A
+            // list the app replaced mid-sweep does the same. Either one hung the
+            // page for the whole test timeout, so the sweep names it instead.
+            if (!(step > 0)) throw new Error(`sweep: the list has no height (clientHeight ${list.clientHeight})`);
             const max = () => list.scrollHeight - list.clientHeight;
+            const stillThere = (at: number) => {
+                if (!list.isConnected) throw new Error(`sweep: the list was replaced while sweeping, at scrollTop ${at}`);
+            };
             for (let top = 0; top <= max(); top += step) {
                 list.scrollTop = top;
                 await twoFrames();
+                stillThere(top);
                 check();
             }
             for (let top = max(); top >= 0; top -= step) {
                 list.scrollTop = top;
                 await twoFrames();
+                stillThere(top);
                 check();
             }
             list.scrollTop = 0;

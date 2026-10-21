@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  generateBackupKey,
+  confirmBackupKey,
+  copyLadderFromChat,
+  sortLadder,
   getBackupKey,
+  startBackupKeySetup,
+  verifyBackupKey,
   getCredentialValue,
   handOverDevice,
 } from './settings';
@@ -136,14 +140,12 @@ describe('getCredentialValue', () => {
 });
 
 /**
- * The backup key takes the same two steps as a credential value.
+ * The legacy backup key reveal takes the same two steps as a credential value.
  *
- * It encrypts every archive this workspace ever uploaded, and it used to be one
- * bare GET away from any installed app. Both key-bearing routes now spend a
- * one-shot token, including the idempotent generate: on a workspace that
- * already has a key, that route hands back the same plaintext the reveal does.
+ * It decrypts every `.enc` archive this workspace uploaded, and it used to be
+ * one bare GET away from any installed app.
  */
-describe('the backup key routes', () => {
+describe('the legacy backup key reveal', () => {
   const originalFetch = globalThis.fetch;
   let mockFetch: ReturnType<typeof vi.fn>;
 
@@ -171,9 +173,9 @@ describe('the backup key routes', () => {
   it('mints a token, then spends it on the reveal', async () => {
     mockFetch
       .mockResolvedValueOnce(okJson({ token: 'tok-1', expires_in_secs: 30 }))
-      .mockResolvedValueOnce(okJson({ key: 'a2V5', is_new: false }));
+      .mockResolvedValueOnce(okJson({ key: 'a2V5' }));
 
-    expect(await getBackupKey()).toEqual({ key: 'a2V5', is_new: false });
+    expect(await getBackupKey()).toEqual({ key: 'a2V5' });
 
     const [mintUrl, mintInit] = mockFetch.mock.calls[0];
     expect(mintUrl).toContain('/backup/key/reveal-token');
@@ -183,27 +185,14 @@ describe('the backup key routes', () => {
     expect(readInit?.method).toBeUndefined();
   });
 
-  it('spends a token on the generate too, because it returns the same key', async () => {
-    mockFetch
-      .mockResolvedValueOnce(okJson({ token: 'tok-2', expires_in_secs: 30 }))
-      .mockResolvedValueOnce(okJson({ key: 'bmV3', is_new: true }));
-
-    expect(await generateBackupKey()).toEqual({ key: 'bmV3', is_new: true });
-
-    expect(mockFetch.mock.calls[0][0]).toContain('/backup/key/reveal-token');
-    const [genUrl, genInit] = mockFetch.mock.calls[1];
-    expect(genUrl).toContain('/backup/key?token=tok-2');
-    expect(genInit.method).toBe('POST');
-  });
-
   it('re-mints once when the token was already spent', async () => {
     mockFetch
       .mockResolvedValueOnce(okJson({ token: 'spent', expires_in_secs: 30 }))
       .mockResolvedValueOnce(forbidden())
       .mockResolvedValueOnce(okJson({ token: 'fresh', expires_in_secs: 30 }))
-      .mockResolvedValueOnce(okJson({ key: 'a2V5', is_new: false }));
+      .mockResolvedValueOnce(okJson({ key: 'a2V5' }));
 
-    expect(await getBackupKey()).toEqual({ key: 'a2V5', is_new: false });
+    expect(await getBackupKey()).toEqual({ key: 'a2V5' });
     expect(mockFetch).toHaveBeenCalledTimes(4);
     expect(mockFetch.mock.calls[3][0]).toContain('token=fresh');
   });
@@ -215,13 +204,12 @@ describe('the backup key routes', () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
-  it('lets a 404 through untouched, so an absent key still offers generate', async () => {
-    // The Backup page catches this exact status and switches to generate. A
-    // retry here would spend a second token to learn the same thing.
+  it('lets a 404 through untouched', async () => {
+    // A retry would spend a second token to learn the same thing.
     mockFetch
       .mockResolvedValueOnce(okJson({ token: 'tok-3', expires_in_secs: 30 }))
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ error: 'No backup key exists yet.' }), {
+        new Response(JSON.stringify({ error: 'This workspace holds no legacy backup key.' }), {
           status: 404,
           headers: { 'Content-Type': 'application/json' },
         }),
@@ -229,5 +217,98 @@ describe('the backup key routes', () => {
 
     await expect(getBackupKey()).rejects.toMatchObject({ httpCode: 404 });
     expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The backup recipient routes reveal no stored secret, so they spend no token.
+ * A pasted backup key travels in the body, never in the URL, where the service
+ * worker, a proxy log or the history could keep it.
+ */
+describe('the backup recipient routes', () => {
+  const originalFetch = globalThis.fetch;
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  const okJson = (body: unknown) =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  beforeEach(() => {
+    mockFetch = vi.fn();
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('starts a setup with one POST and returns the backup key it shows', async () => {
+    mockFetch.mockResolvedValueOnce(okJson({ backup_key: 'AGE-SECRET-KEY-1TEST' }));
+
+    expect(await startBackupKeySetup()).toBe('AGE-SECRET-KEY-1TEST');
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toContain('/backup/recipient/setup');
+    expect(init.method).toBe('POST');
+  });
+
+  it('sends a pasted key in the body only', async () => {
+    mockFetch
+      .mockResolvedValueOnce(okJson({ recipient: 'age1x', pending: false, legacy_key: false, secs_since_verified: 0 }))
+      .mockResolvedValueOnce(okJson({ matches: true }));
+
+    await confirmBackupKey('AGE-SECRET-KEY-1TEST');
+    expect(await verifyBackupKey('AGE-SECRET-KEY-1TEST')).toBe(true);
+
+    for (const [url, init] of mockFetch.mock.calls) {
+      expect(url).not.toContain('AGE-SECRET-KEY');
+      expect(JSON.parse(init.body)).toEqual({ backup_key: 'AGE-SECRET-KEY-1TEST' });
+    }
+    expect(mockFetch.mock.calls[0][0]).toContain('/backup/recipient/confirm');
+    expect(mockFetch.mock.calls[1][0]).toContain('/backup/recipient/verify');
+  });
+});
+
+/** Copy from Lucidos Agent names only the coding-agent surface it writes. The
+ *  engine reads the chat ladder itself, so the request carries no rungs. */
+describe('copyLadderFromChat', () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('posts the target surface and answers the rungs now on', async () => {
+    const rungs = [{ model: 'claude-haiku-5-5', effort: 'high' }];
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ rungs }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    await expect(copyLadderFromChat('claude-code')).resolves.toEqual({ rungs });
+    const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toMatch(/\/api\/v1\/intelligence-ladder\/copy-from-chat$/);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({ surface: 'claude-code' });
+  });
+});
+
+describe('sortLadder', () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('posts the surface to sort and answers the rungs now on', async () => {
+    const rungs = [{ model: 'claude-haiku-5-5', effort: 'high' }];
+    const mockFetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ rungs }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    await expect(sortLadder('claude-code')).resolves.toEqual({ rungs });
+    const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toMatch(/\/api\/v1\/intelligence-ladder\/sort$/);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({ surface: 'claude-code' });
   });
 });

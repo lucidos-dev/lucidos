@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport, disarmFollowSeed } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy, disarmFollowSeed } from './helpers';
 
 /** Scrolling away from a reply IN FLIGHT retires the standing follow.
  *
@@ -45,7 +45,6 @@ test.describe('Scrolling away from a live reply retires the follow (desktop)', (
   });
 
   test('a wheel up while the agent is still writing turns the toggle off', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'covered on desktop; mobile adds a second scroll writer');
 
     // Short viewport so a modest transcript overflows: with no scroll capacity
     // there is nowhere to scroll away TO and the assertion is vacuous.

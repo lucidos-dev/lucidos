@@ -7,6 +7,10 @@ Amends [ADR 0407](0407-inline-widget-cards-and-an-opt-in-shelf.md) (Home's
 pins), [ADR 0411](0411-every-workspace-has-home.md) (where a cold start lands)
 and [ADR 0419](0419-widget-windows-stay-open.md) (the tap in Home).
 
+Amended by [ADR 0538](0538-phone-dashboard-is-a-sheet-over-any-thread.md): a
+phone no longer shows Home as two faces. Home is a plain chat there, and the
+phone dashboard is a sheet over any thread.
+
 ## Context
 
 A tester asked for widgets that are always visible, with live updates, sizes

@@ -3,12 +3,12 @@
 //! hook invokes `lucidos ask-user-question-hook` (a sibling subcommand on the
 //! same `lucidos` CLI binary the engine already prepends to CC's PATH for the
 //! MCP permission server — resolved via `LUCIDOS_CLI_BIN` in a packaged build,
-//! the exe sibling-walk in dev; see `lucidos_cli::resolve_cli_dir`, and the
+//! the engine's pinned copy in dev; see `lucidos_cli::lucidos_cli_dir`, and the
 //! fail-fast in `ClaudeCodeRuntime::spawn` when the CLI can't be resolved).
 //! Keeps the JSON shape literal; no per-spawn interpolation. See
 //! `claude_code::permission_mcp_config_json` for the same pattern.
-//! It carries hooks and directory grants only, never a model or effort default:
-//! see [`build_cc_settings_json`].
+//! It carries hooks, directory grants and hidden skills, never a model or
+//! effort default: see [`build_cc_settings_json`].
 
 use std::path::{Path, PathBuf};
 
@@ -189,7 +189,30 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
         }
     });
     grant_directories(&mut settings, additional_directories);
+    hide_unused_skills(&mut settings);
     settings.to_string()
+}
+
+/// Claude Code's own skills that Lucidos has no use for, so their listing stays
+/// out of every session's fixed prompt. `loop` needs the cron tools, which
+/// `claude_code::DISALLOWED_TOOLS` removes; the others tune a CLI the user does
+/// not drive from here. Each is `off`: hidden from the model and from the user's `/name`.
+const HIDDEN_SKILLS: [&str; 4] = [
+    "loop",
+    "workflow-authoring",
+    "fewer-permission-prompts",
+    "keybindings-help",
+];
+
+/// Add `skillOverrides` for [`HIDDEN_SKILLS`]. CC lists skills in the prompt
+/// prefix, so a side question's copy must hide the same set as its session or
+/// the prompt cache misses.
+fn hide_unused_skills(settings: &mut serde_json::Value) {
+    settings["skillOverrides"] = HIDDEN_SKILLS
+        .iter()
+        .map(|skill| (skill.to_string(), serde_json::json!("off")))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
 }
 
 /// Add the `permissions.additionalDirectories` grant, or nothing for an empty
@@ -271,6 +294,7 @@ pub(crate) fn build_cc_side_question_settings_json(additional_directories: &[Pat
         }
     });
     grant_directories(&mut settings, additional_directories);
+    hide_unused_skills(&mut settings);
     settings.to_string()
 }
 
@@ -318,6 +342,31 @@ mod tests {
         let copy: serde_json::Value =
             serde_json::from_str(&build_cc_side_question_settings_json(&dirs)).unwrap();
         assert_eq!(session["permissions"], copy["permissions"]);
+    }
+
+    /// The skill listing is part of the prompt prefix, so the side-question copy
+    /// must hide exactly what the session hides, and nothing beyond the four.
+    #[test]
+    fn skill_overrides_hide_only_the_unused_skills_in_both_files() {
+        for json in [
+            build_cc_settings_json(&[]),
+            build_cc_side_question_settings_json(&[]),
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let overrides = parsed["skillOverrides"].as_object().unwrap();
+            let mut hidden: Vec<&str> = overrides.keys().map(String::as_str).collect();
+            hidden.sort_unstable();
+            assert_eq!(
+                hidden,
+                [
+                    "fewer-permission-prompts",
+                    "keybindings-help",
+                    "loop",
+                    "workflow-authoring"
+                ]
+            );
+            assert!(overrides.values().all(|v| v == "off"));
+        }
     }
 
     /// The engine's settings file outranks the user's own CC settings, so a

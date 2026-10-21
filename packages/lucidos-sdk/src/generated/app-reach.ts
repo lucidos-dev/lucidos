@@ -33,6 +33,7 @@ export const APP_REACHABLE_ROUTES: AppReachableRoute[] = [
   { path: '/themes/parts', methods: ['GET'] },
   { path: '/themes/resolve', methods: ['POST'] },
   { path: '/themes/tokens', methods: ['GET'] },
+  { path: '/model-prices', methods: ['GET'] },
   { path: '/models', methods: ['GET'] },
   { path: '/notification', methods: ['GET'] },
   { path: '/notification/read', methods: ['POST'] },

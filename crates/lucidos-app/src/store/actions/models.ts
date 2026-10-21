@@ -147,8 +147,9 @@ function lucidosModelChoice(value: string, label: string): ModelChoice {
  *  which is the same shape the coding-agent menu gets off the wire.
  *
  *  `current` is appended when the registry does not list it. A saved
- *  `chat_model` naming a deleted or disabled model then still renders as
- *  selected, rather than the picker silently showing something else. */
+ *  `chat_model` naming a deleted model, or one off the chat ladder, then still
+ *  renders as selected, rather than the picker silently showing something
+ *  else. */
 export function lucidosModelChoices(current?: string | null): ModelChoice[] {
   const choices = chatModelOptions().map((o) => lucidosModelChoice(o.value, o.label));
   if (current && !choices.some((c) => c.value === current)) {
@@ -157,9 +158,10 @@ export function lucidosModelChoices(current?: string | null): ModelChoice[] {
   return choices;
 }
 
-/** Options for the chat model `<Dropdown>` — enabled models from the loaded
- *  registry with at least one configured route, falling back to the static
- *  `MODELS` list before the first load (so the picker never renders empty).
+/** Options for the chat model `<Dropdown>`: the loaded registry's models on
+ *  the chat intelligence ladder with at least one configured route. Before the
+ *  first load it falls back to the static `MODELS` list, so the picker never
+ *  renders empty.
  *
  *  The filter keeps a user with only an OpenAI key from being offered models
  *  that would error on use. It asks about ANY route rather than one provider.
@@ -173,7 +175,7 @@ export function chatModelOptions(): Array<{ value: string; label: string }> {
   const loadable = chatModels.value;
   if (loadable.status === 'loaded') {
     return loadable.data
-      .filter((m) => m.enabled && hasConfiguredRoute(m))
+      .filter((m) => m.on_chat_ladder && hasConfiguredRoute(m))
       .map((m) => ({ value: m.id, label: m.label }));
   }
   return MODELS;
@@ -328,10 +330,6 @@ export async function saveModelRoutes(
     }),
     'Failed to save the routes'
   );
-}
-
-export function setModelEnabled(id: string, enabled: boolean): Promise<boolean> {
-  return runModelMutation(() => updateModel(id, { enabled }), 'Failed to update model');
 }
 
 /** Set a model's *vision flag*. Builtins take it too, since a seed can be

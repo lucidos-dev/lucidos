@@ -77,6 +77,13 @@ pub const AUTO_RESUME_AFTER_SWITCH_REASON: &str = "auto_resume_after_switch";
 /// exchange, as Continue does.
 pub const HARDEN_REQUESTED_REASON: &str = "harden_requested";
 
+/// Tag stamped on `ContinuationRequested.reason` when a Claude Code effort
+/// pick restarted the session mid-work. Claude Code takes effort only at
+/// spawn, so the engine stops the session and resumes it at the new effort.
+/// The resume carries [`EFFORT_RESTART_USER_MESSAGE`], and opens a resume
+/// exchange, because the interrupted turn already has its terminal.
+pub const EFFORT_RESTART_REASON: &str = "effort_restart";
+
 /// Should the SpawnConsumer's `Continue` handler emit `ContinuationStarted`
 /// for a `ContinuationRequested` carrying this `reason`?
 ///
@@ -106,6 +113,7 @@ pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
             | Some(AUTO_RECOVERY_AFTER_HANG_REASON)
             | Some(AUTO_RESUME_AFTER_SWITCH_REASON)
             | Some(AUTO_RESUME_AFTER_API_ERROR_REASON)
+            | Some(EFFORT_RESTART_REASON)
     )
 }
 
@@ -183,6 +191,13 @@ pub fn continue_recovery(error: Option<&str>, retried: bool) -> ContinueRecovery
 /// The wording matches Claude Code's own continuation prompt.
 pub const CONTINUE_RESUME_USER_MESSAGE: &str = "Continue from where you left off.";
 
+/// The [`EFFORT_RESTART_REASON`] resume message. The transcript shows the
+/// interrupted turn, so this says why it stopped and that nothing was asked.
+pub const EFFORT_RESTART_USER_MESSAGE: &str =
+    "[Note from engine: the user changed your reasoning effort, so your session restarted \
+     at the new effort. The interruption was not a request from the user.] \
+     Continue from where you left off.";
+
 /// Opens the [`ANSWERED_AFTER_IDLE_REASON`] resume message. Its whole job is to
 /// disarm what the agent is about to read in its own transcript.
 ///
@@ -230,6 +245,9 @@ pub(crate) async fn continue_input_for_reason(
 ) -> String {
     if reason == Some(HARDEN_REQUESTED_REASON) {
         return crate::engine::claude_code::AUTO_HARDEN_MESSAGE.to_string();
+    }
+    if reason == Some(EFFORT_RESTART_REASON) {
+        return EFFORT_RESTART_USER_MESSAGE.to_string();
     }
     if reason != Some(ANSWERED_AFTER_IDLE_REASON) {
         return CONTINUE_RESUME_USER_MESSAGE.to_string();

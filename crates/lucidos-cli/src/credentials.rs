@@ -6,7 +6,8 @@
 //!
 //! Deliberately CLI-only. Nothing here is an LLM tool or an SDK namespace: the
 //! chat agent asks for a credential through `request_credential`, and Settings
-//! is where a person edits one.
+//! is where a person edits one. `list` also shows the variable names a command
+//! must name to get a credential, since a subprocess gets only those.
 
 use crate::http::{client, send_expect_json};
 use crate::workspace::{BoxError, Workspace};
@@ -72,8 +73,21 @@ pub(crate) fn cmd_list(ws: &Workspace, name: Option<&str>, json: bool) -> Result
             field(row, "auth_type"),
             scope
         );
+        let names = env_var_names_of(row);
+        if !names.is_empty() {
+            println!("    names: {}", names.join(" "));
+        }
     }
     Ok(())
+}
+
+/// The variable names a command names to get this credential. The engine
+/// computes them, so the CLI never re-derives the naming rule.
+fn env_var_names_of(row: &serde_json::Value) -> Vec<&str> {
+    row["env_var_names"]
+        .as_array()
+        .map(|names| names.iter().filter_map(|n| n.as_str()).collect())
+        .unwrap_or_default()
 }
 
 /// `lucidos credentials set-base-urls`, replacing the whole scope.

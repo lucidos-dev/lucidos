@@ -10,7 +10,7 @@
  * The filter shapes Folders only: switching to Ongoing closes the panel and
  * hides the Filter button. jsdom runs no animations and loads no CSS, so these
  * tests pin the DOM the CSS keys on. The frames are covered by
- * `e2e/drawer-grouping.spec.ts`.
+ * `e2e/drawer-grouping-all.spec.ts`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';

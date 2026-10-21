@@ -37,6 +37,9 @@ import type { NavigateTarget, NavigateUi } from './notifications';
  *  in lockstep with the engine `navigate_ui` tool. */
 export type NavigateParams = Omit<NavigateUi, 'target'>;
 
+/** Options for `lucidos.ui.startThread`: the new-chat subset of `NavigateParams`. */
+export type StartThreadOptions = Pick<NavigateParams, 'prompt' | 'coding_agent' | 'folder'>;
+
 /** The stylesheet to load for a font, or `undefined` for a font already on the
  *  device.
  *
@@ -760,20 +763,26 @@ export const ui = {
   },
 
   /**
-   * Open a fresh chat thread, optionally prefilling the compose textarea.
-   * The user must click Send: this never auto-submits. On an app, trigger or
-   * settings panel it closes the overlay first. With a thread focused it drops
-   * the focus, so the compose lands on a new thread.
+   * Open a fresh chat thread, optionally prefilling the compose textarea and
+   * the destination. `coding_agent` and `folder` aim the draft at a coding
+   * agent: its backend and its coding target (a registered repository name or
+   * id, or `data/apps/<id>`). A value that matches nothing leaves that dropdown
+   * at its default and warns. The user must click Send: this never
+   * auto-submits. On an app, trigger or settings panel it closes the overlay
+   * first. With a thread focused it drops the focus, so the compose lands on a
+   * new thread.
    */
-  startThread(opts?: { prompt?: string }): Promise<void> {
-    const params: NavigateParams = {};
-    if (opts && opts.prompt !== undefined) {
-      if (typeof opts.prompt !== 'string') {
-        return Promise.reject(new TypeError('opts.prompt must be a string'));
+  startThread(opts?: StartThreadOptions): Promise<void> {
+    const given: Record<string, string> = {};
+    for (const key of ['prompt', 'coding_agent', 'folder'] as const) {
+      const value = opts?.[key];
+      if (value === undefined) continue;
+      if (typeof value !== 'string') {
+        return Promise.reject(new TypeError(`opts.${key} must be a string`));
       }
-      if (opts.prompt.length > 0) params.prompt = opts.prompt;
+      if (value.length > 0) given[key] = value;
     }
-    return ui.navigate('new-chat', params);
+    return ui.navigate('new-chat', given as NavigateParams);
   },
 
   /**
@@ -998,7 +1007,7 @@ export const ui = {
 
   /**
    * The id of the thread the user has open in the thread pane, or `null` on the
-   * empty compose view. A Home board tile beside a thread reads that thread,
+   * empty compose view. A dashboard tile beside a thread reads that thread,
    * not the widget's own. A compose draft and Home are threads too.
    *
    * An app or a panel in the Canvas pane leaves the value alone: the thread is

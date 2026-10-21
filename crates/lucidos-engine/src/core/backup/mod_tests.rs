@@ -385,15 +385,6 @@ fn a_failed_restore_statement_makes_psql_exit_non_zero() {
 }
 
 #[test]
-fn test_key_file_path() {
-    let workspace = Path::new("/home/user/my-workspace");
-    assert_eq!(
-        key_file_path(workspace),
-        PathBuf::from("/home/user/my-workspace/.lucidos/backup.key")
-    );
-}
-
-#[test]
 fn test_tar_and_compress_excludes_lucidos_and_postgres() {
     let workspace = tempfile::tempdir().unwrap();
     let ws = workspace.path();
@@ -420,7 +411,14 @@ fn test_tar_and_compress_excludes_lucidos_and_postgres() {
 
     // Tar and compress
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(ws, sql_dump.path(), output.path(), &BackupIgnore::default()).unwrap();
+    tar_and_compress(
+        ws,
+        sql_dump.path(),
+        secret_key_file().path(),
+        output.path(),
+        &BackupIgnore::default(),
+    )
+    .unwrap();
 
     // Decompress and verify contents (streaming from file)
     let file = std::fs::File::open(output.path()).unwrap();
@@ -486,7 +484,14 @@ fn test_tar_and_compress_includes_data_blobs() {
     std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
 
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(ws, sql_dump.path(), output.path(), &BackupIgnore::default()).unwrap();
+    tar_and_compress(
+        ws,
+        sql_dump.path(),
+        secret_key_file().path(),
+        output.path(),
+        &BackupIgnore::default(),
+    )
+    .unwrap();
 
     let file = std::fs::File::open(output.path()).unwrap();
     let decoder = zstd::Decoder::new(file).unwrap();
@@ -534,7 +539,14 @@ fn test_tar_and_compress_excludes_postgres_migrated_archives() {
     std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
 
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(ws, sql_dump.path(), output.path(), &BackupIgnore::default()).unwrap();
+    tar_and_compress(
+        ws,
+        sql_dump.path(),
+        secret_key_file().path(),
+        output.path(),
+        &BackupIgnore::default(),
+    )
+    .unwrap();
 
     let file = std::fs::File::open(output.path()).unwrap();
     let decoder = zstd::Decoder::new(file).unwrap();
@@ -583,26 +595,32 @@ fn test_full_pipeline_encrypt_decrypt() {
     tar_and_compress(
         ws,
         sql_dump.path(),
+        secret_key_file().path(),
         compressed_path.path(),
         &BackupIgnore::default(),
     )
     .unwrap();
 
-    // Encrypt (streaming file-to-file)
-    let key = crypto::generate_key();
+    // Seal to a recipient (streaming file-to-file)
+    let (identity, recipient) = crypto::generate_key_pair();
     let encrypted_path = tempfile::NamedTempFile::new().unwrap();
     {
         let input = std::fs::File::open(compressed_path.path()).unwrap();
         let mut output = std::fs::File::create(encrypted_path.path()).unwrap();
-        crypto::encrypt(&key, input, &mut output).unwrap();
+        crypto::seal(
+            &crypto::SealingKey::Recipient(recipient),
+            input,
+            &mut output,
+        )
+        .unwrap();
     }
 
-    // Decrypt (streaming file-to-file)
+    // Open with the backup key (streaming file-to-file)
     let decrypted_path = tempfile::NamedTempFile::new().unwrap();
     {
         let input = std::fs::File::open(encrypted_path.path()).unwrap();
         let mut output = std::fs::File::create(decrypted_path.path()).unwrap();
-        crypto::decrypt(&key, input, &mut output).unwrap();
+        crypto::open(&crypto::OpeningKey::Age(identity), input, &mut output).unwrap();
     }
 
     // Decompress + untar (streaming from file)
@@ -764,7 +782,14 @@ fn test_tar_omits_user_dir_keeps_git() {
     std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
 
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(ws, sql_dump.path(), output.path(), &BackupIgnore::default()).unwrap();
+    tar_and_compress(
+        ws,
+        sql_dump.path(),
+        secret_key_file().path(),
+        output.path(),
+        &BackupIgnore::default(),
+    )
+    .unwrap();
 
     let file = std::fs::File::open(output.path()).unwrap();
     let decoder = zstd::Decoder::new(file).unwrap();
@@ -1352,7 +1377,14 @@ fn tar_and_compress_honors_backupignore() {
     let sql_dump = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(ws, sql_dump.path(), output.path(), &ignore).unwrap();
+    tar_and_compress(
+        ws,
+        sql_dump.path(),
+        secret_key_file().path(),
+        output.path(),
+        &ignore,
+    )
+    .unwrap();
 
     let file = std::fs::File::open(output.path()).unwrap();
     let decoder = zstd::Decoder::new(file).unwrap();
@@ -1594,7 +1626,11 @@ fn is_own_backup_archive_rejects_prefix_collisions() {
 /// tail, a wrong extension, a missing date/time split, or a non-Lucidos name
 /// all fail to match.
 #[test]
-fn is_own_backup_archive_requires_timestamp_and_enc_suffix() {
+fn is_own_backup_archive_requires_timestamp_and_archive_suffix() {
+    assert!(is_own_backup_archive(
+        "lucidos-backup-myws-20260601-040254.age",
+        "myws"
+    ));
     assert!(!is_own_backup_archive(
         "lucidos-backup-myws-notes.enc",
         "myws"
@@ -1744,6 +1780,11 @@ fn parse_workspace_name_from_archive_roundtrips_and_rejects_non_archives() {
         parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.enc").as_deref(),
         Some("myws")
     );
+    // An age archive carries the same name.
+    assert_eq!(
+        parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.age").as_deref(),
+        Some("myws")
+    );
     // Hyphenated workspace name — the timestamp tail is stripped, not the name.
     assert_eq!(
         parse_workspace_name_from_archive("lucidos-backup-e2e-test-20260601-040254.enc").as_deref(),
@@ -1814,16 +1855,24 @@ async fn restore_archive_into_restores_workspace_but_drops_user_dir() {
             .append_dir_all("data", src.path().join("data"))
             .unwrap();
         builder.append_dir_all("user_dir", user_tmp.path()).unwrap();
+        builder
+            .append_path_with_name(secret_key_file().path(), SECRET_STORE_KEY_ENTRY)
+            .unwrap();
         let encoder = builder.into_inner().unwrap();
         encoder.finish().unwrap();
     }
 
-    let key = crypto::generate_key();
+    let (identity, recipient) = crypto::generate_key_pair();
     let encrypted = tempfile::NamedTempFile::new().unwrap();
     {
         let input = std::fs::File::open(compressed.path()).unwrap();
         let mut output = std::fs::File::create(encrypted.path()).unwrap();
-        crypto::encrypt(&key, input, &mut output).unwrap();
+        crypto::seal(
+            &crypto::SealingKey::Recipient(recipient),
+            input,
+            &mut output,
+        )
+        .unwrap();
     }
 
     // Restore into a fresh workspace dir. A bogus DB URL would error if the DB
@@ -1833,7 +1882,7 @@ async fn restore_archive_into_restores_workspace_but_drops_user_dir() {
     restore_archive_into(
         &ws_dir,
         "postgres://unused@nowhere/none-should-not-be-touched",
-        &key,
+        crypto::OpeningKey::Age(identity),
         encrypted.path(),
         |_phase, _cur, _total| {},
     )
@@ -1851,4 +1900,19 @@ async fn restore_archive_into_restores_workspace_but_drops_user_dir() {
         !ws_dir.join("user_dir").exists(),
         "the archive's user_dir/ must be dropped, not restored"
     );
+    assert!(
+        !ws_dir.join(SECRET_STORE_KEY_ENTRY).exists(),
+        "the secret store key goes to the key store, never the workspace"
+    );
+}
+
+/// A secret store key file, the shape `create_backup` writes beside the dump.
+fn secret_key_file() -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        crate::core::secret_store::key().unwrap().to_base64(),
+    )
+    .unwrap();
+    file
 }

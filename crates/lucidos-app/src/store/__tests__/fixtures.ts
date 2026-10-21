@@ -5,6 +5,7 @@ export function makeTrigger(overrides: Partial<TriggerInfo> = {}): TriggerInfo {
   return {
     id: '1',
     name: 'Test',
+    slug: 'test',
     cron_expressions: [],
     timezone: 'UTC',
     paused: false,

@@ -12,10 +12,7 @@ import { resolveCodingAgent } from '../../store/composeSelections';
 import { effectiveCodingAgentBackend } from './promptToggleMode';
 import { lazyComponent } from '../../utils/lazyComponent';
 import { pressControlMenu } from './controlMenuRequests';
-import {
-  CodingAgentIcon, ControlMenuTrigger, LUCIDOS_MENU_LABEL, LUCIDOS_TRIGGER_CLASS, LucidosMenuIcon, codingAgentMenuLabel,
-  menuCodingAgent,
-} from './ControlMenuTrigger';
+import { CodingAgentIcon, ControlMenuTrigger, codingAgentMenuLabel, menuCodingAgent } from './ControlMenuTrigger';
 import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
 
 /** The coding-agent menu's button, drawn until the menu's code arrives. A
@@ -35,40 +32,26 @@ function CodingAgentMenuPlaceholder({ codingAgent, threadId, composeThreadId }: 
   );
 }
 
-/** The Lucidos Agent picker's button, drawn the same way. */
-function LucidosMenuPlaceholder() {
-  return (
-    <div class="control-menu" data-row-item>
-      <ControlMenuTrigger label={LUCIDOS_MENU_LABEL} extraClass={LUCIDOS_TRIGGER_CLASS} onClick={(e) => pressControlMenu('lucidos', e.currentTarget as Element)}>
-        <LucidosMenuIcon />
-      </ControlMenuTrigger>
-    </div>
-  );
-}
-
-/** The two menus load as the row first renders, off the first-paint set. */
+/** The menu loads as the row first renders, off the first-paint set. */
 export const LazyCodingAgentControlMenu = lazyComponent(
   () => import('./CodingAgentControlMenu').then((m) => m.CodingAgentControlMenu),
   CodingAgentMenuPlaceholder,
 );
-export const LazyLucidosControlMenu = lazyComponent(
-  () => import('./LucidosControlMenu').then((m) => m.LucidosControlMenu),
-  LucidosMenuPlaceholder,
-);
 
-/** The row's leading controls: its anchor, and whichever of the two fixed
- *  toggles are still standing.
+/** The row's leading controls: a coding agent's `/` menu as its anchor, and
+ *  whichever of the two fixed toggles are still standing. A Lucidos Agent
+ *  thread has no menu, since its model pick is the rung control's.
  *
- *  **The three slots are fixed.** The control menu is the row's anchor, the
- *  follow toggle is second and the call toggle third. What is fixed is the
- *  POSITION, so a reader reaching for one finds it in the same place on every
- *  thread. The follow toggle once sat after the indicators, which moved it
- *  under the thumb depending on what the thread happened to be doing.
+ *  **The slots are fixed.** The control menu is the row's anchor, the follow
+ *  toggle is next and the call toggle after it. What is fixed is the POSITION,
+ *  so a reader reaching for one finds it in the same place on every thread.
+ *  The follow toggle once sat after the indicators, which moved it under the
+ *  thumb depending on what the thread happened to be doing.
  *
  *  **Only the anchor never folds.** The two toggles fold LAST, after every
  *  other member, so their slots hold at every width that can show them. That is
  *  what the pin was protecting, and a glyph off the screen protects nothing.
- *  The floor is the anchor and the send button, which fit anywhere.
+ *  The floor is the anchor and the send control, which fit anywhere.
  *
  *  A Fragment, deliberately: `.prompt-actions-row` is a flex row and its
  *  children are diffed positionally (see `prompt-vdom-keys.test.ts`).
@@ -78,8 +61,6 @@ export function PromptRowControls({
   codingAgent,
   codingAgentThreadId,
   composeThreadId,
-  lucidosThreadId,
-  composeContext,
   toggles,
   attrsFor,
 }: {
@@ -91,8 +72,6 @@ export function PromptRowControls({
   /** The composing draft's id (absent for an active thread), which keys the
    *  per-draft model / effort / scope picks. */
   composeThreadId: string | undefined;
-  lucidosThreadId: string | undefined;
-  composeContext: boolean;
   /** The fixed toggles still wearing their own box, in slot order. */
   toggles: readonly HeaderActionSpec[];
   /** The row attributes each member carries, by key. */
@@ -100,14 +79,12 @@ export function PromptRowControls({
 }) {
   return (
     <>
-      {codingAgent !== null ? (
+      {codingAgent !== null && (
         <LazyCodingAgentControlMenu
           threadId={codingAgentThreadId}
           composeThreadId={composeThreadId}
           codingAgent={codingAgent}
         />
-      ) : (
-        <LazyLucidosControlMenu threadId={lucidosThreadId} composeContext={composeContext} />
       )}
       {toggles.map((a) => (
         <Fragment key={a.key}>{renderHeaderAction(a, attrsFor(a.key))}</Fragment>

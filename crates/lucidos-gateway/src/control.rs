@@ -31,7 +31,7 @@ pub fn router() -> Router<GatewayState> {
         // waiting for the supervise loop's cached `last_unread` to catch up.
         .route("/unread-total", get(unread_total))
         // Restore a local backup archive into a new workspace (picker upload).
-        // The body is a multipart upload of a potentially multi-GB `.enc`, so the
+        // The body is a multipart upload of a potentially multi-GB archive, so the
         // default 2 MB extractor limit is lifted for this route only.
         .route(
             "/workspaces/restore",
@@ -372,7 +372,8 @@ async fn adopt(
 }
 
 /// Restore a local encrypted backup archive into a NEW workspace. Multipart body:
-/// `file` (the `.enc`), `key` (base64 backup key), and optional `name` (sent only
+/// `file` (the `.age`, or a legacy `.enc`), `key` (the backup key, or the base64
+/// key of a legacy archive), and optional `name` (sent only
 /// when the derived name collides with an existing workspace). Streams the upload
 /// to a temp file, then hands off to the gateway's restore flow (which validates,
 /// provisions, shells out to the engine, and registers the workspace). Returns
@@ -389,7 +390,7 @@ async fn restore(
 
     // The streamed temp archive is removed on ANY early return from here on — a
     // connection dropped mid-upload, a malformed trailing field, or a missing
-    // key — via this guard, so a (possibly multi-GB) `.enc` is never orphaned in
+    // key — via this guard, so a (possibly multi-GB) archive is never orphaned in
     // the temp dir. It's kept only when ownership passes to
     // `restore_workspace` (which then owns cleanup). `tempfile` creates it
     // owner-only, so the archive is never readable by another local user.
@@ -411,7 +412,7 @@ async fn restore(
                 filename = field.file_name().unwrap_or_default().to_string();
                 let path = tempfile::Builder::new()
                     .prefix("lucidos-restore-")
-                    .suffix(".enc")
+                    .suffix(".archive")
                     .tempfile()
                     .map_err(|e| ApiError::internal(format!("temp file: {e}")))?
                     .into_temp_path();

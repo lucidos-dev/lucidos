@@ -31,6 +31,7 @@ import {
   markNotificationRead,
   markAllNotificationsRead,
   isTransportError,
+  retryTransient,
 } from '../../api/client';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
@@ -415,17 +416,29 @@ export function resetViewDedup(): void {
   _lastViewedId = null;
 }
 
+/** How a toast names a notification: its title when a served list holds the
+ *  row, which the user recognises. Only a row this page never loaded falls
+ *  back to its id. */
+function notificationName(id: string): string {
+  for (const list of [servedNotifications.value, servedUnreadNotifications.value]) {
+    const row = list.status === 'loaded' ? list.data.find((n) => n.id === id) : undefined;
+    if (row) return `"${row.title}"`;
+  }
+  return `notification ${id}`;
+}
+
 /** Mark a notification read on tap. The row leaves the unread set and the
  *  badge at once. It stays out until a load started after the server's
- *  acknowledgement replaces it (ADR 0437). Idempotent, so safe on read rows.
- *  A refused POST shows the row again and says so. */
+ *  acknowledgement replaces it (ADR 0437). Idempotent, so safe on read rows,
+ *  and a POST lost in transit is sent once more. A POST that still fails
+ *  shows the row again and says so. */
 export function markReadOptimistic(id: string): void {
   const owner = holdReads([id]);
-  markNotificationRead(id)
+  retryTransient(() => markNotificationRead(id))
     .then(() => acknowledgeReads([id], owner))
     .catch((error) => {
       abandonReads([id], owner);
-      showToast(`Could not mark notification ${id} read: ${errorDetail(error)}`, 'error', {
+      showToast(`Could not mark ${notificationName(id)} read: ${errorDetail(error)}`, 'error', {
         key: `notification-read-failed-${id}`,
       });
     });

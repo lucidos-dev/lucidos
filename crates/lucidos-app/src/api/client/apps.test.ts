@@ -5,7 +5,7 @@ import { engineRestarting } from '../../store/store';
 
 // The trigger event-type picker caches whatever verdict this read produces. So
 // one dropped fetch used to paint "Failed to load event types" until the panel
-// was reopened. `retryTransientRead` is what stops a blip becoming a verdict.
+// was reopened. `retryTransient` is what stops a blip becoming a verdict.
 
 const originalFetch = globalThis.fetch;
 

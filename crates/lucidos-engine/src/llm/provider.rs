@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 /// Callback invoked with each text token/chunk as it streams from the LLM.
 pub type TokenCallback = Box<dyn Fn(&str) + Send + Sync>;
 
+/// One callback shared by a call's first attempt and its retry.
+pub(crate) type SharedCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A fresh [`TokenCallback`] forwarding to `shared`.
+pub(crate) fn forward(shared: &Option<SharedCallback>) -> Option<TokenCallback> {
+    shared
+        .clone()
+        .map(|cb| Box::new(move |token: &str| cb(token)) as TokenCallback)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -21,7 +31,8 @@ impl MessageContent {
                 .filter_map(|b| match b {
                     ContentBlock::Text { text }
                     | ContentBlock::EngineTail { text }
-                    | ContentBlock::MemoryView { text } => Some(text.as_str()),
+                    | ContentBlock::MemoryView { text }
+                    | ContentBlock::StableContext { text } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -86,10 +97,37 @@ pub enum ContentBlock {
     /// Every provider renders it as ordinary text. Anthropic puts a cache
     /// breakpoint on it while one of the four is free, and the GPT Responses
     /// wire puts one on it too. A later request then reads the prefix through
-    /// it from the cache. A Classic turn never builds one, which is what keeps
-    /// its request byte-identical.
+    /// it from the cache. A Classic turn builds none.
     #[serde(rename = "memory_view")]
     MemoryView { text: String },
+    /// The *stable context block* of a turn's user message: the sections that
+    /// change only when the user changes something (profile, accounts, thread
+    /// context, loaded knowhow bodies).
+    ///
+    /// Every provider renders it as ordinary text, and only the Anthropic wire
+    /// marks it. The cache reads a marked block whole, so it must stay a block
+    /// of its own and hold identical bytes from turn to turn.
+    #[serde(rename = "stable_context")]
+    StableContext { text: String },
+}
+
+/// Replace every `ContentBlock::Image` in `blocks` with a text placeholder
+/// produced by `placeholder()`. Returns total base64 bytes removed (used for
+/// logging by callers).
+pub fn replace_image_blocks(
+    blocks: &mut [ContentBlock],
+    placeholder: impl Fn() -> String,
+) -> usize {
+    let mut stripped = 0usize;
+    for block in blocks.iter_mut() {
+        if let ContentBlock::Image { data, .. } = block {
+            stripped += data.len();
+            *block = ContentBlock::Text {
+                text: placeholder(),
+            };
+        }
+    }
+    stripped
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +172,10 @@ pub struct LlmResponse {
     /// can see why a turn was cheap or expensive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_tokens: Option<u32>,
+    /// Part of `cache_creation_tokens`: the tokens written to the 1-hour
+    /// cache. `None` when the provider split no write by lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_tokens: Option<u32>,
     /// Cache-read token count. `None` on providers that report none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u32>,
@@ -141,6 +183,14 @@ pub struct LlmResponse {
     /// `None` when the reply names none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_model: Option<String>,
+    /// The backend that served the call, set by the router from the route it
+    /// resolved. `None` from a provider called outside the router.
+    #[serde(skip)]
+    pub provider: Option<crate::llm::ProviderKind>,
+    /// The *stable-prefix fingerprint* of the request this answers. Set by
+    /// the Anthropic and Vertex Claude providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_prefix_fingerprint: Option<String>,
     /// The service tier the reply says served the call, when not the
     /// standard one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,6 +283,9 @@ pub struct ModelSelection<'a> {
     pub service_tier: Option<ServiceTier>,
     /// Where the prompt cache writes. Only OpenAI's Responses wire reads it.
     pub cache_mode: CacheMode,
+    /// How far from `model` the router may move within its *lineage*. A
+    /// default selection sets `NamedOrNewer`, so it never steps back.
+    pub generation_rule: crate::llm::model_registry::GenerationRule,
 }
 
 /// Where a request writes the prompt cache.
@@ -303,6 +356,14 @@ impl<'a> ModelSelection<'a> {
         self.cache_mode = cache_mode;
         self
     }
+
+    pub fn with_generation_rule(
+        mut self,
+        generation_rule: crate::llm::model_registry::GenerationRule,
+    ) -> Self {
+        self.generation_rule = generation_rule;
+        self
+    }
 }
 
 #[async_trait]
@@ -349,6 +410,13 @@ pub trait LlmProvider: Send + Sync {
     /// ones it holds, `UnconfiguredProvider` reports `Some(vec![])` (nothing).
     /// Surfaced via `/health.configured_providers`.
     fn configured_providers(&self) -> Option<Vec<crate::llm::model_registry::ProviderKind>> {
+        None
+    }
+
+    /// The not-found answers this provider routes around, beside
+    /// [`Self::configured_providers`]. `None` for a provider that keeps no
+    /// ledger; only `RoutingProvider` keeps one.
+    fn not_served_ledger(&self) -> Option<crate::llm::not_served::NotServedLedger> {
         None
     }
 }

@@ -264,7 +264,7 @@ async fn count_events_with_type_filter_returns_matching_count_and_byte_total() {
     insert_event_with_payload(&pool, Uuid::new_v4(), "Other", ts, payload.clone()).await;
 
     let (count, byte_total) = store
-        .count_events(Some("Matching"), None, None)
+        .count_events(Some("Matching"), None, None, None)
         .await
         .expect("count_events");
     assert_eq!(count, 3, "only the 3 Matching rows count");
@@ -288,7 +288,7 @@ async fn count_events_returns_zero_bytes_when_no_matches() {
     let store = EventStore::new(pool.clone());
 
     let (count, byte_total) = store
-        .count_events(Some("Nonexistent"), None, None)
+        .count_events(Some("Nonexistent"), None, None, None)
         .await
         .expect("count_events");
     assert_eq!(count, 0);
@@ -317,7 +317,7 @@ async fn count_events_by_type_returns_breakdown_sorted_by_count_desc() {
     insert_event_with_payload(&pool, Uuid::new_v4(), "Singleton", ts, payload.clone()).await;
 
     let rows = store
-        .count_events_by_type(None, None)
+        .count_events_by_type(None, None, None)
         .await
         .expect("count_events_by_type");
 
@@ -332,6 +332,43 @@ async fn count_events_by_type_returns_breakdown_sorted_by_count_desc() {
     for (_, _, byte_total) in &rows {
         assert!(*byte_total > 0, "byte_total per type must be > 0");
     }
+
+    teardown_test_db(&db).await;
+}
+
+/// `count_events` with a `thread_id` counts only that thread's rows, in both
+/// the single-type and the per-type shape. Without one it counts every row.
+#[tokio::test]
+async fn count_events_with_thread_filter_counts_only_that_thread() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let ts = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+    for _ in 0..2 {
+        insert_thread_event(&pool, Uuid::new_v4(), "Counted", ts, mine).await;
+    }
+    insert_thread_event(&pool, Uuid::new_v4(), "Counted", ts, other).await;
+    insert_thread_event(&pool, Uuid::new_v4(), "OnlyMine", ts, mine).await;
+    insert_thread_event(&pool, Uuid::new_v4(), "OnlyOther", ts, other).await;
+
+    let (scoped, _) = store
+        .count_events(Some("Counted"), None, None, Some(mine))
+        .await
+        .expect("scoped count");
+    assert_eq!(scoped, 2, "only this thread's Counted rows");
+    let (unscoped, _) = store
+        .count_events(Some("Counted"), None, None, None)
+        .await
+        .expect("unscoped count");
+    assert_eq!(unscoped, 3, "no thread_id is the workspace-wide count");
+
+    let rows = store
+        .count_events_by_type(None, None, Some(mine))
+        .await
+        .expect("scoped breakdown");
+    let breakdown: Vec<(&str, i64)> = rows.iter().map(|(t, c, _)| (t.as_str(), *c)).collect();
+    assert_eq!(breakdown, vec![("Counted", 2), ("OnlyMine", 1)]);
 
     teardown_test_db(&db).await;
 }
@@ -355,21 +392,21 @@ async fn count_events_respects_since_until_window() {
 
     // `since = t0` is strict (> t0), so only t1 and t2 should count.
     let (count, _) = store
-        .count_events(Some("Windowed"), Some(t0), None)
+        .count_events(Some("Windowed"), Some(t0), None, None)
         .await
         .expect("count_events with since");
     assert_eq!(count, 2, "since is strictly greater than");
 
     // `until = t2` is strict (< t2), so only t0 and t1 should count.
     let (count, _) = store
-        .count_events(Some("Windowed"), None, Some(t2))
+        .count_events(Some("Windowed"), None, Some(t2), None)
         .await
         .expect("count_events with until");
     assert_eq!(count, 2, "until is strictly less than");
 
     // Combined: only t1 is in the open interval (t0, t2).
     let (count, _) = store
-        .count_events(Some("Windowed"), Some(t0), Some(t2))
+        .count_events(Some("Windowed"), Some(t0), Some(t2), None)
         .await
         .expect("count_events with since+until");
     assert_eq!(count, 1, "open interval excludes both endpoints");
@@ -1043,15 +1080,21 @@ async fn counts_and_distinct_types_never_include_a_side_question() {
     let store = EventStore::new(pool.clone());
     a_thread_with_side_questions(&pool).await;
 
-    assert_eq!(store.count_events(None, None, None).await.unwrap().0, 1);
+    assert_eq!(
+        store.count_events(None, None, None, None).await.unwrap().0,
+        1
+    );
     for &name in ThreadEvent::SIDE_QUESTION_EVENT_TYPES {
         assert_eq!(
-            store.count_events(Some(name), None, None).await.unwrap(),
+            store
+                .count_events(Some(name), None, None, None)
+                .await
+                .unwrap(),
             (0, 0),
             "{name} was counted"
         );
     }
-    let by_type = store.count_events_by_type(None, None).await.unwrap();
+    let by_type = store.count_events_by_type(None, None, None).await.unwrap();
     assert_eq!(
         by_type
             .iter()

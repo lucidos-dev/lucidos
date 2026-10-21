@@ -108,8 +108,8 @@ so one run reports all four verdicts instead of hiding 6-8 behind a rung-5 red.
 **The macOS legs WAIT for the instance to be discoverable before rung 5, because
 health is not the installer's finish line there (2026-08-05).** `register_service`
 bootstraps the LaunchAgent first and calls `record_instance_port` second, which
-is the deliberate ordering described under "Discovery is the
-`<prefix>/<slug>/port` marker" in `.claude/rules/build-release.md`, and launchd
+is the deliberate ordering described under "Instance discovery is the
+`port` marker" in `docs/release-pipeline-notes.md`, and launchd
 starts the gateway the moment
 it accepts the bootstrap while `register_launchd` is still confirming the load.
 So the gateway can be answering `/health`, which is all rung 3 waits for, while

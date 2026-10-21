@@ -82,27 +82,30 @@ pub struct StoredGitCredential {
     pub secret: String,
 }
 
-/// The username and secret a git remote could be offered, or `None` when this
-/// credential's type carries nothing presentable.
+/// The username and secret a git remote could be offered, or `None` when a
+/// credential of this type carries nothing presentable. `value` is the
+/// resolved secret ([`Credential::secret`]).
 ///
 /// Says nothing about the credential's scope: an unscoped one still holds a
 /// usable secret, and the caller reports the two causes apart.
-fn presentable_pair(credential: &Credential) -> Option<(Option<String>, String)> {
-    let (username, secret) = match credential.auth_type {
-        AuthType::Bearer | AuthType::ApiKey => (None, credential.auth_value.clone()),
-        AuthType::Basic => match credential.auth_value.split_once(':') {
+fn presentable_pair(auth_type: AuthType, value: &str) -> Option<(Option<String>, String)> {
+    let (username, secret) = match auth_type {
+        AuthType::Bearer | AuthType::ApiKey => (None, value.to_string()),
+        AuthType::Basic => match value.split_once(':') {
             Some((user, password)) => (Some(user.to_string()), password.to_string()),
-            None => (None, credential.auth_value.clone()),
+            None => (None, value.to_string()),
         },
         AuthType::Password => {
-            let parsed: serde_json::Value = serde_json::from_str(&credential.auth_value).ok()?;
+            let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
             let username = parsed["username"].as_str()?.to_string();
             let password = parsed["password"].as_str()?.to_string();
             (Some(username), password)
         }
-        AuthType::OauthClient | AuthType::EmailPassword | AuthType::Secret | AuthType::Unknown => {
-            return None
-        }
+        AuthType::OauthClient
+        | AuthType::EmailPassword
+        | AuthType::Secret
+        | AuthType::OnepasswordServiceAccount
+        | AuthType::Unknown => return None,
     };
     (!secret.trim().is_empty()).then_some((username, secret))
 }
@@ -123,8 +126,8 @@ impl StoredGitCredential {
     /// The stored value is presented byte for byte, because a password may
     /// legitimately start or end with a space. Trimming decides emptiness and
     /// nothing else, matching the credential form and the env-var injection.
-    pub fn entries_from_credential(credential: Credential) -> Vec<Self> {
-        let Some((username, secret)) = presentable_pair(&credential) else {
+    pub fn entries_from_credential(credential: Credential, value: &str) -> Vec<Self> {
+        let Some((username, secret)) = presentable_pair(credential.auth_type, value) else {
             return Vec::new();
         };
         let username = username.filter(|u| !u.is_empty());
@@ -201,7 +204,12 @@ impl GitCredentials {
                 );
                 continue;
             }
-            let found_entries = StoredGitCredential::entries_from_credential(credential);
+            // An unreadable secret reference logs its reason, and the clone
+            // fails with the ordinary auth message.
+            let Some(value) = credential.secret_or_log(pool, "[GitAuth]").await else {
+                continue;
+            };
+            let found_entries = StoredGitCredential::entries_from_credential(credential, &value);
             if found_entries.is_empty() {
                 log!(
                     "[GitAuth] credential {} holds nothing a git clone can present",

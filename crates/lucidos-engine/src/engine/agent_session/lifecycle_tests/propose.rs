@@ -147,7 +147,7 @@ fn reset_per_turn_flags_clears_all_flags() {
     let mut last_emitted_idle = true;
     let mut emitted_terminal_event = true;
     let mut user_hit_stop = true;
-    let mut interrupt_is_redirect = true;
+    let mut redirect_cause = Some(crate::engine::thread_events::CancelCause::EffortRestart);
     let mut last_terminal_kind = Some(TerminalKind::Generated);
     let mut withheld_api_error = Some("API Error: dropped".to_string());
     let mut cancel_actor = Some(crate::engine::thread_events::MessageOrigin::Device {
@@ -159,7 +159,7 @@ fn reset_per_turn_flags_clears_all_flags() {
         &mut last_emitted_idle,
         &mut emitted_terminal_event,
         &mut user_hit_stop,
-        &mut interrupt_is_redirect,
+        &mut redirect_cause,
         TurnTerminal {
             kind: &mut last_terminal_kind,
             withheld_api_error: &mut withheld_api_error,
@@ -179,9 +179,9 @@ fn reset_per_turn_flags_clears_all_flags() {
         "stop applies to the prior turn's response, not the next one"
     );
     assert!(
-        !interrupt_is_redirect,
-        "must clear in lockstep with user_hit_stop — else a stale redirect flag \
-         could mislabel a later real Stop as SupersededByFollowup"
+        redirect_cause.is_none(),
+        "must clear in lockstep with user_hit_stop — else a stale redirect cause \
+         could mislabel a later real Stop as a redirect"
     );
     assert!(
         last_terminal_kind.is_none(),

@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { clampWithin, safeAreaTopPx } from '../utils/dom';
+import { ANCHOR_GAP } from './anchorGap';
 import { notePressOutcome } from '../utils/tapGesture';
 import { primaryPointerIsDown } from '../utils/pointerPress';
 import { SURFACE_STEP_ATTR, boxOf, startStepMorph, stepSignature, type Box, type StepMorph } from './panelStepMorph';
@@ -42,8 +43,6 @@ const MIN_PANEL_ROOM_PX = 96;
  *  the position is clamped by and the margin `maxWidth` deducts cannot drift. */
 const CLAMP_MARGIN = 8;
 
-/** The gap between the anchor and the panel's near edge, in px. */
-const ANCHOR_GAP = 4;
 
 /** Horizontal alignment of the panel relative to its anchor.
  *  - `'start'` (default): the panel's LEFT edge aligns with the anchor's left
@@ -408,7 +407,7 @@ export function installPairedSwallow(arming?: Event): void {
     e.preventDefault();
     teardown();
   }
-  /** A cancel ends the gesture, and a constructive face would serve it. Naming
+  /** A cancel ends the gesture, and a composer face would serve it. Naming
    *  the swallow stops that, so the dismissing tap still only dismisses. It
    *  does not stop propagation: the swipe and scroll trackers reset on it. */
   function claimCancel() {
@@ -699,7 +698,7 @@ export function makeDismissHandlers(
       // handlers used document click-capture and dismissed + swallowed those
       // too; without this branch the canonical hook silently dropped that
       // contract and any caller relying on synthetic clicks wedged its dismiss
-      // flow. `e2e/overlay-dismiss-swallow.spec.ts` is the canary.
+      // flow. `e2e/overlay-dismiss-swallow-all.spec.ts` is the canary.
       const dismissed = onDismiss();
       if (dismissed !== false) {
         e.stopPropagation();

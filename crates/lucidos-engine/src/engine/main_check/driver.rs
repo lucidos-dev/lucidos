@@ -12,16 +12,21 @@ use std::sync::Arc;
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use uuid::Uuid;
 
-use super::fix_thread::{build_fix_thread_prompt, fix_thread_title, landed_changes_in_range};
+use super::fix_thread::{flaky_opening, landed_changes_in_range, red_opening, FixThreadOpening};
 use super::recovery::{fold, MainCheckRecord};
 use super::runner::{
-    no_verdict, spawn_runner, MainCheckCommand, ReportedVerdict, RunReport, RunnerSlot,
+    no_verdict, spawn_runner, MainCheckCommand, ReportedVerdict, RunLink, RunReport, RunTarget,
+    RunnerSlot,
 };
 use super::snapshot::MainCheckSnapshot;
-use super::state::{CheckRange, CloseRefusal, Effect, MainCheck, RedCheck, RedCloseCause, Verdict};
+use super::state::{
+    CheckRange, CloseRefusal, Effect, FailedTest, FlakyFix, MainCheck, RedCheck, RedCloseCause,
+    Verdict,
+};
 use super::RedCloseReason;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::git_ops::{branch_head_sha, git_answer, GitAnswer};
+use crate::engine::successor::{lineage_root, successor_thread_of, MAX_HANDOFF_HOPS};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::until_restored::UntilRestored;
 
@@ -34,7 +39,7 @@ pub(crate) enum MainCheckMsg {
         pre_sha: Option<String>,
     },
     /// The running check's workflow run started.
-    RunLinked { check_id: Uuid, run_url: String },
+    RunLinked { check_id: Uuid, link: RunLink },
     /// The running check's child ended.
     Ended { check_id: Uuid, report: RunReport },
     /// The maintainer closes the red.
@@ -50,8 +55,8 @@ pub(crate) enum MainCheckMsg {
 
 /// What the driver asks of the engine.
 pub(crate) struct DriverHooks {
-    /// Send a fix thread its first prompt: thread id, prompt, title.
-    pub(crate) open_fix_thread: Box<dyn Fn(Uuid, String, String) + Send + Sync>,
+    /// Send a fix thread, red or flaky, its first prompt.
+    pub(crate) open_fix_thread: Box<dyn Fn(FixThreadOpening) + Send + Sync>,
     /// Publish a changed snapshot to clients.
     pub(crate) publish: Box<dyn Fn(MainCheckSnapshot) + Send + Sync>,
 }
@@ -83,7 +88,7 @@ pub(crate) struct Driver {
     /// Why this checkout cannot run a check, read again at each landing.
     unavailable: Option<String>,
     /// The running check's workflow run, once its child names it.
-    run_url: Option<String>,
+    run_link: Option<RunLink>,
     published: Option<MainCheckSnapshot>,
     /// `main` as git last read it. `None` once a landing moved it unread.
     main: Option<String>,
@@ -101,7 +106,7 @@ impl Driver {
             hooks,
             check: MainCheck::default(),
             unavailable: None,
-            run_url: None,
+            run_link: None,
             published: None,
             main: None,
             until_restored: UntilRestored::default(),
@@ -154,11 +159,7 @@ impl Driver {
     pub(crate) async fn handle(&mut self, msg: MainCheckMsg) {
         match msg {
             MainCheckMsg::Landed { thread_id, pre_sha } => self.landed(thread_id, pre_sha).await,
-            MainCheckMsg::RunLinked { check_id, run_url } => {
-                if self.check.running().is_some_and(|r| r.check_id == check_id) {
-                    self.run_url = Some(run_url);
-                }
-            }
+            MainCheckMsg::RunLinked { check_id, link } => self.run_linked(check_id, link).await,
             MainCheckMsg::Ended { check_id, report } => self.ended(check_id, report).await,
             MainCheckMsg::Close { actor, reply } => {
                 let answer = self.close(actor).await;
@@ -173,7 +174,7 @@ impl Driver {
         let snapshot = MainCheckSnapshot::of(
             &self.check,
             self.unavailable.as_deref(),
-            self.run_url.as_deref(),
+            self.run_link.as_ref().map(|link| link.run_url.as_str()),
         );
         if self.published.as_ref() != Some(&snapshot) {
             (self.hooks.publish)(snapshot.clone());
@@ -185,6 +186,7 @@ impl Driver {
     /// nothing that landed is forgotten. Only starting a check needs `main`
     /// and a checkout that can run one.
     async fn landed(&mut self, thread_id: Uuid, pre_sha: Option<String>) {
+        let thread_id = landing_thread(&self.setup.pool, thread_id).await;
         self.unavailable =
             unavailable_reason(&self.setup.repo_root, &self.setup.command.program).await;
         self.main = None;
@@ -204,6 +206,7 @@ impl Driver {
                 main
             }
         };
+        self.check.close_flaky_for(thread_id);
         let from_fix = self
             .check
             .red()
@@ -217,6 +220,29 @@ impl Driver {
         self.carry_out(effects, None).await;
     }
 
+    /// The running check's run started. It goes on record before a stop may
+    /// detach from it, so a restart always finds the run it left going.
+    async fn run_linked(&mut self, check_id: Uuid, link: RunLink) {
+        if self.check.running().is_none_or(|r| r.check_id != check_id)
+            || self.run_link.as_ref() == Some(&link)
+        {
+            return;
+        }
+        let event = SystemEvent::MainCheckRunLinked {
+            check_id,
+            run_url: link.run_url.clone(),
+            branch: link.branch.clone(),
+        };
+        match self.setup.bus.emit(BusEvent::System(event)).await {
+            Ok(_) => self.setup.runner.mark_linked(check_id),
+            Err(e) => log!(
+                "[MainCheck] MainCheckRunLinked emit failed, so a restart cancels the run: {}",
+                e
+            ),
+        }
+        self.run_link = Some(link);
+    }
+
     async fn ended(&mut self, check_id: Uuid, report: RunReport) {
         if self.check.running().is_none_or(|r| r.check_id != check_id) {
             log!(
@@ -225,13 +251,26 @@ impl Driver {
             );
             return;
         }
-        self.run_url = None;
+        self.run_link = None;
         let run_url = report.run_url.clone();
         let verdict = match report.verdict {
             ReportedVerdict::Pass => {
-                self.emit(SystemEvent::MainCheckPassed { check_id, run_url })
-                    .await;
-                Verdict::Passed
+                let flaky_fix_thread_id = self.flaky_fix_to_open(&report.flaky).await;
+                self.emit(SystemEvent::MainCheckPassed {
+                    check_id,
+                    run_url: run_url.clone(),
+                    flaky: report.flaky.clone(),
+                    flaky_fix_thread_id,
+                })
+                .await;
+                match flaky_fix_thread_id {
+                    Some(fix_thread_id) => Verdict::PassedWithFlakyFix {
+                        run_url,
+                        flaky: report.flaky,
+                        fix_thread_id,
+                    },
+                    None => Verdict::Passed,
+                }
             }
             ReportedVerdict::Fail => {
                 let fix_thread_id = Uuid::new_v4();
@@ -239,6 +278,7 @@ impl Driver {
                     check_id,
                     summary: report.summary.clone(),
                     tail: report.tail.clone(),
+                    failures: report.failures.clone(),
                     run_url: run_url.clone(),
                     fix_thread_id,
                 })
@@ -246,6 +286,7 @@ impl Driver {
                 Verdict::Failed {
                     summary: report.summary,
                     tail: report.tail,
+                    failures: report.failures,
                     run_url,
                     fix_thread_id,
                 }
@@ -271,9 +312,43 @@ impl Driver {
             .cloned()
         {
             log!("[MainCheck] main is red: {}", red.summary);
-            self.open_fix_thread(&red).await;
+            self.open_red_fix_thread(&red).await;
+        }
+        if let Some(flaky) = self
+            .check
+            .flaky_fix()
+            .filter(|f| f.range.check_id == check_id)
+            .cloned()
+        {
+            log!(
+                "[MainCheck] {} flaky test(s) passed check {}; opening flaky fix thread {}",
+                flaky.flaky.len(),
+                check_id,
+                flaky.fix_thread_id
+            );
+            self.open_flaky_fix_thread(&flaky).await;
         }
         self.carry_out(effects, None).await;
+    }
+
+    /// The new flaky fix thread this pass opens: none without flaky tests, and
+    /// none while one is open. An open one the maintainer archived or deleted
+    /// is forgotten first, so this pass can replace it.
+    async fn flaky_fix_to_open(&mut self, flaky: &[FailedTest]) -> Option<Uuid> {
+        if flaky.is_empty() {
+            return None;
+        }
+        if let Some(open) = self.check.flaky_fix() {
+            match fix_thread_trace(&self.setup.pool, open.fix_thread_id).await {
+                Ok(FixThreadTrace::Deleted | FixThreadTrace::Archived) => {
+                    self.check.forget_flaky();
+                }
+                Ok(FixThreadTrace::Prompted | FixThreadTrace::Unprompted) | Err(_) => {
+                    return None;
+                }
+            }
+        }
+        Some(Uuid::new_v4())
     }
 
     async fn close(&mut self, actor: Option<MessageOrigin>) -> Result<(), CloseRefusal> {
@@ -286,10 +361,11 @@ impl Driver {
         Ok(())
     }
 
-    /// Rebuild from events. A check the restart cut off is abandoned. A red
-    /// whose fix already landed closes. A fix thread that never got its prompt
-    /// gets it now, unless the maintainer deleted it. Nothing here starts a
-    /// check. A failed recovery query leaves the restore to the next message.
+    /// Rebuild from events. A check the restart cut off reattaches to its run
+    /// when the run is on record, and is abandoned otherwise. A red whose fix
+    /// already landed closes. A fix thread that never got its prompt gets it
+    /// now, unless the maintainer deleted it. Nothing here starts a check. A
+    /// failed recovery query leaves the restore to the next message.
     pub(crate) async fn restore(&mut self) {
         self.unavailable =
             unavailable_reason(&self.setup.repo_root, &self.setup.command.program).await;
@@ -307,7 +383,10 @@ impl Driver {
         self.restore_failed = false;
         let recovered = fold(&records);
         self.check = recovered.check;
-        self.run_url = None;
+        self.run_link = None;
+        if let Some((range, link)) = recovered.reattach {
+            self.reattach(range, link).await;
+        }
         if let Some(range) = recovered.interrupted {
             log!(
                 "[MainCheck] check {} was running at restart; abandoning it",
@@ -326,12 +405,53 @@ impl Driver {
                     .await;
             }
         }
+        self.restore_red_fix_thread().await;
+        self.restore_flaky_fix_thread().await;
+    }
+
+    /// Pick up the run an earlier engine left going. A checkout that cannot
+    /// run the check abandons it instead.
+    async fn reattach(&mut self, range: CheckRange, link: RunLink) {
+        if let Some(reason) = self.unavailable.clone() {
+            log!(
+                "[MainCheck] check {} cannot reattach here, abandoning it: {}",
+                range.check_id,
+                reason
+            );
+            self.check.take_interrupted();
+            self.emit(SystemEvent::MainCheckAbandoned {
+                check_id: range.check_id,
+                reason,
+                run_url: Some(link.run_url),
+            })
+            .await;
+            return;
+        }
+        log!(
+            "[MainCheck] check {} was running at restart; reattaching to {}",
+            range.check_id,
+            link.run_url
+        );
+        spawn_runner(
+            &self.setup.command,
+            range.check_id,
+            RunTarget::Attach {
+                sha: &range.to_sha,
+                link: &link,
+            },
+            self.setup.tx.clone(),
+            &self.setup.runner,
+        );
+        self.run_link = Some(link);
+    }
+
+    async fn restore_red_fix_thread(&self) {
         let Some(red) = self.check.red().cloned() else {
             return;
         };
         match fix_thread_trace(&self.setup.pool, red.fix_thread_id).await {
-            Ok(FixThreadTrace::Unprompted) => self.open_fix_thread(&red).await,
-            Ok(FixThreadTrace::Prompted) => {}
+            Ok(FixThreadTrace::Unprompted) => self.open_red_fix_thread(&red).await,
+            Ok(FixThreadTrace::Prompted | FixThreadTrace::Archived) => {}
             Ok(FixThreadTrace::Deleted) => log!(
                 "[MainCheck] the maintainer deleted fix thread {}; the red waits on Close",
                 red.fix_thread_id
@@ -339,6 +459,25 @@ impl Driver {
             Err(e) => log!(
                 "[MainCheck] could not read fix thread {}: {}",
                 red.fix_thread_id,
+                e
+            ),
+        }
+    }
+
+    /// A flaky fix thread that never got its prompt gets it now. One the
+    /// maintainer archived or deleted is forgotten, so the next flaky pass can
+    /// open another.
+    async fn restore_flaky_fix_thread(&mut self) {
+        let Some(flaky) = self.check.flaky_fix().cloned() else {
+            return;
+        };
+        match fix_thread_trace(&self.setup.pool, flaky.fix_thread_id).await {
+            Ok(FixThreadTrace::Unprompted) => self.open_flaky_fix_thread(&flaky).await,
+            Ok(FixThreadTrace::Prompted) => {}
+            Ok(FixThreadTrace::Deleted | FixThreadTrace::Archived) => self.check.forget_flaky(),
+            Err(e) => log!(
+                "[MainCheck] could not read flaky fix thread {}: {}",
+                flaky.fix_thread_id,
                 e
             ),
         }
@@ -362,7 +501,7 @@ impl Driver {
             range.from_sha,
             range.to_sha
         );
-        self.run_url = None;
+        self.run_link = None;
         self.emit(SystemEvent::MainCheckStarted {
             check_id: range.check_id,
             from_sha: range.from_sha.clone(),
@@ -380,23 +519,39 @@ impl Driver {
             None => spawn_runner(
                 &self.setup.command,
                 range.check_id,
-                &range.to_sha,
+                RunTarget::Commit(&range.to_sha),
                 self.setup.tx.clone(),
                 &self.setup.runner,
             ),
         }
     }
 
-    async fn open_fix_thread(&self, red: &RedCheck) {
-        let landed = landed_changes_in_range(
+    async fn open_red_fix_thread(&self, red: &RedCheck) {
+        let landed = self.landed_in(&red.range).await;
+        (self.hooks.open_fix_thread)(red_opening(
+            red,
+            landed.as_deref(),
+            &self.setup.workspace_name,
+        ));
+    }
+
+    async fn open_flaky_fix_thread(&self, flaky: &FlakyFix) {
+        let landed = self.landed_in(&flaky.range).await;
+        (self.hooks.open_fix_thread)(flaky_opening(
+            flaky,
+            landed.as_deref(),
+            &self.setup.workspace_name,
+        ));
+    }
+
+    async fn landed_in(&self, range: &CheckRange) -> Option<Vec<super::fix_thread::LandedChange>> {
+        landed_changes_in_range(
             &self.setup.pool,
             &self.setup.repo_root,
-            &red.range.from_sha,
-            &red.range.to_sha,
+            &range.from_sha,
+            &range.to_sha,
         )
-        .await;
-        let prompt = build_fix_thread_prompt(red, landed.as_deref(), &self.setup.workspace_name);
-        (self.hooks.open_fix_thread)(red.fix_thread_id, prompt, fix_thread_title(&red.summary));
+        .await
     }
 
     async fn emit_red_closed(
@@ -470,11 +625,13 @@ fn missing_remote_reason(has_remote: GitAnswer) -> Option<String> {
     ))
 }
 
-/// What the event log holds of a red's fix thread.
+/// What the event log holds of a fix thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FixThreadTrace {
     /// It has events, so its prompt went out.
     Prompted,
+    /// It has events, and the maintainer's last word on it was to archive it.
+    Archived,
     /// The maintainer deleted it. `ThreadsDeleted` is the only trace a delete
     /// leaves, so the thread must not come back.
     Deleted,
@@ -482,22 +639,64 @@ enum FixThreadTrace {
     Unprompted,
 }
 
+/// The thread a landing counts for: a successor's landing is its first
+/// thread's work. An unreadable chain counts for the landing thread itself.
+async fn landing_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Uuid {
+    lineage_root(pool, thread_id).await.unwrap_or_else(|e| {
+        log!(
+            "[MainCheck] handoff chain of {} unreadable: {}",
+            thread_id,
+            e
+        );
+        thread_id
+    })
+}
+
+/// What the log holds of a fix thread, following its handoffs: a thread that
+/// archived itself for a successor is still worked on, by the successor.
 async fn fix_thread_trace(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Result<FixThreadTrace, sqlx::Error> {
-    let (prompted, deleted): (bool, bool) = sqlx::query_as(
+    let mut trace = own_fix_thread_trace(pool, thread_id).await?;
+    let mut current = thread_id;
+    for _ in 0..MAX_HANDOFF_HOPS {
+        if trace != FixThreadTrace::Archived {
+            break;
+        }
+        let Some(next) = successor_thread_of(pool, current).await? else {
+            break;
+        };
+        trace = match own_fix_thread_trace(pool, next).await? {
+            FixThreadTrace::Unprompted => FixThreadTrace::Prompted,
+            other => other,
+        };
+        current = next;
+    }
+    Ok(trace)
+}
+
+async fn own_fix_thread_trace(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<FixThreadTrace, sqlx::Error> {
+    let (prompted, deleted, archived): (bool, bool, bool) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM events WHERE thread_id = $1), \
                 EXISTS (SELECT 1 FROM events WHERE event_type = 'ThreadsDeleted' \
-                        AND payload->'data'->'thread_ids' @> jsonb_build_array($1::text))",
+                        AND payload->'data'->'thread_ids' @> jsonb_build_array($1::text)), \
+                COALESCE((SELECT event_type = 'ThreadArchived' FROM events \
+                          WHERE thread_id = $1 \
+                            AND event_type IN ('ThreadArchived', 'ThreadUnarchived') \
+                          ORDER BY sequence DESC LIMIT 1), false)",
     )
     .bind(thread_id)
     .fetch_one(pool)
     .await?;
-    Ok(match (prompted, deleted) {
-        (true, _) => FixThreadTrace::Prompted,
-        (false, true) => FixThreadTrace::Deleted,
-        (false, false) => FixThreadTrace::Unprompted,
+    Ok(match (prompted, deleted, archived) {
+        (true, _, true) => FixThreadTrace::Archived,
+        (true, _, false) => FixThreadTrace::Prompted,
+        (false, true, _) => FixThreadTrace::Deleted,
+        (false, false, _) => FixThreadTrace::Unprompted,
     })
 }
 
@@ -505,17 +704,35 @@ async fn fix_thread_trace(
 pub(super) async fn load_records(pool: &sqlx::PgPool) -> Result<Vec<MainCheckRecord>, sqlx::Error> {
     let rows: Vec<(String, serde_json::Value, Option<Uuid>)> = sqlx::query_as(
         "SELECT event_type, payload, thread_id FROM events \
-         WHERE event_type IN ('MainCheckStarted', 'MainCheckPassed', 'MainCheckFailed', \
-                              'MainCheckAbandoned', 'MainCheckRedClosed') \
+         WHERE event_type IN ('MainCheckStarted', 'MainCheckRunLinked', 'MainCheckPassed', \
+                              'MainCheckFailed', 'MainCheckAbandoned', 'MainCheckRedClosed') \
             OR (event_type = 'ChangeApplied' AND payload->>'landing_merge_sha' IS NOT NULL) \
          ORDER BY sequence",
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|(event_type, payload, thread_id)| record(event_type, payload, *thread_id))
-        .collect())
+    let mut records = Vec::with_capacity(rows.len());
+    for (event_type, payload, thread_id) in &rows {
+        let Some(mut rec) = record(event_type, payload, *thread_id) else {
+            continue;
+        };
+        if let MainCheckRecord::Landed {
+            thread_id: Some(landing),
+            ..
+        } = &mut rec
+        {
+            *landing = landing_thread(pool, *landing).await;
+        }
+        records.push(rec);
+    }
+    Ok(records)
+}
+
+/// The list of tests under `name` in an event's data, empty when absent.
+fn failed_tests(data: Option<&serde_json::Value>, name: &str) -> Vec<FailedTest> {
+    data.and_then(|d| d.get(name))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
 }
 
 /// One stored event as a [`MainCheckRecord`]. Thread events store their
@@ -535,15 +752,30 @@ fn record(
             from_sha: text("from_sha")?.to_string(),
             to_sha: text("to_sha")?.to_string(),
         }),
+        "MainCheckRunLinked" => MainCheckRecord::RunLinked {
+            check_id: check_id()?,
+            link: RunLink {
+                run_url: text("run_url")?.to_string(),
+                branch: text("branch")?.to_string(),
+            },
+        },
         "MainCheckPassed" => MainCheckRecord::Ended {
             check_id: check_id()?,
-            verdict: Verdict::Passed,
+            verdict: match uuid("flaky_fix_thread_id") {
+                Some(fix_thread_id) => Verdict::PassedWithFlakyFix {
+                    run_url: text("run_url").map(str::to_string),
+                    flaky: failed_tests(data, "flaky"),
+                    fix_thread_id,
+                },
+                None => Verdict::Passed,
+            },
         },
         "MainCheckFailed" => MainCheckRecord::Ended {
             check_id: check_id()?,
             verdict: Verdict::Failed {
                 summary: text("summary").unwrap_or_default().to_string(),
                 tail: text("tail").unwrap_or_default().to_string(),
+                failures: failed_tests(data, "failures"),
                 run_url: text("run_url").map(str::to_string),
                 fix_thread_id: uuid("fix_thread_id")?,
             },
@@ -576,6 +808,37 @@ mod tests {
             .expect("scripts/lib/e2e_github.sh");
         assert!(lib.contains(&format!("E2E_GITHUB_REMOTE=\"{MIRROR_REMOTE}\"")));
         assert!(lib.contains(&format!("$repo/{RELEASE_LIB}")));
+    }
+
+    /// A `MainCheckFailed` row written before `failures` existed still replays,
+    /// with none. A row that carries them replays them.
+    #[test]
+    fn a_failed_row_replays_with_or_without_failures() {
+        let check_id = Uuid::new_v4();
+        let fix = Uuid::new_v4();
+        let old = serde_json::json!({ "data": {
+            "check_id": check_id, "summary": "s", "tail": "t", "fix_thread_id": fix,
+        }});
+        let new = serde_json::json!({ "data": {
+            "check_id": check_id, "summary": "s", "fix_thread_id": fix,
+            "failures": [{ "suite": "engine", "name": "a::b", "detail": "d" }],
+        }});
+        let failures_of = |payload| match record("MainCheckFailed", payload, None) {
+            Some(MainCheckRecord::Ended {
+                verdict: Verdict::Failed { failures, .. },
+                ..
+            }) => failures,
+            other => panic!("not a failed verdict: {other:?}"),
+        };
+        assert!(failures_of(&old).is_empty());
+        assert_eq!(
+            failures_of(&new),
+            vec![FailedTest {
+                suite: "engine".into(),
+                name: "a::b".into(),
+                detail: "d".into(),
+            }]
+        );
     }
 
     /// A `git remote` that timed out never reads as a missing remote.

@@ -22,36 +22,21 @@
 # it existed still reclaims; its release just carries no held_secs.
 #
 # THE LOCK ANNOUNCES ITSELF. Every hold emits E2ELockAcquired when it starts and
-# E2ELockReleased when it ends, as domain events through `lucidos events emit`,
-# so a run that LOST the lock can subscribe with `lucidos await-event` and end
-# its turn instead of busy-waiting. On 2026-08-09 three coding-agent threads
-# raced for this lock and both losers hand-rolled a sleep loop, one of them a
-# 40 minute foreground tool call re-executing the entry script every 20 seconds.
-# The refusal below teaches the subscribe path, and .claude/skills/e2e-lock-wait/
-# carries the full rules.
+# E2ELockReleased when it ends, as domain events through `lucidos events emit`.
 #
-# AND IT CLOSES THAT LOOP AT THE OTHER END. Taking the lock stands the acquiring
-# thread's own watch for E2ELockReleased down (`_e2e_stand_down_lock_waits`),
-# because you cannot hold the lock and still need to be told it is free. Without
-# that, a thread that lost the race, subscribed, and later won the lock anyway
-# left a watch armed on work it had already finished; one woke two hours after
-# its change was applied. Only that watch is ended, never `--all`. Both
-# announcements of one hold are addressed as of the
-# moment it was TAKEN (`_e2e_capture_emit_env`), because the entry scripts
-# repoint $LUCIDOS_WORKSPACE at the e2e workspace in between; that is a fixed
-# bug rather than a gap, and the section header on announcing says what it cost.
-# Two gaps are accepted rather than closed, and both recover through the
-# subscriber's own timeout:
-#   - CROSS-WORKSPACE. The lock is shared by every workspace on the machine, but
-#     an emit lands in the emitting subprocess's own $LUCIDOS_WORKSPACE, so a
-#     holder in workspace A never wakes a waiter in workspace B. The refusal says
-#     so when it can tell (`_e2e_holder_is_another_workspace`).
-#   - ENGINE DOWN AT RELEASE. The emit is an HTTP POST to a live engine and is
-#     best effort, so nothing is written and there is nothing for the waiter's
-#     boot catch-up scan to find. Narrow in practice: a wake only works
-#     same-workspace, so the waiter shares that engine and is down with it.
-# A holder killed hard enough to skip its EXIT trap IS covered: the next run to
-# reclaim its stale lock emits the release on its behalf, outcome=reclaimed.
+# A REFUSED RUN GIVES UP, IT NEVER WAITS (ADR 0541). The refusal exits
+# $E2E_LOCK_BUSY_EXIT, which /harden reads as a skip: the main check runs the
+# specs after landing. Waiting for a release parked a dozen threads at once.
+# .claude/skills/e2e-lock-busy/ carries the agent-facing rule.
+#
+# Taking the lock stands the acquiring thread's own watch for E2ELockReleased
+# down (`_e2e_stand_down_lock_waits`), so a watch armed before ADR 0541 cannot
+# outlive the run it waited for. Only that watch is ended, never `--all`. Both
+# announcements of one hold are addressed as of the moment it was TAKEN
+# (`_e2e_capture_emit_env`), because the entry scripts repoint
+# $LUCIDOS_WORKSPACE at the e2e workspace in between. A holder killed hard
+# enough to skip its EXIT trap still gets its release announced: the next run
+# to reclaim its stale lock emits it on its behalf, outcome=reclaimed.
 #
 # Reclaiming a stale lock is ORPHAN-SAFE, not blind. A "stale" lock is one whose
 # owner PID is dead — but an INTERRUPTED run (killed before its EXIT trap could
@@ -90,8 +75,10 @@
 # A reclaim is one step under a flock (`_e2e_reclaim_stale_lock`), so of two
 # runs reclaiming the same stale lock, one wins and the other refuses.
 
-# The refusal line. scripts/e2e-github.sh matches it to retry a lost race.
+# The refusal line, and the exit code of a run refused because every slot it
+# needs is held. EX_TEMPFAIL: the run did not happen, which is not a failure.
 E2E_LOCK_HELD_MESSAGE="another e2e run is in progress on the e2e-test workspace."
+E2E_LOCK_BUSY_EXIT=75
 
 E2E_LOCK_OWNED=""
 
@@ -106,6 +93,11 @@ _E2E_LK_STARTED=""
 _E2E_LK_STARTED_EPOCH=""
 _E2E_LK_SCRIPT=""
 _E2E_LK_RUN_ID=""
+_E2E_LK_CHECKOUT=""
+
+# The other slots' lock files an exclusive hold took beside its own. They are
+# taken silently and removed before the hold's own lock, by release_e2e_lock.
+E2E_LOCK_COMPANIONS=()
 
 # PID of the announcement `acquire_e2e_lock` backgrounded, so the release can
 # order itself after it. See `_e2e_await_acquire_announcement`.
@@ -123,10 +115,45 @@ source "$_E2E_LOCK_LIB_DIR/proc_env.sh"
 # shellcheck source=flock.sh
 source "$_E2E_LOCK_LIB_DIR/flock.sh"
 
-# Resolve the lock file path. $E2E_LOCK_DIR_OVERRIDE is for tests; otherwise
-# falls back to ~/workspaces/e2e-test/.lucidos/.
+# ── e2e slots ───────────────────────────────────────────────────────────
+# Local runs share out two e2e workspaces, each with its own database, ports
+# and lock: slot 1 is the base workspace ($E2E_WORKSPACE as first set), slot 2
+# its sibling `<base>-2`. A run without mobile-webkit takes one free slot. A
+# run with it, or the umbrella, takes every slot, so WebKit never runs beside
+# another run (the 2026-04-19 crash above). Fixed at source time, so a run
+# that moved $E2E_WORKSPACE to its slot still names both.
+E2E_BASE_WORKSPACE="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
+
+# The checkout these scripts run from. A run records it, because two runs from
+# one checkout would share its dist/ and test-results/.
+_E2E_LOCK_CHECKOUT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)"
+
+# e2e_slot_workspaces: every slot's workspace, slot 1 first, one per line.
+e2e_slot_workspaces() {
+    local base="$E2E_BASE_WORKSPACE"
+    while [ "${base%/}" != "$base" ]; do base="${base%/}"; done
+    printf '%s\n' "$base" "$base-2"
+}
+
+# e2e_lock_kind <projects>: `exclusive` when the comma-separated projects
+# include mobile-webkit, else `shared`.
+e2e_lock_kind() {
+    case ",$1," in
+        *,mobile-webkit,*) echo exclusive ;;
+        *) echo shared ;;
+    esac
+}
+
+# Resolve the lock file path of $E2E_WORKSPACE. $E2E_LOCK_DIR_OVERRIDE is for
+# tests, and a slot other than the base gets a subdirectory of it.
 _e2e_lock_path() {
-    local dir="${E2E_LOCK_DIR_OVERRIDE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos}"
+    local ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}" dir
+    while [ "${ws%/}" != "$ws" ]; do ws="${ws%/}"; done
+    dir="$ws/.lucidos"
+    if [ -n "${E2E_LOCK_DIR_OVERRIDE:-}" ]; then
+        dir="$E2E_LOCK_DIR_OVERRIDE"
+        [ "$ws" = "$(e2e_slot_workspaces | head -1)" ] || dir="$dir/${ws##*/}"
+    fi
     mkdir -p "$dir" 2>/dev/null
     echo "$dir/e2e.lock"
 }
@@ -472,8 +499,10 @@ _e2e_parse_lock_text() {
     _E2E_LK_STARTED_EPOCH=""
     _E2E_LK_SCRIPT=""
     _E2E_LK_RUN_ID=""
+    _E2E_LK_CHECKOUT=""
     while IFS='=' read -r key val || [ -n "$key" ]; do
         case "$key" in
+            CHECKOUT)      _E2E_LK_CHECKOUT="$val" ;;
             PID)           _E2E_LK_PID="$val" ;;
             THREAD_ID)     _E2E_LK_THREAD="$val" ;;
             WORKTREE)      _E2E_LK_WORKTREE="$val" ;;
@@ -490,9 +519,9 @@ _e2e_parse_lock_text() {
 # SCRIPT stays last (see the reader above).
 _e2e_lock_content() {
     local script_name="$1" run_id="$2"
-    printf 'PID=%s\nTHREAD_ID=%s\nWORKTREE=%s\nSTARTED=%s\nSTARTED_EPOCH=%s\nRUN_ID=%s\nSCRIPT=%s\n' \
-        "$$" "${LUCIDOS_THREAD_ID:-unknown}" "$PWD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        "$(date +%s)" "$run_id" "$script_name"
+    printf 'PID=%s\nTHREAD_ID=%s\nWORKTREE=%s\nCHECKOUT=%s\nSTARTED=%s\nSTARTED_EPOCH=%s\nRUN_ID=%s\nSCRIPT=%s\n' \
+        "$$" "${LUCIDOS_THREAD_ID:-unknown}" "$PWD" "$_E2E_LOCK_CHECKOUT" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date +%s)" "$run_id" "$script_name"
 }
 
 # Atomic create-or-fail using noclobber. Returns 0 on success, non-zero if file exists.
@@ -752,9 +781,8 @@ _e2e_emit_lock_event() {
 # and was woken at 21:21 by the stale subscription: a seven-minute turn that
 # re-ran a spec and re-hardened a branch whose diff with main was empty. In
 # between, the thread read "Waiting" in the UI for two hours after its work was
-# done. `.claude/skills/e2e-lock-wait/` already told the model to stand a spent
-# watch down by hand; this is the same instruction as a mechanism, at the one
-# moment the answer is a fact rather than a judgment.
+# done. This stands such a watch down at the one moment the answer is a fact
+# rather than a judgment.
 #
 # ONLY E2ELockReleased, which is why `--on` exists rather than `--all`. A thread
 # may legitimately be waiting on something else while it runs e2e (a release
@@ -844,49 +872,33 @@ _e2e_await_acquire_announcement() {
     return 0
 }
 
-# Would a release by this holder wake THIS session? No, when the holder is
-# working out of a different workspace: `lucidos events emit` writes to the
-# emitting subprocess's own $LUCIDOS_WORKSPACE while the lock is shared across
-# every workspace on the machine, so that release lands in an event store this
-# thread does not watch.
-#
-# Answers "no" (non-zero) whenever it cannot tell, so the refusal's note appears
-# only when the gap is certain. Both forms of our own root are tried, because
-# the holder's WORKTREE is a `$PWD` with symlinks already resolved while
-# $LUCIDOS_WORKSPACE may be written through one: the same double comparison
-# `_e2e_list_orphans` makes, for the same reason.
-_e2e_holder_is_another_workspace() {
-    local holder="$1" ws="${LUCIDOS_WORKSPACE:-}" ws_real
-    [ -n "$holder" ] && [ -n "$ws" ] || return 1
-    if _e2e_path_under "$holder" "$ws"; then
-        return 1
-    fi
-    ws_real="$(cd "$ws" 2>/dev/null && pwd -P)" || ws_real=""
-    if [ -n "$ws_real" ] && _e2e_path_under "$holder" "$ws_real"; then
-        return 1
-    fi
-    return 0
-}
-
 # acquire_e2e_lock <script-name>
-# Returns 0 on success, 1 on conflict.
+# Take the lock of $E2E_WORKSPACE as this hold's own. Returns 0 on success,
+# $E2E_LOCK_BUSY_EXIT when a live run holds it, 2 when a dead run's orphans
+# would not clear.
 acquire_e2e_lock() {
-    local script_name="${1:-e2e}"
-    local lock_file
-    lock_file="$(_e2e_lock_path)"
-
     # Before anything can be announced, and before the caller's own setup gets a
     # chance to repoint $LUCIDOS_WORKSPACE at the e2e workspace. Every
     # announcement of the hold this call is about to take, including the release
     # its EXIT trap emits an hour later, is addressed from here.
     _e2e_capture_emit_env
+    _e2e_take_lock_file "$(_e2e_lock_path)" "${1:-e2e}" "$(_e2e_new_run_id)" own
+}
 
-    # Exported only once the lock file names it, and before anything the run
-    # starts, so every browser this hold launches is findable by its sweep.
-    local run_id
-    run_id="$(_e2e_new_run_id)"
+# _e2e_take_lock_file <lock-file> <script-name> <run-id> <own|companion>
+# `own` makes the lock this hold's: its run marker is exported (only once the
+# lock file names it, so every browser the hold launches is findable by its
+# sweep), and the hold is announced. `companion` takes another slot's lock
+# silently, for an exclusive hold. A set $E2E_LOCK_QUIET skips the refusal
+# block, so a caller can try the next slot. Returns as acquire_e2e_lock.
+_e2e_take_lock_file() {
+    local lock_file="$1" script_name="$2" run_id="$3" role="$4"
 
     if _e2e_lock_write "$lock_file" "$script_name" "$run_id"; then
+        if [ "$role" = companion ]; then
+            E2E_LOCK_COMPANIONS+=("$lock_file")
+            return 0
+        fi
         E2E_LOCK_OWNED="$lock_file"
         _e2e_export_run_id "$run_id"
         # Backgrounded: the lock is now HELD and the caller has not armed its
@@ -962,11 +974,20 @@ EOF
                 echo "and any leftover browser or coding-agent PIDs with: kill -KILL <pid>" >&2
                 echo "" >&2
                 echo "Lock file: $lock_file" >&2
-                return 1
+                return 2
             fi
             echo "[e2e-lock] orphans reaped — reclaiming the stale lock" >&2
         fi
         if _e2e_reclaim_stale_lock "$lock_file" "$existing_raw" "$script_name" "$run_id"; then
+            if [ "$role" = companion ]; then
+                # The dead owner's hold is over all the same, so a waiter on it
+                # still hears so. This hold's own lock announces the acquire.
+                E2E_LOCK_COMPANIONS+=("$lock_file")
+                _e2e_announce_lock_released "${existing_script:-unknown}" \
+                    "${existing_thread:-unknown}" "${existing_wt:-unknown}" \
+                    "$existing_started_epoch" reclaimed &
+                return 0
+            fi
             E2E_LOCK_OWNED="$lock_file"
             _e2e_export_run_id "$run_id"
             # The dead owner's hold is over, and a waiter blocked on that hold
@@ -1006,6 +1027,7 @@ EOF
         existing_script="$_E2E_LK_SCRIPT"
     fi
 
+    [ -z "${E2E_LOCK_QUIET:-}" ] || return "$E2E_LOCK_BUSY_EXIT"
     echo ""
     echo "ERROR: $E2E_LOCK_HELD_MESSAGE"
     echo "  Owner:    PID ${existing_pid:-unknown} (script: ${existing_script:-unknown})"
@@ -1013,22 +1035,112 @@ EOF
     echo "  Worktree: ${existing_wt:-unknown}"
     echo "  Started:  ${existing_started:-unknown}"
     echo ""
-    echo "Concurrent e2e runs against the shared e2e-test workspace race on"
-    echo "Playwright browser processes: two sessions on a 32 GB Mac OOM'd the"
-    echo "system on 2026-04-19."
+    echo "Concurrent e2e runs race on Playwright browser processes: two sessions on"
+    echo "a 32 GB Mac OOM'd the system on 2026-04-19."
     echo ""
-    echo "Do NOT sleep, poll, or write a retry loop. Subscribe and end your turn:"
-    echo "  lucidos await-event --on E2ELockReleased --timeout-secs 21600 \\"
-    echo "    --reason \"the e2e lock to free up\""
-    echo "The engine re-opens this thread when the holder releases; retry once then."
-    echo "Full rules: .claude/skills/e2e-lock-wait/SKILL.md"
-    if _e2e_holder_is_another_workspace "$existing_wt"; then
-        echo "NOTE: that holder runs in another workspace, so its release event will"
-        echo "      not reach this thread. The timeout is your only wake here."
-    fi
+    echo "Do NOT wait for the lock: no event wait, no sleep, no retry loop."
+    echo "  - A committed selection: rerun it on GitHub with --github."
+    echo "  - Otherwise give up. Rely on the other tests and the main check, which"
+    echo "    runs every spec after landing, and report that this spec did not run."
+    echo "Full rule: .claude/skills/e2e-lock-busy/SKILL.md"
     echo ""
     echo "Lock file: $lock_file"
-    return 1
+    return "$E2E_LOCK_BUSY_EXIT"
+}
+
+# acquire_e2e_slots <script-name> <shared|exclusive>
+# Take e2e slots for a local run, and point $E2E_WORKSPACE at the one it runs
+# in. `shared` takes the first free slot. `exclusive` runs in slot 1 and holds
+# every other slot's lock beside its own. Returns as acquire_e2e_lock.
+acquire_e2e_slots() {
+    local script_name="$1" kind="$2" ws rc=0 run_id
+    local -a slots=()
+    while IFS= read -r ws; do slots+=("$ws"); done < <(e2e_slot_workspaces)
+    _e2e_capture_emit_env
+    run_id="$(_e2e_new_run_id)"
+
+    if [ "$kind" = exclusive ]; then
+        # The other slots first, so a refusal leaves nothing announced.
+        for ws in "${slots[@]:1}"; do
+            _e2e_take_slot_lock "$ws" "$script_name" "$run_id" companion || {
+                rc=$?
+                _e2e_release_companions
+                return "$rc"
+            }
+        done
+        export E2E_WORKSPACE="${slots[0]}"
+        _e2e_take_lock_file "$(_e2e_lock_path)" "$script_name" "$run_id" own || {
+            rc=$?
+            _e2e_release_companions
+            return "$rc"
+        }
+        return 0
+    fi
+
+    local same_checkout
+    same_checkout="$(_e2e_slot_held_by_this_checkout "${slots[@]}")"
+    if [ -n "$same_checkout" ]; then
+        echo ""
+        echo "ERROR: $E2E_LOCK_HELD_MESSAGE"
+        echo "  This checkout already runs e2e in $same_checkout."
+        echo "  A second run here would share its dist/ and test-results/."
+        echo "  Do not wait for it: rely on that run, or run from another worktree."
+        return "$E2E_LOCK_BUSY_EXIT"
+    fi
+    local last=$(( ${#slots[@]} - 1 )) i
+    for i in "${!slots[@]}"; do
+        rc=0
+        if [ "$i" -lt "$last" ]; then
+            E2E_LOCK_QUIET=1 _e2e_take_slot_lock "${slots[$i]}" "$script_name" "$run_id" own || rc=$?
+        else
+            _e2e_take_slot_lock "${slots[$i]}" "$script_name" "$run_id" own || rc=$?
+        fi
+        if [ "$rc" -eq 0 ]; then
+            export E2E_WORKSPACE="${slots[$i]}"
+            [ "$i" -eq 0 ] || echo "[e2e-lock] running in e2e slot $((i + 1)): $E2E_WORKSPACE"
+            return 0
+        fi
+        # Orphans a dead run left must not be stepped around: refuse outright.
+        [ "$rc" -eq "$E2E_LOCK_BUSY_EXIT" ] || return "$rc"
+    done
+    echo "[e2e-lock] every e2e slot is taken."
+    return "$E2E_LOCK_BUSY_EXIT"
+}
+
+# _e2e_take_slot_lock <workspace> <script-name> <run-id> <own|companion>
+# _e2e_take_lock_file for another slot. The orphan sweep reads $E2E_WORKSPACE,
+# so it is scoped to that slot for the call.
+_e2e_take_slot_lock() {
+    local E2E_WORKSPACE="$1"
+    _e2e_take_lock_file "$(_e2e_lock_path)" "$2" "$3" "$4"
+}
+
+# _e2e_slot_held_by_this_checkout <workspace>...: the first slot a live run
+# from this checkout holds, or nothing.
+_e2e_slot_held_by_this_checkout() {
+    local E2E_WORKSPACE
+    for E2E_WORKSPACE in "$@"; do
+        _e2e_read_lock_file "$(_e2e_lock_path)" || continue
+        if [ -z "$_E2E_LK_PID" ] || ! kill -0 "$_E2E_LK_PID" 2>/dev/null; then continue; fi
+        if [ -n "$_E2E_LK_CHECKOUT" ] && [ "$_E2E_LK_CHECKOUT" = "$_E2E_LOCK_CHECKOUT" ]; then
+            printf '%s\n' "$E2E_WORKSPACE"
+            return 0
+        fi
+    done
+}
+
+# Remove every companion lock this shell still holds, silently. A companion
+# another PID holds now is left alone, the rule release_e2e_lock keeps.
+_e2e_release_companions() {
+    local lock
+    for lock in ${E2E_LOCK_COMPANIONS[@]+"${E2E_LOCK_COMPANIONS[@]}"}; do
+        _e2e_read_lock_file "$lock" || continue
+        if [ -n "$_E2E_LK_PID" ] && [ "$_E2E_LK_PID" != "$$" ]; then
+            continue
+        fi
+        rm -f "$lock" || echo "[e2e-lock] WARNING: could not remove $lock, so that slot is STILL HELD." >&2
+    done
+    E2E_LOCK_COMPANIONS=()
 }
 
 # release_e2e_lock: only removes the lock if we own it. Safe in EXIT traps.
@@ -1037,6 +1149,9 @@ EOF
 # retries at once, so waking one to find the lock still held would spend a
 # turn on nothing.
 release_e2e_lock() {
+    # The other slots first, so a waiter woken by the release below finds
+    # every slot free.
+    _e2e_release_companions
     local owned="${E2E_LOCK_OWNED:-}"
     # Cleared up front: this shell is done with the lock either way, and the
     # early returns below would otherwise each have to remember to clear it.

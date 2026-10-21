@@ -22,6 +22,24 @@ fn request(input_event_id: Uuid) -> (WithdrawInputRequest, oneshot::Receiver<Inp
     (request, answer)
 }
 
+/// A pool for a test the store never answers, so it never connects.
+fn unused_pool() -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+        .unwrap()
+}
+
+async fn reads(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE thread_id = $1 AND event_type = 'CodingAgentInputRead'",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 async fn tombstones(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT payload->>'removed_message_id' FROM events \
@@ -33,16 +51,117 @@ async fn tombstones(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<String> {
     .unwrap()
 }
 
-/// A message the agent already read, or never got, is not taken back.
+/// A message this session's agent already read is not taken back, and the
+/// store is never asked.
 #[tokio::test]
-async fn an_input_that_is_not_owed_is_already_read() {
+async fn an_input_this_session_read_is_already_read() {
+    let id = Uuid::new_v4();
+    let queued = sent("queued");
+    let mut inputs = InputLedger::new();
+    inputs.forwarded(vec![id], &queued, None);
+    inputs.observe(&crate::runtime::AgentEvent::InputRead { input: queued.uuid });
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
-    let (withdraw, answer) = request(Uuid::new_v4());
-    begin_withdraw(&InputLedger::new(), Some(&driver), withdraw, &mut pending);
+    let (withdraw, answer) = request(id);
+    begin_withdraw(
+        &inputs,
+        Some(&driver),
+        &unused_pool(),
+        Uuid::new_v4(),
+        withdraw,
+        &mut pending,
+    );
     assert_eq!(answer.await.unwrap(), InputWithdrawal::AlreadyRead);
     assert!(driver_rx.try_recv().is_err(), "Claude Code is never asked");
     assert!(pending.is_empty());
+}
+
+/// The reported bug: the previous process took the follow-up into its queue
+/// and died. This session never forwarded it, so no live process holds it,
+/// and the remove records the tombstone. It records no read.
+#[tokio::test]
+async fn an_unread_input_this_session_never_forwarded_is_withdrawn() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    forwarded_in_the_store(&bus, thread_id, id).await;
+    let mut inputs = InputLedger::new();
+    let (driver, mut driver_rx) = mpsc::unbounded_channel();
+    let mut pending = PendingWithdraws::new();
+    let (withdraw, answer) = request(id);
+    begin_withdraw(
+        &inputs,
+        Some(&driver),
+        &pool,
+        thread_id,
+        withdraw,
+        &mut pending,
+    );
+    let back = pending.next().await.expect("the store answers");
+    finish_withdraw(&bus, thread_id, &mut inputs, back).await;
+
+    assert_eq!(answer.await.unwrap(), InputWithdrawal::Withdrawn);
+    assert!(driver_rx.try_recv().is_err(), "Claude Code is never asked");
+    assert_eq!(tombstones(&pool, thread_id).await, [id.to_string()]);
+    assert_eq!(reads(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A message an earlier session's agent read stays read.
+#[tokio::test]
+async fn an_input_an_earlier_session_read_is_already_read() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    read_in_the_store(&bus, thread_id, id).await;
+    let mut inputs = InputLedger::new();
+    let mut pending = PendingWithdraws::new();
+    let (withdraw, answer) = request(id);
+    begin_withdraw(&inputs, None, &pool, thread_id, withdraw, &mut pending);
+    let back = pending.next().await.expect("the store answers");
+    finish_withdraw(&bus, thread_id, &mut inputs, back).await;
+
+    assert_eq!(answer.await.unwrap(), InputWithdrawal::AlreadyRead);
+    assert!(tombstones(&pool, thread_id).await.is_empty());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+async fn read_in_the_store(bus: &EventBus, thread_id: Uuid, id: Uuid) {
+    forwarded_in_the_store(bus, thread_id, id).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentInputRead {
+            input_event_id: id,
+            started_turn: false,
+            verbatim: false,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
+/// A session forwarded `id`'s message to its agent.
+async fn forwarded_in_the_store(bus: &EventBus, thread_id: Uuid, id: Uuid) {
+    crate::test_support::start_cc_session(bus, thread_id, "work", None).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentPromptSent {
+            text: "forwarded".into(),
+            coding_agent: CodingAgent::ClaudeCode,
+            origin: None,
+            input_event_id: Some(id),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -52,7 +171,14 @@ async fn a_backend_without_withdraws_refuses() {
     inputs.forwarded(vec![id], &sent("queued"), None);
     let mut pending = PendingWithdraws::new();
     let (withdraw, answer) = request(id);
-    begin_withdraw(&inputs, None, withdraw, &mut pending);
+    begin_withdraw(
+        &inputs,
+        None,
+        &unused_pool(),
+        Uuid::new_v4(),
+        withdraw,
+        &mut pending,
+    );
     assert_eq!(
         answer.await.unwrap(),
         InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string())
@@ -69,7 +195,14 @@ async fn a_driver_that_ended_refuses() {
     drop(driver_rx);
     let mut pending = PendingWithdraws::new();
     let (withdraw, _answer) = request(id);
-    begin_withdraw(&inputs, Some(&driver), withdraw, &mut pending);
+    begin_withdraw(
+        &inputs,
+        Some(&driver),
+        &unused_pool(),
+        Uuid::new_v4(),
+        withdraw,
+        &mut pending,
+    );
     let back = pending.next().await.expect("the answer lands");
     assert_eq!(
         back.outcome,
@@ -92,7 +225,14 @@ async fn a_withdrawn_input_leaves_the_ledger_and_records_its_tombstone() {
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
     let (withdraw, answer) = request(id);
-    begin_withdraw(&inputs, Some(&driver), withdraw, &mut pending);
+    begin_withdraw(
+        &inputs,
+        Some(&driver),
+        &pool,
+        thread_id,
+        withdraw,
+        &mut pending,
+    );
     let asked: WithdrawRequest = driver_rx.recv().await.expect("Claude Code is asked");
     assert_eq!(asked.input_uuid, queued.uuid);
     asked.reply.send(InputWithdrawal::Withdrawn).unwrap();
@@ -141,8 +281,9 @@ fn sessions_with(session: AgentSession, thread_id: Uuid) -> Mutex<HashMap<Uuid, 
 
 const QUICK: Duration = Duration::from_secs(5);
 
+/// No run loop takes the request, so the caller falls back to the claim.
 #[tokio::test]
-async fn a_thread_without_a_live_session_refuses() {
+async fn a_thread_without_a_live_session_has_no_run_loop_to_ask() {
     let outcome = withdraw_from_session(
         &Mutex::new(HashMap::new()),
         Uuid::new_v4(),
@@ -151,14 +292,11 @@ async fn a_thread_without_a_live_session_refuses() {
         QUICK,
     )
     .await;
-    assert_eq!(
-        outcome,
-        InputWithdrawal::Refused(NO_LIVE_SESSION.to_string())
-    );
+    assert_eq!(outcome, None);
 }
 
 #[tokio::test]
-async fn a_codex_session_refuses() {
+async fn a_codex_session_refuses_at_once() {
     let thread_id = Uuid::new_v4();
     let (mut session, _msg_rx) = AgentSession::for_test();
     session.coding_agent = CodingAgent::Codex;
@@ -172,7 +310,7 @@ async fn a_codex_session_refuses() {
     .await;
     assert_eq!(
         outcome,
-        InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string())
+        Some(InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string()))
     );
 }
 
@@ -198,13 +336,14 @@ async fn a_claude_code_session_answers_through_its_run_loop() {
         QUICK,
     )
     .await;
-    assert_eq!(outcome, InputWithdrawal::Withdrawn);
+    assert_eq!(outcome, Some(InputWithdrawal::Withdrawn));
     run_loop.await.unwrap();
 }
 
-/// A run loop that ends with the request unanswered refuses rather than hangs.
+/// A run loop that ends with the request unanswered does not hang. Its process
+/// is gone, so the caller falls back to the claim.
 #[tokio::test]
-async fn a_run_loop_that_ends_first_refuses() {
+async fn a_run_loop_that_ends_first_leaves_it_to_the_claim() {
     let thread_id = Uuid::new_v4();
     let (mut session, _msg_rx) = AgentSession::for_test();
     let (withdraw_tx, mut withdraw_rx) = mpsc::unbounded_channel::<WithdrawInputRequest>();
@@ -218,11 +357,104 @@ async fn a_run_loop_that_ends_first_refuses() {
         QUICK,
     )
     .await;
+    assert_eq!(outcome, None);
+    run_loop.await.unwrap();
+}
+
+/// Claim `thread_id` the way the engine does, from `sessions`.
+fn claim(
+    sessions: &mut HashMap<Uuid, AgentSession>,
+    thread_id: Uuid,
+) -> std::future::Ready<
+    Result<Option<crate::engine::agent_session::spawn_claim::ClaimedEntry>, String>,
+> {
+    let claimed = crate::engine::agent_session::spawn_claim::claim_thread_for(
+        sessions,
+        thread_id,
+        CodingAgent::ClaudeCode,
+        crate::engine::agent_session::spawn_claim::ClaimFor::Run,
+    );
+    std::future::ready(Ok(claimed.ok()))
+}
+
+/// An idle thread has no process to ask. The remove claims the thread, finds no
+/// read, and records the tombstone. It records no read.
+#[tokio::test]
+async fn an_idle_thread_records_the_tombstone_under_the_claim() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    forwarded_in_the_store(&bus, thread_id, id).await;
+    let mut sessions = HashMap::new();
+    let outcome =
+        withdraw_while_claimed(claim(&mut sessions, thread_id), &bus, thread_id, id, None).await;
+    assert_eq!(outcome, Some(InputWithdrawal::Withdrawn));
+    assert_eq!(tombstones(&pool, thread_id).await, [id.to_string()]);
+    assert_eq!(reads(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn an_idle_thread_keeps_a_message_its_agent_read() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    read_in_the_store(&bus, thread_id, id).await;
+    let mut sessions = HashMap::new();
+    let outcome =
+        withdraw_while_claimed(claim(&mut sessions, thread_id), &bus, thread_id, id, None).await;
+    assert_eq!(outcome, Some(InputWithdrawal::AlreadyRead));
+    assert!(tombstones(&pool, thread_id).await.is_empty());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A message no session ever forwarded may be waiting on a spawn's claim. The
+/// remove writes nothing, or that spawn would deliver it over its tombstone.
+#[tokio::test]
+async fn a_message_no_session_forwarded_is_not_taken_back() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    let outcome =
+        withdraw_while_claimed(claim(&mut sessions, thread_id), &bus, thread_id, id, None).await;
     assert_eq!(
         outcome,
-        InputWithdrawal::Refused(NO_LIVE_SESSION.to_string())
+        Some(InputWithdrawal::Refused(NOT_YET_FORWARDED.to_string()))
     );
-    run_loop.await.unwrap();
+    assert!(tombstones(&pool, thread_id).await.is_empty());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A run that holds the thread could forward the message at any moment. So
+/// the remove writes nothing and leaves the answer to that run's loop.
+#[tokio::test]
+async fn a_held_claim_leaves_the_remove_to_the_run_loop() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    let _run = claim(&mut sessions, thread_id)
+        .into_inner()
+        .unwrap()
+        .expect("the run claims");
+    let outcome =
+        withdraw_while_claimed(claim(&mut sessions, thread_id), &bus, thread_id, id, None).await;
+    assert_eq!(outcome, None);
+    assert!(tombstones(&pool, thread_id).await.is_empty());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 /// A withdrawal whose tombstone failed to record is retried from the ledger,
@@ -240,7 +472,14 @@ async fn a_withdrawal_whose_tombstone_failed_records_it_on_retry() {
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
     let (withdraw, answer) = request(id);
-    begin_withdraw(&inputs, Some(&driver), withdraw, &mut pending);
+    begin_withdraw(
+        &inputs,
+        Some(&driver),
+        &pool,
+        thread_id,
+        withdraw,
+        &mut pending,
+    );
     assert!(
         driver_rx.try_recv().is_err(),
         "Claude Code is not asked again"
@@ -272,7 +511,14 @@ async fn a_read_after_a_drop_settles_the_input_it_names() {
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
     let (withdraw, _answer) = request(a);
-    begin_withdraw(&inputs, Some(&driver), withdraw, &mut pending);
+    begin_withdraw(
+        &inputs,
+        Some(&driver),
+        &pool,
+        thread_id,
+        withdraw,
+        &mut pending,
+    );
     // Polled once, as the select arm does, so it waits on the answer.
     assert!(pending.next().now_or_never().is_none());
     let asked: WithdrawRequest = driver_rx.recv().await.unwrap();

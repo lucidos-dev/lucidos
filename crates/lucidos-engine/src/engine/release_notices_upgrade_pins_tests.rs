@@ -67,3 +67,32 @@ fn a_fresh_0_49_0_workspace_owes_no_notice() {
     assert!(walk(&on_0_49_0, &CLASSIC, stamp.as_deref()).is_empty());
     assert!(walk(&on_0_49_0, &TREE, stamp.as_deref()).is_empty());
 }
+
+/// A workspace that skipped 0.49.0 never reads the Home board notice: the
+/// two dashboards notice replaced it, and contradicts it.
+#[test]
+fn a_workspace_upgrading_from_0_48_1_to_0_49_2_skips_the_home_board() {
+    let walked = walk(&v("0.49.2"), &TREE, Some(ANSWERED_ON_0_48_1));
+    assert!(!walked.iter().any(|id| id == "home-board"), "{walked:?}");
+    assert!(walked.iter().any(|id| id == "two-dashboards"), "{walked:?}");
+}
+
+/// A workspace that answered the Home board notice on 0.49.0 keeps its place.
+#[test]
+fn a_workspace_that_answered_the_home_board_still_owes_what_follows_it() {
+    assert_eq!(
+        walk(&v("0.49.2"), &TREE, Some("home-board")),
+        [
+            "workspace-database-handle",
+            "two-dashboards",
+            "intents-run-in-the-thread"
+        ]
+    );
+}
+
+#[test]
+fn the_shipped_home_board_notice_is_superseded_by_two_dashboards() {
+    let notices = parse(RELEASE_NOTICES_TOML).unwrap();
+    let home_board = notices.iter().find(|n| n.id == "home-board").unwrap();
+    assert_eq!(home_board.superseded_by.as_deref(), Some("two-dashboards"));
+}

@@ -532,8 +532,9 @@ impl LucidosEngine {
     /// Take this thread's naming slot, or answer `None` because a name is
     /// already on its way.
     ///
-    /// The window `thread_has_title` cannot close on its own: naming takes a
-    /// model call, so two askers a second apart both read "no name yet".
+    /// The window the namer's "no title yet" read cannot close on its own:
+    /// naming takes a model call, so two askers a second apart both read "no
+    /// name yet". The slot is held through the namer's retry waits too.
     ///
     /// A poisoned lock takes the slot. A namer panicked mid-flight, and naming
     /// again risks the second title this guard prevents. Refusing would leave

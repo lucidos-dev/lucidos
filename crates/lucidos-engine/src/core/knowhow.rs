@@ -528,11 +528,11 @@ pub fn is_not_found_body(body: &str) -> bool {
 }
 
 /// Load all know-how files from an app's knowhow/ subdirectory (recursively).
-/// Returns formatted sections for injection into the system prompt, or empty string if none found.
+/// Returns formatted sections, or an empty string if none found.
 ///
-/// Recursive on purpose. This injects bodies into an executing app intent
-/// rather than building a routing list, so [`KnowhowListDepth`] does not
-/// apply. A reference folder here reaches that prompt whole.
+/// Recursive on purpose. This returns bodies with an app intent that
+/// `load_knowhow` loads, rather than building a routing list, so
+/// [`KnowhowListDepth`] does not apply. A reference folder here comes back whole.
 pub fn load_app_knowhow(knowhow_dir: &Path) -> String {
     if !knowhow_dir.exists() {
         return String::new();

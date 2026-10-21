@@ -1,7 +1,7 @@
 /**
  * `sendCodingAgentControl` passes on when the engine says a change takes
- * effect. A Claude Code effort change made mid-turn lands on the next turn,
- * and the menu toasts that rather than claiming it applied.
+ * effect. A Codex pick made mid-turn lands on the next turn, and the menu
+ * toasts that rather than claiming it applied.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';

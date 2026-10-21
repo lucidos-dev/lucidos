@@ -2,6 +2,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-09
+- **Amended by**: [0519](0519-retired-models-follow-reach.md): a stored pick
+  may move within its lineage when a generation is not served, never across
 
 ## Context
 

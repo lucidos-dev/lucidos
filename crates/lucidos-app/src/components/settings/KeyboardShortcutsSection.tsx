@@ -1,10 +1,58 @@
 import { useState, useEffect } from 'preact/hooks';
-import { SHORTCUT_DEFS, shortcutDef, shortcutSearchAnchor, type ShortcutId } from '../../utils/shortcuts';
+import { PREF_COMPOSER_ENTER_KEY } from '@lucidos/preference-catalog';
+import { SHORTCUT_DEFS, formatBinding, shortcutDef, shortcutSearchAnchor, type Binding, type ShortcutId } from '../../utils/shortcuts';
 import { displayBinding, isCustomized, setBinding, resetBinding, recordChord } from '../../store/actions/keybindings';
+import { currentComposerEnterKey, setComposerEnterKey, type ComposerEnterKey } from '../../store/actions/preferences';
+import { isMac } from '../../utils/platform';
+import { Explainer } from '../shared/Explainer';
 
 // Derived, not hand-maintained: a category added to the registry can't be
 // silently missing from the sheet. Order = first appearance in SHORTCUT_DEFS.
 const CATEGORIES = [...new Set(SHORTCUT_DEFS.map((d) => d.category))];
+
+export const COMPOSER_ENTER_KEY_LABELS: Record<ComposerEnterKey, string> = {
+  send: 'Sends',
+  newline: 'New line',
+};
+
+const enterChord = (mod: boolean, shift: boolean): string =>
+  formatBinding({ mod, shift, alt: false, key: 'Enter' } satisfies Binding, isMac);
+
+/** The Composer group: what Enter does in the chat composer. */
+function ComposerEnterKeyRow() {
+  const mode = currentComposerEnterKey();
+  const enter = enterChord(false, false);
+  const shiftEnter = enterChord(false, true);
+  const modEnter = enterChord(true, false);
+  return (
+    <div class="settings-section">
+      <div class="settings-section-title">Composer</div>
+      <div class="settings-row" data-search-anchor="keyboard-shortcuts:composer-enter-key">
+        <span class="settings-row-label">
+          Enter key
+          <Explainer title="Enter key">
+            <p>Sends: {enter} sends your message, and {shiftEnter} adds a new line.</p>
+            <p>New line: {enter} adds a new line, and {shiftEnter} sends.</p>
+            <p>{modEnter} sends in both. On a phone, {enter} always adds a new line and the Send button sends.</p>
+          </Explainer>
+        </span>
+        <div class="segmented-control" role="group" aria-label="Enter key">
+          {PREF_COMPOSER_ENTER_KEY.values.map((m) => (
+            <button
+              key={m}
+              type="button"
+              aria-pressed={mode === m}
+              class={`segmented-btn ${mode === m ? 'active' : ''}`}
+              onClick={() => void setComposerEnterKey(m)}
+            >
+              {COMPOSER_ENTER_KEY_LABELS[m]}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 /** Settings → Keyboard Shortcuts. Lists every registry shortcut with its
  *  current (possibly-customized) binding and a Record button to rebind it.
@@ -30,6 +78,9 @@ export function KeyboardShortcutsSection() {
         case 'invalid':
           setError('Use Ctrl/Cmd or Alt together with a key.');
           break;
+        case 'composer':
+          setError(`${enterChord(false, false)}, ${enterChord(false, true)} and ${enterChord(true, false)} send or add a new line in the composer (see Enter key above).`);
+          break;
         case 'conflict':
           setError(`That combination is already used by "${shortcutDef(outcome.withId).label}".`);
           break;
@@ -51,6 +102,7 @@ export function KeyboardShortcutsSection() {
         Click a shortcut and press a new key combination. Changes are saved and synced across your devices.
       </p>
       {error && <p class="error-text">{error}</p>}
+      <ComposerEnterKeyRow />
       {CATEGORIES.map((cat) => (
         <div class="settings-section" key={cat}>
           <div class="settings-section-title">{cat}</div>

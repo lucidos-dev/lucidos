@@ -205,9 +205,10 @@ self.addEventListener('fetch', (event) => {
   // by a later build resolves through the server's SPA fallback to index.html,
   // and caching that under the bundle URL poisons the entry permanently.
   if (rel.startsWith('/assets/')) {
-    event.respondWith(
-      cacheFirst(event.request, SHELL_CACHE, (r) => !!r && r.ok && !isHtmlResponse(r), fetchWhole),
-    );
+    const response = cacheFirst(event.request, SHELL_CACHE, (r) => !!r && r.ok && !isHtmlResponse(r), fetchWhole);
+    event.respondWith(response);
+    // Registered during dispatch, so the worker outlives the log it sends.
+    event.waitUntil(response.then((r) => logFailedAsset(rel, r)).catch(() => {}));
     return;
   }
 
@@ -296,6 +297,19 @@ async function readWhole(request, init) {
   } finally {
     clearTimeout(stallTimer);
   }
+}
+
+// Log a bundle the worker could not serve. The page's import error names no
+// URL in WebKit, so this line says which bundle failed and how: a 404 is a
+// stale build, status 0 is fetchWhole giving up.
+function logFailedAsset(rel, response) {
+  if (response.ok && !isHtmlResponse(response)) return undefined;
+  return swLog('asset_failed', {
+    path: rel,
+    status: response.status,
+    type: response.type,
+    contentType: response.headers.get('content-type'),
+  });
 }
 
 // True if a response is an HTML document. A content-hashed /assets/* URL must

@@ -60,9 +60,9 @@
 /// **Announcing is the default, and this is the narrow exit from it.** Reach for
 /// it only when emitting would be WRONG, never when it is merely inconvenient.
 /// "No variant fits this yet" is a reason to ADD one, not to skip the event. A
-/// new variant costs five match arms and a row in `.claude/rules/db.md`. A
-/// state change that reaches nothing stays invisible to the timeline, to SSE
-/// and to every trigger, permanently.
+/// new variant costs five match arms and a doc comment. A state change that
+/// reaches nothing stays invisible to the timeline, to SSE and to every
+/// trigger, permanently.
 ///
 /// Every current entry is one of three shapes. The write is downstream of an
 /// emit that already happened. It is a cascade the parent event already covers.
@@ -163,6 +163,26 @@ pub const TABLES: &[TableRule] = &[
         },
     },
     TableRule {
+        table: "backup_recipient",
+        owners: &["core/backup/recipient.rs"],
+        announcement: Announcement::Announced {
+            events: &["BackupRecipientSet"],
+            exempt: &[
+                ExemptWriter {
+                    function: "start_setup",
+                    why: "A pending recipient seals nothing until the paste-back \
+                          promotes it, and that promotion announces \
+                          BackupRecipientSet.",
+                },
+                ExemptWriter {
+                    function: "verify",
+                    why: "An observation: the user proved they still hold the \
+                          backup key. Nothing a backup seals with changes.",
+                },
+            ],
+        },
+    },
+    TableRule {
         table: "browser_logins",
         owners: &["runtime/browser/mod.rs"],
         announcement: Announcement::Silent {
@@ -189,7 +209,15 @@ pub const TABLES: &[TableRule] = &[
                 "CredentialUpdated",
                 "CredentialDeleted",
             ],
-            exempt: &[],
+            exempt: &[ExemptWriter {
+                function: "insert_moved_secret",
+                why: "Files a secret the boot step in secret_store::one_home \
+                      moved here from email_accounts.password or \
+                      mcp_servers.env. It runs before the EventBus exists, as \
+                      a migration does, so there is no bus to emit on and no \
+                      client to tell. Every consumer reads the moved rows on \
+                      its first load.",
+            }],
         },
     },
     TableRule {
@@ -288,9 +316,18 @@ pub const TABLES: &[TableRule] = &[
                 "McpServerDisabledToolsChanged",
                 "McpServerRemoved",
             ],
-            exempt: &[ExemptWriter {
-                function: "set_tools",
-                why: "Caches the tool manifest a live server just advertised, \
+            exempt: &[
+                ExemptWriter {
+                    function: "move_env_into_credentials",
+                    why: "The boot step in secret_store::one_home: it moves \
+                          env values into credentials and leaves pointers. It \
+                          runs before the EventBus exists, as a migration does, \
+                          and changes no server's behavior, since each pointer \
+                          resolves to the value it replaced.",
+                },
+                ExemptWriter {
+                    function: "set_tools",
+                    why: "Caches the tool manifest a live server just advertised, \
                       which is an observation rather than a decision anyone \
                       made. The only event that could carry it, \
                       McpServerUpdated, is documented as an auto-approve \
@@ -298,7 +335,8 @@ pub const TABLES: &[TableRule] = &[
                       nobody made on the timeline. The row's \
                       tools_observed_at stamp is the signal instead, and the \
                       MCP settings page reads it.",
-            }],
+                },
+            ],
         },
     },
     TableRule {
@@ -376,6 +414,40 @@ pub const TABLES: &[TableRule] = &[
                       refresh would put an events row on the timeline each time \
                       a token neared expiry.",
             }],
+        },
+    },
+    TableRule {
+        table: "claude_gateway_accounts",
+        owners: &["llm/claude_gateway/account.rs"],
+        announcement: Announcement::Announced {
+            events: &[
+                "ClaudeGatewaySignedIn",
+                "ClaudeGatewaySignedOut",
+                "ClaudeGatewayManagedSettingsChanged",
+            ],
+            exempt: &[ExemptWriter {
+                function: "update_tokens",
+                why: "A token refresh renews the same sign-in in place. \
+                      Nothing user-visible changed, and announcing it would \
+                      put an events row on the timeline every hour.",
+            }],
+        },
+    },
+    TableRule {
+        table: "claude_gateway_telemetry_cursor",
+        owners: &["llm/claude_gateway/telemetry/exporter.rs"],
+        announcement: Announcement::Silent {
+            reason: "The last event sequence the usage telemetry exporter sent \
+                     or skipped. Delivery bookkeeping that only the exporter reads.",
+        },
+    },
+    TableRule {
+        table: "chat_ladder_upgrade_models",
+        owners: &["runtime/chat_ladder.rs"],
+        announcement: Announcement::Silent {
+            reason: "The models a workspace had enabled, snapshotted by a migration \
+                     for the one-time chat ladder upgrade, which empties it. The \
+                     override it writes announces as PreferencesChanged.",
         },
     },
     TableRule {
@@ -556,7 +628,17 @@ pub const TABLES: &[TableRule] = &[
                  The reconcile and backfill writers repair drift in that \
                  derivation rather than introducing new state. keep_alive_turn \
                  spans a cache keep-alive run, from after its PromptInjected \
-                 anchor to its keep-alive CodingAgentIdled.",
+                 anchor to its keep-alive CodingAgentIdled. \
+                 cache_keep_alive_status projects CacheKeepAliveStatusChanged.",
+        },
+    },
+    TableRule {
+        table: "vapid_keys",
+        owners: &["scheduler/push.rs"],
+        announcement: Announcement::Silent {
+            reason: "The workspace's Web Push signing keypair, generated once \
+                     on first use. A transport secret, not a decision anyone \
+                     made.",
         },
     },
     TableRule {

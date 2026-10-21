@@ -1,6 +1,8 @@
 use super::*;
+use crate::api::error::ApiError;
 use crate::engine::cc_permission::{prompt_coding_agent_permission, CodingAgentPermissionInput};
 use crate::engine::event_bus::BusEvent;
+use crate::engine::git_ops::PlanApprovalError;
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 
 #[derive(Deserialize)]
@@ -751,6 +753,9 @@ struct ApprovePlanResponse {
 /// from `proposed` to `planned` so the cc-plan-gate hook and the Apply floor
 /// pass. Idempotent: re-approving an already-`planned` (or `simple`) branch is a
 /// no-op that reports `approved: false`.
+///
+/// The engine checks the user's own answer first. Without it the reply is a 409
+/// with reason `no-plan-approval`, and an unreadable answer is a 500.
 pub(super) async fn approve_plan(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -760,9 +765,15 @@ pub(super) async fn approve_plan(
         return refusal;
     }
     let repo_root = std::path::PathBuf::from(&body.repo_root);
+    let caller_thread = match crate::api::actor::subprocess_origin(&headers) {
+        crate::api::actor::SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } => source_thread_id.map(|id| id.to_string()),
+        crate::api::actor::SubprocessOrigin::NotSubprocess => None,
+    };
     match state
         .engine
-        .approve_plan(&repo_root, &body.branch_name)
+        .approve_plan(&repo_root, &body.branch_name, caller_thread.as_deref())
         .await
     {
         Ok(approved) => Json(ApprovePlanResponse {
@@ -770,6 +781,11 @@ pub(super) async fn approve_plan(
             plan_path: approved.and_then(|a| a.plan_path),
         })
         .into_response(),
+        Err(e @ PlanApprovalError::NotApproved) => {
+            ApiError::new(StatusCode::CONFLICT, e.to_string())
+                .with_reason("no-plan-approval")
+                .into_response()
+        }
         Err(e) => {
             crate::log!(
                 "[Internal] approve_plan failed for {}: {}",

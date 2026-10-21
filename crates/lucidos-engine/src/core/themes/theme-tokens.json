@@ -697,11 +697,11 @@
       "group": "header",
       "kind": "color",
       "label": "Header divider",
-      "description": "The line between pane headers. Transparent by default, for one seamless bar.",
+      "description": "The line between pane headers. By default the pane divider colour, so each divider runs unbroken to the window top.",
       "frames": false,
       "default": {
-        "dark": "transparent",
-        "light": "transparent"
+        "dark": "var(--border-color)",
+        "light": "var(--border-color)"
       }
     },
     {

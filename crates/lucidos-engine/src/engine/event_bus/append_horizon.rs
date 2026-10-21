@@ -44,6 +44,17 @@ impl EventBus {
     }
 }
 
+#[cfg(test)]
+impl EventBus {
+    /// An append transaction for a test to hold open, as a slow append holds
+    /// its sequence before it commits.
+    pub(crate) async fn begin_append_for_test(
+        &self,
+    ) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
+        Ok(self.begin_append().await?.tx)
+    }
+}
+
 /// An append's transaction and its ticket, from [`EventBus::begin_append`].
 pub(super) struct Append {
     pub(super) tx: Transaction<'static, Postgres>,

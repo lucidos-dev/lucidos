@@ -314,6 +314,9 @@ pub async fn proxy(
             // phases: once `bring_up` sets the route (while the engine is still
             // Booting), a lazy-start navigation lands here, not on `fallback`'s
             // no-route branch. So `boot_label` carries the current phase.
+            if crate::auth_api::is_nested_frame(&parts.headers) {
+                return frame_starting_page();
+            }
             return starting_page(boot_label);
         }
     };
@@ -478,7 +481,8 @@ async fn proxy_upgrade(
 /// treat it as the real page. It polls its own url every 2s (see
 /// [`splash_page_html`]) and reloads once the engine answers.
 /// Used by the proxy on a connect failure (engine cold boot) and by the gateway
-/// `fallback` when a document navigation lazy-starts a stopped workspace.
+/// `fallback` when a document navigation lazy-starts a stopped workspace. A
+/// nested frame never gets it: see [`frame_starting_page`].
 ///
 /// `label` is what the gateway currently knows about this boot
 /// ([`crate::server::GatewayState::boot_splash_label`]): the boot phase (see
@@ -500,8 +504,11 @@ async fn proxy_upgrade(
 /// engine, so the splash never shows for an installed PWA. The marker tells the SW
 /// to SHOW this response; it is never cached (still a 503 + `no-store`).
 pub fn starting_page(label: &str) -> Response {
-    // 2s poll, no escape link: the happy-path boot window.
-    boot_splash_response(splash_page_html(label, Some(2), false), "2")
+    // No escape link: the happy-path boot window.
+    boot_splash_response(
+        splash_page_html(label, Some(STARTING_POLL_SECS), false),
+        STARTING_POLL_SECS,
+    )
 }
 
 /// The boot-splash TERMINAL-FAILURE page: the engine reported a boot failure it
@@ -522,9 +529,10 @@ pub fn starting_page(label: &str) -> Response {
 /// startup hook (`store/startup.ts` → `startAppUpdateChecks`), which never runs while
 /// the workspace is stuck on this splash.
 pub fn failed_page(message: &str) -> Response {
-    // `Retry-After` still advertises a sane poll interval for well-behaved clients
-    // even though the page itself does not self-refresh.
-    boot_splash_response(splash_page_html(message, None, true), "60")
+    boot_splash_response(
+        splash_page_html(message, None, true),
+        FAILED_RETRY_AFTER_SECS,
+    )
 }
 
 /// The boot-splash ESCAPE page, served once a workspace has been stuck in its boot
@@ -538,26 +546,83 @@ pub fn failed_page(message: &str) -> Response {
 /// picker↔workspace loop). Same 503 + boot-splash marker as [`starting_page`].
 pub fn stalled_page() -> Response {
     boot_splash_response(
-        splash_page_html("This is taking longer than expected.", Some(10), true),
-        "10",
+        splash_page_html(
+            "This is taking longer than expected.",
+            Some(STALLED_POLL_SECS),
+            true,
+        ),
+        STALLED_POLL_SECS,
     )
 }
 
-/// Shared 503 boot-splash response shell: `text/html`, `Retry-After`, `no-store`,
-/// and the `X-Lucidos-Boot-Splash: 1` marker so the PWA service worker
+/// The boot-window poll, while the boot is on time.
+const STARTING_POLL_SECS: u32 = 2;
+/// The slower poll once the boot has run past its budget.
+const STALLED_POLL_SECS: u32 = 10;
+/// What a failed page advertises. Only its frame version reloads at it.
+const FAILED_RETRY_AFTER_SECS: u32 = 60;
+
+/// What a nested frame (a widget, an app pane) gets in place of
+/// [`starting_page`]. See [`frame_page`].
+pub fn frame_starting_page() -> Response {
+    frame_page(STARTING_POLL_SECS)
+}
+
+/// What a nested frame gets in place of [`stalled_page`], at its slower poll.
+pub fn frame_stalled_page() -> Response {
+    frame_page(STALLED_POLL_SECS)
+}
+
+/// What a nested frame gets in place of [`failed_page`]. Unlike that page it
+/// still reloads, slowly: a frame has no escape link and nobody reloads it,
+/// so a fixed workspace would otherwise leave it blank until the host reloads.
+pub fn frame_failed_page() -> Response {
+    frame_page(FAILED_RETRY_AFTER_SECS)
+}
+
+/// An empty page for a nested frame whose engine cannot answer, reloading
+/// itself every `refresh_secs`.
+///
+/// The splash is a full-screen brand page, so inside a frame it reads as the
+/// widget itself. Its poller cannot help either: an app frame is sandboxed to
+/// an opaque origin, so its `fetch` carries no cookie and never sees the engine
+/// return. A meta-refresh is a navigation, which carries the cookie, so the
+/// real document lands on the first reload after the engine answers. The host
+/// page owns any visible waiting state.
+///
+/// `color-scheme` follows the user's system, so the empty canvas stays
+/// transparent whenever the host's theme mode agrees with it.
+fn frame_page(refresh_secs: u32) -> Response {
+    let html = format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="{refresh_secs}"><meta name="color-scheme" content="light dark"></head><body></body></html>"#
+    );
+    waiting_response(refresh_secs)
+        .body(Body::from(html))
+        .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
+}
+
+/// Shared 503 boot-splash response shell: [`waiting_response`] plus the
+/// `X-Lucidos-Boot-Splash: 1` marker, so the PWA service worker
 /// (`networkFirstShell`) SHOWS the page rather than treating the non-ok
 /// navigation as an error and serving the cached app shell.
-fn boot_splash_response(html: String, retry_after: &'static str) -> Response {
-    let mut resp = Response::builder().status(StatusCode::SERVICE_UNAVAILABLE);
-    resp = resp.header(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    resp = resp.header(header::RETRY_AFTER, HeaderValue::from_static(retry_after));
-    resp = resp.header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp = resp.header("x-lucidos-boot-splash", HeaderValue::from_static("1"));
-    resp.body(Body::from(html))
+fn boot_splash_response(html: String, retry_after: u32) -> Response {
+    waiting_response(retry_after)
+        .header("x-lucidos-boot-splash", HeaderValue::from_static("1"))
+        .body(Body::from(html))
         .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())
+}
+
+/// A 503 HTML page for a wait: `Retry-After` and `no-store`, so no cache keeps
+/// it past the wait.
+fn waiting_response(retry_after: u32) -> axum::http::response::Builder {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )
+        .header(header::RETRY_AFTER, HeaderValue::from(retry_after))
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
 }
 
 /// The brand boot splash as a self-contained HTML page: a full-screen gradient
@@ -1596,6 +1661,43 @@ mod proxy_tests {
         assert!(
             html.contains("Running migrations…"),
             "the connect-failure splash must render the passed boot phase label"
+        );
+    }
+
+    /// A widget is an iframe, and the brand splash would fill it. Its poller
+    /// also cannot reach the gateway from a sandboxed frame, so the splash
+    /// would stay after the engine came back.
+    #[tokio::test]
+    async fn an_unreachable_engine_gives_a_frame_the_quiet_page_not_the_splash() {
+        let dir = test_engine::scratch();
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/dev/app/clock/")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "iframe")
+            .body(Body::empty())
+            .unwrap();
+        let resp = proxy(
+            &test_engine::unreachable(&dir),
+            "dev",
+            "Starting engine…",
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get("x-lucidos-boot-splash").is_none());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(!html.contains("boot-splash"), "{html}");
+        assert!(!html.contains("Starting engine"), "{html}");
+        assert!(
+            html.contains(&format!(
+                r#"<meta http-equiv="refresh" content="{STARTING_POLL_SECS}">"#
+            )),
+            "the frame must reload itself without a fetch: {html}"
         );
     }
 

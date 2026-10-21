@@ -183,6 +183,69 @@ export interface AgentBinariesResponse {
   codex: AgentBinaryStatus;
 }
 
+/** One model at one effort: an intelligence rung. Mirrors the engine
+ *  `IntelligenceRung`. */
+export interface IntelligenceRung {
+  model: string;
+  effort: string;
+}
+
+/** A rung's cost or time per task against the reference rung. Mirrors the
+ *  engine `Band`, whose `label` is the one place a band is formatted. */
+export interface Band {
+  multiple: number;
+  label: string;
+}
+
+/** One served intelligence rung. Its `cost` reads `included` on a route that
+ *  bills nobody. Mirrors the engine `ServedIntelligenceRung`. */
+export interface ServedIntelligenceRung extends IntelligenceRung {
+  label: string;
+  on: boolean;
+  /** The pair has an estimate, whatever the reference rung is. */
+  estimated: boolean;
+  intelligence: Band | null;
+  cost: Band | null;
+  time: Band | null;
+  is_default: boolean;
+}
+
+/** Shares are 0 to 1. Mirrors the engine `LongPromptShare`. */
+export interface LongPromptShare {
+  effective: number;
+  set: number | null;
+  measured: number | null;
+  line_tokens: number;
+}
+
+/** Who picks from an intelligence ladder. Mirrors the engine `LadderSurface`. */
+export type LadderSurface = 'chat' | CodingAgent;
+
+/** GET /api/v1/intelligence-ladder. Mirrors the engine `IntelligenceLadder`. */
+export interface IntelligenceLadder {
+  surface: LadderSurface;
+  /** Absent for chat. */
+  coding_agent?: CodingAgent;
+  source: string;
+  estimated: string;
+  customised: boolean;
+  /** Whether the rungs that are on climb in intelligence, top to bottom. */
+  climbs: boolean;
+  shipped_rungs: IntelligenceRung[];
+  default_rung: IntelligenceRung | null;
+  reference: IntelligenceRung | null;
+  /** `null` for chat, whose calls it does not measure. */
+  long_prompt_share: LongPromptShare | null;
+  rungs: ServedIntelligenceRung[];
+}
+
+/** A coding-agent surface's ladder, which always names its backend and
+ *  prices in the long-prompt share. */
+export interface CodingAgentLadder extends IntelligenceLadder {
+  coding_agent: CodingAgent;
+  long_prompt_share: LongPromptShare;
+}
+
 /** One way a model can be served: a backend, the id sent to it, and what that
  *  backend offers. Mirrors the engine `api::RouteInfo`.
  *
@@ -190,7 +253,7 @@ export interface AgentBinariesResponse {
  *  whichever provider the workspace has credentials for. */
 export interface RouteInfo {
   /** 'vertex' | 'anthropic' | 'openai' | 'openrouter' | 'xai' |
-   *  'opencode-free' | 'local'. */
+   *  'opencode-free' | 'local' | 'claude-gateway'. */
   provider: string;
   /** The id this route puts on the wire. The engine always spells it out, even
    *  where the stored route leaves it to default to the row's own id. */
@@ -208,7 +271,7 @@ export interface RouteInfo {
 }
 
 /** A chat model in the DB-backed registry (Settings → Models). Mirrors the
- *  engine `api::ModelInfo`. `source` is 'builtin' (disable-only) or 'user'
+ *  engine `api::ModelInfo`. `source` is 'builtin' (never deleted) or 'user'
  *  (deletable). */
 export interface ModelInfo {
   id: string;
@@ -230,7 +293,9 @@ export interface ModelInfo {
   successor: string | null;
   sort_order: number;
   source: string;
-  enabled: boolean;
+  /** Whether a rung that is on the chat intelligence ladder runs this model.
+   *  The chat picker lists exactly these. */
+  on_chat_ladder: boolean;
   created_at: string;
 }
 
@@ -532,6 +597,9 @@ export interface BackgroundModel {
    *  not-found for it. Only a stored pick or the chat model can be
    *  unreachable, and its calls then fail. */
   reachable: boolean;
+  /** What runs instead of `model` within its lineage, and why. `null` when
+   *  `model` runs as it is. */
+  generation: GenerationStep | null;
   /** The models this row would run on ahead of `model`, plus `model`, whose
    *  provider answered not-found in the last six hours (ADR 0403). */
   not_served: string[];
@@ -546,6 +614,15 @@ export interface BackgroundModel {
   /** The models the picker lists first, best first. */
   recommended: RecommendedSelection[];
 }
+
+/** What a background task runs instead of the model it names. Mirrors the
+ *  Rust `GenerationStep`: a retired model's successor, an earlier version
+ *  when nothing newer is served, or the retired model held because its
+ *  successor is not served. */
+export type GenerationStep =
+  | { kind: 'successor'; model: string }
+  | { kind: 'predecessor'; model: string }
+  | { kind: 'held'; successor: string };
 
 /** One recommended model, and the tier its picker badges as recommended.
  *  Mirrors the Rust `RecommendedSelection`. `effort` is set only where

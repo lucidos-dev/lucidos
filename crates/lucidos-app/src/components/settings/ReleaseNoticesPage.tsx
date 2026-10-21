@@ -5,6 +5,7 @@ import {
   loadReleaseNotices,
   takeReleaseNoticeAction,
 } from '../../store/actions/releaseNotices';
+import { releaseNoticeActionLabel } from '../../store/releaseNotices';
 import { Disclosure } from '../shared/Disclosure';
 import { ReleaseNoticeBody } from '../shared/ReleaseNoticeBody';
 import { LoadableError } from '../shared/LoadableError';
@@ -72,8 +73,7 @@ export function releaseNoticeSplit(view: ReleaseNoticeView): NoticeSplit {
 }
 
 /** One row. Only a QUEUED notice can be acted on nowhere: it is waiting its
- *  turn. The modal keeps that order by drawing no later notice at all, and this
- *  is the same rule where every row is visible at once.
+ *  turn, so notices are worked through in order even with every row visible.
  *
  *  **An answered row keeps a LIVE action button.** Got it says the reader has
  *  read the notice, never that they have carried it out, so the two are
@@ -85,13 +85,18 @@ export function releaseNoticeSplit(view: ReleaseNoticeView): NoticeSplit {
  *  button, answered or not. Two separate conditions, and each is load bearing.
  *
  *  `action_label` is optional. Without the first, a notice carrying no action
- *  could be answered nowhere but the modal, which Escape closes for the page's
- *  life. The *System attention badge* points at this page, so the reader would
- *  arrive at a dot with nothing to press.
+ *  could be answered nowhere. The *System attention badge* points at this page,
+ *  so the reader would arrive at a dot with nothing to press.
  *
  *  With no `notice`, inside a `SkeletonProvider`, it is the page's loading
  *  placeholder. */
 function NoticeRow({ notice, state = 'owed', blockedBy }: Partial<NoticeRow> & { blockedBy?: string }) {
+  const actionLabel = notice && releaseNoticeActionLabel(notice);
+  const hint = state === 'queued' && blockedBy
+    ? `Work through "${blockedBy}" first.`
+    : notice?.action_label && !actionLabel
+      ? `${notice.action_label} comes with a later notice, so you do it once.`
+      : null;
   if (!notice) {
     return (
       <div class="release-notice-row" aria-hidden="true">
@@ -122,25 +127,22 @@ function NoticeRow({ notice, state = 'owed', blockedBy }: Partial<NoticeRow> & {
         <span class="release-notice-row-since">Since Lucidos {notice.since}</span>
       </div>
       <ReleaseNoticeBody body={notice.body} />
-      {(notice.action_label || state !== 'resolved') && (
+      {(actionLabel || state !== 'resolved') && (
         <div class="release-notice-row-actions">
           {/* Before the buttons, so the reading order matches the row: the
               explanation on the left, the controls it explains on the right. */}
-          {state === 'queued' && blockedBy && (
-            <span class="release-notice-row-hint">Work through "{blockedBy}" first.</span>
-          )}
-          {notice.action_label && (
+          {hint && <span class="release-notice-row-hint">{hint}</span>}
+          {actionLabel && (
             <button
               type="button"
               class="action-btn"
               disabled={state === 'queued'}
               onClick={() => void takeReleaseNoticeAction(notice)}
             >
-              {notice.action_label}
+              {actionLabel}
             </button>
           )}
-          {/* The same word the modal uses, for the same act: it answers this
-              notice and nothing else. */}
+          {/* Answers this notice and nothing else. */}
           {state !== 'resolved' && (
             <button
               type="button"
@@ -165,9 +167,9 @@ function NoticeRow({ notice, state = 'owed', blockedBy }: Partial<NoticeRow> & {
  * different questions. What's New says what CHANGED, release by release. A
  * notice says what you have to do about it, once.
  *
- * This is also where a notice lives once its modal is gone. Tap one action, or
- * close the modal on the way to doing something else, and the rest are here
- * rather than lost.
+ * This is where notices are answered: the modal only announces them and opens
+ * this page. An action starts a thread while the page stays put, so the rest
+ * are still here.
  *
  * ONE heading, the page's own. The owed notices ARE the page, so they need no
  * heading. The answered ones fold under a disclosure that says what they are.

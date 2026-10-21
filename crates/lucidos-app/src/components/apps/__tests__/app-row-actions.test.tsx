@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 /**
  * An apps panel row acts like a thread drawer row. A pin toggle is always
- * drawn, in both states. Edit and Delete sit in the row's menu: a desktop
+ * drawn, in both states. Edit, Add to dashboard and Delete sit in the row's
+ * menu: a desktop
  * row draws its ⋯ and a right-click opens the menu too, while a phone row
  * draws no ⋯ and a hold opens it. Nothing but a plain press opens the app.
  * It names no marketplace and no update: those live in the Plugins panel.
@@ -10,6 +11,21 @@ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 
+const api = vi.hoisted(() => ({ added: [] as Array<{ dashboard: string; tile: unknown }>,
+  removed: [] as Array<{ dashboard: string; tile: unknown }>,
+}));
+vi.mock('../../../api/client/widgets', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../api/client/widgets')>()),
+  addToDashboardApi: (dashboard: string, tile: unknown) => {
+    api.added.push({ dashboard, tile });
+    return Promise.resolve({ made_reusable: false });
+  },
+  removeFromDashboardApi: (dashboard: string, tile: unknown) => {
+    api.removed.push({ dashboard, tile });
+    return Promise.resolve({});
+  },
+}));
+
 vi.mock('../../../store/actions/pinnedApps', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/pinnedApps')>()),
   togglePinApp: vi.fn(),
@@ -17,6 +33,7 @@ vi.mock('../../../store/actions/pinnedApps', async (importOriginal) => ({
 
 import { AppRow } from '../AppCard';
 import { isAppPinned, togglePinApp } from '../../../store/actions/pinnedApps';
+import { currentDashboard, dashboards } from '../../../store/dashboards';
 import { pinnedApps } from '../../../store/store';
 import { viewportIsMobile } from '../../../utils/viewport';
 import type { App } from '../../../store/types';
@@ -40,9 +57,21 @@ const info = () => row().querySelector<HTMLElement>('.list-row-info')!;
 const pin = () => row().querySelector<HTMLButtonElement>('button[aria-pressed]')!;
 const trigger = () => host.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]');
 const menuItems = () => [...document.querySelectorAll<HTMLElement>('.thread-overflow-menu [role="menuitem"]')];
-const item = (label: string) => menuItems().find((el) => el.textContent === label);
+/** A row with a hint (Add to dashboard) names itself in its first span. */
+const menuLabel = (el: HTMLElement) => el.querySelector('.widget-menu-label > span')?.textContent ?? el.textContent;
+const menuLabels = () => menuItems().map(menuLabel);
+const item = (label: string) => menuItems().find((el) => menuLabel(el) === label);
 const rowButtonLabels = () =>
   [...row().querySelectorAll('button')].map((b) => b.textContent?.trim() || b.getAttribute('aria-label'));
+
+/** Both dashboards loaded, holding these apps, so no read starts. */
+function dashboardsHolding(appIds: string[]) {
+  const tiles = appIds.map((app_id) => ({ kind: 'app' as const, app_id, name: app_id, size: 'quarter' as const }));
+  dashboards.value = new Map([
+    ['phone', { status: 'loaded', data: { dashboard: 'phone', tiles } }],
+    ['desktop', { status: 'loaded', data: { dashboard: 'desktop', tiles } }],
+  ]);
+}
 
 function setPinned(pinned: boolean) {
   pinnedApps.value = { status: 'loaded', data: pinned ? [{ app_id: APP.id }] : [] } as typeof pinnedApps.value;
@@ -90,6 +119,9 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
   vi.mocked(togglePinApp).mockImplementation(flipPinned);
+  api.added = [];
+  api.removed = [];
+  dashboardsHolding([]);
   host = document.createElement('div');
   document.body.appendChild(host);
 });
@@ -99,6 +131,7 @@ afterEach(() => {
   host.remove();
   document.querySelectorAll('.thread-overflow-menu').forEach((el) => el.remove());
   pinnedApps.value = { status: 'not-loaded' };
+  dashboards.value = new Map();
   viewportIsMobile.value = false;
   vi.useRealTimers();
 });
@@ -167,7 +200,7 @@ describe('a desktop row', () => {
   it('opens a menu of Edit and Delete from the ⋯, without opening the app', () => {
     mount();
     act(() => { trigger()!.click(); });
-    expect(menuItems().map((el) => el.textContent)).toEqual(['Edit', 'Delete']);
+    expect(menuLabels()).toEqual(['Edit', 'Add to dashboard', 'Delete']);
     expect(trigger()!.getAttribute('aria-expanded')).toBe('true');
     expect(onOpen).not.toHaveBeenCalled();
   });
@@ -186,11 +219,30 @@ describe('a desktop row', () => {
     expect(onOpen).not.toHaveBeenCalled();
   });
 
+  it('adds the app to the dashboard this layout shows, and never opens it', async () => {
+    mount();
+    act(() => { trigger()!.click(); });
+    act(() => { item('Add to dashboard')!.click(); });
+    await vi.waitFor(() => expect(api.added).toHaveLength(1));
+    expect(api.added).toEqual([{ dashboard: currentDashboard(), tile: { appId: 'habit-tracker', params: undefined, label: undefined } }]);
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('offers Remove from dashboard once the dashboard holds the app', async () => {
+    dashboardsHolding(['habit-tracker']);
+    mount();
+    act(() => { trigger()!.click(); });
+    expect(menuLabels()).toEqual(['Edit', 'Remove from dashboard', 'Delete']);
+    act(() => { item('Remove from dashboard')!.click(); });
+    await vi.waitFor(() => expect(api.removed).toHaveLength(1));
+    expect(api.removed[0].dashboard).toBe(currentDashboard());
+  });
+
   it('leaves pinning to the row toggle, pinned or not', () => {
     setPinned(true);
     mount();
     act(() => { trigger()!.click(); });
-    expect(menuItems().map((el) => el.textContent)).toEqual(['Edit', 'Delete']);
+    expect(menuLabels()).toEqual(['Edit', 'Add to dashboard', 'Delete']);
   });
 
   it('opens the same menu on a right-click on the row', () => {
@@ -198,7 +250,7 @@ describe('a desktop row', () => {
     const contextMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 10, clientY: 10 });
     act(() => { info().dispatchEvent(contextMenu); });
     expect(contextMenu.defaultPrevented).toBe(true);
-    expect(menuItems().map((el) => el.textContent)).toEqual(['Edit', 'Delete']);
+    expect(menuLabels()).toEqual(['Edit', 'Add to dashboard', 'Delete']);
   });
 
   it('leaves a right-click on the pin to the pin', () => {
@@ -232,7 +284,7 @@ describe('a phone row', () => {
   it('opens the menu of Edit and Delete on a hold, without opening the app', () => {
     mount(true);
     hold(info());
-    expect(menuItems().map((el) => el.textContent)).toEqual(['Edit', 'Delete']);
+    expect(menuLabels()).toEqual(['Edit', 'Add to dashboard', 'Delete']);
     expect(onOpen).not.toHaveBeenCalled();
 
     act(() => { item('Edit')!.click(); });

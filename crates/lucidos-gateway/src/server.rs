@@ -800,9 +800,10 @@ impl GatewayState {
         }
     }
 
-    /// Record a boot failure for `id` (see [`GatewayInner::boot_failures`]). Two
-    /// producers: the `boot-failure` control endpoint, always terminal, and the
-    /// provisioning paths here, terminal or retrying.
+    /// Record a boot failure for `id` (see [`GatewayInner::boot_failures`]).
+    /// Three producers, listed in [`crate::boot_failure`]: the `boot-failure`
+    /// control endpoint, the provisioning and spawn paths, and the
+    /// supervisor's give-up.
     pub fn set_boot_failure(&self, id: &str, failure: BootFailure) {
         crate::log!(
             "[Gateway] '{}' boot failure ({}): {}",
@@ -817,6 +818,24 @@ impl GatewayState {
         if let Ok(mut f) = self.inner.boot_failures.write() {
             f.insert(id.to_string(), failure);
         }
+    }
+
+    /// Record the supervisor's give-up for `id`, unless a terminal failure is
+    /// already there, and return whichever one is kept. An engine report can
+    /// land after the tick read the map, and its cause beats the give-up's.
+    fn record_give_up(&self, id: &str, give_up: BootFailure) -> BootFailure {
+        // One write lock for the check and the insert, so no report lands
+        // between them.
+        let Ok(mut failures) = self.inner.boot_failures.write() else {
+            return give_up;
+        };
+        if let Some(terminal) = failures.get(id).filter(|f| f.is_terminal()) {
+            return terminal.clone();
+        }
+        failures.insert(id.to_string(), give_up.clone());
+        drop(failures);
+        crate::log!("[Gateway] '{}' gave up: {}", id, give_up.message());
+        give_up
     }
 
     /// Drop any boot failure for `id`. Never call this from `MarkUnhealthy`,
@@ -1521,13 +1540,16 @@ impl GatewayState {
         attempts: u32,
     ) -> ProvisionFailureAction {
         let action = provision_failure_action(e.kind, attempts);
+        let retrying = || BootFailure::retrying(&e.message, attempts, RESTART_CAP);
         self.set_boot_failure(
             id,
             match action {
-                ProvisionFailureAction::Latch => BootFailure::terminal(&e.message),
-                ProvisionFailureAction::Retry => {
-                    BootFailure::retrying(&e.message, attempts, RESTART_CAP)
+                ProvisionFailureAction::Latch if e.kind == ProvisionErrorKind::Terminal => {
+                    BootFailure::terminal(&e.message)
                 }
+                // The budget is spent on a failure that could have cleared.
+                ProvisionFailureAction::Latch => retrying().gave_up(attempts),
+                ProvisionFailureAction::Retry => retrying(),
             },
         );
         if action == ProvisionFailureAction::Latch {
@@ -1586,9 +1608,7 @@ impl GatewayState {
             self.inner.engine_loopback,
             self.engine_scheme(),
         )
-        // Retryable: the common causes (a binary mid-rebuild, a transient
-        // resource limit) clear on their own, and the budget bounds the rest.
-        .map_err(|e| ProvisionError::transient(format!("could not spawn the engine: {e}")))?;
+        .map_err(spawn_failure)?;
         // The engine now reports finer phases through the boot-phase control
         // endpoint until its first healthy probe clears the phase.
         self.set_boot_phase(&ws.id, BootPhase::StartingEngine);
@@ -1911,7 +1931,7 @@ impl GatewayState {
         &self,
         archive_tmp: PathBuf,
         archive_filename: String,
-        key_b64: String,
+        backup_key: String,
         requested_name: Option<String>,
     ) -> Result<(String, String), ApiError> {
         // An explicit name wins, otherwise parse it from the archive filename.
@@ -1986,7 +2006,7 @@ impl GatewayState {
         let me = self.clone();
         let (id_done, name_done) = (id.clone(), name.clone());
         tokio::spawn(async move {
-            let outcome = me.run_restore(ws, &archive_tmp, &key_b64).await;
+            let outcome = me.run_restore(ws, &archive_tmp, &backup_key).await;
             let _ = std::fs::remove_file(&archive_tmp);
             let next = match outcome {
                 Ok(()) => RestoreStatus::Completed {
@@ -2017,7 +2037,7 @@ impl GatewayState {
         &self,
         ws: Workspace,
         archive_tmp: &Path,
-        key_b64: &str,
+        backup_key: &str,
     ) -> Result<(), String> {
         let resolved_dir = ws.resolve_dir(self.app_data());
         // Created exclusively, because every failure below deletes this tree.
@@ -2056,7 +2076,7 @@ impl GatewayState {
 
         self.set_restore_phase("restoring");
         if let Err(e) = self
-            .run_restore_cli(&resolved_dir, &prov.database_url, archive_tmp, key_b64)
+            .run_restore_cli(&resolved_dir, &prov.database_url, archive_tmp, backup_key)
             .await
         {
             self.cleanup_failed_restore(&resolved_dir, Some(&prov.handle));
@@ -2130,7 +2150,7 @@ impl GatewayState {
         ws_dir: &Path,
         database_url: &str,
         archive_tmp: &Path,
-        key_b64: &str,
+        backup_key: &str,
     ) -> Result<(), String> {
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -2141,7 +2161,7 @@ impl GatewayState {
             .arg(archive_tmp)
             .arg("--workspace-dir")
             .arg(ws_dir)
-            .env("LUCIDOS_RESTORE_KEY", key_b64)
+            .env("LUCIDOS_RESTORE_KEY", backup_key)
             .env("DATABASE_URL", database_url)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2392,7 +2412,8 @@ impl GatewayState {
         if let Err(e) = self.teardown_postgres(&ws).await {
             crate::log!("[Gateway] '{}' database teardown failed: {}", id, e);
         }
-        self.clear_route(id);
+        // A restore can reuse this id, and must not inherit a give-up.
+        self.clear_runtime_state(id);
         // Nothing left to guard: the entry is about to leave the registry.
         self.clear_stop(id);
 
@@ -2483,8 +2504,15 @@ impl GatewayState {
                 );
             }
             Err(e) => {
-                s.last_error = Some(format!("spawn: {e}"));
                 crate::log!("[Gateway] respawn of '{}' failed: {}", s.ws.id, e);
+                // Recorded like the first attempt's, so the splash names the
+                // cause and the give-up restates it.
+                let e = spawn_failure(e);
+                s.health = match self.record_provision_failure(&s.ws.id, &e, s.restart_attempts) {
+                    ProvisionFailureAction::Latch => Health::Unhealthy,
+                    ProvisionFailureAction::Retry => Health::Booting,
+                };
+                s.last_error = Some(e.message);
             }
         }
     }
@@ -2629,28 +2657,12 @@ impl GatewayState {
                     // `boot_failures` is NOT cleared here, so a reported cause
                     // outlives the phase and still reaches the splash.
                     self.clear_boot_phase(&t.id);
-                    match &boot_failure {
-                        // A recorded cause always beats the generic "gave up"
-                        // string: it is the specific, actionable text, and it
-                        // doubles as the picker's health-dot tooltip. A
-                        // retrying failure is promoted first, because the
-                        // budget is spent and the splash must stop
-                        // auto-refreshing under a promise of another attempt.
-                        Some(failure) => {
-                            let final_failure = failure.gave_up(s.restart_attempts);
-                            s.last_error = Some(final_failure.message());
-                            if !failure.is_terminal() {
-                                self.set_boot_failure(&t.id, final_failure);
-                            }
-                        }
-                        None if s.last_error.is_none() => {
-                            s.last_error = Some(
-                                "engine failed to become healthy after repeated restarts"
-                                    .to_string(),
-                            )
-                        }
-                        None => {}
-                    }
+                    let kept = self.record_give_up(
+                        &t.id,
+                        failure_at_give_up(boot_failure.as_ref(), s.restart_attempts),
+                    );
+                    // It doubles as the picker's health-dot tooltip.
+                    s.last_error = Some(kept.message());
                     crate::log!(
                         "[Gateway] '{}' marked unhealthy after {} attempts{}",
                         t.id,
@@ -2773,6 +2785,22 @@ fn adoptable_after_stop(
         None => true,
         Some(stopped) => started_at.is_some_and(|started| started > stopped),
     }
+}
+
+/// An engine that would not spawn. Retryable: the common causes (a binary
+/// mid-rebuild, a transient resource limit) clear on their own, and the budget
+/// bounds the rest.
+fn spawn_failure(e: impl std::fmt::Display) -> ProvisionError {
+    ProvisionError::transient(format!("could not spawn the engine: {e}"))
+}
+
+/// The failure a workspace carries once the supervisor gives up on it: the
+/// recorded cause restated, or a cause-less one. Always terminal, because the
+/// budget is spent and the boot pages must stop promising another attempt.
+fn failure_at_give_up(recorded: Option<&BootFailure>, attempts: u32) -> BootFailure {
+    recorded.map_or_else(BootFailure::gave_up_without_cause, |failure| {
+        failure.gave_up(attempts)
+    })
 }
 
 /// Pure cull-or-keep decision for one stack. `misses` is the consecutive-miss
@@ -3054,7 +3082,8 @@ pub enum RunOutcome {
 /// `scripts/lib/gateway_supervisor.sh` stops on it rather than respawning.
 pub const ALREADY_RUNNING_EXIT: u8 = 75;
 
-pub async fn run() -> Result<RunOutcome, BoxError> {
+/// `inherited_lock_fd` comes from [`take_inherited_lock_fd`].
+pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxError> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
@@ -3065,7 +3094,7 @@ pub async fn run() -> Result<RunOutcome, BoxError> {
     let app_data = lucidos_home::gateway_data_dir().ok_or("HOME not set")?;
     // Held as a `run()` local for this gateway's whole life. First, so a loser
     // never loads the registry, probes an engine or reclaims one (ADR 0438).
-    let Some(_owner_lock) = claim_data_dir(&app_data)? else {
+    let Some(_owner_lock) = claim_data_dir(&app_data, inherited_lock_fd.as_deref())? else {
         crate::log!(
             "[Gateway] another gateway already owns {}, so this one exits",
             app_data.display()
@@ -3682,19 +3711,30 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // [`BOOT_ESCAPE_BUDGET`] escapes to the manual "Back to workspaces"
             // page. An alive-but-unreachable engine is never marked
             // `Unhealthy`, so the time budget is the only honest signal.
-            // Non-document traffic still proxies, and the frontend owns its own
-            // disconnected recovery.
-            if is_document_navigation(&req) {
+            // A frame gets the quiet page for the same state, at the same
+            // cadence. Other traffic still proxies, and the frontend owns its
+            // own disconnected recovery.
+            let navigation = classify_navigation(&req);
+            if navigation != Navigation::Other {
+                let frame = navigation == Navigation::Frame;
                 // A TERMINAL failure outranks the time budget, because we
                 // already know this workspace will never come up. A RETRYING one
                 // does not land here: it renders as the ordinary splash label
                 // below, keeping the auto-refresh that carries the user in the
                 // moment an attempt succeeds.
                 if let Some(failure) = state.boot_failure(&slug).filter(|f| f.is_terminal()) {
-                    return proxy::failed_page(&failure.message());
+                    return if frame {
+                        proxy::frame_failed_page()
+                    } else {
+                        proxy::failed_page(&failure.message())
+                    };
                 }
                 if boot_window_stalled(state.boot_elapsed(&slug)) {
-                    return proxy::stalled_page();
+                    return if frame {
+                        proxy::frame_stalled_page()
+                    } else {
+                        proxy::stalled_page()
+                    };
                 }
             }
             // The route is set the instant `bring_up` spawns the engine, while
@@ -3717,12 +3757,18 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 if rest == "manifest.json" {
                     return serve_workspace_manifest(&state, &slug);
                 }
+                let navigation = classify_navigation(&req);
+                // A frame waits for whoever starts the workspace, and lands
+                // on its next reload after that.
+                if navigation == Navigation::Frame {
+                    return proxy::frame_starting_page();
+                }
                 // Never for an app asset or a frame-capability URL, whatever
                 // either claims to accept. `auth_api::enforce` lets both past
                 // the device gate. So an unpaired caller could otherwise send
                 // one `Accept: text/html` and start the engine the picker's
                 // Stop just shut down.
-                if is_document_navigation(&req)
+                if navigation == Navigation::Document
                     && !crate::auth_api::is_public_app_asset(&path)
                     && !crate::auth_api::path_carries_frame_capability(&path)
                 {
@@ -3750,7 +3796,7 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // also makes that head redirect stand down, so the picker renders
             // its list instead of bouncing back here in a loop. Non-document
             // traffic still gets a 404.
-            if is_document_navigation(&req) {
+            if classify_navigation(&req) == Navigation::Document {
                 return redirect(&format!("/{SIGIL}/?pick"));
             }
             (StatusCode::NOT_FOUND, format!("unknown workspace '{slug}'")).into_response()
@@ -3879,15 +3925,38 @@ fn boot_action(ws: &Workspace, healthy: bool, restore: &HashSet<String>) -> Boot
     }
 }
 
-/// True for a browser document navigation that should wake a stopped workspace.
-/// Background traffic from an already-open app tab (API fetches, SSE reconnects,
-/// service-worker requests, assets) must not wake it, or "Stop" cannot stick.
-fn is_document_navigation(req: &axum::extract::Request) -> bool {
+/// What a request loads, as far as the boot window cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Navigation {
+    /// A top-level page load. Only this wakes a stopped workspace, and only
+    /// this gets the full-screen boot pages.
+    Document,
+    /// A widget or app frame inside a page that is already open. It gets the
+    /// quiet frame pages, and never wakes a workspace.
+    Frame,
+    /// Background traffic from an open tab: API fetches, SSE reconnects,
+    /// service-worker requests, assets. Waking a workspace for one would mean
+    /// "Stop" cannot stick.
+    Other,
+}
+
+fn classify_navigation(req: &axum::extract::Request) -> Navigation {
     if req.method() != Method::GET && req.method() != Method::HEAD {
-        return false;
+        return Navigation::Other;
     }
 
     let headers = req.headers();
+    if crate::auth_api::is_nested_frame(headers) {
+        return Navigation::Frame;
+    }
+    if is_top_level_page_load(headers) {
+        Navigation::Document
+    } else {
+        Navigation::Other
+    }
+}
+
+fn is_top_level_page_load(headers: &axum::http::HeaderMap) -> bool {
     let header_eq = |name: &str, expected: &str| {
         headers
             .get(name)
@@ -4342,16 +4411,48 @@ fn restart_after_reload(args: impl IntoIterator<Item = String>) -> Vec<String> {
 #[cfg(unix)]
 static OWNER_LOCK_FD: std::sync::OnceLock<std::os::fd::RawFd> = std::sync::OnceLock::new();
 
+/// Take the lock descriptor a `reload_gateway` re-exec named, out of the env,
+/// and make it close-on-exec again.
+///
+/// Both are a message to this image alone. Left in place, every child inherits
+/// them, and so does every process below one. A daemon there would hold the
+/// lock after this gateway exits. A gateway or test there would read a number
+/// that names one of its own files. Call this before the first spawn, while
+/// the process is still single-threaded, since it sets process env.
+pub fn take_inherited_lock_fd() -> Option<String> {
+    let value = std::env::var(INHERITED_LOCK_FD_ENV).ok();
+    // SAFETY: single-threaded, per the contract above.
+    unsafe {
+        std::env::remove_var(INHERITED_LOCK_FD_ENV);
+    }
+    #[cfg(unix)]
+    if let Some(fd) = value.as_deref().and_then(lock_fd_number) {
+        // SAFETY: only sets one descriptor flag. Stdio is never a lock, so a
+        // stale value cannot cut a child off from it.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    value
+}
+
+/// The descriptor a lock-fd value names. Stdio never holds the lock.
+#[cfg(unix)]
+fn lock_fd_number(value: &str) -> Option<std::os::fd::RawFd> {
+    value.parse().ok().filter(|&fd| fd > 2)
+}
+
 /// Own the gateway data directory, or learn that another gateway does.
 ///
 /// `None` means another live gateway holds the owner lock. Checking and taking
 /// are one call, so two gateways launched together cannot both pass.
-fn claim_data_dir(app_data: &Path) -> Result<Option<lucidos_owner_lock::OwnerLock>, BoxError> {
+/// `inherited_fd` must be [`take_inherited_lock_fd`]'s value, or `None`.
+fn claim_data_dir(
+    app_data: &Path,
+    inherited_fd: Option<&str>,
+) -> Result<Option<lucidos_owner_lock::OwnerLock>, BoxError> {
     use lucidos_owner_lock::{gateway, OwnerLock};
     lucidos_home::ensure_storage_root(app_data)?;
     let lock_path = gateway::lock_path(app_data);
-    let inherited = std::env::var(INHERITED_LOCK_FD_ENV).ok();
-    let lock = match inherited_lock(&lock_path, inherited.as_deref())? {
+    let lock = match inherited_lock(&lock_path, inherited_fd)? {
         Some(lock) => lock,
         None => match OwnerLock::try_acquire(&lock_path)? {
             Some(lock) => lock,
@@ -4378,17 +4479,19 @@ fn inherited_lock(
     lock_path: &Path,
     inherited_fd: Option<&str>,
 ) -> std::io::Result<Option<lucidos_owner_lock::OwnerLock>> {
-    use std::os::fd::{FromRawFd as _, IntoRawFd as _, RawFd};
+    use std::os::fd::{FromRawFd as _, IntoRawFd as _};
     use std::os::unix::fs::MetadataExt as _;
-    let Some(fd) = inherited_fd.and_then(|v| v.parse::<RawFd>().ok()) else {
+    let Some(fd) = inherited_fd.and_then(lock_fd_number) else {
         return Ok(None);
     };
     // SAFETY: F_GETFD only asks whether `fd` is open, and touches no memory.
-    if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
         return Ok(None);
     }
-    // SAFETY: `fd` is open. Ownership is released again below unless it is
-    // provably the lock file.
+    // SAFETY: `fd` is open, and only the exec carried it, so nothing else here
+    // owns it. A value read from the env after boot breaks that: a file this
+    // process opened can sit at the same number. Ownership is released again
+    // below unless it is provably the lock file.
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let (held, expected) = (file.metadata(), std::fs::metadata(lock_path));
     let same =
@@ -4397,9 +4500,6 @@ fn inherited_lock(
         let _ = file.into_raw_fd();
         return Ok(None);
     }
-    // SAFETY: restores close-on-exec on a descriptor this process now owns, so
-    // no engine it spawns inherits the lock.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     lucidos_owner_lock::OwnerLock::adopt(file)
 }
 
@@ -4906,7 +5006,7 @@ mod tests {
     #[test]
     fn a_second_gateway_cannot_claim_an_owned_data_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let first = claim_data_dir(dir.path())
+        let first = claim_data_dir(dir.path(), None)
             .unwrap()
             .expect("a free data dir");
         let pid_path = lucidos_owner_lock::gateway::pid_path(dir.path());
@@ -4915,13 +5015,25 @@ mod tests {
             std::process::id().to_string()
         );
         std::fs::write(&pid_path, "the-winner").unwrap();
-        assert!(claim_data_dir(dir.path()).unwrap().is_none());
+        assert!(claim_data_dir(dir.path(), None).unwrap().is_none());
         assert_eq!(
             std::fs::read_to_string(&pid_path).unwrap(),
             "the-winner",
             "a loser must not name itself"
         );
         drop(first);
+    }
+
+    /// A claim reads the inherited descriptor from its caller, never from the
+    /// process env. A test binary inherits that env from whatever launched it.
+    #[test]
+    fn a_claim_never_reads_the_process_env() {
+        let source = include_str!("server.rs");
+        for function in ["fn claim_data_dir(", "fn inherited_lock("] {
+            let start = source.find(function).expect("the function exists");
+            let body = &source[start..start + source[start..].find("\n}\n").expect("it ends")];
+            assert!(!body.contains("env::"), "{body}");
+        }
     }
 
     /// A data dir from before the storage-root rule converges on the claim.
@@ -4931,7 +5043,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _lock = claim_data_dir(dir.path())
+        let _lock = claim_data_dir(dir.path(), None)
             .unwrap()
             .expect("a free data dir");
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
@@ -4942,12 +5054,12 @@ mod tests {
     #[test]
     fn the_gateway_asserts_the_lucidos_home_first() {
         let source = include_str!("server.rs");
-        let run = &source[source.find("pub async fn run()").expect("run() exists")..];
+        let run = &source[source.find("pub async fn run(").expect("run() exists")..];
         let asserted = run
             .find("lucidos_home::ensure()?")
             .expect("run() asserts the Lucidos home");
         let claimed = run
-            .find("claim_data_dir(&app_data)")
+            .find("claim_data_dir(&app_data,")
             .expect("run() claims the data dir");
         assert!(asserted < claimed);
     }
@@ -4999,9 +5111,9 @@ mod tests {
     #[test]
     fn the_gateway_claims_its_data_dir_before_anything_else() {
         let source = include_str!("server.rs");
-        let run = &source[source.find("pub async fn run()").expect("run() exists")..];
+        let run = &source[source.find("pub async fn run(").expect("run() exists")..];
         let claimed = run
-            .find("claim_data_dir(&app_data)")
+            .find("claim_data_dir(&app_data,")
             .expect("run() claims the data dir");
         for later in [
             "validate_engine_bin(",
@@ -5069,7 +5181,7 @@ mod tests {
     #[test]
     fn the_new_image_restarts_the_hand_over_after_its_boot_pass() {
         let source = include_str!("server.rs");
-        let run = &source[source.find("pub async fn run()").expect("run() exists")..];
+        let run = &source[source.find("pub async fn run(").expect("run() exists")..];
         let booted = run.find(".boot_all()").expect("run() boots");
         let handed = run
             .find("restart_after_reload(std::env::args()")
@@ -5612,26 +5724,206 @@ mod tests {
             ("sec-fetch-dest", "document"),
             (header::ACCEPT.as_str(), "text/html,application/xhtml+xml"),
         ]);
-        assert!(is_document_navigation(&req));
+        assert_eq!(classify_navigation(&req), Navigation::Document);
     }
 
     #[test]
     fn html_accept_falls_back_for_browsers_without_fetch_metadata() {
         let req = request_with_headers(&[(header::ACCEPT.as_str(), "text/html,*/*;q=0.8")]);
-        assert!(is_document_navigation(&req));
+        assert_eq!(classify_navigation(&req), Navigation::Document);
     }
 
     #[test]
     fn api_fetch_does_not_wake_stopped_workspace() {
         let req =
             request_with_headers(&[("sec-fetch-mode", "cors"), (header::ACCEPT.as_str(), "*/*")]);
-        assert!(!is_document_navigation(&req));
+        assert_eq!(classify_navigation(&req), Navigation::Other);
     }
 
     #[test]
     fn sse_reconnect_does_not_wake_stopped_workspace() {
         let req = request_with_headers(&[(header::ACCEPT.as_str(), "text/event-stream")]);
-        assert!(!is_document_navigation(&req));
+        assert_eq!(classify_navigation(&req), Navigation::Other);
+    }
+
+    /// A widget iframe navigates and accepts HTML, yet it belongs to a page
+    /// that is already open.
+    #[test]
+    fn a_nested_frame_is_not_a_document_navigation() {
+        for dest in ["iframe", "frame"] {
+            let req = request_with_headers(&[
+                ("sec-fetch-mode", "navigate"),
+                ("sec-fetch-dest", dest),
+                (header::ACCEPT.as_str(), "text/html,application/xhtml+xml"),
+            ]);
+            assert_eq!(classify_navigation(&req), Navigation::Frame, "{dest}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_waits_for_a_stopped_workspace_rather_than_starting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .add(Workspace::gateway_provisioned(
+                "dev".into(),
+                "Dev".into(),
+                51997,
+            ))
+            .unwrap();
+
+        let request = axum::extract::Request::builder()
+            .method("GET")
+            .uri("/dev/app/clock/")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "iframe")
+            .header(header::ACCEPT, "text/html")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        // Straight to `fallback`: the device gate is not under test here.
+        let response = fallback(State(state), request).await;
+
+        // Only the lazy-start branch stamps the boot splash, so its absence
+        // is the proof that nothing started.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().get("x-lucidos-boot-splash").is_none(),
+            "a frame must never get the boot splash"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains(r#"http-equiv="refresh""#),
+            "the frame reloads itself, to land once someone starts the workspace"
+        );
+    }
+
+    /// A workspace whose route is set but whose engine never answers, and a
+    /// widget frame asking it for its document.
+    fn routed_but_unreachable() -> (GatewayState, tempfile::TempDir, axum::extract::Request) {
+        // Short, under /tmp, so the engine socket path fits.
+        let dir = crate::engine_hop::test_engine::scratch();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        state.set_route_for_test("dev", crate::engine_hop::test_engine::unreachable(&dir));
+        let request = axum::extract::Request::builder()
+            .method("GET")
+            .uri("/dev/app/clock/")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "iframe")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        (state, dir, request)
+    }
+
+    /// Assert `frame` is the quiet frame page, reloading at the cadence the
+    /// full-screen page for the same boot state advertises.
+    async fn assert_quiet_frame_page_at_the_pace_of(frame: Response, full_screen: Response) {
+        assert_eq!(frame.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(frame.headers().get("x-lucidos-boot-splash").is_none());
+        let pace = full_screen
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert_eq!(frame.headers().get(header::RETRY_AFTER).unwrap(), &pace);
+        let body = axum::body::to_bytes(frame.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(!html.contains("boot-splash"), "{html}");
+        assert!(
+            html.contains(&format!(r#"<meta http-equiv="refresh" content="{pace}">"#)),
+            "{html}"
+        );
+    }
+
+    /// The failed page never refreshes, because reloading cannot fix the boot.
+    /// A frame has no escape link, so it keeps a slow reload to recover once
+    /// someone fixes the workspace, and shows nothing meanwhile.
+    #[tokio::test]
+    async fn a_frame_reloads_slowly_once_the_boot_has_failed() {
+        let (state, _dir, request) = routed_but_unreachable();
+        let message = "A newer Lucidos migrated this database.";
+        state.set_boot_failure("dev", BootFailure::terminal(message));
+
+        let response = fallback(State(state), request).await;
+
+        assert_quiet_frame_page_at_the_pace_of(response, proxy::failed_page(message)).await;
+    }
+
+    #[tokio::test]
+    async fn a_frame_slows_its_reload_once_the_boot_has_stalled() {
+        let (state, _dir, request) = routed_but_unreachable();
+        let since = Instant::now()
+            .checked_sub(BOOT_ESCAPE_BUDGET + Duration::from_secs(1))
+            .expect("the host has been up past the escape budget");
+        state.inner.boot_phases.write().unwrap().insert(
+            "dev".into(),
+            BootProgress {
+                phase: BootPhase::StartingEngine,
+                since,
+            },
+        );
+
+        let response = fallback(State(state), request).await;
+
+        assert_quiet_frame_page_at_the_pace_of(response, proxy::stalled_page()).await;
+    }
+
+    /// An engine that kept exiting before it could report why. The give-up
+    /// must still be terminal, or both boot pages poll forever.
+    #[test]
+    fn giving_up_is_terminal_with_or_without_a_recorded_cause() {
+        assert!(failure_at_give_up(None, 5).is_terminal());
+        let retrying = BootFailure::retrying("The Docker daemon is not running yet.", 5, 5);
+        assert!(failure_at_give_up(Some(&retrying), 5).is_terminal());
+        let terminal = BootFailure::terminal("A newer Lucidos migrated this database.");
+        assert_eq!(failure_at_give_up(Some(&terminal), 5), terminal);
+    }
+
+    /// The last attempt of the budget latches, so it must drop the retry
+    /// promise the same way the supervisor's give-up does.
+    #[test]
+    fn a_spent_budget_latches_on_the_give_up_message() {
+        let state = GatewayState::for_tests();
+        let e = crate::postgres::ProvisionError::transient("The Docker daemon is not running yet.");
+        let action = state.record_provision_failure("dev", &e, RESTART_CAP);
+        assert_eq!(action, ProvisionFailureAction::Latch);
+        let expected =
+            BootFailure::retrying(&e.message, RESTART_CAP, RESTART_CAP).gave_up(RESTART_CAP);
+        assert_eq!(state.boot_failure("dev"), Some(expected));
+
+        // A failure no retry can fix keeps its own words.
+        let e = crate::postgres::ProvisionError::terminal("No docker on PATH.");
+        state.record_provision_failure("ws", &e, 1);
+        assert_eq!(
+            state.boot_failure("ws"),
+            Some(BootFailure::terminal(&e.message))
+        );
+    }
+
+    /// An engine report can land after the supervisor read the map. Its
+    /// specific cause must survive the generic give-up.
+    #[test]
+    fn a_give_up_never_buries_a_terminal_report() {
+        let state = GatewayState::for_tests();
+        let reported = BootFailure::terminal("A newer Lucidos migrated this database.");
+        state.set_boot_failure("dev", reported.clone());
+        let kept = state.record_give_up("dev", BootFailure::gave_up_without_cause());
+        assert_eq!(kept, reported);
+        assert_eq!(state.boot_failure("dev"), Some(reported));
+
+        let retrying = BootFailure::retrying("The Docker daemon is not running yet.", 5, 5);
+        state.set_boot_failure("ws", retrying.clone());
+        let promoted = retrying.gave_up(5);
+        assert_eq!(state.record_give_up("ws", promoted.clone()), promoted);
+        assert_eq!(state.boot_failure("ws"), Some(promoted));
     }
 
     /// Locks the exact redirect target the frontend guard depends on: the sigil
@@ -6341,7 +6633,7 @@ mod tests {
     #[tokio::test]
     async fn an_unpaired_caller_cannot_start_a_stopped_workspace_with_an_app_asset() {
         // An app asset is exempt from the device gate, so this request arrives
-        // with nobody behind it. `is_document_navigation` reads `Accept` when
+        // with nobody behind it. `classify_navigation` reads `Accept` when
         // there is no fetch metadata, so a hand-written one can claim to be a
         // page load. Starting an engine on that would undo the picker's Stop
         // for a caller who never paired.

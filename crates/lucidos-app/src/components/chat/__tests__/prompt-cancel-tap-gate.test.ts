@@ -237,6 +237,17 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     expect(findActivationBody('morphActivate')).toMatch(/morphMode === 'cancel',\s*\)$/);
   });
 
+  it('wires the cancel path to both Cancel faces', () => {
+    // iOS cancels a near-still tap in the home-indicator strip, and no click
+    // follows. The ledger shows two Cancel taps lost that way before a third.
+    const loneCancel = promptSource.match(/answerMode === 'cancel' \?[\s\S]*?<\/button>/)?.[0] ?? '';
+    for (const [face, source] of [['morphActivate', findMorphButton()], ['answerCancelActivate', loneCancel]]) {
+      for (const handler of ['onTouchStart', 'onTouchMove', 'onTouchCancel']) {
+        expect(source).toMatch(new RegExp(`${handler}=\\{${face}\\.${handler}\\}`));
+      }
+    }
+  });
+
   it('gives the lone answer Submit a touch path', () => {
     expect(promptSource).toMatch(/onTouchEnd=\{answerSubmitActivate\.onTouchEnd\}/);
   });

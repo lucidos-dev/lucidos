@@ -25,7 +25,8 @@ On a packaged install, trigger agents left 24 of 44 runs to the forced call.
 
 - **Every trigger turn makes its own read decision.** The `TRIGGERS:` rule asks
   for `request_read` false when the run found nothing new. It is also false
-  when a notification the run sent already carried the news. It is true only
+  when a notification the run sent already carried the news (amended below:
+  false after any notification). It is true only
   for findings the user would otherwise miss. `triggers.md` says the same.
   The rule costs 30 characters of always-loaded context
   (`ALWAYS_LOADED_BUDGET_CHARS` is now 131,198).
@@ -34,7 +35,8 @@ On a packaged install, trigger agents left 24 of 44 runs to the forced call.
   call as a closing note with its title and message.
 - **Its question treats a push as a headline.** A reply that restates the push,
   says it was sent, repeats what an app now shows, or adds bookkeeping is a no.
-  Details the user needs to act on still read. A run with nothing new is a no,
+  Details the user needs to act on still read (amended below: they no longer
+  do). A run with nothing new is a no,
   even when it lists what it checked or repeats standing items. A report the
   trigger asks for on every run still reads.
 - **The read decision defaults to its chat model**, led by
@@ -120,6 +122,19 @@ introductory price ends), `gpt-5.6-luna` about $0.0003.
 - The real set is three workspaces, labelled by one agent. Rerun both sets
   before any later change.
 
+## Amendment: a push replaces the read
+
+A price check pushed "Model prices changed" and also asked to be read, so the
+news reached the user twice. The maintainer: "Don't need both." The agent rule,
+`triggers.md` and the judgment's question now say one thing. A turn that sent a
+notification is a no, unless the reply holds a failure the notification does not
+mention. Details beyond the push no longer earn a read. The eval's three
+`trigger-pushed-more` turns are now `trigger-pushed` noes, and a
+`trigger-pushed-failure` turn covers the exception.
+
+It stays guidance, not code: the deterministic rule below is still rejected.
+Record: `docs/plans/2026-10-19-a-notification-replaces-the-read-request.md`.
+
 ## Alternatives considered
 
 - **Keep OpenAI Decisions as the default.** Lost: 22 of 61 routine runs still
@@ -129,7 +144,8 @@ introductory price ends), `gpt-5.6-luna` about $0.0003.
   push?", combined in code. Likely what that API is built for, and cheap, but a
   new design for one backend. Measured and rejected in ADR 0477.
 - **A deterministic rule: a push means no.** Lost: a push can be a teaser, and
-  the reply can hold a failure.
+  the reply can hold a failure. The amendment above keeps it out of code, but
+  no longer treats a teaser push as a reason to read.
 - **Nudge the trigger agent until it decides.** Lost: the forced call is the
   backstop by design (ADR 0417), and a nudge costs a model turn per run.
 - **Raise the threshold.** Lost: see Rationale, the threshold is not the lever.

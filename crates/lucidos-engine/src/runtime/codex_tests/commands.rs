@@ -5,6 +5,7 @@ fn test_config(worktree: &Path) -> CodexConfig {
         codex_bin: std::ffi::OsString::from("codex"),
         worktree_path: worktree.to_path_buf(),
         system_prompt: None,
+        session_context: None,
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),

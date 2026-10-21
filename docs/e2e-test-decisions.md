@@ -21,6 +21,9 @@ It launches `Contents/MacOS/Lucidos --service` (`desktop::run_service` → `spaw
 ### fastembed cache is seeded, not re-downloaded
 `spawn_gateway` pins `FASTEMBED_CACHE_DIR` to `<app-data>/fastembed`; under a temp `HOME` that is cold (~465 MB HF download + networked warmup at engine boot). The smoke test symlinks that dir to the machine-persistent shared cache the embedder e2e already seeds (`${XDG_CACHE_HOME:-$HOME/.cache}/lucidos/fastembed`), so a seeded host is offline/fast and a cold host downloads the model once (warming future runs).
 
+### Real-embedder tests skip on a model-fetch outage
+A `tokenizer.json` fetch from huggingface.co once timed out and failed the nightly e2e. So `e2e-embedder.sh` pins `FASTEMBED_CACHE_DIR` to a machine-persistent dir that survives `cargo clean` and worktree churn. On a cache hit `hf-hub` short-circuits before any network call. When the cache is cold and huggingface.co is unreachable, `shared_embedder()` returns `None` and logs a `SKIP` line. Only a model-fetch error skips. To prove the skip, point `FASTEMBED_CACHE_DIR` at an empty dir with `HF_ENDPOINT=http://127.0.0.1:1`.
+
 ### Packaged smoke test is standalone + opt-in (heavy build)
 Building the `.app` is a full release engine+gateway build + a relocatable Postgres download + a frontend build + `cargo tauri build`. Too heavy for every run, so `e2e-packaged.sh` is a standalone script kept out of the default `e2e.sh`; the nightly opts in via `e2e.sh --packaged` / `LUCIDOS_E2E_PACKAGED=1`. It is macOS-only and skips gracefully elsewhere.
 
@@ -29,6 +32,32 @@ The Tauri command layer (`lib.rs`, `notifications.rs`) is mostly GUI/IPC glue th
 
 ### Dual layout handling
 Lucidos renders desktop and mobile layouts simultaneously — every DOM element exists twice. All Playwright selectors use `.first()` and visibility checks via `getBoundingClientRect()` to target only the visible (desktop) element. The `openThreadDrawer()` helper uses `page.evaluate()` with rect checks rather than Playwright's `.isVisible()` to avoid false positives from the hidden mobile layout.
+
+### Calm motion by default
+
+`playwright.config.ts` sets `reducedMotion: 'reduce'` for every project. The Motion setting defaults to `system`, so the app resolves `data-motion="reduce"`: the duration scale drops to 0.001, and FLIP and scroll glides jump to their end. A spec then never waits out a glide, a fade or a late frame, which was the most common e2e flake.
+
+A spec that tests motion opts back in with `test.use({ reducedMotion: 'no-preference' })`. So does a spec that asserts what reduced motion stops. Its own `emulateMedia` or Motion preference then turns motion off, so the assertion cannot pass vacuously.
+
+`e2e/motion-stance.test.ts` (a Vitest test) enforces this. A spec that calls `getAnimations()`, reads `animationName`, sets the animation speed slider, or samples frames against `performance.now()` must name its stance in a `test.use`: `'no-preference'`, or `'reduce'` when it only waits motion out. The guard cannot see a spec that measures a glide by geometry alone, so check new glide specs by hand.
+
+**Rejected:** a per-spec `emulateMedia` in a shared helper. The suite default is one line, and the opt-in stays visible at the top of the spec that needs it.
+
+### One browser by default
+
+A spec's file suffix picks its Playwright projects (`e2e/projectRules.ts`, ADR 0531):
+
+| Suffix | Projects |
+|---|---|
+| none, `-desktop` | desktop Chromium |
+| `-mobile` | mobile Chromium, mobile WebKit |
+| `-all` | all three |
+
+Name a new spec `-all` when it asserts a phone path or a WebKit behaviour as well as the desktop one. Name it `-mobile` when only the phone matters.
+
+`scripts/lib/e2e_projects.sh` `project_runs_spec` restates the rules for the shell: targeted runs, the WebKit chunking, the GitHub shard plan and `/harden`'s WebKit specs. `e2e/project-rules.test.ts` fails when the two disagree, or when a spec runs on no project. It also fails when a desktop-only spec branches on `isMobile`, `browserName`, `project.name`, `hasTouch`, `tap()` or `touchscreen`.
+
+**Rejected:** unsuffixed specs on all three projects with a `-chromium` opt-out. Every new spec would pay for three projects unless its author thought to opt out.
 
 ### Thread drawer is collapsed by default
 At 1280x800 viewport, the thread drawer starts collapsed. Tests that need it must call `openThreadDrawer()` which clicks the toggle button if the drawer isn't already visible.
@@ -103,30 +132,27 @@ Deliberately *not* swept: any `vite`/web-dev server. Under ADR 0014 e2e runs a o
 
 Lock logic lives in `scripts/lib/e2e_lock.sh`. `scripts/lib/e2e_lock_test.sh` covers it: run it directly, with no harness. It is hermetic, fakes orphans with sleepers, and never spawns a browser.
 
-### A run that LOST the lock subscribes; it does not poll
-The lock's refusal is correct, and how a loser *waits* was not. On 2026-08-09 three coding-agent threads raced for it at once: one held it mid mobile-webkit run, and both losers hand-rolled a busy-wait. One wrote `/tmp/run-e2e-retry-<pid>.sh` with `for i in $(seq 1 120)` around `./scripts/e2e-browser.sh` and `sleep 20; continue` on refusal, a 40 minute foreground tool call that re-executed the entry script's build checks on every attempt; the other parked on a bare `sleep 20`. Both burned a Claude Code turn and held engine capacity to learn something the engine could have told them.
+### A run that LOST the lock gives up; it never waits
+Sleep loops came first: on 2026-08-09 two losers hand-rolled a busy-wait around `./scripts/e2e-browser.sh`. ADR 0057 replaced them with an event wait on `E2ELockReleased`. That did not scale once `/harden` ran the touched specs locally (ADR 0502): 14 threads parked on the lock in 6 hours on 2026-10-20, each keeping its cache warm and blocking its own Apply.
 
-So **the lock announces itself**. Every hold emits `E2ELockAcquired` when it starts and `E2ELockReleased` when it ends, as domain events through `lucidos events emit`. A refused run subscribes with `lucidos await-event --on E2ELockReleased` and **ends its turn**. The engine re-opens the thread when the event lands.
+So **a refused run gives up** (ADR 0541). It exits 75 (`E2E_LOCK_BUSY_EXIT`), and `/harden` reads that from a touched-spec suite as a `SKIP` that passes. The *main check* runs every spec after landing. `.claude/skills/e2e-lock-busy/SKILL.md` carries the agent-facing rule, and the refusal message says the same, so an agent that never loaded the skill still does the right thing.
 
-`.claude/skills/e2e-lock-wait/SKILL.md` carries the agent-facing rules: one-shot subscription, forward-only watch, the cap of 20 counted subscriptions an hour, the attempt cap, and timeout handling. The refusal message teaches the same path in four lines, so an agent that never loaded the skill still does the right thing.
+**The lock still announces itself.** Every hold emits `E2ELockAcquired` when it starts and `E2ELockReleased` when it ends, as domain events through `lucidos events emit`. Taking the lock stands down a watch armed before ADR 0541.
 
 | Event | When | Payload |
 |---|---|---|
 | `E2ELockAcquired` | a run takes the lock | `script`, `thread_id`, `worktree`, `reclaimed` |
 | `E2ELockReleased` | a hold ends | `script`, `thread_id`, `worktree`, `held_secs`, `outcome`: `released` or `reclaimed` |
 
-**Both endings emit, including the reclaim.** A waiter is blocked on the *hold*, and a hold whose owner died is over just as finally: the dead owner's EXIT trap never ran, so the run that reclaims the stale lock emits the release on its behalf with `outcome: "reclaimed"`, describing the dead owner rather than itself. That is what stops a hard-killed holder from stranding every waiter until its own deadline.
+**Both endings emit, including the reclaim.** A hold whose owner died is over just as finally, but its EXIT trap never ran. So the run that reclaims the stale lock emits the release on its behalf, with `outcome: "reclaimed"`. The payload describes the dead owner rather than the reclaimer.
 
-**The emit is best effort and bounded, in that order of importance.** A missing `lucidos`, a down engine, a non-zero exit and a hang must not turn a green run red or stall an EXIT trap, so failures are discarded and the wait is capped at `E2E_LOCK_EMIT_TIMEOUT_S` (5s) against a wall-clock deadline. Not a tick count: each `sleep 0.1` costs a fork, ~0.25s on a loaded Mac, so counting iterations bounds the naps rather than the elapsed time and drifts furthest exactly when a teardown is running. The CLI's own 30s reqwest default is both too slow for a teardown and no help against a `lucidos` wedged before its HTTP client exists. The emit is suppressed entirely while `$E2E_LOCK_DIR_OVERRIDE` is set, which is what keeps `e2e_lock_test.sh` from writing `E2ELock*` events into the developer's live workspace. And the release emit is announced ONLY if the `rm` actually succeeded: `rm -f` is silent about a missing file but not about a permission error, and announcing through one wakes every waiter onto a lock that is still held.
+**The emit is best effort and bounded, in that order of importance.** A missing `lucidos`, a down engine, a non-zero exit or a hang must not turn a green run red. Nor may they stall an EXIT trap. So failures are discarded, and the wait is capped at `E2E_LOCK_EMIT_TIMEOUT_S` (5s) against a wall-clock deadline.
 
-**Acquire announces in the BACKGROUND, release in the foreground**, which is not symmetry worth tidying away. `acquire_e2e_lock` returns having taken the lock, and both entry points install their teardown only afterwards, so anything it blocks on widens the window in which an interrupt leaves a stale lock nobody releases and no waiter hears about. `release_e2e_lock` runs inside that teardown with the lock already gone, so blocking there costs teardown time and nothing else, which is exactly what the bound is for.
+The cap is not a tick count. Each `sleep 0.1` costs a fork, about 0.25s on a loaded Mac. Counting iterations bounds the naps, not the elapsed time, and drifts most during a teardown. The CLI's own 30s reqwest default is too slow for a teardown. It also cannot help against a `lucidos` wedged before its HTTP client exists.
 
-**Two gaps are accepted rather than closed, and the subscriber's own `--timeout-secs` is the recovery for both.** They are documented here and in the skill because a waiter that does not know about them reads an idle thread as progress:
+The emit is suppressed while `$E2E_LOCK_DIR_OVERRIDE` is set, which keeps `e2e_lock_test.sh` from writing `E2ELock*` events into the developer's live workspace. The release is announced ONLY if the `rm` succeeded. `rm -f` is silent about a missing file but not about a permission error. Announcing through one would report a lock free that is still held.
 
-- **Cross-workspace.** The lock is shared by every workspace on the machine, but `lucidos events emit` writes to the emitting subprocess's own `$LUCIDOS_WORKSPACE`. A holder in workspace A releasing does not wake a waiter in workspace B. Deliberately not closed by a second emit or by hand-rolled HTTP at another engine's port (ADR 0057). `acquire_e2e_lock` compares the holder's `WORKTREE` against `$LUCIDOS_WORKSPACE` and says so in the refusal when it can tell, staying silent when it cannot (no `LUCIDOS_WORKSPACE` to compare against) rather than guessing.
-- **Engine down at the moment of release.** The emit is an HTTP POST to a live engine, so nothing is written and there is nothing for the waiter's boot catch-up scan to find. Narrow in practice: a wake only works same-workspace, so the waiter shares that engine and is down with it.
-
-**The subscription itself survives a restart**, and that is the half worth knowing: the persisted `EventWaitStarted` *is* the wait, rebuilt from the event store at boot, carrying the event sequence it was armed at so a release emitted while the engine was down is still delivered on the way back up, and an expired one wakes its thread with a timeout instead of vanishing (`crates/lucidos-engine/src/engine/event_wait/`). Only the emit is mortal.
+**Acquire announces in the BACKGROUND, release in the foreground**, which is not symmetry worth tidying away. `acquire_e2e_lock` returns having taken the lock. Both entry points install their teardown only afterwards. So anything it blocks on widens the window where an interrupt leaves a stale lock nobody releases. `release_e2e_lock` runs inside that teardown, with the lock already gone. Blocking there costs teardown time and nothing else, which is what the bound is for.
 
 ### Worktree cleanup must never delete branches by name or ancestry
 `cleanup_e2e_worktrees` (in `scripts/lib/e2e.sh`, run on browser-test teardown) removes the worktrees that e2e-spawned CC sessions leave behind, so the canonical lucidos repo doesn't accumulate dead worktrees that blow the engine's 30s startup-recovery budget. The trap: those worktrees register in the **canonical** `~/projects/lucidos` repo — the same repo every *real* CC session (dev/personal worktrees + their `claude-code/*` branches) lives in — and `$_E2E_PROJECT_DIR` is whichever checkout invoked the script, frequently a real CC worktree of that repo. An earlier version deleted every `claude-code/*` branch whose tip was an ancestor of `main` ("no unique work"), assuming real sessions are always ahead of main. That's false for a **just-started** session that hasn't committed yet: its branch sits exactly at main. On 2026-06-13 this force-deleted a live session's branch and wiped its worktree mid-task. The only safe discriminator for "created by an e2e run" is the **worktree path under `$E2E_WORKSPACE`**; cleanup now removes only those worktrees and deletes only the branch each was checked out on. Regression: `scripts/lib/e2e_test.sh::test_cleanup_spares_real_cc_sessions` (run directly, no harness).
@@ -259,7 +285,7 @@ already excluded; no marker is needed or effective.
   rate as historically, and the host has no proxy so variant 1 could not have been
   involved.
 - Three deterministic failures (`control-menu.spec.ts:97`,
-  `message-route-panel.spec.ts:11`, `:55`) are **pre-existing and unrelated** to
+  `message-route-panel-all.spec.ts:11`, `:55`) are **pre-existing and unrelated** to
   this change: they fail identically on a baseline checkout (changes stashed) with
   `<div id="app"> intercepts pointer events`, i.e. the overlay inert-behind feature
   (`c86c2adec`) made an anchor/backdrop target `pointer-events: none` while the
@@ -269,18 +295,18 @@ already excluded; no marker is needed or effective.
 **Follow-up verification (2026-06-16, flaky-recovered nightly).**
 
 - Nightly recovered three first-attempt failures: `mobile-webkit`
-  `paste-link-substitution.spec.ts:124`, `mobile-webkit` `drafts.spec.ts:65`,
+  `paste-link-substitution-all.spec.ts:124`, `mobile-webkit` `drafts-all.spec.ts:65`,
   and `chromium` `coding-agent-stuck-waiting.spec.ts:98`.
 - Focused repeats with `--retries=0` did not reproduce the three reported tests,
   but a full `mobile-webkit --retries=0` run did reproduce the residual as
   pre-commit `page.goto('/')` timeouts in unrelated random victims
-  (`drafts.spec.ts:436`, then `repo-files.spec.ts:218`). That proved the old
+  (`drafts-all.spec.ts:436`, then `repo-files-all.spec.ts:218`). That proved the old
   DCL-gated helper was only part of the issue: the remaining wedge can happen
   before the main response commits.
 - After adding the mobile-webkit context preflight, full `mobile-webkit
   --retries=0` passed 228/228. Final-source focused reruns also passed the
-  reported/victim set (`paste-link-substitution.spec.ts:124`,
-  `drafts.spec.ts:65`, `drafts.spec.ts:436`, `repo-files.spec.ts:218`) and the
+  reported/victim set (`paste-link-substitution-all.spec.ts:124`,
+  `drafts-all.spec.ts:65`, `drafts-all.spec.ts:436`, `repo-files-all.spec.ts:218`) and the
   mobile navigation suite with retries disabled.
 - The chromium recovered test was independent: its nightly 0 ms failure shape
   matched setup/worker noise, and it passed focused, repeated, and inside full
@@ -300,9 +326,9 @@ load-dependent; treat a falling `webkit_reaps` count and zero flaky-recovered
 mobile-webkit specs over several nightlies as the real signal. Do not interpret a
 single green local `e2e-browser.sh` as full proof.
 
-#### `drafts.spec.ts:65` — the per-test assertion timeout, not the wedge
+#### `drafts-all.spec.ts:65` — the per-test assertion timeout, not the wedge
 
-`drafts.spec.ts:65` ("thread draft persists when switching to compose and back")
+`drafts-all.spec.ts:65` ("thread draft persists when switching to compose and back")
 was the longest-running mobile-webkit flake (six sessions of compose-draft clobber
 fixes — see `docs/plans/2026-06-27-mobile-webkit-shard-contention.md` and
 `docs/plans/2026-06-28-drafts-sse-empty-clear-guard.md`). The inbound
@@ -338,7 +364,7 @@ that is the exact change that re-introduces the flake.
 
 #### Never select a thread row by POSITION — the drawer is not yours alone
 
-The 2026-07-26 nightly then hit `drafts.spec.ts:65` again — first attempt, **five of
+The 2026-07-26 nightly then hit `drafts-all.spec.ts:65` again — first attempt, **five of
 five** full runs, always ~35.5s — and the instrumentation above reported
 **NOT-STORED**. That verdict was **wrong**, and chasing it would have been a seventh
 blind fix in the compose-draft code. A trace of a reproduced failure (2026-07-29)
@@ -360,7 +386,7 @@ The mechanism, and the rule it forces:
    `clearAllThreads()` deleted, with `last_activity = NOW()` and no `first_message`.
    It renders as "Untitled Thread" and sorts **above** the row the running test just
    created.
-4. `drafts.spec.ts:65` navigated back with
+4. `drafts-all.spec.ts:65` navigated back with
    `clickVisibleElement(page, '.thread-row:not(.compose-draft-row)')` — *the first
    visible real row*. It clicked the foreign thread, found an empty textarea, and its
    classifier then queried `compose_text` for **that** thread — `''` → "NOT-STORED".
@@ -380,14 +406,14 @@ landing instead of masquerading as data loss.
 Why it looked webkit-only: mobile-webkit is the only project that splits its run into
 a CC phase and a nav phase and shards each into fresh-browser chunks. That split
 removes the four CC-destination spec files (14 tests) that otherwise sit between
-`coding-agent-question.spec.ts` and `drafts.spec.ts`, so on webkit `drafts:65` runs
+`coding-agent-question.spec.ts` and `drafts-all.spec.ts`, so on webkit `drafts:65` runs
 ~40s after the leaked Continue spawn — inside its window. chromium and mobile run one
 unsharded alphabetical pass, where those tests (each spawning its own CC subprocess)
 push `drafts:65` well past it. Nothing about WebKit itself was involved.
 
 #### A spec ends every session it starts
 
-Selecting by id kept `drafts.spec.ts` on its own thread. It left the leak open, and
+Selecting by id kept `drafts-all.spec.ts` on its own thread. It left the leak open, and
 the leak then broke a spec that selects by id. `drawer-archive-departure.spec.ts`
 failed every first attempt after the permission-prompt and question specs. The
 resurrected "Untitled Thread" row landed during the archive exit. That render
@@ -738,7 +764,7 @@ preflight in `e2e/fixtures.ts`, `gotoWithRetry`, and `retries: 1`.
 
 **The `drafts:65` window above is not evidence against the reversal.** Both ends
 of it are nav specs: neither `coding-agent-question.spec.ts` nor
-`drafts.spec.ts` calls `pickComposeDestination`. They sit ~40s apart because the
+`drafts-all.spec.ts` calls `pickComposeDestination`. They sit ~40s apart because the
 split removes the CC files that sat between them alphabetically. That is a
 property of the split rather than of the order.
 

@@ -18,6 +18,9 @@
 import { test, expect, Page } from './fixtures';
 import { assertHealthy, ensureOnThreadPane, navigateToApp, waitForPaneAtRest } from './helpers';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 interface Point { id: number; x: number; y: number }
 
 /** Dispatch one touch event on the element under its changed touch. Returns

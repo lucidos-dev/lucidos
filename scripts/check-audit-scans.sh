@@ -72,6 +72,13 @@ url-mutation hit window.location = url
 theme-rename hit <html data-theme="dark">
 theme-rename hit lucidos.preferences.get('look')
 theme-rename miss <html data-theme-mode="dark">
+dashboard-rename hit html[data-widget-place="home"] .clock {
+dashboard-rename hit html[data-widget-place=home] .clock {
+dashboard-rename hit if (lucidos.widget.place() === 'home') {
+dashboard-rename hit const tile = document.documentElement.dataset.widgetPlace == "home"
+dashboard-rename hit lucidos.ui.navigate('home-board')
+dashboard-rename miss html[data-widget-place="dashboard"] .clock {
+dashboard-rename miss if (lucidos.widget.place() === 'inline') {
 hand-rolled-ui hit alert("Saved")
 hand-rolled-ui hit <div class="toast">Saved</div>
 hand-rolled-ui hit <select name="unit">
@@ -108,6 +115,8 @@ removed-flags miss lucidos threads list --parent "$id"
 removed-fields hit if (t.coding_agent_has_diff) {
 cred-env hit token = os.environ["CRED_GITHUB_TOKEN"]
 auth-header hit headers: { Authorization: "Bearer " + t }
+retired-tools hit Use execute_intent(intent_id: "triage") to run it.
+retired-tools miss load_knowhow(id: "triage")
 machine-path hit open("/Users/me/notes.txt")
 machine-path miss open(os.path.expanduser("~/notes.txt"))
 db-defaults hit out = subprocess.run(["psql","-A","-t","-c",sql])
@@ -181,7 +190,7 @@ while read -r id want text; do
         FAILED=1
         continue
     fi
-    printf '%s\n' "$text" | grep -qE -e "$(cat "$WORK/patterns/$id")"
+    grep -qE -e "$(cat "$WORK/patterns/$id")" <<< "$text"
     rc=$?
     if [ "$rc" -gt 1 ]; then
         echo "ERROR: grep rejected the '$id' pattern, so the audit-scan check cannot run." >&2
@@ -196,7 +205,9 @@ while read -r id want text; do
 done <<< "$FIXTURES"
 
 for id in $SCANS; do
-    if ! printf '%s\n' "$FIXTURES" | grep -q "^$id hit "; then
+    # A here-string, not a pipe: `grep -q` quits early, and under pipefail the
+    # writer's SIGPIPE would fail the check.
+    if ! grep -q "^$id hit " <<< "$FIXTURES"; then
         echo "FAIL: scan '$id' has no hit fixture. Add one to FIXTURES in $0."
         FAILED=1
     fi

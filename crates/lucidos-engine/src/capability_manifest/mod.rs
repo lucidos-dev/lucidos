@@ -213,12 +213,11 @@ pub fn llm_tools_for(caps: &crate::llm::ToolCapabilities) -> Vec<ToolDefinition>
 #[cfg(test)]
 mod tests {
 
-    /// The arrange schema spells the size and layout enums out by hand, since
-    /// a `const` string cannot read them. This keeps it on the Rust lists.
+    /// The arrange schema spells the size and dashboard enums out by hand,
+    /// since a `const` string cannot read them. This keeps it on the Rust lists.
     #[test]
-    fn the_arrange_schema_offers_every_size_and_layout_class() {
-        let schema: serde_json::Value =
-            serde_json::from_str(HOME_BOARD_ARRANGE_LLM_SCHEMA).unwrap();
+    fn the_arrange_schema_offers_every_size_and_dashboard() {
+        let schema: serde_json::Value = serde_json::from_str(DASHBOARD_ARRANGE_LLM_SCHEMA).unwrap();
         let names = |v: &serde_json::Value| -> Vec<String> {
             v.as_array()
                 .unwrap()
@@ -226,22 +225,22 @@ mod tests {
                 .map(|s| s.as_str().unwrap().to_string())
                 .collect()
         };
-        let layouts: Vec<String> = crate::engine::thread_events::LayoutClass::ALL
+        let dashboards: Vec<String> = crate::engine::thread_events::Dashboard::ALL
             .iter()
-            .map(|l| l.as_str().to_string())
+            .map(|d| d.as_str().to_string())
             .collect();
-        let sizes: Vec<String> = crate::core::apps::WidgetSize::ALL
+        let sizes: Vec<String> = crate::core::apps::TileSize::ALL
             .iter()
             .map(|s| s.as_str().to_string())
             .collect();
-        assert_eq!(names(&schema["layout"]["enum"]), layouts);
+        assert_eq!(names(&schema["dashboard"]["enum"]), dashboards);
         assert_eq!(
             names(&schema["tiles"]["items"]["properties"]["size"]["enum"]),
             sizes
         );
         assert_eq!(
-            HOME_BOARD_LAYOUT_QUERY_ARG.enum_values,
-            layouts
+            DASHBOARD_QUERY_ARG.enum_values,
+            dashboards
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>()

@@ -19,7 +19,9 @@ impl OpenAiProvider {
     /// Convert internal messages to Responses API input items.
     ///
     /// Responses API uses a flat array of typed items:
-    /// - `{"role": "user"|"assistant", "content": "..."}`
+    /// - `{"role": "user"|"assistant", "content": "..."}`, or typed
+    ///   `input_text` / `input_image` parts when the message holds an image
+    ///   or a cache mark
     /// - `{"type": "function_call", "id": "...", "call_id": "...", "name": "...", "arguments": "..."}`
     /// - `{"type": "function_call_output", "call_id": "...", "output": "..."}`
     ///
@@ -41,7 +43,7 @@ impl OpenAiProvider {
                     }));
                 }
                 MessageContent::Blocks(blocks) => {
-                    let mut text_parts: Vec<String> = Vec::new();
+                    let mut pending = PendingMessage::default();
                     let marked_text = breakpoints.is_some()
                         && msg.role == "user"
                         && blocks
@@ -66,8 +68,9 @@ impl OpenAiProvider {
                             // wrote it.
                             ContentBlock::Text { text }
                             | ContentBlock::EngineTail { text }
-                            | ContentBlock::MemoryView { text } => {
-                                text_parts.push(text.clone());
+                            | ContentBlock::MemoryView { text }
+                            | ContentBlock::StableContext { text } => {
+                                pending.texts.push(text.clone());
                             }
                             ContentBlock::ToolUse {
                                 id,
@@ -75,14 +78,7 @@ impl OpenAiProvider {
                                 input: tool_input,
                                 ..
                             } => {
-                                // Flush accumulated text before emitting function_call
-                                if !text_parts.is_empty() {
-                                    input.push(serde_json::json!({
-                                        "role": "assistant",
-                                        "content": text_parts.join("\n"),
-                                    }));
-                                    text_parts.clear();
-                                }
+                                pending.flush(&mut input, "assistant");
                                 // Responses API requires function_call "id" to start
                                 // with "fc_".  Our internal ToolUse.id stores the
                                 // call_id from the API (starts with "call_"), so
@@ -104,20 +100,16 @@ impl OpenAiProvider {
                                         }),
                                 }));
                             }
-                            ContentBlock::Image { .. } => {
-                                // Responses API (codex models) doesn't support images — skip
+                            ContentBlock::Image {
+                                media_type, data, ..
+                            } => {
+                                pending.image(media_type, data);
                             }
                             ContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
                             } => {
-                                if !text_parts.is_empty() {
-                                    input.push(serde_json::json!({
-                                        "role": msg.role,
-                                        "content": text_parts.join("\n"),
-                                    }));
-                                    text_parts.clear();
-                                }
+                                pending.flush(&mut input, &msg.role);
                                 input.push(serde_json::json!({
                                     "type": "function_call_output",
                                     "call_id": tool_use_id,
@@ -127,12 +119,7 @@ impl OpenAiProvider {
                         }
                     }
 
-                    if !text_parts.is_empty() {
-                        input.push(serde_json::json!({
-                            "role": msg.role,
-                            "content": text_parts.join("\n"),
-                        }));
-                    }
+                    pending.flush(&mut input, &msg.role);
                 }
             }
         }
@@ -570,32 +557,30 @@ pub(crate) const MAX_EXPLICIT_BREAKPOINTS: usize = 4;
 /// same place reads the cache up to there. A read needs a breakpoint in the
 /// very same place, which is why the view marks fixed places.
 ///
-/// The parts read as the joined string would, with a newline between two
-/// parts only where the first does not already end in one. Only text
-/// travels, as images do not on this wire.
+/// The text parts read as the joined string would, with a newline between two
+/// parts only where the first does not already end in one. An image keeps its
+/// place among them and takes no breakpoint.
 fn marked_parts(
     blocks: &[ContentBlock],
     breakpoints: &mut usize,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let texts: Vec<(&str, bool)> = blocks
+    let last_text = blocks
         .iter()
-        .filter_map(|block| match block {
-            ContentBlock::MemoryView { text } => Some((text.as_str(), true)),
-            ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
-                Some((text.as_str(), false))
-            }
-            _ => None,
-        })
-        .filter(|(text, _)| !text.is_empty())
-        .collect();
-    let last = texts.len().saturating_sub(1);
-    texts
+        .rposition(|block| marked_text(block).is_some());
+    blocks
         .iter()
         .enumerate()
-        .map(|(i, &(text, marked))| {
+        .filter_map(|(i, block)| {
+            if let ContentBlock::Image {
+                media_type, data, ..
+            } = block
+            {
+                return Some(input_image(media_type, data));
+            }
+            let (text, marked) = marked_text(block)?;
             let mut text = text.to_string();
-            if i < last && !text.ends_with('\n') {
+            if Some(i) != last_text && !text.ends_with('\n') {
                 text.push('\n');
             }
             let mut part = serde_json::json!({"type": "input_text", "text": text});
@@ -603,9 +588,73 @@ fn marked_parts(
                 *breakpoints += 1;
                 part["prompt_cache_breakpoint"] = serde_json::json!({"mode": "explicit"});
             }
-            part
+            Some(part)
         })
         .collect()
+}
+
+/// A block's non-empty text, and whether it is a memory view block.
+fn marked_text(block: &ContentBlock) -> Option<(&str, bool)> {
+    let (text, marked) = match block {
+        ContentBlock::MemoryView { text } => (text, true),
+        ContentBlock::Text { text }
+        | ContentBlock::EngineTail { text }
+        | ContentBlock::StableContext { text } => (text, false),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some((text.as_str(), marked))
+}
+
+/// An image as a Responses `input_image` part, inlined as a data URL.
+fn input_image(media_type: &str, data: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "input_image",
+        "image_url": format!("data:{media_type};base64,{data}"),
+        "detail": "auto",
+    })
+}
+
+/// The text and images of one message item, gathered in block order. A label
+/// between two images must stay between them.
+#[derive(Default)]
+struct PendingMessage {
+    /// Adjacent text not yet folded into `parts`.
+    texts: Vec<String>,
+    /// Typed parts so far. Stays empty for a message with no image.
+    parts: Vec<serde_json::Value>,
+}
+
+impl PendingMessage {
+    fn image(&mut self, media_type: &str, data: &str) {
+        self.fold_text();
+        self.parts.push(input_image(media_type, data));
+    }
+
+    /// Fold the adjacent text into one `input_text` part.
+    fn fold_text(&mut self) {
+        let text = self.texts.join("\n");
+        self.texts.clear();
+        if !text.is_empty() {
+            self.parts
+                .push(serde_json::json!({"type": "input_text", "text": text}));
+        }
+    }
+
+    /// Push what was gathered as one message item, and start over. Text alone
+    /// stays one joined string.
+    fn flush(&mut self, input: &mut Vec<serde_json::Value>, role: &str) {
+        let content = if !self.parts.is_empty() {
+            self.fold_text();
+            serde_json::Value::Array(std::mem::take(&mut self.parts))
+        } else if !self.texts.is_empty() {
+            let text = self.texts.join("\n");
+            self.texts.clear();
+            serde_json::Value::String(text)
+        } else {
+            return;
+        };
+        input.push(serde_json::json!({ "role": role, "content": content }));
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +680,139 @@ mod tests {
         }
     }
 
+    fn image(data: &str) -> ContentBlock {
+        ContentBlock::Image {
+            source_type: "base64".to_string(),
+            media_type: "image/png".to_string(),
+            data: data.to_string(),
+        }
+    }
+
+    fn input_images(item: &serde_json::Value) -> Vec<&serde_json::Value> {
+        item["content"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|p| p["type"] == "input_image")
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// An attached image reaches the model as an `input_image` part after the
+    /// text. Which models read images is the vision flag's call, not this
+    /// wire's.
+    #[test]
+    fn an_attached_image_travels_as_an_input_image_part() {
+        let input = OpenAiProvider::convert_messages_responses(
+            &[user(vec![text("describe this"), image("AAAA")])],
+            None,
+        );
+        assert_eq!(input.len(), 1);
+        let parts = input[0]["content"].as_array().expect("typed parts");
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[0]["text"], "describe this");
+        assert_eq!(
+            input_images(&input[0]),
+            [&serde_json::json!({
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AAAA",
+                "detail": "auto",
+            })]
+        );
+    }
+
+    /// A tool's image rides after its function call output, in a user
+    /// message, so the output still directly follows its call.
+    #[test]
+    fn a_tool_image_follows_the_function_call_output() {
+        let input = OpenAiProvider::convert_messages_responses(
+            &[user(vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "screenshot taken".to_string(),
+                },
+                image("BBBB"),
+                text("continue"),
+            ])],
+            None,
+        );
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[1]["role"], "user");
+        let images = input_images(&input[1]);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["image_url"], "data:image/png;base64,BBBB");
+    }
+
+    /// A message marked for the cache keeps its image, and the image takes no
+    /// breakpoint.
+    #[test]
+    fn a_marked_message_keeps_its_image_unmarked() {
+        let input = OpenAiProvider::convert_messages_responses(
+            &[user(vec![view("<chat>\na\n"), text("look"), image("CCCC")])],
+            Some(MAX_BREAKPOINTS),
+        );
+        let images = input_images(&input[0]);
+        assert_eq!(images.len(), 1);
+        assert!(images[0].get("prompt_cache_breakpoint").is_none());
+        let parts = input[0]["content"].as_array().unwrap();
+        assert_eq!(parts.last().unwrap()["type"], "input_image");
+    }
+
+    /// A label between two images stays between them, on both paths, so the
+    /// "[Below: image attached to current message]" label names the right one.
+    #[test]
+    fn a_label_between_images_keeps_its_place() {
+        let blocks = || {
+            vec![
+                text("hi"),
+                image("OLD"),
+                text("[Below: current]"),
+                image("NEW"),
+            ]
+        };
+        let shape = |item: &serde_json::Value| -> Vec<String> {
+            item["content"]
+                .as_array()
+                .expect("typed parts")
+                .iter()
+                .map(|p| {
+                    p.get("text")
+                        .or_else(|| p.get("image_url"))
+                        .and_then(|v| v.as_str())
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        let plain = OpenAiProvider::convert_messages_responses(&[user(blocks())], None);
+        assert_eq!(
+            shape(&plain[0]),
+            [
+                "hi",
+                "data:image/png;base64,OLD",
+                "[Below: current]",
+                "data:image/png;base64,NEW",
+            ]
+        );
+        let mut with_view = blocks();
+        with_view.insert(0, view("<chat>\na\n"));
+        let marked =
+            OpenAiProvider::convert_messages_responses(&[user(with_view)], Some(MAX_BREAKPOINTS));
+        assert_eq!(
+            shape(&marked[0]),
+            [
+                "<chat>\na\n",
+                "hi\n",
+                "data:image/png;base64,OLD",
+                "[Below: current]",
+                "data:image/png;base64,NEW",
+            ]
+        );
+    }
+
     /// A memory view block is a cache mark on this wire too: it travels as its
     /// own part with a breakpoint, so a later request marking the same place
     /// reads up to it.
@@ -651,6 +833,27 @@ mod tests {
         assert!(parts[2].get("prompt_cache_breakpoint").is_none());
         let joined: String = parts.iter().map(|p| p["text"].as_str().unwrap()).collect();
         assert_eq!(joined, "<chat>\na\nb\nc\n</chat>\nthe task");
+    }
+
+    /// The stable context block is plain text here, with or without
+    /// breakpoints: this wire never marks it (I8).
+    #[test]
+    fn a_stable_context_block_is_plain_text_on_this_wire() {
+        let stable = || ContentBlock::StableContext {
+            text: "profile".to_string(),
+        };
+        let marked = OpenAiProvider::convert_messages_responses(
+            &[user(vec![view("<chat>\na\n"), stable(), text("the task")])],
+            Some(MAX_BREAKPOINTS),
+        );
+        let parts = marked[0]["content"].as_array().expect("typed parts");
+        assert_eq!(parts[1]["text"], "profile\n");
+        assert!(parts[1].get("prompt_cache_breakpoint").is_none());
+        let joined = OpenAiProvider::convert_messages_responses(
+            &[user(vec![stable(), text("the task")])],
+            Some(MAX_BREAKPOINTS),
+        );
+        assert_eq!(joined[0]["content"], "profile\nthe task");
     }
 
     /// A message with no memory view block, which is every Classic message,

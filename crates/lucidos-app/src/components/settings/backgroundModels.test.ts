@@ -25,7 +25,7 @@ function registryRow(id: string, provider: string, vision = false): ModelInfo {
     successor: null,
     sort_order: 0,
     source: 'builtin',
-    enabled: true,
+    on_chat_ladder: true,
     created_at: '2026-01-01T00:00:00Z',
   };
 }
@@ -133,6 +133,7 @@ describe('backgroundRowCaveat', () => {
     effort: 'none',
     source: 'preference',
     reachable,
+    generation: null,
     not_served: [],
     needs_vision: false,
     asks_no_model: false,
@@ -185,6 +186,57 @@ describe('backgroundRowCaveat', () => {
     expect(
       backgroundRowCaveat(row(true, { source: 'default', not_served: ['claude-haiku-4-5'] }), null),
     ).toBe('Moved past claude-haiku-4-5: its provider no longer serves it');
+  });
+
+  it('names the successor a retired pick runs', () => {
+    expect(
+      backgroundRowCaveat(
+        row(true, { generation: { kind: 'successor', model: 'newer-model' } }),
+        null,
+      ),
+    ).toBe('Retired, so this runs its successor newer-model');
+  });
+
+  /** The step back outranks the not-served list: it says what runs. */
+  it('names the earlier version a refused pick runs', () => {
+    expect(
+      backgroundRowCaveat(
+        row(true, {
+          model: 'newer-model',
+          not_served: ['newer-model'],
+          generation: { kind: 'predecessor', model: 'older-model' },
+        }),
+        null,
+      ),
+    ).toBe('newer-model is not served here, so this runs older-model, an earlier version');
+  });
+
+  /** A default can both pass over a refused model and run a successor. */
+  it('keeps what a default moved past beside the generation it runs', () => {
+    expect(
+      backgroundRowCaveat(
+        row(true, {
+          source: 'default',
+          not_served: ['refused-model'],
+          generation: { kind: 'successor', model: 'newer-model' },
+        }),
+        null,
+      ),
+    ).toBe(
+      'Retired, so this runs its successor newer-model. Moved past refused-model: its provider no longer serves it',
+    );
+  });
+
+  it('names the successor a held retired pick is waiting on', () => {
+    expect(
+      backgroundRowCaveat(
+        row(true, {
+          model: 'older-model',
+          generation: { kind: 'held', successor: 'newer-model' },
+        }),
+        null,
+      ),
+    ).toBe('Retired, but newer-model is not served here, so this keeps running older-model');
   });
 
   /** The wake decision asks nothing then, so its parents always wake. */

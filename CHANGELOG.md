@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.50.0 — 2026-10-21
+
+### Added
+- Two dashboards, one for the phone and one for the desktop, each with its own tiles. Add to dashboard in a widget's menu adds it to the dashboard of the screen you tap it on, from any thread. On a phone, a button in any thread's title row opens the dashboard as a sheet.
+- An app can join a dashboard as a quarter-size shortcut, from the dashboard's Add or an app row's menu.
+- The intelligence ladder: one ordered list of model and effort rungs for the Lucidos Agent, Claude Code and Codex, each rung banded by intelligence, cost and time. Edit it under Settings > Intelligence, where the model prices also live.
+- A rung control in the prompt bar picks the model and effort, with ‹ › steps at the pill's ends. Before a switch rebuilds a warm prompt cache, it shows what the switch costs and asks.
+- An idle thread shows how long its prompt cache stays warm. Turn the line off under Settings > Debugging.
+- The Claude gateway provider: sign in on the Providers page and chat through your organisation's Claude gateway, on the models its policy allows.
+- Credential secrets can be 1Password references. Set up the service account under Settings, then switch a secret field to a reference.
+- Backups can be sealed to an age backup key. Set it up, verify it and rotate it under Settings > Backup.
+- A Trigger model setting, separate from the chat model, in Settings and on the trigger form.
+- Choose whether Enter sends or adds a new line, under Settings > Keyboard Shortcuts > Composer.
+- A new chat opened by an app (`lucidos.ui.startThread`), by the `navigate_ui` tool or by a notification tap can preselect the coding agent and folder. Pass `coding_agent` (`claude-code` or `codex`) and `folder` (a registered repository or `data/apps/<id>`). A value that names nothing leaves that dropdown at its default and shows a warning. You still click Send.
+- A plugin author can raise `setup_revision` so an update runs setup again. The confirm panel says so, and lists the files an update removes.
+
+### Changed
+- Every stored secret is sealed at rest with a per-workspace key. Subprocesses get only the secrets their command names, their output is masked, and the command guard asks before a command reads a secret.
+- New chat threads start on Opus 5.5 when you never picked a chat model. A trigger that pins no model runs on its own default, Sonnet 5.5.
+- Background tasks default to newer, cheaper models: Haiku 5.5 for titles, summaries, image descriptions and memory, then GPT-6 Luna and Gemini 3.1 Flash-Lite as fallbacks. The command judge defaults to Gemini 3.1 Flash-Lite. A model you picked yourself stays.
+- Superseded models are retired: Opus 5, Sonnet 5, Fable 5, Haiku 4.5, Gemini 3 Flash, GPT-5.4 mini and the GPT-5.6 family, among others. A preference, trigger or thread on one moves to its successor where one of your providers serves it. Elsewhere it keeps running the version your provider serves, and Settings names which one runs.
+- Web search falls back to Haiku 5.5 on Anthropic and GPT-6.1 Sol on OpenAI, and Google Search grounding runs on Gemini 3.1 Flash-Lite.
+- Picking a new effort in a Claude Code thread restarts its session on that effort, and the transcript shows one turn with a Restarted row.
+- A large coding-agent thread offers a Successor card above the composer, with Continue with context, Start fresh and Stay here. Continue picks its path by cache warmth: a warm cache lets the old agent write the handoff, a cold one starts the successor at once from a short brief. Stay here hides the card until the thread grows 100k tokens more.
+- A plan card in a Lucidos-source coding-agent thread can offer Implement in a new thread at any context size, when the planning agent recommends a cheaper implementer.
+- An intent runs in the thread that asks for it, on that thread's model, effort and provider. A trigger fire works the same way.
+- A child thread started with `run_thread` follows its parent's model, effort and provider, unless the call pins its own.
+- The cache keep-alive shows as one card in the transcript and in the waiting panel.
+- A release notice that a later notice supersedes is hidden.
+- Right-click or long press on a widget opens its own menu.
+- Breaking for knowhow and triggers: the `execute_intent` tool is removed. A call to it fails with a hint naming the `load_knowhow` call to make. The new retired-tools audit check finds each mention in a workspace and rewrites it.
+- Breaking for widgets: on a dashboard the SDK's widget place is `dashboard`, where it was `home`. `data-widget-size` is unchanged.
+- Breaking for the CLI and HTTP API: `lucidos widgets board` is now `lucidos widgets dashboard`, beside `dashboard-add` and `dashboard-remove`. `arrange` takes `--dashboard` where it took `--layout`, and a tile has no `hidden`. `GET /api/v1/home-board?layout=` is now `GET /api/v1/dashboard?dashboard=`. The navigate target `home-board` is now `dashboard`.
+
+### Fixed
+- A message sent while an effort pick restarted the session is delivered to the session that runs next.
+- An event stream that goes quiet reopens, and one reconcile repairs everything missed in the gap.
+- Apply All skips changes the landing lane holds or an apply already claimed.
+- Opening a queued spawn waits for it instead of reporting it gone.
+- Move to a new thread carries the attached images.
+- Cancel on a phone works when iOS cancels the tap.
+- The desktop shell never scrolls as a whole, and an app page never scrolls sideways.
+- The update blocker names the menu item that really stops the app, Quit and Stop Background Service.
+- A deep link or navigate that lands while the app resumes from the background opens its target.
+- Counting events for one thread returns that thread's count, in the agent tool, the HTTP API and the CLI.
+- The literal `null` clears a trigger's model, effort or provider pin.
 ## v0.49.1 — 2026-10-15
 
 ### Added

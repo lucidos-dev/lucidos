@@ -478,7 +478,7 @@ export interface RestoreStarted {
   name: string;
 }
 
-/** Restore a local encrypted `.enc` backup into a NEW workspace. `name` is sent
+/** Restore a local encrypted backup (`.age`, or a legacy `.enc`) into a NEW workspace. `name` is sent
  *  only to resolve a collision (otherwise the gateway derives it from the
  *  archive filename). Resolves once the background restore has STARTED (the
  *  returned `{id, name}`); poll {@link getRestoreStatus} for progress. A 409 is
@@ -570,10 +570,18 @@ export async function revokePairedDevice(id: string): Promise<void> {
   await authJson<void>(`/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
+/** The file suffixes a backup archive carries: `.age` now, `.enc` before the
+ *  switch to age. Mirrors `core::backup::parse_workspace_name_from_archive`. */
+export const ARCHIVE_SUFFIXES = ['.age', '.enc'] as const;
+
+const ARCHIVE_NAME = new RegExp(
+  `^lucidos-backup-(.+)-\\d{8}-\\d{6}(?:${ARCHIVE_SUFFIXES.map((suffix) => `\\${suffix}`).join('|')})$`,
+);
+
 /** Derive the workspace name a backup archive was produced for, from its
- *  filename (`lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.enc`). Returns null for a
+ *  filename (`lucidos-backup-{name}-{YYYYMMDD-HHMMSS}.age`). Returns null for a
  *  non-archive name. Mirrors `core::backup::parse_workspace_name_from_archive`. */
 export function parseWorkspaceNameFromArchive(filename: string): string | null {
-  const m = filename.match(/^lucidos-backup-(.+)-\d{8}-\d{6}\.enc$/);
+  const m = filename.match(ARCHIVE_NAME);
   return m ? m[1] : null;
 }

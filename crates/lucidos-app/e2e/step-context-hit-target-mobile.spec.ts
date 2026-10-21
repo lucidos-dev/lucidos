@@ -12,7 +12,9 @@
  * near miss can never open a neighbouring row's context.
  */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, disarmFollowSeed, ensureMobileView, navigateToApp, revealSteps } from './helpers';
+import {
+  assertHealthy, disarmFollowSeed, ensureMobileView, navigateToApp, revealSteps, watchPreferenceReads,
+} from './helpers';
 import { psql, seedThreadOfCounters } from './db-helpers';
 
 test.use({ viewport: { width: 393, height: 852 } });
@@ -128,8 +130,12 @@ async function setScale(page: Page, scale: string, rootPx: number): Promise<void
 async function openThread(page: Page, threadId: string): Promise<void> {
   await disarmFollowSeed(page);
   await page.addInitScript((tid: string) => localStorage.setItem('lucidos-focused-thread', tid), threadId);
+  // Every preference read ends in `applyUiScale`, which replaces the scale a
+  // spec wrote. The shell reads at startup and again when its event stream
+  // opens, so wait for both before the first `setScale`.
+  const preferencesSettled = watchPreferenceReads(page);
   await navigateToApp(page);
-  await page.waitForFunction(() => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 });
+  await preferencesSettled();
   await ensureMobileView(page, 'thread');
   await revealSteps(page);
   await expect(page.locator('.mobile-swipe-pane [data-role="step-context"]').first()).toBeVisible({ timeout: 15_000 });

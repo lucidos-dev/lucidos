@@ -45,10 +45,10 @@ function loadingLiterals(code: string): string[] {
 
 /** Consumers that may skip a skeleton, each with the rule that says so. */
 const CONSUMER_EXEMPT: Record<string, Exemption> = {
+  'components/chat/CacheKeepAlive.tsx': { tag: 'single-value', why: 'the cache-warm line stays absent until the engine says how long is left' },
   'components/chat/chat-exchange-parts.tsx': { tag: 'single-value', why: 'a change card holds its headline line empty until it loads' },
   'components/chat/ComposeDestinationRow.tsx': { tag: 'structure-first', why: 'destination dropdown; the lists only fill its options' },
   'components/chat/FrontendPreviewSection.tsx': { tag: 'structure-first', why: 'control menu section; dims its button until the slot is read' },
-  'components/chat/LucidosControlMenu.tsx': { tag: 'structure-first', why: 'anchored menu; only kicks off the model list read' },
   'components/chat/MessageRoutePanel.tsx': { tag: 'no-visual', why: 'label lookup that falls back to the raw id' },
   'components/chat/MicrophonePicker.tsx': { tag: 'structure-first', why: 'anchored popover drawn from the first frame' },
   'components/layout/Drawer.tsx': { tag: 'no-visual', why: 'derives the pinned set; draws nothing itself' },
@@ -61,11 +61,13 @@ const CONSUMER_EXEMPT: Record<string, Exemption> = {
   'components/settings/MemoryPage.tsx': { tag: 'structure-first', why: 'real sections; the inspector stays until preferences say Tree' },
   'components/settings/TreeBackfillStatus.tsx': { tag: 'structure-first', why: 'real progress row; the bar track draws at once, values wait' },
   'components/settings/ProviderBlock.tsx': { tag: 'structure-first', why: 'switch drawn at once; config rows stay shut until known' },
+  'components/settings/ClaudeGatewaySettings.tsx': { tag: 'structure-first', why: 'real sign-in rows inside the provider fold; Sign in waits for the status' },
   'components/settings/SystemOneProviderFrame.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },
   'components/settings/CustomSystemOneSettings.tsx': { tag: 'structure-first', why: 'real controls; defer their values' },
   'components/settings/OpenRouterProviderSettings.tsx': { tag: 'structure-first', why: 'real model field inside the provider fold; defers its value' },
   'components/apps/ReusableWidgetsSection.tsx': { tag: 'single-value', why: 'a group under the apps list, which draws its own skeleton' },
   'components/widgets/InlineWidget.tsx': { tag: 'single-value', why: "an inline widget's bar holds its name empty until the widget is read" },
+  'components/widgets/DashboardItem.tsx': { tag: 'structure-first', why: 'the Add to dashboard row draws at once, inert until its dashboard is read' },
   'components/widgets/WidgetPickerItems.tsx': { tag: 'structure-first', why: 'anchored menu rows; a hidden note holds a line until the widgets land' },
   'components/widgets/WidgetShelf.tsx': { tag: 'single-value', why: 'the title row stays as it was until its widget chips land' },
   'components/widgets/OptionWidgetFrame.tsx': { tag: 'structure-first', why: "an option's frame box holds its room until the manifest says how it reveals" },

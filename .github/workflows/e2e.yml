@@ -10,12 +10,17 @@
 # Limits `scripts/check-e2e-workflow.sh` enforces:
 #   - No secrets, and the token is contents: read.
 #   - Triggers: push to e2e/** runs a selection; push to main only seeds the
-#     dependency caches every e2e/* branch can read. GitHub scopes caches by
-#     branch, so a cache saved on an e2e/* branch would only evict others.
+#     caches every e2e/* branch can read: dependencies, and the macOS jobs'
+#     Postgres and WebKit. GitHub scopes caches by branch, so a cache saved on
+#     an e2e/* branch would only evict others. Test jobs only restore.
 #   - Every job but seed-cache waits on the plan, so only a request runs it.
 #   - Every action is pinned by commit.
 #   - mobile-webkit runs on macOS, the WebKit port iOS ships (ADR 0175).
-#   - Artifacts live one day. Traces upload only for a failed shard.
+#   - Artifacts live one day, except what a later run reuses: an engine and
+#     its manifest live a week, target/ state two days. Traces upload only for
+#     a failed shard.
+#   - The token reads contents and actions. Reading actions is what lets the
+#     plan job find an earlier run's engine and a job download it.
 
 name: e2e
 
@@ -25,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -47,19 +53,37 @@ jobs:
       has_linux: ${{ steps.plan.outputs.has_linux }}
       has_macos: ${{ steps.plan.outputs.has_macos }}
       has_engine: ${{ steps.plan.outputs.has_engine }}
+      linux_engine_run: ${{ steps.find-linux.outputs.linux_engine_run }}
+      linux_engine_artifact: ${{ steps.find-linux.outputs.linux_engine_artifact }}
+      macos_engine_run: ${{ steps.find-macos.outputs.macos_engine_run }}
+      macos_engine_artifact: ${{ steps.find-macos.outputs.macos_engine_artifact }}
+      linux_target_run: ${{ steps.find-linux.outputs.linux_target_run }}
+      linux_target_artifact: ${{ steps.find-linux.outputs.linux_target_artifact }}
+      macos_target_run: ${{ steps.find-macos.outputs.macos_target_run }}
+      macos_target_artifact: ${{ steps.find-macos.outputs.macos_target_artifact }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - id: plan
         run: ./scripts/e2e-github-shard.sh plan
+      - id: find-linux
+        if: steps.plan.outputs.has_linux == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/e2e-github-shard.sh find-engine linux
+      - id: find-macos
+        if: steps.plan.outputs.has_macos == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/e2e-github-shard.sh find-engine macos
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: e2e-plan
-          path: e2e-out/plan/entries
+          path: e2e-out/plan/
           retention-days: 1
 
   build-linux:
     needs: plan
-    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_linux == 'true'
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_linux == 'true' && needs.plan.outputs.linux_engine_run == ''
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -72,16 +96,45 @@ jobs:
           prefix-key: v0-rust-e2e
           shared-key: linux
           save-if: false
-      - run: ./scripts/e2e-github-shard.sh build build-out
+      # The newest target/ state the plan found, so cargo compiles only what changed.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        if: needs.plan.outputs.linux_target_run != ''
+        continue-on-error: true
+        with:
+          name: ${{ needs.plan.outputs.linux_target_artifact }}
+          run-id: ${{ needs.plan.outputs.linux_target_run }}
+          github-token: ${{ github.token }}
+          path: target-in
+      - id: build
+        run: ./scripts/e2e-github-shard.sh build build-out target-in
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: e2e-build-linux
           path: build-out/e2e-build.tar.gz
           retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-engine-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/e2e-engine.tar
+          retention-days: 7
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-manifest-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/manifest
+          retention-days: 7
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-target-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/e2e-target.tar.zst
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: ignore
 
   build-macos:
     needs: plan
-    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_macos == 'true'
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_macos == 'true' && needs.plan.outputs.macos_engine_run == ''
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -94,16 +147,46 @@ jobs:
           prefix-key: v0-rust-e2e
           shared-key: macos
           save-if: false
-      - run: ./scripts/e2e-github-shard.sh build build-out
+      # The newest target/ state the plan found, so cargo compiles only what changed.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        if: needs.plan.outputs.macos_target_run != ''
+        continue-on-error: true
+        with:
+          name: ${{ needs.plan.outputs.macos_target_artifact }}
+          run-id: ${{ needs.plan.outputs.macos_target_run }}
+          github-token: ${{ github.token }}
+          path: target-in
+      - id: build
+        run: ./scripts/e2e-github-shard.sh build build-out target-in
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: e2e-build-macos
           path: build-out/e2e-build.tar.gz
           retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-engine-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/e2e-engine.tar
+          retention-days: 7
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-manifest-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/manifest
+          retention-days: 7
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-target-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/e2e-target.tar.zst
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: ignore
 
   linux:
     needs: [plan, build-linux]
-    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_linux == 'true'
+    # Runs after its build job, or without one when the plan found an engine.
+    if: github.repository == 'lucidos-dev/lucidos' && !cancelled() && needs.plan.outputs.has_linux == 'true' && needs.build-linux.result != 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -115,6 +198,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '20'
+      # The Postgres image, system packages, npm deps and the browser, in the
+      # background. Later steps wait only for what they need.
+      - name: Start the slow setup
+        run: ./scripts/e2e-github-shard.sh warm "${{ matrix.suite }}" "${{ matrix.project }}"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         if: matrix.suite != 'browser'
         with:
@@ -122,21 +209,27 @@ jobs:
           shared-key: linux
           save-if: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        if: needs.build-linux.result == 'success'
         with:
           name: e2e-build-linux
           path: build-in
-      - run: ./scripts/e2e-github-shard.sh unpack build-in/e2e-build.tar.gz
+      - if: needs.build-linux.result == 'success'
+        run: ./scripts/e2e-github-shard.sh unpack build-in/e2e-build.tar.gz
+      # No build ran: the plan found an earlier run's engine for this tree.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        if: needs.build-linux.result == 'skipped'
+        continue-on-error: true
+        with:
+          name: ${{ needs.plan.outputs.linux_engine_artifact }}
+          run-id: ${{ needs.plan.outputs.linux_engine_run }}
+          github-token: ${{ github.token }}
+          path: engine-in
+      - if: needs.build-linux.result == 'skipped'
+        run: ./scripts/e2e-github-shard.sh assemble engine-in
       - name: Prepare the runner
         run: |
           git config --global user.name "Lucidos e2e"
           git config --global user.email "lucidos-e2e@users.noreply.github.com"
-          sudo apt-get update -qq >/dev/null
-          sudo apt-get install -y -qq ripgrep postgresql-client >/dev/null
-      - name: Install Chromium's system libraries
-        if: matrix.suite == 'browser'
-        # e2e-browser.sh runs npm ci itself, so this fetches only the lockfile's
-        # Playwright to install the system libraries.
-        run: npx --yes "playwright@$(node -p "require('./package-lock.json').packages['node_modules/playwright'].version")" install-deps chromium
       - name: Run ${{ matrix.id }}
         run: ./scripts/e2e-github-shard.sh run "${{ matrix.id }}" "${{ matrix.suite }}" "${{ matrix.project }}" "${{ matrix.shard }}" "${{ matrix.total }}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -158,7 +251,8 @@ jobs:
 
   macos:
     needs: [plan, build-macos]
-    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_macos == 'true'
+    # Runs after its build job, or without one when the plan found an engine.
+    if: github.repository == 'lucidos-dev/lucidos' && !cancelled() && needs.plan.outputs.has_macos == 'true' && needs.build-macos.result != 'failure'
     runs-on: macos-15
     timeout-minutes: 120
     strategy:
@@ -170,11 +264,37 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '20'
+      # What seed-cache saved on main. A miss downloads and compiles as before.
+      - id: keys
+        run: ./scripts/e2e-github-shard.sh cache-keys
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: e2e-macos-15-webkit-${{ steps.keys.outputs.playwright }}
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ runner.temp }}/pg/${{ steps.keys.outputs.postgres_dir }}
+          key: e2e-macos-15-${{ steps.keys.outputs.postgres }}
+      - name: Start the slow setup
+        run: ./scripts/e2e-github-shard.sh warm "${{ matrix.suite }}" "${{ matrix.project }}"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        if: needs.build-macos.result == 'success'
         with:
           name: e2e-build-macos
           path: build-in
-      - run: ./scripts/e2e-github-shard.sh unpack build-in/e2e-build.tar.gz
+      - if: needs.build-macos.result == 'success'
+        run: ./scripts/e2e-github-shard.sh unpack build-in/e2e-build.tar.gz
+      # No build ran: the plan found an earlier run's engine for this tree.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        if: needs.build-macos.result == 'skipped'
+        continue-on-error: true
+        with:
+          name: ${{ needs.plan.outputs.macos_engine_artifact }}
+          run-id: ${{ needs.plan.outputs.macos_engine_run }}
+          github-token: ${{ github.token }}
+          path: engine-in
+      - if: needs.build-macos.result == 'skipped'
+        run: ./scripts/e2e-github-shard.sh assemble engine-in
       - name: Prepare the runner
         run: |
           git config --global user.name "Lucidos e2e"
@@ -223,6 +343,13 @@ jobs:
           git config --global user.email "lucidos-e2e@users.noreply.github.com"
           sudo apt-get update -qq >/dev/null
           sudo apt-get install -y -qq ripgrep >/dev/null
+          # The runner's own pg_dump is older than the pg18 test server.
+          # shellcheck source=scripts/lib/workspace_constants.sh
+          source scripts/lib/workspace_constants.sh
+          sudo apt-get install -y -qq postgresql-common >/dev/null
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null
+          sudo apt-get install -y -qq "postgresql-client-${PG_IMAGE##*pg}" >/dev/null
+          echo "/usr/lib/postgresql/${PG_IMAGE##*pg}/bin" >> "$GITHUB_PATH"
       - name: Run the engine suite
         run: ./scripts/e2e-github-shard.sh run engine engine
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -256,7 +383,43 @@ jobs:
           prefix-key: v0-rust-e2e
           shared-key: ${{ matrix.key }}
           save-if: true
-      - run: ./scripts/e2e-github-shard.sh build build-out
+      - id: build
+        run: ./scripts/e2e-github-shard.sh build build-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-engine-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/e2e-engine.tar
+          retention-days: 7
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-manifest-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/manifest
+          retention-days: 7
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: e2e-target-${{ steps.build.outputs.prekey }}-${{ github.run_id }}
+          path: build-out/e2e-target.tar.zst
+          compression-level: 0
+          retention-days: 2
+          if-no-files-found: ignore
+      - id: keys
+        if: matrix.key == 'macos'
+        run: ./scripts/e2e-github-shard.sh cache-keys
+      - name: Fill the macOS test jobs' caches
+        if: matrix.key == 'macos'
+        run: ./scripts/e2e-github-shard.sh seed-macos-cache "$RUNNER_TEMP/pg"
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        if: matrix.key == 'macos'
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: e2e-macos-15-webkit-${{ steps.keys.outputs.playwright }}
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        if: matrix.key == 'macos'
+        with:
+          path: ${{ runner.temp }}/pg/${{ steps.keys.outputs.postgres_dir }}
+          key: e2e-macos-15-${{ steps.keys.outputs.postgres }}
       - name: Compile the API and WASM suites' test binaries
         if: matrix.key == 'linux'
         run: cargo test --locked -p lucidos-e2e --no-run

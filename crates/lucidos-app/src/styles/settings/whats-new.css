@@ -245,9 +245,9 @@
     margin-top: 0.75rem;
 }
 
-/* Says which notice has to come first, so a disabled button is never a dead end
-   with no explanation. It takes the leading edge back off the buttons, which
-   is why it renders before them. */
+/* Says which notice has to come first, or which later notice carries the
+   action, so a missing or disabled button is never left unexplained. It takes
+   the leading edge back off the buttons, which is why it renders before them. */
 .release-notice-row-hint {
     margin-right: auto;
     color: var(--text-muted);

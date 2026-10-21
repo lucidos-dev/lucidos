@@ -39,7 +39,8 @@ import {
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
 import { refreshChangesState, restoreRestartState } from './actions/chat-changes';
-import { openHomeOnColdStart } from './actions/coldStartHome';
+import { offerWithheldThread, openHomeOnColdStart } from './actions/coldStartHome';
+import { installRestoreGuard, takeWithheldThread } from './restoreGuard';
 import { installDevWindowFollow } from './actions/dev-window';
 import { restoreRepoSelectionFromStorage } from './actions/repositories';
 import {
@@ -54,7 +55,7 @@ import { CHECK_ICON, COPY_ICON } from '../utils/copyIcons';
 import { clipboardOrReport } from '../utils/clipboard';
 import { effect } from '@preact/signals';
 import { markBoot } from '../utils/bootTiming';
-import { activeMenuItem, connectionStatus, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from './store';
+import { activeMenuItem, connectionStatus, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, focusedThreadId, setFocusedThread } from './store';
 import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from '../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './actions/client-update';
@@ -153,6 +154,8 @@ export function startClient(): () => void {
   // A device with no stored focus starts in Home (ADR 0411). A returning user
   // keeps their last thread, so this reads the key before anything writes it.
   const stopColdStartHome = openHomeOnColdStart(savedThreadId !== null);
+  const stopRestoreOffer = offerWithheldThread(takeWithheldThread());
+  const stopRestoreGuard = installRestoreGuard(() => focusedThreadId.peek());
 
   // Restore the restart state from localStorage BEFORE the first
   // checkConnection: a reload mid-restart re-raises the progress dialog and
@@ -704,6 +707,8 @@ export function startClient(): () => void {
     stopLiveness();
     stopBootMarks();
     stopColdStartHome();
+    stopRestoreOffer();
+    stopRestoreGuard();
     stopDevWindowFollow();
     stopAppBridge();
     stopFrameCapabilityRenewal();

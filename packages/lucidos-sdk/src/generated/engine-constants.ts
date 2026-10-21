@@ -7,6 +7,12 @@
 /** `CLIENT_LOG_MAX_BATCH` in `api/internal.rs`. */
 export const CLIENT_LOG_MAX_BATCH = 100;
 
+/** `SSE_KEEPALIVE_INTERVAL` in `api/history.rs`. */
+export const SSE_KEEPALIVE_INTERVAL_MS = 30000;
+
+/** `SSE_KEEPALIVE_EVENT` in `api/history.rs`. */
+export const SSE_KEEPALIVE_EVENT = "keepalive";
+
 /** `WIDGET_PARAMS_MAX_BYTES` in `engine/widgets.rs`. */
 export const WIDGET_PARAMS_MAX_BYTES = 2048;
 
@@ -67,6 +73,9 @@ export const ENGINE_RESTART_INTERRUPT_REASON = "engine_restart_interrupt";
 /** `HARDEN_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
 export const HARDEN_REQUESTED_REASON = "harden_requested";
 
+/** `EFFORT_RESTART_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const EFFORT_RESTART_REASON = "effort_restart";
+
 /** `KEEP_ALIVE_IDLE_REASON` in `engine/thread_events/event_impl.rs`. */
 export const KEEP_ALIVE_IDLE_REASON = "cache_keep_alive";
 
@@ -105,9 +114,6 @@ export const TAKES_EFFECT_VALUES = ["now", "next-turn"] as const;
 
 /** `PresenceOutcome::BY_STRENGTH` in `api/presence_pong.rs`. */
 export const PRESENCE_OUTCOMES_BY_STRENGTH = ["shown", "auto_read", "silenced", "not_shown"] as const;
-
-/** `HANDOFF_REQUEST` in `engine/successor.rs`. */
-export const HANDOFF_REQUEST = "handoff this session";
 
 /** `SECTIONS` in `voice/sections.rs`. */
 export const VOICE_RESIDENT_SECTIONS = [

@@ -2,7 +2,7 @@
  *
  *  Each widget frame costs renderer memory. Chrome may give it a process of
  *  its own (ADR 0227); WebKit keeps every frame in the page's one content
- *  process. Inline widgets, option widgets and Home board tiles
+ *  process. Inline widgets, option widgets and dashboard tiles
  *  mount once they come on screen, and stay a while after they scroll off.
  *  This one budget caps how many are mounted at once. Past it, the frame
  *  furthest from view unmounts first and draws again when it next comes on

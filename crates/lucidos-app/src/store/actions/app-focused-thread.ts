@@ -5,7 +5,7 @@ import { focusedThreadId } from '../store';
 import { FOCUSED_THREAD_CHANNEL } from '../../../../../packages/lucidos-sdk/src/_bridge';
 
 /** Tell every open app frame when the user opens another thread, for
- *  `lucidos.ui.onFocusedThreadChange`. The Home board's tiles sit beside the
+ *  `lucidos.ui.onFocusedThreadChange`. The dashboard's tiles sit beside the
  *  thread pane, so they hear it too. A frame's first read is the bridge's
  *  `ui.focused-thread` op, never a push. Returns the teardown. */
 export function installAppFocusedThreadSync(): () => void {

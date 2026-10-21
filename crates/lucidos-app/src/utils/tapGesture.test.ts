@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   createTapGate, touchActivated, takePressOutcome, notePressOutcome, TAP_MOVE_THRESHOLD_PX,
+  CANCELLED_TAP_SETTLE_MS,
 } from './tapGesture';
 import { LONG_PRESS_DELAY_MS } from '../hooks/useLongPress';
 
@@ -172,6 +173,7 @@ function harness(opts: {
   enabled?: () => boolean;
   gate?: { pass(): boolean; spend(): void; aborted?(): boolean };
   destructive?: () => boolean;
+  pageVisible?: () => boolean;
 } = {}) {
   let t = 1_000;
   const action = vi.fn();
@@ -336,9 +338,50 @@ describe('touchActivated serves a tap the system cancelled', () => {
     expect(action).not.toHaveBeenCalled();
   });
 
-  it('never fires a destructive face on a cancel', () => {
+  it('fires a destructive face on a cancelled tap, once the settle window passes', () => {
+    // The ledger's Cancel: 5px in 59ms, in the home-indicator strip. It took
+    // three taps to stop a turn.
+    vi.useFakeTimers();
+    try {
+      const { action } = cancelledTap(5, 59, { destructive: () => true, pageVisible: () => true });
+      expect(action).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(CANCELLED_TAP_SETTLE_MS);
+      expect(action).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops a destructive cancelled tap when the page hides, as on a swipe home', () => {
+    vi.useFakeTimers();
+    try {
+      let visible = true;
+      const { action } = cancelledTap(5, 59, { destructive: () => true, pageVisible: () => visible });
+      visible = false;
+      vi.advanceTimersByTime(CANCELLED_TAP_SETTLE_MS);
+      expect(action).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops a destructive cancelled tap when the face turns back to Send', () => {
+    // One node serves both faces, so firing late would send the draft.
+    vi.useFakeTimers();
+    try {
+      let cancelFace = true;
+      const { action } = cancelledTap(5, 59, { destructive: () => cancelFace, pageVisible: () => true });
+      cancelFace = false;
+      vi.advanceTimersByTime(CANCELLED_TAP_SETTLE_MS);
+      expect(action).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never fires a destructive face on a cancelled scroll', () => {
     // A scroll that began on Cancel must not abort a live turn.
-    const { action } = cancelledTap(0, 50, { destructive: () => true });
+    const { action } = cancelledTap(TAP_MOVE_THRESHOLD_PX + 1, 50, { destructive: () => true });
     expect(action).not.toHaveBeenCalled();
   });
 

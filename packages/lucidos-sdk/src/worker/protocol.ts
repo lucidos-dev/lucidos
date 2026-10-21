@@ -33,13 +33,16 @@ export type FromPort =
       pongUrl: string;
     }
   | { t: 'pong'; notificationId: string; answer: PongAnswer }
+  /** The page came back and wants a silent upstream restarted. */
+  | { t: 'check' }
   | { t: 'bye' };
 
 /** Worker to document. */
 export type ToPort =
   | { t: 'frame'; data: string }
   | { t: 'open'; lateJoin?: boolean }
-  | { t: 'error' };
+  /** `silentMs` is set when the upstream stalled rather than errored. */
+  | { t: 'error'; silentMs?: number };
 
 /** Merge every attached document's answer into the one pong the engine expects.
  *

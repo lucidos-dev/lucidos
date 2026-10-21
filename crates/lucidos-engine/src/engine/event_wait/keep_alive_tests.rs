@@ -4,7 +4,9 @@
 use super::*;
 use crate::core::event_subscription::EventSubscription;
 use crate::engine::event_bus::EventBus;
+use crate::engine::thread_events::WakeMode;
 use crate::engine::types::{ContextProducer, ContextPurpose};
+use crate::llm::model_prices::{cache_shares_of, price_table};
 use crate::test_support::{seed_thread_event, setup_test_db, start_cc_session, teardown_test_db};
 use chrono::Duration;
 
@@ -15,7 +17,7 @@ fn now() -> DateTime<Utc> {
 const MINUTE: f64 = 60.0;
 
 /// A thread the selection beats: idle Claude Code on a 5-minute cache, a
-/// keep-warm wait armed ten minutes ago, the last request 210 s ago, no beat.
+/// keep-warm wait armed ten minutes ago, the last request 240 s ago, no beat.
 fn due() -> Candidate {
     Candidate {
         coding_agent: CodingAgent::ClaudeCode,
@@ -23,9 +25,10 @@ fn due() -> Candidate {
         awaiting_user: false,
         keep_warm_wait_secs: Some(10.0 * MINUTE),
         children: ActiveChildren::None,
-        secs_since_request: Some(210.0),
+        secs_since_request: Some(240.0),
         secs_since_beat: None,
         cache_ttl: Some(CacheTtl::FiveMinutes),
+        cache: cache_shares_of("claude-opus-5-5"),
     }
 }
 
@@ -36,6 +39,11 @@ fn due_on_the_hour() -> Candidate {
         secs_since_request: Some(3310.0),
         ..due()
     }
+}
+
+/// Where a TTL's beat window starts, in seconds.
+fn window_start(ttl: CacheTtl) -> f64 {
+    *ttl.beat_window().start()
 }
 
 fn skip(reason: SkipReason) -> Beat {
@@ -120,24 +128,114 @@ fn the_window_and_the_cut_off_hold_at_their_boundaries() {
         secs_since_request: Some(secs),
         ..due()
     };
-    assert_eq!(decide(&at(199.9)), skip(SkipReason::OutsideWindow));
-    assert!(decide(&at(200.0)) == Beat::Send);
+    assert_eq!(decide(&at(229.9)), skip(SkipReason::OutsideWindow));
+    assert!(decide(&at(230.0)) == Beat::Send);
     assert!(decide(&at(260.0)) == Beat::Send);
     assert_eq!(decide(&at(260.1)), skip(SkipReason::OutsideWindow));
-
-    let armed = |minutes: f64| Candidate {
-        keep_warm_wait_secs: Some(minutes * MINUTE),
-        ..due()
-    };
-    assert!(decide(&armed(150.0)) == Beat::Send);
-    assert_eq!(decide(&armed(151.0)), skip(SkipReason::PastCutOff));
 
     let beaten = |secs: f64| Candidate {
         secs_since_beat: Some(secs),
         ..due()
     };
-    assert_eq!(decide(&beaten(199.0)), skip(SkipReason::BeatInFlight));
-    assert!(decide(&beaten(200.0)) == Beat::Send);
+    assert_eq!(decide(&beaten(229.0)), skip(SkipReason::BeatInFlight));
+    assert!(decide(&beaten(230.0)) == Beat::Send);
+}
+
+/// The budget in beats is the write rate over the read rate of the session's
+/// model and TTL. The engine gives up that many beat windows after the wait
+/// began.
+#[test]
+fn the_budget_is_the_rewrite_cost_in_beats() {
+    let secs = |model: &str, ttl: CacheTtl| ttl.give_up_after_secs(cache_shares_of(model));
+    let cases = [
+        ("claude-opus-5-5", 25.0, 40.0),
+        ("claude-opus-5-5[1m]", 25.0, 40.0),
+        ("claude-sonnet-5-5", 25.0, 40.0),
+        ("claude-fable-5-1", 50.0, 80.0),
+        ("claude-opus-5", 12.5, 20.0),
+        ("claude-haiku-4-5", 12.5, 20.0),
+        ("a-model-nobody-priced", 12.5, 20.0),
+    ];
+    for (model, five, hour) in cases {
+        let got = (
+            secs(model, CacheTtl::FiveMinutes),
+            secs(model, CacheTtl::OneHour),
+        );
+        let want = (
+            five * window_start(CacheTtl::FiveMinutes),
+            hour * window_start(CacheTtl::OneHour),
+        );
+        assert!(
+            (got.0 - want.0).abs() < 1e-6 && (got.1 - want.1).abs() < 1e-6,
+            "{model}: {got:?}, want {want:?}"
+        );
+    }
+}
+
+/// An unknown model and an unknown TTL give the shortest budget there is.
+#[test]
+fn an_unknown_model_and_ttl_get_the_shortest_budget() {
+    let unknown = Candidate {
+        cache_ttl: None,
+        cache: price_table().unpriced_cache_shares,
+        ..due()
+    };
+    let budget = 12.5 * window_start(CacheTtl::FiveMinutes);
+    let waiting = |secs: f64| Candidate {
+        keep_warm_wait_secs: Some(secs),
+        ..unknown.clone()
+    };
+    assert!(decide(&waiting(budget - 0.1)) == Beat::Send);
+    assert_eq!(decide(&waiting(budget + 0.1)), skip(SkipReason::PastCutOff));
+}
+
+/// The cut-off's edge for each TTL, just inside and just out. Each budget is
+/// beats times the window start.
+#[test]
+fn the_cut_off_holds_at_the_budget() {
+    let cases = [
+        (
+            "a 5-minute cache",
+            due(),
+            25.0 * window_start(CacheTtl::FiveMinutes),
+        ),
+        (
+            "a 1-hour cache",
+            due_on_the_hour(),
+            40.0 * window_start(CacheTtl::OneHour),
+        ),
+    ];
+    for (label, base, budget) in cases {
+        let waiting = |secs: f64| Candidate {
+            keep_warm_wait_secs: Some(secs),
+            ..base.clone()
+        };
+        assert!(decide(&waiting(budget - 0.1)) == Beat::Send, "{label}");
+        assert!(decide(&waiting(budget)) == Beat::Send, "{label}");
+        assert_eq!(
+            decide(&waiting(budget + 0.1)),
+            skip(SkipReason::PastCutOff),
+            "{label}"
+        );
+    }
+}
+
+/// A session whose model pays a higher rewrite share beats for longer, and
+/// the same session gives up sooner at standard prices.
+#[test]
+fn the_budget_follows_the_sessions_model() {
+    let waiting = |model: &str| Candidate {
+        keep_warm_wait_secs: Some(60.0 * MINUTE),
+        cache: cache_shares_of(model),
+        ..due()
+    };
+    assert!(decide(&waiting("claude-fable-5-1")) == Beat::Send);
+    assert!(decide(&waiting("claude-opus-5-5")) == Beat::Send);
+    assert_eq!(
+        decide(&waiting("claude-opus-5")),
+        skip(SkipReason::PastCutOff),
+        "12.5 beats of 230 s end at 47.9 minutes"
+    );
 }
 
 /// A 1-hour cache beats once, just under the hour, and never in the 5-minute
@@ -160,14 +258,14 @@ fn the_window_follows_the_observed_ttl() {
         secs_since_request: Some(secs),
         ..due()
     };
-    assert_eq!(decide(&unknown(199.9)), skip(SkipReason::OutsideWindow));
-    assert!(decide(&unknown(200.0)) == Beat::Send);
+    assert_eq!(decide(&unknown(229.9)), skip(SkipReason::OutsideWindow));
+    assert!(decide(&unknown(230.0)) == Beat::Send);
     assert!(decide(&unknown(260.0)) == Beat::Send);
     assert_eq!(decide(&unknown(260.1)), skip(SkipReason::OutsideWindow));
     assert_eq!(decide(&unknown(3300.0)), skip(SkipReason::OutsideWindow));
     let unknown_beaten = Candidate {
         cache_ttl: None,
-        secs_since_beat: Some(199.0),
+        secs_since_beat: Some(229.0),
         ..due()
     };
     assert_eq!(decide(&unknown_beaten), skip(SkipReason::BeatInFlight));
@@ -178,36 +276,6 @@ fn the_window_follows_the_observed_ttl() {
     };
     assert_eq!(decide(&beaten(3299.0)), skip(SkipReason::BeatInFlight));
     assert!(decide(&beaten(3300.0)) == Beat::Send);
-}
-
-/// The TTL a cache write shows: the shortest lifetime any of its tokens got.
-#[test]
-fn the_observed_ttl_is_the_shortest_lifetime_written() {
-    let cases: [(&str, i64, Option<i64>, Option<CacheTtl>); 5] = [
-        ("no write", 0, Some(0), None),
-        ("a write with no split", 5_000, None, None),
-        (
-            "all to the 5-minute cache",
-            5_000,
-            Some(0),
-            Some(CacheTtl::FiveMinutes),
-        ),
-        (
-            "all to the 1-hour cache",
-            5_000,
-            Some(5_000),
-            Some(CacheTtl::OneHour),
-        ),
-        (
-            "some to each",
-            5_000,
-            Some(4_000),
-            Some(CacheTtl::FiveMinutes),
-        ),
-    ];
-    for (label, written, written_1h, expected) in cases {
-        assert_eq!(CacheTtl::observed(written, written_1h), expected, "{label}");
-    }
 }
 
 /// Working children are the second trigger, and the later start wins.
@@ -340,13 +408,14 @@ fn the_reason_kind_constant_is_the_serde_tag() {
 }
 
 fn capture(
+    model: &str,
     duration_ms: u64,
     usage: Option<crate::engine::ApiUsage>,
     parent_tool_use_id: Option<&str>,
 ) -> ThreadEvent {
     ThreadEvent::ContextCaptured {
         producer: ContextProducer::ClaudeCode,
-        model: "claude-opus-5-5".to_string(),
+        model: model.to_string(),
         context_window: 0,
         sections: Vec::new(),
         tools: Vec::new(),
@@ -361,16 +430,24 @@ fn capture(
         reasoning_effort: None,
         duration_ms: Some(duration_ms),
         served_model: None,
+        provider: None,
+        stable_prefix_fingerprint: None,
+        ttft_ms: None,
+        request_id: None,
     }
 }
 
 fn turn_capture(duration_ms: u64) -> ThreadEvent {
-    capture(duration_ms, None, None)
+    capture("claude-opus-5-5", duration_ms, None, None)
 }
 
 /// A turn capture that wrote `written` tokens to the cache, `written_1h` of
 /// them to the 1-hour cache, for the session or for a sub-agent.
 fn capture_writing(written: u32, written_1h: u32, sub_agent: bool) -> ThreadEvent {
+    capture_writing_on("claude-opus-5-5", written, written_1h, sub_agent)
+}
+
+fn capture_writing_on(model: &str, written: u32, written_1h: u32, sub_agent: bool) -> ThreadEvent {
     let usage = crate::engine::ApiUsage {
         input_tokens: written + 10,
         output_tokens: 5,
@@ -378,7 +455,12 @@ fn capture_writing(written: u32, written_1h: u32, sub_agent: bool) -> ThreadEven
         cache_creation_1h_tokens: Some(written_1h),
         ..Default::default()
     };
-    capture(1_000, Some(usage), sub_agent.then_some("toolu_agent"))
+    capture(
+        model,
+        1_000,
+        Some(usage),
+        sub_agent.then_some("toolu_agent"),
+    )
 }
 
 /// The TTL is the latest session write's, read back from the events alone. A
@@ -411,6 +493,72 @@ async fn the_ttl_comes_from_the_latest_session_write() {
         .await
         .unwrap();
     assert_eq!(ttl().await, None, "a Codex thread skips the look-up");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The model is the one that wrote the decisive cache entry: the latest
+/// session write, whatever model wrote the earlier ones. A read-only request
+/// and a sub-agent's write leave it as it was.
+#[tokio::test]
+async fn the_model_comes_from_the_latest_session_write() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/model", None).await;
+    let model = || async {
+        let row = read_candidates(&pool, &[thread_id])
+            .await
+            .unwrap()
+            .remove(0);
+        (row.last_write_model.clone(), row.cache())
+    };
+    assert_eq!(
+        model().await,
+        (None, price_table().unpriced_cache_shares),
+        "no capture yet"
+    );
+
+    seed_thread_event(
+        &bus,
+        thread_id,
+        capture_writing_on("claude-opus-5", 300, 0, false),
+    )
+    .await;
+    assert_eq!(model().await.1, cache_shares_of("claude-opus-5"));
+
+    seed_thread_event(
+        &bus,
+        thread_id,
+        capture_writing_on("claude-sonnet-5-5[1m]", 300, 0, false),
+    )
+    .await;
+    assert_eq!(
+        model().await,
+        (
+            Some("claude-sonnet-5-5[1m]".to_string()),
+            cache_shares_of("claude-sonnet-5-5")
+        )
+    );
+
+    seed_thread_event(
+        &bus,
+        thread_id,
+        capture_writing_on("claude-fable-5-1", 300, 0, true),
+    )
+    .await;
+    seed_thread_event(
+        &bus,
+        thread_id,
+        capture_writing_on("claude-fable-5-1", 0, 0, false),
+    )
+    .await;
+    assert_eq!(
+        model().await.0.as_deref(),
+        Some("claude-sonnet-5-5[1m]"),
+        "a sub-agent's write and a read-only request"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -511,6 +659,479 @@ async fn a_child_counts_as_working_only_while_it_runs() {
         matches!(children_of_parent().await, ActiveChildren::Working { wait_secs } if wait_secs < 60.0),
         "an answered card puts the child back to work, timed from the parent's real idle"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A `no-wake` child's clean finish never wakes its parent, so it keeps
+/// nobody warm. A build chain is the case: each successor is `no-wake`.
+#[tokio::test]
+async fn a_no_wake_child_keeps_nobody_warm() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (parent, child) = (Uuid::new_v4(), Uuid::new_v4());
+    start_cc_session(&bus, parent, "claude-code/parent", None).await;
+    seed_thread_event(&bus, parent, real_idle()).await;
+    start_cc_session(&bus, child, "claude-code/child", None).await;
+    sqlx::query(
+        "UPDATE thread_summaries SET parent_thread_id = $2, wake_mode = $3 WHERE thread_id = $1",
+    )
+    .bind(child)
+    .bind(parent)
+    .bind(WakeMode::NoWake.as_str())
+    .execute(&pool)
+    .await
+    .unwrap();
+    set_status(&pool, child, ThreadStatus::Running).await;
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let children_of_parent = |wake_mode: WakeMode| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE thread_summaries SET wake_mode = $2 WHERE thread_id = $1")
+                .bind(child)
+                .bind(wake_mode.as_str())
+                .execute(&pool)
+                .await
+                .unwrap();
+            read_candidates(&pool, &[])
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.thread_id == parent)
+                .map(|r| r.active_children())
+        }
+    };
+    assert_eq!(
+        children_of_parent(WakeMode::NoWake).await,
+        Some(ActiveChildren::OnlyNoWake),
+        "the parent waits, and nothing would read its warm cache"
+    );
+    for waking in [WakeMode::Wake, WakeMode::WakeWhenAllDone] {
+        assert!(
+            matches!(
+                children_of_parent(waking).await,
+                Some(ActiveChildren::Working { .. })
+            ),
+            "a {} child keeps its parent warm",
+            waking.as_str()
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// --- The cache keep-alive status (I3, I4, I6) ---
+
+fn secs_before_now(secs: f64) -> DateTime<Utc> {
+    now() - Duration::milliseconds((secs * 1000.0) as i64)
+}
+
+/// The anchors a candidate's ages were measured from, at [`now`].
+fn anchors_of(c: &Candidate) -> Anchors {
+    let idle_secs = match c.children {
+        ActiveChildren::Working { wait_secs } => Some(wait_secs),
+        _ => None,
+    };
+    Anchors {
+        keep_warm_armed_at: c.keep_warm_wait_secs.map(secs_before_now),
+        idle_at: idle_secs.map(secs_before_now),
+        request_started_at: c.secs_since_request.map(secs_before_now),
+    }
+}
+
+/// What a status says, without its numbers.
+#[derive(Debug, PartialEq)]
+enum StatusKind {
+    Absent,
+    Warming,
+    Stopped,
+    NotKept(CacheKeepAliveNotKeptReason),
+}
+
+fn kind_of(status: &Option<CacheKeepAliveStatus>) -> StatusKind {
+    match status {
+        None => StatusKind::Absent,
+        Some(CacheKeepAliveStatus::Warming { .. }) => StatusKind::Warming,
+        Some(CacheKeepAliveStatus::Stopped { .. }) => StatusKind::Stopped,
+        Some(CacheKeepAliveStatus::NotKept { reason }) => StatusKind::NotKept(*reason),
+    }
+}
+
+/// The status each verdict must come with. A skip that only waits for the
+/// next beat keeps the thread warming.
+fn status_kind_for(beat: &Beat) -> StatusKind {
+    match beat {
+        Beat::Send
+        | Beat::Skip(
+            SkipReason::Busy
+            | SkipReason::NoRequestYet
+            | SkipReason::OutsideWindow
+            | SkipReason::BeatInFlight,
+        ) => StatusKind::Warming,
+        Beat::Skip(SkipReason::PastCutOff) => StatusKind::Stopped,
+        Beat::Skip(SkipReason::ChildrenAwaitingUser) => {
+            StatusKind::NotKept(CacheKeepAliveNotKeptReason::ChildrenAwaitingUser)
+        }
+        Beat::Skip(SkipReason::OnlyNoWakeChildren) => {
+            StatusKind::NotKept(CacheKeepAliveNotKeptReason::NoWakeChildren)
+        }
+        Beat::Skip(
+            SkipReason::NotClaudeCode | SkipReason::AwaitingUser | SkipReason::NothingToWaitFor,
+        ) => StatusKind::Absent,
+    }
+}
+
+/// One candidate per verdict `decide` can reach.
+fn one_candidate_per_verdict() -> Vec<Candidate> {
+    let working = ActiveChildren::Working {
+        wait_secs: 20.0 * MINUTE,
+    };
+    vec![
+        due(),
+        Candidate {
+            coding_agent: CodingAgent::Codex,
+            ..due()
+        },
+        Candidate {
+            claim: ThreadClaim::Busy,
+            ..due()
+        },
+        Candidate {
+            awaiting_user: true,
+            ..due()
+        },
+        Candidate {
+            keep_warm_wait_secs: None,
+            ..due()
+        },
+        Candidate {
+            keep_warm_wait_secs: None,
+            children: ActiveChildren::AllAwaitingUser,
+            ..due()
+        },
+        Candidate {
+            keep_warm_wait_secs: None,
+            children: ActiveChildren::OnlyNoWake,
+            ..due()
+        },
+        Candidate {
+            keep_warm_wait_secs: None,
+            children: working,
+            ..due()
+        },
+        Candidate {
+            keep_warm_wait_secs: Some(10.0 * 3600.0),
+            ..due()
+        },
+        Candidate {
+            secs_since_request: None,
+            ..due()
+        },
+        Candidate {
+            secs_since_request: Some(100.0),
+            ..due()
+        },
+        Candidate {
+            secs_since_beat: Some(30.0),
+            ..due()
+        },
+    ]
+}
+
+/// The status and the beat read the same inputs, so they agree on every
+/// verdict: the panel never says "kept warm" once the engine stopped (I3).
+#[test]
+fn the_status_agrees_with_the_beat_on_every_verdict() {
+    let mut reached = Vec::new();
+    for candidate in one_candidate_per_verdict() {
+        let beat = decide(&candidate);
+        let status = status(&candidate, &anchors_of(&candidate), Spent::default());
+        assert_eq!(kind_of(&status), status_kind_for(&beat), "{beat:?}");
+        reached.push(beat);
+    }
+    assert_eq!(reached.len(), 12, "every verdict is covered: {reached:?}");
+}
+
+/// A warming status dates everything from the database's own stamps: the wait
+/// start, the stop at the break-even budget, and the next beat's window.
+#[test]
+fn a_warming_status_dates_the_run_from_its_anchors() {
+    let c = due();
+    let spent = Spent {
+        beats: 2,
+        cost_usd: 0.05,
+        context_tokens: 262_000,
+    };
+    let since = secs_before_now(10.0 * MINUTE);
+    let budget = 25;
+    assert_eq!(
+        status(&c, &anchors_of(&c), spent),
+        Some(CacheKeepAliveStatus::Warming {
+            since,
+            beats: 2,
+            budget_beats: budget,
+            beat_every_secs: window_start(CacheTtl::FiveMinutes) as u32,
+            cost_usd: 0.05,
+            context_tokens: 262_000,
+            next_beat_at: Some(secs_before_now(240.0 - window_start(CacheTtl::FiveMinutes))),
+            give_up_at: since
+                + Duration::seconds(i64::from(budget) * window_start(CacheTtl::FiveMinutes) as i64),
+        })
+    );
+}
+
+/// Past the budget the status says when the engine stopped, with what it spent.
+#[test]
+fn a_stopped_status_says_when_the_budget_ran_out() {
+    let c = Candidate {
+        keep_warm_wait_secs: Some(10.0 * 3600.0),
+        ..due()
+    };
+    let spent = Spent {
+        beats: 25,
+        cost_usd: 0.6,
+        context_tokens: 262_000,
+    };
+    let give_up = CacheTtl::FiveMinutes.give_up_after_secs(c.cache);
+    assert_eq!(
+        status(&c, &anchors_of(&c), spent),
+        Some(CacheKeepAliveStatus::Stopped {
+            at: secs_before_now(10.0 * 3600.0 - give_up),
+            beats: 25,
+            cost_usd: 0.6,
+            context_tokens: 262_000,
+        })
+    );
+}
+
+/// The ages drift between ticks, the anchors do not, so a second tick builds
+/// the same status and the sync writes nothing new (I4).
+#[test]
+fn the_status_does_not_move_with_the_clock() {
+    let c = due();
+    let later = Candidate {
+        keep_warm_wait_secs: c.keep_warm_wait_secs.map(|s| s + 10.0),
+        secs_since_request: c.secs_since_request.map(|s| s + 10.0),
+        ..c.clone()
+    };
+    assert_eq!(
+        status(&c, &anchors_of(&c), Spent::default()),
+        status(&later, &anchors_of(&c), Spent::default())
+    );
+}
+
+fn keep_alive_anchor() -> ThreadEvent {
+    ThreadEvent::PromptInjected {
+        text: "keep-alive".to_string(),
+        mode: ActorMode::Engine,
+        origin: Some(MessageOrigin::engine(EngineReason::CacheKeepAlive)),
+        injected_message_id: None,
+        delivered_event_id: None,
+    }
+}
+
+/// A ping's call: Opus 5.5 rereading `read` cached tokens.
+fn ping_capture(read: u32, api_call_id: &str) -> ThreadEvent {
+    let ThreadEvent::ContextCaptured {
+        producer,
+        model,
+        context_window,
+        sections,
+        tools,
+        estimated_total_tokens,
+        trimmed,
+        trim_passes,
+        purpose,
+        reconstructed,
+        parent_tool_use_id,
+        reasoning_effort,
+        duration_ms,
+        served_model,
+        provider,
+        stable_prefix_fingerprint,
+        ..
+    } = turn_capture(1_000)
+    else {
+        unreachable!("turn_capture builds a ContextCaptured")
+    };
+    ThreadEvent::ContextCaptured {
+        producer,
+        model,
+        context_window,
+        sections,
+        tools,
+        estimated_total_tokens,
+        usage: Some(crate::engine::ApiUsage {
+            input_tokens: read,
+            output_tokens: 1,
+            cache_read_tokens: read,
+            ..Default::default()
+        }),
+        trimmed,
+        trim_passes,
+        purpose,
+        reconstructed,
+        parent_tool_use_id,
+        api_call_id: Some(api_call_id.to_string()),
+        reasoning_effort,
+        duration_ms,
+        served_model,
+        provider,
+        stable_prefix_fingerprint,
+        ttft_ms: None,
+        request_id: None,
+    }
+}
+
+async fn seed_ping(bus: &EventBus, thread_id: Uuid, read: u32, frames: usize) -> Uuid {
+    let anchor = seed_thread_event(bus, thread_id, keep_alive_anchor()).await;
+    let call = Uuid::new_v4().to_string();
+    for _ in 0..frames {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ping_capture(read, &call),
+            meta: EventMeta {
+                request_event_id: Some(anchor),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .expect("capture persists");
+    }
+    anchor
+}
+
+/// The spend counts the pings since the wait began and prices each call once,
+/// however many frames it recorded.
+#[tokio::test]
+async fn the_spend_counts_the_pings_since_the_wait_began() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/spend", None).await;
+    let before = seed_ping(&bus, thread_id, 100_000, 1).await;
+    sqlx::query("UPDATE events SET created = now() - interval '1 hour' WHERE id = $1")
+        .bind(before)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let since: DateTime<Utc> = sqlx::query_scalar("SELECT now() - interval '10 minutes'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    seed_ping(&bus, thread_id, 200_000, 2).await;
+    seed_ping(&bus, thread_id, 200_000, 1).await;
+
+    let spent = read_spent(&pool, thread_id, since).await.unwrap();
+    assert_eq!(
+        spent.beats, 2,
+        "the ping before the wait began is not counted"
+    );
+    let one_ping = crate::engine::ApiUsage {
+        input_tokens: 200_000,
+        output_tokens: 1,
+        cache_read_tokens: 200_000,
+        ..Default::default()
+    }
+    .usd_on("claude-opus-5-5", crate::llm::model_prices::today())
+    .unwrap();
+    assert!(
+        (spent.cost_usd - 2.0 * one_ping).abs() < 1e-6,
+        "each call priced once: {}",
+        spent.cost_usd
+    );
+    assert_eq!(spent.context_tokens, 200_000);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+async fn stored_status(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<CacheKeepAliveStatus> {
+    let stored: Option<sqlx::types::Json<CacheKeepAliveStatus>> = sqlx::query_scalar(
+        "SELECT cache_keep_alive_status FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    stored.map(|s| s.0)
+}
+
+async fn status_events(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'CacheKeepAliveStatusChanged'",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The sync writes a status once, writes nothing while it holds, and clears it
+/// when the thread stops being a candidate. None of it moves the thread's
+/// recency (I2, I4, I6).
+#[tokio::test]
+async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/status", None).await;
+    let activity = || async {
+        sqlx::query_as::<_, (DateTime<Utc>, String)>(
+            "SELECT last_activity, status FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let before = activity().await;
+    let candidate = due();
+    let anchors = anchors_of(&candidate);
+
+    sync_status(&bus, thread_id, &candidate, &anchors, None).await;
+    let written = stored_status(&pool, thread_id).await;
+    assert_eq!(kind_of(&written), StatusKind::Warming);
+    sync_status(&bus, thread_id, &candidate, &anchors, written.clone()).await;
+    assert_eq!(
+        status_events(&pool, thread_id).await,
+        1,
+        "an unchanged status writes nothing"
+    );
+    assert_eq!(
+        activity().await,
+        before,
+        "a status moves no recency and no status"
+    );
+
+    let busy = Candidate {
+        claim: ThreadClaim::Busy,
+        keep_warm_wait_secs: Some(1.0),
+        ..candidate.clone()
+    };
+    sync_status(&bus, thread_id, &busy, &anchors_of(&busy), written).await;
+    assert_eq!(
+        status_events(&pool, thread_id).await,
+        1,
+        "a busy thread keeps its status"
+    );
+
+    clear_stale_statuses(&bus, &[thread_id]).await;
+    assert_eq!(
+        status_events(&pool, thread_id).await,
+        1,
+        "a candidate keeps its status"
+    );
+    clear_stale_statuses(&bus, &[]).await;
+    assert_eq!(stored_status(&pool, thread_id).await, None);
+    assert_eq!(status_events(&pool, thread_id).await, 2);
 
     pool.close().await;
     teardown_test_db(&db_name).await;

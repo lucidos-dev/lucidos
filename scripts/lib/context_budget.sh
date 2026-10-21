@@ -14,7 +14,7 @@
 # 5,404 words. Lines are a proxy for tokens and the proxy broke, so this gate
 # counts bytes instead.
 #
-# TWO ARMS, BOTH HARD.
+# THREE ARMS, ALL HARD.
 #
 #   1. SIZE. The always-loaded set must stay at or under CONTEXT_BUDGET_CEILING.
 #      Every byte here is paid on every request of every session, before the
@@ -29,8 +29,15 @@
 #      A rule that silently fails to scope looks exactly like a rule that does
 #      not exist, and the failure is invisible from inside a session.
 #
-# Deliberately NOT counted: path-scoped rules (they are the fix, not the
-# problem), skill bodies (they load on invocation), and nested CLAUDE.md files
+#   3. SCOPED CEILING. Each path-scoped rule must stay at or under
+#      CONTEXT_BUDGET_SCOPED_CEILING, unless it is listed in
+#      CONTEXT_BUDGET_SCOPED_EXCEPTIONS. Claude Code injects a scoped rule whole
+#      on the first Read of a matching file and again after every compaction,
+#      so a big one is re-read on every later call of that session. Arm 1 does
+#      not see it, because a scoped rule is not resident.
+#
+# Deliberately NOT counted in the total: path-scoped rules (arm 3 bounds each
+# one), skill bodies (they load on invocation), and nested CLAUDE.md files
 # (this repo has none; if one appears, the membership arm reports it).
 #
 # The engine system prompt is the OTHER unconditional surface, and it is gated
@@ -70,9 +77,27 @@ CONTEXT_BUDGET_EXPECTED_ALWAYS=(
     ".claude/rules/one-definition-per-value.md"
 )
 
+# Byte ceiling for ONE path-scoped rule. A RATCHET, like the one above: lowering
+# it needs no ceremony, and raising it needs a reason in the commit message.
+# shellcheck disable=SC2034 # read by scripts/check-context-budget.sh, which sources this file
+CONTEXT_BUDGET_SCOPED_CEILING=16000
+
+# Scoped rules allowed over that ceiling, each as `<path>:<bytes>`, the size
+# measured when it was listed. A listed rule may shrink and may not grow.
+# Slimming one under the ceiling means deleting its entry: the gate fails a
+# stale entry, so the list can only shorten.
+# shellcheck disable=SC2034 # read by scripts/check-context-budget.sh, which sources this file
+CONTEXT_BUDGET_SCOPED_EXCEPTIONS=(
+    ".claude/rules/front-door.md:31677"
+)
+
 # Printed verbatim by the gate so the fix is always spelled the same way.
 # shellcheck disable=SC2034 # printed by scripts/check-context-budget.sh
 CONTEXT_BUDGET_ADVICE='Move reference material to a skill (loads on invocation), a convention to a path-scoped rule (loads on a matching Read), or maintainer prose to docs/agent-config.md (never loads). See docs/agent-config.md.'
+
+# Printed by the gate when a scoped rule is over its limit.
+# shellcheck disable=SC2034 # printed by scripts/check-context-budget.sh
+CONTEXT_BUDGET_SCOPED_ADVICE='A rule keeps conventions only. Delete text that restates an ADR, a script header or the code, and link that home. Move rationale with no other home to a docs/ page. See docs/agent-config.md, Sizing a path-scoped rule.'
 
 # context_budget_is_always_loaded <file>
 # True when Claude Code holds this rule file resident in every session.
@@ -132,6 +157,31 @@ context_budget_is_always_loaded() {
 # file, sorted largest first. Discovery is `git ls-files`, not a hand-written
 # list, for the same reason scripts/lint-shell.sh uses it: a rule added anywhere
 # is measured the day it is committed.
+context_budget_scan() {
+    _context_budget_scan_rules "$1" always
+}
+
+# context_budget_scan_scoped <repo-root>
+# The same listing for every path-scoped rule file.
+context_budget_scan_scoped() {
+    _context_budget_scan_rules "$1" scoped
+}
+
+# context_budget_scoped_limit <repo-relative-path>
+# The byte limit for one scoped rule: its listed exception, else the ceiling.
+context_budget_scoped_limit() {
+    local path="$1" entry
+    # The `+` form keeps an empty list from aborting `set -u` on bash 3.2.
+    for entry in ${CONTEXT_BUDGET_SCOPED_EXCEPTIONS[@]+"${CONTEXT_BUDGET_SCOPED_EXCEPTIONS[@]}"}; do
+        if [ "${entry%:*}" = "$path" ]; then
+            echo "${entry##*:}"
+            return 0
+        fi
+    done
+    echo "$CONTEXT_BUDGET_SCOPED_CEILING"
+}
+
+# _context_budget_scan_rules <repo-root> <always|scoped>
 #
 # Streams rather than collecting into an array, and that is not a style choice.
 # `bash` here is macOS's system 3.2.57, where expanding an EMPTY array as
@@ -140,8 +190,8 @@ context_budget_is_always_loaded() {
 # discovery-is-broken case the caller has a fail-closed message for, so the
 # array form died with a confusing bash error one line before the actionable one
 # could print. No array, no special case.
-context_budget_scan() {
-    local root="$1" file bytes
+_context_budget_scan_rules() {
+    local root="$1" want="$2" file bytes loaded
 
     # Pathspecs are a directory and a filename, with the `.md` filter applied
     # here: git's wildmatch treats `*` inconsistently across versions for a
@@ -154,9 +204,13 @@ context_budget_scan() {
             esac
             # CLAUDE.md has no frontmatter contract; it is always resident.
             if [ "$file" = "CLAUDE.md" ] || context_budget_is_always_loaded "$root/$file"; then
-                bytes="$(wc -c <"$root/$file" | tr -d ' ')"
-                printf '%s\t%s\n' "$bytes" "$file"
+                loaded=always
+            else
+                loaded=scoped
             fi
+            [ "$loaded" = "$want" ] || continue
+            bytes="$(wc -c <"$root/$file" | tr -d ' ')"
+            printf '%s\t%s\n' "$bytes" "$file"
         done
     } | sort -rn
 }

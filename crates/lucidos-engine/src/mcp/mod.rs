@@ -81,16 +81,6 @@ impl RunningServer {
 pub const CALLABLE_NOW: &str = "Its tools are callable right now, in this same turn: \
      use them instead of asking the user to send another message.";
 
-/// The same fact for a caller whose tool array does NOT refresh.
-///
-/// `run_intent_loop` builds its array once from `build_intent_tools`, which
-/// never carries the MCP surface. Telling that caller the tools are live sends
-/// it looking for tools it does not have, and the repeat breaker is what stops
-/// it. The server really did start, so the sub-loop's job is to report that and
-/// let the outer turn use it.
-pub const CALLABLE_IN_THE_OUTER_TURN: &str = "Its tools are not in this sub-loop's \
-     array: report that it is running and let the outer turn call them.";
-
 /// What the model is told when it calls a tool the user switched off.
 fn disabled_tool_refusal(server_id: &str, wire_name: &str) -> String {
     format!(
@@ -485,11 +475,7 @@ impl McpStartOutcome {
     /// What the model is told after asking for a start. Both outcomes end in
     /// [`CALLABLE_NOW`], because both leave a connected server the rest of
     /// this turn can use.
-    /// `tools_live` says whether the CALLER's tool array picks the new surface
-    /// up. Only a loop that re-reads it per round may promise [`CALLABLE_NOW`].
-    /// It is a parameter rather than a default, so the promise is visible at
-    /// every call site.
-    pub fn describe(self, id: &str, tools_live: bool) -> String {
+    pub fn describe(self, id: &str) -> String {
         let state = match self {
             Self::AlreadyRunning { tool_count } => {
                 format!("is already running with {tool_count} tools")
@@ -498,12 +484,7 @@ impl McpStartOutcome {
                 format!("started with {tool_count} tools available")
             }
         };
-        let reach = if tools_live {
-            CALLABLE_NOW
-        } else {
-            CALLABLE_IN_THE_OUTER_TURN
-        };
-        format!("MCP server '{id}' {state}, and it is enabled in this thread. {reach}")
+        format!("MCP server '{id}' {state}, and it is enabled in this thread. {CALLABLE_NOW}")
     }
 }
 
@@ -617,9 +598,6 @@ impl McpManager {
 
     /// Register a new MCP server (saves to DB and connects), and enable it in
     /// `thread_id`, the thread that asked for it.
-    /// `tools_live` says whether the CALLER's tool array picks the new surface
-    /// up this turn. See [`McpStartOutcome::describe`].
-    #[allow(clippy::too_many_arguments)]
     pub async fn setup_server(
         &self,
         thread_id: uuid::Uuid,
@@ -627,8 +605,7 @@ impl McpManager {
         name: &str,
         command: &str,
         args: &[String],
-        env: &HashMap<String, String>,
-        tools_live: bool,
+        env: &HashMap<String, crate::core::McpEnvValue>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let server = McpServerStore::register(
             &self.pool,
@@ -651,13 +628,7 @@ impl McpManager {
                 Ok(format!(
                     "MCP server '{}' is set up, connected with {} tools available, and \
                      enabled in this thread. {}",
-                    name,
-                    tool_count,
-                    if tools_live {
-                        CALLABLE_NOW
-                    } else {
-                        CALLABLE_IN_THE_OUTER_TURN
-                    }
+                    name, tool_count, CALLABLE_NOW
                 ))
             }
             Err(e) => {
@@ -874,13 +845,14 @@ impl McpManager {
         server: &McpServer,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         crate::core::mcp_servers::validate_server_id(&server.id)?;
+        let env = crate::core::mcp_servers::launch_env(&self.pool, server).await?;
         // MCP servers are invoked as part of LLM tool calls today, so default to Agent.
         // If engine-internal MCP usage is added, that call site should pass ActorMode::Engine.
         let client = McpClient::connect(
             &server.id,
             &server.command,
             &server.args,
-            &server.env,
+            &env,
             ActorMode::Agent,
         )
         .await?;
@@ -948,16 +920,19 @@ impl McpManager {
     /// Returns whether a row was actually deleted. The caller needs that fact:
     /// reporting "removed" for an id that never existed is a silent success,
     /// and behind a DELETE route it is a 200 that did nothing.
+    ///
+    /// The process stops even on an error: the row may already be gone, and
+    /// a server whose row survived can start again at the next turn setup.
     pub async fn remove_server(
         &self,
         id: &str,
         actor: Option<MessageOrigin>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let deleted = McpServerStore::unregister(&self.pool, &self.event_bus, id, actor).await?;
+        let deleted = McpServerStore::unregister(&self.pool, &self.event_bus, id, actor).await;
         if let Some(entry) = self.take_running(id).await {
             entry.client.lock().await.shutdown().await;
         }
-        Ok(deleted)
+        deleted
     }
 
     /// Switch one of a server's tools off or back on, by wire name.
@@ -2557,6 +2532,14 @@ done
             }
         }
 
+        /// The env as a registration stores it: every entry a plain value.
+        fn registered_env(&self) -> HashMap<String, crate::core::McpEnvValue> {
+            self.env
+                .iter()
+                .map(|(var, value)| (var.clone(), crate::core::McpEnvValue::Plain(value.clone())))
+                .collect()
+        }
+
         /// Start a long `sleep` beside the server, the shape of an `npx` or
         /// `uvx` launcher whose interpreter outlives a kill aimed at it alone.
         fn spawns_a_grandchild(mut self) -> Self {
@@ -2697,9 +2680,18 @@ done
         stub: &StubServer,
     ) -> (McpManager, crate::engine::event_bus::EventBus) {
         let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-        McpServerStore::register(pool, &bus, id, "Stub", &stub.command, &[], &stub.env, None)
-            .await
-            .unwrap();
+        McpServerStore::register(
+            pool,
+            &bus,
+            id,
+            "Stub",
+            &stub.command,
+            &[],
+            &stub.registered_env(),
+            None,
+        )
+        .await
+        .unwrap();
         (McpManager::new(pool.clone(), bus.clone()), bus)
     }
 
@@ -2722,9 +2714,18 @@ done
     async fn manager_with_all(pool: &sqlx::PgPool, stubs: &[(&str, &StubServer)]) -> McpManager {
         let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
         for (id, stub) in stubs {
-            McpServerStore::register(pool, &bus, id, id, &stub.command, &[], &stub.env, None)
-                .await
-                .unwrap();
+            McpServerStore::register(
+                pool,
+                &bus,
+                id,
+                id,
+                &stub.command,
+                &[],
+                &stub.registered_env(),
+                None,
+            )
+            .await
+            .unwrap();
         }
         McpManager::new(pool.clone(), bus)
     }
@@ -3052,10 +3053,10 @@ done
     #[tokio::test]
     async fn every_way_a_server_comes_up_tells_the_model_its_tools_are_live_now() {
         assert!(McpStartOutcome::Started { tool_count: 15 }
-            .describe("slack", true)
+            .describe("slack")
             .contains(CALLABLE_NOW));
         assert!(McpStartOutcome::AlreadyRunning { tool_count: 15 }
-            .describe("slack", true)
+            .describe("slack")
             .contains(CALLABLE_NOW));
 
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -3068,8 +3069,7 @@ done
                 "Fresh",
                 &stub.command,
                 &[],
-                &stub.env,
-                true,
+                &stub.registered_env(),
             )
             .await
             .unwrap();
@@ -3518,9 +3518,7 @@ done
                 )
                 .await
                 .unwrap();
-            assert!(outcome
-                .describe("stub", true)
-                .contains("enabled in this thread"));
+            assert!(outcome.describe("stub").contains("enabled in this thread"));
         }
         assert_eq!(events_named(&pool, "ThreadMcpServerEnabled").await, 1);
 
@@ -3782,7 +3780,7 @@ done
             "Empty",
             &empty.command,
             &[],
-            &empty.env,
+            &empty.registered_env(),
             None,
         )
         .await

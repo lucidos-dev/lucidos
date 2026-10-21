@@ -40,6 +40,7 @@ impl VertexProvider {
         if let Some(tool) = selection.forced_tool {
             request.force_tool(tool, model)?;
         }
+        let stable_prefix_fingerprint = crate::llm::stable_prefix::fingerprint(&request, model);
         let beta_header = (!header_betas.is_empty()).then(|| header_betas.join(","));
         let display = request.thinking_display();
 
@@ -116,7 +117,12 @@ impl VertexProvider {
 
             // Parse SSE stream — retry on overload errors
             match parse_claude_stream(resp, &on_token, display, "Vertex").await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    return Ok(LlmResponse {
+                        stable_prefix_fingerprint,
+                        ..response
+                    })
+                }
                 Err(e) => {
                     let err_str = e.to_string();
                     if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {

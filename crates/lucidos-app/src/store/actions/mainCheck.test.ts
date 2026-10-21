@@ -11,6 +11,14 @@ describe('the main check frames, as pure steps', () => {
       .toEqual(RUNNING);
   });
 
+  it('a linked run shows on the running check, and only there', () => {
+    const link = { check_id: 'k-1', run_url: 'https://example.invalid/runs/1', branch: 'e2e/x' };
+    expect(mainCheckAfter(RUNNING, 'MainCheckRunLinked', link))
+      .toEqual({ ...RUNNING, run_url: 'https://example.invalid/runs/1' });
+    const passed = mainCheckAfter(RUNNING, 'MainCheckPassed', { check_id: 'k-1' });
+    expect(mainCheckAfter(passed, 'MainCheckRunLinked', link)).toEqual(passed);
+  });
+
   it('a pass keeps the range it cleared', () => {
     expect(mainCheckAfter(RUNNING, 'MainCheckPassed', { check_id: 'k-1' }))
       .toEqual({ state: 'passed', check_id: 'k-1', from_sha: 'aaa', to_sha: 'bbb' });

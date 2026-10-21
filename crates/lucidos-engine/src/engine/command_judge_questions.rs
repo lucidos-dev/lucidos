@@ -18,7 +18,9 @@
 
 use serde_json::{json, Value};
 
-use super::command_guard::{JudgeInput, RiskLane, SideEffectCategory};
+use super::command_guard::{
+    command_has_messaging_signal, JudgeInput, RiskLane, SideEffectCategory,
+};
 use super::command_judge::JudgeVerdict;
 use crate::llm::judgment::{Answers, ChoiceAnswer, Question};
 use crate::llm::tool_names as tn;
@@ -29,6 +31,10 @@ pub(crate) const CATEGORY: &str = "category";
 const SAFE: &str = "safe";
 const REVERSIBLE: &str = "reversible";
 const IRREVERSIBLE: &str = "irreversible";
+
+/// The category option for a command with no side-effect. It is listed first,
+/// so a tie goes to it and a harmless command is never guessed into a kind.
+const NONE: &str = "none";
 
 /// The probability at or above which the lane reads as safe.
 ///
@@ -52,7 +58,7 @@ pub(crate) const REVERSIBLE_MIN_PROBABILITY: f64 = 0.7;
 /// gave for a different side effect. Below this floor the answer is
 /// [`SideEffectCategory::Other`], which a trigger must grant outright.
 ///
-/// Lower than the lane's bar, because five options split a distribution more
+/// Lower than the lane's bar, because six options split a distribution more
 /// than three do. A majority on one category is the bar.
 pub(crate) const CATEGORY_MIN_PROBABILITY: f64 = 0.5;
 
@@ -80,12 +86,17 @@ const LANE_INSTRUCTIONS: &str = "Classify the risk of running `command` on the u
      A personal assistant runs it inside one workspace directory. Reading anywhere on the \
      machine is normal and expected, and so is writing under the workspace. Reading or editing \
      a file OUTSIDE the workspace is a wanted feature, not a threat. Only destruction outside \
-     the workspace is. `target_outside_workspace` is what static analysis saw, and it is a \
-     signal rather than a verdict.";
+     the workspace is. The command starts in the workspace root. A relative path with no `..`, \
+     such as `data/x` or `.lucidos/tmp/x`, is inside the workspace, unless the command \
+     changes directory first. `data/` and `.lucidos/` are both inside it. `lucidos data write` writes \
+     under the workspace. `target_outside_workspace` is true when static analysis found a path \
+     that lands outside. False means it found none, but a path built at run time can still \
+     land outside.";
 
 const CATEGORY_INSTRUCTIONS: &str = "If `command` has an irreversible real-world side-effect, \
-     which kind is it? Answer for the side-effect the command would have, even when you judge \
-     the command harmless overall. Pick the single best fit.";
+     which kind is it? Answer `none` when it has no irreversible side-effect. An HTTP GET or \
+     HEAD with no body is safe, and is neither email nor external_api. Writing or overwriting a \
+     file under the workspace is not out_of_workspace_destruction. Pick the single best fit.";
 
 /// The criterion name for `lane`. The judge never answers `Catastrophic`,
 /// which only the static fast path settles.
@@ -130,7 +141,8 @@ pub(crate) fn questions() -> Vec<(String, Question)> {
                              message, a mutating HTTP request, a cloud-service mutation, \
                              publishing, or spending money. Or destruction of content outside \
                              the workspace, such as removing or overwriting a system path, the \
-                             home directory, or another repository."
+                             home directory, or another repository. Writing files under the \
+                             workspace is never this."
                                 .to_string(),
                         ),
                     ),
@@ -142,6 +154,14 @@ pub(crate) fn questions() -> Vec<(String, Question)> {
             Question::Choice {
                 instructions: CATEGORY_INSTRUCTIONS.to_string(),
                 criteria: vec![
+                    (
+                        NONE.to_string(),
+                        Some(
+                            "No irreversible side-effect, such as a read, a computation or an \
+                             HTTP GET."
+                                .to_string(),
+                        ),
+                    ),
                     (
                         "email".to_string(),
                         Some(
@@ -165,7 +185,8 @@ pub(crate) fn questions() -> Vec<(String, Question)> {
                     (
                         "out_of_workspace_destruction".to_string(),
                         Some(
-                            "Deleting or overwriting files outside the workspace directory."
+                            "Deleting or overwriting a file whose path lands outside the \
+                             workspace directory, such as a system path or the home directory."
                                 .to_string(),
                         ),
                     ),
@@ -198,9 +219,11 @@ pub(crate) fn read_lane(answer: &ChoiceAnswer) -> RiskLane {
 }
 
 /// The category an option name stands for. Every name [`questions`] offers
-/// maps to its own variant, and anything else is `Other`.
+/// maps to its own variant, except `none`: it is read on the irreversible lane,
+/// where the command still asks, so it is `Other` like anything else unknown.
 fn parse_category(option: &str) -> SideEffectCategory {
     match option {
+        NONE => SideEffectCategory::Other,
         "email" => SideEffectCategory::Email,
         "external_api" => SideEffectCategory::ExternalApi,
         "cloud_cli" => SideEffectCategory::CloudCli,
@@ -222,10 +245,20 @@ pub(crate) fn read_category(answer: &ChoiceAnswer) -> SideEffectCategory {
     }
 }
 
-/// Turn the answers into a verdict.
+/// The category, with `Email` kept only for a command that names a way to send
+/// one. A model's guess is not evidence, and the lane is never touched.
+fn clamp_email(category: SideEffectCategory, command: &str) -> SideEffectCategory {
+    if category == SideEffectCategory::Email && !command_has_messaging_signal(command) {
+        SideEffectCategory::Other
+    } else {
+        category
+    }
+}
+
+/// Turn the answers into a verdict for `command`.
 ///
 /// A missing lane answer is [`JudgeVerdict::uncertain`]: *ask* (I13).
-pub(crate) fn read(answers: &Answers) -> JudgeVerdict {
+pub(crate) fn read(answers: &Answers, command: &str) -> JudgeVerdict {
     let Some(lane_answer) = answers.choice(LANE) else {
         return JudgeVerdict::uncertain();
     };
@@ -234,7 +267,7 @@ pub(crate) fn read(answers: &Answers) -> JudgeVerdict {
         answers
             .choice(CATEGORY)
             .map(read_category)
-            .unwrap_or(SideEffectCategory::Other)
+            .map_or(SideEffectCategory::Other, |c| clamp_email(c, command))
     });
     JudgeVerdict {
         lane,

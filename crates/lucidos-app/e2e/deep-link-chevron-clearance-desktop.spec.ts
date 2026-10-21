@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy } from './helpers';
 
 /** Regression guard: on desktop the floating up-chevron (.scroll-to-top) sits
  *  OVER the centered transcript (it was pulled in from the right gutter in fix
@@ -20,7 +20,6 @@ test.describe('Deep-link landing clears the scroll-to-top chevron (desktop)', ()
   });
 
   test('.chat-exchange scroll-margin-top clears the up-chevron footprint + focus-marker reach', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'the chevron overlaps transcript content only on desktop');
 
     await navigateToApp(page);
     // One turn is enough — we read layout metrics, not scroll position.

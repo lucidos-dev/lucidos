@@ -33,11 +33,20 @@ if (typeof document !== 'undefined') {
   const release = (e: Event) => { if (isPrimaryPress(e)) pressed = false; };
   document.addEventListener('pointerup', release, true);
   document.addEventListener('pointercancel', release, true);
+  // A press held in a frame lifts there, so only its click reaches this document.
+  document.addEventListener('click', (e) => { if (e.isTrusted) pressed = false; }, true);
   window.addEventListener('blur', () => { pressed = false; });
 }
 
 export function primaryPointerIsDown(): boolean {
   return pressed;
+}
+
+/** A widget frame reports a finger still held inside it, which this document
+ *  never saw go down. Once an overlay inerts the frame, the lift's click lands
+ *  here, so an overlay opening now must count the press as its own. */
+export function notePressHeldInFrame(): void {
+  pressed = true;
 }
 
 /** Run `fn` once the press now in progress has delivered its click.

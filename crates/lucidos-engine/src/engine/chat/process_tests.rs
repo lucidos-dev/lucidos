@@ -4,7 +4,10 @@ use super::super::process_helpers::{
     TriggerContext, APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE,
     FORCE_QUERY_CLASSIFICATION_ENV,
 };
-use super::{build_capture_sections, build_loaded_knowhow_block, TurnTail};
+use super::{
+    assemble_turn_text, build_capture_sections, build_knowhow_retention_block,
+    build_loaded_knowhow_block, TurnSections, TurnTail,
+};
 use crate::core::knowhow::KnowhowSummary;
 use crate::engine::loaded_knowhow::LoadedKnowhow;
 use crate::engine::thread_events::{
@@ -52,6 +55,7 @@ fn run_build(
         file_context_section,
         url_context_section,
         mcp_servers_context,
+        "",
         "",
         setup_reminder,
         thread_depth_context,
@@ -444,8 +448,8 @@ fn trigger_knowhow_section_scoped_to_firing_trigger() {
     // Thread of nightly-build sees the section.
     let section = build_trigger_knowhow_section(&triggers_dir, "nightly-build");
     assert!(
-        section.contains("## Trigger Know-how (this trigger only)"),
-        "trigger thread must see Trigger Know-how header, got: {section}"
+        section.starts_with("[TRIGGER KNOW-HOW]") && section.ends_with("[END TRIGGER KNOW-HOW]"),
+        "trigger thread must see the [TRIGGER KNOW-HOW] block, got: {section}"
     );
     assert!(
         section.contains("Orchestration"),
@@ -679,13 +683,55 @@ fn loaded_knowhow_block_emits_doc_bodies_verbatim() {
         s.contains("Treat their guidance as authoritative"),
         "header guidance missing from block:\n{s}"
     );
-    // Each doc says how long it stays, so the agent can keep one in time.
+    // The general rule rides here, so the agent can keep a doc in time.
     assert!(s.contains("call load_knowhow on it again"), "{s}");
     assert!(s.contains("unload_knowhow"), "{s}");
+    // Each doc keeps its id line. Its countdown rides in `[KNOWHOW RETENTION]`.
     for doc in &docs {
-        let line = format!("(`{}` {})", doc.id, doc.retention_note());
+        let line = format!("(`{}`)", doc.id);
+        assert!(s.contains(&line), "missing `{line}`:\n{s}");
+        assert!(
+            !s.contains(&doc.retention_note()),
+            "a retention note changes every turn, so it cannot sit in the stable block:\n{s}"
+        );
+    }
+}
+
+/// The block is the stable half of the knowhow section: ageing a doc must not
+/// change one byte of it.
+#[test]
+fn loaded_knowhow_block_is_identical_at_every_idle_age() {
+    let at = |idle_turns| {
+        build_loaded_knowhow_block(&[LoadedKnowhow::loaded_turns_ago(
+            "alpha",
+            "[KNOW-HOW: Alpha]\nBody\n[END KNOW-HOW]",
+            idle_turns,
+        )])
+    };
+    assert_eq!(at(0), at(2));
+    assert_eq!(at(0), at(3));
+}
+
+/// One note per doc, in the doc's own words, in a block of its own.
+#[test]
+fn knowhow_retention_block_carries_one_note_per_doc() {
+    let docs = vec![
+        LoadedKnowhow::loaded_turns_ago("alpha", "Body A", 0),
+        LoadedKnowhow::loaded_turns_ago("beta", "Body B", 2),
+    ];
+    let s = build_knowhow_retention_block(&docs).expect("non-empty docs produce a block");
+    assert!(s.starts_with("[KNOWHOW RETENTION]"), "{s}");
+    assert!(s.ends_with("[END KNOWHOW RETENTION]"), "{s}");
+    for doc in &docs {
+        let line = format!("`{}` {}", doc.id, doc.retention_note());
         assert!(s.contains(&line), "missing `{line}`:\n{s}");
     }
+    assert!(!s.contains("Body A") && !s.contains("Body B"), "{s}");
+}
+
+#[test]
+fn knowhow_retention_block_returns_none_for_empty_docs() {
+    assert!(build_knowhow_retention_block(&[]).is_none());
 }
 
 /// Empty loaded set must not produce a section — pushing an empty-string part
@@ -854,6 +900,7 @@ fn build_capture_sections_bills_the_todo_list_block() {
         "",
         "",
         "",
+        "",
         block,
         "user msg",
         &TurnTail {
@@ -923,6 +970,7 @@ fn build_capture_sections_bills_the_mcp_tools_not_sent_notice() {
         "",
         "",
         "",
+        "",
         "user msg",
         &TurnTail {
             engine_build: "",
@@ -953,6 +1001,7 @@ fn build_capture_sections_bills_the_mcp_tools_not_sent_notice() {
 fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
     let sections = build_capture_sections(
         "sys",
+        "",
         "",
         "",
         "",
@@ -1713,6 +1762,80 @@ async fn a_resolved_effort_is_clamped_to_what_the_resolved_model_supports() {
     teardown_test_db(&db_name).await;
 }
 
+/// The route a `run_thread` child stamps, resolved the way the tool does it.
+async fn sub_thread_route(
+    pool: &sqlx::PgPool,
+    registry: &crate::llm::ModelRegistry,
+    args: serde_json::Value,
+    caller: crate::core::ResolvedModelSelection,
+) -> crate::core::ResolvedModelSelection {
+    let overrides = crate::engine::agentic_loop::sub_thread_route_overrides(&args, &caller)
+        .expect("valid pins");
+    resolve_route_overrides(
+        pool,
+        crate::core::ModelDefaults {
+            registry,
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        overrides,
+    )
+    .await
+}
+
+/// An unpinned child follows its caller, never the account's `chat_model`.
+#[tokio::test]
+async fn an_unpinned_child_runs_on_its_callers_route_not_the_chat_model() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "account-model")
+        .await
+        .unwrap();
+    seed_chat_effort(&pool, "account-model", "high").await;
+    let registry = registry_with("claude-sonnet-5", crate::llm::ProviderKind::Anthropic);
+
+    let resolved = sub_thread_route(
+        &pool,
+        &registry,
+        serde_json::json!({ "prompt": "p" }),
+        sel(Some("claude-sonnet-5"), Some("low"), Some("anthropic")),
+    )
+    .await;
+
+    assert_eq!(
+        resolved,
+        sel(Some("claude-sonnet-5"), Some("low"), Some("anthropic"))
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An effort pinned for the inherited model is clamped to what its route runs.
+#[tokio::test]
+async fn a_childs_pinned_effort_is_clamped_to_the_inherited_route() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry = registry_with("muse-glimmer:30b-mlx", crate::llm::ProviderKind::Local);
+
+    let resolved = sub_thread_route(
+        &pool,
+        &registry,
+        serde_json::json!({ "prompt": "p", "reasoning_effort": "xhigh" }),
+        sel(Some("muse-glimmer:30b-mlx"), Some("low"), None),
+    )
+    .await;
+
+    assert_eq!(resolved.model.as_deref(), Some("muse-glimmer:30b-mlx"));
+    assert_eq!(
+        resolved.reasoning_effort.as_deref(),
+        Some("high"),
+        "a local model cannot run xhigh, so the child must not stamp it"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// A coding-agent route is exempt: the effort belongs to Claude Code / Codex,
 /// whose models are not in the chat registry and whose drivers validate it
 /// themselves. Clamping it against a chat model would answer a question about
@@ -1933,6 +2056,353 @@ async fn a_provider_the_model_cannot_use_is_not_stamped() {
     )
     .await;
     assert_eq!(on_route.provider.as_deref(), Some("vertex"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Every section, each a unique token, so a test can tell where it landed.
+fn every_section() -> TurnSections<'static> {
+    TurnSections {
+        recent: "RECENT",
+        profile: "PROFILE",
+        email_accounts: "EMAIL",
+        oauth: "OAUTH",
+        thread_depth: "DEPTH",
+        loaded_knowhow: "KNOWHOW",
+        device_preferences: "DEVICE",
+        memory: "MEMORY",
+        history: "HISTORY",
+        file_list: "LIST",
+        credentials: "CREDS",
+        knowhow_retention: "RETENTION",
+        app_context: "APP",
+        file_context: "OPENFILE",
+        url_context: "URL",
+        todo_list: "TODO",
+        mcp_servers: "MCP",
+        mcp_dropped_notice: "DROPPED",
+        trigger_knowhow: "TRIGGERDOCS",
+        setup_reminder: "SETUP",
+        request: "ASK",
+        tail: TurnTail {
+            engine_build: "BUILD",
+            client_url: "CLIENT",
+            current_time: "CLOCK",
+        },
+    }
+}
+
+/// Where each token first appears in `text`, in the order asked for.
+fn positions(text: &str, tokens: &[&str]) -> Vec<usize> {
+    tokens
+        .iter()
+        .map(|t| {
+            text.find(t)
+                .unwrap_or_else(|| panic!("`{t}` is missing:\n{text}"))
+        })
+        .collect()
+}
+
+fn is_ascending(xs: &[usize]) -> bool {
+    xs.windows(2).all(|w| w[0] < w[1])
+}
+
+/// The stable half holds the five inputs that change only when the user
+/// changes something, in this order. Everything else is volatile.
+#[test]
+fn the_stable_text_holds_the_five_stable_sections_in_order() {
+    let text = assemble_turn_text(&every_section());
+    assert_eq!(text.stable, "PROFILE\n\nEMAIL\n\nOAUTH\n\nDEPTH\n\nKNOWHOW");
+    for token in ["PROFILE", "EMAIL", "OAUTH", "DEPTH", "KNOWHOW"] {
+        assert!(
+            !text.volatile.contains(token),
+            "{token} leaked:\n{}",
+            text.volatile
+        );
+    }
+}
+
+/// Today's relative order survives in the volatile half, with the retention
+/// notes where the knowhow block used to sit.
+#[test]
+fn the_volatile_text_keeps_the_relative_order() {
+    let text = assemble_turn_text(&every_section());
+    let order = [
+        "RECENT",
+        "DEVICE",
+        "MEMORY",
+        "HISTORY",
+        "LIST",
+        "CREDS",
+        "RETENTION",
+        "APP",
+        "OPENFILE",
+        "URL",
+        "TODO",
+        "MCP",
+        "DROPPED",
+        "TRIGGERDOCS",
+        "SETUP",
+        "Request: ASK",
+        "BUILD",
+        "CLIENT",
+        "CLOCK",
+    ];
+    assert!(
+        is_ascending(&positions(&text.volatile, &order)),
+        "{}",
+        text.volatile
+    );
+}
+
+/// I6: the request and the tail stay last.
+#[test]
+fn the_request_and_the_tail_end_the_volatile_text() {
+    let text = assemble_turn_text(&every_section());
+    assert!(
+        text.volatile
+            .ends_with("Request: ASK\n\nBUILD\n\nCLIENT\n\nCLOCK"),
+        "{}",
+        text.volatile
+    );
+}
+
+/// I5: each section reaches the model once, so no token appears twice.
+#[test]
+fn every_section_appears_exactly_once_across_the_two_texts() {
+    let text = assemble_turn_text(&every_section());
+    let whole = format!("{}\n\n{}", text.stable, text.volatile);
+    for token in [
+        "RECENT",
+        "PROFILE",
+        "EMAIL",
+        "OAUTH",
+        "DEPTH",
+        "KNOWHOW",
+        "DEVICE",
+        "MEMORY",
+        "HISTORY",
+        "LIST",
+        "OPENFILE",
+        "URL",
+        "CREDS",
+        "RETENTION",
+        "APP",
+        "TODO",
+        "MCP",
+        "DROPPED",
+        "TRIGGERDOCS",
+        "SETUP",
+        "BUILD",
+        "CLIENT",
+        "CLOCK",
+    ] {
+        assert_eq!(whole.matches(token).count(), 1, "{token}:\n{whole}");
+    }
+}
+
+/// I1: the stable bytes depend on the stable inputs and on nothing else.
+#[test]
+fn the_stable_text_ignores_every_volatile_input() {
+    let base = assemble_turn_text(&every_section());
+    let changed = assemble_turn_text(&TurnSections {
+        recent: "other recent",
+        device_preferences: "seen 9 min ago",
+        memory: "other memory",
+        history: "longer history",
+        file_list: "",
+        credentials: "other credentials",
+        knowhow_retention: "stays 1 more turn",
+        app_context: "",
+        file_context: "other file",
+        url_context: "other url",
+        todo_list: "other todo",
+        mcp_servers: "",
+        mcp_dropped_notice: "",
+        trigger_knowhow: "other docs",
+        setup_reminder: "",
+        request: "another request",
+        tail: TurnTail {
+            engine_build: "other build",
+            client_url: "other client",
+            current_time: "other clock",
+        },
+        ..every_section()
+    });
+    assert_eq!(base.stable, changed.stable);
+    assert_ne!(base.volatile, changed.volatile);
+}
+
+/// An empty section leaves no gap behind, and no stable inputs leave no
+/// stable text for the caller to turn into a block.
+#[test]
+fn empty_sections_leave_no_separator_behind() {
+    let text = assemble_turn_text(&TurnSections {
+        request: "ASK",
+        tail: TurnTail {
+            engine_build: "",
+            client_url: "CLIENT",
+            current_time: "CLOCK",
+        },
+        ..TurnSections::default()
+    });
+    assert_eq!(text.stable, "");
+    assert_eq!(text.volatile, "Request: ASK\n\nCLIENT\n\nCLOCK");
+}
+
+/// I13: a trigger's own listing rides in the fire's volatile text, never in the
+/// stable block, so two triggers still share the stable entry.
+#[test]
+fn a_trigger_knowhow_listing_rides_in_the_volatile_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let kh_dir = tmp.path().join("nightly-build").join("knowhow");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(
+        kh_dir.join("orchestration.md"),
+        "---\nname: Orchestration\n---\nHow nightly orchestrates each phase.",
+    )
+    .unwrap();
+    let listing = build_trigger_knowhow_section(tmp.path(), "nightly-build");
+    let text = assemble_turn_text(&TurnSections {
+        trigger_knowhow: &listing,
+        request: "fire",
+        ..TurnSections::default()
+    });
+    assert!(
+        text.volatile
+            .contains("triggers/nightly-build/orchestration"),
+        "{}",
+        text.volatile
+    );
+    assert!(!text.stable.contains("nightly-build"), "{}", text.stable);
+}
+
+use super::run::trigger_model_override;
+
+const TRIGGER_DEFAULT: &str = "claude-sonnet-5-5";
+
+/// A registry serving the trigger default on Anthropic at its default effort.
+fn trigger_default_registry() -> crate::llm::ModelRegistry {
+    let registry = registry_with(TRIGGER_DEFAULT, crate::llm::ProviderKind::Anthropic);
+    registry
+        .write()
+        .unwrap()
+        .get_mut(TRIGGER_DEFAULT)
+        .unwrap()
+        .default_effort = Some("high");
+    registry
+}
+
+/// An unpinned trigger runs on the trigger model, never the chat model. It uses
+/// that model's default effort while the account stores no tier for it.
+#[tokio::test]
+async fn an_unpinned_trigger_runs_on_the_trigger_model_not_the_chat_model() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "claude-opus-5-5")
+        .await
+        .unwrap();
+    let registry = trigger_default_registry();
+
+    let model = trigger_model_override(&pool, &registry, |_| true, None).await;
+    assert_eq!(model.as_deref(), Some(prefs::TRIGGER_MODEL.default_text()));
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry,
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(model.as_deref(), None, None),
+    )
+    .await;
+
+    assert_eq!(resolved.model.as_deref(), Some(TRIGGER_DEFAULT));
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A trigger's own pin wins over the trigger model, stored or default.
+#[tokio::test]
+async fn a_pinned_trigger_keeps_its_model() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::TRIGGER_MODEL.key(), "account-model")
+        .await
+        .unwrap();
+
+    let model = trigger_model_override(&pool, &registry(), |_| true, Some("pinned-model")).await;
+    assert_eq!(model.as_deref(), Some("pinned-model"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A stored `trigger_model` replaces the catalog default.
+#[tokio::test]
+async fn a_stored_trigger_model_replaces_the_default() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::TRIGGER_MODEL.key(), "account-model")
+        .await
+        .unwrap();
+
+    let model = trigger_model_override(&pool, &registry(), |_| true, None).await;
+    assert_eq!(model.as_deref(), Some("account-model"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// With the default on no configured backend, the fire follows the chat
+/// resolver instead of failing on a model the workspace cannot reach.
+#[tokio::test]
+async fn an_unreachable_trigger_default_leaves_the_fire_to_the_chat_resolver() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry = trigger_default_registry();
+
+    let model = trigger_model_override(
+        &pool,
+        &registry,
+        |kind| kind != crate::llm::ProviderKind::Anthropic,
+        None,
+    )
+    .await;
+    assert_eq!(model, None);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The trigger model never reaches a chat turn: with no override and no thread
+/// memory, a turn still starts on the chat model.
+#[tokio::test]
+async fn the_trigger_model_never_reaches_a_chat_turn() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "chat-account-model")
+        .await
+        .unwrap();
+    crate::test_support::seed_preference(
+        &pool,
+        prefs::TRIGGER_MODEL.key(),
+        "trigger-account-model",
+    )
+    .await
+    .unwrap();
+
+    let resolved = resolve_route_overrides(
+        &pool,
+        crate::core::ModelDefaults {
+            registry: &registry(),
+            fallback_model: FALLBACK_MODEL,
+        },
+        |_| true,
+        None,
+        None,
+        None,
+        sel(None, None, None),
+    )
+    .await;
+
+    assert_eq!(resolved.model.as_deref(), Some("chat-account-model"));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

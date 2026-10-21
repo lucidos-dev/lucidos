@@ -45,6 +45,7 @@ function trigger(over: Partial<TriggerInfo> = {}): TriggerInfo {
   return {
     id: TRIGGER_ID,
     name: 'Scheduled CI result',
+    slug: 'scheduled-ci-result',
     cron_expressions: ['0 0 9 * * *'],
     timezone: 'UTC',
     paused: false,

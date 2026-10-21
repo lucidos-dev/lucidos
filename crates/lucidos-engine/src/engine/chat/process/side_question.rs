@@ -108,15 +108,18 @@ impl LucidosEngine {
         };
         messages.push(Message {
             role: "user".to_string(),
-            content: views.lead(build_user_content_with_images(
-                text,
-                &self.workspace_path,
-                &history.history_image_hashes,
-                Some(images),
-                // `SideQuestionAsked` is not walked for thread images, so a
-                // handle printed here would resolve to nothing.
-                &[],
-            )),
+            content: views.lead(
+                String::new(),
+                build_user_content_with_images(
+                    text,
+                    &self.workspace_path,
+                    &history.history_image_hashes,
+                    Some(images),
+                    // `SideQuestionAsked` is not walked for thread images, so a
+                    // handle printed here would resolve to nothing.
+                    &[],
+                ),
+            ),
         });
 
         let tools = self

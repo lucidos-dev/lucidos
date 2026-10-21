@@ -8,6 +8,7 @@
 
 use super::ToolOutcome;
 use crate::core::devices::SeenDevice;
+use crate::core::AppManager;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 use sqlx::PgPool;
@@ -127,6 +128,7 @@ pub(crate) async fn emit_navigation(
 pub(crate) async fn navigate_ui_impl(
     bus: &EventBus,
     pool: &PgPool,
+    apps: &AppManager,
     args: &serde_json::Value,
     thread_id: Uuid,
     last_used: Option<&str>,
@@ -171,11 +173,56 @@ pub(crate) async fn navigate_ui_impl(
     if target == "url" {
         out.push_str(URL_NOTE);
     }
+    if let Some(note) = new_chat_folder_note(pool, apps, &payload).await {
+        out.push_str(&note);
+    }
     if let Some(guide) = page_guide(target, args) {
         out.push_str("\n\n");
         out.push_str(guide);
     }
     Ok(out)
+}
+
+/// A warning when a `new-chat` `folder` names no registered repository and no
+/// installed app. The navigate still goes out, and the page leaves that
+/// dropdown at its default. The agent learns here, so it can correct itself.
+async fn new_chat_folder_note(
+    pool: &PgPool,
+    apps: &AppManager,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    if payload.get("target").and_then(|v| v.as_str()) != Some("new-chat") {
+        return None;
+    }
+    let folder = payload.get("folder")?.as_str()?;
+    if folder.is_empty() {
+        return None;
+    }
+    let reason = match folder
+        .strip_prefix("data/apps/")
+        .map(|id| id.trim_end_matches('/'))
+    {
+        Some(app_id) if apps.app_exists(app_id) => return None,
+        Some(app_id) => format!("no installed app has the id '{app_id}'"),
+        None => {
+            let repos = match crate::core::repositories::RepositoryStore::list(pool).await {
+                Ok(repos) => repos,
+                Err(e) => {
+                    log!("[Navigate] could not list repositories for folder '{folder}': {e}");
+                    return None;
+                }
+            };
+            match crate::api::match_repository(&repos, folder) {
+                Ok(_) => return None,
+                Err(reason) => reason,
+            }
+        }
+    };
+    Some(format!(
+        "\n\nWarning: folder '{folder}' was not preselected: {reason}. The new chat still \
+         opens with the folder dropdown at its default. manage_repositories 'list' shows \
+         each repository's name and id."
+    ))
 }
 
 /// The first line of every result: what was sent, to whom, and that sent is

@@ -258,6 +258,26 @@ export function CameraIcon({ size = '1rem' }: { size?: string }) {
   );
 }
 
+/** A five-point star: filled marks the default, outlined offers to make it so. */
+export function StarIcon({ filled = false, size = '1rem' }: { filled?: boolean; size?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill={filled ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+    </svg>
+  );
+}
+
+/** Two columns of three dots: the handle a row is dragged by. */
+export function GripIcon({ size = '1rem' }: { size?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <circle cx="9" cy="6" r="1.6" /><circle cx="15" cy="6" r="1.6" />
+      <circle cx="9" cy="12" r="1.6" /><circle cx="15" cy="12" r="1.6" />
+      <circle cx="9" cy="18" r="1.6" /><circle cx="15" cy="18" r="1.6" />
+    </svg>
+  );
+}
+
 export function ChevronUpIcon({ size = '1.25rem' }: { size?: string }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -529,12 +549,14 @@ export function SidebarIcon() {
   );
 }
 
-// The Home rail toggle: `SidebarIcon` mirrored, since the rail is the right
-// column of the window.
-export function RightSidebarIcon() {
+// The dashboard toggle: one medium tile over two small ones. The desktop rail's
+// toggle and the phone's dashboard sheet button both draw it.
+export function DashboardIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM15 4v16" />
+      <rect x="3" y="3.5" width="18" height="8" rx="2" />
+      <rect x="3" y="14.5" width="7.5" height="6" rx="2" />
+      <rect x="13.5" y="14.5" width="7.5" height="6" rx="2" />
     </svg>
   );
 }

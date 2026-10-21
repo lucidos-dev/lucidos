@@ -45,6 +45,7 @@ export function ConfirmDialog() {
   if (!state.visible) return null;
 
   const cancelLabel = state.cancelLabel || 'Cancel';
+  const choices = state.choices;
 
   return (
     <Overlay
@@ -79,6 +80,25 @@ export function ConfirmDialog() {
             ))}
           </div>
         )}
+        {choices && (
+          <div class="confirm-choices">
+            <button ref={okBtnRef} class="confirm-choice confirm-choice-primary" data-role="confirm-ok" onClick={() => settleConfirm(true)}>
+              <strong>{state.okLabel}</strong>
+              <span>{choices.okDetail}</span>
+            </button>
+            <button
+              class="confirm-choice"
+              data-role="confirm-extra"
+              onClick={() => {
+                choices.alternative.onClick();
+                settleConfirm(false);
+              }}
+            >
+              <strong>{choices.alternative.label}</strong>
+              <span>{choices.alternative.detail}</span>
+            </button>
+          </div>
+        )}
       </div>
       <div class="surface-foot">
         {/* An acknowledgement has no Cancel: there is nothing to decline, and
@@ -102,14 +122,16 @@ export function ConfirmDialog() {
             {cancelLabel}
           </button>
         )}
-        <button
-          ref={okBtnRef}
-          class={`action-btn${state.variant === 'danger' ? ' action-btn-danger' : ''}`}
-          data-role="confirm-ok"
-          onClick={() => settleConfirm(true)}
-        >
-          {state.okLabel}
-        </button>
+        {!choices && (
+          <button
+            ref={okBtnRef}
+            class={`action-btn${state.variant === 'danger' ? ' action-btn-danger' : ''}`}
+            data-role="confirm-ok"
+            onClick={() => settleConfirm(true)}
+          >
+            {state.okLabel}
+          </button>
+        )}
       </div>
     </Overlay>
   );

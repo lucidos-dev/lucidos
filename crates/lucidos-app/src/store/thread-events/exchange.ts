@@ -275,10 +275,10 @@ export function exchangeUserImageHashes(exchange: Exchange): string[] {
   return raw.filter((h): h is string => typeof h === 'string');
 }
 
-/** Extract a field from the response completion event or CodingAgentSettingsChanged fallback.
- *  Walks steps backward, skipping terminal events that omit the field (recovery
- *  paths emit ResponseAborted with model=null). Claude Code sessions fall back to
- *  CodingAgentSettingsChanged (emitted at session start). Chat sessions fall back to the
+/** Extract a field from the response completion event, else from the newest step
+ *  `midTurn` reads it from. Walks steps backward, skipping terminal events that
+ *  omit the field (recovery paths emit ResponseAborted with model=null). A
+ *  coding-agent session reads its steps mid-turn. Chat sessions fall back to the
  *  request metadata stamped on the exchange's STARTER event so the route popover
  *  shows model/effort while the response is still streaming.
  *
@@ -290,7 +290,11 @@ export function exchangeUserImageHashes(exchange: Exchange): string[] {
  *  Executor section with no Model and no Effort row for the whole run, even
  *  though the fire had resolved both. */
 type ResponseField = 'model' | 'reasoning_effort';
-function extractResponseField(exchange: Exchange, field: ResponseField): string | undefined {
+function extractResponseField(
+  exchange: Exchange,
+  field: ResponseField,
+  midTurn: (event: StoredEvent) => string | undefined,
+): string | undefined {
   let ccFallback: string | undefined;
   for (let i = exchange.steps.length - 1; i >= 0; i--) {
     const event = exchange.steps[i].event;
@@ -298,9 +302,7 @@ function extractResponseField(exchange: Exchange, field: ResponseField): string 
       const v = event[field];
       if (v) return v;
     }
-    if (!ccFallback && event.type === 'CodingAgentSettingsChanged' && event[field]) {
-      ccFallback = event[field];
-    }
+    ccFallback ??= midTurn(event);
   }
   if (ccFallback) return ccFallback;
   const starter = exchange.userEvent;
@@ -312,11 +314,24 @@ function extractResponseField(exchange: Exchange, field: ResponseField): string 
 }
 
 export function exchangeResponseModel(exchange: Exchange): string | undefined {
-  return extractResponseField(exchange, 'model');
+  return extractResponseField(exchange, 'model', (event) =>
+    event.type === 'CodingAgentSettingsChanged' ? event.model || undefined : undefined);
 }
 
+/** The effort the exchange's calls ran at, its *effort in force*. Mid-turn that
+ *  is the newest main-session capture, or the settings the engine wrote at
+ *  spawn. A user's pick carries an `actor` and is skipped: it is a selection,
+ *  and a Claude Code call runs at its session's spawn effort. */
 export function exchangeReasoningEffort(exchange: Exchange): string | undefined {
-  return extractResponseField(exchange, 'reasoning_effort');
+  return extractResponseField(exchange, 'reasoning_effort', (event) => {
+    if (event.type === 'ContextCaptured') {
+      return parentToolUseIdOf(event) ? undefined : event.reasoning_effort || undefined;
+    }
+    if (event.type === 'CodingAgentSettingsChanged' && !(event as { actor?: unknown }).actor) {
+      return event.reasoning_effort || undefined;
+    }
+    return undefined;
+  });
 }
 
 // Static fallback labels: the `MODELS` fallback list plus legacy model strings
@@ -346,6 +361,22 @@ const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   ['claude-opus-4-1', 'Opus 4.1'],
   ['claude-opus-4-8[1m]', 'Opus 4.8 (1M)'],
   ['claude-opus-4-8', 'Opus 4.8'],
+  ['claude-fable-5', 'Fable 5'],
+  ['claude-fable-5[1m]', 'Fable 5 (1M)'],
+  ['claude-opus-5', 'Opus 5'],
+  ['claude-opus-5[1m]', 'Opus 5 (1M)'],
+  ['claude-sonnet-5', 'Sonnet 5'],
+  ['claude-sonnet-5[1m]', 'Sonnet 5 (1M)'],
+  ['claude-fable-5-1[1m]', 'Fable 5.1 (1M)'],
+  ['claude-opus-5-5[1m]', 'Opus 5.5 (1M)'],
+  ['claude-sonnet-5-5[1m]', 'Sonnet 5.5 (1M)'],
+  ['claude-haiku-4-5', 'Haiku 4.5'],
+  ['gemini-3-flash-preview', 'Gemini 3 Flash'],
+  ['gpt-5.6-sol', 'GPT-5.6 Sol'],
+  ['gpt-5.6-terra', 'GPT-5.6 Terra'],
+  ['gpt-5.6-luna', 'GPT-5.6 Luna'],
+  ['gpt-5.5-pro', 'GPT-5.5 Pro'],
+  ['gpt-5.4-mini', 'GPT-5.4 mini'],
   // The `@default` spellings the chat registry used to carry. They still reach
   // the transcript from two places the re-spell deliberately left alone: the
   // Claude Code picker, whose own vocabulary still says `claude-opus-5@default`,

@@ -26,7 +26,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use lucidos_local_token::SHARED_PG_PASSWORD_FILE;
-use lucidos_pg_url::{redact, Host, PgUrl};
+use lucidos_pg_url::{redact, Host, PgUrl, PG_MAX_IDENTIFIER_BYTES};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -304,9 +304,6 @@ pub fn database_name(ws_id: &str) -> Result<String, BoxError> {
 }
 
 const DATABASE_PREFIX: &str = "lucidos_";
-
-/// Postgres silently cuts an identifier past this many bytes (`NAMEDATALEN - 1`).
-const PG_MAX_IDENTIFIER_BYTES: usize = 63;
 
 /// The longest id a NEW workspace may take. Past it, Postgres cuts the database
 /// name: two long ids sharing a prefix then share one database, and an id past
@@ -647,7 +644,16 @@ fn drop_database_docker(container: &str, database: &str) -> Result<(), BoxError>
     );
     let drop = format!("DROP DATABASE IF EXISTS {}", quote_ident(database));
     let _ = psql_query_docker(container, PG_ADMIN_DATABASE, &terminate);
-    psql_query_docker(container, PG_ADMIN_DATABASE, &drop).map(|_| ())
+    psql_query_docker(container, PG_ADMIN_DATABASE, &drop)?;
+    psql_query_docker(container, PG_ADMIN_DATABASE, &drop_agent_role(database)).map(|_| ())
+}
+
+/// The database's agent role goes with it. The engine created it at boot.
+fn drop_agent_role(database: &str) -> String {
+    format!(
+        "DROP ROLE IF EXISTS {}",
+        quote_ident(&lucidos_pg_url::agent_role(database))
+    )
 }
 
 fn verify_database_docker(container: &str, database: &str) -> Result<(), BoxError> {
@@ -909,7 +915,8 @@ fn shell_quote(arg: &str) -> String {
 }
 
 /// Rewrite `pg_hba.conf` and `pg_ident.conf` so only this OS user connects,
-/// and only as [`PG_USER`] over the socket. Runs before every start.
+/// over the socket: as [`PG_USER`], or as an agent role with its password.
+/// Runs before every start.
 fn write_auth_files(data: &Path) -> Result<(), ProvisionError> {
     let ident = pg_ident_conf(&os_user_name()?)?;
     for (name, body) in [("pg_hba.conf", pg_hba_conf()), ("pg_ident.conf", ident)] {
@@ -924,8 +931,14 @@ fn write_auth_files(data: &Path) -> Result<(), ProvisionError> {
 const AUTH_FILE_HEADER: &str =
     "# Written by the Lucidos gateway before every start. Edits here are lost.\n";
 
+/// An agent role (ADR 0509) signs in with the password its engine minted at
+/// boot. The socket directory is owner-only, so it is still this OS user.
 fn pg_hba_conf() -> String {
-    format!("{AUTH_FILE_HEADER}local all {PG_USER} peer map={PEER_MAP}\n")
+    let agents = lucidos_pg_url::AGENT_ROLE_GROUP;
+    format!(
+        "{AUTH_FILE_HEADER}local all +{agents} scram-sha-256\n\
+         local all {PG_USER} peer map={PEER_MAP}\n"
+    )
 }
 
 /// The ident map: `os_user` connects as [`PG_USER`], and nobody else does.
@@ -1294,7 +1307,15 @@ fn drop_database_embedded(
     );
     let drop = format!("DROP DATABASE IF EXISTS {}", quote_ident(database));
     let _ = psql_query_embedded(bin, lib, socket_dir, PG_ADMIN_DATABASE, &terminate);
-    psql_query_embedded(bin, lib, socket_dir, PG_ADMIN_DATABASE, &drop).map(|_| ())
+    psql_query_embedded(bin, lib, socket_dir, PG_ADMIN_DATABASE, &drop)?;
+    psql_query_embedded(
+        bin,
+        lib,
+        socket_dir,
+        PG_ADMIN_DATABASE,
+        &drop_agent_role(database),
+    )
+    .map(|_| ())
 }
 
 fn verify_database_embedded(
@@ -1829,7 +1850,13 @@ mod tests {
             .filter(|l| !l.starts_with('#'))
             .map(str::to_string)
             .collect();
-        assert_eq!(rules, ["local all lucidos peer map=owner"]);
+        assert_eq!(
+            rules,
+            [
+                "local all +lucidos_agents scram-sha-256",
+                "local all lucidos peer map=owner"
+            ]
+        );
         let ident = pg_ident_conf("me x").unwrap();
         let maps: Vec<&str> = ident.lines().filter(|l| !l.starts_with('#')).collect();
         assert_eq!(maps, ["owner \"me x\" lucidos"]);

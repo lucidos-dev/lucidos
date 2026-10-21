@@ -155,6 +155,11 @@ pub(super) async fn list_credentials(
     Ok(Json(CredentialsListResponse { credentials }))
 }
 
+/// The 1Password service account decides what every secret reference reads,
+/// so only its own owner-only routes (`api::onepassword`) write it.
+const SERVICE_ACCOUNT_IS_SETTINGS_ONLY: &str =
+    "The 1Password service account is managed in Settings, Accounts, 1Password";
+
 /// Create or update a credential
 pub(super) async fn create_credential(
     State(state): State<AppState>,
@@ -162,6 +167,9 @@ pub(super) async fn create_credential(
     Json(request): Json<CreateCredentialRequest>,
 ) -> Json<ApiResult> {
     let auth_type = AuthType::parse(&request.auth_type);
+    if auth_type == AuthType::OnepasswordServiceAccount {
+        return ApiResult::err(SERVICE_ACCOUNT_IS_SETTINGS_ONLY.to_string());
+    }
     // Normalized at this boundary too, not just on the LLM tool path: typing
     // `oauth:google` into the Add Credential form must land on the same row as
     // typing `google`, or the form recreates the duplicate-credential incident
@@ -201,6 +209,15 @@ pub(super) async fn create_credential(
         Ok(urls) => urls,
         Err(reason) => return ApiResult::err(reason),
     };
+    if let Err(reason) = crate::core::credentials::check_secret_references(
+        &state.pool,
+        auth_type,
+        &request.auth_value,
+    )
+    .await
+    {
+        return ApiResult::err(reason);
+    }
     // `upsert` emits `Credential{Created,Updated}` itself, so this handler
     // resolves the device actor up front and passes it down. The emit is not
     // the caller's to make (see `CredentialStore`'s type doc).
@@ -222,23 +239,6 @@ pub(super) async fn create_credential(
     .await
     {
         Ok(_) => {
-            // If this is an email password, also sync it into the email account
-            // row. IMAP/SMTP read the password from `email_accounts`, not the
-            // credentials table, so a failed sync must surface as an error (the
-            // edit path in `update_credential` does the same) rather than report
-            // a false success while email silently breaks.
-            // The service name IS the account name now; the helper only differs
-            // for a row the prefix migration had to leave alone.
-            if auth_type == AuthType::EmailPassword {
-                use crate::core::EmailStore;
-                let account_name = EmailStore::account_name_for_credential(&service_name);
-                if let Err(e) =
-                    EmailStore::update_password(&state.pool, account_name, &request.auth_value)
-                        .await
-                {
-                    return ApiResult::err(format!("Failed to update email password: {}", e));
-                }
-            }
             complete_credential_requests(&state, request.form_request_id, &service_name, actor)
                 .await;
             ApiResult::ok()
@@ -267,10 +267,10 @@ async fn complete_credential_requests(
     form_requests::complete_credential_requests_for(pool, bus, service_name, actor).await;
 }
 
-/// Update an existing credential's editable fields. For `email_password`
-/// credentials the `email_accounts` row (server settings + password) is kept in
-/// sync, because IMAP/SMTP read from `email_accounts`, not the credentials
-/// table — the create path does the same, and the edit path must match it.
+/// Update an existing credential's editable fields. For an `email_password`
+/// credential the body can also carry the mailbox's server settings, which
+/// land on its `email_accounts` row. The password itself lives only in the
+/// credential.
 pub(super) async fn update_credential(
     State(state): State<AppState>,
     Query(query): Query<CredentialIdQuery>,
@@ -314,6 +314,26 @@ pub(super) async fn update_credential(
         }
     }
 
+    // Neither side of the edit may be the service account. Keeping the stored
+    // value across that type change would make its token injectable.
+    let touches_service_account = auth_type == AuthType::OnepasswordServiceAccount
+        || match CredentialStore::get_by_id(&state.pool, id).await {
+            Ok(stored) => {
+                stored.is_some_and(|stored| stored.auth_type == AuthType::OnepasswordServiceAccount)
+            }
+            Err(e) => return ApiResult::err(format!("Failed to update credential: {}", e)),
+        };
+    if touches_service_account {
+        return ApiResult::err(SERVICE_ACCOUNT_IS_SETTINGS_ONLY.to_string());
+    }
+    if let Some(secret) = new_secret {
+        if let Err(reason) =
+            crate::core::credentials::check_secret_references(&state.pool, auth_type, secret).await
+        {
+            return ApiResult::err(reason);
+        }
+    }
+
     // Same as the create path: the store owns the `CredentialUpdated` emit, so
     // resolve the device actor here and hand it over.
     let actor = crate::api::actor::user_actor(&headers, None);
@@ -353,13 +373,6 @@ pub(super) async fn update_credential(
                     .await
                     {
                         return ApiResult::err(format!("Failed to update email account: {}", e));
-                    }
-                }
-                if let Some(value) = new_secret {
-                    if let Err(e) =
-                        EmailStore::update_password(&state.pool, account_name, value).await
-                    {
-                        return ApiResult::err(format!("Failed to update email password: {}", e));
                     }
                 }
             }
@@ -599,12 +612,12 @@ pub(crate) fn routes_for_create(
     Ok(routes)
 }
 
-/// Apply an edit to a stored model: the fields to store, and `enabled`.
-/// Shared with the `manage_models` tool, so the two apply one rule set.
+/// Apply an edit to a stored model: the fields to store. Shared with the
+/// `manage_models` tool, so the two apply one rule set. `on_chat_ladder` is
+/// not a column, so each caller applies it through `runtime::chat_ladder`.
 ///
 /// Builtins keep their IDENTITY, so `label` and `sort_order` are engine-owned
-/// there. Routes, the preferred pick, the vision flag and `enabled` apply to
-/// every row.
+/// there. Routes, the preferred pick and the vision flag apply to every row.
 ///
 /// `provider` and `context_window` apply to the FIRST route, which is what the
 /// single-route shorthand means. Neither is identity: a vendor can raise a
@@ -612,7 +625,7 @@ pub(crate) fn routes_for_create(
 pub(crate) fn apply_model_update(
     existing: &crate::core::Model,
     request: UpdateModelRequest,
-) -> Result<(ModelFields, bool), String> {
+) -> Result<ModelFields, String> {
     let builtin = existing.is_builtin();
     let mut routes = request.routes.unwrap_or_else(|| existing.routes.clone());
     if request.provider.is_some() || request.context_window.is_some() {
@@ -648,18 +661,18 @@ pub(crate) fn apply_model_update(
         true => existing.sort_order,
         false => request.sort_order.unwrap_or(existing.sort_order),
     };
-    let fields = ModelFields {
+    Ok(ModelFields {
         label,
         routes,
         preferred_provider,
         vision: request.vision.unwrap_or(existing.vision),
         sort_order,
-    };
-    Ok((fields, request.enabled.unwrap_or(existing.enabled)))
+    })
 }
 
-/// GET /api/v1/models — the full registry (enabled + disabled). The chat picker
-/// filters to `enabled`; the Settings → Models manager shows all.
+/// GET /api/v1/models: the full registry, the catalogue the chat intelligence
+/// ladder picks from. Each row says whether a rung that is on runs it, which
+/// is what the chat picker filters on.
 ///
 /// Each ROUTE carries the reasoning efforts its backend supports, derived here
 /// so the picker offers exactly what `RoutingProvider` will send. Per route
@@ -678,12 +691,24 @@ pub(super) async fn list_models(
             format!("Failed to list models: {}", e),
         )
     })?;
-    let models = models.into_iter().map(model_info).collect();
+    let chat_ladder = crate::runtime::intelligence_ladder::load(
+        &state.pool,
+        &state.engine.model_routes(),
+        crate::runtime::intelligence_ladder::LadderSurface::Chat,
+    )
+    .await;
+    let models = models
+        .into_iter()
+        .map(|model| {
+            let on_chat_ladder = chat_ladder.lists_model(&model.id);
+            model_info(model, on_chat_ladder)
+        })
+        .collect();
     Ok(Json(ModelsListResponse { models }))
 }
 
 /// Serve one registry row, deriving each route's reasoning efforts.
-fn model_info(model: crate::core::Model) -> ModelInfo {
+fn model_info(model: crate::core::Model, on_chat_ladder: bool) -> ModelInfo {
     let routes = model
         .routes
         .iter()
@@ -707,7 +732,7 @@ fn model_info(model: crate::core::Model) -> ModelInfo {
         successor: model.successor,
         sort_order: model.sort_order,
         source: model.source,
-        enabled: model.enabled,
+        on_chat_ladder,
         created_at: model.created_at,
     }
 }
@@ -762,6 +787,7 @@ pub(super) async fn create_model(
     };
     // The store emits `ModelCreated` from inside its write path (the in-memory
     // ModelRegistry reloads on it), so resolve the device actor and hand it over.
+    // A new model lists off the chat ladder until someone turns it on.
     let actor = crate::api::actor::user_actor(&headers, None);
     match ModelStore::create(&state.pool, &state.engine.event_bus, &id, &fields, actor).await {
         Ok(_) => ApiResult::ok(),
@@ -775,8 +801,8 @@ pub(super) async fn create_model(
 /// PUT /api/v1/models?id= to edit a model.
 ///
 /// Builtins keep their IDENTITY, so `label` and `sort_order` are engine-owned
-/// there. They still accept `enabled`, `routes`, `preferred_provider` and
-/// `vision`.
+/// there. They still accept `on_chat_ladder`, `routes`, `preferred_provider`
+/// and `vision`.
 ///
 /// None of those is identity. Which backends serve a model is a fact that
 /// changes, and `preferred_provider` is the model picker's own write path.
@@ -795,25 +821,55 @@ pub(super) async fn update_model(
         Ok(None) => return ApiResult::err(format!("Model '{}' not found", query.id)),
         Err(e) => return ApiResult::err(format!("Failed to load model: {}", e)),
     };
-    let (fields, enabled) = match apply_model_update(&existing, request) {
-        Ok(applied) => applied,
+    let on_chat_ladder = request.on_chat_ladder;
+    let fields = match apply_model_update(&existing, request) {
+        Ok(fields) => fields,
         Err(err) => return ApiResult::err(err),
     };
     // The store owns the `ModelUpdated` emit.
     let actor = crate::api::actor::user_actor(&headers, None);
-    match ModelStore::update(
+    // Turning off reads no field, so it goes first: its refusal then leaves
+    // the row untouched. Turning on may need the routes this edit sets.
+    if on_chat_ladder == Some(false) {
+        if let Err(err) = set_on_chat_ladder(&state, &existing.id, false, actor.clone()).await {
+            return ApiResult::err(err);
+        }
+    }
+    if let Err(e) = ModelStore::update(
         &state.pool,
         &state.engine.event_bus,
         &existing.id,
         &fields,
-        enabled,
-        actor,
+        actor.clone(),
     )
     .await
     {
-        Ok(_) => ApiResult::ok(),
-        Err(e) => ApiResult::err(format!("Failed to update model: {}", e)),
+        return ApiResult::err(format!("Failed to update model: {}", e));
     }
+    if on_chat_ladder == Some(true) {
+        if let Err(err) = set_on_chat_ladder(&state, &existing.id, true, actor).await {
+            return ApiResult::err(format!("Model updated, but {err}"));
+        }
+    }
+    ApiResult::ok()
+}
+
+/// Reads the routes at call time, so turning on sees an edit's new routes.
+async fn set_on_chat_ladder(
+    state: &AppState,
+    model: &str,
+    on: bool,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> Result<crate::runtime::chat_ladder::ChatLadderChange, String> {
+    crate::runtime::chat_ladder::set_model_on_chat_ladder(
+        &state.pool,
+        &state.engine.event_bus,
+        &state.engine.model_routes(),
+        model,
+        on,
+        actor,
+    )
+    .await
 }
 
 /// DELETE /api/v1/models?id= — delete a user model. Builtins are not deletable
@@ -832,9 +888,17 @@ pub(super) async fn delete_model(
         return ApiResult::err("Builtin models cannot be deleted — disable it instead");
     }
     let actor = crate::api::actor::user_actor(&headers, None);
-    match ModelStore::delete(&state.pool, &state.engine.event_bus, &existing.id, actor).await {
+    match crate::runtime::chat_ladder::delete_user_model(
+        &state.pool,
+        &state.engine.event_bus,
+        &state.engine.model_routes(),
+        &existing.id,
+        actor,
+    )
+    .await
+    {
         Ok(_) => ApiResult::ok(),
-        Err(e) => ApiResult::err(format!("Failed to delete model: {}", e)),
+        Err(err) => ApiResult::err(err),
     }
 }
 
@@ -930,9 +994,11 @@ pub(super) async fn reauthorize_oauth(
         Ok(None) => return ApiResult::needs_credentials(&provider, &overrides),
         Err(e) => return ApiResult::err(format!("Failed to check credentials: {}", e)),
         Ok(Some(cred)) => {
-            let missing = crate::core::oauth::missing_flow_fields(&cred.auth_value);
+            // Asks which fields are filled in, so the stored value serves: a
+            // secret reference fills its field.
+            let missing = crate::core::oauth::missing_flow_fields(cred.stored_value());
             if !missing.is_empty() {
-                let client_id = serde_json::from_str::<serde_json::Value>(&cred.auth_value)
+                let client_id = serde_json::from_str::<serde_json::Value>(cred.stored_value())
                     .ok()
                     .and_then(|v| v["client_id"].as_str().map(str::to_string));
                 return ApiResult::needs_credential_repair(
@@ -1029,8 +1095,8 @@ pub(super) async fn get_preferences(
 
 /// Drop the engine's own bookkeeping rows from a preference map.
 ///
-/// `GET /preferences` is an `App` route, and `vapid_keys` holds the Web Push
-/// private signing key. Silent keys are not settings, so no client reads them.
+/// `GET /preferences` is an `App` route. Silent keys are not settings, so no
+/// client reads them.
 fn settings_only(
     mut preferences: std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
@@ -2239,27 +2305,22 @@ mod hand_over_guard_tests {
 mod preferences_read_tests {
     use super::*;
 
-    /// An app reads `GET /preferences`, so the Web Push private key must not
-    /// ride along. Every other row is a setting, and it still does.
+    /// An app reads `GET /preferences`, so engine bookkeeping must not ride
+    /// along. Every other row is a setting, and it still does.
     #[test]
     fn the_preference_read_leaves_out_engine_bookkeeping() {
         use crate::core::prefs;
         let theme_mode = prefs::THEME_MODE.key();
-        let vapid_keys = prefs::VAPID_KEYS.key();
         let backfill = prefs::BACKFILL_REPO_NAMES_FROM_CHANGES_DONE.key();
-        let stored: std::collections::HashMap<String, String> = [
-            (theme_mode, "dark"),
-            (vapid_keys, r#"{"private_key_pem":"secret"}"#),
-            (backfill, "true"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        let stored: std::collections::HashMap<String, String> =
+            [(theme_mode, "dark"), (backfill, "true")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
 
         let served = settings_only(stored);
 
         assert_eq!(served.get(theme_mode).map(String::as_str), Some("dark"));
-        assert!(!served.contains_key(vapid_keys));
         assert!(!served.contains_key(backfill));
     }
 }
@@ -2279,7 +2340,6 @@ mod model_update_tests {
             successor: None,
             sort_order: 5,
             source: source.to_string(),
-            enabled: true,
             created_at: chrono::Utc::now(),
         }
     }
@@ -2292,7 +2352,7 @@ mod model_update_tests {
     /// never quietly takes image description away from it.
     #[test]
     fn an_edit_without_the_vision_flag_keeps_it() {
-        let (fields, _) = apply_model_update(
+        let fields = apply_model_update(
             &stored("user", true),
             edit(serde_json::json!({"label": "New"})),
         )
@@ -2303,13 +2363,13 @@ mod model_update_tests {
     /// A seed can be wrong, so a builtin takes the flag like it takes routes.
     #[test]
     fn a_builtin_accepts_the_vision_flag() {
-        let (fields, _) = apply_model_update(
+        let fields = apply_model_update(
             &stored("builtin", false),
             edit(serde_json::json!({"vision": true})),
         )
         .unwrap();
         assert!(fields.vision);
-        let (fields, _) = apply_model_update(
+        let fields = apply_model_update(
             &stored("builtin", true),
             edit(serde_json::json!({"vision": false})),
         )

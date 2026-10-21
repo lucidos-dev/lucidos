@@ -16,7 +16,7 @@ report. Each section carries its own scan, checks and fixes.
 | id | load | covers |
 |---|---|---|
 | `triggers` | `system-knowhow/workspace-audit/triggers` | intent vs knowhow split, retired event subscriptions, slugs, notification taps |
-| `apps` | `system-knowhow/workspace-audit/apps` | SDK boilerplate, the isolated app frame, escaping, theme names, hand-drawn controls, the ready signal, widgets |
+| `apps` | `system-knowhow/workspace-audit/apps` | SDK boilerplate, the isolated app frame, escaping, theme names, dashboard names, hand-drawn controls, the ready signal, widgets |
 | `knowhow` | `system-knowhow/workspace-audit/knowhow` | frontmatter, naming, placement, unreachable references, orphans |
 | `intents` | `system-knowhow/workspace-audit/intents` | frontmatter, knowhow ids, tone |
 | `scripts` | `system-knowhow/workspace-audit/scripts` | CLI usage, machine paths |
@@ -144,10 +144,12 @@ calling a category clean.
 | `web-share` | the OS share sheet, from an app frame | `apps` |
 | `url-mutation` | the frame writing its own session-history URL | `apps` |
 | `theme-rename` | names from before *look* became *theme* | `apps` |
+| `dashboard-rename` | names from before the dashboard rename | `apps` |
 | `hand-rolled-ui` | a control the app draws itself that the SDK provides | `apps` |
 | `attr-escape` | a text-only escaper writing into an attribute value | `apps` |
 | `ready-signal` | the manifest's `reveal`, and calls to `lucidos.ui.ready()` | `apps` |
 | `app-icon` | the manifest's `icon` | `apps` |
+| `widget-tile` | the manifest's `sizes` and `transparent` | `apps` |
 | `touch-hover` | every `:hover` rule, to judge whether a hover gate wraps it | `apps` |
 | `state-as-action` | `.action-btn` variants swapped in code, or written without the base class | `apps` |
 | `tap-strings` | the retired `tap` string forms | `triggers` |
@@ -155,6 +157,7 @@ calling a category clean.
 | `removed-fields` | thread-summary fields the engine no longer sends | `cross-cutting` |
 | `cred-env` | a credential read from the environment | `cross-cutting` |
 | `auth-header` | an auth header built in app UI code | `cross-cutting` |
+| `retired-tools` | LLM tools that were retired | `cross-cutting` |
 | `machine-path` | a hardcoded home or machine path | `scripts` |
 | `db-defaults` | database access that may lean on libpq defaults the engine no longer sets | `scripts` |
 | `plugin-manifests` | authored plugin-root `manifest.toml` files and whether each declares `engine` | `plugins` |
@@ -247,9 +250,31 @@ lucidos events emit WorkspaceAuditCompleted \
   --payload '{"artifact": "artifacts/audits/<dir>/report.md", "findings": <N>, "broken": <A>, "stale": <B>, "drift": <C>, "smell": <D>, "nit": <E>}'
 ```
 
-## Remediation: only on request, and only as child threads
+## Remediation: only on request, inline or as child threads
 
 Fixes are a separate step, only when the user asks: up front ("audit and fix what you can") or after reading the report ("go fix the app theming ones").
+
+### Inline or a coding agent
+
+Each fix takes one of two routes. The section's § Remediation names the route per row; for a fix it does not cover, judge by the table.
+
+| Route | How it runs | For |
+|---|---|---|
+| **Inline** | You edit with `edit_file` / `write_file` in this thread, every target in one pass. Each write commits straight to the workspace. | A mechanical, pattern-shaped edit that changes no control flow: a hover gate, a rename, an attribute or class swap, a trimmed manifest description, a dead line deleted. |
+| **Coding agent** | One child thread per target through `run_coding_agent`. Its work lands as a pending change the user reviews and applies. | A control-flow change (sync to async, startup order), anything that needs tests or a build, a refactor across files, and any diff the user should read before Apply. |
+
+**The tradeoff: an inline edit skips review.** It commits at once, with no branch, no diff to read and no Apply. So only a purely mechanical edit goes inline. When in doubt, send it to a coding agent.
+
+**The default is mixed**: inline for the mechanical batch, coding agents for the rest. Give the split in the "Do all suggested fixes" description: how many inline edits, and how many coding-agent threads.
+
+**Verify an inline batch by re-running its scans.** Run the same `scan` lines after the pass. Each fixed category should fall to the hits you judged fine. For an app file, the `[APP LINT]` note in each write's result is a second check (glossary § App lint).
+
+**Worked example.** One full pass found ungated `:hover` rules in about 40 apps, one to six rules each. Sent as one coding-agent thread per app, they filled the Thread Queue and left the user about 30 pending changes, each a wrap in `@media (hover: hover)`. Inline, that is one pass in the audit thread and one re-run of the `touch-hover` scan. The same pass found work that earned its coding agent:
+
+- startup reads moved after `await lucidos.storage.ready`, with the `catch` that hid the old error removed
+- `escapeHtml` swapped for `escapeHtmlAttr`, which needs a read of each call site to see whether the value lands in an attribute
+- `confirm()` swapped for `await lucidos.ui.confirm(…)`, which made every caller `async`
+- a failing test, fixed and run
 
 ### Ask once, and lead with the whole set
 
@@ -260,7 +285,7 @@ Ask right after the report lands, with these options in this order:
 | Option | Means |
 |---|---|
 | **Do all suggested fixes** | Every fix in the report. Say how many, across how many targets, in the description. |
-| *A narrower cut* | Only when one exists and is genuinely safer or cheaper, such as the direct cleanups without the coding-agent work. Skip the slot otherwise. |
+| *A narrower cut* | Only when one exists and is genuinely safer or cheaper, such as the inline batch without the coding-agent work. Skip the slot otherwise. |
 | **Let me pick which** | Follow with a multi-select card: one option per target batch, using the batching rule below. |
 | **Nothing for now** | Leave the report as the record. It needs its own option: Submit stays disabled with nothing ticked, and Cancel aborts the turn rather than declining. |
 
@@ -268,18 +293,19 @@ The first label says *suggested* because each finding's own line says so. A labe
 
 **Skip the card when the user already asked for fixes.** "Audit and fix what you can" is the answer; re-asking bounces a settled decision back.
 
-When you do spawn fix work:
+When you do spawn coding-agent work:
 
 - **Spawn child threads: omit `relation` (it defaults to `"child"`). Never pass `relation: "top"`.** When a child's session ends, this audit thread resumes with the result. You can then confirm each fix, note what didn't land, and update the report.
-  - The fix threads nest under the audit in the thread drawer. Each one on a pending change is an *attention descendant*, which bubbles the audit thread to the Current section. The user follows one row, not N.
+  - The coding-agent threads nest under the audit in the thread drawer. Each one on a pending change is an *attention descendant*, which bubbles the audit thread to the Current section. The user follows one row, not N.
   - `relation: "top"` records no parent *and* no spawning event. Nothing links the fix to the audit, and the report stays frozen at "suggested fix". The `"top"` wording ("for the user to follow themselves") does **not** cover audit remediation.
   - Only exception: a fix in a *different* workspace must use `relation: "top"`. Child callbacks don't cross a workspace boundary, and the tool refuses the combination. Say so in the report and link the thread, since it won't report back.
 - **One thread per target, spawned in parallel.** Issue the `run_coding_agent` calls in a single response; each reports back independently. Batch per app / per repo, not per finding: one thread fixing six findings in one `index.html` beats six threads racing on the file.
-- **A child reporting back means its session ended, not that the fix is live.** Coding-agent work lands as a pending change the user applies. Report it as "proposed", never as "applied" or "live".
-- **Fold the outcomes into the same report.** When the children have reported back, append a `## Remediation` section to the run's existing `report.md` (same timestamped directory). List target, spawned thread link, and outcome per fix. A fresh sweep gets a fresh directory; a remediation pass does not.
+- **A child reporting back means its session ended, not that the fix is live.** Coding-agent work lands as a pending change the user applies. Report it as "proposed", never as "applied" or "live". An inline fix is live once written, so report it as "applied".
+- **Fold the outcomes into the same report.** When the inline pass is done and the children have reported back, append a `## Remediation` section to the run's existing `report.md` (same timestamped directory). List target, route (inline, or the spawned thread link) and outcome per fix. A fresh sweep gets a fresh directory; a remediation pass does not.
 
-Each section's own `## Remediation` carries the tables a fix thread gets: the
-old-to-new mappings, and which fixes may join "Do all suggested fixes".
+Each section's own `## Remediation` carries the tables a fix gets: the
+old-to-new mappings, the route each fix takes, and which fixes may join "Do all
+suggested fixes".
 
 - **A deletion never joins "Do all suggested fixes".** Deleting an app or a
   knowhow doc gets its own card, naming the item.

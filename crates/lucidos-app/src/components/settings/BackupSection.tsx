@@ -1,9 +1,11 @@
 import { type ComponentChildren, type VNode } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
+import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import {
   backupPreferencesVersion,
   backupProgress,
+  backupRecipientVersion,
   backupStatusVersion,
   knownOAuthProviders,
   showToast,
@@ -25,7 +27,6 @@ import { openConnectedAccountsSettings } from '../../store/actions/menu';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
-import { copyToClipboard } from '../../utils/clipboard';
 import { Dropdown, DropdownSkeleton } from '../shared/Dropdown';
 import { ProgressBar } from '../shared/progressBar';
 import { Explainer } from '../shared/Explainer';
@@ -33,9 +34,7 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText } from '../shared/Skeleton';
 import {
   getBackupProviders,
-  getBackupKey,
-  generateBackupKey,
-  getBackupKeyExists,
+  getBackupKeys,
   getBackupSchedule,
   setBackupSchedule,
   getBackupRetention,
@@ -44,7 +43,7 @@ import {
   getBackupStatus,
   ApiError,
   type BackupProviderInfo,
-  type BackupKeyResponse,
+  type BackupKeys,
   type BackupStatus,
   type BackupLastRun,
 } from '../../api/client';
@@ -52,9 +51,10 @@ import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { errorDetail } from '../../utils/errorDetail';
+import { BackupKeyPanel, backupKeyPanelSkeleton, backupsCanSeal } from './BackupKeyPanel';
 
 // Restore lives in the workspace picker now (it provisions the new workspace);
-// this section is backup creation + key + scheduling only. These are the phases
+// this section is backup creation, the backup key and scheduling only. These are the phases
 // the backup pipeline reports via BackupProgress.
 const PHASE_LABELS: Record<string, string> = {
   starting: 'Starting...',
@@ -73,12 +73,12 @@ const SCHEDULE_OPTIONS: { label: string; value: string }[] = [
 ];
 
 const RETENTION_OPTIONS: { label: string; value: string }[] = [
-  { label: 'Keep 1', value: '1' },
-  { label: 'Keep 3', value: '3' },
-  { label: 'Keep 5', value: '5' },
-  { label: 'Keep 10', value: '10' },
-  { label: 'Keep 20', value: '20' },
-  { label: 'Keep 50', value: '50' },
+  { label: '1 backup', value: '1' },
+  { label: '3 backups', value: '3' },
+  { label: '5 backups', value: '5' },
+  { label: '10 backups', value: '10' },
+  { label: '20 backups', value: '20' },
+  { label: '50 backups', value: '50' },
 ];
 
 function scheduleLabel(cron: string): string {
@@ -99,7 +99,7 @@ function askLucidosToSetUpBackups(): void {
     target: 'new-chat',
     prompt:
       'Help me set up encrypted backups: pick a provider, connect the account, '
-      + 'choose a schedule, and make sure I save the encryption key.',
+      + 'choose a schedule, and make sure I save the backup key.',
   });
 }
 
@@ -261,19 +261,6 @@ export function backupHealthCardSkeleton(): VNode {
   );
 }
 
-/** The access line under the Provider picker, as shimmer: its own box, three lines. */
-function backupProviderAccessSkeleton(): VNode {
-  return (
-    <SkeletonProvider>
-      <div class="backup-provider-access" aria-hidden="true">
-        <SkText as="div" w="100%" />
-        <SkText as="div" w="100%" />
-        <SkText as="div" w="60%" />
-      </div>
-    </SkeletonProvider>
-  );
-}
-
 /**
  * A dropdown that shows a skeleton while its value is still being read.
  *
@@ -350,28 +337,10 @@ export function shouldPollBackupStatus(status: Loadable<BackupStatus>, liveProgr
   return status.status === 'loaded' && status.data.running && !liveProgress;
 }
 
-/** Label for the single backup-key button. `keyExists` is the read-only probe
- *  result (null = not probed yet); it decides "Show backup key" (a key exists)
- *  vs "Generate new backup key" (none yet). Once a key is revealed the button
- *  toggles to "Hide backup key". Defaulting the unknown state to "Show backup
- *  key" is safe because the click handler falls back to generate if the reveal
- *  404s. This is what stops a "show" action from silently minting a key — the
- *  behavior that surfaced a "New backup key generated" toast for a workspace
- *  that already had backups. */
-export function backupKeyButtonLabel(keyExists: boolean | null, showingKey: boolean): string {
-  if (showingKey) return 'Hide backup key';
-  if (keyExists === false) return 'Generate new backup key';
-  return 'Show backup key';
-}
-
 export function BackupSection() {
   const [providersLoadable, setProvidersLoadable] = useState<Loadable<BackupProviderInfo[]>>({ status: 'not-loaded' });
   const [selectedProvider, setSelectedProvider] = useState<string>('');
-  const [keyInfo, setKeyInfo] = useState<BackupKeyResponse | null>(null);
-  const [showKey, setShowKey] = useState(false);
-  // null until the on-mount existence probe answers. Drives the button label
-  // (Show vs Generate) without revealing or minting the key.
-  const [keyExists, setKeyExists] = useState<boolean | null>(null);
+  const [keysLoadable, setKeysLoadable] = useState<Loadable<BackupKeys>>({ status: 'not-loaded' });
   const [statusLoadable, setStatusLoadable] = useState<Loadable<BackupStatus>>({ status: 'not-loaded' });
   const [schedule, setSchedule] = useState<string>(PREFERENCE_CATALOG.backup_schedule.fallback);
   const [scheduleLoaded, setScheduleLoaded] = useState(false);
@@ -458,15 +427,7 @@ export function BackupSection() {
       }
     })();
 
-    // Probe whether a backup key already exists so the key button labels itself
-    // correctly ("Show backup key" vs "Generate new backup key") without
-    // revealing the secret or minting one. Best-effort startup probe: a failed
-    // probe leaves keyExists null, and the click handler still resolves
-    // correctly (reveal, falling back to generate on a 404) and surfaces any
-    // real error there — so no toast is owed here.
-    getBackupKeyExists()
-      .then((r) => setKeyExists(r.exists))
-      .catch(() => { /* label falls back to "Show"; the click handler resolves it */ });
+    void loadKeys();
 
     // The *OAuth provider registry*, for the console guidance beside *Grant
     // access*. Shared with Settings > Accounts through the same signal, so
@@ -575,9 +536,14 @@ export function BackupSection() {
     backupPreferencesVersion.value = version;
     return Promise.all([
       preferences,
+      loadKeys(),
       selectedProvider && selectedReady ? loadStatus({ keepPrevious: true }) : undefined,
     ]);
   });
+
+  // A backup key set up on another device, or by a second tab, reaches this
+  // page through `BackupRecipientSet`.
+  useVersionedRefresh(backupRecipientVersion.value, false, () => { void loadKeys(); });
 
   const progress = backupProgress.value;
 
@@ -658,55 +624,14 @@ export function BackupSection() {
     }
   }
 
-  async function handleKeyButton() {
-    // Already revealed → just toggle visibility, no refetch.
-    if (keyInfo) {
-      setShowKey(!showKey);
-      return;
-    }
-    // No key yet → generate one (the only user-facing mint path).
-    if (keyExists === false) {
-      await generateAndShowKey();
-      return;
-    }
-    // A key exists (or existence is still unknown) → reveal it read-only.
+  /** Re-reads keep what is on screen: the answer names the same workspace. */
+  async function loadKeys() {
+    setKeysLoadable((prev) => (prev.status === 'loaded' ? prev : { status: 'loading' }));
     try {
-      const resp = await getBackupKey();
-      setKeyInfo(resp);
-      setShowKey(true);
-      setKeyExists(true);
+      setKeysLoadable({ status: 'loaded', data: await getBackupKeys() });
     } catch (err) {
-      // 404 = key vanished since the probe (or never existed) → generate it.
-      // Any other error is a real failure the user must see.
-      if (err instanceof ApiError && err.httpCode === 404) {
-        await generateAndShowKey();
-      } else {
-        showToast(`Failed to show backup key: ${errorDetail(err)}`, 'error');
-      }
+      setKeysLoadable(toFailed(err));
     }
-  }
-
-  async function generateAndShowKey() {
-    try {
-      const resp = await generateBackupKey();
-      setKeyInfo(resp);
-      setShowKey(true);
-      setKeyExists(true);
-      // is_new is false if a key already existed (race) — only warn when we
-      // actually minted one, since that's the moment the user must save it.
-      if (resp.is_new) {
-        showToast(
-          'New backup key generated. Store it somewhere safe right now — you need it to restore, and it cannot be recovered.',
-          'warning',
-        );
-      }
-    } catch (err) {
-      showToast(`Failed to generate backup key: ${errorDetail(err)}`, 'error');
-    }
-  }
-
-  function copyKey() {
-    if (keyInfo) copyToClipboard(keyInfo.key, 'Key copied to clipboard');
   }
 
   /** `keepPrevious` leaves whatever is on screen there while the new answer is
@@ -824,6 +749,9 @@ export function BackupSection() {
     !!providerInfo?.connected && !providerInfo.ready,
   );
   const backingUp = progress !== null;
+  // Nothing can seal a backup before the backup key setup, and the engine
+  // refuses one. Unknown keeps the button live: the engine is the authority.
+  const keysMissing = keysLoadable.status === 'loaded' && !backupsCanSeal(keysLoadable.data);
   // Same `selectedReady` the status fetch and the skeleton gate key off, so the
   // offer and the health card cannot disagree about whether a destination works.
   const offerSetup = showBackupSetupOffer(providersLoadable, selectedReady, statusLoadable);
@@ -838,7 +766,8 @@ export function BackupSection() {
   // last of these reads settles. Per-slot gates each armed when their own read
   // started, which is what made the shimmer arrive in waves. Each slot still
   // CLEARS on its own read, so the gate withholds nothing already loaded.
-  const skeletonsVisible = useDelayedFlag(pending.controls || pending.status);
+  const keysPending = keysLoadable.status === 'not-loaded' || keysLoadable.status === 'loading';
+  const skeletonsVisible = useDelayedFlag(pending.controls || pending.status || keysPending);
   const showControlSkeleton = pending.controls && skeletonsVisible;
 
   const healthCard = backupHealthCard({
@@ -898,7 +827,14 @@ export function BackupSection() {
       </LoadingFade>
 
       <div class="settings-row" data-search-anchor="backup:provider">
-        <span class="settings-row-label">Provider</span>
+        <span class="settings-row-label">
+          Provider
+          {PROVIDER_ACCESS[selectedProvider] && (
+            <Explainer title="Provider">
+              <p>{PROVIDER_ACCESS[selectedProvider]}</p>
+            </Explainer>
+          )}
+        </span>
         <DropdownSlot pending={pending.controls} showSkeleton={showControlSkeleton} skeletonWidth="5rem">
           <Dropdown
             options={providerOptions}
@@ -911,13 +847,6 @@ export function BackupSection() {
           <span class="error-text">Failed to load providers: {providersLoadable.error}</span>
         )}
       </div>
-      {/* Several lines of copy that land with the provider read, so its place is
-          held on the section's one gate like the controls around it. */}
-      <LoadingFade showSkeleton={showControlSkeleton} skeleton={backupProviderAccessSkeleton()}>
-        {PROVIDER_ACCESS[selectedProvider] && (
-          <p class="backup-provider-access">{PROVIDER_ACCESS[selectedProvider]}</p>
-        )}
-      </LoadingFade>
 
       {providerInfo && !providerInfo.connected && (
         // Still an error state (nothing uploads until an account is connected),
@@ -982,21 +911,19 @@ export function BackupSection() {
         </div>
       )}
 
-      <div class="backup-actions-row">
-        <button
-          class="action-btn action-btn-confirm"
-          disabled={backingUp || !selectedProvider || !providerInfo?.ready}
-          onClick={handleBackup}
-        >
-          {backingUp ? 'Backing up...' : 'Back up now'}
-        </button>
-        {/* The schedule picker keeps its "render nothing once we know there is
-            nothing to show" behaviour: a failed read leaves no control at all,
-            because the 'off' default is not a value we may claim. So the SLOT
-            has to disappear with it rather than staying as an empty child, or
-            the row's gap would open twice where the control used to be. The
-            skeleton covers only the window before that verdict exists. */}
-        {(pending.controls || scheduleLoaded) && (
+      {/* The schedule picker keeps its "render nothing once we know there is
+          nothing to show" behaviour: a failed read leaves no control at all,
+          because the 'off' default is not a value we may claim. So its row
+          goes with it. The skeleton covers only the window before that
+          verdict exists. */}
+      {(pending.controls || scheduleLoaded) && (
+        <div class="settings-row" data-search-anchor="backup:schedule">
+          <span class="settings-row-label">
+            Schedule
+            <Explainer title="Schedule">
+              <p>Scheduled backups run at the selected time in your timezone (set in Settings → Locale).</p>
+            </Explainer>
+          </span>
           <DropdownSlot pending={pending.controls} showSkeleton={showControlSkeleton} skeletonWidth="6.5rem">
             <Dropdown
               options={SCHEDULE_OPTIONS}
@@ -1005,8 +932,11 @@ export function BackupSection() {
               onChange={handleScheduleChange}
             />
           </DropdownSlot>
-        )}
-        <DropdownSlot pending={pending.controls} showSkeleton={showControlSkeleton} skeletonWidth="3rem">
+        </div>
+      )}
+      <div class="settings-row" data-search-anchor="backup:retention">
+        <span class="settings-row-label">Keep</span>
+        <DropdownSlot pending={pending.controls} showSkeleton={showControlSkeleton} skeletonWidth="4.5rem">
           <Dropdown
             options={RETENTION_OPTIONS}
             value={retention}
@@ -1015,35 +945,32 @@ export function BackupSection() {
           />
         </DropdownSlot>
       </div>
-      {scheduleLoaded && schedule !== 'off' && (
-        <div class="backup-schedule-hint">
-          Scheduled backups run at the selected time in your timezone (set in Settings → Locale).
-        </div>
-      )}
+      <div class="backup-actions-row">
+        <button
+          class="action-btn action-btn-confirm"
+          disabled={backingUp || !selectedProvider || !providerInfo?.ready || keysMissing}
+          onClick={handleBackup}
+        >
+          {backingUp ? 'Backing up...' : 'Back up now'}
+        </button>
+      </div>
 
       {/* Live backup progress is shown by the health card at the top of this
           section (backupHealthCard's running branch) — no duplicate bar here. */}
 
-      <div class="backup-key-row">
-        <button
-          class="action-btn"
-          onClick={handleKeyButton}
-        >
-          {backupKeyButtonLabel(keyExists, showKey)}
-        </button>
-        {showKey && keyInfo && (
-          <>
-            <span class="backup-key-value">{keyInfo.key}</span>
-            <button class="action-btn" onClick={copyKey}>Copy</button>
-          </>
+      <LoadingFade showSkeleton={keysPending && skeletonsVisible} skeleton={backupKeyPanelSkeleton()}>
+        {keysLoadable.status === 'loaded' && (
+          <BackupKeyPanel
+            keys={keysLoadable.data}
+            onKeysChanged={(keys) => setKeysLoadable({ status: 'loaded', data: keys })}
+          />
         )}
-      </div>
-      {showKey && keyInfo && (
-        <div class="backup-key-warning">
-          Store this key somewhere safe right now — you need it to restore, and it cannot be recovered.
-          You restore a backup from the workspace picker.
-        </div>
-      )}
+        {keysLoadable.status === 'failed' && (
+          <div class="backup-key">
+            <span class="error-text">Failed to load the backup key status: {keysLoadable.error}</span>
+          </div>
+        )}
+      </LoadingFade>
     </div>
   );
 }

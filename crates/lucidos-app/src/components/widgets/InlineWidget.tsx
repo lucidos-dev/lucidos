@@ -1,6 +1,8 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useState } from 'preact/hooks';
 import { OverflowMenu } from '../shared/OverflowMenu';
+import { useObjectMenu, type ObjectMenu } from '../shared/useObjectMenu';
+import type { ViewportPoint } from '../../hooks/useAnchoredPopover';
 import { OpenInCanvasIcon } from '../shared/icons';
 import { AppIcon } from '../shared/AppIcon';
 import { readAppsById } from '../../store/actions/appsById';
@@ -27,13 +29,14 @@ export function UnavailableWidget({ appId, stamp }: { appId?: string; stamp?: st
 }
 
 /** A widget's bar: its app icon, its name, the word "widget", and its
- *  actions. An inline widget and the dropped open shelf panel draw it. The
- *  icon slot stays empty until the name lands. */
-export function WidgetBar({ target, icon, leading, trailing }: {
+ *  actions. The icon slot stays empty until the name lands. `opener` lets the
+ *  panel around it open the bar's ⋯ menu from a gesture. */
+function WidgetBar({ target, icon, leading, trailing, opener }: {
   target: WidgetMenuTarget;
   icon?: string;
   leading?: ComponentChildren;
   trailing?: ComponentChildren;
+  opener: ObjectMenu['opener'];
 }) {
   return (
     <div class="widget-bar">
@@ -53,9 +56,50 @@ export function WidgetBar({ target, icon, leading, trailing }: {
         >
           <OpenInCanvasIcon />
         </button>
-        <OverflowMenu ariaLabel={`${target.name} widget actions`} itemsChunk={WidgetMenuItems} items={(ctx) => <WidgetMenuItems ctx={ctx} target={target} />} />
+        <OverflowMenu
+          ariaLabel={`${target.name} widget actions`}
+          hostOpener={{ ref: opener, trigger: true }}
+          itemsChunk={WidgetMenuItems}
+          items={(ctx) => <WidgetMenuItems ctx={ctx} target={target} />}
+        />
         {trailing}
       </span>
+    </div>
+  );
+}
+
+/** A widget's panel: its bar over its frame. An inline widget and the dropped
+ *  open shelf widget draw it. A right-click or a long press anywhere on it
+ *  opens the bar's ⋯ menu, inside the frame included (`frame` gets `onMenu`).
+ *  The click a hold pairs is swallowed in capture, so a bar button under the
+ *  finger does not also run. `stamp` and `inlineWidget` are an inline
+ *  widget's deep-link stamp and app id. */
+export function WidgetPanel({ class: className, stamp, inlineWidget, target, icon, leading, trailing, frame }: {
+  class: string;
+  stamp?: string;
+  inlineWidget?: string;
+  target: WidgetMenuTarget;
+  icon?: string;
+  leading?: ComponentChildren;
+  trailing?: ComponentChildren;
+  frame: (onMenu: (at?: ViewportPoint) => void) => ComponentChildren;
+}) {
+  const [panel, setPanel] = useState<HTMLDivElement | null>(null);
+  const menu = useObjectMenu({ anchor: (el) => el.querySelector<HTMLElement>('.widget-bar') ?? el });
+  const onMenu = (at?: ViewportPoint) => {
+    if (panel) menu.open(panel, at);
+  };
+  return (
+    <div
+      ref={setPanel}
+      class={className}
+      data-event-id={stamp}
+      data-inline-widget={inlineWidget}
+      {...menu.press}
+      onClickCapture={menu.onClick}
+    >
+      <WidgetBar target={target} icon={icon} leading={leading} trailing={trailing} opener={menu.opener} />
+      {frame(onMenu)}
     </div>
   );
 }
@@ -107,28 +151,33 @@ export function InlineWidget({ threadId, appId, params, label, eventId, stamped 
     drawnByEventId: eventId,
   };
   return (
-    <div class="widget-panel inline-widget" data-event-id={stamp} data-inline-widget={appId}>
-      <WidgetBar target={target} icon={named?.icon} />
-      {app ? (
-        <ClippedFrame appId={appId} params={params} name={target.name} reveal={app.reveal} />
+    <WidgetPanel
+      class="widget-panel inline-widget"
+      stamp={stamp}
+      inlineWidget={appId}
+      target={target}
+      icon={named?.icon}
+      frame={(onMenu) => (app ? (
+        <ClippedFrame appId={appId} params={params} name={target.name} reveal={app.reveal} onMenu={onMenu} />
       ) : (
         // The frame waits on the manifest's `reveal`. Its box holds the room.
         <div class="inline-widget-clip">
           <div class="widget-frame widget-frame-inline" style={{ height: `${defaultWidgetHeight('inline')}px` }} />
         </div>
-      )}
-    </div>
+      ))}
+    />
   );
 }
 
 /** The inline frame inside a box about one phone screen tall. The frame keeps
  *  its full height, so it never scrolls inside the transcript. A widget taller
  *  than the box is clipped, and says so with a fade and an Expand button. */
-function ClippedFrame({ appId, params, name, reveal }: {
+function ClippedFrame({ appId, params, name, reveal, onMenu }: {
   appId: string;
   params?: WidgetParams;
   name: string;
   reveal: AppReveal;
+  onMenu: (at?: ViewportPoint) => void;
 }) {
   const [clip, setClip] = useState<HTMLDivElement | null>(null);
   const [height, setHeight] = useState(0);
@@ -150,7 +199,7 @@ function ClippedFrame({ appId, params, name, reveal }: {
 
   return (
     <div ref={setClip} class="inline-widget-clip">
-      <WidgetFrame appId={appId} params={params} reveal={reveal} place="inline" onHeight={setHeight} />
+      <WidgetFrame appId={appId} params={params} reveal={reveal} place="inline" onHeight={setHeight} onMenu={onMenu} />
       {clipped && (
         <div class="inline-widget-fade">
           <button

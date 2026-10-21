@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::llm::model_registry::GenerationRule;
 use crate::llm::provider::{
-    LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
+    forward, LlmProvider, LlmResponse, Message, ModelSelection, SharedCallback, TokenCallback,
+    ToolDefinition,
 };
 use crate::llm::ModelNotServed;
 
@@ -36,6 +38,8 @@ pub(crate) struct AuxProvider {
     moved: OnceLock<String>,
     report: Option<Arc<dyn NotServedReport>>,
     attempt_timeout: Duration,
+    /// How far the router may move each request within its model's lineage.
+    generation_rule: GenerationRule,
 }
 
 impl AuxProvider {
@@ -51,7 +55,15 @@ impl AuxProvider {
             moved: OnceLock::new(),
             report: None,
             attempt_timeout,
+            generation_rule: GenerationRule::default(),
         }
+    }
+
+    /// Let the router move each request only as far as `rule` allows. A
+    /// default never steps back to an older generation (ADR 0403).
+    pub(crate) fn with_generation_rule(mut self, rule: GenerationRule) -> Self {
+        self.generation_rule = rule;
+        self
     }
 
     /// Report each not-found answer to `report`, and retry once on `fallback`.
@@ -69,23 +81,16 @@ impl AuxProvider {
         self.moved.get().unwrap_or(&self.model)
     }
 
-    /// The caller's selection, sent on `model` with the purpose's attempt cap.
+    /// The caller's selection, sent on `model` with the purpose's attempt cap
+    /// and generation rule.
     fn pinned<'a>(&self, model: &'a str, selection: ModelSelection<'a>) -> ModelSelection<'a> {
         ModelSelection {
             model: Some(model),
             attempt_timeout: Some(self.attempt_timeout),
             ..selection
         }
+        .with_generation_rule(self.generation_rule)
     }
-}
-
-/// One callback shared by the first attempt and the retry.
-type SharedCallback = Arc<dyn Fn(&str) + Send + Sync>;
-
-fn forward(shared: &Option<SharedCallback>) -> Option<TokenCallback> {
-    shared
-        .clone()
-        .map(|cb| Box::new(move |token: &str| cb(token)) as TokenCallback)
 }
 
 #[async_trait]
@@ -155,10 +160,8 @@ impl LlmProvider for AuxProvider {
     }
 
     fn effort_sent(&self, selection: &ModelSelection<'_>) -> Option<String> {
-        self.inner.effort_sent(&ModelSelection {
-            model: Some(self.current_model()),
-            ..*selection
-        })
+        self.inner
+            .effort_sent(&self.pinned(self.current_model(), *selection))
     }
 }
 

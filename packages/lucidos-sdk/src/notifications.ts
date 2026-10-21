@@ -1,6 +1,10 @@
 import { request, requestVoid } from './_fetch';
 import { assertPlainObject } from './_validate';
-import type { NavigateTarget, SettingsViewTarget } from './generated/navigate-targets';
+import type {
+  CodingAgentTarget,
+  NavigateTarget,
+  SettingsViewTarget,
+} from './generated/navigate-targets';
 
 /** The navigation contract is GENERATED from the engine's `navigate_ui` tool
  *  (the `NAVIGATE_TARGETS` / `NAVIGABLE_SETTINGS_VIEWS` consts in
@@ -8,7 +12,7 @@ import type { NavigateTarget, SettingsViewTarget } from './generated/navigate-ta
  *  `./generated/navigate-targets.ts`, so the SDK and the LLM tool schema cannot
  *  drift. Re-exported here so consumers keep importing these from `@lucidos/sdk`.
  *  See system-knowhow/js-sdk.md § lucidos.notifications. */
-export type { NavigateTarget, SettingsViewTarget };
+export type { CodingAgentTarget, NavigateTarget, SettingsViewTarget };
 
 /** Navigation payload — the same shape the `navigate_ui` LLM tool accepts.
  *  When `tap.kind === 'navigate'`, `tap.to` is this. Required sub-fields
@@ -39,7 +43,17 @@ export interface NavigateUi {
   id?: string;
   url?: string;
   event_id?: string;
+  /** Draft text for the compose box. Only used with `target: 'new-chat'`. */
   prompt?: string;
+  /** The coding agent backend a new chat preselects. Only used with
+   *  `target: 'new-chat'`. Naming it (or `folder`) aims the draft at a coding
+   *  agent. */
+  coding_agent?: CodingAgentTarget;
+  /** The coding target a new chat preselects: a registered repository name or
+   *  id, or `data/apps/<id>`. Only used with `target: 'new-chat'`. A value
+   *  that matches nothing leaves the dropdown at its default and shows a
+   *  warning toast. */
+  folder?: string;
 }
 
 /** What a notification tap does. `modal` (default) opens the inbox detail

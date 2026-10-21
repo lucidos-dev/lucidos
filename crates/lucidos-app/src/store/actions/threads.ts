@@ -1,6 +1,6 @@
 import { showToast, showConfirm, threadMap, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
 import { appliedThreadFilter } from '../appliedThreadFilter';
-import { homeFace, takeHomeLanding } from '../homeBoard';
+import { closeDashboardSheet } from '../dashboards';
 import { revealThreadPane } from './pane';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import { deepLinkAnchorInThread, describeWaitSubscription, NO_CHANGE } from '../thread-events';
@@ -10,6 +10,7 @@ import { computeFamilyGraph, filterByTopThread, ongoingFilter, orderedCurrentFor
 import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread, unarchiveThreads, type ArchiveSkippedMember } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
+import { threadQueueHolds } from './threadQueue';
 import { abandonRowIntent, acknowledgeRowIntent, archiveRequestInFlight, holdRowIntent, rowRequestInFlight, type RowFields, type RowIntent } from '../rowIntents';
 import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, threadEventsStillArriving } from './thread-loading';
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
@@ -78,9 +79,9 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // retires at its own optimistic focus instead.
   if (!wasFocused) stopFollowingBottom();
   setFocusedThread(threadId);
-  // Every way into Home picks the face a phone shows (ADR 0432): the board for
-  // the Home icon and a cold start, the chat for a link or a notification.
-  if (threadMap.value.get(threadId)?.meta.home) homeFace.value = takeHomeLanding();
+  // The sheet belongs to the thread it was opened over. Any focus closes it,
+  // so a drafted prompt in the open thread is not hidden behind it.
+  closeDashboardSheet();
   rememberOpenedViewRows(threadId);
   resetCodingAgentPendingPreferences();
   // Focusing a thread does NOT position its transcript. `useScrollMemory` owns
@@ -193,9 +194,9 @@ export function landOnEvent(threadId: string, eventId: string): void {
  *  Claiming the await says so. ThreadView holds its delay-gated skeleton
  *  instead, and the transcript appears the moment the row arrives.
  *
- *  Not `focusThreadOrBootstrap` either. A merely QUEUED spawn owns no
- *  `thread_summaries` row, so the fetch 404s and the miss path drops the focus
- *  back where it came from. */
+ *  `focusThreadOrBootstrap` would land too, but only after two round trips: a
+ *  queued spawn owns no `thread_summaries` row, so its miss path must ask the
+ *  thread queue before it can tell "not started" from "gone". */
 export function focusSpawnedThread(threadId: string, options?: FocusThreadOptions): void {
   // Before the focus, so `setFocusedThread`'s move-away clear sees its own id.
   awaitedThreadId.value = threadId;
@@ -209,6 +210,8 @@ export function focusSpawnedThread(threadId: string, options?: FocusThreadOption
  *  behind the gateway routinely produces on the first request. */
 export type FocusBootstrapOutcome =
   | { kind: 'focused' }
+  /** Focused on a queued spawn whose row has not arrived yet. */
+  | { kind: 'awaiting' }
   | { kind: 'not-found' }
   | { kind: 'failed'; error: unknown };
 
@@ -258,6 +261,20 @@ export async function focusThreadOrBootstrapResult(
   } catch (error) {
     releaseAwait(threadId, previousFocus);
     return { kind: 'failed', error };
+  }
+  if (!found) {
+    // A 404 does not prove the thread is gone. A spawn the thread queue holds
+    // owns no summary row until it starts, so keep the await: ThreadView holds
+    // its skeleton and the transcript appears once the row lands over SSE.
+    // The queue may admit the spawn between the two reads. So a thread it no
+    // longer holds gets one more by-id read before it counts as gone.
+    try {
+      if (await threadQueueHolds(threadId)) return { kind: 'awaiting' };
+      found = await ensureThreadByIdInMap(threadId);
+    } catch (error) {
+      releaseAwait(threadId, previousFocus);
+      return { kind: 'failed', error };
+    }
   }
   if (!found) {
     releaseAwait(threadId, previousFocus);

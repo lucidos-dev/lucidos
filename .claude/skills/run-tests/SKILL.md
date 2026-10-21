@@ -1,6 +1,6 @@
 ---
 name: run-tests
-description: Use when asked to "run tests", "build & test", "check the engine builds", or any variant. It builds the engine (`cargo build -p lucidos-engine --release`) and runs the full engine suite via `./scripts/test-engine.sh --full`, which provisions a disposable Postgres (bare `cargo test -p lucidos-engine` panics every DB-backed integration test). It also runs the frontend suite (`cd crates/lucidos-app && npm run typecheck && npm test`). Fixes failures at root cause, never bypasses with #[ignore], reports exact pass/fail counts.
+description: Use when asked to "run tests", "build & test", or "check the engine builds". Builds the engine, runs the full engine suite via `./scripts/test-engine.sh --full`, then the frontend suite. Bare `cargo test -p lucidos-engine` panics every DB-backed test, so never use it. Fixes failures at root cause, never bypasses with #[ignore], and reports exact pass/fail counts.
 ---
 
 # Run tests (engine + frontend unit)

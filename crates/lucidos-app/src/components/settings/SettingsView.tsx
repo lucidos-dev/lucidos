@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileDynamicBars, setMobileDynamicBars, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileDynamicBars, setMobileDynamicBars, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import { openScaleModal } from '../shared/scaleModalState';
@@ -46,6 +46,7 @@ import { XaiProviderSettings } from './XaiProviderSettings';
 import { OpenCodeFreeSettings } from './OpenCodeFreeSettings';
 import { ProviderBlock } from './ProviderBlock';
 import { LocalProviderSettings } from './LocalProviderSettings';
+import { ClaudeGatewaySettings } from './ClaudeGatewaySettings';
 import { TypeSafeJudgmentSettings } from './TypeSafeJudgmentSettings';
 import { CloudflareWorkersAiSettings } from './CloudflareWorkersAiSettings';
 import { CustomSystemOneSettings } from './CustomSystemOneSettings';
@@ -71,12 +72,14 @@ import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
+import { IntelligenceLinkRow, IntelligencePage } from './IntelligencePage';
 import { SystemPage } from './SystemPage';
 import { SystemSubmenu } from './SystemSubmenu';
 import { warmSettingsReads } from '../../store/actions/settingsReads';
 import { isTauri, describeDeviceUserAgent } from '../../utils/platform';
 import { viewportIsMobile } from '../../utils/viewport';
 import { CredentialItem } from '../credentials/CredentialItem';
+import { OnePasswordSection } from './OnePasswordSection';
 import { openAddCredential } from '../../store/actions/credentials';
 import { loadRepositories } from '../../store/actions/chat';
 import { API, mutatingFetch, throwIfNotOk } from '../../api/client';
@@ -615,9 +618,12 @@ export function SettingsView() {
             when `auth_type` became the discriminator, so an `oauth_client` app
             registration and an API key for the same provider share a name and
             would collide into one key. */}
-        {credLoadable.data.map((cred) => (
-          <CredentialItem key={cred.id} credential={cred} />
-        ))}
+        {/* The service account lives in the 1Password section below. */}
+        {credLoadable.data
+          .filter((cred) => cred.auth_type !== 'onepassword_service_account')
+          .map((cred) => (
+            <CredentialItem key={cred.id} credential={cred} />
+          ))}
         <ListRowAddCard label="Add Credential" onClick={openAddCredential} />
       </div>
     );
@@ -816,6 +822,7 @@ export function SettingsView() {
           </div>
           {credentialsSection()}
         </div>
+        <OnePasswordSection />
       </>
     );
   }
@@ -939,7 +946,8 @@ export function SettingsView() {
   }
 
   /** Coding Agents: which `claude` / `codex` binary a coding-agent thread runs,
-   *  and which repositories it may run in. Two halves of the same setup that
+   *  a link to the ladders on Intelligence, and which repositories it may run
+   *  in. Two halves of the same setup that
    *  used to sit in different places (the binaries under System → Overview, the
    *  repositories as their own top-level category). */
   function codingAgentsSection() {
@@ -947,6 +955,10 @@ export function SettingsView() {
       <>
         <CodingAgentBinariesSection />
         <CodingAgentPermissionSection />
+        <div class="settings-section">
+          <div class="settings-section-title" data-search-anchor="coding-agents:intelligence">Intelligence ladders</div>
+          <IntelligenceLinkRow>Which model and effort an agent may pick for Claude Code and Codex</IntelligenceLinkRow>
+        </div>
         {repositoriesSection()}
       </>
     );
@@ -1110,6 +1122,7 @@ export function SettingsView() {
 
   function modelsSection() {
     const maxToolCalls = currentMaxToolCalls();
+    const triggerModel = currentTriggerModel();
 
     /** The dropdown is `freeText`, so this takes whatever the user typed. Only
      *  a whole number is a cap; anything else is rejected with a toast rather
@@ -1145,8 +1158,9 @@ export function SettingsView() {
             Chat &amp; triggers
             <Explainer title="Chat &amp; triggers">
               <p>
-                The model and reasoning here are the defaults for new chat threads
-                and for every trigger.
+                Chat model is the default for new chat threads. Trigger model is the
+                default for every trigger that pins none, so a costly chat model
+                does not run every unattended fire.
               </p>
               <p>
                 A trigger can pin its own instead, on its edit form in the Triggers
@@ -1155,7 +1169,7 @@ export function SettingsView() {
             </Explainer>
           </div>
           <ModelSelectionRow
-            label="Model"
+            label="Chat model"
             anchor="models:chat-model"
             models={lucidosModelChoices(currentModel.value)}
             vocabulary={LUCIDOS_TIER_VOCABULARY}
@@ -1166,6 +1180,21 @@ export function SettingsView() {
             defaultEffortLabel={(m) => defaultTierLabel(modelDefaultEffort(m))}
             onChange={(p) => {
               void setChatModelSelection(p);
+              if (p.provider) void rememberProvider(p.model, p.provider);
+            }}
+          />
+          <ModelSelectionRow
+            label="Trigger model"
+            anchor="models:trigger-model"
+            models={lucidosModelChoices(triggerModel)}
+            vocabulary={LUCIDOS_TIER_VOCABULARY}
+            model={triggerModel}
+            effort={accountChatEffort(triggerModel)}
+            effortFor={accountChatEffort}
+            unsetEffortLabel={PROVIDER_DEFAULT_EFFORT_LABEL}
+            defaultEffortLabel={(m) => defaultTierLabel(modelDefaultEffort(m))}
+            onChange={(p) => {
+              void setTriggerModelSelection(p);
               if (p.provider) void rememberProvider(p.model, p.provider);
             }}
           />
@@ -1307,6 +1336,7 @@ export function SettingsView() {
           <XaiProviderSettings />
           <OpenCodeFreeSettings />
           <LocalProviderSettings />
+          <ClaudeGatewaySettings />
           <TypeSafeJudgmentSettings />
           <CloudflareWorkersAiSettings />
           <CustomSystemOneSettings />
@@ -1696,6 +1726,7 @@ export function SettingsView() {
       case 'whats-new': return <SystemPage panel="whats-new" />;
       case 'thread-queue': return <SystemPage panel="thread-queue" />;
       case 'models': return modelsSection();
+      case 'intelligence': return <IntelligencePage />;
       case 'appearance': return appearanceSection();
       case 'memory': return <SystemPage panel="memory" />;
       case 'devices': return devicesSection();

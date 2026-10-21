@@ -4,8 +4,41 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Full email account row including password
-#[derive(Clone, sqlx::FromRow)]
+/// A mailbox password, as the account's `email_password` credential gives it.
+#[derive(Clone, PartialEq, Eq)]
+pub enum MailPassword {
+    /// The account has no `email_password` credential.
+    Missing,
+    Saved(String),
+    /// The credential holds a *secret reference* that cannot be read now. The
+    /// reason never quotes a value.
+    Unreadable(String),
+}
+
+impl MailPassword {
+    /// Whether a password is on file, readable or not. A guard that keeps the
+    /// password at its host must ask this, so an outage never reads as none.
+    pub fn is_on_file(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+
+    /// The password to sign in with, or why there is none to send.
+    pub fn to_sign_in(&self, account: &str) -> Result<&str, String> {
+        match self {
+            Self::Saved(password) => Ok(password),
+            Self::Missing => Err(format!(
+                "Email account '{account}' has no password configured. Either enter an app \
+                 password or connect an OAuth account."
+            )),
+            Self::Unreadable(reason) => Err(format!(
+                "The password for email account '{account}' cannot be read: {reason}"
+            )),
+        }
+    }
+}
+
+/// An email account with its mailbox password.
+#[derive(Clone)]
 pub struct EmailAccount {
     pub id: Uuid,
     pub name: String,
@@ -15,7 +48,7 @@ pub struct EmailAccount {
     pub smtp_host: String,
     pub smtp_port: i32,
     pub username: String,
-    pub password: String,
+    pub password: MailPassword,
     pub use_tls: bool,
     pub require_send_confirmation: bool,
     pub oauth_account_id: Option<Uuid>,
@@ -127,59 +160,18 @@ impl EmailStore {
     /// `20260805134838_drop_credential_name_prefixes_use_auth_type.sql` had to
     /// leave prefixed, because their bare name was already held by another
     /// non-oauth credential. Without it, editing such a credential resolves no
-    /// `email_accounts` row: the settings load 404s, and worse, the password
-    /// write silently affects zero rows and reports success while IMAP keeps the
-    /// old secret. Remove alongside the `get_email_password` fallback.
+    /// `email_accounts` row: the settings load 404s, and the server settings
+    /// write lands nowhere. Remove alongside the `get_email_password` fallback.
     pub fn account_name_for_credential(service_name: &str) -> &str {
         service_name.strip_prefix("email:").unwrap_or(service_name)
     }
 
-    /// Update just the password for an existing email account
-    pub async fn update_password(
-        pool: &PgPool,
-        name: &str,
-        password: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            UPDATE email_accounts
-            SET password = $2, updated_at = NOW()
-            WHERE name = $1
-            "#,
-        )
-        .bind(name)
-        .bind(password)
-        .execute(pool)
-        .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Forget an account's password, inside the transaction that deletes the
-    /// credential supplying it.
-    pub(crate) async fn clear_password(
-        conn: &mut sqlx::PgConnection,
-        name: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE email_accounts SET password = '', updated_at = NOW() WHERE name = $1")
-            .bind(name)
-            .execute(conn)
-            .await?;
-        Ok(())
-    }
-
-    /// Get an email account by name (includes the password)
+    /// Get an email account by name, with its password.
     pub async fn get(pool: &PgPool, name: &str) -> Result<Option<EmailAccount>, sqlx::Error> {
-        sqlx::query_as::<_, EmailAccount>(
-            r#"
-            SELECT id, name, email_address, imap_host, imap_port, smtp_host, smtp_port, username, password, use_tls, require_send_confirmation, oauth_account_id, created_at, updated_at
-            FROM email_accounts
-            WHERE name = $1
-            "#,
-        )
-        .bind(name)
-        .fetch_optional(pool)
-        .await
+        match Self::get_info(pool, name).await? {
+            Some(info) => Ok(Some(with_password(pool, info).await?)),
+            None => Ok(None),
+        }
     }
 
     /// Get an email account's settings by name, without the password
@@ -200,18 +192,22 @@ impl EmailStore {
         .await
     }
 
-    /// Get the default email account (first by created_at)
+    /// Get the default email account (first by created_at), with its password.
     pub async fn get_default(pool: &PgPool) -> Result<Option<EmailAccount>, sqlx::Error> {
-        sqlx::query_as::<_, EmailAccount>(
+        let info = sqlx::query_as::<_, EmailAccountInfo>(
             r#"
-            SELECT id, name, email_address, imap_host, imap_port, smtp_host, smtp_port, username, password, use_tls, require_send_confirmation, oauth_account_id, created_at, updated_at
+            SELECT id, name, email_address, imap_host, imap_port, smtp_host, smtp_port, username, use_tls, require_send_confirmation, oauth_account_id, created_at, updated_at
             FROM email_accounts
             ORDER BY created_at ASC
             LIMIT 1
             "#,
         )
         .fetch_optional(pool)
-        .await
+        .await?;
+        match info {
+            Some(info) => Ok(Some(with_password(pool, info).await?)),
+            None => Ok(None),
+        }
     }
 
     /// List all email accounts (without passwords)
@@ -247,6 +243,37 @@ impl EmailStore {
 
         Ok(result.rows_affected() > 0)
     }
+}
+
+/// `info` with the password its `email_password` credential holds. The
+/// credential is the password's one home, so deleting it ends mail access.
+///
+/// A *secret reference* that cannot be read is [`MailPassword::Unreadable`],
+/// so IMAP and SMTP refuse to sign in rather than send no password.
+async fn with_password(pool: &PgPool, info: EmailAccountInfo) -> Result<EmailAccount, sqlx::Error> {
+    let password = match crate::core::CredentialStore::get_email_password(pool, &info.name).await? {
+        Some(credential) => match credential.secret(pool).await {
+            Ok(password) => MailPassword::Saved(password),
+            Err(reason) => MailPassword::Unreadable(reason),
+        },
+        None => MailPassword::Missing,
+    };
+    Ok(EmailAccount {
+        id: info.id,
+        name: info.name,
+        email_address: info.email_address,
+        imap_host: info.imap_host,
+        imap_port: info.imap_port,
+        smtp_host: info.smtp_host,
+        smtp_port: info.smtp_port,
+        username: info.username,
+        password,
+        use_tls: info.use_tls,
+        require_send_confirmation: info.require_send_confirmation,
+        oauth_account_id: info.oauth_account_id,
+        created_at: info.created_at,
+        updated_at: info.updated_at,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -830,7 +857,10 @@ async fn imap_connect_unbounded(
             .map_err(|(err, _)| err)?
     } else {
         client
-            .login(&account.username, &account.password)
+            .login(
+                &account.username,
+                account.password.to_sign_in(&account.name)?,
+            )
             .await
             .map_err(|(err, _)| err)?
     };

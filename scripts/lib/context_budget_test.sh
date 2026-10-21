@@ -165,6 +165,36 @@ echo "check-context-budget.sh:"
 # and a test that needed an env hook would be testing a seam that only exists
 # for the test.
 #
+# The scoped arm defaults to the real ceiling with NO exceptions, so a fixture
+# never inherits a listing for a rule file it does not hold. A case sets
+# SCOPED_CEILING and SCOPED_EXCEPTIONS (space-separated `<path>:<bytes>`) in the
+# environment of the make_repo call to change either.
+#
+# patch_lib <dir> <ceiling> <scoped ceiling> <expected list> <exceptions list>
+# Rewrites the constants and both array bodies in the fixture's copy of the
+# library. Each list is one `    "item"\n` line per entry.
+patch_lib() {
+    awk -v ceiling="$2" -v scoped="$3" -v expected="$4" -v exceptions="$5" '
+        /^CONTEXT_BUDGET_CEILING=/ { print "CONTEXT_BUDGET_CEILING=" ceiling; next }
+        /^CONTEXT_BUDGET_SCOPED_CEILING=/ { print "CONTEXT_BUDGET_SCOPED_CEILING=" scoped; next }
+        /^CONTEXT_BUDGET_EXPECTED_ALWAYS=\(/ {
+            print "CONTEXT_BUDGET_EXPECTED_ALWAYS=("
+            printf "%s", expected
+            skipping = 1
+            next
+        }
+        /^CONTEXT_BUDGET_SCOPED_EXCEPTIONS=\(/ {
+            print "CONTEXT_BUDGET_SCOPED_EXCEPTIONS=("
+            printf "%s", exceptions
+            skipping = 1
+            next
+        }
+        skipping && /^\)/ { print ")"; skipping = 0; next }
+        skipping { next }
+        { print }
+    ' "$SCRIPT_DIR/context_budget.sh" >"$1/scripts/lib/context_budget.sh"
+}
+
 # make_repo <dir> <ceiling> <expected...>
 make_repo() {
     local dir="$1" ceiling="$2"
@@ -178,19 +208,9 @@ make_repo() {
     local want
     for want in "$@"; do list="$list    \"$want\"\n"; done
 
-    # Replace the ceiling and rewrite the array body between its own delimiters.
-    awk -v ceiling="$ceiling" -v list="$list" '
-        /^CONTEXT_BUDGET_CEILING=/ { print "CONTEXT_BUDGET_CEILING=" ceiling; next }
-        /^CONTEXT_BUDGET_EXPECTED_ALWAYS=\(/ {
-            print "CONTEXT_BUDGET_EXPECTED_ALWAYS=("
-            printf "%s", list
-            skipping = 1
-            next
-        }
-        skipping && /^\)/ { print ")"; skipping = 0; next }
-        skipping { next }
-        { print }
-    ' "$SCRIPT_DIR/context_budget.sh" >"$dir/scripts/lib/context_budget.sh"
+    local exceptions="" entry
+    for entry in ${SCOPED_EXCEPTIONS:-}; do exceptions="$exceptions    \"$entry\"\n"; done
+    patch_lib "$dir" "$ceiling" "${SCOPED_CEILING:-$CONTEXT_BUDGET_SCOPED_CEILING}" "$list" "$exceptions"
 
     git -C "$dir" init -q -b main
     git -C "$dir" config user.email "t@t"
@@ -321,6 +341,141 @@ fi
 case "$OUT" in
     *TOTAL*) pass "--report prints a total" ;;
     *) fail "--report printed no total: $OUT" ;;
+esac
+
+# 6b. The scoped arm. Each case holds one scoped rule and an always-loaded
+#     CLAUDE.md, so only the per-file ceiling can fail.
+scoped_repo() {
+    local dir="$1" rule_bytes="$2"
+    make_repo "$dir" 100000 "CLAUDE.md"
+    printf 'root\n' >"$dir/CLAUDE.md"
+    {
+        printf -- '---\npaths:\n  - "src/**"\n---\n'
+        printf 'x%.0s' $(seq 1 "$rule_bytes")
+    } >"$dir/.claude/rules/big.md"
+    commit_all "$dir"
+}
+RULE_BYTES="$(printf -- '---\npaths:\n  - "src/**"\n---\n' | wc -c | tr -d ' ')"
+
+# Over the ceiling with no exception: blocked, and the rule is named.
+R="$TMP/scoped-over"
+SCOPED_CEILING=300 scoped_repo "$R" 400
+run_cli "$R"
+OUT="$CLI_OUT"
+if [ "$CLI_RC" -ne 0 ]; then
+    pass "a scoped rule over the ceiling exits non-zero"
+else
+    fail "a scoped rule over the ceiling exited 0: $OUT"
+fi
+case "$OUT" in
+    *"big.md is "*"over its 300 limit"*) pass "the over-ceiling scoped rule is named with its limit" ;;
+    *) fail "over-ceiling scoped rule not named: $OUT" ;;
+esac
+
+# Exactly at the ceiling: clean.
+R="$TMP/scoped-at"
+BYTES=$((300 - RULE_BYTES))
+SCOPED_CEILING=300 scoped_repo "$R" "$BYTES"
+run_cli "$R"
+if [ "$CLI_RC" -eq 0 ]; then
+    pass "a scoped rule at the ceiling passes"
+else
+    fail "a scoped rule at the ceiling exited $CLI_RC: $CLI_OUT"
+fi
+
+# An exception at the rule's size passes.
+R="$TMP/scoped-excepted"
+SIZE=$((RULE_BYTES + 400))
+SCOPED_CEILING=300 SCOPED_EXCEPTIONS=".claude/rules/big.md:$SIZE" scoped_repo "$R" 400
+run_cli "$R"
+if [ "$CLI_RC" -eq 0 ]; then
+    pass "a scoped rule at its listed exception passes"
+else
+    fail "a scoped rule at its listed exception exited $CLI_RC: $CLI_OUT"
+fi
+
+# An exception the rule has outgrown fails, and names the exceeded limit.
+R="$TMP/scoped-grown"
+SIZE=$((RULE_BYTES + 400 - 1))
+SCOPED_CEILING=300 SCOPED_EXCEPTIONS=".claude/rules/big.md:$SIZE" scoped_repo "$R" 400
+run_cli "$R"
+OUT="$CLI_OUT"
+if [ "$CLI_RC" -ne 0 ]; then
+    pass "a scoped rule over its listed exception exits non-zero"
+else
+    fail "a scoped rule over its listed exception exited 0"
+fi
+case "$OUT" in
+    *"over its $SIZE limit by 1"*) pass "the exceeded exception is named with its size" ;;
+    *) fail "exceeded exception not named: $OUT" ;;
+esac
+
+# A rule that shrank below its listed size still passes: lowering is free.
+R="$TMP/scoped-shrunk"
+SIZE=$((RULE_BYTES + 900))
+SCOPED_CEILING=300 SCOPED_EXCEPTIONS=".claude/rules/big.md:$SIZE" scoped_repo "$R" 400
+run_cli "$R"
+if [ "$CLI_RC" -eq 0 ]; then
+    pass "a scoped rule under its listed exception passes"
+else
+    fail "a scoped rule under its listed exception exited $CLI_RC: $CLI_OUT"
+fi
+
+# A stale exception fails: the rule fits under the ceiling, so the entry goes.
+R="$TMP/scoped-stale"
+SCOPED_CEILING=300 SCOPED_EXCEPTIONS=".claude/rules/big.md:900" scoped_repo "$R" 50
+run_cli "$R"
+OUT="$CLI_OUT"
+if [ "$CLI_RC" -ne 0 ]; then
+    pass "a stale exception exits non-zero"
+else
+    fail "a stale exception exited 0"
+fi
+case "$OUT" in
+    *"exception is stale"*) pass "the stale exception is named" ;;
+    *) fail "stale exception not named: $OUT" ;;
+esac
+
+# An exception for a file that no longer exists fails the same way.
+R="$TMP/scoped-gone"
+SCOPED_CEILING=300 SCOPED_EXCEPTIONS=".claude/rules/gone.md:900" scoped_repo "$R" 50
+run_cli "$R"
+OUT="$CLI_OUT"
+if [ "$CLI_RC" -ne 0 ]; then
+    pass "an exception for a missing rule exits non-zero"
+else
+    fail "an exception for a missing rule exited 0"
+fi
+case "$OUT" in
+    *"gone.md is listed but is not a path-scoped rule"*) pass "the missing rule's exception is named" ;;
+    *) fail "missing rule's exception not named: $OUT" ;;
+esac
+
+# An always-loaded file skips this arm: only its total is bounded.
+R="$TMP/scoped-skips-always"
+SCOPED_CEILING=100 make_repo "$R" 100000 "CLAUDE.md" ".claude/rules/resident.md"
+printf 'x%.0s' $(seq 1 500) >"$R/CLAUDE.md"
+printf 'x%.0s' $(seq 1 500) >"$R/.claude/rules/resident.md"
+commit_all "$R"
+run_cli "$R"
+if [ "$CLI_RC" -eq 0 ]; then
+    pass "an always-loaded file is not held to the scoped ceiling"
+else
+    fail "an always-loaded file tripped the scoped ceiling: $CLI_OUT"
+fi
+
+# --report lists the scoped rules and never fails over them.
+R="$TMP/scoped-report"
+SCOPED_CEILING=300 scoped_repo "$R" 400
+run_cli "$R" --report
+if [ "$CLI_RC" -eq 0 ]; then
+    pass "--report exits 0 with a scoped rule over the ceiling"
+else
+    fail "--report exited $CLI_RC over a scoped rule"
+fi
+case "$CLI_OUT" in
+    *"big.md"*) pass "--report lists the scoped rule" ;;
+    *) fail "--report did not list the scoped rule: $CLI_OUT" ;;
 esac
 
 # 7. A tree with NO matching files scans cleanly and says so through the

@@ -7,6 +7,12 @@
   A polled wait returns inside it, so long work now waits in-turn by default.
 - **Amended by**: [0479: The keep-alive follows the observed cache TTL](0479-keep-alive-follows-the-observed-cache-ttl.md).
   Its 4-minute beat holds for a 5-minute cache only.
+- **Amended by**: [0489: The keep-alive gives up at break-even](0489-keep-alive-budget-follows-model-prices.md).
+  Its fixed 150-minute cut-off holds for one model only.
+- **Amended by**: [0492](0492-keep-alive-beat-lands-near-4-5-minutes.md). The
+  5-minute beat fires at 230 s, so its request lands near 4.5 minutes.
+- **Amended by**: [0529](0529-keep-alive-shows-one-status.md). Each ping still
+  leaves no trace, but one aggregate status now shows the keep-alive.
 
 ## Context
 

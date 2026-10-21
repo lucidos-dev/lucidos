@@ -436,6 +436,41 @@ async fn a_draft_theme_resolves_without_being_saved() {
     );
 }
 
+/// A theme sets the drawer title weight as a string from 400 to 600. The API
+/// serves the cap, resolves the token and names the field it refuses.
+#[tokio::test]
+async fn a_drawer_title_weight_resolves_and_a_heavier_one_is_refused() {
+    let client = user_client().await;
+    let resolved: serde_json::Value = client
+        .post(api("/themes/resolve"))
+        .body(r#"{"name":"Draft","parts":{"drawer-title":{"font-weight":"600"}}}"#)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for mode in ["dark", "light"] {
+        assert_eq!(
+            resolved["resolved"][mode]["--part-drawer-title-font-weight"], "600",
+            "{mode}"
+        );
+    }
+
+    let refused = client
+        .post(api("/themes/resolve"))
+        .body(r#"{"name":"Draft","parts":{"drawer-title":{"font-weight":"700"}}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 422);
+    let error: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        error["error"],
+        "parts.drawer-title.font-weight: 700 is over the 600 cap."
+    );
+}
+
 /// `theme` named the light/dark mode before the rename, so an older app still
 /// sends `theme=dark`. The write is refused with the key it meant. It is never
 /// stored as a theme id that silently paints the default.

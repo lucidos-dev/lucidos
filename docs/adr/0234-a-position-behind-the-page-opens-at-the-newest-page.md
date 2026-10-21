@@ -17,7 +17,7 @@ the top of the newest page.
 
 That was correct for a turn genuinely gone and undecided for a turn merely
 behind the page. The 2026-09-21 nightly filed it, left
-`e2e/transcript-reopens-on-the-same-turn.spec.ts` red rather than shrinking its
+`e2e/transcript-reopens-on-the-same-turn-all.spec.ts` red rather than shrinking its
 seed, and asked for a product decision.
 
 ## Decision
@@ -57,7 +57,7 @@ them. Nothing is lost that a gesture cannot reach.
   open after a backfill, still lands on the turn.
 - "Not in the loaded window" is now a decision rather than an omission, so
   `reachAnchor` says so at the give-up.
-- `e2e/transcript-reopens-on-the-same-turn.spec.ts` narrows to the in-page case
+- `e2e/transcript-reopens-on-the-same-turn-all.spec.ts` narrows to the in-page case
   and gains a second test for this one, which also asserts no older page is
   fetched. That second half is the guard against the chase returning.
 

@@ -35,7 +35,13 @@
     {"token": "--part-card-border-style", "value": "solid", "canonical": "solid"},
     {"token": "--part-surface-border-width", "value": "3PX", "canonical": "3px"},
     {"token": "--part-card-border-width", "value": "4px", "canonical": "4px"},
-    {"token": "--part-surface-border-color", "value": "#0f4d0f", "canonical": "#0f4d0f"}
+    {"token": "--part-surface-border-color", "value": "#0f4d0f", "canonical": "#0f4d0f"},
+    {"token": "--part-drawer-title-font-weight", "value": "400", "canonical": "400"},
+    {"token": "--part-drawer-title-font-weight", "value": "500", "canonical": "500"},
+    {"token": "--part-drawer-title-font-weight", "value": "600", "canonical": "600"},
+    {"token": "--part-drawer-title-font-weight", "value": "NORMAL", "canonical": "normal"},
+    {"token": "--part-drawer-title-font-weight", "value": " 600 ", "canonical": "600"},
+    {"token": "--part-drawer-title-font-weight", "value": "500.0", "canonical": "500"}
   ],
   "invalid": [
     {"token": "--part-inline-code-background-color", "value": "transparent", "error": "transparent is not allowed here."},
@@ -111,6 +117,13 @@
     {"token": "--part-surface-border-width", "value": "0.2em", "error": "use px for border-width lengths."},
     {"token": "--part-surface-border-width", "value": "normal", "error": "'normal' is not a length."},
     {"token": "--part-surface-border-style", "value": "dashed", "error": "border-style takes solid, double."},
-    {"token": "--part-composer-text-caret-shape", "value": "ibeam", "error": "caret-shape takes auto, bar, block, underscore."}
+    {"token": "--part-composer-text-caret-shape", "value": "ibeam", "error": "caret-shape takes auto, bar, block, underscore."},
+    {"token": "--part-drawer-title-font-weight", "value": "700", "error": "700 is over the 600 cap."},
+    {"token": "--part-drawer-title-font-weight", "value": "300", "error": "300 is under the 400 floor."},
+    {"token": "--part-drawer-title-font-weight", "value": "bold", "error": "'bold' is not a weight."},
+    {"token": "--part-drawer-title-font-weight", "value": "600px", "error": "'600px' is not a weight."},
+    {"token": "--part-drawer-title-font-weight", "value": "calc(600)", "error": "calc() is not allowed here."},
+    {"token": "--part-drawer-title-font-weight", "value": "var(--x)", "error": "var() is not allowed here."},
+    {"token": "--part-drawer-title-font-weight", "value": "1e3", "error": "'1e3' is not a weight."}
   ]
 }

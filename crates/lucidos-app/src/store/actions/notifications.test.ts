@@ -19,17 +19,20 @@ import {
 } from '../store';
 import type { Notification, Loadable } from '../types';
 
-// Mock the API client to prevent real HTTP calls. `isTransportError` is inlined
-// to the real matcher (mirrors plugin-marketplaces.test.ts) so the transport-blip
-// suppression path is exercised, not stubbed away.
-vi.mock('../../api/client', () => ({
-  getNotifications: vi.fn().mockResolvedValue({ notifications: [], unread_count: 0, has_more: false }),
-  getNotification: vi.fn(),
-  markNotificationRead: vi.fn().mockResolvedValue({ success: true }),
-  markAllNotificationsRead: vi.fn(),
-  isTransportError: (err: unknown) =>
-    err instanceof TypeError && /Load failed|Failed to fetch|NetworkError/i.test(err.message),
-}));
+// Mock the API client to prevent real HTTP calls. The error classifiers and the
+// retry are the real ones, so the transport-blip paths are exercised, not
+// stubbed away.
+vi.mock('../../api/client', async () => {
+  const core = await vi.importActual<typeof import('../../api/client/_core')>('../../api/client/_core');
+  return {
+    getNotifications: vi.fn().mockResolvedValue({ notifications: [], unread_count: 0, has_more: false }),
+    getNotification: vi.fn(),
+    markNotificationRead: vi.fn().mockResolvedValue({ success: true }),
+    markAllNotificationsRead: vi.fn(),
+    isTransportError: core.isTransportError,
+    retryTransient: core.retryTransient,
+  };
+});
 
 // viewNotification reveals the content pane and pushes a nav-history entry as a
 // side effect; both reach for the DOM / localStorage, so they are stubbed. They
@@ -1109,6 +1112,50 @@ describe('a read holds until the server has acknowledged it', () => {
     reject(new Error('request timed out'));
 
     await vi.waitFor(() => expect(ids(unreadNotifications.value)).toEqual(['x', 'y']));
+  });
+
+  it('a read whose first POST timed out is sent once more, and holds when that one lands', async () => {
+    toasts.value = [];
+    (markNotificationRead as Mock)
+      .mockRejectedValueOnce(new DOMException('Request timed out after 10000ms', 'TimeoutError'))
+      .mockResolvedValueOnce({ success: true });
+
+    markReadOptimistic('x');
+
+    await vi.waitFor(() => expect(markNotificationRead).toHaveBeenCalledTimes(2));
+    await Promise.resolve();
+    expect(ids(unreadNotifications.value)).toEqual(['y']);
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
+  });
+
+  it('a refused read is not sent again', async () => {
+    (markNotificationRead as Mock).mockRejectedValueOnce(new Error('500 boom'));
+
+    markReadOptimistic('x');
+
+    await vi.waitFor(() => expect(ids(unreadNotifications.value)).toEqual(['x', 'y']));
+    expect(markNotificationRead).toHaveBeenCalledTimes(1);
+  });
+
+  it('a read that fails names the notification by its title, never by its id', async () => {
+    toasts.value = [];
+    const timeout = () => new DOMException('Request timed out after 10000ms', 'TimeoutError');
+    (markNotificationRead as Mock).mockRejectedValueOnce(timeout()).mockRejectedValueOnce(timeout());
+
+    markReadOptimistic('x');
+
+    await vi.waitFor(() => expect(toasts.value).toHaveLength(1));
+    expect(toasts.value[0].message).toBe('Could not mark "Notification x" read: request timed out');
+  });
+
+  it('a read of a row this page never loaded falls back to its id', async () => {
+    toasts.value = [];
+    (markNotificationRead as Mock).mockRejectedValueOnce(new Error('500 boom'));
+
+    markReadOptimistic('never-loaded');
+
+    await vi.waitFor(() => expect(toasts.value).toHaveLength(1));
+    expect(toasts.value[0].message).toBe('Could not mark notification never-loaded read: 500 boom');
   });
 
   it('the browse list keeps the row read across a load served before the commit', async () => {

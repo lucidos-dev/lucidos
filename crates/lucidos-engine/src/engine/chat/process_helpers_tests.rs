@@ -162,8 +162,9 @@ async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
         idle.is_some(),
         "a Codex mid-turn user follow-up must arm the redirect and return idle_notify"
     );
-    assert!(
-        sessions.get(&thread_id).unwrap().redirect_followup,
+    assert_eq!(
+        sessions.get(&thread_id).unwrap().redirect_cause,
+        Some(crate::engine::thread_events::CancelCause::SupersededByFollowup),
         "arming the redirect must flag the session so the interrupt arm classifies \
          the interrupted turn as SupersededByFollowup (neutral), not UserStop"
     );
@@ -208,7 +209,7 @@ async fn arm_redirect_skips_plain_claude_code_mid_turn() {
         "a plain (non-urgent) CC follow-up must not be interrupted: it steers via stdin"
     );
     assert!(
-        !sessions.get(&thread_id).unwrap().redirect_followup,
+        sessions.get(&thread_id).unwrap().redirect_cause.is_none(),
         "a plain CC follow-up must not be flagged for redirect"
     );
     assert!(
@@ -238,8 +239,9 @@ async fn arm_redirect_fires_for_urgent_claude_code_mid_turn() {
         idle.is_some(),
         "an urgent CC mid-turn follow-up must arm the redirect and return idle_notify"
     );
-    assert!(
-        sessions.get(&thread_id).unwrap().redirect_followup,
+    assert_eq!(
+        sessions.get(&thread_id).unwrap().redirect_cause,
+        Some(crate::engine::thread_events::CancelCause::SupersededByFollowup),
         "the interrupted turn must classify as SupersededByFollowup (neutral), not UserStop"
     );
     assert!(
@@ -329,7 +331,7 @@ fn a_redirect_armed_inside_the_result_arm_does_not_outlive_its_turn() {
     );
 
     assert!(
-        !s.redirect_followup,
+        s.redirect_cause.is_none(),
         "the next real Stop would render as superseded"
     );
     assert_eq!(

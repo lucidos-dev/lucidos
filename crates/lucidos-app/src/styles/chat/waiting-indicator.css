@@ -267,6 +267,35 @@
     flex: 0 0 auto;
 }
 
+/* The Prompt cache section: what the keep-alive does, why, and a thin meter
+   of the pings spent against the break-even budget. */
+.waiting-panel-cache-line {
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    line-height: 1.35;
+}
+
+.waiting-panel-cache-detail {
+    margin-top: var(--space-xs);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+}
+
+.waiting-panel-cache-meter {
+    margin-top: var(--space-sm);
+    height: 0.1875rem;
+    border-radius: var(--radius-round);
+    background: var(--border-color);
+    overflow: hidden;
+}
+
+.waiting-panel-cache-meter > span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+}
+
 /* The indicator's own paint is the accent, and it lives beside the row's other
    lit controls in `styles/chat/input-messages.css` rather than here. Sizing is
    still plain `.icon-btn.header-icon`.

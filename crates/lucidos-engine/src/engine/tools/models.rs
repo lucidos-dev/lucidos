@@ -5,10 +5,13 @@
 //! updates without a restart. Mirrors `manage_repositories`' multi-action shape.
 //!
 //! Switching the *active* chat model is a preference (`chat_model`) handled by
-//! `set_preference`; this tool manages which models EXIST in the picker.
+//! `set_preference`. This tool manages which models EXIST. `enable` and
+//! `disable` turn a model on or off the chat intelligence ladder, which is
+//! what the chat picker lists (`runtime::chat_ladder`).
 
 use super::super::LucidosEngine;
 use crate::core::models::{ModelFields, ModelStore, Route};
+use crate::runtime::chat_ladder::ChatLadderChange;
 
 /// Every action the tool answers, for the refusal that lists them.
 const ACTIONS: &str = "list, add, enable, disable, update, remove";
@@ -22,8 +25,8 @@ impl LucidosEngine {
         match action {
             "list" => self.manage_models_list().await,
             "add" => self.manage_models_add(args).await,
-            "enable" => self.manage_models_set_enabled(args, true).await,
-            "disable" => self.manage_models_set_enabled(args, false).await,
+            "enable" => self.manage_models_set_on_chat_ladder(args, true).await,
+            "disable" => self.manage_models_set_on_chat_ladder(args, false).await,
             "update" => self.manage_models_update(args).await,
             "remove" => self.manage_models_remove(args).await,
             "" => Ok(format!("Error: action is required (one of: {ACTIONS})")),
@@ -38,6 +41,12 @@ impl LucidosEngine {
         if models.is_empty() {
             return Ok("No models registered.".to_string());
         }
+        let chat_ladder = crate::runtime::intelligence_ladder::load(
+            &self.pool,
+            &self.model_routes(),
+            crate::runtime::intelligence_ladder::LadderSurface::Chat,
+        )
+        .await;
         let mut out = format!("{} models in the registry:\n", models.len());
         for m in &models {
             // Surface each route's declared context window so the agent can see
@@ -73,7 +82,10 @@ impl LucidosEngine {
                 routes,
                 vision_label(m.vision),
                 m.default_effort.as_deref().unwrap_or("provider default"),
-                if m.enabled { "enabled" } else { "disabled" },
+                match chat_ladder.lists_model(&m.id) {
+                    true => "on the Lucidos Agent's ladder",
+                    false => "off the Lucidos Agent's ladder",
+                },
                 if m.is_builtin() { "builtin" } else { "user" },
             ));
         }
@@ -143,7 +155,8 @@ impl LucidosEngine {
         match ModelStore::create(&self.pool, &self.event_bus, id, &fields, None).await {
             Ok(model) => {
                 Ok(format!(
-                    "[ACTION COMPLETED] Model '{}' ({}) added to the registry and enabled.",
+                    "[ACTION COMPLETED] Model '{}' ({}) added to the registry. It is off the Lucidos \
+                     Agent's ladder, so the model picker lists it once action 'enable' turns it on.",
                     model.id,
                     model
                         .routes
@@ -156,33 +169,48 @@ impl LucidosEngine {
             // The unique-PK violation is the common case — a clearer message than
             // the raw sqlx error.
             Err(e) => Ok(format!(
-                "Error: failed to add model '{}' (it may already exist — use action 'enable' instead): {}",
+                "Error: failed to add model '{}' (it may already exist, so use action 'enable' to put it on the Lucidos Agent's ladder): {}",
                 id, e
             )),
         }
     }
 
-    async fn manage_models_set_enabled(
+    /// Turn a model on or off the chat intelligence ladder, saying which rungs.
+    async fn manage_models_set_on_chat_ladder(
         &self,
         args: &serde_json::Value,
-        enabled: bool,
+        on: bool,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let id = args["id"].as_str().unwrap_or("").trim();
         if id.is_empty() {
             return Ok("Error: id is required.".to_string());
         }
-        match ModelStore::set_enabled(&self.pool, &self.event_bus, id, enabled, None).await {
-            Ok(true) => Ok(format!(
-                "[ACTION COMPLETED] Model '{}' {}.",
-                id,
-                if enabled { "enabled" } else { "disabled" }
-            )),
-            Ok(false) => Ok(format!(
-                "Error: no model '{}' in the registry. Use action 'list' to see model ids.",
-                id
-            )),
-            Err(e) => Ok(format!("Error: failed to update model '{}': {}", id, e)),
+        if ModelStore::get(&self.pool, id).await?.is_none() {
+            return Ok(format!(
+                "Error: no model '{id}' in the registry. Use action 'list' to see model ids."
+            ));
         }
+        Ok(self.set_on_chat_ladder(id, on).await)
+    }
+
+    /// The chat ladder change for `id`, as the tool reports it.
+    async fn set_on_chat_ladder(&self, id: &str, on: bool) -> String {
+        match self.change_chat_ladder(id, on).await {
+            Ok(change) => format!("[ACTION COMPLETED] {}", change.describe(id)),
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    async fn change_chat_ladder(&self, id: &str, on: bool) -> Result<ChatLadderChange, String> {
+        crate::runtime::chat_ladder::set_model_on_chat_ladder(
+            &self.pool,
+            &self.event_bus,
+            &self.model_routes(),
+            id,
+            on,
+            None,
+        )
+        .await
     }
 
     /// Edit a model in place, under exactly the rules `PUT /api/v1/models`
@@ -214,34 +242,44 @@ impl LucidosEngine {
                 "Error: no model '{id}' in the registry. Use action 'list' to see model ids."
             ));
         };
-        let (fields, enabled) = match crate::api::apply_model_update(&existing, edit) {
-            Ok(applied) => applied,
+        let on_chat_ladder = edit.on_chat_ladder;
+        let fields = match crate::api::apply_model_update(&existing, edit) {
+            Ok(fields) => fields,
             Err(e) => return Ok(format!("Error: {e}")),
         };
-        match ModelStore::update(
-            &self.pool,
-            &self.event_bus,
-            &existing.id,
-            &fields,
-            enabled,
-            None,
-        )
-        .await
+        // Turning off reads no field, so it goes first, as in the HTTP update.
+        let turned_off = match on_chat_ladder {
+            Some(false) => match self.change_chat_ladder(&existing.id, false).await {
+                Ok(change) => Some(change),
+                Err(e) => return Ok(format!("Error: {e}")),
+            },
+            _ => None,
+        };
+        if let Err(e) =
+            ModelStore::update(&self.pool, &self.event_bus, &existing.id, &fields, None).await
         {
-            Ok(_) => Ok(format!(
-                "[ACTION COMPLETED] Model '{}' updated: routes {}; preferred provider {}; {}.",
-                existing.id,
-                fields
-                    .routes
-                    .iter()
-                    .map(|r| r.provider.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                fields.preferred_provider.as_deref().unwrap_or("none"),
-                vision_label(fields.vision),
-            )),
-            Err(e) => Ok(format!("Error: failed to update model '{id}': {e}")),
+            return Ok(format!("Error: failed to update model '{id}': {e}"));
         }
+        let mut out = format!(
+            "[ACTION COMPLETED] Model '{}' updated: routes {}; preferred provider {}; {}.",
+            existing.id,
+            fields
+                .routes
+                .iter()
+                .map(|r| r.provider.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            fields.preferred_provider.as_deref().unwrap_or("none"),
+            vision_label(fields.vision),
+        );
+        if let Some(change) = turned_off {
+            out.push_str(&format!("\n[ACTION COMPLETED] {}", change.describe(id)));
+        }
+        if on_chat_ladder == Some(true) {
+            out.push('\n');
+            out.push_str(&self.set_on_chat_ladder(&existing.id, true).await);
+        }
+        Ok(out)
     }
 
     async fn manage_models_remove(
@@ -261,20 +299,28 @@ impl LucidosEngine {
                 ));
             }
         };
-        // Builtins can only be disabled, not deleted — deleting one could orphan a
-        // saved chat_model preference (mirrors the HTTP delete guard).
+        // Builtins are never deleted: deleting one could orphan a saved
+        // chat_model preference (mirrors the HTTP delete guard).
         if existing.is_builtin() {
             return Ok(format!(
-                "Error: '{}' is a builtin model — it can't be removed, only disabled (use action 'disable').",
-                id
+                "Error: '{id}' is a builtin model, so it can't be removed. Use action 'disable' \
+                 to take it off the Lucidos Agent's ladder."
             ));
         }
-        match ModelStore::delete(&self.pool, &self.event_bus, id, None).await {
+        match crate::runtime::chat_ladder::delete_user_model(
+            &self.pool,
+            &self.event_bus,
+            &self.model_routes(),
+            id,
+            None,
+        )
+        .await
+        {
             Ok(_) => Ok(format!(
                 "[ACTION COMPLETED] Model '{}' removed from the registry.",
                 id
             )),
-            Err(e) => Ok(format!("Error: failed to remove model '{}': {}", id, e)),
+            Err(e) => Ok(format!("Error: {e}")),
         }
     }
 }

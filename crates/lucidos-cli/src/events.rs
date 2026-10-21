@@ -73,6 +73,8 @@ pub(crate) struct CountFilters<'a> {
     pub event_type: Option<&'a str>,
     pub since: Option<&'a str>,
     pub until: Option<&'a str>,
+    /// One thread only. Absent is every thread.
+    pub thread_id: Option<&'a str>,
 }
 
 pub(crate) fn cmd_count(ws: &Workspace, filters: CountFilters<'_>) -> Result<(), BoxError> {
@@ -95,6 +97,9 @@ fn build_count_params(filters: &CountFilters<'_>) -> Vec<(&'static str, String)>
     }
     if let Some(u) = filters.until {
         params.push(("until", u.to_string()));
+    }
+    if let Some(id) = filters.thread_id {
+        params.push(("thread_id", id.to_string()));
     }
     params
 }
@@ -231,5 +236,22 @@ mod tests {
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].0, "after_event_id");
         assert_eq!(params[0].1, "22222222-2222-2222-2222-222222222222");
+    }
+
+    #[test]
+    fn build_count_params_sends_the_thread_filter_when_set() {
+        let params = build_count_params(&CountFilters {
+            event_type: None,
+            since: None,
+            until: None,
+            thread_id: Some("33333333-3333-3333-3333-333333333333"),
+        });
+        assert_eq!(
+            params,
+            vec![(
+                "thread_id",
+                "33333333-3333-3333-3333-333333333333".to_string()
+            )]
+        );
     }
 }

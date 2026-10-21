@@ -152,6 +152,9 @@
     padding: 0.25rem 0.375rem 0.25rem 0.75rem;
     border-bottom: 1px solid var(--border-color);
     font-size: var(--font-size-sm);
+    /* A hold on the bar opens the widget menu, so it selects no text. */
+    -webkit-user-select: none;
+    user-select: none;
 }
 
 .widget-bar-icon {

@@ -122,7 +122,11 @@ pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub async fn openai_api_key(pool: &sqlx::PgPool) -> Option<(String, OpenAiKeySource)> {
     let service = crate::llm::ProviderKind::OpenAi.as_str();
     let credential = match crate::core::CredentialStore::get(pool, service).await {
-        Ok(credential) => credential.map(|c| (c.auth_type, c.auth_value)),
+        Ok(Some(c)) => c
+            .secret_or_log(pool, "[OpenAI]")
+            .await
+            .map(|secret| (c.auth_type, secret)),
+        Ok(None) => None,
         Err(e) => {
             log!(
                 "[OpenAI] Could not read the '{}' credential: {}",
@@ -360,8 +364,11 @@ impl OpenAiProvider {
             // come from the Responses API (GPT-5.6 on) and from OpenRouter's
             // Anthropic models.
             cache_creation_tokens: meta.cache_write_tokens,
+            cache_creation_1h_tokens: None,
+            stable_prefix_fingerprint: None,
             cache_read_tokens: meta.cache_read_tokens,
             served_model: meta.served_model,
+            provider: None,
             service_tier: meta.service_tier,
             thinking_chars: None,
             thinking_blocks: None,

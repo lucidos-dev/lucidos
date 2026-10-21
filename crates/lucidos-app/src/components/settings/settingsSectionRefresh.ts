@@ -3,6 +3,7 @@ import type { PanelRefreshAction } from '../../store/panelRefresh';
 import { loadPreferences } from '../../store/actions/preferences';
 import { loadChatModels } from '../../store/actions/models';
 import { loadCredentials } from '../../store/actions/credentials';
+import { loadClaudeGatewayStatus } from '../../store/actions/claudeGateway';
 import { loadResponseStyles } from '../../store/actions/responseStyles';
 import { loadThemeGallery } from '../../store/actions/themes';
 import { loadDevices } from '../../store/actions/devices';
@@ -21,6 +22,7 @@ export const SETTINGS_SECTION_REFRESH: Partial<Record<SettingsSubview, PanelRefr
     loadChatModels(),
     loadCredentials(),
     loadResponseStyles(),
+    loadClaudeGatewayStatus(),
   ]),
   appearance: () => Promise.all([
     loadPreferences(),

@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { HamburgerButton } from '../ContentNav';
 import { SystemAttentionBadge } from '../../shared/SystemAttentionBadge';
 import { findByClass, textOf, type AnyVNode } from './vnodeWalk';
-import { actionableChangeCount, changes, releaseNoticeView } from '../../../store/store';
+import { actionableChangeCount, changes, landingLane, EMPTY_LANDING_LANE, applyingChangeIds, releaseNoticeView } from '../../../store/store';
 import { drawerClosing, drawerOpen } from '../drawerState';
 import type { Change } from '../../../api/client';
 
@@ -24,6 +24,8 @@ function hamburger(): AnyVNode {
 beforeEach(() => {
   changes.value = { status: 'not-loaded' };
   releaseNoticeView.value = { status: 'not-loaded' };
+  landingLane.value = EMPTY_LANDING_LANE;
+  applyingChangeIds.value = new Set();
   drawerOpen.value = false;
   drawerClosing.value = false;
 });
@@ -34,6 +36,22 @@ describe('the actionable change count', () => {
       status: 'loaded',
       data: [change('a', false), change('b', true), change('c', true)],
     };
+    expect(actionableChangeCount.value).toBe(1);
+  });
+
+  // A change the lane holds, or one an apply started, sits in Applying and
+  // owes the reader nothing (ADR 0463).
+  it('leaves out a change the lane holds and one an apply started', () => {
+    changes.value = {
+      status: 'loaded',
+      data: [change('a', false), change('b', false), change('c', false), change('d', false)],
+    };
+    landingLane.value = {
+      open_batch: { batch_id: 'x', lane_thread_id: 't', members: ['b'], step: 'resolving' },
+      waiting: ['c'],
+      gathering: false,
+    };
+    applyingChangeIds.value = new Set(['d']);
     expect(actionableChangeCount.value).toBe(1);
   });
 

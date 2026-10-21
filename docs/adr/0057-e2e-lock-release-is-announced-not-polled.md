@@ -1,6 +1,6 @@
 # 0057: A blocked e2e run subscribes to the lock's release event; the cross-workspace gap recovers on the timeout
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0541](0541-a-busy-e2e-lock-is-given-up.md): a refused run now gives up instead of subscribing. The lock events stay.
 - **Date**: 2026-08-09
 
 ## Context

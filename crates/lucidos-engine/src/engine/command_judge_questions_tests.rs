@@ -60,6 +60,16 @@ fn with_category(answers: Answers, category: &str) -> Answers {
     with_category_at(&answers, category, 0.9)
 }
 
+/// A command with no messaging signal, and one that sends mail.
+const PLAIN: &str = "ls";
+const SENDS_MAIL: &str = "sendmail -t < x";
+
+/// A read-only fetch with no messaging signal: the shape that was blocked as an
+/// email.
+const READ_ONLY_FETCH: &str = "import urllib.request\n\
+     req = urllib.request.Request('https://docs.example.com/pricing', headers={'User-Agent': 'x'})\n\
+     html = urllib.request.urlopen(req, timeout=20).read().decode()";
+
 /// The invariant this whole module exists for. The command text leaves the
 /// machine for a third party, so the password goes first.
 #[test]
@@ -118,6 +128,40 @@ fn the_lane_question_offers_three_options_and_no_catastrophic() {
     }
 }
 
+/// The judge cannot see where the command runs, so both questions tell it.
+/// Without that it read a write to `.lucidos/tmp` as destruction outside.
+#[test]
+fn both_questions_say_where_the_command_runs() {
+    let questions = questions();
+    let Question::Choice {
+        instructions: lane, ..
+    } = &questions[0].1
+    else {
+        panic!("the lane is a choice");
+    };
+    for phrase in [
+        "workspace root",
+        "`data/`",
+        "`.lucidos/`",
+        "`lucidos data write`",
+        "`target_outside_workspace` is true",
+        "False means",
+    ] {
+        assert!(lane.contains(phrase), "{phrase}: {lane}");
+    }
+    let Question::Choice {
+        instructions: category,
+        ..
+    } = &questions[1].1
+    else {
+        panic!("the category is a choice");
+    };
+    assert!(
+        category.contains("under the workspace is not out_of_workspace_destruction"),
+        "{category}"
+    );
+}
+
 #[test]
 fn every_category_option_matches_a_real_variant() {
     let questions = questions();
@@ -128,6 +172,7 @@ fn every_category_option_matches_a_real_variant() {
     assert_eq!(
         parsed,
         vec![
+            SideEffectCategory::Other,
             SideEffectCategory::Email,
             SideEffectCategory::ExternalApi,
             SideEffectCategory::CloudCli,
@@ -193,12 +238,12 @@ fn an_unrecognized_distribution_asks() {
             confidence: 1.0,
         }),
     )]));
-    assert_eq!(read(&answers).lane, RiskLane::IrreversibleDanger);
+    assert_eq!(read(&answers, PLAIN).lane, RiskLane::IrreversibleDanger);
 }
 
 #[test]
 fn a_missing_lane_answer_is_the_uncertain_verdict() {
-    let verdict = read(&Answers::default());
+    let verdict = read(&Answers::default(), PLAIN);
     assert_eq!(verdict, JudgeVerdict::uncertain());
     assert_eq!(verdict.lane, RiskLane::IrreversibleDanger);
     assert_eq!(verdict.category, Some(SideEffectCategory::Other));
@@ -206,10 +251,10 @@ fn a_missing_lane_answer_is_the_uncertain_verdict() {
 
 #[test]
 fn the_category_is_read_only_for_the_irreversible_lane() {
-    let irreversible = read(&with_category(lanes(0.05, 0.05, 0.9), "email"));
+    let irreversible = read(&with_category(lanes(0.05, 0.05, 0.9), "email"), SENDS_MAIL);
     assert_eq!(irreversible.category, Some(SideEffectCategory::Email));
 
-    let safe = read(&with_category(lanes(0.95, 0.03, 0.02), "email"));
+    let safe = read(&with_category(lanes(0.95, 0.03, 0.02), "email"), SENDS_MAIL);
     assert_eq!(
         safe.category, None,
         "the speculative answer is thrown away when the lane came back safe"
@@ -218,7 +263,7 @@ fn the_category_is_read_only_for_the_irreversible_lane() {
 
 #[test]
 fn an_irreversible_lane_with_no_category_answer_falls_to_other() {
-    let verdict = read(&lanes(0.05, 0.05, 0.9));
+    let verdict = read(&lanes(0.05, 0.05, 0.9), PLAIN);
     assert_eq!(verdict.category, Some(SideEffectCategory::Other));
 }
 
@@ -229,12 +274,12 @@ fn an_irreversible_lane_with_no_category_answer_falls_to_other() {
 fn an_unsure_category_falls_to_other() {
     let irreversible = lanes(0.05, 0.05, 0.9);
     assert_eq!(
-        read(&with_category_at(&irreversible, "cloud_cli", 0.49)).category,
+        read(&with_category_at(&irreversible, "cloud_cli", 0.49), PLAIN).category,
         Some(SideEffectCategory::Other),
         "below the floor, a granted cloud_cli must not be matched"
     );
     assert_eq!(
-        read(&with_category_at(&irreversible, "cloud_cli", 0.5)).category,
+        read(&with_category_at(&irreversible, "cloud_cli", 0.5), PLAIN).category,
         Some(SideEffectCategory::CloudCli),
         "at the floor it is taken"
     );
@@ -262,7 +307,10 @@ fn a_category_missing_from_its_own_distribution_falls_to_other() {
             }),
         ),
     ]));
-    assert_eq!(read(&answers).category, Some(SideEffectCategory::Other));
+    assert_eq!(
+        read(&answers, SENDS_MAIL).category,
+        Some(SideEffectCategory::Other)
+    );
 }
 
 /// A judgment carries no prose, so every lane and category pair has to produce a
@@ -282,7 +330,7 @@ fn every_verdict_carries_a_card_sentence() {
             Some(c) => with_category(probabilities, c),
             None => probabilities,
         };
-        let verdict = read(&answers);
+        let verdict = read(&answers, SENDS_MAIL);
         assert!(
             !verdict.summary.trim().is_empty() && verdict.summary.ends_with('.'),
             "{:?} / {:?} produced {:?}",
@@ -297,8 +345,8 @@ fn every_verdict_carries_a_card_sentence() {
 /// card stops telling the user anything.
 #[test]
 fn two_categories_produce_two_different_sentences() {
-    let email = read(&with_category(lanes(0.05, 0.05, 0.9), "email")).summary;
-    let cloud = read(&with_category(lanes(0.05, 0.05, 0.9), "cloud_cli")).summary;
+    let email = read(&with_category(lanes(0.05, 0.05, 0.9), "email"), SENDS_MAIL).summary;
+    let cloud = read(&with_category(lanes(0.05, 0.05, 0.9), "cloud_cli"), PLAIN).summary;
     assert_ne!(email, cloud);
 }
 
@@ -306,7 +354,7 @@ fn two_categories_produce_two_different_sentences() {
 /// reader can see how close the verdict was.
 #[test]
 fn the_reason_records_the_distribution() {
-    let verdict = read(&lanes(0.1, 0.2, 0.7));
+    let verdict = read(&lanes(0.1, 0.2, 0.7), PLAIN);
     assert!(verdict.reason.contains("safe 0.10"), "{}", verdict.reason);
     assert!(
         verdict.reason.contains("irreversible 0.70"),
@@ -315,6 +363,61 @@ fn the_reason_records_the_distribution() {
     );
 }
 
+/// Whatever a model says, a command with no messaging signal is not an email.
+/// The lane stays: the command still asks.
+#[test]
+fn an_email_answer_without_a_messaging_signal_falls_to_other() {
+    let verdict = read(
+        &with_category(lanes(0.05, 0.05, 0.9), "email"),
+        READ_ONLY_FETCH,
+    );
+    assert_eq!(verdict.category, Some(SideEffectCategory::Other));
+    assert_eq!(verdict.lane, RiskLane::IrreversibleDanger);
+    assert!(
+        !verdict.summary.contains("email"),
+        "the card must not name email: {}",
+        verdict.summary
+    );
+}
+
+#[test]
+fn a_command_that_sends_a_message_still_reads_as_email() {
+    for command in [
+        "import smtplib; smtplib.SMTP('localhost').sendmail(a, b, m)",
+        "sendmail -t < x",
+        "echo hi | mail -s subj a@b.com",
+        "osascript -e 'tell application \"Messages\" to send'",
+    ] {
+        let verdict = read(&with_category(lanes(0.05, 0.05, 0.9), "email"), command);
+        assert_eq!(
+            verdict.category,
+            Some(SideEffectCategory::Email),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn a_none_answer_reads_as_other() {
+    assert_eq!(parse_category("none"), SideEffectCategory::Other);
+    let verdict = read(
+        &with_category(lanes(0.05, 0.05, 0.9), "none"),
+        READ_ONLY_FETCH,
+    );
+    assert_eq!(verdict.category, Some(SideEffectCategory::Other));
+}
+
+/// A tie between `none` and any real category goes to the first option, which
+/// must be `none`. Otherwise a model unsure about a harmless command guesses.
+#[test]
+fn the_category_question_lists_none_first() {
+    let questions = questions();
+    let Question::Choice { criteria, .. } = &questions[1].1 else {
+        panic!("the category is a choice");
+    };
+    assert_eq!(criteria[0].0, "none");
+}
+
 fn read_lane_of(answers: Answers) -> RiskLane {
-    read(&answers).lane
+    read(&answers, PLAIN).lane
 }

@@ -14,6 +14,10 @@ vi.mock('../../../store/actions/thread-loading', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/thread-loading')>()),
   ensureThreadByIdInMap: async () => engine.hasThread,
 }));
+vi.mock('../../../store/actions/threadQueue', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../store/actions/threadQueue')>()),
+  threadQueueHolds: async () => false,
+}));
 
 import { SearchEverywhere } from '../SearchEverywhere';
 import { searchEverywhereOpen, threadMap, threadsLoaded } from '../../../store/store';

@@ -29,7 +29,7 @@ const cssSource = readFileSync(resolve(here, '../../../styles/mobile.css'), 'utf
  * half, and this file owns the carve-out. Both shapes are the same one-line
  * mistake away, so both are pinned.
  *
- * Covered end-to-end by `e2e/welcome.spec.ts` "draft in progress: clicking a
+ * Covered end-to-end by `e2e/welcome-all.spec.ts` "draft in progress: clicking a
  * suggestion confirms, then overrides the prompt text" on the mobile projects
  * (it passed on desktop chromium — the block is inside `(--phone-layout)`).
  * Pinned here too because that spec only runs in the browser e2e suite, and

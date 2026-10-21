@@ -21,8 +21,6 @@ pub enum Gate {
     Ungated,
     /// At least one configured email account.
     EmailAccount,
-    /// At least one intent.
-    Intent,
     /// A configured image-generation provider.
     ImageProvider,
     /// A configured judgment provider, switched on.
@@ -541,7 +539,7 @@ const TRIGGER_MODEL_ARG: Arg = Arg {
     required: false,
     loc: ArgIn::Body,
     description:
-        "Chat model id this trigger's intent runs on. Omit or null for the account default.",
+        "Chat model id this trigger's intent runs on, a Lucidos Agent ladder rung: an agent's off-ladder pick is refused. Omit or null for the account default.",
 };
 const TRIGGER_REASONING_EFFORT_ARG: Arg = Arg {
     name: "reasoning_effort",
@@ -582,9 +580,9 @@ pub const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "go_to_review": {"type":"boolean","description":"Threads this trigger spawns land in REVIEW, not ARCHIVE. Default false."},
   "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."},
   "mcp_servers": {"anyOf":[{"type":"null"},{"type":"array","items":{"type":"string"}}],"description":"MCP server ids its fires call; any other is refused."},
-  "model": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Chat model id for the intent, e.g. 'claude-sonnet-5'. Null = account default (on update, clears a pin). Set only if asked."},
+  "model": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Model id, a Lucidos Agent rung, else REFUSED. Null = account default (on update, clears a pin). Set only if asked."},
   "reasoning_effort": {"anyOf":[{"type":"null"},{"type":"string","enum":["none","low","medium","high","xhigh","max"]}],"description":"Thinking budget for the intent. Null = account default (on update, clears a pin)."},
-  "provider": {"anyOf":[{"type":"null"},{"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local"]}],"description":"Backend for the pinned model, one of its routes; needs model. Null = its preferred provider. Set only if asked."}
+  "provider": {"anyOf":[{"type":"null"},{"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local","claude-gateway"]}],"description":"Backend for the pinned model, one of its routes; needs model. Null = its preferred provider. Set only if asked."}
 }"#;
 // `model` / `reasoning_effort` / `provider` are deliberately NOT repeated here.
 // Properties are unioned across a domain's operations first-wins (see
@@ -1041,6 +1039,7 @@ const EVENTS_QUERY_LLM_SCHEMA: &str = r#"{
 }"#;
 const EVENTS_COUNT_LLM_SCHEMA: &str = r#"{
   "event_type": {"type":"string","description":"Omit for a per-type breakdown across all types."},
+  "thread_id": {"type":"string","description":"One thread: 'current' is this one. Omit to count every thread."},
   "since": {"type":"string","description":"After this RFC 3339 timestamp."},
   "until": {"type":"string","description":"Before this RFC 3339 timestamp."}
 }"#;
@@ -1276,6 +1275,7 @@ pub const MODEL_PROVIDER_ENUM: &[&str] = &[
     "xai",
     "opencode-free",
     "local",
+    "claude-gateway",
 ];
 
 const MODEL_ID_BODY_ARG: Arg = Arg {
@@ -1335,13 +1335,13 @@ const MODEL_SORT_ORDER_ARG: Arg = Arg {
     loc: ArgIn::Body,
     description: "Lower sorts first; user models default to 1000.",
 };
-const MODEL_ENABLED_ARG: Arg = Arg {
-    name: "enabled",
+const MODEL_ON_CHAT_LADDER_ARG: Arg = Arg {
+    name: "on_chat_ladder",
     ty: ArgType::Bool,
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Whether the model is enabled (shown in the picker).",
+    description: "On or off the ladder.",
 };
 const MODEL_CONTEXT_WINDOW_ARG: Arg = Arg {
     name: "context_window",
@@ -1367,7 +1367,7 @@ const MODEL_VISION_ARG: Arg = Arg {
 pub const MODELS_ADD_LLM_SCHEMA: &str = r#"{
   "id": {"type":"string","description":"Model id, the API string unless a route overrides it. All but list need it."},
   "label": {"type":"string","description":"Display name; defaults to the id."},
-  "provider": {"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local"],"description":"Single-route shorthand for the first route. Add needs it or routes."},
+  "provider": {"type":"string","enum":["vertex","anthropic","openai","openrouter","xai","opencode-free","local","claude-gateway"],"description":"Single-route shorthand for the first route. Add needs it or routes."},
   "sort_order": {"type":"integer","description":"Lower sorts first."},
   "context_window": {"anyOf":[{"type":"null"},{"type":"integer"}],"description":"First route's window in tokens; omitted, most non-Claude ids get 200k. Null clears."},
   "routes": {"type":"array","description":"Backends in priority order. Replaces the whole list.","items":{"type":"object","properties":{"provider":{"type":"string"},"id":{"type":"string","description":"This backend's id if different, e.g. 'anthropic/claude-opus-5-5'."},"context_window":{"type":"integer"}},"required":["provider"]}},
@@ -1382,7 +1382,7 @@ const MODELS_UPDATE_LLM_SCHEMA: &str = r#"{
 const MODELS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "Every model, enabled or not, builtin or user.",
+        summary: "Every model, on the ladder or off.",
         method: Method::Get,
         path: "/models",
         args: &[],
@@ -1420,7 +1420,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "enable",
-        summary: "Show it in the picker.",
+        summary: "Put it on the ladder.",
         method: Method::Put,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1429,15 +1429,15 @@ const MODELS_OPS: &[Operation] = &[
         mutating: true,
         llm_alias: None,
         llm_schema: None,
-        // LLM-only convenience (the in-process handler toggles enabled); the CLI
-        // uses `update --enabled true|false` instead.
+        // LLM-only convenience (the in-process handler turns its chat ladder
+        // rungs on); the CLI uses `update --on-chat-ladder true|false` instead.
         llm: None,
         cli: Some(false),
         sdk: Some(false),
     },
     Operation {
         action: "disable",
-        summary: "Hide it from the picker; builtins cannot be deleted.",
+        summary: "Take it off the ladder.",
         method: Method::Put,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1460,7 +1460,7 @@ const MODELS_OPS: &[Operation] = &[
             MODEL_LABEL_ARG,
             MODEL_PROVIDER_ARG,
             MODEL_SORT_ORDER_ARG,
-            MODEL_ENABLED_ARG,
+            MODEL_ON_CHAT_LADDER_ARG,
             MODEL_CONTEXT_WINDOW_ARG,
             MODEL_ROUTES_ARG,
             MODEL_PREFERRED_PROVIDER_ARG,
@@ -1497,7 +1497,7 @@ const MODELS_DOMAIN: Domain = Domain {
     // Keep the existing LLM tool name so cached prompts/threads don't churn; the
     // schema is now built from this manifest entry (no more get_manage_models_tool).
     tool_name: "manage_models",
-    tool_summary: "The chat-model registry behind the Lucidos Agent's model picker. A builtin can be disabled but not removed. Switch the ACTIVE model with set_preference(key='chat_model').",
+    tool_summary: "The chat-model registry the Lucidos Agent ladder picks from. A builtin can leave it but not be removed. Switch the ACTIVE model with set_preference(key='chat_model').",
     llm: true,
     cli: true,
     sdk: false,
@@ -1716,8 +1716,9 @@ const ENV_VARS_DOMAIN: Domain = Domain {
 };
 
 // ---------------------------------------------------------------------------
-// widgets: a thread's widgets, its shelf and reusable widgets (ADRs 0402, 0407,
-// 0415). Show, pin and unpin name a widget instance: the widget and its params.
+// widgets: a thread's widgets, its shelf, reusable widgets and the two
+// dashboards (ADRs 0402, 0407, 0415, 0496). Pin, unpin and the dashboard edits
+// name a widget instance: the widget and its params.
 // Every widget action the UI offers has an action here, for the agent and the
 // CLI. Open in Canvas is navigate_ui to the widget's id. `thread_id` is
 // optional so the CLI can default it to the session's own thread; the HTTP
@@ -1788,29 +1789,47 @@ const WIDGET_THREAD_QUERY_ARG: Arg = Arg {
     description: "Thread uuid. Default: yours.",
 };
 
-pub const HOME_BOARD_LAYOUT_QUERY_ARG: Arg = Arg {
-    name: "layout",
+pub const DASHBOARD_QUERY_ARG: Arg = Arg {
+    name: "dashboard",
     ty: ArgType::Str,
     enum_values: &["phone", "desktop"],
-    required: true,
+    required: false,
     loc: ArgIn::Query,
-    description: "Layout class.",
+    description: "Default: your device's.",
 };
-const HOME_BOARD_LAYOUT_BODY_ARG: Arg = Arg {
+const DASHBOARD_BODY_ARG: Arg = Arg {
     loc: ArgIn::Body,
-    ..HOME_BOARD_LAYOUT_QUERY_ARG
+    ..DASHBOARD_QUERY_ARG
 };
-const HOME_BOARD_TILES_ARG: Arg = Arg {
+const DASHBOARD_LABEL_ARG: Arg = Arg {
+    description: "Tile label. Default: the name.",
+    ..WIDGET_LABEL_ARG
+};
+/// A tile is a widget, or an app shown as an app shortcut.
+const DASHBOARD_APP_ID_ARG: Arg = Arg {
+    description: "The widget's or app's id. An app joins as a shortcut and takes no params.",
+    ..WIDGET_APP_ID_ARG
+};
+/// What an add names: one widget instance, or an app, on one dashboard.
+const DASHBOARD_ADD_ARGS: &[Arg] = &[
+    DASHBOARD_APP_ID_ARG,
+    DASHBOARD_BODY_ARG,
+    WIDGET_PARAMS_ARG,
+    DASHBOARD_LABEL_ARG,
+];
+const DASHBOARD_REMOVE_ARGS: &[Arg] =
+    &[DASHBOARD_APP_ID_ARG, DASHBOARD_BODY_ARG, WIDGET_PARAMS_ARG];
+const DASHBOARD_TILES_ARG: Arg = Arg {
     name: "tiles",
     ty: ArgType::Json,
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description: "Tiles in board order: [{app_id, params?, size, hidden?}].",
+    description: "Tiles in order: [{app_id, params?, size}].",
 };
 /// The arrange action's LLM shape: `tiles` is an array, which a `Json` arg
 /// cannot describe.
-pub const HOME_BOARD_ARRANGE_LLM_SCHEMA: &str = r#"{"layout":{"type":"string","enum":["phone","desktop"]},"tiles":{"type":"array","description":"Home's pins in order, each at a declared size.","items":{"type":"object","properties":{"app_id":{"type":"string"},"params":{"type":"object"},"size":{"enum":["small","medium","large"]},"hidden":{"type":"boolean"}},"required":["app_id","size"]}}}"#;
+pub const DASHBOARD_ARRANGE_LLM_SCHEMA: &str = r#"{"dashboard":{"type":"string","enum":["phone","desktop"]},"tiles":{"type":"array","description":"Tiles in order.","items":{"type":"object","properties":{"app_id":{"type":"string"},"params":{"type":"object"},"size":{"enum":["quarter","small","medium","large"]}},"required":["app_id","size"]}}}"#;
 
 const fn widget_op(
     action: &'static str,
@@ -1887,21 +1906,37 @@ const WIDGETS_OPS: &[Operation] = &[
         "stop-reusing",
     ),
     widget_op(
-        "board",
-        "Read the Home board.",
+        "dashboard",
+        "Read a dashboard.",
         Method::Get,
-        "/home-board",
-        &[HOME_BOARD_LAYOUT_QUERY_ARG],
-        "board",
+        "/dashboard",
+        &[DASHBOARD_QUERY_ARG],
+        "dashboard",
+    ),
+    widget_op(
+        "add_to_dashboard",
+        "Add to a dashboard.",
+        Method::Post,
+        "/widgets/dashboard-add",
+        DASHBOARD_ADD_ARGS,
+        "dashboard-add",
+    ),
+    widget_op(
+        "remove_from_dashboard",
+        "Remove from a dashboard.",
+        Method::Post,
+        "/widgets/dashboard-remove",
+        DASHBOARD_REMOVE_ARGS,
+        "dashboard-remove",
     ),
     Operation {
-        llm_schema: Some(HOME_BOARD_ARRANGE_LLM_SCHEMA),
+        llm_schema: Some(DASHBOARD_ARRANGE_LLM_SCHEMA),
         ..widget_op(
             "arrange",
-            "Arrange the Home board, only when asked this turn.",
+            "Arrange a dashboard, only when asked this turn.",
             Method::Post,
             "/widgets/arrange",
-            &[HOME_BOARD_LAYOUT_BODY_ARG, HOME_BOARD_TILES_ARG],
+            &[DASHBOARD_BODY_ARG, DASHBOARD_TILES_ARG],
             "arrange",
         )
     },
@@ -1911,7 +1946,7 @@ const WIDGETS_DOMAIN: Domain = Domain {
     name: "widgets",
     tool_name: "widgets",
     tool_summary:
-        "A thread's widgets, shelf and reusable widgets. Make one with create_app kind='widget'.",
+        "A thread's widgets, shelf, reusable widgets and dashboards. Make one with create_app kind='widget'.",
     llm: true,
     cli: true,
     sdk: false,
@@ -2700,16 +2735,16 @@ const MCP_THREAD_VERB_LLM_SCHEMA: &str =
 
 const MCP_SETUP_LLM_SCHEMA: &str = r#"{
   "id": {"type":"string","description":"Lowercase with hyphens, e.g. 'blender-mcp'."},
-  "name": {"type":"string","description":"Human-readable name."},
-  "command": {"type":"string","description":"Command to run the server (e.g. 'npx', 'uvx')."},
-  "args": {"type":"array","items":{"type":"string"},"description":"Arguments for the command, e.g. ['blender-mcp']."},
-  "env": {"type":"object","additionalProperties":{"type":"string"},"description":"Optional environment variables for the process."}
+  "name": {"type":"string","description":"Display name."},
+  "command": {"type":"string","description":"e.g. 'npx', 'uvx'."},
+  "args": {"type":"array","items":{"type":"string"},"description":"e.g. ['blender-mcp']."},
+  "env": {"type":"object","additionalProperties":{"anyOf":[{"type":"string"},{"type":"object","properties":{"credential":{"type":"string"}},"required":["credential"]}]},"description":"Env vars. Pass a secret as {\"credential\": \"<name>\"} naming a stored credential, never its value."}
 }"#;
 
 const MCP_OPS: &[Operation] = &[
     Operation {
         action: "setup",
-        summary: "Register and connect a server, spawning it and discovering its tools. (requires: id, name, command, args)",
+        summary: "Register a server, spawn it and discover its tools. (requires: id, name, command, args)",
         method: Method::Post,
         path: "/mcp/servers",
         args: &[],
@@ -2728,7 +2763,7 @@ const MCP_OPS: &[Operation] = &[
     },
     Operation {
         action: "list",
-        summary: "List all configured MCP servers with their status (running/stopped) and available tools.",
+        summary: "List servers with their status and tools.",
         method: Method::Get,
         path: "/mcp/servers",
         args: &[],
@@ -2803,7 +2838,7 @@ const MCP_OPS: &[Operation] = &[
     },
     Operation {
         action: "remove",
-        summary: "Remove an MCP server configuration (stops it first if running). (requires: id)",
+        summary: "Remove a server, stopping it first. (requires: id)",
         method: Method::Delete,
         path: "/mcp/servers/:id",
         args: &[MCP_ID_ARG],

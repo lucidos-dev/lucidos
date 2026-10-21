@@ -59,6 +59,21 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### Opus 5.5 ignores its single coding index row
+
+- **Added:** 2026-10-20
+- **Lives in:** `CODING_UNMEASURED` in
+  `.claude/skills/update-lucidos-models/estimate_rungs.py`.
+- **Impermanent because:** AA's Coding Agent Index measured Opus 5.5 at max
+  only, and there it scores below Sonnet 5.5 at max. One point cannot place the
+  model's other efforts, and the owner judged Opus the stronger model. So its
+  coding scores equal its general scores, and max reads as xhigh.
+- **Removal / resolution condition:** AA's coding index measures Opus 5.5 at
+  two or more efforts. Then empty `CODING_UNMEASURED`, regenerate the rung
+  estimates and update the pinned ladder tests.
+- **Status:** `active`
+- **Investigation:** none.
+
 ### The lane batch borrows the Tier-3 merge session
 
 - **Added:** 2026-10-13
@@ -271,6 +286,30 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Verify by confirming no open work reads the line. Then delete both modules,
   the test, the install file, its import in `main.tsx`, and the call in
   `shellStartup.ts`.
+- **Status:** active
+- **Investigation:** none.
+
+### Shell snap-back log
+
+- **Added:** 2026-10-20
+- **Lives in:** `crates/lucidos-app/src/utils/shellScrollProbe.ts`
+  (`reportShellSnapBack`, one `postClientLog('shell-scroll', 'snap-back', …)` per
+  snap-back, at most one a second), its test, and its call in
+  `src/shellStartup.ts`. The guard it reports for,
+  `utils/shellScrollGuard.ts`, is permanent and stays.
+- **Impermanent because:** pure telemetry chasing a bug. On the packaged macOS
+  app the whole desktop shell slid up its window, header first, until only the
+  page background showed. Scrolling or a reopen put it back. The traffic lights
+  followed the shrinking band, so the page itself saw the shift. Chromium and
+  WebKit under Playwright never let the document or `.app-shell` take an
+  offset, and no WebDriver reaches WKWebView (ADR 0016). The line names which
+  box moved, by how much, and what held focus.
+- **Removal / resolution condition:** a reported episode produces a
+  `[Client/shell-scroll]` line that names the trigger, and that trigger is fixed
+  at its source. Or two months pass with no line in a tester's gateway log.
+  Verify by confirming no open work reads the line. Then delete the module, its
+  test, the `reportShellSnapBack` call in `shellStartup.ts`, and the
+  `shell-scroll` entry in `docs/client-logs.md`.
 - **Status:** active
 - **Investigation:** none.
 
@@ -766,8 +805,9 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   button sat in the bottom 34pt home-indicator strip, since the phone composer
   carries no bottom safe-area padding. No click follows a `touchcancel`.
 
-  A constructive face now serves such a tap (`cancelledPressWasATap` in
-  `utils/tapGesture.ts`). That is a fix, not part of this probe, so the removal
+  A composer face now serves such a tap (`cancelledPressWasATap` in
+  `utils/tapGesture.ts`). Cancel joined Send once the ledger showed two Cancel
+  taps lost this way. That is a fix, not part of this probe, so the removal
   keeps it. The probe's cancel arm now rules a task later, so a served cancel
   logs `served` and raises no toast.
 - **Status:** `active` for the quiet period the removal condition names, now
@@ -1682,6 +1722,41 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** `prompt-cache-first-of-turn-miss`
 
+### Claude Code prompt-cache probe (Vertex relay)
+
+- **Added:** 2026-10-18. Plan:
+  `docs/plans/2026-10-18-claude-code-cache-probe.md`.
+- **Lives in:** `crates/lucidos-engine/src/runtime/vertex_relay_probe.rs` plus
+  `vertex_relay_probe_tests.rs`. Everything outside that module is thin, and
+  all of it is in this list.
+  - `mod vertex_relay_probe;` in `crates/lucidos-engine/src/runtime/mod.rs`.
+  - In `vertex_relay.rs`: the `CallProbe::of` call after the body is
+    rewritten, the `probe.watch` wrapper around `upstream.bytes_stream()`, the
+    `StreamExt` and `vertex_relay_probe` imports, and one sentence in the
+    module header.
+  - The two tests at the end of `vertex_relay_tests.rs`, under the heading
+    "The prompt-cache probe changes nothing the relay forwards". Their
+    constants go too: `SSE_CHUNKS`, `ODD_BODY` and `UNREWRITTEN_PATH`.
+
+  Always on while the relay runs, with no env gate. Writes one line per call to
+  engine.log: no event, no DB row, no UI.
+- **Impermanent because:** Pure telemetry for the **first-of-turn prompt-cache
+  miss** investigation. About 45% of new Opus 5.5 Claude Code sessions read no
+  cache on their first call, even with a neighbour session seconds earlier.
+  `ContextCaptured` holds usage, not request bytes, so it cannot tell "we sent
+  different bytes" from "Vertex served the call from a cache that lacked them".
+  The probe hashes three things on their raw wire bytes: the `tools` array,
+  each `system` block and the first message. It reads the usage and message id
+  from `message_start`. It changes no byte the relay forwards.
+- **Removal / resolution condition:** When the **first-of-turn prompt-cache
+  miss** investigation (`prompt-cache-first-of-turn-miss`) is closed, that is,
+  the cause is identified and either fixed or attributed upstream. Verify no
+  open work still needs the `[VertexRelayProbe]` lines. Then delete every site
+  in the "Lives in" list above. `grep -rE 'VertexRelayProbe|vertex_relay_probe|CallProbe'
+  crates` must come back empty, and `make lint` must pass.
+- **Status:** active
+- **Investigation:** `prompt-cache-first-of-turn-miss`
+
 ### Movement distance in the discarded-tap toast
 
 - **Added:** 2026-08-24
@@ -1751,7 +1826,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Removed:** 2026-09-17, the same day, on a second report from the phone. The
   first half of the condition was taken. The turns moved into a `.thread-feed`
   box, and the rest went onto that box. The chrome left the aligned box, so the
-  media query is gone. `e2e/transcript-ends-where-its-content-ends.spec.ts`
+  media query is gone. `e2e/transcript-ends-where-its-content-ends-all.spec.ts`
   runs on every project now, pinning the title row's place beside the air.
   The rest itself was then reverted, hours later again, so no scope is left to
   widen. Below one page the turns flow from the top and hold still (ADR 0212).
@@ -1932,7 +2007,8 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   - The `ANTHROPIC_VERTEX_BASE_URL` stamp in `build_command`,
     `runtime/claude_code.rs`.
   - The `notes_relayed` flag on `CcStreamState` in
-    `runtime/claude_code_parse.rs`, which renders a note as a message.
+    `runtime/claude_code_parse.rs`, which renders a note as a message. A spawn
+    sets it from the provider verdict, not from the stamp (see the next entry).
 - **Impermanent because (works around):** Claude Code 2.1.280 sets
   `thinking.display: "updates"` only when its provider is `firstParty`. On
   Vertex, Opus 5.5, Sonnet 5.5 and Fable 5.x then return every note before a
@@ -1943,10 +2019,46 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   measured session, and 336 for the repro's 150-word ask. A draft the user
   must read never fits in one. See § "A question card with no answer before
   it" for the gate that catches a card pointing at one.
+
+  The relay reaches Vertex only. Claude Code's `gateway`, Bedrock and Foundry
+  routes ignore `ANTHROPIC_VERTEX_BASE_URL`, and the `gateway` route ignores
+  `ANTHROPIC_BASE_URL` too, so no relay can reach them. § "Claude Code's
+  progress notes are hidden on other providers" covers those sessions.
 - **Removal / resolution condition:** run the repro in the plan WITHOUT the
   relay, on the current Claude Code with Opus 5.5 on Vertex. When the note
   block before the `Bash` call carries text, delete the relay, its spawn stamp,
   its start in `main.rs` and the parser flag.
+- **Status:** active
+- **Investigation:** n/a. An upstream gap with a checkable repro.
+
+### Claude Code's progress notes are hidden on other providers
+
+- **Added:** 2026-10-16. Plan:
+  `docs/plans/2026-10-16-tell-the-agent-when-its-notes-are-hidden.md`.
+- **Lives in:** four sites.
+  - `crates/lucidos-engine/src/runtime/claude_code_provider.rs`: runs
+    `claude auth status` at spawn, keeps the answer for ten minutes, and
+    allows only `firstParty`, and `vertex` with the relay stamped.
+  - `with_notes_visibility` and `NOTES_HIDDEN_SENTENCE` in
+    `engine/agent_session/prompts.rs`, applied in
+    `engine/agent_session/run_session/run.rs`.
+  - `SpawnArgs::notes`, read by `stream_state_for` in `runtime/claude_code.rs`.
+  - The `auth status` answer of the e2e fake,
+    `crates/lucidos-app/e2e/fake-claude-code/claude.mjs`.
+- **Impermanent because (works around):** an always-thinking model returns
+  its notes before a tool call as an empty `thinking` block unless the request
+  sets `thinking.display: "updates"`. Claude Code sets it on Anthropic's API
+  only. On the `gateway` route, all 45 blocks of one session were empty. The
+  same holds on Bedrock and Foundry: nothing sets it and no relay reaches them. The
+  agent's own context still holds the text, so it told the user a table was
+  "in my message just before this card".
+
+  A session on such a route reads a hard rule in place of the "short note"
+  sentence: text in a message that also calls a tool is never seen.
+- **Removal / resolution condition:** Claude Code requests `updates` on every
+  provider. Check: on the `gateway` route with Opus 5.5, a note before a `Bash`
+  call carries text. Then delete the module, the prompt swap, the `notes`
+  field and the fake's answer, and let every session's notes reach the user.
 - **Status:** active
 - **Investigation:** n/a. An upstream gap with a checkable repro.
 
@@ -2011,7 +2123,7 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Lives in:** `crates/lucidos-app/src/utils/drawnCaret.ts`, its effect in
   `components/chat/PromptInput.tsx`, and the `.drawn-caret` rules in
   `styles/global/host-components.css`. Tests: `utils/drawnCaret.test.ts` and
-  `e2e/theme-caret-fallback.spec.ts`.
+  `e2e/theme-caret-fallback-all.spec.ts`.
 - **Impermanent because:** only Chromium draws `caret-shape`. WebKit and
   Firefox ignore it, so Lucidos draws the `composer-text` caret shape itself
   there. The native property is the right mechanism; the overlay stands in for
@@ -2021,23 +2133,25 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Verify in MDN browser-compat-data for `css.properties.caret-shape`, then
   check `CSS.supports('caret-shape', 'block')` is true in Safari and in the
   macOS app. Then delete the three sites and the two tests. The native-shape
-  check in `e2e/theme-parts-retro.spec.ts` then holds on every engine.
+  check in `e2e/theme-parts-retro-all.spec.ts` then holds on every engine.
 - **Status:** active
 
 ### Gemini 3.8 Flash's introductory compactor price
 
 - **Added:** 2026-10-06
-- **Lives in:** `crates/lucidos-engine/src/engine/summary_tree/compactor_models.rs`,
-  the `gemini-3.8-flash` row's `price`.
+- **Lives in:** `crates/lucidos-engine/src/llm/model_prices.rs`, the
+  `GEMINI_3_8_FLASH` row's `input` and `output`.
 - **Impermanent because:** It records Google's introductory list price,
   $0.75 / $3.75 per million tokens. Google doubles it to $1.50 / $7.50 on
   1 January 2027. After that date the Tree backfill estimate prices this
   model at half its real cost.
 - **Removal / resolution condition:** On or after 2027-01-01, set the row's
-  `price` to `(1.5, 7.5)` and drop the comment that points here. Confirm the
+  `input` and `output` to `1.5` and `7.5` and drop the comment that points here. Confirm the
   new rate on Google's Vertex AI pricing page first. Then set this entry to
   `resolved`.
-- **Status:** open
+- **Status:** resolved 2026-10-19. The *price table* (`llm/model_prices.json`)
+  carries the 2027 price as a card dated `2027-01-01`, which applies from that
+  day by itself.
 
 ---
 
@@ -2112,6 +2226,41 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** n/a (see ADR 0256, Consequences, and
   `docs/plans/2026-10-12-markers-commit-with-what-they-record.md`)
+
+### Claude Code startup instructions ride the system prompt
+
+- **Added:** 2026-10-17
+- **Lives in:** `plan_startup` in `crates/lucidos-engine/src/runtime/claude_code.rs`,
+  and `crates/lucidos-engine/src/runtime/startup_instructions/`.
+- **Impermanent because:** Claude Code puts CLAUDE.md and the unscoped rules into
+  its first user message, which names the worktree. Every fresh session rewrites
+  about 26k tokens to the prompt cache. The mirror moves them into the shared
+  system prompt until Claude Code stops doing that (anthropics/claude-code#93499).
+- **Removal / resolution condition:** Claude Code serves CLAUDE.md from the cache
+  across sessions itself. Check by rerunning the probe in
+  `docs/plans/2026-10-17-claude-code-startup-instructions-ride-the-shared-prompt.md`
+  without the move: a fresh session in a second worktree must write under 10k
+  tokens. Then delete the module, the per-session settings file and the
+  `plan_startup` branch, and revert the glossary and `agent-config.md` wording.
+- **Status:** active
+- **Investigation:** n/a (see ADR 0513)
+
+### Static secret-key read rule in the command guard
+
+- **Added:** 2026-10-18
+- **Lives in:** `mentions_secret_path` and `SECRET_PATHS` in
+  `crates/lucidos-engine/src/engine/command_guard.rs`, and the `SecretRead`
+  category they feed.
+- **Impermanent because:** a text rule cannot see a path built at run time,
+  through `base64`, a `cd` then a relative path, or a glob. It stands in for the
+  real boundary, an OS sandbox around subprocesses (ADR 0516).
+- **Removal / resolution condition:** subprocesses run in a sandbox, or as a
+  separate OS user, that cannot read `~/.lucidos/secret-keys` or the shared
+  Postgres password file. Check by running `cat` on a key file from a chat
+  `run_bash` with the rule disabled: the read must fail. Then decide whether the
+  rule stays as an early, friendlier refusal, or goes along with its tests.
+- **Status:** active
+- **Investigation:** n/a (see ADR 0516)
 
 ## 2. Model-tolerance measures
 
@@ -3006,9 +3155,13 @@ event that retires it.
   - `EmailStore::account_name_for_credential`
     (`crates/lucidos-engine/src/core/email.rs`), the `strip_prefix("email:")` that
     resolves a stranded row back to its `email_accounts` name.
-  - its two production callers in `crates/lucidos-engine/src/api/settings.rs`,
-    `create_credential` and `update_credential`, which sync the secret into
-    `email_accounts` so IMAP and SMTP read the new one.
+  - its production caller in `crates/lucidos-engine/src/api/settings.rs`,
+    `update_credential`, which writes the mailbox's server settings to its
+    `email_accounts` row.
+  - `move_mailbox_passwords` in
+    `crates/lucidos-engine/src/core/secret_store/one_home.rs`, the boot step
+    that drops `email_accounts.password`. It files a password as
+    `email:<account>` when another credential holds the bare name, and logs it.
   - `emailAccountName` in
     `crates/lucidos-app/src/components/credentials/CredentialModal.tsx`, the
     frontend mirror. Without it the edit form's settings fetch 404s on a stranded
@@ -3036,8 +3189,9 @@ event that retires it.
   sites in the same change:
   - delete `EmailStore::account_name_for_credential` and its three
     `account_name_*` cases.
-  - have both `settings.rs` callers pass `service_name` straight to
-    `EmailStore::update_password` and `EmailStore::upsert`.
+  - have `update_credential` pass `service_name` straight to
+    `EmailStore::upsert`.
+  - drop the `email:<account>` fallback name from `move_mailbox_passwords`.
   - delete `emailAccountName` and pass `existingCred.service_name` to
     `getEmailAccount`.
 
@@ -3320,7 +3474,7 @@ event that retires it.
   boot option (`boot/appearanceBoot.ts`, set in `boot/iframe.ts`), and the
   second `setAttribute` in `ui.applyPreferences` (`ui.ts`). Tests: the
   "legacy data-theme attribute" cases in `boot/appearanceBoot.test.ts` and the
-  `data-theme` asserts in `e2e/sdk-iframe-theme.spec.ts`, and the bundle asserts
+  `data-theme` asserts in `e2e/sdk-iframe-theme-all.spec.ts`, and the bundle asserts
   and module doc in `crates/lucidos-engine/src/api/sdk_prefs.rs`. App-facing
   sentence: `system-knowhow/js-sdk.md` § Theme variables.
 - **What it is:** the light/dark attribute became `data-theme-mode` when
@@ -3710,7 +3864,8 @@ measure now eligible for removal** — search this file for the id to find them 
   `Investigation: prompt-cache-first-of-turn-miss` to `removed` per its own
   removal steps.
 - **Status:** open
-- **Measures referencing this investigation:** Prompt-cache wire probe (§1).
+- **Measures referencing this investigation:** Prompt-cache wire probe (§1),
+  Claude Code prompt-cache probe (Vertex relay) (§1).
 
 ### `follow-ride-lands-short`: the ride's own write comes to rest short of the edge
 

@@ -19,6 +19,7 @@ fn failed(fix: u8) -> Verdict {
     Verdict::Failed {
         summary: "Failed: engine.".into(),
         tail: "test result: FAILED".into(),
+        failures: Vec::new(),
         run_url: Some("https://example.invalid/runs/1".into()),
         fix_thread_id: id(fix),
     }
@@ -293,4 +294,63 @@ fn at_most_one_check_runs_and_at_most_one_red_is_open_across_a_long_day() {
             let _ = check.close(Some(&tip), fresh());
         }
     }
+}
+
+fn passed_flaky(fix: u8) -> Verdict {
+    Verdict::PassedWithFlakyFix {
+        run_url: None,
+        flaky: Vec::new(),
+        fix_thread_id: id(fix),
+    }
+}
+
+/// A pass with flaky tests is a pass: it opens the flaky fix thread and
+/// holds no check, so the next landing starts one at once.
+#[test]
+fn a_flaky_pass_opens_a_flaky_fix_thread_and_holds_no_check() {
+    let mut check = running_a_to_b();
+    assert!(check
+        .ended(id(1), passed_flaky(8), Some("b"), id(2))
+        .is_empty());
+    assert_eq!(check.flaky_fix().map(|f| f.fix_thread_id), Some(id(8)));
+    assert!(check.red().is_none());
+    assert_eq!(check.passed(), Some(&range(1, "a", "b")));
+    assert_eq!(
+        check.landed(Some("b"), false, Some("c"), id(3)),
+        vec![Effect::Start(range(3, "b", "c"))],
+        "the flaky thread blocks nothing"
+    );
+    assert!(
+        check.flaky_fix().is_some(),
+        "and an unrelated landing keeps it open"
+    );
+}
+
+/// Only a change from the flaky fix thread closes it.
+#[test]
+fn only_a_landing_from_the_flaky_thread_closes_it() {
+    let mut check = running_a_to_b();
+    check.ended(id(1), passed_flaky(8), Some("b"), id(2));
+    assert!(!check.close_flaky_for(id(5)));
+    assert!(check.flaky_fix().is_some());
+    assert!(check.close_flaky_for(id(8)));
+    assert!(check.flaky_fix().is_none());
+}
+
+/// The flaky thread and the red are independent: a red opens beside an open
+/// flaky thread, and neither closes the other.
+#[test]
+fn a_red_and_a_flaky_thread_are_independent() {
+    let mut check = running_a_to_b();
+    check.ended(id(1), passed_flaky(8), Some("b"), id(2));
+    check.landed(Some("b"), false, Some("c"), id(3));
+    check.ended(id(3), failed(9), Some("c"), id(4));
+    assert!(check.red().is_some());
+    assert_eq!(check.flaky_fix().map(|f| f.fix_thread_id), Some(id(8)));
+    check.landed(Some("c"), true, Some("d"), id(5));
+    assert!(check.red().is_none(), "the red's fix closes the red");
+    assert!(
+        check.flaky_fix().is_some(),
+        "and leaves the flaky thread open"
+    );
 }

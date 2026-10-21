@@ -3,6 +3,7 @@ import type { ReleaseNotice, ReleaseNoticeView } from '../../api/client';
 
 const resolveReleaseNotice = vi.fn();
 const sendSeededPrompt = vi.fn();
+const openSettingsSubview = vi.fn();
 
 vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
@@ -14,18 +15,24 @@ vi.mock('./compose', () => ({
   sendSeededPrompt: (...a: unknown[]) => sendSeededPrompt(...a),
 }));
 
+vi.mock('./menu', () => ({
+  openSettingsSubview: (...a: unknown[]) => openSettingsSubview(...a),
+}));
+
 const {
   acknowledgeReleaseNotice,
   dismissReleaseNoticeModal,
+  openReleaseNoticesPanel,
   takeReleaseNoticeAction,
 } = await import('./releaseNotices');
 // The reads live a layer up, away from anything that can send a prompt. Both
 // halves are exercised together here: they are one behaviour, and the split is
 // about the import graph rather than about what a notice does.
 const {
-  modalActionLabel,
   owedReleaseNotice,
   owedReleaseNoticeCount,
+  owedReleaseNoticeTitles,
+  releaseNoticeActionLabel,
   releaseNoticeDismissed,
   releaseNoticeModalOpen,
 } = await import('../releaseNotices');
@@ -71,8 +78,9 @@ describe('the notice the modal owes', () => {
     expect(owedReleaseNotice()?.id).toBe('b');
   });
 
-  it('counts what is still owed, so the modal can say 1 of 3', () => {
+  it('lists and counts what is still owed, so the modal can name it', () => {
     loaded([notice('a', true), notice('b', false), notice('c', false)], 'b');
+    expect(owedReleaseNoticeTitles()).toEqual(['Notice b', 'Notice c']);
     expect(owedReleaseNoticeCount()).toBe(2);
   });
 
@@ -90,7 +98,7 @@ describe('answering', () => {
     vi.clearAllMocks();
   });
 
-  it('steps to the next notice without closing the modal', async () => {
+  it('makes the next notice the owed one', async () => {
     loaded([notice('a', false), notice('b', false)], 'a');
     resolveReleaseNotice.mockResolvedValue(settled([notice('a', true), notice('b', false)], 'b'));
 
@@ -120,7 +128,7 @@ describe('acting on a notice', () => {
     vi.clearAllMocks();
   });
 
-  it('sends the notice sentence, then closes and answers', async () => {
+  it('sends the notice sentence and answers it', async () => {
     loaded([notice('a', false, true), notice('b', false)], 'a');
     sendSeededPrompt.mockResolvedValue(true);
     resolveReleaseNotice.mockResolvedValue(
@@ -131,23 +139,21 @@ describe('acting on a notice', () => {
 
     expect(sendSeededPrompt).toHaveBeenCalledWith('Do the thing for me.', expect.any(String));
     expect(resolveReleaseNotice).toHaveBeenCalledWith('a');
-    // Closed even though 'b' is now owed: the send landed the reader in a new
-    // thread, and an overlay would cover it.
-    expect(releaseNoticeDismissed.value).toBe(true);
-    expect(releaseNoticeModalOpen()).toBe(false);
+    // The action runs from the panel, which stays put. It leaves the modal's
+    // dismissal alone, so 'b' still announces itself on the next open.
+    expect(releaseNoticeDismissed.value).toBe(false);
+    expect(owedReleaseNotice()?.id).toBe('b');
   });
 
   it('answers nothing when the send did not happen', async () => {
-    // A failed send starts nothing, so the notice is still owed and the modal
-    // stays up to ask again.
+    // A failed send starts nothing, so the notice is still owed.
     loaded([notice('a', false, true)], 'a');
     sendSeededPrompt.mockResolvedValue(false);
 
     await takeReleaseNoticeAction(notice('a', false, true));
 
     expect(resolveReleaseNotice).not.toHaveBeenCalled();
-    expect(releaseNoticeDismissed.value).toBe(false);
-    expect(releaseNoticeModalOpen()).toBe(true);
+    expect(owedReleaseNotice()?.id).toBe('a');
   });
 
   /** **Got it says "I have read this", never "I have done it".** So the action
@@ -173,7 +179,7 @@ describe('dismissing without answering', () => {
     vi.clearAllMocks();
   });
 
-  // Escape, the X and an outside click all land here.
+  // Later, Escape, the X and an outside click all land here.
   it('closes the modal and resolves nothing, so the notice returns', () => {
     loaded([notice('a', false)], 'a');
 
@@ -186,18 +192,42 @@ describe('dismissing without answering', () => {
   });
 });
 
-describe('the action the modal draws', () => {
+describe('opening the panel', () => {
+  beforeEach(() => {
+    releaseNoticeDismissed.value = false;
+    releaseNoticeView.value = { status: 'not-loaded' };
+    vi.clearAllMocks();
+  });
+
+  it('closes the modal, lands the Release Notices panel, and answers nothing', () => {
+    loaded([notice('a', false)], 'a');
+
+    openReleaseNoticesPanel();
+
+    expect(openSettingsSubview).toHaveBeenCalledWith('release-notices');
+    expect(releaseNoticeModalOpen()).toBe(false);
+    expect(resolveReleaseNotice).not.toHaveBeenCalled();
+    expect(owedReleaseNotice()?.id).toBe('a');
+  });
+});
+
+describe('the action a notice row draws', () => {
   it('is the notice\'s own label', () => {
-    expect(modalActionLabel(notice('a', false, true))).toBe('Do it');
+    expect(releaseNoticeActionLabel(notice('a', false, true))).toBe('Do it');
   });
 
   it('is nothing for a notice with no action', () => {
-    expect(modalActionLabel(notice('a', false))).toBeNull();
+    expect(releaseNoticeActionLabel(notice('a', false))).toBeNull();
   });
 
   // A workspace that skipped releases owes several audit notices. The engine
   // marks all but the last as deferred, so the reader runs one audit.
   it('is nothing when a later owed notice carries the same action', () => {
-    expect(modalActionLabel(notice('a', false, true, true))).toBeNull();
+    expect(releaseNoticeActionLabel(notice('a', false, true, true))).toBeNull();
+  });
+
+  // Got it says "read", never "done", so an answered row keeps its action.
+  it('comes back once the notice is answered', () => {
+    expect(releaseNoticeActionLabel(notice('a', true, true, true))).toBe('Do it');
   });
 });

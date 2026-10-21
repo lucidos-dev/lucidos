@@ -218,13 +218,13 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 ## Packaged vs dev
 
 ### Gateway self-reload control is dev-only
-- **Where:** `.claude/rules/dev-runtime.md` § "Gateway self-reload"; gateway control status `packaged` field (`crates/lucidos-gateway/src/`), `crates/lucidos-app/src/desktop.rs` (`LUCIDOS_PACKAGED=1`), `crates/lucidos-app/src/components/.../WorkspacePicker.tsx`
+- **Where:** `docs/dev-runtime.md` § "Gateway self-reload"; gateway control status `packaged` field (`crates/lucidos-gateway/src/`), `crates/lucidos-app/src/desktop.rs` (`LUCIDOS_PACKAGED=1`), `crates/lucidos-app/src/components/.../WorkspacePicker.tsx`
 - **Gap:** The workspace picker's "reload the gateway onto the rebuilt binary" control (`POST /~/api/v1/control/gateway/reload`, re-exec in place) is hidden in packaged builds.
 - **Why:** In-place re-exec onto a rebuilt on-disk binary only makes sense in dev (a CC Apply rebuilds the gateway under a running gateway). A packaged build never rebuilds in place — its updates go through the app updater + a full launchd service restart.
 - **Status:** Open by design — packaged gateway updates are delivered by the updater, not an in-place reload.
 
 ### Frontend-only in-process Apply refresh is dev-only
-- **Where:** `crates/lucidos-engine/src/engine/frontend_refresh.rs` (`refresh_served_frontend_after_rebuild` and the peer `spawn_served_frontend_sync` both early-return packaged/headless), `.claude/rules/dev-runtime.md` § "Exception — a frontend-only Apply…" and § "Shared build-watch"
+- **Where:** `crates/lucidos-engine/src/engine/frontend_refresh.rs` (`refresh_served_frontend_after_rebuild` and the peer `spawn_served_frontend_sync` both early-return packaged/headless), `.claude/rules/dev-runtime.md` § "Exception: a frontend-only Apply…" and § "Shared build-watch"
 - **Gap:** The fast path where a pure frontend change advances the served client without an engine restart exists only in dev — both for the applying workspace (in-process re-snapshot on Apply) and for **peer** workspaces (a ~10s periodic re-snapshot of the checkout-shared `dist/` when INV-A-safe, emitting `ServedFrontendAdvanced`); packaged Applies don't get an in-process client swap.
 - **Why:** In dev the engine serves a pinned snapshot of a live `dist/` and can re-snapshot in place. Packaged serves an immutable bundled Resources directory that is already one unit — there is no live `dist/` to re-snapshot, so the refresh is a no-op there. (Packaged is also single-workspace-per-install, so the cross-workspace peer case doesn't arise.)
 - **Status:** Open by design — packaged frontend updates ship via the updater's full restart. The cross-workspace peer propagation gap (a peer serving a stale client with no badge) is **closed in dev** by the periodic sync — see `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`.
@@ -236,7 +236,7 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Status:** Open by design — reload to pick up a change (rebuild is typically sub-second).
 
 ### The default `curl | sh` installer 404s today
-- **Where:** `install.sh` (download-and-run default), `.github/workflows/release-tarballs.yml` (the attach step), `.claude/rules/build-release.md` § Installer "Caveat"
+- **Where:** `install.sh` (download-and-run default), `.github/workflows/release-tarballs.yml` (the attach step), `.claude/rules/build-release.md` § Installer
 - **Gap:** The default installer path downloads `lucidos-<version>-<triple>.tar.gz` from GitHub Releases, but no release asset was published, so the download returned 404.
 - **Why:** The release workflow uploaded tarballs as **workflow artifacts only** and never auto-attached them; attaching to a Release was behind a manual `workflow_dispatch` + tag ref + opt-in flag.
 - **Status:** **Closed (2026-07-30)**, and its residual closed too (2026-08-04). Attaching became automatic on 2026-07-30 and every release from v0.16.0 on carries all four per-platform tarballs + `.sha256` sidecars, but the attach landed 11 to 35 minutes AFTER the Release was cut, so a download started inside that window still 404s (v0.21.0: published 15:49:28Z, Intel Mac tarball attached 16:24:14Z). That window is gone: the tag push is now what attaches, the Release is created as a DRAFT and published only once all four are on it, so a release is complete at the moment it becomes public. `download_failed` still offers `--version <older>` / `--dev` / `--from-tarball` for the other causes.
@@ -384,7 +384,7 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Where:** `crates/lucidos-engine/src/llm/openai/responses.rs` (`ContentBlock::Image { .. } =>` "Responses API (codex models) doesn't support images — skip")
 - **Gap:** Sending an image to a model that uses OpenAI's Responses API (GPT-5+ / Codex) silently omits the image.
 - **Why:** The Responses API wire format the engine emits has no image support, so image blocks are skipped when building the request.
-- **Status:** Open — images reach only Chat-Completions / Anthropic-format models.
+- **Status:** **Closed (2026-10-17)** by "fix(llm): the Responses API sends images as input_image parts". The builder sends each image as an `input_image` data URL part, in block order. A tool's image follows its function call output, and a cache-marked message keeps its images too. The wire no longer decides which models see images.
 
 ### OpenRouter and local providers are Chat-Completions-only, with no routing heuristic
 - **Where:** `crates/lucidos-engine/src/llm/openai/mod.rs` (`force_chat_completions` for OpenRouter/local), `crates/lucidos-engine/src/llm/model_registry.rs` ("no rule for these shapes, so it falls back to Vertex (documented limitation)")
@@ -429,6 +429,18 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Gap:** You can't point a coding-agent session at an arbitrary directory — only Lucidos itself, an installed app's `data/apps/<id>/`, or a registered external repo.
 - **Why:** v1 resolves targets via the repo registry / app layout; an unregistered or non-git path is refused rather than silently handled.
 - **Status:** Open — register the repo first (`manage_repositories action='add'`), or use the chat file tools for `data/` subtrees.
+
+### A rung pick under the Successor card can later switch the thread without asking
+- **Where:** `crates/lucidos-app/src/components/chat/useRungState.ts` (`cardPickRidesSend`, `cardPickSendProceeds`, the card branch of `pickModelSelection`), `crates/lucidos-app/src/components/chat/SuccessorCard.tsx`
+- **Gap:** A pick made under the Successor card aims the successor, but it lands in the same pending pair any send in this thread carries. The send check asks the rung switch question only while the card shows. After *Stay here*, or once the card goes cold, the next send switches the thread and rebuilds its cache with no question. The check also ignores a thread that runs the default implementer's model, so an effort-only pick there never asks.
+- **Why:** One rung control serves two targets: the successor and the current thread. Each guard patches one path through that shared state, and the edge cases keep multiplying.
+- **Status:** Open, deferred for a redesign. The intended shape: the successor's model is chosen in one place on the card, and the prompt box's rung control only ever applies to the current thread.
+
+### A failed warm Continue leaves its successor request open
+- **Where:** `crates/lucidos-engine/src/api/threads/successor.rs` (`request_narrative`), `crates/lucidos-engine/src/engine/successor.rs` (`pending_successor_request`)
+- **Gap:** A warm Continue records `SuccessorRequested` before it submits the handoff request. The submit can fail, for example when the thread turned busy. The UI then reports a failure, but the event stays open until the thread next idles. An agent handoff in that window picks up the message and implementer of the failed Continue.
+- **Why:** Recording and submitting are two steps with no rollback, and no event withdraws a request.
+- **Status:** Open, deferred to the same Successor card redesign as the gap above.
 
 ## Backup & restore
 

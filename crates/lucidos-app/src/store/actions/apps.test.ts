@@ -19,7 +19,7 @@ vi.mock('../../api/client', async () => ({
   getAppApi: (...args: unknown[]) => mockGetAppApi(...args),
   postAppCapture: (...args: unknown[]) => mockPostAppCapture(...args),
   listAppsApi: (...args: unknown[]) => mockListAppsApi(...args),
-  retryTransientRead: <T>(read: () => Promise<T>) => read(),
+  retryTransient: <T>(read: () => Promise<T>) => read(),
   appUrl: vi.fn((id: string, tid?: string, fragment?: string) =>
     `/app/${id}/${tid ? `?thread_id=${tid}` : ''}${fragment ? `#${fragment}` : ''}`),
 }));

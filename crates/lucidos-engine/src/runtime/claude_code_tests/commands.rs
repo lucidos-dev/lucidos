@@ -394,8 +394,8 @@ fn normalize_cc_model_id_preserves_unknown() {
 
 #[test]
 fn every_fable_generation_round_trips_through_cc_model_helpers() {
-    // Each Fable id is a full model id present in cc_menu_options.json, so it
-    // passes through normalize unchanged, and the 1M variant reconciles like
+    // A Fable id is not offered, but a thread already on one still reports it.
+    // It passes through normalize unchanged, and the 1M variant reconciles like
     // the others. Fable 5.1 is the trap: `claude-fable-5` is a prefix of it,
     // so a prefix-shaped fold would rewrite one generation into the other.
     for base in ["claude-fable-5", "claude-fable-5-1"] {
@@ -404,19 +404,6 @@ fn every_fable_generation_round_trips_through_cc_model_helpers() {
         assert_eq!(normalize_cc_model_id(&one_m), one_m);
         assert_eq!(reconcile_cc_model(Some(&one_m), base), one_m);
     }
-    // The /model picker offers both generations, each with its 1M variant.
-    let defs = cc_command_definitions();
-    assert_command_options(
-        &defs,
-        "set_model",
-        "model",
-        &[
-            "claude-fable-5-1",
-            "claude-fable-5-1[1m]",
-            "claude-fable-5",
-            "claude-fable-5[1m]",
-        ],
-    );
 }
 
 #[test]
@@ -466,8 +453,8 @@ fn every_sonnet_5_generation_round_trips_through_cc_model_helpers() {
 fn every_opus_5_generation_round_trips_through_cc_model_helpers() {
     // Opus 5.5 is the trap Fable 5.1 was: `claude-opus-5` is a prefix of
     // `claude-opus-5-5`, so a prefix-shaped fold would rewrite one generation
-    // into the other. Both are pinned picker values, so both normalize to
-    // themselves and neither collapses onto the `opus` alias.
+    // into the other. Neither collapses onto the `opus` alias. Opus 5 is no
+    // longer offered, but a thread already on it still reports its id.
     for base in ["claude-opus-5-5", "claude-opus-5@default"] {
         assert_eq!(normalize_cc_model_id(base), base);
     }
@@ -487,19 +474,13 @@ fn every_opus_5_generation_round_trips_through_cc_model_helpers() {
     );
     // Opus 4.6 still folds back to the alias (unchanged behaviour).
     assert_eq!(normalize_cc_model_id("claude-opus-4-6"), "opus");
-    // The /model picker offers both generations, each with its 1M variant.
+    // The /model picker offers Opus 5.5 with its 1M variant.
     let defs = cc_command_definitions();
     assert_command_options(
         &defs,
         "set_model",
         "model",
-        &[
-            "claude-opus-5-5",
-            "claude-opus-5-5[1m]",
-            "claude-opus-5@default",
-            "claude-opus-5[1m]",
-            "opus",
-        ],
+        &["claude-opus-5-5", "claude-opus-5-5[1m]", "opus"],
     );
 }
 
@@ -555,12 +536,19 @@ fn reconcile_cc_model_passes_through_when_no_1m() {
     );
 }
 
-/// The picker is Claude Code's own list once it has answered, and the curated
-/// rows before. Never a mix of the two.
+/// The offered list is Claude Code's own rows first, then the curated rows it
+/// did not list. Before it has answered, that is the offered curated rows alone.
 #[test]
-fn the_picker_is_the_discovered_list_or_the_curated_one() {
-    assert_eq!(&*pick_cc_model_options(None), curated_cc_model_options());
-    let discovered: std::sync::Arc<[CcMenuOption]> = vec![CcMenuOption {
+fn the_offered_list_is_the_discovered_rows_then_the_curated_rest() {
+    let offered_curated: Vec<&CcMenuOption> = curated_cc_model_options()
+        .iter()
+        .filter(|o| o.offered)
+        .collect();
+    assert_eq!(
+        offered_cc_model_options(None).iter().collect::<Vec<_>>(),
+        offered_curated
+    );
+    let discovered = vec![CcMenuOption {
         value: "sonnet".to_string(),
         resolved_model: None,
         label: "Sonnet 5".to_string(),
@@ -568,9 +556,17 @@ fn the_picker_is_the_discovered_list_or_the_curated_one() {
         supported_models: None,
         context_window: None,
         reasoning_efforts: Some(vec!["low".to_string()]),
-    }]
-    .into();
-    assert_eq!(pick_cc_model_options(Some(discovered.clone())), discovered);
+        offered: true,
+    }];
+    let merged = offered_cc_model_options(Some(&discovered));
+    assert_eq!(merged[0], discovered[0], "a discovered row leads and wins");
+    let expected_rest: Vec<&str> = offered_curated
+        .iter()
+        .map(|o| o.value.as_str())
+        .filter(|v| *v != "sonnet")
+        .collect();
+    let rest: Vec<&str> = merged[1..].iter().map(|o| o.value.as_str()).collect();
+    assert_eq!(rest, expected_rest);
 }
 
 /// A discovered row carries its own tiers, and the wire serves those rather
@@ -585,6 +581,7 @@ fn a_discovered_row_offers_its_own_tiers() {
         supported_models: None,
         context_window: None,
         reasoning_efforts: Some(Vec::new()),
+        offered: true,
     };
     let (models, _) = model_and_effort_options(&[row], cc_reasoning_effort_options());
     assert_eq!(models[0]["reasoning_efforts"], serde_json::json!([]));
@@ -601,6 +598,7 @@ fn discovered_row(value: &str, runs: &str) -> CcMenuOption {
         supported_models: None,
         context_window: None,
         reasoning_efforts: None,
+        offered: true,
     }
 }
 
@@ -633,22 +631,16 @@ fn the_picker_runs_strongest_first_and_shows_each_model_once() {
 
 /// The fallback list groups by family and runs newest version first. A
 /// version-free alias sits last in its family, and no row is folded, because
-/// each curated row runs a model of its own.
+/// each curated row runs a model of its own. Overlay-only rows are absent.
 #[test]
 fn the_fallback_picker_groups_by_family_newest_first() {
-    let rows = cc_picker_rows(curated_cc_model_options());
+    let rows = cc_picker_rows(&offered_cc_model_options(None));
     assert_eq!(
         values(&rows),
         [
             "default",
-            "claude-fable-5-1",
-            "claude-fable-5-1[1m]",
-            "claude-fable-5",
-            "claude-fable-5[1m]",
             "claude-opus-5-5",
             "claude-opus-5-5[1m]",
-            "claude-opus-5@default",
-            "claude-opus-5[1m]",
             "claude-opus-4-8@default",
             "claude-opus-4-8[1m]",
             "claude-opus-4-7",
@@ -659,6 +651,7 @@ fn the_fallback_picker_groups_by_family_newest_first() {
             "claude-sonnet-5-5[1m]",
             "claude-sonnet-5",
             "sonnet",
+            "claude-haiku-5-5",
             "haiku",
         ]
     );

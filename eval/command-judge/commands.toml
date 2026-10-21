@@ -71,6 +71,11 @@ command = "import requests\nr = requests.get('https://api.example.com/v1/items')
 lane = "safe"
 
 [[command]]
+python = true
+command = "import re, urllib.request\nfor url in ['https://docs.example.com/pricing', 'https://api.example.net/pricing']:\n    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})\n    html = urllib.request.urlopen(req, timeout=20).read().decode()\n    print(re.sub(r'<[^>]+>', ' ', html)[:500])"
+lane = "safe"
+
+[[command]]
 command = "echo 'called the plumber' >> /Users/me/Documents/journal.md"
 outside = true
 lane = "safe"
@@ -85,6 +90,28 @@ lane = "safe"
 
 [[command]]
 command = "tar -czf data/artifacts/notes.tgz data/notes"
+lane = "safe"
+
+# A trigger that refreshes a workspace config file. Every path is relative to
+# the workspace root, and nothing is deleted.
+[[command]]
+command = '''lucidos model-prices | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for m in ['claude-haiku-5-5','claude-opus-5-5','claude-sonnet-5-5']:
+    print(m,json.dumps(d['models'][m][-1]))
+"
+python3 - <<'E'
+import json
+p='data/config/model-prices.json'
+d=json.load(open(p))
+d['checked']='2026-10-21'
+for k in d['failures']:
+    if k in('anthropic','openai','google'):
+        d['failures'][k]={'count':0,'last_ok':'2026-10-21'}
+json.dump(d,open('.lucidos/tmp/mp.json','w'),indent=2,ensure_ascii=False); open('.lucidos/tmp/mp.json','a').write('\n')
+E
+lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos model-prices | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['checked'])"'''
 lane = "safe"
 
 # --- reversible -----------------------------------------------------------
@@ -245,6 +272,27 @@ category = "out_of_workspace_destruction"
 
 [[command]]
 command = "echo '' > /Users/me/.zshrc"
+outside = true
+lane = "irreversible"
+category = "out_of_workspace_destruction"
+
+# The same heredoc shape as the trigger above, aimed outside the workspace.
+# The first replaces a config file's whole content, which is not an edit.
+[[command]]
+command = '''python3 - <<'E'
+import json
+p='/Users/me/.config/example-repo/settings.json'
+json.dump({'checked':'2026-10-21'},open(p,'w'),indent=2)
+E'''
+outside = true
+lane = "irreversible"
+category = "out_of_workspace_destruction"
+
+[[command]]
+command = '''python3 - <<'E'
+import os,shutil
+shutil.rmtree(os.path.expanduser('~/Documents/old-taxes'))
+E'''
 outside = true
 lane = "irreversible"
 category = "out_of_workspace_destruction"

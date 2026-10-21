@@ -200,8 +200,8 @@ impl LucidosEngine {
     /// own lifecycle event (`ChangeApplied` / `ChangeDiscarded` /
     /// `ThreadArchived`) and must NOT also emit `ResponseCanceled`.
     ///
-    /// At engine teardown the whole body is skipped for a session parked on an
-    /// unanswered `AskUserQuestion` (see
+    /// At engine teardown, and on an effort restart, the whole body is skipped
+    /// for a session parked on an unanswered `AskUserQuestion` (see
     /// [`crate::engine::agent_recovery::preserve_question_park_at_shutdown`]):
     /// such a session must land NOTHING after its `UserQuestionAsked`.
     #[allow(clippy::too_many_arguments)]
@@ -212,7 +212,7 @@ impl LucidosEngine {
         is_waiting: bool,
         is_shutdown: bool,
         suppress_user_terminal: bool,
-        interrupt_is_redirect: bool,
+        redirect_cause: Option<crate::engine::thread_events::CancelCause>,
         agent_cancel: &tokio_util::sync::CancellationToken,
         claude_text_buf: &mut CodingAgentTextBuffer,
         meta: &crate::engine::thread_events::EventMeta,
@@ -228,11 +228,13 @@ impl LucidosEngine {
         // arrives as the per-session snapshot; from here on `is_shutdown` is the
         // real answer.
         let is_shutdown = self.session_is_shutting_down(is_shutdown);
+        let effort_restart = self.pending_stop_reason(thread_id).await
+            == Some(crate::engine::StopReason::EffortRestart);
         if crate::engine::agent_recovery::preserve_question_park_at_shutdown(
             &self.pool,
             arm,
             thread_id,
-            is_shutdown,
+            is_shutdown || effort_restart,
         )
         .await
         {
@@ -259,12 +261,11 @@ impl LucidosEngine {
             return;
         };
         // Refine a real-Cancel into a redirect cancel when this stop came from a
-        // Codex mid-turn follow-up redirect that escalated (CC ignored the
-        // graceful interrupt) — neutral render instead of "Canceled ✕".
-        if interrupt_is_redirect {
-            if let TerminalKind::Canceled(cause) = &mut kind {
-                *cause = crate::engine::thread_events::CancelCause::SupersededByFollowup;
-            }
+        // redirect: one that escalated (the agent ignored the graceful
+        // interrupt), or an effort restart. It renders neutrally, not as
+        // "Canceled ✕".
+        if let (Some(redirect), TerminalKind::Canceled(cause)) = (redirect_cause, &mut kind) {
+            *cause = redirect;
         }
         let is_aborted = matches!(kind, TerminalKind::Aborted(_));
         // Dedup BOTH Aborted and Canceled — eviction-path pre-emits set the
@@ -371,18 +372,7 @@ impl LucidosEngine {
     /// through the router like any message. The first turn opens the thread,
     /// named `title`, in the inbox. A lane thread and a fix thread open this
     /// way, so they keep the ordinary steps, questions and recovery.
-    pub(crate) fn spawn_engine_coding_turn(
-        self: &std::sync::Arc<Self>,
-        thread_id: Uuid,
-        prompt: String,
-        title: Option<String>,
-        reason: EngineReason,
-    ) {
-        self.spawn_engine_coding_turn_or_else(thread_id, prompt, title, reason, |_| {});
-    }
-
-    /// [`Self::spawn_engine_coding_turn`], calling `on_failure` with the
-    /// error when the turn fails.
+    /// `on_failure` hears the error when the turn fails.
     pub(crate) fn spawn_engine_coding_turn_or_else(
         self: &std::sync::Arc<Self>,
         thread_id: Uuid,
@@ -391,15 +381,55 @@ impl LucidosEngine {
         reason: EngineReason,
         on_failure: impl FnOnce(&str) + Send + 'static,
     ) {
+        self.spawn_engine_coding_turn_with(thread_id, prompt, title, reason, None, on_failure);
+    }
+
+    /// [`Self::spawn_engine_coding_turn_or_else`] on a named `implementer`,
+    /// not the workspace's default.
+    pub(crate) fn spawn_engine_coding_turn_as(
+        self: &std::sync::Arc<Self>,
+        thread_id: Uuid,
+        prompt: String,
+        title: Option<String>,
+        reason: EngineReason,
+        implementer: crate::engine::successor::Implementer,
+    ) {
+        self.spawn_engine_coding_turn_with(
+            thread_id,
+            prompt,
+            title,
+            reason,
+            Some(implementer),
+            |_| {},
+        );
+    }
+
+    fn spawn_engine_coding_turn_with(
+        self: &std::sync::Arc<Self>,
+        thread_id: Uuid,
+        prompt: String,
+        title: Option<String>,
+        reason: EngineReason,
+        implementer: Option<crate::engine::successor::Implementer>,
+        on_failure: impl FnOnce(&str) + Send + 'static,
+    ) {
         let engine = self.clone();
         Self::spawn_cc_task_guarded(engine.clone(), thread_id, async move {
+            let (cc_model, reasoning_effort, coding_agent) = match &implementer {
+                Some(implementer) => (
+                    implementer.model.as_deref(),
+                    implementer.reasoning_effort.as_deref(),
+                    Some(implementer.coding_agent),
+                ),
+                None => (None, None, None),
+            };
             let result = engine
                 .process_message_with_steps(
                     &prompt,
                     None,
                     None,
                     None,
-                    None,
+                    reasoning_effort,
                     None,
                     None,
                     None,
@@ -413,8 +443,8 @@ impl LucidosEngine {
                     None,
                     None,
                     crate::engine::thread_events::ActorMode::Engine,
-                    None,
-                    None,
+                    cc_model,
+                    coding_agent,
                     None,
                     title.as_deref(),
                     Some(MessageOrigin::engine(reason)),

@@ -81,6 +81,8 @@ function suppressMergeReload(): Plugin {
   };
 }
 
+const BUILD_ID_PLACEHOLDER = '__LUCIDOS_BUILD_ID__';
+
 /**
  * Expose the per-build id to the app bundle as the virtual module
  * `virtual:build-id` (`CLIENT_BUILD_ID`). The module ships the
@@ -103,7 +105,7 @@ function buildIdVirtualModule(): Plugin {
     },
     load(id) {
       if (id === resolvedId) {
-        return `export const CLIENT_BUILD_ID = '__LUCIDOS_BUILD_ID__';`;
+        return `export const CLIENT_BUILD_ID = '${BUILD_ID_PLACEHOLDER}';`;
       }
     },
   };
@@ -140,12 +142,15 @@ function stampServiceWorker(): Plugin {
       const swPath = resolve(outDir, 'sw.js');
       if (!fs.existsSync(swPath)) return;
       const assetNames = Object.keys(bundle).sort().join('\n');
-      const buildId = crypto.createHash('sha256').update(assetNames).digest('hex').slice(0, 12);
+      // A coverage build's id is as long as the placeholder, so no byte moves
+      // and its sourcemaps still match the stamped JS (e2e/coverage.ts).
+      const idLength = process.env.LUCIDOS_E2E_COVERAGE ? BUILD_ID_PLACEHOLDER.length : 12;
+      const buildId = crypto.createHash('sha256').update(assetNames).digest('hex').slice(0, idLength);
       const stamp = (filePath: string): void => {
         if (!fs.existsSync(filePath)) return;
         const src = fs.readFileSync(filePath, 'utf-8');
-        if (!src.includes('__LUCIDOS_BUILD_ID__')) return;
-        fs.writeFileSync(filePath, src.replace(/__LUCIDOS_BUILD_ID__/g, buildId));
+        if (!src.includes(BUILD_ID_PLACEHOLDER)) return;
+        fs.writeFileSync(filePath, src.replaceAll(BUILD_ID_PLACEHOLDER, buildId));
       };
       // sw.js (cache name + update-detect byte change) is copied from public/,
       // so it's not a bundle key — stamp it by path. The app JS chunks carrying
@@ -310,6 +315,10 @@ export default defineConfig({
     // tell the first-paint chunks from the lazy ones. `chunkBudget` judges each
     // chunk against the number for its class instead (ADR 0436).
     chunkSizeWarningLimit: Infinity,
+    // The main check's coverage build maps executed code back to source
+    // (e2e/coverage.ts). Hidden: no bundle names its map, and no other build
+    // writes one.
+    sourcemap: process.env.LUCIDOS_E2E_COVERAGE ? 'hidden' : false,
     rollupOptions: {
       output: {
         // Split third-party code out of the always-loaded entry chunk. The
@@ -396,6 +405,11 @@ export default defineConfig({
       // (ADR 0469). Reached WITHOUT the barrel, like the pane swipe above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/app-scroll': resolve(__dirname, '../../packages/lucidos-sdk/src/appScroll.ts'),
+      // The right-click rule (ADR 0285), shared with widget frames so a frame
+      // and the host agree on what counts as content. Reached WITHOUT the
+      // barrel, like the pane swipe above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/context-menu': resolve(__dirname, '../../packages/lucidos-sdk/src/contextMenu.ts'),
       // The widget height protocol (ADR 0402): the channel the host marks a
       // widget frame on and the message the frame answers with. Reached
       // WITHOUT the barrel, like the pane swipe above.

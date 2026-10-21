@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
-import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView } from '../../store/store';
+import { panelOverlay, panelUrl, threadSearchQuery, mobileView } from '../../store/store';
 import { useHideOnScroll } from '../../hooks/useHideOnScroll';
 import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
 import { watchTitlebarBand } from '../../store/actions/trafficLights';
@@ -19,6 +19,7 @@ import { SlownessBanner } from './SlownessBanner';
 import { PaneDrag, attachPaneDragTouches, type PaneTrack } from './paneDrag';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
+import { drawnDrawerShown, drawnSplitRatio } from './drawnLayout';
 import { ContentRefreshButton } from './RefreshIndicator';
 import { ThreadHeaderActions, ThreadHeaderHomeButton, ThreadHeaderNewThreadButton } from './ThreadHeaderActions';
 import { BrandMenuButton } from './HeaderMark';
@@ -128,13 +129,13 @@ function onHeaderDblClick(e: MouseEvent) {
   if (isMobile()) return;
 
   const header = (e.currentTarget as HTMLElement).getBoundingClientRect();
-  const ratio = splitRatio.value;
+  const ratio = drawnSplitRatio.value;
 
   // The DOM reads; the attribution itself is pure (headerDblClickRegion), which
   // is also where the drawer segment is ruled out as a surface that answers.
   const styles = getComputedStyle(document.documentElement);
   const drawerWidthPx = parseFloat(styles.getPropertyValue('--content-offset') || '0');
-  const drawerDividerPx = threadDrawerOpen.value
+  const drawerDividerPx = drawnDrawerShown.peek()
     ? parseFloat(styles.getPropertyValue('--divider-width') || '0')
     : 0;
 

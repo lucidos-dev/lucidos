@@ -110,7 +110,7 @@ variables there.
 One rule stays resident because it is safety-critical and must hold even when the
 skill is not loaded:
 
-- `LUCIDOS_DATABASE_URL`: the workspace database, read-only by default (ADR 0481). CC sessions, bash and python tools, and scripts get it, so run `psql "$LUCIDOS_DATABASE_URL" -c '…'`, and `BEGIN READ WRITE` for a deliberate write. **Never put the URL or password in argv**: it lands in the persisted `Bash` tool-call payload. The engine sets no `PG*` and no `DATABASE_URL`, so bare `psql` reaches nothing.
+- `LUCIDOS_DATABASE_URL`: the workspace database, read-only by default (ADR 0481), as the *agent role*, which cannot read a secret column (ADR 0509). CC sessions, bash and python tools, and scripts get it, so run `psql "$LUCIDOS_DATABASE_URL" -c '…'`, and `BEGIN READ WRITE` for a deliberate write. **Never put the URL or password in argv**: it lands in the persisted `Bash` tool-call payload. The engine sets no `PG*` and no `DATABASE_URL`, so bare `psql` reaches nothing.
 
 ## Workspace Layout & Taxonomy
 

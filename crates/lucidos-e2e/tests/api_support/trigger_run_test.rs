@@ -39,7 +39,7 @@ const NEVER_SOON_CRON: &str = "0 0 3 1 1 *";
 /// must write and later remove. The refusal tests below never reach execution,
 /// so they carry an intent they will never run and own no files at all. The
 /// engine's own `trigger.toml` is gitignored, so it never dirties the tree.
-async fn create_trigger(
+pub(crate) async fn create_trigger(
     client: &reqwest::Client,
     name: &str,
     slug: &str,
@@ -117,7 +117,7 @@ async fn try_run_trigger(client: &reqwest::Client, id: &str) -> Result<serde_jso
 
 /// Delete a trigger. Best-effort: a failed cleanup must not fail the assertion
 /// the test exists for.
-async fn delete_trigger(client: &reqwest::Client, id: &str) {
+pub(crate) async fn delete_trigger(client: &reqwest::Client, id: &str) {
     let _ = client
         .delete(format!("{}/api/v1/triggers?id={}", base_url(), id))
         .send()
@@ -230,7 +230,7 @@ async fn set_capacity_policy(client: &reqwest::Client, policy: &serde_json::Valu
 ///   first's widened policy as "the original"). `capacity_policy_lock` is what
 ///   makes them exclusive.
 /// - Duplicating it per test is how one copy drifts out of step with the other.
-async fn run_trigger_with_a_free_slot(
+pub(crate) async fn run_trigger_with_a_free_slot(
     client: &reqwest::Client,
     id: &str,
 ) -> Result<serde_json::Value, String> {

@@ -110,6 +110,7 @@ describe('the memory choice', () => {
         effort: 'low',
         source: 'default',
         reachable: true,
+        generation: null,
         not_served: [],
         needs_vision: false,
         asks_no_model: false,

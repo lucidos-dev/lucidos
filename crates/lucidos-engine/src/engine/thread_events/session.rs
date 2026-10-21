@@ -111,6 +111,20 @@ pub enum ChildCompletionStatus {
     Interrupted,
 }
 
+/// The *handoff consent* that let a child's successor start under its parent
+/// (ADR 0507). The successor inherits it for its own automatic handoffs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HandoffConsent {
+    /// The owner's device asked, or a caller carrying their standing
+    /// instruction did.
+    Owner,
+    /// The handoff spent an owner approval (ADR 0387 and 0493).
+    OwnerApproval,
+    /// The handoff passed on the consent its predecessor carried.
+    Carried,
+}
+
 /// What a child's clean finish does to its parent, declared by the spawn: the
 /// child's *wake mode* (ADR 0451). A failure wakes the parent under every mode.
 ///

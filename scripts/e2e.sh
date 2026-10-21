@@ -68,7 +68,7 @@ source "$SCRIPT_DIR/lib/e2e.sh"
 # The browser phase's projects, named in this hold's E2ELockAcquired.
 # shellcheck disable=SC2034 # read by _e2e_announce_lock_acquired in scripts/lib/e2e_lock.sh
 E2E_LOCK_PROJECTS="$(e2e_browser_projects ${BROWSER_ARGS[@]+"${BROWSER_ARGS[@]}"} | paste -sd, -)"
-acquire_e2e_lock e2e || exit 1
+acquire_e2e_slots e2e exclusive || exit $?
 kill_orphan_simulator
 teardown_e2e() {
     # Belt-and-suspenders: e2e-browser.sh stops its own reaper and host-load
@@ -124,7 +124,7 @@ echo "════════════════════════�
 # the workspace was just freshly booted (see e2e-browser.sh: only projects 2+
 # reset). Under this umbrella that assumption is false, so the first project
 # would inherit hundreds of API-phase threads and fail drawer-order-sensitive
-# specs. One did: threads.spec.ts "thread loads with correct messages when
+# specs. One did: threads-all.spec.ts "thread loads with correct messages when
 # clicked" picked an API thread as the first drawer row.
 #
 # Reset here so the first project gets the clean DB it expects. This restarts

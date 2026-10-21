@@ -22,7 +22,7 @@
  *
  * A source scan rather than a rendered test, for the same reason the sibling
  * guards are: the defect is a MISSING declaration and jsdom resolves no
- * cascade. `e2e/type-scale.spec.ts` is the rendered half, and asserts the same
+ * cascade. `e2e/type-scale-all.spec.ts` is the rendered half, and asserts the same
  * two defaults reach real pixels.
  */
 import { describe, it, expect } from 'vitest';

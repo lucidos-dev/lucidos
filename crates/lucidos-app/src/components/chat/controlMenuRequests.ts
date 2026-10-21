@@ -4,7 +4,11 @@ import { signal } from '@preact/signals';
  *  menu consumes it. */
 export const codingAgentMenuOpenRequest = signal<string | null>(null);
 
-export type ControlMenuKind = 'coding-agent' | 'lucidos';
+/** The ⋯ box a folded rung control opens its list against. The ⋯ menu row sets
+ *  it, and the control, which stays mounted while folded, takes it. */
+export const rungFoldOpenRequest = signal<HTMLElement | null>(null);
+
+export type ControlMenuKind = 'coding-agent' | 'rung';
 
 /** A press on a control menu's button before the menu's code arrived. The menu
  *  takes it as it mounts and opens as that press would have (ADR 0436). */

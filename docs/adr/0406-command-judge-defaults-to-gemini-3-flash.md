@@ -1,6 +1,6 @@
 # 0406: The command judge defaults to Gemini 3 Flash, the model that waved no irreversible command through
 
-- **Status**: Accepted
+- **Status**: Accepted; its default clauses are superseded by [0515](0515-model-defaults-move-to-current-cheaper-models.md)
 - **Date**: 2026-10-09
 
 ## Context

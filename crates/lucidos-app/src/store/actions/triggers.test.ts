@@ -205,7 +205,7 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
   it('sends the backend pin only beside a model pin', async () => {
     await submitTrigger({
       ...base, run: intentRun, triggerId: 't1',
-      model: 'claude-opus-5-5', reasoningEffort: 'high', provider: 'anthropic',
+      model: 'claude-opus-5-6', reasoningEffort: 'high', provider: 'anthropic',
     });
     expect(mockUpdateTrigger.mock.calls[0][1].provider).toBe('anthropic');
 

@@ -48,6 +48,7 @@ const SETTINGS: Record<SettingsSubview, Coverage> = {
   'whats-new': { registers: ['settings/WhatsNewPage.tsx'] },
   'thread-queue': { registers: ['thread-queue/ThreadQueueView.tsx'] },
   models: { sectionTable: true },
+  intelligence: { registers: ['settings/IntelligencePage.tsx'] },
   appearance: { sectionTable: true },
   memory: { registers: ['settings/MemoryInspector.tsx', 'settings/SummaryTreeBrowser.tsx'] },
   devices: { sectionTable: true },

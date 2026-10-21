@@ -6,7 +6,8 @@
  * handleThreadEvent or handleGlobalEvent.
  */
 import { refreshThreadWidgetsNaming } from './widgets';
-import { refreshHomeBoardsNaming } from './homeBoard';
+import { onDashboardEvent, refreshDashboardsNaming } from './dashboards';
+import type { Dashboard } from '../../generated/thread-event-wire';
 import { forgetAppById } from './appsById';
 import { reloadFilterFacetsIfLoaded } from './thread-loading';
 import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, marketplaceScanning, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion, memoryEntriesVersion, promptFootprintVersion } from '../store';
@@ -22,6 +23,7 @@ import { loadArtifacts, refreshArtifacts, invalidateFilePreview } from './artifa
 import { refreshThemesIfLoaded } from './themes';
 import { isActiveThemePath, refreshActiveTheme } from './preferences';
 import { refreshWorkspaceFontsIfLoaded } from './workspaceFonts';
+import { refreshClaudeGatewayStatusIfLoaded } from './claudeGateway';
 import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
@@ -153,6 +155,8 @@ export const PROVIDER_PREFERENCE_KEYS: ReadonlySet<string> = new Set([
   'provider_enabled_openrouter',
   'provider_enabled_xai',
   'provider_enabled_local',
+  'provider_enabled_claude_gateway',
+  'claude_gateway_url',
 ]);
 
 /** Process a raw SSE message for entity reference updates.
@@ -237,7 +241,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       // A widget's name or reusable flag may have changed (ADR 0402).
       if (appId) {
         refreshThreadWidgetsNaming(appId);
-        refreshHomeBoardsNaming(appId);
+        refreshDashboardsNaming(appId);
       }
       promptFootprintVersion.value++;
       break;
@@ -256,9 +260,17 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       // Delete (a thread) removes its widgets: re-read every thread that showed one.
       if (appId) {
         refreshThreadWidgetsNaming(appId);
-        refreshHomeBoardsNaming(appId);
+        refreshDashboardsNaming(appId);
       }
       promptFootprintVersion.value++;
+      break;
+    }
+    // A dashboard is workspace state, so its events carry no thread (ADR 0496).
+    case 'DashboardTileAdded':
+    case 'DashboardTileRemoved':
+    case 'DashboardArranged': {
+      const dashboard = data.dashboard as Dashboard | undefined;
+      if (dashboard) onDashboardEvent(dashboard);
       break;
     }
     // File events. `ArtifactImported` is the user-driven import flow;
@@ -392,6 +404,22 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       // (and thus first-run provider onboarding) reflects the swap without a
       // manual page refresh.
       refreshLlmConfigured();
+      break;
+    // A Claude gateway sign-in or sign-out installs or drops the engine's
+    // gateway provider, as a credential change does, so it takes the same
+    // re-probe. Settings also shows the account.
+    case 'ClaudeGatewaySignedIn':
+    case 'ClaudeGatewaySignedOut':
+      refreshLlmConfigured();
+      refreshClaudeGatewayStatusIfLoaded();
+      break;
+    // A sign-in starting, stopping or ending without tokens, or a new
+    // gateway policy, changes only what Settings shows.
+    case 'ClaudeGatewaySignInStarted':
+    case 'ClaudeGatewaySignInCanceled':
+    case 'ClaudeGatewaySignInFailed':
+    case 'ClaudeGatewayManagedSettingsChanged':
+      refreshClaudeGatewayStatusIfLoaded();
       break;
     case 'EnvironmentVariableSet':
     case 'EnvironmentVariableDeleted':

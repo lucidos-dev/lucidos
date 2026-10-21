@@ -171,6 +171,7 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
         thread_id,
         origin_id,
         user_message,
+        "",
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
@@ -304,6 +305,7 @@ async fn resume_prompt_is_prefixed_with_discarded_change_note() {
         thread_id,
         origin_id,
         user_message,
+        "",
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
@@ -366,6 +368,7 @@ async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
         Uuid::new_v4(),
         Uuid::new_v4(),
         user_message,
+        "",
         spawn(Some(
             "[Note from engine: APPLIED: fix(app): the composer's Diff is an icon]",
         )),
@@ -400,6 +403,7 @@ async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
         Uuid::new_v4(),
         Uuid::new_v4(),
         user_message,
+        "",
         spawn(None),
     )
     .await;
@@ -494,6 +498,7 @@ async fn a_switch_resume_is_told_the_restart_stopped_the_call() {
         thread_id,
         origin_id,
         CONTINUE_RESUME_USER_MESSAGE,
+        "",
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
@@ -613,6 +618,7 @@ async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
         Some(origin),
         Some(sent),
         follow_up,
+        Default::default(),
         Some(branch),
     )
     .await;
@@ -636,6 +642,7 @@ async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
             Some(origin),
             Some(sent),
             second,
+            Default::default(),
             Some(branch)
         )
         .await,
@@ -651,6 +658,7 @@ async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
         thread_id,
         origin,
         respawn,
+        "",
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
@@ -739,8 +747,16 @@ async fn an_image_only_follow_up_still_carries_the_note() {
     })
     .await;
 
-    let text =
-        build_followup_prompt_text(&pool, thread_id, None, Some(sent), "", Some(branch)).await;
+    let text = build_followup_prompt_text(
+        &pool,
+        thread_id,
+        None,
+        Some(sent),
+        "",
+        Default::default(),
+        Some(branch),
+    )
+    .await;
     assert!(
         text.contains("free on Friday"),
         "the image-only prompt must carry the filed report: {text}"
@@ -763,6 +779,29 @@ fn a_forwarded_input_owes_its_read_to_its_origin_or_its_delivery() {
     assert_eq!(owed_input_event_ids(None, Some(sent)), vec![sent]);
     assert_eq!(owed_input_event_ids(Some(origin), None), vec![origin]);
     assert!(owed_input_event_ids(None, None).is_empty());
+}
+
+use super::run::HeldBlocks;
+use crate::engine::agent_context::SentDeviceContexts;
+
+/// A conversation the engine has not seen `Init` name: it holds no block.
+fn held(sent: &SentDeviceContexts) -> HeldBlocks<'_> {
+    HeldBlocks {
+        sent,
+        conversation: None,
+        unread: &[],
+    }
+}
+
+/// Only Claude Code reports a compaction, so only its conversation can be
+/// trusted to still hold a block it was sent.
+#[test]
+fn only_a_claude_code_conversation_is_trusted_to_hold_the_block() {
+    use crate::runtime::CodingAgent;
+    let sent = SentDeviceContexts::default();
+    let held_by = |agent| HeldBlocks::for_agent(&sent, agent, Some("session-1"), &[]).conversation;
+    assert_eq!(held_by(CodingAgent::ClaudeCode), Some("session-1"));
+    assert_eq!(held_by(CodingAgent::Codex), None);
 }
 
 /// A thread whose next prompt has something to put in front of it: a device
@@ -868,6 +907,7 @@ async fn a_spawn_sends_a_slash_command_verbatim() {
         adoption_note: None,
         session_branch: Some(branch),
     };
+    let sent = SentDeviceContexts::default();
 
     let command = emit_on(&bus, thread_id, user_message("/cost")).await;
     let text = first_prompt_for_agent(
@@ -877,8 +917,10 @@ async fn a_spawn_sends_a_slash_command_verbatim() {
         command,
         PromptFor::Turn("/cost"),
         spawn(),
+        held(&sent),
     )
-    .await;
+    .await
+    .text;
     assert_eq!(text, "/cost");
 
     // A keep-alive's nudge carries no device block and no notes.
@@ -890,8 +932,10 @@ async fn a_spawn_sends_a_slash_command_verbatim() {
         nudge,
         PromptFor::KeepAlive("keep warm"),
         spawn(),
+        held(&sent),
     )
-    .await;
+    .await
+    .text;
     assert_eq!(text, "keep warm");
 
     let prompt = emit_on(&bus, thread_id, user_message("what changed?")).await;
@@ -902,8 +946,10 @@ async fn a_spawn_sends_a_slash_command_verbatim() {
         prompt,
         PromptFor::Turn("what changed?"),
         spawn(),
+        held(&sent),
     )
-    .await;
+    .await
+    .text;
     assert!(
         text.starts_with("[USER DEVICE & PREFERENCES]")
             && text.contains("free on Friday")
@@ -923,6 +969,7 @@ async fn a_follow_up_sends_a_slash_command_verbatim() {
     let branch = "claude-code/verbatim-follow-up";
     let (pool, db_name, bus, thread_id) = thread_with_context_to_prepend(branch).await;
     let event_store = crate::core::EventStore::new(pool.clone());
+    let memory = SentDeviceContexts::default();
     let follow_up = |text: &str, origin| AgentUserInput {
         text: text.into(),
         images: None,
@@ -947,8 +994,10 @@ async fn a_follow_up_sends_a_slash_command_verbatim() {
         &follow_up("/cost", command),
         Some(sent),
         Some(branch),
+        held(&memory),
     )
-    .await;
+    .await
+    .text;
     assert_eq!(text, "/cost");
 
     let prompt = emit_on(&bus, thread_id, user_message("what changed?")).await;
@@ -960,14 +1009,381 @@ async fn a_follow_up_sends_a_slash_command_verbatim() {
         &follow_up("what changed?", prompt),
         Some(sent),
         Some(branch),
+        held(&memory),
     )
-    .await;
+    .await
+    .text;
     assert!(
         text.starts_with("[USER DEVICE & PREFERENCES]")
             && text.contains("free on Friday")
             && text.ends_with("what changed?"),
         "a prompt keeps its device block and note: {text}"
     );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A `MessageReceived` opened by `origin`, as the standing-instruction gate
+/// weighs it.
+fn message_from(
+    text: &str,
+    mode: crate::engine::thread_events::ActorMode,
+    origin: crate::engine::thread_events::MessageOrigin,
+) -> crate::engine::thread_events::ThreadEvent {
+    crate::engine::thread_events::ThreadEvent::MessageReceived {
+        provider: None,
+        voice_session_id: None,
+        wake_mode: None,
+        text: text.into(),
+        user_image_hashes: vec![],
+        device_id: None,
+        image_description: None,
+        parent_thread_id: None,
+        spawning_event_id: None,
+        mode,
+        model: None,
+        reasoning_effort: None,
+        origin: Some(origin),
+    }
+}
+
+/// The first prompt and a follow-up for a turn `origin` opened.
+async fn prompts_for_turns_opened_by(
+    mode: crate::engine::thread_events::ActorMode,
+    origin: crate::engine::thread_events::MessageOrigin,
+) -> (String, String) {
+    use super::run::{first_prompt_for_agent, follow_up_for_agent, PromptFor, ResumeSpawnContext};
+    use crate::engine::{AgentInputKind, AgentUserInput};
+    let branch = "claude-code/standing-note";
+    let (pool, db_name, bus, thread_id) = thread_with_context_to_prepend(branch).await;
+    let event_store = crate::core::EventStore::new(pool.clone());
+    let sent = SentDeviceContexts::default();
+
+    let first = emit_on(&bus, thread_id, message_from("start", mode, origin.clone())).await;
+    let first_text = first_prompt_for_agent(
+        &pool,
+        &event_store,
+        thread_id,
+        first,
+        PromptFor::Turn("start"),
+        ResumeSpawnContext {
+            worktree_path: None,
+            last_idle_sha: None,
+            adoption_note: None,
+            session_branch: Some(branch),
+        },
+        held(&sent),
+    )
+    .await
+    .text;
+
+    let next = emit_on(&bus, thread_id, message_from("next", mode, origin)).await;
+    let follow_up_text = follow_up_for_agent(
+        &pool,
+        &event_store,
+        thread_id,
+        &AgentUserInput {
+            text: "next".into(),
+            images: None,
+            origin_event_id: Some(next),
+            kind: AgentInputKind::User,
+            completion: None,
+        },
+        None,
+        Some(branch),
+        held(&sent),
+    )
+    .await
+    .text;
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+    (first_text, follow_up_text)
+}
+
+/// A turn another thread opened learns the approval path before it asks, not
+/// from the 403. The note rides each such turn, follow-ups included: the
+/// system prompt is frozen at session start, so it cannot carry it (ADR 0491).
+#[tokio::test]
+async fn every_turn_another_thread_opened_carries_the_owner_approval_note() {
+    use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
+    let spawner = MessageOrigin::ThreadLink {
+        thread_id: uuid::Uuid::new_v4(),
+        title: None,
+        spawning_event_id: None,
+        mode: ActorMode::Agent,
+        direction: ThreadDirection::Parent,
+    };
+    let (first, follow_up) = prompts_for_turns_opened_by(ActorMode::Agent, spawner).await;
+    for (label, text) in [("first prompt", &first), ("follow-up", &follow_up)] {
+        assert!(
+            text.contains("THE OWNER DID NOT OPEN THIS TURN"),
+            "{label}: {text}"
+        );
+        // Pins the CLI contract the note must teach: the command and its 409.
+        assert!(text.contains("lucidos ask-owner-approval"), "{label}");
+        assert!(text.contains("409"), "{label}");
+        // ADR 0475: a spawn is not among the acts it gates.
+        assert!(!text.contains("create-top-thread"), "{label}");
+        assert!(text.contains("needs no authority"), "{label}");
+    }
+}
+
+/// A turn the owner opened already carries their instruction, so the note
+/// would only cost context.
+#[tokio::test]
+async fn no_turn_the_owner_opened_carries_the_owner_approval_note() {
+    use crate::engine::thread_events::{ActorMode, MessageOrigin};
+    let owner = MessageOrigin::Device {
+        device_id: "device-abc".into(),
+    };
+    let (first, follow_up) = prompts_for_turns_opened_by(ActorMode::Human, owner).await;
+    for (label, text) in [("first prompt", &first), ("follow-up", &follow_up)] {
+        assert!(
+            !text.contains("THE OWNER DID NOT OPEN THIS TURN"),
+            "{label}: {text}"
+        );
+        assert!(text.ends_with(if label == "first prompt" {
+            "start"
+        } else {
+            "next"
+        }));
+    }
+}
+
+/// Once forwarded, the redelivery is withdrawable like any follow-up, and the
+/// agent's read names the original message, so its bubble clears truthfully.
+#[test]
+fn a_forwarded_redelivery_is_withdrawable_and_its_read_names_the_message() {
+    use super::run::owed_input_event_ids;
+    use crate::engine::agent_session::input_ledger::{InputLedger, ReadInput, Settled};
+    use uuid::Uuid;
+
+    let id = Uuid::new_v4();
+    let prompt_sent = Uuid::new_v4();
+    let input = crate::runtime::AgentInput {
+        text: "also add a test".into(),
+        images: Vec::new(),
+        uuid: Uuid::new_v4(),
+    };
+    let mut inputs = InputLedger::new();
+    inputs.forwarded(
+        owed_input_event_ids(Some(id), Some(prompt_sent)),
+        &input,
+        None,
+    );
+
+    assert_eq!(inputs.withdrawable(id), Some(input.uuid));
+    assert_eq!(
+        inputs.observe(&crate::runtime::AgentEvent::InputRead { input: input.uuid }),
+        Settled::Read(vec![ReadInput {
+            event_id: id,
+            verbatim: false
+        }])
+    );
+}
+
+/// A redelivered follow-up tells the agent it is late and when the user sent
+/// it, in the note block above the message. A slash command still goes
+/// verbatim, or the note would turn it into a prompt.
+#[tokio::test]
+async fn a_redelivered_follow_up_tells_the_agent_it_is_late() {
+    use super::run::{follow_up_for_agent, RESUME_NOTE_REFERENT_GUARD};
+    use crate::engine::{AgentInputKind, AgentUserInput};
+    let branch = "claude-code/redelivered";
+    let (pool, db_name, bus, thread_id) = thread_with_context_to_prepend(branch).await;
+    let event_store = crate::core::EventStore::new(pool.clone());
+    let sent = SentDeviceContexts::default();
+    let sent_at = chrono::DateTime::parse_from_rfc3339("2026-10-17T09:00:50Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let redelivered = |text: &str, origin| AgentUserInput {
+        text: text.into(),
+        images: None,
+        origin_event_id: Some(origin),
+        kind: AgentInputKind::Redelivered {
+            sent_at,
+            input: crate::engine::RedeliveredInput::Message {
+                sender: crate::engine::thread_events::ActorMode::Human,
+            },
+        },
+        completion: None,
+    };
+    let note = crate::engine::agent_session::stranded_follow_ups::late_delivery_note(
+        crate::engine::RedeliveredInput::Message {
+            sender: crate::engine::thread_events::ActorMode::Human,
+        },
+        sent_at,
+    );
+
+    let message = emit_on(&bus, thread_id, user_message("also add a test")).await;
+    let text = follow_up_for_agent(
+        &pool,
+        &event_store,
+        thread_id,
+        &redelivered("also add a test", message),
+        None,
+        Some(branch),
+        held(&sent),
+    )
+    .await
+    .text;
+    let at_note = text.find(&note).expect("the late note is there");
+    let at_guard = text
+        .find(RESUME_NOTE_REFERENT_GUARD)
+        .expect("the guard closes the notes");
+    assert!(at_note < at_guard, "{text}");
+    assert!(text.ends_with("also add a test"), "{text}");
+
+    let command = emit_on(&bus, thread_id, user_message("/cost")).await;
+    let text = follow_up_for_agent(
+        &pool,
+        &event_store,
+        thread_id,
+        &redelivered("/cost", command),
+        None,
+        Some(branch),
+        held(&sent),
+    )
+    .await
+    .text;
+    assert_eq!(text, "/cost");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+const DEVICE_BLOCK: &str = "[USER DEVICE & PREFERENCES]";
+
+/// I1 and I2 on the first prompt: a spawn always carries the block, and a
+/// resume carries it unless the conversation it reattaches already holds an
+/// equal one.
+#[tokio::test]
+async fn a_resume_skips_the_device_block_its_conversation_already_holds() {
+    use super::run::{first_prompt_for_agent, PromptFor, ResumeSpawnContext};
+    let branch = "claude-code/held-first-prompt";
+    let (pool, db_name, bus, thread_id) = thread_with_context_to_prepend(branch).await;
+    let event_store = crate::core::EventStore::new(pool.clone());
+    let sent = SentDeviceContexts::default();
+    let prompt = |conversation| {
+        let (pool, event_store, bus, sent) = (&pool, &event_store, &bus, &sent);
+        async move {
+            let origin = emit_on(bus, thread_id, user_message("go on")).await;
+            first_prompt_for_agent(
+                pool,
+                event_store,
+                thread_id,
+                origin,
+                PromptFor::Turn("go on"),
+                ResumeSpawnContext {
+                    worktree_path: None,
+                    last_idle_sha: None,
+                    adoption_note: None,
+                    session_branch: Some(branch),
+                },
+                HeldBlocks {
+                    sent,
+                    conversation,
+                    unread: &[],
+                },
+            )
+            .await
+        }
+    };
+
+    let spawned = prompt(None).await;
+    assert!(spawned.text.starts_with(DEVICE_BLOCK), "{}", spawned.text);
+    sent.record(
+        thread_id,
+        "session-1",
+        spawned.device_block.expect("the block is in flight"),
+    );
+
+    let resumed = prompt(Some("session-1")).await;
+    assert!(!resumed.text.contains(DEVICE_BLOCK), "{}", resumed.text);
+    assert!(resumed.text.ends_with("go on"), "{}", resumed.text);
+    assert!(resumed.device_block.is_none());
+
+    let other = prompt(Some("session-2")).await;
+    assert!(other.text.starts_with(DEVICE_BLOCK), "{}", other.text);
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// I2 and I3 on a follow-up: the block rides until the agent has read it,
+/// then only a change brings it back. Compaction (I4) brings it back too.
+#[tokio::test]
+async fn a_follow_up_repeats_the_device_block_only_when_it_changed() {
+    use super::run::follow_up_for_agent;
+    use crate::engine::{AgentInputKind, AgentUserInput};
+    let branch = "claude-code/held-follow-up";
+    let (pool, db_name, bus, thread_id) = thread_with_context_to_prepend(branch).await;
+    let event_store = crate::core::EventStore::new(pool.clone());
+    let sent = SentDeviceContexts::default();
+    let follow_up = |text: &str, origin| AgentUserInput {
+        text: text.into(),
+        images: None,
+        origin_event_id: Some(origin),
+        kind: AgentInputKind::User,
+        completion: None,
+    };
+    let send = |text: &'static str| {
+        let (pool, event_store, bus, sent) = (&pool, &event_store, &bus, &sent);
+        async move {
+            let origin = emit_on(bus, thread_id, user_message(text)).await;
+            follow_up_for_agent(
+                pool,
+                event_store,
+                thread_id,
+                &follow_up(text, origin),
+                None,
+                Some(branch),
+                HeldBlocks {
+                    sent,
+                    conversation: Some("session-1"),
+                    unread: &[],
+                },
+            )
+            .await
+        }
+    };
+
+    let first = send("one").await;
+    assert!(first.text.contains(DEVICE_BLOCK), "{}", first.text);
+    let fingerprint = first.device_block.expect("the block is in flight");
+    let queued = send("one and a half").await;
+    assert!(
+        queued.text.contains(DEVICE_BLOCK),
+        "nothing counts as read yet: {}",
+        queued.text
+    );
+
+    sent.record(thread_id, "session-1", fingerprint);
+    let unchanged = send("two").await;
+    assert!(!unchanged.text.contains(DEVICE_BLOCK), "{}", unchanged.text);
+    assert!(unchanged.text.ends_with("two"), "{}", unchanged.text);
+    assert!(unchanged.device_block.is_none());
+
+    crate::test_support::seed_preference(&pool, crate::core::prefs::THEME_MODE.key(), "light")
+        .await
+        .unwrap();
+    let changed = send("three").await;
+    assert!(
+        changed.text.starts_with(DEVICE_BLOCK) && changed.text.contains("- theme-mode: light"),
+        "{}",
+        changed.text
+    );
+    sent.record(
+        thread_id,
+        "session-1",
+        changed.device_block.expect("the block is in flight"),
+    );
+    assert!(!send("four").await.text.contains(DEVICE_BLOCK));
+
+    sent.forget(thread_id);
+    assert!(send("five").await.text.starts_with(DEVICE_BLOCK));
 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;

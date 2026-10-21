@@ -10,7 +10,7 @@ import type {
   Notification,
   OAuthAccountInfo,
 } from '../../store/types';
-import type { AgentBinariesResponse, ApiResult, BackgroundModels, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, RecallDateResponse, RecallZoomResponse, SummaryTreeThreadsResponse, SummaryTreeTop, TreeBackfill, TreeBackfillEstimate, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse, TailnetStatusResponse } from '../types';
+import type { AgentBinariesResponse, ApiResult, CodingAgent, CodingAgentLadder, IntelligenceLadder, IntelligenceRung, LadderSurface, BackgroundModels, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, RecallDateResponse, RecallZoomResponse, SummaryTreeThreadsResponse, SummaryTreeTop, TreeBackfill, TreeBackfillEstimate, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse, TailnetStatusResponse } from '../types';
 
 // --- Notifications (SDK delegation) ---
 export function getNotifications(params?: {
@@ -108,6 +108,38 @@ export function deleteEnvVarApi(name: string): Promise<ApiResult> {
 // --- Coding agent binaries (Settings → Coding Agents) ---
 export function getCodingAgentBinaries(): Promise<AgentBinariesResponse> {
   return json(`${API}/coding-agents/binaries`);
+}
+
+export function getCodingAgentLadder(agent: CodingAgent): Promise<CodingAgentLadder> {
+  return json(`${API}/intelligence-ladder?surface=${agent}`);
+}
+
+export function getChatLadder(): Promise<IntelligenceLadder> {
+  return json(`${API}/intelligence-ladder?surface=chat`);
+}
+
+/** Copy from Lucidos Agent: write the chat rungs `surface` runs into its
+ *  override. Answers the rungs now on. */
+export function copyLadderFromChat(surface: CodingAgent): Promise<{ rungs: IntelligenceRung[] }> {
+  return json(`${API}/intelligence-ladder/copy-from-chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ surface } satisfies { surface: LadderSurface }),
+  });
+}
+
+/** Sort by intelligence: restate `surface`'s rungs from least to most intelligent,
+ *  keeping what is on. Answers the rungs now on. */
+export function sortLadder(surface: LadderSurface): Promise<{ rungs: IntelligenceRung[] }> {
+  return json(`${API}/intelligence-ladder/sort`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ surface } satisfies { surface: LadderSurface }),
+  });
+}
+
+export function getModelPrices() {
+  return lucidos.priceTable.get();
 }
 
 export function deletePreference(key: string): Promise<ApiResult> {
@@ -522,9 +554,21 @@ export interface BackupEntry {
   created_at: string;
 }
 
+/** The legacy backup key, revealed for the `.enc` archives it sealed. */
 export interface BackupKeyResponse {
   key: string;
-  is_new: boolean;
+}
+
+/** What seals this workspace's backups. Reveals no key. */
+export interface BackupKeys {
+  /** The age public key new archives are sealed to, or null before setup. */
+  recipient: string | null;
+  /** A minted backup key waits to be pasted back. */
+  pending: boolean;
+  /** A legacy key exists. Until the switch, it seals backups. */
+  legacy_key: boolean;
+  /** Seconds since the user last proved they hold the backup key. */
+  secs_since_verified: number | null;
 }
 
 export interface BackupProviderInfo {
@@ -545,7 +589,7 @@ export async function getBackupProviders(): Promise<BackupProviderInfo[]> {
   return json(`${API}/backup/providers`);
 }
 
-/** Mint a one-shot token for the two key routes below. Step one of two.
+/** Mint a one-shot token for the legacy key reveal below. Step one of two.
  *
  *  The backup key takes the same shape as a credential reveal (ADR 0117): the
  *  token lives 30 seconds, dies on use, and is bound to this one secret. It
@@ -578,32 +622,91 @@ async function withBackupKeyToken(
   }
 }
 
-/** Reveal the EXISTING backup key. Read-only — throws `ApiError` 404 when no key
- *  has been generated yet (call `generateBackupKey` for that). Never mints a key. */
+/** Reveal the legacy backup key, so the user keeps it for old `.enc`
+ *  archives. Throws `ApiError` 404 when the workspace holds none. */
 export async function getBackupKey(): Promise<BackupKeyResponse> {
   return withBackupKeyToken((token) =>
     json(`${API}/backup/key?token=${encodeURIComponent(token)}`));
 }
 
-/** Generate the backup key if none exists yet, then return it. Idempotent on the
- *  engine: if a key already exists it's returned unchanged (`is_new: false`), so
- *  this can never overwrite the key that protects existing backups.
- *
- *  That idempotence is why it spends a token too. On a workspace that already
- *  has a key, this route hands back the same plaintext the reveal does. */
-export async function generateBackupKey(): Promise<BackupKeyResponse> {
-  return withBackupKeyToken((token) =>
-    json(`${API}/backup/key?token=${encodeURIComponent(token)}`, { method: 'POST' }));
+export async function getBackupKeys(): Promise<BackupKeys> {
+  return json(`${API}/backup/recipient`);
 }
 
-export interface BackupKeyExists {
-  exists: boolean;
+/** Mint a key pair and return its backup key, shown once. Backups keep their
+ *  current key until {@link confirmBackupKey} accepts the paste-back. */
+export async function startBackupKeySetup(): Promise<string> {
+  const { backup_key } = await json<{ backup_key: string }>(
+    `${API}/backup/recipient/setup`, { method: 'POST' });
+  return backup_key;
 }
 
-/** Whether a backup key already exists, without revealing it. Used on page load
- *  to label the key button ("Show backup key" vs "Generate new backup key"). */
-export async function getBackupKeyExists(): Promise<BackupKeyExists> {
-  return json(`${API}/backup/key/exists`);
+/** The paste-back gate. Throws `ApiError` with reason `key-mismatch`,
+ *  `not-a-backup-key` or `nothing-pending`. */
+export async function confirmBackupKey(backupKey: string): Promise<BackupKeys> {
+  return json(`${API}/backup/recipient/confirm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backup_key: backupKey }),
+  });
+}
+
+/** Seal backups to an age public key the user made themselves. */
+export async function setOwnBackupRecipient(recipient: string): Promise<BackupKeys> {
+  return json(`${API}/backup/recipient`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ recipient }),
+  });
+}
+
+/** Whether a pasted backup key opens this workspace's backups. */
+export async function verifyBackupKey(backupKey: string): Promise<boolean> {
+  const { matches } = await json<{ matches: boolean }>(`${API}/backup/recipient/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ backup_key: backupKey }),
+  });
+  return matches;
+}
+
+/** What Settings, 1Password shows about the service account. Never the token. */
+export interface OnepasswordStatus {
+  saved: boolean;
+  cli_path: string | null;
+}
+
+/** What a working service account reaches. */
+export interface OnepasswordVaultCheck {
+  /** The `op` binary that ran. */
+  cli: string;
+  vaults: string[];
+}
+
+export async function getOnepasswordStatus(): Promise<OnepasswordStatus> {
+  return json(`${API}/onepassword`);
+}
+
+/** Save the service account. A blank `token` keeps the stored one, so the
+ *  `op` path can change without pasting the token again. */
+export async function saveOnepassword(token: string, cliPath: string): Promise<void> {
+  await text(`${API}/onepassword`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, cli_path: cliPath }),
+  });
+}
+
+export async function deleteOnepassword(): Promise<void> {
+  await text(`${API}/onepassword`, { method: 'DELETE' });
+}
+
+/** How long the Test may take: the engine gives `op` 20 seconds. */
+const ONEPASSWORD_TEST_TIMEOUT_MS = 30_000;
+
+/** Run `op` with the saved service account and list the vaults it reaches. */
+export async function testOnepassword(): Promise<OnepasswordVaultCheck> {
+  return json(`${API}/onepassword/test`, { method: 'POST' }, ONEPASSWORD_TEST_TIMEOUT_MS);
 }
 
 /** Returns when the backup is queued — completion arrives via SSE

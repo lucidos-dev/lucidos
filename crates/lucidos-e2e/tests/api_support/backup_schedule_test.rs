@@ -25,6 +25,7 @@
 //! `reqwest` (no `blocking` feature) cannot do without re-entering the reactor.
 
 use crate::support::{base_url, http_client, user_client};
+use lucidos_engine::core::backup::crypto;
 use serde_json::json;
 
 /// `(schedule, provider)` as the engine reports them, or `None` if the request
@@ -61,13 +62,20 @@ async fn put_schedule(provider: &str, schedule: &str) -> serde_json::Value {
 /// One pass over the whole contract, in a single test so the assertions cannot
 /// race each other on the shared preference pair.
 ///
-/// Takes the backup-key lock because enabling a schedule is not only a
-/// preference write: `PUT /backup/schedule` calls `crypto::ensure_key` for an
-/// active schedule, which re-mints the key `backup_key_test` deletes to prove a
-/// reveal never mints one. Without the lock this test reds THAT one.
+/// An active schedule needs something to seal with, so the test sets its own
+/// backup recipient first, under the lock `backup_key_test` takes.
 #[tokio::test]
 async fn the_configured_provider_survives_an_inactive_schedule() {
     let _lock = crate::support::backup_key_lock().lock().await;
+    let (_, recipient) = crypto::generate_key_pair();
+    let resp = user_client()
+        .await
+        .put(format!("{}/api/v1/backup/recipient", base_url()))
+        .json(&json!({ "recipient": recipient.to_string() }))
+        .send()
+        .await
+        .expect("PUT /backup/recipient");
+    assert!(resp.status().is_success(), "{}", resp.status());
 
     // An active schedule reports both halves, which is the pre-existing
     // behavior and stays untouched.

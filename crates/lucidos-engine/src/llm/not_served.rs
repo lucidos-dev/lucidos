@@ -5,26 +5,116 @@
 //! unset default to its next recommended model, and the command judge names
 //! the refusal on its card. Decision: ADR 0403.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
+
+use crate::llm::model_registry::ProviderKind;
+
+/// How long a not-found answer keeps a model out of reach. After it, the next
+/// call tries the model again, so enabling it in the provider's console takes
+/// effect with no restart.
+pub const NOT_SERVED_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// A provider's answer that it does not serve the requested model. Its text is
 /// the provider's own failure message, rewritten into advice where we have one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelNotServed(String);
+pub struct ModelNotServed {
+    message: String,
+    refused_by: Option<(ProviderKind, String)>,
+}
 
 impl ModelNotServed {
     pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            refused_by: None,
+        }
+    }
+
+    /// Name the provider and the registry model that refused. The router
+    /// stamps this, because only it knows which model it actually sent.
+    pub(crate) fn refused_by(mut self, provider: ProviderKind, model: impl Into<String>) -> Self {
+        self.refused_by = Some((provider, model.into()));
+        self
+    }
+
+    /// The provider and model that refused, when the router stamped them.
+    pub fn refusal(&self) -> Option<(ProviderKind, &str)> {
+        self.refused_by
+            .as_ref()
+            .map(|(provider, model)| (*provider, model.as_str()))
     }
 }
 
 impl fmt::Display for ModelNotServed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for ModelNotServed {}
+
+/// The `(provider, model)` pairs that answered not-found within
+/// [`NOT_SERVED_WINDOW`]. One shared ledger is what the router, default
+/// selection and Settings read, so they resolve the same model.
+///
+/// It lives in memory. The engine seeds it at boot from the
+/// `ModelNotServedObserved` events, so the window survives a restart.
+#[derive(Clone, Debug, Default)]
+pub struct NotServedLedger(Arc<RwLock<HashMap<(ProviderKind, String), SystemTime>>>);
+
+impl NotServedLedger {
+    /// Record a not-found answer from `provider` for `model`, now.
+    pub fn mark(&self, provider: ProviderKind, model: &str) {
+        self.seed(provider, model, Duration::ZERO);
+    }
+
+    /// Record a not-found answer observed `age` ago. An answer older than the
+    /// window is dropped.
+    pub fn seed(&self, provider: ProviderKind, model: &str, age: Duration) {
+        let Some(at) = SystemTime::now()
+            .checked_sub(age)
+            .filter(|_| age < NOT_SERVED_WINDOW)
+        else {
+            return;
+        };
+        if let Ok(mut map) = self.0.write() {
+            let entry = map.entry((provider, model.to_string())).or_insert(at);
+            *entry = (*entry).max(at);
+        }
+    }
+
+    /// Whether `provider` answered not-found for `model` within the window.
+    pub fn refused(&self, provider: ProviderKind, model: &str) -> bool {
+        self.0
+            .read()
+            .ok()
+            .and_then(|map| map.get(&(provider, model.to_string())).copied())
+            .is_some_and(within_window)
+    }
+
+    /// The pairs inside the window, as one consistent view.
+    pub fn snapshot(&self) -> Vec<(ProviderKind, String)> {
+        self.0
+            .read()
+            .map(|map| {
+                map.iter()
+                    .filter(|(_, at)| within_window(**at))
+                    .map(|(pair, _)| pair.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Whether an answer observed `at` is still inside [`NOT_SERVED_WINDOW`].
+/// Wall-clock time, so the window keeps running while the host sleeps. A
+/// clock stepped back reads as just observed.
+fn within_window(at: SystemTime) -> bool {
+    at.elapsed().unwrap_or_default() < NOT_SERVED_WINDOW
+}
 
 /// The phrases a 404 body carries when the missing thing is the model. Each
 /// is paired with the word "model", so a 404 for a wrong path never matches.
@@ -147,5 +237,50 @@ mod tests {
         assert_eq!(boxed.to_string(), "Vertex has no `x`");
         let other: Box<dyn std::error::Error + Send + Sync> = "Claude API error (404)".into();
         assert!(!other.is::<ModelNotServed>());
+    }
+
+    /// The stamp names the refusing route, and the message stays the
+    /// provider's own.
+    #[test]
+    fn the_stamp_names_who_refused() {
+        let refusal = ModelNotServed::new("Vertex has no `claude-haiku-5-5`")
+            .refused_by(ProviderKind::Vertex, "claude-haiku-5-5");
+        assert_eq!(
+            refusal.refusal(),
+            Some((ProviderKind::Vertex, "claude-haiku-5-5"))
+        );
+        assert_eq!(refusal.to_string(), "Vertex has no `claude-haiku-5-5`");
+        assert_eq!(ModelNotServed::new("x").refusal(), None);
+    }
+
+    /// The pair is the provider AND the model, and an answer older than the
+    /// window does not count.
+    #[test]
+    fn the_ledger_holds_pairs_inside_the_window() {
+        let ledger = NotServedLedger::default();
+        ledger.mark(ProviderKind::Vertex, "claude-haiku-5-5");
+        ledger.seed(
+            ProviderKind::Anthropic,
+            "claude-haiku-4-5",
+            NOT_SERVED_WINDOW + Duration::from_secs(60),
+        );
+        ledger.seed(
+            ProviderKind::Vertex,
+            "gemini-3.8-flash",
+            Duration::from_secs(60),
+        );
+        assert!(ledger.refused(ProviderKind::Vertex, "claude-haiku-5-5"));
+        assert!(!ledger.refused(ProviderKind::Anthropic, "claude-haiku-5-5"));
+        assert!(!ledger.refused(ProviderKind::Anthropic, "claude-haiku-4-5"));
+        assert!(ledger.refused(ProviderKind::Vertex, "gemini-3.8-flash"));
+        let mut pairs = ledger.snapshot();
+        pairs.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            pairs,
+            vec![
+                (ProviderKind::Vertex, "claude-haiku-5-5".to_string()),
+                (ProviderKind::Vertex, "gemini-3.8-flash".to_string()),
+            ]
+        );
     }
 }

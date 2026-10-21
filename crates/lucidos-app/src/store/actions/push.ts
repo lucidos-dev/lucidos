@@ -68,7 +68,7 @@ const STALE_KEY_ERROR = 'InvalidStateError';
  * engine's CURRENT VAPID public key.
  *
  * The reconciliation is load-bearing, not defensive. VAPID keys are per
- * workspace (`vapid_keys` in that workspace's `preferences`), while behind the
+ * workspace (that workspace's `vapid_keys` table), while behind the
  * gateway every workspace shares one origin and takes a `/<slug>/` service-worker
  * scope. So a workspace *recreated at the same slug* gets a fresh keypair while
  * the browser keeps the previous incarnation's subscription at that unchanged

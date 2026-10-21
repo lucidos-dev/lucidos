@@ -7,7 +7,7 @@ const getPreferencesMock = vi.fn(async (..._args: unknown[]) => ({
 const listModelsMock = vi.fn(async () => ({ models: [] as ModelInfo[] }));
 
 // Spreads the real module first: `loadPreferences` also calls
-// `retryTransientRead`, and a mock that omitted it would silently throw
+// `retryTransient`, and a mock that omitted it would silently throw
 // inside the try/catch, masking every assertion below as "stayed at default".
 vi.mock('../../../api/client', async (importActual) => ({
   ...(await importActual<typeof import('../../../api/client')>()),
@@ -18,9 +18,10 @@ vi.mock('../../../api/client', async (importActual) => ({
 }));
 
 import { currentModel, preferences, chatModels } from '../../../store/store';
-import { accountChatEffort, setChatModelSelection, loadPreferences } from '../../../store/actions/preferences';
+import { accountChatEffort, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, loadPreferences } from '../../../store/actions/preferences';
 import { loadChatModels } from '../../../store/actions/models';
 import { DEFAULT_CHAT_MODEL } from '../../../store/models';
+import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import type { ModelInfo } from '../../../api/types';
 
 /** A `provider = local` registry row as the engine serves it: the tiers come
@@ -43,19 +44,41 @@ const LOCAL_MODEL: ModelInfo = {
   successor: null,
   sort_order: 1000,
   source: 'user',
-  enabled: true,
+  on_chat_ladder: true,
   created_at: '2026-01-01T00:00:00Z',
 };
 
 /** A registry row whose provider documents a default effort. */
 const OPUS_55: ModelInfo = {
   ...LOCAL_MODEL,
-  id: 'claude-opus-5-5',
-  label: 'Opus 5.5',
-  routes: [{ provider: 'vertex', id: 'claude-opus-5-5', reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] }],
+  id: 'claude-opus-5-6',
+  label: 'Opus 5.6',
+  routes: [{ provider: 'vertex', id: 'claude-opus-5-6', reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] }],
   default_effort: 'medium',
   source: 'builtin',
 };
+
+describe('Trigger model and its tier', () => {
+  beforeEach(() => {
+    setPreferenceMock.mockClear();
+    preferences.value = { status: 'loaded', data: {} };
+    currentModel.value = DEFAULT_CHAT_MODEL;
+  });
+
+  it('reads the catalog default while none is stored', () => {
+    expect(currentTriggerModel()).toBe(PREFERENCE_CATALOG.trigger_model.fallback);
+  });
+
+  it('setTriggerModelSelection writes trigger_model and leaves the chat model alone', async () => {
+    await setTriggerModelSelection({ model: 'claude-opus-5-6', reasoningEffort: 'high' });
+
+    expect(currentTriggerModel()).toBe('claude-opus-5-6');
+    expect(currentModel.value).toBe(DEFAULT_CHAT_MODEL);
+    expect(setPreferenceMock).toHaveBeenCalledWith('trigger_model', 'claude-opus-5-6', undefined);
+    expect(setPreferenceMock).toHaveBeenCalledWith('chat_reasoning_efforts', 'claude-opus-5-6=high', undefined);
+    expect(setPreferenceMock).not.toHaveBeenCalledWith('chat_model', expect.anything(), expect.anything());
+  });
+});
 
 describe('Chat model and its tier persist across restarts', () => {
   beforeEach(() => {
@@ -116,12 +139,12 @@ describe('A model with no stored tier runs at its default effort', () => {
   });
 
   it('reads the default effort from the registry row', () => {
-    expect(accountChatEffort('claude-opus-5-5')).toBe('medium');
+    expect(accountChatEffort('claude-opus-5-6')).toBe('medium');
   });
 
   it('a stored tier wins, for that model only', () => {
-    preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: 'claude-opus-5-5=xhigh' } };
-    expect(accountChatEffort('claude-opus-5-5')).toBe('xhigh');
+    preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: 'claude-opus-5-6=xhigh' } };
+    expect(accountChatEffort('claude-opus-5-6')).toBe('xhigh');
     expect(accountChatEffort('muse-glimmer:30b-mlx')).toBeNull();
   });
 
@@ -138,7 +161,7 @@ describe('A model with no stored tier runs at its default effort', () => {
 describe('The chat model selection is written whole', () => {
   beforeEach(() => {
     setPreferenceMock.mockClear();
-    preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: 'claude-opus-5-5=low' } };
+    preferences.value = { status: 'loaded', data: { chat_reasoning_efforts: 'claude-opus-5-6=low' } };
     chatModels.value = { status: 'loaded', data: [OPUS_55, LOCAL_MODEL] };
     currentModel.value = DEFAULT_CHAT_MODEL;
   });
@@ -148,9 +171,9 @@ describe('The chat model selection is written whole', () => {
 
     expect(currentModel.value).toBe('muse-glimmer:30b-mlx');
     expect(setPreferenceMock).toHaveBeenCalledWith(
-      'chat_reasoning_efforts', 'claude-opus-5-5=low, muse-glimmer:30b-mlx=high', undefined,
+      'chat_reasoning_efforts', 'claude-opus-5-6=low, muse-glimmer:30b-mlx=high', undefined,
     );
-    expect(accountChatEffort('claude-opus-5-5')).toBe('low');
+    expect(accountChatEffort('claude-opus-5-6')).toBe('low');
   });
 
   it('refuses to write the list before preferences load, keeping the stored tiers', async () => {
@@ -166,15 +189,15 @@ describe('The chat model selection is written whole', () => {
   it('the Default row removes that model\'s stored tier alone', async () => {
     preferences.value = {
       status: 'loaded',
-      data: { chat_reasoning_efforts: 'claude-opus-5-5=low, muse-glimmer:30b-mlx=high' },
+      data: { chat_reasoning_efforts: 'claude-opus-5-6=low, muse-glimmer:30b-mlx=high' },
     };
 
-    await setChatModelSelection({ model: 'claude-opus-5-5', reasoningEffort: null });
+    await setChatModelSelection({ model: 'claude-opus-5-6', reasoningEffort: null });
 
     expect(setPreferenceMock).toHaveBeenCalledWith(
       'chat_reasoning_efforts', 'muse-glimmer:30b-mlx=high', undefined,
     );
-    expect(accountChatEffort('claude-opus-5-5')).toBe('medium');
+    expect(accountChatEffort('claude-opus-5-6')).toBe('medium');
   });
 
   it('stores nothing for a model with no tiers', async () => {
@@ -188,12 +211,12 @@ describe('The chat model selection is written whole', () => {
   it('the registry arriving supplies the default effort', async () => {
     chatModels.value = { status: 'not-loaded' };
     preferences.value = { status: 'loaded', data: {} };
-    expect(accountChatEffort('claude-opus-5-5')).toBeNull();
+    expect(accountChatEffort('claude-opus-5-6')).toBeNull();
 
     listModelsMock.mockResolvedValueOnce({ models: [OPUS_55] });
     await loadChatModels();
 
-    expect(accountChatEffort('claude-opus-5-5')).toBe('medium');
+    expect(accountChatEffort('claude-opus-5-6')).toBe('medium');
     expect(setPreferenceMock).not.toHaveBeenCalled();
   });
 });

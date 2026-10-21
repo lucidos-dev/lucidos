@@ -468,7 +468,7 @@ fn read_runs(paths: &Paths, run_ids: &[String]) -> Fallible<Vec<ResultRow>> {
 /// The model under test when nothing pins one.
 ///
 /// Named because the run label defaults to it too, and the two must not drift.
-const DEFAULT_MODEL: &str = "claude-opus-5";
+const DEFAULT_MODEL: &str = "claude-opus-5-5";
 
 /// The pins ADR 0087's precondition P5 asks for, plus the declared window.
 fn seed_pins(window: Option<i64>) -> workspace::SeedPins<'static> {

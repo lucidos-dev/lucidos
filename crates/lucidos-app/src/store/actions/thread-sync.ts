@@ -1,14 +1,15 @@
 import { API } from '../../api/client';
 import { forgetThreadWidgets, onWidgetEvent } from './widgets';
 import type { ApplyEstimates, Change, LandingLane, MainCheck } from '../../api/client';
-import { EVENT_STREAM_RETRY_MS, eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
+import { EVENT_STREAM_RETRY_MS, eventStreamTargets, openEventStream, type EventStreamTargets, type StreamDrop } from '@lucidos/event-stream';
+import { postClientLog } from '../../utils/clientLog';
 import { getEventStream, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
-import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, removingQueuedMessageIds, queuedMessageRemovalKey, UNREAD_HOLD_EVENT_TYPES } from '../store';
-import { backgroundModelsVersion, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, landingLane, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, removingQueuedMessageIds, queuedMessageRemovalKey, UNREAD_HOLD_EVENT_TYPES } from '../store';
+import { backgroundModelsVersion, chatModels, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, backupRecipientVersion, intelligenceLadderVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanup';
-import { isFormRequest, isHomeBoardEvent, isWidgetEvent } from '../thread-events/thread-event-types';
-import { onHomeBoardEvent } from './homeBoard';
+import { isFormRequest, isWidgetEvent } from '../thread-events/thread-event-types';
+import { rereadLoadedDashboards } from './dashboards';
 import { liftRowIntent, overlayRowIntent } from '../rowIntents';
 import { handleEvent, isChannelDefiningEvent, isSummaryCurrent, makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
@@ -43,10 +44,12 @@ import {
 import { changeToastMessage } from './changeToast';
 import { changeHeadline, changeNamingFromEvents } from '../changeHeadline';
 import { batchSummary, clearApplyPhase, isBatchMember, openApplyPhase, setApplyPhase } from './applyProgress';
-import { handleLaneFrame, setLandingLaneFromServer } from './landingLane';
+import { handleLaneFrame, laneWithChangeQueued, laneWithoutWaiting, setLandingLaneFromServer } from './landingLane';
 import { handleMainCheckFrame, setMainCheckFromServer } from './mainCheck';
+import { repairGapState } from '../eventGap';
 import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences, refreshActiveTheme } from './preferences';
+import { loadChatModels } from './models';
 import { loadReleaseNotices } from './releaseNotices';
 import { loadArtifacts, refreshArtifacts } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
@@ -55,7 +58,6 @@ import { closeResolvedFormRequest, openFormRequest, syncPendingFormRequests } fr
 import { setDevicePushEnabled } from './push';
 import { getDeviceId } from './devices';
 import { focusThread } from './threads';
-import { homeThreadId } from './homeThread';
 import { refreshRepoView } from './repositories';
 import {
   processSSEForReferences,
@@ -74,6 +76,7 @@ import { routeThreadNavigation } from './navigation-request';
 import { isForThisDevice, type DeviceScopeActor } from './device-scope';
 import { openBackupSettings } from './menu';
 import { applyEmbeddingModelStatus } from './backgroundActivity';
+import { CHAT_DEFAULT_PREFS, CHAT_LADDER_PREF, LADDER_PREFS, LONG_PROMPT_SHARE_PREF } from '../intelligenceLadderPrefs';
 import {
   applyTreeBackfillFrame,
   applyTreeBackfillProgress,
@@ -122,6 +125,15 @@ const BACKUP_PREFERENCE_KEYS = new Set([
   'backup_provider',
   'backup_schedule',
   'backup_retention',
+]);
+
+/** The preferences the served intelligence ladder reads. A `PreferencesChanged`
+ *  for one of them makes Settings → Coding agents re-read the ladder. */
+const INTELLIGENCE_LADDER_PREFERENCE_KEYS = new Set([
+  ...Object.values(LADDER_PREFS).flatMap((p) => [p.ladder, p.model, p.effort]),
+  CHAT_LADDER_PREF,
+  ...CHAT_DEFAULT_PREFS,
+  LONG_PROMPT_SHARE_PREF,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -237,51 +249,27 @@ export function connectThreadEvents(): void {
       if (gen !== sseGeneration) return;
       markEventStreamStatus('connected');
       fanOutEventStreamStatus('open');
-      // On EVERY open, the first one included, and after the open: a form
-      // request emitted while no stream was up reaches this page only here.
-      // It owns its own failure reporting.
-      void syncPendingFormRequests();
-      // The Files list and the unread notifications too, for the same reason.
-      // The page's first reads can finish before this open, and a change in
-      // between was announced to nobody. Neither read can land stale: an open
-      // during a listing asks for one more, and the newest unread read wins.
-      refreshArtifacts();
-      void loadUnreadNotifications();
-      // Preferences too, or a theme picked in that window never paints. The
-      // load applies what changed and owns its own failure state.
-      void loadPreferences();
-      // Only resync after a reconnect. On the initial connect, startup.ts
-      // already loads thread state. Without the flag we'd double-fetch on every
-      // page load.
-      if (needsResyncOnOpen) {
-        needsResyncOnOpen = false;
-        // Terminal BackupCompleted and BackupFailed are ephemeral. Fired during
-        // the SSE gap, they leave the UI on "Backing up" forever. Clear the
-        // signal so the user can retry. An in-flight backup repopulates on the
-        // next BackupProgress event, and a duplicate POST returns 409.
-        backupProgress.value = null;
-        // The recommended cleanup's terminal event is lost the same way. The
-        // Disk Usage page re-reads the running flag from its summary.
-        recommendedCleanupProgress.value = null;
-        diskUsageVersion.value++;
-        // App opens and changes during the gap move the footprint report.
-        promptFootprintVersion.value++;
-        // `resyncLoadedThreads` coalesces and surfaces its own failures, so
-        // `void` here only acknowledges that the promise is not needed back.
-        void resyncLoadedThreads();
-        resyncChangesAndQueue();
-        // `ServedFrontendAdvanced` is transient too. A swap during the gap
-        // announced a newer client to nobody, so re-run the build-id check.
-        void syncClientUpdateFromBuild();
-      }
+      // The first open reads what a frame emitted while no stream was up
+      // would have refreshed. A reopen after an error reads it through the gap
+      // reconcile, so it never runs both. On the first open startup.ts already
+      // loads thread state, and a resync there would double-fetch every page
+      // load.
+      const reopenedAfterError = needsResyncOnOpen;
+      needsResyncOnOpen = false;
+      if (reopenedAfterError) reconcileAfterEventGap();
+      else readStateMissedBeforeOpen();
     },
 
-    onError: () => {
+    onError: (drop: StreamDrop) => {
       // Stale handler: disconnectThreadEvents() already closed this transport
       // and connectThreadEvents() created a replacement. Without this guard the
       // old handler closes the NEW connection, via the module-scoped
       // `eventStream`, costing a 3s SSE gap on every iOS Safari PWA resume.
       if (gen !== sseGeneration) return;
+
+      if (drop.reason === 'stalled') {
+        postClientLog('event-stream', 'stalled', { silentMs: drop.silentMs, transport: drop.transport });
+      }
 
       // Mark for resync. Events emitted during the gap never reach this tab, so
       // the next successful connect must refetch persisted state.
@@ -314,9 +302,60 @@ export function connectThreadEvents(): void {
   setEventStream(openEventStream(hostTargets(), handlers, { pongs: true }));
 }
 
+/** Make sure a stream is up after a resume, without cutting a healthy one.
+ *
+ *  A resume runs on every window focus, and a click that raises the window
+ *  fires focus beside the action it caused. A frame the engine emits in a
+ *  teardown gap is never replayed, so a navigate requested by that click would
+ *  be lost. Only a missing or stale stream is replaced. A shared stream the
+ *  worker finds silent reports through `onError`, then `onOpen`, and
+ *  `reconcileAfterEventGap` repairs it there. */
+export function reviveThreadEvents(): void {
+  const stream = getEventStream();
+  if (stream && stream.revalidate() !== 'stale') return;
+  disconnectThreadEvents();
+  connectThreadEvents();
+}
+
+/** The one repair after an event gap: a reopen after an error, or `Lagged`.
+ *  Events emitted in the gap reach nobody. Every signal only a frame can move
+ *  is repaired here (`repairGapState`), and every read a frame would have
+ *  triggered runs again. Nothing else repairs a gap, so neither path can lack a
+ *  repair the other has.
+ *
+ *  `ServedFrontendAdvanced` is transient too. A swap during the gap announced a
+ *  newer client to nobody, so the build-id check runs again. Each read below
+ *  coalesces and reports its own failures, so `void` only acknowledges that the
+ *  promise is not needed back.
+ *
+ *  A wake that replaces a stale stream opens it as a first open, and one that
+ *  keeps a live stream opens nothing. `runResumeSync` therefore repairs the
+ *  signals itself (`repairGapState`). */
+function reconcileAfterEventGap(): void {
+  repairGapState();
+  void resyncLoadedThreads();
+  resyncChangesAndQueue();
+  void syncClientUpdateFromBuild();
+  readStateMissedBeforeOpen();
+}
+
+/** The reads whose frames reach this page only if a stream was up: a form
+ *  request, the Files list, the unread notifications and the preferences, so a
+ *  theme picked in that window still paints. The page's first reads can finish
+ *  before the first open, and a change in between was announced to nobody.
+ *  None can land stale: an open during a listing asks for one more, and the
+ *  newest unread read wins. Each owns its own failure reporting. */
+function readStateMissedBeforeOpen(): void {
+  void syncPendingFormRequests();
+  refreshArtifacts();
+  void loadUnreadNotifications();
+  void loadPreferences();
+}
+
 /** Refetch thread metadata for every thread, and missed events for the focused
- *  one. Called when SSE drops + reconnects, or when the backend signals `Lagged`
- *  (its broadcast subscriber fell behind the buffer and dropped events).
+ *  one. Called by `reconcileAfterEventGap` when SSE drops and reconnects, or
+ *  when the backend signals `Lagged` (its broadcast subscriber fell behind the
+ *  buffer and dropped events).
  *  Without this, a tab that misses `ResponseGenerated` shows the "Thinking"
  *  spinner indefinitely while the backend has long since gone idle.
  *
@@ -355,11 +394,9 @@ export function resyncLoadedThreads(): Promise<void> {
         // A widget event missed in the gap changed the thread's widgets too.
         onWidgetEvent(focused);
       }
-      // Home's widgets decide Pin to Home in every thread's widget menu, so a
-      // pin missed in the gap matters there too.
-      const home = homeThreadId.value;
-      if (home && !(refreshFocused && home === focused)) onWidgetEvent(home);
-      onHomeBoardEvent();
+      // The dashboards decide Add to dashboard in every widget menu, so a
+      // dashboard event missed in the gap matters there too.
+      rereadLoadedDashboards();
     } finally {
       resyncInFlight = null;
     }
@@ -367,11 +404,11 @@ export function resyncLoadedThreads(): Promise<void> {
   return resyncInFlight;
 }
 
-/** Re-read the Changes and Thread Queue state after a stream gap: a reconnect
- *  or a `Lagged`. Neither `ChangesUpdated`, `ApplyAllBatchCompleted` nor a queue
- *  event is replayed. Without this, a batch that finished in the gap reads "in
- *  progress" until the next wake or reload. A wake runs `runResumeSync`, which
- *  re-reads both itself. Both reads report their own failures and never reject. */
+/** Re-read the Changes and Thread Queue state after a stream gap. Neither
+ *  `ChangesUpdated`, `ApplyAllBatchCompleted` nor a queue event is replayed.
+ *  Without this, a batch that finished in the gap reads "in progress" until
+ *  the next wake or reload. A wake runs `runResumeSync`, which re-reads both
+ *  itself. Both reads report their own failures and never reject. */
 function resyncChangesAndQueue(): void {
   void refreshChangesState();
   void loadThreadQueue();
@@ -415,7 +452,6 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     : undefined;
   if (!threadId || !event || typeof event !== 'object' || !('type' in event)) return;
   if (isWidgetEvent(event)) onWidgetEvent(threadId);
-  if (isHomeBoardEvent(event) && threadId === homeThreadId.value) onHomeBoardEvent();
   // Live persisted events MUST carry an aggregate — its absence here (vs.
   // historical-replay where applyEventRows applies one snapshot at the end)
   // means the backend missed populating EmittedEvent.aggregate.
@@ -653,6 +689,22 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     resolveBatchMember(event.change_id);
   }
 
+  // The lane and the pending list move on the change's own event. Their
+  // snapshot trails it by a merge prediction per change, and the row would
+  // read Apply until it arrived. The next snapshot replaces both whole.
+  if (event.type === 'ChangeQueued' && event.change_id) {
+    landingLane.value = laneWithChangeQueued(landingLane.value, event.change_id);
+  } else if ((event.type === 'ChangeUnqueued' || event.type === 'ChangeApplied') && event.change_id) {
+    landingLane.value = laneWithoutWaiting(landingLane.value, event.change_id);
+  }
+  if (event.type === 'ChangeApplied' && event.change_id) {
+    const landed = event.change_id;
+    const pending = changes.value;
+    if (pending.status === 'loaded' && pending.data.some((c) => c.id === landed)) {
+      changes.value = { status: 'loaded', data: pending.data.filter((c) => c.id !== landed) };
+    }
+  }
+
   // After apply/discard/revert, reveal the app header on mobile so the result
   // is readable with full navigation visible. The transcript is NOT moved: the
   // resolution card lands below whatever the reader is looking at, and the
@@ -848,6 +900,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       if (BACKUP_PREFERENCE_KEYS.has(String(data.key ?? ''))) {
         backupPreferencesVersion.value++;
       }
+      if (INTELLIGENCE_LADDER_PREFERENCE_KEYS.has(String(data.key ?? ''))) {
+        intelligenceLadderVersion.value++;
+      }
+      // Each served model row says whether the chat ladder lists it, so the
+      // chat picker and Settings → Models re-read the registry.
+      if (data.key === CHAT_LADDER_PREF && chatModels.value.status === 'loaded') {
+        void loadChatModels();
+      }
       // A provider switch (or the free tier, or the local base URL) rebuilds
       // the engine's active provider set in-process, exactly as a credential
       // change does. So it takes the same `/health` re-probe: without it the
@@ -1041,12 +1101,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
 
     case 'MainCheckStarted':
+    case 'MainCheckRunLinked':
     case 'MainCheckPassed':
     case 'MainCheckFailed':
     case 'MainCheckAbandoned':
     case 'MainCheckRedClosed':
-      // The main check started or ended, or its red closed. The snapshot
-      // arrives whole with the `ChangesUpdated` the engine sends beside it.
+      // The main check started, linked its run or ended, or its red closed.
+      // The snapshot arrives whole with the `ChangesUpdated` the engine sends
+      // beside it.
       handleMainCheckFrame(type, data);
       break;
 
@@ -1148,6 +1210,10 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
     }
 
+    case 'BackupRecipientSet':
+      backupRecipientVersion.value++;
+      break;
+
     case 'RecommendedCleanupStarted':
       recommendedCleanupProgress.value = { done: 0, total: 0 };
       break;
@@ -1234,18 +1300,11 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
 
     case 'Lagged': {
       // Backend signals our broadcast subscriber fell behind the buffer and
-      // dropped events. Refetch state so any "in-flight" UI (Thinking spinner,
-      // streaming exchange) reconciles with the now-completed backend state.
+      // dropped events. Reconcile so any "in-flight" UI (Thinking spinner,
+      // streaming exchange) agrees with the now-completed backend state.
       const count = (data.count as number) ?? 0;
-      console.warn(`[SSE] Stream lagged by ${count} events — resyncing loaded threads`);
-      // `resyncLoadedThreads` toasts a genuine failure itself (and stays silent
-      // on transient wake noise), so `void` just acknowledges that we don't
-      // need the promise back.
-      void resyncLoadedThreads();
-      resyncChangesAndQueue();
-      // A dropped frame may have been a form request, which the thread resync
-      // does not reopen. It reports its own failures.
-      void syncPendingFormRequests();
+      console.warn(`[SSE] Stream lagged by ${count} events — reconciling`);
+      reconcileAfterEventGap();
       break;
     }
 

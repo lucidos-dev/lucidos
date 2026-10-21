@@ -147,20 +147,8 @@ Archiving a parent *thread* also archives every *sub-thread* under it, atomicall
 ### Chat thread
 A *thread* whose `source = 'chat'`: the user typed the opening message in the Lucidos chat UI. Answered by the *Lucidos Agent*. Contrast with *trigger thread* and *coding-agent thread*.
 
-### Home board
-The face of Home that shows the *widgets* pinned to Home, laid out in a grid of square cells. **Home is one place with two faces: the Home board and the Home chat**, which is the *home thread*. Each pinned widget is a tile at one of its *widget sizes*, live like any widget frame.
-
-**On a phone, Home is the middle pane.** The Home icon and a first start open it on the board. The prompt docked under it reads "What can I help with?", as on a desktop. A link or a notification into Home opens its chat, where the reply is. A tap in the prompt slides the Home chat up over the board, and a tap on the Home icon slides it back down.
-
-**On a desktop, the board is a rail at the window's right edge**, the full height of the window, beside the header and the panes. It stays in view whatever the Conversation and the Canvas show. Drag its left edge to resize it: it is two board cells wide at least, and wider shows more columns. Its button, a sidebar icon in the window's top-right corner, hides and shows it, and stays put either way. Each device remembers its width and whether it shows (ADRs 0466, 0468).
-
-**Arrange it in edit mode:** a long press on a tile, or Edit in the board's header. Drag a tile to move it, or tap its size pill to resize it. A tile can be hidden on this *layout class*, or removed, which unpins it from Home.
-
-The board keeps one arrangement per layout class, so a phone can show fewer or smaller tiles than a desktop. The agent arranges it with `widgets(action="arrange")` only when you ask, the CLI with `lucidos widgets arrange`, and HTTP with `POST /api/v1/widgets/arrange`. A new pin starts at its widget's default size (ADR 0432).
-See also: *home thread*, *widget size*, *layout class*, ADR 0455, ADR 0466.
-
 ### Home thread
-One *chat thread* per workspace, titled "Home", that never ends: **Home's chat**, the other face of Home beside the *Home board*. **Every workspace has one**, and there is no switch for it. On a new install, Lucidos opens Home first, on its board face, with the welcome in the chat. A device that has opened a thread before opens that thread instead. It can be neither archived, deleted nor pinned.
+One *chat thread* per workspace, titled "Home", that never ends: **Home's chat**. It is a plain chat on every layout, and the *dashboard* is not part of it. **Every workspace has one**, and there is no switch for it. On a new install, Lucidos opens Home first, with the welcome in the chat. A device that has opened a thread before opens that thread instead. It can be neither archived, deleted nor pinned.
 
 **Left alone, it starts nothing.** Home works only when you write in it, call it, or something it started for you comes back: a thread it started, or an event it waits for. It starts no work by itself, and asks for nothing.
 
@@ -170,7 +158,7 @@ Its clean report is a *filed report*, which Home reads on its next turn, and *Re
 
 **You open it from Home, not from the thread list.** The Home icon leads the thread pane's header, with New thread beside it, and opens it. On a phone it sits beside the Lucidos mark, and the menu that the thread drawer's mark opens carries Home as its first row. The *thread drawer* draws no row for it, but its *sub-threads* show in the drawer's sections as threads of their own.
 
-Home draws no *widget shelf* under its title: its widgets live on the *Home board*. A tap on Home opens it. On a desktop it opens only the chat, even in Home, since the board has its own rail and toggle. On a phone, a tap in Home slides the chat down to the board.
+Home draws no *widget shelf* under its title and takes no pins: a widget you want in view goes on a *dashboard*. A tap on Home opens it. On a desktop it opens only the chat, even in Home, since the dashboard has its own rail and toggle. On a phone, a tap in Home slides the chat down to the dashboard.
 
 **Only you name it.** You can rename it by hand, from its menu. Lucidos never names it: it gets no automatic title and offers no suggested name, because one topic in a thread that never ends is not its name.
 
@@ -179,7 +167,7 @@ Home draws no *widget shelf* under its title: its widgets live on the *Home boar
 *Voice sessions* live here and nowhere else.
 
 **It also holds the cost of model calls no thread made**, such as a memory summary of a file written outside any thread. So the Token Cost app counts every call. Those calls run whether you use Home or not.
-See also: *Home board*, *voice session*, *child follow-up*, *standing instruction*, *setup interview*, ADR 0362, ADR 0381, ADR 0411, ADR 0432, ADR 0455.
+See also: *dashboard*, *voice session*, *child follow-up*, *standing instruction*, *setup interview*, ADR 0362, ADR 0381, ADR 0411, ADR 0432, ADR 0455, ADR 0496.
 
 ### Child follow-up
 A message from a *parent thread* to one of its own *child threads*, sent with the `follow_up_child_thread` tool. The one privileged cross-thread write: redirect a child, hand it something a sibling learned, or tell a stalled child to continue. A thread can address its **direct** children and nothing else: not a sibling, not a grandchild (go through the child), and nothing cross-workspace. The engine looks the relationship up from the child's `parent_thread_id`. The one exception is the *home thread*, which may address any thread in its workspace.
@@ -304,10 +292,15 @@ See also: *Model registry*, *Provider*.
 A secret Lucidos stores on the user's behalf: an API key, bearer token, username
 and password, mailbox password, a plain **secret**, or an OAuth client
 registration. Listed under **Settings → Accounts → Credentials**, keyed by a
-**service name**. Every subprocess Lucidos spawns gets it as `CRED_<NAME>`, plus
-an optional custom env var name as an extra alias. The proxy auth pipeline
+**service name**. A subprocess gets it as `CRED_<NAME>`, plus an optional
+custom env var name as an extra alias. It does so only when its text names
+one of them, a *secret mention*. The proxy auth pipeline
 (`data/config/apis.json`) also resolves it to sign outbound requests. Distinct
 from a non-secret *environment variable*.
+
+Every secret you enter lives here and nowhere else, mailbox passwords and MCP
+server env values included. A secret field may hold a *secret reference* to
+1Password instead of the value.
 
 A credential is identified by its service name **together with its auth type**.
 That matters for one pair only: an OAuth Client registration may share a name
@@ -325,12 +318,89 @@ sent (a key, a bearer token, basic auth, an app registration). A `secret` is a
 shared secret something signs with, so it takes no base URL and no header. A
 *webhook* signing secret is one; generating it in **Settings > Webhooks** saves
 it here.
-See also: *connected account*, *environment variable*, *config*, *webhook*.
+See also: *connected account*, *environment variable*, *config*, *webhook*,
+*secret mention*, *secret reference*.
+
+### Secret mention
+A `CRED_*` or `OAUTH_*` variable name, or a credential's custom alias, written
+as a whole word in the text a subprocess runs. That text is the `run_bash`
+command or `run_python` code, plus each workspace `.py` / `.sh` file it names.
+A scheduled script's text is its own file. **A subprocess gets a credential
+only through a secret mention.**
+
+A name built at run time is declared with a header comment,
+`# lucidos-credentials: CRED_A CRED_B`. A bare `CRED_` names nothing.
+`lucidos credentials list` shows the names to use.
+
+### Secret reference
+A *credential* field that points at a secret in 1Password instead of holding
+it: `op://vault/item/field`, or `op://vault/item/section/field`. Any secret
+field can hold one: an API key, a token, a password, an OAuth client secret.
+Turn on **From 1Password** beside the field, then paste the reference. Copy it
+from the item's field menu in 1Password.
+
+Lucidos reads the value through the 1Password command line tool (`op`) with a
+read-only service account token. Set both up under **Settings → Accounts →
+1Password**, and use Test there to check them. The token reaches only `op`:
+no script, request or reveal ever gets it.
+
+Lucidos fetches the value only when something uses that credential, and keeps
+it in memory for 10 minutes. It is never written to disk. Saving checks the
+reference once, so a typo is refused. Revealing the field shows the reference,
+not the value. If 1Password is unreachable, the last value keeps working for
+up to a day. If the item is gone or access is denied, the credential fails at
+once and you get a notice.
+
+### Backup recipient
+The public half of a workspace's *backup key* pair, an age public key starting
+`age1`. Every new backup is sealed to it. Lucidos stores only this half, so it
+can make backups but never open them. Set it up under **Settings → System →
+Backup**, or paste an age public key you already own.
+
+### Backup key
+The private key that opens a workspace's backups, starting `AGE-SECRET-KEY-1`.
+Lucidos shows it once at setup and never stores it. Backups stay off until you
+paste it back, which proves you saved it. Keep it in a password manager: a lost
+backup key cannot be recovered, and neither can the backups.
+
+Settings offers **Verify** (paste it to check it still matches, suggested
+yearly) and **Rotate** (a new pair; old backups still need the old key). A
+backup is an age file (`.age`), so the `age` command line tool opens it too.
+Backups made before age (`.enc`) need the older base64 key, which Settings
+showed before the switch.
 
 ### Cross-gateway link
 A link to a *thread* in a *workspace* your OTHER Lucidos install serves. Most machines run one install, where no link is cross-gateway. A machine running the packaged app beside a dev checkout runs two, each with its own workspaces.
 
 It opens in a tab on that install's own address, port and all. Pairing is per gateway (see *paired device*), so a browser that install has never met lands on its pairing screen. You reach it from the machine, or wherever you reach Lucidos on its own port. A forwarded address (`tailscale serve`, an ssh tunnel) has only one install on the far end. There the link says where the workspace lives instead of opening a tab that cannot load. A workspace neither install knows still says it is not available.
+
+### Dashboard
+A grid of live *widget* tiles and *app shortcuts* in square cells. **There are two dashboards, `phone` and `desktop`, and each has its own tiles.** A screen in the phone's swipe layout shows the phone dashboard, and one in the split layout shows the desktop dashboard, a tablet included. A widget tile is a *widget instance* at one of its *widget sizes*, live like any widget frame. An app shortcut is a quarter-size tile that opens its app, and both kinds sync across devices. Before ADR 0496 this was the "Home board": one tile set, the widgets pinned to Home.
+
+**On a phone, the dashboard is a *dashboard sheet* over the open thread.** A button at the end of the thread's title row opens it, on every thread, Home included. Home is a plain chat there, as on a desktop.
+
+**On a desktop, the dashboard is a rail at the window's right edge**, the full height of the window, beside the header and the panes. It stays in view whatever the Conversation and the Canvas show. Drag its left edge to resize it: it is two cells wide at least, and wider shows more columns. Its button, the dashboard icon in the window's top-right corner, reads Show dashboard or Hide dashboard and stays put either way. Each device remembers its width and whether it shows (ADRs 0466, 0468).
+
+**Add to dashboard** in a widget's menu adds it to the dashboard of the layout you tap it in, from any thread, Home included. A widget that belongs to its thread becomes reusable first, in the same action, so deleting the thread never empties the tile. Each dashboard also has its own Add, which lists the reusable widgets, then your apps. An app's row in the Apps panel has Add to dashboard too. **Remove from dashboard** takes the tile off that dashboard only. That is how a phone shows fewer tiles than a desktop.
+
+**Arrange it in edit mode:** Edit in the dashboard's header, or Edit dashboard in a tile's menu. A long press or a right-click on a tile opens that menu. Drag a tile to move it, tap its size pill to resize it, or remove it. A new widget tile starts at its widget's default size. An app shortcut has no size pill, since it has one size.
+
+**The agent names a dashboard, or takes the default.** Its `widgets` tool reads one with `action="dashboard"`, and changes one with `add_to_dashboard`, `remove_from_dashboard` and `arrange`. It arranges only when you ask. With no dashboard named, it uses the *last used device*'s: an iPhone or an Android phone means `phone`, and anything else `desktop`, an iPad included. A turn with no device, such as a trigger run, must name one.
+
+The CLI has `lucidos widgets dashboard`, `dashboard-add`, `dashboard-remove` and `arrange`. Over HTTP they are `GET /api/v1/dashboard` and `POST /api/v1/widgets/dashboard-add`, `dashboard-remove` and `arrange`, and an omitted dashboard means the calling device's.
+See also: *dashboard sheet*, *home thread*, *app shortcut*, *widget size*, *widget shelf*, *last used device*, ADR 0432, ADR 0455, ADR 0466, ADR 0496, ADR 0532, ADR 0538.
+
+### Dashboard sheet
+The phone *dashboard* drawn over the open thread. A button at the trailing end of the thread's title row toggles it, on every thread. It rises from the bottom edge and hangs 0.75rem below the title row, so a strip of the thread shows above it. The header and that strip dim, while the title row and its button stay clear. A tap on the button or on the dim closes it.
+
+**Opening it never changes the thread you are in.** A *widget* tile that asks which thread is focused gets the thread under the sheet, so a thread-aware tile describes that thread. Moving to another thread or pane closes the sheet. It keeps its tiles live while closed, so a reopen shows them as they were.
+
+A reload opens with it closed. The desktop has no sheet: its dashboard is the rail. See ADR 0538.
+
+### App shortcut
+An *app* on a *dashboard*: its icon and name, and a tap opens it in the Canvas. **It is a quarter tile**, half a small cell's edge on each side, so four fill one small cell. It has no border and no fill: the icon and name sit on the rail, as on a phone home screen. Edit mode outlines it. No frame mounts, so an app never runs inside its tile. It has one size and takes no *widget params*.
+
+Add one from the dashboard's Add, an app row's Add to dashboard, `widgets(action="add_to_dashboard")`, `lucidos widgets dashboard-add --app-id`, or `POST /api/v1/widgets/dashboard-add`. The app's manifest decides whether an id is a shortcut or a widget tile. A deleted app's shortcut drops off (ADR 0532).
 
 ### Draft
 What you typed into a *thread*'s composer and have not sent: text, images, or both. It lives with its thread and follows you to your other devices. A never-sent thread is all draft and shows in the **Drafts** group of the *Ongoing grouping*. A thread with history can hold one too, archived or not.
@@ -403,9 +473,9 @@ Stored in the `environment_variables` table. Edited in Settings or by the *Lucid
 
 Distinct from a *credential*: env vars are non-secret and appear in tool-call payloads, logs, and the *event* store. Credentials hold secrets and feed the proxy auth pipeline. Names are uppercase letters, digits and underscores, not starting with a digit. They may not clobber engine-owned names (`CRED_*`, `OAUTH_*`, `PATH`, internal `LUCIDOS_*`), which always win a collision.
 
-One engine-owned name reaches the same subprocesses: `LUCIDOS_DATABASE_URL`, a read-only connection URL for the workspace database. Use `psql "$LUCIDOS_DATABASE_URL"`, and `BEGIN READ WRITE` for a deliberate write. The engine sets no `PG*` variables, so bare `psql` reaches nothing.
+One engine-owned name reaches the same subprocesses: `LUCIDOS_DATABASE_URL`, a read-only connection URL for the workspace database. It cannot read stored secrets. Use `psql "$LUCIDOS_DATABASE_URL"`, and `BEGIN READ WRITE` for a deliberate write. The engine sets no `PG*` variables, so bare `psql` reaches nothing.
 
-A credential can take a custom env var name, so its secret also injects as, say, `GITHUB_TOKEN`. That is an extra alias **in addition to** `CRED_<NAME>`, which keeps working. An auth handshake script never gets the custom name, only `CRED_*` and `OAUTH_*` names.
+A credential can take a custom env var name, so its secret also injects as, say, `GITHUB_TOKEN`. That is an extra alias **in addition to** `CRED_<NAME>`, which keeps working. Either is set only for a *secret mention*. An auth handshake script never gets the custom name, only `CRED_*` and `OAUTH_*` names.
 
 The engine also copies every pair into its own process environment once at startup. So a variable the engine itself reads picks up a change only on the next engine start.
 
@@ -474,13 +544,10 @@ See also: `system-knowhow/building-knowhow.md` § "Where the file goes".
 A knowhow file that belongs to one *knowhow doc*: a long endpoint table, a payload dump, an error matrix. It sits in a folder named after the doc, below the listed depth, so it takes no row in the routing list. Placement is the whole distinction. A reference keeps its full id and `load_knowhow` still reads it. Nothing routes to one, so the owning doc must name its id, and the workspace audit flags a reference no doc names.
 See also: `system-knowhow/building-knowhow.md` § "Where the file goes", `docs/taxonomy.md` § "Knowhow: Docs and References".
 
-### Layout class
-Which arrangement of the *Home board* a screen shows: `phone` in the phone's swipe layout, `desktop` in the split layout. A tablet in split layout is `desktop`. Each layout class keeps its own order, sizes and hidden tiles, synced across devices. The phone arrangement copies the desktop one until a phone arranges it. A tile hidden on one layout class mounts no frame there.
-
 ### Last used device
 The *device* of your newest action in the current turn: the message that started it, a prompt sent while it runs, or an answer to a question card. Start a turn on your phone and answer from your laptop, and the laptop is the last used device from then on. `navigate_ui` sends a file, app or page there unless the agent names another device, and a sign-in page opens there. `capture_app` reaches that device too unless the agent names another, and `refresh_app` reaches only that device. A turn with no device, such as a trigger run, has none, so a navigate reaches every device showing the thread.
 
-The agent's `[USER DEVICE & PREFERENCES]` block names it from the same lookup, so the two agree. The block is a snapshot from when it was built; a coding agent gets a fresh one with every message you send.
+The agent's `[USER DEVICE & PREFERENCES]` block names it from the same lookup, so the two agree. The block is a snapshot from when it was built. A coding agent gets it once per conversation. It gets it again when a device or preference changed, after the conversation compacts, or on a new conversation.
 
 Not an *active device*, which is one showing Lucidos right now, asked fresh per notification. Several devices can be active, but a turn has one last used device.
 See also: *device*, *active device*.
@@ -564,23 +631,30 @@ Recorded as the `MemoryRecalled` *event*, which a *trigger* can subscribe to. Re
 Part of the Classic *memory module*. The *Lucidos Agent* searching long-term memory itself, mid-turn, with its own query: the `memory` tool's `search` action, shown as "Searching memory for ...". It backs up a *memory recall* that missed, since recall runs once, from queries made before the agent read anything. Both rank the same corpus the same way, so a search never reorders facts already in context.
 
 ### Model registry
-The database-backed list of chat models the user manages in **Settings → Models**. It drives the *Lucidos Agent* model picker and tells the engine which *provider* serves each model. The engine seeds known models. The user can add, enable, disable or delete models (builtins are disable-only). Adding one takes an id, a label and a provider, plus an unusual *context window* and the *vision flag*. Each row also carries its *default effort*, which the engine seeds and the user cannot edit.
+The database-backed list of chat models the user manages in **Settings → Models**. It is the catalogue the Lucidos Agent's *intelligence ladder* picks from, and tells the engine which *provider* serves each model. The model picker lists the models with a rung on that ladder. The engine seeds known models. The user can add models and delete their own (a builtin is never deleted).
 
-A model listing several providers is served by whichever the workspace has credentials for: see *preferred provider*. Separate from the *Claude Code* model picker, which keeps its own list.
+A model the user adds starts off the ladder, and **Settings → Intelligence** turns it on. Adding one takes an id, a label and a provider, plus an unusual *context window* and the *vision flag*. Each row also carries its *default effort*, which the engine seeds and the user cannot edit.
+
+A model listing several providers is served by whichever the workspace has credentials for: see *preferred provider*. The *rung control* lists *intelligence rungs* from the *intelligence ladder*, not these rows.
 
 ### Vision flag
-Whether a model reads images: the image icon on each row in **Settings → Models**, the `vision` field of `manage_models` and `lucidos models`. It is off unless declared. Image description offers, defaults to and runs only models that have it, and a set `model_image_description` without it is refused rather than replaced. The engine seeds it on the Claude, Gemini and GPT-5/6 builtins. Any row, builtin included, can be switched, since a seed can be wrong. A model with no registry row has no flag.
+Whether a model reads images: the image icon on each row in **Settings → Models**, the `vision` field of `manage_models` and `lucidos models`. It is off unless declared. A chat turn withholds images from a row whose flag is off, and puts a short note in each image's place.
+
+Image description offers, defaults to and runs only models that have it, and a set `model_image_description` without it is refused rather than replaced. The engine seeds it on the Claude, Gemini and GPT-5/6 builtins. Any row, builtin included, can be switched, since a seed can be wrong. A model with no registry row has no flag: a chat turn sends it images and lets the provider decide, while image description never picks it.
 
 ### Monogram tile
 The stand-in for a missing *app icon* or plugin icon: the first letter of the name on a tile. A stable hash of the id picks its colour from the theme, so each one keeps its colour.
 
 ### Retired model
-A *model registry* row whose provider retired the model. An engine update disables it and names its **successor**, the `successor` field of `GET /api/v1/models`. The same update moves every saved setting off it: model *preferences*, trigger pins and each thread's remembered model, at a reasoning tier the successor takes. A call that still names a retired model is sent as its successor, never left for the provider to reroute.
+A *model registry* row whose provider retired the model. An engine update takes it off the Lucidos Agent's *intelligence ladder* and names its **successor**, the `successor` field of `GET /api/v1/models`. The same update moves every saved setting off it: model *preferences*, the Lucidos Agent's rungs, trigger pins and each thread's remembered model, at a reasoning tier the successor takes. A call that still names a retired model is sent as its successor, never left for the provider to reroute.
 
-Past turns keep the old name, since that model answered them. Decision: ADR 0418.
+The successor runs only where this install reaches it: its provider is set up and has not answered that it lacks the model. Otherwise a saved setting keeps running the newest earlier version that is served, and Settings names it. A task's default never steps back to an earlier version. Past turns keep the old name, since that model answered them. Decisions: ADRs 0418 and 0519.
 
 ### Served model
 The model a provider's reply says answered a call: Gemini's `modelVersion`, or the `model` field from OpenAI and Anthropic. Recorded as `served_model` on `ContextCaptured`, beside `model`, the one Lucidos asked for. A served model that is neither the requested one nor a dated snapshot of it means another model answered. Either the provider rerouted the call, or Lucidos sent a *retired model*'s successor. A Claude Code call records the reply's id in both fields, so it never reads as rerouted.
+
+### Price table
+The model list prices Lucidos uses wherever it estimates a cost: how long a *cache keep-alive* runs, the *handoff estimate*, the Tree backfill estimate, the intelligence ladder and the cost on usage telemetry. Each model has dated price cards, each naming its source, which Lucidos ships and updates with each release. A workspace overrides them card by card in `data/config/model-prices.json`. The table carries the day its prices were last checked, which Settings → Intelligence shows. **Keep prices current** there creates a trigger that runs the price check: it reads the providers' price pages and writes only the cards that differ to the override (`model-price-check` knowhow). `GET /api/v1/model-prices` and `lucidos.priceTable.get()` read the merged table.
 
 ### Motion
 How much Lucidos moves on one device: **Settings → Appearance → Motion**, the device-scoped `motion` *preference*. **System** follows the device's reduce-motion switch. **Reduce** calms the app regardless: nothing slides, pulses or spins, and changes appear at once. **Full** keeps every animation even when the device asks for less. The page gets `data-motion="reduce"` or `data-motion="full"` before first paint, and apps read the same attribute. The Animation speed slider under **Settings → System → Debugging** is a diagnostic, and has no effect while Motion reduces.
@@ -605,6 +679,8 @@ On a *Lucidos Agent* thread a message is read once the agent starts its turn, or
 
 Until read, a queued message offers **Edit** and a bin, on a Lucidos Agent or Claude Code thread. The bin takes it back. Edit takes it back into the compose box, text and images, so resending puts it at the back of the queue. Once read, both refuse and say so. Codex cannot take a message back, so its queued messages offer neither.
 
+A Claude Code process can stop before it reads a queued message, as when Lucidos restarts under it. The next session then sends the message again, with a note that it is late. Until the agent reads it, it stays queued and removable (ADR 0506).
+
 ### Reasoning effort
 How hard a *model* is told to think before it answers, chosen beside the model in the picker and in **Settings → Models**. Six levels: Off, Low, Med, High, X-High, Max.
 
@@ -615,7 +691,7 @@ A level the model lacks snaps to the nearest one it offers, ties going up. So sw
 Chat remembers a level per model, set in **Settings → Models** (the `chat_reasoning_efforts` *preference*). A model you never set one for runs at its *default effort*, and the picker's **Default** row returns a model to it. Switching a thread to another model never carries the old model's level along.
 
 ### Default effort
-The *reasoning effort* a model runs at when nothing stored names one: the level its *provider* documents as the default, for example Medium for Opus 5.5 and High for Opus 5. Each row in the *model registry* carries it, and `manage_models` `list` shows it. A model whose provider documents none runs at "Provider default": Lucidos sends no level, and the provider picks. A background task keeps its own level on its recommended models, and runs any other model at that model's default effort.
+The *reasoning effort* a model runs at when nothing stored names one: the level its *provider* documents as the default, for example Medium for Opus 5.5 and High for Opus 5. Each row in the *model registry* carries it, and `manage_models` `list` shows it. A model whose provider documents none runs at "Provider default": Lucidos sends no level, and the provider picks. A background task keeps its own level on its recommended models, and runs any other model at that model's default effort. A coding-agent pick that names a model and no effort runs at that model's default effort too.
 
 ### Response style
 How an answer comes back, chosen in **Settings → Models → Response style**. Two independent parts. The **style** is the shape: how much comes back and what for, from outcome-only to explaining the why. The *technical literacy* is how technical the words are.
@@ -679,9 +755,34 @@ The backend that serves a *model*. Each *model registry* entry names its provide
 
 **OpenCode Free** is `opencode.ai/zen/v1`, the one provider with no credential. The relay serves free models anonymously, so no key and no account exist. It is off by default and switched on with a toggle. Requests leave the machine to a third party, and several free models may train on them, so the toggle says so.
 
+**Claude gateway** (`claude-gateway`) is an organisation's own *Claude gateway*, signed in to with a device code rather than a stored key. No launch env var sets it up, since the sign-in needs a person.
+
 OpenAI, OpenRouter, xAI, OpenCode Free and Local all speak the OpenAI Chat Completions wire format but are distinct backends.
 
 A model naming several providers stays ONE picker entry, served by whichever has credentials. The first-party Claude models list Vertex and Anthropic, since their ids match on both. A backend that spells a model differently says so per provider: Grok is `grok-4.6` on xAI and `x-ai/grok-4.6` on OpenRouter.
+
+### Claude gateway
+An organisation's own front door to Anthropic's API: the Messages API behind the organisation's sign-in. Lucidos serves Claude models through it on the `claude-gateway` *provider*. Set up under **Settings → Models → Providers** or with `lucidos claude-gateway sign-in`.
+
+Signing in shows a code to confirm on the gateway's page. Lucidos signs in as itself, apart from Claude Code, and keeps and refreshes the tokens. No API response, event, app or provider proxy hands them on. Like every stored secret, they sit sealed in the workspace database, and `LUCIDOS_DATABASE_URL` cannot read them. The URL field starts on the gateway Claude Code's managed settings name, when that file exists, and nothing signs in until you confirm.
+
+The gateway decides which models your account may use, and Lucidos never sends a model it did not list. Its *gateway managed settings* can narrow that list further. When the gateway ends the sign-in, Settings and the failed turn both say to sign in again. Changing the gateway URL signs out of the old one, and signing out asks the gateway to revoke the tokens. Web search and the *builtin provider proxy* do not reach it.
+See also: *provider*, *credential*, *gateway usage telemetry*.
+
+### Gateway managed settings
+The policy a *Claude gateway* serves for your account: the same document Claude Code's managed settings hold. Lucidos fetches it after signing in, after each token refresh and hourly, and keeps it until you sign out. Two parts of it apply in Lucidos:
+
+- `availableModels`, when it lists any, decides which models the gateway serves here.
+- Its telemetry switches turn on *gateway usage telemetry*.
+
+Nothing else in it reaches Lucidos. It never hides your other providers: an organisation's policy shapes only its own gateway.
+See also: *Claude gateway*.
+
+### Gateway usage telemetry
+A record of each model call made through a *Claude gateway*, sent when its *gateway managed settings* ask for it. It goes to the gateway, or to a collector the policy names. Each record holds the model, the token counts, the cost and the timing of one call. It also names the thread, and your account's email and id when the sign-in carries them. It never holds a prompt, a reply or a file. Settings and `lucidos claude-gateway status` say when it is on.
+
+Calls made while it was off are never sent later, and one sign-in's records never reach another gateway. An engine started with `CLAUDE_CODE_ENABLE_TELEMETRY=0` or `DISABLE_TELEMETRY=1` sends nothing.
+See also: *Claude gateway*.
 
 ### System One model
 A model that answers typed questions with a probability for every answer, rather than writing text. It cannot hold a conversation, so it never appears in the chat model picker. Six are offered: TypeSafe's **Jev**, Jev through **OpenRouter**, Cloudflare's **Clef** and **Clef-flash**, **OpenAI Decisions**, and a **custom** endpoint. OpenAI Decisions is GPT-6 Luna on OpenAI's Decisions API. A custom endpoint can be a model hosted on the user's own machine.
@@ -693,7 +794,7 @@ A System One model is picked in the model control of a decision Lucidos makes: t
 Most decisions run on a chat model until you pick, and storing a key moves none of them. One is the exception: the Wake decision runs on OpenAI Decisions while the OpenAI provider is set up, unless you picked a model for it.
 
 ### Builtin provider proxy
-A *provider*'s API exposed through the engine's proxy **without** re-entering the credential in `data/config/apis.json`. Apps reach it with `lucidos.proxy(<name>).fetch(path, init)`, scripts with `lucidos proxy <name>`, and the Lucidos Agent with `proxy_request`. The builtin names are `anthropic`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. `opencode-free` has none (ADR 0104).
+A *provider*'s API exposed through the engine's proxy **without** re-entering the credential in `data/config/apis.json`. Apps reach it with `lucidos.proxy(<name>).fetch(path, init)`, scripts with `lucidos proxy <name>`, and the Lucidos Agent with `proxy_request`. The builtin names are `anthropic`, `local`, `openai`, `openrouter`, `typesafe`, `vertex` and `xai`. `opencode-free` has none (ADR 0104), and neither has `claude-gateway`, so no app can spend a gateway sign-in (ADR 0508).
 
 When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root (every default root includes `/v1`). It injects the credential from Settings → Models → Providers server-side, so the secret never reaches the caller. A same-named `apis.json` entry is consulted first and overrides the builtin. The Lucidos Agent's context lists every builtin and whether it is configured. `request_credential` refuses a key a configured builtin already injects (ADR 0350).
 
@@ -823,7 +924,7 @@ See also: `system-knowhow/plugins.md`.
 A topical tag on a *plugin* (e.g. `finance`, `health`, `developer-tools`) for browsing the *Plugins panel*'s catalog, as a per-category filter and chips on each *plugin detail page*. A **controlled vocabulary**: the author tags it in the *plugin manifest* (`categories = [...]`) from a fixed set. A value outside the set is dropped and flagged in the catalog scan's `errors`, never blocking install. Distinct from a plugin's *content* kinds (`apps`/`knowhow`/`triggers`/`scripts`/`auth-modules`), which the engine derives from the files. Allowed set and rationale: `system-knowhow/plugins.md`.
 
 ### Plugin manifest
-The `manifest.toml` file at the root of a *plugin*. Declares `id`, `version`, `name` and `description`. Optional: topical `categories` (see *plugin category*), an *engine requirement*, install-time `setup` steps, and *plugin media* (`icon`, `screenshots`, `videos`). Schema in `system-knowhow/plugins.md`.
+The `manifest.toml` file at the root of a *plugin*. Declares `id`, `version`, `name` and `description`. Optional: topical `categories` (see *plugin category*), an *engine requirement*, install-time `setup` steps with an optional *setup revision*, and *plugin media* (`icon`, `screenshots`, `videos`). Schema in `system-knowhow/plugins.md`.
 
 ### Engine requirement
 The Lucidos releases a *plugin* works on, declared in its *plugin manifest* as a semver requirement: `engine = ">=0.46.1"`. Set it to the first release with every platform feature the plugin uses. Omit it and any release will do, but Lucidos shows the gap: "No version requirement" on the *plugin detail page* until it is installed, and a note in the confirmation panel.
@@ -945,17 +1046,22 @@ It is a sibling to the two other workspace-wide recipes:
 It is the only one of the three that needs the user present, since it asks and then builds rather than sweeping and proposing. Distinct too from a *setup thread*, which finishes installing one *plugin*.
 
 ### Setup thread
-A *Lucidos Agent* *thread* the engine spawns when a *plugin* with a `setup` field is installed, from the *Plugins panel* or the `install_plugin` tool. On an **update** it spawns only when the new `setup` differs from the installed one. The user lands straight in it on install. Only a user-confirmed install spawns one; the background marketplace update check only notifies.
+A *Lucidos Agent* *thread* the engine spawns when a *plugin* with a `setup` field is installed, from the *Plugins panel* or the `install_plugin` tool. On an **update** it spawns only when the new `setup` differs from the installed one, or the author raised the *setup revision*. The user lands straight in it on install. Only a user-confirmed install spawns one; the background marketplace update check only notifies.
 
-Its first message names the occasion. A first install seeds `Set up the newly installed <name> plugin.` An update seeds `Set up <name> again: its setup instructions changed since version <prior>.` under the title `Update <name> setup`, so the thread list never shows one name twice. A legacy record naming no version drops the `since version` clause, and says `this update changed its setup instructions` instead.
+Its first message names the occasion. A first install seeds `Set up the newly installed <name> plugin.` An update seeds `Set up <name> again: its setup instructions changed since version <prior>.` under the title `Update <name> setup`, so the thread list never shows one name twice. A legacy record naming no version drops the `since version` clause, and says `this update changed its setup instructions` instead. A raised *setup revision* seeds `Set up <name> again: version <v> asks to run its setup again since version <prior>.` It adds the author's note when the manifest has a `setup_reason`.
 
 The engine wrote that line, so it is attributed to the *Lucidos Engine* with the reason `plugin_setup`, never to the user. It records the plugin, both versions and the occasion. The message route popover shows "Plugin install" or "Plugin update", with the confirming device as "Confirmed on". See `system-knowhow/thread-events.md` § Engine origins.
 
 The agent loads `system-knowhow/plugin-setup` to plan the steps as a todo list. The author's setup instructions come by reference from the `PluginInstalled` event, not embedded in the thread. The agent walks the user through them, asking for credentials and choices and doing the wiring it can.
 
-On an update it starts from the last run. It diffs the two `setup` texts and reads the previous run's `PluginSetupCompleted` *domain event*, which holds the user's choices and what was skipped. Without one, the earlier setup thread is the fallback. A record is never enough alone: the agent checks each trigger, webhook, credential or config entry is in place, since a record cannot see a deletion.
+On an update it starts from the last run. It diffs the two `setup` texts. When only the *setup revision* rose, the diff is empty, so it re-runs the steps that install shipped files. It also reads the previous run's `PluginSetupCompleted` *domain event*, which holds the user's choices and what was skipped. Without one, the earlier setup thread is the fallback. A record is never enough alone: the agent checks each trigger, webhook, credential or config entry is in place, since a record cannot see a deletion.
 
 Its id is in the `PluginInstalled` event, so the card's *Setup→Open* button can reopen it. The card treats setup as done once the thread is no longer `running` or `waiting_for_user_answer`. The same holds once the thread is gone entirely, with no summary row and no live *Thread Queue* entry. So a lost or stale setup thread degrades to *Open*, never a *Setup* button that errors.
+
+### Setup revision
+A positive integer, `setup_revision` in the *plugin manifest*. The author raises it to make an update run the *setup thread* again, although the `setup` text is unchanged. It exists for plugins whose setup installs a file outside `data/`, such as a Claude Code skill copied to `~/.claude/skills/`.
+
+An update re-runs setup only when the staged revision is **greater** than the installed one. A missing field counts as 0. A lowered or removed one never re-runs setup, and a fresh install ignores it. An optional `setup_reason` says why, in one line of at most 200 characters. It shows in the confirmation panel and the thread's first message. Rules and the authoring step: `system-knowhow/plugins.md` § "A release can ask for setup to run again".
 
 ### Side-effect grant
 The irreversible side-effect categories a *trigger* may perform unattended, set per trigger under "Allowed side-effects". No human is present to ask, so the *command guard* consults the grant instead. An irreversible command (email, a mutating HTTP request, a cloud-CLI change, out-of-workspace destruction, anything else irreversible) runs only if its category is granted. Otherwise it is blocked and the run fails, with a notification naming the missing grant.
@@ -1098,7 +1204,7 @@ No answer is assumed. When a turn ends without deciding, one background call dec
 
 A turn that ends with work still in flight is a step, not the end: its *sub-threads* still run, or its *event wait* is still armed. A progress report from such a turn is a no. A yes is for what you should read before the work finishes, such as a failure, a finding or a decision. The background call is told what the thread still waits on (ADR 0424).
 
-A *trigger* run makes its own read decision every time. It says no when it found nothing new, or when a notification it sent already carried the news. It says yes only for what you would miss without reading the reply. When the background call decides instead, it learns what the turn already notified you about. A reply that only repeats that is a no (ADR 0472).
+A *trigger* run makes its own read decision every time. It says no when it found nothing new, or when it sent you a notification: you hear through the notification, so you do not need both. The one exception is a failure the notification does not mention. It says yes only for what you would miss without reading the reply. When the background call decides instead, it learns what the turn already notified you about, and applies the same rule (ADR 0472).
 
 A *sub-thread* that another agent started reports to that agent. When its report wakes the parent, the parent acts on it and you read the parent's reply. So a routine result from such a turn is a no. A yes is for a failure, a gap you must know about, or something only you can do or decide. A payment, a sign-in and an approval are examples. The background call is told when the report wakes the parent, unless you opened the turn or answered a question in it (ADR 0446).
 
@@ -1165,8 +1271,8 @@ Switching grouping, or between the list and the thread filter, dips through the 
 See also: *Conversation*, *thread pane*, *content pane*, *Current section*.
 
 ### Focused thread
-The *thread* open in the *thread pane* on this device. A *draft* and the *Home thread* count; the empty compose view has none. An *app* or panel in the *Canvas* leaves it alone. Apps and widgets read it with `lucidos.ui.focusedThread()` and follow it with `lucidos.ui.onFocusedThreadChange()`, so a widget on the *Home board* sees the thread open beside it.
-See also: *thread pane*, *Home board*, `system-knowhow/js-sdk.md` § Reading the thread the user has open.
+The *thread* open in the *thread pane* on this device. A *draft* and the *Home thread* count; the empty compose view has none. An *app* or panel in the *Canvas* leaves it alone. Apps and widgets read it with `lucidos.ui.focusedThread()` and follow it with `lucidos.ui.onFocusedThreadChange()`, so a widget on the desktop *dashboard* sees the thread open beside it.
+See also: *thread pane*, *dashboard*, `system-knowhow/js-sdk.md` § Reading the thread the user has open.
 
 ### Thread pane
 The pane showing the open *thread*'s transcript plus the prompt input, where you read what the *Lucidos Agent* did and type the next message. Second of the three panes, the other half of the *Conversation* side beside the *thread drawer*. CSS container `.pane-thread` (`FocusedPane = 'thread'`; on mobile the middle swipe pane, `MobileView = 'thread'`).
@@ -1300,6 +1406,8 @@ Your **Allow once** on an *owner approval card*: a *question card* Lucidos write
 
 Your Allow lets that thread do that one thing, to that one thread, once. It expires when the thread's next turn starts. **Don't allow**, Cancel, or an answer from anyone but you grants nothing. A card never asks to answer another card for you.
 
+One pick counts as an Allow without this card. When you pick **Implement in a new thread** on a plan card, you consent to that thread starting its *successor thread*, once. A typed reply does not.
+
 <!--gloss-trigger-start-->
 ### Trigger
 A workspace configuration that fires on a schedule (`run.cron`) or on one of its *event subscriptions* (`on`). The `run` takes one of two shapes:
@@ -1421,17 +1529,21 @@ See also: `system-knowhow/running-python.md` § The drain pattern.
 ### Release notice
 Something a release needs you to KNOW or DO, shown once on the first open after you upgrade. "Run a workspace audit" was the first. The release notes in *What's New* say what changed; a release notice says what to do about it. Most releases carry none, which keeps the ones that do worth reading.
 
-It arrives as a card over the workspace with the instruction and, where there is something to start, one button. That button SENDS an ordinary sentence as a new message, like the first-run welcome's setup-interview button. So you see what was asked and can reword it later. Anything else it points at is a link in the text.
+It arrives as a small card over the workspace that names the notices you owe. **Read them** opens **Settings > System > Release Notices**, where you read and answer each one. **Later**, Escape and the X close the card and answer nothing, so it returns next time you open the workspace. The card only points the way: the page stays put while a button's thread runs, so the notices behind it are still there.
+
+A notice gives its instruction and, where there is something to start, one button. That button SENDS an ordinary sentence as a new message, like the first-run welcome's setup-interview button. So you see what was asked and can reword it later. Anything else it points at is a link in the text.
 
 **Only where it applies.** A notice can be meant for some workspaces only. "Tree memory is ready to try" shows only while the workspace has chosen Classic, and goes away once you choose Tree.
 
-**One at a time, oldest first.** Skip several releases and they come in order, "1 of 3", each replacing the last as you answer it. A later notice waits until the one before is answered. **Got it** answers the one you are reading. Escape and the X close the card and answer nothing, so it returns next time you open the workspace.
+**Replaced, not repeated.** When a later release changes what a notice described, the newer notice replaces it. Once you reach the newer one, the older one is gone from the Release Notices page, even if you answered it. So you never read an instruction the next notice contradicts. A button the older notice offered comes with the newer one, and work a button already started stays in its thread.
+
+**In order, oldest first.** Skip several releases and they line up on the page in order. A later notice waits until the one before is answered. **Got it** answers that one notice.
 
 **A shared button comes once.** When several owed notices offer the same button, such as "Audit my workspace", only the last draws it. The earlier ones say it comes later, so one audit covers them all.
 
-Every notice this workspace has met lives on its own page, **Settings > System > Release Notices**. Go there if you closed the card mid-task, or tapped one action and want the others. It sits apart from *What's New*, which says what CHANGED.
+Every notice this workspace has met stays on that page. It sits apart from *What's New*, which says what CHANGED.
 
-Anything still owed leads the page. Answered notices fold away behind a shut **Already answered** row, each ticked and struck through: a record of what the release asked. Their buttons stay live, since **Got it** means you READ the notice, not that you carried it out. So after acknowledging the card, the audit is still one tap away on the answered row.
+Anything still owed leads the page. Answered notices fold away behind a shut **Already answered** row, each ticked and struck through: a record of what the release asked. Their buttons stay live, since **Got it** means you READ the notice, not that you carried it out. So after acknowledging a notice, the audit is still one tap away on the answered row.
 
 Answering is remembered per *workspace*, not per *device*: settle it on your laptop and your phone will not ask. The workspace's place in the sequence is the *release notice cursor* (`docs/glossary.md`). A brand new workspace starts level and hears from its next upgrade, so nothing lands over the first-run welcome.
 
@@ -1457,7 +1569,7 @@ Two things raise it, on two pages. A Lucidos update you can take is *What's New*
 
 Upstream of those pages one dot stands for both. On a System row it means work on that row's page, so an update never dots Release Notices.
 
-**It clears by being acted on, never by being seen.** Install the update or answer the notice and it goes. Opening and closing the panel changes nothing, nor does closing a release notice card with Escape.
+**It clears by being acted on, never by being seen.** Install the update or answer the notice and it goes. Opening and closing the panel changes nothing, nor does closing the release notice card.
 
 Distinct from the dot on the Lucidos menu's version row, which means you have not read the notes for the release you run. That one is per device and clears when you open the panel. This one is about the workspace, and about work.
 See also: *What's New*, *release notice*.
@@ -1528,12 +1640,12 @@ A widget can take *widget params*, so one widget shows in many places with diffe
 See also: *reusable widget*, *built-in widget*, *widget instance*, *inline widget*, `system-knowhow/building-an-app.md` § Widgets, ADRs 0402, 0407, 0415 and 0466.
 
 ### Reusable widget
-A *widget* whose manifest says `"reusable": true`, so any thread may embed or pin it. The apps panel lists them in a Widgets group, and the agent sees them in its prompt. Its origin thread stays recorded: "Stop reusing" clears the flag, and the widget then belongs to that thread again, so it is refused once that thread is deleted. Deleting the origin thread never removes a reusable widget. A *built-in widget* is a reusable widget that ships with Lucidos, and a *plugin widget* one a plugin ships. Neither offers "Stop reusing".
+A *widget* whose manifest says `"reusable": true`, so any thread may embed or pin it. The apps panel lists them in a Widgets group, and the agent sees them in its prompt. Its origin thread stays recorded: "Stop reusing" clears the flag, and the widget then belongs to that thread again. So it is refused once that thread is deleted, and while a *dashboard* holds the widget. Deleting the origin thread never removes a reusable widget. A *built-in widget* is a reusable widget that ships with Lucidos, and a *plugin widget* one a plugin ships, and neither offers "Stop reusing".
 
 ### Widget shelf
 The row of chips in a thread's title row, one per **pinned *widget instance***. A chip shows the instance's label, else the widget's name. Embedding a *widget* adds no chip: the user or the agent pins the ones worth coming back to, such as a picker. A chip never squeezes the title: on a phone the shelf takes its own line under it, and on desktop it sits beside the title when the row has room. A chip tap drops the widget open under the title on every device; it never scrolls to the turn. A right-click, a long press or the ⋯ in the widget's bar opens its menu: Open in Canvas, Make reusable, Make app, Show in thread, and Pin to shelf or Unpin from shelf.
 
-Home draws no shelf. Its pinned widgets are tiles on the *Home board*. In Home the menu reads Pin to Home and Unpin from Home. Every other thread's menu offers Pin to Home beside Pin to shelf. On a widget that belongs to its thread, Pin to Home makes it reusable first, in the same action. "Add widget" in the thread's ⋯ menu pins a reusable widget to its shelf, and Home's board has its own Add.
+Home draws no shelf and takes no pins. Every thread's menu, Home's included, offers Add to dashboard, or Remove from dashboard once the widget is a tile there. It acts on the *dashboard* of the layout you tap it in. On a widget that belongs to its thread, Add to dashboard makes it reusable first, in the same action. "Add widget" in the thread's ⋯ menu pins a reusable widget to its shelf, and each dashboard has its own Add.
 
 Unpinning takes the chip off the shelf. The *inline widget* and the files stay. The shelf is the pinned part of the *thread widgets*, so it reads the same on every device and after a reload. The agent pins and unpins through the `widgets` tool, and the CLI through `lucidos widgets pin` and `unpin` (ADR 0407).
 
@@ -1556,7 +1668,7 @@ The JSON object a *widget* receives for one place it is shown, read with `lucido
 One *widget* with one set of *widget params*. *Thread widgets* and the *widget shelf* key on it, so two instances of one widget can both be pinned. Its label is not part of the key. The same names and values in a different order are one instance (ADR 0415).
 
 ### Widget size
-One of three sizes a *widget* takes as a tile on the *Home board*: `small` (one cell, square), `medium` (two cells wide, one high) and `large` (two by two). Cells are square and scale with the UI scale. A cell keeps its size at every board width: the board has as many columns as fit, centred, and only a board too narrow for two draws them smaller. A widget that declares no sizes takes all three and starts medium. One that declares `"sizes": ["medium", "small"]` in its *app manifest* takes only those, the first as its default.
+One of three sizes a *widget* takes as a tile on a *dashboard* (an *app shortcut* has its own, `quarter`, which no widget takes): `small` (one cell, square), `medium` (two cells wide, one high) and `large` (two by two). Cells are square and scale with the UI scale. A cell keeps its size at every dashboard width: the dashboard has as many columns as fit, centred, and only one too narrow for two draws them smaller. A widget that declares no sizes takes all three and starts medium. One that declares `"sizes": ["medium", "small"]` in its *app manifest* takes only those, the first as its default.
 
 The tile sets the size and the widget draws for it, with no scroll inside. It reads its size from `data-widget-size` on `<html>` or `lucidos.widget.size()`. Content past the tile is clipped under a fade, and the tile's menu opens the widget full size in Canvas. A size the widget no longer declares falls back to the nearest smaller one it does (ADR 0432).
 
@@ -1574,8 +1686,8 @@ the path prefix `/<slug>/`.
 The workspace picker is at `/~/`, or just `/` when there is more than one. There
 you switch, create, rename and delete workspaces, and toggle each one's
 *auto-start*. You can also **restore one from a backup**: drop in an encrypted
-`.enc` backup file and its backup key. The name comes from the backup, and you
-must change it if its address is taken. Every workspace you have launched stays
+`.age` backup file and its *backup key*, or an older `.enc` file and its key.
+The name comes from the backup, and you must change it if its address is taken. Every workspace you have launched stays
 **listed** after it stops, and opening a stopped one starts it.
 
 You can also **switch without the picker**. The Lucidos menu's Workspaces row
@@ -1671,12 +1783,12 @@ The button for *Switch to new version* reads **Switch**, on the toast and in the
 One packaged failure is reported differently: if the swap leaves no runnable app on disk, Lucidos does **not** restart anything. It says so and tells you to reinstall from the `.dmg`, since a retry has nothing left to install over. The background service keeps running the loaded version, so your workspaces stay up until you reboot.
 
 ### Apply-ready
-A pending *change* that *Apply* merges as it stands: its thread has finished, and it needs no *hardening*. It needs none when `/harden` ran on its branch, when it carries only implementation plans, or when it comes from an *app coding-agent thread*. Exactly the Changes panel's **Ready** section, and what **Apply All** and **Discard All** act on. The engine decides it and sends it as `apply_ready` on each change, beside `needs_hardening`. A turn end never proposes work that needs hardening. So once its thread rests, only a change from before that rule can be pending and not apply-ready.
+A pending *change* that *Apply* merges as it stands: its thread has finished, and it needs no *hardening*. It needs none when `/harden` ran on its branch, when it carries only implementation plans, or when it comes from an *app coding-agent thread*. The Changes panel's **Ready** section lists it until it starts landing, and **Apply All** and **Discard All** act on it. The engine decides it and sends it as `apply_ready` on each change, beside `needs_hardening`. A turn end never proposes work that needs hardening. So once its thread rests, only a change from before that rule can be pending and not apply-ready.
 
 ### Apply All
 The user-clicked action that runs an *Apply* on every pending *change* in one batch. UI label: **Apply All**, beside each row's *Apply* on the changes panel, whose caret holds Set aside and Discard.
 
-The batch acts on the *apply-ready* changes only, the Changes panel's **Ready** section, and skips any with no file changes left. Discard All also acts on the apply-ready changes, and does not skip an empty one.
+The batch acts on the *apply-ready* changes only, the Changes panel's **Ready** section, and skips any with no file changes left. It also skips a change the landing lane already holds or an apply has claimed: that change sits in the **Applying** section. Discard All also acts on the apply-ready changes, and does not skip an empty one.
 
 Changes apply one at a time, with one exception. A change that hits a merge conflict hands it to its thread to resolve, and the batch moves on meanwhile. The parked change lands when its resolution finishes. If a change applied meanwhile collides with that resolution, the parked change re-queues once for a fresh try.
 
@@ -1723,7 +1835,7 @@ When its turn ends cleanly, the batch lands. A message you send while it works g
 ### Main check
 A GitHub run on a stripped copy of `main` after changes landed (ADR 0464). It runs the engine suite and every e2e suite, and gates nothing: `main` never waits for it. One runs at a time. When it ends, the next covers everything that landed meanwhile. A red one opens one *fix thread*.
 
-Only a *landing lane* landing starts one, and only in a checkout with the release libraries and the `lucidos` remote. A run that ends without a verdict (GitHub down, a refused push, a restart) starts nothing by itself: the next landing does. Its events are `MainCheckStarted`, `MainCheckPassed`, `MainCheckFailed`, `MainCheckAbandoned` and `MainCheckRedClosed`.
+Only a *landing lane* landing starts one, and only in a checkout with the release libraries and the `lucidos` remote. An engine restart picks up the GitHub run it left going, once that run is on record. A run that ends without a verdict (GitHub down, a refused push, a restart before the run started) starts nothing by itself: the next landing does. Its events are `MainCheckStarted`, `MainCheckRunLinked`, `MainCheckPassed`, `MainCheckFailed`, `MainCheckAbandoned` and `MainCheckRedClosed`.
 
 The *landing lane*'s line in the Lucidos menu says where it stands: "Main check: passing", "Main check: running" linking the run, or "Main red: <what failed>" linking the fix thread, with **Close**. While it runs or main is red, the line shows even with the lane empty. `lucidos main-check status` reads the same.
 
@@ -1731,6 +1843,13 @@ The *landing lane*'s line in the Lucidos menu says where it stands: "Main check:
 The one *coding-agent thread* a red *main check* opens, titled "Fix main: <what failed>". Its first prompt carries the failure and its tail, the run, the range, and the changes that landed in it. It is an ordinary thread: its change goes through the *landing lane* when you press Apply.
 
 No check starts while main is red. When a change from the fix thread lands, the red closes and the next check starts. You can also close the red yourself with **Close** (`POST /api/v1/main-check/close`). What landed meanwhile then starts the next check. An agent cannot close it.
+
+Its first prompt lists each failed test with the head of its error. It runs on Claude Code, Sonnet 5.5, medium effort, whatever the workspace's own default is.
+
+### Flaky fix thread
+The *coding-agent thread* a *main check* opens when it passes but some tests failed once and passed a retry, titled "Fix flaky: <first test>". The engine suite reruns its failed tests once, and Playwright retries each browser test once. A test that fails twice still turns main red.
+
+A pass with flaky tests holds no check. At most one flaky fix thread is open: while it is, a later pass records its flaky tests on `MainCheckPassed` and opens nothing. It closes when a change from it lands, or when you archive or delete it. It runs on the same implementer as the *fix thread*.
 
 ### Apply estimate
 How long a hardening and a merge conflict resolution usually take in this workspace, from its own past applies. Recent applies count most, since the process gets faster. With fewer than five past runs there is no estimate, and the Lucidos menu shows only the time so far. It is a typical time, never a countdown: the slowest runs take two to three times as long.
@@ -1773,7 +1892,7 @@ It routes through `interrupt_agent` (`POST /api/v1/claude-code/stop`, default `S
 ### Change
 A *coding-agent*-proposed set of file edits shown as a pending branch in the UI. It is resolved by *Apply* or Discard, or kept for later with **Set aside**. Apply is a non-disruptive merge into main; an engine-affecting change then surfaces *New version available / Switch to new version*. Lifecycle events: `ChangeProposed`, `ChangeApplied`, `ChangeDiscarded`, `ChangeSetAside`, `ChangeBroughtBack`, `ChangeWithdrawn`. Stored as a row in the `changes` table. Internal (Lucidos-repo) coding-agent threads produce changes; *external-repo coding-agent threads* skip this flow.
 
-The Changes panel lists pending changes in two sections. **Ready** comes first: the *apply-ready* changes, with **Discard All** and **Apply All**. **Not finished** comes second: changes whose thread is still unsettled (*settling* or parked on a question), with **Apply all on settle**, and any older change that still needs hardening. Discard All never reaches Not finished. Below them sit **Set aside** and **Recently applied**.
+The Changes panel lists pending changes in three sections. **Ready** comes first: the *apply-ready* changes, with **Discard All** and **Apply All**. **Applying** comes second: changes the landing lane holds or an apply has claimed, which Apply All and Discard All leave alone. **Not finished** comes third: changes whose thread is still unsettled (*settling* or parked on a question), with **Apply all on settle**, and any older change that still needs hardening. Discard All never reaches Not finished. Below them sit **Set aside** and **Recently applied**.
 
 A change's `status` is one of six values: `pending` (awaiting Apply or Discard), `set_aside` (a *set-aside change*), `applied`, `discarded`, `reverted` (applied, then undone), or `withdrawn` (a *withdrawn change*). No other value exists.
 
@@ -1825,28 +1944,105 @@ A thread that continued in a *successor thread* shows no strip. A muted "Continu
 ### Successor thread
 A new *coding-agent thread* that carries on a heavy thread's work with a fresh context. Its branch starts at the old thread's last commit, so its *change* carries all of that work, and the old thread proposes nothing. It sits in the old thread's place: top-level if that one was, otherwise a child of the same parent, which then waits on it. The old thread archives itself once the successor starts and nothing blocks it. Its transcript ends on a "Continued in" row linking the successor, and the successor's opens on a "Continued from" row. A thread hands off once.
 
+A successor's title is the base title, its position in the chain, and the checkpoint it starts at. The first successor of "Fix the drawer" is "Fix the drawer (2)". The next, handed off at a flow's `pre-harden` checkpoint, is "Fix the drawer (3) · pre-harden". A checkpoint run with progress adds it, as in "· phase-commit 2/5". The base title never changes, so a repeat handoff counts up and never stacks suffixes. A legacy "(continued)" counts as one position.
+
+A top-level thread's plan card is the exception: its pick starts a *build chain*, whose builder sits under the planning thread, and the planner stays open.
+
 Four moments start one:
 
 - picking an `Implement in a new thread` option on a plan card;
-- **Send to a new thread** on the *successor strip*;
 - asking the agent to "handoff this session";
-- **Continue in a new thread** on the *successor strip*.
+- **Continue with context** on the *Successor card*;
+- an automatic *handoff checkpoint* where the *handoff estimate* says the handoff pays.
 
-Every handoff but **Send to a new thread** carries a *handoff narrative*, which the agent writes before it runs `lucidos successor spawn`.
+Every handoff carries a *handoff narrative*, which the agent writes before it runs `lucidos successor spawn`.
 
 A successor runs on the old thread's *implementer* unless the handoff names another.
 
+### Build chain
+The threads that build one approved plan. Picking `Implement in a new thread` on a top-level thread's plan card starts one. A child thread's successor keeps its place, so its parent still gets the report. The builder is a child of the planning thread and carries its branch and plan marker. It wakes the planner only if it does not finish cleanly.
+
+The builder's own successors join the chain as its siblings, and each archives once the next one starts. The planner stays open, proposes nothing and groups the chain in the thread list. A chain member may hand off to its successor without an owner approval card, when the *handoff estimate* says the handoff pays.
+
+### Handoff consent
+The authority that let a child thread's successor start under its parent, recorded on the handoff. It is `owner` when the owner's device asked, or a turn the owner opened did. It is `owner-approval` when the handoff spent an *owner approval*, such as a plan card's `Implement in a new thread` pick. It is `carried` when the successor passed on its predecessor's.
+
+A successor with a recorded consent may hand off again under the same parent with no owner approval card. That holds only at a *handoff checkpoint* where the *handoff estimate* says the handoff pays. The consent covers that one handoff and nothing else. A *build chain* records none, since its own consent covers every member.
+
+### Handoff estimate
+The engine's answer to "does a handoff pay here?" at a *handoff checkpoint*. Calls left are the units of work left times the calls one unit takes. A checkpoint's `--progress <done>/<total>` gives the units left, else one.
+
+The calls per unit come from past runs of the same checkpoint in the same repository. Those runs share the model and effort, and entered at a similar context size. Without history, a default applies. Below 100k tokens it never says yes.
+
+The estimate reads the *prompt cache*'s warmth. With a warm cache, the handoff cost adds the narrative turn's reread of the old context at the cache-read price. With a cold cache, it is only the successor's own context, and staying adds one full rewrite of the old context. The handoff pays when the calls left, saving the gap between this context and a fresh one, outweigh that cost.
+
+### Handoff checkpoint
+A named point in a coding-agent thread's work where the agent may continue in a successor thread. A repository names its own in its plan skill, review flow or agent instructions, and Lucidos's own repo does the same. At one, the agent runs `lucidos successor offer --at <name>` and follows what it prints.
+
+- **Automatic**: when the *handoff estimate* says the handoff pays, the agent hands off on the same implementer. Otherwise it carries on. A child thread hands off on its *build chain*'s consent or its *handoff consent*. With neither, it asks the owner on an owner approval card first.
+- **Offered** (`--ask`): the user decides on a question card, which recommends a new thread when the estimate pays. Plan approval is the usual one.
+
 ### Implementer
-The coding agent that builds a thread's work: a backend, a model and a reasoning effort, such as Claude Code on Sonnet 5.5 at high effort. An unset model or effort means the backend's own default. On a large planning thread the plan card recommends one for the *successor thread*, and names the thread's own beside it. The planning agent picks the recommendation from how settled the plan is. `lucidos successor spawn` takes the choice as `--coding-agent`, `--coding-agent-model` and `--reasoning-effort`.
+The coding agent that builds a thread's work: a backend, a model and a reasoning effort, such as Claude Code on Opus 5.5 at medium effort. With no pick, a thread runs on its backend's *default implementer*. A model-only pick runs at that model's *default effort*.
+
+A plan card recommends one for the *successor thread*, as an *intelligence rung* on the *intelligence ladder*. It always does when the *handoff estimate* pays, beside the thread's own. Otherwise it offers a lower rung, or a higher one for a hard plan. `lucidos successor spawn` takes the choice as `--coding-agent`, `--coding-agent-model` and `--reasoning-effort`.
+
+### Default implementer
+The model and effort a coding-agent thread runs on when nobody picked one. Claude Code's comes from the `model_claude_code` and `reasoning_claude_code` *preferences*, Opus 5.5 at medium unless the owner changed it. Codex's comes from `model_codex` and `reasoning_codex`, unset by default, so Codex's own config decides. Lucidos pins it at spawn, so Claude Code's settings file never decides a Lucidos thread's model.
+
+### Intelligence ladder
+One *ladder surface*'s model options, ordered from least to most intelligent, each an *intelligence rung*. There is one each for the Lucidos Agent, Claude Code and Codex. The shipped ladder is Lucidos's own estimate, weighted toward Artificial Analysis: a rung is on when no other pair beats it on both intelligence and cost.
+
+The owner's lists are the `intelligence_ladder_chat`, `intelligence_ladder_claude_code` and `intelligence_ladder_codex` *preferences*, and **Settings → Intelligence** edits all three. The page also shows when the prices were last checked, and offers **Keep prices current**: a trigger, daily or weekly, created only when you press it. **Copy from Lucidos Agent** copies the Lucidos Agent's rungs a coding agent runs onto its ladder, once. An agent may pick only a rung that is on, and Lucidos refuses any other pick it makes. Your own *rung control* offers the same rungs that are on, so it lists no old model. `lucidos intelligence-ladder --surface <surface>` prints it.
+
+A ladder with an owner's saved order wears a **Customised** mark, and **Reset** brings back the shipped one. When the rungs that are on do not climb in intelligence, the page says so above the rows and offers **Sort by intelligence**: one tap restates the order, keeping what is on. Nothing re-sorts without that tap.
+
+### Rung control
+The prompt-bar control for choosing a thread's model and effort. It is a small pill beside the send button, showing the model, effort ("Opus 5.5 · medium") and a chevron. The ‹ and › at its ends step one rung down or up the list, and the pill keeps one width as it steps. The compose view and a started thread draw the same pill. A narrow bar sheds the effort, which brings in the rung's place on the ladder ("3/7"), then the model name. A phone draws the steps smaller.
+
+It opens a list of *intelligence rungs* from the thread's own *intelligence ladder*: each estimated rung that is on, and the pair in force when it sits off the ladder. Then come the rungs with no estimate, under *Not estimated*, and a link to **Settings → Intelligence** last. Pick one row to set model and effort together. On the Lucidos Agent, a rung whose model has a choice of backend then asks for the *preferred provider*. Codex has no slash menu, so its `/` button stays dimmed.
+
+There is no Default row: while nothing is picked, the ladder's default rung wears the checkmark in its own place in the list. The pill never reads "Default" either. With no model of its own, a thread names its *default implementer*. When none is set, it names the backend ("Codex"), whose own config picks.
+
+A mid-thread change that rewrites a warm prompt cache asks first. The confirm states the estimated extra cost, a one-time re-read. A coding-agent thread may hand off to a new thread on the picked rung. Both kinds can Keep the current pair or Switch anyway. A pick made in the compose view belongs to that draft and never changes an account *preference*.
+
+### Intelligence rung
+One option on the *intelligence ladder*: one model at one reasoning effort, such as Opus 5.5 at medium. It shows an intelligence *band*, a cost *band* and a time *band*. A rung is on or off, and only a rung that is on may be picked by an agent. A higher rung is more intelligent. The UI may say just "rung". Not a cache rung, which marks the prompt cache inside a memory view.
+
+### Band
+A rung's rough intelligence, cost or time per task, as a multiple of the default rung: `0.02×`, `0.6×`, `2.5×`. Cost and time bands move in steps of about a quarter. The intelligence band is the rung's score on its surface's *intelligence profile*, in steps of 2 points, and reads in hundredths, such as `0.96×`. Codex, with no default yet, compares to Claude Code's.
+
+Cost is the rung's tokens per task at today's *price table* price. On a free route, such as OpenCode's free tier, cost reads `included`. A paid route reads a price, whoever pays, so a Claude gateway subscription reads one too. On Claude Code, a cost band includes the *long-prompt share*.
+
+### Intelligence profile
+The benchmark mix an intelligence *band* is scored on. Each rung has two. `general` weighs Artificial Analysis's Intelligence Index 75% and Epoch's ECI 25%. `coding` is Artificial Analysis's Coding Agent Index, and, where that index has no score, takes `general` plus the model's measured coding gap, marked estimated. Coding agents rank their rungs on `coding`. The Lucidos Agent's ladder ranks on `general`.
+
+### Ladder surface
+A place that picks from its own *intelligence ladder*: the Lucidos Agent, Claude Code and Codex. The UI names each by its agent, so the Lucidos Agent's ladder is never "the chat ladder". Its wire and storage key stays `chat` (`--surface chat`, `intelligence_ladder_chat`). The surfaces share one set of rung estimates, and each keeps its own on-list: the shipped one, or the owner's edit.
+
+### Long-prompt share
+The share of coding-agent calls whose prompt passes 100k tokens. Some models, such as Haiku 5.5, bill the whole call higher past that line, so their cost *band* rises with it. Lucidos measures it from the last 30 days of Claude Code calls. The slider in Settings → Intelligence overrides it, saved as the `long_prompt_share` *preference*.
 
 ### Auto-compact trial
 An experiment on Claude Code threads: does a 400k-token auto-compact window cost less without hurting the work? The `coding_agent_auto_compact_trial` preference switches it. `ab` gives the window to half of all top-level threads, each together with its sub-threads and successors. A thread keeps the arm it first ran in. `on` gives it to all of them. When Claude Code compacts its context, the step says so, and the context counter drops.
 
-### Successor strip
-The strip on top of the composer that offers a *successor thread* to a large *coding-agent thread*. It shows the thread's size and one button, and only at a clean idle: no running turn, no open question, no queued message, no event wait and no pending or withheld work. The engine measures the size and decides when it is large.
+### Successor card
+The card on top of the composer that offers a *successor thread* to a large *coding-agent thread*. It names the thread's size and how much more each reply costs than in a fresh thread. Then it asks "Carry on in a new thread?". It shows only at a clean idle: no running turn, no open question, no queued message, no event wait and no pending or withheld work. The engine measures the size and decides when the *handoff estimate* says a handoff pays.
 
-- **Send to a new thread** shows after an *Apply* landed, once you type a new request. It sends that request to the successor, with a link back and the applied change's summary. The old thread is not woken.
-- **Continue in a new thread** shows on a very large thread with an empty composer. It sends "handoff this session", so the agent writes a *handoff narrative* and spawns the successor.
+It offers three options, drawn like a question card's:
+
+- **Continue with context** starts a successor. Anything you typed in the composer goes along as its first request. The composer's model and reasoning picks aim the successor, not the old thread. The engine picks the path by the *prompt cache*'s warmth at the tap. A warm cache has the old agent write a *handoff narrative*, with a spinner until the successor exists. A cold cache starts the successor at once with a *handoff brief*, and the old thread makes no model call.
+- **Start fresh** opens an empty compose view on the same repository and backend. Anything you typed moves there unsent, so you can pick the model and reasoning first. It starts a plain thread, not a successor, and the old thread is not woken.
+- **Stay here** hides the card until the thread holds 100k tokens more, and a compaction below that size lifts the hold. It is a recorded decision, so a reload or another device agrees.
+
+A picker pick under the card switches nothing. If you send in the old thread instead, that send asks the usual rung switch question first.
+
+The card flips from warm to cold by itself when the cache goes cold. A cold Continue on a worktree with uncommitted work is refused, and the card says so and stays.
+
+### Handoff brief
+What the engine writes as a *successor thread*'s first message when the *prompt cache* is cold, in place of a *handoff narrative*. It names the old thread and says the worktree already holds its last commit. It tells the successor to rebuild only what it needs: the old thread's recent turns, the branch's git log and any plan under `docs/plans/`.
+
+With no request typed on the *Successor card*, the successor ends its first turn on a question card. The card says where things stand and offers the open items as options.
 
 ### Handoff narrative
 What an agent writes for its *successor thread*: what was learned, what was settled and why, what bit it, where things stand, what to do first, and the files that matter. It has six sections, Outcomes, Decisions, Gotchas, State, Next step and Files, and Lucidos refuses one that lacks any. It becomes the successor's first message.
@@ -1923,7 +2119,9 @@ A command the agent backgrounds on its own dies when its turn ends, which is why
 A *background task* started with `lucidos background-task run --poll`, the usual choice for long work. No *event wait* is armed. The agent stays in its turn and calls `lucidos background-task wait <id>`, which returns within 230 s, until the task finishes. Every return lands inside the prompt cache's 5-minute life, so no wait pays to re-read the whole conversation. A watched task stays for an open-ended wait, such as a run queued behind a held lock.
 
 ### Cache keep-alive
-Lucidos resuming an idle Claude Code agent that waits, only to keep its prompt cache warm. It runs about every 4 minutes on a 5-minute cache and every 55 on a 1-hour one, for up to 150 minutes. It covers an agent waiting on a background task, a lock, a change or a working child thread (not one waiting on you). The turn leaves no trace: the thread keeps showing Waiting, and no parent, wait or trigger hears of it. A message sent meanwhile waits the few seconds until it ends. Codex agents get none.
+Lucidos resuming an idle Claude Code agent that waits, only to keep its prompt cache warm. It runs about every 4 minutes on a 5-minute cache and every 55 on a 1-hour one. It stops when the beats would cost more than one cache rewrite: from about 40 minutes to 3 hours on a 5-minute cache, by model, and far longer on a 1-hour one. It covers an agent waiting on a background task, a lock, a change, or a working child thread not spawned `no-wake`. Each ping leaves no trace: the thread keeps showing Waiting, and no parent, wait or trigger hears of it. A message sent meanwhile waits the few seconds until it ends, and Codex agents get none.
+
+You see the keep-alive as a whole, never the pings. Each wait it kept warm leaves one card in the transcript, such as "Cache kept warm · 12 pings · $0.31 · next in 3m". The card counts down while the wait lasts, and stays as a record after it ends. The waiting panel's Prompt cache section says how far into the budget it is, what it saves, and when it stops. It also says when the cache is not kept warm, and why. The Token Cost app labels these calls "Cache keep-alive".
 
 ### Coding-agent thread
 A *thread* driven by a *coding agent* (Claude Code or Codex) inside an isolated git worktree. Marked by `is_coding_agent = true` on `thread_summaries`. A `SessionStarted` opening an agent session sets it, as does another event on the `claude_code` channel. A *resume boundary* alone never does: `ContinuationStarted` fires on chat and trigger threads too.

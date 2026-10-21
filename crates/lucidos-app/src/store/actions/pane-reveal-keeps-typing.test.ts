@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach } from 'vitest';
 import { focusedPane, splitRatio } from '../store';
+import { dashboardRailShown } from '../dashboardRail';
 import { holdFocusedPaneWhileTyping, releaseTypingHold, revealContentPane } from './pane';
+import { drawnSplitRatio, layoutGeometry } from '../../components/layout/drawnLayout';
 
 // An agent opens a file while the reader types in the prompt. The reveal's
 // reconcile never pulls focus off a field being edited. Moving the marker
@@ -48,6 +50,24 @@ describe('revealContentPane while the reader types in another pane', () => {
     releaseTypingHold();
     revealContentPane();
     expect(focusedPane.value).toBe('content');
+  });
+
+  it('an agent navigation never swaps out the pane the reader types in', () => {
+    // The Canvas yielded for room, so showing it would hide the Conversation.
+    const floors = { minThreadPx: 400, minContentPx: 300, drawerPx: 300, railPx: 360 };
+    const railWasShown = dashboardRailShown.value;
+    dashboardRailShown.value = false;
+    layoutGeometry.value = { windowPx: 600, floors, dividerPx: 3 };
+    try {
+      panes().prompt.focus();
+      holdFocusedPaneWhileTyping();
+      revealContentPane();
+      expect(splitRatio.value).toBe(0.5);
+      expect(drawnSplitRatio.value).toBe(1);
+    } finally {
+      layoutGeometry.value = null;
+      dashboardRailShown.value = railWasShown;
+    }
   });
 
   it('a hold is spent by one reveal', () => {

@@ -1,8 +1,7 @@
 import { useRef } from 'preact/hooks';
 import { llmConfigured, recoveryProgress, searchEverywhereAnchor, searchEverywhereOpen } from '../../store/store';
 import { unfocusThread } from '../../store/actions/threads';
-import { homeThreadId } from '../../store/actions/homeThread';
-import { openHome } from '../../store/actions/homeBoardNav';
+import { homeThreadId, openHomeThread } from '../../store/actions/homeThread';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { confirmAndStartSetupInterview } from '../shared/setupInterview';
 import { focusSearchInput } from '../search/searchEverywhereActions';
@@ -85,7 +84,7 @@ export function threadHeaderHomeAction(): HeaderActionSpec | null {
     key: 'home',
     label: 'Home',
     icon: () => <HomeIcon />,
-    onClick: openHome,
+    onClick: openHomeThread,
     extraClass: 'home-thread-btn',
   };
 }

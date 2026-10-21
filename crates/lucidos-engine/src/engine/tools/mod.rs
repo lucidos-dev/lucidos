@@ -44,6 +44,8 @@ pub(crate) use capabilities::TurnCapabilities;
 /// capability parity manifest. Only these eight names resolve. A flat alias
 /// runs as itself whatever `action` it carries, and domains with bespoke
 /// handling (notifications, preferences, triggers) keep their own arms.
+///
+/// A retired name is refused here with its replacement, never "Unknown tool".
 pub(crate) fn dispatch_name<'a>(
     name: &'a str,
     args: &serde_json::Value,
@@ -57,8 +59,22 @@ pub(crate) fn dispatch_name<'a>(
         | tn::THREAD_QUEUE
         | tn::MEMORY
         | tn::RECALL => grouped::grouped_legacy_name(name, args),
+        tn::EXECUTE_INTENT => Err(execute_intent_refusal(args)),
         other => Ok(other),
     }
+}
+
+/// What a call to the retired `execute_intent` gets. Replayed history and old
+/// workspace prose can still name it, so the answer says what to do instead.
+fn execute_intent_refusal(args: &serde_json::Value) -> String {
+    let intent_id = args["intent_id"]
+        .as_str()
+        .or_else(|| args["prompt_id"].as_str())
+        .unwrap_or("<intent id>");
+    format!(
+        "Error: execute_intent was removed. Call load_knowhow(id: \"{intent_id}\") and do its \
+         steps in this turn."
+    )
 }
 
 use super::LucidosEngine;
@@ -182,7 +198,6 @@ impl LucidosEngine {
 
 impl LucidosEngine {
     /// Execute a tool call and return its outcome.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn execute_tool(
         &self,
         name: &str,
@@ -190,7 +205,6 @@ impl LucidosEngine {
         extraction_ctx: &str,
         request_id: uuid::Uuid,
         device_id: Option<&str>,
-        cancel_token: &tokio_util::sync::CancellationToken,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
         let name = dispatch_name(name, args)?;
@@ -257,7 +271,7 @@ impl LucidosEngine {
             // Grouped env-var tool (list/set/delete). `set_environment_variable`
             // stays wired as a back-compat alias → dispatched as action "set".
             tn::ENV_VARS | tn::SET_ENVIRONMENT_VARIABLE => self.execute_env_vars(name, args).await,
-            tn::WIDGETS => to_outcome(self.execute_widgets(args, thread_id).await),
+            tn::WIDGETS => to_outcome(self.execute_widgets(args, thread_id, device_id).await),
             tn::MANAGE_MODELS => to_outcome(self.execute_manage_models(args).await),
             tn::WEB_SEARCH | tn::FETCH_NEWS => {
                 to_outcome(self.execute_web_tool(name, args, thread_id).await)
@@ -269,17 +283,6 @@ impl LucidosEngine {
             tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW | tn::UNLOAD_KNOWHOW => {
                 to_outcome(self.execute_app_tool(name, args, thread_id).await)
             }
-            tn::EXECUTE_INTENT => to_outcome(
-                Box::pin(self.handle_execute_intent(
-                    args,
-                    extraction_ctx,
-                    request_id,
-                    device_id,
-                    cancel_token,
-                    thread_id,
-                ))
-                .await,
-            ),
             tn::RUN_PYTHON => to_outcome(self.execute_python_tool(args, thread_id).await),
             tn::RUN_PYTHON_BACKGROUND => self.execute_python_background_tool(args, thread_id).await,
             tn::RUN_BASH => to_outcome(self.execute_bash_tool(args, thread_id).await),
@@ -306,7 +309,7 @@ impl LucidosEngine {
             }
             tn::EMIT_EVENT => self.execute_emit_event(args).await,
             tn::QUERY_EVENTS => self.execute_query_events(args, thread_id).await,
-            tn::COUNT_EVENTS => self.execute_count_events(args).await,
+            tn::COUNT_EVENTS => self.execute_count_events(args, thread_id).await,
             tn::LIST_EVENT_TYPES => self.execute_list_event_types().await,
             tn::FOLLOW_UP_CHILD_THREAD => {
                 self.execute_follow_up_child_thread(args, thread_id).await
@@ -402,6 +405,7 @@ impl LucidosEngine {
         navigate::navigate_ui_impl(
             &self.event_bus,
             &self.pool,
+            &self.app_manager,
             args,
             thread_id,
             last_used.as_deref(),
@@ -553,50 +557,15 @@ impl LucidosEngine {
         query_events_impl(&self.event_store, args, thread_id).await
     }
 
-    /// LLM tool: per-`event_type` count + byte total over the same time
-    /// filters as `query_events`. Mirrors `count_threads` shape-wise.
-    /// Without an `event_type` filter, returns the per-type breakdown sorted
-    /// by count desc — the "what's noisy this week" view that a sweep recipe
-    /// (workspace-learning, workspace-audit) should call before drilling.
-    async fn execute_count_events(&self, args: &serde_json::Value) -> ToolOutcome {
-        let event_type = args.get("event_type").and_then(|v| v.as_str());
-        let since = parse_time_filter(args, "since")?;
-        let until = parse_time_filter(args, "until")?;
-
-        if let Some(et) = event_type {
-            match self.event_store.count_events(Some(et), since, until).await {
-                Ok((count, byte_total)) => Ok(serde_json::json!({
-                    "count": count,
-                    "byte_total": byte_total,
-                })
-                .to_string()),
-                Err(e) => Err(format!("Error: failed to count events: {}", e)),
-            }
-        } else {
-            match self.event_store.count_events_by_type(since, until).await {
-                Ok(rows) => {
-                    let total_count: i64 = rows.iter().map(|(_, c, _)| *c).sum();
-                    let total_byte_total: i64 = rows.iter().map(|(_, _, b)| *b).sum();
-                    let by_type: Vec<serde_json::Value> = rows
-                        .into_iter()
-                        .map(|(et, count, byte_total)| {
-                            serde_json::json!({
-                                "event_type": et,
-                                "count": count,
-                                "byte_total": byte_total,
-                            })
-                        })
-                        .collect();
-                    Ok(serde_json::json!({
-                        "by_type": by_type,
-                        "total_count": total_count,
-                        "total_byte_total": total_byte_total,
-                    })
-                    .to_string())
-                }
-                Err(e) => Err(format!("Error: failed to count events: {}", e)),
-            }
-        }
+    /// Thin wrapper over [`count_events_impl`], which owns the arg parsing.
+    /// `thread_id` is the caller's own, ambient from `execute_tool`. It resolves
+    /// the `current` alias, and the model cannot set it.
+    async fn execute_count_events(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        count_events_impl(&self.event_store, args, thread_id).await
     }
 
     /// LLM tool: the event names this workspace can subscribe to.
@@ -1933,6 +1902,94 @@ pub(crate) async fn emit_event_impl(
     Ok(text)
 }
 
+/// The `thread_id` argument of `query_events` and `count_events`.
+///
+/// Refused rather than ignored. This is the read half of "we talked about
+/// this": the model finds a thread with `threads` 'search', then asks for its
+/// events here. Widening a malformed id to EVERY thread silently would hand it
+/// another conversation, or the workspace total under a thread's name.
+///
+/// Matched on the VALUE, not on `as_str()`. Filtering to strings first would
+/// send a `thread_id` of `["<uuid>"]` or `{...}` down the absent arm, which
+/// widens the query to every thread. The alias is the one string that is not
+/// an id, and it resolves to the caller's own thread. Anything else still has
+/// to parse as a uuid. Shared with every other thread-id slot an agent can
+/// write, so the vocabulary cannot drift between them.
+fn events_thread_id_arg(
+    args: &serde_json::Value,
+    caller_thread_id: uuid::Uuid,
+) -> Result<Option<uuid::Uuid>, String> {
+    match args.get("thread_id") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(raw)) => {
+            crate::api::resolve_thread_id_arg(raw, Some(caller_thread_id))
+                .map(Some)
+                .map_err(|e| format!("Error: {e}"))
+        }
+        Some(other) => Err(format!(
+            "Error: thread_id must be a uuid string or 'current', got {other}. Pass \
+             'current' for this thread. For another thread, copy its id from the \
+             `threads` tool's 'search' or 'list' result."
+        )),
+    }
+}
+
+/// LLM tool body: per-`event_type` count + byte total over the same filters as
+/// `query_events`. Without an `event_type` filter, it returns the per-type
+/// breakdown sorted by count desc. A sweep recipe (workspace-learning,
+/// workspace-audit) calls that "what's noisy this week" view before drilling.
+pub(crate) async fn count_events_impl(
+    event_store: &crate::core::store::EventStore,
+    args: &serde_json::Value,
+    caller_thread_id: uuid::Uuid,
+) -> ToolOutcome {
+    let event_type = args.get("event_type").and_then(|v| v.as_str());
+    let since = parse_time_filter(args, "since")?;
+    let until = parse_time_filter(args, "until")?;
+    let thread_id = events_thread_id_arg(args, caller_thread_id)?;
+
+    if let Some(et) = event_type {
+        match event_store
+            .count_events(Some(et), since, until, thread_id)
+            .await
+        {
+            Ok((count, byte_total)) => Ok(serde_json::json!({
+                "count": count,
+                "byte_total": byte_total,
+            })
+            .to_string()),
+            Err(e) => Err(format!("Error: failed to count events: {}", e)),
+        }
+    } else {
+        match event_store
+            .count_events_by_type(since, until, thread_id)
+            .await
+        {
+            Ok(rows) => {
+                let total_count: i64 = rows.iter().map(|(_, c, _)| *c).sum();
+                let total_byte_total: i64 = rows.iter().map(|(_, _, b)| *b).sum();
+                let by_type: Vec<serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(et, count, byte_total)| {
+                        serde_json::json!({
+                            "event_type": et,
+                            "count": count,
+                            "byte_total": byte_total,
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::json!({
+                    "by_type": by_type,
+                    "total_count": total_count,
+                    "total_byte_total": total_byte_total,
+                })
+                .to_string())
+            }
+            Err(e) => Err(format!("Error: failed to count events: {}", e)),
+        }
+    }
+}
+
 /// Read core for the `events` tool's `query` action. Factored out of the
 /// `LucidosEngine` impl so unit tests can drive every refusal branch against
 /// a real Postgres pool without booting the full engine.
@@ -1951,31 +2008,7 @@ pub(crate) async fn query_events_impl(
     let limit = QUERY_EVENTS_LIMIT.apply(args.get("limit").and_then(|v| v.as_i64()));
     let byte_limit =
         QUERY_EVENTS_BYTE_BUDGET.apply(args.get("byte_limit").and_then(|v| v.as_i64()));
-    // Refused rather than ignored. This is the read half of "we talked
-    // about this": the model finds a thread with `threads` 'search', then
-    // asks for its messages here. Silently widening a malformed id to EVERY
-    // thread would hand it another conversation, with no way to tell.
-    // Matched on the VALUE, not on `as_str()`. Filtering to strings first
-    // would send a `thread_id` of `["<uuid>"]` or `{...}` down the absent
-    // arm, which widens the query to every thread.
-    // The alias is the one string that is not an id, and it resolves to the
-    // caller's own thread. Anything else still has to parse as a uuid. Shared
-    // with every other thread-id slot an agent can write, so the vocabulary
-    // cannot drift between them.
-    let thread_id = match args.get("thread_id") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(raw)) => Some(
-            crate::api::resolve_thread_id_arg(raw, Some(caller_thread_id))
-                .map_err(|e| format!("Error: {e}"))?,
-        ),
-        Some(other) => {
-            return Err(format!(
-                "Error: thread_id must be a uuid string or 'current', got {other}. Pass \
-                 'current' for this thread. For another thread, copy its id from the \
-                 `threads` tool's 'search' or 'list' result."
-            ))
-        }
-    };
+    let thread_id = events_thread_id_arg(args, caller_thread_id)?;
 
     // Dereference half of a noted pointer (ADR 0085). Matched on the VALUE
     // for the same reason `thread_id` is. A non-string is a malformed

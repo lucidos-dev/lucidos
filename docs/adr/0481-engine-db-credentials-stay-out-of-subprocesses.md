@@ -5,6 +5,9 @@
 - **Amends**: [0356](0356-coding-agent-threads-get-a-built-in-terminal.md)
   decision 5. The built-in terminal gets `LUCIDOS_DATABASE_URL`, not the
   `PG*` variables.
+- **Amended by**: [0509](0509-stored-secrets-are-sealed-at-rest.md).
+  `LUCIDOS_DATABASE_URL` now signs in as the workspace's agent role, which
+  cannot read a secret column or reach another database.
 
 ## Context
 

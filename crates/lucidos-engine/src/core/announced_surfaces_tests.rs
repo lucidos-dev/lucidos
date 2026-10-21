@@ -486,7 +486,7 @@ fn tables_written_ignores_prose_and_finds_real_sql() {
     // "update the stored value" and "delete from disk" are prose, not writes.
     assert!(tables_written("/// Update the stored value, then delete from disk.").is_empty());
     assert_eq!(
-        tables_written("sqlx::query(\"UPDATE models SET enabled = $2 WHERE id = $1\")"),
+        tables_written("sqlx::query(\"UPDATE models SET label = $2 WHERE id = $1\")"),
         ["models".to_string()].into_iter().collect()
     );
     assert_eq!(

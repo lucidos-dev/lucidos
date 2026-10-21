@@ -44,7 +44,8 @@ import { releaseNoticeModalOpen } from './store/releaseNotices';
 import { memoryChoiceOpen } from './store/memoryChoice';
 import { viewportIsMobile } from './utils/viewport';
 import { CameraCaptureSlot } from './components/chat/PromptInput';
-import { HomeRail } from './components/home/HomeRail';
+import { DashboardRail } from './components/dashboard/DashboardRail';
+import { DashboardSheet } from './components/dashboard/DashboardSheet';
 
 // Re-exported so it ships in the shell chunk, which `main.tsx` runs it from.
 export { startShell } from './shellStartup';
@@ -156,8 +157,9 @@ export function App() {
             />
           </div>
         )}
-        <HomeRail />
+        <DashboardRail />
       </div>
+      {mobile && <DashboardSheet />}
 
       {/* Overlays -- rendered outside the split layout.
 

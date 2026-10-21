@@ -20,7 +20,6 @@ import { appendMessagesToCompose } from './chat';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { showEventWhereItLives } from './event-navigation';
 import { closeShelfWidget } from './widgets';
-import { homeThreadId, isHomeThread } from './homeThread';
 
 /** A chip tap: drop the instance open under the title, or fold it back. */
 export function toggleShelfWidget(threadId: string, instanceKey: string): void {
@@ -39,39 +38,19 @@ async function run(action: () => Promise<unknown>, failure: string): Promise<voi
   }
 }
 
-/** Where a pin in this thread puts a widget, as the user reads it. Home draws
- *  no shelf: its pins are tiles on the Home board. */
-function pinPlace(threadId: string): string {
-  return isHomeThread(threadId) ? 'Home' : 'the shelf';
-}
-
 /** "Unpin from shelf": the chip goes, the inline widget and the files stay. */
 export async function unpinWidgetFromShelf(instance: WidgetInstanceRef, name: string): Promise<void> {
   const open = openShelfWidget.value;
   if (open?.threadId === instance.threadId && open.instanceKey === widgetInstanceKey(instance.appId, instance.params)) {
     closeShelfWidget();
   }
-  await run(() => unpinWidgetApi(instance), `Couldn't unpin widget "${name}" from ${pinPlace(instance.threadId)}`);
+  await run(() => unpinWidgetApi(instance), `Couldn't unpin widget "${name}" from the shelf`);
 }
 
 /** "Pin to shelf": the instance gets a chip. `shownEventId` is the event that
  *  draws it in the thread, where "Show in thread" lands. */
 export async function pinWidgetToShelf(instance: WidgetInstanceRef, name: string, shownEventId?: string): Promise<void> {
-  await run(() => pinWidgetApi(instance, shownEventId), `Couldn't pin widget "${name}" to ${pinPlace(instance.threadId)}`);
-}
-
-/** "Pin to Home" from another thread: a tile on the Home board. The engine makes
- *  a thread's own widget reusable in the same action, and the toast says so.
- *  Deleting that thread then never empties the tile (ADR 0432). */
-export async function pinWidgetToHome(instance: Omit<WidgetInstanceRef, 'threadId'>, name: string): Promise<void> {
-  const home = homeThreadId.value;
-  if (!home) return;
-  await run(async () => {
-    const answer = await pinWidgetApi({ ...instance, threadId: home }) as { made_reusable?: boolean } | null;
-    showToast(answer?.made_reusable
-      ? `Pinned "${name}" to Home and made it reusable, so it stays if its thread is deleted.`
-      : `Pinned "${name}" to Home.`, 'success');
-  }, `Couldn't pin widget "${name}" to Home`);
+  await run(() => pinWidgetApi(instance, shownEventId), `Couldn't pin widget "${name}" to the shelf`);
 }
 
 export async function makeWidgetReusable(appId: string, name: string): Promise<void> {

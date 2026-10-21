@@ -12,6 +12,9 @@
 import { test, expect, type Page } from './fixtures';
 import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 const SLOWEST = '-10';
 
 test.use({ viewport: { width: 1280, height: 900 } });

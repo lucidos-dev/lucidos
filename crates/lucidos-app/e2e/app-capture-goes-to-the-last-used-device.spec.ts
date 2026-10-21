@@ -103,7 +103,7 @@ test.describe('an app capture goes to the device it names', () => {
       expect(result.slice(0, 200), 'the named device sent its capture').toMatch(/^\[APP_CAPTURE:/);
       expect(result, 'the capture carries the DOM').toContain(DOM_PROBE);
       // The engine replies once the POST lands, and Playwright reports the
-      // request on its own channel, which can trail that reply on WebKit.
+      // request on its own channel, which can trail that reply.
       await expect.poll(() => answersWithApp.count).toBe(1);
       expect(answersWithoutApp.count, 'the page without the app must not answer').toBe(0);
 

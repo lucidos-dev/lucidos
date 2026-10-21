@@ -2,8 +2,10 @@ import { Page, APIResponse, expect, Locator, Request } from '@playwright/test';
 import { HARNESS_DEVICE_ID, ensurePageDeviceRegistered, registerHarnessDevice } from './harnessDevice';
 import { MODAL_EXIT_DRAWING_CLASS } from '../src/components/shared/overlayExitClass';
 import { computeMinThreadPaneWidth, THREAD_ROW_LEAD_CONTROLS } from '../src/store/paneMinimums';
-import { HOME_RAIL_SHOWN_KEY } from '../src/store/homeRailKeys';
+import { DASHBOARD_RAIL_SHOWN_KEY } from '../src/store/dashboardRailKeys';
 import { DEVICE_ID_KEY } from '../src/utils/deviceIdKey';
+import { ANCHOR_GAP } from '../src/hooks/anchorGap';
+import { rungSwitchCopy } from '../src/components/chat/rungSwitchCopy';
 import { homeThreadIdInDb } from './db-helpers';
 
 /** The device id this page registered at boot, or null before it navigates. */
@@ -352,16 +354,16 @@ export async function disarmFollowSeed(page: Page): Promise<void> {
   });
 }
 
-/** Hide the desktop Home rail before the app boots. It shows by default and
+/** Hide the desktop dashboard rail before the app boots. It shows by default and
  *  takes width from the panes (ADR 0466). A spec that measures pane geometry
  *  at a fixed window therefore opts out of it.
  *
- *  An init script for the same reason as `disarmFollowSeed`: `homeRailShown`
+ *  An init script for the same reason as `disarmFollowSeed`: `dashboardRailShown`
  *  reads the key once at module load. */
-export async function hideHomeRail(page: Page): Promise<void> {
+export async function hideDashboardRail(page: Page): Promise<void> {
   await page.addInitScript((key) => {
     localStorage.setItem(key, 'false');
-  }, HOME_RAIL_SHOWN_KEY);
+  }, DASHBOARD_RAIL_SHOWN_KEY);
 }
 
 /** The Conversation pane's floor, by the app's own function, from what the
@@ -395,10 +397,14 @@ export async function renderWholeTranscript(page: Page): Promise<void> {
   const chevron = page.locator('.scroll-to-top.visible').first();
   if (await chevron.count() === 0) return;
   await chevron.click();
-  // The chevron GLIDES, and its easing sits near zero for several frames before
-  // it lands. A caller that parked the reader while the tween still had frames
-  // to write would have its own `scrollTop` overwritten on the next one. So
-  // wait for two settled frames at the top, not merely for a small offset.
+  // Under calm motion the jump lands before the older history does, and a
+  // reader at the top of a partial thread still sees the chevron. It hides
+  // only once nothing is left above.
+  await expect(chevron).toBeHidden({ timeout: 30_000 });
+  // With motion the chevron GLIDES, and its easing sits near zero for several
+  // frames before it lands. A caller that parked the reader while the tween
+  // still had frames to write would have its own `scrollTop` overwritten on
+  // the next one. So wait for two settled frames at the top.
   await expect.poll(() => page.evaluate(() => new Promise<boolean>(resolve => {
     const el = document.querySelector('.thread-content') as HTMLElement | null;
     if (!el) return resolve(false);
@@ -480,6 +486,22 @@ export async function sendMessage(page: Page, text: string): Promise<void> {
   }
 }
 
+/** Send a message and return the thread id the chat POST carried.
+ *
+ *  The "Requesting" label is optimistic: the POST waits behind the device
+ *  registration first, so a listener read right after the label sees no
+ *  request yet. This waits for the POST itself. */
+export async function sendMessageCapturingThreadId(page: Page, text: string): Promise<string> {
+  const posted = page.waitForRequest(
+    (req) => req.url().includes('/api/v1/chat/stream') && req.method() === 'POST',
+    { timeout: 60_000 },
+  );
+  await sendMessage(page, text);
+  const threadId = (await posted).postDataJSON()?.thread_id;
+  expect(threadId, 'chat POST carries the thread id').toBeTruthy();
+  return threadId as string;
+}
+
 /** A turn's reply. The compose view's welcome card shares the class but is no
  *  reply. A wait that counted it passed on a send that never went out. */
 const TURN_RESPONSE_SELECTOR = '.response-content:not(.welcome-message)';
@@ -555,6 +577,17 @@ export async function waitAndClick(page: Page, selector: string, text?: string, 
   await clickVisibleElement(page, selector, text);
 }
 
+/** Wait out the glide into the picker's current step. The panel pins its
+ *  children and clips them while it runs, then scrolls the active row into view
+ *  the moment it ends. A click pressed inside that window can be released over a
+ *  different row, which fires no click and leaves the step as it was. */
+async function pickerStepSettled(row: Locator): Promise<void> {
+  await expect
+    .poll(() => row.evaluate(el => el.closest('[data-overlay-panel]')?.getAnimations({ subtree: true }).length ?? 0),
+      { timeout: 5_000, message: 'the picker step never finished gliding in' })
+    .toBe(0);
+}
+
 /** Drive the open model picker: a model, then one of its tiers when it has any.
  *
  *  A step-1 row carries the model id. A row that opens a step draws the
@@ -565,6 +598,7 @@ export async function waitAndClick(page: Page, selector: string, text?: string, 
 export async function pickModelPair(page: Page, model: string, tier?: string): Promise<string> {
   const modelRow = page.locator(`.control-option[data-value="${model}"]:visible`).first();
   await expect(modelRow).toBeVisible({ timeout: 10_000 });
+  await pickerStepSettled(modelRow);
   if ((await modelRow.locator('.control-option-more').count()) === 0) {
     if (tier) throw new Error(`pickModelPair: "${model}" offers no tiers, so "${tier}" cannot be picked`);
     await modelRow.click();
@@ -576,21 +610,97 @@ export async function pickModelPair(page: Page, model: string, tier?: string): P
     ? page.locator(`.control-option[data-value="${model}|${tier}"]:visible`).first()
     : page.locator(`.control-option[data-value^="${model}|"]:visible`).first();
   await expect(row).toBeVisible({ timeout: 5_000 });
+  await pickerStepSettled(row);
   const pair = (await row.getAttribute('data-value')) ?? '';
   await row.click();
   return pair;
 }
 
-/** Open the tiers of the model the picker has checked, returning its id.
- *
- *  Step 1 shows the model in force with its tier in the label, but the VALUE
- *  is the model alone. A test asserting on the tier has to step in. */
-export async function openCurrentModelTiers(page: Page): Promise<string> {
-  const current = page.locator('.control-option-current:visible').first();
-  await expect(current).toBeVisible({ timeout: 5_000 });
-  const model = (await current.getAttribute('data-value')) ?? '';
-  await current.click();
-  return model;
+/** One row of the prompt bar's rung list: a ladder rung, model and effort
+ *  together. `value` is the row's `data-value`, an encoded pair. */
+export interface RungRow {
+  value: string;
+  model: string;
+  effort: string | null;
+  current: boolean;
+}
+
+/** Split a rung row's `data-value` at its last `|`, as the app does. An empty
+ *  tail is no effort. */
+export function splitRungValue(value: string): { model: string; effort: string | null } {
+  const at = value.lastIndexOf('|');
+  if (at === -1) return { model: value, effort: null };
+  return { model: value.slice(0, at), effort: value.slice(at + 1) || null };
+}
+
+const RUNG_PICKABLE = '.control-dropdown .control-option:visible:not([data-value="ladder-link"])';
+
+/** Open the rung list and return the panel. A row with room opens it from the
+ *  pill's trigger, which names no rung until the commands have loaded. A row
+ *  too narrow for the pill folds it into the ⋯ menu, and that menu's row opens
+ *  the same list. Which one a row gets depends on the pane and the font, so
+ *  neither is assumed. */
+export async function openRungList(page: Page): Promise<Locator> {
+  const trigger = page.locator('.rung-trigger[aria-label^="Model"]:visible').first();
+  const more = page.locator('.prompt-actions-row:visible [data-fold-key=""]').first();
+  const foldedRow = page.locator('.thread-overflow-item[data-role="rung-control"]:visible');
+  await expect(async () => {
+    if (await trigger.isVisible()) {
+      await trigger.click();
+      return;
+    }
+    await more.click();
+    try {
+      await expect(foldedRow).toBeVisible({ timeout: 1_000 });
+    } catch (err) {
+      await page.keyboard.press('Escape');
+      throw err;
+    }
+    await foldedRow.click();
+  }).toPass({ timeout: 30_000 });
+  const panel = page.locator('.control-dropdown:visible').first();
+  await expect(panel.locator('.control-option:visible').first()).toBeVisible({ timeout: 10_000 });
+  return panel;
+}
+
+/** The open rung list's ladder rungs, in order. The ladder link is left out,
+ *  and a thread's off-ladder pair stays in. */
+export async function readRungRows(page: Page): Promise<RungRow[]> {
+  await expect(page.locator(RUNG_PICKABLE).first()).toBeVisible({ timeout: 5_000 });
+  const rows = await page.locator(RUNG_PICKABLE).evaluateAll((els) =>
+    els.map((el) => ({
+      value: el.getAttribute('data-value') ?? '',
+      current: el.classList.contains('control-option-current'),
+    })));
+  return rows.map((r) => ({ ...r, ...splitRungValue(r.value) }));
+}
+
+/** The `data-value` of the open rung list's checked row. */
+export async function currentRungValue(page: Page): Promise<string> {
+  const current = page.locator('.control-dropdown .control-option-current:visible');
+  await expect(current).toHaveCount(1, { timeout: 5_000 });
+  return (await current.getAttribute('data-value')) ?? '';
+}
+
+/** Tap a row of the open rung list. One tap commits the model and the effort
+ *  together and closes the list. A pick on a live thread whose cache is warm
+ *  asks first, and this switches the thread: the "Switch this thread" card
+ *  where a handoff is offered, else "Switch anyway". A cold cache asks nothing. */
+export async function pickRung(page: Page, value: string): Promise<void> {
+  const row = page.locator(`.control-dropdown .control-option[data-value="${value}"]:visible`).first();
+  await expect(row).toBeVisible({ timeout: 5_000 });
+  await pickerStepSettled(row);
+  await row.click();
+  await expect(page.locator('.control-dropdown:visible')).toHaveCount(0, { timeout: 5_000 });
+  const confirm = page.locator('.confirm-dialog');
+  const asked = await confirm.waitFor({ state: 'visible', timeout: 2_000 }).then(() => true, () => false);
+  if (asked) {
+    const { switchHereLabel, switchLabel } = rungSwitchCopy({ from: '', to: '', extraCostUsd: null, canHandOff: true });
+    const switchThread = confirm.getByRole('button', { name: switchHereLabel })
+      .or(confirm.getByRole('button', { name: switchLabel, exact: true }));
+    await switchThread.click();
+    await expect(confirm).toHaveCount(0, { timeout: 5_000 });
+  }
 }
 
 /** Click a content-header action by its ACTION class (`.file-edit-btn`,
@@ -1023,6 +1133,24 @@ export async function pickDropdownOption(page: Page, rootSelector: string, optio
       return rect.width > 0 && rect.height > 0;
     });
   }, MENU_OPTION, { timeout: 3_000 });
+}
+
+/** Make the compose `/` menu hold slash commands. The engine learns them from a
+ *  coding-agent session's init. A fresh workspace has none until a session has
+ *  run in the repo, so the button stays inert. This runs one when none has.
+ *  A route stub would not do: WebKit does not route the page's own reads. */
+export async function ensureSlashCommandsReported(page: Page): Promise<void> {
+  const reported = async () => {
+    const res = await page.request.get('/api/v1/claude-code/commands?repo_id=');
+    return ((await res.json()).builtin_commands ?? []).length;
+  };
+  if (await reported() > 0) return;
+  await navigateToApp(page);
+  await newThread(page);
+  await pickComposeDestination(page);
+  await sendMessage(page, 'Say exactly: "seed" and nothing else. Do not create any files.');
+  await waitForActionPanel(page, 'Archive', 120_000);
+  await expect.poll(reported).toBeGreaterThan(0);
 }
 
 /** Pick an option in the compose destination picker (dual-layout safe).
@@ -1483,7 +1611,7 @@ export async function getVisibleTitleText(page: Page): Promise<string> {
 // Backed by GET /api/v1/_test/push-log, which is only mounted when the engine
 // is built with the `e2e-test-hooks` cargo feature (see
 // system-knowhow/notifications.md §5.4). Used by the §5.3 scenarios in
-// notifications.spec.ts to assert "OS push WAS / WAS NOT sent" without
+// notifications-all.spec.ts to assert "OS push WAS / WAS NOT sent" without
 // waiting for actual APNs/FCM delivery.
 // =====================================================================
 
@@ -1595,4 +1723,23 @@ export async function waitForScrollSettled(page: Page): Promise<void> {
     previous = now;
     return stable;
   }, { timeout: 15_000, intervals: [50, 50, 100] }).toBeGreaterThanOrEqual(2);
+}
+
+/** Right-clicks a point inside a widget's frame, so the SDK in it forwards the
+ *  event, and returns the object menu it opened. The menu must open at the
+ *  pointer: its top or bottom edge, whichever way it flipped, sits the anchor
+ *  gap from the point. Its left edge may be clamped into the viewport. */
+export async function rightClickInsideFrame(page: Page, frame: Locator): Promise<Locator> {
+  const b = (await frame.boundingBox())!;
+  const at = { x: b.x + Math.min(40, b.width / 2), y: b.y + Math.min(30, b.height / 2) };
+  await page.mouse.click(at.x, at.y, { button: 'right' });
+  const menu = page.locator('.thread-overflow-menu');
+  await expect(menu).toHaveCount(1);
+  await expect(menu).toBeVisible();
+  const m = (await menu.boundingBox())!;
+  const edgeGap = Math.min(Math.abs(m.y - at.y), Math.abs(m.y + m.height - at.y));
+  expect(Math.abs(edgeGap - ANCHOR_GAP)).toBeLessThanOrEqual(1);
+  expect(at.x).toBeGreaterThanOrEqual(m.x - 2);
+  expect(at.x).toBeLessThanOrEqual(m.x + m.width + 2);
+  return menu;
 }

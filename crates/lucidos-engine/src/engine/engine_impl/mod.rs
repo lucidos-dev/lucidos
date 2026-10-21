@@ -13,3 +13,5 @@ mod scripts;
 mod shutdown;
 mod threads;
 mod trigger_runs;
+
+pub(crate) use scripts::ScriptEnv;

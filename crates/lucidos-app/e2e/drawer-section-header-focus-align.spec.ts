@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import { navigateToApp, openThreadDrawer, assertHealthy } from './helpers';
 import { psql, clearAllThreads, seedThreadRow } from './db-helpers';
 
-test.use({ viewport: { width: 1280, height: 900 }, colorScheme: 'dark' });
+test.use({ viewport: { width: 1280, height: 900 }, colorScheme: 'dark', reducedMotion: 'reduce' });
 
 test.describe('Drawer section-header focus band alignment', () => {
     test.beforeEach(async ({ page, context }) => {

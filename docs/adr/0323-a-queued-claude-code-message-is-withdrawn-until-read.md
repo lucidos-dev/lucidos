@@ -59,6 +59,8 @@ the compose box. It exists on both lanes.
   refusal, never as a false removal.
 - Stop still leaves a Claude Code thread's queued messages with the agent, as
   Claude Code's plain interrupt does. Only the bin or Edit takes one back.
+- Claude Code decides only for a message a live process holds. A message only
+  a dead process held is redelivered or removed from the store (ADR 0506).
 
 ## Alternatives considered
 

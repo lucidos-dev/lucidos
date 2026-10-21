@@ -31,7 +31,15 @@ pub const JUDGE_PROVIDER_VAR: &str = "LUCIDOS_EVAL_JUDGE_PROVIDER";
 
 /// Every provider the judge can be pinned to, in the engine's own vocabulary.
 /// The engine's own list, so a backend it gains is pinnable here at once.
-const PROVIDER_KINDS: [ProviderKind; 7] = ProviderKind::ALL;
+///
+/// A Claude gateway is the one exception. Its sign-in lives in a workspace
+/// database, and the eval has none.
+fn provider_kinds() -> Vec<ProviderKind> {
+    ProviderKind::ALL
+        .into_iter()
+        .filter(|kind| *kind != ProviderKind::ClaudeGateway)
+        .collect()
+}
 
 /// The one question the preflight asks, when the judge session is built.
 ///
@@ -286,17 +294,18 @@ impl<'a> Judge<'a> {
 ///
 /// `ProviderKind::parse` falls back to Vertex on an unknown string, so a typo
 /// would quietly route somewhere nobody asked for. The round-trip through
-/// `as_str` is what turns that into an error.
+/// `as_str` is what turns that into an error. A provider the eval cannot reach
+/// is refused the same way.
 pub(crate) fn provider_override(raw: Option<&str>) -> Fallible<Option<ProviderKind>> {
     let name = raw.unwrap_or_default().trim();
     if name.is_empty() {
         return Ok(None);
     }
     let kind = ProviderKind::parse(name);
-    if kind.as_str() != name {
+    if kind.as_str() != name || !provider_kinds().contains(&kind) {
         return Err(format!(
-            "{JUDGE_PROVIDER_VAR} is `{name}`, which is not a provider. Use one of: {}.",
-            provider_list(&PROVIDER_KINDS)
+            "{JUDGE_PROVIDER_VAR} is `{name}`, which the judge cannot use. Use one of: {}.",
+            provider_list(&provider_kinds())
         )
         .into());
     }
@@ -347,7 +356,9 @@ pub(crate) fn judge_context(model: &str, registry: &ModelRegistry) -> ProviderBu
         vertex_location: vertex::location_handle(region),
         vertex_token_cache: token_cache,
         model_registry: registry.clone(),
+        not_served: Default::default(),
         boot_without_provider: false,
+        claude_gateway_access: None,
     }
 }
 
@@ -398,12 +409,15 @@ fn how_to_configure(kind: ProviderKind) -> &'static str {
         ProviderKind::XAi => "set LUCIDOS_XAI_API_KEY",
         ProviderKind::OpenCodeFree => "set LUCIDOS_OPENCODE_FREE=1 (keyless, no account)",
         ProviderKind::Local => "set LUCIDOS_LOCAL_BASE_URL",
+        ProviderKind::ClaudeGateway => {
+            "use another provider: the eval has no workspace to sign in from"
+        }
     }
 }
 
 /// The failure when this machine has no provider at all.
 fn no_provider_message() -> String {
-    let options = PROVIDER_KINDS
+    let options = provider_kinds()
         .iter()
         .map(|kind| format!("{} ({})", kind.as_str(), how_to_configure(*kind)))
         .collect::<Vec<_>>()
@@ -535,12 +549,12 @@ mod tests {
 
     #[test]
     fn every_provider_name_is_accepted_and_a_typo_names_the_ones_that_are() {
-        for kind in PROVIDER_KINDS {
+        for kind in provider_kinds() {
             assert_eq!(provider_override(Some(kind.as_str())).unwrap(), Some(kind));
         }
         assert_eq!(provider_override(None).unwrap(), None);
         assert_eq!(provider_override(Some("   ")).unwrap(), None);
-        for typo in ["Vertex", "gemini", "claude"] {
+        for typo in ["Vertex", "gemini", "claude", "claude-gateway"] {
             let err = provider_override(Some(typo)).unwrap_err().to_string();
             assert!(err.contains(JUDGE_PROVIDER_VAR), "{err}");
             assert!(err.contains("vertex, anthropic, openai"), "{err}");

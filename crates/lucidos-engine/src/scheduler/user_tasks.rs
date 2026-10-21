@@ -394,9 +394,8 @@ async fn execute_llm_task(
             config.go_to_review,
             config.side_effect_grant.clone(),
             config.mcp_servers.clone(),
-            // `None` on either means this trigger is on the account chat
-            // default for that field. That is what every trigger did before
-            // the per-trigger model existed.
+            // `None` on either means this trigger follows the account default
+            // for that field: the trigger model default, for the model.
             config.model.as_deref(),
             config.reasoning_effort.as_deref(),
             config.provider.as_deref(),
@@ -497,9 +496,9 @@ fn sanitize_header_label(label: &str) -> String {
 /// the pretty-printed JSON payload.
 ///
 /// The static rules ("don't call create_trigger…") live in
-/// [`TRIGGER_SYSTEM_ADDENDUM`] and are appended to the system prompt instead of
-/// repeated here. That keeps the system-prompt cache hot across every fire and
-/// puts the rules where injected user text can't outweigh them. The trigger id
+/// [`TRIGGER_SYSTEM_ADDENDUM`], part of the static system prompt body, instead
+/// of repeated here. That keeps the system-prompt cache hot across every fire
+/// and puts the rules where injected user text can't outweigh them. The trigger id
 /// is the canonical reference (always a UUID); the name is shown for human
 /// readability only and is sanitized.
 ///
@@ -547,14 +546,15 @@ pub(crate) fn build_trigger_user_message(
     }
 }
 
-/// Static system-prompt addendum applied to every LLM trigger fire. Carries
-/// the trigger-fire framing rules (do not re-schedule; self-pause /
-/// self-delete only on the id named in the user header). Kept 100% static —
-/// no per-trigger interpolation — so the system-prompt prefix cache stays hot
-/// across fires. Per-trigger id and name travel in the user header built by
-/// [`build_trigger_user_message`]. The hard tool-layer guard in
-/// `engine/tools/scheduler.rs` is the second line of defense; this is the
-/// soft, in-prompt one.
+/// The trigger-fire framing rules (do not re-schedule; self-pause /
+/// self-delete only on the id named in the user header). It sits in the static
+/// system prompt body of every chat and trigger turn. A fire's system block
+/// then equals a chat turn's, and both read one cache entry. Kept 100% static,
+/// with no per-trigger interpolation. Per-trigger id and name travel in the user
+/// header built by [`build_trigger_user_message`], and the trigger's own
+/// know-how listing rides in the turn's `[TRIGGER KNOW-HOW]` block. The hard
+/// tool-layer guard in `engine/tools/scheduler.rs` is the second line of
+/// defense; this is the soft, in-prompt one.
 pub const TRIGGER_SYSTEM_ADDENDUM: &str = "\n\n## Trigger Execution\n\
 When the user message starts with `[SCHEDULED TRIGGER FIRE: ...]` or \
 `[EVENT TRIGGER FIRE: ...]`, treat it as a trigger firing request and \
@@ -564,7 +564,7 @@ firing. The only scheduling calls available during a firing are pause_trigger \
 / delete_trigger for the trigger id named in the header, and only if the \
 intent explicitly says to self-pause/delete.\n\n\
 If the intent is procedural (multi-step, uses subprocesses, follows a known \
-recipe), and your system prompt includes a `Trigger Know-how` section, items \
+recipe), and the fire's message includes a `[TRIGGER KNOW-HOW]` section, items \
 listed there belong to THIS trigger and are likely relevant. Use \
 `load_knowhow` to load what you need before acting. Beyond that, the \
 workspace and system know-how lists are also available — load whatever the \
@@ -1318,20 +1318,17 @@ mod tests {
 
     #[test]
     fn addendum_directs_llm_to_load_knowhow_and_trigger_section() {
-        // Phase 1 of the trigger-knowhow-discovery refactor deleted the
-        // synthetic `load_knowhow` tool turns the engine fabricated for
-        // trigger fires. The addendum now points the LLM at the system-prompt
-        // Trigger Know-how section (Phase 2 will populate it; reference is
-        // conditional so absence is silent) and tells it to call
-        // `load_knowhow` itself when it needs context.
+        // The addendum points the LLM at the fire's `[TRIGGER KNOW-HOW]`
+        // section, and tells it to call `load_knowhow` itself. The reference
+        // is conditional, so absence is silent.
         assert!(
             TRIGGER_SYSTEM_ADDENDUM.contains("load_knowhow"),
             "addendum must mention load_knowhow so the LLM knows it's how \
              trigger threads pull in knowhow on demand"
         );
         assert!(
-            TRIGGER_SYSTEM_ADDENDUM.contains("Trigger Know-how"),
-            "addendum must reference the Trigger Know-how section so the LLM \
+            TRIGGER_SYSTEM_ADDENDUM.contains("[TRIGGER KNOW-HOW]"),
+            "addendum must reference the [TRIGGER KNOW-HOW] section so the LLM \
              knows where to look for trigger-scoped recipes when it exists"
         );
     }

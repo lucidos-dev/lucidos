@@ -80,7 +80,7 @@ pub(super) fn turn_has_terminal(
 /// takes it.
 pub(crate) fn mark_turn_boundary(s: &mut crate::engine::AgentSession) {
     s.is_waiting = true;
-    s.redirect_followup = false;
+    s.redirect_cause = None;
     s.cancel_actor = None;
     if futures::FutureExt::now_or_never(s.interrupt.notified()).is_some() {
         crate::log!("[AgentSession] Retired an interrupt that arrived after its turn's Result");
@@ -328,7 +328,7 @@ pub(super) const EMPTY_RESPONSE_ERROR: &str =
 /// `text_is_empty` stays below for the same reason: a cancel is still a cancel.
 pub(super) fn classify_result(
     user_hit_stop: bool,
-    interrupt_is_redirect: bool,
+    redirect_cause: Option<crate::engine::thread_events::CancelCause>,
     is_shutdown: bool,
     cc_error: Option<String>,
     text_is_empty: bool,
@@ -337,13 +337,9 @@ pub(super) fn classify_result(
     let terminal = if is_shutdown {
         TerminalKind::Aborted(AbortCause::EngineShutdown)
     } else if user_hit_stop {
-        // A Codex mid-turn follow-up redirect is mechanically a cancel, but it
-        // is NOT a user Stop, so render it neutrally.
-        TerminalKind::Canceled(if interrupt_is_redirect {
-            CancelCause::SupersededByFollowup
-        } else {
-            CancelCause::UserStop
-        })
+        // A redirect (a follow-up, an effort restart) is mechanically a
+        // cancel, but it is NOT a user Stop, so it carries its own cause.
+        TerminalKind::Canceled(redirect_cause.unwrap_or(CancelCause::UserStop))
     } else if let Some(error) = cc_error {
         TerminalKind::Failed { error }
     } else if text_is_empty {
@@ -537,7 +533,8 @@ pub(super) fn lane_thread_end(
         Some(StopReason::Apply | StopReason::Discard | StopReason::Archive) => {
             return Some(LaneThreadEnd::Failed(LANE_THREAD_CLOSED.to_string()))
         }
-        None => {}
+        // A lane thread never restarts for an effort pick (`effort_restart`).
+        Some(StopReason::EffortRestart) | None => {}
     }
     match conflict_resolution_cleanup_action(has_unmerged, last_terminal, continuation_pending) {
         ConflictResolutionCleanupAction::Apply => Some(LaneThreadEnd::Completed),
@@ -753,7 +750,7 @@ pub(super) enum SessionEndAction {
 ///
 /// `cancel` says how the last terminal ended the turn short, if it did. A
 /// cancel keeps the branch so the session stays resumable. A Stop or a failure
-/// with net work withholds it; a redirect never proposes, because the follow-up
+/// with net work withholds it; a redirect never proposes, because the work
 /// continues on the branch. These rank below the external and crash arms,
 /// which carry more specific semantics. A cancel cannot co-occur with
 /// `safety_net_fired`, because a cancel emits a terminal.
@@ -787,7 +784,8 @@ pub(super) enum TurnCancel {
     None,
     /// The user pressed Stop.
     Stopped,
-    /// A follow-up interrupted the turn and continues it.
+    /// A follow-up or an effort restart interrupted the turn, and the work
+    /// continues.
     Redirected,
     /// The turn ended in failure, so it did not finish.
     Failed,
@@ -798,7 +796,7 @@ impl TurnCancel {
         use crate::engine::thread_events::CancelCause;
         match terminal {
             Some(TerminalKind::Canceled(CancelCause::UserStop)) => Self::Stopped,
-            Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup)) => Self::Redirected,
+            Some(TerminalKind::Canceled(cause)) if cause.is_redirect() => Self::Redirected,
             Some(TerminalKind::Failed { .. }) => Self::Failed,
             _ => Self::None,
         }
@@ -811,11 +809,11 @@ impl TurnCancel {
 /// silently skips the safety net. `last_terminal_kind` is per-turn for the same
 /// reason: [`should_auto_commit_on_cleanup`] must reflect THIS turn's outcome.
 ///
-/// `cancel_actor` and `interrupt_is_redirect` reset in lockstep with
+/// `cancel_actor` and `redirect_cause` reset in lockstep with
 /// `user_hit_stop`, because the interrupt arm sets all three together. A
 /// follow-up arriving during the cancel race clears the latch on its own.
 /// Without this it would leave the prior turn's device on `meta`, or leave a
-/// stale redirect flag that mislabels a later real Stop.
+/// stale redirect cause that mislabels a later real Stop.
 ///
 /// The terminal is [`TurnTerminal`], one argument rather than two, so a caller
 /// cannot clear half of it.
@@ -824,7 +822,7 @@ pub(super) fn reset_per_turn_flags(
     last_emitted_idle: &mut bool,
     emitted_terminal_event: &mut bool,
     user_hit_stop: &mut bool,
-    interrupt_is_redirect: &mut bool,
+    redirect_cause: &mut Option<crate::engine::thread_events::CancelCause>,
     terminal: TurnTerminal<'_>,
     cancel_actor: &mut Option<crate::engine::thread_events::MessageOrigin>,
 ) {
@@ -832,7 +830,7 @@ pub(super) fn reset_per_turn_flags(
     *last_emitted_idle = false;
     *emitted_terminal_event = false;
     *user_hit_stop = false;
-    *interrupt_is_redirect = false;
+    *redirect_cause = None;
     *terminal.kind = None;
     *terminal.withheld_api_error = None;
     *cancel_actor = None;

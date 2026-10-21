@@ -23,7 +23,7 @@
  */
 import { test, expect, Page } from './fixtures';
 import {
-  navigateToApp, uniqueMessage, assertHealthy, setVoiceEnabled, waitForVisibleInput,
+  navigateToApp, uniqueMessage, assertHealthy, setVoiceEnabled, waitForVisibleInput, watchPreferenceReads,
   composerControl,
 } from './helpers';
 import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
@@ -237,7 +237,11 @@ test.describe('Composer action row - one row, nothing outside the box', () => {
           // Set the state, never inherit it. The app reads its preferences at
           // boot, so this lands before the navigation.
           await setVoiceEnabled(page, voice);
+          // Every preference read ends in `applyUiScale`, which replaces the
+          // scale `setScaleAndSettle` writes. Wait out the startup reads first.
+          const preferencesSettled = watchPreferenceReads(page);
           await navigateToApp(page);
+          await preferencesSettled();
           await expect(page.locator('.thread-action-buttons:visible'))
             .toBeVisible({ timeout: 15_000 });
 

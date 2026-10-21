@@ -13,7 +13,7 @@ import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { applyDraftBatch, type ComposeDraft } from '../composeDrafts';
 import { fetchThreads, fetchThreadById, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
 import type { ThreadSummary, ThreadEventRow, ThreadEventsSnapshot } from '../../api/threads';
-import { isTransientFetchError, retryTransientRead } from '../../api/client';
+import { isTransientFetchError, retryTransient } from '../../api/client';
 import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
@@ -71,6 +71,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       state: info.state,
       latestTodoList: null,
       liveEventWaits: info.live_event_waits ?? [],
+      cacheKeepAliveStatus: info.cache_keep_alive_status ?? null,
     },
     events: new Map(),
     streamingBuffer: '',
@@ -164,6 +165,8 @@ export function upsertThread(
       // omits the field, and must leave a populated list alone. Only an
       // explicit `[]` clears it.
       if (info.live_event_waits) existing.meta.liveEventWaits = info.live_event_waits;
+      // Absence IS emptiness here: the engine omits a status it does not hold.
+      existing.meta.cacheKeepAliveStatus = info.cache_keep_alive_status ?? null;
       existing.meta.codingAgentIsExternalRepo = info.coding_agent_is_external_repo || false;
       if (info.last_revived_at) existing.meta.lastRevivedAt = info.last_revived_at;
       // A null clears: a thread moved to top level has no parent any more, and
@@ -1599,7 +1602,7 @@ async function backfillOnePage(threadId: string, pageSize: number, landWhen?: Hi
   if (!floor) return false;
   try {
     const fetchStart = performance.now();
-    const snapshot = await retryTransientRead(() => fetchThreadEvents(threadId, {
+    const snapshot = await retryTransient(() => fetchThreadEvents(threadId, {
       limit: pageSize,
       before: floor,
     }));
@@ -1661,7 +1664,7 @@ async function loadWholeThread(threadId: string, landWhen?: HistoryLandingGate):
   const thread = threadMap.value.get(threadId);
   if (!thread || !thread.hasOlderEvents) return false;
   try {
-    const snapshot = await retryTransientRead(() => fetchThreadEvents(threadId));
+    const snapshot = await retryTransient(() => fetchThreadEvents(threadId));
     await landWhen?.();
     const current = threadMap.value.get(threadId);
     if (!current) return false;

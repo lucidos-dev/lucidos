@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, ensureMobileView, waitForActionPanel } from './helpers';
+import { navigateToApp, assertHealthy, waitForActionPanel } from './helpers';
 import { createIframeAppFixture, createAppCCThreadWithChange, cleanupCCThread, git } from './db-helpers';
 
 test.describe('App coding-agent thread — Apply', () => {
@@ -43,7 +43,6 @@ test.describe('App coding-agent thread — Apply', () => {
 
     try {
       await navigateToApp(page);
-      await ensureMobileView(page, 'thread');
 
       // Open the app + focus the thread (same routing as the WIP-preview
       // spec — see comments there).

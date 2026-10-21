@@ -508,7 +508,7 @@ struct Evidence<'a> {
     intent_knowhow: IntentKnowhow,
 }
 
-/// What `execute_intent` loads into an intent's turn, for the unused check.
+/// What `load_knowhow` on an intent id loads with it, for the unused check.
 #[derive(Default)]
 struct IntentKnowhow {
     ids: std::collections::HashSet<String>,

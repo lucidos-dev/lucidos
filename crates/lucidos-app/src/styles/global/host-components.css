@@ -875,6 +875,11 @@ html[data-theme-mode="dark"] .split-button.open::before {
      * pinned to the left margin and ran off the right edge. Capped, the row
      * wraps instead (see `.thread-overflow-item`). */
     max-width: min(22rem, calc(100vw - 1rem));
+    /* A long menu, such as the dashboard's Add, scrolls inside the room on the
+       side it opens. `--anchor-room` works as on `.dropdown-menu`. */
+    max-height: var(--anchor-room, calc(var(--app-height, 100dvh) - 1rem));
+    overflow-y: auto;
+    overscroll-behavior: contain;
     padding: 0.25rem;
     z-index: calc(var(--z-popover) + 1);
 }

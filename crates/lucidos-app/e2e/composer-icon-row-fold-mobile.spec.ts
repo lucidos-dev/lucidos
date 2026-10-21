@@ -69,16 +69,18 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     for (const width of WIDTH_LADDER) {
       await page.setViewportSize({ width, height: restore?.height ?? 812 });
       // The fold follows a resize measurement, so it lands a frame later.
-      const folded = await expect.poll(() => more.count(), { timeout: 1_000 })
-        .toBeGreaterThan(0).then(() => true, () => false);
+      // The pill folds before attach, so wait for attach to have left too.
+      const folded = await expect.poll(async () => (await more.count()) > 0 && (await attach.count()) === 0, { timeout: 1_000 })
+        .toBe(true).then(() => true, () => false);
       if (folded) { foldedAt = width; break; }
     }
     expect(foldedAt, `the row never folded, down to ${WIDTH_LADDER.at(-1)}px`).toBeGreaterThan(0);
 
     // The ⋯ took the head of the foldable list, so attach left the row. The
-    // three fixed controls and the send button did not.
+    // two fixed toggles and the send button did not. A Lucidos Agent thread has
+    // no `/` menu, since its model pick is the rung control's.
     await expect(attach).toHaveCount(0);
-    await expect(page.locator('.prompt-actions-row .control-menu:visible')).toHaveCount(1);
+    await expect(page.locator('.prompt-actions-row .control-menu:visible')).toHaveCount(0);
     await expect(follow).toHaveCount(1);
     await expect(page.locator('.prompt-actions-row [data-role="call-toggle"]:visible')).toHaveCount(1);
     await expect(page.locator('.send-cancel-morph:visible')).toHaveCount(1);
@@ -95,10 +97,15 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     await clear.click();
     await expect.poll(() => input.inputValue()).toBe('');
 
-    // Widening hands the icons back, and the ⋯ goes with them.
+    // Widening hands the icons back. The ⋯ may stay: a started thread folds the
+    // rung pill first, and a phone row can be too narrow for it.
     await page.setViewportSize({ width: restore?.width ?? 390, height: restore?.height ?? 812 });
-    await expect.poll(() => more.count()).toBe(0);
     await expect.poll(() => attach.count()).toBe(1);
+    await expect(follow).toHaveCount(1);
+    if (await more.count() > 0) {
+      await expect(await composerControl(page, '[data-role="rung-control"]')).toBeVisible();
+      await page.keyboard.press('Escape');
+    }
 
     await assertHealthy(page);
   });

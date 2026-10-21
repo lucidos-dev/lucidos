@@ -1,11 +1,11 @@
 /**
  * How narrow each desktop pane is allowed to get: the thread drawer, the
- * Conversation pane, the Canvas pane, and the rail that holds the Home board.
+ * Conversation pane, the Canvas pane, and the rail that holds the dashboard.
  *
  * One module for all four because they are read TOGETHER. A divider drag is
  * clamped to what the panes on either side of it need, and a container too
  * narrow to hold every minimum at once has to degrade deterministically
- * (`clampSplitRatio` in components/layout/splitHelpers.ts), so a reader weighing
+ * (`computeDrawnLayout` in components/layout/splitHelpers.ts), so a reader weighing
  * one floor is always weighing it against the others. They used to live in two
  * files, one of them a 2000-line store.
  *
@@ -21,17 +21,20 @@
  * sum to 1178px at 100% ui-scale, 1392 at 125%, 1607 at 150% and 1821 at 175%.
  * A shown rail adds 364, 455, 546 and 637.
  *
- * So even without the rail, from 112.5% on a 1280px screen
- * `clampSplitRatio`'s empty-range branch is what the user meets. That branch is load-bearing, not a corner. Those
- * sums hold on every desktop client, because neither derived floor varies by
- * build (see `computeMinDrawerWidth` and `computeMinThreadPaneWidth`).
+ * So even without the rail, from 112.5% on a 1280px screen the split cannot
+ * hold both pane floors, and the Canvas yields (`computeDrawnSplitRatio` in
+ * components/layout/splitHelpers.ts). That case is load-bearing, not a corner.
+ * The rail then yields before the drawer, and the Conversation never yields
+ * (`computeDrawnLayout`, ADR 0498). Those sums hold on every desktop client,
+ * because neither derived floor varies by build (see `computeMinDrawerWidth`
+ * and `computeMinThreadPaneWidth`).
  *
  * Deliberately holds no signal and imports nothing from `store.ts`: the store's
  * own module init reads `minDrawerWidth()` to clamp the persisted drawer width,
  * so an import back the other way would be a cycle resolved at boot.
  */
 import { getRemPx } from '../utils/dom';
-import { BOARD_CELL_REM, BOARD_GAP_REM, BOARD_MIN_COLUMNS, BOARD_PAD_X_REM } from '../utils/boardGeometry';
+import { DASHBOARD_CELL_REM, DASHBOARD_GAP_REM, DASHBOARD_MIN_COLUMNS, DASHBOARD_PAD_X_REM } from '../utils/dashboardGeometry';
 
 /** One control at an end of the threads header's row, in rem: a button and its
  *  gap. Each end holds two. The leading end is the drawer toggle resting over
@@ -70,10 +73,12 @@ const THREAD_ROW_PAD_REM = 0.5;
  *  `.pane-header-brand-label` floors the box at. */
 const THREAD_ROW_CLUSTER_REM = 2 * 2.25 + 2.1;
 /** The Canvas pane's floor. 360px at a 16px root. It is a constant where the
- *  other two are derived, and it can be. Its row needs
+ *  other two are derived. Its row needs
  *  `2 * --content-side-reserve + --desktop-nav-min-span`, which is 22.1rem, so
- *  this already covers it. The Canvas title cluster therefore never reaches its
- *  clamp's min-span arm at or above this width. Pinned in the suite. */
+ *  the title cluster rests on its clamp's reserve arm down to this width. Pinned
+ *  in the suite. The docked dashboard rail toggle widens the reserve by a box, and
+ *  then the cluster reaches its min-span arm near this floor. There
+ *  `useHeaderActionCollapse` folds the actions into ⋯ to keep them clear. */
 const MIN_CONTENT_PANE_REM = 22.5;
 
 /** Floor for the thread drawer's width, from the root font size and the lead its
@@ -149,10 +154,12 @@ export function computeMinThreadPaneWidth(remPx: number, leadPx: number, leadCon
   return Math.ceil(2 * sidePx + THREAD_ROW_CLUSTER_REM * remPx);
 }
 
-/** The controls leading the Conversation header's row, each a box and a gap
- *  the floor pays at both ends. */
-export const THREAD_ROW_LEAD_CONTROLS =
-  '.desktop-header .pane-header-brand > :is(.brand-compose-btn, .home-thread-btn)';
+/** The Conversation header's row on desktop. */
+export const THREAD_ROW = '.desktop-header .pane-header-brand';
+
+/** The controls leading that row, each a box and a gap the floor pays at both
+ *  ends. */
+export const THREAD_ROW_LEAD_CONTROLS = `${THREAD_ROW} > :is(.brand-compose-btn, .home-thread-btn)`;
 
 /** Floor for the Conversation pane, at the CURRENT root font size. Reads the
  *  same lead the drawer's floor does, and by the same rule: the reserve decides
@@ -164,22 +171,32 @@ export function minThreadPanePx(): number {
   return computeMinThreadPaneWidth(getRemPx(), titlebarLightsReservePx(), leadControls);
 }
 
-/** Floor for the Canvas pane. */
-export function minContentPanePx(): number {
-  return Math.ceil(MIN_CONTENT_PANE_REM * getRemPx());
+/** Floor for the Canvas pane, from the root font size. Pure, like the others. */
+export function computeMinContentPaneWidth(remPx: number): number {
+  return Math.ceil(MIN_CONTENT_PANE_REM * remPx);
 }
 
-/** The divider band the rail pads its leading side by: `--divider-width` in
- *  styles/global/base.css. */
-export const HOME_RAIL_DIVIDER_REM = 0.1875;
+/** Floor for the Canvas pane, at the CURRENT root font size. */
+export function minContentPanePx(): number {
+  return computeMinContentPaneWidth(getRemPx());
+}
 
-/** Floor for the desktop rail that holds the Home board: two of the board's
- *  cells, the gap between them, the board's side padding, the rail's divider
- *  band, and the scrollbar gutter `.home-rail-body` reserves. Pure, so the
+/** The divider band: `--divider-width` in styles/global/base.css. The rail pads
+ *  its leading side by it, and the drawer's divider is one. */
+export const DIVIDER_BAND_REM = 0.1875;
+
+/** The divider band, at the CURRENT root font size. */
+export function dividerBandPx(): number {
+  return DIVIDER_BAND_REM * getRemPx();
+}
+
+/** Floor for the desktop rail that holds the dashboard: two of the dashboard's
+ *  cells, the gap between them, the dashboard's side padding, the rail's divider
+ *  band, and the scrollbar gutter `.dashboard-rail-body` reserves. Pure, so the
  *  arithmetic is testable without a layout engine. */
-export function computeMinHomeRailWidth(remPx: number, scrollbarGutterPx: number): number {
-  const board = BOARD_MIN_COLUMNS * BOARD_CELL_REM + (BOARD_MIN_COLUMNS - 1) * BOARD_GAP_REM + 2 * BOARD_PAD_X_REM;
-  const rem = board + HOME_RAIL_DIVIDER_REM;
+export function computeMinDashboardRailWidth(remPx: number, scrollbarGutterPx: number): number {
+  const dashboard = DASHBOARD_MIN_COLUMNS * DASHBOARD_CELL_REM + (DASHBOARD_MIN_COLUMNS - 1) * DASHBOARD_GAP_REM + 2 * DASHBOARD_PAD_X_REM;
+  const rem = dashboard + DIVIDER_BAND_REM;
   return Math.ceil(rem * remPx + scrollbarGutterPx);
 }
 
@@ -190,9 +207,9 @@ function publishedScrollbarGutterPx(): number {
   return parseFloat(value) || 0;
 }
 
-/** Floor for the Home board's rail, at the CURRENT root font size. */
-export function minHomeRailPx(): number {
-  return computeMinHomeRailWidth(getRemPx(), publishedScrollbarGutterPx());
+/** Floor for the dashboard's rail, at the CURRENT root font size. */
+export function minDashboardRailPx(): number {
+  return computeMinDashboardRailWidth(getRemPx(), publishedScrollbarGutterPx());
 }
 
 /** The two split-pane floors, measured together and handed to the pure clamp
@@ -206,4 +223,16 @@ export interface SplitBounds {
 
 export function splitBounds(): SplitBounds {
   return { minThreadPx: minThreadPanePx(), minContentPx: minContentPanePx() };
+}
+
+/** All four floors, for the *drawn layout* (`computeDrawnLayout` in
+ *  components/layout/splitHelpers.ts): the window holds the drawer, the split
+ *  and the rail side by side, and each is weighed against the others. */
+export interface PaneFloors extends SplitBounds {
+  drawerPx: number;
+  railPx: number;
+}
+
+export function paneFloors(): PaneFloors {
+  return { ...splitBounds(), drawerPx: minDrawerWidth(), railPx: minDashboardRailPx() };
 }

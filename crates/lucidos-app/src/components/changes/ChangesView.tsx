@@ -1,6 +1,6 @@
 import { useRef, useCallback, useEffect } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
-import { changes, appliedChanges, setAsideChanges, changeIsReady, threadMap, threadUnsettled, changesHasMore, changesLoadingMore, busyChangeIds, applyAllInProgress, applyAllBatch, applyPhases, landingLane, lanePlace, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading, type LanePlace } from '../../store/store';
+import { changes, appliedChanges, setAsideChanges, changeIsReady, threadMap, threadUnsettled, changesHasMore, changesLoadingMore, busyChangeIds, inFlightChangeIds, applyAllInProgress, applyAllBatch, applyPhases, landingLane, lanePlace, showConfirm, standingApplyThreadIds, collapsedChangesSectionIds, toggleChangesSectionCollapsed, type ApplyAllBatch, type ApplyPhase, type ApplyPhaseReading, type LanePlace } from '../../store/store';
 import { applyPhaseOf, isBatchMember } from '../../store/actions/applyProgress';
 import { LANE_PLACE_LABEL, LANE_THREAD_TIP } from '../../store/actions/landingLane';
 import { removeFromLandingLane } from '../../store/actions/laneControls';
@@ -399,16 +399,20 @@ export const SETTLE_ALL_TIP =
 export const SETTLE_ALL_ARMED_TIP =
   'Armed. Each change here applies the moment its thread finishes. Click to cancel. Anything already applying keeps going.';
 
-/** How the pending list splits into its two sections, and what each section's
- *  bulk row offers. Pure, so the answer is testable without a render.
+/** How the pending list splits into its three sections, and what each
+ *  section's bulk row offers. Pure, so the answer is testable without a render.
  *
- *  **Ready** holds the *apply-ready* changes: a finished thread, and nothing
- *  to harden. Its row offers Discard All and Apply All. **Not finished** holds
+ *  **Applying** holds the changes an apply has started or the landing lane
+ *  holds, ready or not. It offers no bulk row: its changes are already on
+ *  their way (ADR 0463). **Ready** holds the *apply-ready* changes left: a
+ *  finished thread, and nothing to harden. Its row offers Discard All and
+ *  Apply All. **Not finished** holds
  *  the rest: a thread settling or parked on a question, or an older change
  *  that still needs hardening. Its row
  *  offers only "Apply all on settle", a TOGGLE over the settling changes it
  *  lists (ADR 0168). Discard never reaches it. */
 export interface PendingSections {
+  applying: Change[];
   ready: Change[];
   notFinished: Change[];
   /** At least one Ready change the server would apply right now. */
@@ -427,12 +431,16 @@ export function pendingSections(
   pending: Change[],
   armedThreadIds: ReadonlySet<string>,
   applyAllRunning = false,
+  inFlightIds: ReadonlySet<string> = new Set(),
 ): PendingSections {
-  const ready = pending.filter(changeIsReady);
-  const notFinished = pending.filter((c) => !changeIsReady(c));
+  const applying = pending.filter((c) => inFlightIds.has(c.id));
+  const waiting = pending.filter((c) => !inFlightIds.has(c.id));
+  const ready = waiting.filter(changeIsReady);
+  const notFinished = waiting.filter((c) => !changeIsReady(c));
   const canApplyNow = ready.some((c) => !applyBlockedReason(c));
   const armable = notFinished.filter((c) => c.thread_settling && !c.resolving_conflict && c.thread_id);
   return {
+    applying,
     ready,
     notFinished,
     canApplyNow,
@@ -475,6 +483,7 @@ export function ChangesView() {
   const hasMore = changesHasMore.value;
   const loadingMore = changesLoadingMore.value;
   const showLoadingMore = useDelayedFlag(loadingMore);
+  const applyingCollapsed = collapsedChangesSectionIds.value.has('applying');
   const readyCollapsed = collapsedChangesSectionIds.value.has('ready');
   const notFinishedCollapsed = collapsedChangesSectionIds.value.has('not-finished');
   const setAsideCollapsed = collapsedChangesSectionIds.value.has('set-aside');
@@ -515,11 +524,12 @@ export function ChangesView() {
     setAsideLoadable.status === 'loaded';
   const armedThreadIds = standingApplyThreadIds.value;
   const sections = pendingLoadable.status === 'loaded'
-    ? pendingSections(pendingLoadable.data, armedThreadIds, applyAllInProgress.value)
+    ? pendingSections(pendingLoadable.data, armedThreadIds, applyAllInProgress.value, inFlightChangeIds.value)
     : null;
   const ids = (list: Change[] | undefined) => (allLoaded && list ? list.map(c => c.id) : null);
   // A change that turns ready arrives in Ready. A change that drops back to
   // Not finished was already here, so Not finished lights only a new change.
+  const applyingArrived = useArrivals(ids(sections?.applying));
   const readyArrived = useArrivals(ids(sections?.ready));
   const pendingArrived = useArrivals(ids(pendingLoadable.status === 'loaded' ? pendingLoadable.data : undefined));
   const setAsideArrived = useArrivals(ids(setAsideLoadable.status === 'loaded' ? setAsideLoadable.data : undefined));
@@ -583,6 +593,19 @@ export function ChangesView() {
           ) : (
             <>
           {/* Each section rolls in with its first row and out with its last. */}
+          <Disclosure open={sections.applying.length > 0}>
+            <SectionHeader
+              title="Applying"
+              count={sections.applying.length}
+              collapsed={applyingCollapsed}
+              onToggle={() => toggleChangesSectionCollapsed('applying')}
+            />
+            <Disclosure open={!applyingCollapsed}>
+              <ArrivalList items={sections.applying} keyOf={(c) => c.id} arrived={applyingArrived}>
+                {renderRow}
+              </ArrivalList>
+            </Disclosure>
+          </Disclosure>
           <Disclosure open={sections.ready.length > 0}>
             <SectionHeader
               title="Ready"

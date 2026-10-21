@@ -1,8 +1,8 @@
 import { test, expect } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
-  sendMessage, waitForCCToStart, waitForActionPanel, dismissCCSession,
-  waitForActiveSession, waitAndClick, waitForVisibleElement, pickModelPair,
+  sendMessageCapturingThreadId, waitForCCToStart, waitForActionPanel, dismissCCSession,
+  waitForActiveSession, openRungList, readRungRows, pickRung, currentRungValue,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -11,8 +11,9 @@ import { clearAllThreads } from './db-helpers';
  * ClaudeCodeSession.current_model was not set from cc_model. The commands API
  * returned stale/null current_model until the CC process Init event arrived.
  *
- * This test selects "Haiku" via the CC menu before starting a session and
- * verifies the commands API and UI reflect it after session start.
+ * This test picks a ladder rung from the prompt bar's rung control before
+ * starting a session. It checks the commands API and the control reflect the
+ * rung's model and effort after session start.
  */
 
 test.describe('CC model pre-session selection', () => {
@@ -26,40 +27,29 @@ test.describe('CC model pre-session selection', () => {
     await newThread(page);
     await pickComposeDestination(page);
 
-    await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
-    await waitAndClick(page, '.control-item', 'Model');
-    // Haiku offers no tiers, so picking the model commits it.
-    await pickModelPair(page, 'haiku');
+    // The first rung that is not the checked row. A tap commits its model and
+    // its effort together.
+    await openRungList(page);
+    const picked = (await readRungRows(page)).find((r) => !r.current);
+    expect(picked).toBeTruthy();
+    await pickRung(page, picked!.value);
 
-    let sentThreadId: string | null = null;
-    page.on('request', (req) => {
-      if (req.url().includes('/api/v1/chat/stream') && req.method() === 'POST') {
-        try {
-          const body = req.postDataJSON();
-          sentThreadId = body?.thread_id ?? null;
-        } catch { /* ignore */ }
-      }
-    });
-
-    await sendMessage(page, 'Say exactly: "model-preselect-ok". Do not create any files.');
+    const sentThreadId = await sendMessageCapturingThreadId(
+      page, 'Say exactly: "model-preselect-ok". Do not create any files.',
+    );
 
     await waitForCCToStart(page, 60_000);
-    expect(sentThreadId).toBeTruthy();
 
     // === Core bug assertion ===
-    const cmdData = await waitForActiveSession(page, sentThreadId!);
-    expect(cmdData.current_model).toBe('haiku');
+    const cmdData = await waitForActiveSession(page, sentThreadId);
+    expect(cmdData.current_model).toBe(picked!.model);
+    expect(cmdData.current_reasoning_effort).toBe(picked!.effort);
 
     await waitForActionPanel(page, 'Archive', 120_000);
 
-    await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
-    await waitAndClick(page, '.control-item', 'Model');
-    await waitForVisibleElement(page, '.control-option');
-
-    // Haiku is the checked model. A step-1 row carries the model id alone.
-    const currentOption = page.locator('.control-option-current:visible').first();
-    await expect(currentOption).toBeVisible({ timeout: 5_000 });
-    expect(await currentOption.getAttribute('data-value')).toBe('haiku');
+    // The rung is the checked row once the session runs on it.
+    await openRungList(page);
+    expect(await currentRungValue(page)).toBe(picked!.value);
 
     // Cleanup
     await page.keyboard.press('Escape');

@@ -44,7 +44,7 @@ fn question_tools_are_suppressed_other_tools_are_not() {
 /// subprocess-termination decision, not here.
 #[test]
 fn generated_result_always_emits_idle() {
-    let (terminal, emit_idle) = classify_result(false, false, false, None, false);
+    let (terminal, emit_idle) = classify_result(false, None, false, None, false);
     assert_eq!(terminal, TerminalKind::Generated);
     assert!(
         emit_idle,
@@ -60,7 +60,7 @@ fn generated_result_always_emits_idle() {
 #[test]
 fn cc_error_classifies_as_failed() {
     let err = "Stream interrupted: connection reset".to_string();
-    let (terminal, emit_idle) = classify_result(false, false, false, Some(err.clone()), false);
+    let (terminal, emit_idle) = classify_result(false, None, false, Some(err.clone()), false);
     assert_eq!(terminal, TerminalKind::Failed { error: err });
     assert!(
         emit_idle,
@@ -75,7 +75,7 @@ fn cc_error_classifies_as_failed() {
 #[test]
 fn shutdown_wins_over_cc_error() {
     let (terminal, emit_idle) =
-        classify_result(false, false, true, Some("api timeout".to_string()), false);
+        classify_result(false, None, true, Some("api timeout".to_string()), false);
     assert_eq!(
         terminal,
         TerminalKind::Aborted(crate::engine::thread_events::AbortCause::EngineShutdown)
@@ -100,7 +100,7 @@ fn shutdown_wins_over_cc_error() {
 fn user_hit_stop_wins_over_cc_error() {
     use crate::engine::thread_events::CancelCause;
     let err = "[ede_diagnostic] result_type=user stop_reason=tool_use".to_string();
-    let (terminal, emit_idle) = classify_result(true, false, false, Some(err), false);
+    let (terminal, emit_idle) = classify_result(true, None, false, Some(err), false);
     assert_eq!(
         terminal,
         TerminalKind::Canceled(CancelCause::UserStop),
@@ -122,7 +122,7 @@ fn user_hit_stop_wins_over_cc_error() {
 /// worktree state for Apply.
 #[test]
 fn empty_text_classifies_as_failed_with_empty_response_error() {
-    let (terminal, emit_idle) = classify_result(false, false, false, None, true);
+    let (terminal, emit_idle) = classify_result(false, None, false, None, true);
     assert_eq!(
         terminal,
         TerminalKind::Failed {
@@ -144,7 +144,7 @@ fn empty_text_classifies_as_failed_with_empty_response_error() {
 #[test]
 fn cc_error_wins_over_empty_text() {
     let err = "rate_limit_error".to_string();
-    let (terminal, _) = classify_result(false, false, false, Some(err.clone()), true);
+    let (terminal, _) = classify_result(false, None, false, Some(err.clone()), true);
     assert_eq!(terminal, TerminalKind::Failed { error: err });
 }
 
@@ -155,20 +155,42 @@ fn cc_error_wins_over_empty_text() {
 #[test]
 fn user_hit_stop_wins_over_empty_text() {
     use crate::engine::thread_events::CancelCause;
-    let (terminal, _) = classify_result(true, false, false, None, true);
+    let (terminal, _) = classify_result(true, None, false, None, true);
     assert_eq!(terminal, TerminalKind::Canceled(CancelCause::UserStop));
 }
 
-/// A Codex mid-turn follow-up redirect (interrupt_is_redirect=true) classifies
+/// A Codex mid-turn follow-up redirect (`redirect_cause` set) classifies
 /// the interrupted turn as `Canceled(SupersededByFollowup)`, NOT `UserStop`,
 /// so the frontend renders it neutrally (like the chat/CC follow-up) instead of
 /// "Canceled ✕". Still a cancel mechanically (no Generated, no proposal); only
 /// the cause differs. The redirect flag is meaningful only when user_hit_stop
 /// is set (an interrupt fired); it never overrides shutdown/error precedence.
+/// An effort restart is a redirect too, and keeps its own cause, so the
+/// popover explains the pick rather than a follow-up nobody sent.
+#[test]
+fn an_effort_restart_interrupt_classifies_with_its_own_cause() {
+    use crate::engine::thread_events::CancelCause;
+    let (terminal, emit_idle) =
+        classify_result(true, Some(CancelCause::EffortRestart), false, None, false);
+    assert_eq!(terminal, TerminalKind::Canceled(CancelCause::EffortRestart));
+    assert!(emit_idle);
+    assert_eq!(
+        TurnCancel::of(&Some(terminal)),
+        TurnCancel::Redirected,
+        "the work continues on the branch, so nothing is proposed or withheld"
+    );
+}
+
 #[test]
 fn redirect_followup_classifies_as_superseded_by_followup() {
     use crate::engine::thread_events::CancelCause;
-    let (terminal, emit_idle) = classify_result(true, true, false, None, false);
+    let (terminal, emit_idle) = classify_result(
+        true,
+        Some(CancelCause::SupersededByFollowup),
+        false,
+        None,
+        false,
+    );
     assert_eq!(
         terminal,
         TerminalKind::Canceled(CancelCause::SupersededByFollowup),
@@ -182,7 +204,7 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
     // redirect cancel (user_hit_stop ranks above cc_error).
     let (with_err, _) = classify_result(
         true,
-        true,
+        Some(CancelCause::SupersededByFollowup),
         false,
         Some("[ede_diagnostic] result_type=user stop_reason=tool_use".to_string()),
         true,
@@ -192,10 +214,22 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
         TerminalKind::Canceled(CancelCause::SupersededByFollowup),
     );
     // redirect flag without user_hit_stop is inert: a clean Result is Generated.
-    let (clean, _) = classify_result(false, true, false, None, false);
+    let (clean, _) = classify_result(
+        false,
+        Some(CancelCause::SupersededByFollowup),
+        false,
+        None,
+        false,
+    );
     assert_eq!(clean, TerminalKind::Generated);
     // Shutdown still wins over a redirect interrupt.
-    let (shutdown, _) = classify_result(true, true, true, None, false);
+    let (shutdown, _) = classify_result(
+        true,
+        Some(CancelCause::SupersededByFollowup),
+        true,
+        None,
+        false,
+    );
     assert_eq!(
         shutdown,
         TerminalKind::Aborted(crate::engine::thread_events::AbortCause::EngineShutdown),
@@ -209,7 +243,7 @@ fn redirect_followup_classifies_as_superseded_by_followup() {
 #[test]
 fn shutdown_wins_over_empty_text() {
     use crate::engine::thread_events::AbortCause;
-    let (terminal, emit_idle) = classify_result(false, false, true, None, true);
+    let (terminal, emit_idle) = classify_result(false, None, true, None, true);
     assert_eq!(terminal, TerminalKind::Aborted(AbortCause::EngineShutdown));
     assert!(
         !emit_idle,
@@ -225,7 +259,7 @@ fn shutdown_wins_over_empty_text() {
 /// would render as a green "completed" turn AND propose the partial work.
 #[test]
 fn empty_text_failed_does_not_propose() {
-    let (terminal, _) = classify_result(false, false, false, None, true);
+    let (terminal, _) = classify_result(false, None, false, None, true);
     let write = idle_change_write(IdleSession::default(), &Some(terminal));
     assert_eq!(
         write,
@@ -475,7 +509,7 @@ fn oom_killed_turn_still_fails_rather_than_being_skipped() {
     };
     assert!(!is_resume_settle_result(oom_shaped, true));
     assert_eq!(
-        classify_result(false, false, false, None, true),
+        classify_result(false, None, false, None, true),
         (
             TerminalKind::Failed {
                 error: EMPTY_RESPONSE_ERROR.to_string()
@@ -550,7 +584,7 @@ fn classify_result_table() {
     for ((stop, shutdown), expected) in cases {
         assert_eq!(
             // redirect=false: this table pins the non-redirect cause matrix.
-            classify_result(stop, false, shutdown, None, false),
+            classify_result(stop, None, shutdown, None, false),
             expected,
             "(user_hit_stop={}, is_shutdown={})",
             stop,
@@ -713,7 +747,7 @@ fn should_auto_commit_on_cleanup_table() {
 #[test]
 fn only_a_shutdown_result_leaves_the_worktree_uncommitted() {
     use crate::engine::thread_events::CancelCause;
-    let shutdown = |is_shutdown| classify_result(false, false, is_shutdown, None, false).0;
+    let shutdown = |is_shutdown| classify_result(false, None, is_shutdown, None, false).0;
     assert!(!result_auto_commits(&shutdown(true)));
     assert!(result_auto_commits(&shutdown(false)));
     assert!(result_auto_commits(&TerminalKind::Canceled(
@@ -1114,7 +1148,7 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
     let mut user_hit_stop = true;
     let (first, _) = classify_result(
         user_hit_stop,
-        false,
+        None,
         false,
         Some("[ede_diagnostic] result_type=user stop_reason=tool_use".to_string()),
         true,
@@ -1138,7 +1172,7 @@ fn inflight_followup_completion_after_cancel_is_generated_not_double_cancel() {
 
     // 3) The drained follow-ups complete successfully with full text. With the
     //    latch cleared this is a clean completion, NOT a second cancel.
-    let (second, _) = classify_result(user_hit_stop, false, false, None, false);
+    let (second, _) = classify_result(user_hit_stop, None, false, None, false);
     assert_eq!(
         second,
         TerminalKind::Generated,

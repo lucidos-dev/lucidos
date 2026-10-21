@@ -49,7 +49,7 @@ provideScrollState(scrollState);
 
 /** The pongs this page sent, as `[notification_id, answer]` pairs. */
 const submitPong = vi.fn();
-setEventStream({ submitPong, close: () => {}, ownsReconnect: false });
+setEventStream({ submitPong, close: () => {}, ownsReconnect: false, revalidate: () => 'live' });
 
 const DEADLINE_MS = 2000;
 
@@ -191,7 +191,7 @@ describe('PresenceCheck (active page) → in-app toast', () => {
   it('a tap on a navigate (thread + event) notification deep-links to the source event', () => {
     // The tap must route through the SAME navigate dispatch the inbox detail
     // and push taps use: focusThreadOrBootstrap(threadId, { targetEventId }).
-    // The scroll-and-pulse itself is covered by e2e/notifications.spec.ts.
+    // The scroll-and-pulse itself is covered by e2e/notifications-all.spec.ts.
     emitToast({
       notification_id: 'notif-q',
       title: 'Claude is asking',

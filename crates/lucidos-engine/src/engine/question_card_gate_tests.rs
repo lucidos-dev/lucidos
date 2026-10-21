@@ -30,6 +30,7 @@ fn message() -> LastInput {
 fn card_refusal() -> String {
     Refusal::OwesWords {
         input: LastInput::None,
+        words: String::new(),
     }
     .text()
 }
@@ -368,6 +369,7 @@ fn a_long_reply_is_quoted_cut_and_on_one_line() {
     let long = format!("first line\n\n{}", "word ".repeat(100));
     let text = Refusal::OwesWords {
         input: LastInput::Typed(long.clone()),
+        words: String::new(),
     }
     .text();
     let quoted = quote(&long);
@@ -389,7 +391,13 @@ fn a_long_reply_is_quoted_cut_and_on_one_line() {
 
 #[test]
 fn owing_words_quotes_the_input_it_means() {
-    let owes = |input: LastInput| Refusal::OwesWords { input }.text();
+    let owes = |input: LastInput| {
+        Refusal::OwesWords {
+            input,
+            words: String::new(),
+        }
+        .text()
+    };
 
     let after_typed = owes(typed());
     assert!(after_typed.starts_with(REFUSAL_MARKER));
@@ -398,7 +406,7 @@ fn owing_words_quotes_the_input_it_means() {
     )));
     assert!(!after_typed.contains("reply they typed"));
     assert!(after_typed.contains(NOTHING_NEW));
-    assert!(after_typed.contains(OWES_WORDS));
+    assert!(after_typed.contains("they have read nothing from you"));
 
     let after_message = owes(message());
     assert!(after_message.contains("this message: \"what is in the next release?\""));
@@ -411,7 +419,8 @@ fn owing_words_quotes_the_input_it_means() {
         LastInput::Message(" ".to_string()),
     ] {
         let text = owes(input);
-        assert_eq!(text, format!("{REFUSAL_MARKER} {OWES_WORDS}"));
+        assert_eq!(text, card_refusal());
+        assert!(text.starts_with(&format!("{REFUSAL_MARKER} Since the user's last input,")));
         assert!(!text.contains(NOTHING_NEW));
     }
     assert!(!after_typed.contains('\u{2014}'));
@@ -425,7 +434,10 @@ fn a_refusal_carries_the_input_it_was_decided_on() {
     };
     assert_eq!(
         should_refuse(&s, ""),
-        Some(Refusal::OwesWords { input: typed() })
+        Some(Refusal::OwesWords {
+            input: typed(),
+            words: String::new()
+        })
     );
     let s = SinceLastInput {
         unreported_tool_calls: 1,
@@ -433,7 +445,10 @@ fn a_refusal_carries_the_input_it_was_decided_on() {
     };
     assert_eq!(
         should_refuse(&s, ""),
-        Some(Refusal::OwesWords { input: message() })
+        Some(Refusal::OwesWords {
+            input: message(),
+            words: String::new()
+        })
     );
 }
 
@@ -474,7 +489,8 @@ fn a_card_after_a_saved_picture_nobody_saw_is_refused() {
     assert_eq!(
         should_refuse(&saved_mockup(INCIDENT_SUMMARY), &card),
         Some(Refusal::ArtifactNotShown {
-            paths: vec![MOCKUP.to_string()]
+            paths: vec![MOCKUP.to_string()],
+            words: INCIDENT_SUMMARY.to_string()
         })
     );
 }
@@ -564,7 +580,8 @@ fn a_retry_that_drops_a_picture_is_refused_after_another_refusal() {
     assert_eq!(
         should_refuse(&s, &card_text(&incident_approval_card(None))),
         Some(Refusal::ArtifactNotShown {
-            paths: vec![MOCKUP.to_string()]
+            paths: vec![MOCKUP.to_string()],
+            words: INCIDENT_SUMMARY.to_string()
         })
     );
     let preview = format!("![Mockup]({MOCKUP})");
@@ -590,12 +607,10 @@ fn a_missing_picture_comes_before_owing_words() {
             ..saved_mockup("")
         },
     ] {
-        assert_eq!(
+        assert!(matches!(
             should_refuse(&s, ""),
-            Some(Refusal::ArtifactNotShown {
-                paths: vec![MOCKUP.to_string()]
-            })
-        );
+            Some(Refusal::ArtifactNotShown { .. })
+        ));
     }
 }
 
@@ -611,11 +626,12 @@ fn a_missing_picture_comes_before_pointing_above() {
 fn the_artifact_refusal_names_the_path_and_the_card() {
     let text = Refusal::ArtifactNotShown {
         paths: vec![MOCKUP.to_string(), "artifacts/b.png".to_string()],
+        words: String::new(),
     }
     .text();
     assert!(text.starts_with(REFUSAL_MARKER));
     assert!(text.contains(&format!("`{MOCKUP}`, `artifacts/b.png`")));
-    assert!(text.contains("short summary"));
+    assert!(text.contains("they have read nothing from you"));
     assert!(text.contains("ON the card"));
     // Claude Code's tool has `preview`, the chat agent's has a description,
     // and Codex's has neither, so it falls back to the question.
@@ -702,7 +718,8 @@ fn a_card_after_a_saved_page_nobody_linked_is_refused() {
             &card_text(&glossary_card("", None))
         ),
         Some(Refusal::ArtifactNotShown {
-            paths: vec![EXPLAINER.to_string()]
+            paths: vec![EXPLAINER.to_string()],
+            words: EXPLAINER_SUMMARY.to_string()
         })
     );
 }
@@ -884,7 +901,8 @@ fn a_reporting_card_still_needs_the_picture() {
     assert_eq!(
         decide(saved_mockup(INCIDENT_SUMMARY), &card),
         Some(Refusal::ArtifactNotShown {
-            paths: vec![MOCKUP.to_string()]
+            paths: vec![MOCKUP.to_string()],
+            words: INCIDENT_SUMMARY.to_string()
         })
     );
 }
@@ -972,7 +990,8 @@ async fn the_query_reads_what_each_agent_writes() {
     assert_eq!(
         refuse_card(&pool, t, "toolu_next", &json!([]), None, None).await,
         Some(Refusal::OwesWords {
-            input: LastInput::Typed("is there a difference?".to_string())
+            input: LastInput::Typed("is there a difference?".to_string()),
+            words: String::new()
         }),
         "blank text reports no work, and the refusal quotes the typed text"
     );
@@ -1011,7 +1030,8 @@ async fn the_query_reads_what_each_agent_writes() {
     assert_eq!(
         refuse_card(&pool, c, "toolu_chat", &json!([]), None, None).await,
         Some(Refusal::OwesWords {
-            input: LastInput::Message("what is in .3".to_string())
+            input: LastInput::Message("what is in .3".to_string()),
+            words: String::new()
         }),
         "the refusal names the message"
     );
@@ -1255,7 +1275,8 @@ async fn the_query_finds_the_artifacts_this_thread_saved_since_the_input() {
     assert_eq!(
         refusal,
         Some(Refusal::ArtifactNotShown {
-            paths: vec![MOCKUP.to_string()]
+            paths: vec![MOCKUP.to_string()],
+            words: format!("I'll save it so you can see it.{INCIDENT_SUMMARY}")
         }),
         "only this thread's artifact since the input counts"
     );
@@ -1326,11 +1347,11 @@ async fn a_rendered_mockup_after_a_typed_reply_gets_the_picture_refusal() {
         None,
     )
     .await;
-    assert_eq!(
-        refusal,
-        Some(Refusal::ArtifactNotShown {
-            paths: vec![MOCKUP.to_string()]
-        }),
+    assert!(
+        matches!(
+            &refusal,
+            Some(Refusal::ArtifactNotShown { paths, .. }) if *paths == [MOCKUP]
+        ),
         "the only refusal this input gets must ask for the picture"
     );
 
@@ -1400,12 +1421,10 @@ async fn the_query_refuses_a_retry_that_drops_the_picture_once() {
         None,
     )
     .await;
-    assert_eq!(
-        refusal,
-        Some(Refusal::ArtifactNotShown {
-            paths: vec![MOCKUP.to_string()]
-        })
-    );
+    assert!(matches!(
+        &refusal,
+        Some(Refusal::ArtifactNotShown { paths, .. }) if *paths == [MOCKUP]
+    ));
 
     insert(
         &pool,
@@ -1508,12 +1527,16 @@ fn a_card_message_still_has_to_show_a_saved_picture() {
 #[test]
 fn every_refusal_names_the_message_field() {
     let refusals = [
-        Refusal::OwesWords { input: typed() },
+        Refusal::OwesWords {
+            input: typed(),
+            words: INCIDENT_NOTE.to_string(),
+        },
         Refusal::PointsAboveAtNothing {
             words: INCIDENT_NOTE.to_string(),
         },
         Refusal::ArtifactNotShown {
             paths: vec![MOCKUP.to_string()],
+            words: INCIDENT_NOTE.to_string(),
         },
     ];
     for refusal in refusals {
@@ -1521,6 +1544,103 @@ fn every_refusal_names_the_message_field() {
         assert!(text.contains(CARD_MESSAGE_HINT), "{text}");
         assert!(!text.contains('\u{2014}'));
     }
+}
+
+/// Every refusal built over `words`, one per reason.
+fn refusals_over(words: &str) -> Vec<Refusal> {
+    vec![
+        Refusal::OwesWords {
+            input: typed(),
+            words: words.to_string(),
+        },
+        Refusal::PointsAboveAtNothing {
+            words: words.to_string(),
+        },
+        Refusal::ArtifactNotShown {
+            paths: vec![MOCKUP.to_string()],
+            words: words.to_string(),
+        },
+    ]
+}
+
+/// The incident: the agent trusted its own context over the user's screen.
+#[test]
+fn every_refusal_quotes_what_the_user_read() {
+    for refusal in refusals_over(INCIDENT_NOTE) {
+        let text = refusal.text();
+        assert!(
+            text.contains(&format!(
+                "all they have read from you is this: \"{INCIDENT_NOTE}\""
+            )),
+            "{text}"
+        );
+        assert!(text.contains("the words quoted above") || text.contains("not meant for them"));
+    }
+}
+
+#[test]
+fn every_refusal_says_when_the_user_read_nothing() {
+    for words in ["", " \n"] {
+        for refusal in refusals_over(words) {
+            let text = refusal.text();
+            assert!(text.contains("they have read nothing from you"), "{text}");
+            assert!(!text.contains("the words quoted above"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn no_refusal_asks_about_the_users_screen() {
+    for words in ["", INCIDENT_NOTE] {
+        for refusal in refusals_over(words) {
+            assert!(!refusal.text().contains("on their screen"));
+        }
+    }
+    let note = Refusal::NoteShownAsSummary {
+        note: SUMMARY_NOTE.to_string(),
+    };
+    assert!(!note.text().contains("on their screen"));
+}
+
+#[test]
+fn a_refusal_cuts_a_long_quote() {
+    let words = "word ".repeat(QUOTED_READ_CHARS);
+    let text = Refusal::OwesWords {
+        input: LastInput::None,
+        words: words.clone(),
+    }
+    .text();
+    assert!(text.contains("It begins: \""), "{text}");
+    assert!(!text.contains("all they have read"), "{text}");
+    assert!(text.contains("word ...\""), "{text}");
+    assert!(text.len() < words.len());
+}
+
+#[test]
+fn the_decision_hands_the_refusal_what_the_user_read() {
+    let s = SinceLastInput {
+        words: "  Let me check the log.\n".to_string(),
+        unreported_tool_calls: 1,
+        ..since(message())
+    };
+    assert_eq!(
+        should_refuse(&s, ""),
+        Some(Refusal::OwesWords {
+            input: message(),
+            words: "Let me check the log.".to_string()
+        })
+    );
+    let s = SinceLastInput {
+        words: "Done.".to_string(),
+        ..saved_mockup("Done.")
+    };
+    assert_eq!(
+        should_refuse(&s, ""),
+        Some(Refusal::ArtifactNotShown {
+            paths: vec![MOCKUP.to_string()],
+            words: "Done.".to_string()
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1625,7 +1745,8 @@ fn an_unseen_artifact_outranks_a_progress_note() {
     assert_eq!(
         should_refuse(&s, &card_text(&cancellation_card())),
         Some(Refusal::ArtifactNotShown {
-            paths: vec!["artifacts/steps.png".to_string()]
+            paths: vec!["artifacts/steps.png".to_string()],
+            words: SUMMARY_NOTE.to_string()
         })
     );
 }

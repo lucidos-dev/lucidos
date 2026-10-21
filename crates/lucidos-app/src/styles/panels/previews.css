@@ -8,9 +8,12 @@
     position: relative;
 }
 
+/* Never wider than its pane, whatever the app inside lays out (ADR 0530). */
 .app-ui-iframe {
     flex: 1;
     width: 100%;
+    max-width: 100%;
+    min-width: 0;
     border: none;
     background: var(--bg-primary);
 }

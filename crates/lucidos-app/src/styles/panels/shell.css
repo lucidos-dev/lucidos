@@ -345,7 +345,7 @@
 /* --- Pane headers --- */
 
 /* The header row's inline padding. On :root because things outside the row
-   line up with it: the Home rail's toggle, and rows that put their actions in
+   line up with it: the dashboard rail's toggle, and rows that put their actions in
    the same slot as the header's icons. */
 :root {
     --header-padding-x: 0.625rem;
@@ -783,8 +783,8 @@
         --ddo: 0px; /* drawer-divider offset: 0 when closed */
         --divider-x: calc(var(--co) + var(--ddo) + var(--sr) * (100% - var(--co) - var(--ddo)));
         /* The same x for a `position: fixed` reader. Its 100% is the window,
-           so it still holds the Home rail's room, which the shell gave up. */
-        --divider-x-in-window: calc(var(--divider-x) - var(--sr) * var(--home-rail-room));
+           so it still holds the dashboard rail's room, which the shell gave up. */
+        --divider-x-in-window: calc(var(--divider-x) - var(--sr) * var(--dashboard-rail-room));
         /* `.icon-btn.header-icon`'s box (global/host-components.css), which four
            rules below reserve room for or measure against. It was written out
            as a `2.25rem` literal at each of them with a note that there was no
@@ -1025,12 +1025,18 @@
         --ddo: var(--divider-width); /* account for drawer divider element */
     }
 
-    /* The Home rail's toggle, docked at the Canvas row's trailing end while
-       the rail is hidden (.home-rail-toggle-slot), widens that end by its box
+    /* The dashboard rail's toggle, docked at the Canvas row's trailing end while
+       the rail is hidden (.dashboard-rail-toggle-slot), widens that end by its box
        and a gap. Both content reserves grow by exactly that. */
-    :root[data-home-rail-toggle]:not([data-home-rail]) {
+    :root[data-dashboard-rail-toggle]:not([data-dashboard-rail]) {
         --content-side-reserve: calc(4 * var(--header-icon-box) + 5 * 0.25rem);
         --content-unfolded-reserve: calc(8 * var(--header-icon-box) + 9 * 0.25rem);
+    }
+
+    /* With the Canvas hidden, the toggle docks at the Conversation row's
+       trailing end instead, and widens that end by the same box and gap. */
+    :root[data-dashboard-rail-toggle][data-content-collapsed]:not([data-dashboard-rail]) {
+        --brand-trail-end: calc(var(--header-padding-x) + 3 * var(--header-icon-box) + 2 * 0.25rem);
     }
 
     /* The header's fill, painted as ONE box. At --titlebar-strip-continues 0
@@ -1063,15 +1069,19 @@
 
     /* Divider between chat and panel header areas, centered on the split bar.
        Same width as the pane .split-divider below it, so the two read as one
-       continuous divider. Painted with --header-divider, which is transparent
-       unless a theme turns it on.
+       continuous divider. Painted with --header-divider, which defaults to the
+       pane divider's --border-color.
 
        Both dividers rise through the reclaimed macOS title-bar band, like
        .header-focus-wash, so they run to the window's top edge. Off the macOS
-       Tauri build --titlebar-inset is unset and the rise is 0px. */
+       Tauri build --titlebar-inset is unset and the rise is 0px.
+
+       z-index 1 lifts both above .header-focus-wash, whose tint reaches under
+       them, so the focus tint never shades a divider's header segment. */
     .app-header::after {
         content: '';
         position: absolute;
+        z-index: 1;
         left: var(--divider-x);
         top: calc(-1 * var(--titlebar-inset, 0px));
         bottom: 0;
@@ -1086,6 +1096,7 @@
     .app-header::before {
         content: '';
         position: absolute;
+        z-index: 1;
         left: var(--co);
         top: calc(-1 * var(--titlebar-inset, 0px));
         bottom: 0;
@@ -1154,11 +1165,20 @@
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
     }
 
-    /* Room for the Home rail's toggle, docked past the bell while the rail is
+    /* Room for the dashboard rail's toggle, docked past the bell while the rail is
        hidden. Padding rather than a moved `right`, so the title stays centred
        on the pane. */
-    :root[data-home-rail-toggle]:not([data-home-rail]) .app-header .content-header-elements {
+    :root[data-dashboard-rail-toggle]:not([data-dashboard-rail]) .app-header .content-header-elements {
         padding-right: calc(var(--header-icon-box) + var(--pane-header-gap));
+    }
+
+    /* The same slot in the Conversation row while the Canvas is hidden.
+       That row runs to the header's edge, where the Canvas row stops
+       --header-padding-x short, so it keeps that padding too.
+       `useHeaderActionCollapse` reads this padding and folds the actions
+       short of it. */
+    :root[data-dashboard-rail-toggle][data-content-collapsed]:not([data-dashboard-rail]) .app-header .pane-header-brand {
+        padding-right: calc(var(--header-padding-x) + var(--header-icon-box) + var(--pane-header-gap));
     }
 
     /* Packaged macOS: the row never starts left of the traffic lights, whatever
@@ -1556,7 +1576,7 @@
            enough. */
         padding-left: var(--pane-header-gap);
         transition: left var(--duration-slow) ease, width var(--duration-slow) ease,
-                    padding-left var(--duration-slow) ease,
+                    padding-left var(--duration-slow) ease, padding-right var(--duration-slow) ease,
                     opacity var(--duration-slow) ease, visibility var(--duration-slow);
     }
 
@@ -1649,7 +1669,7 @@
        region's -50% is half its own height, which is -24.75px at 137.5%.
        Inside a fractional translate, Chrome snaps a badge's pill and digit
        apart. On a 1x screen the pill then loses a row and the count sits low.
-       Pinned by e2e/badge-glyph-centring.spec.ts.
+       Pinned by e2e/badge-glyph-centring-all.spec.ts.
        Gated, and after every rule it rounds. An engine without `round()`
        drops a whole transform that carries a `var()`, and the region would
        fall half its height down the bar. */
@@ -1743,10 +1763,10 @@
        cannot, never squeeze below the controls' own width. Its middle arm is
        the structural non-overlap guarantee that `min-width: 0` used to give the
        flex zone, and it is a DERIVED reserve rather than a guessed one (see
-       --content-side-reserve). The min-span arm engages only BELOW this pane's
-       own floor, since twice the reserve plus the min span is inside
-       MIN_CONTENT_PANE_REM (store/paneMinimums.ts). Only an unclamped persisted
-       ratio reaches such a width. There the ends do reach the
+       --content-side-reserve). Twice the reserve plus the min span is inside
+       MIN_CONTENT_PANE_REM (store/paneMinimums.ts), so the min-span arm
+       engages only below this pane's floor, or near it while the dashboard rail's
+       toggle docks and widens the reserve. There the ends do reach the
        clusters, and `useHeaderActionCollapse` is what pulls the actions
        into the ⋯ menu instead.
 
@@ -1818,10 +1838,11 @@
        changes. Focus moving between panes is a CROSSFADE, not a slide: the outgoing
        pane's tint eases out and the incoming pane's eases in, while each box
        stays fixed to its own segment. The tint is painted by ::before so it can
-       spill past the box edges to cover the adjacent header divider(s), giving the
-       focused pane ONE continuous lighter band with no unwashed strip at the divider
-       seams. NO z-index and rendered as the header's first children, so it sits
-       above the header background yet under every control. Driven by
+       spill past the box edges under the adjacent header divider(s). A theme with a
+       transparent divider then gets ONE continuous lighter band, with no unwashed
+       strip at the divider seams. NO z-index and rendered as the header's first
+       children, so it sits above the header background yet under every control and
+       both dividers. Driven by
        data-focused-pane on :root (set by SplitLayout); collapsed panes never show
        theirs (the :not() guards). */
     .header-focus-wash {
@@ -1867,9 +1888,9 @@
     }
 
     /* The tint. It lives on ::before rather than the box background so its edges can
-       extend PAST the box (via negative left/right) to cover the adjacent header
-       divider(s) too — the box itself stops flush at each divider, leaving a thin
-       unwashed seam otherwise. Full box height, no z-index. The per-pane overhangs
+       extend PAST the box (via negative left/right) under the adjacent header
+       divider(s). The box itself stops flush at each divider, so a transparent
+       divider would show a thin unwashed seam. Full box height, no z-index. The per-pane overhangs
        below push each interior edge out by exactly the neighbouring divider's width.
 
        The fade is the TINT'S OWN COLOUR, transparent to --focus-header-tint,
@@ -1942,7 +1963,7 @@
     }
 
     /* While a divider drag is live (data-pane-resizing, set by
-       beginPaneResize in splitHelpers.ts), geometry transitions go off so the
+       beginPaneResize in drawnLayout.ts), geometry transitions go off so the
        header regions and the drawer track the pointer 1:1 with the panes —
        the always-on var(--duration-slow) eases otherwise leave the header
        visibly lagging behind the panels mid-drag. They come back on at
@@ -2165,6 +2186,14 @@
     cursor: default;
 }
 
+/* A side pane's toggle in a window too narrow for its pane reads dimmed, as a
+   disabled `.icon-btn` does, and keeps the pointer for the tooltip saying why
+   (components/layout/drawnLayout.ts). */
+.thread-toggle[aria-disabled="true"],
+.dashboard-rail-toggle[aria-disabled="true"] {
+    opacity: 0.25;
+}
+
 @media (hover: hover) {
     .app-header .icon-btn:hover:where(:not(:disabled, [aria-disabled="true"])) {
         --header-control-veil: var(--header-control-veil-hover);
@@ -2180,20 +2209,20 @@
     }
 }
 
-/* The Home rail's toggle is no child of the bar (it is fixed to the window
-   corner, styles/panels/home-board.css). While the rail is hidden it rests on
+/* The dashboard rail's toggle is no child of the bar (it is fixed to the window
+   corner, styles/panels/dashboard.css). While the rail is hidden it rests on
    the blue bar, so it wears the bar's icon colours. Shown, it sits on the
    rail's own --bg-primary head, where a white glyph would vanish in light mode. */
-:root:not([data-home-rail]) .home-rail-toggle-slot .icon-btn {
+:root:not([data-dashboard-rail]) .dashboard-rail-toggle-slot .icon-btn {
     color: var(--header-fg-muted);
 }
 
-:root:not([data-home-rail]) .home-rail-toggle-slot .icon-btn:focus-visible {
+:root:not([data-dashboard-rail]) .dashboard-rail-toggle-slot .icon-btn:focus-visible {
     --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--header-fg) 55%, transparent);
 }
 
 @media (hover: hover) {
-    :root:not([data-home-rail]) .home-rail-toggle-slot .icon-btn:hover {
+    :root:not([data-dashboard-rail]) .dashboard-rail-toggle-slot .icon-btn:hover {
         --header-control-veil: var(--header-control-veil-hover);
         color: var(--header-fg);
         background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);

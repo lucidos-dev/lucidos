@@ -108,6 +108,27 @@ describe('lucidos.ui.startThread', () => {
     await expect(ui.startThread({ prompt: 123 as unknown as string })).rejects.toThrow(TypeError);
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it('passes the coding agent and folder through params', async () => {
+    await ui.startThread({ prompt: 'Work on it', coding_agent: 'claude-code', folder: 'example-repo' });
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body).params).toEqual({
+      prompt: 'Work on it',
+      coding_agent: 'claude-code',
+      folder: 'example-repo',
+    });
+  });
+
+  it('omits an empty coding agent or folder', async () => {
+    await ui.startThread({ folder: '', coding_agent: undefined });
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body).params).toEqual({});
+  });
+
+  it.each(['coding_agent', 'folder'])('rejects when %s is not a string', async (key) => {
+    await expect(ui.startThread({ [key]: 7 } as never)).rejects.toThrow(TypeError);
+    expect(fetch).not.toHaveBeenCalled();
+  });
 });
 
 describe('isIOSAgent', () => {

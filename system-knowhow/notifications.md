@@ -639,7 +639,7 @@ The symptom was a tab that focused and marked the notification read (the SW-side
 - That avoids both known bad forms. `/?notification=…` escapes the workspace prefix to the origin-root picker. `?notification=…` is correct by URL resolution but iOS/WebKit did not apply it consistently.
 - Legacy rows without `scope_url` use the query-only fallback until the next page load refreshes them.
 
-**The browser subscription is reconciled against the engine's current VAPID key on every subscribe and refresh.** VAPID keys are per workspace (`vapid_keys` in that workspace's `preferences`, minted on first use by `get_or_create_vapid_keys`). Behind the gateway every workspace shares one origin and takes a `/<slug>/` scope. A workspace **recreated at the same slug** mints a fresh keypair while the browser keeps the old subscription at that scope. Unreconciled, the two push paths fail in opposite ways:
+**The browser subscription is reconciled against the engine's current VAPID key on every subscribe and refresh.** VAPID keys are per workspace: the `vapid_keys` table, minted on first use by `get_or_create_vapid_keys`, with the private key sealed at rest. Behind the gateway every workspace shares one origin and takes a `/<slug>/` scope. A workspace **recreated at the same slug** mints a fresh keypair while the browser keeps the old subscription at that scope. Unreconciled, the two push paths fail in opposite ways:
 - `pushManager.subscribe()` rejects with `InvalidStateError` ("A subscription with a different applicationServerKey (or gcm_sender_id) already exists"). That surfaced as a dead-end *"Failed to enable push notifications"* toast.
 - The silent page-load refresh re-POSTs the stale subscription. The engine then holds an endpoint whose push service rejects its VAPID signature, and notifications never arrive.
 
@@ -943,7 +943,7 @@ The §4 row matrix is exercised in `__tests__/presence-check-toast.test.ts`, dri
 - `s4_a_not_shown_ack_leaves_the_push_to_the_os`: an answer alone suppresses nothing; a `not_shown` one gets the push.
 - `s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscription`: a connected page with NO web-push subscription still triggers the decision. On the push-allowed branch it receives a `NativePushRequested` frame carrying the notification id.
 
-### §5.3: Browser e2e (`crates/lucidos-app/e2e/notifications.spec.ts`)
+### §5.3: Browser e2e (`crates/lucidos-app/e2e/notifications-all.spec.ts`)
 
 Per Lucidos's Playwright project setup (`chromium`, `mobile`, `mobile-webkit`), the scenarios that depend on platform behavior tag the project they apply to.
 

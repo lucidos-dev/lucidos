@@ -2,10 +2,10 @@ use crate::engine::agent_session::node_modules_setup::{
     has_install_marker, member_node_modules_links,
 };
 use crate::engine::agent_session::prompts::{
-    app_worktree_recovery_system_prompt, app_worktree_system_prompt, append_backend_rules,
+    app_worktree_recovery_system_prompt, app_worktree_system_prompt,
     conflict_resolution_system_prompt, external_repo_recovery_system_prompt,
-    external_repo_system_prompt, file_link_rule, lane_thread_system_prompt, recovery_system_prompt,
-    standing_instruction_section, wake_decision_section, worktree_system_prompt,
+    external_repo_system_prompt, lane_thread_system_prompt, recovery_system_prompt, spawn_prompts,
+    wake_decision_section, worktree_system_prompt, SessionContext, SpawnPromptInputs,
 };
 use crate::engine::agent_session::spawn::{
     resolve_branch_for_resume, BranchResolution, FreshBranch,
@@ -154,10 +154,12 @@ pub(crate) async fn link_node_modules(repo_root: &Path, wt_path: &Path) {
 /// spawn. Produced by [`LucidosEngine::resolve_run_worktree_context`], the
 /// "start" lifecycle stage extracted from the driver: it picks recovery vs
 /// conflict vs normal mode, creates/reuses the isolated worktree, links
-/// node_modules, writes the workspace marker, and builds the system prompt.
+/// node_modules, writes the workspace marker, and builds the system prompt
+/// and the session context block (ADR 0491).
 pub(super) struct SpawnWorktreeContext {
     pub(super) cwd: PathBuf,
     pub(super) system_prompt: String,
+    pub(super) session_context: SessionContext,
     pub(super) branch_name: String,
     pub(super) worktree_path: Option<PathBuf>,
     pub(super) interactive_session: bool,
@@ -210,6 +212,9 @@ impl LucidosEngine {
         coding_agent: crate::runtime::CodingAgent,
     ) -> Result<SpawnWorktreeContext, Box<dyn std::error::Error + Send + Sync>> {
         let mut adoption_note: Option<String> = None;
+        // An external repo's base ref, for the session context. Known only
+        // when this spawn resolved where a new worktree branches from.
+        let mut base_ref: Option<String> = None;
         let (
             cwd,
             system_prompt,
@@ -228,11 +233,11 @@ impl LucidosEngine {
             let system_prompt = if let Some(sp) = system_prompt_override {
                 sp
             } else if let Some(ref app_id) = app_spawn_id {
-                app_worktree_recovery_system_prompt(&branch, workspace_name, app_id)
+                app_worktree_recovery_system_prompt(workspace_name, app_id)
             } else if let Some(ref name) = external_repo_name {
-                external_repo_recovery_system_prompt(name, &branch)
+                external_repo_recovery_system_prompt(name)
             } else {
-                recovery_system_prompt(&branch, workspace_name)
+                recovery_system_prompt(workspace_name)
             };
             // Reused worktree + branch — nothing here is ours to delete on
             // a failed spawn.
@@ -759,12 +764,16 @@ impl LucidosEngine {
                         manifest_path.display()
                     ),
                 };
-                app_worktree_system_prompt(&branch_name, workspace_name, app_id, &manifest_json)
+                app_worktree_system_prompt(workspace_name, app_id, &manifest_json)
             } else if let Some(ref name) = external_repo_name {
-                let base = worktree_base_branch.as_deref().unwrap_or("origin/main");
-                external_repo_system_prompt(name, &branch_name, base)
+                base_ref = Some(
+                    worktree_base_branch
+                        .clone()
+                        .unwrap_or_else(|| "origin/main".to_string()),
+                );
+                external_repo_system_prompt(name)
             } else {
-                worktree_system_prompt(&branch_name, workspace_name)
+                worktree_system_prompt(workspace_name)
             };
             // What did THIS call create? `existing_worktree.is_none()` means
             // the create path ran (worktree_add / sparse app worktree);
@@ -806,42 +815,41 @@ impl LucidosEngine {
                 }
             }
         }
-        // Backend-specific teaching rides every prompt flavor (normal,
-        // recovery, conflict, override) — a recovered or conflict-resolving
-        // Codex session needs the CLI + question teaching just as much as a
-        // fresh one.
-        let system_prompt = append_backend_rules(system_prompt, coding_agent);
-        let system_prompt = format!(
-            "{system_prompt}{}",
-            file_link_rule(repo_id.as_deref(), app_spawn_id.as_deref(), &branch_name)
-        );
         // Every flavor talks to the same user. Read at spawn, so a change
         // reaches the next session rather than a running one.
-        let literacy = crate::core::technical_literacy::read(&self.pool).await;
-        let system_prompt = format!(
-            "{system_prompt}{}",
-            crate::core::technical_literacy::coding_agent_section(literacy)
-        );
-        // Callers write any turn start before the spawn, so this weighs the
-        // turn this session runs, as the 403 gate would.
-        let system_prompt = format!(
-            "{system_prompt}{}",
-            standing_instruction_section(&self.pool, thread_id).await
-        );
-        // Only a sub-thread reports to a parent, so only it decides a wake.
-        let system_prompt = format!(
-            "{system_prompt}{}",
-            wake_decision_section(&self.pool, thread_id).await
+        let literacy = crate::core::technical_literacy::coding_agent_section(
+            crate::core::technical_literacy::read(&self.pool).await,
         );
         // ADR 0362: on the Tree memory module the session starts from the
         // workspace memory view. Only this appended prompt changes (I15).
-        let system_prompt = format!("{system_prompt}{}", self.coding_agent_memory().await);
+        let memory = self.coding_agent_memory().await;
         // The same widgets section the chat agent reads, so a coding agent
         // embeds widgets in its options and replies the same way (ADR 0415).
-        let system_prompt = format!("{system_prompt}{}", self.coding_agent_widgets());
+        let widgets = self.coding_agent_widgets();
+        // A resume drops the session context, and Codex states 5 minutes
+        // whatever was observed, so neither pays for the read.
+        let cache_ttl = match (coding_agent, &resume_session_id) {
+            (crate::runtime::CodingAgent::ClaudeCode, None) => {
+                crate::engine::cache_ttl::repo_cache_ttl(&self.pool, repo_id.as_deref()).await
+            }
+            _ => None,
+        };
+        let (system_prompt, session_context) = spawn_prompts(SpawnPromptInputs {
+            flavor: system_prompt,
+            coding_agent,
+            workspace_sections: &[&literacy, &memory, &widgets],
+            branch: &branch_name,
+            base_ref: base_ref.as_deref(),
+            repo_id: repo_id.as_deref(),
+            app_id: app_spawn_id.as_deref(),
+            // Only a sub-thread reports to a parent, so only it decides a wake.
+            wake_section: wake_decision_section(&self.pool, thread_id).await,
+            cache_ttl,
+        });
         Ok(SpawnWorktreeContext {
             cwd,
             system_prompt,
+            session_context,
             branch_name,
             worktree_path,
             interactive_session,

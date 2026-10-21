@@ -84,7 +84,7 @@ fn non_json_and_unknown_lines_map_to_other() {
 
 fn track(lines: &[&str]) -> (Vec<AgentEvent>, crate::runtime::codex_parse::TurnTracker) {
     let mut tracker = crate::runtime::codex_parse::TurnTracker::new(None);
-    tracker.begin_turn();
+    tracker.begin_turn(None);
     let mut events = Vec::new();
     for line in lines {
         events.extend(tracker.map_line(parse_codex_line(line), 1234));
@@ -347,13 +347,13 @@ fn multiple_agent_messages_join_in_result_text() {
 #[test]
 fn begin_turn_resets_per_turn_state_but_keeps_session() {
     let mut tracker = crate::runtime::codex_parse::TurnTracker::new(None);
-    tracker.begin_turn();
+    tracker.begin_turn(None);
     let _ = tracker.map_line(parse_codex_line(REAL_THREAD_STARTED), 0);
     let _ = tracker.map_line(parse_codex_line(REAL_AGENT_MESSAGE), 0);
     let _ = tracker.map_line(parse_codex_line(REAL_TURN_COMPLETED), 0);
     assert!(tracker.turn_terminal_seen);
 
-    tracker.begin_turn();
+    tracker.begin_turn(None);
     assert!(!tracker.turn_terminal_seen);
     assert_eq!(tracker.turn_text(), "");
     assert_eq!(
@@ -379,4 +379,21 @@ fn empty_usage_turn_completed_still_emits_result() {
     let (events, _) = track(&[line]);
     assert_eq!(events.len(), 1, "zero usage is skipped, Result still fires");
     assert!(matches!(&events[0], AgentEvent::Result { error: None, .. }));
+}
+
+/// The usage names the effort the driver sent with its turn, so the capture
+/// records what the call ran at.
+#[test]
+fn turn_usage_carries_the_effort_the_turn_was_sent_with() {
+    let mut tracker = crate::runtime::codex_parse::TurnTracker::new(None);
+    tracker.begin_turn(Some("high".into()));
+    let events = tracker.map_line(parse_codex_line(REAL_TURN_COMPLETED), 1234);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Usage { reasoning_effort: Some(effort), .. } if effort == "high"
+        )),
+        "{events:?}"
+    );
 }

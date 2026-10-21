@@ -19,8 +19,8 @@ use crate::engine::summary_tree::module::{
 use crate::engine::summary_tree::shape::complete_addresses;
 use crate::engine::summary_tree::store::{self, StoredNode};
 use crate::engine::summary_tree::view::{
-    coding_agent_section, render_thread_view, rungs, thread_view, ViewBlocks, ViewSnapshots,
-    WorkspaceView, BLOCK_LINES, LOOKBACK_BLOCKS, RECENT_LINES, THREAD_RUNGS,
+    cache_rungs, coding_agent_section, render_thread_view, thread_view, ViewBlocks, ViewSnapshots,
+    WorkspaceView, BLOCK_LINES, LOOKBACK_BLOCKS, RECENT_LINES, THREAD_CACHE_RUNGS,
 };
 use crate::engine::summary_tree::{NodeAddr, SummaryScope};
 use crate::engine::thread_events::EventChannel;
@@ -127,9 +127,9 @@ async fn the_snapshot_rolls_over_when_the_recent_block_passes_its_cap() {
 
 /// Short lines roll the snapshot over by count before they reach its byte cap.
 /// So a rollover appends fewer blocks than a lookback, and the new snapshot's
-/// rung still finds the old one in the cache.
+/// cache rung still finds the old one in the cache.
 #[tokio::test]
-async fn the_snapshot_rolls_over_before_its_rung_leaves_the_lookback() {
+async fn the_snapshot_rolls_over_before_its_cache_rung_leaves_the_lookback() {
     let (pool, db_name) = setup_test_db().await;
     build_workspace(&pool, 8, 40).await;
     let snapshots = ViewSnapshots::default();
@@ -466,7 +466,7 @@ fn thread_view_marks_fall_on_block_ends() {
     );
     let pieces = view.pieces();
     assert_eq!(pieces.iter().map(|p| p.0).collect::<String>(), view.text);
-    assert_eq!(pieces.iter().filter(|p| p.1).count(), THREAD_RUNGS);
+    assert_eq!(pieces.iter().filter(|p| p.1).count(), THREAD_CACHE_RUNGS);
 }
 
 /// A view shorter than one block has nothing to mark.
@@ -479,15 +479,18 @@ fn a_short_thread_view_has_no_block_to_mark() {
     assert_eq!(view.pieces(), vec![(view.text.as_str(), false)]);
 }
 
-/// The rungs: the last block, then every lookback before it, never block 0.
+/// The cache rungs: the last block, then every lookback before it, never block 0.
 #[test]
-fn the_rungs_climb_back_from_the_last_block() {
-    assert_eq!(rungs(0, 2), Vec::<usize>::new());
-    assert_eq!(rungs(3, 2), vec![3]);
-    assert_eq!(rungs(LOOKBACK_BLOCKS, 2), vec![LOOKBACK_BLOCKS]);
-    assert_eq!(rungs(LOOKBACK_BLOCKS + 1, 2), vec![1, LOOKBACK_BLOCKS + 1]);
-    assert_eq!(rungs(50, 2), vec![50 - LOOKBACK_BLOCKS, 50]);
-    assert_eq!(rungs(50, 1), vec![50]);
+fn the_cache_rungs_climb_back_from_the_last_block() {
+    assert_eq!(cache_rungs(0, 2), Vec::<usize>::new());
+    assert_eq!(cache_rungs(3, 2), vec![3]);
+    assert_eq!(cache_rungs(LOOKBACK_BLOCKS, 2), vec![LOOKBACK_BLOCKS]);
+    assert_eq!(
+        cache_rungs(LOOKBACK_BLOCKS + 1, 2),
+        vec![1, LOOKBACK_BLOCKS + 1]
+    );
+    assert_eq!(cache_rungs(50, 2), vec![50 - LOOKBACK_BLOCKS, 50]);
+    assert_eq!(cache_rungs(50, 1), vec![50]);
 }
 
 /// Unbuilt entries past the built prefix ride after its lines as raw text.

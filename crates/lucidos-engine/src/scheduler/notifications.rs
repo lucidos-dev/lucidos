@@ -141,6 +141,15 @@ pub struct NavigateUi {
     pub event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// The coding agent backend a `NewChat` draft preselects, as
+    /// `CodingAgent::as_str` spells it. A string, not the enum: the page
+    /// validates it, so an unknown value warns instead of failing the tap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent: Option<String>,
+    /// The coding target a `NewChat` draft preselects: a registered
+    /// repository name or id, or `data/apps/<id>`. The page resolves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
 }
 
 /// Navigation target enum — every UI surface a notification tap can deep-link
@@ -709,6 +718,23 @@ mod tests {
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["to"]["fragment"], "day-2026-08-28");
+        assert_eq!(serde_json::from_value::<Tap>(v).unwrap(), t);
+    }
+
+    #[test]
+    fn tap_navigate_new_chat_round_trips_its_destination() {
+        let t = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::NewChat,
+                prompt: Some("Work on the change".into()),
+                coding_agent: Some("codex".into()),
+                folder: Some("example-repo".into()),
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["to"]["coding_agent"], "codex");
+        assert_eq!(v["to"]["folder"], "example-repo");
         assert_eq!(serde_json::from_value::<Tap>(v).unwrap(), t);
     }
 

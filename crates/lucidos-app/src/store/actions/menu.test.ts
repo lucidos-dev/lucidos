@@ -50,7 +50,7 @@ vi.mock('../../api/client', () => ({
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
-const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting } = await import('./menu');
+const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting, openCacheWarmLineSetting } = await import('./menu');
 
 const fakeApp: App = {
   id: 'trip-planner',
@@ -351,7 +351,7 @@ describe('openWebhookSettings', () => {
   });
 });
 
-describe('openCaptureContextSetting', () => {
+describe('Debugging row deep links', () => {
   beforeEach(() => {
     activeMenuItem.value = 'files';
     settingsSubview.value = 'main';
@@ -368,6 +368,17 @@ describe('openCaptureContextSetting', () => {
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('debugging');
     expect(settingsScrollTarget.value).toBe('debugging:capture-context');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+
+  it('lands on the Cache-warm line row in Settings > Debugging', () => {
+    // The cache-warm line's explainer link. Without the scroll target the
+    // page opens at its top and the row the link names is not marked.
+    openCacheWarmLineSetting();
+    expect(activeMenuItem.value).toBe('settings');
+    expect(settingsSubview.value).toBe('debugging');
+    expect(settingsScrollTarget.value).toBe('debugging:cache-warm-line');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });

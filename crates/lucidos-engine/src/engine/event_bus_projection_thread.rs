@@ -11,8 +11,8 @@
 use uuid::Uuid;
 
 use super::super::{
-    branch_work_sql, preserving_verdict, BusEvent, EventBus, CLEAR_CODING_AGENT_FLAGS,
-    STATUS_FROM_PROPOSED_CHANGE,
+    branch_work_sql, keeping_status_across_redirect, preserving_verdict, BusEvent, EventBus,
+    CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE,
 };
 use super::propagation::{
     detach_child_from_parent, hold_parent_recount_lock, load_blocking_sample,
@@ -606,7 +606,7 @@ impl EventBus {
                      status = {} \
                      WHERE thread_id = $1",
                     branch_work_sql("$3"),
-                    preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)
+                    keeping_status_across_redirect(&preserving_verdict(STATUS_FROM_PROPOSED_CHANGE))
                 ))
                 .bind(thread_id)
                 .bind(is_external_repo)
@@ -961,10 +961,20 @@ impl EventBus {
                 // of a genuinely new turn is preceded by a start event that
                 // already cleared the verdict, so a real Stop still settles the
                 // thread.
+                //
+                // A redirect cancel (`CancelCause::is_redirect`) is the engine
+                // interrupting the turn to carry the work on, so the thread
+                // keeps its status. The redirected turn's start follows once
+                // teardown ends, and `CodingAgentIdled` and `SessionEnded`
+                // hold the status until then (`keeping_status_across_redirect`).
+                let status = if cause.is_redirect() {
+                    "status".to_string()
+                } else {
+                    preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)
+                };
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET has_response = TRUE, \
-                     status = {} WHERE thread_id = $1",
-                    preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)
+                     status = {status} WHERE thread_id = $1",
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1026,7 +1036,9 @@ impl EventBus {
                     sqlx::query(&format!(
                         "UPDATE thread_summaries SET has_response = TRUE, \
                          status = {} WHERE thread_id = $1",
-                        preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)
+                        keeping_status_across_redirect(&preserving_verdict(
+                            STATUS_FROM_PROPOSED_CHANGE
+                        ))
                     ))
                     .bind(thread_id)
                     .execute(&mut **tx)
@@ -1446,6 +1458,19 @@ impl EventBus {
                     .extend(reconcile_parent_waiting_children_count(tx, thread_id).await?);
                 Vec::new()
             }
+            // The keep-alive tick's status. It moves no recency and no status,
+            // because nothing happened on the thread: the engine only reports
+            // what it does while the thread waits.
+            ThreadEvent::CacheKeepAliveStatusChanged { status } => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET cache_keep_alive_status = $2 WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .bind(status.as_ref().map(sqlx::types::Json))
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
             ThreadEvent::EventWaitCanceled { wait_id, .. } => {
                 sqlx::query(EVENT_WAIT_CANCEL_SQL.as_str())
                     .bind(thread_id)
@@ -1760,8 +1785,15 @@ impl EventBus {
             // section transition, no last_activity bump).
             | ThreadEvent::ImageUploaded { .. }
             | ThreadEvent::ContextCaptured { .. }
+            | ThreadEvent::ModelCallFailed { .. }
             // A compaction step changes no status; the turn around it does.
             | ThreadEvent::CodingAgentCompacted { .. }
+            // A checkpoint run is history for the handoff estimate only.
+            | ThreadEvent::HandoffCheckpointReached { .. }
+            // A decline is read back by the Successor card's context reading.
+            | ThreadEvent::SuccessorOfferDeclined { .. }
+            // A request is read back by the narrative spawn, never projected.
+            | ThreadEvent::SuccessorRequested { .. }
             // User removed a queued prompt before ingestion. Pure marker:
             // the original MessageReceived remains in history, and the
             // renderer/agentic loop consult this row without changing the
@@ -1780,6 +1812,8 @@ impl EventBus {
             // A read marks an input already recorded, so it moves nothing,
             // unless it started a turn (the arm above).
             | ThreadEvent::CodingAgentInputRead { started_turn: false, .. }
+            // A discard marks an input already recorded as owed again.
+            | ThreadEvent::CodingAgentInputDiscarded { .. }
             // Agent-driven curation of a prior tool result / child completion
             // in future resume context: the retired dismissal, and the record
             // of a keep. Pure bookkeeping; no projection state change.
@@ -1831,7 +1865,7 @@ impl EventBus {
             | ThreadEvent::WidgetShown { .. }
             | ThreadEvent::WidgetPinned { .. }
             | ThreadEvent::WidgetUnpinned { .. }
-            // The Home board derives from its pins and this snapshot on read.
+            // The dashboards' legacy seed, folded on read (ADR 0496).
             | ThreadEvent::HomeBoardArranged { .. }
             // The end of a call says nothing a column holds. Persisted so a
             // session is countable and a trigger can subscribe.

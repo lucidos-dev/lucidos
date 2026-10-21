@@ -63,10 +63,8 @@ test.describe('Section-aware Save/Archive buttons', () => {
       data: { thread_id: threadId },
     });
     expect(archResp.ok()).toBeTruthy();
-    // Desktop chromium hides the drawer by default — open it so
-    // waitForThreadInSection can find the section's DOM. Mobile/webkit
-    // projects keep the drawer mounted, so openThreadDrawer is a no-op
-    // there.
+    // Desktop hides the drawer by default. Open it so
+    // waitForThreadInSection can find the section's DOM.
     await openThreadDrawer(page);
     await waitForThreadInSection(page, threadId, 'archive');
 
@@ -94,10 +92,8 @@ test.describe('Section-aware Save/Archive buttons', () => {
       data: { thread_id: threadId },
     });
     expect(saveResp.ok()).toBeTruthy();
-    // Desktop chromium hides the drawer by default — open it so
-    // waitForThreadInSection can find the section's DOM. Mobile/webkit
-    // projects keep the drawer mounted, so openThreadDrawer is a no-op
-    // there.
+    // Desktop hides the drawer by default. Open it so
+    // waitForThreadInSection can find the section's DOM.
     await openThreadDrawer(page);
     await waitForThreadInSection(page, threadId, 'saved');
 

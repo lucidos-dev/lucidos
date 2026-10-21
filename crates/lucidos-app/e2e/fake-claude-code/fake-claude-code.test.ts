@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { afterEach, describe, expect, it } from 'vitest';
-import { FAKE_VERSION, NO_RULE_REPLY, failToStartText, resolveModel } from './claude.mjs';
+import {
+  AUTH_STATUS, FAKE_VERSION, NO_EFFORT, NO_RULE_REPLY, NO_SESSION_CONTEXT_REPLY,
+  failToStartText, replyTo, resolveModel, turnDurationMs,
+} from './claude.mjs';
 import {
   SCENARIO_FLAGS, SESSION_FLAGS, UNREPLAYED_FLAGS, diffShapes, shapeOf, unknownKinds,
 } from './drift-check.mjs';
@@ -13,7 +16,9 @@ const FAKE = join(__dirname, 'claude.mjs');
 
 type Line = Record<string, any>;
 
-const NO_DELAY = { ...process.env, FAKE_CLAUDE_CODE_TURN_MS: '0' };
+// No effort either: a suite run from inside Claude Code inherits its own.
+const { CLAUDE_CODE_EFFORT_LEVEL: _, ...ENV } = process.env;
+const NO_DELAY = { ...ENV, FAKE_CLAUDE_CODE_TURN_MS: '0' };
 
 function runFake(args: string[], inputs: Line[] = []): Line[] {
   const input = inputs.map((l) => `${JSON.stringify(l)}\n`).join('');
@@ -37,6 +42,11 @@ describe('the fake Claude Code', () => {
     dir = mkdtempSync(join(tmpdir(), 'fake-cc-'));
     symlinkSync(FAKE, join(dir, 'claude'));
     expect(execFileSync(join(dir, 'claude'), ['--version'], { encoding: 'utf8' })).toBe(`${FAKE_VERSION} (Claude Code)\n`);
+  });
+
+  it('answers `auth status` as a first-party login, so the engine shows its notes', () => {
+    expect(runFake(['auth', 'status'])).toEqual([AUTH_STATUS]);
+    expect(AUTH_STATUS.apiProvider).toBe('firstParty');
   });
 
   it('answers initialize with the model list and sends no init', () => {
@@ -81,6 +91,44 @@ describe('the fake Claude Code', () => {
     expect(seen.result - seen.control_response).toBeGreaterThanOrEqual(300);
   });
 
+  it('reports the effort it was spawned with, also to the effort restart note', () => {
+    const lines = execFileSync(process.execPath, [FAKE], {
+      input: `${JSON.stringify(user('Report your reasoning effort.'))}\n`,
+      encoding: 'utf8',
+      env: { ...NO_DELAY, CLAUDE_CODE_EFFORT_LEVEL: 'high' },
+    }).trim().split('\n').map((l) => JSON.parse(l));
+    expect(lines.at(-1)?.result).toBe('effort: high');
+    expect(runFake([], [user('Report your reasoning effort.')]).at(-1)?.result).toBe(`effort: ${NO_EFFORT}`);
+    // The engine's own note is pinned by the effort restart e2e, which reads
+    // this reply after the restart.
+    expect(replyTo('the user changed your reasoning effort. Continue.', 'low')).toBe('effort: low');
+  });
+
+  it('lasts as long as a turn asks', () => {
+    expect(turnDurationMs('Take 20 seconds, then say hi.', 3000)).toBe(20_000);
+    expect(turnDurationMs('Say exactly: "x"', 3000)).toBe(3000);
+  });
+
+  it('ends the turn in flight on an interrupt, with an error result and no reply', async () => {
+    const child = spawn(process.execPath, [FAKE], { env: process.env });
+    const lines: Line[] = [];
+    const done = new Promise<void>((resolve) => {
+      createInterface({ input: child.stdout }).on('line', (raw) => {
+        const line = JSON.parse(raw);
+        lines.push(line);
+        if (line.isReplay) child.stdin.write(`${JSON.stringify(control('interrupt'))}\n`);
+        if (line.type === 'result') resolve();
+      });
+    });
+    const started = Date.now();
+    child.stdin.write(`${JSON.stringify(user('Take 30 seconds. Say exactly: "never"'))}\n`);
+    await done;
+    child.kill();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(lines.find((l) => l.type === 'assistant')).toBeUndefined();
+    expect(lines.at(-1)).toMatchObject({ type: 'result', subtype: 'error_during_execution', is_error: true });
+  });
+
   it('answers a prompt it has no rule for with the fixed reply, never a guess', () => {
     const lines = runFake([], [user('What is the codeword?')]);
     expect(lines.at(-1)?.result).toBe(NO_RULE_REPLY);
@@ -98,6 +146,27 @@ describe('the fake Claude Code', () => {
     expect(run.status).toBe(1);
     expect(run.stderr).toBe('claude-gateway.example.com refused the request\n');
     expect(run.stdout).toBe('');
+  });
+
+  // A fresh session's first message, shaped like `SessionContext::render`.
+  const withSessionContext = (history: string, turn: string) => [
+    'SESSION CONTEXT: Lucidos sends this once.',
+    'BRANCH: Your worktree is on branch `lucidos-x`.',
+    `THREAD HISTORY: earlier:\n\n${history}`,
+    '---\nEnd of session context.',
+    turn,
+  ].join('\n\n');
+
+  it('names the branch the session context names, and says when there is none', () => {
+    expect(replyTo(withSessionContext('', "Name your session's branch."))).toBe('lucidos-x');
+    expect(replyTo("Name your session's branch.")).toBe(NO_SESSION_CONTEXT_REPLY);
+  });
+
+  it('reads its rules from the turn, never from the history before it', () => {
+    const prompt = withSessionContext('**User:** Say exactly: "old"\n\n**User:** Fail to start: "old"', 'Say exactly: "new"');
+    expect(replyTo(prompt)).toBe('new');
+    expect(failToStartText(prompt)).toBeUndefined();
+    expect(replyTo(withSessionContext('', 'What is the codeword?'))).toBe(NO_RULE_REPLY);
   });
 
   it('starts normally when Fail to start arrives after the session began', () => {
@@ -183,5 +252,33 @@ describe('the drift check shape diff', () => {
     expect(diffShapes(shapeOf([more]), shapeOf([fake]))).toEqual([]);
     const fewerFields = { ...fake, response: { ...fake.response, response: { models: models.map(({ displayName: _, ...m }: Line) => m) } } };
     expect(diffShapes(shapeOf([fewerFields]), shapeOf([fake]))).not.toEqual([]);
+  });
+
+  describe('model row shapes', () => {
+    const [initialize] = runFake([], [control('initialize')]);
+    const withModels = (models: Line[]): Line => ({
+      ...initialize, response: { ...initialize.response, response: { models } },
+    });
+    const plain = { value: 'a', resolvedModel: 'a-1', displayName: 'A', description: 'plain' };
+    const effort = { ...plain, value: 'b', supportsEffort: true, supportedEffortLevels: ['low', 'high'] };
+
+    it('passes when the real and fake rows have the same shapes', () => {
+      expect(diffShapes(shapeOf([withModels([plain, effort])]), shapeOf([withModels([effort, plain])]))).toEqual([]);
+    });
+
+    it('passes when the fake has a row shape the real CLI does not send', () => {
+      expect(diffShapes(shapeOf([withModels([plain])]), shapeOf([withModels([plain, effort])]))).toEqual([]);
+    });
+
+    it('fails when a real row shape is missing from the fake, and names it', () => {
+      const diffs = diffShapes(shapeOf([withModels([plain, effort])]), shapeOf([withModels([plain])]));
+      expect(diffs).toHaveLength(1);
+      expect(diffs[0]).toContain('fake lacks model row shape [value,resolvedModel,displayName,description,supportsEffort,supportedEffortLevels]');
+    });
+
+    it('still fails when the rest of the line differs, extra shapes or not', () => {
+      const refused = { ...withModels([plain, effort]), response: { subtype: 'error', request_id: initialize.response.request_id } };
+      expect(diffShapes(shapeOf([refused]), shapeOf([withModels([plain, effort])]))).not.toEqual([]);
+    });
   });
 });

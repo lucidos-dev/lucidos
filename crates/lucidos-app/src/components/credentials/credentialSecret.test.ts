@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseSecret, buildSecret, emptyFields } from './credentialSecret';
+import { parseSecret, buildSecret, emptyFields, isSecretReference } from './credentialSecret';
 
 describe('parseSecret', () => {
   it('returns the raw value for single-value types', () => {
@@ -152,4 +152,12 @@ describe('buildSecret', () => {
     expect(JSON.parse(buildSecret('oauth_client', parsed))).toEqual(JSON.parse(stored));
   });
 
+});
+
+describe('isSecretReference', () => {
+  it('reads the op scheme as a reference, as the engine does', () => {
+    expect(isSecretReference('op://Engineering/Stripe/credential')).toBe(true);
+    expect(isSecretReference('sk-live-value')).toBe(false);
+    expect(isSecretReference('')).toBe(false);
+  });
 });

@@ -4,8 +4,8 @@ import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../ev
 import { formatTokens } from '../../utils/formatTokens';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, isAgentReplyText, isChangeLifecycleEvent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool, apiCallIdOf, parentToolUseIdOf } from './exchange';
-import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, computeExchanges, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUnsentExchange, isUningestedMessage, isWaitingTypedMessage, opensAwaitingAnswer, toolUseIdOf } from './exchange-grouping';
-import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
+import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, computeExchanges, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUnsentExchange, isUningestedMessage, isWaitingTypedMessage, latestRunSteps, opensAwaitingAnswer, toolUseIdOf } from './exchange-grouping';
+import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isRedirectCancel, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, RecalledMemory, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
@@ -1067,6 +1067,11 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         });
         break;
       }
+      // Only a resume folded into the turn it continued is a step. Every other
+      // one opens its exchange, and draws as its `ResumeCard`.
+      case 'ContinuationStarted':
+        events.push({ type: 'restart', reason: event.reason ?? '', actor: event.actor });
+        break;
       case 'WidgetShown': {
         const e = event as { app_id: string; params?: Record<string, unknown>; label?: string; _eventId?: string };
         events.push({ type: 'widget', app_id: e.app_id, params: e.params, label: e.label, event_id: e._eventId });
@@ -1953,7 +1958,7 @@ function exchangeHasTerminalStep(exchange: Exchange): boolean {
   // The shared list, plus `SessionEnded`. A coding-agent session ending is a
   // terminal a QUEUE reads, not one the fold reads: it never resolves a turn's
   // continuation, so `TERMINAL_EVENT_TYPES` leaves it out.
-  return exchange.steps.some(({ event }) =>
+  return latestRunSteps(exchange).some(({ event }) =>
     TERMINAL_EVENT_TYPES.has(event.type) || event.type === 'SessionEnded'
   );
 }
@@ -2297,6 +2302,9 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   // (which is 'done') from "crashed mid-work" (which is 'aborted').
   let wasCompleted = false;
   let completedBeforeAbort = false;
+  // An effort pick cancelled the turn and its resume has not landed yet. The
+  // engine idles the session in between, so the idle must not read as done.
+  let restartOwed = false;
 
   const supersededAborts = supersededAbortIndices(exchange.steps);
 
@@ -2311,11 +2319,19 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
     switch (event.type) {
       case 'ResponseGenerated': isComplete = true; wasCompleted = true; break;
       case 'ResponseCanceled':
-        // A Codex mid-turn follow-up redirect is mechanically a cancel, but
-        // the user steered rather than stopping. Render it neutrally, like
-        // every other follow-up. Only a real Stop sets isCanceled.
-        if (event.cause === 'superseded_by_followup') { isComplete = true; break; }
+        // A redirect (a follow-up, an effort restart) is mechanically a
+        // cancel, but the work goes on. Render it neutrally, like every other
+        // follow-up. Only a real Stop sets isCanceled.
+        if (isRedirectCancel(event.cause)) {
+          isComplete = true;
+          if (event.cause === 'effort_restart') restartOwed = true;
+          break;
+        }
         isCanceled = true; isComplete = true; break;
+      // An effort restart's resume, folded in: the turn runs again.
+      case 'ContinuationStarted':
+        restartOwed = false; isComplete = false; isCCWaiting = false; wasCompleted = false;
+        break;
       case 'ResponseAborted':
         if (supersededAborts.has(i)) break; // superseded by a later same-id terminal
         if (wasCompleted) completedBeforeAbort = true;
@@ -2550,6 +2566,9 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   // `queuedFollowupRun` instead. Only the LAST queued exchange shows "Queued":
   // earlier ones were superseded and the empty-non-last rule below takes them.
   if (hasPriorActive && !hasSteps && !isCC && isLast) return verdict('queued');
+  // Only while the turn is last: a follow-up after the cancel drives the
+  // thread instead, and the engine then owes no resume.
+  if (restartOwed && isLast) return verdict('coding-agent-working');
   // Agent idle. WaitingBanner handles the "can interact" state separately.
   if (isCCWaiting) return verdict('done');
   // Parked on an event wait: the turn ran to its end and registered a

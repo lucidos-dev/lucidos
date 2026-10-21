@@ -5,7 +5,9 @@
 //! to the phone. The tool said "Navigated to file", so the agent told the user
 //! it had opened. Nothing opened where they were looking.
 
+use super::ToolOutcome;
 use super::{navigate_ui_impl, presence_note, BACKUP_SETTINGS_GUIDE};
+use crate::core::AppManager;
 use crate::engine::agent_context::{
     build_user_device_preferences_context_for_turn, last_used_device,
 };
@@ -135,6 +137,24 @@ async fn next_navigation_actor(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid)
     }
 }
 
+/// A workspace with no apps installed, in a directory the test owns.
+fn empty_apps() -> (AppManager, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    (AppManager::new(dir.path()).expect("app manager"), dir)
+}
+
+/// `navigate_ui_impl` in a workspace with no apps.
+async fn navigate(
+    bus: &EventBus,
+    pool: &PgPool,
+    args: &serde_json::Value,
+    thread_id: Uuid,
+    last_used: Option<&str>,
+) -> ToolOutcome {
+    let (apps, _dir) = empty_apps();
+    navigate_ui_impl(bus, pool, &apps, args, thread_id, last_used).await
+}
+
 fn open_changelog() -> serde_json::Value {
     json!({"target": "file", "file_path": "artifacts/releases/changelog.md"})
 }
@@ -150,7 +170,7 @@ async fn a_question_answered_from_another_device_moves_the_target_there() {
     let last_used = last_used_device(&pool, thread_id, Some(anchor), Some(PHONE)).await;
     assert_eq!(last_used.as_deref(), Some(LAPTOP));
 
-    let out = navigate_ui_impl(
+    let out = navigate(
         &bus,
         &pool,
         &open_changelog(),
@@ -201,7 +221,9 @@ async fn the_context_block_names_the_device_navigate_ui_targets() {
     answer_from(&bus, thread_id, LAPTOP).await;
 
     let resumed =
-        build_user_device_preferences_context_for_turn(&pool, thread_id, Some(anchor), None).await;
+        build_user_device_preferences_context_for_turn(&pool, thread_id, Some(anchor), None)
+            .await
+            .render();
     assert!(
         resumed.contains(&format!("- id: {LAPTOP}")),
         "a resume names the answering device: {resumed}"
@@ -215,7 +237,8 @@ async fn the_context_block_names_the_device_navigate_ui_targets() {
         Some(anchor),
         Some(PHONE),
     )
-    .await;
+    .await
+    .render();
     assert!(
         fresh.contains(&format!("- id: {PHONE}")),
         "with no answer the turn's own device stands: {fresh}"
@@ -244,7 +267,7 @@ async fn an_explicit_device_gets_the_navigation_and_no_other_does() {
     let mut args = open_changelog();
     args["device"] = json!(LAPTOP);
 
-    let out = navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE))
+    let out = navigate(&bus, &pool, &args, thread_id, Some(PHONE))
         .await
         .expect("navigate succeeds");
     assert_eq!(
@@ -267,7 +290,7 @@ async fn an_unknown_device_is_refused_and_nothing_is_sent() {
     let mut args = open_changelog();
     args["device"] = json!("device-nobody");
 
-    let out = navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE)).await;
+    let out = navigate(&bus, &pool, &args, thread_id, Some(PHONE)).await;
     assert!(
         matches!(&out, Err(msg) if msg.contains("device-nobody")),
         "must refuse and name the id: {out:?}"
@@ -348,7 +371,7 @@ async fn a_repo_file_named_by_its_repository_name_is_sent_with_the_uuid() {
         ),
     ] {
         let args = json!({"target": "file", "file_path": asked});
-        navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE))
+        navigate(&bus, &pool, &args, thread_id, Some(PHONE))
             .await
             .unwrap_or_else(|e| panic!("{asked} must send, got: {e}"));
         assert_eq!(next_navigation_file_path(&mut rx, thread_id).await, sent);
@@ -374,7 +397,7 @@ async fn an_unregistered_repository_is_refused_and_nothing_is_sent() {
         format!("repo:{}:file#main:docs/guide.md", Uuid::new_v4()),
     ] {
         let args = json!({"target": "file", "file_path": file_path});
-        let out = navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE)).await;
+        let out = navigate(&bus, &pool, &args, thread_id, Some(PHONE)).await;
         let err = out.expect_err(&format!("{file_path} must be refused"));
         assert!(
             err.contains(&file_path),
@@ -397,6 +420,49 @@ async fn an_unregistered_repository_is_refused_and_nothing_is_sent() {
     teardown_test_db(&db).await;
 }
 
+/// A `new-chat` navigate that names a folder nothing matches still goes out,
+/// since the page leaves the dropdown at its default. The agent is warned so it
+/// can correct itself, and a folder that does match adds no warning.
+#[tokio::test]
+async fn a_new_chat_folder_that_matches_nothing_warns_but_still_sends() {
+    let (bus, mut rx, pool, db) = setup().await;
+    register_example_repo(&pool, &bus).await;
+    let (apps, dir) = empty_apps();
+    let app_dir = dir.path().join("data/apps/habit-tracker");
+    std::fs::create_dir_all(&app_dir).expect("app dir");
+    std::fs::write(app_dir.join("manifest.json"), "{}").expect("manifest");
+    let thread_id = Uuid::new_v4();
+
+    for folder in [
+        "unregistered-repo",
+        "data/apps/no-such-app",
+        &Uuid::new_v4().to_string(),
+    ] {
+        let args = json!({"target": "new-chat", "folder": folder});
+        let out = navigate_ui_impl(&bus, &pool, &apps, &args, thread_id, Some(PHONE))
+            .await
+            .expect("an unknown folder still sends");
+        assert!(out.contains("Warning: folder"), "{folder}: {out}");
+        assert!(out.contains(folder), "names the value: {out}");
+        next_navigation_actor(&mut rx, thread_id).await;
+    }
+    for folder in [
+        "example-repo",
+        "EXAMPLE-REPO",
+        "data/apps/habit-tracker",
+        "data/apps/habit-tracker/",
+    ] {
+        let args = json!({"target": "new-chat", "folder": folder});
+        let out = navigate_ui_impl(&bus, &pool, &apps, &args, thread_id, Some(PHONE))
+            .await
+            .expect("navigate succeeds");
+        assert!(!out.contains("Warning"), "{folder}: {out}");
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
 /// A blank `device` is the model filling an optional field, not a choice.
 #[tokio::test]
 async fn a_blank_device_reads_as_omitted() {
@@ -405,7 +471,7 @@ async fn a_blank_device_reads_as_omitted() {
     let mut args = open_changelog();
     args["device"] = json!("  ");
 
-    navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE))
+    navigate(&bus, &pool, &args, thread_id, Some(PHONE))
         .await
         .expect("a blank device falls back to the last used device");
     assert_eq!(
@@ -425,7 +491,7 @@ async fn a_thread_navigate_names_the_resolved_thread() {
     let thread_id = Uuid::new_v4();
     let args = json!({"target": "thread", "id": "current"});
 
-    let out = navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE))
+    let out = navigate(&bus, &pool, &args, thread_id, Some(PHONE))
         .await
         .expect("navigate succeeds");
     assert!(out.contains(&thread_id.to_string()), "{out}");
@@ -442,7 +508,7 @@ async fn a_turn_with_no_device_stays_unscoped_and_says_so() {
     let (bus, mut rx, pool, db) = setup().await;
     let thread_id = Uuid::new_v4();
 
-    let out = navigate_ui_impl(&bus, &pool, &open_changelog(), thread_id, None)
+    let out = navigate(&bus, &pool, &open_changelog(), thread_id, None)
         .await
         .expect("navigate succeeds");
     assert_eq!(next_navigation_actor(&mut rx, thread_id).await, None);
@@ -466,7 +532,7 @@ async fn no_result_claims_the_target_opened() {
         json!({"target": "settings", "settings_view": "environment-variables"}),
         json!({"target": "url", "url": "https://example.com"}),
     ] {
-        let out = navigate_ui_impl(&bus, &pool, &args, thread_id, Some(PHONE))
+        let out = navigate(&bus, &pool, &args, thread_id, Some(PHONE))
             .await
             .expect("navigate succeeds");
         assert!(out.starts_with("Sent"), "{args}: {out}");
@@ -483,7 +549,7 @@ async fn no_result_claims_the_target_opened() {
 #[tokio::test]
 async fn a_device_not_seen_visible_is_told_as_such_with_a_notification_offer() {
     let (bus, _rx, pool, db) = setup().await;
-    let out = navigate_ui_impl(&bus, &pool, &open_changelog(), Uuid::new_v4(), Some(PHONE))
+    let out = navigate(&bus, &pool, &open_changelog(), Uuid::new_v4(), Some(PHONE))
         .await
         .expect("navigate succeeds");
     assert!(
@@ -507,7 +573,7 @@ async fn a_device_seen_visible_carries_no_warning() {
     crate::core::DevicePresenceStore::record_visible(&pool, PHONE)
         .await
         .unwrap();
-    let out = navigate_ui_impl(&bus, &pool, &open_changelog(), Uuid::new_v4(), Some(PHONE))
+    let out = navigate(&bus, &pool, &open_changelog(), Uuid::new_v4(), Some(PHONE))
         .await
         .expect("navigate succeeds");
     assert!(out.contains("Lucidos was visible on it"), "{out}");

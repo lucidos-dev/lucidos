@@ -105,8 +105,8 @@ describe('menus wear the shared box instead of a copy of it', () => {
     ['../../components/shared/ModelSelectionField.tsx', 'surface-box', 'dropdown-menu'],
     ['../../components/shared/NavChevron.tsx', 'surface-box', 'dropdown-menu'],
     ['../../components/files/ChangeSelector.tsx', 'surface-box', 'dropdown-menu'],
-    ['../../components/chat/LucidosControlMenu.tsx', 'surface-box', 'control-dropdown'],
     ['../../components/chat/CodingAgentControlMenu.tsx', 'surface-box', 'control-dropdown'],
+    ['../../components/chat/RungControl.tsx', 'surface-box', 'control-dropdown'],
     ['../../components/chat/PromptInput.tsx', 'surface-box', 'image-attach-menu'],
     ['../../components/chat/MessageRoutePanel.tsx', 'surface', 'message-route-panel'],
   ])('%s gives its panel the %s class before %s', (path, box, menu) => {

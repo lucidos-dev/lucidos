@@ -2,7 +2,7 @@ import { test, expect, type Page } from './fixtures';
 import {
   navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy,
   newThread, openThreadDrawer, showOngoingGroup, waitForVisibleInput, ensureOnThreadPane,
-  clickVisibleElement, isMobileViewport, userMessageBody,
+  clickVisibleElement, userMessageBody,
 } from './helpers';
 
 /** Sample the visible prompt textarea's height + inline transition over ~900ms.
@@ -32,7 +32,7 @@ function sampleHeights(page: Page): Promise<Array<{ h: number; tr: string }>> {
 test.describe('prompt textarea height survives the compose FLIP', () => {
   // Both the ThreadPane FLIP and the draft→draft height animation are gated on
   // !isReducedMotion(), which follows the OS switch under the default `system`
-  // Motion setting. Headless Chromium can default that switch to 'reduce', which
+  // Motion setting. The suite emulates 'reduce' (playwright.config.ts), which
   // would silently skip the very animations under test (and hide the
   // regression). Force motion on so the tests actually exercise them.
   test.use({ reducedMotion: 'no-preference' });
@@ -48,8 +48,6 @@ test.describe('prompt textarea height survives the compose FLIP', () => {
   // inline height the collapse animation itself set (animateHeight), never the
   // autoResize height owned by a position-only navigation.
   test('a multi-line draft is not clipped after sliding in from a sent thread', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'ThreadPane FLIP is desktop-only');
-
     await navigateToApp(page);
 
     // 1. A sent (active) thread to navigate away from.
@@ -121,8 +119,6 @@ test.describe('prompt textarea height survives the compose FLIP', () => {
   // instead of insta-resizing. Assert the height transition actually engages and
   // the box lands at the new draft's full height.
   test('switching between two drafts animates the textarea height', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'height-FLIP is desktop-only');
-
     await navigateToApp(page);
 
     // Draft A — tall (many lines).
@@ -186,8 +182,6 @@ test.describe('prompt textarea height survives the compose FLIP', () => {
   // the old gate required both sides to be composing threads. The compose view
   // stays centered throughout (composeViewActive true), so the height must ease.
   test('switching between an existing draft and the blank compose view animates', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'height-FLIP is desktop-only');
-
     await navigateToApp(page);
 
     const tall = Array.from({ length: 8 }, (_, i) => `blank-switch line ${i + 1}`).join('\n');
@@ -232,8 +226,6 @@ test.describe('prompt textarea height survives the compose FLIP', () => {
   // draft is in the box. It must start where the multi-line draft's prompt
   // was, rather than a draft's extra height below it.
   test('leaving a multi-line draft for a sent thread slides from where the prompt was', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'ThreadPane FLIP is desktop-only');
-
     await navigateToApp(page);
     await sendMessage(page, `Say exactly: "${uniqueMessage('flip-dst')}"`);
     await waitForResponse(page);

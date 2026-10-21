@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use uuid::Uuid;
 
+use crate::core::secret_reference::{engine_resolver, SecretField, SecretResolver};
+use crate::core::secret_store::{CredentialAuthValue, Secret};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
@@ -26,6 +28,9 @@ pub enum AuthType {
     /// value is SENT; this one is never sent. A webhook signing secret is the
     /// first, and it is only ever fed to an HMAC.
     Secret,
+    /// The token `op` reads 1Password with, for *secret references*. Only the
+    /// `op` child ever sees it (`core::secret_reference::op`).
+    OnepasswordServiceAccount,
     Unknown,
 }
 
@@ -44,6 +49,7 @@ impl AuthType {
             "oauth_client" => Self::OauthClient,
             "email_password" => Self::EmailPassword,
             "secret" => Self::Secret,
+            "onepassword_service_account" => Self::OnepasswordServiceAccount,
             _ => Self::Unknown,
         }
     }
@@ -61,6 +67,7 @@ impl AuthType {
         Self::OauthClient,
         Self::EmailPassword,
         Self::Secret,
+        Self::OnepasswordServiceAccount,
         Self::Unknown,
     ];
 
@@ -78,8 +85,26 @@ impl AuthType {
             | Self::Secret => true,
             // `configure_email` owns email_password, building a JSON value the
             // credential modal has no fields for. `Unknown` is what a row from
-            // a newer engine parses to, never something to ask a user for.
-            Self::EmailPassword | Self::Unknown => false,
+            // a newer engine parses to, never something to ask a user for. The
+            // agent never asks for the token that reads the user's vaults.
+            Self::EmailPassword | Self::OnepasswordServiceAccount | Self::Unknown => false,
+        }
+    }
+
+    /// Whether a value of this type may reach a subprocess, a request header
+    /// or the proxy. An `oauth_client` blob is read only by the OAuth flow,
+    /// and a service account token only by the `op` child.
+    pub fn is_injectable(self) -> bool {
+        !matches!(self, Self::OauthClient | Self::OnepasswordServiceAccount)
+    }
+
+    /// The JSON key of the secret field, for a type whose value is a JSON
+    /// object. `None` for a type whose whole value is the secret.
+    fn secret_json_key(self) -> Option<&'static str> {
+        match self {
+            Self::Password => Some("password"),
+            Self::OauthClient => Some("client_secret"),
+            _ => None,
         }
     }
 
@@ -103,6 +128,7 @@ impl fmt::Display for AuthType {
             Self::OauthClient => "oauth_client",
             Self::EmailPassword => "email_password",
             Self::Secret => "secret",
+            Self::OnepasswordServiceAccount => "onepassword_service_account",
             Self::Unknown => "unknown",
         };
         f.write_str(s)
@@ -123,11 +149,20 @@ pub struct CredentialInfo {
     /// Optional custom env var name for the injected secret (e.g. `GITHUB_TOKEN`
     /// instead of the default `CRED_<NAME>`). `None` = default `CRED_` form.
     pub env_var_name: Option<String>,
+    /// Every variable name a subprocess can name to get this credential. See
+    /// [`credential_env_var_names`].
+    pub env_var_names: Vec<String>,
+    /// Whether a secret field is a *secret reference*, read from 1Password.
+    pub secret_reference: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// Full credential including the secret value
+/// Full credential including the stored secret.
+///
+/// **The stored value is private.** It may be a *secret reference*, so a
+/// consumer reads the secret through [`Self::secret`], which resolves it.
+/// Only reveal and edit read [`Self::stored_value`].
 #[derive(Clone)]
 pub struct Credential {
     pub id: Uuid,
@@ -136,7 +171,7 @@ pub struct Credential {
     /// [`credential_scope_covers`], which asks whether ANY member covers a URL.
     pub base_urls: Vec<String>,
     pub auth_type: AuthType,
-    pub auth_value: String,
+    stored_value: String,
     pub auth_header: String,
     /// Optional custom env var name for the injected secret (e.g. `GITHUB_TOKEN`
     /// instead of the default `CRED_<NAME>`). `None` = default `CRED_` form.
@@ -145,9 +180,9 @@ pub struct Credential {
     pub updated_at: DateTime<Utc>,
 }
 
-// Manual `Debug` so the secret `auth_value` (API key, bearer token, password,
-// or the oauth client_secret JSON blob) never leaks through `{:?}`. Everything
-// else stays visible so the struct is still useful for debugging.
+// Manual `Debug` so the stored secret (API key, bearer token, password, or the
+// oauth client_secret JSON blob) never leaks through `{:?}`. Everything else
+// stays visible so the struct is still useful for debugging.
 impl fmt::Debug for Credential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Credential")
@@ -155,13 +190,157 @@ impl fmt::Debug for Credential {
             .field("service_name", &self.service_name)
             .field("base_urls", &self.base_urls)
             .field("auth_type", &self.auth_type)
-            .field("auth_value", &"<redacted>")
+            .field("stored_value", &"<redacted>")
             .field("auth_header", &self.auth_header)
             .field("env_var_name", &self.env_var_name)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish()
     }
+}
+
+impl Credential {
+    /// The secret as stored: a reference stays a reference. Reveal and the
+    /// edit form read this; every other consumer reads [`Self::secret`].
+    pub fn stored_value(&self) -> &str {
+        &self.stored_value
+    }
+
+    /// A credential built in memory, for a test to adjust field by field.
+    #[cfg(test)]
+    pub(crate) fn fixture(service_name: &str, auth_type: AuthType, stored_value: &str) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            service_name: service_name.to_string(),
+            base_urls: Vec::new(),
+            auth_type,
+            stored_value: stored_value.to_string(),
+            auth_header: "Authorization".to_string(),
+            env_var_name: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Whether a secret field holds a *secret reference*.
+    pub fn holds_reference(&self) -> bool {
+        secret_field_raw(self.auth_type, &self.stored_value)
+            .is_some_and(|raw| matches!(SecretField::parse(&raw), Ok(SecretField::Reference(_))))
+    }
+
+    /// The secret, in the stored shape, with a reference resolved through the
+    /// engine's resolver. The one read every consumer makes.
+    ///
+    /// The error names the credential and the reason, never a value.
+    pub async fn secret(&self, pool: &PgPool) -> Result<String, String> {
+        self.secret_with(&engine_resolver(pool)).await
+    }
+
+    /// [`Self::secret`] for a consumer that treats an unreadable secret as no
+    /// secret, such as an LLM provider. The reason goes to the log under
+    /// `module`.
+    pub async fn secret_or_log(&self, pool: &PgPool, module: &str) -> Option<String> {
+        match self.secret(pool).await {
+            Ok(secret) => Some(secret),
+            Err(reason) => {
+                log!("{module} {reason}");
+                None
+            }
+        }
+    }
+
+    /// [`Self::secret`] through a given resolver. Resolves only when a field
+    /// holds a reference, and reports the outcome to the resolver.
+    pub async fn secret_with<R: SecretResolver + ?Sized>(
+        &self,
+        resolver: &R,
+    ) -> Result<String, String> {
+        if self.auth_type == AuthType::OnepasswordServiceAccount {
+            return Err(format!(
+                "credential '{}' is a 1Password service account token, which only the op tool reads",
+                self.service_name
+            ));
+        }
+        let result = resolve_secret_fields(self.auth_type, &self.stored_value, resolver)
+            .await
+            .map_err(|reason| format!("credential '{}' {reason}", self.service_name));
+        if self.holds_reference() {
+            resolver
+                .record_outcome(
+                    &self.service_name,
+                    result.as_ref().err().map(String::as_str),
+                )
+                .await;
+        }
+        result
+    }
+}
+
+/// The raw secret field of a stored value: the whole value, or the string at
+/// the type's JSON key. `None` for a JSON value with no such string.
+fn secret_field_raw(auth_type: AuthType, stored: &str) -> Option<String> {
+    match auth_type.secret_json_key() {
+        None => Some(stored.to_string()),
+        Some(key) => serde_json::from_str::<serde_json::Value>(stored)
+            .ok()?
+            .get(key)?
+            .as_str()
+            .map(str::to_string),
+    }
+}
+
+/// `stored` with its secret field resolved, when that field is a reference.
+/// A value whose JSON does not parse passes through, for its consumer to
+/// refuse as it always did.
+async fn resolve_secret_fields<R: SecretResolver + ?Sized>(
+    auth_type: AuthType,
+    stored: &str,
+    resolver: &R,
+) -> Result<String, String> {
+    let Some(raw) = secret_field_raw(auth_type, stored) else {
+        return Ok(stored.to_string());
+    };
+    let reference = match SecretField::parse(&raw) {
+        Ok(SecretField::Stored(_)) => return Ok(stored.to_string()),
+        Ok(SecretField::Reference(reference)) => reference,
+        Err(reason) => return Err(format!("holds a malformed secret reference: {reason}")),
+    };
+    let value = resolver
+        .resolve(&reference)
+        .await
+        .map_err(|failure| format!("could not be read from 1Password: {failure}"))?;
+    let Some(key) = auth_type.secret_json_key() else {
+        return Ok(value);
+    };
+    let mut parsed: serde_json::Value =
+        serde_json::from_str(stored).map_err(|e| format!("holds invalid JSON: {e}"))?;
+    parsed[key] = serde_json::Value::String(value);
+    Ok(parsed.to_string())
+}
+
+/// Refuse a value about to be saved whose reference is malformed or does not
+/// resolve now, so a typo never lands. A service account token can never be
+/// a reference: it is what reads them.
+///
+/// Asks 1Password directly, past the cache, so the answer is current.
+pub async fn check_secret_references(
+    pool: &PgPool,
+    auth_type: AuthType,
+    value: &str,
+) -> Result<(), String> {
+    if auth_type == AuthType::OnepasswordServiceAccount {
+        let account = crate::core::secret_reference::op::ServiceAccount::parse(value);
+        if account.token.starts_with("op://") || account.token.is_empty() {
+            return Err("a 1Password service account needs its token itself".to_string());
+        }
+        return Ok(());
+    }
+    let resolver = crate::core::secret_reference::op::OpResolver::new(pool.clone());
+    resolve_secret_fields(auth_type, value, &resolver)
+        .await
+        .map(|_| ())
+        .map_err(|reason| format!("This secret {reason}"))
 }
 
 /// Full credential DB row tuple (with secret). `env_var_name` is the trailing
@@ -171,7 +350,7 @@ type CredentialRow = (
     String,
     Vec<String>,
     String,
-    String,
+    Secret<CredentialAuthValue>,
     String,
     DateTime<Utc>,
     DateTime<Utc>,
@@ -181,6 +360,9 @@ type CredentialRow = (
 /// Columns selected for a full credential (with secret), in `CredentialRow` order.
 const CREDENTIAL_COLUMNS: &str =
     "id, service_name, base_urls, auth_type, auth_value, auth_header, created_at, updated_at, env_var_name";
+
+/// The SQL form of [`AuthType::is_injectable`], for a lookup by name or URL.
+const INJECTABLE_SQL: &str = "auth_type NOT IN ('oauth_client', 'onepassword_service_account')";
 
 /// Parse a credential row tuple from the database (with secret).
 fn parse_credential(row: CredentialRow) -> Credential {
@@ -200,7 +382,7 @@ fn parse_credential(row: CredentialRow) -> Credential {
         service_name,
         base_urls,
         auth_type: AuthType::parse(&auth_type),
-        auth_value,
+        stored_value: auth_value.into_inner(),
         auth_header,
         env_var_name,
         created_at,
@@ -208,27 +390,29 @@ fn parse_credential(row: CredentialRow) -> Credential {
     }
 }
 
-/// Credential info DB row tuple (without secret).
-type CredentialInfoRow = (
-    Uuid,
-    String,
-    Vec<String>,
-    String,
-    String,
-    DateTime<Utc>,
-    DateTime<Utc>,
-    Option<String>,
-);
-
-/// Parse a credential info row tuple from the database (without secret).
-fn parse_credential_info(row: CredentialInfoRow) -> CredentialInfo {
-    let (id, service_name, base_urls, auth_type, auth_header, created_at, updated_at, env_var_name) =
-        row;
-    CredentialInfo {
+/// What a list shows of a credential: everything but the secret, plus
+/// whether the secret is a reference.
+fn parse_credential_info(row: CredentialRow) -> CredentialInfo {
+    let credential = parse_credential(row);
+    let secret_reference = credential.holds_reference();
+    let Credential {
         id,
         service_name,
         base_urls,
-        auth_type: AuthType::parse(&auth_type),
+        auth_type,
+        auth_header,
+        env_var_name,
+        created_at,
+        updated_at,
+        ..
+    } = credential;
+    CredentialInfo {
+        env_var_names: credential_env_var_names(&service_name, auth_type, env_var_name.as_deref()),
+        secret_reference,
+        id,
+        service_name,
+        base_urls,
+        auth_type,
         auth_header,
         env_var_name,
         created_at,
@@ -319,7 +503,7 @@ impl CredentialStore {
         .bind(service_name)
         .bind(&base_urls)
         .bind(auth_type.to_string())
-        .bind(auth_value)
+        .bind(Secret::<CredentialAuthValue>::new(auth_value))
         .bind(auth_header)
         .bind(env_var_name)
         .fetch_one(pool)
@@ -356,6 +540,7 @@ impl CredentialStore {
             env_var_name,
         )
         .await?;
+        crate::core::secret_reference::forget_resolved_values();
         let event = if created {
             SystemEvent::CredentialCreated {
                 service_name: service_name.to_string(),
@@ -386,12 +571,15 @@ impl CredentialStore {
     /// `apis.json` resolvers in `api/proxy.rs` and `api/proxy_builtin.rs`. The
     /// OAuth flow uses [`Self::get_oauth_client`] instead.
     ///
+    /// Blind to a 1Password service account too, so no name-keyed consumer
+    /// (the proxy, a webhook, an MCP pointer) can ever send its token.
+    ///
     /// Still returns at most one row: the same index keeps a name globally
     /// unique across every other type.
     pub async fn get(pool: &PgPool, service_name: &str) -> Result<Option<Credential>, sqlx::Error> {
         let result = sqlx::query_as::<_, CredentialRow>(&format!(
             "SELECT {CREDENTIAL_COLUMNS} FROM credentials \
-             WHERE service_name = $1 AND auth_type <> 'oauth_client'"
+             WHERE service_name = $1 AND {INJECTABLE_SQL}"
         ))
         .bind(service_name)
         .fetch_optional(pool)
@@ -479,15 +667,54 @@ impl CredentialStore {
         Ok(result.map(parse_credential))
     }
 
-    /// List all credentials (without secrets)
-    pub async fn list(pool: &PgPool) -> Result<Vec<CredentialInfo>, sqlx::Error> {
-        let results = sqlx::query_as::<_, CredentialInfoRow>(
-            r#"
-            SELECT id, service_name, base_urls, auth_type, auth_header, created_at, updated_at, env_var_name
-            FROM credentials
-            ORDER BY service_name ASC
-            "#,
+    /// The workspace's 1Password service account, the newest if several.
+    /// Read by the `op` resolver alone.
+    pub(crate) async fn onepassword_service_account(
+        pool: &PgPool,
+    ) -> Result<Option<crate::core::secret_reference::op::ServiceAccount>, sqlx::Error> {
+        let stored: Option<Secret<CredentialAuthValue>> = sqlx::query_scalar(
+            "SELECT auth_value FROM credentials \
+             WHERE auth_type = 'onepassword_service_account' \
+             ORDER BY updated_at DESC LIMIT 1",
         )
+        .fetch_optional(pool)
+        .await?;
+        Ok(stored.map(|stored| {
+            crate::core::secret_reference::op::ServiceAccount::parse(&stored.into_inner())
+        }))
+    }
+
+    /// Insert a secret a boot step moved here from another table. Returns
+    /// whether it landed: a name already held by another credential leaves
+    /// the table as it was.
+    ///
+    /// Silent, like a migration: it runs before the EventBus exists, and no
+    /// client is connected to tell (`secret_store::one_home`).
+    pub(crate) async fn insert_moved_secret(
+        conn: &mut sqlx::PgConnection,
+        service_name: &str,
+        auth_type: AuthType,
+        base_urls: &[String],
+        value: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let inserted = sqlx::query(
+            "INSERT INTO credentials (service_name, base_urls, auth_type, auth_value) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(service_name)
+        .bind(scope_members(base_urls))
+        .bind(auth_type.to_string())
+        .bind(Secret::<CredentialAuthValue>::new(value))
+        .execute(conn)
+        .await?;
+        Ok(inserted.rows_affected() > 0)
+    }
+
+    /// List all credentials, without their secrets.
+    pub async fn list(pool: &PgPool) -> Result<Vec<CredentialInfo>, sqlx::Error> {
+        let results = sqlx::query_as::<_, CredentialRow>(&format!(
+            "SELECT {CREDENTIAL_COLUMNS} FROM credentials ORDER BY service_name ASC"
+        ))
         .fetch_all(pool)
         .await?;
 
@@ -515,27 +742,11 @@ impl CredentialStore {
     /// key), so a name-keyed DELETE would be a coin flip over which one goes.
     /// `RETURNING` is what keeps the event able to name the deleted service
     /// without a second round trip.
-    ///
-    /// An `email_password` also clears the mailbox password in the same
-    /// transaction. IMAP and SMTP read it from `email_accounts`, so leaving it
-    /// kept mail access alive after the user revoked it.
     async fn delete_row(pool: &PgPool, id: Uuid) -> Result<Option<String>, sqlx::Error> {
-        let mut tx = pool.begin().await?;
-        let removed = sqlx::query_as::<_, (String, String)>(
-            "DELETE FROM credentials WHERE id = $1 RETURNING service_name, auth_type",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((service_name, auth_type)) = removed else {
-            return Ok(None);
-        };
-        if AuthType::parse(&auth_type) == AuthType::EmailPassword {
-            let account = crate::core::EmailStore::account_name_for_credential(&service_name);
-            crate::core::EmailStore::clear_password(&mut tx, account).await?;
-        }
-        tx.commit().await?;
-        Ok(Some(service_name))
+        sqlx::query_scalar("DELETE FROM credentials WHERE id = $1 RETURNING service_name")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
     }
 
     /// Delete a credential and announce it. The only way to remove one.
@@ -549,6 +760,7 @@ impl CredentialStore {
         actor: Option<MessageOrigin>,
     ) -> Result<bool, sqlx::Error> {
         let removed = Self::delete_row(pool, id).await?;
+        crate::core::secret_reference::forget_resolved_values();
         if let Some(service_name) = &removed {
             event_bus
                 .emit_or_log(
@@ -612,7 +824,7 @@ impl CredentialStore {
                 .bind(&base_urls)
                 .bind(auth_type.to_string())
                 .bind(auth_header)
-                .bind(value)
+                .bind(Secret::<CredentialAuthValue>::new(value))
                 .bind(env_var_name)
                 .fetch_optional(pool)
                 .await
@@ -669,6 +881,7 @@ impl CredentialStore {
             env_var_name,
         )
         .await?;
+        crate::core::secret_reference::forget_resolved_values();
         if let Some(service_name) = &updated {
             event_bus
                 .emit_or_log(
@@ -821,10 +1034,11 @@ impl CredentialStore {
         // (`https://www.googleapis.com`), which is exactly what a request to
         // that provider matches, and now that an API key may share the row's
         // name the two are far likelier to sit side by side. The tie-break here
-        // is longest-matching-scope-first, so which one won was arbitrary.
+        // is longest-matching-scope-first, so which one won was arbitrary. A
+        // service account token goes to the `op` child only.
         let results = sqlx::query_as::<_, CredentialRow>(&format!(
             "SELECT {CREDENTIAL_COLUMNS} FROM credentials \
-             WHERE auth_type <> 'oauth_client' \
+             WHERE {INJECTABLE_SQL} \
              ORDER BY service_name ASC"
         ))
         .fetch_all(pool)
@@ -950,101 +1164,401 @@ pub(crate) fn credential_base_url_matches(base_url: &str, request_url: &str) -> 
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Build CRED_* environment variables from a list of credentials.
-/// - `password` type: emits `CRED_{NAME}_USERNAME` and `CRED_{NAME}_PASSWORD`
-///   from the JSON-encoded auth_value. The custom `env_var_name` does NOT apply
-///   to password credentials — the username/password split has no single name.
-/// - other (single-value) types (api_key, bearer, basic, …): always emits the
-///   canonical `CRED_{NAME}`, AND — when a custom `env_var_name` is set — emits
-///   the same secret a SECOND time under that name (e.g. `GITHUB_TOKEN`). The
-///   custom name is an ADDITIONAL alias, not a replacement, so existing scripts /
-///   knowhow that reference `CRED_{NAME}` keep working while a tool that expects
-///   an exact variable name also gets it.
+/// The prefixes of the secret variables a subprocess gets only by naming them.
+const SECRET_VAR_PREFIXES: [&str; 2] = ["CRED_", "OAUTH_"];
+
+/// The most of one script file [`SecretMentions`] reads.
+const MENTION_SCAN_MAX_BYTES: u64 = 256 * 1024;
+
+/// The most sibling scripts [`SecretMentions`] reads beside one named script.
+const MENTION_SCAN_MAX_SIBLINGS: usize = 32;
+
+/// The env-shaped words in the text a subprocess runs. A chat or script
+/// subprocess gets a `CRED_*` or `OAUTH_*` variable only when this names it.
 ///
-/// - `oauth_client` type: **skipped entirely**. See below.
-///
-/// `{NAME}` is the credential's `service_name` run through
-/// [`crate::core::env_var_segment`] (uppercased, every character outside
-/// `[A-Z0-9_]` replaced by `_`).
-///
-/// **An OAuth client registration is never part of the blanket fan-out.** Its
-/// `auth_value` is a `{client_id, client_secret, auth_url, ...}` JSON blob that
-/// only the OAuth flow consumes, and that flow reads the credentials table
-/// directly, so including it broadcast a `client_secret` into the environment of
-/// every `run_bash` / `run_python` / scheduled script for no reader. Excluding
-/// it is also what keeps `CRED_<NAME>` unambiguous now that `oauth_client` is
-/// the one type allowed to shadow a name: the remaining types stay globally
-/// unique under the partial index, so two credentials can never contend for one
-/// variable.
-///
-/// That is a rule about the FAN-OUT, not about the credential. A caller holding
-/// one credential the user named explicitly (a `script_handshake` layer's
-/// `credential` field) calls [`credential_env_vars_for`] instead and does get
-/// it: neither the broadcast nor the ambiguity applies to a single named row,
-/// and silently injecting nothing there would be a configured secret going
-/// missing with no error.
-pub fn credential_env_vars(credentials: Vec<Credential>) -> Vec<(String, String)> {
-    credentials
-        .into_iter()
-        .filter(|c| c.auth_type != AuthType::OauthClient)
-        .flat_map(credential_env_vars_for)
-        .collect()
+/// A word is a maximal run of `[A-Za-z0-9_]`. So `$CRED_X`,
+/// `os.environ["CRED_X"]` and `${CRED_X:-}` all name `CRED_X`, while
+/// `MY_CRED_X` names nothing. Only env-shaped words are kept: capitals,
+/// digits and `_`, as a custom alias may be. A name built at run time is
+/// declared with a header comment, `# lucidos-credentials: CRED_A CRED_B`,
+/// which is just another mention.
+#[derive(Debug, Default, Clone)]
+pub struct SecretMentions {
+    words: BTreeSet<String>,
 }
 
-/// The `CRED_*` variables for ONE credential, with no type filtering. See
-/// [`credential_env_vars`] for the shape per auth type and for why the
-/// list-taking version skips `oauth_client` while this one does not.
-///
-/// The custom alias is still emitted here. The handshake runner drops it,
-/// because a handshake script gets only `CRED_*` and `OAUTH_*` names
-/// (`api::proxy_script_runner`).
-pub fn credential_env_vars_for(cred: Credential) -> Vec<(String, String)> {
-    let mut env_vars = Vec::new();
-    {
-        let prefix = format!("CRED_{}", crate::core::env_var_segment(&cred.service_name));
+impl SecretMentions {
+    /// The mentions in one piece of text.
+    pub fn scan(text: &str) -> Self {
+        let mut mentions = Self::default();
+        mentions.add_text(text);
+        mentions
+    }
 
-        if cred.auth_type == AuthType::Password {
-            match serde_json::from_str::<serde_json::Value>(&cred.auth_value) {
-                Ok(parsed) => {
-                    let username = parsed["username"].as_str().unwrap_or("");
-                    let password = parsed["password"].as_str().unwrap_or("");
-                    env_vars.push((format!("{}_USERNAME", prefix), username.to_string()));
-                    env_vars.push((format!("{}_PASSWORD", prefix), password.to_string()));
-                }
-                Err(e) => {
-                    // Malformed JSON in a Password credential means a script
-                    // expecting CRED_<NAME>_USERNAME / _PASSWORD will see them
-                    // missing with no signal — log so the user has something to
-                    // diagnose against instead of silently failing in the script.
-                    log!(
-                        "[Credentials] {} has invalid password JSON, skipping env injection: {}",
-                        cred.service_name,
-                        e
-                    );
-                }
-            }
-        } else {
-            // Always emit the canonical CRED_<NAME>. When a custom name is set,
-            // ALSO emit the secret under that name (an additional alias) so
-            // existing references to CRED_<NAME> keep working.
-            let value = cred.auth_value;
-            let custom = cred
-                .env_var_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && *s != prefix.as_str());
-            if let Some(custom) = custom {
-                env_vars.push((custom.to_string(), value.clone()));
-            }
-            env_vars.push((prefix, value));
+    /// The mentions in a command or code, plus those in every workspace
+    /// script it names. `python data/triggers/x/fetch.py` then gets what
+    /// `fetch.py` names, with no edit to the command.
+    pub fn of_command(text: &str, workspace: &std::path::Path) -> Self {
+        let mut mentions = Self::scan(text);
+        for script in named_workspace_scripts(text, workspace) {
+            mentions.add_script(&script);
+        }
+        mentions
+    }
+
+    /// The mentions in one script file.
+    pub fn of_script_file(path: &std::path::Path) -> Self {
+        let mut mentions = Self::default();
+        mentions.add_script(path);
+        mentions
+    }
+
+    /// A script and the `.py` / `.sh` files beside it, since a trigger's
+    /// `run.sh` may call its `fetch.py`, and a script may import a sibling.
+    fn add_script(&mut self, path: &std::path::Path) {
+        self.add_file(path);
+        let Some(entries) = path.parent().and_then(|dir| std::fs::read_dir(dir).ok()) else {
+            return;
+        };
+        let siblings = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|sibling| {
+                sibling != path
+                    && sibling.is_file()
+                    && matches!(
+                        sibling.extension().and_then(|ext| ext.to_str()),
+                        Some("py" | "sh")
+                    )
+            })
+            .take(MENTION_SCAN_MAX_SIBLINGS);
+        for sibling in siblings {
+            self.add_file(&sibling);
         }
     }
-    env_vars
+
+    fn add_text(&mut self, text: &str) {
+        let words = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+        for word in words.filter(|word| is_env_shaped(word)) {
+            self.words.insert(word.to_string());
+        }
+    }
+
+    /// Reads the head of the file. An unreadable file adds nothing: the run
+    /// then fails on its own terms, with the secret-names note to help.
+    fn add_file(&mut self, path: &std::path::Path) {
+        use std::io::Read;
+        let mut head = Vec::new();
+        let read = std::fs::File::open(path)
+            .and_then(|file| file.take(MENTION_SCAN_MAX_BYTES).read_to_end(&mut head));
+        if read.is_ok() {
+            self.add_text(&String::from_utf8_lossy(&head));
+        }
+    }
+
+    /// Whether the text names `var` as a whole word.
+    pub fn names(&self, var: &str) -> bool {
+        self.words.contains(var)
+    }
+
+    /// Whether resolving credentials could inject anything, or the names are
+    /// wanted. True for a `CRED_*` mention, and for any other env-shaped word,
+    /// which may be a credential's custom alias.
+    pub fn wants_credentials(&self) -> bool {
+        self.asks_for_names() || self.words.iter().any(|word| !word.starts_with("OAUTH_"))
+    }
+
+    /// Whether the text names any `OAUTH_*` variable, or asks for the names.
+    /// Only a named account is refreshed.
+    pub fn wants_oauth(&self) -> bool {
+        self.asks_for_names() || self.secret_names().any(|name| name.starts_with("OAUTH_"))
+    }
+
+    /// Whether the text holds a bare prefix, as `env | grep CRED_` does. It
+    /// names nothing, so it is a search for the names.
+    fn asks_for_names(&self) -> bool {
+        SECRET_VAR_PREFIXES
+            .iter()
+            .any(|prefix| self.words.contains(*prefix))
+    }
+
+    /// Every `CRED_*` / `OAUTH_*` name the text mentions.
+    fn secret_names(&self) -> impl Iterator<Item = &str> {
+        self.words.iter().map(String::as_str).filter(|word| {
+            SECRET_VAR_PREFIXES
+                .iter()
+                .any(|prefix| word.len() > prefix.len() && word.starts_with(prefix))
+        })
+    }
+}
+
+/// The shape a custom alias may take, so `TOKEN` counts as well as `CRED_X`.
+fn is_env_shaped(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && !word.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// The `.py` / `.sh` files inside `workspace` that `text` names as a word.
+/// A relative path resolves against the workspace, which is where the
+/// subprocess runs.
+fn named_workspace_scripts(text: &str, workspace: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(root) = workspace.canonicalize() else {
+        return Vec::new();
+    };
+    let mut scripts = Vec::new();
+    // A shell operator can touch a path, as in `./fetch.sh|tee log`.
+    for word in text.split(|c: char| c.is_whitespace() || "|&;<>".contains(c)) {
+        let word = word.trim_matches(|c: char| "\"'`()[]{},;".contains(c));
+        if !(word.ends_with(".py") || word.ends_with(".sh")) {
+            continue;
+        }
+        let Ok(path) = root.join(word).canonicalize() else {
+            continue;
+        };
+        if path.starts_with(&root) && path.is_file() && !scripts.contains(&path) {
+            scripts.push(path);
+        }
+    }
+    scripts
+}
+
+/// Secret variables resolved against a subprocess's [`SecretMentions`].
+#[derive(Debug, Default)]
+pub struct NamedSecretVars {
+    /// What the subprocess gets: only what its text names.
+    pub env_vars: Vec<(String, String)>,
+    /// Every `CRED_*` / `OAUTH_*` name it could have named. Names, never values.
+    pub known_names: BTreeSet<String>,
+    /// Why each named credential that could not be read was left out: the
+    /// credential and the reason, never a value.
+    pub unavailable: Vec<String>,
+}
+
+impl NamedSecretVars {
+    pub fn extend(&mut self, other: NamedSecretVars) {
+        self.env_vars.extend(other.env_vars);
+        self.known_names.extend(other.known_names);
+        self.unavailable.extend(other.unavailable);
+    }
+
+    /// The note a tool result carries for the named credentials left out.
+    /// `None` when every one loaded.
+    pub fn unavailable_note(&self) -> Option<String> {
+        if self.unavailable.is_empty() {
+            return None;
+        }
+        let lines: Vec<String> = self
+            .unavailable
+            .iter()
+            .map(|reason| format!("[lucidos] Not set: {reason}."))
+            .collect();
+        Some(lines.join("\n"))
+    }
+}
+
+/// The `CRED_*` variables for the credentials `mentions` names.
+///
+/// - **A mention injects the whole credential.** Naming either half of a
+///   `password` pair, or its bare `CRED_<NAME>`, injects both halves.
+/// - **A custom alias counts.** Naming `GITHUB_TOKEN` injects that credential,
+///   under both its alias and `CRED_<NAME>`.
+/// - **`oauth_client` and a service account token are never injected**
+///   ([`AuthType::is_injectable`]).
+/// - **Only a named credential is resolved.** A *secret reference* runs `op`
+///   only when the text names its credential. One that cannot be read is left
+///   out with a reason in [`NamedSecretVars::unavailable`], and the rest load.
+///
+/// A caller holding one credential the user configured by name (a
+/// `script_handshake` layer's `credential` field) calls
+/// [`credential_env_vars_for`] instead.
+pub async fn named_credential_env_vars<R: SecretResolver + ?Sized>(
+    credentials: Vec<Credential>,
+    mentions: &SecretMentions,
+    resolver: &R,
+) -> NamedSecretVars {
+    let mut named = NamedSecretVars::default();
+    for cred in credentials {
+        if !cred.auth_type.is_injectable() {
+            continue;
+        }
+        let prefix = format!("CRED_{}", crate::core::env_var_segment(&cred.service_name));
+        let names = env_var_names_for(
+            &cred.service_name,
+            cred.auth_type,
+            cred.env_var_name.as_deref(),
+        );
+        let mentioned = mentions.names(&prefix) || names.iter().any(|name| mentions.names(name));
+        named
+            .known_names
+            .extend(names.into_iter().filter(|name| name.starts_with("CRED_")));
+        if mentioned {
+            match credential_env_vars_for(cred, resolver).await {
+                Ok(vars) => named.env_vars.extend(vars),
+                Err(reason) => named.unavailable.push(reason),
+            }
+        }
+    }
+    named
+}
+
+/// The note a tool result carries when its text names a `CRED_*` / `OAUTH_*`
+/// variable the workspace does not have, or holds a bare prefix. `None` when
+/// every name resolved.
+///
+/// It lists names only, never values, nearest to the first unknown name first.
+/// A mention that prefixes a known name, like `CRED_MAIL` for
+/// `CRED_MAIL_PASSWORD`, is not unknown.
+pub fn secret_names_note(
+    mentions: &SecretMentions,
+    known_names: &BTreeSet<String>,
+) -> Option<String> {
+    const LISTED: usize = 20;
+    let unknown: Vec<&str> = mentions
+        .secret_names()
+        .filter(|name| {
+            !known_names.contains(*name)
+                && !known_names
+                    .iter()
+                    .any(|known| known.starts_with(&format!("{name}_")))
+        })
+        .collect();
+    let bare: Vec<&str> = SECRET_VAR_PREFIXES
+        .into_iter()
+        .filter(|prefix| mentions.names(prefix))
+        .collect();
+    let first = *unknown.first().or(bare.first())?;
+
+    let mut note = String::new();
+    for prefix in &bare {
+        note.push_str(&format!(
+            "[lucidos] A bare {prefix} names no credential, so none was set.\n"
+        ));
+    }
+    for name in &unknown {
+        note.push_str(&format!(
+            "[lucidos] {name} is not a credential in this workspace, so it was not set.\n"
+        ));
+    }
+    let mut nearest: Vec<&String> = known_names.iter().collect();
+    nearest.sort_by_key(|known| {
+        let shared = known
+            .chars()
+            .zip(first.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let distance = crate::core::event_subscription::known_names::levenshtein(known, first);
+        (std::cmp::Reverse(shared), distance, (*known).clone())
+    });
+    let listed: Vec<&str> = nearest.iter().take(LISTED).map(|s| s.as_str()).collect();
+    let more = if nearest.len() > LISTED { ", …" } else { "" };
+    if listed.is_empty() {
+        note.push_str("This workspace has no credentials to name.\n");
+    } else {
+        note.push_str(&format!(
+            "Credentials you can name: {}{more}\n",
+            listed.join(", ")
+        ));
+    }
+    note.push_str(
+        "Run `lucidos credentials list` for every stored credential and the names it sets. \
+         To add one, use request_credential.",
+    );
+    Some(note)
+}
+
+/// The `CRED_*` variables for ONE credential, with no type filtering.
+///
+/// - `password`: `CRED_{NAME}_USERNAME` and `CRED_{NAME}_PASSWORD`, from the
+///   JSON-encoded value. A custom `env_var_name` does not apply.
+/// - every other type: `CRED_{NAME}`, plus the same value under the custom
+///   `env_var_name` when one is set. The alias is additional, so a reference
+///   to `CRED_{NAME}` keeps working.
+///
+/// `{NAME}` is the `service_name` through [`crate::core::env_var_segment`].
+/// The handshake runner drops the alias, because a handshake script gets only
+/// `CRED_*` and `OAUTH_*` names (`api::proxy_script_runner`).
+///
+/// A reference resolves here; one that cannot is an `Err` naming the
+/// credential and the reason.
+pub async fn credential_env_vars_for<R: SecretResolver + ?Sized>(
+    cred: Credential,
+    resolver: &R,
+) -> Result<Vec<(String, String)>, String> {
+    let names = env_var_names_for(
+        &cred.service_name,
+        cred.auth_type,
+        cred.env_var_name.as_deref(),
+    );
+    let secret = cred.secret_with(resolver).await?;
+    if cred.auth_type != AuthType::Password {
+        return Ok(names
+            .into_iter()
+            .map(|name| (name, secret.clone()))
+            .collect());
+    }
+    match serde_json::from_str::<serde_json::Value>(&secret) {
+        Ok(parsed) => {
+            let half = |key: &str| parsed[key].as_str().unwrap_or("").to_string();
+            Ok(names
+                .into_iter()
+                .zip([half("username"), half("password")])
+                .collect())
+        }
+        Err(e) => {
+            // The script would see both halves missing with no signal, so
+            // the log is the user's only clue.
+            log!(
+                "[Credentials] {} has invalid password JSON, skipping env injection: {}",
+                cred.service_name,
+                e
+            );
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The names a subprocess can set for one stored credential, as
+/// `lucidos credentials list` shows them. A type that is not
+/// [`AuthType::is_injectable`] sets none.
+pub fn credential_env_var_names(
+    service_name: &str,
+    auth_type: AuthType,
+    env_var_name: Option<&str>,
+) -> Vec<String> {
+    if !auth_type.is_injectable() {
+        return Vec::new();
+    }
+    env_var_names_for(service_name, auth_type, env_var_name)
+}
+
+/// The one definition of a credential's variable names, with no type
+/// filtering. A `password` sets `_USERNAME` then `_PASSWORD`. Every other type
+/// sets its custom alias, when one is set, then the canonical `CRED_<NAME>`.
+fn env_var_names_for(
+    service_name: &str,
+    auth_type: AuthType,
+    env_var_name: Option<&str>,
+) -> Vec<String> {
+    let prefix = format!("CRED_{}", crate::core::env_var_segment(service_name));
+    if auth_type == AuthType::Password {
+        return vec![format!("{prefix}_USERNAME"), format!("{prefix}_PASSWORD")];
+    }
+    let alias = env_var_name
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty() && *alias != prefix);
+    alias
+        .map(str::to_string)
+        .into_iter()
+        .chain([prefix])
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::secret_reference::tests::ScriptedResolver;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
     /// Every agent-facing type list is rendered from `ALL`, so a variant
@@ -1381,7 +1895,7 @@ mod tests {
     /// IMAP and SMTP log in with the copy of the password in `email_accounts`,
     /// so deleting the credential alone left mail access live and invisible.
     #[tokio::test]
-    async fn delete_of_an_email_password_clears_the_mailbox_password() {
+    async fn deleting_an_email_password_ends_mail_access() {
         use crate::core::EmailStore;
         let (pool, db) = setup_test_db().await;
         let (bus, _callback_rx) = EventBus::new(pool.clone());
@@ -1414,12 +1928,19 @@ mod tests {
         )
         .await
         .unwrap();
-        EmailStore::update_password(&pool, "mail", "hunter2")
-            .await
-            .unwrap();
-        EmailStore::update_password(&pool, "other", "kept")
-            .await
-            .unwrap();
+        CredentialStore::upsert(
+            &pool,
+            &bus,
+            "other",
+            &[],
+            AuthType::EmailPassword,
+            "kept",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let id = CredentialStore::upsert(
             &pool,
             &bus,
@@ -1439,33 +1960,44 @@ mod tests {
             .unwrap());
 
         let account = EmailStore::get(&pool, "mail").await.unwrap().unwrap();
-        assert_eq!(account.password, "", "the mailbox password must go with it");
+        assert!(
+            account.password == crate::core::MailPassword::Missing,
+            "the mailbox password must go with it"
+        );
         let other = EmailStore::get(&pool, "other").await.unwrap().unwrap();
-        assert_eq!(other.password, "kept", "another account is untouched");
+        assert!(
+            other.password == crate::core::MailPassword::Saved("kept".into()),
+            "another account is untouched"
+        );
 
         teardown_test_db(&db).await;
     }
 
     fn make_cred(service_name: &str, auth_type: AuthType, auth_value: &str) -> Credential {
-        Credential {
-            id: Uuid::nil(),
-            service_name: service_name.to_string(),
-            base_urls: Vec::new(),
-            auth_type,
-            auth_value: auth_value.to_string(),
-            auth_header: "Authorization".to_string(),
-            env_var_name: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
+        Credential::fixture(service_name, auth_type, auth_value)
+    }
+
+    /// A resolver for credentials holding no reference: any call fails the test.
+    fn no_references() -> ScriptedResolver {
+        ScriptedResolver::answering(Vec::new())
+    }
+
+    /// [`credential_env_vars_for`] for a credential holding no reference.
+    fn env_for(cred: Credential) -> Vec<(String, String)> {
+        futures::executor::block_on(credential_env_vars_for(cred, &no_references()))
+            .expect("a stored value always loads")
+    }
+
+    /// [`named_credential_env_vars`] over credentials holding no reference.
+    fn named_for(creds: Vec<Credential>, mentions: &SecretMentions) -> NamedSecretVars {
+        futures::executor::block_on(named_credential_env_vars(creds, mentions, &no_references()))
     }
 
     #[test]
     fn custom_env_var_name_adds_alias_alongside_cred_prefix() {
         let mut cred = make_cred("github", AuthType::Bearer, "ghp_xxx");
         cred.env_var_name = Some("GITHUB_TOKEN".to_string());
-        let env: std::collections::HashMap<_, _> =
-            credential_env_vars(vec![cred]).into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env_for(cred).into_iter().collect();
         // Additive: the custom name is an EXTRA alias, the canonical CRED_<NAME>
         // is still emitted so existing references keep working.
         assert_eq!(env.get("GITHUB_TOKEN").map(String::as_str), Some("ghp_xxx"));
@@ -1476,7 +2008,7 @@ mod tests {
     fn blank_custom_env_var_name_emits_only_cred_prefix() {
         let mut cred = make_cred("github", AuthType::Bearer, "ghp_xxx");
         cred.env_var_name = Some("   ".to_string());
-        let pairs = credential_env_vars(vec![cred]);
+        let pairs = env_for(cred);
         assert_eq!(pairs.len(), 1, "blank custom name adds no alias");
         assert_eq!(pairs[0].0, "CRED_GITHUB");
         assert_eq!(pairs[0].1, "ghp_xxx");
@@ -1486,7 +2018,7 @@ mod tests {
     fn custom_name_equal_to_prefix_is_not_duplicated() {
         let mut cred = make_cred("github", AuthType::Bearer, "ghp_xxx");
         cred.env_var_name = Some("CRED_GITHUB".to_string());
-        let pairs = credential_env_vars(vec![cred]);
+        let pairs = env_for(cred);
         assert_eq!(
             pairs.len(),
             1,
@@ -1502,8 +2034,7 @@ mod tests {
             AuthType::Password,
             r#"{"username":"alice","password":"s3cret"}"#,
         );
-        let env: std::collections::HashMap<_, _> =
-            credential_env_vars(vec![cred]).into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env_for(cred).into_iter().collect();
         assert_eq!(
             env.get("CRED_COMFORT_CLOUD_USERNAME").map(String::as_str),
             Some("alice")
@@ -1522,8 +2053,7 @@ mod tests {
             AuthType::ApiKey,
             "AIzaSy-fake-key-value",
         );
-        let env: std::collections::HashMap<_, _> =
-            credential_env_vars(vec![cred]).into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env_for(cred).into_iter().collect();
         assert_eq!(
             env.get("CRED_FIREBASE_WEB_API_KEY").map(String::as_str),
             Some("AIzaSy-fake-key-value")
@@ -1535,8 +2065,7 @@ mod tests {
     #[test]
     fn bearer_emits_single_cred_var() {
         let cred = make_cred("openai-key", AuthType::Bearer, "sk-test-123");
-        let env: std::collections::HashMap<_, _> =
-            credential_env_vars(vec![cred]).into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env_for(cred).into_iter().collect();
         assert_eq!(
             env.get("CRED_OPENAI_KEY").map(String::as_str),
             Some("sk-test-123")
@@ -1550,8 +2079,7 @@ mod tests {
         // to the script as `CRED_<NAME>` and let the script decide how to
         // split it. Mirrors what `run_python` / `run_bash` already do.
         let cred = make_cred("svc-basic", AuthType::Basic, "alice:s3cret");
-        let env: std::collections::HashMap<_, _> =
-            credential_env_vars(vec![cred]).into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env_for(cred).into_iter().collect();
         assert_eq!(
             env.get("CRED_SVC_BASIC").map(String::as_str),
             Some("alice:s3cret")
@@ -1583,8 +2111,7 @@ mod tests {
         // Unknown — Unknown lands in the else branch with a single CRED_*
         // variable carrying the raw value, same as ApiKey/Bearer/Basic.
         let cred = make_cred("legacy-svc", AuthType::Unknown, "raw-value");
-        let env: std::collections::HashMap<_, _> =
-            credential_env_vars(vec![cred]).into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env_for(cred).into_iter().collect();
         assert_eq!(
             env.get("CRED_LEGACY_SVC").map(String::as_str),
             Some("raw-value")
@@ -1596,8 +2123,7 @@ mod tests {
     #[test]
     fn name_transform_uppercases_and_replaces_separators() {
         let cred = make_cred("snake.storage shared-prod", AuthType::ApiKey, "v");
-        let env: std::collections::HashMap<_, _> =
-            credential_env_vars(vec![cred]).into_iter().collect();
+        let env: std::collections::HashMap<_, _> = env_for(cred).into_iter().collect();
         assert_eq!(
             env.get("CRED_SNAKE_STORAGE_SHARED_PROD")
                 .map(String::as_str),
@@ -1612,11 +2138,12 @@ mod tests {
     /// shell can actually expand.
     #[test]
     fn name_transform_replaces_namespace_colon_and_address_chars() {
-        let env: std::collections::HashMap<_, _> = credential_env_vars(vec![
+        let env: std::collections::HashMap<_, _> = [
             make_cred("oauth:google", AuthType::ApiKey, "client-blob"),
             make_cred("email:user@example.com", AuthType::EmailPassword, "pw"),
-        ])
+        ]
         .into_iter()
+        .flat_map(env_for)
         .collect();
         assert_eq!(
             env.get("CRED_OAUTH_GOOGLE").map(String::as_str),
@@ -1637,6 +2164,280 @@ mod tests {
         }
     }
 
+    fn named_vars(creds: Vec<Credential>, text: &str) -> std::collections::HashMap<String, String> {
+        named_for(creds, &SecretMentions::scan(text))
+            .env_vars
+            .into_iter()
+            .collect()
+    }
+
+    /// The core of the rule: a subprocess gets only the credential its text
+    /// names, never the rest of the workspace's.
+    #[test]
+    fn only_the_named_credential_is_injected() {
+        let creds = || {
+            vec![
+                make_cred("github", AuthType::Bearer, "gh-value"),
+                make_cred("slack", AuthType::Bearer, "slack-value"),
+            ]
+        };
+        let env = named_vars(creds(), r#"curl -H "Authorization: Bearer $CRED_GITHUB" x"#);
+        assert_eq!(env.get("CRED_GITHUB").map(String::as_str), Some("gh-value"));
+        assert!(
+            !env.contains_key("CRED_SLACK"),
+            "an unnamed credential leaked"
+        );
+
+        assert!(named_vars(creds(), "ls -la").is_empty());
+        assert!(
+            named_vars(creds(), "echo $MY_CRED_GITHUB").is_empty(),
+            "a mention is a whole word"
+        );
+    }
+
+    /// Naming either half of a password pair, or its bare prefix, injects both.
+    #[test]
+    fn a_password_half_injects_the_whole_pair() {
+        let cred = || {
+            make_cred(
+                "mail",
+                AuthType::Password,
+                r#"{"username":"alice","password":"s3cret"}"#,
+            )
+        };
+        for text in [
+            "os.environ['CRED_MAIL_USERNAME']",
+            "echo $CRED_MAIL_PASSWORD",
+            "# lucidos-credentials: CRED_MAIL",
+        ] {
+            let env = named_vars(vec![cred()], text);
+            assert_eq!(env.len(), 2, "{text}");
+            assert_eq!(
+                env.get("CRED_MAIL_PASSWORD").map(String::as_str),
+                Some("s3cret")
+            );
+        }
+    }
+
+    /// A custom alias injects its credential when the text names the alias
+    /// or the canonical name, under both names.
+    #[test]
+    fn an_alias_or_its_canonical_name_injects_both() {
+        let cred = || {
+            let mut cred = make_cred("github", AuthType::Bearer, "gh-value");
+            cred.env_var_name = Some("GITHUB_TOKEN".to_string());
+            cred
+        };
+        for text in ["gh pr list  # GITHUB_TOKEN", "echo $CRED_GITHUB"] {
+            let env = named_vars(vec![cred()], text);
+            assert_eq!(
+                env.get("GITHUB_TOKEN").map(String::as_str),
+                Some("gh-value")
+            );
+            assert_eq!(env.get("CRED_GITHUB").map(String::as_str), Some("gh-value"));
+        }
+        assert!(named_vars(vec![cred()], "gh pr list").is_empty());
+    }
+
+    /// An OAuth client registration stays out even when named: only the OAuth
+    /// flow reads its blob.
+    #[test]
+    fn an_oauth_client_is_never_injected() {
+        let named = named_for(
+            vec![make_cred("google", AuthType::OauthClient, "{}")],
+            &SecretMentions::scan("echo $CRED_GOOGLE"),
+        );
+        assert!(named.env_vars.is_empty());
+        assert!(named.known_names.is_empty());
+    }
+
+    /// A custom alias needs no underscore: `TOKEN` is a valid alias.
+    #[test]
+    fn an_alias_without_an_underscore_injects_its_credential() {
+        let mut aliased = make_cred("github", AuthType::Bearer, "ghp_value");
+        aliased.env_var_name = Some("TOKEN".to_string());
+        let named = named_for(vec![aliased], &SecretMentions::scan("echo $TOKEN"));
+        assert_eq!(named.env_vars.len(), 2, "the alias and CRED_GITHUB");
+    }
+
+    /// A text with no env-shaped word needs no credential or OAuth query.
+    #[test]
+    fn plain_text_wants_no_secret_query() {
+        for text in ["ls -la", "print(my_var)", "git log --oneline"] {
+            let mentions = SecretMentions::scan(text);
+            assert!(!mentions.wants_credentials(), "{text}");
+            assert!(!mentions.wants_oauth(), "{text}");
+        }
+        assert!(SecretMentions::scan("echo $CRED_X").wants_credentials());
+        assert!(!SecretMentions::scan("echo $CRED_X").wants_oauth());
+        assert!(SecretMentions::scan("echo $OAUTH_GOOGLE_ACCESS_TOKEN").wants_oauth());
+        assert!(
+            !SecretMentions::scan("echo $OAUTH_GOOGLE_ACCESS_TOKEN").wants_credentials(),
+            "an OAuth mention alone loads no credential"
+        );
+    }
+
+    /// A command running a workspace script names that script's mentions too,
+    /// and a script outside the workspace adds nothing.
+    #[test]
+    fn a_command_names_the_workspace_scripts_it_runs() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let dir = workspace.path().join("data/triggers/watch");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("fetch.py"),
+            "import os\nos.environ['CRED_GITHUB']\n",
+        )
+        .unwrap();
+        let outside = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(outside.path().join("x.sh"), "echo $CRED_SLACK\n").unwrap();
+
+        let mentions = SecretMentions::of_command(
+            &format!(
+                "python data/triggers/watch/fetch.py && sh {}",
+                outside.path().join("x.sh").display()
+            ),
+            workspace.path(),
+        );
+        assert!(mentions.names("CRED_GITHUB"));
+        assert!(
+            !mentions.names("CRED_SLACK"),
+            "a script outside the workspace"
+        );
+
+        let quoted = SecretMentions::of_command(
+            r#"subprocess.run(["python", "data/triggers/watch/fetch.py"])"#,
+            workspace.path(),
+        );
+        assert!(quoted.names("CRED_GITHUB"), "a quoted path in Python code");
+
+        for command in [
+            "python data/triggers/watch/fetch.py|tee log",
+            "python data/triggers/watch/fetch.py&&echo done",
+        ] {
+            let piped = SecretMentions::of_command(command, workspace.path());
+            assert!(piped.names("CRED_GITHUB"), "{command}");
+        }
+    }
+
+    /// A trigger's `run.sh` that calls its `fetch.py` gets what `fetch.py`
+    /// names, whether the command or the scheduler names `run.sh`.
+    #[test]
+    fn a_named_script_brings_its_sibling_scripts_mentions() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let dir = workspace.path().join("data/triggers/watch");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("run.sh"), "python3 fetch.py\n").unwrap();
+        std::fs::write(dir.join("fetch.py"), "os.environ['CRED_GITHUB']\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "CRED_SLACK\n").unwrap();
+
+        let by_command =
+            SecretMentions::of_command("sh data/triggers/watch/run.sh", workspace.path());
+        let by_scheduler = SecretMentions::of_script_file(&dir.join("run.sh"));
+        for mentions in [by_command, by_scheduler] {
+            assert!(mentions.names("CRED_GITHUB"));
+            assert!(!mentions.names("CRED_SLACK"), "only scripts count");
+        }
+    }
+
+    /// An unknown name never fails the call. The note names the real
+    /// credentials, nearest first, and never carries a value.
+    #[test]
+    fn an_unknown_name_gets_a_note_with_names_only() {
+        let named = named_for(
+            vec![
+                make_cred("github", AuthType::Bearer, "gh-value"),
+                make_cred(
+                    "mail",
+                    AuthType::Password,
+                    r#"{"username":"alice","password":"s3cret"}"#,
+                ),
+            ],
+            &SecretMentions::scan("echo $CRED_MAIL_PASSWRD $CRED_MAIL"),
+        );
+        let note = secret_names_note(
+            &SecretMentions::scan("echo $CRED_MAIL_PASSWRD $CRED_MAIL"),
+            &named.known_names,
+        )
+        .expect("an unknown name gets a note");
+        assert!(
+            note.contains("CRED_MAIL_PASSWRD is not a credential"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("CRED_MAIL is not"),
+            "a prefix of a real name is not unknown: {note}"
+        );
+        assert!(
+            note.contains("Credentials you can name: CRED_MAIL_PASSWORD, CRED_MAIL_USERNAME"),
+            "nearest first: {note}"
+        );
+        for value in ["gh-value", "s3cret", "alice"] {
+            assert!(!note.contains(value), "the note leaked a value: {note}");
+        }
+
+        assert!(secret_names_note(
+            &SecretMentions::scan("echo $CRED_GITHUB"),
+            &named.known_names
+        )
+        .is_none());
+        assert!(secret_names_note(&SecretMentions::scan("ls"), &named.known_names).is_none());
+    }
+
+    /// `env | grep CRED_` is how an agent looks for its credentials. It names
+    /// none, so it sets none, and the note lists the names to use instead.
+    #[test]
+    fn a_bare_prefix_asks_for_the_names() {
+        for text in ["env | grep CRED_", "echo ${!OAUTH_@}"] {
+            let mentions = SecretMentions::scan(text);
+            assert!(mentions.wants_credentials(), "{text}");
+            assert!(mentions.wants_oauth(), "{text}");
+            let known: BTreeSet<String> = ["CRED_GITHUB".to_string()].into();
+            let note = secret_names_note(&mentions, &known).expect("a bare prefix gets a note");
+            assert!(note.contains("names no credential"), "{note}");
+            assert!(
+                note.contains("Credentials you can name: CRED_GITHUB"),
+                "{note}"
+            );
+            assert!(note.contains("lucidos credentials list"), "{note}");
+        }
+        assert!(
+            named_vars(
+                vec![make_cred("github", AuthType::Bearer, "gh-value")],
+                "env | grep CRED_"
+            )
+            .is_empty(),
+            "a bare prefix sets nothing"
+        );
+    }
+
+    /// The names a credential sets, as `lucidos credentials list` shows them.
+    /// They are exactly the names the injection uses.
+    #[test]
+    fn credential_info_lists_the_names_its_credential_sets() {
+        let mut github = make_cred("github", AuthType::Bearer, "gh-value");
+        github.env_var_name = Some("GITHUB_TOKEN".to_string());
+        let mail = make_cred(
+            "mail",
+            AuthType::Password,
+            r#"{"username":"alice","password":"s3cret"}"#,
+        );
+        for cred in [github, mail] {
+            let names = credential_env_var_names(
+                &cred.service_name,
+                cred.auth_type,
+                cred.env_var_name.as_deref(),
+            );
+            let injected: Vec<String> = env_for(cred).into_iter().map(|(name, _)| name).collect();
+            assert_eq!(names, injected);
+        }
+        assert_eq!(
+            credential_env_var_names("google", AuthType::OauthClient, None),
+            Vec::<String>::new(),
+            "an OAuth client is never set in a subprocess"
+        );
+    }
+
     #[test]
     fn debug_redacts_credential_secret() {
         let cred = make_cred(
@@ -1645,11 +2446,11 @@ mod tests {
             r#"{"client_id":"abc","client_secret":"super-secret-value"}"#,
         );
         let dbg = format!("{:?}", cred);
-        // The secret `auth_value` must never appear in a `{:?}` rendering.
+        // The stored secret must never appear in a `{:?}` rendering.
         assert!(!dbg.contains("super-secret-value"), "secret leaked: {dbg}");
         assert!(
-            dbg.contains("auth_value: \"<redacted>\""),
-            "expected redacted auth_value: {dbg}"
+            dbg.contains("stored_value: \"<redacted>\""),
+            "expected a redacted stored_value: {dbg}"
         );
         // Non-secret fields stay visible for debugging.
         assert!(dbg.contains("oauth:google"));
@@ -1864,6 +2665,13 @@ mod tests {
     }
 
     async fn insert_raw(pool: &PgPool, service_name: &str, auth_type: &str) {
+        // The schema this migration ran on had no sealed-secret CHECK.
+        sqlx::query(
+            "ALTER TABLE credentials DROP CONSTRAINT IF EXISTS credentials_auth_value_sealed",
+        )
+        .execute(pool)
+        .await
+        .expect("drop the sealed CHECK");
         sqlx::query(
             "INSERT INTO credentials (service_name, base_urls, auth_type, auth_value) \
              VALUES ($1, ARRAY['https://api.example.com'], $2, '{}')",
@@ -1873,6 +2681,14 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert credential");
+    }
+
+    /// The engine seals the rows an old migration left plain at its next boot.
+    async fn seal_as_boot_would(pool: &PgPool) {
+        let key = crate::core::secret_store::key().unwrap();
+        crate::core::secret_store::boot::seal_plain_values(pool, key)
+            .await
+            .unwrap();
     }
 
     async fn names(pool: &PgPool) -> Vec<String> {
@@ -1956,6 +2772,7 @@ mod tests {
 
         assert_eq!(names(&pool).await, vec!["email:work", "work"]);
 
+        seal_as_boot_would(&pool).await;
         let stranded = CredentialStore::get_email_password(&pool, "work")
             .await
             .unwrap()
@@ -2000,7 +2817,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the API key still matches");
-        assert_eq!(found.auth_value, "the-real-key");
+        assert_eq!(found.stored_value(), "the-real-key");
 
         teardown_test_db(&db).await;
     }
@@ -2077,13 +2894,13 @@ mod tests {
             .await
             .unwrap()
             .expect("both scope it, so one must answer");
-        assert_eq!(found.auth_value, "narrow-key");
+        assert_eq!(found.stored_value(), "narrow-key");
 
         let outside = CredentialStore::find_by_url(&pool, "https://api.acme.test/v2/things")
             .await
             .unwrap()
             .expect("only the wide credential reaches here");
-        assert_eq!(outside.auth_value, "wide-key");
+        assert_eq!(outside.stored_value(), "wide-key");
 
         teardown_test_db(&db).await;
     }
@@ -2124,12 +2941,14 @@ mod tests {
             .await
             .unwrap();
 
+        seal_as_boot_would(&pool).await;
         let live = CredentialStore::get_oauth_client(&pool, "dropbox")
             .await
             .unwrap()
             .expect("the provider still resolves");
         assert_eq!(
-            live.auth_value, "{\"client_id\":\"live\"}",
+            live.stored_value(),
+            "{\"client_id\":\"live\"}",
             "the row every pre-migration read resolved must be the one that keeps the provider"
         );
         // The duplicate is renamed aside, not deleted: a migration must not
@@ -2162,6 +2981,7 @@ mod tests {
             .await
             .unwrap();
 
+        seal_as_boot_would(&pool).await;
         let live = CredentialStore::get_oauth_client(&pool, "dropbox")
             .await
             .unwrap()
@@ -2294,6 +3114,13 @@ mod tests {
     );
 
     async fn insert_client(pool: &PgPool, service_name: &str, auth_value: &str) {
+        // The schema this migration ran on had no sealed-secret CHECK.
+        sqlx::query(
+            "ALTER TABLE credentials DROP CONSTRAINT IF EXISTS credentials_auth_value_sealed",
+        )
+        .execute(pool)
+        .await
+        .expect("drop the sealed CHECK");
         sqlx::query(
             "INSERT INTO credentials (service_name, base_urls, auth_type, auth_value) \
              VALUES ($1, ARRAY['https://api.example.com'], 'oauth_client', $2)",
@@ -2564,6 +3391,13 @@ mod tests {
     }
 
     async fn insert_with_single_scope(pool: &PgPool, service_name: &str, base_url: &str) {
+        // The schema this migration ran on had no sealed-secret CHECK.
+        sqlx::query(
+            "ALTER TABLE credentials DROP CONSTRAINT IF EXISTS credentials_auth_value_sealed",
+        )
+        .execute(pool)
+        .await
+        .expect("drop the sealed CHECK");
         sqlx::query(
             "INSERT INTO credentials (service_name, base_url, auth_type, auth_value) \
              VALUES ($1, $2, 'api_key', 'k')",
@@ -2609,6 +3443,262 @@ mod tests {
             vec!["https://api.example.com".to_string()],
             "the carried value is trimmed, matching what the write path stores"
         );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A reference no other test shares, since the engine's cache is global.
+    fn unique_reference() -> String {
+        format!(
+            "op://Engineering/item-{}/credential",
+            Uuid::new_v4().simple()
+        )
+    }
+
+    fn not_an_item() -> crate::core::secret_reference::ResolveFailure {
+        crate::core::secret_reference::ResolveFailure::Definitive(
+            "op said: \"Stripe\" isn't an item".to_string(),
+        )
+    }
+
+    /// The *secret reference* half of ADR 0516: `op` runs only for a
+    /// credential the subprocess names.
+    #[tokio::test]
+    async fn a_reference_resolves_only_when_its_credential_is_named() {
+        let creds = || {
+            vec![
+                make_cred(
+                    "stripe",
+                    AuthType::ApiKey,
+                    "op://Engineering/Stripe/credential",
+                ),
+                make_cred("github", AuthType::Bearer, "gh-value"),
+            ]
+        };
+        let resolver = ScriptedResolver::answering(vec![Ok("sk-from-vault".into())]);
+
+        let named = named_credential_env_vars(
+            creds(),
+            &SecretMentions::scan("echo $CRED_GITHUB"),
+            &resolver,
+        )
+        .await;
+        assert_eq!(resolver.calls(), 0, "naming another credential runs no op");
+        assert_eq!(
+            named.env_vars,
+            vec![("CRED_GITHUB".into(), "gh-value".into())]
+        );
+
+        let named = named_credential_env_vars(
+            creds(),
+            &SecretMentions::scan("echo $CRED_STRIPE"),
+            &resolver,
+        )
+        .await;
+        assert_eq!(resolver.calls(), 1);
+        assert_eq!(
+            named.env_vars,
+            vec![("CRED_STRIPE".into(), "sk-from-vault".into())]
+        );
+    }
+
+    /// One unreadable reference costs its own variables and a note. The other
+    /// named credentials still load, and the name is not called unknown.
+    #[tokio::test]
+    async fn a_named_reference_that_cannot_be_read_is_left_out_and_the_rest_load() {
+        let creds = vec![
+            make_cred(
+                "stripe",
+                AuthType::ApiKey,
+                "op://Engineering/Stripe/credential",
+            ),
+            make_cred("github", AuthType::Bearer, "gh-value"),
+        ];
+        let resolver = ScriptedResolver::answering(vec![Err(not_an_item())]);
+        let mentions = SecretMentions::scan("echo $CRED_STRIPE $CRED_GITHUB");
+        let named = named_credential_env_vars(creds, &mentions, &resolver).await;
+
+        assert_eq!(
+            named.env_vars,
+            vec![("CRED_GITHUB".into(), "gh-value".into())]
+        );
+        let note = named
+            .unavailable_note()
+            .expect("the left-out credential gets a note");
+        assert!(
+            note.contains("'stripe'") && note.contains("isn't an item"),
+            "{note}"
+        );
+        assert!(secret_names_note(&mentions, &named.known_names).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_password_reference_resolves_the_password_and_keeps_the_username() {
+        let cred = make_cred(
+            "mail",
+            AuthType::Password,
+            r#"{"username":"alice","password":"op://Personal/Mail/password"}"#,
+        );
+        let resolver = ScriptedResolver::answering(vec![Ok("s3cret".into())]);
+        let env: std::collections::HashMap<_, _> = credential_env_vars_for(cred, &resolver)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            env.get("CRED_MAIL_USERNAME").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            env.get("CRED_MAIL_PASSWORD").map(String::as_str),
+            Some("s3cret")
+        );
+    }
+
+    /// The token that reads 1Password reaches only the `op` child.
+    #[test]
+    fn a_service_account_is_never_injected_even_when_named() {
+        let mut token = make_cred(
+            "onepassword",
+            AuthType::OnepasswordServiceAccount,
+            "ops_FAKETOKEN",
+        );
+        token.env_var_name = Some("OP_TOKEN".to_string());
+        let named = named_for(
+            vec![token],
+            &SecretMentions::scan("echo $CRED_ONEPASSWORD $OP_TOKEN"),
+        );
+        assert!(named.env_vars.is_empty());
+        assert!(named.known_names.is_empty());
+        assert_eq!(
+            credential_env_var_names(
+                "onepassword",
+                AuthType::OnepasswordServiceAccount,
+                Some("OP_TOKEN")
+            ),
+            Vec::<String>::new()
+        );
+        assert!(!AuthType::OnepasswordServiceAccount.agent_requestable());
+    }
+
+    #[tokio::test]
+    async fn name_and_url_lookups_never_return_a_service_account() {
+        let (pool, db) = setup_test_db().await;
+        crate::test_support::seed_credential(
+            &pool,
+            "onepassword",
+            "https://my.1password.com",
+            AuthType::OnepasswordServiceAccount,
+            "ops_FAKETOKEN",
+        )
+        .await;
+
+        assert!(CredentialStore::get(&pool, "onepassword")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            CredentialStore::find_by_url(&pool, "https://my.1password.com/api")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let account = CredentialStore::onepassword_service_account(&pool)
+            .await
+            .unwrap()
+            .expect("the op resolver still finds it");
+        assert_eq!(account.token, "ops_FAKETOKEN");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A resolved value lives only in memory: the row keeps the reference,
+    /// and no event or sealed column holds the value.
+    #[tokio::test]
+    async fn a_resolved_value_is_never_persisted() {
+        const VALUE: &str = "resolved-value-never-stored";
+        let (pool, db) = setup_test_db().await;
+        let (_dir, cli) =
+            crate::core::secret_reference::op::tests::fake_op(&format!("printf '{VALUE}'"));
+        let account = serde_json::json!({ "token": "ops_FAKETOKEN", "cli_path": cli });
+        crate::test_support::seed_credential(
+            &pool,
+            "onepassword",
+            "",
+            AuthType::OnepasswordServiceAccount,
+            &account.to_string(),
+        )
+        .await;
+        let reference = unique_reference();
+        crate::test_support::seed_credential(
+            &pool,
+            "stripe",
+            "https://api.stripe.com",
+            AuthType::ApiKey,
+            &reference,
+        )
+        .await;
+
+        let stripe = CredentialStore::get(&pool, "stripe")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stripe.secret(&pool).await.unwrap(), VALUE);
+        assert_eq!(
+            stripe.stored_value(),
+            reference,
+            "the row keeps the reference"
+        );
+        let listed = CredentialStore::list(&pool).await.unwrap();
+        assert!(listed
+            .iter()
+            .any(|c| c.service_name == "stripe" && c.secret_reference));
+
+        let in_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE payload::text LIKE '%' || $1 || '%'",
+        )
+        .bind(VALUE)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(in_events, 0, "an event holds the value");
+        for stored in CredentialStore::list_all_with_secrets(&pool).await.unwrap() {
+            assert!(
+                !stored.stored_value().contains(VALUE),
+                "{} holds it",
+                stored.service_name
+            );
+        }
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Save resolves a reference once, so a typo never lands.
+    #[tokio::test]
+    async fn a_reference_that_does_not_resolve_is_refused_on_save() {
+        let (pool, db) = setup_test_db().await;
+        let refused = check_secret_references(&pool, AuthType::ApiKey, &unique_reference())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("service account"), "{refused}");
+        assert!(
+            check_secret_references(&pool, AuthType::ApiKey, "op://only-a-vault")
+                .await
+                .is_err()
+        );
+        assert!(check_secret_references(&pool, AuthType::ApiKey, "sk-plain")
+            .await
+            .is_ok());
+        assert!(check_secret_references(
+            &pool,
+            AuthType::OnepasswordServiceAccount,
+            &unique_reference()
+        )
+        .await
+        .is_err());
 
         pool.close().await;
         teardown_test_db(&db).await;

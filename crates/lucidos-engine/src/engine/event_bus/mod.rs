@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use crate::engine::thread_events::{EventMeta, ThreadEvent};
+use crate::engine::thread_events::{CancelCause, EventMeta, ThreadEvent};
 use crate::engine::thread_lifecycle::{
     self, ArchiveState, ChangeStateKind, ThreadStatus, ThreadType,
 };
@@ -87,6 +87,66 @@ pub(super) fn preserving_verdict(target: &str) -> String {
     format!(
         "CASE WHEN status IN ({verdicts}) THEN status ELSE {target} END",
         verdicts = &*PRESERVED_STATUS_VERDICTS_SQL,
+    )
+}
+
+/// The events that end a thread's turn or start one. The newest of them says
+/// whether the thread is between turns (`MessageReceived` through
+/// `ContinuationRequested` start one, the first four end one).
+const TURN_BOUNDARY_EVENT_TYPES: &[&str] = &[
+    "ResponseGenerated",
+    "ResponseFailed",
+    "ResponseCanceled",
+    "ResponseAborted",
+    "MessageReceived",
+    "CodingAgentUserMessageSent",
+    "PromptInjected",
+    "CodingAgentPromptSent",
+    "ContinuationRequested",
+];
+
+/// SQL boolean: the newest turn boundary of the thread named by `thread_id_text`
+/// (a SQL expression of type text) is a redirect cancel. The engine interrupted
+/// that turn to carry the work on, and the redirected turn has not started yet.
+/// A start event after the cancel is the redirected turn, so the answer turns to
+/// FALSE. A thread with no boundary at all is FALSE too.
+///
+/// One definition for the fan-in (`turn_ended_as_redirect`) and the thread
+/// status projection, which keeps a redirected thread `running` between turns.
+/// The redirect causes come from [`CancelCause::is_redirect`].
+pub(super) fn turn_ended_as_redirect_sql(thread_id_text: &str) -> String {
+    let boundaries = quoted_list(TURN_BOUNDARY_EVENT_TYPES.iter().copied());
+    let redirects = quoted_list(
+        CancelCause::ALL
+            .into_iter()
+            .filter(|cause| cause.is_redirect())
+            .map(CancelCause::as_str),
+    );
+    format!(
+        "COALESCE((SELECT e.event_type = 'ResponseCanceled' \
+                          AND e.payload->>'cause' IN ({redirects}) \
+                   FROM events e \
+                   WHERE e.aggregate_id = {thread_id_text} \
+                     AND e.event_type IN ({boundaries}) \
+                   ORDER BY e.sequence DESC LIMIT 1), FALSE)"
+    )
+}
+
+fn quoted_list<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    items
+        .map(|item| format!("'{item}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Wrap a `status` target so a thread between a redirect's cancel and its
+/// resumed turn stays as it is. See [`turn_ended_as_redirect_sql`]. The
+/// closing-out events of the interrupted run (`CodingAgentIdled`,
+/// `SessionEnded`) use it, so the status does not flicker to `idle` in the gap.
+pub(super) fn keeping_status_across_redirect(target: &str) -> String {
+    format!(
+        "CASE WHEN {redirected} THEN status ELSE {target} END",
+        redirected = turn_ended_as_redirect_sql("thread_summaries.thread_id::text"),
     )
 }
 

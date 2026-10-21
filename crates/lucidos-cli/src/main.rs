@@ -27,6 +27,7 @@ mod cc_plan_gate;
 mod cc_read_coerce;
 mod cc_stop_reminder;
 mod changes;
+mod claude_gateway;
 mod coding_agent_diff_hook;
 mod credentials;
 mod data;
@@ -34,6 +35,7 @@ mod data_store;
 mod event_waits;
 mod events;
 mod frontend_preview;
+mod intelligence_ladder;
 /// Manifest-generated subcommands, one per `cli = true` capability domain,
 /// rendered by `build.rs` from `lucidos-capabilities`. Wire each enum below.
 /// Variant names come verbatim from the manifest's operation names, and the
@@ -49,6 +51,7 @@ mod knowhow;
 mod main_check;
 mod mcp_permission_server;
 mod merge_driver;
+mod model_prices;
 mod notify;
 mod owner_approval;
 mod pair;
@@ -272,6 +275,24 @@ enum Command {
         #[command(subcommand)]
         action: SuccessorCmd,
     },
+    /// Print an intelligence ladder: the rungs an agent may pick, least to
+    /// most intelligent. Each rung shows its intelligence, cost and time per
+    /// task as a rough multiple of a reference rung. Inside a coding-agent
+    /// thread it marks the thread's own rung.
+    #[command(name = "intelligence-ladder")]
+    IntelligenceLadder {
+        /// The surface whose ladder to print: chat, claude-code or codex.
+        /// Defaults to this thread's backend, else Claude Code.
+        #[arg(long, value_enum, alias = "coding-agent")]
+        surface: Option<CliLadderSurface>,
+        /// Print the engine's JSON instead of the numbered list.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the price table as JSON: what each model charges per million
+    /// tokens, card by dated card, with the workspace override merged in.
+    #[command(name = "model-prices")]
+    ModelPrices,
     /// Start, stop, or inspect the frontend preview: a Vite dev server the
     /// engine supervises inside a coding-agent worktree, on its own port, so a
     /// TypeScript or CSS change is visible in the real app BEFORE Apply. The
@@ -391,6 +412,14 @@ enum Command {
     /// `api.binance.com` and `fapi.binance.com`. Adding or removing a secret is
     /// Settings, not this.
     Credentials(CredentialsCliArgs),
+    /// Sign Lucidos in to a Claude gateway, sign it out, or show where it
+    /// stands.
+    ///
+    /// A Claude gateway is the Anthropic Messages API run by an organisation,
+    /// behind its own sign-in. The engine keeps the tokens; this shows only the
+    /// code to enter on the gateway's page.
+    #[command(name = "claude-gateway")]
+    ClaudeGateway(ClaudeGatewayCliArgs),
     /// Send a push notification via the parent workspace. Persists to the
     /// inbox AND pushes to subscribed devices, identical to the
     /// `send_notification` LLM tool. Use from scripts that need to nudge the
@@ -534,10 +563,10 @@ enum Command {
     /// Manage the chat-model registry (Settings → Models) — `list`, `add --id
     /// <id> --provider <p> [--label L] [--sort-order N]`, `update --id <id> …`,
     /// or `delete --id <id>`. Generated from the capability parity manifest;
-    /// routed through the gateway-safe HTTP client. Mirrors the chat agent's
+    /// routed through the gateway-safe HTTP client. Mirrors the Lucidos Agent's
     /// `manage_models` tool. (To switch the ACTIVE model, set the `chat_model`
-    /// preference; builtins can be disabled via `update --enabled false`, not
-    /// deleted.)
+    /// preference; a builtin leaves the Lucidos Agent's ladder via `update
+    /// --on-chat-ladder false`, and is never deleted.)
     Models {
         #[command(subcommand)]
         action: generated::ModelsCmd,
@@ -1005,6 +1034,33 @@ pub(crate) struct NotifyArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct ClaudeGatewayCliArgs {
+    #[command(subcommand)]
+    pub(crate) action: ClaudeGatewayAction,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ClaudeGatewayAction {
+    /// The gateway URL, who is signed in, and any sign-in in progress.
+    Status {
+        /// Print the engine's own JSON instead of sentences.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start a sign-in, show the code to enter, and wait for approval.
+    #[command(name = "sign-in")]
+    SignIn {
+        /// Set the gateway URL first, e.g. `https://gateway.example`. A new URL
+        /// signs out of the old gateway.
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Forget the sign-in, and stop one in progress.
+    #[command(name = "sign-out")]
+    SignOut,
+}
+
+#[derive(Args)]
 pub(crate) struct CredentialsCliArgs {
     #[command(subcommand)]
     pub(crate) action: CredentialsAction,
@@ -1012,7 +1068,8 @@ pub(crate) struct CredentialsCliArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum CredentialsAction {
-    /// Every stored credential, its auth type, and the base URLs it covers.
+    /// Every stored credential, its auth type, the base URLs it covers, and
+    /// the variable names a command names to get it.
     List {
         /// Only the credential with this service name.
         #[arg(long)]
@@ -1130,6 +1187,25 @@ impl CliCodingAgent {
         match self {
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
+        }
+    }
+}
+
+/// A *ladder surface*: who picks from an intelligence ladder.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliLadderSurface {
+    Chat,
+    #[value(alias = "claude_code")]
+    ClaudeCode,
+    Codex,
+}
+
+impl CliLadderSurface {
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::ClaudeCode => CliCodingAgent::ClaudeCode.as_wire(),
+            Self::Codex => CliCodingAgent::Codex.as_wire(),
         }
     }
 }
@@ -1289,6 +1365,21 @@ enum FrontendPreviewCmd {
 
 #[derive(Subcommand)]
 enum SuccessorCmd {
+    /// Run a handoff checkpoint your flow names, and print what to do. An
+    /// automatic one hands off or carries on, asking nothing. With `--ask`,
+    /// the offered one prints the question card's shape.
+    Offer {
+        /// The checkpoint's name, as your flow writes it: lowercase letters,
+        /// digits and hyphens.
+        #[arg(long)]
+        at: String,
+        /// The flow's units of work done, as `<done>/<total>`.
+        #[arg(long)]
+        progress: Option<String>,
+        /// Offer the user a question card instead of deciding alone.
+        #[arg(long)]
+        ask: bool,
+    },
     /// Start the successor from a handoff narrative file and print its link.
     Spawn {
         /// The handoff narrative, a markdown file with the six sections
@@ -1309,6 +1400,17 @@ enum SuccessorCmd {
             value_parser = clap::builder::PossibleValuesParser::new(crate::spawn_thread::EFFORT_LEVELS)
         )]
         reasoning_effort: Option<String>,
+        /// On a top-level thread, start a build chain whose builder is a
+        /// child of this thread, which stays open. A flow says when.
+        #[arg(long)]
+        build_chain: bool,
+        /// The automatic checkpoint this handoff happens at, as `offer`
+        /// printed it.
+        #[arg(long)]
+        at: Option<String>,
+        /// The checkpoint's progress, as `offer` printed it.
+        #[arg(long, requires = "at")]
+        progress: Option<String>,
     },
 }
 
@@ -1466,6 +1568,9 @@ enum EventsCmd {
         /// ISO 8601 upper bound (exclusive).
         #[arg(long)]
         until: Option<String>,
+        /// Count one thread's events only. Omit to count every thread.
+        #[arg(long, value_name = "UUID")]
+        thread_id: Option<String>,
     },
 }
 
@@ -1534,12 +1639,14 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     event_type,
                     since,
                     until,
+                    thread_id,
                 } => events::cmd_count(
                     &ws,
                     events::CountFilters {
                         event_type: event_type.as_deref(),
                         since: since.as_deref(),
                         until: until.as_deref(),
+                        thread_id: thread_id.as_deref(),
                     },
                 )?,
             }
@@ -1560,11 +1667,17 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Successor { action } => {
             let ws = resolve_from_env()?;
             match action {
+                SuccessorCmd::Offer { at, progress, ask } => {
+                    successor::cmd_offer(&ws, successor::CheckpointRun { name: at, progress }, ask)
+                }
                 SuccessorCmd::Spawn {
                     narrative,
                     coding_agent,
                     coding_agent_model,
                     reasoning_effort,
+                    build_chain,
+                    at,
+                    progress,
                 } => successor::cmd_spawn(
                     &ws,
                     &narrative,
@@ -1573,8 +1686,21 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                         model: coding_agent_model,
                         reasoning_effort,
                     },
+                    successor::SpawnPlacement {
+                        build_chain,
+                        at: at.map(|name| successor::CheckpointRun { name, progress }),
+                    },
                 )?,
             }
+            Ok(0)
+        }
+        Command::IntelligenceLadder { surface, json } => {
+            let ws = resolve_from_env()?;
+            intelligence_ladder::cmd(&ws, surface, json)?;
+            Ok(0)
+        }
+        Command::ModelPrices => {
+            model_prices::cmd(&resolve_from_env()?)?;
             Ok(0)
         }
         Command::Planned { action } => {
@@ -1684,6 +1810,17 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             match args.action {
                 HandshakeAction::List => handshake::cmd_list(&ws)?,
                 HandshakeAction::Approve { path } => handshake::cmd_approve(&ws, &path)?,
+            }
+            Ok(0)
+        }
+        Command::ClaudeGateway(args) => {
+            let ws = resolve_from_env()?;
+            match args.action {
+                ClaudeGatewayAction::Status { json } => claude_gateway::cmd_status(&ws, json)?,
+                ClaudeGatewayAction::SignIn { url } => {
+                    claude_gateway::cmd_sign_in(&ws, url.as_deref())?
+                }
+                ClaudeGatewayAction::SignOut => claude_gateway::cmd_sign_out(&ws)?,
             }
             Ok(0)
         }

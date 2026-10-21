@@ -118,7 +118,6 @@ const PLAIN_TEXT_ARGS_BY_TOOL: &[(&str, &[&str])] = &[
     (tn::FOLLOW_UP_CHILD_THREAD, &["message"]),
     // The app's display name and one-line description. NOT `html_content`.
     (tn::CREATE_APP, &["name", "description"]),
-    (tn::EXECUTE_INTENT, &["task"]),
     // Every string on a question card: the question, its chip label, each
     // option's button text and the explanation under it.
     (

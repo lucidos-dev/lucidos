@@ -116,6 +116,12 @@ export function buildSecret(authType: AuthType, f: CredentialFields): string {
   return f.value;
 }
 
+/** Whether a secret field holds a *secret reference* rather than the value.
+ *  The engine's `SecretField::parse` decides the same way, by the scheme. */
+export function isSecretReference(value: string): boolean {
+  return value.startsWith('op://');
+}
+
 function safeJson(s: string): Record<string, unknown> {
   try {
     const v = JSON.parse(s);

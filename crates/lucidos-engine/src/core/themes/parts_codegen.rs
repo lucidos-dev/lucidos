@@ -60,6 +60,9 @@ fn grammar_ts(grammar: &Grammar) -> String {
             "{{ grammar: 'length', unit: {}, min: {min}, max: {max} }}",
             unit(u)
         ),
+        Grammar::Weight { min, max } => {
+            format!("{{ grammar: 'weight', min: {min}, max: {max} }}")
+        }
         Grammar::Keyword { values } => {
             let quoted: Vec<String> = values.iter().map(|v| format!("'{v}'")).collect();
             format!("{{ grammar: 'keyword', values: [{}] }}", quoted.join(", "))
@@ -87,6 +90,7 @@ pub(crate) fn render_ts() -> String {
     );
     out.push_str("  | { grammar: 'spacing'; unit: PartUnit; min: number; max: number }\n");
     out.push_str("  | { grammar: 'length'; unit: PartUnit; min: number; max: number }\n");
+    out.push_str("  | { grammar: 'weight'; min: number; max: number }\n");
     out.push_str("  | { grammar: 'keyword'; values: readonly string[] }\n");
     out.push_str(
         "  | { grammar: 'scanlines'; maxAlpha: number; maxPeriod: number; maxStops: number };\n\n",

@@ -46,6 +46,9 @@
       "text-shadow": "0.1em 0.1em 0.6em var(--accent)",
       "letter-spacing": "0.12em"
     },
+    "drawer-title": {
+      "font-weight": "600"
+    },
     "composer": {
       "background-color": "#050805",
       "border-color": "#33ff33",

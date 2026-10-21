@@ -38,7 +38,14 @@ export const PREF_CHAT_MODEL = {
   key: "chat_model",
   scope: "global",
   type: "text",
-  fallback: "claude-opus-5",
+  fallback: "claude-opus-5-5",
+} as const;
+
+export const PREF_TRIGGER_MODEL = {
+  key: "trigger_model",
+  scope: "global",
+  type: "text",
+  fallback: "claude-sonnet-5-5",
 } as const;
 
 export const PREF_CHAT_REASONING_EFFORTS = {
@@ -82,7 +89,7 @@ export const PREF_MODEL_TITLE = {
   key: "model_title",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "claude-haiku-5-5",
 } as const;
 
 export const PREF_REASONING_TITLE = {
@@ -97,7 +104,7 @@ export const PREF_MODEL_IMAGE_DESCRIPTION = {
   key: "model_image_description",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "claude-haiku-5-5",
 } as const;
 
 export const PREF_REASONING_IMAGE_DESCRIPTION = {
@@ -113,7 +120,7 @@ export const PREF_MODEL_CHANGE_SUMMARY = {
   scope: "global",
   type: "text",
   inherits: "model_title",
-  fallback: "gemini-3-flash-preview",
+  fallback: "claude-haiku-5-5",
 } as const;
 
 export const PREF_REASONING_CHANGE_SUMMARY = {
@@ -144,7 +151,7 @@ export const PREF_MODEL_MEMORY_FIND = {
   key: "model_memory_find",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "claude-haiku-5-5",
 } as const;
 
 export const PREF_REASONING_MEMORY_FIND = {
@@ -159,7 +166,7 @@ export const PREF_MODEL_READ_DECISION = {
   key: "model_read_decision",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "claude-haiku-5-5",
 } as const;
 
 export const PREF_REASONING_READ_DECISION = {
@@ -174,7 +181,7 @@ export const PREF_MODEL_WAKE_DECISION = {
   key: "model_wake_decision",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "gpt-6-luna",
 } as const;
 
 export const PREF_REASONING_WAKE_DECISION = {
@@ -189,7 +196,7 @@ export const PREF_MODEL_MEMORY = {
   key: "model_memory",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "claude-haiku-5-5",
 } as const;
 
 export const PREF_REASONING_MEMORY = {
@@ -204,7 +211,7 @@ export const PREF_MODEL_QUERY_CLASSIFICATION = {
   key: "model_query_classification",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "claude-haiku-5-5",
 } as const;
 
 export const PREF_REASONING_QUERY_CLASSIFICATION = {
@@ -219,7 +226,7 @@ export const PREF_MODEL_CONVERSATION_SUMMARY = {
   key: "model_conversation_summary",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "claude-haiku-5-5",
 } as const;
 
 export const PREF_VOICE_ENABLED = {
@@ -301,6 +308,14 @@ export const PREF_NOTIFICATION_TOASTS = {
   scope: "global",
   type: "flag",
   fallback: "true",
+} as const;
+
+export const PREF_COMPOSER_ENTER_KEY = {
+  key: "composer_enter_key",
+  scope: "global",
+  type: "enum",
+  values: ["send", "newline"],
+  fallback: "send",
 } as const;
 
 export const PREF_MOBILE_DYNAMIC_BARS = {
@@ -482,6 +497,66 @@ export const PREF_CODING_AGENT_AUTO_COMPACT_TRIAL = {
   fallback: "off",
 } as const;
 
+export const PREF_MODEL_CLAUDE_CODE = {
+  key: "model_claude_code",
+  scope: "global",
+  type: "coding-agent-model",
+  fallback: "claude-opus-5-5",
+} as const;
+
+export const PREF_REASONING_CLAUDE_CODE = {
+  key: "reasoning_claude_code",
+  scope: "global",
+  type: "enum",
+  values: ["low", "medium", "high", "xhigh", "max"],
+  fallback: "medium",
+} as const;
+
+export const PREF_MODEL_CODEX = {
+  key: "model_codex",
+  scope: "global",
+  type: "coding-agent-model",
+  fallback: null,
+} as const;
+
+export const PREF_REASONING_CODEX = {
+  key: "reasoning_codex",
+  scope: "global",
+  type: "enum",
+  values: ["low", "medium", "high", "xhigh", "max"],
+  fallback: null,
+} as const;
+
+export const PREF_INTELLIGENCE_LADDER_CHAT = {
+  key: "intelligence_ladder_chat",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
+export const PREF_INTELLIGENCE_LADDER_CLAUDE_CODE = {
+  key: "intelligence_ladder_claude_code",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
+export const PREF_INTELLIGENCE_LADDER_CODEX = {
+  key: "intelligence_ladder_codex",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
+export const PREF_LONG_PROMPT_SHARE = {
+  key: "long_prompt_share",
+  scope: "global",
+  type: "number",
+  min: 0,
+  max: 100,
+  fallback: null,
+} as const;
+
 export const PREF_THEME_MODE = {
   key: "theme-mode",
   scope: "device",
@@ -593,7 +668,7 @@ export const PREF_MODEL_COMMAND_JUDGE = {
   key: "model_command_judge",
   scope: "global",
   type: "text",
-  fallback: "gemini-3-flash-preview",
+  fallback: "gemini-3.1-flash-lite",
 } as const;
 
 export const PREF_REASONING_COMMAND_JUDGE = {
@@ -653,6 +728,13 @@ export const PREF_CAPTURE_CONTEXT = {
   scope: "global",
   type: "flag",
   fallback: "false",
+} as const;
+
+export const PREF_CACHE_WARM_LINE = {
+  key: "cache_warm_line",
+  scope: "global",
+  type: "flag",
+  fallback: "true",
 } as const;
 
 export const PREF_KEYBINDINGS = {
@@ -732,6 +814,13 @@ export const PREF_PROVIDER_ENABLED_LOCAL = {
   fallback: "true",
 } as const;
 
+export const PREF_PROVIDER_ENABLED_CLAUDE_GATEWAY = {
+  key: "provider_enabled_claude_gateway",
+  scope: "global",
+  type: "flag",
+  fallback: "true",
+} as const;
+
 export const PREF_PROVIDER_ENABLED_TYPESAFE = {
   key: "provider_enabled_typesafe",
   scope: "global",
@@ -760,6 +849,13 @@ export const PREF_LOCAL_BASE_URL = {
   fallback: "http://localhost:11434/v1",
 } as const;
 
+export const PREF_CLAUDE_GATEWAY_URL = {
+  key: "claude_gateway_url",
+  scope: "global",
+  type: "text",
+  fallback: null,
+} as const;
+
 export const PREF_SYSTEM_ONE_CUSTOM_URL = {
   key: "system_one_custom_url",
   scope: "global",
@@ -785,6 +881,7 @@ export const PREFERENCE_CATALOG = {
   "language": PREF_LANGUAGE,
   "timezone": PREF_TIMEZONE,
   "chat_model": PREF_CHAT_MODEL,
+  "trigger_model": PREF_TRIGGER_MODEL,
   "chat_reasoning_efforts": PREF_CHAT_REASONING_EFFORTS,
   "response_style": PREF_RESPONSE_STYLE,
   "response_styles": PREF_RESPONSE_STYLES,
@@ -820,6 +917,7 @@ export const PREFERENCE_CATALOG = {
   "proxy_timeout_secs": PREF_PROXY_TIMEOUT_SECS,
   "notifications_filter": PREF_NOTIFICATIONS_FILTER,
   "notification_toasts": PREF_NOTIFICATION_TOASTS,
+  "composer_enter_key": PREF_COMPOSER_ENTER_KEY,
   "mobile_dynamic_bars": PREF_MOBILE_DYNAMIC_BARS,
   "automatic_widgets": PREF_AUTOMATIC_WIDGETS,
   "external_link_target": PREF_EXTERNAL_LINK_TARGET,
@@ -842,6 +940,14 @@ export const PREFERENCE_CATALOG = {
   "coding_agent_codex_path": PREF_CODING_AGENT_CODEX_PATH,
   "coding_agent_claude_permission_mode": PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
   "coding_agent_auto_compact_trial": PREF_CODING_AGENT_AUTO_COMPACT_TRIAL,
+  "model_claude_code": PREF_MODEL_CLAUDE_CODE,
+  "reasoning_claude_code": PREF_REASONING_CLAUDE_CODE,
+  "model_codex": PREF_MODEL_CODEX,
+  "reasoning_codex": PREF_REASONING_CODEX,
+  "intelligence_ladder_chat": PREF_INTELLIGENCE_LADDER_CHAT,
+  "intelligence_ladder_claude_code": PREF_INTELLIGENCE_LADDER_CLAUDE_CODE,
+  "intelligence_ladder_codex": PREF_INTELLIGENCE_LADDER_CODEX,
+  "long_prompt_share": PREF_LONG_PROMPT_SHARE,
   "theme-mode": PREF_THEME_MODE,
   "font-family": PREF_FONT_FAMILY,
   "ui-scale": PREF_UI_SCALE,
@@ -865,6 +971,7 @@ export const PREFERENCE_CATALOG = {
   "judgment_wake_decision": PREF_JUDGMENT_WAKE_DECISION,
   "max_tool_calls": PREF_MAX_TOOL_CALLS,
   "capture_context": PREF_CAPTURE_CONTEXT,
+  "cache_warm_line": PREF_CACHE_WARM_LINE,
   "keybindings": PREF_KEYBINDINGS,
   "voice_input_device": PREF_VOICE_INPUT_DEVICE,
   "network_bind": PREF_NETWORK_BIND,
@@ -876,10 +983,12 @@ export const PREFERENCE_CATALOG = {
   "provider_enabled_openrouter": PREF_PROVIDER_ENABLED_OPENROUTER,
   "provider_enabled_xai": PREF_PROVIDER_ENABLED_XAI,
   "provider_enabled_local": PREF_PROVIDER_ENABLED_LOCAL,
+  "provider_enabled_claude_gateway": PREF_PROVIDER_ENABLED_CLAUDE_GATEWAY,
   "provider_enabled_typesafe": PREF_PROVIDER_ENABLED_TYPESAFE,
   "provider_enabled_cloudflare_workers_ai": PREF_PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI,
   "provider_enabled_system_one_custom": PREF_PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM,
   "local_base_url": PREF_LOCAL_BASE_URL,
+  "claude_gateway_url": PREF_CLAUDE_GATEWAY_URL,
   "system_one_custom_url": PREF_SYSTEM_ONE_CUSTOM_URL,
   "system_one_custom_model": PREF_SYSTEM_ONE_CUSTOM_MODEL,
   "system_one_openrouter_model": PREF_SYSTEM_ONE_OPENROUTER_MODEL,

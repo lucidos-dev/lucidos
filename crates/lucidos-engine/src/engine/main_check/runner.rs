@@ -3,11 +3,13 @@
 //! It runs in its own process group, detached from any request, and reports
 //! to the driver over its channel. Its stdout carries the protocol in
 //! `scripts/lib/main_check.sh`: a run line once the workflow run starts, then
-//! one verdict line. Engine shutdown stops it through [`RunnerSlot::stop`]:
-//! SIGTERM to the group, then a grace while the script cancels its workflow
-//! run and deletes its branch. The next start abandons the check it cut off.
+//! one verdict line. Engine shutdown stops it through [`RunnerSlot::stop`].
+//! Once the run is on record, SIGUSR2 detaches the script and leaves the run
+//! going: the next start reattaches to it. Before that, SIGTERM has the script
+//! cancel its run and delete its branch, and the next start abandons the check.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::driver::MainCheckMsg;
+use super::state::FailedTest;
 
 /// What runs a check, and from where.
 #[derive(Debug, Clone)]
@@ -30,9 +33,9 @@ pub(crate) struct MainCheckCommand {
 const RUN_PREFIX: &str = "main-check run ";
 /// Must match `MAIN_CHECK_VERDICT_PREFIX` in `scripts/lib/main_check.sh`.
 const VERDICT_PREFIX: &str = "main-check verdict ";
-/// How long the script's own cleanup gets after SIGTERM: one `gh run cancel`
-/// and one branch delete. The engine starts the stop early in its teardown, so
-/// this fits inside the supervisor's force-kill window.
+/// How long the script's own cleanup gets after the stop: one `gh run cancel`
+/// and one branch delete, or nothing on a detach. The engine starts the stop
+/// early in its teardown, so this fits inside the supervisor's force-kill window.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// How a check's run ended, as the script reported it.
@@ -45,6 +48,10 @@ pub(crate) struct RunReport {
     pub(crate) summary: String,
     #[serde(default)]
     pub(crate) tail: String,
+    #[serde(default)]
+    pub(crate) failures: Vec<FailedTest>,
+    #[serde(default)]
+    pub(crate) flaky: Vec<FailedTest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -55,18 +62,40 @@ pub(crate) enum ReportedVerdict {
     NoVerdict,
 }
 
+/// The workflow run a check's child started: its page, and the mirror branch
+/// it runs on. Reattaching needs both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunLink {
+    pub(crate) run_url: String,
+    pub(crate) branch: String,
+}
+
+/// What a child checks: a commit from the start, or a commit whose run an
+/// earlier engine left going.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RunTarget<'a> {
+    Commit(&'a str),
+    Attach { sha: &'a str, link: &'a RunLink },
+}
+
 /// One protocol line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProtocolLine {
-    RunStarted(String),
+    RunStarted(RunLink),
     Verdict(RunReport),
 }
 
 /// Read one stdout line. Anything else the script prints is not protocol.
 pub(crate) fn parse_line(line: &str) -> Option<ProtocolLine> {
-    if let Some(url) = line.strip_prefix(RUN_PREFIX) {
-        let url = url.trim();
-        return (!url.is_empty()).then(|| ProtocolLine::RunStarted(url.to_string()));
+    if let Some(rest) = line.strip_prefix(RUN_PREFIX) {
+        let mut words = rest.split_whitespace();
+        let (Some(run_url), Some(branch), None) = (words.next(), words.next(), words.next()) else {
+            return None;
+        };
+        return Some(ProtocolLine::RunStarted(RunLink {
+            run_url: run_url.to_string(),
+            branch: branch.to_string(),
+        }));
     }
     let json = line.strip_prefix(VERDICT_PREFIX)?;
     serde_json::from_str(json).ok().map(ProtocolLine::Verdict)
@@ -79,11 +108,15 @@ pub(crate) fn no_verdict(summary: String) -> RunReport {
         run_url: None,
         summary,
         tail: String::new(),
+        failures: Vec::new(),
+        flaky: Vec::new(),
     }
 }
 
 struct RunnerHandle {
     check_id: Uuid,
+    /// The check's run is on record, so a stop detaches instead of cancelling.
+    linked: Arc<AtomicBool>,
     cancel: CancellationToken,
     done: tokio::task::JoinHandle<()>,
 }
@@ -128,8 +161,16 @@ impl RunnerSlot {
         }
     }
 
+    /// `check_id`'s run is on record: from now on a stop detaches from it.
+    pub(crate) fn mark_linked(&self, check_id: Uuid) {
+        if let Some(held) = self.lock().as_ref().filter(|h| h.check_id == check_id) {
+            held.linked.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Stop the running check's child and wait for it to go. It reports
-    /// nothing: the next start finds the check running and abandons it.
+    /// nothing: the next start finds the check running, and reattaches to a
+    /// run on record or abandons the check.
     pub(crate) async fn stop(&self) {
         let Some(handle) = self.take() else {
             return;
@@ -144,13 +185,13 @@ impl RunnerSlot {
     }
 }
 
-/// Start the child for `check_id` on `sha`. Its run line and its verdict come
-/// back over `tx`. While another check's child still runs, nothing starts and
-/// the check ends with no verdict: two children never run at once.
+/// Start the child for `check_id` on `target`. Its run line and its verdict
+/// come back over `tx`. While another check's child still runs, nothing starts
+/// and the check ends with no verdict: two children never run at once.
 pub(crate) fn spawn_runner(
     command: &MainCheckCommand,
     check_id: Uuid,
-    sha: &str,
+    target: RunTarget<'_>,
     tx: UnboundedSender<MainCheckMsg>,
     slot: &Arc<RunnerSlot>,
 ) {
@@ -168,8 +209,11 @@ pub(crate) fn spawn_runner(
         return;
     }
     let mut cmd = tokio::process::Command::new(&command.program);
-    cmd.arg(sha)
-        .current_dir(&command.cwd)
+    match target {
+        RunTarget::Commit(sha) => cmd.arg(sha),
+        RunTarget::Attach { sha, link } => cmd.args([sha, "--attach", &link.run_url, &link.branch]),
+    };
+    cmd.current_dir(&command.cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -187,21 +231,38 @@ pub(crate) fn spawn_runner(
         }
     };
     let cancel = CancellationToken::new();
-    let done = tokio::spawn(run_child(child, check_id, tx, cancel.clone(), slot.clone()));
+    let linked = Arc::new(AtomicBool::new(matches!(target, RunTarget::Attach { .. })));
+    let child = RunningChild {
+        child,
+        check_id,
+        linked: linked.clone(),
+    };
+    let done = tokio::spawn(run_child(child, tx, cancel.clone(), slot.clone()));
     *held = Some(RunnerHandle {
         check_id,
+        linked,
         cancel,
         done,
     });
 }
 
-async fn run_child(
-    mut child: tokio::process::Child,
+struct RunningChild {
+    child: tokio::process::Child,
     check_id: Uuid,
+    linked: Arc<AtomicBool>,
+}
+
+async fn run_child(
+    running: RunningChild,
     tx: UnboundedSender<MainCheckMsg>,
     cancel: CancellationToken,
     slot: Arc<RunnerSlot>,
 ) {
+    let RunningChild {
+        mut child,
+        check_id,
+        linked,
+    } = running;
     let pid = child.id();
     let mut lines = child.stdout.take().map(|out| BufReader::new(out).lines());
     let mut report = None;
@@ -214,12 +275,13 @@ async fn run_child(
         };
         tokio::select! {
             () = cancel.cancelled() => {
-                stop_child(&mut child, pid, slot.grace).await;
+                let detach = linked.load(Ordering::SeqCst);
+                stop_child(&mut child, pid, slot.grace, detach).await;
                 return;
             }
             line = next => match line.as_deref().and_then(parse_line) {
-                Some(ProtocolLine::RunStarted(run_url)) => {
-                    let _ = tx.send(MainCheckMsg::RunLinked { check_id, run_url });
+                Some(ProtocolLine::RunStarted(link)) => {
+                    let _ = tx.send(MainCheckMsg::RunLinked { check_id, link });
                 }
                 Some(ProtocolLine::Verdict(verdict)) => report = Some(verdict),
                 None if line.is_none() => break,
@@ -238,15 +300,25 @@ async fn run_child(
     let _ = tx.send(MainCheckMsg::Ended { check_id, report });
 }
 
-/// SIGTERM the child's group, and wait up to `grace` for the script to finish
-/// its cleanup and exit. Only then SIGKILL what is left. The group is
-/// signalled only while the leader is unreaped, so its pid cannot be reused.
-async fn stop_child(child: &mut tokio::process::Child, pid: Option<u32>, grace: Duration) {
+/// Signal the child's group, SIGUSR2 to `detach` and SIGTERM to cancel, and
+/// wait up to `grace` for the script to finish and exit. Only then SIGKILL
+/// what is left. The group is signalled only while the leader is unreaped, so
+/// its pid cannot be reused.
+async fn stop_child(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    grace: Duration,
+    detach: bool,
+) {
     let Some(pid) = pid else {
         let _ = child.wait().await;
         return;
     };
-    crate::runtime::spawn_env::terminate_child_process_group(pid);
+    if detach {
+        crate::runtime::spawn_env::detach_child_process_group(pid);
+    } else {
+        crate::runtime::spawn_env::terminate_child_process_group(pid);
+    }
     if tokio::time::timeout(grace, child.wait()).await.is_err() {
         log!("[MainCheck] the check's child outlived its grace; killing it");
         crate::runtime::spawn_env::kill_child_process_group_now(pid);
@@ -259,19 +331,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_run_line_names_the_run() {
+    fn the_run_line_names_the_run_and_its_branch() {
         assert_eq!(
-            parse_line("main-check run https://github.com/o/r/actions/runs/1"),
-            Some(ProtocolLine::RunStarted(
-                "https://github.com/o/r/actions/runs/1".into()
-            ))
+            parse_line(
+                "main-check run https://github.com/o/r/actions/runs/1 e2e/20261019-120000-ab"
+            ),
+            Some(ProtocolLine::RunStarted(RunLink {
+                run_url: "https://github.com/o/r/actions/runs/1".into(),
+                branch: "e2e/20261019-120000-ab".into(),
+            }))
         );
         assert_eq!(parse_line("main-check run "), None);
+        assert_eq!(
+            parse_line("main-check run https://github.com/o/r/actions/runs/1"),
+            None,
+            "a run with no branch cannot be reattached"
+        );
+        assert_eq!(parse_line("main-check run u b extra"), None);
     }
 
     #[test]
     fn the_verdict_line_carries_every_field() {
-        let line = r#"main-check verdict {"verdict": "fail", "run_url": "https://r", "summary": "Failed: engine.", "tail": "t", "log": "/x"}"#;
+        let line = r#"main-check verdict {"verdict": "fail", "run_url": "https://r", "summary": "Failed: engine.", "tail": "t", "failures": [{"suite": "engine", "name": "a::b", "detail": "d"}], "log": "/x"}"#;
         assert_eq!(
             parse_line(line),
             Some(ProtocolLine::Verdict(RunReport {
@@ -279,6 +360,12 @@ mod tests {
                 run_url: Some("https://r".into()),
                 summary: "Failed: engine.".into(),
                 tail: "t".into(),
+                failures: vec![FailedTest {
+                    suite: "engine".into(),
+                    name: "a::b".into(),
+                    detail: "d".into(),
+                }],
+                flaky: Vec::new(),
             }))
         );
         let none = r#"main-check verdict {"verdict": "no-verdict", "run_url": null, "summary": "s", "tail": ""}"#;

@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 /// `OpenCodeFree` and `Local` all speak the OpenAI Chat Completions wire format
 /// but are distinct backends (different base URL / key / headers). Each maps to
 /// its own provider instance in [`crate::llm::routing::RoutingProvider`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     Vertex,
     Anthropic,
@@ -35,13 +35,18 @@ pub enum ProviderKind {
     /// A generic OpenAI-compatible local server (Ollama / LM Studio / vLLM /
     /// llama.cpp), base URL configurable.
     Local,
+    /// A Claude gateway: the Anthropic Messages API at an organisation's own
+    /// origin, behind its device-code sign-in (`llm::claude_gateway`). Its own
+    /// kind, apart from [`Self::Anthropic`], so each credential stays on its
+    /// own host.
+    ClaudeGateway,
 }
 
 impl ProviderKind {
     /// Every backend, in the order `/health` reports them. One list, so a new
     /// variant cannot reach the router while missing from what `/health` says
     /// is configured, which is what the picker filters against.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Vertex,
         Self::Anthropic,
         Self::OpenAi,
@@ -49,6 +54,7 @@ impl ProviderKind {
         Self::XAi,
         Self::OpenCodeFree,
         Self::Local,
+        Self::ClaudeGateway,
     ];
 
     /// Parse a provider name strictly: `None` for anything that is not one.
@@ -84,7 +90,15 @@ impl ProviderKind {
             Self::XAi => "xai",
             Self::OpenCodeFree => "opencode-free",
             Self::Local => "local",
+            Self::ClaudeGateway => "claude-gateway",
         }
+    }
+
+    /// Whether a call on this backend bills nobody, as on OpenCode's free tier.
+    /// A route somebody pays for is never free, whoever the payer is. A ladder
+    /// reads cost on a free route as "included" (ADR 0525).
+    pub const fn is_free(self) -> bool {
+        matches!(self, Self::OpenCodeFree)
     }
 }
 
@@ -303,13 +317,81 @@ pub async fn reload(registry: &ModelRegistry, pool: &PgPool) {
     }
 }
 
-/// The model a call naming `model` is sent as: `model` itself, or the end of
-/// its successor chain when it was retired (ADR 0418). A provider that retires
-/// a model may route its id elsewhere, and Lucidos never relies on that.
+/// How far from the named model a call may move within its *lineage*.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GenerationRule {
+    /// A stored pick or a turn's model: it may step back to a predecessor when
+    /// nothing newer is reachable, which undoes a retirement's rewrite.
+    #[default]
+    AnyGeneration,
+    /// A default or a recommended model: never older than named, because only
+    /// the named model was measured for its purpose (ADRs 0403, 0406, 0448).
+    NamedOrNewer,
+}
+
+/// How the model a call runs relates to the model it named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Generation {
+    /// The named model runs, and it is current.
+    Named,
+    /// A newer generation runs, because the named model was retired.
+    Successor,
+    /// An earlier generation runs, because nothing newer is reachable.
+    Predecessor,
+    /// The named model was retired to `successor`, which is not reachable, so
+    /// the named model keeps running.
+    Held { successor: String },
+}
+
+/// The model a call is sent as, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGeneration {
+    pub model: String,
+    pub generation: Generation,
+}
+
+/// Resolve the model a call naming `model` is sent as, within its *lineage*.
 ///
-/// The walk stops at the first model it has already seen, so a hand-edited
-/// cycle sends the last new model rather than looping.
-pub fn current_model(registry: &ModelRegistry, model: &str) -> String {
+/// The newest reachable generation wins, so a retired model is sent as its
+/// successor wherever the successor answers (ADR 0418). Under
+/// [`GenerationRule::AnyGeneration`], a lineage with nothing reachable from
+/// `model` forward tries its predecessors, nearest first. With nothing
+/// reachable at all, the end of the chain goes out and fails loudly.
+///
+/// `reachable` answers for one model id: see [`reaches`].
+pub fn resolve_generation(
+    registry: &ModelRegistry,
+    model: &str,
+    rule: GenerationRule,
+    reachable: impl Fn(&str) -> bool,
+) -> ResolvedGeneration {
+    let chain = successor_chain(registry, model);
+    let newest = chain.last().cloned().unwrap_or_else(|| model.to_string());
+    let resolved = |model: &str, generation| ResolvedGeneration {
+        model: model.to_string(),
+        generation,
+    };
+    if let Some(found) = chain.iter().rev().find(|m| reachable(m)) {
+        return match found == model {
+            true if chain.len() > 1 => resolved(model, Generation::Held { successor: newest }),
+            true => resolved(model, Generation::Named),
+            false => resolved(found, Generation::Successor),
+        };
+    }
+    if rule == GenerationRule::AnyGeneration {
+        if let Some(found) = predecessors(registry, &chain).find(|m| reachable(m)) {
+            return resolved(&found, Generation::Predecessor);
+        }
+    }
+    match newest == model {
+        true => resolved(model, Generation::Named),
+        false => resolved(&newest, Generation::Successor),
+    }
+}
+
+/// `model` and its successors, oldest first. The walk stops at the first model
+/// it has already seen, so a hand-edited cycle ends rather than looping.
+fn successor_chain(registry: &ModelRegistry, model: &str) -> Vec<String> {
     let mut chain = vec![model.to_string()];
     while let Some(next) = chain
         .last()
@@ -319,21 +401,74 @@ pub fn current_model(registry: &ModelRegistry, model: &str) -> String {
     {
         chain.push(next);
     }
-    chain.pop().unwrap_or_default()
+    chain
+}
+
+/// The models retired into `chain`'s first model, nearest generation first.
+/// Within one generation, ids run in descending order, so the order is fixed.
+/// A model already met is skipped, so a cycle ends.
+fn predecessors(registry: &ModelRegistry, chain: &[String]) -> impl Iterator<Item = String> {
+    let retired: Vec<(String, String)> = registry
+        .read()
+        .map(|map| {
+            map.iter()
+                .filter_map(|(id, routing)| Some((id.clone(), routing.successor.clone()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut seen: Vec<String> = chain.to_vec();
+    let mut generation: Vec<String> = chain.first().cloned().into_iter().collect();
+    let mut found = Vec::new();
+    while !generation.is_empty() {
+        let mut older: Vec<String> = retired
+            .iter()
+            .filter(|(id, successor)| generation.contains(successor) && !seen.contains(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        older.sort_unstable_by(|a, b| b.cmp(a));
+        older.dedup();
+        seen.extend(older.iter().cloned());
+        found.extend(older.iter().cloned());
+        generation = older;
+    }
+    found.into_iter()
+}
+
+/// Whether a call on `model` can be expected to answer: the route
+/// [`resolve_route`] takes is configured, and `refused` holds no not-found
+/// answer from it.
+pub fn reaches(
+    registry: &ModelRegistry,
+    model: &str,
+    chosen: Option<ProviderKind>,
+    is_configured: impl Fn(ProviderKind) -> bool,
+    refused: impl Fn(ProviderKind, &str) -> bool,
+) -> bool {
+    resolve_route(registry, model, chosen, is_configured)
+        .is_ok_and(|route| !refused(route.provider, model))
 }
 
 /// Look up a model id in the registry, if the lock is readable.
-fn routing_for(registry: &ModelRegistry, model: &str) -> Option<ModelRouting> {
+pub(crate) fn routing_for(registry: &ModelRegistry, model: &str) -> Option<ModelRouting> {
     registry.read().ok().and_then(|map| map.get(model).cloned())
 }
 
-/// Whether `model` reads images, by its row's *vision flag*.
+/// The *vision flag* of `model`'s row, or `None` when it has no row: a Claude
+/// Code id, a deleted model or an env-only id.
 ///
-/// A model with no row does not: a Claude Code id, a deleted model and an
-/// env-only id all answer `false`. Guessing from the id would send images to a
+/// A chat turn withholds images only on `Some(false)`. With no row there is no
+/// flag to read, so the provider decides (ADR 0504).
+pub fn vision_flag(registry: &ModelRegistry, model: &str) -> Option<bool> {
+    routing_for(registry, model).map(|routing| routing.vision)
+}
+
+/// Whether `model` is known to read images, for a caller choosing where to
+/// send them.
+///
+/// A model with no row does not. Guessing from the id would send images to a
 /// model that rejects them, which is the failure the flag exists to stop.
 pub fn reads_images(registry: &ModelRegistry, model: &str) -> bool {
-    routing_for(registry, model).is_some_and(|routing| routing.vision)
+    vision_flag(registry, model) == Some(true)
 }
 
 /// The *default effort* of `model`: the tier it runs at when nothing stored
@@ -516,6 +651,30 @@ mod tests {
         }
     }
 
+    /// Every model is reachable except `refused`.
+    fn all_but<'a>(refused: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
+        move |model| !refused.contains(&model)
+    }
+
+    fn sent(reg: &ModelRegistry, model: &str, rule: GenerationRule, refused: &[&str]) -> String {
+        resolve_generation(reg, model, rule, all_but(refused)).model
+    }
+
+    /// Haiku 4.5 retired to 5.5, the shape migration
+    /// `20261018074151` left on a Vertex-only install.
+    fn haiku() -> ModelRegistry {
+        registry_of(&[
+            (
+                "claude-haiku-4-5",
+                retired_to("claude-haiku-4-5", "claude-haiku-5-5"),
+            ),
+            (
+                "claude-haiku-5-5",
+                ModelRouting::single(ProviderKind::Vertex, "claude-haiku-5-5"),
+            ),
+        ])
+    }
+
     #[test]
     fn a_retired_model_is_sent_as_the_end_of_its_successor_chain() {
         let reg = registry_of(&[
@@ -523,18 +682,135 @@ mod tests {
             ("middle", retired_to("middle", "new")),
             ("new", ModelRouting::single(ProviderKind::Vertex, "new")),
         ]);
-        assert_eq!(current_model(&reg, "old"), "new");
-        assert_eq!(current_model(&reg, "middle"), "new");
-        assert_eq!(current_model(&reg, "new"), "new");
-        assert_eq!(current_model(&reg, "unknown"), "unknown");
+        let any = GenerationRule::AnyGeneration;
+        assert_eq!(sent(&reg, "old", any, &[]), "new");
+        assert_eq!(sent(&reg, "middle", any, &[]), "new");
+        assert_eq!(sent(&reg, "new", any, &[]), "new");
+        assert_eq!(sent(&reg, "unknown", any, &[]), "unknown");
+        assert_eq!(
+            resolve_generation(&reg, "old", any, all_but(&[])).generation,
+            Generation::Successor
+        );
+        assert_eq!(
+            resolve_generation(&reg, "new", any, all_but(&[])).generation,
+            Generation::Named
+        );
     }
 
-    /// A hand-edited table can form a cycle. The walk must still end.
+    /// The reported failure: Vertex refuses Haiku 5.5 and serves 4.5. A pick
+    /// of 4.5 keeps running 4.5, and says it is held.
+    #[test]
+    fn a_retired_model_is_held_while_its_successor_is_refused() {
+        let resolved = resolve_generation(
+            &haiku(),
+            "claude-haiku-4-5",
+            GenerationRule::AnyGeneration,
+            all_but(&["claude-haiku-5-5"]),
+        );
+        assert_eq!(
+            resolved,
+            ResolvedGeneration {
+                model: "claude-haiku-4-5".to_string(),
+                generation: Generation::Held {
+                    successor: "claude-haiku-5-5".to_string()
+                },
+            }
+        );
+    }
+
+    /// A pick the migration rewrote to 5.5 steps back to 4.5 where 5.5 is
+    /// refused. A default never steps back, and goes out to fail loudly.
+    #[test]
+    fn only_a_stored_pick_steps_back_to_a_predecessor() {
+        let reg = haiku();
+        let refused = ["claude-haiku-5-5"];
+        let resolved = resolve_generation(
+            &reg,
+            "claude-haiku-5-5",
+            GenerationRule::AnyGeneration,
+            all_but(&refused),
+        );
+        assert_eq!(resolved.model, "claude-haiku-4-5");
+        assert_eq!(resolved.generation, Generation::Predecessor);
+        let default = resolve_generation(
+            &reg,
+            "claude-haiku-5-5",
+            GenerationRule::NamedOrNewer,
+            all_but(&refused),
+        );
+        assert_eq!(default.model, "claude-haiku-5-5");
+        assert_eq!(default.generation, Generation::Named);
+    }
+
+    /// A refused hop is skipped for the newest reachable one, and a lineage
+    /// with nothing reachable sends the end of the chain.
+    #[test]
+    fn a_multi_hop_chain_picks_the_newest_reachable_generation() {
+        let reg = registry_of(&[
+            ("a", retired_to("a", "b")),
+            ("b", retired_to("b", "c")),
+            ("c", ModelRouting::single(ProviderKind::Vertex, "c")),
+        ]);
+        let any = GenerationRule::AnyGeneration;
+        assert_eq!(sent(&reg, "a", any, &["c"]), "b");
+        assert_eq!(sent(&reg, "a", any, &["c", "b"]), "a");
+        assert_eq!(sent(&reg, "c", any, &["c"]), "b");
+        assert_eq!(sent(&reg, "c", any, &["c", "b"]), "a");
+        assert_eq!(sent(&reg, "a", any, &["a", "b", "c"]), "c");
+        assert_eq!(sent(&reg, "b", any, &["a", "b", "c"]), "c");
+    }
+
+    /// Predecessors come nearest generation first, and in a fixed order within
+    /// one generation.
+    #[test]
+    fn predecessors_come_nearest_first_in_a_fixed_order() {
+        let reg = registry_of(&[
+            ("x-1", retired_to("x-1", "x-2")),
+            ("y-1", retired_to("y-1", "x-2")),
+            ("x-2", retired_to("x-2", "x-3")),
+            ("x-3", ModelRouting::single(ProviderKind::Vertex, "x-3")),
+        ]);
+        let any = GenerationRule::AnyGeneration;
+        assert_eq!(sent(&reg, "x-3", any, &["x-3"]), "x-2");
+        assert_eq!(sent(&reg, "x-3", any, &["x-3", "x-2"]), "y-1");
+        assert_eq!(sent(&reg, "x-3", any, &["x-3", "x-2", "y-1"]), "x-1");
+    }
+
+    /// A hand-edited table can form a cycle. The walk must still end, with or
+    /// without refusals.
     #[test]
     fn a_successor_cycle_ends_on_the_last_new_model() {
         let reg = registry_of(&[("a", retired_to("a", "b")), ("b", retired_to("b", "a"))]);
-        assert_eq!(current_model(&reg, "a"), "b");
-        assert_eq!(current_model(&reg, "b"), "a");
+        let any = GenerationRule::AnyGeneration;
+        assert_eq!(sent(&reg, "a", any, &[]), "b");
+        assert_eq!(sent(&reg, "b", any, &[]), "a");
+        assert_eq!(sent(&reg, "a", any, &["b"]), "a");
+        assert_eq!(sent(&reg, "a", any, &["a", "b"]), "b");
+    }
+
+    /// Reach is the route the router would take, minus its refusals.
+    #[test]
+    fn reach_reads_the_resolved_route_and_its_refusals() {
+        let reg = registry_of(&[("claude-opus-5-5", dual_routed("claude-opus-5-5"))]);
+        let vertex = only(&[ProviderKind::Vertex]);
+        let none = |_: ProviderKind, _: &str| false;
+        let vertex_refused = |p: ProviderKind, _: &str| p == ProviderKind::Vertex;
+        assert!(reaches(&reg, "claude-opus-5-5", None, &vertex, none));
+        assert!(!reaches(
+            &reg,
+            "claude-opus-5-5",
+            None,
+            &vertex,
+            vertex_refused
+        ));
+        assert!(reaches(
+            &reg,
+            "claude-opus-5-5",
+            None,
+            only(&[ProviderKind::Anthropic]),
+            vertex_refused
+        ));
+        assert!(!reaches(&reg, "claude-opus-5-5", None, only(&[]), none));
     }
 
     fn registry_with_windows(pairs: &[(&str, Option<usize>)]) -> ModelRegistry {
@@ -572,6 +848,10 @@ mod tests {
             ProviderKind::OpenCodeFree
         );
         assert_eq!(ProviderKind::parse("local"), ProviderKind::Local);
+        assert_eq!(
+            ProviderKind::parse("claude-gateway"),
+            ProviderKind::ClaudeGateway
+        );
         assert_eq!(ProviderKind::parse("vertex"), ProviderKind::Vertex);
         assert_eq!(ProviderKind::parse("something-new"), ProviderKind::Vertex);
     }
@@ -589,6 +869,7 @@ mod tests {
             ProviderKind::XAi,
             ProviderKind::OpenCodeFree,
             ProviderKind::Local,
+            ProviderKind::ClaudeGateway,
         ] {
             assert_eq!(ProviderKind::parse(kind.as_str()), kind, "{kind:?}");
         }
@@ -929,6 +1210,27 @@ mod tests {
         assert!(reads_images(&registry, "flagged"));
         assert!(!reads_images(&registry, "unflagged"));
         assert!(!reads_images(&registry, "claude-opus-5-5"));
+    }
+
+    /// The flag has three answers, because a missing row is not a "no". The
+    /// chat-turn gate strips images only on `Some(false)`.
+    #[test]
+    fn the_vision_flag_is_unknown_without_a_row() {
+        let registry = empty();
+        registry.write().unwrap().insert(
+            "flagged".to_string(),
+            ModelRouting {
+                vision: true,
+                ..dual_routed("flagged")
+            },
+        );
+        registry
+            .write()
+            .unwrap()
+            .insert("unflagged".to_string(), dual_routed("unflagged"));
+        assert_eq!(vision_flag(&registry, "flagged"), Some(true));
+        assert_eq!(vision_flag(&registry, "unflagged"), Some(false));
+        assert_eq!(vision_flag(&registry, "claude-opus-5-5"), None);
     }
 
     /// The reported bug, at the layer that fixes it. A workspace holding only

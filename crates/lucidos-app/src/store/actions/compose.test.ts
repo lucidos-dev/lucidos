@@ -23,13 +23,13 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
 }));
 
-import { seedSuggestion, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, awaitThreadStarted, isThreadStartPending, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
+import { seedSuggestion, startFreshDraft, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, awaitThreadStarted, isThreadStartPending, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { _resetRowIntentsForTesting } from '../rowIntents';
 import { acceptComposeReport, composeEditSeq, isComposeIntentPending, knownComposeEpoch, _resetComposeSyncForTesting } from '../composeSync';
 import { focusThread, unfocusThread } from './threads';
 import { connectionStatus, confirmState, effectiveThreadStatus, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
 import { promptCaretToEndSeq } from '../../components/chat/promptValueSync';
-import { patchComposeSelection, getComposeSelectionOverride, resolveProvider, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
+import { patchComposeSelection, getComposeSelectionOverride, resolveCodingAgent, resolveProvider, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -356,6 +356,121 @@ describe('seedSuggestion: seeding the compose input on the user\'s behalf', () =
     expect(seeded).not.toBe('cc-1');
     expect(getDraft(seeded).mode).toBe('lucidos');
     expect(getDraft('cc-1').text).toBe('my own idea');
+  });
+});
+
+/** The Successor card's Start fresh. The typed request leaves the big thread
+ *  for a fresh draft on the same target. It stays unsent, so the user can pick
+ *  the model and reasoning first. */
+describe('startFreshDraft', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    mockFetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    connectionStatus.value = 'connected';
+    inputMode.value = { type: 'do' };
+    selectedScope.value = { kind: 'lucidos' };
+    _resetComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    inputMode.value = { type: 'do' };
+    selectedScope.value = { kind: 'lucidos' };
+    _resetComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+    vi.restoreAllMocks();
+  });
+
+  it('opens an unsent draft on the same repo and backend, and empties the old composer', () => {
+    const source = makeActiveThread({
+      id: 'big', channel: 'claude_code', codingAgentKind: 'external', repoId: 'repo-1',
+      codingAgent: 'codex', composeText: 'Add a dark-mode toggle',
+    });
+    threadMap.value = new Map([['big', source]]);
+    focusedThreadId.value = 'big';
+
+    startFreshDraft(source.meta);
+
+    const id = focusedThreadId.value!;
+    expect(id).not.toBe('big');
+    expect(getDraft(id).text).toBe('Add a dark-mode toggle');
+    expect(getDraft(id).mode).toBe('claude_code');
+    expect(resolveScope(id)).toEqual({ kind: 'external', repoId: 'repo-1' });
+    expect(resolveCodingAgent(id)).toBe('codex');
+    expect(getDraft('big').text).toBe('');
+    const chatCall = mockFetch.mock.calls.find(([url]) => typeof url === 'string' && url.endsWith('/chat/stream'));
+    expect(chatCall, 'moving a draft must not send it').toBeUndefined();
+  });
+
+  it('opens an empty compose view on the same repo and backend when nothing was typed', () => {
+    const source = makeActiveThread({
+      id: 'big', channel: 'claude_code', codingAgentKind: 'external', repoId: 'repo-1', codingAgent: 'codex',
+    });
+    threadMap.value = new Map([['big', source]]);
+    focusedThreadId.value = 'big';
+
+    startFreshDraft(source.meta);
+
+    expect(focusedThreadId.value).toBeNull();
+    expect(resolveScope(null)).toEqual({ kind: 'external', repoId: 'repo-1' });
+    expect(resolveCodingAgent(null)).toBe('codex');
+    const chatCall = mockFetch.mock.calls.find(([url]) => typeof url === 'string' && url.endsWith('/chat/stream'));
+    expect(chatCall, 'starting fresh must not send anything').toBeUndefined();
+  });
+
+  it('carries the attached images into the new draft', () => {
+    const source = makeActiveThread({ id: 'big', channel: 'claude_code', composeText: 'Fix this layout' });
+    threadMap.value = new Map([['big', source]]);
+    focusedThreadId.value = 'big';
+    setDraft('big', { text: 'Fix this layout', image_hashes: ['h1'], mode: null });
+
+    startFreshDraft(source.meta);
+
+    expect(getDraft(focusedThreadId.value!).image_hashes).toEqual(['h1']);
+    expect(getDraft('big').image_hashes).toEqual([]);
+  });
+
+  it('a second press keeps the moved draft in front', () => {
+    const source = makeActiveThread({ id: 'big', channel: 'claude_code', composeText: 'Next' });
+    threadMap.value = new Map([['big', source]]);
+    focusedThreadId.value = 'big';
+
+    startFreshDraft(source.meta);
+    const moved = focusedThreadId.value!;
+    startFreshDraft(source.meta);
+
+    expect(focusedThreadId.value).toBe(moved);
+    expect(getDraft(moved).text).toBe('Next');
+  });
+
+  it('aims an app thread\'s draft at the same app', () => {
+    const source = makeActiveThread({
+      id: 'big', channel: 'claude_code', codingAgentKind: 'app',
+      codingAgentFolder: '/Users/me/workspaces/myws/data/apps/habit-tracker/', composeText: 'Next',
+    });
+    threadMap.value = new Map([['big', source]]);
+    focusedThreadId.value = 'big';
+
+    startFreshDraft(source.meta);
+
+    expect(resolveScope(focusedThreadId.value)).toEqual({ kind: 'app', appId: 'habit-tracker' });
+  });
+
+  it('keeps a legacy thread with no backend on Claude Code, whatever was picked last', () => {
+    const source = makeActiveThread({ id: 'old', channel: 'claude_code', composeText: 'Next' });
+    threadMap.value = new Map([['old', source]]);
+    focusedThreadId.value = 'old';
+    patchComposeSelection(null, { codingAgent: 'codex' });
+
+    startFreshDraft(source.meta);
+
+    expect(resolveCodingAgent(focusedThreadId.value)).toBe('claude-code');
   });
 });
 
@@ -2389,7 +2504,7 @@ describe('a compose backend pick is per-draft', () => {
     threadMap.value = new Map<string, ThreadState>()
       .set('d-A', composingChat('d-A', 'first'))
       .set('d-B', composingChat('d-B', 'second'));
-    patchComposeSelection('d-A', { model: 'claude-opus-5-5', provider: 'anthropic' });
+    patchComposeSelection('d-A', { model: 'claude-opus-5-6', provider: 'anthropic' });
 
     expect(resolveProvider('d-B')).toBeNull();
 
@@ -2397,7 +2512,7 @@ describe('a compose backend pick is per-draft', () => {
     await sendCompose('d-B', { useCodingAgent: false });
 
     expect(chatBodies).toHaveLength(2);
-    expect(chatBodies[0]).toMatchObject({ model: 'claude-opus-5-5', provider: 'anthropic' });
+    expect(chatBodies[0]).toMatchObject({ model: 'claude-opus-5-6', provider: 'anthropic' });
     expect(chatBodies[1].provider).toBeUndefined();
   });
 });

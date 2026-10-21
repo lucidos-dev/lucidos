@@ -52,6 +52,11 @@ user's change on top until the server confirms it.
   Apply Now with the version after its start.
 - A write that fails drops its intent and lets the server state show through.
   There is no retry or re-queue in the intent layer.
+- An idempotent write may resend once when the transport drops it
+  (`retryTransient`), before the intent layer sees any outcome. A timeout or a
+  lost connection is no verdict: the request may never have reached the engine.
+  A notification read does this, since a dropped POST otherwise put the row
+  back with a false failure toast.
 - Intent maps never write `summaryVersion`. `thread-meta.ts` stays its one
   writer.
 - The compose draft follows the same rule. Its revision is `summary_version`,

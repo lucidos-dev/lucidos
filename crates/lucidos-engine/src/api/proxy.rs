@@ -981,7 +981,7 @@ pub(crate) async fn fetch_required_credential(
         Err(e) => Err(e),
     };
     match found {
-        Ok(Some(c)) if c.auth_value.is_empty() => Err((
+        Ok(Some(c)) if c.stored_value().is_empty() => Err((
             StatusCode::BAD_GATEWAY,
             format!("proxy auth credential '{}' has an empty value", name),
         )),
@@ -1000,15 +1000,18 @@ pub(crate) async fn fetch_required_credential(
     }
 }
 
-/// Look up a single credential's `auth_value`. Same error shapes as
-/// `fetch_required_credential`, but for callers that only need the secret string.
+/// Look up a single credential's secret, with a *secret reference* resolved.
+/// Same error shapes as `fetch_required_credential`, and a reference that
+/// cannot be read is a 502 naming the credential.
 pub(crate) async fn lookup_credential_value(
     pool: &sqlx::PgPool,
     name: &str,
 ) -> Result<String, (StatusCode, String)> {
     fetch_required_credential(pool, name)
+        .await?
+        .secret(pool)
         .await
-        .map(|c| c.auth_value)
+        .map_err(|reason| (StatusCode::BAD_GATEWAY, reason))
 }
 
 /// Refuse to present `name` to a provider no member of its scope covers

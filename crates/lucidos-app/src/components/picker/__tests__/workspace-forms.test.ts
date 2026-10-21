@@ -94,13 +94,15 @@ describe('applyRestoreFile: an empty selection is never a reset', () => {
     const typed: RestoreDraft = { ...EMPTY_RESTORE_DRAFT, name: 'my choice' };
     expect(applyRestoreFile(typed, file('renamed-download.enc')).name).toBe('my choice');
     expect(applyRestoreFile(typed, file('lucidos-backup-work-20260601-040254.enc')).name).toBe('work');
+    expect(applyRestoreFile(typed, file('lucidos-backup-work-20260601-040254.age')).name).toBe('work');
   });
 });
 
 describe('restoreFileNote: warns about a non-archive without blocking it', () => {
-  it('flags a file that is not .enc', () => {
+  it('flags a file that is neither .age nor .enc', () => {
     expect(restoreFileNote(file('holiday.jpg'))).toContain('holiday.jpg');
     expect(restoreFileNote(file('BACKUP.ENC'))).toBeNull();
+    expect(restoreFileNote(file('backup.age'))).toBeNull();
     expect(restoreFileNote(null)).toBeNull();
   });
 

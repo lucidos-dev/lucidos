@@ -1,9 +1,9 @@
-//! The compactor's model catalog: one source for its price table, its
-//! per-tier token and time seeds and its default. A second copy of any of them
-//! falls silently out of sync; see
+//! The compactor's model catalog: its per-tier token and time seeds and its
+//! default, over the prices of the *price table*. A second copy of any of
+//! them falls silently out of sync; see
 //! `docs/plans/2026-10-06-tree-compactor-provider-aware-default.md`.
 //!
-//! [`super::estimate`] reads [`COMPACTOR_MODELS`] for its price table, and
+//! [`super::estimate`] reads [`COMPACTOR_MODELS`] for its priced rows, and
 //! Settings recommends [`COMPACTOR_DEFAULTS`] first. Every default is a priced
 //! row, so the default always has an estimate.
 
@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::engine::aux_purpose::{recommended, select_model, ModelSource, Reach};
 use crate::engine::ContextPurpose;
+use crate::llm::model_prices::{price_of, ModelPrice};
 use crate::llm::model_registry::{
     default_effort, resolve_route, ModelRegistry, ProviderKind, Unconfigured,
 };
@@ -20,13 +21,6 @@ use crate::llm::ServiceTier;
 /// One measured compactor model.
 pub(crate) struct CompactorModel {
     pub(crate) id: &'static str,
-    /// List price in USD per million (input, output) tokens.
-    pub(crate) price: (f64, f64),
-    /// What a cached input token costs, as a share of the input price.
-    pub(crate) cache: CacheRates,
-    /// Every rate on the Flex tier, as a share of the standard rate. `None`
-    /// for a model no route serves on Flex.
-    pub(crate) flex: Option<f64>,
     /// One compactor call at each tier the comparison measured, in ladder
     /// order. The estimate prices a tier with too little history of its own on
     /// these. Figures and their derivations:
@@ -97,13 +91,6 @@ const fn uncached(effort: &'static str, input: u64, output: u64, secs: Option<f6
     }
 }
 
-/// A cached input token's price, as a share of the plain input price.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct CacheRates {
-    pub(crate) read: f64,
-    pub(crate) write: f64,
-}
-
 /// Tokens of some compactor calls, summed. `input` counts every input token,
 /// cached or not, as the capture records it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -115,19 +102,27 @@ pub(crate) struct Tokens {
 }
 
 impl CompactorModel {
+    /// Its price today, from the *price table*. Every compactor model is
+    /// priced: `every_compactor_model_is_priced` holds the shipped cards to it,
+    /// and an override only adds cards.
+    pub(crate) fn price(&self) -> ModelPrice {
+        price_of(self.id).unwrap_or_else(|| panic!("{} has no price card", self.id))
+    }
+
     /// What `tokens` cost at this model's list price on `tier`. The estimate
-    /// and the backfill's spend both price through here. A tier the catalog
-    /// has no rate for prices at the standard rate.
+    /// and the backfill's spend both price through here. A tier the table has
+    /// no rate for prices at the standard rate.
     pub(crate) fn usd(&self, tokens: Tokens, tier: Option<ServiceTier>) -> f64 {
-        let (input_price, output_price) = self.price;
+        let price = self.price();
         let plain = (tokens.input - tokens.cache_read - tokens.cache_write).max(0.0);
-        let input =
-            plain + tokens.cache_read * self.cache.read + tokens.cache_write * self.cache.write;
+        let input = plain
+            + tokens.cache_read * price.cache.read
+            + tokens.cache_write * price.cache.write_5m;
         let share = match tier {
-            Some(ServiceTier::Flex) => self.flex.unwrap_or(1.0),
+            Some(ServiceTier::Flex) => price.flex.unwrap_or(1.0),
             None => 1.0,
         };
-        share * (input * input_price + tokens.output * output_price) / 1_000_000.0
+        share * (input * price.input + tokens.output * price.output) / 1_000_000.0
     }
 }
 
@@ -137,40 +132,20 @@ pub(crate) fn priced(model: &str) -> Option<&'static CompactorModel> {
 }
 
 /// Whether a route through `provider` serves `model` on the Flex tier: OpenAI
-/// does, for a model the catalog has a Flex rate for.
+/// does, for a model the price table has a Flex rate for.
 pub(crate) fn serves_flex(provider: ProviderKind, model: &str) -> bool {
-    provider == ProviderKind::OpenAi && priced(model).is_some_and(|m| m.flex.is_some())
+    provider == ProviderKind::OpenAi && priced(model).is_some_and(|m| m.price().flex.is_some())
 }
 
 pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
     CompactorModel {
         id: "gpt-6.1-sol",
-        // https://developers.openai.com/api/docs/models/gpt-6.1-sol
-        price: (2.0, 10.0),
-        // https://developers.openai.com/api/docs/guides/prompt-caching
-        cache: CacheRates {
-            read: 0.05,
-            write: 1.25,
-        },
-        // https://developers.openai.com/api/docs/pricing, the Flex table.
-        flex: Some(0.5),
         // One workspace's whole backfill at low, 138,000 calls, before the
         // compactor asked for explicit cache mode.
         seeds: &[cached("low", 7_315, 4_905, 2_407, 116, 3.7)],
     },
     CompactorModel {
         id: "gemini-3.8-flash",
-        // Introductory: it doubles to (1.5, 7.5) on 1 January 2027
-        // (docs/temporary-measures.md, "Gemini 3.8 Flash's introductory
-        // compactor price").
-        price: (0.75, 3.75),
-        // https://ai.google.dev/gemini-api/docs/pricing, "Context caching
-        // price". Implicit caching writes at no premium.
-        cache: CacheRates {
-            read: 0.1,
-            write: 1.0,
-        },
-        flex: None,
         // Medium's output assumes low's calls per node and input: the
         // comparison reports only its dollars per node.
         seeds: &[
@@ -180,16 +155,6 @@ pub(crate) const COMPACTOR_MODELS: &[CompactorModel] = &[
     },
     CompactorModel {
         id: "claude-sonnet-5-5",
-        // https://platform.claude.com/docs/en/about-claude/pricing, "Model
-        // pricing" table, "Claude Sonnet 5.5" row.
-        price: (2.0, 10.0),
-        // https://platform.claude.com/docs/en/build-with-claude/prompt-caching,
-        // 5-minute entries.
-        cache: CacheRates {
-            read: 0.05,
-            write: 1.25,
-        },
-        flex: None,
         // The comparison timed no medium run.
         seeds: &[
             uncached("low", 4_383, 181, Some(2.2)),
@@ -300,7 +265,7 @@ pub(crate) struct CompactorRoute {
     /// records this, so the estimate finds history under the tier that ran.
     pub(crate) effort: Option<String>,
     /// The route serves `model` on the Flex tier: OpenAI does, for a model the
-    /// catalog has a Flex rate for.
+    /// price table has a Flex rate for.
     pub(crate) flex: bool,
 }
 
@@ -348,14 +313,29 @@ mod tests {
         assert_eq!(ids.len(), before, "a duplicate id in COMPACTOR_MODELS");
     }
 
+    /// The shipped cards price every compactor model, so `price` never
+    /// panics: an override only adds cards.
+    #[test]
+    fn every_compactor_model_is_priced() {
+        let table = crate::llm::model_prices::shipped_table();
+        for model in COMPACTOR_MODELS {
+            let cards = table.models.get(model.id);
+            assert!(
+                cards.is_some_and(|c| c.iter().any(|card| card.card.from.is_none())),
+                "{} has no undated card",
+                model.id
+            );
+        }
+    }
+
     fn compactor_ids() -> Vec<&'static str> {
         COMPACTOR_MODELS.iter().map(|m| m.id).collect()
     }
 
-    /// The comparison measured one model per provider family, and the price
-    /// table holds exactly those.
+    /// The comparison measured one model per provider family, and the
+    /// compactor's catalog holds exactly those.
     #[test]
-    fn the_price_table_holds_one_model_per_provider_family() {
+    fn the_compactor_catalog_holds_one_model_per_provider_family() {
         assert_eq!(
             compactor_ids(),
             ["gpt-6.1-sol", "gemini-3.8-flash", "claude-sonnet-5-5"]
@@ -388,13 +368,18 @@ mod tests {
                 entry.effort
             );
         }
-        let rung = |effort: &str| crate::llm::EFFORT_LADDER.iter().position(|t| *t == effort);
+        let effort_step =
+            |effort: &str| crate::llm::EFFORT_LADDER.iter().position(|t| *t == effort);
         for model in COMPACTOR_MODELS {
-            let rungs: Vec<_> = model.seeds.iter().map(|s| rung(s.effort)).collect();
-            assert!(rungs.iter().all(Option::is_some), "{}: {rungs:?}", model.id);
+            let effort_steps: Vec<_> = model.seeds.iter().map(|s| effort_step(s.effort)).collect();
             assert!(
-                rungs.windows(2).all(|w| w[0] < w[1]),
-                "{}: {rungs:?}",
+                effort_steps.iter().all(Option::is_some),
+                "{}: {effort_steps:?}",
+                model.id
+            );
+            assert!(
+                effort_steps.windows(2).all(|w| w[0] < w[1]),
+                "{}: {effort_steps:?}",
                 model.id
             );
         }

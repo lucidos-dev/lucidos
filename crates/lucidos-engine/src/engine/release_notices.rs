@@ -15,15 +15,21 @@
 //! invisible exactly as an unreleased one is, so nobody is told to do what
 //! their workspace already does.
 //!
+//! A notice may also name, in `superseded_by`, a later notice that replaces
+//! it. Once that one is meant for the workspace, the older one is hidden the
+//! same way, so nobody reads an instruction the next notice contradicts.
+//!
 //! The modal and the What's New panel are two renderings of one list. So
 //! [`view`] returns every visible notice, plus the id of the next one owed.
 
 use crate::core::preferences::PreferenceStore;
 use crate::core::prefs;
+use crate::core::IntentStore;
 use crate::engine::summary_tree::module::MemoryModule;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::path::Path;
 use std::sync::OnceLock;
 
 /// The authored notices as of this build. Read that file's own header before
@@ -51,6 +57,10 @@ pub struct ReleaseNotice {
     /// decides, so a client never sees it.
     #[serde(default, skip_serializing)]
     pub only_when: Option<NoticeCondition>,
+    /// The id of a later notice that replaces this one. Once that notice is
+    /// meant for the workspace, this one is hidden. The engine decides.
+    #[serde(default, skip_serializing)]
+    pub superseded_by: Option<String>,
 }
 
 /// A fact about the workspace a notice can require, named in kebab-case in
@@ -61,12 +71,16 @@ pub enum NoticeCondition {
     /// The workspace chose the Classic memory module. One that never chose
     /// gets the memory choice instead.
     OnClassicMemory,
+    /// The workspace holds at least one intent: an app intent or a trigger's
+    /// procedure file.
+    HasIntents,
 }
 
 impl NoticeCondition {
     fn holds(self, facts: &NoticeFacts) -> bool {
         match self {
             Self::OnClassicMemory => facts.memory_module == Some(MemoryModule::Classic),
+            Self::HasIntents => facts.has_intents,
         }
     }
 }
@@ -77,18 +91,27 @@ impl NoticeCondition {
 pub(crate) struct NoticeFacts {
     /// The stored choice, `None` while the workspace has never chosen.
     pub(crate) memory_module: Option<MemoryModule>,
+    /// Whether the intent registry finds any intent under the data directory.
+    pub(crate) has_intents: bool,
 }
 
 impl NoticeFacts {
     /// An unreadable memory module reads as Classic, which shows the Tree
     /// notice: the recoverable direction.
-    pub(crate) async fn read(pool: &PgPool) -> Self {
+    pub(crate) async fn read(pool: &PgPool, workspace_path: &Path) -> Self {
         let memory_module = MemoryModule::stored(pool).await.unwrap_or_else(|e| {
             log!("[ReleaseNotices] Failed to read the memory module: {}", e);
             Some(MemoryModule::Classic)
         });
-        Self { memory_module }
+        Self {
+            memory_module,
+            has_intents: workspace_has_intents(workspace_path),
+        }
     }
+}
+
+fn workspace_has_intents(workspace_path: &Path) -> bool {
+    !IntentStore::load_all(&workspace_path.join(crate::core::DATA_DIR)).is_empty()
 }
 
 /// The file's top level: a single array of tables, `[[notice]]`.
@@ -157,6 +180,19 @@ pub fn parse(src: &str) -> Result<Vec<ReleaseNotice>, String> {
             ));
         }
         previous = Some(since);
+        if let Some(by) = &notice.superseded_by {
+            let Some(replacement) = file.notice[i + 1..].iter().find(|n| &n.id == by) else {
+                return Err(format!(
+                    "{at} names superseded_by = {by:?}, which is not a later notice"
+                ));
+            };
+            // Hiding a notice must never take its button away.
+            if notice.action_prompt.is_some() && replacement.action_prompt != notice.action_prompt {
+                return Err(format!(
+                    "{at} has an action that {by:?}, which supersedes it, does not carry"
+                ));
+            }
+        }
     }
     Ok(file.notice)
 }
@@ -208,10 +244,47 @@ fn applies_to(notice: &ReleaseNotice, running: &Version) -> bool {
     Version::parse(&notice.since).is_ok_and(|since| since <= *running)
 }
 
-/// Does `notice` show to this workspace: reached by the release, and its
+/// Is `notice` meant for this workspace: reached by the release, and its
 /// condition, if any, holding?
-fn shown(notice: &ReleaseNotice, running: &Version, facts: &NoticeFacts) -> bool {
+fn meant_for(notice: &ReleaseNotice, running: &Version, facts: &NoticeFacts) -> bool {
     applies_to(notice, running) && notice.only_when.is_none_or(|c| c.holds(facts))
+}
+
+/// Does `notice` show to this workspace: meant for it, and not replaced by a
+/// later notice that is meant for it too?
+///
+/// The single hiding rule. Everything it hides is unlisted, unowed and
+/// unanswerable, answered or not: the cursor cannot tell an answer from a skip.
+fn shown(
+    notice: &ReleaseNotice,
+    notices: &[ReleaseNotice],
+    running: &Version,
+    facts: &NoticeFacts,
+) -> bool {
+    meant_for(notice, running, facts) && !superseded(notice, notices, running, facts)
+}
+
+/// Is any notice down `notice`'s `superseded_by` chain meant for this
+/// workspace? A link whose condition fails still passes the chain on, so a
+/// replacement two steps later hides it too. [`parse`] only accepts later
+/// ids, so the walk ends.
+fn superseded(
+    notice: &ReleaseNotice,
+    notices: &[ReleaseNotice],
+    running: &Version,
+    facts: &NoticeFacts,
+) -> bool {
+    let mut by = notice.superseded_by.as_deref();
+    while let Some(id) = by {
+        let Some(replacement) = notices.iter().find(|n| n.id == id) else {
+            return false;
+        };
+        if meant_for(replacement, running, facts) {
+            return true;
+        }
+        by = replacement.superseded_by.as_deref();
+    }
+    false
 }
 
 /// Where the cursor sits in `notices`: the count of entries it has answered.
@@ -239,7 +312,7 @@ fn owed<'a>(
     notices
         .iter()
         .skip(answered_count(notices, cursor))
-        .find(|n| shown(n, running, facts))
+        .find(|n| shown(n, notices, running, facts))
 }
 
 /// Both surfaces, for one workspace on one release.
@@ -254,7 +327,7 @@ pub(crate) fn view(
     let visible: Vec<(usize, &ReleaseNotice)> = notices
         .iter()
         .enumerate()
-        .filter(|(_, n)| shown(n, running, facts))
+        .filter(|(_, n)| shown(n, notices, running, facts))
         .collect();
     let states = visible
         .iter()
@@ -286,7 +359,7 @@ pub(crate) fn view(
 /// starts level and hears from the NEXT release instead. Only it is stamped:
 /// [`place_workspace`] owns the other half of that decision.
 ///
-/// Conditions are ignored. A fresh workspace picks its memory module in the
+/// Conditions and supersession are ignored. A fresh workspace picks its memory module in the
 /// memory choice, and must not meet the Tree notice the day it picks Classic.
 fn fresh_workspace_stamp(notices: &[ReleaseNotice], running: &Version) -> Option<String> {
     notices
@@ -306,8 +379,8 @@ fn fresh_workspace_stamp(notices: &[ReleaseNotice], running: &Version) -> Option
 /// - An id at or behind the cursor is a stale client re-answering.
 /// - A queued id is a turn out of order, skipping the notices before it.
 /// - A notice this release has not reached would be skipped by the release
-///   that finally ships it. A notice whose condition fails is hidden the same
-///   way.
+///   that finally ships it. A notice whose condition fails, or that a later
+///   notice supersedes, is hidden the same way.
 ///
 /// The middle two are unreachable from our own surfaces, which draw from
 /// [`view`] and disable what is not owed. The rule is here because the endpoint
@@ -491,17 +564,25 @@ mod tests {
             action_label: None,
             action_prompt: None,
             only_when: None,
+            superseded_by: None,
         }
     }
 
     pub(super) const CLASSIC: NoticeFacts = NoticeFacts {
         memory_module: Some(MemoryModule::Classic),
+        has_intents: true,
     };
     pub(super) const TREE: NoticeFacts = NoticeFacts {
         memory_module: Some(MemoryModule::Tree),
+        has_intents: true,
     };
     const NEVER_CHOSE: NoticeFacts = NoticeFacts {
         memory_module: None,
+        has_intents: true,
+    };
+    const NO_INTENTS: NoticeFacts = NoticeFacts {
+        memory_module: Some(MemoryModule::Tree),
+        has_intents: false,
     };
 
     /// `a` and `c` for everybody, with `b` only for a Classic workspace.
@@ -604,6 +685,186 @@ mod tests {
         assert_eq!(tree.only_when, Some(NoticeCondition::OnClassicMemory));
     }
 
+    /// `a` and `c` for everybody, with `b` only for a workspace with an intent.
+    fn b_only_with_intents() -> Vec<ReleaseNotice> {
+        let mut notices = three();
+        notices[1].only_when = Some(NoticeCondition::HasIntents);
+        notices
+    }
+
+    #[test]
+    fn the_has_intents_notice_shows_to_a_workspace_with_an_intent() {
+        let view = view(&b_only_with_intents(), &v("3.0.0"), &TREE, Some("a"));
+        assert_eq!(ids(&view), ["a", "b", "c"]);
+        assert_eq!(view.next_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn the_has_intents_notice_hides_from_a_workspace_without_one() {
+        let view = view(&b_only_with_intents(), &v("3.0.0"), &NO_INTENTS, Some("a"));
+        assert_eq!(ids(&view), ["a", "c"]);
+        assert_eq!(view.next_id.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn has_intents_parses_from_its_kebab_case_name() {
+        let src = "[[notice]]\nid = \"a\"\nsince = \"1.0.0\"\ntitle = \"A\"\nbody = \"x\"\n\
+                   only_when = \"has-intents\"\n";
+        assert_eq!(
+            parse(src).unwrap()[0].only_when,
+            Some(NoticeCondition::HasIntents)
+        );
+    }
+
+    /// The fact reads the intent registry, so a trigger procedure counts too.
+    #[test]
+    fn a_workspace_has_intents_once_the_registry_finds_one() {
+        let ws = tempfile::tempdir().unwrap();
+        assert!(!workspace_has_intents(ws.path()));
+        let triggers = ws
+            .path()
+            .join(crate::core::DATA_DIR)
+            .join("triggers/digest");
+        std::fs::create_dir_all(&triggers).unwrap();
+        std::fs::write(
+            triggers.join("digest.md"),
+            "---\nname: Digest\n---\nSum up.\n",
+        )
+        .unwrap();
+        assert!(workspace_has_intents(ws.path()));
+    }
+
+    #[test]
+    fn the_shipped_intents_notice_shows_only_with_intents() {
+        let notices = parse(RELEASE_NOTICES_TOML).unwrap();
+        let intents = notices
+            .iter()
+            .find(|n| n.id == "intents-run-in-the-thread")
+            .unwrap();
+        assert_eq!(intents.only_when, Some(NoticeCondition::HasIntents));
+    }
+
+    /// `c` replaces `a`.
+    fn c_supersedes_a() -> Vec<ReleaseNotice> {
+        let mut notices = three();
+        notices[0].superseded_by = Some("c".to_string());
+        notices
+    }
+
+    #[test]
+    fn a_superseded_notice_is_neither_listed_nor_owed() {
+        let view = view(&c_supersedes_a(), &v("3.0.0"), &TREE, None);
+        assert_eq!(ids(&view), ["b", "c"]);
+        assert_eq!(view.next_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_superseded_notice_cannot_be_answered() {
+        let notices = c_supersedes_a();
+        assert_eq!(
+            advanced_cursor(&notices, &v("3.0.0"), &TREE, None, "a"),
+            None
+        );
+    }
+
+    /// Until the release reaches the replacement, the old notice is the only
+    /// word on the subject.
+    #[test]
+    fn a_superseder_not_yet_reached_hides_nothing() {
+        let view = view(&c_supersedes_a(), &v("2.0.0"), &TREE, None);
+        assert_eq!(ids(&view), ["a", "b"]);
+        assert_eq!(view.next_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_superseder_whose_condition_fails_hides_nothing() {
+        let mut notices = c_supersedes_a();
+        notices[2].only_when = Some(NoticeCondition::OnClassicMemory);
+        assert_eq!(ids(&view(&notices, &v("3.0.0"), &TREE, None)), ["a", "b"]);
+        assert_eq!(
+            ids(&view(&notices, &v("3.0.0"), &CLASSIC, None)),
+            ["b", "c"]
+        );
+    }
+
+    /// `a` → `b` → `c`, where `b` is Classic-only: `c` still replaces `a` on
+    /// Tree, or `a` would show beside its own replacement.
+    #[test]
+    fn supersession_passes_through_a_link_whose_condition_fails() {
+        let mut notices = c_supersedes_a();
+        notices[0].superseded_by = Some("b".to_string());
+        notices[1].superseded_by = Some("c".to_string());
+        notices[1].only_when = Some(NoticeCondition::OnClassicMemory);
+        assert_eq!(ids(&view(&notices, &v("3.0.0"), &TREE, None)), ["c"]);
+        assert_eq!(ids(&view(&notices, &v("2.0.0"), &TREE, None)), ["a"]);
+    }
+
+    /// The cursor cannot tell an answer from a skip, so the page drops an
+    /// answered superseded notice rather than claim it was read.
+    #[test]
+    fn an_answered_superseded_notice_leaves_the_page_too() {
+        let view = view(&c_supersedes_a(), &v("3.0.0"), &TREE, Some("b"));
+        assert_eq!(ids(&view), ["b", "c"]);
+        assert!(view.notices[0].resolved);
+    }
+
+    /// A workspace that answered `a` before `c` shipped is still past it.
+    #[test]
+    fn a_cursor_on_a_superseded_notice_keeps_its_place() {
+        let view = view(&c_supersedes_a(), &v("3.0.0"), &TREE, Some("a"));
+        assert_eq!(view.next_id.as_deref(), Some("b"));
+    }
+
+    fn superseded_src(superseded_by: &str) -> String {
+        format!(
+            "[[notice]]\nid = \"a\"\nsince = \"1.0.0\"\ntitle = \"A\"\nbody = \"x\"\n\
+             superseded_by = \"{superseded_by}\"\n\
+             [[notice]]\nid = \"b\"\nsince = \"2.0.0\"\ntitle = \"B\"\nbody = \"x\"\n"
+        )
+    }
+
+    #[test]
+    fn superseded_by_parses_when_it_names_a_later_notice() {
+        let parsed = parse(&superseded_src("b")).unwrap();
+        assert_eq!(parsed[0].superseded_by.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn superseded_by_must_name_a_later_notice() {
+        assert!(parse(&superseded_src("a")).is_err(), "itself");
+        assert!(parse(&superseded_src("z")).is_err(), "an unknown id");
+        let earlier = "[[notice]]\nid = \"a\"\nsince = \"1.0.0\"\ntitle = \"A\"\nbody = \"x\"\n\
+                       [[notice]]\nid = \"b\"\nsince = \"2.0.0\"\ntitle = \"B\"\nbody = \"x\"\n\
+                       superseded_by = \"a\"\n";
+        assert!(parse(earlier).is_err(), "an earlier notice");
+    }
+
+    fn superseded_action_src(replacement_action: &str) -> String {
+        format!(
+            "[[notice]]\nid = \"a\"\nsince = \"1.0.0\"\ntitle = \"A\"\nbody = \"x\"\n\
+             superseded_by = \"b\"\naction_label = \"Go\"\naction_prompt = \"Audit it.\"\n\
+             [[notice]]\nid = \"b\"\nsince = \"2.0.0\"\ntitle = \"B\"\nbody = \"x\"\n\
+             {replacement_action}"
+        )
+    }
+
+    /// Hiding a notice must never take its button away.
+    #[test]
+    fn a_superseder_must_carry_the_replaced_action() {
+        assert!(parse(&superseded_action_src("")).is_err(), "no action");
+        let other = "action_label = \"Go\"\naction_prompt = \"Fix it.\"\n";
+        assert!(parse(&superseded_action_src(other)).is_err(), "another one");
+        let same = "action_label = \"Run\"\naction_prompt = \"Audit it.\"\n";
+        assert!(parse(&superseded_action_src(same)).is_ok());
+    }
+
+    #[test]
+    fn superseded_by_stays_off_the_wire() {
+        let notices = c_supersedes_a();
+        let json = serde_json::to_value(&notices[0]).unwrap();
+        assert!(json.get("superseded_by").is_none(), "{json}");
+    }
+
     fn three() -> Vec<ReleaseNotice> {
         vec![
             notice("a", "1.0.0"),
@@ -683,17 +944,21 @@ mod tests {
         parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
     }
 
-    /// A knowhow file's frontmatter `description`, lowercased. That line is what
-    /// the engine splices into the routing list, so it is the half a prompt has
-    /// to meet.
-    fn knowhow_description(id: &str) -> String {
+    fn knowhow_source(id: &str) -> String {
         let path = format!(
             "{}/../../system-knowhow/{id}.md",
             env!("CARGO_MANIFEST_DIR")
         );
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("system-knowhow/{id}.md must exist: {e}"));
-        src.lines()
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("system-knowhow/{id}.md must exist: {e}"))
+    }
+
+    /// A knowhow file's frontmatter `description`, lowercased. That line is what
+    /// the engine splices into the routing list, so it is the half a prompt has
+    /// to meet.
+    fn knowhow_description(id: &str) -> String {
+        knowhow_source(id)
+            .lines()
             .find_map(|l| l.strip_prefix("description:"))
             .unwrap_or_else(|| panic!("system-knowhow/{id}.md needs a frontmatter description"))
             .to_lowercase()
@@ -711,11 +976,14 @@ mod tests {
     fn every_action_prompt_routes_to_the_knowhow_meant_to_answer_it() {
         // Notice id, the knowhow that must answer it, and the words both sides
         // have to keep. A word here is one the description ROUTES on.
-        let routes = [(
-            "run-a-workspace-audit",
-            "workspace-audit",
-            ["audit", "workspace", "drift"],
-        )];
+        let routes: [(&str, &str, &[&str]); 2] = [
+            (
+                "run-a-workspace-audit",
+                "workspace-audit",
+                &["audit", "workspace", "drift"],
+            ),
+            ("two-dashboards", "workspace-audit", &["apps", "check"]),
+        ];
         let notices = parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
         for (id, knowhow, words) in routes {
             let notice = notices
@@ -738,6 +1006,27 @@ mod tests {
                     "system-knowhow/{knowhow}.md's description drops {word:?}, so {id} may not reach it"
                 );
             }
+        }
+    }
+
+    /// A targeted run picks its check by the name the prompt uses. Rename the
+    /// check alone and the button falls back to a guess, or the full pass.
+    #[test]
+    fn a_targeted_action_names_a_check_its_audit_section_owns() {
+        let targeted = [("two-dashboards", "workspace-audit/apps", "dashboard rename")];
+        let notices = parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
+        for (id, section, check) in targeted {
+            let prompt = notices
+                .iter()
+                .find(|n| n.id == id)
+                .and_then(|n| n.action_prompt.as_ref())
+                .unwrap_or_else(|| panic!("{id} must carry the action this pins"))
+                .to_lowercase();
+            assert!(prompt.contains(check), "{id}'s prompt drops {check:?}");
+            assert!(
+                knowhow_source(section).to_lowercase().contains(check),
+                "system-knowhow/{section}.md no longer names {check:?}, so {id} cannot pick it"
+            );
         }
     }
 

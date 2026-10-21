@@ -7,7 +7,7 @@
 //! exercises bus paths.
 
 use super::{
-    merge_thread_queue_policy_patch, parent_filter_arg, parse_required_uuid,
+    count_events_impl, merge_thread_queue_policy_patch, parent_filter_arg, parse_required_uuid,
     parse_send_notification_args, parse_source_arg, parse_status_arg, pending_scope_arg,
     query_events_impl, status_filter_arg,
 };
@@ -1125,5 +1125,115 @@ fn a_boolean_filter_arg_refuses_what_is_not_a_boolean() {
     for name in ["d", "e"] {
         let err = super::bool_arg(&args, name).expect_err("not a boolean");
         assert!(err.contains("true or false"), "{err}");
+    }
+}
+
+/// A model that still calls the retired `execute_intent` learns the
+/// replacement, with its intent id, rather than "Unknown tool".
+#[test]
+fn a_call_to_execute_intent_is_refused_with_its_replacement() {
+    use crate::llm::tool_names as tn;
+    for args in [
+        serde_json::json!({ "intent_id": "habit-tracker/daily" }),
+        serde_json::json!({ "prompt_id": "habit-tracker/daily" }),
+    ] {
+        let refusal = super::dispatch_name(tn::EXECUTE_INTENT, &args).expect_err("retired");
+        assert!(
+            refusal.contains(r#"load_knowhow(id: "habit-tracker/daily")"#),
+            "{refusal}"
+        );
+        assert!(
+            refusal.starts_with("Error: execute_intent was removed"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("Unknown tool"), "{refusal}");
+    }
+}
+
+// ============================================================================
+// `count_events_impl`: a thread-scoped count
+// ============================================================================
+
+/// Seed `mine` with two `Counted` rows and `other` with one, then count.
+async fn count_with(args: serde_json::Value, caller: Uuid, mine: Uuid) -> Result<String, String> {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let other = Uuid::new_v4();
+    for _ in 0..2 {
+        insert_thread_event(&pool, Uuid::new_v4(), mine, "Counted", json!({})).await;
+    }
+    insert_thread_event(&pool, Uuid::new_v4(), other, "Counted", json!({})).await;
+    insert_thread_event(&pool, Uuid::new_v4(), other, "OnlyOther", json!({})).await;
+
+    let out = count_events_impl(&store, &args, caller).await;
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+    out
+}
+
+#[tokio::test]
+async fn count_events_scopes_the_single_type_shape_to_a_thread() {
+    let mine = Uuid::new_v4();
+    let out = count_with(
+        json!({"event_type": "Counted", "thread_id": mine.to_string()}),
+        some_caller(),
+        mine,
+    )
+    .await
+    .expect("scoped count");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(
+        parsed["count"], 2,
+        "this thread's rows, not the workspace's 3"
+    );
+}
+
+#[tokio::test]
+async fn count_events_scopes_the_per_type_shape_to_a_thread() {
+    let mine = Uuid::new_v4();
+    let out = count_with(json!({"thread_id": mine.to_string()}), some_caller(), mine)
+        .await
+        .expect("scoped breakdown");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(parsed["total_count"], 2);
+    assert_eq!(parsed["by_type"].as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn count_events_resolves_the_current_alias_to_the_caller() {
+    let mine = Uuid::new_v4();
+    let out = count_with(json!({"thread_id": "current"}), mine, mine)
+        .await
+        .expect("alias resolves");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(parsed["total_count"], 2);
+}
+
+#[tokio::test]
+async fn count_events_without_a_thread_counts_every_thread() {
+    let out = count_with(
+        json!({"event_type": "Counted"}),
+        some_caller(),
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("unscoped count");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(parsed["count"], 3);
+}
+
+/// A bad id is refused. Reading it as absent would hand back the workspace
+/// total under a thread's name.
+#[tokio::test]
+async fn count_events_refuses_a_malformed_thread_id() {
+    for bad in [json!("not-a-uuid"), json!(["x"]), json!(7)] {
+        let out = count_with(
+            json!({"thread_id": bad.clone()}),
+            some_caller(),
+            Uuid::new_v4(),
+        )
+        .await;
+        assert!(out.is_err(), "{bad} must be refused, got {out:?}");
     }
 }

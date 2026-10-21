@@ -500,7 +500,12 @@ impl PythonRuntime {
             // need a Drop guard, not a call on one arm: `kill_on_drop` still
             // signals only the leader on cancel and shutdown.
             .kill_on_drop(true);
-        crate::core::apply_to_subprocess_env(&mut cmd, &env_vars);
+        // Every caller is `run_python` or a scheduled script, never an agent.
+        crate::core::apply_to_subprocess_env(
+            &mut cmd,
+            &env_vars,
+            crate::core::InheritedSecrets::Strip(crate::core::inherited_secret_env()),
+        );
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = cmd
@@ -688,12 +693,21 @@ impl PythonRuntime {
         let mut args = vec!["-m", "pip", "install", "--quiet", "--"];
         args.extend(packages);
 
-        let output = tokio::process::Command::new(&self.python_bin)
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(&self.python_bin);
+        cmd.args(&args)
             .stdin(std::process::Stdio::null())
             // pip install can hang on a slow network — kill_on_drop ensures
             // the cancel path reaps it instead of leaking the child.
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // A package's build step is code the agent chose, so it is stripped
+        // like the script it serves.
+        let inherited = crate::core::inherited_secret_env();
+        crate::core::apply_to_subprocess_env(
+            &mut cmd,
+            &[],
+            crate::core::InheritedSecrets::Strip(inherited),
+        );
+        let output = cmd
             .output()
             .await
             .map_err(|e| format!("Failed to install packages: {}", e))?;
@@ -701,9 +715,13 @@ impl PythonRuntime {
         if output.status.success() {
             Ok(())
         } else {
+            let secrets = crate::core::subprocess_secret_values(&[], inherited);
             Err(format!(
                 "Failed to install packages:\n{}",
-                String::from_utf8_lossy(&output.stderr)
+                crate::core::redact_subprocess_output(
+                    &String::from_utf8_lossy(&output.stderr),
+                    &secrets
+                )
             ))
         }
     }

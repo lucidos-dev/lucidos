@@ -9,20 +9,20 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::runtime::intelligence_ladder::drops_context_variant;
 use crate::runtime::{validate_coding_agent_effort, validate_coding_agent_model, CodingAgent};
 
 use super::event_bus::{BusEvent, EventBus};
-use super::thread_events::{EventMeta, MessageOrigin, ThreadEvent, UnproposedReason};
+use super::thread_events::{
+    EventMeta, HandoffConsent, MessageOrigin, ThreadEvent, UnproposedReason,
+};
 
-/// Context size, in input tokens, from which plan approval and the composer
-/// offer a successor thread.
+/// Context size, in input tokens, from which plan approval offers a successor
+/// thread.
 pub const HANDOFF_OFFER_TOKENS: u64 = 150_000;
 
-/// Context size from which an idle thread's composer nudges toward one.
-pub const HANDOFF_NUDGE_TOKENS: u64 = 300_000;
-
 /// What the user says to have the agent hand off. The engine prompt teaches
-/// it, and the composer's "Continue in a new thread" sends it.
+/// it, and the Successor card's Continue sends it while the cache is warm.
 pub const HANDOFF_REQUEST: &str = "handoff this session";
 
 /// Why the projection refuses a second handoff of one thread, rolling the
@@ -36,10 +36,11 @@ pub struct ThreadContext {
     /// The input tokens of the thread's latest main-session model call.
     /// `None` when the thread has made none.
     pub input_tokens: Option<u64>,
+    /// The thread may start a successor at all, at any size. A plan card
+    /// reads it to offer a new thread for a cheaper implementer.
+    pub can_hand_off: bool,
     /// Over [`HANDOFF_OFFER_TOKENS`], on a thread that can hand off.
     pub offer: bool,
-    /// Over [`HANDOFF_NUDGE_TOKENS`], on a thread that can hand off.
-    pub nudge: bool,
     /// The thread has an applied change, so a new request can go to a
     /// successor after it.
     pub applied: bool,
@@ -50,8 +51,8 @@ impl ThreadContext {
         let over = |limit: u64| input_tokens.is_some_and(|t| t > limit);
         Self {
             input_tokens,
+            can_hand_off: true,
             offer: over(HANDOFF_OFFER_TOKENS),
-            nudge: over(HANDOFF_NUDGE_TOKENS),
             applied: false,
         }
     }
@@ -81,9 +82,11 @@ pub struct ImplementerRequest {
 /// The successor's implementer: what the handoff asked for, the old thread's
 /// for the rest. Refuses a model or effort the backend does not offer.
 ///
-/// A model carries over only on the same backend. An effort carries over as
-/// is while backend and model stay. On a new model it carries only if that
-/// model accepts it, so it never pins a tier the model drops.
+/// A model carries over only on the same backend. A pick of the old model
+/// that drops its *context variant* keeps the old exact id. The successor then
+/// sends the same request and can read the prompt cache. An effort carries
+/// over as is while backend and model stay. On a new model it carries only if
+/// that model accepts it, so it never pins a tier the model drops.
 pub fn resolve_implementer(
     old: &Implementer,
     requested: &ImplementerRequest,
@@ -91,7 +94,17 @@ pub fn resolve_implementer(
     let coding_agent = requested.coding_agent.unwrap_or(old.coding_agent);
     let same_backend = coding_agent == old.coding_agent;
     let model = match requested.coding_agent_model.as_deref() {
-        Some(model) => validate_coding_agent_model(coding_agent, Some(model))?,
+        Some(model) => {
+            let picked = validate_coding_agent_model(coding_agent, Some(model))?;
+            match old.model.as_deref() {
+                Some(current)
+                    if same_backend && drops_context_variant(coding_agent, model, current) =>
+                {
+                    old.model.clone()
+                }
+                _ => picked,
+            }
+        }
         None if same_backend => old.model.clone(),
         None => None,
     };
@@ -114,6 +127,14 @@ pub fn resolve_implementer(
     })
 }
 
+/// A SQL predicate over unaliased `events` columns: a model call of a
+/// thread's own turn that reports its input size. A sub-agent's call and an
+/// auxiliary call on the thread do not count.
+pub(crate) const MAIN_SESSION_CAPTURE: &str = "event_type = 'ContextCaptured' \
+     AND payload->>'parent_tool_use_id' IS NULL \
+     AND payload->'usage'->>'input_tokens' IS NOT NULL \
+     AND COALESCE(payload->>'purpose', 'turn') = 'turn'";
+
 /// The one definition of a thread's context size: the latest `ContextCaptured`
 /// of its own turns, read as `usage.input_tokens`. A sub-agent's call and an
 /// auxiliary call on the thread do not count. A later `CodingAgentCompacted`
@@ -121,22 +142,20 @@ pub fn resolve_implementer(
 /// An integrated sub-thread, or a thread that already handed off, is offered
 /// nothing.
 pub async fn thread_context(pool: &PgPool, thread_id: Uuid) -> Result<ThreadContext, sqlx::Error> {
-    let tokens: Option<i64> = sqlx::query_scalar(
+    let sql = format!(
         "SELECT tokens FROM ( \
            SELECT sequence, (payload->'usage'->>'input_tokens')::bigint AS tokens FROM events \
-            WHERE thread_id = $1 AND event_type = 'ContextCaptured' \
-              AND payload->>'parent_tool_use_id' IS NULL \
-              AND payload->'usage'->>'input_tokens' IS NOT NULL \
-              AND COALESCE(payload->>'purpose', 'turn') = 'turn' \
+            WHERE thread_id = $1 AND {MAIN_SESSION_CAPTURE} \
            UNION ALL \
            SELECT sequence, (payload->>'post_tokens')::bigint FROM events \
             WHERE thread_id = $1 AND event_type = 'CodingAgentCompacted' \
-         ) readings ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(thread_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
+         ) readings ORDER BY sequence DESC LIMIT 1"
+    );
+    let tokens: Option<i64> = sqlx::query_scalar(&sql)
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
     let (can_hand_off, applied): (bool, bool) = sqlx::query_as(
         "SELECT NOT coding_agent_integrated AND successor_thread_id IS NULL, \
                 EXISTS (SELECT 1 FROM changes WHERE thread_id = $1 AND status = $2) \
@@ -148,10 +167,99 @@ pub async fn thread_context(pool: &PgPool, thread_id: Uuid) -> Result<ThreadCont
     .await?
     .unwrap_or((true, false));
     let mut context = ThreadContext::of_tokens(tokens.and_then(|t| u64::try_from(t).ok()));
+    context.can_hand_off = can_hand_off;
     context.offer &= can_hand_off;
-    context.nudge &= can_hand_off;
     context.applied = applied;
     Ok(context)
+}
+
+/// The context size the user last declined the Successor card at, from the
+/// latest `SuccessorOfferDeclined`.
+pub(crate) async fn latest_offer_decline(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<Option<u64>, sqlx::Error> {
+    let tokens: Option<i64> = sqlx::query_scalar(
+        "SELECT (payload->>'input_tokens')::bigint FROM events \
+         WHERE thread_id = $1 AND event_type = 'SuccessorOfferDeclined' \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    Ok(tokens.and_then(|t| u64::try_from(t).ok()))
+}
+
+/// What the user asked for on the *Successor card* while the cache was warm,
+/// and the agent's narrative spawn has not yet used.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingRequest {
+    /// The user's first request for the successor, when they typed one.
+    pub message: Option<String>,
+    pub implementer: ImplementerRequest,
+}
+
+/// The latest `SuccessorRequested` of `thread_id` that its turn has not yet
+/// ended on. A `CodingAgentIdled` after it closes the request, so a later
+/// handoff by the agent never picks up a stale one.
+pub(crate) async fn pending_successor_request(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<Option<PendingRequest>, sqlx::Error> {
+    let payload: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload FROM events \
+         WHERE thread_id = $1 AND event_type = 'SuccessorRequested' \
+           AND sequence > COALESCE(( \
+               SELECT MAX(sequence) FROM events \
+               WHERE thread_id = $1 AND event_type = 'CodingAgentIdled'), 0) \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(payload.map(|p| {
+        let text = |key: &str| p.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        PendingRequest {
+            message: text("message"),
+            implementer: ImplementerRequest {
+                coding_agent: text("coding_agent").map(|a| CodingAgent::parse(&a)),
+                coding_agent_model: text("coding_agent_model"),
+                reasoning_effort: text("reasoning_effort"),
+            },
+        }
+    }))
+}
+
+/// The opening message of a successor that starts with no *handoff
+/// narrative*: the old thread was too costly to wake. It names the old
+/// thread, and tells the successor how to rebuild what it needs.
+pub fn handoff_brief(
+    old_link: &str,
+    old_id: Uuid,
+    request: Option<&str>,
+    applied: Option<&str>,
+) -> String {
+    let applied = applied
+        .map(|s| format!(" The change it applied last: {s}"))
+        .unwrap_or_default();
+    let ending = match request {
+        Some(request) => format!("The user's first request for you:\n\n{request}"),
+        None => "The user typed no request. Once you know where things stand, end your first \
+                 turn on an AskUserQuestion card. Its question says where this stands. Its \
+                 options are the open items to pick up."
+            .to_string(),
+    };
+    format!(
+        "This thread continues {old_link}. Its worktree starts at that thread's last commit, \
+         so it already holds all of its work.{applied}\n\n\
+         There is no handoff narrative: waking the earlier thread would cost too much. \
+         Rebuild only what you need:\n\
+         - Its recent turns: `lucidos events query --thread-id {old_id} --limit 30`.\n\
+         - The branch history: `git log`.\n\
+         - Any plan under `docs/plans/` that the branch touched.\n\n\
+         {ending}"
+    )
 }
 
 /// The sections a *handoff narrative* must carry, as markdown headings. A
@@ -181,6 +289,68 @@ pub fn missing_narrative_sections(narrative: &str) -> Vec<&'static str> {
         .collect()
 }
 
+const CHECKPOINT_SEPARATOR: &str = " · ";
+const LEGACY_CONTINUED_MARK: &str = " (continued)";
+
+/// The title of the thread that continues `old_title`: the base title, the
+/// successor's position in its chain, and the checkpoint it starts at.
+/// Position 2 is the first successor. The suffixes of `old_title` are
+/// stripped first, so a repeat handoff never stacks them.
+pub fn successor_title(old_title: &str, checkpoint: Option<&str>) -> String {
+    let (base, position) = chain_position(old_title);
+    let number = position + 1;
+    match checkpoint {
+        Some(checkpoint) => format!("{base} ({number}){CHECKPOINT_SEPARATOR}{checkpoint}"),
+        None => format!("{base} ({number})"),
+    }
+}
+
+/// `title` without its chain suffixes, and its own position in the chain. A
+/// title with no suffix is position 1. A legacy ` (continued)` adds one each.
+fn chain_position(title: &str) -> (&str, u32) {
+    let mut rest = title.trim_end();
+    if let Some((head, _)) = rest.rsplit_once(CHECKPOINT_SEPARATOR) {
+        if strip_legacy_mark(head).is_some() || strip_number_mark(head).is_some() {
+            rest = head;
+        }
+    }
+    let mut position = 1;
+    let mut numbered = false;
+    loop {
+        if let Some(head) = strip_legacy_mark(rest) {
+            position += 1;
+            rest = head;
+        } else if let Some((head, number)) = strip_number_mark(rest).filter(|_| !numbered) {
+            position += number - 1;
+            numbered = true;
+            rest = head;
+        } else {
+            return (rest, position);
+        }
+    }
+}
+
+fn strip_legacy_mark(title: &str) -> Option<&str> {
+    title
+        .strip_suffix(LEGACY_CONTINUED_MARK)
+        .filter(|head| !head.trim().is_empty())
+        .map(str::trim_end)
+}
+
+/// A trailing ` (N)` with N from 2 to 99: a year or a one-off count in a
+/// plain title is no chain position.
+fn strip_number_mark(title: &str) -> Option<(&str, u32)> {
+    let (head, tail) = title.rsplit_once(" (")?;
+    let digits = tail.strip_suffix(')')?;
+    let number: u32 = digits
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| digits.parse().ok())
+        .flatten()?;
+    ((2..=99).contains(&number) && digits.len() <= 2 && !head.trim().is_empty())
+        .then(|| (head.trim_end(), number))
+}
+
 /// Where a successor sits: in its old thread's place. Top-level when the old
 /// thread was, otherwise under the same parent with the same wake mode, so
 /// the parent waits on the successor. Never a child that is later detached.
@@ -205,6 +375,75 @@ impl Placement {
             spawning_event_id: parent_thread_id.and(spawning_event_id),
         }
     }
+
+    /// The builder's place in a *build chain*: a `no-wake` child of the
+    /// planning thread, so a clean finish files its report without waking it.
+    pub fn build_chain_under(planner: Uuid) -> Self {
+        Self {
+            parent_thread_id: Some(planner),
+            wake_mode: Some(super::thread_events::WakeMode::NoWake),
+            spawning_event_id: None,
+        }
+    }
+}
+
+/// A *build chain*, as one of its members sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildChain {
+    /// The planning thread every member sits under.
+    pub planner: Uuid,
+    /// The builder first, then each successor, down to the asking member.
+    pub members: Vec<Uuid>,
+}
+
+/// The build chain `thread_id` belongs to, if any. Its `successor_of` links
+/// lead, through threads under one parent, to that parent: only the plan
+/// card's handoff puts a successor under its own old thread.
+pub async fn build_chain(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<Option<BuildChain>, sqlx::Error> {
+    // The hop bound ends a corrupt cycle, as `lineage_root`'s does.
+    let lineage: Vec<(Uuid, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        "WITH RECURSIVE lineage AS ( \
+           SELECT thread_id, successor_of, parent_thread_id, 0 AS depth \
+             FROM thread_summaries WHERE thread_id = $1 \
+           UNION ALL \
+           SELECT t.thread_id, t.successor_of, t.parent_thread_id, l.depth + 1 \
+             FROM thread_summaries t \
+             JOIN lineage l ON t.thread_id = l.successor_of \
+                           AND t.parent_thread_id = l.parent_thread_id \
+            WHERE l.depth < $2 \
+         ) \
+         SELECT thread_id, successor_of, parent_thread_id FROM lineage ORDER BY depth DESC",
+    )
+    .bind(thread_id)
+    .bind(i32::try_from(MAX_HANDOFF_HOPS).unwrap_or(i32::MAX))
+    .fetch_all(pool)
+    .await?;
+    let Some(&(_, Some(started_by), Some(planner))) = lineage.first() else {
+        return Ok(None);
+    };
+    Ok((started_by == planner).then(|| BuildChain {
+        planner,
+        members: lineage.iter().map(|(id, _, _)| *id).collect(),
+    }))
+}
+
+/// Whether `successor_thread_id` is the builder of a build chain: the only
+/// successor that sits under its own old thread.
+pub(crate) async fn starts_build_chain(
+    pool: &PgPool,
+    successor_thread_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, Option<bool>>(
+        "SELECT successor_of = parent_thread_id FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(successor_thread_id)
+    .fetch_optional(pool)
+    .await?
+    .flatten()
+    .unwrap_or(false))
 }
 
 /// Whether `thread_id` has a change waiting in the landing lane. The lane
@@ -253,6 +492,22 @@ pub(crate) async fn predecessor_of(
     .fetch_optional(pool)
     .await?
     .flatten())
+}
+
+/// How far a handoff chain is followed, so a corrupt cycle ends.
+pub(crate) const MAX_HANDOFF_HOPS: usize = 16;
+
+/// The thread a chain of handoffs began at: `thread_id` itself when it is no
+/// successor. A change a successor lands belongs to this thread's work.
+pub(crate) async fn lineage_root(pool: &PgPool, thread_id: Uuid) -> Result<Uuid, sqlx::Error> {
+    let mut root = thread_id;
+    for _ in 0..MAX_HANDOFF_HOPS {
+        match predecessor_of(pool, root).await? {
+            Some(older) => root = older,
+            None => break,
+        }
+    }
+    Ok(root)
 }
 
 /// The commit a successor's first branch starts at, from its old thread's
@@ -328,6 +583,54 @@ pub(crate) async fn carry_plan_marker(
     }
 }
 
+/// What the old thread's `SuccessorThreadSpawned` records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Handoff {
+    pub successor_thread_id: Uuid,
+    /// The old thread's last commit, which the successor's branch starts at.
+    pub base_sha: String,
+    pub starts_build_chain: bool,
+    pub handoff_consent: Option<HandoffConsent>,
+}
+
+/// The *handoff consent* `thread_id` carries under `parent` (ADR 0507): the
+/// one its predecessor recorded on the handoff that started it, when both sit
+/// under `parent`. A value this engine cannot read counts as none, so the
+/// thread asks rather than hands off.
+pub(crate) async fn carried_consent(
+    pool: &PgPool,
+    thread_id: Uuid,
+    parent: Uuid,
+) -> Result<Option<HandoffConsent>, sqlx::Error> {
+    let recorded: Option<Option<serde_json::Value>> = sqlx::query_scalar(
+        "SELECT e.payload->'handoff_consent' \
+           FROM thread_summaries t \
+           JOIN thread_summaries p ON p.thread_id = t.successor_of \
+           JOIN events e ON e.thread_id = p.thread_id \
+                        AND e.event_type = 'SuccessorThreadSpawned' \
+                        AND e.payload->>'successor_thread_id' = t.thread_id::text \
+          WHERE t.thread_id = $1 AND t.parent_thread_id = $2 AND p.parent_thread_id = $2 \
+          ORDER BY e.sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .bind(parent)
+    .fetch_optional(pool)
+    .await?;
+    let Some(value) = recorded.flatten() else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_value(value.clone())
+        .inspect_err(|e| {
+            crate::log!(
+                "[Successor] unreadable handoff consent {} for {}: {}",
+                value,
+                thread_id,
+                e
+            )
+        })
+        .ok())
+}
+
 /// Record the handoff on the old thread, then take back its pending change
 /// and withhold its work as carried. Every read comes first and the link
 /// lands next, so a turn end racing this call already finds the hold. After
@@ -338,8 +641,7 @@ pub(crate) async fn record_handoff(
     bus: &EventBus,
     pool: &PgPool,
     old_thread_id: Uuid,
-    successor_thread_id: Uuid,
-    base_sha: &str,
+    handoff: Handoff,
     actor: Option<MessageOrigin>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let had_work: bool = sqlx::query_scalar(
@@ -360,8 +662,10 @@ pub(crate) async fn record_handoff(
     bus.emit(BusEvent::Thread {
         thread_id: old_thread_id,
         event: ThreadEvent::SuccessorThreadSpawned {
-            successor_thread_id,
-            base_sha: base_sha.to_string(),
+            successor_thread_id: handoff.successor_thread_id,
+            base_sha: handoff.base_sha,
+            starts_build_chain: handoff.starts_build_chain,
+            handoff_consent: handoff.handoff_consent,
         },
         meta: EventMeta::with_actor(actor.clone()),
     })
@@ -427,6 +731,7 @@ pub fn spawn_successor_archive_net(
 
 /// Ask `successor_thread_id`'s old thread to archive, on the successor's
 /// first session only, so a resume or a replayed frame asks nothing twice.
+/// A build chain's planner stays open, and an unknown answer keeps it open.
 async fn request_predecessor_archive(bus: &EventBus, pool: &PgPool, successor_thread_id: Uuid) {
     let old = match predecessor_of(pool, successor_thread_id).await {
         Ok(Some(old)) => old,
@@ -436,6 +741,14 @@ async fn request_predecessor_archive(bus: &EventBus, pool: &PgPool, successor_th
             return;
         }
     };
+    match starts_build_chain(pool, successor_thread_id).await {
+        Ok(false) => {}
+        Ok(true) => return,
+        Err(e) => {
+            crate::log!("[Successor] build chain of {}: {}", successor_thread_id, e);
+            return;
+        }
+    }
     let sessions: Result<i64, sqlx::Error> = sqlx::query_scalar(
         "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'SessionStarted'",
     )

@@ -41,12 +41,18 @@ pub(crate) mod working_understanding;
 // shares its routing-description ceiling, and `widget_guidance` its app lines.
 pub(crate) mod workspace_prompt_footprint;
 
+// A `run_thread` child resolves its inherited route the way a turn does.
+pub(crate) use run::resolve_route_overrides;
+
 // Re-exported only for the colocated `process_tests` module, which reaches
 // these via `super::`. Non-test code imports them from the child modules
 // directly (run.rs uses `context_build::*`; system_prompt.rs uses the const
 // locally), so the re-exports are `cfg(test)`-gated to avoid unused warnings.
 #[cfg(test)]
-pub(crate) use context_build::{build_capture_sections, build_loaded_knowhow_block};
+pub(crate) use context_build::{
+    assemble_turn_text, build_capture_sections, build_knowhow_retention_block,
+    build_loaded_knowhow_block, TurnSections,
+};
 // `PLUGIN_SETUP_RULE` also travels to `tools::plugins_tests`, whose seed test
 // pins the route against the two lines the engine actually sends.
 #[cfg(test)]
@@ -169,13 +175,22 @@ impl LucidosEngine {
         // See `TriggerContext::queue_entry_id`.
         queue_entry_id: Uuid,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
-        // The trigger's own model / effort when it pinned one, else `None` so
-        // the single canonical resolver in `process_message_with_steps_internal`
-        // applies the account chat preferences. An explicit value here wins
-        // there, which is what makes a pinned trigger a pin.
+        // The trigger's own model when it pinned one, else the account's
+        // trigger model, so a fire never starts on the chat default. The
+        // resolver in `process_message_with_steps_internal` takes an explicit
+        // value as the override, which is what makes a pinned trigger a pin.
+        // The effort stays `None` unless pinned, and resolves for that model.
+        let configured = self.current_provider().configured_providers();
+        let model = run::trigger_model_override(
+            &self.pool,
+            &self.model_registry,
+            |kind| configured.as_ref().is_none_or(|set| set.contains(&kind)),
+            model,
+        )
+        .await;
         self.process_message_with_steps_internal(
             prompt,
-            model,
+            model.as_deref(),
             Some(TriggerContext {
                 trigger_id: trigger_id.to_string(),
                 trigger_name: trigger_name.to_string(),

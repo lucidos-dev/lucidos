@@ -1,11 +1,17 @@
 import { test, expect, Page } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
-  sendMessage, waitForActionPanel, pickModelPair, openCurrentModelTiers,
+  sendMessage, waitForActionPanel, openRungList, readRungRows, pickRung, currentRungValue,
+  splitRungValue,
 } from './helpers';
 
+// `sw.js` serves the commands and estimate GETs. Once the worker controls the
+// page, those fetches run in the worker, where `page.route` cannot see them.
+// The mocks below then lapse.
+test.use({ serviceWorkers: 'block' });
+
 /** Send a CC message and wait for session to go idle (Done).
- * Commands are cached after this — the dropdown button will be active. */
+ * Commands are cached after this, so the rung control has its rungs. */
 async function setupIdleCCThread(page: Page) {
   await navigateToApp(page);
   await newThread(page);
@@ -17,17 +23,22 @@ async function setupIdleCCThread(page: Page) {
 
 /** Install API route handlers that force has_active_session: true in commands
  * responses and intercept control commands (returning success).
- * This allows testing the Model picker UI without needing a live CC process. */
+ * This allows testing the rung control without needing a live CC process.
+ * Call it BEFORE the thread is set up. The app reads the commands again only on
+ * a session event. A mock installed after the last event never reaches it, so
+ * the app holds `has_active_session: false`.
+ * Returns the control requests the app sent, in order. */
 async function mockActiveSession(page: Page) {
   let modelOverride: string | null = null;
+  let effortOverride: string | null = null;
+  const controls: Array<{ subtype?: string; model?: string; effort?: string }> = [];
 
   await page.route('**/api/v1/claude-code/commands*', async (route) => {
     const response = await route.fetch();
     const body = await response.json();
     body.has_active_session = true;
-    if (modelOverride) {
-      body.current_model = modelOverride;
-    }
+    if (modelOverride) body.current_model = modelOverride;
+    if (effortOverride) body.current_reasoning_effort = effortOverride;
     await route.fulfill({
       status: response.status(),
       headers: response.headers(),
@@ -35,43 +46,47 @@ async function mockActiveSession(page: Page) {
     });
   });
 
+  // A pick on a live thread asks what it costs first. This one is free.
+  await page.route(/\/api\/v1\/threads\/[^/]+\/switch-estimate/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ context_tokens: 0, rebuilds_cache: false, extra_cost_usd: null }),
+    });
+  });
+
+  // The request event is the record of what the app sent.
+  page.on('request', (req) => {
+    if (req.method() !== 'POST' || !req.url().endsWith('/api/v1/claude-code/control')) return;
+    try {
+      controls.push(req.postDataJSON()?.request ?? {});
+    } catch { /* a body that is not JSON is no control request */ }
+  });
+
   await page.route('**/api/v1/claude-code/control', async (route) => {
-    const postData = route.request().postDataJSON();
-    if (postData?.request?.subtype === 'set_model') {
-      modelOverride = postData.request.model;
-    }
+    const request = route.request().postDataJSON()?.request ?? {};
+    if (request.subtype === 'set_model') modelOverride = request.model;
+    if (request.subtype === 'set_reasoning_effort') effortOverride = request.effort;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify({ ok: true }),
     });
   });
-}
 
-/** Open the CC dropdown and navigate to the model-selection list. */
-async function openModelPicker(page: Page) {
-  // Wait for the button to have commands loaded (active class) before clicking.
-  const cmdBtn = page.locator('.commands-btn-active:visible').first();
-  await expect(cmdBtn).toBeVisible({ timeout: 30_000 });
-  await cmdBtn.click();
-
-  const dropdown = page.locator('.control-dropdown:visible').first();
-  await expect(dropdown).toBeVisible({ timeout: 5_000 });
-
-  // Use strict regex to avoid matching skill commands like "vertex-models"
-  const modelOption = dropdown.locator('.control-item:visible').filter({ hasText: /^Model/ }).first();
-  await expect(modelOption).toBeVisible({ timeout: 10_000 });
-  await modelOption.click();
-
-  // Wait for model list to render
-  await expect(page.locator('.control-option:visible').first()).toBeVisible({ timeout: 5_000 });
-
-  return { cmdBtn, dropdown };
+  return controls;
 }
 
 test.describe('Model switching', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+  });
+
+  // A refetch can still be in flight when the test ends. Playwright then
+  // disposes its response while the context closes, before `page.isClosed()`
+  // turns true. Dropping the routes first ignores that handler's error.
+  test.afterEach(async ({ page }) => {
+    if (!page.isClosed()) await page.unrouteAll({ behavior: 'ignoreErrors' });
   });
 
   test('CC control menu opens and shows options', async ({ page }) => {
@@ -91,94 +106,67 @@ test.describe('Model switching', () => {
     expect(optionCount).toBeGreaterThan(0);
   });
 
-  test('model picker shows available models with current highlighted', async ({ page }) => {
-    // Setup idle CC thread first (caches commands), then mock active session
-    await setupIdleCCThread(page);
+  test('rung list shows the ladder with the current rung checked', async ({ page }) => {
     await mockActiveSession(page);
+    await setupIdleCCThread(page);
 
-    const { dropdown } = await openModelPicker(page);
+    const dropdown = await openRungList(page);
 
-    const currentModel = dropdown.locator('.control-option-current:visible').first();
-    if (await currentModel.isVisible({ timeout: 3_000 }).catch(() => false)) {
-      const text = await currentModel.textContent();
-      expect(text).toBeTruthy();
+    // One row is checked: a rung, or the thread's own pair.
+    const currentModel = dropdown.locator('.control-option-current:visible');
+    await expect(currentModel).toHaveCount(1);
+    expect((await currentModel.textContent())?.trim()).toBeTruthy();
+
+    // The list carries rungs and the ladder link. No rung opens a tier step.
+    expect((await readRungRows(page)).length).toBeGreaterThan(0);
+    await expect(dropdown.locator('.control-option[data-value="ladder-link"]:visible')).toBeVisible();
+    await expect(dropdown.locator('.control-option:not([data-value="ladder-link"]) .control-option-more')).toHaveCount(0);
+
+    await page.keyboard.press('Escape');
+  });
+
+  test('ending the test mid-refetch does not fail the commands mock', async ({ page }) => {
+    await mockActiveSession(page);
+    await navigateToApp(page);
+
+    // Leave a commands fetch in flight and end the test under it.
+    await page.evaluate(() => { void fetch('/api/v1/claude-code/commands').catch(() => {}); });
+  });
+
+  test('Escape closes the rung list', async ({ page }) => {
+    await mockActiveSession(page);
+    await setupIdleCCThread(page);
+
+    const dropdown = await openRungList(page);
+    await page.keyboard.press('Escape');
+    await expect(dropdown).not.toBeVisible({ timeout: 3_000 });
+  });
+
+  test('picking a rung sends its model and effort and updates the selection', async ({ page }) => {
+    const controls = await mockActiveSession(page);
+    await setupIdleCCThread(page);
+
+    await openRungList(page);
+
+    // Pick a rung that is not the checked one. One tap commits both halves.
+    const rungs = await readRungRows(page);
+    expect(rungs.length).toBeGreaterThanOrEqual(2);
+    const target = rungs.find((r) => !r.current);
+    expect(target).toBeTruthy();
+    await pickRung(page, target!.value);
+
+    await expect.poll(() => controls.map((c) => c.subtype)).toContain('set_model');
+    expect(controls.find((c) => c.subtype === 'set_model')?.model).toBe(target!.model);
+    if (target!.effort) {
+      await expect.poll(() => controls.find((c) => c.subtype === 'set_reasoning_effort')?.effort)
+        .toBe(target!.effort);
     }
 
-    await page.keyboard.press('Escape');
-  });
-
-  test('Escape steps back from the tier list without closing the picker', async ({ page }) => {
-    await setupIdleCCThread(page);
-    await mockActiveSession(page);
-
-    const { dropdown } = await openModelPicker(page);
-
-    // Step into a model's tiers. Only a model with tiers shows the disclosure.
-    const withTiers = page.locator('.control-option:visible:has(.control-option-more)').first();
-    await expect(withTiers).toBeVisible({ timeout: 5_000 });
-    const model = await withTiers.getAttribute('data-value');
-    expect(model).toBeTruthy();
-    await withTiers.click();
-    await expect(page.locator(`.control-option[data-value^="${model}|"]:visible`).first())
-      .toBeVisible({ timeout: 5_000 });
-
-    await page.keyboard.press('Escape');
-
-    // Back on the model list, panel still open: the model the user stepped
-    // into must not be lost to one keystroke.
-    await expect(dropdown).toBeVisible();
-    await expect(page.locator(`.control-option[data-value="${model}"]:visible`).first())
-      .toBeVisible({ timeout: 5_000 });
-
-    // A second Escape lands on the command list, matching the picker's own
-    // Back row, so the menu is not lost either.
-    await page.keyboard.press('Escape');
-    await expect(dropdown).toBeVisible();
-    await expect(dropdown.locator('.control-item:visible').filter({ hasText: /^Model/ }).first())
-      .toBeVisible({ timeout: 5_000 });
-
-    await page.keyboard.press('Escape');
-    await expect(dropdown).not.toBeVisible({ timeout: 3_000 });
-  });
-
-  test('switching model updates the selection', async ({ page }) => {
-    // Setup idle CC thread first (caches commands), then mock active session
-    await setupIdleCCThread(page);
-    await mockActiveSession(page);
-
-    const { cmdBtn, dropdown } = await openModelPicker(page);
-
-    // Pick a non-default, non-current MODEL, then one of its tiers. Only the
-    // tier commits. Default is skipped because it names an inheritance and
-    // reads back as the model it resolves to.
-    const allOptions = page.locator('.control-option:visible');
-    expect(await allOptions.count()).toBeGreaterThanOrEqual(2);
-
-    const target = page.locator(
-      '.control-option:visible:not(.control-option-current):not([data-value="default"])',
-    ).first();
-    await expect(target).toBeVisible({ timeout: 5_000 });
-    const targetModel = await target.getAttribute('data-value');
-    expect(targetModel).toBeTruthy();
-    const targetPair = await pickModelPair(page, targetModel!);
-
     // Re-open to verify selection changed
-    await expect(dropdown).not.toBeVisible({ timeout: 3_000 });
-    await cmdBtn.click();
-    await expect(dropdown).toBeVisible({ timeout: 5_000 });
+    await openRungList(page);
+    const checked = await currentRungValue(page);
+    expect(splitRungValue(checked)).toEqual({ model: target!.model, effort: target!.effort });
 
-    const modelOption2 = dropdown.locator('.control-item:visible').filter({ hasText: /^Model/ }).first();
-    await expect(modelOption2).toBeVisible({ timeout: 10_000 });
-    await modelOption2.click();
-    await expect(page.locator('.control-option:visible').first()).toBeVisible({ timeout: 5_000 });
-
-    // The chosen model is checked on step 1, and its tier one step in.
-    expect(await openCurrentModelTiers(page)).toBe(targetModel);
-    const currentAfter = page.locator('.control-option-current:visible').first();
-    await expect(currentAfter).toBeVisible({ timeout: 5_000 });
-    expect(await currentAfter.getAttribute('data-value')).toBe(targetPair);
-
-    await page.keyboard.press('Escape');
     await page.keyboard.press('Escape');
   });
 });

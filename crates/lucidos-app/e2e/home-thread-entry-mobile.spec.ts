@@ -1,16 +1,27 @@
-import { test, expect } from './fixtures';
+import { test, expect, Page } from './fixtures';
 import { navigateToApp, assertHealthy, ensureMobileView } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
 /** A phone reaches Home from a Home icon paired with the mark in the thread
- *  pane's header, landing on Home's board face (ADR 0432). The thread
+ *  pane's header, landing on Home as a plain chat (ADR 0496, amended). The thread
  *  drawer's header has no Home icon, so the menu its mark opens keeps a Home
  *  row; the thread pane's menu drops it. */
 test.describe('The home thread from the phone header', () => {
+  let home: string;
+
+  /** Home is focused, and it is a plain chat with no dashboard face. */
+  async function expectHomeOpen(page: Page): Promise<void> {
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem('lucidos-focused-thread')))
+      .toBe(home);
+    await expect(page.locator('.home-pane')).toHaveCount(0);
+    await expect(page.locator('[data-home-face]')).toHaveCount(0);
+  }
+
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
     // A spec before this one may have truncated the threads, home included.
-    ensureHomeThread();
+    home = ensureHomeThread();
     await navigateToApp(page);
     await ensureMobileView(page, 'thread');
   });
@@ -27,8 +38,7 @@ test.describe('The home thread from the phone header', () => {
     expect(Math.abs(offset), `the pair sits ${offset}px off the row middle`).toBeLessThan(2.5);
 
     await home.click();
-    // Home opens on its board face (ADR 0432).
-    await expect(page.locator('.home-pane:visible')).toHaveAttribute('data-home-face', 'board');
+    await expectHomeOpen(page);
   });
 
   test('Home and the mark spread apart when the row has room, and touch when it has none', async ({ page }) => {
@@ -90,7 +100,6 @@ test.describe('The home thread from the phone header', () => {
     await expect(first).toHaveText('Home');
     await first.click();
     await expect(page.locator('.brand-menu')).toBeHidden();
-    // Home opens on its board face (ADR 0432).
-    await expect(page.locator('.home-pane:visible')).toHaveAttribute('data-home-face', 'board');
+    await expectHomeOpen(page);
   });
 });

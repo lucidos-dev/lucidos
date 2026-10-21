@@ -240,7 +240,7 @@ pub(crate) fn path_carries_frame_capability(path: &str) -> bool {
 /// which is why it is read first. The `Accept` fallback covers clients that
 /// send no fetch metadata at all.
 ///
-/// Deliberately NOT `server::is_document_navigation`, which answers a related
+/// Deliberately NOT `server::classify_navigation`, which answers a related
 /// question and disagrees on the case that matters here. That one reaches
 /// `Accept` whenever the fetch metadata is merely not a navigation. So a script
 /// `fetch` asking for HTML reads to it as a page load. Waking a stopped
@@ -387,7 +387,7 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
 ///
 /// The engine asks the same question of the same header, to decide whether to
 /// mint. So the answer lives in the crate the two share.
-fn is_nested_frame(headers: &HeaderMap) -> bool {
+pub(crate) fn is_nested_frame(headers: &HeaderMap) -> bool {
     frame_capability::is_nested_frame_dest(
         headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()),
     )

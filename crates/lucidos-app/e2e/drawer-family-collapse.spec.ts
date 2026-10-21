@@ -3,6 +3,9 @@ import { randomUUID } from 'crypto';
 import { navigateToApp, openThreadDrawer, assertHealthy } from './helpers';
 import { psql, clearAllThreads, seedThreadRow } from './db-helpers';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 /** Seed a parent thread with one child thread directly in `thread_summaries`. */
 function seedParentChild(parentTitle: string, childTitle: string): { parentId: string; childId: string } {
     const parentId = randomUUID();

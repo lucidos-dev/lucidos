@@ -16,13 +16,14 @@ struct Retirement {
     accepted: Vec<String>,
 }
 
-/// Every retirement any migration declares, in migration order. A call starts
-/// its line, so the example in a comment is not one.
-fn retirements() -> Vec<Retirement> {
-    let call = regex::Regex::new(
-        r"(?m)^SELECT retire_model\('([^']+)',\s*'([^']+)',\s*ARRAY\[([^\]]*)\]\);",
-    )
-    .unwrap();
+/// A call starts its line, so the example in a comment is not one.
+fn retire_call() -> regex::Regex {
+    regex::Regex::new(r"(?m)^SELECT retire_model\('([^']+)',\s*'([^']+)',\s*ARRAY\[([^\]]*)\]\);")
+        .unwrap()
+}
+
+/// Every migration as (file name, SQL), in migration order.
+fn migrations() -> Vec<(String, String)> {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
@@ -31,9 +32,20 @@ fn retirements() -> Vec<Retirement> {
     files.sort();
     files
         .iter()
-        .flat_map(|path| {
-            let sql = std::fs::read_to_string(path).unwrap();
-            call.captures_iter(&sql)
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read_to_string(path).unwrap())
+        })
+        .collect()
+}
+
+/// Every retirement any migration declares, in migration order.
+fn retirements() -> Vec<Retirement> {
+    let call = retire_call();
+    migrations()
+        .iter()
+        .flat_map(|(_, sql)| {
+            call.captures_iter(sql)
                 .map(|c| Retirement {
                     old: c[1].to_string(),
                     successor: c[2].to_string(),
@@ -45,6 +57,17 @@ fn retirements() -> Vec<Retirement> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// The retirement in force for each model: a later migration may re-point a
+/// model an earlier one retired.
+fn latest_retirements() -> Vec<Retirement> {
+    let mut latest: Vec<Retirement> = Vec::new();
+    for r in retirements() {
+        latest.retain(|earlier| earlier.old != r.old);
+        latest.push(r);
+    }
+    latest
 }
 
 fn retire_sql(r: &Retirement) -> String {
@@ -67,45 +90,214 @@ fn gemini_3_5_flash_is_retired_to_3_8_flash() {
     assert_eq!(gemini.successor, "gemini-3.8-flash");
 }
 
-/// The tier list a migration passes must be exactly what every route of the
-/// successor accepts, and the SQL snap must land where `clamp_effort` does.
-/// A drift here writes an effort the successor then refuses.
+const SEED_SUCCESSORS: &str = include_str!(
+    "../../migrations/20261018074150_seed_the_successors_the_retirement_migration_needs.sql"
+);
+const RETIRE_SUPERSEDED: &str = include_str!(
+    "../../migrations/20261018074151_retire_superseded_models_and_seed_their_successors.sql"
+);
+
+/// The newest migration whose successors another migration seeds. Later ones
+/// seed their own. It and older ones are applied history, and sqlx refuses
+/// to boot on an edited applied migration.
+const LAST_UNSELF_SEEDED_MIGRATION: &str = "20261018074151";
+
+/// Each successor `sql` retires to before an `INSERT INTO models` in `sql`
+/// seeds it.
+fn unseeded_successors(sql: &str) -> Vec<String> {
+    retire_call()
+        .captures_iter(sql)
+        .filter(|c| {
+            let before = &sql[..c.get(0).unwrap().start()];
+            !(before.contains("INSERT INTO models") && before.contains(&format!("('{}',", &c[2])))
+        })
+        .map(|c| c[2].to_string())
+        .collect()
+}
+
+#[test]
+fn unseeded_successors_finds_a_retirement_with_no_seed_before_it() {
+    let retire = "SELECT retire_model('old', 'new', ARRAY['low']);\n";
+    let seed = "INSERT INTO models (id) VALUES\n  ('new', 'New')\nON CONFLICT (id) DO NOTHING;\n";
+    assert_eq!(unseeded_successors(retire), ["new"]);
+    assert_eq!(unseeded_successors(&format!("{retire}{seed}")), ["new"]);
+    assert!(unseeded_successors(&format!("{seed}{retire}")).is_empty());
+}
+
+/// `retire_model` raises on a missing successor, and a raise in a migration
+/// stops the engine at boot. A workspace can lack a row an older migration
+/// seeded, so each migration seeds every successor before retiring to it.
+#[test]
+fn every_migration_seeds_each_successor_before_retiring_to_it() {
+    for (name, sql) in migrations() {
+        let version = &name[..LAST_UNSELF_SEEDED_MIGRATION.len()];
+        if version > LAST_UNSELF_SEEDED_MIGRATION {
+            assert_eq!(unseeded_successors(&sql), Vec::<String>::new(), "{name}");
+        }
+    }
+    let applied_in_order = format!("{SEED_SUCCESSORS}{RETIRE_SUPERSEDED}");
+    assert_eq!(unseeded_successors(&applied_in_order), Vec::<String>::new());
+}
+
+/// A workspace that lost successor rows still migrates, and gets back the
+/// exact rows the earlier seeds and route migrations produced.
+#[tokio::test]
+async fn the_retirement_migration_restores_successors_the_workspace_lost() {
+    let (pool, db_name) = setup_test_db().await;
+    let mut successors: Vec<String> = retirements()
+        .into_iter()
+        .filter(|r| RETIRE_SUPERSEDED.contains(&retire_sql(r)))
+        .map(|r| r.successor)
+        .collect();
+    successors.sort();
+    successors.dedup();
+    assert!(successors.contains(&"claude-fable-5-1".to_string()));
+
+    let snapshot = |pool: PgPool, ids: Vec<String>| async move {
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                serde_json::Value,
+                i32,
+                String,
+                bool,
+                Option<String>,
+            ),
+        >(
+            "SELECT id, label, routes, sort_order, source, vision, default_effort \
+             FROM models WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(ids)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    let before = snapshot(pool.clone(), successors.clone()).await;
+    assert_eq!(before.len(), successors.len(), "every successor has a row");
+
+    sqlx::query("DELETE FROM models WHERE id = ANY($1)")
+        .bind(&successors)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(SEED_SUCCESSORS).execute(&pool).await.unwrap();
+    sqlx::raw_sql(RETIRE_SUPERSEDED)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot(pool.clone(), successors.clone()).await, before);
+    let fable = ModelStore::get(&pool, "claude-fable-5")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fable.successor.as_deref(), Some("claude-fable-5-1"));
+
+    // A database that applied the retirement first runs the seed after it.
+    sqlx::raw_sql(SEED_SUCCESSORS).execute(&pool).await.unwrap();
+    assert_eq!(snapshot(pool.clone(), successors).await, before);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn every_superseded_model_is_retired_to_the_audited_successor() {
+    let all = latest_retirements();
+    for (old, successor) in [
+        ("claude-opus-5", "claude-opus-5-5"),
+        ("claude-opus-5[1m]", "claude-opus-5-5"),
+        ("claude-sonnet-5", "claude-sonnet-5-5"),
+        ("claude-sonnet-5[1m]", "claude-sonnet-5-5"),
+        ("claude-fable-5", "claude-fable-5-1"),
+        ("claude-fable-5[1m]", "claude-fable-5-1"),
+        ("claude-opus-4-8[1m]", "claude-opus-5-5"),
+        ("claude-opus-4-7[1m]", "claude-opus-5-5"),
+        ("claude-opus-4-6[1m]", "claude-opus-5-5"),
+        ("claude-sonnet-4-6[1m]", "claude-sonnet-5-5"),
+        ("claude-haiku-4-5", "claude-haiku-5-5"),
+        ("gemini-3-flash-preview", "gemini-3.8-flash"),
+        ("gpt-5.4-mini", "gpt-6-luna"),
+        ("gpt-5.6-luna", "gpt-6-luna"),
+        ("gpt-5.6-sol", "gpt-6.1-sol"),
+        ("gpt-5.6-terra", "gpt-6.1-sol"),
+        ("gpt-5.5-pro", "gpt-6-astra"),
+        ("claude-fable-5-1[1m]", "claude-fable-5-1"),
+        ("claude-opus-5-5[1m]", "claude-opus-5-5"),
+        ("claude-sonnet-5-5[1m]", "claude-sonnet-5-5"),
+    ] {
+        let r = all
+            .iter()
+            .find(|r| r.old == old)
+            .unwrap_or_else(|| panic!("no migration retires {old}"));
+        assert_eq!(r.successor, successor, "{old}");
+    }
+}
+
+/// The tier list a migration passes must be exactly what EVERY route of the
+/// successor accepts, so a snapped effort is one each route takes. Where all
+/// routes agree, the SQL snap must also land where `clamp_effort` does.
 #[tokio::test]
 async fn each_retirement_snaps_efforts_the_way_the_router_does() {
     let (pool, db_name) = setup_test_db().await;
-    for r in retirements() {
+    for r in latest_retirements() {
         let successor = ModelStore::get(&pool, &r.successor)
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("successor {} has no row", r.successor));
-        for route in &successor.routes {
-            let provider = ProviderKind::parse(&route.provider);
-            let wire_id = route.wire_id(&successor.id);
-            assert_eq!(
-                r.accepted,
-                supported_efforts(provider, wire_id),
-                "{} on {}: the migration's tiers differ from the route's",
-                r.successor,
-                route.provider
-            );
-            for tier in EFFORT_LADDER {
-                let snapped: Option<String> = sqlx::query_scalar("SELECT snap_effort($1, $2)")
-                    .bind(tier)
-                    .bind(&r.accepted)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    snapped.as_deref(),
-                    clamp_effort(tier, provider, wire_id),
-                    "{tier} on {wire_id}"
-                );
+        assert!(
+            successor.successor.is_none(),
+            "{} retires to {}, which is itself retired",
+            r.old,
+            r.successor
+        );
+        let route_tiers: Vec<(ProviderKind, &str, &[&str])> = successor
+            .routes
+            .iter()
+            .map(|route| {
+                let provider = ProviderKind::parse(&route.provider);
+                let wire_id = route.wire_id(&successor.id);
+                (provider, wire_id, supported_efforts(provider, wire_id))
+            })
+            .collect();
+        let every_route_takes: Vec<&str> = EFFORT_LADDER
+            .iter()
+            .copied()
+            .filter(|tier| route_tiers.iter().all(|(_, _, tiers)| tiers.contains(tier)))
+            .collect();
+        assert_eq!(
+            r.accepted, every_route_takes,
+            "{}: the migration's tiers differ from what every route accepts",
+            r.successor
+        );
+        for tier in EFFORT_LADDER {
+            let snapped: Option<String> = sqlx::query_scalar("SELECT snap_effort($1, $2)")
+                .bind(tier)
+                .bind(&r.accepted)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            for (provider, wire_id, tiers) in &route_tiers {
+                if *tiers == r.accepted.as_slice() {
+                    assert_eq!(
+                        snapped.as_deref(),
+                        clamp_effort(tier, *provider, wire_id),
+                        "{tier} on {wire_id}"
+                    );
+                } else {
+                    let snapped = snapped.as_deref().unwrap();
+                    assert!(
+                        tiers.contains(&snapped),
+                        "{tier} snaps to {snapped} on {wire_id}"
+                    );
+                }
             }
         }
 
         let old = ModelStore::get(&pool, &r.old).await.unwrap();
         if let Some(old) = old {
-            assert!(!old.enabled, "{} stays offered", r.old);
             assert_eq!(old.successor.as_deref(), Some(r.successor.as_str()));
         }
     }
@@ -130,6 +322,133 @@ fn the_frontend_model_list_offers_no_retired_model() {
     }
 }
 
+/// A coding agent's settings name its own lineup, which still offers ids the
+/// registry retires, so none of them moves. A list already naming the
+/// successor keeps the user's own entry and drops the retired one.
+#[tokio::test]
+async fn retire_model_leaves_coding_agents_alone_and_never_duplicates_a_pair() {
+    let (pool, db_name) = setup_test_db().await;
+    let all = retirements();
+    let retire = |old: &str| {
+        all.iter()
+            .find(|r| r.old == old)
+            .map(retire_sql)
+            .unwrap_or_else(|| panic!("no migration retires {old}"))
+    };
+    let (chat_thread, agent_thread) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let coding_agent_settings = [
+        (prefs::MODEL_CLAUDE_CODE.key(), "claude-opus-5"),
+        (prefs::REASONING_CLAUDE_CODE.key(), "max"),
+        (prefs::MODEL_CODEX.key(), "gpt-5.6-sol"),
+        (prefs::REASONING_CODEX.key(), "max"),
+        (
+            prefs::INTELLIGENCE_LADDER_CLAUDE_CODE.key(),
+            "claude-sonnet-5=high, claude-opus-5=max",
+        ),
+        (
+            prefs::INTELLIGENCE_LADDER_CODEX.key(),
+            "gpt-5.6-luna=medium, gpt-5.6-sol=max",
+        ),
+    ];
+    let efforts = prefs::CHAT_REASONING_EFFORTS.key();
+    let values: Vec<String> = coding_agent_settings
+        .iter()
+        .map(|(key, value)| format!("('{key}', '{value}', NULL)"))
+        .collect();
+    let seed = [
+        "DELETE FROM preferences".to_string(),
+        format!(
+            "INSERT INTO preferences (key, value, device_id) VALUES {}, \
+             ('{efforts}', 'gpt-6.1-sol=low, gpt-5.6-sol=max, gpt-5.6-terra=medium', NULL)",
+            values.join(", ")
+        ),
+        format!(
+            "INSERT INTO thread_summaries (thread_id, is_coding_agent, compose_selection) VALUES \
+             ('{agent_thread}', TRUE, '{{\"model\": \"claude-opus-5\"}}'), \
+             ('{chat_thread}', FALSE, '{{\"model\": \"claude-opus-5\"}}')"
+        ),
+        format!(
+            "INSERT INTO thread_queue (id, kind, summary, request) VALUES \
+             ('{agent_thread}', 'coding-agent', 's', \
+              '{{\"type\": \"coding-agent\", \"model\": \"gpt-5.6-sol\", \
+                \"reasoning_effort\": \"max\"}}')"
+        ),
+        format!(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload) VALUES \
+             (gen_random_uuid(), 'thread', '{agent_thread}', 'MessageReceived', \
+              '{{\"model\": \"claude-opus-5\"}}'), \
+             (gen_random_uuid(), 'thread', '{chat_thread}', 'MessageReceived', \
+              '{{\"model\": \"claude-opus-5\"}}')"
+        ),
+    ];
+    for statement in seed {
+        sqlx::query(&statement)
+            .execute(&pool)
+            .await
+            .expect(&statement);
+    }
+    for old in [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+    ] {
+        sqlx::query(&retire(old)).execute(&pool).await.unwrap();
+    }
+
+    let text = |sql: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(&sql)
+                .fetch_one(&pool)
+                .await
+                .expect(&sql)
+        }
+    };
+    let pref = |key: &str| format!("SELECT value FROM preferences WHERE key = '{key}'");
+    for (key, value) in coding_agent_settings {
+        assert_eq!(text(pref(key)).await.as_deref(), Some(value), "{key}");
+    }
+    assert_eq!(
+        text(pref(efforts)).await.as_deref(),
+        Some("gpt-6.1-sol=low")
+    );
+    let draft = |thread: uuid::Uuid| {
+        format!("SELECT compose_selection ->> 'model' FROM thread_summaries WHERE thread_id = '{thread}'")
+    };
+    assert_eq!(
+        text(draft(agent_thread)).await.as_deref(),
+        Some("claude-opus-5")
+    );
+    assert_eq!(
+        text(draft(chat_thread)).await.as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(
+        text(format!(
+            "SELECT request ->> 'model' FROM thread_queue WHERE id = '{agent_thread}'"
+        ))
+        .await
+        .as_deref(),
+        Some("gpt-5.6-sol")
+    );
+    let turn = |thread: uuid::Uuid| {
+        format!("SELECT payload ->> 'model' FROM events WHERE aggregate_id = '{thread}'")
+    };
+    assert_eq!(
+        text(turn(agent_thread)).await.as_deref(),
+        Some("claude-opus-5")
+    );
+    assert_eq!(
+        text(turn(chat_thread)).await.as_deref(),
+        Some("claude-opus-5-5")
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Every live setting moves to the successor at an effort it takes. Every
 /// record of what happened, and every id that only starts like the retired
 /// one, stays as it was. A second run changes nothing.
@@ -141,8 +460,9 @@ async fn retire_model_moves_every_live_setting_and_leaves_history() {
         .find(|r| r.old == "gemini-3.5-flash")
         .unwrap();
     let thread = uuid::Uuid::new_v4();
-    let (chat, memory, title, judge) = (
+    let (chat, trigger, memory, title, judge) = (
         prefs::CHAT_MODEL.key(),
+        prefs::TRIGGER_MODEL.key(),
         prefs::MODEL_MEMORY.key(),
         prefs::MODEL_TITLE.key(),
         prefs::MODEL_COMMAND_JUDGE.key(),
@@ -161,6 +481,7 @@ async fn retire_model_moves_every_live_setting_and_leaves_history() {
         format!(
             "INSERT INTO preferences (key, value, device_id) VALUES \
              ('{chat}', 'gemini-3.5-flash', NULL), \
+             ('{trigger}', 'gemini-3.5-flash', NULL), \
              ('{memory}', 'gemini-3.5-flash', NULL), \
              ('{memory_tier}', 'none', NULL), \
              ('{title}', 'gemini-3.5-flash', 'device-1'), \
@@ -245,7 +566,7 @@ async fn retire_model_moves_every_live_setting_and_leaves_history() {
         }
     };
     let pref = |key: &str| format!("SELECT value FROM preferences WHERE key = '{key}'");
-    for key in [chat, memory, title] {
+    for key in [chat, trigger, memory, title] {
         assert_eq!(
             text(pref(key)).await.as_deref(),
             Some("gemini-3.8-flash"),
@@ -319,6 +640,120 @@ async fn retire_model_moves_every_live_setting_and_leaves_history() {
         );
     }
 
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The chat ladder moves each retired rung to the successor at a tier it
+/// takes, beside the successor's own rungs. A rung it would duplicate is
+/// dropped, so the override still parses.
+#[tokio::test]
+async fn retire_model_moves_chat_ladder_rungs_without_duplicating_one() {
+    let (pool, db_name) = setup_test_db().await;
+    let all = retirements();
+    let key = prefs::INTELLIGENCE_LADDER_CHAT.key();
+    sqlx::query("INSERT INTO preferences (key, value) VALUES ($1, $2)")
+        .bind(key)
+        .bind(
+            "claude-opus-5-5=high, claude-opus-5=medium, claude-opus-5=xhigh, \
+             claude-opus-5-5=xhigh, gpt-5.6-sol=xhigh, gpt-5.6-sol=max",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    for old in ["claude-opus-5", "gpt-5.6-sol"] {
+        let retirement = all.iter().find(|r| r.old == old).unwrap();
+        sqlx::query(&retire_sql(retirement))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let value: String = sqlx::query_scalar("SELECT value FROM preferences WHERE key = $1")
+        .bind(key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        value,
+        "claude-opus-5-5=high, claude-opus-5-5=medium, claude-opus-5-5=xhigh, gpt-6.1-sol=high"
+    );
+    assert!(
+        prefs::parse_intelligence_ladder(&value, prefs::REASONING_EFFORTS).is_ok(),
+        "{value}"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+const RETIRE_TWINS: &str =
+    include_str!("../../migrations/20261019180742_retire_the_redundant_1m_twins.sql");
+
+/// The twins of the models that only run at 1M retire to their bare rows.
+/// Every bare route then declares 1M, a route's own window survives, and a
+/// cost row naming a twin learns the id the provider answered with.
+#[tokio::test]
+async fn the_1m_twins_retire_to_bare_rows_that_keep_a_1m_window() {
+    let (pool, db_name) = setup_test_db().await;
+    let bare = ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"];
+
+    // The state a live workspace had: bare Fable 5.1 declared no window, and
+    // one Opus 5.5 route carries a window of its own.
+    sqlx::raw_sql(
+        "UPDATE models SET routes = '[{\"provider\": \"anthropic\"}, \
+           {\"provider\": \"claude-gateway\"}]'::jsonb WHERE id = 'claude-fable-5-1'; \
+         UPDATE models SET routes = '[{\"provider\": \"vertex\", \"context_window\": 500000}, \
+           {\"provider\": \"anthropic\"}]'::jsonb WHERE id = 'claude-opus-5-5'; \
+         INSERT INTO events (id, aggregate, aggregate_id, event_type, payload) VALUES \
+           (gen_random_uuid(), 'thread', 'a', 'ContextCaptured', \
+            '{\"model\": \"claude-opus-5-5[1m]\"}'), \
+           (gen_random_uuid(), 'thread', 'b', 'ContextCaptured', \
+            '{\"model\": \"claude-opus-5-5[1m]\", \"served_model\": \"claude-opus-5\"}'), \
+           (gen_random_uuid(), 'thread', 'c', 'ContextCaptured', \
+            '{\"model\": \"claude-opus-5-5\"}');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(RETIRE_TWINS).execute(&pool).await.unwrap();
+
+    for id in bare {
+        let twin = ModelStore::get(&pool, &format!("{id}[1m]"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(twin.successor.as_deref(), Some(id));
+        let row = ModelStore::get(&pool, id).await.unwrap().unwrap();
+        assert!(row.successor.is_none(), "{id} is current");
+        for route in &row.routes {
+            let expected = if id == "claude-opus-5-5" && route.provider == "vertex" {
+                500_000
+            } else {
+                1_000_000
+            };
+            assert_eq!(
+                route.context_window,
+                Some(expected),
+                "{id} on {}",
+                route.provider
+            );
+        }
+    }
+
+    let captures: Vec<String> = sqlx::query_scalar(
+        "SELECT payload::text FROM events WHERE event_type = 'ContextCaptured' \
+          ORDER BY aggregate_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        captures,
+        [
+            r#"{"model": "claude-opus-5-5[1m]", "served_model": "claude-opus-5-5"}"#,
+            r#"{"model": "claude-opus-5-5[1m]", "served_model": "claude-opus-5"}"#,
+            r#"{"model": "claude-opus-5-5"}"#,
+        ]
+    );
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

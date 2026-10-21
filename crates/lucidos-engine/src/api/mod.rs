@@ -11,6 +11,7 @@ pub(crate) mod browser_origin;
 pub(crate) mod changes;
 pub(crate) mod chat;
 mod claude_code;
+mod claude_gateway;
 mod command_checkpoint;
 mod command_permission;
 pub(crate) mod credential_reveal;
@@ -29,7 +30,8 @@ pub(crate) mod frontend_snapshot;
 pub(crate) mod handshake_scripts;
 pub(crate) mod hex;
 mod history;
-pub(crate) use history::ROUTE_FRAMES;
+mod intelligence_ladder;
+pub(crate) use history::{ROUTE_FRAMES, SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL};
 mod images;
 pub(crate) mod internal;
 mod knowhow;
@@ -38,8 +40,10 @@ mod main_check;
 mod mcp;
 mod mcp_permission;
 mod memory;
+mod model_prices;
 pub(crate) mod mutating_gate;
 mod notifications;
+mod onepassword;
 mod recall;
 #[cfg(test)]
 pub(crate) mod route_scan;
@@ -108,10 +112,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
+    response::{IntoResponse, Response},
     routing::{any, delete, get, post, put},
     Json, Router,
 };
@@ -325,7 +326,7 @@ pub(crate) async fn resolve_repo_in_nav_payload(
 /// one tier are refused, since names are not unique. The same tiers as
 /// `matchRepository` in `store/actions/repoFileLink.ts`, so a link and a
 /// navigate land on the same repository or both refuse.
-fn match_repository(
+pub(crate) fn match_repository(
     repos: &[crate::core::repositories::Repository],
     reference: &str,
 ) -> Result<Uuid, String> {
@@ -955,7 +956,9 @@ pub struct ModelInfo {
     pub successor: Option<String>,
     pub sort_order: i32,
     pub source: String,
-    pub enabled: bool,
+    /// Whether a rung that is on the chat intelligence ladder runs this
+    /// model, which is what puts it in the chat picker.
+    pub on_chat_ladder: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -981,8 +984,8 @@ pub struct CreateModelRequest {
     #[serde(default)]
     pub label: String,
     /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
-    /// "openrouter" | "xai" | "opencode-free" | "local". Validated by
-    /// `core::validate_routes`.
+    /// "openrouter" | "xai" | "opencode-free" | "local" | "claude-gateway".
+    /// Validated by `core::validate_routes`.
     ///
     /// The single-route shorthand, and what nearly every caller sends. With
     /// `routes` given it is ignored; with neither, the request is refused.
@@ -1018,8 +1021,10 @@ pub struct UpdateModelRequest {
     pub provider: Option<String>,
     #[serde(default)]
     pub sort_order: Option<i32>,
+    /// Turn the model on the chat intelligence ladder at the rung it joins
+    /// at, or turn off every rung that runs it. Absent leaves the ladder.
     #[serde(default)]
-    pub enabled: Option<bool>,
+    pub on_chat_ladder: Option<bool>,
     /// Context window in tokens. Absent keeps the stored value; an explicit
     /// `null` CLEARS it, handing the model back to the id-shape fallback. The
     /// double `Option` is what distinguishes those two cases — serde maps a
@@ -1546,6 +1551,9 @@ pub fn create_router(
         .merge(history::router())
         .merge(chat::router())
         .merge(claude_code::router())
+        .merge(claude_gateway::router())
+        .merge(intelligence_ladder::router())
+        .merge(model_prices::router())
         .merge(side_questions::router())
         .merge(owner_approval::router())
         .merge(threads::router())
@@ -1556,6 +1564,7 @@ pub fn create_router(
         .merge(settings::router())
         .merge(background_models::router())
         .merge(credential_reveal::router())
+        .merge(onepassword::router())
         .merge(triggers::router())
         .merge(trigger_groups::router())
         .merge(thread_queue::router())

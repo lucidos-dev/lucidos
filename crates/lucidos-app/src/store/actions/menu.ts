@@ -134,6 +134,13 @@ export function openCaptureContextSetting(): void {
   openSettingsSubview('debugging');
 }
 
+/** Deep-link to the Cache-warm line switch in Settings → System → Debugging.
+ *  One caller, the cache-warm line's explainer. It navigates and nothing else. */
+export function openCacheWarmLineSetting(): void {
+  settingsScrollTarget.value = 'debugging:cache-warm-line';
+  openSettingsSubview('debugging');
+}
+
 /** Deep-link to Settings → System → Backup in a single render. Two callers: the
  *  app-shell backup reminder's "Set up backup" button, and the tap on the
  *  backup-failure toast. No scroll target: the page is short, and its health

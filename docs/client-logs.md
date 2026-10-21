@@ -37,7 +37,7 @@ The lines below are the common ones, not the full set. Grep for callers of
 
 | Channel | Gate | Common lines |
 |---|---|---|
-| `postClientLog` (`utils/clientLog.ts`) | always on | `[Client/page-health]`, `composer-press`, `toast-press`, `deeplink`, `scroll`, `render`, `connection`, `lifecycle`, `theme-mode`, `error` |
+| `postClientLog` (`utils/clientLog.ts`) | always on | `[Client/page-health]`, `composer-press`, `toast-press`, `shell-scroll`, `deeplink`, `event-stream`, `scroll`, `render`, `connection`, `lifecycle`, `theme-mode`, `error` |
 | `recordPerfSample` (`utils/perfQueue.ts`) | off by default, per device | `[Client/perf]`: `interaction`, `main-thread-stall`, `thread-load`, `thread-render`, `thread-rerender`, `navigation`, `boot`, `perf-probe-support` |
 
 Switch the perf channel on from **Settings → System → Debugging → Perf

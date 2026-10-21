@@ -4,6 +4,7 @@
 //! functions — no engine state — so they unit-test without standing up an
 //! engine (see `process_tests.rs`).
 
+use super::turn_tail::TurnTail;
 use crate::engine::loaded_knowhow::LoadedKnowhow;
 
 /// Cap on per-section body persistence in `ContextCaptured` events. Both
@@ -89,6 +90,7 @@ pub(crate) fn build_capture_sections(
     url_context_section: &str,
     mcp_servers_context: &str,
     mcp_dropped_notice: &str,
+    trigger_knowhow_context: &str,
     setup_reminder: &str,
     thread_depth_context: &str,
     todo_list_block: &str,
@@ -114,7 +116,7 @@ pub(crate) fn build_capture_sections(
         })
     };
 
-    let labeled: [LabeledSection; 21] = [
+    let labeled: [LabeledSection; 22] = [
         LabeledSection {
             name: "System Instructions",
             content: system_prompt,
@@ -202,6 +204,12 @@ pub(crate) fn build_capture_sections(
             content: mcp_dropped_notice,
             role: ContextRole::User,
             group: Some("System notices"),
+        },
+        LabeledSection {
+            name: "Trigger Know-how",
+            content: trigger_knowhow_context,
+            role: ContextRole::User,
+            group: Some("Workspace inventory"),
         },
         LabeledSection {
             name: "Setup Reminder",
@@ -331,29 +339,131 @@ pub(crate) fn build_capture_sections(
     capture_sections
 }
 
-/// Build the per-turn `[LOADED KNOWHOW]` block injected into the user
-/// message: the only place a loaded doc's body rides after the turn that
-/// loaded it. Returns `None` for an empty loaded set so callers can skip
-/// pushing an empty section.
+/// Build the `[LOADED KNOWHOW]` block injected into the user message: the only
+/// place a loaded doc's body rides after the turn that loaded it. Returns
+/// `None` for an empty loaded set so callers can skip pushing an empty section.
 ///
 /// `doc.body` is already the formatted `[SYSTEM-KNOWHOW: <name>]` /
 /// `[KNOW-HOW: <name>]` block produced by
 /// `core::knowhow::load_one_knowhow_section`, pushed verbatim so the LLM
 /// sees the same markers it did on first-turn inline returns. Each doc gets a
-/// line with its id and its retention note, since the marker carries the name.
+/// line with its id, since the marker carries the name.
+///
+/// The block is part of the stable context block, so its bytes change only when
+/// a doc loads or leaves. A doc's countdown ticks every turn and rides in
+/// [`build_knowhow_retention_block`] instead.
 pub(crate) fn build_loaded_knowhow_block(docs: &[LoadedKnowhow]) -> Option<String> {
     if docs.is_empty() {
         return None;
     }
     let mut s = format!(
         "[LOADED KNOWHOW]\nThe following knowhow docs are loaded for this thread. Treat their guidance as authoritative.\n\
-         A doc leaves after {} finished turns that do not load it. To keep one you still follow, call load_knowhow on it again: that returns no body. Call unload_knowhow on one you are done with.\n",
+         A doc leaves after {} finished turns that do not load it. The [KNOWHOW RETENTION] section below says how many turns each one has left. To keep one you still follow, call load_knowhow on it again: that returns no body. Call unload_knowhow on one you are done with.\n",
         crate::engine::loaded_knowhow::IDLE_TURNS_BEFORE_UNLOAD
     );
     for doc in docs {
-        s.push_str(&format!("\n(`{}` {})\n", doc.id, doc.retention_note()));
+        s.push_str(&format!("\n(`{}`)\n", doc.id));
         s.push_str(&doc.body);
     }
     s.push_str("\n[END LOADED KNOWHOW]");
     Some(s)
+}
+
+/// Build the `[KNOWHOW RETENTION]` block: one countdown per loaded doc. It
+/// changes every finished turn, so it rides in the volatile part of the user
+/// message, apart from the bodies it describes.
+pub(crate) fn build_knowhow_retention_block(docs: &[LoadedKnowhow]) -> Option<String> {
+    if docs.is_empty() {
+        return None;
+    }
+    let mut s = String::from("[KNOWHOW RETENTION]");
+    for doc in docs {
+        s.push_str(&format!("\n`{}` {}", doc.id, doc.retention_note()));
+    }
+    s.push_str("\n[END KNOWHOW RETENTION]");
+    Some(s)
+}
+
+/// Every section of one turn's user message, by name. An empty one is absent.
+#[derive(Default)]
+pub(crate) struct TurnSections<'a> {
+    pub recent: &'a str,
+    pub profile: &'a str,
+    pub email_accounts: &'a str,
+    pub oauth: &'a str,
+    pub thread_depth: &'a str,
+    pub loaded_knowhow: &'a str,
+    pub device_preferences: &'a str,
+    pub memory: &'a str,
+    pub history: &'a str,
+    pub file_list: &'a str,
+    pub credentials: &'a str,
+    pub knowhow_retention: &'a str,
+    pub app_context: &'a str,
+    pub file_context: &'a str,
+    pub url_context: &'a str,
+    pub todo_list: &'a str,
+    pub mcp_servers: &'a str,
+    pub mcp_dropped_notice: &'a str,
+    /// The firing trigger's own know-how listing. Empty on a chat turn.
+    pub trigger_knowhow: &'a str,
+    pub setup_reminder: &'a str,
+    /// The user's words, without the `Request:` label.
+    pub request: &'a str,
+    pub tail: TurnTail<'a>,
+}
+
+/// One turn's user message text in its two halves.
+pub(crate) struct TurnText {
+    /// The *stable context block*: sections that change only when the user
+    /// changes something, so a later turn can read it from the prompt cache.
+    pub stable: String,
+    /// Everything that moves per turn, ending with the request and the tail.
+    pub volatile: String,
+}
+
+/// Split a turn's sections into the stable context block and the rest, each in
+/// its relative order. The stable half reads nothing per turn: the retention
+/// notes, the device line and the classification-gated sections all sit in
+/// the volatile half.
+pub(crate) fn assemble_turn_text(s: &TurnSections<'_>) -> TurnText {
+    let join = |parts: &[&str]| {
+        parts
+            .iter()
+            .copied()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(super::context_mode::PART_SEPARATOR)
+    };
+    let request = format!("Request: {}", s.request);
+    TurnText {
+        stable: join(&[
+            s.profile,
+            s.email_accounts,
+            s.oauth,
+            s.thread_depth,
+            s.loaded_knowhow,
+        ]),
+        volatile: join(&[
+            s.recent,
+            s.device_preferences,
+            s.memory,
+            s.history,
+            s.file_list,
+            s.credentials,
+            s.knowhow_retention,
+            s.app_context,
+            s.file_context,
+            s.url_context,
+            s.todo_list,
+            s.mcp_servers,
+            s.mcp_dropped_notice,
+            s.trigger_knowhow,
+            s.setup_reminder,
+            &request,
+            s.tail.engine_build,
+            s.tail.client_url,
+            s.tail.current_time,
+        ]),
+    }
 }

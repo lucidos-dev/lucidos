@@ -15,13 +15,26 @@ pub(super) fn drain_lost_followups(
 }
 
 /// Convert drained CC follow-ups into orphaned injections for re-processing.
-/// Only user follow-ups (with `origin_event_id`) are kept — internal messages
+/// Only user follow-ups (with `origin_event_id`) are kept. Internal messages
 /// (auto-harden etc.) are dropped since they have no user-visible exchange.
+/// So is a redelivered input that is not a human message: only a discard
+/// strands one, and the store keeps it owed for the next session.
 pub(super) fn lost_followups_to_orphans(
     lost: Vec<AgentUserInput>,
 ) -> Vec<crate::engine::InjectedPrompt> {
+    use crate::engine::thread_events::ActorMode;
+    use crate::engine::{AgentInputKind, RedeliveredInput};
     lost.into_iter()
         .filter_map(|input| {
+            if let AgentInputKind::Redelivered { input: kind, .. } = input.kind {
+                if kind
+                    != (RedeliveredInput::Message {
+                        sender: ActorMode::Human,
+                    })
+                {
+                    return None;
+                }
+            }
             let eid = input.origin_event_id?;
             Some(crate::engine::InjectedPrompt {
                 text: input.text,
@@ -66,6 +79,38 @@ mod tests {
         assert_eq!(lost[0].origin_event_id, Some(eid));
         assert!(lost[1].origin_event_id.is_none());
         assert!(rx.try_recv().is_err(), "channel must be empty after drain");
+    }
+
+    /// A discarded wake stays owed, so the next session redelivers it as a
+    /// wake rather than as a message the user never sent.
+    #[test]
+    fn only_a_redelivered_human_message_becomes_an_orphan() {
+        use crate::engine::thread_events::ActorMode;
+        use crate::engine::{AgentInputKind, RedeliveredInput};
+        let redelivered = |input| AgentUserInput {
+            text: "late".into(),
+            images: None,
+            origin_event_id: Some(uuid::Uuid::new_v4()),
+            kind: AgentInputKind::Redelivered {
+                sent_at: chrono::Utc::now(),
+                input,
+            },
+            completion: None,
+        };
+        let human = redelivered(RedeliveredInput::Message {
+            sender: ActorMode::Human,
+        });
+        let human_id = human.origin_event_id;
+        let orphans = lost_followups_to_orphans(vec![
+            human,
+            redelivered(RedeliveredInput::ChildReport),
+            redelivered(RedeliveredInput::EnginePrompt),
+            redelivered(RedeliveredInput::Message {
+                sender: ActorMode::Engine,
+            }),
+        ]);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].event_id, human_id);
     }
 
     #[test]

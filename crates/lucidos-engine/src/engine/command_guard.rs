@@ -80,9 +80,19 @@ pub enum SideEffectCategory {
     /// judge's catch-all, and the fallback when the judge can't categorise. A
     /// trigger must grant `other` to run such a command.
     Other,
+    /// A read of the secrets key directory or the shared Postgres password
+    /// file (see [`command_reads_secret`]). Never grantable, so it has no wire
+    /// form: no trigger can name it, and an unattended lane always refuses it.
+    #[serde(skip)]
+    SecretRead,
 }
 
 impl SideEffectCategory {
+    /// Whether a trigger's side-effect grant can allow this category.
+    pub fn is_grantable(&self) -> bool {
+        !matches!(self, Self::SecretRead)
+    }
+
     /// Noun phrase for LLM-facing refusal / card text — reads as "may perform
     /// {reason}".
     pub fn reason(&self) -> &'static str {
@@ -96,13 +106,17 @@ impl SideEffectCategory {
             Self::CloudCli => "a cloud-service mutation via gh, aws, or gcloud",
             Self::OutOfWorkspaceDestruction => "destruction of files outside the workspace",
             Self::Other => "an irreversible real-world side-effect",
+            Self::SecretRead => {
+                "a read of the workspace's secret keys or the shared database password"
+            }
         }
     }
 
     /// Short user-facing label for the trigger side-effect-grant UI. Kept in
     /// sync with the frontend `SIDE_EFFECT_CATEGORIES` list by
     /// `components/triggers/__tests__/side-effect-categories-mirror.test.ts`,
-    /// which reads these arms and the enum above out of this file.
+    /// which reads these arms and the enum above out of this file. The mirror
+    /// skips a `#[serde(skip)]` variant, which the UI never offers.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Email => "Send email or messages",
@@ -110,6 +124,7 @@ impl SideEffectCategory {
             Self::CloudCli => "Cloud CLI mutations (gh / aws / gcloud)",
             Self::OutOfWorkspaceDestruction => "Destroy files outside the workspace",
             Self::Other => "Other irreversible side-effects",
+            Self::SecretRead => "Read secret keys",
         }
     }
 }
@@ -169,6 +184,8 @@ struct OnDisk<'a> {
 pub enum StaticVerdict {
     /// Settled by static rules — use this lane, never consult the judge.
     Settled(RiskLane),
+    /// Settled `IrreversibleDanger` with this category, never judged.
+    SettledIrreversible(SideEffectCategory),
     /// The static fast-path can't confidently settle this command; the judge
     /// (or, when the judge is off/unavailable, the static fallback) decides.
     NeedsJudge(JudgeInput),
@@ -559,7 +576,7 @@ fn ends_shell_word(c: u8) -> bool {
 /// **Redirection counts too**, even though it starts no new segment. It
 /// belongs to the OUTER shell, so it writes a file the unwrapped script never
 /// mentions. The unwrap result replaces the raw command for every later check,
-/// so an unnoticed redirect is invisible even to `command_escapes_workspace`.
+/// so an unnoticed redirect is invisible even to `command_names_path_outside`.
 fn tail_runs_more_commands(tail: &str) -> bool {
     tail.contains(';')
         || tail.contains('|')
@@ -570,12 +587,63 @@ fn tail_runs_more_commands(tail: &str) -> bool {
         || has_command_substitution(tail)
 }
 
+/// The two secret paths under the Lucidos home, `.lucidos/secret-keys` and
+/// `.lucidos/pg-shared-password`. Matched as a suffix, so `~`, `$HOME`,
+/// `${HOME}` and an absolute home all match.
+static SECRET_PATHS: LazyLock<[String; 2]> = LazyLock::new(|| {
+    let home = lucidos_home::HOME_DIR_NAME;
+    [
+        format!(
+            "{home}/{}",
+            crate::core::secret_store::key_store::KEY_DIR_NAME
+        ),
+        format!("{home}/{}", lucidos_local_token::SHARED_PG_PASSWORD_FILE),
+    ]
+});
+
+/// Whether `text` names a secret path. Quotes and backslashes are dropped and
+/// `/./` and `//` collapse first, so `"$HOME/.lucidos"/secret-keys` matches.
+///
+/// A static rule is a stopgap: string building or `base64` gets around it.
+/// The real boundary is an OS sandbox (docs/temporary-measures.md).
+pub fn mentions_secret_path(text: &str) -> bool {
+    let mut path: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    loop {
+        let collapsed = path.replace("/./", "/").replace("//", "/");
+        if collapsed == path {
+            break;
+        }
+        path = collapsed;
+    }
+    // A match must end the path name: `secret-keys-notes` is another file.
+    let ends_name = |c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    SECRET_PATHS.iter().any(|secret| {
+        path.match_indices(secret.as_str()).any(|(at, _)| {
+            path[at + secret.len()..]
+                .chars()
+                .next()
+                .is_none_or(ends_name)
+        })
+    })
+}
+
+/// Whether a bash command or Python code reads a secret path, read both as
+/// written and as the inner script of a shell wrapper.
+pub fn command_reads_secret(command: &str) -> bool {
+    mentions_secret_path(command) || mentions_secret_path(&unwrap_shell_command(command))
+}
+
 /// The static, deterministic, zero-cost classification pass.
 ///
 /// Only the four bash/python command-running tools are inspected; every other
 /// tool is `Settled(Safe)` (the guard never gates reads, edits, HTTP, etc.).
 /// Settles the two ends of the spectrum and hands the middle to the judge:
 ///   * catastrophic deny-list → `Settled(Catastrophic)` (hard-block),
+///   * a secret read ([`command_reads_secret`]) →
+///     `SettledIrreversible(SecretRead)`, which no grant covers,
 ///   * obviously read-only / in-workspace-write shapes → `Settled(Safe)`,
 ///   * everything else → `NeedsJudge` (the judge classifies it, or the static
 ///     fallback does when the judge is off — see [`fallback_classify`]).
@@ -604,6 +672,9 @@ fn static_classify_at(
     if catastrophic_reason(cmd).is_some() {
         return StaticVerdict::Settled(RiskLane::Catastrophic);
     }
+    if command_reads_secret(raw) {
+        return StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead);
+    }
     let is_bash = matches!(tool_name, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND);
     // Python declines are all ACTIVE signals: subprocess, eval, a network
     // write, a destruction call, a package install. None is an unlisted-head
@@ -628,7 +699,7 @@ fn static_classify_at(
         // `cd` earlier in the line, or a link another segment can make first.
         // For Python only a destruction call is weighed, against its literals.
         out_of_workspace: if is_bash {
-            command_escapes_workspace(cmd, disk)
+            command_names_path_outside(cmd, root, disk)
                 || bash_destruction_scope_at(cmd, 0, root, disk, false)
                     == Some(DestructionScope::OutOfWorkspace)
         } else {
@@ -1699,7 +1770,10 @@ fn python_side_effect_signal(code: &str) -> bool {
         ".put(",
         ".patch(",
         ".delete(",
-        "urllib.request.urlopen(",
+        "urlopen(",
+        ".request(",
+        "http.client",
+        "urllib3",
         "aiohttp",
         "pycurl",
         // Mail / remote-execution / cloud SDKs — side-effect-capable libraries
@@ -1737,11 +1811,142 @@ fn python_side_effect_signal(code: &str) -> bool {
 
 // --- Out-of-workspace marker + path helpers --------------------------------
 
-/// True when any segment of `command` touches a filesystem path or redirect
-/// outside the workspace. A *risk signal* passed to the judge, NOT a verdict:
-/// an out-of-workspace read is wanted, and only destruction is a threat.
-fn command_escapes_workspace(command: &str, disk: Option<OnDisk<'_>>) -> bool {
-    command_segments(command).any(|s| segment_escapes_workspace(&s, disk))
+/// True when `command` names a path that lands outside the workspace. The
+/// judge reads this as evidence, so a word the guard cannot read does not
+/// count. An out-of-workspace read is wanted, and only destruction is a threat.
+///
+/// Each quoted run is a candidate too, so a path literal in quoted code still
+/// counts. On disk a word is read as the shell reads it, with no glob
+/// expansion: a `{` or `[` in quoted code is not a glob.
+fn command_names_path_outside(
+    command: &str,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+) -> bool {
+    command_segments(command).any(|segment| {
+        let redirects = redirect_targets(&segment).flat_map(shell_words);
+        redirects
+            .chain(shell_words(&segment))
+            .flat_map(with_glued_values)
+            .any(|word| word_leads_out(&word, root, disk))
+    })
+}
+
+/// A word as the shell reads it. `expands` is true when a `$` or backtick in
+/// it sits outside single quotes, so it can turn into any path.
+#[derive(Debug, Default)]
+struct ShellWord {
+    text: String,
+    expands: bool,
+}
+
+/// The words of `code`, split at unquoted whitespace, then the text of each
+/// quoted run. Quote state spans the whole of `code`, so a run holding a space
+/// pairs its quotes right. An unclosed run runs to the end.
+fn shell_words(code: &str) -> Vec<ShellWord> {
+    read_words(code, true)
+}
+
+/// [`shell_words`], or only the quoted runs when `keep_words` is false. The
+/// runs inside a double-quoted run count too, since quoted Python holds its
+/// own single-quoted literals. Its bare words do not: the shell never reads
+/// them, so a backslash in them escapes nothing.
+fn read_words(code: &str, keep_words: bool) -> Vec<ShellWord> {
+    let mut words = Vec::new();
+    let mut runs = Vec::new();
+    let mut word: Option<ShellWord> = None;
+    let mut run = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = code.chars();
+    while let Some(c) = chars.next() {
+        let mut text = String::new();
+        match (quote, c) {
+            (None, c) if c.is_whitespace() => {
+                words.extend(word.take());
+                continue;
+            }
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                run.clear();
+            }
+            (Some(q), _) if c == q => {
+                quote = None;
+                runs.push((q, std::mem::take(&mut run)));
+            }
+            (None, '\\') => text.extend(chars.next()),
+            (Some('"'), '\\') => match chars.next() {
+                Some(next @ ('$' | '`' | '"' | '\\')) => text.push(next),
+                Some(next) => text.extend(['\\', next]),
+                None => text.push('\\'),
+            },
+            _ => text.push(c),
+        }
+        let current = word.get_or_insert_with(ShellWord::default);
+        current.expands |= quote != Some('\'') && c != '\\' && text.contains(['$', '`']);
+        current.text.push_str(&text);
+        if quote.is_some() {
+            run.push_str(&text);
+        }
+    }
+    words.extend(word);
+    if !keep_words {
+        words.clear();
+    }
+    if let Some(q) = quote {
+        runs.push((q, run));
+    }
+    for (q, text) in runs {
+        if q == '"' {
+            words.extend(read_words(&text, false));
+        }
+        let expands = q == '"' && text.contains(['$', '`']);
+        words.push(ShellWord { text, expands });
+    }
+    words
+}
+
+/// `word`, plus the value after its first `=` and a short-glued option value.
+fn with_glued_values(word: ShellWord) -> Vec<ShellWord> {
+    let derived = |text: &str| ShellWord {
+        text: text.to_string(),
+        expands: word.expands && text.contains(['$', '`']),
+    };
+    let mut words: Vec<ShellWord> = word
+        .text
+        .split_once('=')
+        .map(|(_, v)| derived(v))
+        .into_iter()
+        .collect();
+    words.extend(short_glued_value(&word.text).map(derived));
+    words.push(word);
+    words
+}
+
+/// True when `word` lands outside the workspace.
+fn word_leads_out(word: &ShellWord, root: Option<&Path>, disk: Option<OnDisk<'_>>) -> bool {
+    let text = word.text.as_str();
+    if text.is_empty()
+        || text.starts_with('-')
+        || text.contains("://")
+        || is_harmless_redirect(text)
+    {
+        return false;
+    }
+    if text.starts_with('~')
+        || text.split('/').any(|seg| seg == "..")
+        || (word.expands && text.contains('/'))
+    {
+        return true;
+    }
+    let path = Path::new(text);
+    match disk {
+        Some(d) if path.is_absolute() => !resolves_inside(path, d.root, false),
+        Some(d) => d
+            .cwds
+            .iter()
+            .any(|cwd| !resolves_inside(&cwd.join(path), d.root, false)),
+        None => path.is_absolute() && !absolute_under_root(path, root),
+    }
 }
 
 fn segment_escapes_workspace(segment: &str, disk: Option<OnDisk<'_>>) -> bool {
@@ -1784,24 +1989,20 @@ fn token_escapes_workspace(tok: &str, disk: Option<OnDisk<'_>>) -> bool {
             return true;
         }
     }
-    // Short-glued option value: drop the leading dashes and the single option
-    // character, and judge what is left. Scanning for the first `/` instead
-    // would turn an in-workspace relative path into an absolute one, which is
-    // wrong in the direction that matters most. A multi-letter bundle simply
-    // leaves a non-pathish remainder. `char_indices` keeps the slice on a
-    // boundary. The shell drops a quote or backslash before the dash too.
-    let word = dequoted(tok);
-    if let Some(rest) = word.strip_prefix('-') {
-        let rest = rest.strip_prefix('-').unwrap_or(rest);
-        let mut chars = rest.char_indices();
-        chars.next();
-        if let Some((idx, _)) = chars.next() {
-            if escapes(&rest[idx..]) {
-                return true;
-            }
-        }
-    }
-    false
+    // The shell drops a quote or backslash before the dash too.
+    short_glued_value(&dequoted(tok)).is_some_and(escapes)
+}
+
+/// The value glued to a short option: `-o/x` holds `/x`. Drop the leading
+/// dashes and the single option character, and keep what is left. Scanning
+/// for the first `/` instead would turn an in-workspace relative path into an
+/// absolute one. A multi-letter bundle simply leaves a non-path remainder.
+fn short_glued_value(word: &str) -> Option<&str> {
+    let rest = word.strip_prefix('-')?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    let mut chars = rest.char_indices();
+    chars.next();
+    chars.next().map(|(idx, _)| &rest[idx..])
 }
 
 /// True when a token looks like a filesystem path, so its location is worth
@@ -2005,8 +2206,11 @@ fn unquoted(token: &str) -> &str {
 
 /// True when `token` is an absolute path lexically under `root` with no `..`.
 fn path_under_root(token: &str, root: Option<&Path>) -> bool {
-    let word = dequoted(token);
-    let path = Path::new(&word);
+    absolute_under_root(Path::new(&dequoted(token)), root)
+}
+
+/// [`path_under_root`] for a word already read as the shell reads it.
+fn absolute_under_root(path: &Path, root: Option<&Path>) -> bool {
     root.is_some_and(|root| {
         path.is_absolute()
             && path.starts_with(root)
@@ -2907,6 +3111,43 @@ fn static_side_effect_category_at(command: &str, depth: usize) -> Option<SideEff
     None
 }
 
+/// True when `command` names a way to send an email or message.
+///
+/// [`SideEffectCategory::Email`] needs this: a model's category guess is not
+/// evidence. A trigger's grant is checked against the category, so a miss here
+/// downgrades a real email to `Other`. The match is therefore broad, and a
+/// false positive costs nothing, because the lane is decided elsewhere.
+pub(crate) fn command_has_messaging_signal(command: &str) -> bool {
+    const SUBSTRINGS: &[&str] = &[
+        "smtp", "sendmail", "mailx", "msmtp", "mutt", "mailto", "mailgun", "sendgrid",
+    ];
+    let text = command.to_ascii_lowercase();
+    if SUBSTRINGS.iter().any(|s| text.contains(s)) {
+        return true;
+    }
+    // A whole word `mail` covers a shell head, a quoted argv word and the
+    // last component of a `bin/mail` path.
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/');
+    if text
+        .split(|c: char| !is_word_char(c))
+        .any(|word| word.rsplit('/').next() == Some("mail"))
+    {
+        return true;
+    }
+    const SCRIPTED_CLIENTS: &[&str] = &[
+        "mail",
+        "messages",
+        "outlook",
+        "thunderbird",
+        "slack",
+        "whatsapp",
+        "telegram",
+        "outgoing message",
+    ];
+    (text.contains("osascript") || text.contains("tell application"))
+        && SCRIPTED_CLIENTS.iter().any(|c| text.contains(c))
+}
+
 /// Side-effect category for one shell command segment, or `None`. Skips the same
 /// benign prefixes the catastrophic scan does so `sudo curl -X POST …` is seen.
 fn segment_side_effect_category(segment: &str) -> Option<SideEffectCategory> {
@@ -2922,7 +3163,12 @@ fn segment_side_effect_category(segment: &str) -> Option<SideEffectCategory> {
         .find_map(|(base, args)| match base.as_str() {
             "curl" | "wget" => (is_mutating_http(args) || http_args_hide_options(&base, args))
                 .then_some(SideEffectCategory::ExternalApi),
-            "mail" | "mailx" | "sendmail" | "osascript" => Some(SideEffectCategory::Email),
+            "mail" | "mailx" | "sendmail" => Some(SideEffectCategory::Email),
+            "osascript" => Some(if command_has_messaging_signal(segment) {
+                SideEffectCategory::Email
+            } else {
+                SideEffectCategory::Other
+            }),
             "gh" | "aws" | "gcloud" => Some(SideEffectCategory::CloudCli),
             _ => None,
         })
@@ -3182,7 +3428,8 @@ pub fn first_command_token(command: &str) -> Option<String> {
 /// so it is the only thing standing there.
 ///
 /// A broad `label` grant is deliberately still honoured: it means "any
-/// command", which this is one of.
+/// command", which this is one of. The one exception is a secret read
+/// ([`command_reads_secret`]), which no grant covers, so it is checked first.
 ///
 /// An exec wrapper is never covered by name. `timeout 5 curl …` resolves to
 /// head `timeout`, so `Bash(timeout:*)` would cover every program it wraps.
@@ -3194,6 +3441,9 @@ pub fn grant_covers_command(
     site: CommandSite<'_>,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
+    if command_reads_secret(command) {
+        return false;
+    }
     if allowed(label) {
         return true;
     }
@@ -4936,6 +5186,67 @@ mod tests {
     }
 
     #[test]
+    fn python_http_calls_the_old_list_missed_go_to_judge() {
+        for code in [
+            "from urllib.request import urlopen\nurlopen(req)",
+            "import requests; requests.request('POST', url, json={})",
+            "import http.client; c = http.client.HTTPSConnection(host)",
+            "import urllib3; http = urllib3.PoolManager()",
+        ] {
+            assert_needs_judge(python(code), code);
+        }
+    }
+
+    #[test]
+    fn messaging_signal_matches_every_way_to_send_a_message() {
+        for text in [
+            "import smtplib; smtplib.SMTP('localhost')",
+            "echo body | mail -s subj a@b.com",
+            "echo body | /usr/bin/mail -s subj a@b.com",
+            "mailx -s subj a@b.com",
+            "sendmail -t < x",
+            "msmtp a@b.com",
+            "mutt -s subj a@b.com",
+            "open 'mailto:a@b.com?subject=x'",
+            "curl -u api:key https://api.mailgun.example/v3/messages -F to=a@b.com",
+            "subprocess.run([\"mail\", \"-s\", \"x\"])",
+            "subprocess.run(['mail', '-s', 'x'])",
+            "osascript -e 'tell application \"Mail\" to send'",
+            "osascript -e 'tell application \"Messages\" to send'",
+            "osascript -e 'tell application \"Microsoft Outlook\" to send theMessage'",
+            "SENDMAIL -t",
+        ] {
+            assert!(command_has_messaging_signal(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn messaging_signal_is_absent_from_a_read_only_fetch() {
+        for text in [
+            "import re, urllib.request\nreq = urllib.request.Request('https://docs.example.com/pricing', headers={'User-Agent': 'x'})\nhtml = urllib.request.urlopen(req, timeout=20).read().decode()",
+            "curl -s https://api.example.net/pricing",
+            "osascript -e 'display notification \"done\"'",
+            "ls -la",
+        ] {
+            assert!(!command_has_messaging_signal(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn osascript_is_email_only_when_it_drives_messaging() {
+        use SideEffectCategory::*;
+        assert_eq!(
+            static_side_effect_category("osascript -e 'tell application \"Messages\" to send'"),
+            Some(Email)
+        );
+        assert_eq!(
+            static_side_effect_category("osascript -e 'display notification \"done\"'"),
+            Some(Other),
+            "still irreversible and askable, but not email"
+        );
+    }
+
+    #[test]
     fn python_code_catastrophic_shellout_is_blocked() {
         // Embedded disk ops in a python shell-out are caught by the full-text
         // catastrophic scan, ahead of the side-effect signal.
@@ -5000,14 +5311,22 @@ mod tests {
 
     #[test]
     fn escapes_workspace_detects_paths_and_redirects() {
-        assert!(command_escapes_workspace("rm -rf /etc/x", None));
-        assert!(command_escapes_workspace("cp data/a ~/b", None));
-        assert!(command_escapes_workspace("echo x > /tmp/y", None));
-        assert!(command_escapes_workspace("cat ../secret", None));
-        assert!(!command_escapes_workspace("rm -rf data/tmp", None));
-        assert!(!command_escapes_workspace("cp data/a ./b", None));
-        assert!(!command_escapes_workspace("curl -X POST https://x", None)); // URL, not a path
-        assert!(!command_escapes_workspace("echo hi > /dev/null", None)); // harmless sink
+        assert!(command_names_path_outside("rm -rf /etc/x", None, None));
+        assert!(command_names_path_outside("cp data/a ~/b", None, None));
+        assert!(command_names_path_outside("echo x > /tmp/y", None, None));
+        assert!(command_names_path_outside("cat ../secret", None, None));
+        assert!(!command_names_path_outside("rm -rf data/tmp", None, None));
+        assert!(!command_names_path_outside("cp data/a ./b", None, None));
+        assert!(!command_names_path_outside(
+            "curl -X POST https://x",
+            None,
+            None
+        )); // URL, not a path
+        assert!(!command_names_path_outside(
+            "echo hi > /dev/null",
+            None,
+            None
+        )); // harmless sink
     }
 
     /// The shell drops quotes and backslashes inside a word, so a quoted `..`
@@ -5022,7 +5341,7 @@ mod tests {
             "rm -rf .'.'",
             r"sort \-o/../etc/x f",
         ] {
-            assert!(command_escapes_workspace(cmd, None), "{cmd}");
+            assert!(command_names_path_outside(cmd, None, None), "{cmd}");
         }
         for cmd in ["echo x > '..'/'..'/.zshrc", "echo x >> ..'/'x"] {
             assert!(
@@ -5030,15 +5349,76 @@ mod tests {
                 "{cmd} must not settle Safe"
             );
         }
-        assert!(!command_escapes_workspace("echo x > 'data'/'f'", None));
+        assert!(!command_names_path_outside(
+            "echo x > 'data'/'f'",
+            None,
+            None
+        ));
         // Quotes keep a backslash that escapes nothing, so these name a
         // literal `.\.` entry.
-        assert!(!command_escapes_workspace(r"rm -rf '.\./x'", None));
-        assert!(!command_escapes_workspace(r#"rm -rf ".\./x""#, None));
+        assert!(!command_names_path_outside(r"rm -rf '.\./x'", None, None));
+        assert!(!command_names_path_outside(r#"rm -rf ".\./x""#, None, None));
         let root = Some(Path::new("/ws"));
         assert!(!path_under_root("/ws/'..'", root));
         assert!(!path_under_root(r"/ws/.\.", root));
         assert!(path_under_root("'/ws/data'", root));
+    }
+
+    /// What the "Keep prices current" trigger ran. Every path is relative to
+    /// the workspace, and nothing is deleted.
+    const KEEP_PRICES_CURRENT: &str = r#"lucidos model-prices | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+for m in ['claude-haiku-5-5','claude-opus-5-5','claude-sonnet-5-5','gpt-6-luna','gpt-6.1-sol']:
+    print(m,json.dumps(d['models'][m][-1]))
+"
+python3 - <<'E'
+import json
+p='data/config/model-prices.json'
+d=json.load(open(p))
+d['checked']='2026-10-21'
+for k in d['failures']:
+    if k in('anthropic','openai','google'):
+        d['failures'][k]={'count':0,'last_ok':'2026-10-21'}
+json.dump(d,open('.lucidos/tmp/mp.json','w'),indent=2,ensure_ascii=False); open('.lucidos/tmp/mp.json','a').write('\n')
+E
+lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos model-prices | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['checked'],d['override'].get('error'))""#;
+
+    /// The judge reads the marker as evidence, so quoted code it cannot read
+    /// must not set it.
+    #[test]
+    fn workspace_relative_code_reaches_the_judge_unmarked() {
+        let StaticVerdict::NeedsJudge(ji) = bash(KEEP_PRICES_CURRENT) else {
+            panic!("the heredoc goes to the judge");
+        };
+        assert!(!ji.out_of_workspace);
+        assert_eq!(fb_bash(KEEP_PRICES_CURRENT).lane, RiskLane::Safe);
+        // A `$` in single quotes cannot expand into a path.
+        for cmd in [r"sed -i 's/ *$//' data/notes.md", r"echo \$HOME/x > data/f"] {
+            assert!(!command_names_path_outside(cmd, None, None), "{cmd}");
+        }
+        assert!(command_names_path_outside(
+            "cp data/a \"$HOME\"/b",
+            None,
+            None
+        ));
+    }
+
+    /// Quoted code still carries evidence: a literal path inside it.
+    #[test]
+    fn a_path_literal_inside_quoted_code_marks_the_command() {
+        for cmd in [
+            "python3 - <<'E'\nd={}\nopen('/Users/me/notes.txt','w').write('x')\nE",
+            "python3 -c \"open('/Users/me/notes.txt','w').write('x')\"",
+            "python3 -c \"open('../notes.txt','w')\"",
+            "cp data/a.txt \"$HOME/notes.txt\"",
+            "python3 - <<'E'\nimport shutil\nshutil.move('old notes.txt','/Users/me/Archive/')\nE",
+        ] {
+            let StaticVerdict::NeedsJudge(ji) = bash(cmd) else {
+                panic!("{cmd} goes to the judge");
+            };
+            assert!(ji.out_of_workspace, "{cmd} must carry the marker");
+        }
     }
 
     // --- Static fallback (judge off / unavailable) --------------------------
@@ -5388,6 +5768,75 @@ mod tests {
         }
     }
 
+    const SECRET_READS: [&str; 10] = [
+        "cat ~/.lucidos/secret-keys/db",
+        "cat $HOME/.lucidos/secret-keys/db",
+        "cat ${HOME}/.lucidos/secret-keys/db",
+        "cat /Users/me/.lucidos/secret-keys/db",
+        "cat /home/u/.lucidos/pg-shared-password",
+        "cat ~/.lucidos/pg-shared-password | head -c 4",
+        "cat \"$HOME/.lucidos\"/secret-keys/db",
+        "ls ~/.lucidos//./secret-keys",
+        "bash -lc 'cat ~/.lucidos/secret-keys/db'",
+        "xxd ~/.lucidos/secret-keys/db",
+    ];
+
+    #[test]
+    fn a_secret_read_settles_irreversible_whatever_the_home_form() {
+        let want = StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead);
+        for cmd in SECRET_READS {
+            assert_eq!(bash(cmd), want, "{cmd}");
+        }
+        for code in [
+            "print(open('/Users/me/.lucidos/secret-keys/db').read())",
+            "import os\nopen(os.path.expanduser('~/.lucidos/pg-shared-password')).read()",
+        ] {
+            assert_eq!(python(code), want, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_neighbouring_path_is_not_a_secret_read() {
+        for cmd in [
+            "ls ~/.lucidos",
+            "cat ~/.lucidos/ports",
+            "cat data/secret-keys.md",
+            "cat .lucidos/secret-keys-notes",
+        ] {
+            assert_ne!(
+                bash(cmd),
+                StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_grant_covers_a_secret_read() {
+        let all = |_: &str| true;
+        for cmd in SECRET_READS {
+            assert!(!grant_covers_command("Bash", cmd, TEXT_ONLY, all), "{cmd}");
+            assert!(
+                !grant_covers_command("command_execution", cmd, TEXT_ONLY, all),
+                "{cmd}"
+            );
+        }
+        assert!(grant_covers_command(
+            "Bash",
+            "cat ~/.lucidos/ports",
+            TEXT_ONLY,
+            all
+        ));
+    }
+
+    #[test]
+    fn a_secret_read_is_never_grantable() {
+        assert!(!SideEffectCategory::SecretRead.is_grantable());
+        assert!(SideEffectCategory::Other.is_grantable());
+        assert!(serde_json::to_value(SideEffectCategory::SecretRead).is_err());
+        assert!(serde_json::from_value::<SideEffectCategory>(json!("secret_read")).is_err());
+    }
+
     /// The grant lane's coverage rule, shared with the chat lane so the two
     /// cannot disagree.
     #[test]
@@ -5675,6 +6124,59 @@ mod tests {
             panic!("a redirect through the link must reach the judge");
         };
         assert!(ji.fast_path_refused);
+    }
+
+    /// The trigger run this guards: the marker read quoted Python as paths it
+    /// could not resolve, and the judge took that as destruction outside.
+    #[test]
+    fn workspace_relative_code_reaches_the_judge_unmarked_on_disk() {
+        let d = disk();
+        std::fs::create_dir_all(d.ws.join("data/config")).unwrap();
+        std::fs::write(d.ws.join("data/config/model-prices.json"), "{}").unwrap();
+        std::fs::create_dir_all(d.ws.join(".lucidos/tmp")).unwrap();
+        let StaticVerdict::NeedsJudge(ji) = d.static_lane(KEEP_PRICES_CURRENT) else {
+            panic!("the heredoc goes to the judge");
+        };
+        assert!(!ji.out_of_workspace);
+        assert_eq!(
+            d.fallback(tn::RUN_BASH, KEEP_PRICES_CURRENT).lane,
+            RiskLane::Safe
+        );
+        // Code full of glob characters is still not a path.
+        for cmd in [
+            "python3 -c \"d={}; d['x']=[1]; print(d)\"",
+            "awk '{print $1}' data/sub/a.txt",
+        ] {
+            let StaticVerdict::NeedsJudge(ji) = d.static_lane(cmd) else {
+                panic!("{cmd} goes to the judge");
+            };
+            assert!(!ji.out_of_workspace, "{cmd}");
+        }
+    }
+
+    /// Real targets outside the workspace still set the marker on disk.
+    #[test]
+    fn an_outside_target_marks_the_command_on_disk() {
+        let d = disk();
+        d.link("x", &d.outside);
+        let outside = d.outside.display();
+        for cmd in [
+            "rm -rf ~/something".to_string(),
+            format!("echo x > {outside}/keep.txt"),
+            format!("cp data/sub/a.txt {outside}/b.txt"),
+        ] {
+            d.assert_escapes(&cmd);
+        }
+        for cmd in [
+            format!("python3 - <<'E'\nopen('{outside}/keep.txt','w').write('x')\nE"),
+            "python3 - <<'E'\nopen('/Users/me/notes.txt','w')\nE".to_string(),
+            "python3 -c \"open('data/x/keep.txt','w')\"".to_string(),
+        ] {
+            let StaticVerdict::NeedsJudge(ji) = d.static_lane(&cmd) else {
+                panic!("{cmd} goes to the judge");
+            };
+            assert!(ji.out_of_workspace, "{cmd} must carry the marker");
+        }
     }
 
     /// A link that stays inside the workspace keeps the checkpoint lane, and

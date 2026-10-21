@@ -1,5 +1,5 @@
 /**
- * The shared walk behind `type-scale.spec.ts` and
+ * The shared walk behind `type-scale-all.spec.ts` and
  * `type-scale-settings-desktop.spec.ts`: collect every visible run of text in
  * the live document and report the ones that are not on the type scale, or not
  * in one of the app's two fonts.

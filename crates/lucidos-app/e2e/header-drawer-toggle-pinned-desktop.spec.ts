@@ -1,6 +1,9 @@
 import { test, expect, type Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer, stampOverlayBuild } from './helpers';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 /**
  * The desktop header's drawer toggle rests in ONE place, the header's corner.
  *

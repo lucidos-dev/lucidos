@@ -1,4 +1,4 @@
-import type { BackgroundModel, RecommendedSelection } from '../../api/types';
+import type { BackgroundModel, GenerationStep, RecommendedSelection } from '../../api/types';
 import { lucidosModelChoices, readsImages } from '../../store/actions/models';
 import type { ModelChoice } from '../../store/modelSelection';
 
@@ -64,8 +64,32 @@ export function backgroundRowCaveat(
       ? 'This model cannot read images, so images go undescribed'
       : 'No recommended model that reads images is reachable. Pick one that does';
   }
-  if (resolved && resolved.not_served.length > 0) {
-    return `Moved past ${resolved.not_served.join(', ')}: its provider no longer serves it`;
+  const caveats = [
+    resolved?.generation ? generationCaveat(resolved.model, resolved.generation) : null,
+    movedPastCaveat(resolved),
+  ].filter((caveat) => caveat !== null);
+  return caveats.length > 0 ? caveats.join('. ') : null;
+}
+
+/** The recommended models a default passed over, unless the generation
+ *  caveat already names the one refused model. */
+function movedPastCaveat(resolved: BackgroundModel | null): string | null {
+  const passed = (resolved?.not_served ?? []).filter(
+    (model) => !(resolved?.generation?.kind === 'predecessor' && model === resolved.model),
+  );
+  return passed.length > 0
+    ? `Moved past ${passed.join(', ')}: its provider no longer serves it`
+    : null;
+}
+
+/** What runs instead of `named`, said plainly. */
+function generationCaveat(named: string, step: GenerationStep): string {
+  switch (step.kind) {
+    case 'successor':
+      return `Retired, so this runs its successor ${step.model}`;
+    case 'predecessor':
+      return `${named} is not served here, so this runs ${step.model}, an earlier version`;
+    case 'held':
+      return `Retired, but ${step.successor} is not served here, so this keeps running ${named}`;
   }
-  return null;
 }

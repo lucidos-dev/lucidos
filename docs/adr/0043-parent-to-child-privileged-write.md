@@ -154,6 +154,11 @@ second reclaimer.
   this was written) has always had for a human
   follow-up into a live Codex child. What is new is how often a parent reaches
   it.
+  *Amended 2026-10-20: closed.* A redirect cancel now keeps the child
+  `running`, along with the idle and session end that close the interrupted run,
+  until the redirected turn starts. The parent's count no longer dips. See
+  `docs/plans/2026-10-20-a-redirect-keeps-the-thread-running.md`. The test is
+  now `a_redirect_keeps_the_parent_count_while_the_child_is_between_turns`.
 - A follow-up to an archived coding-agent child re-surfaces it to the user's
   Inbox at its next idle. Consistent with the existing rules, but it means an
   agent can pull an archived thread back into view.

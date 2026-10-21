@@ -171,8 +171,8 @@ test-gateway:
 # (a throwaway $HOME, pool or lock dir, no Postgres) and all twelve finish in
 # about a second. `make lint` compiles them under `--all-targets` and runs none, so
 # without this target a broken token check or capability check still passes.
-TEST_CRATES := lucidos-build-slot lucidos-capabilities lucidos-file-backup-exclusion \
-	lucidos-frame-capability lucidos-engine-socket lucidos-gateway-constants lucidos-home \
+TEST_CRATES := lucidos-build-slot lucidos-capabilities lucidos-claude-code-managed \
+	lucidos-file-backup-exclusion lucidos-frame-capability lucidos-engine-socket lucidos-gateway-constants lucidos-home \
 	lucidos-installs lucidos-local-token lucidos-owner-lock lucidos-pg-url lucidos-tailscale
 test-crates:
 	cargo test --locked $(addprefix -p ,$(TEST_CRATES))

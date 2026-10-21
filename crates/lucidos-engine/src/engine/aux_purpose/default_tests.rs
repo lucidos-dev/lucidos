@@ -1,8 +1,8 @@
 use std::sync::{Arc, RwLock};
 
 use super::*;
-use crate::engine::aux_purpose::NotServed;
-use crate::llm::model_registry::{load_from_db, resolve_route, ProviderKind};
+use crate::core::preference_catalog::{BACKGROUND_MODEL, COMMAND_JUDGE_MODEL};
+use crate::llm::model_registry::{load_from_db, resolve_route, Generation, ProviderKind};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
 /// Every purpose that runs on a chat model through [`super::super::AuxCall`].
@@ -55,21 +55,19 @@ async fn the_default_follows_the_configured_providers() {
     use ProviderKind::*;
     let (pool, db_name) = setup_test_db().await;
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
-    let gemini = "gemini-3-flash-preview";
-    let mini = "gpt-5.4-mini";
-    let haiku = "claude-haiku-4-5";
-    let luna = "gpt-5.6-luna";
+    let haiku = "claude-haiku-5-5";
+    let lite = "gemini-3.1-flash-lite";
+    let luna = "gpt-6-luna";
     let sol = "gpt-6.1-sol";
     let flash38 = "gemini-3.8-flash";
     let sonnet = "claude-sonnet-5-5";
-    // Per install: most purposes (the judge among them), extraction, the
-    // summary, the read decision, and the wake decision. The judge's measured
-    // default leads the shared fallbacks, so it resolves like the rest. The
-    // wake decision runs only on a measured model, so with none reachable it
-    // resolves to the chat model, which its gate never asks (`None`).
+    // Per install: most purposes, the judge, extraction, the summary, the read
+    // decision, and the wake decision. `None` means the chat model: no model
+    // the judge or the wake decision may run on is reachable.
     type Row<'a> = (
         &'a [ProviderKind],
         Served,
+        Option<Served>,
         Served,
         Served,
         Served,
@@ -78,15 +76,17 @@ async fn the_default_follows_the_configured_providers() {
     let rows: &[Row] = &[
         (
             &[Vertex],
-            (gemini, Vertex),
-            (gemini, Vertex),
+            (haiku, Vertex),
+            Some((lite, Vertex)),
+            (haiku, Vertex),
             (flash38, Vertex),
             (flash38, Vertex),
             Some((flash38, Vertex)),
         ),
         (
             &ProviderKind::ALL,
-            (gemini, Vertex),
+            (haiku, Vertex),
+            Some((lite, Vertex)),
             (luna, OpenAi),
             (sol, OpenAi),
             (flash38, Vertex),
@@ -94,15 +94,17 @@ async fn the_default_follows_the_configured_providers() {
         ),
         (
             &[Vertex, Anthropic],
-            (gemini, Vertex),
-            (gemini, Vertex),
+            (haiku, Vertex),
+            Some((lite, Vertex)),
+            (haiku, Vertex),
             (flash38, Vertex),
             (flash38, Vertex),
             Some((flash38, Vertex)),
         ),
         (
             &[OpenRouter],
-            (gemini, OpenRouter),
+            (haiku, OpenRouter),
+            Some((lite, OpenRouter)),
             (luna, OpenRouter),
             (sol, OpenRouter),
             (flash38, OpenRouter),
@@ -110,7 +112,8 @@ async fn the_default_follows_the_configured_providers() {
         ),
         (
             &[OpenAi],
-            (mini, OpenAi),
+            (luna, OpenAi),
+            Some((luna, OpenAi)),
             (luna, OpenAi),
             (sol, OpenAi),
             (luna, OpenAi),
@@ -119,6 +122,7 @@ async fn the_default_follows_the_configured_providers() {
         (
             &[Anthropic],
             (haiku, Anthropic),
+            None,
             (haiku, Anthropic),
             (sonnet, Anthropic),
             (haiku, Anthropic),
@@ -126,16 +130,18 @@ async fn the_default_follows_the_configured_providers() {
         ),
         (
             &[OpenAi, Anthropic],
-            (mini, OpenAi),
+            (haiku, Anthropic),
+            Some((luna, OpenAi)),
             (luna, OpenAi),
             (sol, OpenAi),
             (luna, OpenAi),
             Some((sol, OpenAi)),
         ),
     ];
-    for (kinds, most, extraction, summary, read, wake) in rows {
+    for (kinds, most, judge, extraction, summary, read, wake) in rows {
         for purpose in CHAT_MODEL_PURPOSES {
             let expected = match purpose {
+                ContextPurpose::CommandJudge => judge.as_ref(),
                 ContextPurpose::Memory => Some(extraction),
                 ContextPurpose::ConversationSummary => Some(summary),
                 ContextPurpose::ReadDecision => Some(read),
@@ -190,7 +196,7 @@ async fn a_stored_pick_is_never_substituted() {
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
     let kinds = [ProviderKind::Anthropic];
     let (model, source) = select(
-        Some("gemini-3-flash-preview".to_string()),
+        Some("gemini-3.1-flash-lite".to_string()),
         &recommended_with(ContextPurpose::Title, None),
         CHAT_MODEL,
         &registry,
@@ -198,57 +204,52 @@ async fn a_stored_pick_is_never_substituted() {
     );
     assert_eq!(
         (model.as_str(), source),
-        ("gemini-3-flash-preview", ModelSource::Preference)
+        ("gemini-3.1-flash-lite", ModelSource::Preference)
     );
-    assert!(!Reach::configured(&kinds).serves(&registry, &model));
+    assert!(!Reach::configured(&kinds).serves(&registry, &model, source.generation_rule()));
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// When Vertex stops serving the judge's default, the judge moves to the next
-/// model Vertex serves. The failing call retries on it (I4).
+/// When a Vertex project does not serve the background default, a title moves
+/// to the next model Vertex serves. The failing call retries on it (I4).
 #[tokio::test]
 async fn a_not_served_default_moves_to_the_next_reachable_model() {
     let (pool, db_name) = setup_test_db().await;
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
-    let gemini = "gemini-3-flash-preview";
-    let haiku = "claude-haiku-4-5";
-    let purpose = ContextPurpose::CommandJudge;
+    let haiku = BACKGROUND_MODEL;
+    let lite = "gemini-3.1-flash-lite";
+    let purpose = ContextPurpose::Title;
     let list = keep_capable(purpose, recommended_with(purpose, None), &registry);
     let fresh = Reach::configured(&[ProviderKind::Vertex]);
-    let retired = Reach::new(
-        vec![ProviderKind::Vertex],
-        NotServed::of(&[(ProviderKind::Vertex, gemini)]),
-    );
-    assert_eq!(list[0], gemini);
-    // GPT-5.4 mini comes between them, but Vertex does not serve it.
+    let refused = Reach::refusing(&[ProviderKind::Vertex], &[(ProviderKind::Vertex, haiku)]);
+    assert_eq!(list[0], haiku);
+    // GPT-6 Luna comes between them, but Vertex does not serve it.
     assert_eq!(
-        next_reachable(gemini, &list, &registry, &fresh).as_deref(),
-        Some(haiku)
+        next_reachable(haiku, &list, &registry, &fresh).as_deref(),
+        Some(lite)
     );
-    let (model, source) = select(None, &list, CHAT_MODEL, &registry, &retired);
-    assert_eq!((model.as_str(), source), (haiku, ModelSource::Default));
+    let (model, source) = select(None, &list, CHAT_MODEL, &registry, &refused);
+    assert_eq!((model.as_str(), source), (lite, ModelSource::Default));
     assert_eq!(
-        passed_over(&model, source, &list, &registry, &retired),
-        [gemini]
+        passed_over(&model, source, &list, &registry, &refused),
+        [haiku]
     );
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// A stored pick its provider refuses stays the pick and reads unreachable.
-/// Moving it would substitute a model the user never chose (I2).
+/// A stored pick its provider refuses stays the pick. It reaches only within
+/// its own lineage: Haiku 5.5 refused runs the Haiku 4.5 it was retired
+/// from, never another vendor (I2).
 #[tokio::test]
 async fn a_not_served_stored_pick_stays_the_pick() {
     let (pool, db_name) = setup_test_db().await;
     let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
-    let haiku = "claude-haiku-4-5";
+    let haiku = "claude-haiku-5-5";
     let purpose = ContextPurpose::CommandJudge;
     let list = recommended_with(purpose, None);
-    let retired = Reach::new(
-        vec![ProviderKind::Vertex],
-        NotServed::of(&[(ProviderKind::Vertex, haiku)]),
-    );
+    let retired = Reach::refusing(&[ProviderKind::Vertex], &[(ProviderKind::Vertex, haiku)]);
     let (model, source) = select(
         Some(haiku.to_string()),
         &list,
@@ -257,7 +258,12 @@ async fn a_not_served_stored_pick_stays_the_pick() {
         &retired,
     );
     assert_eq!((model.as_str(), source), (haiku, ModelSource::Preference));
-    assert!(!retired.serves(&registry, &model));
+    let runs = retired.resolve(&registry, &model, source.generation_rule());
+    assert_eq!(
+        (runs.model.as_str(), runs.generation),
+        ("claude-haiku-4-5", Generation::Predecessor)
+    );
+    assert!(retired.serves(&registry, &model, source.generation_rule()));
     assert_eq!(
         passed_over(&model, source, &list, &registry, &retired),
         [haiku]
@@ -272,20 +278,20 @@ async fn a_not_served_stored_pick_stays_the_pick() {
 async fn image_description_skips_a_candidate_that_cannot_read_images() {
     let (pool, db_name) = setup_test_db().await;
     let mut rows = load_from_db(&pool).await;
-    rows.get_mut("gemini-3-flash-preview").unwrap().vision = false;
+    rows.get_mut(BACKGROUND_MODEL).unwrap().vision = false;
     let registry: ModelRegistry = Arc::new(RwLock::new(rows));
     let vertex = [ProviderKind::Vertex];
     assert_eq!(
         resolved(&registry, ContextPurpose::ImageDescribe, &vertex),
         (
-            "claude-haiku-4-5".to_string(),
+            "gemini-3.1-flash-lite".to_string(),
             ModelSource::Default,
             Some(ProviderKind::Vertex)
         )
     );
     assert_eq!(
         resolved(&registry, ContextPurpose::Title, &vertex).0,
-        "gemini-3-flash-preview"
+        BACKGROUND_MODEL
     );
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -307,7 +313,7 @@ async fn a_text_only_override_never_leads_image_description() {
     assert_eq!(with_env(ContextPurpose::Title)[0], "z-ai/glm-5.2");
     let images = with_env(ContextPurpose::ImageDescribe);
     assert!(!images.iter().any(|m| m == "z-ai/glm-5.2"), "{images:?}");
-    assert_eq!(images[0], "gemini-3-flash-preview");
+    assert_eq!(images[0], BACKGROUND_MODEL);
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -350,7 +356,7 @@ fn the_extraction_override_leads_all_but_the_judge_and_the_wake_decision() {
     assert_eq!(with_env(ContextPurpose::Title)[0], "gemini-3.8-flash");
     assert_eq!(
         with_env(ContextPurpose::CommandJudge)[0],
-        "gemini-3-flash-preview"
+        COMMAND_JUDGE_MODEL
     );
     assert_eq!(
         with_env(ContextPurpose::WakeDecision),
@@ -464,6 +470,42 @@ async fn every_lead_has_a_registry_row() {
                 "{purpose:?} leads with {model}, which has no row"
             );
         }
+    }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// No default names a superseded model: every model a catalog default, a lead,
+/// a fallback, the compactor or grounded search names is unretired and
+/// routable. Whether the chat ladder lists it has no bearing on a background
+/// purpose.
+#[tokio::test]
+async fn every_default_names_a_current_model() {
+    let (pool, db_name) = setup_test_db().await;
+    let catalog = CHAT_MODEL_PURPOSES
+        .iter()
+        .filter_map(|purpose| model_source(*purpose).prefs())
+        .map(|pair| pair.model.default_text());
+    let named: Vec<&str> = catalog
+        .chain([
+            crate::core::prefs::CHAT_MODEL.default_text(),
+            crate::llm::vertex::GROUNDING_MODEL,
+        ])
+        .chain(AUX_FALLBACKS.iter().copied())
+        .chain(CHAT_MODEL_PURPOSES.iter().flat_map(|p| purpose_lead(*p)))
+        .chain(COMPACTOR_DEFAULTS.iter().map(|entry| entry.model))
+        .collect();
+    for model in named {
+        let row = crate::core::ModelStore::get(&pool, model)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{model} has no row"));
+        assert_eq!(
+            crate::core::validate_routes(&row.routes),
+            Ok(()),
+            "{model} is not routable"
+        );
+        assert_eq!(row.successor, None, "{model} is retired");
     }
     pool.close().await;
     teardown_test_db(&db_name).await;

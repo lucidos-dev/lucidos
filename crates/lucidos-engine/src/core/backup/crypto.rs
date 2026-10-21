@@ -1,50 +1,199 @@
+//! How a backup archive is sealed and opened.
+//!
+//! New archives are age files sealed to the workspace's backup recipient: an
+//! open format that the `age` and `rage` tools open with no Lucidos at all.
+//! The age stream authenticates its header and its last chunk, so a cut,
+//! reordered or edited archive fails to open.
+//!
+//! The older `LUCIDOS1` format (and its pre-rebrand `COGNOS01` spelling) is a
+//! symmetric AES-256-GCM stream with neither guarantee. It stays readable for
+//! every archive already made. A workspace that has not switched to a
+//! recipient still writes it, until the switch.
+
 use std::io::{Read, Write};
-use std::path::Path;
+use std::str::FromStr;
 
 use aes_gcm::aead::generic_array::typenum::U12;
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
+use age::secrecy::ExposeSecret;
+
+use crate::core::secret_store::SecretKey;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Magic header identifying the chunked encryption format. Written by `encrypt`.
+/// Magic header of the legacy chunked format.
 const MAGIC: &[u8; 8] = b"LUCIDOS1";
 
 /// Pre-rebrand magic. Still recognized on read so backups produced before
 /// the cognos→lucidos rename remain decryptable.
 const LEGACY_MAGIC: &[u8; 8] = b"COGNOS01";
 
-/// Chunk size for streaming encryption (1 MB).
+/// The first bytes of every binary age file (`age-encryption.org/v1`).
+const AGE_MAGIC: &[u8; 8] = b"age-encr";
+
+/// Chunk size of the legacy format (1 MiB).
 const CHUNK_SIZE: usize = 1_048_576;
 
-/// Generate a random 32-byte AES-256 key.
-pub fn generate_key() -> Vec<u8> {
-    Aes256Gcm::generate_key(OsRng).to_vec()
+/// The prefix of an age backup key, as `age-keygen` prints it.
+const AGE_KEY_PREFIX: &str = "AGE-SECRET-KEY-";
+
+/// The suffix of an archive sealed to a backup recipient.
+pub const AGE_SUFFIX: &str = ".age";
+/// The suffix of an archive sealed with a legacy symmetric key.
+pub const LEGACY_SUFFIX: &str = ".enc";
+
+/// What seals a new archive.
+pub enum SealingKey {
+    /// The workspace's backup recipient. Only the user holds the matching key.
+    Recipient(age::x25519::Recipient),
+    /// The symmetric key of a workspace that has not switched yet.
+    Legacy(SecretKey),
 }
 
-/// Encode a key as base64 for display/storage.
-pub fn key_to_base64(key: &[u8]) -> String {
-    BASE64.encode(key)
-}
-
-/// Decode a base64-encoded key, validating it is exactly 32 bytes.
-pub fn key_from_base64(s: &str) -> Result<Vec<u8>, BoxError> {
-    let bytes = BASE64.decode(s.trim())?;
-    if bytes.len() != 32 {
-        return Err(format!("invalid key length: expected 32 bytes, got {}", bytes.len()).into());
+impl SealingKey {
+    /// The filename suffix an archive sealed with this key carries.
+    pub fn archive_suffix(&self) -> &'static str {
+        match self {
+            Self::Recipient(_) => AGE_SUFFIX,
+            Self::Legacy(_) => LEGACY_SUFFIX,
+        }
     }
-    Ok(bytes)
 }
 
-/// Encrypt data using AES-256-GCM with chunked streaming.
+/// What opens an archive: the key text the user pasted, of either kind.
+pub enum OpeningKey {
+    /// An age backup key (`AGE-SECRET-KEY-1…`).
+    Age(age::x25519::Identity),
+    /// A legacy base64 backup key.
+    Legacy(SecretKey),
+}
+
+impl FromStr for OpeningKey {
+    type Err = BoxError;
+
+    fn from_str(text: &str) -> Result<Self, BoxError> {
+        let text = text.trim();
+        if text.to_ascii_uppercase().starts_with(AGE_KEY_PREFIX) {
+            return Ok(Self::Age(parse_backup_key(text)?));
+        }
+        SecretKey::from_base64(text).map(Self::Legacy).map_err(|_| {
+            "not a backup key: paste the key that starts with AGE-SECRET-KEY-1, \
+             or the base64 key of an older .enc backup"
+                .into()
+        })
+    }
+}
+
+/// Parse an age backup key. The error never repeats the pasted text.
+pub fn parse_backup_key(text: &str) -> Result<age::x25519::Identity, BoxError> {
+    age::x25519::Identity::from_str(text.trim())
+        .map_err(|_| "not a valid backup key: it should start with AGE-SECRET-KEY-1".into())
+}
+
+/// Parse a backup recipient (`age1…`).
+pub fn parse_recipient(text: &str) -> Result<age::x25519::Recipient, BoxError> {
+    age::x25519::Recipient::from_str(text.trim())
+        .map_err(|e| format!("not a valid age public key (it should start with age1): {e}").into())
+}
+
+/// A fresh key pair. The caller shows the backup key once and keeps only the
+/// recipient.
+pub fn generate_key_pair() -> (age::x25519::Identity, age::x25519::Recipient) {
+    let identity = age::x25519::Identity::generate();
+    let recipient = identity.to_public();
+    (identity, recipient)
+}
+
+/// The backup key as the user copies it.
+pub fn backup_key_text(identity: &age::x25519::Identity) -> String {
+    identity.to_string().expose_secret().to_string()
+}
+
+/// Seal `input` into `output` with `key`.
+pub fn seal(key: &SealingKey, input: impl Read, output: &mut impl Write) -> Result<(), BoxError> {
+    match key {
+        SealingKey::Recipient(recipient) => seal_to_recipient(recipient, input, output),
+        SealingKey::Legacy(key) => encrypt_legacy(key.as_bytes(), input, output),
+    }
+}
+
+/// Open an archive of either format. The format comes from the archive's own
+/// header, so a key of the wrong kind fails with a message naming the right one.
+pub fn open(
+    key: &OpeningKey,
+    mut input: impl Read,
+    output: &mut impl Write,
+) -> Result<(), BoxError> {
+    let mut header = [0u8; 8];
+    input
+        .read_exact(&mut header)
+        .map_err(|e| format!("not a backup archive: {e}"))?;
+    match (&header, key) {
+        (AGE_MAGIC, OpeningKey::Age(identity)) => {
+            let rejoined = std::io::Cursor::new(header).chain(input);
+            open_age(identity, rejoined, output)
+        }
+        (AGE_MAGIC, OpeningKey::Legacy(_)) => Err(
+            "this is an age backup: open it with the backup key that starts with AGE-SECRET-KEY-1"
+                .into(),
+        ),
+        (MAGIC | LEGACY_MAGIC, OpeningKey::Legacy(key)) => {
+            decrypt_legacy_body(key.as_bytes(), &mut input, output)
+        }
+        (MAGIC | LEGACY_MAGIC, OpeningKey::Age(_)) => Err(
+            "this is an older .enc backup: open it with the base64 backup key it was made with"
+                .into(),
+        ),
+        _ => Err(
+            "not a backup archive: the file starts with neither an age nor a LUCIDOS1 header"
+                .into(),
+        ),
+    }
+}
+
+fn seal_to_recipient(
+    recipient: &age::x25519::Recipient,
+    mut input: impl Read,
+    output: &mut impl Write,
+) -> Result<(), BoxError> {
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(recipient as &dyn age::Recipient))?;
+    let mut writer = encryptor.wrap_output(output)?;
+    std::io::copy(&mut input, &mut writer)?;
+    writer.finish()?;
+    Ok(())
+}
+
+fn open_age(
+    identity: &age::x25519::Identity,
+    input: impl Read,
+    output: &mut impl Write,
+) -> Result<(), BoxError> {
+    let decryptor =
+        age::Decryptor::new(input).map_err(|e| format!("not a valid age backup: {e}"))?;
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .map_err(|e| match e {
+            age::DecryptError::NoMatchingKeys => {
+                "this backup key does not open this archive".to_string()
+            }
+            other => format!("cannot open the archive: {other}"),
+        })?;
+    std::io::copy(&mut reader, output)
+        .map_err(|e| format!("the archive is damaged or incomplete: {e}"))?;
+    Ok(())
+}
+
+/// The legacy format.
 ///
-/// Format: MAGIC(8) || nonce_prefix(8) || [chunk_len(4 LE) || ciphertext+tag]* || end_marker(4 zero bytes)
-///
-/// Each chunk uses a unique nonce: nonce_prefix(8) || chunk_index(4 LE).
-/// This avoids loading the entire input into memory.
-pub fn encrypt(key: &[u8], mut input: impl Read, output: &mut impl Write) -> Result<(), BoxError> {
+/// Layout: MAGIC(8) || nonce_prefix(8) || [chunk_len(4 LE) || ciphertext+tag]* || end_marker(4 zero bytes).
+/// Each chunk uses the nonce nonce_prefix(8) || chunk_index(4 LE).
+fn encrypt_legacy(
+    key: &[u8],
+    mut input: impl Read,
+    output: &mut impl Write,
+) -> Result<(), BoxError> {
     let key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(key);
 
@@ -82,23 +231,9 @@ pub fn encrypt(key: &[u8], mut input: impl Read, output: &mut impl Write) -> Res
     Ok(())
 }
 
-/// Decrypt data produced by `encrypt`.
-pub fn decrypt(key: &[u8], mut input: impl Read, output: &mut impl Write) -> Result<(), BoxError> {
-    let mut header = [0u8; 8];
-    input.read_exact(&mut header)?;
-
-    if &header != MAGIC && &header != LEGACY_MAGIC {
-        return Err(format!(
-            "invalid magic header: expected {:?}, got {:?}",
-            MAGIC, header
-        )
-        .into());
-    }
-    decrypt_chunked(key, &mut input, output)
-}
-
-/// Chunked decryption: reads chunk-by-chunk, never holding more than one chunk in memory.
-fn decrypt_chunked(
+/// Chunked decryption of everything after the legacy magic, never holding
+/// more than one chunk in memory.
+fn decrypt_legacy_body(
     key: &[u8],
     input: &mut impl Read,
     output: &mut impl Write,
@@ -120,11 +255,11 @@ fn decrypt_chunked(
             break;
         }
 
-        // `encrypt` never writes a chunk larger than CHUNK_SIZE, so a bigger
-        // length means a corrupt or hostile archive. The length is four bytes
-        // read straight out of a downloaded file. Unchecked, the allocation
-        // below zeroes up to 4 GiB before the short read can fail, which
-        // OOM-kills the engine instead of failing the restore.
+        // `encrypt_legacy` never writes a chunk larger than CHUNK_SIZE, so a
+        // bigger length means a corrupt or hostile archive. The length is four
+        // bytes read straight out of a downloaded file. Unchecked, the
+        // allocation below zeroes up to 4 GiB before the short read can fail,
+        // which OOM-kills the engine instead of failing the restore.
         if chunk_len > CHUNK_SIZE {
             return Err(format!(
                 "corrupt archive: chunk {chunk_index} declares {chunk_len} bytes, \
@@ -171,495 +306,6 @@ fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize, std::io::E
     Ok(total)
 }
 
-/// Load a base64-encoded key from a file. Returns None if the file doesn't exist.
-pub fn load_key_file(path: &Path) -> Result<Option<Vec<u8>>, BoxError> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(key_from_base64(&contents)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Write a key to `path` as base64, only if no file is there yet. Returns
-/// `false` when another writer got there first, leaving its key untouched.
-///
-/// The key goes to a temp file beside `path`, then links into place without
-/// clobbering, so a reader never sees a half-written key. This one file
-/// decrypts every backup the workspace uploads. `NamedTempFile` creates it
-/// `0600` on the open, so it is never readable by others, not even briefly.
-fn create_key_file_exclusive(path: &Path, key: &[u8]) -> Result<bool, BoxError> {
-    let dir = path
-        .parent()
-        .ok_or("backup key path has no parent directory")?;
-    std::fs::create_dir_all(dir)?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
-    temp.write_all(key_to_base64(key).as_bytes())?;
-    temp.as_file().sync_all()?;
-    match temp.persist_noclobber(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        // The directory took the temp file, so the link itself is what failed.
-        // exFAT and FAT on macOS reject the no-clobber rename with `ENOTSUP`.
-        Err(_) => create_key_file_in_place(path, key),
-    }
-}
-
-/// Create the key file with `O_EXCL`, for filesystems that cannot link
-/// without clobbering. It still never overwrites a key. A concurrent reader
-/// can see the file before the write lands, and then fails on a short key.
-fn create_key_file_in_place(path: &Path, key: &[u8]) -> Result<bool, BoxError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    let written = file
-        .write_all(key_to_base64(key).as_bytes())
-        .and_then(|()| file.sync_all());
-    if let Err(e) = written {
-        // An empty key file would fail every later backup until removed.
-        let _ = std::fs::remove_file(path);
-        return Err(e.into());
-    }
-    Ok(true)
-}
-
-/// Load the backup key from the workspace, auto-generating one if it doesn't exist.
-///
-/// No caller ever returns a key that is not on disk, and at most one reports
-/// it as new. A caller that kept a key it failed to persist would encrypt
-/// backups nobody can restore. Concurrent callers on a keyless workspace all
-/// get the one key, except where `create_key_file_in_place` lets one fail.
-pub fn ensure_key(workspace: &std::path::Path) -> Result<(Vec<u8>, bool), BoxError> {
-    let key_path = super::key_file_path(workspace);
-    if let Some(key) = load_key_file(&key_path)? {
-        return Ok((key, false));
-    }
-    let key = generate_key();
-    if create_key_file_exclusive(&key_path, &key)? {
-        return Ok((key, true));
-    }
-    match load_key_file(&key_path)? {
-        Some(winner) => Ok((winner, false)),
-        None => Err(format!(
-            "backup key path {} exists but holds no readable key",
-            key_path.display()
-        )
-        .into()),
-    }
-}
-
-/// Whether a usable backup key is already persisted for this workspace.
-///
-/// Pure read: unlike [`ensure_key`], this NEVER generates or writes a key. It
-/// lets the Settings → Backup page choose its button label ("Show backup key"
-/// when a key exists vs "Generate new backup key" when none does) without the
-/// mere act of checking minting one — the exact footgun that surfaced a "New
-/// backup key generated" toast for a workspace that already had backups. A
-/// present-but-unreadable/corrupt file is treated as "no usable key" so the
-/// caller routes to generate rather than to a reveal that would error.
-pub fn key_exists(workspace: &std::path::Path) -> bool {
-    load_key_file(&super::key_file_path(workspace))
-        .ok()
-        .flatten()
-        .is_some()
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn test_generate_key_is_32_bytes() {
-        let key = generate_key();
-        assert_eq!(key.len(), 32);
-
-        // Two generated keys should differ
-        let key2 = generate_key();
-        assert_ne!(key, key2);
-    }
-
-    #[test]
-    fn test_key_to_base64_roundtrip() {
-        let key = generate_key();
-        let encoded = key_to_base64(&key);
-        let decoded = key_from_base64(&encoded).unwrap();
-        assert_eq!(key, decoded);
-    }
-
-    #[test]
-    fn test_key_from_base64_invalid() {
-        // Bad base64
-        assert!(key_from_base64("not-valid-base64!!!").is_err());
-
-        // Valid base64 but wrong length (16 bytes instead of 32)
-        let short_key = BASE64.encode(vec![0u8; 16]);
-        let err = key_from_base64(&short_key).unwrap_err();
-        assert!(err.to_string().contains("expected 32 bytes"));
-
-        // Valid base64 but too long (64 bytes)
-        let long_key = BASE64.encode(vec![0u8; 64]);
-        let err = key_from_base64(&long_key).unwrap_err();
-        assert!(err.to_string().contains("expected 32 bytes"));
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_roundtrip() {
-        let key = generate_key();
-        let plaintext = b"Hello, Lucidos backup encryption!";
-
-        let mut encrypted = Vec::new();
-        encrypt(&key, Cursor::new(plaintext), &mut encrypted).unwrap();
-
-        // Chunked format: MAGIC(8) + nonce_prefix(8) + chunk_len(4) + ciphertext+tag(32+16) + end_marker(4)
-        assert_eq!(encrypted.len(), 8 + 8 + 4 + plaintext.len() + 16 + 4);
-
-        let mut decrypted = Vec::new();
-        decrypt(&key, Cursor::new(&encrypted), &mut decrypted).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_decrypt_accepts_legacy_cognos_magic() {
-        // Pre-rebrand backups carry b"COGNOS01" in the first 8 bytes.
-        // Patch a freshly-encrypted blob's header in place and verify it
-        // still decrypts.
-        let key = generate_key();
-        let plaintext = b"pre-rebrand backup";
-
-        let mut encrypted = Vec::new();
-        encrypt(&key, Cursor::new(plaintext), &mut encrypted).unwrap();
-        encrypted[..8].copy_from_slice(LEGACY_MAGIC);
-
-        let mut decrypted = Vec::new();
-        decrypt(&key, Cursor::new(&encrypted), &mut decrypted).unwrap();
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_large_multi_chunk() {
-        let key = generate_key();
-        // 2.5 MB — spans 3 chunks (1MB + 1MB + 0.5MB)
-        let plaintext: Vec<u8> = (0..2_621_440).map(|i| (i % 251) as u8).collect();
-
-        let mut encrypted = Vec::new();
-        encrypt(&key, Cursor::new(&plaintext), &mut encrypted).unwrap();
-
-        let mut decrypted = Vec::new();
-        decrypt(&key, Cursor::new(&encrypted), &mut decrypted).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_exact_chunk_boundary() {
-        let key = generate_key();
-        // Exactly 1MB — one full chunk
-        let plaintext = vec![42u8; CHUNK_SIZE];
-
-        let mut encrypted = Vec::new();
-        encrypt(&key, Cursor::new(&plaintext), &mut encrypted).unwrap();
-
-        let mut decrypted = Vec::new();
-        decrypt(&key, Cursor::new(&encrypted), &mut decrypted).unwrap();
-
-        assert_eq!(decrypted, plaintext);
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_empty() {
-        let key = generate_key();
-
-        let mut encrypted = Vec::new();
-        encrypt(&key, Cursor::new(b""), &mut encrypted).unwrap();
-
-        // Just header + end marker
-        assert_eq!(encrypted.len(), 8 + 8 + 4);
-
-        let mut decrypted = Vec::new();
-        decrypt(&key, Cursor::new(&encrypted), &mut decrypted).unwrap();
-
-        assert!(decrypted.is_empty());
-    }
-
-    #[test]
-    fn test_decrypt_wrong_key_fails() {
-        let key1 = generate_key();
-        let key2 = generate_key();
-        let plaintext = b"secret data";
-
-        let mut encrypted = Vec::new();
-        encrypt(&key1, Cursor::new(plaintext), &mut encrypted).unwrap();
-
-        let mut decrypted = Vec::new();
-        let result = decrypt(&key2, Cursor::new(&encrypted), &mut decrypted);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("decryption failed"));
-    }
-
-    #[test]
-    fn test_decrypt_corrupted_data_fails() {
-        let key = generate_key();
-        let plaintext = b"important data";
-
-        let mut encrypted = Vec::new();
-        encrypt(&key, Cursor::new(plaintext), &mut encrypted).unwrap();
-
-        // Corrupt a byte in the ciphertext (after header + nonce_prefix + chunk_len = 20 bytes)
-        encrypted[22] ^= 0xFF;
-
-        let mut decrypted = Vec::new();
-        let result = decrypt(&key, Cursor::new(&encrypted), &mut decrypted);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_decrypt_data_too_short() {
-        let key = generate_key();
-        let mut out = Vec::new();
-        let result = decrypt(&key, Cursor::new(&[0u8; 5]), &mut out);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_load_key_file_absent_and_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("backup.key");
-        assert!(load_key_file(&path).unwrap().is_none());
-
-        let key = generate_key();
-        std::fs::write(&path, key_to_base64(&key)).unwrap();
-        assert_eq!(load_key_file(&path).unwrap().unwrap(), key);
-    }
-
-    /// The key is CREATED owner-only, never created and then narrowed.
-    ///
-    /// No runtime assertion can see the difference: both shapes end at `0600`.
-    /// What differs is the mode the file exists at in between, which under the
-    /// usual `022` umask is `0644`. So this test pins both writers at the
-    /// source: each sets `0600` on the open, and neither writes or chmods.
-    #[test]
-    fn the_key_file_is_created_owner_only_rather_than_chmodded_afterwards() {
-        let source = include_str!("crypto.rs");
-        let body_of = |name: &str| {
-            source
-                .split_once(&format!("fn {name}("))
-                .unwrap_or_else(|| panic!("{name} must be declared here"))
-                .1
-                .split_once("\n}\n")
-                .unwrap_or_else(|| panic!("{name} must have a body"))
-                .0
-        };
-        let writers = [
-            ("create_key_file_exclusive", "NamedTempFile::new_in("),
-            ("create_key_file_in_place", "mode(&mut options, 0o600)"),
-        ];
-        for (name, owner_only_open) in writers {
-            let body = body_of(name);
-            assert!(
-                body.contains(owner_only_open),
-                "{name} must open the key owner-only: {body}"
-            );
-            for banned in ["fs::write(", "set_permissions("] {
-                assert!(
-                    !body.contains(banned),
-                    "{name}: {banned} creates the key at the umask's mode first"
-                );
-            }
-        }
-    }
-
-    /// The fallback for filesystems without a no-clobber link still lets
-    /// exactly one concurrent writer create the key, owner-only.
-    #[test]
-    fn the_in_place_fallback_lets_exactly_one_writer_create_the_key() {
-        const WRITERS: usize = 16;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("backup.key");
-        let barrier = std::sync::Barrier::new(WRITERS);
-        let results: Vec<(Vec<u8>, bool)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..WRITERS)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let key = generate_key();
-                        barrier.wait();
-                        let created = create_key_file_in_place(&path, &key).unwrap();
-                        (key, created)
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let winners: Vec<_> = results.iter().filter(|(_, created)| *created).collect();
-        assert_eq!(winners.len(), 1, "exactly one writer may create the key");
-        assert_eq!(load_key_file(&path).unwrap().unwrap(), winners[0].0);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-
-    /// The scheduled backup (and the manual path) rely on `ensure_key` to never
-    /// skip when no key exists: it must generate + persist a fresh 32-byte key
-    /// at the workspace's `.lucidos/backup.key`, then return the same key
-    /// idempotently on subsequent calls. This is the exact shared helper the
-    /// scheduled cron now uses instead of skipping the backup.
-    #[test]
-    fn test_ensure_key_generates_when_absent_and_is_idempotent() {
-        let workspace = tempfile::tempdir().unwrap();
-        let key_path = crate::core::backup::key_file_path(workspace.path());
-
-        // No pre-existing key — the scheduled-backup precondition.
-        assert!(load_key_file(&key_path).unwrap().is_none());
-
-        // First call generates + persists: is_new is true, never a skip.
-        let (key, is_new) = ensure_key(workspace.path()).unwrap();
-        assert!(
-            is_new,
-            "first ensure_key must report a freshly generated key"
-        );
-        assert_eq!(key.len(), 32, "generated key must be a 32-byte AES-256 key");
-
-        // The key landed at the same path the manual path writes to, in the
-        // same base64-on-disk format `load_key_file` round-trips.
-        assert!(key_path.exists());
-        assert_eq!(load_key_file(&key_path).unwrap().unwrap(), key);
-
-        // Second call is idempotent: same key, no regeneration.
-        let (key2, is_new2) = ensure_key(workspace.path()).unwrap();
-        assert!(!is_new2, "second ensure_key must reuse the existing key");
-        assert_eq!(key, key2);
-    }
-
-    /// `POST /backup/key` and a backup run can both reach `ensure_key` on a
-    /// workspace with no key. Each caller must get the key that stays on disk.
-    /// A caller holding a losing key would upload a backup nothing can decrypt.
-    #[test]
-    fn concurrent_ensure_key_calls_all_return_the_persisted_key() {
-        const CALLERS: usize = 16;
-        for _ in 0..50 {
-            let workspace = tempfile::tempdir().unwrap();
-            let barrier = std::sync::Barrier::new(CALLERS);
-            let results: Vec<(Vec<u8>, bool)> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..CALLERS)
-                    .map(|_| {
-                        scope.spawn(|| {
-                            barrier.wait();
-                            ensure_key(workspace.path()).unwrap()
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-
-            let persisted = load_key_file(&crate::core::backup::key_file_path(workspace.path()))
-                .unwrap()
-                .expect("a key must be on disk");
-            for (key, _) in &results {
-                assert_eq!(key, &persisted, "a caller got a key that is not on disk");
-            }
-            let minted = results.iter().filter(|(_, is_new)| *is_new).count();
-            assert_eq!(minted, 1, "exactly one caller may report a new key");
-        }
-    }
-
-    /// A key path that exists but reads as missing, such as a dangling
-    /// symlink, refuses the link and yields no key. `ensure_key` must fail
-    /// rather than retry forever on a request thread.
-    #[cfg(unix)]
-    #[test]
-    fn ensure_key_fails_on_a_key_path_that_exists_but_cannot_be_read() {
-        let workspace = tempfile::tempdir().unwrap();
-        let key_path = crate::core::backup::key_file_path(workspace.path());
-        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(workspace.path().join("missing"), &key_path).unwrap();
-
-        let err = ensure_key(workspace.path()).unwrap_err();
-        assert!(err.to_string().contains("holds no readable key"), "{err}");
-    }
-
-    /// The key `ensure_key` mints is owner-only, and no temp file stays behind.
-    #[cfg(unix)]
-    #[test]
-    fn a_minted_key_is_owner_only_and_leaves_no_temp_file() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let workspace = tempfile::tempdir().unwrap();
-        let key_path = crate::core::backup::key_file_path(workspace.path());
-        ensure_key(workspace.path()).unwrap();
-        assert_eq!(
-            std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
-            0o600,
-            "a minted key file must be owner-only"
-        );
-        let entries: Vec<_> = std::fs::read_dir(key_path.parent().unwrap())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(entries, vec![key_path.file_name().unwrap().to_owned()]);
-    }
-
-    /// `key_exists` is the read-only counterpart to `ensure_key`: it reports
-    /// whether a key is on disk WITHOUT ever creating one. This is what lets the
-    /// Settings → Backup button label itself ("Show backup key" vs "Generate
-    /// new backup key") without the mere act of checking minting a key — the
-    /// exact behavior behind a "New backup key generated" toast appearing for a
-    /// workspace that already had backups.
-    #[test]
-    fn test_key_exists_is_read_only_and_reflects_presence() {
-        let workspace = tempfile::tempdir().unwrap();
-        let key_path = crate::core::backup::key_file_path(workspace.path());
-
-        // Absent: reports false AND must not create the file as a side effect.
-        assert!(!key_exists(workspace.path()));
-        assert!(!key_path.exists(), "checking existence must not mint a key");
-        // Repeated checks stay read-only — no key materializes.
-        assert!(!key_exists(workspace.path()));
-        assert!(!key_path.exists());
-
-        // After a real generation, it reports true.
-        let (key, is_new) = ensure_key(workspace.path()).unwrap();
-        assert!(is_new);
-        assert!(key_exists(workspace.path()));
-
-        // Checking existence on a present key never alters the stored bytes.
-        assert!(key_exists(workspace.path()));
-        assert_eq!(load_key_file(&key_path).unwrap().unwrap(), key);
-    }
-
-    /// Revealing the key (the read path the GET endpoint uses) must never
-    /// overwrite or regenerate it: reading an existing key returns the same
-    /// bytes every time, and reading an ABSENT key returns `None` without
-    /// creating a file. Together with the `ensure_key` idempotency test this
-    /// pins the core guarantee the user asked about — "Show backup key" cannot
-    /// replace the key that protects existing backups.
-    #[test]
-    fn test_reveal_is_non_destructive() {
-        let workspace = tempfile::tempdir().unwrap();
-        let key_path = crate::core::backup::key_file_path(workspace.path());
-
-        // Reading an absent key never mints one.
-        assert!(load_key_file(&key_path).unwrap().is_none());
-        assert!(!key_path.exists());
-
-        // Generate once, then read repeatedly — the bytes are stable.
-        let (key, _) = ensure_key(workspace.path()).unwrap();
-        for _ in 0..3 {
-            assert_eq!(load_key_file(&key_path).unwrap().unwrap(), key);
-        }
-    }
-}
+#[path = "crypto_tests.rs"]
+mod tests;

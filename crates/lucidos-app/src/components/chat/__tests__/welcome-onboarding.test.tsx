@@ -288,7 +288,7 @@ describe('setup interview: cross-file wiring', () => {
     // conversation row could not take one anyway: it centers the brand
     // absolutely and shrink-to-content, so a fourth trailing icon beside
     // compose + search + menu pushes the brand into the cluster at 375px, which
-    // e2e/mobile-threads-title-alignment.spec.ts fails on. Pinned here because
+    // e2e/mobile-threads-title-alignment-all.spec.ts fails on. Pinned here because
     // the natural "make it consistent with desktop" edit is to add it back, and
     // the unit suite would otherwise stay green while the mobile header broke.
     const src: string = readFileSync(resolve(SRC, 'components/layout/MobileAppHeader.tsx'), 'utf8');

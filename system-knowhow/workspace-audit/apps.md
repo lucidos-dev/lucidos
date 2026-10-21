@@ -23,6 +23,7 @@ scan media-capture "getUserMedia" $inc apps
 scan web-share "navigator\.share" $inc apps
 scan url-mutation "history\.(replaceState|pushState)|location\.(href|assign|replace)[[:space:]]*=|location\.(assign|replace)\(|window\.location[[:space:]]*=" $inc apps
 scan theme-rename "data-theme([^-]|\$)|data-look-|look-effects|lucidos-look|/looks?[/?'\"\`]|preferences\.(set|get)\(['\"](look|theme)['\"]" $inc --include=*.css apps
+scan dashboard-rename "data-widget-place[^=]*=[[:space:]]*['\"]?home[]'\"]|(place\(\)|widgetPlace)[[:space:]]*[!=]==?[[:space:]]*['\"\`]home['\"\`]|['\"\`]home-board['\"\`]" $inc --include=*.css apps
 scan hand-rolled-ui "(^|[^.[:alnum:]_])(alert|confirm|prompt)\(|window\.(alert|confirm|prompt)\(|function[[:space:]]+(toast|showToast|snackbar)[[:space:]]*\(|class=[\"'][^\"']*(toast|snackbar)|^[[:space:]]*\.(toast|snackbar)[[:space:]{.,:]|<select[[:space:]>]|[[:space:]]title=[\"']|role=[\"']switch|(toggle|switch)[[:alnum:]_-]*(thumb|knob)|^[[:space:]]*\.[[:alnum:]_-]*(spinner|loader|badge|chip|pill|tabs?)[[:space:]{.,:]|role=[\"']tab[\"']|^[[:space:]]*(input|textarea)[[:space:]{.,:[]" $inc --include=*.css --exclude-dir=tests apps
 scan attr-escape "=[[:space:]]*[\"'](\\\$\{|[\"'][[:space:]]*\+)[^}]*escapeHtml\(" $inc apps
 scan ready-signal "\"reveal\"[[:space:]]*:|lucidos\.ui\.ready\(" --include=manifest.json $inc apps
@@ -77,7 +78,7 @@ Per `system-knowhow/js-sdk.md`:
     The remedy: keep the app's state in its fragment or query, written as above. Inbound deep links arrive on the fragment, so apply `location.hash` at boot and subscribe to `hashchange`. Reference: `system-knowhow/js-sdk.md` § Setup (what the frame is granted) and § "fragment: opening at a place inside the app".
   - **A write to `/env-vars`**, through `lucidos.request` or the app's own `fetch`. The route opens `GET` only. A user env var reaches every command the agent runs, so a name the interpreter loads from would be host code execution. Severity: **broken**, since the call answers 403 and the app's settings never persist. § Remediation below carries the replacement.
   - **A write of a human-only preference**, through `lucidos.preferences.set` or a `PUT /preferences`. The route stays open, but two key classes are refused to an app. One the Lucidos Agent may not write either: `command_guard`, `max_tool_calls`, `network_bind`, `local_base_url`, the judge settings and the `provider_enabled_*` switches. One the agent may write but an app may not: the coding-agent paths and permission mode. These would let an app run its own script as the user, or read local-model chat. Severity: **broken** (403); § Remediation below carries the answer.
-  - **A read or write of engine bookkeeping**, such as the Web Push keypair in `vapid_keys`. A preference read leaves it out, and an app's `PUT /preferences` naming it is refused. Severity: **broken** (403 on write, a missing key on read); § Remediation below carries the answer.
+  - **A read or write of engine bookkeeping**, such as the last backup's outcome in `backup_last_run`. A preference read leaves it out, and an app's `PUT /preferences` naming it is refused. Severity: **broken** (403 on write, a missing key on read); § Remediation below carries the answer.
   - **The app's own bundled file, fetched by a relative path.** `fetch('data/song.json')`, ``fetch(`audio/clips/${name}.json`)``, any `fetch` whose first argument is a relative path. The frame's origin is opaque, so the browser refuses it like an engine call: `Load failed` in WebKit, a `TypeError` in Chromium. It reads as safe, and the engine-fetch pattern misses it, since nothing in the string says `/api/v1`. Split the severity the way the failure does:
     - **broken** where the throw escapes setup, or the fetch is the app's only data path. The app renders an error banner, or nothing.
     - **stale** where a `catch` falls back to `lucidos.data` and the app keeps running, minus whatever the bundled file carried.
@@ -112,6 +113,16 @@ Per `system-knowhow/js-sdk.md`:
     the `theme` and `theme-effects` preferences, and `/themes` or `/theme?id=`.
   - **broken**: `theme` set to `light`, `dark` or `system`. The engine refuses
     it. Recommend `theme-mode`. A `theme` set to a theme id is correct.
+
+- **Names from before the dashboard rename.** The Home board became two
+  dashboards (ADR 0496). The `dashboard-rename` scan finds the old names.
+  Judge each hit:
+  - **broken**: the widget place `home`, in a `data-widget-place` selector or
+    a `lucidos.widget.place()` comparison. A tile's frame now says
+    `dashboard`, so the code meant for a tile never runs. Recommend
+    `dashboard`.
+  - **broken**: the navigate target `home-board`. It no longer exists.
+    Recommend `dashboard`.
 
 - **A control the app draws itself that the SDK provides.** The host draws the
   SDK's helpers, so they pick up every later fix and theme change. An app's own
@@ -182,7 +193,7 @@ Per `system-knowhow/js-sdk.md`:
     render. The user sees an empty app until the data lands. Recommend the
     opt-in. Skip an app that draws a skeleton or its own placeholder first.
 
-- **The Home board tile.** The `widget-tile` scan lists each manifest that
+- **The dashboard tile.** The `widget-tile` scan lists each manifest that
   sets `sizes` or `transparent`. Read the hit with its `kind`. Owns the rule:
   `system-knowhow/building-an-app.md` § Widgets, the Sizes and Transparent
   paragraphs.
@@ -217,12 +228,17 @@ Per `system-knowhow/best-practices.md`:
 
 ## Remediation
 
-Fixes run only on request, as the root's § Remediation says. A fix thread gets
-the table for its finding.
+Fixes run only on request, as the root's § Remediation says. A fix gets the
+table for its finding. The root's § Inline or a coding agent defines the two
+routes, and each table below names its own.
 
 ### Rewriting an app for an isolated frame
 
-Hand a fix thread this table and the rules under it:
+**Route: a coding agent, one per app.** The storage rows add a startup `await`
+and drop a `catch`, which changes control flow. Two rows go inline: deleting a
+`<base href>`, and the `location.hash = …` swap for the app's own state.
+
+Hand a coding agent this table and the rules under it:
 
 | Old | New |
 |---|---|
@@ -235,7 +251,7 @@ Hand a fix thread this table and the rules under it:
 | `fetch('<the app's own bundled file>')` | `await lucidos.data.read('apps/<app-id>/<file>')`, then parse. Not `lucidos.data.url()`, which builds a `src` and is refused when fetched |
 | `lucidos.request('/env-vars', { method: 'POST' })` storing the app's own setting | `lucidos.preferences` for a user-facing one, else `lucidos.data.write('artifacts/<app-id>/settings.json', …)`. The read stays, so a genuine read of the workspace's variables is left alone |
 | `lucidos.preferences.set` on a human-only key such as `command_guard` | nothing. It is a security setting, and the user changes it in Settings |
-| `lucidos.preferences` reading or writing engine bookkeeping such as `vapid_keys` | nothing. It is engine state, not a setting: delete the read or the write |
+| `lucidos.preferences` reading or writing engine bookkeeping such as `backup_last_run` | nothing. It is engine state, not a setting: delete the read or the write |
 | a call to a route the engine keeps from apps | nothing. Report it and name what it reaches for |
 | `<a href="report.pdf" download>` on the app's own file | load `/api/v1/sdk.js`, which rewrites the click, or build a `blob:` URL |
 | a `<base href>` the app declares | delete it. It replaces the pass the engine stamps for the app's own files |
@@ -256,7 +272,9 @@ Hand a fix thread this table and the rules under it:
 
 ### Opting an app into the ready signal
 
-Hand a fix thread this table and the rule under it:
+**Route: a coding agent.** The call has to land on every path that ends the
+first render, which takes a read of the startup code. Hand it this table and
+the rule under it:
 
 | Old | New |
 |---|---|
@@ -270,6 +288,8 @@ Hand a fix thread this table and the rule under it:
 
 ### Giving an app its icon
 
+**Route: inline.** An icon is one file and a manifest field.
+
 | Old | New |
 |---|---|
 | `icon` that breaks `building-an-app.md` § App icon | fix the file, or draw a new icon as that section says |
@@ -277,26 +297,30 @@ Hand a fix thread this table and the rule under it:
 
 ### Replacing a control the app draws itself
 
-Hand a fix thread this table and the rules under it:
+Each row names its route. The inline rows swap one pattern for another. The
+`:hover` and lone-variant rows are also what `[APP LINT]` reports, so each
+write's result confirms its fix. The coding-agent rows change control flow, or
+delete CSS the app may still use elsewhere. Hand a fix this table and the rules
+under it:
 
-| Old | New |
-|---|---|
-| `alert(message)` | `lucidos.ui.toast(message, 'error')` for a failure, else `'info'` |
-| the app's own `toast(message)` and its element | `lucidos.ui.toast(message, type)`, then delete the element and its CSS |
-| `if (confirm(message))` | `if (await lucidos.ui.confirm({ message }))`, with `danger: true` for a destructive action |
-| `const value = prompt(message)` | `const value = await lucidos.ui.prompt({ message })`. It also returns `null` on cancel |
-| a plain `<select>` | `lucidos.ui.enhanceSelects()` once the markup is on the page |
-| `title="…"` as a tooltip | `data-tooltip="…"` |
-| a switch the app draws itself | `<label class="toggle-switch"><input type="checkbox" role="switch"><span class="toggle-slider"></span></label>`, then delete the app's own switch CSS |
-| a spinner the app draws itself | `<span class="mini-spinner" aria-hidden="true"></span>` beside its text, then delete the app's own spinner CSS and keyframes |
-| a status or category chip the app draws itself | `<span class="label">`, plus `label-success`, `label-warning`, `label-error` or `label-neutral` for a status. Map the app's own colours onto those four and the bare accent, then delete its chip CSS |
-| tabs the app draws itself | `<div class="pill-bar" role="tablist">` with a `<button class="pill-bar-btn" role="tab" aria-selected>` per view, then delete the app's own tab CSS |
-| filter pills the app draws itself | the same `.pill-bar`, with `role="group"` and `aria-pressed` on each button |
-| a widget's own choice buttons, ring gauge or bar series | `.choice-row` with a `<button class="choice">` per item, `.ring`, or `.bar-run` (`js-sdk.md` § Widget shapes), then delete the widget's own CSS for them |
-| `.action-btn` variants swapped to mark the current choice | `.segmented-control` with `.active` on the current `.segmented-btn` for two or three options, else the `.pill-bar` rows above |
-| a `:hover` rule outside any gate | the same rule inside `@media (hover: hover) { … }` |
-| a lone `.action-btn-X` variant | `class="action-btn action-btn-X"` |
-| a text input or textarea the app draws itself | `<input class="text-input">` / `<textarea class="text-input">`, then delete the app's own border/background/focus CSS for it |
+| Old | New | Route |
+|---|---|---|
+| `alert(message)` | `lucidos.ui.toast(message, 'error')` for a failure, else `'info'` | inline |
+| the app's own `toast(message)` and its element | `lucidos.ui.toast(message, type)`, then delete the element and its CSS | coding agent |
+| `if (confirm(message))` | `if (await lucidos.ui.confirm({ message }))`, with `danger: true` for a destructive action | coding agent |
+| `const value = prompt(message)` | `const value = await lucidos.ui.prompt({ message })`. It also returns `null` on cancel | coding agent |
+| a plain `<select>` | `lucidos.ui.enhanceSelects()` once the markup is on the page | coding agent |
+| `title="…"` as a tooltip | `data-tooltip="…"` | inline |
+| a switch the app draws itself | `<label class="toggle-switch"><input type="checkbox" role="switch"><span class="toggle-slider"></span></label>`, then delete the app's own switch CSS | coding agent |
+| a spinner the app draws itself | `<span class="mini-spinner" aria-hidden="true"></span>` beside its text, then delete the app's own spinner CSS and keyframes | coding agent |
+| a status or category chip the app draws itself | `<span class="label">`, plus `label-success`, `label-warning`, `label-error` or `label-neutral` for a status. Map the app's own colours onto those four and the bare accent, then delete its chip CSS | coding agent |
+| tabs the app draws itself | `<div class="pill-bar" role="tablist">` with a `<button class="pill-bar-btn" role="tab" aria-selected>` per view, then delete the app's own tab CSS | coding agent |
+| filter pills the app draws itself | the same `.pill-bar`, with `role="group"` and `aria-pressed` on each button | coding agent |
+| a widget's own choice buttons, ring gauge or bar series | `.choice-row` with a `<button class="choice">` per item, `.ring`, or `.bar-run` (`js-sdk.md` § Widget shapes), then delete the widget's own CSS for them | coding agent |
+| `.action-btn` variants swapped to mark the current choice | `.segmented-control` with `.active` on the current `.segmented-btn` for two or three options, else the `.pill-bar` rows above | coding agent |
+| a `:hover` rule outside any gate | the same rule inside `@media (hover: hover) { … }` | inline |
+| a lone `.action-btn-X` variant | `class="action-btn action-btn-X"` | inline |
+| a text input or textarea the app draws itself | `<input class="text-input">` / `<textarea class="text-input">`, then delete the app's own border/background/focus CSS for it | coding agent |
 
 - **Confirm and prompt become asynchronous.** The SDK's return a promise, so
   the calling function becomes `async`, and every caller has to await it.
@@ -305,3 +329,13 @@ Hand a fix thread this table and the rules under it:
 - **Every helper needs `sdk.js`.** An app whose `index.html` does not load
   `/api/v1/sdk.js` gets it first, per the boilerplate in `system-knowhow/js-sdk.md`
   § Setup.
+
+### Renaming the board's old names
+
+**Route: inline.** Each row is a one-word swap at the hit:
+
+| Old | New |
+|---|---|
+| `data-widget-place="home"` in a selector | `data-widget-place="dashboard"` |
+| `lucidos.widget.place() === 'home'` | `lucidos.widget.place() === 'dashboard'` |
+| `lucidos.ui.navigate('home-board')` | `lucidos.ui.navigate('dashboard')` |

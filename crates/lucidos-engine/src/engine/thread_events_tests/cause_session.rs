@@ -89,6 +89,19 @@ fn response_cancel_abort_cause_round_trip_and_legacy_default() {
     }
 }
 
+/// `CancelCause::as_str` names the stored string that SQL matches a redirect
+/// by, so it must equal the serde wire name for every variant.
+#[test]
+fn cancel_cause_as_str_is_the_wire_name() {
+    for cause in CancelCause::ALL {
+        assert_eq!(
+            serde_json::to_value(cause).unwrap(),
+            serde_json::Value::String(cause.as_str().into()),
+            "{cause:?}"
+        );
+    }
+}
+
 #[test]
 fn session_ended_reason_serialization() {
     // Each emit-able variant round-trips on the wire.

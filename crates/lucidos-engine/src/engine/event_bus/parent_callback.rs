@@ -12,7 +12,7 @@
 use chrono::Utc;
 use uuid::Uuid;
 
-use super::{BusEvent, EmittedEvent, EventBus, ParentCallback};
+use super::{turn_ended_as_redirect_sql, BusEvent, EmittedEvent, EventBus, ParentCallback};
 use crate::engine::agent_recovery::ENGINE_RESTART_INTERRUPT_REASON;
 use crate::engine::thread_events::{
     CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ThreadEvent, WakeMode,
@@ -369,7 +369,8 @@ impl EventBus {
         // `SupersededByFollowup` is the mid-turn redirect `arm_followup_redirect`
         // arms when a follow-up lands on a live Codex turn: the caller steered,
         // they did not abandon (`thread_events/cause.rs`), and the child runs
-        // the redirected turn immediately after. Reporting it would wake the
+        // the redirected turn immediately after. An `EffortRestart` is the same
+        // shape: the engine resumes the child at the new effort. Reporting it would wake the
         // parent with a false "child canceled" card for work that is still
         // running, and the parent may spawn a replacement. The redirected
         // turn's own terminal is the real report. Dropping out of the terminal
@@ -381,9 +382,7 @@ impl EventBus {
             ThreadEvent::CodingAgentIdled { .. }
             | ThreadEvent::ResponseGenerated { .. }
             | ThreadEvent::ResponseFailed { .. } => true,
-            ThreadEvent::ResponseCanceled { cause, .. } => {
-                !matches!(cause, CancelCause::SupersededByFollowup)
-            }
+            ThreadEvent::ResponseCanceled { cause, .. } => !cause.is_redirect(),
             ThreadEvent::ResponseAborted { cause, .. } => !cause.promises_auto_resume(actor),
             ThreadEvent::SessionEnded { reason } => !reason.is_transient(),
             _ => false,
@@ -503,6 +502,19 @@ impl EventBus {
             return;
         }
 
+        // **The idle closing a redirected turn is no completion either.** Its
+        // cancel stood down at `is_terminal`, and the turn the redirect runs
+        // next reports. The marker stays set for it.
+        if matches!(event, ThreadEvent::CodingAgentIdled { .. })
+            && self.turn_ended_as_redirect(child_thread_id).await
+        {
+            crate::log!(
+                "[FanOut] Child {} idled after a redirect: no card until the redirected turn ends",
+                child_thread_id
+            );
+            return;
+        }
+
         // CC threads can emit CodingAgentIdled multiple times (initial work,
         // auto-harden, background agents). Only process the first one —
         // subsequent idles should not decrement the counter again or send
@@ -555,7 +567,7 @@ impl EventBus {
         // ChildThreadCompleted on the parent thread) and surface the parent
         // to inbox. ResponseCanceled is included for a cancel that is not a
         // person's Stop: an agent cancelling its own child, or a `UserAction`.
-        // A person's Stop and a `SupersededByFollowup` redirect returned above.
+        // A person's Stop and a redirect returned above.
         // ResponseAborted reports only for a child a restart cut with no
         // resume promised. The user already sees any other abort's error state
         // (SafetyNet/ProcessKilled), and a switch abort was filtered out above.
@@ -721,6 +733,26 @@ impl EventBus {
                     e
                 );
                 None
+            })
+    }
+
+    /// Whether `child_thread_id`'s current turn ended as a redirect cancel:
+    /// its newest terminal or start event is one. A start event after the
+    /// cancel is the redirected turn, which reports. The start events are the
+    /// ones `mark_parent_callback_pending` names. Every miss answers no, so
+    /// the card still goes out.
+    async fn turn_ended_as_redirect(&self, child_thread_id: Uuid) -> bool {
+        sqlx::query_scalar::<_, bool>(&format!("SELECT {}", turn_ended_as_redirect_sql("$1")))
+            .bind(child_thread_id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                crate::log!(
+                    "[FanOut] Failed to read child {}'s last terminal: {}",
+                    child_thread_id,
+                    e
+                );
+                false
             })
     }
 

@@ -233,7 +233,7 @@ impl OpenAiProvider {
                         match block {
                             // A tail block is ordinary text here. Only the
                             // engine and the cache markers care who wrote it.
-                            ContentBlock::Text { text } => {
+                            ContentBlock::Text { text } | ContentBlock::StableContext { text } => {
                                 text_parts.push(TextPart::new(text, PartKind::Body));
                             }
                             ContentBlock::EngineTail { text } => {
@@ -1488,6 +1488,25 @@ mod tests {
         assert_eq!(wire[3]["content"][1]["cache_control"], marker, "last");
         assert_eq!(wire[3]["content"][0]["cache_control"], marker, "view");
         assert_eq!(marker_count(&body), 4);
+    }
+
+    /// The stable context block is plain text on this wire (I8). A GPT model
+    /// gets it joined, and an Anthropic model gets a part of its own that
+    /// carries no marker.
+    #[test]
+    fn a_stable_context_block_is_plain_text_and_takes_no_marker() {
+        let stable = ContentBlock::StableContext {
+            text: "profile".to_string(),
+        };
+        let messages = vec![msg("user", vec![stable, text("question")])];
+        let gpt = body_for("gpt-5.4", &messages, None);
+        assert_eq!(gpt["messages"][0]["content"], "profile\nquestion");
+        assert_eq!(marker_count(&gpt), 0);
+        let claude = body_for(CLAUDE, &messages, None);
+        let content = &claude["messages"][0]["content"];
+        assert_eq!(content[0]["text"], "profile");
+        assert!(content[0].get("cache_control").is_none());
+        assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
     }
 
     /// A tail block carries the engine's volatile notes. It is rewritten every

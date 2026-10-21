@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport, disarmFollowSeed, hideHomeRail } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy, disarmFollowSeed, hideDashboardRail } from './helpers';
 
 /** The transcript's scroll position belongs to the reader: the app moves it only
  *  when the reader asks, and exactly ONE of those asks is STANDING rather than
@@ -9,7 +9,7 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileVie
  *  which gets a one-shot landing and is over when it is done.
  *
  *  What the transcript reserves under its newest turn (nothing) has its own spec
- *  (`transcript-ends-where-its-content-ends-desktop.spec.ts`), because that is
+ *  (`transcript-ends-where-its-content-ends-all.spec.ts`), because that is
  *  real layout and no fake container can answer it. What this one uses a submit
  *  for is the contrast: after a send the reader is left exactly where the landing
  *  put them, and the reply then grows past the fold without taking them with it.
@@ -43,11 +43,10 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileVie
 test.describe('Transcript scroll belongs to the reader (desktop)', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    await hideHomeRail(page);
+    await hideDashboardRail(page);
   });
 
   test('a send rides nothing, the toggle rides, and taking it back moves nobody', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'covered on desktop; mobile adds a second scroll writer');
 
     // A short viewport so a modest transcript overflows: with no scroll capacity
     // the assertions are vacuous.
@@ -186,7 +185,6 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
    *  The seed ships ARMED, so this context rides with no press behind it. Only
    *  a disarm press turns it off, and there has been none. */
   test('a device that has never pressed the toggle rides a brand-new thread', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'covered on desktop; mobile adds a second scroll writer');
 
     await page.setViewportSize({ width: 1280, height: 400 });
     // Deliberately NOT disarmed: an untouched context IS the case under test.

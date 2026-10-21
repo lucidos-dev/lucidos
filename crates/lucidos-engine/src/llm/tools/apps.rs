@@ -37,7 +37,7 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                     "sizes": {
                         "type": "array",
                         "items": { "enum": crate::core::apps::WidgetSize::ALL.map(|s| s.as_str()) },
-                        "description": "Widget only: Home board sizes, default first."
+                        "description": "Widget only: tile sizes, default first."
                     },
                     "icon_svg": {
                         "type": "string",
@@ -61,13 +61,13 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::LOAD_KNOWHOW.to_string(),
-            description: "Load the full content of a knowhow document. The system prompt lists the available ones by name and description; call this when one is relevant.".to_string(),
+            description: "Load the full content of a knowhow document, or of an intent with its knowhow. The system prompt lists the available ones by name and description; call this when one is relevant.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "Knowhow id as shown in the knowhow list (e.g. 'system-knowhow/best-practices')"
+                        "description": "Knowhow or intent id as shown in the system prompt (e.g. 'system-knowhow/best-practices')"
                     }
                 },
                 "required": ["id"]

@@ -8,6 +8,7 @@ fn test_config() -> CodexConfig {
         codex_bin: std::ffi::OsString::from("codex"),
         worktree_path: PathBuf::from("/tmp/wt"),
         system_prompt: Some("SYSPROMPT".into()),
+        session_context: None,
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),

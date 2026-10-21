@@ -4,6 +4,10 @@
  * compose box after any draft. A refused take-back leaves compose alone, so a
  * message the agent already read never also sits in compose. See
  * docs/plans/2026-09-29-withdraw-a-queued-claude-code-message.md.
+ *
+ * A message a dead agent process held is removable too: the engine records
+ * its tombstone from the store, so Remove answers 200 like any withdraw. See
+ * docs/plans/2026-10-17-a-follow-up-a-dead-agent-never-read.md.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
@@ -18,7 +22,7 @@ vi.mock('./thread-loading', async (importOriginal) => ({
   refreshThreadEvents,
 }));
 
-import { editQueuedMessage } from './chat';
+import { editQueuedMessage, removeQueuedMessage } from './chat';
 import { removingQueuedMessageIds, toasts } from '../store';
 import { setDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
 
@@ -82,5 +86,45 @@ describe('editQueuedMessage', () => {
     const shown = JSON.stringify(toasts.value);
     expect(shown).toContain('Failed to edit queued message');
     expect(shown).toContain('already read this message');
+  });
+});
+
+describe('removeQueuedMessage', () => {
+  beforeEach(() => {
+    removingQueuedMessageIds.value = new Set();
+    toasts.value = [];
+    refreshThreadEvents.mockClear();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    toasts.value = [];
+  });
+
+  it('takes back a message a dead agent process held, with nothing to say', async () => {
+    const removed = answerRemoveWith(() => new Response(null, { status: 200 }));
+
+    await removeQueuedMessage('t-1', 'm2');
+
+    expect(removed).toEqual(['m2']);
+    expect(toasts.value).toEqual([]);
+    expect(refreshThreadEvents).not.toHaveBeenCalled();
+  });
+
+  it('says why and re-syncs when the session is still winding down', async () => {
+    answerRemoveWith(() => new Response(
+      JSON.stringify({
+        error: "The coding agent's session is still winding down. Remove the message again in a moment.",
+        reason: 'withdraw_refused',
+      }),
+      { status: 409, headers: { 'Content-Type': 'application/json' } },
+    ));
+
+    await removeQueuedMessage('t-1', 'm2');
+
+    expect(refreshThreadEvents).toHaveBeenCalledWith('t-1');
+    const shown = JSON.stringify(toasts.value);
+    expect(shown).toContain('Failed to remove queued message');
+    expect(shown).toContain('still winding down');
   });
 });

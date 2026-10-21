@@ -16,7 +16,15 @@
  * aggregated; see `collectPong`.
  */
 
-import { EVENT_STREAM_RETRY_MS, postPong, type PongAnswer } from '../eventStream';
+import {
+  EVENT_STREAM_RETRY_MS,
+  LATE_JOIN_STALL_AFTER_MS,
+  postPong,
+  startLiveness,
+  type Liveness,
+  type PongAnswer,
+} from '../eventStream';
+import { SSE_KEEPALIVE_EVENT } from '../generated/engine-constants';
 import {
   aggregatePongAnswers,
   PONG_COLLECT_MS,
@@ -34,6 +42,8 @@ interface Client {
 const clients = new Set<Client>();
 
 let source: EventSource | null = null;
+/** The silence clock of `source`. Null exactly when `source` is. */
+let liveness: Liveness | null = null;
 let streamUrl = '';
 let pongUrl = '';
 /** Whether the upstream is up RIGHT NOW, not whether it ever was.
@@ -78,6 +88,8 @@ function closeUpstream(): void {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  liveness?.stop();
+  liveness = null;
   source?.close();
   source = null;
   upstreamOpen = false;
@@ -88,33 +100,55 @@ function ensureSource(): void {
   if (source) return;
   const es = new EventSource(streamUrl);
   source = es;
+  const watch = startLiveness((silentMs) => {
+    // A silent upstream never errors, so silence is the only signal. Reopen at
+    // once: the stall itself was the wait.
+    dropUpstream({ silentMs });
+    ensureSource();
+  });
+  liveness = watch;
   es.onmessage = (event: MessageEvent) => {
+    watch.touch();
     const data = event.data as string;
     maybeStartPongCollection(data);
     broadcast({ t: 'frame', data });
   };
+  es.addEventListener(SSE_KEEPALIVE_EVENT, () => watch.touch());
   es.onopen = () => {
+    watch.touch();
     upstreamOpen = true;
     broadcast({ t: 'open' });
   };
   es.onerror = () => {
-    // Relayed, not swallowed. Each port drives its own status chrome and arms
-    // its own resync, so a follower can never read as connected while the
-    // upstream is down.
-    upstreamOpen = false;
-    broadcast({ t: 'error' });
-
+    dropUpstream({});
     // The worker owns the retry, and its ports must not duplicate it. A port
     // that tore itself down on this error would leave the worker, and the last
     // port leaving takes this very stream with it.
-    es.close();
-    source = null;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       if (clients.size > 0) ensureSource();
     }, EVENT_STREAM_RETRY_MS);
   };
+}
+
+/** Close the upstream and tell every port it dropped.
+ *
+ *  Relayed, not swallowed. Each port drives its own status chrome and arms its
+ *  own resync, so a follower can never read as connected while the upstream is
+ *  down. `silentMs` marks a stall, which the page logs. */
+function dropUpstream(drop: { silentMs?: number }): void {
+  closeUpstream();
+  broadcast({ t: 'error', ...drop });
+}
+
+/** Restart the upstream if it has been silent for a late-join's worth of time.
+ *
+ *  A page that just came back may be holding a half-open upstream. Only a silent
+ *  one restarts: a live upstream keeps serving every port. */
+function restartSilentUpstream(): void {
+  const silentMs = liveness?.silentMs() ?? 0;
+  if (silentMs >= LATE_JOIN_STALL_AFTER_MS) dropUpstream({ silentMs });
+  ensureSource();
 }
 
 // --- Presence aggregation -------------------------------------------------
@@ -191,11 +225,16 @@ function attach(port: MessagePort): void {
       streamUrl ||= msg.streamUrl;
       pongUrl ||= msg.pongUrl;
       clients.add(client);
-      ensureSource();
+      restartSilentUpstream();
       // A port attaching to a stream that is already open gets its `open` now.
       // It never saw the upstream's own, and without one it would sit on
       // "connecting" for good and never run its late-join reconcile.
       if (upstreamOpen) send(client, { t: 'open', lateJoin: true });
+      return;
+    }
+
+    if (msg.t === 'check') {
+      restartSilentUpstream();
       return;
     }
 

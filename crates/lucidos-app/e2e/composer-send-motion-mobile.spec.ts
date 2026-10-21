@@ -11,6 +11,9 @@ import {
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
+
 /**
  * A follow-up send on a phone moves as one piece.
  *

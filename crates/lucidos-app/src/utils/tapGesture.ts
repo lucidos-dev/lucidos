@@ -229,7 +229,14 @@ export interface TouchActivateOptions {
   destructive?: () => boolean;
   /** Injected clock, so the twin window is testable without a real one. */
   now?: () => number;
+  /** Is the page still on screen? Injected so the swipe-home test needs no DOM. */
+  pageVisible?: () => boolean;
 }
+
+/** How long a destructive face waits before serving a cancelled tap. A swipe
+ *  home that starts on the button reads as one, and it hides the page within
+ *  this window. Best effort: a slow swipe can outlast it. */
+export const CANCELLED_TAP_SETTLE_MS = 400;
 
 /** Activation handlers for a button whose action must survive the iOS keyboard.
  *
@@ -257,10 +264,12 @@ export interface TouchActivateOptions {
  *  A DESTRUCTIVE face is the exception and asks the gate, so a scroll cannot
  *  fire it. See `opts.destructive`.
  *
- *  **A constructive face also serves a tap the system CANCELLED.** iOS can take
- *  a press that barely moved, as when the button sits in the home-indicator
- *  strip, and no click follows a `touchcancel`. `onTouchStart` and
- *  `onTouchMove` measure the press so `cancelledPressWasATap` can rule on it.
+ *  **Every face also serves a tap the system CANCELLED.** iOS can take a press
+ *  that barely moved, as when the button sits in the home-indicator strip, and
+ *  no click follows a `touchcancel`. `onTouchStart` and `onTouchMove` measure
+ *  the press so `cancelledPressWasATap` can rule on it. A destructive face
+ *  takes this path too: the ruling uses the gate's threshold, so a scroll fails.
+ *  It waits `CANCELLED_TAP_SETTLE_MS` first, so a swipe home cannot abort a turn.
  *
  *  `composeHandlers` in `composeHandlers.ts` wraps this with focus-first. A local
  *  copy of the repair lives in `FileSearchModal.tsx`. */
@@ -268,6 +277,7 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
   const enabled = opts.enabled ?? (() => true);
   const destructive = opts.destructive ?? (() => false);
   const clock = opts.now ?? Date.now;
+  const pageVisible = opts.pageVisible ?? (() => document.visibilityState === 'visible');
   let lastTouchAt: number | null = null;
   let press: {
     identifier: number;
@@ -312,7 +322,7 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
       const p = press;
       press = null;
       if (!p || !contactOf(e, p.identifier)) return;
-      if (!enabled() || destructive()) return;
+      if (!enabled()) return;
       // A tap outside an open overlay only dismisses it (see `installPairedSwallow`).
       if (swallowedSince(p.at)) return;
       const tap = cancelledPressWasATap({
@@ -322,11 +332,18 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
         fingersLeft: e.touches.length,
       });
       if (!tap) return;
-      // No click follows a cancel, so no twin window opens. The pointer cancel
-      // marked the gate aborted, which stops only a destructive face.
+      // No click follows a cancel, so no twin window opens. The tap test above
+      // is the gate's own threshold, so a scroll cannot reach a destructive face.
       opts.gate?.spend();
       notePressOutcome('served');
-      action();
+      if (!destructive()) {
+        action();
+        return;
+      }
+      // One node serves Send and Cancel, so the face must still be Cancel.
+      setTimeout(() => {
+        if (pageVisible() && enabled() && destructive()) action();
+      }, CANCELLED_TAP_SETTLE_MS);
     },
     onTouchEnd(e: TouchEventLike): void {
       press = null;

@@ -1168,23 +1168,16 @@ fn one_email_account_opens_the_whole_family() {
     }
 }
 
-/// `execute_intent` takes an intent id, so a workspace with no intent has
-/// nothing to pass it.
+/// `execute_intent` is retired. Running an intent is `load_knowhow` on its id,
+/// so no array may offer the old tool, under any gates.
 #[test]
-fn execute_intent_is_offered_exactly_when_an_intent_exists() {
-    assert!(
-        !offered_names(&ToolCapabilities::default()).contains(&tn::EXECUTE_INTENT.to_string()),
-        "no intent exists, so execute_intent has no argument that resolves"
-    );
-
-    let caps = ToolCapabilities {
-        intent: true,
-        ..ToolCapabilities::default()
-    };
-    assert!(
-        offered_names(&caps).contains(&tn::EXECUTE_INTENT.to_string()),
-        "one intent must open the tool that runs it"
-    );
+fn no_tool_array_offers_execute_intent() {
+    for caps in [ToolCapabilities::default(), ToolCapabilities::all_open()] {
+        assert!(
+            !chat_wire_order(&caps).contains(&tn::EXECUTE_INTENT.to_string()),
+            "execute_intent is retired, yet {caps:?} offers it"
+        );
+    }
 }
 
 /// The gate ADR 0088 extends, asserted through the same table as the two it
@@ -1332,7 +1325,6 @@ fn two_callers_in_one_workspace_get_a_byte_identical_array() {
         ToolCapabilities::all_open(),
         ToolCapabilities {
             email_account: true,
-            intent: false,
             image_provider: true,
             judgment_provider: false,
             context_mode: false,
@@ -1452,7 +1444,6 @@ const FROZEN_WIRE_ORDER: &[&str] = &[
     "run_thread",
     "run_coding_agent",
     "follow_up_child_thread",
-    "execute_intent",
     "ask_user_question",
     "await_event",
     "list_event_waits",

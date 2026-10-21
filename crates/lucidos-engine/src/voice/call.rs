@@ -36,7 +36,7 @@ use super::{build, language, resident};
 use crate::core::store::messages::spoken_merge::join_spoken;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus, LagReplay, ReplayScope};
 use crate::engine::thread_events::{
-    AgentParticipant, CancelCause, EventMeta, MessageOrigin, ThreadEvent, VoiceSessionEndReason,
+    AgentParticipant, EventMeta, MessageOrigin, ThreadEvent, VoiceSessionEndReason,
 };
 use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
 use crate::llm::tool_names;
@@ -1439,11 +1439,10 @@ impl Call<'_> {
             // `SupersededByFollowup` is the caller talking over the answer,
             // which is how people talk. The turn that replaced it is already
             // running, so "that did not finish" would talk over the real answer
-            // on its way. A Stop is the other half: nothing is coming, and a
-            // caller left waiting in silence is the failure this reports.
-            ThreadEvent::ResponseCanceled { cause, .. }
-                if *cause != CancelCause::SupersededByFollowup =>
-            {
+            // on its way. An effort restart resumes the same way. A Stop is the
+            // other half: nothing is coming, and a caller left waiting in
+            // silence is the failure this reports.
+            ThreadEvent::ResponseCanceled { cause, .. } if !cause.is_redirect() => {
                 self.say(session, UNFINISHED.to_string()).await;
             }
             _ => {}

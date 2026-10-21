@@ -7,8 +7,8 @@
 //! work still in flight says so, so a progress report reads as one (ADR 0424).
 //! An agent-opened turn says when its report wakes the parent agent, so a
 //! routine report to that agent reads as one (ADR 0446). A turn that already
-//! notified the user names the notification, so a reply repeating it reads as
-//! news the user has.
+//! notified the user names the notification, and the notification replaces
+//! the read unless the reply holds a failure it does not mention.
 //!
 //! The site's chat model answers, unless the user picked a System One row
 //! (ADR 0472). The reply is never changed. A failed call or a missing answer
@@ -64,13 +64,9 @@ pub(crate) const READ_DECISION_INSTRUCTIONS: &str = "Should the user read the ag
     is not worth the user's read. It is still worth reading when it holds a failure, a gap the \
     user must know about, or something only the user can do or decide, such as a payment, a \
     sign-in or an approval. The parent agent seeing it does not make it the parent's to settle.\n\n\
-    When a closing note says the turn already sent the user a notification, the user has its \
-    news, including any failure or decision it names. A notification is short, though. The \
-    reply is still worth reading when it holds what the user needs to act on that the \
-    notification only counts or names, such as each item's details and what to do about it. It \
-    is not worth reading when it restates the notification, says it was sent, repeats what an \
-    app or file it updated now shows, or adds routine bookkeeping such as what was checked, \
-    removed or left alone.";
+    When a closing note says the turn already sent the user a notification, the reply is not \
+    worth reading. The notification is how the user hears, and they do not need both. The one \
+    exception is a failure the notification does not mention.";
 
 /// What a yes means.
 const READ_YES: &str = "The reply holds findings, research, an answer to the user's question, \
@@ -85,8 +81,8 @@ const READ_NO: &str = "The reply only confirms or carries out what the user just
     reply about a change that is ready, applied or merged, even when it explains what was \
     wrong, counts commits and files, or names a step such as a restart. Such a reply is a yes \
     only when it also holds a failure, a finding beyond the change, or a decision for the user. \
-    Also no when a closing note says the turn already sent the user a notification and the reply \
-    only restates it, says it was sent, or adds routine bookkeeping.";
+    Also no when a closing note says the turn already sent the user a notification, unless the \
+    reply holds a failure the notification does not mention.";
 
 /// The most bytes of the opening message the call reads.
 const MESSAGE_BYTES: usize = 4_000;
@@ -164,8 +160,8 @@ pub struct TurnRead {
     /// Whether this turn's report wakes the parent agent, which then acts on
     /// it. The prompt says so only for a turn the user did not open or resume.
     pub report_wakes_parent: bool,
-    /// The notifications the turn delivered before its reply. The user has
-    /// seen their news, so a reply only repeating it is not worth a read.
+    /// The notifications the turn delivered before its reply. A notification
+    /// replaces the read, unless the reply holds a failure it does not mention.
     pub pushed: Vec<PushedNotification>,
 }
 

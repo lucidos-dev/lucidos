@@ -8,6 +8,7 @@ import {
   waitForThreadTitle,
   renameThreadViaMenu,
 } from './helpers';
+import { DASHBOARD_RAIL_SHOWN_KEY } from '../src/store/dashboardRailKeys';
 
 // Desktop-only thread-title layout tests — they depend on `page.setViewportSize()`
 // actually changing the rendered layout, which mobile-emulated projects (mobile,
@@ -106,6 +107,13 @@ test.describe('Thread title: desktop resize', () => {
   test('long title stays on one line (truncates) at narrow widths instead of wrapping', async ({ page }) => {
     // The title is always one line: it hugs a short title and ellipsises a
     // too-long one at the row's edge, rather than wrapping the header to 2+ lines.
+    // The Canvas and the rail start hidden, so the Conversation is the whole
+    // window, and a narrower window is a narrower pane. Shown, both yield in a
+    // narrow window, and the Conversation grows instead.
+    await page.addInitScript((railShownKey) => {
+      localStorage.setItem('lucidos-split-ratio', '1');
+      localStorage.setItem(railShownKey, 'false');
+    }, DASHBOARD_RAIL_SHOWN_KEY);
     await page.setViewportSize({ width: 1600, height: 800 });
     await navigateToApp(page);
 
@@ -114,7 +122,9 @@ test.describe('Thread title: desktop resize', () => {
     await waitForResponse(page);
     await waitForThreadTitle(page);
 
-    const longTitle = 'A deliberately long thread title that will not fit a narrow desktop pane on one line';
+    // Longer than an 820px Conversation, the narrowest desktop pane on its own.
+    const longTitle = 'A deliberately long thread title that will not fit a narrow desktop pane on one line, '
+      + 'so the header has to truncate it with an ellipsis';
     await renameThreadViaMenu(page, longTitle);
     await page.waitForFunction((t) => {
       const els = document.querySelectorAll('.thread-view-header .thread-title');
@@ -143,10 +153,10 @@ test.describe('Thread title: desktop resize', () => {
 
     // Widen again: still one line, and more of the title is visible. Asserted as
     // a width recovery rather than "no longer truncated" on purpose: whether an
-    // 84-char title fits the thread pane at a 1600px viewport depends on the
-    // split ratio and the font, so a no-ellipsis assertion here would be a
-    // coin-flip. The fits-with-no-ellipsis case is covered by the medium-title
-    // test above, which pins the title at under 60% of the row.
+    // 135-char title fits the thread pane at a 1600px viewport depends on the
+    // font, so a no-ellipsis assertion here would be a coin-flip. The
+    // fits-with-no-ellipsis case is covered by the medium-title test above,
+    // which pins the title at under 60% of the row.
     await page.setViewportSize({ width: 1600, height: 800 });
     await page.waitForTimeout(150);
     expect(await isTitleOneLine(page), 'one line again at 1600px').toBe(true);

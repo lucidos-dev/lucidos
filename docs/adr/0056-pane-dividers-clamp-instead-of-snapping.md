@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-09
+- **Amended by**: [0495: A Canvas that cannot fit its floor is drawn collapsed](0495-canvas-yields-instead-of-squeezing.md)
 
 ## Context
 
@@ -66,6 +67,9 @@ not a constraint.
   `store/paneMinimums.ts`) and stop summing under a 1280px screen somewhere past
   150% ui-scale. (ADR 0058 raised the drawer's floor on the web client, which
   moved that crossing down to 150% exactly.)
+  **Amended by ADR 0495:** the remainder no longer reaches the screen. A Canvas
+  that cannot fit its floor is drawn collapsed instead, and the clamp's answer
+  only shows during a drag.
 - **`computeSnapRatio`, `computeDrawerSnap`, `cancelPendingSnap`, the pending-snap
   timer and `SNAP_DELAY_MS` are deleted.** `beginPaneResize` / `endPaneResize`
   survive as the `data-pane-resizing` attribute pair, which still turns the header

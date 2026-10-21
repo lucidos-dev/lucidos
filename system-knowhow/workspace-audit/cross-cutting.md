@@ -1,6 +1,6 @@
 ---
 name: Workspace audit: cross-cutting
-description: The cross-cutting audit section: credentials in workspace code, broken references, duplicates, removed CLI flags and removed thread-summary fields.
+description: The cross-cutting audit section: credentials in workspace code, broken references, duplicates, removed CLI flags, removed thread-summary fields and retired LLM tools.
 ---
 
 # Workspace audit section: cross-cutting
@@ -18,6 +18,7 @@ scan removed-flags "spawn-thread[^|]*--(parent|cc-model)|run_coding_agent\([^)]*
 scan removed-fields "coding_agent_(applying|has_diff|proposed|incomplete|requires_restart)" $all
 scan cred-env "CRED_[A-Z0-9_]+" --exclude-dir=auth $all
 scan auth-header "Authorization|X-API-Key" $inc apps
+scan retired-tools "execute_intent" $all
 ```
 
 ## Checks
@@ -70,3 +71,38 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
     object. Unfinished work is `unproposed` with `reason: "turn_incomplete"`.
     Do NOT flag SQL that reads `thread_summaries.coding_agent_requires_restart`:
     that column still exists.
+- **Retired LLM tools still named by workspace code.** The `retired-tools`
+  scan finds every mention across `data/apps/**`, `data/triggers/**`,
+  `data/knowhow/**` and `data/scripts/**`. Fix every hit, so none survives the
+  run. Currently retired:
+  - `execute_intent`. An intent now runs in the thread that asks for it: load
+    it with `load_knowhow(<intent id>)` and do its steps in the same turn.
+    Owns the rule: `system-knowhow/intent-registry.md`.
+    - **broken**: an instruction to call it, such as "use `execute_intent` to
+      run the digest". The call now fails with a hint.
+    - **stale**: a passing mention that tells nobody to call it, such as a note
+      that an intent "runs through `execute_intent`".
+
+## Remediation
+
+Fixes run only on request, as the root's § Remediation says. A fix gets the
+table for its finding, and the root's § Inline or a coding agent picks its
+route.
+
+### Rewriting a retired tool call
+
+**Route: inline.** Each row rewrites prose or one call, and changes no control
+flow.
+
+| Old | New |
+|---|---|
+| An instruction to call `execute_intent(intent_id: "<id>")` | `load_knowhow(id: "<id>")`, then do its steps in this turn |
+| An instruction to run the work in a separate thread through `execute_intent` | `run_thread`, only where the work truly needs its own thread |
+| A passing mention of `execute_intent` | the same sentence about `load_knowhow`, or delete it when it only described the old tool |
+
+**A hit in `data/triggers/<slug>/trigger.toml` is not a file edit.** That file
+is a copy of the trigger's `run`, written from its events. Rewrite the
+`run.intent` with one `update_trigger` call per trigger, per
+`system-knowhow/triggers.md`. The engine then rewrites the file.
+
+Verify by re-running the `retired-tools` scan. It should fall to zero.

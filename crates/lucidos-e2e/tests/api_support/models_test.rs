@@ -84,13 +84,13 @@ async fn context_window_round_trips_over_http() {
     let listed = find_model(&client, &api, &id).await.expect("model listed");
     assert_eq!(listed["routes"][0]["context_window"], 262_144);
 
-    // A PUT that doesn't mention the field must LEAVE IT ALONE — otherwise
-    // toggling `enabled` from the Settings row would silently wipe the window
+    // A PUT that doesn't mention the field must LEAVE IT ALONE. Otherwise the
+    // chat ladder switch on the Settings row would silently wipe the window
     // and drop the model back to the 200k fallback.
     let resp = client
         .put(format!("{}/api/v1/models", api))
         .query(&[("id", &id)])
-        .json(&json!({ "enabled": false }))
+        .json(&json!({ "on_chat_ladder": false }))
         .send()
         .await
         .expect("update failed");
@@ -100,7 +100,7 @@ async fn context_window_round_trips_over_http() {
         listed["routes"][0]["context_window"], 262_144,
         "an unrelated PUT must not clear the declared window"
     );
-    assert_eq!(listed["enabled"], false);
+    assert_eq!(listed["on_chat_ladder"], false, "a new model starts off");
 
     // An explicit null DOES clear it, back to inferring from the id.
     let resp = client
@@ -210,21 +210,20 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
     }
 }
 
-/// A retired builtin stays listed, so past turns keep its label, but no
-/// picker offers it, and it names the model the engine sends instead.
+/// A retired builtin stays listed, so past turns keep its label. The chat
+/// ladder never lists it, and it names the model the engine sends instead.
 #[tokio::test]
-async fn a_retired_builtin_is_disabled_and_names_its_successor() {
+async fn a_retired_builtin_is_off_the_chat_ladder_and_names_its_successor() {
     let client = user_client().await;
     let api = base_url();
     let retired = find_model(&client, &api, "gemini-3.5-flash")
         .await
         .expect("the retired row stays in the registry");
-    assert_eq!(retired["enabled"], false);
+    assert_eq!(retired["on_chat_ladder"], false);
     assert_eq!(retired["successor"], "gemini-3.8-flash");
     let current = find_model(&client, &api, "gemini-3.8-flash")
         .await
         .expect("the successor is seeded");
-    assert_eq!(current["enabled"], true);
     assert!(current["successor"].is_null());
 }
 
@@ -259,28 +258,26 @@ async fn a_new_local_model_is_offered_only_the_universally_safe_tiers() {
 /// real window over the wire. The id-shape fallback has no rule for a `grok-`
 /// id, so an undeclared row would budget the 2M model at 200k.
 ///
-/// Grok 4.5 and 4.3 are switched off by the prior-generation prune, and are
-/// asserted here precisely BECAUSE they are: `GET /models` serves every row,
-/// enabled or not, and a disabled row still has to carry a true window. Routing
-/// resolves it for a saved `chat_model`, and the picker filters on `enabled`
-/// separately.
+/// Grok 4.5 and 4.3 are the prior generation, and are asserted here precisely
+/// BECAUSE they are: `GET /models` serves every row, on the chat ladder or
+/// not, and such a row still has to carry a true window. Routing resolves it
+/// for a saved `chat_model`.
 #[tokio::test]
 async fn seeded_grok_models_report_xai_and_their_declared_windows() {
     let client = user_client().await;
     let api = base_url();
 
-    for (id, window, enabled) in [
-        ("grok-4.6", 500_000, true),
-        ("grok-4.5", 500_000, false),
-        ("grok-4.20", 2_000_000, true),
-        ("grok-4.3", 1_000_000, false),
+    for (id, window) in [
+        ("grok-4.6", 500_000),
+        ("grok-4.5", 500_000),
+        ("grok-4.20", 2_000_000),
+        ("grok-4.3", 1_000_000),
     ] {
         let m = find_model(&client, &api, id)
             .await
             .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
         assert_eq!(m["routes"][0]["provider"], "xai", "{id}");
         assert_eq!(m["source"], "builtin", "{id}");
-        assert_eq!(m["enabled"], enabled, "{id}");
         assert_eq!(m["routes"][0]["context_window"], window, "{id}");
     }
 }
@@ -640,4 +637,55 @@ async fn non_positive_context_window_is_rejected() {
             "a rejected create must not leave a row behind"
         );
     }
+}
+
+async fn set_on_chat_ladder(client: &reqwest::Client, api: &str, id: &str, on: bool) {
+    let resp = client
+        .put(format!("{}/api/v1/models", api))
+        .query(&[("id", id)])
+        .json(&json!({ "on_chat_ladder": on }))
+        .send()
+        .await
+        .expect("update failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true, "{body}");
+}
+
+/// The chat ladder is the only switch for what the picker lists. A model the
+/// user adds starts off it, `on_chat_ladder` turns it on and off, and the
+/// served row says which.
+#[tokio::test]
+async fn a_user_model_turns_on_and_off_the_chat_ladder() {
+    let client = user_client().await;
+    let api = base_url();
+    let id = unique_marker("e2e-model-ladder");
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({ "id": id, "label": "Ladder", "provider": "local" }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(listed["on_chat_ladder"], false);
+
+    set_on_chat_ladder(&client, &api, &id, true).await;
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(listed["on_chat_ladder"], true);
+
+    set_on_chat_ladder(&client, &api, &id, false).await;
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(listed["on_chat_ladder"], false);
+
+    client
+        .delete(format!(
+            "{}/api/v1/preferences?key={}",
+            api,
+            lucidos_engine::core::prefs::INTELLIGENCE_LADDER_CHAT.key()
+        ))
+        .send()
+        .await
+        .expect("preference reset failed");
+    delete_model(&client, &api, &id).await;
 }

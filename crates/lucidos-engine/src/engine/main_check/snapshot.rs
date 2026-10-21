@@ -38,6 +38,9 @@ pub struct MainCheckSnapshot {
     pub run_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix_thread_id: Option<Uuid>,
+    /// The open flaky fix thread, whatever state the check is in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flaky_fix_thread_id: Option<Uuid>,
     /// What failed, for a red check; why the check cannot run, when
     /// unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +51,13 @@ impl MainCheckSnapshot {
     /// The snapshot of `check`. `unavailable` is why this checkout cannot run
     /// the check, and `run_url` is the running check's run once known.
     pub(crate) fn of(check: &MainCheck, unavailable: Option<&str>, run_url: Option<&str>) -> Self {
+        Self {
+            flaky_fix_thread_id: check.flaky_fix().map(|flaky| flaky.fix_thread_id),
+            ..Self::of_state(check, unavailable, run_url)
+        }
+    }
+
+    fn of_state(check: &MainCheck, unavailable: Option<&str>, run_url: Option<&str>) -> Self {
         if let Some(running) = check.running() {
             return Self {
                 state: MainCheckState::Running,
@@ -67,6 +77,7 @@ impl MainCheckSnapshot {
                 run_url: red.run_url.clone(),
                 fix_thread_id: Some(red.fix_thread_id),
                 summary: Some(red.summary.clone()),
+                ..Self::default()
             };
         }
         if let Some(reason) = unavailable {
@@ -134,6 +145,7 @@ mod tests {
             Verdict::Failed {
                 summary: "Failed: engine.".into(),
                 tail: String::new(),
+                failures: Vec::new(),
                 run_url: Some("https://r".into()),
                 fix_thread_id: id(9),
             },

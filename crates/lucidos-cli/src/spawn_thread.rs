@@ -57,8 +57,10 @@ pub(crate) const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "m
 
 /// The two picker menus the engine validates a coding-agent effort against.
 /// Baked in at compile time, so the CLI needs no path lookup at runtime.
-const CC_MENU: &str = include_str!("../../lucidos-engine/src/runtime/cc_menu_options.json");
-const CODEX_MENU: &str = include_str!("../../lucidos-engine/src/runtime/codex_menu_options.json");
+pub(crate) const CC_MENU: &str =
+    include_str!("../../lucidos-engine/src/runtime/cc_menu_options.json");
+pub(crate) const CODEX_MENU: &str =
+    include_str!("../../lucidos-engine/src/runtime/codex_menu_options.json");
 
 /// The `reasoning_efforts` rows of one menu file.
 ///
@@ -303,7 +305,20 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("spawn-thread failed: HTTP {}: {}", status, text).into());
+        let off_ladder = serde_json::from_str::<serde_json::Value>(&text)
+            .is_ok_and(|body| body["reason"] == crate::intelligence_ladder::OFF_LADDER_REASON);
+        let ladder = off_ladder
+            .then(|| {
+                crate::intelligence_ladder::render_for_refusal(
+                    &format!("{scheme}://localhost:{api_port}"),
+                    Some(&target_basename),
+                    selected_coding_agent.map(crate::CliCodingAgent::as_wire),
+                )
+            })
+            .flatten()
+            .map(|ladder| format!("\n\n{ladder}"))
+            .unwrap_or_default();
+        return Err(format!("spawn-thread failed: HTTP {}: {}{}", status, text, ladder).into());
     }
 
     // Print the spawned thread as a markdown link the receiving frontend
@@ -587,8 +602,9 @@ mod tests {
         );
     }
 
-    /// The restriction the refusal is built on. Codex names three models for
-    /// `max`; every other level, and every Claude Code level, is universal.
+    /// The restriction the refusal is built on. Codex names its GPT-5.6 and
+    /// GPT-6 models for `max`; every other level, and every Claude Code level,
+    /// is universal.
     ///
     /// `system-knowhow/lucidos-cli.md` tells the reader exactly this, so a menu
     /// that restricts a second level has to fail here rather than silently make
@@ -597,7 +613,9 @@ mod tests {
     fn only_codex_max_names_the_models_that_offer_it() {
         let codex_max = models_offering(CODEX_MENU, "max").expect("codex max names its models");
         assert!(
-            codex_max.iter().all(|m| m.starts_with("gpt-5.6")),
+            codex_max
+                .iter()
+                .all(|m| m.starts_with("gpt-5.6") || m.starts_with("gpt-6")),
             "unexpected models for codex max: {:?}",
             codex_max
         );

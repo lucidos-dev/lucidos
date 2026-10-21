@@ -162,6 +162,8 @@ touch -t 202001010000 "$BIN"
 echo 'pub const A: u32 = 5;' > "$R/crates/lucidos-engine/src/lib.rs"
 expect_eq "a bin older than an input it compiled is refused" "1" \
     "$(codegen_main "$R" --bin "$BIN" 2>/dev/null; echo $?)"
+expect_eq "a reused bin is not refused for its age" "0" \
+    "$(codegen_main "$R" --reused-bin "$BIN" 2>/dev/null; echo $?)"
 git -C "$R" reset -q --hard
 
 echo "prune"

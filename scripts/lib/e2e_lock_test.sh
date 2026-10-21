@@ -338,7 +338,7 @@ first_rc=$?
 acquire_e2e_lock e2e-api >"$OUT_DIR"/test-2b.out 2>&1
 second_rc=$?
 assert_eq "0" "$first_rc" "first acquire returns 0"
-assert_eq "1" "$second_rc" "second acquire returns 1"
+assert_eq "$E2E_LOCK_BUSY_EXIT" "$second_rc" "second acquire returns the busy exit"
 if grep -q "another e2e run is in progress" "$OUT_DIR"/test-2b.out; then
     pass "error message names the conflict"
 else
@@ -439,7 +439,7 @@ E2E_ORPHAN_REAP_TIMEOUT_S=1 acquire_e2e_lock e2e-browser >"$OUT_DIR"/test-5.out 
 rc5=$?
 eval "$real_reap"   # restore the real reaper
 SYNTHETIC_PS=""
-assert_eq "1" "$rc5" "acquire refuses when the orphan survives the sweep"
+assert_eq "2" "$rc5" "acquire refuses when the orphan survives the sweep, with the orphan code"
 if grep -q "orphaned processes that the" "$OUT_DIR"/test-5.out; then
     pass "refusal message explains the orphan pile-up"
 else
@@ -794,7 +794,8 @@ assert_eq "0" "$([ -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" ] && echo 1 || echo 0)" 
 # ── 9. Entry-point script bails out when the lock is held (live PID) ──────
 # Simulates the original incident at the entry-point level: hold the lock from a
 # "first" session (alive PID), then invoke e2e-browser.sh as the "second" and
-# verify it exits before touching the workspace.
+# verify it exits before touching the workspace. A WebKit run, because a run
+# without it would take the free second slot.
 echo "Test 9: e2e-browser.sh bails out when lock held"
 reset_lock_dir
 cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
@@ -804,9 +805,9 @@ WORKTREE=/tmp/holder
 STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 SCRIPT=e2e-browser
 EOF
-"$PROJECT_DIR/scripts/e2e-browser.sh" -f none.spec.ts >"$OUT_DIR"/test-9.out 2>&1
+"$PROJECT_DIR/scripts/e2e-browser.sh" --webkit -f none.spec.ts >"$OUT_DIR"/test-9.out 2>&1
 script_rc=$?
-assert_eq "1" "$script_rc" "e2e-browser.sh exits 1"
+assert_eq "$E2E_LOCK_BUSY_EXIT" "$script_rc" "e2e-browser.sh exits the busy exit"
 if grep -q "another e2e run is in progress" "$OUT_DIR"/test-9.out; then
     pass "e2e-browser.sh prints conflict message"
 else
@@ -820,7 +821,81 @@ else
     fail "e2e-browser.sh started workspace despite lock"
 fi
 assert_eq "1" "$([ -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" ] && echo 1 || echo 0)" "held lock preserved"
+assert_eq "0" "$([ -f "$E2E_LOCK_DIR_OVERRIDE/e2e-ws-2/e2e.lock" ] && echo 1 || echo 0)" \
+    "the refused WebKit run gave its second slot back"
 rm -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+
+# ── 9b. e2e slots: two Chromium runs side by side, WebKit alone ──────────
+SLOT1_LOCK="$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+SLOT2_LOCK="$E2E_LOCK_DIR_OVERRIDE/e2e-ws-2/e2e.lock"
+# hold_slot <lock-file> <pid> [checkout]: a live run holding that slot.
+hold_slot() {
+    mkdir -p "$(dirname "$1")"
+    printf 'PID=%s\nTHREAD_ID=slot-holder\nWORKTREE=/tmp/holder\nCHECKOUT=%s\nRUN_ID=held\nSCRIPT=e2e-browser\n' \
+        "$2" "${3:-/tmp/another-checkout}" > "$1"
+}
+lock_pid() { sed -n 's/^PID=//p' "$1" 2>/dev/null; }
+
+echo "Test 9b: a second Chromium run takes the free slot, in its own workspace"
+reset_lock_dir
+spawn_sleeper
+hold_slot "$SLOT1_LOCK" "$SLEEPER_PID"
+out="$(acquire_e2e_slots e2e-browser shared 2>&1; echo "rc=$? ws=$E2E_WORKSPACE pid=$(lock_pid "$SLOT2_LOCK")")"
+assert_eq "rc=0 ws=$TMPROOT/e2e-ws-2 pid=$$" "$(printf '%s\n' "$out" | tail -1)" \
+    "the run holds slot 2 and runs in e2e-ws-2"
+assert_eq "$SLEEPER_PID" "$(lock_pid "$SLOT1_LOCK")" "slot 1 still belongs to its holder"
+
+echo "Test 9c: a third entrant is refused while both slots are held"
+reset_lock_dir
+hold_slot "$SLOT1_LOCK" "$SLEEPER_PID"
+hold_slot "$SLOT2_LOCK" "$SLEEPER_PID"
+out="$(acquire_e2e_slots e2e-browser shared 2>&1; echo "rc=$?")"
+assert_eq "rc=$E2E_LOCK_BUSY_EXIT" "$(printf '%s\n' "$out" | tail -1)" "the third entrant is refused"
+if [[ "$out" == *"another e2e run is in progress"* && "$out" == *"every e2e slot is taken"* ]]; then
+    pass "the refusal names the hold and says every slot is taken"
+else
+    fail "refusal was: $out"
+fi
+
+echo "Test 9d: a WebKit run is refused beside a held slot, and leaves nothing behind"
+reset_lock_dir
+hold_slot "$SLOT2_LOCK" "$SLEEPER_PID"
+out="$(acquire_e2e_slots e2e-browser exclusive 2>&1; echo "rc=$?")"
+assert_eq "rc=$E2E_LOCK_BUSY_EXIT" "$(printf '%s\n' "$out" | tail -1)" "WebKit is refused while slot 2 runs"
+assert_eq "0" "$([ -f "$SLOT1_LOCK" ] && echo 1 || echo 0)" "slot 1 was never taken"
+reset_lock_dir
+hold_slot "$SLOT1_LOCK" "$SLEEPER_PID"
+out="$(acquire_e2e_slots e2e-browser exclusive 2>&1; echo "rc=$?")"
+assert_eq "rc=$E2E_LOCK_BUSY_EXIT" "$(printf '%s\n' "$out" | tail -1)" "WebKit is refused while slot 1 runs"
+assert_eq "0" "$([ -f "$SLOT2_LOCK" ] && echo 1 || echo 0)" "slot 2 was given back"
+
+echo "Test 9e: a WebKit run holds every slot, and a Chromium run then finds none"
+reset_lock_dir
+out="$(
+    acquire_e2e_slots e2e-browser exclusive >/dev/null 2>&1
+    echo "rc=$? ws=$E2E_WORKSPACE 1=$(lock_pid "$SLOT1_LOCK") 2=$(lock_pid "$SLOT2_LOCK")"
+    [ "$(sed -n 's/^RUN_ID=//p' "$SLOT1_LOCK")" = "$(sed -n 's/^RUN_ID=//p' "$SLOT2_LOCK")" ] && echo same-run
+    E2E_LOCK_ANNOUNCE_PID=""
+    release_e2e_lock 2>/dev/null
+    echo "after: $([ -f "$SLOT1_LOCK" ] && echo 1 || echo 0)$([ -f "$SLOT2_LOCK" ] && echo 1 || echo 0)"
+)"
+assert_eq "rc=0 ws=$TMPROOT/e2e-ws 1=$$ 2=$$" "$(printf '%s\n' "$out" | sed -n 1p)" "both slots are this run's, in slot 1"
+assert_eq "same-run" "$(printf '%s\n' "$out" | sed -n 2p)" "both carry one run marker, so a sweep finds its browsers"
+assert_eq "after: 00" "$(printf '%s\n' "$out" | sed -n 3p)" "the release frees both"
+reset_lock_dir
+hold_slot "$SLOT1_LOCK" "$SLEEPER_PID"
+hold_slot "$SLOT2_LOCK" "$SLEEPER_PID"
+out="$(acquire_e2e_slots e2e-browser shared 2>&1; echo "rc=$?")"
+assert_eq "rc=$E2E_LOCK_BUSY_EXIT" "$(printf '%s\n' "$out" | tail -1)" "a Chromium run gives up on a WebKit hold"
+
+echo "Test 9f: a second run from the same checkout is refused, though a slot is free"
+reset_lock_dir
+hold_slot "$SLOT1_LOCK" "$SLEEPER_PID" "$_E2E_LOCK_CHECKOUT"
+out="$(acquire_e2e_slots e2e-browser shared 2>&1; echo "rc=$?")"
+assert_eq "rc=$E2E_LOCK_BUSY_EXIT" "$(printf '%s\n' "$out" | tail -1)" "the same checkout is refused as busy"
+assert_eq "0" "$([ -f "$SLOT2_LOCK" ] && echo 1 || echo 0)" "and takes no slot"
+if [[ "$out" == *"This checkout already runs e2e"* ]]; then pass "the refusal says why"; else fail "refusal was: $out"; fi
+reset_lock_dir
 
 # ── 10-18. The lock announces itself (the E2ELock* domain events) ────────
 # A hold now emits E2ELockAcquired when it starts and E2ELockReleased when it
@@ -1131,76 +1206,31 @@ else
 fi
 
 echo ""
-echo "Test 17: the refusal teaches the subscribe path, not a sleep loop"
-# An agent that never loaded the e2e-lock-wait skill has only this text to go on,
-# and on 2026-08-09 two of them read the old wording and wrote retry loops.
+echo "Test 17: the refusal says give up, never wait (ADR 0541)"
+# An agent that never loaded the e2e-lock-busy skill has only this text to go on.
 reset_lock_dir
 acquire_e2e_lock e2e-browser >/dev/null 2>&1
 acquire_e2e_lock e2e-api > "$OUT_DIR"/test-17.out 2>&1
-if grep -q "await-event --on E2ELockReleased" "$OUT_DIR"/test-17.out; then
-    pass "the refusal spells out the await-event command"
+if grep -q "await-event" "$OUT_DIR"/test-17.out; then
+    fail "the refusal still teaches a wait"
+    echo "  ---"; cat "$OUT_DIR"/test-17.out; echo "  ---"
 else
-    fail "the refusal does not name await-event"
+    pass "the refusal names no await-event"
+fi
+if grep -q "Do NOT wait for the lock" "$OUT_DIR"/test-17.out \
+    && grep -q -- "--github" "$OUT_DIR"/test-17.out \
+    && grep -q "main check" "$OUT_DIR"/test-17.out; then
+    pass "the refusal names --github and the main check instead"
+else
+    fail "the refusal does not say what to do instead of waiting"
     echo "  ---"; cat "$OUT_DIR"/test-17.out; echo "  ---"
 fi
-if grep -qi "do NOT sleep, poll, or write a retry loop" "$OUT_DIR"/test-17.out; then
-    pass "the refusal names the anti-pattern it is replacing"
-else
-    fail "the refusal does not warn against polling"
-fi
-if grep -q "e2e-lock-wait" "$OUT_DIR"/test-17.out; then
-    pass "the refusal points at the skill carrying the full rules"
+if grep -q "e2e-lock-busy" "$OUT_DIR"/test-17.out; then
+    pass "the refusal points at the skill carrying the rule"
 else
     fail "the refusal does not point at the skill"
 fi
 release_e2e_lock
-
-echo ""
-echo "Test 18: the refusal warns when the holder's release cannot reach us"
-# The lock is shared across every workspace on the machine, but an emit lands in
-# the emitting subprocess's own $LUCIDOS_WORKSPACE. A waiter that subscribes to a
-# holder in another workspace waits out its whole timeout, so say so up front.
-reset_lock_dir
-mkdir -p "$TMPROOT/ws-a" "$TMPROOT/ws-b"
-cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
-PID=$$
-THREAD_ID=other
-WORKTREE=$TMPROOT/ws-b/.lucidos/worktrees/thread-x
-STARTED=2020-01-01T00:00:00Z
-STARTED_EPOCH=1577836800
-SCRIPT=e2e-browser
-EOF
-( LUCIDOS_WORKSPACE="$TMPROOT/ws-a"; acquire_e2e_lock e2e-api ) > "$OUT_DIR"/test-18a.out 2>&1
-if grep -q "not reach this thread" "$OUT_DIR"/test-18a.out; then
-    pass "a holder in another workspace is called out in the refusal"
-else
-    fail "no cross-workspace note for a holder elsewhere"
-    echo "  ---"; cat "$OUT_DIR"/test-18a.out; echo "  ---"
-fi
-cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
-PID=$$
-THREAD_ID=other
-WORKTREE=$TMPROOT/ws-a/.lucidos/worktrees/thread-x
-STARTED=2020-01-01T00:00:00Z
-STARTED_EPOCH=1577836800
-SCRIPT=e2e-browser
-EOF
-# shellcheck disable=SC2030 # local to this case is the point: the library reads it in the same subshell, and the next case must not inherit it
-( LUCIDOS_WORKSPACE="$TMPROOT/ws-a"; acquire_e2e_lock e2e-api ) > "$OUT_DIR"/test-18b.out 2>&1
-if grep -q "not reach this thread" "$OUT_DIR"/test-18b.out; then
-    fail "a same-workspace holder was wrongly reported as unreachable"
-else
-    pass "a holder in THIS workspace gets no note (its release does wake us)"
-fi
-# Cannot tell is not the same as another workspace: a manual terminal run has no
-# $LUCIDOS_WORKSPACE, and guessing there would warn every such run for nothing.
-( unset LUCIDOS_WORKSPACE; acquire_e2e_lock e2e-api ) > "$OUT_DIR"/test-18c.out 2>&1
-if grep -q "not reach this thread" "$OUT_DIR"/test-18c.out; then
-    fail "warned about the workspace gap with no LUCIDOS_WORKSPACE to compare against"
-else
-    pass "no workspace to compare against means no claim either way"
-fi
-rm -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
 
 echo ""
 echo "Test 18b: a removal that FAILS is not announced as a release"
@@ -1568,7 +1598,7 @@ SPAWNED="$SPAWNED $winner"
     acquire_e2e_lock e2e-browser >"$OUT_DIR"/test-29.out 2>&1
     echo "$?" > "$OUT_DIR"/test-29.rc
 )
-assert_eq "1" "$(cat "$OUT_DIR"/test-29.rc)" "the loser refuses"
+assert_eq "$E2E_LOCK_BUSY_EXIT" "$(cat "$OUT_DIR"/test-29.rc)" "the loser refuses"
 assert_eq "$winner" "$(sed -n 's/^PID=//p' "$E2E_LOCK_DIR_OVERRIDE/e2e.lock")" "and leaves the winner's lock in place"
 if grep -q "PID $winner (script: e2e-api)" "$OUT_DIR"/test-29.out && grep -q "Thread:   winner" "$OUT_DIR"/test-29.out; then
     pass "the refusal names the winner"
@@ -1592,7 +1622,7 @@ stale_lock
     acquire_e2e_lock e2e-browser >"$OUT_DIR"/test-30.out 2>&1
     echo "$?" > "$OUT_DIR"/test-30.rc
 )
-assert_eq "1" "$(cat "$OUT_DIR"/test-30.rc)" "the reclaimer sees a changed lock and refuses"
+assert_eq "$E2E_LOCK_BUSY_EXIT" "$(cat "$OUT_DIR"/test-30.rc)" "the reclaimer sees a changed lock and refuses"
 assert_eq "reuse-run" "$(sed -n 's/^RUN_ID=//p' "$E2E_LOCK_DIR_OVERRIDE/e2e.lock")" "and the reuser's lock survives"
 
 # ── Summary ──────────────────────────────────────────────────────────────

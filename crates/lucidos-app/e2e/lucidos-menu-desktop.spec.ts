@@ -18,7 +18,7 @@
  * Desktop-only by viewport: the mobile layout has no `.desktop-header` at all.
  */
 import { test, expect, Page } from './fixtures';
-import { navigateToApp, assertHealthy, hideHomeRail } from './helpers';
+import { navigateToApp, assertHealthy, hideDashboardRail } from './helpers';
 
 /** An action the menu deliberately does not carry is still reachable in the row
  *  itself: as its own icon, or inside the row's ⋯ overflow menu once the pane is
@@ -38,7 +38,7 @@ test.describe('Lucidos menu from the desktop mark', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    await hideHomeRail(page);
+    await hideDashboardRail(page);
   });
 
   test('opens with every control it owes, names the workspace, and closes on a second click', async ({ page }) => {

@@ -58,7 +58,7 @@ export function signature(line) {
     case 'control_response': {
       const r = line.response ?? {};
       // Which models a machine lists depends on its settings, so only the
-      // distinct field shapes count.
+      // distinct field shapes count. diffShapes lets the fake carry extra ones.
       const models = r.response?.models;
       const shapes = Array.isArray(models) ? [...new Set(models.map((m) => keysOf(m, PARSED_MODEL_FIELDS)))].sort() : null;
       const modelFields = shapes ? `models[${shapes.join('|')}]` : '';
@@ -108,12 +108,32 @@ export function unknownKinds(lines) {
   return [...kinds];
 }
 
+const MODELS_SUFFIX = /^(.*)models\[(.*)\]$/;
+
+/**
+ * The model row shapes the real side sends that the fake lacks, or null when
+ * either signature carries no model list or the rest of the line differs.
+ * Which row shapes a machine lists depends on its gateway, so the fake may
+ * send more shapes than the real CLI does, never fewer.
+ */
+function missingModelShapes(real, fake) {
+  const r = MODELS_SUFFIX.exec(real ?? '');
+  const f = MODELS_SUFFIX.exec(fake ?? '');
+  if (!r || !f || r[1] !== f[1]) return null;
+  const fakeShapes = new Set(f[2].split('|'));
+  return r[2].split('|').filter((shape) => !fakeShapes.has(shape));
+}
+
 /** Every difference between two shapes, as readable lines. Empty when in step. */
 export function diffShapes(real, fake) {
   const diffs = [];
   const length = Math.max(real.length, fake.length);
   for (let i = 0; i < length; i++) {
-    if (real[i] !== fake[i]) diffs.push(`#${i}: real ${real[i] ?? '(none)'} | fake ${fake[i] ?? '(none)'}`);
+    if (real[i] === fake[i]) continue;
+    const missing = missingModelShapes(real[i], fake[i]);
+    if (missing?.length === 0) continue;
+    const note = missing ? ` | fake lacks model row shape [${missing.join('] [')}]` : '';
+    diffs.push(`#${i}: real ${real[i] ?? '(none)'} | fake ${fake[i] ?? '(none)'}${note}`);
   }
   return diffs;
 }

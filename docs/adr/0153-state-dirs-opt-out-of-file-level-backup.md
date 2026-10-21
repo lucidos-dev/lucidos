@@ -2,6 +2,13 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-29
+- **Amended by**: [0509](0509-stored-secrets-are-sealed-at-rest.md).
+  Decision 3 is reversed for the signed macOS `.app`: the backup key moves into
+  the Keychain there, and into a key file under `~/.lucidos/secret-keys/`
+  elsewhere.
+- **Amended by**: [0520](0520-backups-seal-to-an-age-recipient.md).
+  New archives seal to an age backup recipient, and the engine no longer holds
+  a backup key at all. A legacy key stays only until its workspace switches.
 
 ## Context
 

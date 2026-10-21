@@ -3,10 +3,10 @@ import { parseChatEfforts, withChatEffort } from './chatEfforts';
 
 describe('parseChatEfforts', () => {
   it('reads each model with its own tier', () => {
-    const efforts = parseChatEfforts('claude-opus-5-5[1m]=high, gpt-6.1-sol=low');
-    expect(efforts.get('claude-opus-5-5[1m]')).toBe('high');
+    const efforts = parseChatEfforts('claude-opus-5-6[1m]=high, gpt-6.1-sol=low');
+    expect(efforts.get('claude-opus-5-6[1m]')).toBe('high');
     expect(efforts.get('gpt-6.1-sol')).toBe('low');
-    expect(efforts.get('claude-opus-5-5')).toBeUndefined();
+    expect(efforts.get('claude-opus-5-6')).toBeUndefined();
   });
 
   it('skips a pair the engine would refuse, and keeps the rest', () => {

@@ -236,6 +236,34 @@ async fn chat_stream_rejects_unknown_repo() {
     );
 }
 
+/// `lucidos spawn-thread --coding-agent-model` reaches this route. A model the
+/// backend does not offer is refused before a thread exists. The text lists the
+/// valid ids, as `run_coding_agent` does (ADR 0488).
+#[tokio::test]
+async fn chat_stream_rejects_an_unoffered_coding_agent_model() {
+    let client = user_client().await;
+    let url = format!("{}/api/v1/chat/stream", base_url());
+    let body = serde_json::json!({
+        "message": "test",
+        "mode": "human",
+        "use_coding_agent": true,
+        "cc_model": "claude-sonnet-9",
+    });
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(resp.status(), 400, "an unoffered model must be refused");
+    let text = resp.text().await.expect("body");
+    assert!(text.contains("claude-sonnet-9"), "names the id: {text}");
+    assert!(
+        text.contains("Choose one of:"),
+        "lists the valid ids: {text}"
+    );
+}
+
 /// `mode` is mandatory — requests omitting it must be rejected (not silently
 /// defaulted to human) so the spawn-thread skill and other callers cannot
 /// accidentally produce mislabeled threads.

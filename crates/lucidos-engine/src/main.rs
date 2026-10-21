@@ -1,7 +1,7 @@
 use lucidos_engine::api::{create_router, SharedEngine};
 use lucidos_engine::engine::thread_lifecycle::ThreadStatus;
 use lucidos_engine::engine::LucidosEngine;
-use lucidos_engine::llm::{build_active_provider, ProviderBuildContext, ProviderBuildOutcome};
+use lucidos_engine::llm::ProviderBuildContext;
 use lucidos_engine::log;
 use lucidos_engine::net_config;
 use lucidos_engine::scheduler::SchedulerManager;
@@ -344,14 +344,11 @@ fn python_preflight() {
 ///
 /// The engine polls deeply-nested async chains on a single worker thread. A
 /// trigger fire descends the scheduler, the Thread Queue executor, the agentic
-/// loop, `execute_intent`, a nested sub-loop and a tool, all as one un-spawned
-/// future. Tokio's default 2 MiB worker stack overflows on that depth and
-/// aborts the engine.
+/// loop and a tool, all as one un-spawned future. Tokio's default 2 MiB worker
+/// stack once overflowed on a deeper chain and aborted the engine.
 ///
-/// The depth is bounded, because `execute_intent` is excluded from the intent
-/// sub-loop's tool set, so a larger fixed stack resolves it. 16 MiB is reserved
-/// virtual address space committed lazily per touched page, so the headroom is
-/// effectively free.
+/// 16 MiB is reserved virtual address space committed lazily per touched page,
+/// so the headroom is effectively free. Shrinking it gains nothing.
 const WORKER_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Build the multi-threaded Tokio runtime the engine runs on. What
@@ -430,13 +427,93 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return build_runtime()?.block_on(run_restore_archive());
     }
 
+    // The two ways out of a boot the secret store refused (ADR 0509).
+    if std::env::args().nth(1).as_deref() == Some("secrets") {
+        return build_runtime()?.block_on(run_secrets());
+    }
+
+    // Boots this binary against a copy of the workspace database. The dev
+    // build runs it before publishing the binary.
+    if std::env::args().nth(1).as_deref() == Some("preflight") {
+        return build_runtime()?.block_on(run_preflight());
+    }
+
     build_runtime()?.block_on(run())
 }
 
-/// `lucidos-engine restore-archive --file <enc> --workspace-dir <dir>`.
+/// `lucidos-engine preflight`, against the database in `DATABASE_URL` and the
+/// workspace in `LUCIDOS_WORKSPACE`. Exits non-zero, with the reason on stderr,
+/// when a boot of this binary on that data would fail.
+async fn run_preflight() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use lucidos_engine::core::secret_store::key_store;
+
+    let _ = dotenvy::dotenv();
+    let workspace = std::env::var("LUCIDOS_WORKSPACE")
+        .map_err(|_| "preflight: LUCIDOS_WORKSPACE env var is required")?;
+    let scratch = PathBuf::from(workspace).join(".lucidos");
+    std::fs::create_dir_all(&scratch)?;
+    let store = key_store::resolve()?;
+    lucidos_engine::preflight::run(
+        &lucidos_engine::core::database_url(),
+        &scratch,
+        store.as_ref(),
+    )
+    .await?;
+    log!("[Preflight] This binary boots on a copy of the workspace database");
+    Ok(())
+}
+
+/// `lucidos-engine secrets import-key --key-file <file>` or
+/// `lucidos-engine secrets discard`, against the database in `DATABASE_URL`.
 ///
-/// Restores a local encrypted backup archive into an already-provisioned
-/// workspace directory and database.
+async fn run_secrets() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use lucidos_engine::core::secret_store::{boot, key_store, SecretKey};
+
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let _ = dotenvy::dotenv();
+    let database_url = lucidos_engine::core::database_url();
+    let database = boot::database_name(&database_url)?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    let store = key_store::resolve()?;
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["import-key", "--key-file", path] => {
+            let key = SecretKey::from_base64(&std::fs::read_to_string(path)?)?;
+            boot::import_key(&pool, &database, store.as_ref(), &key).await?;
+            log!("[SecretStore] Installed key {} for {database}.", key.id());
+        }
+        ["discard"] => {
+            let removed = boot::discard(&pool, &database, store.as_ref()).await?;
+            if removed.is_empty() {
+                log!("[SecretStore] Nothing to discard: every secret in {database} opens.");
+            }
+            for line in removed {
+                log!("[SecretStore] Discarded {line}");
+            }
+        }
+        _ => {
+            return Err(
+                "usage: lucidos-engine secrets import-key --key-file <file> \
+                        | lucidos-engine secrets discard"
+                    .into(),
+            )
+        }
+    }
+    Ok(())
+}
+
+/// `lucidos-engine restore-archive --file <archive> --workspace-dir <dir>`.
+///
+/// Restores a local backup archive (`.age`, or a legacy `.enc`) into an
+/// already-provisioned workspace directory and database. The key is either
+/// kind, and the archive's own header picks the decoder.
 ///
 /// The key and the connection string both arrive through the environment, so
 /// neither lands in argv, which `ps` shows. Prints
@@ -461,16 +538,17 @@ async fn run_restore_archive() -> Result<(), Box<dyn std::error::Error + Send + 
     let workspace_dir = workspace_dir.ok_or("restore-archive: --workspace-dir is required")?;
 
     let _ = dotenvy::dotenv();
-    let key_b64 = std::env::var("LUCIDOS_RESTORE_KEY")
+    let key_text = std::env::var("LUCIDOS_RESTORE_KEY")
         .map_err(|_| "restore-archive: LUCIDOS_RESTORE_KEY env var is required")?;
-    let key = lucidos_engine::core::backup::crypto::key_from_base64(&key_b64)
-        .map_err(|e| format!("restore-archive: invalid key: {e}"))?;
+    let key: lucidos_engine::core::backup::crypto::OpeningKey = key_text
+        .parse()
+        .map_err(|e| format!("restore-archive: {e}"))?;
     let database_url = lucidos_engine::core::database_url();
 
     lucidos_engine::core::backup::restore_archive_into(
         &workspace_dir,
         &database_url,
-        &key,
+        key,
         &file,
         |phase, cur, _total| {
             // One progress line per tick, best-effort: the gateway parses the
@@ -580,6 +658,9 @@ async fn own_workspace(
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // First, before any wait: it names the binary this engine started from, the
+    // baseline the CLI pin checks a later publish against.
+    let launched_as = lucidos_engine::runtime::lucidos_cli::launch_file_id();
     // Before any TLS use, and before anything that might reach the network.
     lucidos_engine::net_config::install_crypto_provider();
 
@@ -633,6 +714,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Held as a `run()` local for this engine's whole life. Nothing stateful
     // may run before it: see `own_workspace`.
     let _owner_lock = own_workspace(&workspace_path).await?;
+    // Eager, so the CLI is fixed before the first spawn and a publish minutes
+    // later cannot give subprocesses a newer CLI than this engine.
+    lucidos_engine::runtime::lucidos_cli::pin_cli_for_workspace(&workspace_path, launched_as);
     // Resolved now, while the workspace path is at hand, and bound only once
     // the router can answer: a socket bound early would queue the gateway's
     // requests against an engine still booting, instead of refusing them.
@@ -650,6 +734,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `apply_to_process_env` below, so a value the user stored in Settings
     // still wins.
     lucidos_engine::memory::apply_default_cache_dir(&workspace_path);
+
+    // Every price the engine reads merges this workspace's override.
+    lucidos_engine::llm::model_prices::read_overrides_from(workspace_path.clone());
 
     // Upgrade a legacy `apis.json` to the pipeline shape. Idempotent, and it
     // writes a backup first. NOT fatal: an `Err` here is the filesystem or
@@ -751,17 +838,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     log!("[Startup] Using default model: {}", model);
 
-    // Shared model→provider routing map. Populated from the DB below for real
-    // providers; left empty for mock. Cloned into RoutingProvider and handed to
-    // the engine so the reload subscriber can hot-swap it on Model* events.
+    // Shared model→provider routing map. The engine loads it after migrations
+    // and hands it to the reload subscriber, which hot-swaps it on Model* events.
     let model_registry = lucidos_engine::llm::model_registry::empty();
 
-    // Built through `llm::build_active_provider`, so this boot path and the
-    // runtime credential subscriber produce an identical provider. The decision
-    // matrix itself lives in `llm::select_provider`, which is unit-tested.
-    //
-    // Once a provider is configured, the credential subscriber swaps it in
-    // without a restart, and a later boot finds it here.
+    // The engine builds the provider from these inputs once the secret store
+    // key loads, since a stored provider key is sealed (ADR 0509). The runtime
+    // credential subscriber rebuilds from the same inputs.
     let model_is_mock = model == lucidos_engine::llm::MOCK_MODEL;
     let boot_without_provider = lucidos_engine::llm::boot_without_provider_enabled();
 
@@ -785,72 +868,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         && !project_id.is_empty())
     .then(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
 
-    // One throwaway pool for the initial registry load and provider build: the
-    // engine's own pool does not exist until `LucidosEngine::new` below. `None`
-    // degrades to env-only providers and an empty registry.
-    let boot_pool = if model_is_mock {
-        None
-    } else {
-        match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(std::time::Duration::from_secs(5))
-            .connect(&database_url)
-            .await
-        {
-            Ok(p) => Some(p),
-            Err(e) => {
-                log!(
-                    "[Startup] Could not open pool for direct-provider credentials / model registry: {}",
-                    e
-                );
-                None
-            }
-        }
-    };
-    if let Some(pool) = &boot_pool {
-        lucidos_engine::llm::model_registry::reload(&model_registry, pool).await;
-    }
-
     let provider_ctx = ProviderBuildContext {
         default_model: model,
         model_is_mock,
-        vertex_project_id: project_id.clone(),
-        vertex_location: vertex_region.clone(),
-        vertex_token_cache: vertex_token_cache.clone(),
-        model_registry: model_registry.clone(),
+        vertex_project_id: project_id,
+        vertex_location: vertex_region,
+        vertex_token_cache,
+        model_registry,
+        // The engine seeds it from the events once its migrations have run.
+        not_served: Default::default(),
         boot_without_provider,
+        // No event bus yet, so no gateway access. The engine rebuilds
+        // with one once it has a bus.
+        claude_gateway_access: None,
     };
-    let (llm, web_search) = match build_active_provider(boot_pool.as_ref(), &provider_ctx).await? {
-        ProviderBuildOutcome::Install {
-            llm,
-            web_search,
-            selection,
-        } => {
-            log!("[Startup] LLM provider installed: {:?}", selection);
-            (llm, web_search)
-        }
-        ProviderBuildOutcome::FailFast => {
-            panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter / xAI credential (Settings → Models → Providers) or OPENAI_API_KEY / ANTHROPIC_API_KEY / LUCIDOS_OPENROUTER_API_KEY / LUCIDOS_XAI_API_KEY, set a local OpenAI-compatible base URL (Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL), turn on the keyless OpenCode Free tier (Settings → Models → Providers or LUCIDOS_OPENCODE_FREE=1), LUCIDOS_BOOT_WITHOUT_PROVIDER=1 (boot into provider onboarding), or LUCIDOS_MODEL=mock (for testing).");
-        }
-    };
-    drop(boot_pool);
 
     // Deliberately NO catch-all boot-failure report here. A reported failure is
     // terminal and stops the gateway respawning, while construction fails for
     // plenty of transient reasons the supervisor's retry recovers from. Only a
     // CLASSIFIED-terminal failure reports, from the site that can classify it:
     // see `boot_failure::terminal_migration_message`.
-    let engine = LucidosEngine::new(
-        workspace_path.clone(),
-        &database_url,
-        llm,
-        web_search,
-        project_id,
-        vertex_region,
-        vertex_token_cache,
-        model_registry,
-    )
-    .await?;
+    let engine = LucidosEngine::new(workspace_path.clone(), &database_url, provider_ctx).await?;
     log!("[Startup] PostgreSQL connected");
     boot_stages.lap("engine setup");
 
@@ -873,6 +911,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     lucidos_engine::core::PreferenceStore::replace_retired_values(engine.pool(), &engine.event_bus)
         .await;
+    engine.upgrade_chat_ladder_from_enabled().await;
     // Apply stored env vars to the engine's OWN process env, so every
     // engine-internal shell-out that inherits it sees them. Runs after the
     // migration, so just-migrated vars are included. Reserved names are
@@ -1157,9 +1196,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     boot_stages.lap("summary resets");
 
     // Before recovery spawns a session that writes a new one.
-    lucidos_engine::runtime::claude_code::sweep_stale_system_prompt_files(
-        shared_engine.workspace_path(),
-    );
+    lucidos_engine::runtime::claude_code::sweep_stale_session_files(shared_engine.workspace_path());
 
     // Recover worktrees whose in-flight session an engine crash interrupted. An
     // idle session stays idle, shown in the waiting UI for the user to act on.

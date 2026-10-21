@@ -147,7 +147,21 @@ Fixes, in order of preference:
 1. **Inline the env var on the same line as the command**: `GWS_CONFIG_DIR=/Users/me/.config/gws-work gws calendar list`. For `cd`, chain in one call: `cd /some/dir && ./run.sh`.
 2. **Same value across all calls in the workspace?** Define an **environment variable** (next section), so every subprocess inherits it.
 
-Exception: the engine injects `CRED_*`, `OAUTH_*_ACCESS_TOKEN`, `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL` into every subprocess, so each fresh call has them.
+Exception: the engine sets `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL` in every subprocess, so each fresh call has them. Credentials are set per call, by name (next section).
+
+## Credentials in subprocesses: name what you use
+
+`run_bash`, `run_bash_background`, `run_python`, `run_python_background` and scheduled scripts get a credential's variable **only when their own text names it**. That is a *secret mention*: the variable as a whole word, in the command or code, or in a workspace `.py` / `.sh` file the command runs.
+
+- **A script that reads `os.environ["CRED_GITHUB"]` works as is.** `python data/triggers/watch/fetch.py` gets what `fetch.py` names, with no edit to the command. The `.py` / `.sh` files beside it count too, so a `run.sh` calling `python3 fetch.py` works. A module imported from another directory does not: name its variables in the header comment below.
+- **One mention sets the whole credential.** Naming `CRED_MAIL_USERNAME` also sets `CRED_MAIL_PASSWORD`.
+- **A custom alias needs naming too.** A tool that reads `GITHUB_TOKEN` by itself, like `gh`, gets it from `gh pr list  # GITHUB_TOKEN`.
+- **A name built at run time** needs a header comment: `# lucidos-credentials: CRED_A CRED_B`.
+- **`OAUTH_<PROVIDER>_ACCESS_TOKEN`** follows the same rule. Only a named account is refreshed.
+- **To see the names**, run `lucidos credentials list`. `env | grep CRED_` finds nothing, because a bare `CRED_` names no credential. The result carries a note listing the names instead.
+- **An unknown name still runs.** The result carries the same note, with names only, never values.
+
+Every subprocess output is masked: an injected value, a token in the engine's own environment, and well-known token shapes such as `ghp_…` come back as `[REDACTED]`. A token in the shell that started the engine never reaches a chat tool's environment. To use one there, store it as a credential.
 
 ## The workspace database: `LUCIDOS_DATABASE_URL`
 
@@ -163,6 +177,7 @@ conn = psycopg.connect(os.environ["LUCIDOS_DATABASE_URL"])
 ```
 
 - **It is read-only by default.** Every transaction opens read-only, so an accidental `DROP`, `DELETE` or `CREATE` fails with `cannot execute … in a read-only transaction`. A deliberate write opts in per transaction: `BEGIN READ WRITE; …; COMMIT;`.
+- **It cannot read stored secrets.** It signs in as an agent role with no access to secret columns, such as `credentials.auth_value` or OAuth tokens. A query naming one fails with `permission denied`. Reach a secret through its `CRED_*` variable or the proxy instead. Every other column reads as usual.
 - **Never put the URL or a password on the command line.** The command is recorded in the tool call. Naming the variable keeps the password out, and tool output masks the URL's value.
 - **Bare `psql` reaches nothing.** The engine sets no `PGHOST` / `PGUSER` / `PGDATABASE` defaults and passes on no `DATABASE_URL` of its own. So an unset variable, as in `psql "$STAGING_URL"`, fails instead of landing on the workspace database.
 - **A project's own database is yours to configure.** Set its `DATABASE_URL` or `PG*` names as environment variables (next section); the engine no longer reserves them.
@@ -173,7 +188,7 @@ For environment that must be the **same for every subprocess in this workspace**
 
 - **You (the agent) can list, set and delete them** with the grouped `env_vars` tool (`action: list | set | delete`; `set`/`delete` take `name`, `set` also `value`). The retired `set_environment_variable` name still works as an alias for `set`. The user can also edit them in Settings. Changes take effect on the **next** tool call or agent turn, with **no engine restart**.
   - Exception: the engine's *own* shell-outs read their vars at startup. For example, the Apply-time `git push` uses `GIT_SSH_COMMAND` / `GH_CONFIG_DIR`. A change reaches the engine's own git on the next restart. Tool and agent subprocesses see it immediately.
-- **Non-secret only.** Values appear in logs, the event store and tool-call payloads, by design. For API keys, tokens or passwords use a **credential** (`request_credential`). It is injected as `CRED_<NAME>` and kept out of the event log.
+- **Non-secret only.** Values appear in logs, the event store and tool-call payloads, by design. For API keys, tokens or passwords use a **credential** (`request_credential`). A call that names `CRED_<NAME>` gets it, and output masks its value.
 - **Names** are uppercase letters, digits and underscores, not starting with a digit (e.g. `CLAUDE_CODE_USE_VERTEX`, `LUCIDOS_REPO`). Engine-owned names (`CRED_*`, `OAUTH_*`, `PATH`, internal `LUCIDOS_*` like `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL`) are rejected. Engine-owned vars always win a collision.
 
 The main use is **per-workspace identity**: a `gh` config dir, a Google `gws` config dir and project id, an SSH command. Then `gh` / `git push` from agent subprocesses authenticate as the right account:
@@ -189,7 +204,7 @@ Setup is **partly interactive**. You can set the variables, but the user must co
 2. For SSH push, make sure the key referenced by `GIT_SSH_COMMAND` is registered on that GitHub account.
 3. Set `GH_CONFIG_DIR` and `GIT_SSH_COMMAND` with the `env_vars` tool (`action: set`), or in Settings → System → Environment variables.
 
-**Want a credential's secret under a specific env var name?** Give the credential a custom env var name, for a CLI or SDK that expects an exact variable. Its secret then also injects as e.g. `GITHUB_TOKEN`, and the default `CRED_<NAME>` still works. Set it two ways:
+**Want a credential's secret under a specific env var name?** Give the credential a custom env var name, for a CLI or SDK that expects an exact variable. Its secret then also injects as e.g. `GITHUB_TOKEN`, and the default `CRED_<NAME>` still works. A call gets it only when it names the alias or `CRED_<NAME>`. Set it two ways:
 
 - In the credential editor (Settings → credential editor).
 - Up front, when the agent requests the credential. `request_credential` takes an optional `env_var_name` arg that pre-fills the modal's "Env var name" field. The user can still edit or clear it before saving.
@@ -199,6 +214,12 @@ The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_
 **An auth handshake script never gets the custom name.** It receives only `CRED_*` and `OAUTH_*` names, so it reads `CRED_<NAME>`. See `building-an-auth-handshake`.
 
 **A credential names every host it may be sent to.** Its Base URLs field is a set, one row per hostname, and the secret is refused at any host outside it. So a provider with API, clone and download traffic on different hostnames takes **one** credential naming all of them. Nothing is inferred from a hostname's spelling: name each in full. `request_credential` takes the whole set in `base_urls`. Asking for a host an existing credential does not cover reopens that credential, so the user never types the same secret twice.
+
+**A secret can stay in 1Password.** Any secret field in the credential editor has a **From 1Password** toggle. On, the field takes a *secret reference* (`op://vault/item/field`) instead of the value. Lucidos reads it through the `op` tool with a service account token, set up under **Settings → Accounts → 1Password**. You cannot see or set the token.
+
+Nothing changes for a script or app: it still names `CRED_<NAME>` or calls the proxy. When the value cannot be read, the call fails or the variable is left out, and the result says why. Point the user at 1Password or that Settings section, not at the script.
+
+**Every secret the user enters is a credential.** A mailbox password is the `email_password` credential. A secret MCP server env value belongs in a credential too: `setup_mcp_server` takes `{"credential": "<name>"}` as that variable's value. Removing the server deletes a credential named `mcp-<server id>-<VAR>` that no other server names. A credential with any other name stays.
 
 The legacy `data/.env` file is retired. On the next engine startup, any existing `data/.env` moves into the environment-variables store and the file is removed.
 
@@ -237,4 +258,5 @@ Every image a user pastes (and every image you generate) has two addresses. `img
 - **Recent images are already in your vision**: you can see and describe them natively, so just answer.
 - **Older images age out of your vision** after a few newer messages, so stale screenshots don't mislead you in long threads. The history then shows only a text note like `[attached image (thread:2, img-0123456789abcdef, 2h ago, image not included, may be outdated)]` plus the saved description.
 - **To see an aged-out image again, call `view_image`** with its handle, e.g. `view_image(image: "img-0123456789abcdef")`. It reloads the actual pixels into your vision. **When the user refers to an earlier image you cannot see, call `view_image`.** Never reply that there is no image, and never ask them to re-send it. Take the address from the history's image notes.
+- **`[Image not sent: <model> does not read images. …]` means this model is text-only.** Its vision flag is off, so no image reaches it, `view_image` included. Answer from the saved description. If that is not enough, say so, and point the user at the model's vision flag in Settings → Models.
 - **To keep an image** as a file, use `save_thread_image(image: "img-<hex>", path: "...")` (writes under `data/artifacts/`, git-committed). **To edit or restyle an image**, use `generate_image` with `input_images: ["img-<hex>"]`. To view an image *file* already under `data/artifacts/`, use `read_file`, not `view_image`.

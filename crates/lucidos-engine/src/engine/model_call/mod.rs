@@ -20,7 +20,8 @@
 mod capture;
 
 pub(crate) use capture::{
-    auxiliary_capture, usage_from_provider, usage_from_response, AuxCapture, CallDetail,
+    auxiliary_capture, model_call_failed, usage_from_provider, usage_from_response, AuxCapture,
+    CallDetail,
 };
 
 use crate::engine::event_bus::{BusEvent, EventBus};
@@ -28,7 +29,7 @@ use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::{ApiUsage, ContextProducer, ContextPurpose};
 use crate::llm::image::{ImageProvider, ImageResult, ImageSize};
 use crate::llm::judgment::{Judgment, JudgmentProvider, Question};
-use crate::llm::metered::{self, CallCost, CostSink, Reported};
+use crate::llm::metered::{self, CallCost, CallFailed, CostSink, Reported};
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
 };
@@ -39,7 +40,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 impl AuxCapture {
     /// Make one chat call and record what it cost, with the tier and time it
-    /// took. A failed call reported nothing, so it records nothing.
+    /// took. A failed call records a `ModelCallFailed`, never a capture.
     pub(crate) async fn chat<P: LlmProvider + ?Sized>(
         &self,
         provider: &P,
@@ -104,11 +105,17 @@ impl AuxCapture {
 /// Make the agent's own chat call for one round of a turn.
 ///
 /// Returns the response and its [`TurnCapture`], which the loop finishes with
-/// the round's context sections once its repairs have run.
+/// the round's context sections once its repairs have run. A failed call
+/// records a `ModelCallFailed` instead. Both rows carry `meta`, so each keeps
+/// the turn's `request_event_id`. `round` counts from 1. Only round 1 keeps
+/// the stable-prefix fingerprint, since every later round of the turn sends
+/// the same prefix.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn turn_chat(
     bus: &EventBus,
     thread_id: Uuid,
+    meta: EventMeta,
+    round: usize,
     provider: &dyn LlmProvider,
     messages: Vec<Message>,
     tools: Vec<ToolDefinition>,
@@ -116,7 +123,7 @@ pub(crate) async fn turn_chat(
     system_prompt: Option<&str>,
     on_token: Option<TokenCallback>,
 ) -> Result<(LlmResponse, TurnCapture), BoxError> {
-    let slot = TurnSlot::default();
+    let slot = TurnSlot::new(bus, thread_id, meta.clone());
     // The turn's row sizes itself from its context sections, so the size
     // the call reports is not read.
     let response = metered::chat(
@@ -130,45 +137,82 @@ pub(crate) async fn turn_chat(
         on_token,
     )
     .await?;
-    let TurnCall {
-        model,
-        usage,
-        served_model,
-    } = slot.0.into_inner().unwrap_or_else(|p| p.into_inner());
+    let TurnCall { model, mut report } = slot.call.into_inner().unwrap_or_else(|p| p.into_inner());
+    if round != 1 {
+        report.stable_prefix_fingerprint = None;
+    }
     let capture = TurnCapture {
         bus: bus.clone(),
         thread_id,
+        meta,
         model,
-        usage,
-        served_model,
-        finished: false,
+        report: Some(report),
     };
     Ok((response, capture))
 }
 
-/// What a turn's call reported, held until [`TurnCapture`] records it.
 #[derive(Default)]
 struct TurnCall {
     model: String,
-    usage: Option<ApiUsage>,
-    served_model: Option<String>,
+    report: TurnReport,
 }
 
+/// What a turn's call reported, held until [`TurnCapture`] records it.
 #[derive(Default)]
-struct TurnSlot(std::sync::Mutex<TurnCall>);
+pub(crate) struct TurnReport {
+    pub(crate) usage: Option<ApiUsage>,
+    pub(crate) detail: CallDetail,
+    pub(crate) stable_prefix_fingerprint: Option<String>,
+}
+
+/// Holds what a turn round's call reported, and records the call if it fails.
+struct TurnSlot {
+    bus: EventBus,
+    thread_id: Uuid,
+    meta: EventMeta,
+    call: std::sync::Mutex<TurnCall>,
+}
+
+impl TurnSlot {
+    fn new(bus: &EventBus, thread_id: Uuid, meta: EventMeta) -> Self {
+        Self {
+            bus: bus.clone(),
+            thread_id,
+            meta,
+            call: std::sync::Mutex::default(),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl CostSink for TurnSlot {
     async fn record(&self, cost: CallCost<'_>) {
-        let usage = match cost.reported {
-            Reported::Chat(response) => usage_from_response(response),
+        let response = match cost.reported {
+            Reported::Chat(response) => Some(response),
             _ => None,
         };
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = TurnCall {
+        *self.call.lock().unwrap_or_else(|p| p.into_inner()) = TurnCall {
             model: cost.model.to_string(),
-            usage,
-            served_model: cost.reported.served_model().map(str::to_string),
+            report: TurnReport {
+                usage: response.and_then(usage_from_response),
+                detail: CallDetail::of(&cost),
+                stable_prefix_fingerprint: response
+                    .and_then(|response| response.stable_prefix_fingerprint.clone()),
+            },
         };
+    }
+
+    async fn record_failure(&self, failed: CallFailed<'_>) {
+        self.bus
+            .emit_or_log(
+                BusEvent::Thread {
+                    thread_id: self.thread_id,
+                    event: model_call_failed(ContextPurpose::Turn, &failed),
+                    meta: self.meta.clone(),
+                },
+                "[ModelCall] ModelCallFailed",
+            )
+            .await;
     }
 }
 
@@ -180,34 +224,29 @@ impl CostSink for TurnSlot {
 pub(crate) struct TurnCapture {
     bus: EventBus,
     thread_id: Uuid,
+    /// The turn's meta, which the finished row and the `Drop` fallback carry.
+    meta: EventMeta,
     model: String,
-    usage: Option<ApiUsage>,
-    served_model: Option<String>,
-    finished: bool,
+    /// Taken by whichever records the row: [`Self::finish`] or `Drop`.
+    report: Option<TurnReport>,
 }
 
 impl TurnCapture {
     /// What the provider reported for this round.
     pub(crate) fn usage(&self) -> Option<ApiUsage> {
-        self.usage
+        self.report.as_ref().and_then(|report| report.usage)
     }
 
-    /// Emit the round's row. `build` receives the usage the provider reported
-    /// and the *served model* its reply named, and returns the
-    /// `ContextCaptured` to persist.
-    pub(crate) async fn finish(
-        mut self,
-        meta: EventMeta,
-        build: impl FnOnce(Option<ApiUsage>, Option<String>) -> ThreadEvent,
-    ) {
-        self.finished = true;
-        let event = build(self.usage.take(), self.served_model.take());
+    /// Emit the round's row. `build` receives what the call reported and
+    /// returns the `ContextCaptured` to persist.
+    pub(crate) async fn finish(mut self, build: impl FnOnce(TurnReport) -> ThreadEvent) {
+        let event = build(self.report.take().unwrap_or_default());
         self.bus
             .emit_or_log(
                 BusEvent::Thread {
                     thread_id: self.thread_id,
                     event,
-                    meta,
+                    meta: self.meta.clone(),
                 },
                 "[AgenticLoop] ContextCaptured",
             )
@@ -217,15 +256,16 @@ impl TurnCapture {
 
 impl Drop for TurnCapture {
     fn drop(&mut self) {
-        if self.finished {
+        let Some(report) = self.report.take() else {
             return;
-        }
+        };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             crate::log!("[ModelCall] A turn row was dropped with no runtime to record it");
             return;
         };
         let bus = self.bus.clone();
         let thread_id = self.thread_id;
+        let meta = self.meta.clone();
         let event = ThreadEvent::ContextCaptured {
             producer: ContextProducer::MainLlm,
             model: std::mem::take(&mut self.model),
@@ -233,23 +273,28 @@ impl Drop for TurnCapture {
             sections: Vec::new(),
             tools: Vec::new(),
             estimated_total_tokens: 0,
-            usage: self.usage.take(),
+            usage: report.usage,
             trimmed: false,
             trim_passes: Vec::new(),
             purpose: ContextPurpose::Turn,
             reconstructed: false,
             parent_tool_use_id: None,
             api_call_id: None,
-            reasoning_effort: None,
-            duration_ms: None,
-            served_model: self.served_model.take(),
+            reasoning_effort: report.detail.reasoning_effort,
+            duration_ms: report.detail.duration_ms,
+            served_model: report.detail.served_model,
+            provider: report.detail.provider,
+            // The round is unknown here, and only round 1 carries one.
+            stable_prefix_fingerprint: None,
+            ttft_ms: report.detail.ttft_ms,
+            request_id: report.detail.request_id,
         };
         runtime.spawn(async move {
             bus.emit_or_log(
                 BusEvent::Thread {
                     thread_id,
                     event,
-                    meta: EventMeta::NONE,
+                    meta,
                 },
                 "[ModelCall] unfinished turn row",
             )

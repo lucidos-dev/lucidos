@@ -177,7 +177,9 @@ The header bar is fully tunable:
   two stops to one colour, often `--bg-primary`.
 - **Dark text on a light bar:** set `--header-fg` to a dark colour.
   `--header-fg-muted` and the control veils follow it.
-- **Lines between pane headers:** set `--header-divider` to a colour.
+- **One seamless bar, no lines between pane headers:** set `--header-divider`
+  to `transparent`. By default it takes `--border-color`, so each pane divider
+  runs unbroken to the window top.
 - **A patterned bar:** set `--header-gradient` to a pattern, such as a
   `repeating-linear-gradient`. Setting it sets `--titlebar-strip-continues` to
   1, so on macOS the pattern runs on up through the title-bar band, lined up.
@@ -201,8 +203,8 @@ marks sets them, for example `"--claude-mark": "var(--accent)"`.
 ## Theme parts
 
 A *theme part* is a named region of the UI that a theme may style with capped
-paint-only properties, such as a glow on chat text or wider letter-spacing on
-header titles. The theme names the part and the property. It never writes a
+paint-only properties, such as a glow on chat text, wider letter-spacing on
+header titles or semibold titles in the thread drawer. The theme names the part and the property. It never writes a
 selector: Lucidos owns every selector.
 
 ```json
@@ -251,6 +253,7 @@ refusal names the field, the rule and the limit, for example
 | `actor-icon` | The Lucidos, Claude and Codex marks beside a message. The Brand marks tokens colour them; this part adds a glow. | `filter` |
 | `header-icon` | The glyphs on the icon buttons in a pane's header. Their colour follows --header-fg-muted. | `filter` |
 | `header-title` | Pane, thread and workspace titles in the header. Their colour follows --header-fg. | `text-shadow`, `letter-spacing` |
+| `drawer-title` | Thread titles in the thread drawer. A heavier weight wraps a long title sooner, and the row grows with it. | `font-weight` |
 | `composer` | The box around the message you type in chat. It can overlap scrolled messages, so it takes inset shadows only. | `background-color`, `border-color`, `box-shadow` |
 | `composer-text` | The text you type in the composer. `caret-shape` is native in Chromium and drawn by Lucidos elsewhere. | `color`, `caret-color`, `caret-shape`, `text-shadow`, `letter-spacing` |
 | `card` | The bordered blocks a step shows: tool output, its result and its reasoning. | `border-style`, `border-width`, `border-color` |
@@ -271,6 +274,7 @@ links and code blocks unless the theme sets them apart.
 | `box-shadow` | `none`, or 1 or 2 layers of `[inset] <x> <y> <blur> [<spread>] <colour>` | `px` only; x and y within ±4px; blur 0 to 16px; spread within ±2px. The composer takes `inset` only. |
 | `filter` | `none`, or one `drop-shadow(<x> <y> <blur> <colour>)` | `px` only; x and y within ±2px; blur 0 to 6px |
 | `letter-spacing` | `normal`, or a length | `em` only; −0.02em to 0.12em |
+| `font-weight` | `normal`, or a number | no unit; 400 to 600. Write it as a string, `"600"`, never the number 600. |
 | `caret-shape` | `auto`, `bar`, `block` or `underscore` | none |
 | `border-style` | `solid` or `double` | none |
 | `border-width` | a length | `px` only; 1px to 4px |
@@ -305,7 +309,7 @@ glow sized in `rem` or `px` compiles as `em`. A new theme sets the parts instead
 The device-scoped `theme-effects` preference decides whether part shadows,
 filters and scanlines show. `reduce` drops every part `text-shadow`,
 `box-shadow` and `filter` and the screen's scanlines. It keeps part colours,
-letter-spacing, the caret shape and borders. `system`, the default, drops them
+letter-spacing, font-weight, the caret shape and borders. `system`, the default, drops them
 when the OS asks for more contrast or less transparency. `full` always shows
 them.
 
@@ -515,7 +519,7 @@ The bar across the top of every pane: its fill, its foreground, badges and contr
 | `--header-control-veil-hover` | How much header text colour a control mixes in under the pointer. |  |
 | `--header-control-veil-active` | The veil of a header control that is toggled on. |  |
 | `--header-control-veil-active-hover` | The veil of a toggled-on control under the pointer. |  |
-| `--header-divider` | The line between pane headers. Transparent by default, for one seamless bar. |  |
+| `--header-divider` | The line between pane headers. By default the pane divider colour, so each divider runs unbroken to the window top. |  |
 | `--header-badge-bg` | The fill of a count badge on the header. | `--accent`, `--bg-primary`, `--text-primary` |
 | `--header-badge-fg` | The text of a count badge on the header. | `--accent`, `--bg-primary`, `--text-primary` |
 

@@ -11,12 +11,17 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  LATE_JOIN_STALL_AFTER_MS,
   openEventStream,
   postPong,
   sharedWorkerAvailable,
+  startLiveness,
+  STREAM_STALL_AFTER_MS,
   type EventStreamTargets,
   type PongAnswer,
+  type StreamDrop,
 } from './eventStream';
+import { SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL_MS } from './generated/engine-constants';
 
 const TARGETS: EventStreamTargets = {
   streamUrl: 'http://test/api/v1/events',
@@ -90,8 +95,16 @@ describe('openEventStream', () => {
     onopen: (() => void) | null = null;
     onerror: (() => void) | null = null;
     closed = false;
+    private named = new Map<string, () => void>();
     constructor(public url: string) {
       FakeEventSource.last = this;
+    }
+    addEventListener(type: string, listener: () => void) {
+      this.named.set(type, listener);
+    }
+    /** Deliver a named SSE event, as the browser does for `event: <type>`. */
+    emit(type: string) {
+      this.named.get(type)?.();
     }
     close() {
       this.closed = true;
@@ -274,5 +287,230 @@ describe('openEventStream', () => {
       notificationId: 'n-1',
       answer: ANSWER,
     });
+  });
+});
+
+describe('startLiveness', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('calls back once, with the silence length, when nothing arrives', () => {
+    const onStall = vi.fn();
+    startLiveness(onStall, 1000);
+
+    vi.advanceTimersByTime(999);
+    expect(onStall).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(onStall).toHaveBeenCalledExactlyOnceWith(1000);
+    vi.advanceTimersByTime(10_000);
+    expect(onStall).toHaveBeenCalledOnce();
+  });
+
+  it('is pushed back by every touch', () => {
+    const onStall = vi.fn();
+    const liveness = startLiveness(onStall, 1000);
+
+    for (let i = 0; i < 5; i++) {
+      vi.advanceTimersByTime(900);
+      liveness.touch();
+    }
+    expect(onStall).not.toHaveBeenCalled();
+    expect(liveness.silentMs()).toBe(0);
+  });
+
+  it('stays quiet once stopped', () => {
+    const onStall = vi.fn();
+    startLiveness(onStall, 1000).stop();
+
+    vi.advanceTimersByTime(5000);
+    expect(onStall).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The direct transport's watchdog. A stream that goes quiet without erroring,
+ * a half-open connection after a phone sleeps, must still reach `onError`.
+ */
+describe('direct stream watchdog', () => {
+  class WatchedEventSource {
+    static last: WatchedEventSource | null = null;
+    onmessage: ((e: MessageEvent) => void) | null = null;
+    onopen: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    closed = false;
+    private named = new Map<string, () => void>();
+    constructor(public url: string) {
+      WatchedEventSource.last = this;
+    }
+    addEventListener(type: string, listener: () => void) {
+      this.named.set(type, listener);
+    }
+    emit(type: string) {
+      this.named.get(type)?.();
+    }
+    close() {
+      this.closed = true;
+    }
+  }
+
+  const open = () => {
+    const frames: string[] = [];
+    const drops: StreamDrop[] = [];
+    const stream = openEventStream(
+      TARGETS,
+      {
+        onFrame: (d) => frames.push(d),
+        onOpen: () => {},
+        onError: (drop) => drops.push(drop),
+      },
+      { pongs: false },
+    );
+    return { frames, drops, stream, es: WatchedEventSource.last! };
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('SharedWorker', undefined);
+    vi.stubGlobal('EventSource', WatchedEventSource);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('closes and reports a stall once nothing has arrived for two intervals and slack', () => {
+    const { drops, es } = open();
+
+    vi.advanceTimersByTime(STREAM_STALL_AFTER_MS - 1);
+    expect(drops).toEqual([]);
+    vi.advanceTimersByTime(1);
+
+    expect(es.closed).toBe(true);
+    expect(drops).toEqual([
+      { reason: 'stalled', silentMs: STREAM_STALL_AFTER_MS, transport: 'direct' },
+    ]);
+  });
+
+  it('stays open indefinitely while keepalives arrive on time', () => {
+    const { drops, es } = open();
+
+    for (let i = 0; i < 20; i++) {
+      vi.advanceTimersByTime(SSE_KEEPALIVE_INTERVAL_MS);
+      es.emit(SSE_KEEPALIVE_EVENT);
+    }
+
+    expect(es.closed).toBe(false);
+    expect(drops).toEqual([]);
+  });
+
+  it('counts a frame as life too', () => {
+    const { drops, es } = open();
+
+    vi.advanceTimersByTime(STREAM_STALL_AFTER_MS - 1);
+    es.onmessage!({ data: '{"type":"X"}' } as MessageEvent);
+    vi.advanceTimersByTime(STREAM_STALL_AFTER_MS - 1);
+
+    expect(drops).toEqual([]);
+  });
+
+  it('never hands a keepalive to the frame consumer', () => {
+    const { frames, es } = open();
+
+    es.emit(SSE_KEEPALIVE_EVENT);
+
+    expect(frames).toEqual([]);
+  });
+
+  it('reports an error with no stall reason', () => {
+    const { drops, es } = open();
+
+    es.onerror!();
+
+    expect(drops).toEqual([{ reason: 'error' }]);
+  });
+
+  it('stops watching once closed', () => {
+    const { drops, stream } = open();
+
+    stream.close();
+    vi.advanceTimersByTime(STREAM_STALL_AFTER_MS * 2);
+
+    expect(drops).toEqual([]);
+  });
+
+  it('revalidates as live until one keepalive and slack of silence', () => {
+    const { stream } = open();
+
+    vi.advanceTimersByTime(LATE_JOIN_STALL_AFTER_MS - 1);
+
+    expect(stream.revalidate()).toBe('live');
+  });
+
+  it('revalidates as stale once silent for the late-join threshold', () => {
+    const { stream } = open();
+
+    vi.advanceTimersByTime(LATE_JOIN_STALL_AFTER_MS);
+
+    expect(stream.revalidate()).toBe('stale');
+  });
+
+  it('revalidates as live again after a keepalive', () => {
+    const { stream, es } = open();
+
+    vi.advanceTimersByTime(LATE_JOIN_STALL_AFTER_MS);
+    es.emit(SSE_KEEPALIVE_EVENT);
+
+    expect(stream.revalidate()).toBe('live');
+  });
+
+  it('revalidating never closes the stream', () => {
+    const { stream, es } = open();
+
+    stream.revalidate();
+
+    expect(es.closed).toBe(false);
+  });
+});
+
+describe('shared stream revalidate', () => {
+  it('asks the worker to check its upstream and reports the check as pending', () => {
+    const port = {
+      postMessage: vi.fn(),
+      close: vi.fn(),
+      start: vi.fn(),
+      onmessage: null as unknown,
+    };
+    vi.stubGlobal('SharedWorker', class { port = port; });
+
+    const stream = openEventStream(TARGETS, NO_OP_HANDLERS, { pongs: false });
+
+    expect(stream.revalidate()).toBe('checking');
+    expect(port.postMessage).toHaveBeenLastCalledWith({ t: 'check' });
+    vi.unstubAllGlobals();
+  });
+});
+
+describe('shared stream drop', () => {
+  it('relays a worker stall as a shared stall, and a bare error as an error', () => {
+    const port = {
+      postMessage: vi.fn(),
+      close: vi.fn(),
+      start: vi.fn(),
+      onmessage: null as unknown,
+    };
+    vi.stubGlobal('SharedWorker', class { port = port; });
+    const drops: StreamDrop[] = [];
+
+    openEventStream(TARGETS, { ...NO_OP_HANDLERS, onError: (d) => drops.push(d) }, { pongs: false });
+    const onmessage = port.onmessage as unknown as (e: { data: unknown }) => void;
+    onmessage({ data: { t: 'error', silentMs: 65_000 } });
+    onmessage({ data: { t: 'error' } });
+
+    expect(drops).toEqual([
+      { reason: 'stalled', silentMs: 65_000, transport: 'shared' },
+      { reason: 'error' },
+    ]);
+    vi.unstubAllGlobals();
   });
 });

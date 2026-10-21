@@ -41,6 +41,7 @@ class FakeEventSource {
   constructor(public readonly url: string) {
     FakeEventSource.last = this;
   }
+  addEventListener(): void {}
   close(): void {}
 }
 
@@ -68,6 +69,7 @@ describe('lucidos.sse dispatch', () => {
   it('a listener that throws costs no other listener its frame', () => {
     const after = vi.fn();
     const wildcard = vi.fn();
+    const watchdogOnly = vi.getTimerCount();
     const offs = [
       sse.on('PreferencesChanged', () => { throw new Error('app bug'); }),
       sse.on('PreferencesChanged', after),
@@ -77,7 +79,7 @@ describe('lucidos.sse dispatch', () => {
     expect(after).toHaveBeenCalledWith({ key: 'theme' }, expect.anything());
     expect(wildcard).toHaveBeenCalledOnce();
     // Rethrown on its own task, so the console still reports it.
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(watchdogOnly + 1);
     for (const off of offs) off();
   });
 
@@ -295,10 +297,11 @@ describe('lucidos.sse.onOpen isolation', () => {
   it('a callback that throws costs no other callback its call', () => {
     const after = vi.fn();
     const offs = [sse.onOpen(() => { throw new Error('app bug'); }), sse.onOpen(after)];
+    const watchdogOnly = vi.getTimerCount();
     direct.open();
     expect(after).toHaveBeenCalledOnce();
     // Rethrown on its own task, so the console still reports it.
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(watchdogOnly + 1);
     for (const off of offs) off();
   });
 

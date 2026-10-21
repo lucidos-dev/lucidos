@@ -427,7 +427,7 @@
     .action-btn::before {
         content: '';
         position: absolute;
-        inset: -0.375rem -0.25rem;
+        inset: -0.375rem calc(-1 * var(--tap-reach-inline));
     }
 
     .action-btn {
@@ -985,8 +985,13 @@
 
     /* The title's menu holds in-place actions on the current thread, not a
        navigation. Keep it tappable while the keyboard is up, since iOS Safari
-       has no fallback click path. */
+       has no fallback click path. The dashboard button is the same kind of
+       control: it opens over the thread and leaves it where it is. */
     :root[data-keyboard-active] .mobile-thread-title-row .thread-title-menu {
+        pointer-events: auto;
+    }
+
+    :root[data-keyboard-active] .mobile-thread-title-row .dashboard-sheet-toggle {
         pointer-events: auto;
     }
 

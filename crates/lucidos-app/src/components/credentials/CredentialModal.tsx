@@ -24,7 +24,7 @@ import { getCredentialValue, getEmailAccount } from '../../api/client';
 import type { UpdateCredentialBody } from '../../api/client/settings';
 import { Dropdown } from '../shared/Dropdown';
 import { copyToClipboard } from '../../utils/clipboard';
-import { SecretInput } from '../shared/SecretInput';
+import { SecretField } from './SecretField';
 import { isMobile } from '../../utils/viewport';
 import { pickCredentialAutofocus } from './credentialAutofocus';
 import { parseSecret, buildSecret, emptyFields, type CredentialFields } from './credentialSecret';
@@ -754,43 +754,43 @@ function CredentialFormInner({
                 required={!editing}
               />
             </div>
-            <div class="form-group">
-              {/* Advisory, from the registry: the engine still derives the real
-                  client type from whether a secret was saved. But "leave it
-                  blank" is wrong advice for a provider that only issues
-                  confidential clients, and both mismatches (a secret sent by a
-                  public client, a secret-less redemption by a confidential one)
-                  are refused by the provider late, looking nothing like their
-                  cause. */}
-              <FieldLabel
-                title="Client Secret"
-                label={
-                  <>
-                    Client Secret{' '}
-                    <span class="form-hint">
-                      {expectsSecret ? '(required by this provider)' : '(optional)'}
-                    </span>
-                  </>
-                }
-              >
-                  <p>
-                    {expectsSecret
-                      ? "This provider's app registrations are confidential clients, so the "
-                        + 'secret is part of the registration rather than an extra.'
-                      : "Leave blank when the provider's app registration is a desktop or native app: "
-                        + 'Lucidos then connects as a public client using PKCE instead of a secret.'}
-                  </p>
-              </FieldLabel>
-              <SecretInput
-                inputRef={clientSecretRef}
-                defaultValue={initialFields.clientSecret}
-                placeholder={
-                  expectsSecret
-                    ? 'Paste the secret generated with the client ID'
-                    : 'Leave blank for a desktop/native app'
-                }
-              />
-            </div>
+            {/* Advisory, from the registry: the engine still derives the real
+                client type from whether a secret was saved. But "leave it
+                blank" is wrong advice for a provider that only issues
+                confidential clients, and both mismatches (a secret sent by a
+                public client, a secret-less redemption by a confidential one)
+                are refused by the provider late, looking nothing like their
+                cause. */}
+            <SecretField
+              label={
+                <FieldLabel
+                  title="Client Secret"
+                  label={
+                    <>
+                      Client Secret{' '}
+                      <span class="form-hint">
+                        {expectsSecret ? '(required by this provider)' : '(optional)'}
+                      </span>
+                    </>
+                  }
+                >
+                    <p>
+                      {expectsSecret
+                        ? "This provider's app registrations are confidential clients, so the "
+                          + 'secret is part of the registration rather than an extra.'
+                        : "Leave blank when the provider's app registration is a desktop or native app: "
+                          + 'Lucidos then connects as a public client using PKCE instead of a secret.'}
+                    </p>
+                </FieldLabel>
+              }
+              inputRef={clientSecretRef}
+              initialValue={initialFields.clientSecret}
+              placeholder={
+                expectsSecret
+                  ? 'Paste the secret generated with the client ID'
+                  : 'Leave blank for a desktop/native app'
+              }
+            />
             <details
               class="credential-oauth-endpoints"
               open={!hasPrefilledEndpoints || repairNamedEndpoints}
@@ -891,26 +891,22 @@ function CredentialFormInner({
                 required={!editing}
               />
             </div>
-            <div class="form-group">
-              <label>Password</label>
-              <SecretInput
-                inputRef={passwordRef}
-                defaultValue={initialFields.password}
-                placeholder="Enter your password"
-                required={!editing}
-              />
-            </div>
-          </>
-        ) : (
-          <div class="form-group">
-            <label>{getAuthLabel(selectedAuthType)}</label>
-            <SecretInput
-              inputRef={valueRef}
-              defaultValue={initialFields.value}
-              placeholder={getAuthPlaceholder(selectedAuthType)}
+            <SecretField
+              label={<label>Password</label>}
+              inputRef={passwordRef}
+              initialValue={initialFields.password}
+              placeholder="Enter your password"
               required={!editing}
             />
-          </div>
+          </>
+        ) : (
+          <SecretField
+            label={<label>{getAuthLabel(selectedAuthType)}</label>}
+            inputRef={valueRef}
+            initialValue={initialFields.value}
+            placeholder={getAuthPlaceholder(selectedAuthType)}
+            required={!editing}
+          />
         )}
         {editing && isSingleValue && (
           <details class="credential-oauth-endpoints">

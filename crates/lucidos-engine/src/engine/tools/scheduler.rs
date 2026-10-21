@@ -89,6 +89,43 @@ pub(crate) fn check_scheduling_tool_in_trigger(
     }
 }
 
+/// The model, reasoning effort and provider pins an `update_trigger` call sets.
+/// Each is `None` when the call leaves it alone and `Some(None)` when it goes
+/// back to the account default.
+#[derive(Debug, PartialEq)]
+struct RoutePinUpdate {
+    model: Option<Option<String>>,
+    reasoning_effort: Option<Option<String>>,
+    provider: Option<Option<String>>,
+}
+
+/// Read the three pins from `update_trigger` args. A provider pin is also
+/// cleared when the model moves without one: a pin belongs to its model.
+fn route_pin_update(
+    registry: &crate::llm::ModelRegistry,
+    existing: &crate::triggers::TriggerConfig,
+    args: &serde_json::Value,
+) -> Result<RoutePinUpdate, String> {
+    let model = args
+        .get("model")
+        .map(|v| normalize_route_setting(v.as_str()));
+    let reasoning_effort = args
+        .get("reasoning_effort")
+        .map(|v| validate_trigger_reasoning_effort(v.as_str()))
+        .transpose()?;
+    let provider = resolve_trigger_provider_update(
+        registry,
+        existing,
+        model.as_ref().map(Option::as_deref),
+        args.get("provider").map(|v| v.as_str()),
+    )?;
+    Ok(RoutePinUpdate {
+        model,
+        reasoning_effort,
+        provider,
+    })
+}
+
 impl LucidosEngine {
     pub(crate) async fn execute_scheduler_tool(
         &self,
@@ -262,6 +299,18 @@ impl LucidosEngine {
                     Ok(Some(provider)) => event_payload["provider"] = serde_json::json!(provider),
                     Ok(None) => {}
                     Err(e) => return Ok(format!("Error: {}", e)),
+                }
+                // An agent's chat pick must be a rung (ADR 0525).
+                if let Err(e) = crate::runtime::intelligence_ladder::check_agent_pick(
+                    &self.pool,
+                    &self.model_routes(),
+                    crate::runtime::intelligence_ladder::LadderSurface::Chat,
+                    event_payload["model"].as_str(),
+                    event_payload["reasoning_effort"].as_str(),
+                )
+                .await
+                {
+                    return Ok(format!("Error: {e}"));
                 }
                 let mcp_servers = match mcp_servers_arg(args.get("mcp_servers")) {
                     Ok(ids) => ids.unwrap_or_default(),
@@ -449,31 +498,34 @@ impl LucidosEngine {
                         ));
                     }
                 }
-                // model / reasoning_effort: Some(None) = clear back to the
-                // account chat default, Some(Some(s)) = set, None = absent.
-                let new_model: Option<Option<String>> = args
-                    .get("model")
-                    .map(|v| normalize_route_setting(v.as_str()));
-                let new_reasoning_effort: Option<Option<String>> =
-                    match args.get("reasoning_effort") {
-                        Some(v) => match validate_trigger_reasoning_effort(v.as_str()) {
-                            Ok(normalized) => Some(normalized),
-                            Err(e) => return Ok(format!("Error: {}", e)),
-                        },
-                        None => None,
-                    };
-                // Cleared as well when the model moves without it: a pin
-                // belongs to its model.
-                let new_provider: Option<Option<String>> = match resolve_trigger_provider_update(
-                    &self.model_registry,
-                    &existing,
-                    new_model.as_ref().map(Option::as_deref),
-                    args.get("provider").map(|v| v.as_str()),
-                ) {
-                    Ok(p) => p,
+                let RoutePinUpdate {
+                    model: new_model,
+                    reasoning_effort: new_reasoning_effort,
+                    provider: new_provider,
+                } = match route_pin_update(&self.model_registry, &existing, args) {
+                    Ok(update) => update,
                     Err(e) => return Ok(format!("Error: {}", e)),
                 };
 
+                // A changed pick must be a rung, judged as the trigger will
+                // fire on it (ADR 0525).
+                if new_model.is_some() || new_reasoning_effort.is_some() {
+                    let model = new_model.clone().unwrap_or_else(|| existing.model.clone());
+                    let effort = new_reasoning_effort
+                        .clone()
+                        .unwrap_or_else(|| existing.reasoning_effort.clone());
+                    if let Err(e) = crate::runtime::intelligence_ladder::check_agent_pick(
+                        &self.pool,
+                        &self.model_routes(),
+                        crate::runtime::intelligence_ladder::LadderSurface::Chat,
+                        model.as_deref(),
+                        effort.as_deref(),
+                    )
+                    .await
+                    {
+                        return Ok(format!("Error: {e}"));
+                    }
+                }
                 let new_mcp_servers = match mcp_servers_arg(args.get("mcp_servers")) {
                     Ok(ids) => ids,
                     Err(e) => return Ok(e),

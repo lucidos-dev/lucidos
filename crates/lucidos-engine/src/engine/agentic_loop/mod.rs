@@ -15,6 +15,10 @@ pub(crate) use helpers::*;
 #[path = "../agentic_loop_special_tool.rs"]
 mod special_tool;
 
+// The chat route tests resolve a child's route the way `run_thread` does.
+#[cfg(test)]
+pub(crate) use special_tool::sub_thread_route_overrides;
+
 #[cfg(test)]
 #[path = "../agentic_loop_unit_tests/flush.rs"]
 mod flush_unit_tests;

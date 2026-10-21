@@ -37,6 +37,8 @@ does the menu offer something useful here?
 - **An object menu is a shortcut to actions the user already has.** Making it
   the ⋯ menu itself means the two can never drift, and there is one set of
   items to test. The ⋯ stays drawn, so the context menu is never the only path.
+  A dashboard tile and a shelf widget are the exceptions: they draw no ⋯, and a
+  long press, a right-click or the keyboard's menu key opens their menu.
 - **The native text menu is OS integration we cannot rebuild.** Dictionary,
   translation, Services and spelling come from macOS. A home-made copy would be
   worse on every one of them.
@@ -62,7 +64,8 @@ dev build, and Reload within reach if the app is ever wedged.
   overridden by the chrome rule. The workspace switcher's alternate-mode row
   keeps working unchanged.
 - App iframes and preview iframes own their own right-click. A `contextmenu`
-  event does not cross a document boundary.
+  event does not cross a document boundary. Amended by ADR 0528: a widget
+  frame forwards an unclaimed right-click, so the widget menu opens.
 - WebKit selects the word under a right-click before the event fires. When the
   menu is suppressed, that selection is undone, so no stray highlight remains.
 

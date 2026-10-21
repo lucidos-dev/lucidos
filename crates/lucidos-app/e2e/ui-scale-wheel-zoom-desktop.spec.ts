@@ -19,7 +19,7 @@
  * Responsiveness is asserted by the test finishing at all. A wedged main thread
  * answers no query, so the assertion after each burst is the check. */
 import { test, expect, Page } from './fixtures';
-import { apiRequest, assertHealthy, isMobileViewport, navigateToApp, waitForEventStream } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
 
 const UI_SCALE_BUTTON = '[data-search-anchor="appearance:ui-scale"] .settings-option';
 
@@ -62,7 +62,6 @@ async function appliedScale(page: Page): Promise<string> {
 test.describe('Desktop UI-scale wheel zoom', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
-    test.skip(isMobileViewport(page), 'A wheel is a desktop input');
   });
 
   test('a pinch shorter than one notch moves nothing', async ({ page }) => {

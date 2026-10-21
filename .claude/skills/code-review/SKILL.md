@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review the current branch diff for correctness bugs plus reuse / simplification / efficiency / altitude cleanups, scaled by an effort arg (low/medium → precision, fewer high-confidence findings; high → recall-biased; xhigh/max → broader + a gap sweep). Reports findings through a structured channel (the ReportFindings tool, or an in-band array handoff for agents without it) — never pasted into chat. Repo-owned so it runs identically under Claude Code and Codex — Phase 1 of /harden drives it. Pass an effort word as the arg (default medium).
+description: Review the current branch diff for correctness bugs plus reuse, simplification, efficiency and altitude cleanups, scaled by an effort arg (low/medium: precision; high: recall-biased; xhigh/max: broader plus a gap sweep). Reports findings through the ReportFindings tool or an in-band array handoff, never pasted into chat. Repo-owned, so it runs under Claude Code and Codex; Phase 1 of /harden drives it. Pass an effort word as the arg (default medium).
 ---
 
 # code-review (Lucidos, repo-owned)

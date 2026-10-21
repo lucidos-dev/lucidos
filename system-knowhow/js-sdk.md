@@ -42,7 +42,7 @@ What each piece does (include only what you need):
 |---|---|---|
 | `<title>` | Tab title | Never: browsers require it |
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script. Sets `data-theme-mode`, `--bg-primary` and `--font-ui` on `<html>` (plus `--user-ui-scale` when set) *before* any later stylesheet evaluates. The engine resolves this device's theme mode, theme, font and scale and serves them inside the script, so the frame needs no access to the shell's storage. It stamps `?device=` onto this one `src` and adds nothing to your document. It also carries the device's Autocorrect switch, so `sdk.js` knows it before any field takes focus. It sets `data-motion` (§ Reduced motion), `data-theme-effects` (§ Theme parts) and `data-font-bold` (§ Theme variables). This removes the flash of default theme before `applyPreferences()`. **Place it as early in `<head>` as possible: before `sdk-iframe.css`, any other `<link rel="stylesheet">`, and any inline `<style>` that reads theme vars.** The inline `--bg-primary` makes `background: var(--bg-primary, …)` paint even when stylesheets load asynchronously (JS-injected, dynamic `import()`, Vite dev mode). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
-| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). With these classes your controls render like the host shell. The body is set to `--font-size-sm`, the chat prose step. Inputs and buttons get `--font-ui` at `--font-size-md`, the host's step for labels and controls. The root font-size is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Without these defaults, unsized text would read two steps larger than body. | App ships its own complete stylesheet and doesn't want Lucidos theming |
+| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). With these classes your controls render like the host shell. The body is set to `--font-size-sm`, the chat prose step. Inputs and buttons get `--font-ui` at `--font-size-md`, the host's step for labels and controls. The root font-size is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Without these defaults, unsized text would read two steps larger than body. The page never scrolls sideways: `<html>` and `<body>` clip on the x axis, and images and video cap at `max-width: 100%` (`building-an-app.md` § Responsive by default). | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance that survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
 | `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API, plus iframe-only side effects that need no call from you. **Link interceptor:** `target="_blank"` links resolve in-frame, and external `http(s)://` links go through `lucidos.ui.openExternal()`. **Shortcut forwarder:** host shortcuts (focus/hide a pane, narrow/widen, new thread, search, Escape) keep working while the app has focus. Apply and the voice call never run from an app, since an app's script could send their chords. A chord bound to a host shortcut has its browser default cancelled, so ⌘P opens file search, not print. Your handlers still get that key, marked `defaultPrevented`. Only modifier chords, Escape and the F-keys are forwarded. Plain typing stays in the app, and so does Ctrl plus a bare letter in a Mac text field. **Per-app scroll memory** across an app switch or reload. **Pull to refresh** (§ Pull to refresh). **Pane swipe** (§ Pane swipe). **Dynamic bars** (§ Dynamic bars). The Lucidos **tooltip** on any `data-tooltip` element (§ Tooltips, under lucidos.ui). The device's **Autocorrect switch** plus a key-code guard on text fields (§ Text fields and autocorrect). | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme mode/theme/font/scale (resolving `system` to the live OS light/dark) and sets `data-theme-mode`, `data-font-bold` and CSS vars on `<html>`. Pairs with `sdk-iframe.css`. | **Don't skip if you include `sdk-iframe.css`**: without it the app ignores a light or system setting and stays dark. Skip only when opting out of Lucidos theming entirely. |
@@ -906,6 +906,7 @@ The engine already holds credentials and routing for every model provider in the
 - **Not configured → 404.** With no credential/config and no `apis.json` entry, the call returns 404 naming what to set.
 - **Every default base already includes `/v1`.** Send `/models`, never `/v1/models`, which doubles the segment and answers 404. A `local` base you configure yourself may lack it.
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, and an app must not build on an anonymous endpoint that can vanish without notice (ADR 0104).
+- **`claude-gateway` has no proxy.** The Claude gateway sign-in is the user's own, granted for chat, so no app may spend it.
 - **The same proxies serve scripts and the agent.** `lucidos proxy <name>` and the `proxy_request` tool resolve names exactly as this route does.
 
 ```js
@@ -1081,7 +1082,7 @@ Denied, and why:
 | writing an env var (the read is open) | an env var reaches every command the agent runs, so a loader-hook name would be host code execution |
 | writing a preference the Lucidos Agent may not write | a security setting such as the command guard or the local model host (`local_base_url`) stays the user's, changed in Settings |
 | writing the coding-agent paths or their permission mode | a path could run the app's own script as the user |
-| reading or writing engine bookkeeping such as `vapid_keys` | it is engine state, not a setting: a read leaves it out |
+| reading or writing engine bookkeeping such as `backup_last_run` | it is engine state, not a setting: a read leaves it out |
 | message bodies, history, search, memory | an app sees that a thread exists, never what is in it |
 | repositories, `/browse-directories`, `/workspaces` | outside the workspace |
 
@@ -1200,6 +1201,9 @@ type SideEffectCategory =
 interface Trigger {
   id: string;
   name: string;
+  // Stable kebab-case id, the directory of its knowhow at
+  // data/triggers/<slug>/knowhow/.
+  slug: string;
   cron_expressions: string[];
   timezone: string;
   paused: boolean;
@@ -1228,6 +1232,8 @@ interface Trigger {
 
 interface CreateTrigger {
   name: string;
+  /** Stable kebab-case id. Omit to derive it from `name`. */
+  slug?: string;
   run: TriggerRun;
   cron_expressions: string[];
   on?: EventSubscription[];
@@ -1397,19 +1403,30 @@ if (!clip) document.body.textContent = 'No clip given';
 ```ts
 lucidos.widget.size(): 'small' | 'medium' | 'large' | null
 lucidos.widget.onSize(callback: (size) => void): () => void
-lucidos.widget.place(): 'home' | 'inline' | 'shelf' | 'option' | null
+lucidos.widget.place(): 'dashboard' | 'inline' | 'shelf' | 'option' | null
 lucidos.widget.visible(): boolean
 lucidos.widget.onVisibility(callback: (visible: boolean) => void): () => void
 ```
 
 What the host told a *widget* about the place it shows in (ADR 0432). The SDK also stamps two attributes on `<html>`, so most widgets adapt in CSS alone:
 
-- **`data-widget-place`**: `home` on the *Home board*, `inline` in a thread (a reply's embed included), `shelf` or `option`. Absent in the Canvas, where a widget opens as an app.
-- **`data-widget-size`**: the tile's *widget size* on the Home board, `small`, `medium` or `large`. Absent anywhere else, where `size()` is `null`.
+- **`data-widget-place`**: `dashboard` on a *dashboard*, phone or desktop, `inline` in a thread (a reply's embed included), `shelf` or `option`. Absent in the Canvas, where a widget opens as an app. Before ADR 0496 a dashboard tile read `home`, so a widget that still compares the place to `home` no longer matches.
+- **`data-widget-size`**: the tile's *widget size* on a dashboard, `small`, `medium` or `large`. Absent anywhere else, where `size()` is `null`.
 
-On the Home board the tile sets the box and the frame fills it. Draw for the size you are told, with no scroll inside. Content past the tile is clipped under a fade. The tile's menu offers Open in Canvas, which opens the widget full size. A widget whose manifest declares no sizes takes all three (`system-knowhow/building-an-app.md` § Widgets).
+On a dashboard the tile sets the box and the frame fills it. Draw for the size you are told, with no scroll inside. Content past the tile is clipped under a fade. The tile's menu offers Open in Canvas, which opens the widget full size. A widget whose manifest declares no sizes takes all three (`system-knowhow/building-an-app.md` § Widgets).
 
-`visible()` turns false while a hidden board keeps the frame loaded, just before it unloads. Stop timers then, and read again when it turns true.
+`visible()` turns false while a hidden dashboard keeps the frame loaded, just before it unloads. Stop timers then, and read again when it turns true.
+
+A right-click anywhere in a widget opens the widget's own menu at the pointer (ADR 0528). A finger held on a dashboard tile opens it too, and a dashboard tile draws no ⋯. Content keeps the native menu, by the host's own rule:
+
+- a link, an input, a text area, editable content, an image, a video or audio;
+- a selection the press landed in;
+- the text itself of `pre`, `code` or an element marked `data-native-context-menu`;
+- anything, with Alt held.
+
+To keep a right-click for your own menu, call `preventDefault()` in your own `contextmenu` handler. The SDK listens on `window` in the bubble phase, so your handler runs first. A widget showing as a question option forwards nothing, since an option has no widget menu.
+
+The SDK writes an attribute only when the host's value changes. A widget may set `data-widget-size` itself, for a preview, and the SDK leaves it alone until the host names a new size. A `MutationObserver` over `<html>` must write only when a value differs. Even `classList.add` of a class already present queues a fresh record, so an observer that writes on every record loops forever and freezes the page.
 
 ### Example
 
@@ -1447,8 +1464,8 @@ are security settings the user changes in Settings. It also refuses the keys
 that choose what a coding-agent session spawns (`coding_agent_claude_path`,
 `coding_agent_codex_path`, `coding_agent_claude_permission_mode`).
 
-Engine bookkeeping, such as the Web Push keypair in `vapid_keys`, is not a
-setting: `get()` leaves it out, and `set()` refuses it.
+Engine bookkeeping, such as the last backup's outcome in `backup_last_run`, is
+not a setting: `get()` leaves it out, and `set()` refuses it.
 
 Every refusal rejects the promise with the engine's reason, including a value
 the engine will not store, such as a malformed timezone.
@@ -1469,6 +1486,66 @@ type Preferences = Record<string, string>;
 | `autocorrect` | `true`, `false` | Whether text fields autocorrect on this device. Unset, on everywhere. `sdk.js` applies it to your fields (§ Text fields and autocorrect, under Setup) |
 | `motion` | `system`, `reduce`, `full` | Whether this device reduces motion. `system` (the default) follows the OS. Read it as `data-motion` on `<html>` (§ Reduced motion, under Setup) |
 | `theme-effects` | `system`, `reduce`, `full` | Whether this device shows a theme's part shadows, filters and scanlines. `system` (the default) drops them when the OS asks for more contrast or less transparency. Read it as `data-theme-effects` on `<html>` (§ Theme parts, under Setup) |
+
+## lucidos.priceTable: Model Prices
+
+```ts
+lucidos.priceTable.get(): Promise<PriceTable>
+```
+
+Reads the *price table* (`GET /api/v1/model-prices`): the model prices Lucidos
+ships, merged card by card with the workspace override in
+`data/config/model-prices.json`. Each model holds a list of dated cards, oldest
+first. A card is in force from its `from` day until the next card's. To price
+a past day, take the newest card whose `from` is on or before it. Each card
+says where it came from in `origin`.
+
+An invalid override is ignored whole, and `override.error` says why. To change
+a price, write the override with `lucidos.data`. The engine re-reads it on
+change.
+
+### Types
+
+```ts
+interface PriceRates {
+  uncached_in: number;       // per million tokens, in `currency`
+  cache_write: number;       // the 5-minute cache write
+  cache_write_1h?: number;   // omitted means cache_write
+  cache_read: number;
+  out: number;
+}
+
+interface PriceCard extends PriceRates {
+  from?: string;             // YYYY-MM-DD, local time; omitted = since the beginning
+  long?: PriceRates & { threshold_tokens: number; inclusive?: boolean };
+  flex?: PriceRates;
+  per_minute?: number;       // billed by the minute; token rates unused
+  source: string;
+  origin: 'shipped' | 'override';
+}
+
+interface PriceTable {
+  currency: string;
+  checked: string;           // YYYY-MM-DD the prices in force were last checked
+  unpriced_cache_shares: { read: number; write_5m: number; write_1h: number };
+  models: Record<string, PriceCard[]>;
+  override: { path: string; present: boolean; checked: string | null; error: string | null };
+}
+```
+
+The override file holds `currency` (optional, must match), `checked`
+(optional, YYYY-MM-DD) and `models`, in the same card format without
+`origin`. A card replaces the shipped card from the same day and joins the
+list otherwise.
+
+### Example
+
+```js
+const table = await lucidos.priceTable.get();
+const cards = table.models['claude-sonnet-5-5'] ?? [];
+const today = new Date().toLocaleDateString('sv'); // YYYY-MM-DD
+const card = cards.filter(c => !c.from || c.from <= today).at(-1);
+```
 
 ## lucidos.storage: Per-Device App State
 
@@ -1560,7 +1637,7 @@ schema cannot drift. To change the set, edit those Rust consts.
 
 ```ts
 type NavigateTarget =
-  | 'home-board' | 'files' | 'apps' | 'app-store' | 'plugins' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
+  | 'dashboard' | 'files' | 'apps' | 'app-store' | 'plugins' | 'triggers' | 'thread-queue' | 'changes' | 'notifications'
   | 'settings' | 'app' | 'file' | 'trigger' | 'thread'
   | 'new-app' | 'new-trigger' | 'new-chat' | 'url';
 
@@ -1570,7 +1647,7 @@ type NavigateTarget =
 // are absent because nothing has asked to link them: `webhooks` and
 // `communication-surfaces`.
 type SettingsViewTarget =
-  | 'models' | 'permissions' | 'mcp' | 'coding-agents' | 'accounts' | 'locale' | 'marketplaces'
+  | 'models' | 'intelligence' | 'permissions' | 'mcp' | 'coding-agents' | 'accounts' | 'locale' | 'marketplaces'
   | 'access' | 'devices' | 'system' | 'appearance' | 'keyboard-shortcuts'
   | 'system-overview' | 'release-notices' | 'whats-new'
   | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
@@ -1590,7 +1667,13 @@ interface NavigateUi {
   id?: string;
   url?: string;
   event_id?: string;
+  /** Only with `target: 'new-chat'`: the compose text to prefill. */
   prompt?: string;
+  /** Only with `target: 'new-chat'`: the coding agent backend to preselect. */
+  coding_agent?: 'claude-code' | 'codex';
+  /** Only with `target: 'new-chat'`: the coding target to preselect. A registered
+   *  repository (name or id) or `data/apps/<id>`. */
+  folder?: string;
 }
 
 /** What a notification tap does. `modal` (default) opens the inbox detail
@@ -1858,7 +1941,7 @@ interface ThreadSummary {
 | Show "N active threads" badge (working AND asking) | `lucidos.threads.count({ active: true })` |
 | Render one thread's children (a fan-out board) | `lucidos.threads.list({ parent: id })` |
 | React to thread state changes in real time | Subscribe to `lucidos.sse` instead |
-| Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })` |
+| Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })`, plus `coding_agent` and `folder` to preselect a coding target |
 | Open a link outside Lucidos from JS | `lucidos.ui.openExternal(url)` (never `window.open`) |
 
 ## lucidos.ui: UI Control
@@ -1868,7 +1951,7 @@ lucidos.ui.applyPreferences(): Promise<void>
 lucidos.ui.watchPreferences(): void
 lucidos.ui.navigate(target: NavigateTarget, params?: NavigateParams): Promise<void>
 lucidos.ui.openExternal(url: string): Promise<void>
-lucidos.ui.startThread(opts?: { prompt?: string }): Promise<void>
+lucidos.ui.startThread(opts?: { prompt?: string; coding_agent?: 'claude-code' | 'codex'; folder?: string }): Promise<void>
 lucidos.ui.previewFile(params: FilePreviewParams): Promise<void>
 lucidos.ui.confirm(options: ConfirmOptions): Promise<boolean>
 lucidos.ui.toast(message: string, type?: ToastType, opts?: ToastOptions): void
@@ -2001,7 +2084,7 @@ lucidos.ui.onFocusedThreadChange(show);
 show(await lucidos.ui.focusedThread());
 ```
 
-- **The host decides, not your app.** A widget on the Home board sits beside
+- **The host decides, not your app.** A widget on the desktop dashboard sits beside
   whatever thread the user is in. So the value is that thread, not the thread
   the widget came from.
 - **`null` means the empty compose view.** No thread is open there.
@@ -2012,7 +2095,7 @@ show(await lucidos.ui.focusedThread());
 - **No host, no answer.** In its own tab your app has no thread pane, so
   `focusedThread()` rejects. The subscription is never called there.
 - **Every frame hears every change.** The Canvas app, each inline widget and
-  each Home board tile get the same calls.
+  each dashboard tile get the same calls.
 
 ### Navigation targets
 
@@ -2021,10 +2104,10 @@ show(await lucidos.ui.focusedThread());
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` (or `app_id`), `fragment` (optional) | Open an app UI, optionally at a place inside it. See the fragment param below. |
 | `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. |
-| `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()`, the typed wrapper around this target. |
+| `new-chat` | `prompt`, `coding_agent`, `folder` (all optional) | Open a fresh chat thread, optionally prefilling the compose textarea and preselecting the coding agent and folder. Prefer `lucidos.ui.startThread()`, the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row. The plugin-update notification uses this, so a tap on one update lands on its plugin. |
 | `app-store` | (none) | Open the Plugins panel's Store (marketplace) tab. |
-| `home-board` | (none) | Show the *Home board*: its rail on desktop, shown if it was hidden, and Home's board face on a phone. |
+| `dashboard` | (none) | Show the *dashboard* of the device's layout: the rail on desktop, shown if it was hidden, and the dashboard sheet over the open thread on a phone. |
 | `file` | `file_path`, `line` (optional), `line_end` (optional) | Open a file in the preview pane, optionally at a line. See the two accepted path forms and the line params below. |
 | _other panels_ | (none) | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
 
@@ -2236,6 +2319,31 @@ document.querySelector('#setup-trigger').addEventListener('click', () => {
 ```
 
 Call it with no arguments to open a blank fresh chat, like the "new thread" shortcut.
+
+#### Preselecting the coding agent and folder
+
+`coding_agent` and `folder` aim the new chat at a coding agent, so the user opens a ready-to-send coding-agent chat instead of picking dropdowns first.
+
+```js
+// "Work on PR" button: a coding-agent chat on the PR's repository.
+lucidos.ui.startThread({
+  prompt: 'Work on PR #123 on branch feature/x',
+  coding_agent: 'claude-code',
+  folder: 'example-repo',
+});
+```
+
+| Field | Value | Effect |
+|-------|-------|--------|
+| `coding_agent` | `'claude-code'` or `'codex'` | Preselects that backend. |
+| `folder` | A registered repository's name or id, or `data/apps/<id>` for an installed app | Preselects that coding target. A name matches exactly first, then in any case. |
+
+- **Either field aims the chat at a coding agent.** `folder` alone keeps the backend the chat would have used. `coding_agent` alone keeps the target the chat would have used.
+- **A value that names nothing never breaks the chat.** The chat still opens with the prompt. The dropdown stays at its default, and a warning toast names the value and who asked. An unknown agent, an unregistered or ambiguous repository name, and an app that is not installed all behave this way. Name a repository by id to avoid ambiguity.
+- **Nothing is sent.** The user still clicks Send, and can change either dropdown first.
+- **Only this chat changes.** The picks apply to the new draft, never to another existing draft. A folder pick also becomes the starting folder of the next new chat, as a manual pick does.
+- **There is no `branch` or `model`.** Write the branch in the prompt text.
+- **The `navigate_ui` tool takes the same two fields.** It also tells the agent in its result when `folder` matches no repository and no app, so the agent can correct itself.
 
 ### Confirmation dialogs
 
@@ -2621,6 +2729,12 @@ There is nothing to configure. For an app author:
 - **A frame hears only the types it listens to.** The SDK tells the host which types have an `on()` listener, and the host relays only those. A streaming reply is thousands of frames, so this keeps a page of live widgets cheap. An `on('*')` listener takes every frame, and `on('ThreadEvent')` every thread event.
 
 Where `SharedWorker` is missing (Chromium on Android, and Android WebView), a document that is not an app frame opens a private `EventSource`. Same events, same order, one connection per document.
+
+### A quiet stream is reopened
+
+The engine sends a `keepalive` event every 30 seconds, and the SDK reopens a stream that hears nothing for much longer. A half-open connection, such as one a phone left behind when it slept, never errors, so silence is the only sign. The reopen is an ordinary drop and open, so `onOpen` runs and your app catches up as above.
+
+The keepalive is a named SSE event. It reaches no `on()` listener and no `onmessage` handler, so an app never sees it.
 
 ### Types
 

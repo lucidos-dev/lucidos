@@ -6,7 +6,7 @@
  *
  * A source scan, because a missing consumer is silent: the press still holds
  * to half a pixel, which is exactly the twitch this removes. The exact hold is
- * measured by e2e/turn-control-holds-the-reader-still.spec.ts.
+ * measured by e2e/turn-control-holds-the-reader-still-all.spec.ts.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project

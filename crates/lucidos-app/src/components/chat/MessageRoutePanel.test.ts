@@ -887,6 +887,7 @@ const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, 
   successor_residue: { kind: 'successor_residue' },
   merge_conflict: { kind: 'merge_conflict' },
   main_check_red: { kind: 'main_check_red' },
+  main_check_flaky: { kind: 'main_check_flaky' },
   missing_hardening: { kind: 'missing_hardening' },
   missing_plan: { kind: 'missing_plan' },
   plugin_auto_update: {
@@ -969,6 +970,25 @@ describe('plugin seeds name what the engine acted on', () => {
     expect(s).toMatch(/You updated ⏰ Habit Tracker to 0\.1\.4/);
     // No device recorded: no row claims one.
     expect(s).not.toContain('Confirmed on');
+  });
+
+  it('an update the author asked for says so, and quotes the reason', () => {
+    const s = origin(
+      setup({
+        kind: 'update',
+        from_version: '0.1.3',
+        cause: { kind: 'revision_raised', revision: 2, reason: 'The skill changed.' },
+      }),
+    );
+    expect(s).toContain('its author asks to run its setup again');
+    expect(s).toContain("Author's note: The skill changed.");
+    expect(s).not.toContain('changed its setup instructions');
+  });
+
+  it('an update with both causes names both', () => {
+    const s = origin(setup({ kind: 'update', cause: { kind: 'both', revision: 2 } }));
+    expect(s).toContain('changed its setup instructions, and its author asks to run it again');
+    expect(s).not.toContain("Author's note");
   });
 
   it('a fresh install reads as an install', () => {

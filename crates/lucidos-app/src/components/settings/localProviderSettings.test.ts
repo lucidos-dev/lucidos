@@ -16,6 +16,7 @@ const key = (base_urls: string[], env_var_name: string | null = null): Credentia
   auth_header: 'Authorization',
   created_at: '2026-01-01T00:00:00Z',
   env_var_name,
+  secret_reference: false,
 });
 
 describe('providerKeyRescope', () => {

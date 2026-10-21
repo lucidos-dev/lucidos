@@ -1,9 +1,10 @@
+import type { CacheKeepAliveStatus } from '../../generated/thread-event-wire';
 import { EVENT_CLASSIFICATION } from '../../generated/thread-lifecycle';
 import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, isAgentReplyText, modeToInitiator, parentToolUseIdOf } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
-import { SIDE_QUESTION_TYPES, WIDGET_SHELF_CHANGE_TYPES, isFormRequest, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
+import { CONTINUATION_EFFORT_RESTART_REASON, SIDE_QUESTION_TYPES, WIDGET_SHELF_CHANGE_TYPES, isFormRequest, isRedirectCancel, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange, TypedAnswer } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
@@ -604,7 +605,8 @@ export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHand
   ['ResponseCanceled', 'ends'],
   // The resume owns what it resumed. The turn can be anchored elsewhere: a
   // pending event wait wakes the thread first and the turn anchors on that
-  // prompt. Leaving it stranded the work above the resume card.
+  // prompt. Leaving it stranded the work above the resume card. An effort
+  // restart's resume never gets here: `foldsAsEffortRestart` folds it first.
   ['ContinuationStarted', 'takes-unless-parked'],
   // A wake from a detached wait, injected as a ReentryFromWait, which holds no
   // turn of its own (ADR 0049).
@@ -730,12 +732,15 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // A pin or an unpin is shelf bookkeeping (ADR 0407). The inline widget it
   // names stays as it is.
   ...WIDGET_SHELF_CHANGE_TYPES,
-  // Arranging the Home board draws nothing in Home's chat (ADR 0432).
+  // A legacy arrangement of Home's old board, read only, draws nothing (ADR 0496).
   'HomeBoardArranged',
   // An Apply Now's bracket only marks the row as applying (ADR 0437). What the
   // apply did is told by its change events.
   'ApplyNowStarted',
   'ApplyNowEnded',
+  // A failed model call is telemetry for the gateway export. No step draws it
+  // (docs/adr/0510-claude-gateway-managed-settings-and-telemetry.md).
+  'ModelCallFailed',
 ]);
 
 /** True for a `ContextCaptured` recording an *auxiliary model call* rather
@@ -775,6 +780,48 @@ export function isCacheKeepAliveIdle(event: StoredEvent): boolean {
   return event.type === 'CodingAgentIdled' && event.reason === KEEP_ALIVE_IDLE_REASON;
 }
 
+/** Whether `status` reports the wait that `card` last reported. A wait has one
+ *  `since` while it warms, and stops for good once past break-even. */
+function continuesWait(card: StoredEvent, status: CacheKeepAliveStatus | null | undefined): boolean {
+  const last = (card as { status?: CacheKeepAliveStatus }).status;
+  if (!last || !status || status.state !== 'warming') return true;
+  return last.state === 'warming' && last.since === status.since;
+}
+
+/** Fold one status of the engine's keep-alive report. A *keep-alive run* is one
+ *  wait the engine kept warm, and leaves one turnless card, opened by its first
+ *  ping. A later status updates that card in place, and a `not_kept` one
+ *  leaves it alone: the engine counts pings from the wait's start, so the
+ *  same wait may warm again. A cleared status, or a ping count that fell back
+ *  to a lower number, or a status of another wait, ends the run: the wait is over and the next one starts
+ *  afresh. A wait that ended before its first ping spent nothing, so it leaves
+ *  no card (ADR 0540). */
+function foldKeepAliveStatus(
+  state: GroupFoldState,
+  seq: number,
+  event: Extract<StoredEvent, { type: 'CacheKeepAliveStatusChanged' }>,
+  touched: Set<Exchange> | null,
+): void {
+  const status: CacheKeepAliveStatus | null | undefined = event.status;
+  if (status?.state === 'not_kept') return;
+  const beats = status ? status.beats : 0;
+  const { keepAliveRun: run } = state;
+  if (run && beats >= run.beats && continuesWait(run.card.userEvent, status)) {
+    // The card keeps its first event id: `exchangeKey` keys the node on it,
+    // and a new id would remount the card on every ping.
+    run.card.userEvent = { ...event, _eventId: run.card.userEvent._eventId };
+    run.beats = beats;
+    touched?.add(run.card);
+    return;
+  }
+  state.keepAliveRun = null;
+  if (beats === 0) return;
+  const card: Exchange = { userEvent: event, userSeq: seq, steps: [] };
+  state.exchanges.push(card);
+  touched?.add(card);
+  state.keepAliveRun = { card, beats };
+}
+
 /** Whether `event` belongs to one of the thread's keep-alive turns. */
 function isKeepAliveTurnEvent(thread: ThreadState, event: StoredEvent): boolean {
   if (isCacheKeepAliveAnchor(event) || isCacheKeepAliveIdle(event)) return true;
@@ -796,6 +843,19 @@ export function hasContentEvents(events: Map<number, StoredEvent>): boolean {
     if (EVENT_CLASSIFICATION[event.type] !== 'metadata') return true;
   }
   return false;
+}
+
+/** The turn an effort restart's resume continues, or null.
+ *
+ *  An effort pick is one turn to the reader. The engine cancels the turn, then
+ *  resumes it at the new effort under a `ContinuationStarted`. That resume is a
+ *  step of the turn it interrupted, drawn as a restart row, and opens no turn
+ *  of its own. Its own card there read as the explanation of the turn above. */
+function foldsAsEffortRestart(state: GroupFoldState, event: StoredEvent): Exchange | null {
+  if (event.type !== 'ContinuationStarted' || event.reason !== CONTINUATION_EFFORT_RESTART_REASON) return null;
+  const turn = state.effortRestartedTurn;
+  state.effortRestartedTurn = null;
+  return turn;
 }
 
 /** Find an existing exchange to absorb `event` into instead of starting a new one.
@@ -1132,9 +1192,19 @@ export const TERMINAL_EVENT_TYPES: ReadonlySet<string> = new Set([
   'CodingAgentIdled',
 ]);
 
+/** The steps of the turn's latest run. An effort restart's resume folds into
+ *  the turn it cancelled (`foldsAsEffortRestart`), so a terminal step before
+ *  that resume ended the replaced run, not the turn. */
+export function latestRunSteps(exchange: Exchange): Exchange['steps'] {
+  for (let i = exchange.steps.length - 1; i >= 0; i--) {
+    if (exchange.steps[i].event.type === 'ContinuationStarted') return exchange.steps.slice(i + 1);
+  }
+  return exchange.steps;
+}
+
 /** Is this exchange's turn still going, as far as its own steps say? */
 function stillRunning(exchange: Exchange): boolean {
-  return !exchange.steps.some(({ event }) => TERMINAL_EVENT_TYPES.has(event.type));
+  return !latestRunSteps(exchange).some(({ event }) => TERMINAL_EVENT_TYPES.has(event.type));
 }
 
 /** Does this event belong to a coding-agent session? `EventMeta` stamps the
@@ -1380,6 +1450,10 @@ interface GroupFoldState {
    *  delivers one at a time, recording each copy right after its release, so
    *  one slot is enough. See `pairHeldDelivery`. */
   pendingRelease: { holder: Exchange; held: Extract<StoredEvent, { type: 'MessageHeld' }> } | null;
+  /** The turn an effort pick cancelled, until its resume folds back into it.
+   *  Any other boundary clears it, since the engine then owes no resume. See
+   *  `foldsAsEffortRestart`. */
+  effortRestartedTurn: Exchange | null;
   // request_event_id to redirect target exchange. Set when a PromptInjected is absorbed
   // mid-flight. The loop emits the PromptInjected when it ingests the queued follow-up, so
   // every event after that answers the absorbed prompt rather than the original
@@ -1399,6 +1473,9 @@ interface GroupFoldState {
   /** Ids of the *cache keep-alive* anchors folded so far. Every event of such
    *  a turn names one as its `request_event_id`, and none of it renders. */
   keepAliveAnchors: Set<string>;
+  /** The open *keep-alive run*: its card, and the pings it reports. Null
+   *  between runs. See `foldKeepAliveStatus`. */
+  keepAliveRun: { card: Exchange; beats: number } | null;
   /** request_event_id of the most recent request-id-routed chat event, i.e. the
    *  active chat turn's req_id. The divider redirect bootstrap reads it to
    *  target the divider directly. It cannot trust `previousCurrent`, which can
@@ -1435,10 +1512,12 @@ function newFoldState(paged: boolean): GroupFoldState {
     readsReported: false,
     gatedCalls: new Map(),
     pendingRelease: null,
+    effortRestartedTurn: null,
     reqIdRedirect: new Map(),
     resolvedReqIds: new Set(),
     abortReqIds: new Set(),
     keepAliveAnchors: new Set(),
+    keepAliveRun: null,
   };
 }
 
@@ -2072,6 +2151,10 @@ function foldEvent(
       }
       return;
     }
+    if (event.type === 'CacheKeepAliveStatusChanged') {
+      foldKeepAliveStatus(state, seq, event, touched);
+      return;
+    }
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
     if (isAuxiliaryCapture(event)) return;
     if (isCacheKeepAliveAnchor(event)) {
@@ -2144,6 +2227,11 @@ function foldEvent(
       ? owner ?? turnEndedBy(state, current, event)
       : null;
 
+    // Any other end of the turn means the engine owes no effort resume into it.
+    if (event.type === 'ResponseAborted' || (event.type === 'ResponseCanceled' && event.cause !== 'effort_restart')) {
+      state.effortRestartedTurn = null;
+    }
+
     // ResponseAborted is dual-purpose. It terminates the originating exchange,
     // so the partial-response panel reads 'Aborted'. It also opens a boundary
     // exchange whose userEvent is the abort itself, rendered as the AbortPanel.
@@ -2167,16 +2255,17 @@ function foldEvent(
     // attribution via its Cancel-as-picked button. Any other resolution leaves
     // the picked option visible, so the boundary panel must render.
     //
-    // A `superseded_by_followup` cancel (a Codex mid-turn follow-up redirect)
-    // is the exception. The user steered rather than Stopped, so it renders
+    // A redirect cancel (a mid-turn follow-up, an effort restart) is the
+    // exception. The work goes on rather than stopping, so it renders
     // neutrally like the chat or CC follow-up. Keep it as a step, so step
     // resolution and model extraction still see a terminator, but open NO
     // boundary: there must be no standalone 'Response canceled' panel.
     if (event.type === 'ResponseCanceled') {
       if (terminalTarget && terminalTarget.userEvent.type !== 'ResponseCanceled') {
-        if (event.cause === 'superseded_by_followup') {
+        if (isRedirectCancel(event.cause)) {
           terminalTarget.steps.push({ seq, event });
           touched?.add(terminalTarget);
+          if (event.cause === 'effort_restart') state.effortRestartedTurn = terminalTarget;
           return;
         }
         terminalTarget.steps.push({ seq, event });
@@ -2304,6 +2393,15 @@ function foldEvent(
       touched?.add(current);
       return;
     }
+    const restarted = foldsAsEffortRestart(state, event);
+    if (restarted) {
+      restarted.steps.push({ seq, event });
+      touched?.add(restarted);
+      if (event._eventId) reqIdRedirect.set(event._eventId, restarted);
+      current = restarted;
+      return;
+    }
+    if (isExchangeStartEvent(event) && !isTurnlessBoundary(event)) state.effortRestartedTurn = null;
     const absorbTarget = findAbsorbTarget(state, current, exchanges, event);
     if (absorbTarget) {
       // A queued mid-flight message is ingested here, the PromptInjected being the moment

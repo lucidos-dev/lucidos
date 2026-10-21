@@ -67,14 +67,12 @@ fn read_ports() -> (u16, String) {
     (port, proto.unwrap_or_else(|| "https".to_string()))
 }
 
-/// Serializes every test that touches the workspace's `backup.key`.
+/// Serializes every test that touches the workspace's backup recipient or
+/// legacy backup key.
 ///
-/// Two files contend for it and the contention is not obvious from either:
-/// `backup_key_test` deletes the key and asserts a read-only reveal does not
-/// mint one, while `backup_schedule_test` enables a schedule, and
-/// `PUT /backup/schedule` calls `crypto::ensure_key` whenever the new schedule
-/// is active. Run in parallel, the second silently re-mints the key the first
-/// just removed, and the failure surfaces in the innocent test.
+/// `backup_key_test` clears both to prove a schedule is refused before setup,
+/// while `backup_schedule_test` sets a recipient so its schedule may turn on.
+/// Run in parallel, either reds the other.
 ///
 /// Lives here rather than in either test file because a lock only one side
 /// takes is not a lock.

@@ -785,7 +785,7 @@ exec sleep 600
         assert!(!renderers.is_empty(), "Chrome started no renderer");
         for renderer in renderers {
             assert!(
-                runs_in_os_sandbox(pid, renderer),
+                enters_os_sandbox(pid, renderer).await,
                 "renderer {renderer} runs outside the OS sandbox"
             );
         }
@@ -795,6 +795,23 @@ exec sleep 600
     }
 
     /// Every live descendant of `root` whose argv says `--type=renderer`.
+    /// Chrome forks spare renderers ahead of need, and each enters the sandbox
+    /// a moment after it appears. So a renderer gets a few seconds to get
+    /// there. One that has exited runs no page code, and passes.
+    async fn enters_os_sandbox(browser: u32, renderer: u32) -> bool {
+        for _ in 0..50 {
+            // SAFETY: signal 0 only asks the kernel whether `renderer` exists.
+            if unsafe { libc::kill(renderer as libc::pid_t, 0) } != 0 {
+                return true;
+            }
+            if runs_in_os_sandbox(browser, renderer) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
     fn renderer_pids(root: u32) -> Vec<u32> {
         let ps = std::process::Command::new("ps")
             .args(["-A", "-o", "pid=,ppid=,args="])

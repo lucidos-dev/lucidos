@@ -1,11 +1,12 @@
 //! A Tree turn's *memory views* (ADR 0362), in the order the request sends
 //! them: the view snapshot, the thread memory view, then the recent workspace
-//! entries. A Classic turn never reaches this file, which is what keeps its
-//! request byte-identical (I2).
+//! entries. A Classic turn has no views, so only [`TurnMemoryViews::lead`]
+//! reaches it.
 //!
 //! Both views lead the message in blocks of a few lines. A later request can
 //! read the prompt cache up to any block end. Each block that takes a cache
-//! mark is a memory view block.
+//! mark is a memory view block. The stable context block sits between the two
+//! views.
 
 use uuid::Uuid;
 
@@ -37,13 +38,20 @@ impl TurnMemoryViews {
             .join(super::context_mode::PART_SEPARATOR)
     }
 
-    /// Put the views in front of the message, snapshot first, one content
-    /// block per view block. A marked block is a memory view block, and every
-    /// other block is plain text.
-    pub(crate) fn lead(&self, content: MessageContent) -> MessageContent {
-        let mut blocks: Vec<ContentBlock> = [&self.snapshot, &self.thread]
-            .into_iter()
-            .flat_map(ViewBlocks::blocks)
+    /// Put the views and the stable context block in front of the message:
+    /// snapshot, stable block, thread view, one content block per view block.
+    /// A marked view block is a memory view block, and every other block is
+    /// plain text.
+    ///
+    /// The one place that orders a message's leading blocks, for Classic too.
+    /// A Classic turn has no views, so its stable block leads alone.
+    pub(crate) fn lead(&self, stable: String, content: MessageContent) -> MessageContent {
+        let stable = (!stable.is_empty()).then_some(ContentBlock::StableContext { text: stable });
+        let mut blocks: Vec<ContentBlock> = self
+            .snapshot
+            .blocks()
+            .chain(stable)
+            .chain(self.thread.blocks())
             .collect();
         if blocks.is_empty() {
             return content;
@@ -133,29 +141,55 @@ mod tests {
         }
     }
 
-    fn texts(content: MessageContent) -> Vec<(bool, String)> {
+    #[derive(Debug, PartialEq)]
+    enum Kind {
+        View,
+        Stable,
+        Text,
+    }
+
+    fn texts(content: MessageContent) -> Vec<(Kind, String)> {
         let MessageContent::Blocks(blocks) = content else {
             panic!("a led message is blocks");
         };
         blocks
             .into_iter()
             .map(|b| match b {
-                ContentBlock::MemoryView { text } => (true, text),
-                ContentBlock::Text { text } => (false, text),
+                ContentBlock::MemoryView { text } => (Kind::View, text),
+                ContentBlock::StableContext { text } => (Kind::Stable, text),
+                ContentBlock::Text { text } => (Kind::Text, text),
                 other => panic!("unexpected block {other:?}"),
             })
             .collect()
     }
 
     #[test]
-    fn no_views_leave_the_message_alone() {
-        let led = TurnMemoryViews::default().lead(MessageContent::Text("rest".into()));
+    fn no_views_and_no_stable_text_leave_the_message_alone() {
+        let led =
+            TurnMemoryViews::default().lead(String::new(), MessageContent::Text("rest".into()));
         assert!(matches!(led, MessageContent::Text(text) if text == "rest"));
+    }
+
+    /// Classic: no views, so the stable block alone leads the message.
+    #[test]
+    fn a_classic_message_leads_with_the_stable_block() {
+        let led =
+            TurnMemoryViews::default().lead("stable".into(), MessageContent::Text("rest".into()));
+        assert_eq!(
+            texts(led),
+            vec![
+                (Kind::Stable, "stable".to_string()),
+                (Kind::Text, "rest".to_string())
+            ]
+        );
     }
 
     /// Every view block is its own content block, snapshot first, so each
     /// block end is a boundary the cache lookback can find. Only the marked
     /// ones are memory view blocks; the rest, which moves every turn, is text.
+    /// The stable block sits between the two views: the snapshot stays first so
+    /// every thread shares it (I3), and the thread view's rungs read the stable
+    /// block through their own prefix.
     #[test]
     fn each_view_block_leads_as_its_own_block_and_the_marked_ones_are_memory_views() {
         let snapshot =
@@ -171,15 +205,33 @@ mod tests {
             [thread.find("[2+1]").unwrap(), thread.find("[3+1]").unwrap()],
         );
         assert_eq!(
-            texts(views.lead(MessageContent::Text("rest".into()))),
+            texts(views.lead("stable".into(), MessageContent::Text("rest".into()))),
             vec![
-                (true, snapshot[..s].to_string()),
-                (false, snapshot[s..].to_string()),
-                (false, thread[..t[0]].to_string()),
-                (true, thread[t[0]..t[1]].to_string()),
-                (false, thread[t[1]..].to_string()),
-                (false, "rest".to_string()),
+                (Kind::View, snapshot[..s].to_string()),
+                (Kind::Text, snapshot[s..].to_string()),
+                (Kind::Stable, "stable".to_string()),
+                (Kind::Text, thread[..t[0]].to_string()),
+                (Kind::View, thread[t[0]..t[1]].to_string()),
+                (Kind::Text, thread[t[1]..].to_string()),
+                (Kind::Text, "rest".to_string()),
             ]
         );
+    }
+
+    /// A new thread has an empty thread view: the stable block follows the
+    /// snapshot directly.
+    #[test]
+    fn an_empty_thread_view_leaves_the_stable_block_behind_the_snapshot() {
+        let snapshot = "[WORKSPACE MEMORY VIEW]\n[w/0+4] a\n[END WORKSPACE MEMORY VIEW]\n";
+        let views = TurnMemoryViews {
+            snapshot: blocks(snapshot, &[], &[]),
+            ..TurnMemoryViews::default()
+        };
+        let led = texts(views.lead("stable".into(), MessageContent::Text("rest".into())));
+        assert_eq!(led.last(), Some(&(Kind::Text, "rest".to_string())));
+        let order: Vec<&Kind> = led.iter().map(|(kind, _)| kind).collect();
+        let stable = order.iter().position(|k| **k == Kind::Stable).unwrap();
+        assert!(order[..stable].iter().all(|k| **k != Kind::Stable));
+        assert_eq!(led[stable - 1].1, snapshot);
     }
 }

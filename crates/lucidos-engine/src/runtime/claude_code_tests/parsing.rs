@@ -1341,6 +1341,19 @@ fn thinking_text_stays_hidden_unless_the_relay_asked_for_notes() {
     }
 }
 
+/// The verdict decides both the prompt and the parser. A session told its
+/// notes are hidden never turns reasoning into transcript text, and the
+/// reverse.
+#[test]
+fn the_stream_state_follows_the_notes_verdict() {
+    use crate::runtime::claude_code_provider::NotesVisibility::{Hidden, Shown};
+    let thinking = assistant_thinking("claude-opus-5-5", "Found it.");
+    let mut shown = stream_state_for(Shown);
+    assert_eq!(messages(&parse_line(&mut shown, &thinking)), ["Found it."]);
+    let mut hidden = stream_state_for(Hidden);
+    assert!(messages(&parse_line(&mut hidden, &thinking)).is_empty());
+}
+
 #[test]
 fn an_empty_note_and_the_interrupted_sentinel_render_nothing() {
     let mut state = CcStreamState::with_notes_relayed(true);

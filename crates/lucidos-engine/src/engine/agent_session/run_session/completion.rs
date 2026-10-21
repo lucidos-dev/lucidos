@@ -17,7 +17,7 @@ use crate::engine::git_ops::{
     files_require_restart, git_cmd, git_commit_no_edit, git_ran_ok, has_branch_commits,
     worktree_current_branch,
 };
-use crate::engine::thread_events::EventChannel;
+use crate::engine::thread_events::{CancelCause, EventChannel};
 use crate::engine::{AgentSession, LucidosEngine, ProcessResult, StopReason};
 use crate::runtime::AgentExitFacts;
 use std::collections::HashMap;
@@ -50,19 +50,36 @@ fn own_session_entry<'a>(
         .filter(|s| std::ptr::eq(Arc::as_ptr(&s.external_terminal_emitted), token))
 }
 
-/// The model and reasoning effort a terminal event reports: the latest this
-/// run's session was asked for. `send_agent_control_request` changes them
-/// mid-session and never tells the run loop, so only the entry knows. An entry
-/// that is gone or replaced reports neither. An effort change made mid-turn
-/// lands on the next turn: `docs/plans/2026-10-08-claude-code-effort-is-a-spawn-setting.md`.
+/// The model and reasoning effort a terminal event reports. The model is the
+/// latest this run's session was asked for: `send_agent_control_request`
+/// changes it mid-session and never tells the run loop, so only the entry
+/// knows. The effort is the session's *effort in force*, never a pick no call
+/// ran at. An entry that is gone or replaced reports neither.
 pub(in crate::engine::agent_session) fn own_model_settings(
     sessions: &HashMap<Uuid, AgentSession>,
     thread_id: Uuid,
     token: &std::sync::atomic::AtomicBool,
 ) -> (Option<String>, Option<String>) {
     own_session_entry(sessions, thread_id, token)
-        .map(|s| (s.current_model.clone(), s.current_reasoning_effort.clone()))
+        .map(|s| (s.current_model.clone(), s.reasoning_effort_in_force.clone()))
         .unwrap_or_default()
+}
+
+/// Record the effort a main-session call of this run's session ran at. A
+/// replacement's entry is left alone, and a call that reports no effort
+/// changes nothing.
+pub(in crate::engine::agent_session) fn note_effort_in_force(
+    sessions: &mut HashMap<Uuid, AgentSession>,
+    thread_id: Uuid,
+    token: &std::sync::atomic::AtomicBool,
+    effort: Option<&str>,
+) {
+    let Some(effort) = effort else { return };
+    if own_session_entry(sessions, thread_id, token).is_some() {
+        if let Some(session) = sessions.get_mut(&thread_id) {
+            session.reasoning_effort_in_force = Some(effort.to_string());
+        }
+    }
 }
 
 /// Drop this teardown's own entry and leave a replacement alone. Returns the
@@ -178,7 +195,73 @@ async fn remove_discarded_worktree(
     }
 }
 
+/// Whether a run that ends after an effort restart resumes its session.
+///
+/// `resume_owed` is the session's `effort_resume`. A turn the pick interrupted
+/// resumes when it ended as that redirect. One that ended on its own needs
+/// nothing, because the next spawn carries the pick. It still resumes when
+/// `discarded_owed`: the pick discarded an input no turn read since, so the
+/// resume carries it. A follow-up redirect armed after the pick drives the
+/// thread itself, whether drained here or routed by its caller, and its
+/// session redelivers that input. A session stopped on a question resumes
+/// only once the question is answered, which it may have been before the
+/// stop. Otherwise the answer resumes it.
+pub(super) fn resumes_after_effort_restart(
+    resume_owed: bool,
+    kept_question: bool,
+    last_terminal: &Option<TerminalKind>,
+    still_parked: bool,
+    followups_queued: bool,
+    discarded_owed: bool,
+) -> bool {
+    let work_stopped = if kept_question {
+        !still_parked
+    } else {
+        match last_terminal {
+            Some(TerminalKind::Canceled(CancelCause::EffortRestart)) => true,
+            Some(TerminalKind::Generated) => discarded_owed,
+            _ => false,
+        }
+    };
+    resume_owed && !followups_queued && work_stopped
+}
+
 impl LucidosEngine {
+    /// The `discarded_owed` fact of [`resumes_after_effort_restart`]: an effort
+    /// pick discarded an input no turn read since. Asked only while the
+    /// session owes an effort resume.
+    pub(super) async fn effort_discard_owed(&self, thread_id: Uuid, resume_owed: bool) -> bool {
+        resume_owed
+            && crate::engine::agent_recovery::discarded_input(&self.pool, thread_id)
+                .await
+                .is_some()
+    }
+
+    /// Resume a session an effort restart stopped, at the new effort. Called
+    /// after the session's idle and teardown, as
+    /// [`Self::maybe_auto_resume_after_api_error`] is, and for the same reasons.
+    pub(super) async fn resume_after_effort_restart(
+        &self,
+        thread_id: Uuid,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) {
+        if self.is_shutting_down() {
+            log!(
+                "[AgentSession] thread {} restarted for a reasoning effort pick, but the engine is shutting down: not resuming",
+                thread_id,
+            );
+            return;
+        }
+        crate::engine::thread_events::emit_continuation_requested_or_log(
+            &self.event_bus,
+            thread_id,
+            crate::engine::agent_recovery::EFFORT_RESTART_REASON,
+            actor,
+            "[AgentSession] ContinuationRequested (effort restart)",
+        )
+        .await;
+    }
+
     /// [`own_model_settings`] under the `agent_sessions` lock.
     pub(in crate::engine::agent_session) async fn terminal_model_settings(
         &self,
@@ -576,10 +659,11 @@ impl LucidosEngine {
         // a replacement onto this thread, and a Discard meant for that one
         // would delete the worktree it is running in. One snapshot serves both
         // reads, so the resume and the Discard cannot disagree about the stop.
-        let pending_stop = {
+        let (pending_stop, effort_resume) = {
             let guard = self.agent_sessions.lock().await;
             own_session_entry(&guard, thread_id, &external_terminal_emitted)
-                .and_then(|s| s.pending_stop)
+                .map(|s| (s.pending_stop, s.effort_resume.clone()))
+                .unwrap_or_default()
         };
         let should_discard = matches!(pending_stop, Some(StopReason::Discard));
         let is_resolution_session = conflict.is_some() || lane_duty.is_some();
@@ -639,6 +723,45 @@ impl LucidosEngine {
             // never the user's own text. Dropping it here loses it for good.
             // The idle exit in `run.rs` returns its drain under shutdown too,
             // so this adds no exposure the common path does not already carry.
+            return Ok(ProcessResult {
+                response: String::new(),
+                steps: vec![],
+                images,
+                request_id,
+                thread_id,
+                proposed_change: false,
+                auto_apply: false,
+                orphaned_injections: cc_orphans,
+            });
+        }
+
+        // An effort restart stopped the session on a question it keeps, so
+        // nothing may land after the question: no cleanup and no idle. The
+        // worktree and branch stay for the resume.
+        if pending_stop == Some(StopReason::EffortRestart) {
+            reap_own_session_entry(
+                &mut *self.agent_sessions.lock().await,
+                thread_id,
+                &external_terminal_emitted,
+            );
+            let still_parked = crate::engine::agent_recovery::thread_has_unanswered_question(
+                &self.pool, thread_id,
+            )
+            .await;
+            let discarded_owed = self
+                .effort_discard_owed(thread_id, effort_resume.is_some())
+                .await;
+            if resumes_after_effort_restart(
+                effort_resume.is_some(),
+                true,
+                &last_terminal_kind,
+                still_parked,
+                !cc_orphans.is_empty(),
+                discarded_owed,
+            ) {
+                self.resume_after_effort_restart(thread_id, effort_resume.and_then(|r| r.actor))
+                    .await;
+            }
             return Ok(ProcessResult {
                 response: String::new(),
                 steps: vec![],
@@ -1274,6 +1397,27 @@ impl LucidosEngine {
             }
         }
 
+        // A turn an effort pick interrupted ends here when it ignored the
+        // interrupt and was stopped hard. Any other stop ends the session.
+        let discarded_owed = self
+            .effort_discard_owed(thread_id, effort_resume.is_some())
+            .await;
+        if pending_stop.is_none()
+            && pending_stop_at_reap.is_none()
+            && !another_session_coming
+            && resumes_after_effort_restart(
+                effort_resume.is_some(),
+                false,
+                &last_terminal_kind,
+                false,
+                !cc_orphans.is_empty(),
+                discarded_owed,
+            )
+        {
+            self.resume_after_effort_restart(thread_id, effort_resume.and_then(|r| r.actor))
+                .await;
+        }
+
         // SessionEnded is now terminal-only (Phase 4 of CC resume architecture).
         // Per-turn idle is signaled by `CodingAgentIdled`, which was already
         // emitted earlier in the loop. Discard, ChangesProposed, and Completed
@@ -1360,16 +1504,17 @@ mod tests {
         );
     }
 
-    /// A model change mid-session reaches a terminal event. The session was
-    /// spawned on one model, and the user switched it through a control request
-    /// the run loop never sees.
+    /// A model change mid-session reaches a terminal event, because Claude Code
+    /// applies it to the running session. An effort pick does not: the calls
+    /// still run at the spawn effort, so the terminal reports that.
     #[test]
-    fn a_terminal_reports_the_model_a_control_request_switched_to() {
+    fn a_terminal_reports_the_model_switched_to_and_the_effort_in_force() {
         use crate::runtime::ControlRequest;
         let thread_id = Uuid::new_v4();
         let (mut session, token, _rx) = session_with(false);
         session.current_model = Some("spawn-model".into());
         session.current_reasoning_effort = Some("low".into());
+        session.reasoning_effort_in_force = Some("low".into());
 
         crate::engine::claude_code::record_control_request(
             &mut session,
@@ -1387,7 +1532,7 @@ mod tests {
 
         assert_eq!(
             own_model_settings(&sessions, thread_id, &token),
-            (Some("switched-model".into()), Some("high".into()))
+            (Some("switched-model".into()), Some("low".into()))
         );
 
         let (replacement, _their_token, _their_rx) = session_with(false);
@@ -1397,6 +1542,124 @@ mod tests {
             (None, None),
             "a replacement's model belongs to its own turn"
         );
+    }
+
+    /// A backend that applies effort per turn reports it on each call, and the
+    /// terminal follows the calls. A call with no effort, or one from a run
+    /// whose entry was replaced, changes nothing.
+    #[test]
+    fn the_effort_in_force_follows_the_calls_of_this_run_only() {
+        let thread_id = Uuid::new_v4();
+        let (mut session, token, _rx) = session_with(false);
+        session.reasoning_effort_in_force = Some("medium".into());
+        let mut sessions = HashMap::from([(thread_id, session)]);
+
+        note_effort_in_force(&mut sessions, thread_id, &token, Some("high"));
+        note_effort_in_force(&mut sessions, thread_id, &token, None);
+        assert_eq!(
+            own_model_settings(&sessions, thread_id, &token)
+                .1
+                .as_deref(),
+            Some("high")
+        );
+
+        let (replacement, their_token, _their_rx) = session_with(false);
+        sessions.insert(thread_id, replacement);
+        note_effort_in_force(&mut sessions, thread_id, &token, Some("low"));
+        assert_eq!(
+            own_model_settings(&sessions, thread_id, &their_token).1,
+            None,
+            "an outgoing run never writes into its replacement"
+        );
+    }
+
+    /// The turn an effort pick interrupted resumes at the new effort, so no
+    /// work stops for good. A turn that ended on its own needs no resume,
+    /// unless the pick left a discarded input owed. A follow-up that will
+    /// drive the thread never needs one.
+    #[test]
+    fn an_interrupted_turn_resumes_after_an_effort_restart() {
+        let restarted = Some(TerminalKind::Canceled(CancelCause::EffortRestart));
+        let superseded = Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup));
+        let stopped = Some(TerminalKind::Canceled(CancelCause::UserStop));
+        let generated = Some(TerminalKind::Generated);
+
+        assert!(resumes_after_effort_restart(
+            true, false, &restarted, false, false, false
+        ));
+        assert!(
+            !resumes_after_effort_restart(true, false, &superseded, false, false, false),
+            "a follow-up armed after the pick took over the turn: it drives the \
+             thread even when its caller, not this drain, holds it"
+        );
+        assert!(
+            !resumes_after_effort_restart(true, false, &generated, false, false, false),
+            "the turn ended before the interrupt: the next spawn carries the pick"
+        );
+        assert!(
+            !resumes_after_effort_restart(true, false, &stopped, false, false, false),
+            "the user stopped the turn"
+        );
+        assert!(
+            !resumes_after_effort_restart(true, false, &restarted, false, true, false),
+            "a drained follow-up drives the thread"
+        );
+        assert!(
+            !resumes_after_effort_restart(false, false, &superseded, false, false, false),
+            "a follow-up redirect owes no resume"
+        );
+        assert!(
+            resumes_after_effort_restart(true, false, &generated, false, false, true),
+            "a follow-up read after the pick ended the turn, and the discarded \
+             input is still owed: the resume carries it"
+        );
+        assert!(
+            !resumes_after_effort_restart(true, false, &stopped, false, false, true),
+            "the user stopped the turn, discarded input or not"
+        );
+        assert!(
+            !resumes_after_effort_restart(true, false, &superseded, false, false, true),
+            "the follow-up's session redelivers the discarded input"
+        );
+        assert!(
+            !resumes_after_effort_restart(true, false, &generated, false, true, true),
+            "a drained follow-up's session redelivers the discarded input"
+        );
+    }
+
+    /// A session stopped on a question resumes through the answer, so it
+    /// resumes here only when the question was answered before the stop.
+    #[test]
+    fn a_kept_question_resumes_through_its_answer() {
+        assert!(
+            !resumes_after_effort_restart(true, true, &None, true, false, false),
+            "the answer resumes the session"
+        );
+        assert!(
+            resumes_after_effort_restart(true, true, &None, false, false, false),
+            "answered before the stop: nothing else will resume it"
+        );
+        assert!(!resumes_after_effort_restart(
+            true, true, &None, false, true, false
+        ));
+    }
+
+    /// Finalize resumes a kept question in the branch that lands nothing after
+    /// it, and that branch reads the park after the stop.
+    #[test]
+    fn finalize_resumes_a_kept_question_only_once_it_is_answered() {
+        const SRC: &str = include_str!("completion.rs");
+        let body = &SRC[SRC
+            .find("if pending_stop == Some(StopReason::EffortRestart) {")
+            .expect("finalize still has its kept-question branch")..];
+        let branch = &body[..body.find("return Ok(ProcessResult").unwrap()];
+        assert!(branch.contains("thread_has_unanswered_question("));
+        for lands in ["emit_coding_agent_idled", "propose", "emit_response"] {
+            assert!(
+                !branch.contains(lands),
+                "nothing may land after the question: {lands}"
+            );
+        }
     }
 
     /// Apply clicked just as an idle turn terminated its subprocess. Stop found
@@ -1437,7 +1700,7 @@ mod tests {
             .find("async fn finalize_direct_agent(")
             .expect("finalize is still here")..];
         let snapshot = body
-            .find("let pending_stop = {")
+            .find("let (pending_stop, effort_resume) = {")
             .expect("finalize snapshots its own pending stop");
         let call = body
             .find("maybe_auto_resume_after_api_error(")
@@ -1664,8 +1927,9 @@ mod tests {
         }
         assert_eq!(
             exits.len(),
-            2,
-            "completion.rs has two exits: the shutdown one and the normal one"
+            3,
+            "completion.rs has three exits: the shutdown one, the kept question's \
+             and the normal one"
         );
     }
 }

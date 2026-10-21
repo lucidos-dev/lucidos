@@ -2,6 +2,7 @@ import {
   CONTINUATION_AUTO_RECOVERY_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
+  CONTINUATION_EFFORT_RESTART_REASON,
   CONTINUATION_HARDEN_REQUESTED_REASON,
   CONTINUATION_USER_CLICKED_REASON,
   plainEventName,
@@ -9,6 +10,8 @@ import {
   type CancelCause,
   type EngineReason,
   type EventWaitReason,
+  type PluginSetupCause,
+  type PluginSetupOccasion,
 } from '../store/thread-events';
 
 /** Why a user-driven `ResponseCanceled` fired, for the route popover.
@@ -23,6 +26,8 @@ export function describeCancelCause(cause: CancelCause | undefined): string {
       return 'You applied, discarded or archived this thread while the agent was still working, so Lucidos stopped the agent first.';
     case 'superseded_by_followup':
       return 'You sent a follow-up while the agent was working. Lucidos stopped that reply and answered your follow-up next. Work already done is kept.';
+    case 'effort_restart':
+      return 'You picked a new reasoning effort. This agent takes effort only when it starts, so Lucidos stopped this reply and restarted the agent at the new effort. Work already done is kept.';
     case 'unknown':
     case undefined:
       return 'You stopped the reply. Lucidos did not record how.';
@@ -80,12 +85,18 @@ export function describeContinuationReason(reason: string | undefined): string |
       return 'You chose Switch on the new version, which stopped this reply. Lucidos picked it back up once the new version was running.';
     case CONTINUATION_HARDEN_REQUESTED_REASON:
       return 'You pressed Harden. Lucidos picked the thread back up to review the work and run its tests, and proposes the change when that finishes.';
+    case CONTINUATION_EFFORT_RESTART_REASON:
+      return 'You picked a new reasoning effort. This agent takes effort only when it starts, so Lucidos restarted it at the new effort and it carried on where it stopped.';
     case CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON:
       return 'The connection to the model dropped part-way through the reply above, so it stopped unfinished. Nothing restarted: Lucidos picked the reply back up. It does this a few times in a row at most, then leaves the failure standing.';
     default:
       return null;
   }
 }
+
+/** Why the engine pings a waiting agent. The route popover and the
+ *  transcript's keep-alive divider both say it. */
+export const CACHE_KEEP_ALIVE_EXPLAINER = 'The agent was waiting, so Lucidos nudged it to keep its prompt cache warm. Once that cache expires, after 5 minutes or an hour depending on how the agent is billed, its next step pays to read the whole conversation again.';
 
 /** Why the engine acted, in plain words, for the route popover and a boundary
  *  card's Details. The heading ("Why Lucidos acted") is owned by the renderer. */
@@ -113,6 +124,8 @@ export function describeEngineReason(reason: EngineReason): string {
       return 'Your changes conflict with newer changes in the project: a merge conflict. Lucidos asked the agent to resolve it before your changes can be applied.';
     case 'main_check_red':
       return 'The main check failed: the tests that run on GitHub after changes land found main broken. Lucidos started this thread to find the cause and fix it.';
+    case 'main_check_flaky':
+      return 'The main check passed, but some tests failed once and passed on a retry. Lucidos started this thread to find what makes them flaky and fix it.';
     case 'missing_hardening':
       return `${REVIEW_RULE} It had not run yet, so Lucidos asked the agent to run it.`;
     case 'missing_plan':
@@ -130,7 +143,7 @@ export function describeEngineReason(reason: EngineReason): string {
     case 'event_wait':
       return describeEventWait(reason);
     case 'cache_keep_alive':
-      return 'The agent was waiting, so Lucidos nudged it to keep its prompt cache warm. Once that cache expires, after 5 minutes or an hour depending on how the agent is billed, its next step pays to read the whole conversation again.';
+      return CACHE_KEEP_ALIVE_EXPLAINER;
   }
 }
 
@@ -166,7 +179,40 @@ function describePluginSetup({ plugin_name: name, version, occasion }: PluginSet
     return `You installed ${name}, and its setup needs your input. ${handOff}`;
   }
   const from = occasion.from_version ? ` from ${occasion.from_version}` : '';
-  return `You updated ${name}${from} to ${version}, and the new version changed its setup instructions. ${handOff} The agent reuses what you set up before.`;
+  const cause = occasion.cause ?? { kind: 'instructions_changed' };
+  return `You updated ${name}${from} to ${version}, and ${describeSetupCause(cause)}${authorNote(cause)} ${handOff} The agent reuses what you set up before.`;
+}
+
+/** Why an update ran setup, as a clause that follows "the new version". */
+function describeSetupCause(cause: PluginSetupCause): string {
+  switch (cause.kind) {
+    case 'instructions_changed':
+      return 'the new version changed its setup instructions.';
+    case 'revision_raised':
+      return 'its author asks to run its setup again.';
+    case 'both':
+      return 'the new version changed its setup instructions, and its author asks to run it again.';
+  }
+}
+
+/** The author's `setup_reason` as a sentence, with its leading space. Empty when
+ *  the cause carries none. */
+function authorNote(cause: PluginSetupCause): string {
+  return 'reason' in cause && cause.reason ? ` Author's note: ${cause.reason}` : '';
+}
+
+/** The confirm panel's line about setup on an update: whether the thread will
+ *  run again, and why. `run` is the occasion the engine would seed, `null` when
+ *  it would seed none. */
+export function describeSetupRunNote(run: PluginSetupOccasion | null | undefined): string {
+  if (run?.kind !== 'update') return 'Setup does not run again: nothing in it changed.';
+  const cause = run.cause ?? { kind: 'instructions_changed' };
+  const why = {
+    instructions_changed: 'the steps changed.',
+    revision_raised: 'the author asks for it.',
+    both: 'the steps changed and the author asks for it.',
+  }[cause.kind];
+  return `Setup runs again after this update: ${why}${authorNote(cause)}`;
 }
 
 /** The named origin of an engine-seeded thread: a label and a value for the

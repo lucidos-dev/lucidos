@@ -1075,6 +1075,29 @@ fn build_hook_answers_keys_on_question_field_ignoring_header() {
     assert_eq!(out, serde_json::json!({ "Real question?": "Go" }));
 }
 
+/// Claude Code looks each answer up with `Object.hasOwn(answers, question)` on
+/// the exact string it sent. A trimmed key misses, and the agent reads "The
+/// user did not answer the questions."
+#[test]
+fn build_hook_answers_keys_by_the_exact_question_string() {
+    let raw = ["Ends in a newline?\n", "  Starts with spaces?", "Plain?"];
+    let questions = serde_json::json!(raw.map(|q| serde_json::json!({
+        "question": q,
+        "options": [{"label": "Yes"}],
+    })));
+    let answers = vec![serde_json::json!({"kind": "Selected", "option_id": "opt-0"}); raw.len()];
+    let out = build_hook_answers(&answers, &questions, AnswerImages::AttachedBlocks);
+    let obj = out.as_object().expect("object");
+    for q in raw {
+        assert_eq!(
+            obj.get(q),
+            Some(&serde_json::json!("Yes")),
+            "key {q:?} in {out}"
+        );
+    }
+    assert_eq!(obj.len(), raw.len());
+}
+
 #[test]
 fn lookup_option_label_uses_question_index_not_first() {
     let questions = three_questions();

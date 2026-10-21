@@ -35,7 +35,7 @@ moves.
   pill at a fractional device-pixel x can still sit its digit up to half a
   device pixel further off. The header's rem geometry puts the mark's count
   there at 200% (0.5px, against 0.83px before).
-  `e2e/badge-glyph-centring.spec.ts` allows exactly that on WebKit, and still
+  `e2e/badge-glyph-centring-all.spec.ts` allows exactly that on WebKit, and still
   fails at the 0.67px the original bug showed.
 - The mobile nav cluster is placed by `left`, not `translateX(-50%)`. A
   half-pixel translate added one more device pixel of the same split.

@@ -60,6 +60,13 @@
       "max": 0.12,
       "protectedValue": "normal"
     },
+    "font-weight": {
+      "grammar": "weight",
+      "inherits": true,
+      "min": 400,
+      "max": 600,
+      "protectedValue": "normal"
+    },
     "caret-shape": {
       "grammar": "keyword",
       "values": [
@@ -104,7 +111,7 @@
     {
       "id": "chrome",
       "label": "Chrome",
-      "description": "The frame around the work: header titles, header icons and the actor icons."
+      "description": "The frame around the work: header titles, drawer titles, header icons and the actor icons."
     },
     {
       "id": "composer",
@@ -342,6 +349,21 @@
           "name": "letter-spacing",
           "token": "--part-header-title-letter-spacing",
           "default": "normal"
+        }
+      ]
+    },
+    {
+      "id": "drawer-title",
+      "label": "Drawer titles",
+      "group": "chrome",
+      "description": "Thread titles in the thread drawer. A heavier weight wraps a long title sooner, and the row grows with it.",
+      "selector": ".thread-row-title",
+      "frames": false,
+      "properties": [
+        {
+          "name": "font-weight",
+          "token": "--part-drawer-title-font-weight",
+          "default": "400"
         }
       ]
     },

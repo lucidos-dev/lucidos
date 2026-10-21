@@ -1,18 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { ThreadWidget } from '../../api/client/widgets';
-import { OverflowMenu, type OverflowMenuOpener } from '../shared/OverflowMenu';
+import { OverflowMenu } from '../shared/OverflowMenu';
+import { useObjectMenu } from '../shared/useObjectMenu';
 import { Disclosure } from '../shared/Disclosure';
 import { Overlay } from '../shared/Overlay';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { ChevronDownIcon, CloseIcon } from '../shared/icons';
 import { AppIcon } from '../shared/AppIcon';
-import { useLongPress } from '../../hooks/useLongPress';
-import { viewportIsMobile } from '../../utils/viewport';
 import { openShelfWidget, threadWidgetKey, threadWidgetsFor } from '../../store/widgets';
 import { closeShelfWidget, rereadThreadWidgets } from '../../store/actions/widgets';
 import { isHomeThread } from '../../store/actions/homeThread';
 import { showWidgetInThread, toggleShelfWidget } from '../../store/actions/widget-actions';
-import { WidgetBar } from './InlineWidget';
+import { WidgetPanel } from './InlineWidget';
 import { WidgetFrame } from './WidgetFrame';
 import type { WidgetMenuTarget } from './WidgetMenu';
 import { WidgetMenuItems } from './widgetMenuChunks';
@@ -43,13 +42,9 @@ export function menuTarget(threadId: string, entry: ThreadWidget): WidgetMenuTar
  *  draws no ⋯ of its own: the open widget's bar has one. The name is always
  *  the tooltip, since a tight shelf hides it. */
 function ShelfChip({ threadId, entry, open }: { threadId: string; entry: ThreadWidget; open: boolean }) {
-  const openMenu = useRef<OverflowMenuOpener | null>(null);
   const instanceKey = threadWidgetKey(entry);
   const name = chipName(entry);
-  const press = useLongPress(
-    (chip, at) => openMenu.current?.(chip, viewportIsMobile.value ? undefined : at),
-    () => toggleShelfWidget(threadId, instanceKey),
-  );
+  const menu = useObjectMenu({ onTap: () => toggleShelfWidget(threadId, instanceKey) });
   return (
     <>
       <div
@@ -62,13 +57,8 @@ function ShelfChip({ threadId, entry, open }: { threadId: string; entry: ThreadW
         aria-expanded={open}
         aria-label={`${name} widget`}
         data-tooltip={name}
-        onPointerDown={press.onPointerDown}
-        onPointerMove={press.onPointerMove}
-        onPointerUp={press.onPointerUp}
-        onPointerLeave={press.onPointerLeave}
-        onPointerCancel={press.onPointerCancel}
-        onContextMenu={(e) => { if (!e.altKey) press.onContextMenu(e); }}
-        onClick={press.onClick}
+        {...menu.press}
+        onClick={menu.onClick}
         onKeyDown={(e) => {
           if (e.key !== 'Enter' && e.key !== ' ') return;
           e.preventDefault();
@@ -80,7 +70,7 @@ function ShelfChip({ threadId, entry, open }: { threadId: string; entry: ThreadW
       </div>
       <OverflowMenu
         ariaLabel={`${name} widget actions`}
-        hostOpener={{ ref: openMenu, trigger: false }}
+        hostOpener={{ ref: menu.opener, trigger: false }}
         itemsChunk={WidgetMenuItems}
         items={(ctx) => <WidgetMenuItems ctx={ctx} target={menuTarget(threadId, entry)} />}
       />
@@ -91,8 +81,8 @@ function ShelfChip({ threadId, entry, open }: { threadId: string; entry: ThreadW
 /** The widget shelf in a thread's title row (ADRs 0402, 0407, 0415): a chip
  *  per pinned widget instance, and the one a chip dropped open, under the title. Every
  *  widget also shows as an inline widget in the transcript, so an unpinned one
- *  has no chip and loses nothing. Home draws no shelf: its pinned widgets are
- *  tiles on the Home board (ADR 0466).
+ *  has no chip and loses nothing. Home draws no shelf and takes no pins: a
+ *  widget there goes on a dashboard instead (ADR 0496).
  *
  *  The dropped open widget covers the transcript, so it is an `<Overlay>`
  *  anchored to its chip: an outside tap or Escape closes it. It rolls open
@@ -192,24 +182,25 @@ export function OpenShelfWidget({ threadId, entry, onClose }: {
 }) {
   const target = menuTarget(threadId, entry);
   return (
-    <div class="widget-panel widget-panel-shelf">
-      <WidgetBar
-        target={target}
-        icon={entry.icon}
-        leading={<ShowInThreadButton threadId={threadId} name={target.name} shownEventId={entry.shown_event_id} />}
-        trailing={(
-          <button
-            type="button"
-            class="icon-btn header-icon"
-            aria-label={`Close ${target.name}`}
-            data-tooltip="Close"
-            onClick={onClose}
-          >
-            <CloseIcon />
-          </button>
-        )}
-      />
-      <WidgetFrame appId={entry.app_id} params={entry.params} reveal={entry.reveal} place="shelf" />
-    </div>
+    <WidgetPanel
+      class="widget-panel widget-panel-shelf"
+      target={target}
+      icon={entry.icon}
+      leading={<ShowInThreadButton threadId={threadId} name={target.name} shownEventId={entry.shown_event_id} />}
+      trailing={(
+        <button
+          type="button"
+          class="icon-btn header-icon"
+          aria-label={`Close ${target.name}`}
+          data-tooltip="Close"
+          onClick={onClose}
+        >
+          <CloseIcon />
+        </button>
+      )}
+      frame={(onMenu) => (
+        <WidgetFrame appId={entry.app_id} params={entry.params} reveal={entry.reveal} place="shelf" onMenu={onMenu} />
+      )}
+    />
   );
 }

@@ -22,11 +22,13 @@ fn type_name(value: PrefValue) -> &'static str {
         PrefValue::Bool => "flag",
         PrefValue::Number { .. } => "number",
         PrefValue::Enum(_) => "enum",
+        PrefValue::CodingAgentModel(_) => "coding-agent-model",
         PrefValue::IanaTimezone
         | PrefValue::Text
         | PrefValue::ThemeId
         | PrefValue::ModelBytes
         | PrefValue::ModelEfforts
+        | PrefValue::IntelligenceLadder(_)
         | PrefValue::FontFamily => "text",
     }
 }

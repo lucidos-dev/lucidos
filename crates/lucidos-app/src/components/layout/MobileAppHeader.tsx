@@ -20,6 +20,7 @@ import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { MobileThreadsPane } from './MobileThreadsPane';
 import { ThreadPane } from './ThreadPane';
+import { DashboardSheetToggle } from '../dashboard/DashboardSheet';
 import { ContentPane } from './ContentPane';
 
 /** Configuration pairing a header with its corresponding pane component.
@@ -137,7 +138,7 @@ function MobileThreadHeader() {
             the title followed, see .mobile-header-title in mobile.css). Unlike
             a title this cluster cannot shrink, so its clearance from both edges
             is a fixed-width guarantee, pinned by
-            e2e/mobile-threads-title-alignment.spec.ts. */}
+            e2e/mobile-threads-title-alignment-all.spec.ts. */}
         <div class="header-nav-cluster">
           <ThreadBackButton />
           {/* Home and the mark centre as one pair between the chevrons. So
@@ -244,6 +245,7 @@ export function MobileThreadTitleBar() {
       data-scroller-pinned
     >
       <ThreadTitleMenu thread={eventThread} title={threadTitle} status={threadVisualStatus(eventThread)} />
+      <DashboardSheetToggle />
       <WidgetShelf threadId={threadId} />
     </div>
   );

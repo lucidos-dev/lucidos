@@ -99,7 +99,7 @@ test.describe('Mobile pane-swipe — every navigation source reveals the content
     // taps the OS notification; hashchange → handleHashLocation →
     // dispatchDeepLink → handleNavigationRequest. We drive the same hash-set
     // directly here — the engine's push fan-out is exercised in
-    // notifications.spec.ts; this test asserts the pane behavior on land.
+    // notifications-all.spec.ts; this test asserts the pane behavior on land.
     await navigateToApp(page);
     await expectMobileView(page, 'thread');
 

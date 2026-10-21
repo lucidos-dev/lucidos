@@ -88,44 +88,72 @@
     color: var(--accent-red);
 }
 
-/* Back up now + the schedule and retention pickers. The section's rows carried
-   no shared rhythm at all before (five of them were inline styles with their
-   own eyeballed margins, and this one had none), so this row sat flush against
-   whichever state line preceded it. The gap above is what separates "what is
-   wrong with the destination" from "what you can do now". */
+/* Back up now, under the Schedule and Keep rows it acts alongside. */
 .backup-actions-row {
     display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    flex-wrap: wrap;
-    margin-top: var(--space-md);
-}
-
-/* What the picked provider can reach. Read before connecting, so it sits
-   directly under the Provider row. */
-.backup-provider-access {
-    margin: 0 0 var(--space-sm);
-    font-size: var(--font-size-xs);
-    color: var(--text-muted);
-}
-
-/* Explains when a non-manual schedule actually fires. Sits tight under the row
-   it qualifies. */
-.backup-schedule-hint {
+    justify-content: flex-end;
     margin-top: var(--space-xs);
-    font-size: var(--font-size-xs);
-    color: var(--text-muted);
 }
 
-/* The encryption key is a separate concern from where and when backups run, so
+/* The backup key is a separate concern from where and when backups run, so
    it opens a full gutter below the controls rather than continuing their
    rhythm. */
-.backup-key-row {
+.backup-key {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin-top: var(--space-lg);
+}
+
+.backup-key-status {
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+/* No backup key yet, or a legacy one: backups are not where they should be. */
+.backup-key-status[data-state="warn"] {
+    color: var(--accent-yellow);
+}
+
+.backup-key-actions {
     display: flex;
     align-items: center;
-    gap: var(--space-md);
+    justify-content: flex-end;
+    gap: var(--space-sm);
     flex-wrap: wrap;
-    margin-top: var(--space-lg);
+}
+
+.backup-key-step {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+}
+
+.backup-key-note {
+    margin: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* A pasted key is one long token, so the field takes the whole width. */
+.backup-key-input {
+    min-width: 0;
+    width: 100%;
+    font-family: var(--font-mono);
+}
+
+/* The revealed key gets the full width in a box of its own. Beside a button
+   it wrapped into a narrow column on a phone. */
+.backup-key-reveal {
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-control);
+    background: var(--bg-secondary);
+}
+
+/* Copy leads the row; the step's own buttons pack right. */
+.backup-key-copy {
+    margin-right: auto;
 }
 
 /* The revealed key. Monospace and fully selectable: the user is here to copy it
@@ -133,16 +161,16 @@
    that. */
 .backup-key-value {
     font-size: var(--font-size-xs);
-    color: var(--text-muted);
+    color: var(--text-primary);
     font-family: var(--font-mono);
     user-select: all;
     overflow-wrap: anywhere;
 }
 
-/* Shown only while the key is revealed: this is the one irreversible obligation
-   on the page. */
+/* Shown only while a new backup key is on screen: this is the one
+   irreversible obligation on the page. */
 .backup-key-warning {
-    margin-top: var(--space-xs);
+    margin: 0;
     font-size: var(--font-size-xs);
     color: var(--accent-red);
 }

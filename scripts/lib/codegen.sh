@@ -21,6 +21,7 @@ CODEGEN_INPUT_ROOTS=(
     scripts/lib/codegen.sh
     crates/lucidos-build-slot
     crates/lucidos-capabilities
+    crates/lucidos-claude-code-managed
     crates/lucidos-engine
     crates/lucidos-engine-socket
     crates/lucidos-file-backup-exclusion
@@ -122,16 +123,21 @@ codegen_cached() { # <root> <fingerprint>
 }
 
 # Render into the cache under <fingerprint>. With <bin>, run that freshly built
-# `lucidos-codegen`; without, run the engine's ignored writer test.
-codegen_render() { # <root> <fingerprint> [bin]
-    local root=$1 fp=$2 bin=${3:-} cache tmp
+# `lucidos-codegen`; without, run the engine's ignored writer test. <reused>
+# marks a <bin> from the e2e engine cache, whose engine input manifest already
+# matched this tree. Its age says nothing then, and its dep-info stayed behind
+# with the build that made it, so its inputs are not checked again here.
+codegen_render() { # <root> <fingerprint> [bin] [reused]
+    local root=$1 fp=$2 bin=${3:-} reused=${4:-} cache tmp
     cache=$(codegen_cache_root "$root")
     mkdir -p "$cache"
     tmp=$(mktemp -d "$cache/.rendering.XXXXXX")
     if [ -n "$bin" ]; then
         codegen_log "rendering with $bin"
         "$bin" --out "$tmp" --repo-root "$root" || { rm -rf "$tmp"; return 1; }
-        codegen_check_inputs "$root" "$bin.d" "$bin" || { rm -rf "$tmp"; return 1; }
+        if [ -z "$reused" ]; then
+            codegen_check_inputs "$root" "$bin.d" "$bin" || { rm -rf "$tmp"; return 1; }
+        fi
     else
         codegen_log "rendering through the engine's write_generated_outputs test"
         local log test_bin
@@ -257,7 +263,7 @@ codegen_build_sdk() { # <root>
 
 codegen_usage() {
     cat >&2 <<'EOF'
-Usage: scripts/codegen.sh [--bin <lucidos-codegen>] [--cached-only]
+Usage: scripts/codegen.sh [--bin <lucidos-codegen> | --reused-bin <lucidos-codegen>] [--cached-only]
        scripts/codegen.sh --fingerprint [<rev>]
        scripts/codegen.sh --cache-dir [<rev>]
 
@@ -265,6 +271,9 @@ Writes every generated file: the Rust-rendered TS, CSS and JSON, then the SDK
 bundles in packages/lucidos-sdk/dist/.
 
   --bin <path>     render a miss with this freshly built lucidos-codegen
+  --reused-bin <path>
+                   render a miss with a lucidos-codegen the e2e engine cache
+                   matched to this tree, without checking its inputs again
   --cached-only    never compile: on a miss keep the outputs already there
   --fingerprint    print the codegen fingerprint of the working tree or <rev>
   --cache-dir      print the cached rendering for the working tree or <rev>
@@ -272,7 +281,7 @@ EOF
 }
 
 codegen_main() { # <root> [args...]
-    local root=$1 bin="" cached_only="" fp dir
+    local root=$1 bin="" reused="" cached_only="" fp dir
     shift
     case ${1:-} in
         --fingerprint) codegen_fingerprint "$root" "${2:-}"; return ;;
@@ -281,6 +290,7 @@ codegen_main() { # <root> [args...]
     while [ $# -gt 0 ]; do
         case $1 in
             --bin) bin=${2:?--bin needs a path}; shift 2 ;;
+            --reused-bin) bin=${2:?--reused-bin needs a path}; reused=1; shift 2 ;;
             --cached-only) cached_only=1; shift ;;
             -h | --help) codegen_usage; return 0 ;;
             *) codegen_usage; return 2 ;;
@@ -298,7 +308,7 @@ codegen_main() { # <root> [args...]
         fi
     else
         codegen_log "cache miss"
-        codegen_render "$root" "$fp" "$bin" || return 1
+        codegen_render "$root" "$fp" "$bin" "$reused" || return 1
         dir=$(codegen_cached "$root" "$fp")
     fi
     [ -z "${dir:-}" ] || codegen_sync "$dir" "$root"

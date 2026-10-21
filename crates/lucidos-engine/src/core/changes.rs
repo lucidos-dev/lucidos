@@ -741,6 +741,19 @@ pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
+/// Return the subset of `changes` not in `applying`: the ids the landing lane
+/// holds and the ids another apply has claimed. Apply All never re-submits
+/// them (ADR 0463).
+pub fn drop_applying_changes(
+    changes: Vec<Change>,
+    applying: &std::collections::HashSet<Uuid>,
+) -> Vec<Change> {
+    changes
+        .into_iter()
+        .filter(|c| !applying.contains(&c.id))
+        .collect()
+}
+
 /// Which pending changes a reader asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingScope {
@@ -1369,6 +1382,20 @@ mod tests {
         let kept = drop_empty_changes(vec![normal, emptied, applied_zero]);
         let kept_ids: Vec<_> = kept.iter().map(|c| c.id).collect();
         assert_eq!(kept_ids, vec![normal_id, applied_id]);
+    }
+
+    /// Apply All never re-submits a change the lane holds or another apply
+    /// has claimed.
+    #[test]
+    fn drop_applying_changes_removes_only_the_named_ids() {
+        let (a, b, c) = (make_change(None), make_change(None), make_change(None));
+        let (a_id, c_id) = (a.id, c.id);
+        let applying = std::collections::HashSet::from([b.id]);
+        let kept: Vec<_> = drop_applying_changes(vec![a, b, c], &applying)
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(kept, vec![a_id, c_id]);
     }
 
     /// Every surface that serves a pending list reads it through

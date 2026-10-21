@@ -2,7 +2,7 @@
 //
 // Replaces `vite build --watch`. That command keeps ONE long-lived Rollup
 // incremental cache alive for the life of the process, and a watch that survives
-// many engine-only Apply restarts (it does — see `.claude/rules/dev-runtime.md`) can
+// many engine-only Apply restarts (it does — see `.claude/rules/dev-runtime.md` § "Frontend: the engine serves the built `dist/`") can
 // WEDGE that cache: it re-emits fresh JS from changed source while serving a
 // FROZEN, stale CSS bundle. The engine then serves styles that no longer match
 // the source — silently, for hours, with no health check able to see it. (This
@@ -33,7 +33,8 @@
 // **It says so when a build fails.** The atomic publish keeps the previous
 // `dist/` rather than shipping a broken one, which is right and is also what
 // makes a failure invisible. A failing build now writes `.build-watch/status.json`
-// and raises one notification, so nobody discovers it hours later.
+// and, once the failure outlives a short grace period, raises one notification,
+// so nobody discovers it hours later.
 //
 // Both, and why: `docs/plans/2026-08-21-a-wedged-frontend-build-heals-itself-and-shouts.md`.
 //
@@ -113,6 +114,54 @@ export function alertTransition(prevOk, nextOk) {
   if (prevOk === null) return nextOk ? null : 'broken';
   if (prevOk === nextOk) return null;
   return nextOk ? 'recovered' : 'broken';
+}
+
+/** How long a failing build is held back before it is announced. An Apply's
+ *  merge can catch a build half-written, and the next build heals it. */
+export const BROKEN_ALERT_GRACE_MS = 30_000;
+
+/**
+ * The build-outcome alerts, with the failing one held for a grace period.
+ *
+ * A failure healed inside the grace period raises nothing at all, neither the
+ * failure nor its recovery. A recovery speaks only after an announced failure.
+ * The status file is written regardless, so the engine still sees every build.
+ *
+ * A grace period that ends mid-build waits for another one. That build may be
+ * the fix, and an `npm ci` inside it can outlast the grace period on its own.
+ */
+export function createBuildAlerts({ raise, setTimer, clearTimer, buildRunning, graceMs = BROKEN_ALERT_GRACE_MS }) {
+  let lastOk = null;
+  let latestError = null;
+  let held = null;
+  const announceBroken = () => {
+    if (buildRunning()) {
+      held = setTimer(announceBroken, graceMs);
+      return;
+    }
+    held = null;
+    raise({
+      title: 'Frontend build is failing',
+      message: `Nothing new is being served from this checkout until it builds. ${latestError ?? ''}`,
+    });
+  };
+  return {
+    record(ok, error) {
+      const transition = alertTransition(lastOk, ok);
+      lastOk = ok;
+      if (!ok) latestError = error;
+      if (transition === 'broken') {
+        held = setTimer(announceBroken, graceMs);
+      } else if (transition === 'recovered') {
+        if (held !== null) {
+          clearTimer(held);
+          held = null;
+        } else {
+          raise({ title: 'Frontend build is green again', message: 'The checkout is publishing again.' });
+        }
+      }
+    },
+  };
 }
 
 /**
@@ -291,8 +340,12 @@ function raiseAlert({ title, message }) {
 let building = false;
 let pending = false;
 let child = null;
-/** `null` until this process has completed a build. See `alertTransition`. */
-let lastOk = null;
+const buildAlerts = createBuildAlerts({
+  raise: raiseAlert,
+  setTimer: setTimeout,
+  clearTimer: clearTimeout,
+  buildRunning: () => building || pending,
+});
 /** Per budget, whether its last measurement was within. See `budgetAlerts`. */
 let budgetsWithin = {};
 
@@ -310,16 +363,7 @@ function recordOutcome(ok, error, skippedInstall, chunkBudgets) {
   } catch (err) {
     log(`could not write status: ${err.message}`);
   }
-  const transition = alertTransition(lastOk, ok);
-  lastOk = ok;
-  if (transition === 'broken') {
-    raiseAlert({
-      title: 'Frontend build is failing',
-      message: `Nothing new is being served from this checkout until it builds. ${error ?? ''}`,
-    });
-  } else if (transition === 'recovered') {
-    raiseAlert({ title: 'Frontend build is green again', message: 'The checkout is publishing again.' });
-  }
+  buildAlerts.record(ok, error);
 
   for (const measured of Object.values(chunkBudgets)) {
     if (!measured.overBudget) continue;

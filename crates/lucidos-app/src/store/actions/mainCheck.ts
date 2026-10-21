@@ -14,6 +14,7 @@ import { IDLE_MAIN_CHECK, mainCheck, mainCheckClosing } from '../store';
 /** The main check frames, by name. */
 export type MainCheckFrame =
   | 'MainCheckStarted'
+  | 'MainCheckRunLinked'
   | 'MainCheckPassed'
   | 'MainCheckFailed'
   | 'MainCheckAbandoned'
@@ -32,6 +33,8 @@ export function mainCheckAfter(current: MainCheck, frame: MainCheckFrame, data: 
   if (current.check_id !== checkId) return current;
   const range = { check_id: checkId, from_sha: current.from_sha, to_sha: current.to_sha };
   switch (frame) {
+    case 'MainCheckRunLinked':
+      return current.state === 'running' ? { ...current, run_url: text(data.run_url) } : current;
     case 'MainCheckPassed':
       return { state: 'passed', ...range };
     case 'MainCheckFailed':

@@ -93,7 +93,8 @@ impl LucidosEngine {
                 Some(turn_anchor),
                 device_id,
             )
-            .await;
+            .await
+            .render();
 
         // Include available API credentials so LLM knows which services are configured
         let credentials_context = if classification.needs_credentials {

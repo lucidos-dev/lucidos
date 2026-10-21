@@ -43,7 +43,7 @@ const saved: Record<string, unknown> = {};
  * `_fetch.ts` resolves it once at MODULE load, before any of this runs. What
  * that derivation reads (the shell's `<base href>`, or the path before `/app/`
  * for an iframe) is `_fetch`'s own, unchanged by this script, and exercised for
- * real by `e2e/sdk-iframe-theme.spec.ts` in a browser.
+ * real by `e2e/sdk-iframe-theme-all.spec.ts` in a browser.
  */
 function setEnv(opts: {
   baseUrl?: string;

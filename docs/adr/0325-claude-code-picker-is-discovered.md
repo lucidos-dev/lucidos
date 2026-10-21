@@ -3,6 +3,9 @@
 - **Status**: Accepted
 - **Date**: 2026-09-29
 
+*Superseded in part 2026-10-15 (ADR 0488).* The offered list is no longer
+discovered-only: curated rows Claude Code did not list follow its own rows.
+
 ## Context
 
 The Claude Code `/model` picker in Lucidos was a hand-kept file,

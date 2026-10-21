@@ -1120,6 +1120,8 @@ fn static_command_verdict(tool_name: &str, input: &serde_json::Value) -> Command
 ///   escaped its sandbox, so "I could not see the paths" is not permission.
 ///   A target that [`writes_engine_state`] is [`RequestVerdict::Unclassified`],
 ///   because no grant names it and a write there outlives the session.
+/// * A file read of a secret path ([`file_tool_reads_secret`]) is a
+///   [`SideEffectCategory::SecretRead`], which no grant allows.
 /// * Anything else is benign.
 pub fn classify_coding_agent_request(
     tool_name: &str,
@@ -1135,6 +1137,9 @@ pub fn classify_coding_agent_request(
             let destroys_from_cwd = || destroys_from_request_cwd(tool_name, input, workspace_path);
             return match verdict {
                 StaticVerdict::Settled(RiskLane::Catastrophic) => RequestVerdict::Catastrophic,
+                StaticVerdict::SettledIrreversible(category) => {
+                    RequestVerdict::SideEffect(category)
+                }
                 StaticVerdict::Settled(_) if destroys_from_cwd() => {
                     RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
                 }
@@ -1168,6 +1173,9 @@ pub fn classify_coding_agent_request(
         }
         CommandStatic::NotACommand => {}
     }
+    if file_tool_reads_secret(tool_name, input) {
+        return RequestVerdict::SideEffect(SideEffectCategory::SecretRead);
+    }
     match coding_agent_file_targets(tool_name, input) {
         FileTargets::Known(targets) => {
             // First, so a grant for out-of-workspace writes never covers one:
@@ -1197,6 +1205,28 @@ pub fn classify_coding_agent_request(
         FileTargets::NotAFileWrite => {}
     }
     RequestVerdict::Benign
+}
+
+/// Claude Code's file-reading tools, whose path reaches the prompt tool when
+/// it lies outside the worktree.
+const FILE_READ_TOOLS: [&str; 3] = ["Read", "Grep", "Glob"];
+
+/// Whether a `Read`, `Grep` or `Glob` request reaches a secret path
+/// ([`command_guard::mentions_secret_path`]). The path is read alone and
+/// joined with its glob, so a search rooted at `~/.lucidos` for
+/// `secret-keys/*` counts. A bash command is the static pass's business.
+fn file_tool_reads_secret(tool_name: &str, input: &serde_json::Value) -> bool {
+    if !FILE_READ_TOOLS.contains(&tool_name) {
+        return false;
+    }
+    let field = |key: &str| input.get(key).and_then(|v| v.as_str());
+    let root = field("file_path").or_else(|| field("path")).unwrap_or("");
+    let globs = [field("pattern"), field("glob")];
+    command_guard::mentions_secret_path(root)
+        || globs
+            .into_iter()
+            .flatten()
+            .any(|glob| command_guard::mentions_secret_path(&format!("{root}/{glob}")))
 }
 
 /// The Codex app-server's command-approval tool. Only this one reaches the
@@ -1304,6 +1334,9 @@ async fn attended_escalation_allowed(
     }
     let lane = match static_command_verdict(tool_name, input) {
         CommandStatic::Verdict(StaticVerdict::Settled(lane)) => Some(lane),
+        CommandStatic::Verdict(StaticVerdict::SettledIrreversible(_)) => {
+            Some(RiskLane::IrreversibleDanger)
+        }
         CommandStatic::Verdict(StaticVerdict::NeedsJudge(ji)) if ji.fast_path_refused => None,
         CommandStatic::Verdict(StaticVerdict::NeedsJudge(ji)) => match engine {
             Some(engine) => judge_escalation_lane(engine, &ji, thread_id).await,
@@ -1338,13 +1371,16 @@ fn command_privilege_escalation(tool_name: &str, input: &serde_json::Value) -> b
 /// covered, and a code-injecting `VAR=value` preamble is refused outright.
 /// Matching a single derived pattern instead let `git status && rm -rf /` ride
 /// a grant naming only `git`. Every other tool matches its one derived pattern
-/// exactly, as before.
+/// exactly, as before. No grant covers a secret read, by command or file tool.
 fn session_allow_covers(
     tool_name: &str,
     input: &serde_json::Value,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
     use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+    if file_tool_reads_secret(tool_name, input) {
+        return false;
+    }
     if matches!(tool_name, "Bash" | "command_execution") {
         let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
             return false;
@@ -1381,6 +1417,9 @@ fn persisted_allow_covers(
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
     use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+    if file_tool_reads_secret(tool_name, input) {
+        return false;
+    }
     if matches!(tool_name, "Bash" | "command_execution") {
         // `Broad` is `None` for exactly the two cases a stored pattern must not
         // reach here: a CC-protected path, and a Codex backend tool.
@@ -1403,6 +1442,20 @@ fn persisted_allow_covers(
         .any(|pattern| allowed(&pattern))
 }
 
+/// The copy of a permission request's input that its event stores: masked like
+/// a coding agent's tool output, minus the session values only its run knows.
+fn permission_event_input(input: &serde_json::Value) -> serde_json::Value {
+    let secrets = crate::core::subprocess_secret_values(&[], crate::core::inherited_secret_env());
+    let mut masked = input.clone();
+    crate::core::redact_subprocess_output_in_json(&mut masked, &secrets);
+    masked
+}
+
+/// Why no grant helps. A coding-agent shell never gets a stored secret, so
+/// unlike the trigger lane it is not told to name a `CRED_*` variable.
+const UNATTENDED_UNGRANTABLE_REMEDY: &str =
+    "No side-effect grant can allow this, and a coding-agent session gets no stored secrets.";
+
 /// Resolve a permission request for an unattended session from its classified
 /// verdict and the inherited grant. Returns `(allowed, reason)`.
 fn decide_unattended(verdict: RequestVerdict, grant: &[SideEffectCategory]) -> (bool, String) {
@@ -1411,7 +1464,15 @@ fn decide_unattended(verdict: RequestVerdict, grant: &[SideEffectCategory]) -> (
         RequestVerdict::Catastrophic => (false, UNATTENDED_DENY_CATASTROPHIC_REASON.to_string()),
         RequestVerdict::Unclassified => (false, UNATTENDED_DENY_UNCLASSIFIED_REASON.to_string()),
         RequestVerdict::SideEffect(cat) => {
-            if grant.contains(&cat) {
+            if !cat.is_grantable() {
+                (
+                    false,
+                    format!(
+                        "Auto-denied: this request may perform {}. {UNATTENDED_UNGRANTABLE_REMEDY}",
+                        cat.reason(),
+                    ),
+                )
+            } else if grant.contains(&cat) {
                 (true, UNATTENDED_ALLOW_GRANTED_REASON.to_string())
             } else {
                 (
@@ -1601,13 +1662,12 @@ pub async fn prompt_coding_agent_permission(
     let canonical_input = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
     let dedup_key: DedupKey = (thread_id, tool_name.clone(), canonical_input);
     // The event below is persisted AND fanned out over SSE, and it carries the
-    // tool input verbatim. A hardcoded connection URI in the command text would
-    // reach the event store in the clear, so redact a COPY for the event. The
-    // dedup key and the pending entry keep the verbatim input, which is what
+    // tool input. A token or a hardcoded connection URI in the command would
+    // reach the store in the clear, so redact a COPY for the event.
+    // The dedup key and the pending entry keep the verbatim input, which is what
     // the agent asked to run and what the approval must match. The summary is
     // built from the redacted copy, because it interpolates the command.
-    let mut event_input = input.clone();
-    crate::core::redact_postgres_secrets_in_json(&mut event_input);
+    let event_input = permission_event_input(&input);
     let summary = build_permission_summary(&tool_name, &event_input);
 
     let (request_id, mut rx, is_canonical) = {
@@ -1669,8 +1729,7 @@ async fn record_unattended_denial(
     reason: &str,
 ) {
     let request_id = Uuid::new_v4().to_string();
-    let mut event_input = input.clone();
-    crate::core::redact_postgres_secrets_in_json(&mut event_input);
+    let event_input = permission_event_input(input);
     let summary = build_permission_summary(tool_name, &event_input);
     // No header-borne actor on either raise path, so recover the originating
     // actor from the thread's last user message, as the card path does.
@@ -3444,6 +3503,121 @@ mod tests {
             let (allowed, reason) = decide_unattended(RequestVerdict::Unclassified, grant);
             assert!(!allowed);
             assert_eq!(reason, UNATTENDED_DENY_UNCLASSIFIED_REASON);
+        }
+    }
+
+    /// Secret reads by every coding-agent tool that can make one.
+    fn secret_read_requests() -> Vec<(&'static str, serde_json::Value)> {
+        use serde_json::json;
+        vec![
+            (
+                "Bash",
+                json!({ "command": "cat ~/.lucidos/secret-keys/db" }),
+            ),
+            (
+                "command_execution",
+                json!({ "command": "/bin/zsh -lc 'cat $HOME/.lucidos/pg-shared-password'" }),
+            ),
+            (
+                "Read",
+                json!({ "file_path": "/Users/me/.lucidos/secret-keys/db" }),
+            ),
+            (
+                "Grep",
+                json!({ "pattern": "x", "path": "/Users/me/.lucidos/secret-keys" }),
+            ),
+            (
+                "Glob",
+                json!({ "pattern": "secret-keys/*", "path": "/Users/me/.lucidos" }),
+            ),
+            (
+                "Glob",
+                json!({ "pattern": "/home/u/.lucidos/pg-shared-password" }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_secret_read_is_denied_unattended_whatever_the_grant() {
+        let every_grant = [
+            SideEffectCategory::Email,
+            SideEffectCategory::ExternalApi,
+            SideEffectCategory::CloudCli,
+            SideEffectCategory::OutOfWorkspaceDestruction,
+            SideEffectCategory::Other,
+            SideEffectCategory::SecretRead,
+        ];
+        for (tool, input) in secret_read_requests() {
+            let verdict = classify_coding_agent_request(tool, &input, Path::new("/ws"));
+            assert_eq!(
+                verdict,
+                RequestVerdict::SideEffect(SideEffectCategory::SecretRead),
+                "{tool}: {input}"
+            );
+            let (allowed, reason) = decide_unattended(verdict, &every_grant);
+            assert!(!allowed, "{tool}: {input}");
+            assert!(reason.contains(UNATTENDED_UNGRANTABLE_REMEDY), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_permission_event_stores_its_input_masked() {
+        let input = serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer ghp_Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7d' \
+                        && psql postgres://lucidos:hunter2@localhost/db",
+        });
+        assert_eq!(
+            permission_event_input(&input),
+            serde_json::json!({
+                "command": "curl -H 'Authorization: Bearer ghp_[REDACTED]' \
+                            && psql postgres://lucidos:***@localhost/db",
+            })
+        );
+    }
+
+    #[test]
+    fn no_stored_grant_covers_a_secret_read_in_the_interactive_lane() {
+        let all = |_: &str| true;
+        for (tool, input) in secret_read_requests() {
+            assert!(!session_allow_covers(tool, &input, all), "{tool}: {input}");
+            assert!(
+                !persisted_allow_covers(tool, &input, all),
+                "{tool}: {input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_secret_read_escalation_still_cards() {
+        let input =
+            serde_json::json!({ "command": "/bin/zsh -lc 'cat ~/.lucidos/secret-keys/db'" });
+        assert!(
+            !attended_escalation_allowed(
+                None,
+                CODEX_COMMAND_TOOL,
+                &input,
+                Path::new("/ws"),
+                Uuid::new_v4()
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn a_neighbouring_file_read_is_not_a_secret_read() {
+        use serde_json::json;
+        for (tool, input) in [
+            ("Read", json!({ "file_path": "/Users/me/.lucidos/ports" })),
+            (
+                "Grep",
+                json!({ "pattern": "secret-keys", "path": "/ws/docs" }),
+            ),
+            (
+                "Glob",
+                json!({ "pattern": "**/*.rs", "path": "/Users/me/.lucidos" }),
+            ),
+        ] {
+            assert!(!file_tool_reads_secret(tool, &input), "{tool}: {input}");
         }
     }
 

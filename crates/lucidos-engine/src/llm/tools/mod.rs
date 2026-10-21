@@ -23,12 +23,12 @@
 //! - `images` — save_thread_image, generate_image
 //! - `judgment`: judge (typed questions over one state, gated on a provider)
 //! - `misc` — navigate_ui, git_clone, get_backup_status, request_credential,
-//!   connect_oauth_account, execute_intent, ask_user_question, await_event,
+//!   connect_oauth_account, ask_user_question, await_event,
 //!   list_event_waits, cancel_event_wait, todo_write
 //!   (env-var management is the grouped `env_vars` tool, see below)
 //!
 //! Grouped, manifest-driven tools (one tool per domain with an `action` enum,
-//! built from `crate::capability_manifest` and spliced by the chat/intent
+//! built from `crate::capability_manifest` and spliced by the chat and trigger
 //! callers, not here): `notifications` (list/mark_read/mark_all_read),
 //! `preferences` (get/set), `triggers` (create/list/update/delete/pause/resume),
 //! `trigger_groups` (list/create/rename/reorder/delete), `mcp`
@@ -101,8 +101,6 @@ pub(crate) const BG_MAX_TIMEOUT_SECS: u64 = 3600;
 pub struct ToolCapabilities {
     /// The workspace has at least one configured email account.
     pub email_account: bool,
-    /// The workspace has at least one intent.
-    pub intent: bool,
     /// An image-generation provider is configured.
     pub image_provider: bool,
     /// A judgment provider is configured and switched on, so the agent can ask
@@ -135,7 +133,6 @@ impl ToolCapabilities {
     pub fn all_open() -> Self {
         Self {
             email_account: true,
-            intent: true,
             image_provider: true,
             judgment_provider: true,
             context_mode: false,
@@ -153,7 +150,6 @@ pub(crate) fn gate_is_open(gate: Gate, caps: &ToolCapabilities) -> bool {
     match gate {
         Gate::Ungated => true,
         Gate::EmailAccount => caps.email_account,
-        Gate::Intent => caps.intent,
         Gate::ImageProvider => caps.image_provider,
         Gate::JudgmentProvider => caps.judgment_provider,
         Gate::MemoryTree => caps.memory_tree,
@@ -203,7 +199,7 @@ const FAMILIES: &[FamilyRow] = &[
     (Gate::Ungated, Build::Fixed(file::import_file_tools)), // import_file
     (Gate::Ungated, Build::Fixed(misc::git_clone_tools)), // git_clone
     (Gate::Ungated, Build::Fixed(misc::backup_status_tools)), // get_backup_status
-    // Spliced from `capability_manifest::llm_tools()` by the chat and intent
+    // Spliced from `capability_manifest::llm_tools()` by the chat and trigger
     // callers rather than here:
     // - get_preferences/set_preference → grouped `preferences` tool
     // - the trigger and trigger-group family → `triggers` / `trigger_groups`
@@ -222,7 +218,6 @@ const FAMILIES: &[FamilyRow] = &[
     (Gate::Ungated, Build::Fixed(threads::spawn_tools)), // run_thread, run_coding_agent, follow_up_child_thread
     // correct_memory/correct_memory_by_id are the grouped `memory` manifest tool
     // (spliced via capability_manifest::llm_tools()).
-    (Gate::Intent, Build::Fixed(misc::execute_intent_tools)), // execute_intent
     // emit/query/count events and list/apply changes are the grouped `events` /
     // `changes` manifest tools (spliced via capability_manifest::llm_tools()).
     // list_threads/count_threads are the grouped `threads` manifest tool (spliced
@@ -231,7 +226,7 @@ const FAMILIES: &[FamilyRow] = &[
     // list_thread_queue/update_thread_queue_policy are the grouped `thread_queue`
     // manifest tool (spliced via capability_manifest::llm_tools()).
     // plugin + MCP management are the grouped `plugins` / `mcp` manifest tools
-    // (spliced from capability_manifest::llm_tools() by the chat/intent callers).
+    // (spliced from capability_manifest::llm_tools() by the chat and trigger callers).
     (Gate::Ungated, Build::Fixed(misc::ask_user_question_tools)), // ask_user_question
     (Gate::Ungated, Build::Fixed(misc::await_event_tools)),       // await_event
     (Gate::Ungated, Build::Fixed(misc::event_wait_agent_tools)), // list_event_waits, cancel_event_wait
@@ -262,8 +257,7 @@ const CHAT_TAIL: &[FamilyRow] = &[
     (Gate::Ungated, Build::Fixed(images::thread_image_tools)), // save_thread_image, view_image
     (Gate::ImageProvider, Build::Fixed(images::generation_tools)), // generate_image
     // Last, so adding it moved no tool already on the wire. A chat turn and a
-    // trigger run both splice this tail; an intent sub-loop asks through its
-    // caller's turn.
+    // trigger run both splice this tail.
     (Gate::Ungated, Build::Fixed(misc::request_read_tools)), // request_read
 ];
 

@@ -100,7 +100,10 @@ pub(crate) async fn judge_with<J: JudgmentProvider + ?Sized>(
             command_judge_questions::questions(),
         )
         .await?;
-    Ok(command_judge_questions::read(&judgment.answers))
+    Ok(command_judge_questions::read(
+        &judgment.answers,
+        &input.command,
+    ))
 }
 
 /// What `lucidos-eval`'s command judge check reads from one classification.
@@ -145,7 +148,7 @@ pub async fn classify_for_eval(
             call,
         )
         .await?;
-    let verdict = command_judge_questions::read(&judgment.answers);
+    let verdict = command_judge_questions::read(&judgment.answers, &input.command);
     Ok(EvalVerdict {
         lane: command_judge_questions::lane_name(verdict.lane),
         category: verdict.category.and_then(|category| {

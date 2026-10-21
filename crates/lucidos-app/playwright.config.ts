@@ -3,6 +3,7 @@ import { defineConfig } from '@playwright/test';
 // the one place that reads them. See its header for why the protocol half is
 // not optional.
 import { readAddress } from './e2e/address';
+import { DESKTOP_IGNORES, PHONE_SPECS } from './e2e/projectRules';
 
 const { port, proto } = readAddress();
 
@@ -30,24 +31,22 @@ export default defineConfig({
     actionTimeout: 15_000,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
+    // Calm motion by default. The Motion setting follows the OS, so every
+    // glide, fade and FLIP jumps to its end, and no spec waits one out. A spec
+    // that tests motion opts back in with `reducedMotion: 'no-preference'`
+    // (e2e/motion-stance.test.ts, docs/e2e-test-decisions.md § Calm motion).
+    reducedMotion: 'reduce',
   },
+  // One browser by default: the suffix picks the projects (e2e/projectRules.ts).
   projects: [
     {
       name: 'chromium',
-      // *-mobile.spec.ts files target mobile-only UI (edge-swipe overlay,
-      // touch-specific stacking contexts) that doesn't render on desktop —
-      // exclude them rather than runtime-skipping so the chromium results
-      // stay clean.
-      testIgnore: /-mobile\.spec\.ts$/,
+      testIgnore: DESKTOP_IGNORES,
       use: { browserName: 'chromium' },
     },
     {
       name: 'mobile',
-      // *-desktop.spec.ts files target desktop-only flows (resize-driven
-      // measurements, viewport shrink/grow) that don't apply when the
-      // mobile projects pin viewport via device emulation — exclude them
-      // rather than runtime-skipping so the mobile results stay clean.
-      testIgnore: /-desktop\.spec\.ts$/,
+      testMatch: PHONE_SPECS,
       use: {
         browserName: 'chromium',
         viewport: { width: 375, height: 812 },
@@ -57,7 +56,7 @@ export default defineConfig({
     },
     {
       name: 'mobile-webkit',
-      testIgnore: /-desktop\.spec\.ts$/,
+      testMatch: PHONE_SPECS,
       use: {
         browserName: 'webkit',
         viewport: { width: 390, height: 844 },

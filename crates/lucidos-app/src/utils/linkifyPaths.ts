@@ -141,7 +141,7 @@ const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
 /** UI panels reachable from a markdown link like `[Notifications](notifications)`.
  *  Every `MenuItem` plus the three bare `navigate_ui` targets that land somewhere
- *  other than a menu row: `home-board` reveals the Home board, `app-store` is
+ *  other than a menu row: `dashboard` reveals the dashboard, `app-store` is
  *  the retired alias for Plugins, and `thread-queue` opens a Settings subview.
  *
  *  Held apart from `MenuItem` on purpose. This set answers "is this href a
@@ -150,7 +150,7 @@ const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
  *  keeps it honest: a menu item or a bare generated target missing here is a
  *  link the agent writes and the reader cannot open. */
 export const NAV_TARGETS: ReadonlySet<string> = new Set([
-  'home-board',
+  'dashboard',
   'notifications',
   'apps',
   'plugins',

@@ -298,7 +298,7 @@ impl RepositoryStore {
     ///
     /// `RepositoryRemoved` fires only when a row was actually deleted, so a
     /// repeated or racing delete announces once. The `repo_names` projection
-    /// deliberately keeps the name (see `.claude/rules/db.md` § repo_names), so
+    /// deliberately keeps the name (see `docs/database-schema-notes.md` § repo_names), so
     /// threads bound to the gone repo still resolve a label.
     pub async fn unregister(
         pool: &PgPool,

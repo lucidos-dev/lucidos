@@ -49,6 +49,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
 vi.mock('../actions/thread-sync', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
+  reviveThreadEvents: vi.fn(),
 }));
 
 const fetchEvents = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;

@@ -103,6 +103,15 @@ cache_read_per_mtok = 0.10
 cache_creation_per_mtok = 1.25
 
 [[model]]
+# The background default. Same figures as the engine's `llm/model_prices.rs`
+# row: a cache read at 0.1x input, a 5-minute write at 1.25x.
+id = "claude-haiku-5-5"
+input_per_mtok = 0.10
+output_per_mtok = 0.50
+cache_read_per_mtok = 0.01
+cache_creation_per_mtok = 0.125
+
+[[model]]
 # Free while the stealth window is open, so every cost figure in an ox-alpha run
 # is 0.00. That is not a saving: it means the cost axis measures nothing, and
 # the run is read on quality, rounds and utilisation alone. Re-price and re-run

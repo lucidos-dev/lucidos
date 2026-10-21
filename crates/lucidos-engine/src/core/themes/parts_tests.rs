@@ -119,6 +119,32 @@ fn filter_sits_on_leaf_icons_only() {
     }
 }
 
+/// `font-weight` inherits, so a part that sets it sits on a leaf element:
+/// nothing below it can reach a protected surface.
+#[test]
+fn font_weight_sits_on_leaf_selectors_only() {
+    let mut seen = 0;
+    for (part, usage) in CATALOG.tokens() {
+        if usage.name == "font-weight" {
+            seen += 1;
+            assert!(
+                part.selector
+                    .split(", ")
+                    .all(|s| s.starts_with('.') && !s.contains([' ', '>', '+', '~'])),
+                "{}",
+                part.id
+            );
+        }
+    }
+    assert!(seen > 0, "no part takes font-weight");
+}
+
+/// A weight is not an effect, so `theme-effects: reduce` keeps it.
+#[test]
+fn font_weight_is_not_an_effect() {
+    assert!(!CATALOG.property("font-weight").effect);
+}
+
 /// The header and the composer can overlap scrolled content. The header takes
 /// no box shadow, and the composer takes inset shadows only.
 #[test]
@@ -208,6 +234,34 @@ fn mode_parts_paint_in_their_mode_only() {
         vec![(ICON, "drop-shadow(0 0 3px var(--accent))")]
     );
     assert!(parts_of(&light).is_empty());
+}
+
+#[test]
+fn a_drawer_title_weight_resolves_in_both_modes() {
+    let (dark, light) =
+        resolved(r#"{"name": "W", "parts": {"drawer-title": {"font-weight": " 600 "}}}"#);
+    for map in [&dark, &light] {
+        assert_eq!(
+            parts_of(map),
+            vec![("--part-drawer-title-font-weight", "600")]
+        );
+    }
+}
+
+#[test]
+fn a_drawer_title_weight_is_a_string_in_range() {
+    for (json, message) in [
+        (
+            r#"{"name":"x","parts":{"drawer-title":{"font-weight":600}}}"#,
+            "parts.drawer-title.font-weight: must be a string.",
+        ),
+        (
+            r#"{"name":"x","parts":{"drawer-title":{"font-weight":"700"}}}"#,
+            "parts.drawer-title.font-weight: 700 is over the 600 cap.",
+        ),
+    ] {
+        assert_eq!(refusal(json), message, "{json}");
+    }
 }
 
 #[test]

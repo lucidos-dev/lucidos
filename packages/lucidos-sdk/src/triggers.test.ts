@@ -12,6 +12,7 @@ describe('Trigger type matches engine wire format', () => {
     ({
       id: 't1',
       name: 'Daily summary',
+      slug: 'daily-summary',
       cron_expressions: ['0 0 8 * * *'],
       timezone: 'UTC',
       paused: false,

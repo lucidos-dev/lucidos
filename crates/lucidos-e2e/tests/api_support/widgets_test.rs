@@ -423,19 +423,19 @@ async fn built_in_instances_pin_apart_and_the_built_in_stays_read_only() {
     pool.close().await;
 }
 
-async fn home_board(client: &reqwest::Client, layout: &str) -> serde_json::Value {
+async fn dashboard(client: &reqwest::Client, which: &str) -> serde_json::Value {
     client
-        .get(format!("{}/api/v1/home-board?layout={layout}", base_url()))
+        .get(format!("{}/api/v1/dashboard?dashboard={which}", base_url()))
         .send()
         .await
-        .expect("home board request failed")
+        .expect("dashboard request failed")
         .json()
         .await
-        .expect("the home board is JSON")
+        .expect("the dashboard is JSON")
 }
 
 /// (app id, size) per tile, keeping only this test's widgets: other tests may
-/// pin to the same Home.
+/// add to the same dashboards.
 fn tile_sizes(board: &serde_json::Value, ours: &[&str]) -> Vec<(String, String)> {
     board["tiles"]
         .as_array()
@@ -451,12 +451,13 @@ fn tile_sizes(board: &serde_json::Value, ours: &[&str]) -> Vec<(String, String)>
         .collect()
 }
 
-/// Prompt parity for the Home board (ADR 0432). An arrangement over HTTP
-/// reads back the same. A new pin lands at its first declared size, and an
-/// undeclared size is refused. Pin to Home on a thread's own widget makes it
-/// reusable in the same action.
+/// Prompt parity for the dashboards (ADRs 0432, 0496). Each dashboard holds
+/// its own tiles, and an arrangement over HTTP reads back the same. A new tile
+/// lands at its first declared size, and an undeclared size is refused.
+/// Adding a thread's own widget makes it reusable in the same action. The
+/// Home thread takes no pins.
 #[tokio::test]
-async fn the_home_board_arranges_over_http_and_reads_back() {
+async fn the_dashboards_hold_their_own_tiles_over_http() {
     let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect");
     let clock = folder("clock");
@@ -478,34 +479,34 @@ async fn the_home_board_arranges_over_http_and_reads_back() {
     )
     .await;
     write_app_folder(&client, &owned, widget_manifest(origin, false)).await;
-    let home = home_board(&client, "desktop").await["thread_id"]
-        .as_str()
-        .expect("the board names Home")
-        .to_string();
 
     for id in [&clock, &inbox] {
         let (status, body) = post(
             &client,
-            "/widgets/pin",
-            json!({ "app_id": id, "thread_id": home }),
+            "/widgets/dashboard-add",
+            json!({ "app_id": id, "dashboard": "desktop" }),
         )
         .await;
-        assert_eq!(status, 200, "pin {id}: {body}");
+        assert_eq!(status, 200, "add {id}: {body}");
     }
-    let ours = [clock.as_str(), inbox.as_str()];
+    let ours = [clock.as_str(), inbox.as_str(), owned.as_str()];
     assert_eq!(
-        tile_sizes(&home_board(&client, "desktop").await, &ours),
+        tile_sizes(&dashboard(&client, "desktop").await, &ours),
         [
             (clock.clone(), "small".into()),
             (inbox.clone(), "medium".into())
         ],
-        "a new pin lands at its first declared size"
+        "a new tile lands at its first declared size"
+    );
+    assert!(
+        tile_sizes(&dashboard(&client, "phone").await, &ours).is_empty(),
+        "the desktop's tiles stay on the desktop"
     );
 
     let (status, arranged) = post(
         &client,
         "/widgets/arrange",
-        json!({ "layout": "desktop", "tiles": [
+        json!({ "dashboard": "desktop", "tiles": [
             { "app_id": inbox, "size": "medium" },
             { "app_id": clock, "size": "large" },
         ]}),
@@ -518,37 +519,144 @@ async fn the_home_board_arranges_over_http_and_reads_back() {
     ];
     assert_eq!(tile_sizes(&arranged, &ours), expected);
     assert_eq!(
-        tile_sizes(&home_board(&client, "desktop").await, &ours),
+        tile_sizes(&dashboard(&client, "desktop").await, &ours),
         expected
     );
 
     let (status, body) = post(
         &client,
         "/widgets/arrange",
-        json!({ "layout": "phone", "tiles": [{ "app_id": clock, "size": "medium" }] }),
+        json!({ "dashboard": "phone", "tiles": [{ "app_id": clock, "size": "small" }] }),
     )
     .await;
-    assert_eq!(status, 409, "clock declares no medium size: {body}");
+    assert_eq!(status, 409, "clock is not on the phone dashboard: {body}");
 
     let (status, body) = post(
         &client,
-        "/widgets/pin",
-        json!({ "app_id": owned, "thread_id": home }),
+        "/widgets/dashboard-add",
+        json!({ "app_id": owned, "dashboard": "phone" }),
     )
     .await;
-    assert_eq!(status, 200, "pin to Home: {body}");
+    assert_eq!(status, 200, "add to the phone: {body}");
     assert_eq!(body["made_reusable"], true, "{body}");
+    assert_eq!(
+        tile_sizes(&dashboard(&client, "phone").await, &ours),
+        [(owned.clone(), "medium".into())]
+    );
 
-    for id in [&clock, &inbox, &owned] {
-        post(
+    let home: String =
+        sqlx::query_scalar("SELECT thread_id::text FROM thread_summaries WHERE is_home")
+            .fetch_one(&pool)
+            .await
+            .expect("the workspace has a home thread");
+    let (status, body) = post(
+        &client,
+        "/widgets/pin",
+        json!({ "app_id": clock, "thread_id": home }),
+    )
+    .await;
+    assert_eq!(status, 409, "Home has no shelf: {body}");
+
+    for (id, which) in [(&clock, "desktop"), (&inbox, "desktop"), (&owned, "phone")] {
+        let (status, body) = post(
             &client,
-            "/widgets/unpin",
-            json!({ "app_id": id, "thread_id": home }),
+            "/widgets/dashboard-remove",
+            json!({ "app_id": id, "dashboard": which }),
         )
         .await;
+        assert_eq!(status, 200, "remove {id}: {body}");
     }
-    assert!(tile_sizes(&home_board(&client, "desktop").await, &ours).is_empty());
+    for which in ["desktop", "phone"] {
+        assert!(tile_sizes(&dashboard(&client, which).await, &ours).is_empty());
+    }
     cleanup(&pool, &[origin]).await;
     remove_folders(&client, &[&clock, &inbox, &owned]).await;
     pool.close().await;
+}
+
+/// ADR 0532 over real HTTP. An app that is not a widget joins a dashboard as a
+/// quarter-size shortcut through the one checked add. The tile reads back as
+/// `kind: "app"`, takes only `quarter`, and refuses params and unknown ids.
+#[tokio::test]
+async fn an_app_joins_a_dashboard_as_a_quarter_shortcut_over_http() {
+    let client = user_client().await;
+    let notes = folder("notes");
+    write_app_folder(
+        &client,
+        &notes,
+        json!({"name": "Notes", "description": "Quick notes"}),
+    )
+    .await;
+
+    let (status, body) = post(
+        &client,
+        "/widgets/dashboard-add",
+        json!({ "app_id": notes, "dashboard": "desktop", "params": { "a": 1 } }),
+    )
+    .await;
+    assert_eq!(status, 409, "an app takes no params: {body}");
+
+    let (status, body) = post(
+        &client,
+        "/widgets/dashboard-add",
+        json!({ "app_id": "no-such-app-exists", "dashboard": "desktop" }),
+    )
+    .await;
+    assert_eq!(status, 409, "an unknown id is refused: {body}");
+
+    let (status, body) = post(
+        &client,
+        "/widgets/dashboard-add",
+        json!({ "app_id": notes, "dashboard": "desktop", "label": "My notes" }),
+    )
+    .await;
+    assert_eq!(status, 200, "add the app: {body}");
+    assert_ne!(body["made_reusable"], true, "an app is never made reusable");
+
+    let board = dashboard(&client, "desktop").await;
+    let tile = board["tiles"]
+        .as_array()
+        .expect("tiles")
+        .iter()
+        .find(|t| t["app_id"] == notes.as_str())
+        .unwrap_or_else(|| panic!("the shortcut is on the dashboard: {board}"));
+    assert_eq!(tile["kind"], "app", "{tile}");
+    assert_eq!(tile["size"], "quarter", "{tile}");
+    assert_eq!(tile["name"], "Notes", "{tile}");
+
+    let (status, body) = post(
+        &client,
+        "/widgets/dashboard-add",
+        json!({ "app_id": notes, "dashboard": "desktop" }),
+    )
+    .await;
+    assert_eq!(status, 409, "a second add is refused: {body}");
+
+    let (status, body) = post(
+        &client,
+        "/widgets/arrange",
+        json!({ "dashboard": "desktop", "tiles": [{ "app_id": notes, "size": "small" }] }),
+    )
+    .await;
+    assert_eq!(status, 409, "a shortcut takes only quarter: {body}");
+    let (status, body) = post(
+        &client,
+        "/widgets/arrange",
+        json!({ "dashboard": "desktop", "tiles": [{ "app_id": notes, "size": "quarter" }] }),
+    )
+    .await;
+    assert_eq!(status, 200, "arrange at quarter: {body}");
+
+    let (status, body) = post(
+        &client,
+        "/widgets/dashboard-remove",
+        json!({ "app_id": notes, "dashboard": "desktop" }),
+    )
+    .await;
+    assert_eq!(status, 200, "remove the shortcut: {body}");
+    assert!(
+        tile_sizes(&dashboard(&client, "desktop").await, &[notes.as_str()]).is_empty(),
+        "the shortcut left the dashboard"
+    );
+    remove_folders(&client, &[&notes]).await;
 }

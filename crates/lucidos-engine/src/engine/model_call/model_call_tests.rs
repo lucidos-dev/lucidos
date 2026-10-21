@@ -116,6 +116,8 @@ async fn an_unfinished_turn_capture_still_records() {
     let (_, capture) = turn_chat(
         &bus,
         thread,
+        EventMeta::NONE,
+        1,
         &provider,
         ask("hi"),
         vec![],
@@ -171,12 +173,14 @@ impl LlmProvider for Rerouting {
             .await?;
         Ok(LlmResponse {
             served_model: Some("gemini-3.6-flash".to_string()),
+            provider: Some(crate::llm::ProviderKind::ClaudeGateway),
             ..response
         })
     }
 }
 
-/// Both rows keep the model Lucidos asked for and the one the reply named.
+/// Both rows keep the model Lucidos asked for, the one the reply named, and
+/// the backend the router sent it to.
 #[tokio::test]
 async fn a_capture_records_the_model_that_served_the_call() {
     let (pool, db) = setup_test_db().await;
@@ -198,10 +202,13 @@ async fn a_capture_records_the_model_that_served_the_call() {
     let rows = aux_captures(&pool, thread, "title").await;
     assert_eq!(rows[0]["model"], "gemini-3.5-flash");
     assert_eq!(rows[0]["served_model"], "gemini-3.6-flash");
+    assert_eq!(rows[0]["provider"], "claude-gateway");
 
     let (_, capture) = turn_chat(
         &bus,
         thread,
+        EventMeta::NONE,
+        1,
         &provider,
         ask("hi"),
         vec![],
@@ -211,28 +218,7 @@ async fn a_capture_records_the_model_that_served_the_call() {
     )
     .await
     .expect("the scripted model answers");
-    capture
-        .finish(EventMeta::NONE, |usage, served_model| {
-            ThreadEvent::ContextCaptured {
-                producer: ContextProducer::MainLlm,
-                model: "gemini-3.5-flash".to_string(),
-                context_window: 0,
-                sections: Vec::new(),
-                tools: Vec::new(),
-                estimated_total_tokens: 0,
-                usage,
-                trimmed: false,
-                trim_passes: Vec::new(),
-                purpose: ContextPurpose::Turn,
-                reconstructed: false,
-                parent_tool_use_id: None,
-                api_call_id: None,
-                reasoning_effort: None,
-                duration_ms: None,
-                served_model,
-            }
-        })
-        .await;
+    capture.finish(turn_row("gemini-3.5-flash")).await;
     let turn: serde_json::Value = sqlx::query_scalar(
         "SELECT payload FROM events WHERE thread_id = $1 \
            AND event_type = 'ContextCaptured' AND payload->>'producer' = 'main_llm'",
@@ -242,6 +228,188 @@ async fn a_capture_records_the_model_that_served_the_call() {
     .await
     .expect("read the turn row");
     assert_eq!(turn["served_model"], "gemini-3.6-flash");
+    assert_eq!(turn["provider"], "claude-gateway");
+    teardown_test_db(&db).await;
+}
+
+/// The row the agentic loop builds from a turn's report for a call to
+/// `model`, cut to the fields the call itself reported.
+fn turn_row(model: &str) -> impl FnOnce(TurnReport) -> ThreadEvent + '_ {
+    move |report| ThreadEvent::ContextCaptured {
+        producer: ContextProducer::MainLlm,
+        model: model.to_string(),
+        context_window: 0,
+        sections: Vec::new(),
+        tools: Vec::new(),
+        estimated_total_tokens: 0,
+        usage: report.usage,
+        trimmed: false,
+        trim_passes: Vec::new(),
+        purpose: ContextPurpose::Turn,
+        reconstructed: false,
+        parent_tool_use_id: None,
+        api_call_id: None,
+        reasoning_effort: report.detail.reasoning_effort,
+        duration_ms: report.detail.duration_ms,
+        served_model: report.detail.served_model,
+        provider: report.detail.provider,
+        stable_prefix_fingerprint: report.stable_prefix_fingerprint,
+        ttft_ms: report.detail.ttft_ms,
+        request_id: report.detail.request_id,
+    }
+}
+
+/// A provider that reports a cache write split by lifetime and the
+/// fingerprint of the prefix it sent, the way the Anthropic wire does.
+struct CacheReporting(ScriptedProvider);
+
+#[async_trait::async_trait]
+impl LlmProvider for CacheReporting {
+    async fn chat(
+        &self,
+        messages: Vec<Message>,
+        tools: Vec<ToolDefinition>,
+        selection: ModelSelection<'_>,
+        system_prompt: Option<&str>,
+        on_token: Option<TokenCallback>,
+        call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, BoxError> {
+        let response = self
+            .0
+            .chat(messages, tools, selection, system_prompt, on_token, call)
+            .await?;
+        Ok(LlmResponse {
+            input_tokens: Some(50_000),
+            cache_creation_tokens: Some(40_000),
+            cache_creation_1h_tokens: Some(0),
+            stable_prefix_fingerprint: Some("0123456789abcdef".to_string()),
+            ..response
+        })
+    }
+}
+
+/// A turn row carries four things its call reported: the time it took, its
+/// effort, its cache write's lifetime split and its prefix fingerprint. The
+/// time places the request start, which a cache-gap measurement needs.
+#[tokio::test]
+async fn a_turn_row_carries_what_its_call_reported() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let provider = CacheReporting(ScriptedProvider::new("claude-opus-5-5", vec!["a"]));
+
+    let (_, capture) = turn_chat(
+        &bus,
+        thread,
+        EventMeta::NONE,
+        1,
+        &provider,
+        ask("hi"),
+        vec![],
+        ModelSelection::model("claude-opus-5-5").with_effort(Some("high")),
+        None,
+        None,
+    )
+    .await
+    .expect("the scripted model answers");
+    capture.finish(turn_row("claude-opus-5-5")).await;
+    let turn: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE thread_id = $1 AND event_type = 'ContextCaptured'",
+    )
+    .bind(thread)
+    .fetch_one(&pool)
+    .await
+    .expect("read the turn row");
+    assert_eq!(turn["producer"], "main_llm");
+    assert!(turn["duration_ms"].is_u64(), "the call was timed: {turn}");
+    assert_eq!(turn["reasoning_effort"], "high");
+    assert_eq!(turn["usage"]["cache_creation_1h_tokens"], 0);
+    assert_eq!(turn["stable_prefix_fingerprint"], "0123456789abcdef");
+    teardown_test_db(&db).await;
+}
+
+/// A later round sends the same stable prefix as round 1, so only round 1
+/// keeps the fingerprint.
+#[tokio::test]
+async fn only_round_one_keeps_the_stable_prefix_fingerprint() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let provider = CacheReporting(ScriptedProvider::new("claude-opus-5-5", vec!["a", "b"]));
+
+    for round in [1, 2] {
+        let (_, capture) = turn_chat(
+            &bus,
+            Uuid::new_v4(),
+            EventMeta::NONE,
+            round,
+            &provider,
+            ask("hi"),
+            vec![],
+            ModelSelection::model("claude-opus-5-5"),
+            None,
+            None,
+        )
+        .await
+        .expect("the scripted model answers");
+        let mut fingerprint = None;
+        capture
+            .finish(|report| {
+                fingerprint = report.stable_prefix_fingerprint.clone();
+                turn_row("claude-opus-5-5")(report)
+            })
+            .await;
+        assert_eq!(
+            fingerprint.is_some(),
+            round == 1,
+            "round {round}: {fingerprint:?}"
+        );
+    }
+    teardown_test_db(&db).await;
+}
+
+/// A turn row nobody finished still records the call's time from `Drop`.
+#[tokio::test]
+async fn an_unfinished_turn_row_still_records_the_call_time() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let provider = CacheReporting(ScriptedProvider::new("claude-opus-5-5", vec!["a"]));
+
+    let (_, capture) = turn_chat(
+        &bus,
+        thread,
+        EventMeta::NONE,
+        1,
+        &provider,
+        ask("hi"),
+        vec![],
+        ModelSelection::model("claude-opus-5-5"),
+        None,
+        None,
+    )
+    .await
+    .expect("the scripted model answers");
+    drop(capture);
+    let mut turn = None;
+    for _ in 0..50 {
+        turn = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT payload FROM events WHERE thread_id = $1 AND event_type = 'ContextCaptured'",
+        )
+        .bind(thread)
+        .fetch_optional(&pool)
+        .await
+        .expect("read the turn row");
+        if turn.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let turn = turn.expect("Drop recorded the row");
+    assert!(turn["duration_ms"].is_u64(), "the call was timed: {turn}");
+    assert!(
+        turn.get("stable_prefix_fingerprint").is_none(),
+        "Drop cannot tell round 1, so it records no fingerprint"
+    );
     teardown_test_db(&db).await;
 }
 
@@ -361,8 +529,8 @@ impl LlmProvider for Slow {
 }
 
 /// The deadline bounds the provider call and nothing else. A call that runs
-/// out reports a typed timeout and records nothing, since it reported nothing.
-/// A call that answers in time keeps its answer and its row.
+/// out reports a typed timeout and records no capture, since it reported
+/// nothing. A call that answers in time keeps its answer and its row.
 #[tokio::test]
 async fn a_deadline_bounds_the_call_never_its_record() {
     let (pool, db) = setup_test_db().await;
@@ -404,6 +572,187 @@ async fn a_deadline_bounds_the_call_never_its_record() {
         .await
         .expect("the call answered in time");
     assert_eq!(aux_captures(&pool, thread, "title").await.len(), 1);
+    teardown_test_db(&db).await;
+}
+
+/// Every `ModelCallFailed` row on a thread, oldest first.
+async fn failure_rows(pool: &sqlx::PgPool, thread: Uuid) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM events \
+         WHERE thread_id = $1 AND event_type = 'ModelCallFailed' ORDER BY sequence ASC",
+    )
+    .bind(thread)
+    .fetch_all(pool)
+    .await
+    .expect("read the failure rows")
+}
+
+async fn capture_count(pool: &sqlx::PgPool, thread: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'ContextCaptured'",
+    )
+    .bind(thread)
+    .fetch_one(pool)
+    .await
+    .expect("count the captures")
+}
+
+/// A failed call leaves a `ModelCallFailed`, never a capture a rollup could
+/// bill. The row holds facts only: the provider's message, which can echo the
+/// request, appears nowhere in it, while the caller still gets the error.
+#[tokio::test]
+async fn a_failed_call_records_facts_and_never_a_capture() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let capture = AuxCapture::new(&bus, thread, ContextPurpose::Title);
+    let provider = crate::test_support::JudgmentChatStub::failing("body echoed the SECRET prompt");
+
+    let error = capture
+        .chat(
+            &provider,
+            ask("hi"),
+            vec![],
+            ModelSelection::model("title-model").with_effort(Some("low")),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the provider failed");
+    assert!(error.to_string().contains("SECRET"), "the caller keeps it");
+
+    let rows = failure_rows(&pool, thread).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["model"], "title-model");
+    assert_eq!(row["purpose"], "title");
+    assert_eq!(row["reasoning_effort"], "low");
+    assert_eq!(row["failure"], "other", "no send, no status, no deadline");
+    assert_eq!(row["attempts"], 0);
+    assert!(row["duration_ms"].is_u64(), "{row}");
+    assert!(!row.to_string().contains("SECRET"), "{row}");
+    assert_eq!(
+        capture_count(&pool, thread).await,
+        0,
+        "a failure bills nothing"
+    );
+    teardown_test_db(&db).await;
+}
+
+/// A call that runs past its deadline fails as a timeout, which no send
+/// attempt sees.
+#[tokio::test]
+async fn a_call_past_its_deadline_fails_as_a_timeout() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let slow = Slow {
+        delay: std::time::Duration::from_millis(300),
+        inner: ScriptedProvider::new("title-model", vec!["late"]),
+    };
+    AuxCapture::new(&bus, thread, ContextPurpose::Title)
+        .until(tokio::time::Instant::now() + std::time::Duration::from_millis(20))
+        .chat(
+            &slow,
+            ask("hi"),
+            vec![],
+            ModelSelection::default(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the call outran its deadline");
+
+    let rows = failure_rows(&pool, thread).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["failure"], "timeout");
+    teardown_test_db(&db).await;
+}
+
+/// A turn's failure row keeps the turn's `request_event_id`, so the exporter
+/// can name the prompt it belongs to.
+#[tokio::test]
+async fn a_failed_turn_call_keeps_the_turns_request() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let origin = Uuid::new_v4();
+    let meta = EventMeta {
+        request_event_id: Some(origin),
+        ..EventMeta::NONE
+    };
+    let provider = crate::test_support::JudgmentChatStub::failing("down");
+
+    turn_chat(
+        &bus,
+        thread,
+        meta,
+        1,
+        &provider,
+        ask("hi"),
+        vec![],
+        ModelSelection::model("turn-model"),
+        None,
+        None,
+    )
+    .await
+    .err()
+    .expect("the provider failed");
+
+    let rows = failure_rows(&pool, thread).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["request_event_id"], origin.to_string());
+    assert!(rows[0].get("purpose").is_none(), "a turn writes no purpose");
+    assert_eq!(capture_count(&pool, thread).await, 0);
+    teardown_test_db(&db).await;
+}
+
+/// The `Drop` fallback records the turn's row under the turn's meta, not the
+/// empty one it wrote before.
+#[tokio::test]
+async fn an_unfinished_turn_row_keeps_the_turns_request() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let origin = Uuid::new_v4();
+    let meta = EventMeta {
+        request_event_id: Some(origin),
+        ..EventMeta::NONE
+    };
+    let provider = ScriptedProvider::new("turn-model", vec!["hello"]);
+
+    let (_, capture) = turn_chat(
+        &bus,
+        thread,
+        meta,
+        1,
+        &provider,
+        ask("hi"),
+        vec![],
+        ModelSelection::model("turn-model"),
+        None,
+        None,
+    )
+    .await
+    .expect("the scripted model answers");
+    drop(capture);
+
+    let mut row = None;
+    for _ in 0..50 {
+        row = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT payload FROM events WHERE thread_id = $1 AND event_type = 'ContextCaptured'",
+        )
+        .bind(thread)
+        .fetch_optional(&pool)
+        .await
+        .expect("read the turn row");
+        if row.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = row.expect("Drop recorded the row");
+    assert_eq!(row["request_event_id"], origin.to_string());
     teardown_test_db(&db).await;
 }
 

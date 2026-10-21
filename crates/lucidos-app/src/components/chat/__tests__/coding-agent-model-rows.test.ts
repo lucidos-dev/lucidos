@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { modelRowNote, pickerRowValue } from '../CodingAgentControlMenu';
+import { pickerRowValue } from '../useRungState';
 import type { CodingAgentCommandOption } from '../../../api/client';
 
 const row = (value: string, resolved_model?: string, description = ''): CodingAgentCommandOption => ({
@@ -32,22 +32,5 @@ describe('pickerRowValue', () => {
 
   it('leaves a model no row runs as it is, for the picker to name', () => {
     expect(pickerRowValue(served, 'claude-opus-4-1')).toBe('claude-opus-4-1');
-  });
-});
-
-describe('modelRowNote', () => {
-  it("names the model once on Claude Code's own Default row", () => {
-    const discovered = row('default', 'claude-opus-5-5[1m]', 'Use the default model (currently Opus 5.5 (1M context))');
-    expect(modelRowNote(discovered, 'Opus 5.5 (1M context)'))
-      .toBe('Use the default model (currently Opus 5.5 (1M context))');
-  });
-
-  it('adds the model to the fallback Default row, which does not name it', () => {
-    const curated = row('default', undefined, 'Use the default model for your plan');
-    expect(modelRowNote(curated, 'Opus 5.5')).toBe('Use the default model for your plan (currently Opus 5.5)');
-  });
-
-  it('leaves every other row as described', () => {
-    expect(modelRowNote(row('sonnet', 'claude-sonnet-5[1m]', 'Sonnet'), 'Opus 5.5')).toBe('Sonnet');
   });
 });

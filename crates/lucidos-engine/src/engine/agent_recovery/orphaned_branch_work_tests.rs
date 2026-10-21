@@ -980,6 +980,8 @@ async fn handed_off_thread(
         event: ThreadEvent::SuccessorThreadSpawned {
             successor_thread_id: successor,
             base_sha: base,
+            starts_build_chain: false,
+            handoff_consent: None,
         },
         meta: cc_meta(),
     })

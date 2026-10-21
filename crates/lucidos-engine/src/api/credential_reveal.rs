@@ -18,7 +18,7 @@ use super::secret_reveal::{
     RevealTokenResponse,
 };
 use super::*;
-use crate::core::CredentialStore;
+use crate::core::{AuthType, CredentialStore};
 
 /// The route that mints a credential-reveal token, named in its own refusal.
 const MINT_ROUTE: &str = "/api/v1/credential-reveal-token";
@@ -43,6 +43,9 @@ pub(super) async fn mint_reveal_token(
     // Refuse to mint against a row that does not exist, so a caller learns that
     // here rather than after spending the token.
     match CredentialStore::get_by_id(&state.pool, query.id).await {
+        Ok(Some(cred)) if cred.auth_type == AuthType::OnepasswordServiceAccount => {
+            return Err(service_account_unrevealable())
+        }
         Ok(Some(_)) => {}
         Ok(None) => return Err((StatusCode::NOT_FOUND, "Credential not found".to_string())),
         Err(e) => {
@@ -107,6 +110,11 @@ pub(super) async fn get_credential_value(
         return Err(token_required(MINT_ROUTE));
     }
     match CredentialStore::get_by_id(&state.pool, query.id).await {
+        Ok(Some(cred)) if cred.auth_type == AuthType::OnepasswordServiceAccount => {
+            Err(service_account_unrevealable())
+        }
+        // The stored value, so a *secret reference* shows as the reference.
+        // Its value already sits in the user's 1Password.
         Ok(Some(cred)) => {
             state
                 .engine
@@ -124,7 +132,7 @@ pub(super) async fn get_credential_value(
                 .await;
             Ok(Json(serde_json::json!({
                 "auth_type": cred.auth_type.to_string(),
-                "auth_value": cred.auth_value,
+                "auth_value": cred.stored_value(),
             })))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, "Credential not found".to_string())),
@@ -133,6 +141,16 @@ pub(super) async fn get_credential_value(
             format!("Failed to get credential: {}", e),
         )),
     }
+}
+
+/// The refusal for a 1Password service account token, which only the `op`
+/// tool ever reads.
+fn service_account_unrevealable() -> (StatusCode, String) {
+    (
+        StatusCode::FORBIDDEN,
+        "a 1Password service account token is never shown again. Replace it to change it"
+            .to_string(),
+    )
 }
 
 /// Routes for the two-step credential reveal.

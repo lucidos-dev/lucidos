@@ -158,6 +158,7 @@ impl CcStreamState {
                 parent_tool_use_id,
                 api_call_id: message_id.map(String::from),
                 duration_ms,
+                reasoning_effort: None,
             },
         )
     }

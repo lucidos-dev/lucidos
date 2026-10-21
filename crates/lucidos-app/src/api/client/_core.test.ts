@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { json, mutatingFetch, API, isTransientFetchError, retryTransientRead, throwIfNotOk, ApiError } from './_core';
+import { json, mutatingFetch, API, isTransientFetchError, retryTransient, throwIfNotOk, ApiError } from './_core';
 import { trackDeviceRegistration } from '../../utils/deviceRegistration';
 import { engineRestarting } from '../../store/store';
 
@@ -277,7 +277,7 @@ describe('a failed response never surfaces its body', () => {
   });
 });
 
-describe('isTransientFetchError / retryTransientRead', () => {
+describe('isTransientFetchError / retryTransient', () => {
   it('classifies browser-cancelled, timed-out and transport rejections as transient', () => {
     expect(isTransientFetchError(new DOMException('Fetch is aborted', 'AbortError'))).toBe(true);
     expect(isTransientFetchError(new DOMException('timed out', 'TimeoutError'))).toBe(true);
@@ -311,19 +311,19 @@ describe('isTransientFetchError / retryTransientRead', () => {
     const read = vi.fn()
       .mockRejectedValueOnce(new DOMException('Fetch is aborted', 'AbortError'))
       .mockResolvedValueOnce('ok');
-    await expect(retryTransientRead(read)).resolves.toBe('ok');
+    await expect(retryTransient(read)).resolves.toBe('ok');
     expect(read).toHaveBeenCalledTimes(2);
   });
 
   it('rethrows a non-transient rejection without a second call', async () => {
     const read = vi.fn().mockRejectedValue(new ApiError(500, 'DB error'));
-    await expect(retryTransientRead(read)).rejects.toThrow('DB error');
+    await expect(retryTransient(read)).rejects.toThrow('DB error');
     expect(read).toHaveBeenCalledTimes(1);
   });
 
   it('surfaces the second failure when the retry fails too', async () => {
     const read = vi.fn().mockRejectedValue(new DOMException('timed out', 'TimeoutError'));
-    await expect(retryTransientRead(read)).rejects.toMatchObject({ name: 'TimeoutError' });
+    await expect(retryTransient(read)).rejects.toMatchObject({ name: 'TimeoutError' });
     expect(read).toHaveBeenCalledTimes(2);
   });
 });

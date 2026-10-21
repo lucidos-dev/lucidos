@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join, relative } from 'node:path';
 import { VOICE_RESIDENT_SECTIONS } from '../../../store/actions/preferences';
 import { SYSTEM_ONE_PROVIDERS } from '../../settings/judgmentBackend';
+import { LADDER_SURFACES, ladderAnchor } from '../../settings/intelligenceLadder';
 import { SHORTCUT_DEFS, shortcutSearchAnchor } from '../../../utils/shortcuts';
 
 const COMPONENTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -63,6 +64,10 @@ const DYNAMIC_ANCHORS: Record<string, DynamicAnchor> = {
   'settings/VoiceSection.tsx `models:voice-section-${section.id}`': {
     kind: 'expands',
     anchors: () => VOICE_RESIDENT_SECTIONS.map((s) => `models:voice-section-${s.id}`),
+  },
+  'settings/IntelligencePage.tsx ladderAnchor(surface)': {
+    kind: 'expands',
+    anchors: () => LADDER_SURFACES.map(({ surface }) => ladderAnchor(surface)),
   },
   'settings/KeyboardShortcutsSection.tsx shortcutSearchAnchor(def.id)': {
     kind: 'expands',

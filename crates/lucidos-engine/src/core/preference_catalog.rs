@@ -72,6 +72,11 @@ pub enum PrefValue {
     ModelBytes,
     /// Comma-separated `model=tier` pairs, each a model id and a reasoning tier.
     ModelEfforts,
+    /// A model id the named coding-agent backend offers a new spawn.
+    CodingAgentModel(crate::runtime::CodingAgent),
+    /// An *intelligence ladder*: comma-separated `model=effort` rungs, least to
+    /// most intelligent, each effort one the surface takes, no rung twice.
+    IntelligenceLadder(crate::runtime::intelligence_ladder::LadderSurface),
     /// `theme`, a font catalog id, or a well-formed workspace font id. Whether
     /// the workspace font exists is asked where it is used, which falls back
     /// when it does not (ADR 0308).
@@ -319,6 +324,9 @@ pub const FLAG_OFF_VALUES: &[&str] = &["0", "false", "no", "off"];
 /// snapped at the routing chokepoint, so changing the model can never make a
 /// stored preference unwritable.
 pub(crate) const REASONING_EFFORTS: &[&str] = crate::llm::EFFORT_LADDER;
+/// The tiers a coding agent takes: the ladder above without `none`. A test
+/// pins it to both coding-agent menu files.
+pub(crate) const CODING_AGENT_EFFORTS: &[&str] = crate::llm::EFFORT_LADDER.split_at(1).1;
 /// The OpenAI image model `auto` runs when no Vertex project is configured.
 pub const OPENAI_IMAGE_MODEL: &str = "gpt-image-2.5-flare";
 /// The frontend reads these lists from the generated catalog.
@@ -334,17 +342,28 @@ const EXTERNAL_LINK_TARGETS: &[&str] = &["safari", "ask", "in-app"];
 const THEME_MODES: &[&str] = &["light", "dark", "system"];
 const MOTION_PREFS: &[&str] = &["system", "reduce", "full"];
 const THEME_EFFECTS_PREFS: &[&str] = &["system", "reduce", "full"];
+/// The rule that reads it is `composerEnterSends` in
+/// `crates/lucidos-app/src/components/chat/prompt-input-helpers.ts`.
+const COMPOSER_ENTER_KEYS: &[&str] = &["send", "newline"];
 
 /// The default model of every background task that has its own one.
 /// `lucidos-eval` pins the memory tasks to it, so its runs stay comparable.
-pub const BACKGROUND_MODEL: &str = "gemini-3-flash-preview";
+pub const BACKGROUND_MODEL: &str = "claude-haiku-5-5";
+
+/// The command judge's default, the model `lucidos-eval command-judge`
+/// measured with no irreversible command classed safe (ADR 0406).
+pub const COMMAND_JUDGE_MODEL: &str = "gemini-3.1-flash-lite";
+
+/// The wake decision's default, the last of the models
+/// `lucidos-eval wake-decision` measured with no missed must-wake (ADR 0448).
+pub const WAKE_DECISION_MODEL: &str = "gpt-6-luna";
 
 /// What an unset background model resolves to when no configured provider
 /// serves its default. The list is `engine::aux_purpose::AUX_FALLBACKS`, and
 /// `the_description_names_the_lead_and_every_fallback` pins the two together.
 macro_rules! aux_fallback_note {
     () => {
-        " While unset and its default unreachable, the engine runs the first of gemini-3-flash-preview, gpt-5.4-mini and claude-haiku-4-5 that a configured provider serves, else the chat model. GET /api/v1/models/background says which model runs."
+        " While unset and its default unreachable, the engine runs the first of gpt-6-luna and gemini-3.1-flash-lite that a configured provider serves, else the chat model. GET /api/v1/models/background says which model runs."
     };
 }
 
@@ -388,8 +407,19 @@ pub const CHAT_MODEL: Pref<Text> = Pref::text(PrefSpec {
     access: PrefAccess::Agent,
     scope: PrefScope::Global,
     value: PrefValue::Text,
-    default: PrefDefault::Value("claude-opus-5"),
-    description: "Default chat model id for NEW Lucidos Agent threads. A thread that's already running reuses its own last-used model, so changing this does NOT switch the current/running thread on its next turn (use the thread's in-thread picker for that). Must be an enabled model id from the registry: call get_preferences or manage_models(action='list') to see the options (e.g. 'claude-opus-5', 'claude-fable-5').",
+    default: PrefDefault::Value("claude-opus-5-5"),
+    description: "Default chat model id for NEW Lucidos Agent threads. Triggers have their own default, 'trigger_model'. A thread that's already running reuses its own last-used model, so changing this does NOT switch the current/running thread on its next turn (use the thread's in-thread picker for that). Must be an enabled model id from the registry: call get_preferences or manage_models(action='list') to see the options (e.g. 'claude-sonnet-5-5', 'claude-opus-5-5').",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const TRIGGER_MODEL: Pref<Text> = Pref::text(PrefSpec {
+    key: "trigger_model",
+    label: "Trigger model",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Value("claude-sonnet-5-5"),
+    description: "Default model id for an intent trigger that pins no model of its own. A trigger's own model always wins. It never changes a chat thread, and a human follow-up in a trigger thread stays on the model the trigger ran on. The effort is the account's tier for this model in 'chat_reasoning_efforts', else the model's default effort. Must be an enabled model id from the registry: call get_preferences or manage_models(action='list') to see the options (e.g. 'claude-sonnet-5-5', 'claude-opus-5-5').",
     side_effect: PrefSideEffect::None,
 });
 
@@ -587,7 +617,7 @@ pub const MODEL_READ_DECISION: Pref<Text> = Pref::text(PrefSpec {
     value: PrefValue::Text,
     default: PrefDefault::Value(BACKGROUND_MODEL),
     description: concat!(
-        "Background model that decides whether a reply is worth reading, when a turn ended without deciding. It sees the turn's message, a question the user answered inside the turn, and its reply, and must answer one forced yes/no question. While unset, the engine runs the first of gemini-3.8-flash and gpt-5.6-luna that a configured provider serves, else this default. A Claude model that always thinks cannot be forced, so the reply then waits under Review. Settings offers the System One models in the same control, which write judgment_read_decision instead. It follows no other key.",
+        "Background model that decides whether a reply is worth reading, when a turn ended without deciding. It sees the turn's message, a question the user answered inside the turn, and its reply, and must answer one forced yes/no question. While unset, the engine runs the first of gemini-3.8-flash and gpt-6-luna that a configured provider serves, else this default. A Claude model that always thinks cannot be forced, so the reply then waits under Review. Settings offers the System One models in the same control, which write judgment_read_decision instead. It follows no other key.",
         aux_fallback_note!()
     ),
     side_effect: PrefSideEffect::None,
@@ -613,8 +643,8 @@ pub const MODEL_WAKE_DECISION: Pref<Text> = Pref::text(PrefSpec {
     access: PrefAccess::Agent,
     scope: PrefScope::Global,
     value: PrefValue::Text,
-    default: PrefDefault::Value(BACKGROUND_MODEL),
-    description: "Background model that decides whether a child thread's report wakes its parent, when the child's turn ended without deciding and judgment_wake_decision leaves it on chat. It sees the message that opened the child's turn, the parent's latest reply, the child's reply and how many siblings still run, and must answer one forced yes/no question. While unset, the engine runs the first of gemini-3.8-flash, gpt-6.1-sol, gpt-5.6-luna and this default that a configured provider serves: the models lucidos-eval wake-decision measured. With none of them served, no chat model is asked and the parent wakes. A Claude model that always thinks cannot be forced, so its calls fail and the parent wakes. Setting it keeps the wake decision on chat even while OpenAI is configured, on the model it names. A failed call wakes the parent. It follows no other key. GET /api/v1/models/background says which model runs.",
+    default: PrefDefault::Value(WAKE_DECISION_MODEL),
+    description: "Background model that decides whether a child thread's report wakes its parent, when the child's turn ended without deciding and judgment_wake_decision leaves it on chat. It sees the message that opened the child's turn, the parent's latest reply, the child's reply and how many siblings still run, and must answer one forced yes/no question. While unset, the engine runs the first of gemini-3.8-flash, gpt-6.1-sol and this default that a configured provider serves: the models lucidos-eval wake-decision measured. With none of them served, no chat model is asked and the parent wakes. A Claude model that always thinks cannot be forced, so its calls fail and the parent wakes. Setting it keeps the wake decision on chat even while OpenAI is configured, on the model it names. A failed call wakes the parent. It follows no other key. GET /api/v1/models/background says which model runs.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -640,7 +670,7 @@ pub const MODEL_MEMORY: Pref<Text> = Pref::text(PrefSpec {
     value: PrefValue::Text,
     default: PrefDefault::Value(BACKGROUND_MODEL),
     description: concat!(
-        "Background model that extracts facts from a turn for long-term memory. While unset, the engine runs gpt-5.6-luna when a configured provider serves it, else this default. It binds extraction only: the conversation summary, query classification and find have keys of their own.",
+        "Background model that extracts facts from a turn for long-term memory. While unset, the engine runs gpt-6-luna when a configured provider serves it, else this default. It binds extraction only: the conversation summary, query classification and find have keys of their own.",
         aux_fallback_note!()
     ),
     side_effect: PrefSideEffect::None,
@@ -654,7 +684,7 @@ pub const REASONING_MEMORY: Pref<Text> = Pref::text(PrefSpec {
     value: PrefValue::Enum(REASONING_EFFORTS),
     default: PrefDefault::Value("low"),
     description: concat!(
-        "Thinking budget for fact extraction. GPT-5.6 Luna and GPT-5.4 mini lost coverage at none, and Gemini 3 Flash measured the same at low as at none.",
+        "Thinking budget for fact extraction. GPT-6 Luna's predecessors lost coverage at none, so the default spends a little.",
         task_tier_note!()
     ),
     side_effect: PrefSideEffect::None,
@@ -828,6 +858,17 @@ pub const NOTIFICATION_TOASTS: Pref<Flag> = Pref::flag(PrefSpec {
     value: PrefValue::Bool,
     default: PrefDefault::Value("true"),
     description: "Whether a notification pops an in-app toast on a device the user is looking at. 'false' silences the pop-up: the notification still counts on the bell badge and waits in the Notifications panel, and no OS push arrives in its place, because a device that is present never gets one. Unlike push_notifications this covers every device, so one write silences them all.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const COMPOSER_ENTER_KEY: Pref<Text> = Pref::text(PrefSpec {
+    key: "composer_enter_key",
+    label: "Enter key in the composer",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(COMPOSER_ENTER_KEYS),
+    default: PrefDefault::Value("send"),
+    description: "What Enter does in the chat composer on a desktop layout. 'send' (the default): Enter sends and Shift+Enter adds a new line. 'newline': Enter adds a new line, and Shift+Enter sends. Cmd+Enter or Ctrl+Enter sends in both modes. On a phone, Enter always adds a new line and the Send button sends. Offer 'newline' to a user who keeps sending half-written prompts.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1023,7 +1064,7 @@ pub const MEMORY_VIEW_MODEL_CAPS: Pref<Optional> = Pref::optional(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::ModelBytes,
     default: PrefDefault::Unset("no caps"),
-    description: "Caps both memory views for named models, as 'model=bytes' pairs separated by commas, for example 'claude-haiku-4-5=8192'. A turn on a listed model reads at most that many bytes of each view. Unlisted models use the surface sizes alone.",
+    description: "Caps both memory views for named models, as 'model=bytes' pairs separated by commas, for example 'claude-haiku-5-5=8192'. A turn on a listed model reads at most that many bytes of each view. Unlisted models use the surface sizes alone.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1082,6 +1123,110 @@ pub const CODING_AGENT_AUTO_COMPACT_TRIAL: Pref<Text> = Pref::text(PrefSpec {
     value: PrefValue::Enum(crate::engine::auto_compact_trial::TRIAL_MODES),
     default: PrefDefault::Value("off"),
     description: "The auto-compact trial for Claude Code threads. 'off' (the default) leaves Claude Code's own compaction alone. 'ab' gives a 400k-token auto-compact window to half of all top-level threads, each with its sub-threads and successors, picked by a stable hash. A thread keeps the arm it first ran in. 'on' gives every family that window. A workspace CLAUDE_CODE_AUTO_COMPACT_WINDOW env var always wins. Applies to new sessions.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const MODEL_CLAUDE_CODE: Pref<Text> = Pref::text(PrefSpec {
+    key: "model_claude_code",
+    label: "Claude Code default model",
+    access: PrefAccess::Human {
+        hint: "the default implementer is the owner's choice: only the owner sets it, with the star in Settings → Coding agents",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::CodingAgentModel(crate::runtime::CodingAgent::ClaudeCode),
+    default: PrefDefault::Value("claude-opus-5-5"),
+    description: "The model a Claude Code thread runs on when nobody picked one, beside reasoning_claude_code. Lucidos pins it at spawn, so Claude Code's own settings file never decides a Lucidos thread's model. A thread's own earlier pick still wins on its later sessions.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const REASONING_CLAUDE_CODE: Pref<Text> = Pref::text(PrefSpec {
+    key: "reasoning_claude_code",
+    label: "Claude Code default effort",
+    access: PrefAccess::Human {
+        hint: "the default implementer is the owner's choice: only the owner sets it, with the star in Settings → Coding agents",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(CODING_AGENT_EFFORTS),
+    default: PrefDefault::Value("medium"),
+    description: "The reasoning effort a Claude Code thread runs at when nobody picked a model or an effort, beside model_claude_code. A pick that names only a model runs at that model's default effort instead.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const MODEL_CODEX: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "model_codex",
+    label: "Codex default model",
+    access: PrefAccess::Human {
+        hint: "the default implementer is the owner's choice: only the owner sets it, with the star in Settings → Coding agents",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::CodingAgentModel(crate::runtime::CodingAgent::Codex),
+    default: PrefDefault::Unset("Codex's own config decides"),
+    description: "The model a Codex thread runs on when nobody picked one, beside reasoning_codex. Unset leaves the choice to Codex's own config.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const REASONING_CODEX: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "reasoning_codex",
+    label: "Codex default effort",
+    access: PrefAccess::Human {
+        hint: "the default implementer is the owner's choice: only the owner sets it, with the star in Settings → Coding agents",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(CODING_AGENT_EFFORTS),
+    default: PrefDefault::Unset("Codex's own config decides"),
+    description: "The reasoning effort a Codex thread runs at when nobody picked one, beside model_codex. Read only while model_codex is set.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const INTELLIGENCE_LADDER_CHAT: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "intelligence_ladder_chat",
+    label: "Lucidos Agent intelligence ladder",
+    access: PrefAccess::Human {
+        hint: "the intelligence ladder binds agents, so only the owner sets it, in Settings → Intelligence",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::IntelligenceLadder(crate::runtime::intelligence_ladder::LadderSurface::Chat),
+    default: PrefDefault::Unset("the shipped ladder's rungs that are on"),
+    description: "The rungs an agent may pick for a chat thread (run_thread's model, a trigger's model), least to most intelligent, as 'model=effort' pairs separated by commas, for example 'claude-haiku-5-5=high, claude-opus-5-5=medium'. Set means exactly this list, minus pairs no model offers any more, and a later model never joins it by itself. The owner's own picks are never held to it. lucidos intelligence-ladder --surface chat shows the effective ladder.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const INTELLIGENCE_LADDER_CLAUDE_CODE: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "intelligence_ladder_claude_code",
+    label: "Claude Code intelligence ladder",
+    access: PrefAccess::Human {
+        hint: "the intelligence ladder binds agents, so only the owner sets it, in Settings → Coding agents",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::IntelligenceLadder(crate::runtime::intelligence_ladder::LadderSurface::ClaudeCode),
+    default: PrefDefault::Unset("the shipped ladder's rungs that are on"),
+    description: "The rungs an agent may pick for a Claude Code thread, least to most intelligent, as 'model=effort' pairs separated by commas, for example 'claude-sonnet-5-5=high, claude-opus-5-5=medium'. Set means exactly this list, minus pairs Claude Code no longer offers, and a later model never joins it by itself. Settings → Coding agents edits it. A workspace may build it from its own measurements. lucidos intelligence-ladder shows the effective ladder.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const INTELLIGENCE_LADDER_CODEX: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "intelligence_ladder_codex",
+    label: "Codex intelligence ladder",
+    access: PrefAccess::Human {
+        hint: "the intelligence ladder binds agents, so only the owner sets it, in Settings → Coding agents",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::IntelligenceLadder(crate::runtime::intelligence_ladder::LadderSurface::Codex),
+    default: PrefDefault::Unset("the shipped ladder's rungs that are on"),
+    description: "The rungs an agent may pick for a Codex thread, least to most intelligent, as 'model=effort' pairs separated by commas, for example 'gpt-6-luna=high, gpt-6.1-sol=medium'. Set means exactly this list, minus pairs Codex no longer offers, and a later model never joins it by itself.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const LONG_PROMPT_SHARE: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "long_prompt_share",
+    label: "Share of calls over 100k tokens",
+    access: PrefAccess::Human {
+        hint: "the long-prompt share is the owner's estimate: only the owner sets it, with the slider in Settings → Coding agents",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Number { min: 0.0, max: 100.0 },
+    default: PrefDefault::Unset("the share measured from the last 30 days of Claude Code calls"),
+    description: "The percentage of coding-agent calls whose prompt passes 100k tokens. A model that bills the whole call higher past that line, such as Haiku 5.5, shows its intelligence ladder cost band at this mix.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1262,7 +1407,7 @@ pub const MODEL_COMMAND_JUDGE: Pref<Text> = Pref::text(PrefSpec {
     },
     scope: PrefScope::Global,
     value: PrefValue::Text,
-    default: PrefDefault::Value(BACKGROUND_MODEL),
+    default: PrefDefault::Value(COMMAND_JUDGE_MODEL),
     description: concat!(
         "The model the command-guard judge runs on.",
         aux_fallback_note!()
@@ -1380,6 +1525,19 @@ pub const CAPTURE_CONTEXT: Pref<Flag> = Pref::flag(PrefSpec {
     value: PrefValue::Bool,
     default: PrefDefault::Value("false"),
     description: "Whether ContextCaptured keeps each LLM call's section bodies. Off keeps only each section's name and its two sizes.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const CACHE_WARM_LINE: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "cache_warm_line",
+    label: "Cache-warm line",
+    access: PrefAccess::Human {
+        hint: "the cache-warm line is a display switch; the user changes it in Settings → System → Debugging",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Bool,
+    default: PrefDefault::Value("true"),
+    description: "Whether a thread waiting on the user draws the cache-warm line, which counts down how long its prompt cache stays warm. Off hides the line and skips the read behind it.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1526,6 +1684,19 @@ pub const PROVIDER_ENABLED_LOCAL: Pref<Flag> = Pref::flag(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const PROVIDER_ENABLED_CLAUDE_GATEWAY: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "provider_enabled_claude_gateway",
+    label: "Claude gateway provider",
+    access: PrefAccess::Human {
+        hint: "whether the Claude gateway provider is switched on: managed in Settings → Models → Providers, never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Bool,
+    default: PrefDefault::Value("true"),
+    description: "Whether the Claude gateway provider is switched on. A veto over a signed-in gateway: off parks it and keeps the sign-in.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const PROVIDER_ENABLED_TYPESAFE: Pref<Flag> = Pref::flag(PrefSpec {
     key: "provider_enabled_typesafe",
     label: "TypeSafe provider",
@@ -1578,6 +1749,19 @@ pub const LOCAL_BASE_URL: Pref<Text> = Pref::text(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const CLAUDE_GATEWAY_URL: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "claude_gateway_url",
+    label: "Claude gateway URL",
+    access: PrefAccess::Human {
+        hint: "the Claude gateway's origin, which receives every prompt sent to a Claude model routed there, with the user's sign-in: the user sets it in Settings → Models → Providers, never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Unset("no Claude gateway"),
+    description: "The origin of the Claude gateway Lucidos signs in to, such as https://gateway.example.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const SYSTEM_ONE_CUSTOM_URL: Pref<Optional> = Pref::optional(PrefSpec {
     key: "system_one_custom_url",
     label: "Custom System One URL",
@@ -1618,19 +1802,6 @@ pub const SYSTEM_ONE_OPENROUTER_MODEL: Pref<Optional> = Pref::optional(PrefSpec 
 });
 
 // ---- Engine bookkeeping: refused to the agent, written silently ----
-
-pub const VAPID_KEYS: Pref<Optional> = Pref::optional(PrefSpec {
-    key: "vapid_keys",
-    label: "Web Push keys",
-    access: PrefAccess::Engine {
-        hint: "the workspace's Web Push signing keypair, generated once on demand; a transport secret, not a setting",
-    },
-    scope: PrefScope::Global,
-    value: PrefValue::Text,
-    default: PrefDefault::Unset("not written yet"),
-    description: "the workspace's Web Push signing keypair, generated once on demand; a transport secret, not a setting",
-    side_effect: PrefSideEffect::None,
-});
 
 pub const BACKUP_LAST_RUN: Pref<Optional> = Pref::optional(PrefSpec {
     key: "backup_last_run",
@@ -1716,6 +1887,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &LANGUAGE.spec,
     &TIMEZONE.spec,
     &CHAT_MODEL.spec,
+    &TRIGGER_MODEL.spec,
     &CHAT_REASONING_EFFORTS.spec,
     &RESPONSE_STYLE.spec,
     &RESPONSE_STYLES.spec,
@@ -1751,6 +1923,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &PROXY_TIMEOUT_SECS.spec,
     &NOTIFICATIONS_FILTER.spec,
     &NOTIFICATION_TOASTS.spec,
+    &COMPOSER_ENTER_KEY.spec,
     &MOBILE_DYNAMIC_BARS.spec,
     &AUTOMATIC_WIDGETS.spec,
     &EXTERNAL_LINK_TARGET.spec,
@@ -1773,6 +1946,14 @@ pub const CATALOG: &[&PrefSpec] = &[
     &CODING_AGENT_CODEX_PATH.spec,
     &CODING_AGENT_CLAUDE_PERMISSION_MODE.spec,
     &CODING_AGENT_AUTO_COMPACT_TRIAL.spec,
+    &MODEL_CLAUDE_CODE.spec,
+    &REASONING_CLAUDE_CODE.spec,
+    &MODEL_CODEX.spec,
+    &REASONING_CODEX.spec,
+    &INTELLIGENCE_LADDER_CHAT.spec,
+    &INTELLIGENCE_LADDER_CLAUDE_CODE.spec,
+    &INTELLIGENCE_LADDER_CODEX.spec,
+    &LONG_PROMPT_SHARE.spec,
     &THEME_MODE.spec,
     &FONT_FAMILY.spec,
     &UI_SCALE.spec,
@@ -1796,6 +1977,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &JUDGMENT_WAKE_DECISION.spec,
     &MAX_TOOL_CALLS.spec,
     &CAPTURE_CONTEXT.spec,
+    &CACHE_WARM_LINE.spec,
     &KEYBINDINGS.spec,
     &VOICE_INPUT_DEVICE.spec,
     &NETWORK_BIND.spec,
@@ -1807,14 +1989,15 @@ pub const CATALOG: &[&PrefSpec] = &[
     &PROVIDER_ENABLED_OPENROUTER.spec,
     &PROVIDER_ENABLED_XAI.spec,
     &PROVIDER_ENABLED_LOCAL.spec,
+    &PROVIDER_ENABLED_CLAUDE_GATEWAY.spec,
     &PROVIDER_ENABLED_TYPESAFE.spec,
     &PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI.spec,
     &PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM.spec,
     &LOCAL_BASE_URL.spec,
+    &CLAUDE_GATEWAY_URL.spec,
     &SYSTEM_ONE_CUSTOM_URL.spec,
     &SYSTEM_ONE_CUSTOM_MODEL.spec,
     &SYSTEM_ONE_OPENROUTER_MODEL.spec,
-    &VAPID_KEYS.spec,
     &BACKUP_LAST_RUN.spec,
     &RELEASE_NOTICE_CURSOR.spec,
     &BACKFILL_TRIGGER_ID_FROM_EVENTS_DONE.spec,
@@ -1831,10 +2014,16 @@ pub fn spec(key: &str) -> Option<&'static PrefSpec> {
 /// Keys that no longer mean anything, each with what a writer is told. A
 /// write of one is refused on every path, so a stale client or agent cannot
 /// bring back a row nothing reads.
-pub const RETIRED_KEYS: &[(&str, &str)] = &[(
-    "home_thread_enabled",
-    "home_thread_enabled was removed: every workspace has a home thread now (ADR 0411).",
-)];
+pub const RETIRED_KEYS: &[(&str, &str)] = &[
+    (
+        "home_thread_enabled",
+        "home_thread_enabled was removed: every workspace has a home thread now (ADR 0411).",
+    ),
+    (
+        "vapid_keys",
+        "vapid_keys moved to its own table: a signing key is a sealed secret, not a preference (ADR 0509).",
+    ),
+];
 
 /// Model ids their provider shut down, each as `(key, retired, replacement)`.
 ///
@@ -2015,6 +2204,16 @@ pub fn validate(spec: &PrefSpec, value: &str) -> Result<(), String> {
         PrefValue::ModelEfforts => parse_model_efforts(value)
             .map(|_| ())
             .map_err(|e| format!("'{}': {}", spec.key, e)),
+        PrefValue::IntelligenceLadder(surface) => {
+            parse_intelligence_ladder(value, surface.efforts())
+                .map(|_| ())
+                .map_err(|e| format!("'{}': {}", spec.key, e))
+        }
+        PrefValue::CodingAgentModel(agent) => {
+            crate::runtime::validate_coding_agent_model(agent, Some(value))
+                .map(|_| ())
+                .map_err(|e| format!("'{}': {}", spec.key, e))
+        }
         PrefValue::FontFamily => {
             if crate::core::fonts::FONT_PREFERENCE_VALUES.contains(&value)
                 || crate::core::workspace_fonts::is_workspace_id(value)
@@ -2065,6 +2264,34 @@ pub(crate) fn parse_model_efforts(value: &str) -> Result<Vec<(&str, &'static str
     })
 }
 
+/// Parse an *intelligence ladder*: `model=effort` rungs in order. Refuses an
+/// empty list, a tier outside `efforts`, and a rung named twice. A `[1m]`
+/// twin is the same rung as its base model.
+pub(crate) fn parse_intelligence_ladder<'a>(
+    value: &'a str,
+    efforts: &'static [&'static str],
+) -> Result<Vec<(&'a str, &'static str)>, String> {
+    let pairs = parse_model_pairs(value, "effort", |raw| {
+        efforts.iter().find(|e| **e == raw).copied().ok_or_else(|| {
+            format!(
+                "has no effort this ladder takes; use one of {}",
+                efforts.join(", ")
+            )
+        })
+    })?;
+    if pairs.is_empty() {
+        return Err("names no rung".to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (model, effort) in &pairs {
+        let base = crate::runtime::intelligence_ladder::intelligence_rung_model_base(model);
+        if !seen.insert((base, *effort)) {
+            return Err(format!("names {model}={effort} twice"));
+        }
+    }
+    Ok(pairs)
+}
+
 /// Human-readable summary of a spec's allowed values, used in the agent-facing
 /// description for both `set_preference`'s error path and `get_preferences`.
 pub fn allowed_values_hint(spec: &PrefSpec) -> String {
@@ -2080,6 +2307,13 @@ pub fn allowed_values_hint(spec: &PrefSpec) -> String {
             "model=tier, model=tier (tier: {})",
             REASONING_EFFORTS.join(" | ")
         ),
+        PrefValue::CodingAgentModel(agent) => {
+            format!("a model id {} offers", agent.display_name())
+        }
+        PrefValue::IntelligenceLadder(surface) => format!(
+            "model=effort, model=effort, least to most intelligent (effort: {})",
+            surface.efforts().join(" | ")
+        ),
         PrefValue::FontFamily => format!(
             "{} | ws-<slug> (a workspace font)",
             crate::core::fonts::FONT_PREFERENCE_VALUES.join(" | ")
@@ -2090,6 +2324,41 @@ pub fn allowed_values_hint(spec: &PrefSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_intelligence_ladder_is_ordered_rungs_with_no_repeat() {
+        assert_eq!(
+            parse_intelligence_ladder(
+                "claude-sonnet-5-5=high, claude-opus-5-5=medium",
+                CODING_AGENT_EFFORTS
+            ),
+            Ok(vec![
+                ("claude-sonnet-5-5", "high"),
+                ("claude-opus-5-5", "medium")
+            ])
+        );
+        for (bad, why) in [
+            ("", "names no rung"),
+            ("claude-opus-5-5", "is not model=effort"),
+            ("claude-opus-5-5=none", "has no effort this ladder takes"),
+            ("claude-opus-5-5=high, claude-opus-5-5=high", "twice"),
+            ("claude-opus-5-5=high, claude-opus-5-5[1m]=high", "twice"),
+        ] {
+            let err = validate(&INTELLIGENCE_LADDER_CLAUDE_CODE.spec, bad).unwrap_err();
+            assert!(err.contains(why), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_chat_intelligence_ladder_takes_the_tier_no_coding_agent_offers() {
+        assert_eq!(
+            validate(
+                &INTELLIGENCE_LADDER_CHAT.spec,
+                "gpt-6-luna=none, claude-opus-5-5=high"
+            ),
+            Ok(())
+        );
+    }
 
     #[test]
     fn catalog_keys_are_unique() {
@@ -2445,6 +2714,19 @@ mod tests {
         assert!(validate(spec, "true").is_ok());
         assert!(validate(spec, "false").is_ok());
         assert!(validate(spec, "off").is_err());
+    }
+
+    /// The Enter key is a typing habit, like the keyboard shortcuts on the same
+    /// Settings page, so one choice follows the user to every desktop.
+    #[test]
+    fn composer_enter_key_is_a_global_two_way_choice() {
+        let spec = &COMPOSER_ENTER_KEY.spec;
+        assert_eq!(spec.scope, PrefScope::Global);
+        assert_eq!(spec.access, PrefAccess::Agent);
+        for value in ["send", "newline"] {
+            assert!(validate(spec, value).is_ok(), "{value} must be accepted");
+        }
+        assert!(validate(spec, "shift-enter").is_err());
     }
 
     /// Drift guard (`.claude/rules/system-knowhow.md`): every catalogued key is

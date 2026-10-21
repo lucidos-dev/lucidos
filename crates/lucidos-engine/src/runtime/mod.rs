@@ -3,23 +3,28 @@ pub mod agent_runtime;
 pub mod browser;
 mod browser_consent;
 pub mod cc_model_discovery;
+pub mod chat_ladder;
 pub mod claude_code;
+pub mod claude_code_provider;
 pub mod codex;
 mod codex_app_server;
 mod codex_app_server_parse;
 mod codex_parse;
 pub(crate) mod compile_mode;
+pub mod intelligence_ladder;
 pub mod lucidos_cli;
 pub mod python;
 pub(crate) mod spawn_env;
+pub(crate) mod startup_instructions;
 pub mod vertex_relay;
+mod vertex_relay_probe;
 
 use std::sync::Arc;
 
 pub use agent_runtime::{
     AccountPin, AgentEvent, AgentExitFacts, AgentInput, AgentPermissionRequest, AgentRuntime,
-    CodingAgent, ControlReach, ControlRequest, InputWithdrawal, RunningAgent, SpawnArgs,
-    TakesEffect, WithdrawRequest,
+    CodingAgent, ControlReach, ControlRequest, InputWithdrawal, RunningAgent, SessionContextBlock,
+    SpawnArgs, TakesEffect, WithdrawRequest,
 };
 pub use browser::{BrowserLogins, BrowserRuntime, HeadlessBlocklist};
 // The three CC wire names are re-exported beside Codex's so every consumer
@@ -36,7 +41,8 @@ pub use python::PythonRuntime;
 
 /// The `/model` picker entries for one backend. Same data the frontend picker
 /// renders, reached without the caller having to know which module owns it.
-/// Claude Code's come from discovery once it has answered.
+/// Claude Code's are its discovered rows once it has answered, then the offered
+/// curated rows it did not list.
 pub fn coding_agent_model_options(agent: CodingAgent) -> Arc<[claude_code::CcMenuOption]> {
     match agent {
         CodingAgent::ClaudeCode => claude_code::cc_model_options(),
@@ -47,8 +53,9 @@ pub fn coding_agent_model_options(agent: CodingAgent) -> Arc<[claude_code::CcMen
 static CODEX_MODEL_OPTIONS: std::sync::LazyLock<Arc<[claude_code::CcMenuOption]>> =
     std::sync::LazyLock::new(|| codex::codex_model_options().into());
 
-/// The hand-kept rows for one backend: the fallback picker, and the overlay
-/// that declares context windows.
+/// Every hand-kept row for one backend, offered or not: the source of the
+/// offered rows Claude Code did not list, and the overlay that declares
+/// context windows.
 fn curated_coding_agent_model_options(agent: CodingAgent) -> &'static [claude_code::CcMenuOption] {
     match agent {
         CodingAgent::ClaudeCode => claude_code::curated_cc_model_options(),
@@ -71,11 +78,11 @@ fn curated_coding_agent_model_options(agent: CodingAgent) -> &'static [claude_co
 /// folds onto its alias (`normalize_cc_model_id`), so the alias's current model
 /// says nothing about the session that reported it.
 ///
-/// The lookup ignores a `@default` version pin, which the picker writes on two
-/// rows (`claude-opus-5@default`) and the agent strips when it echoes the model
-/// back. It deliberately does NOT ignore `[1m]`: that suffix is what keeps a 1M
-/// row distinct from its bare sibling, the same rule [`likely_intended_model`]
-/// documents.
+/// The lookup ignores a `@default` version pin. The curated file writes it on two
+/// rows (`claude-opus-5@default`), and the agent strips it when it echoes the
+/// model back. It deliberately does NOT ignore `[1m]`, which keeps a 1M row
+/// distinct from its bare sibling. [`likely_intended_model`] documents the same
+/// rule.
 pub fn coding_agent_context_window(agent: CodingAgent, model: &str) -> Option<usize> {
     let target = strip_version_pin(model);
     curated_coding_agent_model_options(agent)
@@ -110,8 +117,8 @@ pub fn coding_agent_reasoning_effort_options(
 ///
 /// When the rejected id is not offered but is a close spelling of one that
 /// is, `likely_intended_model` names it before the full list. A caller can
-/// paste the LUCIDOS CHAT id `claude-opus-5@default[1m]` by mistake. Claude
-/// Code spells that same model `claude-opus-5[1m]`.
+/// paste the LUCIDOS CHAT id `claude-opus-5-5@default[1m]` by mistake. Claude
+/// Code spells that same model `claude-opus-5-5[1m]`.
 pub fn validate_coding_agent_model(
     agent: CodingAgent,
     model: Option<&str>,
@@ -982,21 +989,23 @@ mod tests {
             "name the rejected id: {err}"
         );
         assert!(
-            err.contains("claude-opus-5@default"),
+            err.contains("claude-opus-5-5[1m]"),
             "list what IS offered, so the caller can fix it in one step: {err}"
         );
     }
 
     /// The real mistake this guards against: a caller pastes the LUCIDOS CHAT
-    /// id for Opus 5's 1M variant, which carries CHAT's own `@default`
+    /// id for Opus 5.5's 1M variant, which carries CHAT's own `@default`
     /// version pin. Claude Code spells the same model without that pin.
     #[test]
     fn a_near_miss_id_names_the_likely_intended_one_before_the_list() {
-        let err =
-            validate_coding_agent_model(CodingAgent::ClaudeCode, Some("claude-opus-5@default[1m]"))
-                .expect_err("an id no backend offers must fail the spawn");
+        let err = validate_coding_agent_model(
+            CodingAgent::ClaudeCode,
+            Some("claude-opus-5-5@default[1m]"),
+        )
+        .expect_err("an id no backend offers must fail the spawn");
         assert!(
-            err.contains("which spells that model 'claude-opus-5[1m]'"),
+            err.contains("which spells that model 'claude-opus-5-5[1m]'"),
             "name the near miss before the full list: {err}"
         );
         assert!(
@@ -1230,6 +1239,145 @@ mod tests {
             validate_coding_agent_effort(CodingAgent::ClaudeCode, None, Some("max")),
             Ok(Some("max".to_string()))
         );
+    }
+
+    // ── One vocabulary: discovered rows, then curated rows it did not list ──
+
+    /// The seven rows Claude Code 2.1.300 listed on the incident machine. It
+    /// omits `claude-opus-5-5[1m]`, which it still accepts through `--model`.
+    fn incident_picker() -> Vec<claude_code::CcMenuOption> {
+        let row = |value: &str, runs: &str| serde_json::json!({ "value": value, "resolvedModel": runs, "displayName": value });
+        let reply = serde_json::json!({ "models": [
+            row("default", "claude-opus-5-5[1m]"),
+            row("opus", "claude-opus-5-5[1m]"),
+            row("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            row("claude-sonnet-5", "claude-sonnet-5"),
+            row("claude-sonnet-4-6", "claude-sonnet-4-6"),
+            row("claude-sonnet-4-6[1m]", "claude-sonnet-4-6[1m]"),
+            row("haiku", "claude-haiku-4-5"),
+        ]});
+        cc_model_discovery::menu_options(
+            &cc_model_discovery::parse_initialize_models(&reply).expect("recorded reply parses"),
+        )
+    }
+
+    /// The incident list with the overlay-only ids Claude Code can still list,
+    /// as it did before Fable and Opus 5 left the offered set.
+    fn picker_listing_withdrawn_models() -> Vec<claude_code::CcMenuOption> {
+        let mut rows = incident_picker();
+        let template = rows[0].clone();
+        for value in ["claude-fable-5-1", "claude-opus-5[1m]"] {
+            rows.push(claude_code::CcMenuOption {
+                value: value.to_string(),
+                resolved_model: Some(value.to_string()),
+                label: value.to_string(),
+                ..template.clone()
+            });
+        }
+        rows
+    }
+
+    /// The list states a spawn can meet: Claude Code has not answered, it has
+    /// answered with the incident list, and it lists a withdrawn model.
+    fn both_list_states() -> [std::sync::Arc<[claude_code::CcMenuOption]>; 3] {
+        [
+            claude_code::offered_cc_model_options(None),
+            claude_code::offered_cc_model_options(Some(&incident_picker())),
+            claude_code::offered_cc_model_options(Some(&picker_listing_withdrawn_models())),
+        ]
+    }
+
+    /// The reported bug. Claude Code accepts `claude-opus-5-5[1m]` but did not
+    /// list it, so the spawn refused an id the picker's own vendor runs.
+    #[test]
+    fn a_model_claude_code_accepts_but_did_not_list_is_still_offered() {
+        for options in both_list_states() {
+            for id in [
+                "claude-opus-5-5",
+                "claude-opus-5-5[1m]",
+                "claude-sonnet-5-5",
+            ] {
+                assert_eq!(
+                    validate_model_against(CodingAgent::ClaudeCode, Some(id), &options),
+                    Ok(Some(id.to_string())),
+                    "{id} must pass whatever Claude Code listed"
+                );
+            }
+        }
+    }
+
+    /// An overlay-only row keeps its window for old threads and is never a
+    /// choice for a new one, listed or accepted.
+    #[test]
+    fn an_overlay_only_model_is_never_listed_or_accepted() {
+        let banned = [
+            "claude-opus-5",
+            "claude-opus-5@default",
+            "claude-opus-5[1m]",
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+        ];
+        for options in both_list_states() {
+            for id in banned {
+                assert!(
+                    offered_row(&options, id).is_none(),
+                    "{id} is overlay only and must not be offered"
+                );
+                assert!(
+                    validate_model_against(CodingAgent::ClaudeCode, Some(id), &options).is_err(),
+                    "{id} must be refused"
+                );
+            }
+            let listed: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+            for id in banned {
+                assert!(!listed.contains(&id), "{id} is in the list: {listed:?}");
+            }
+        }
+    }
+
+    /// Claude Code's own row wins on a shared value, so its label and the
+    /// `resolvedModel` it reported stay the ones shown.
+    #[test]
+    fn a_discovered_row_wins_over_a_curated_row_with_its_value() {
+        let options = claude_code::offered_cc_model_options(Some(&incident_picker()));
+        let rows: Vec<_> = options
+            .iter()
+            .filter(|o| o.value == "claude-sonnet-5-5")
+            .collect();
+        assert_eq!(rows.len(), 1, "the value is listed once");
+        assert_eq!(rows[0].label, "claude-sonnet-5-5");
+        assert_eq!(rows[0].resolved_model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(options[0].value, "default", "discovered rows lead");
+    }
+
+    /// An alias resolves only from what Claude Code reported, so a curated row
+    /// never carries a `resolvedModel` of its own.
+    #[test]
+    fn a_curated_row_names_no_model_it_runs() {
+        for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
+            for option in curated_coding_agent_model_options(agent) {
+                assert_eq!(
+                    option.resolved_model, None,
+                    "{} hardcodes what it runs",
+                    option.value
+                );
+            }
+        }
+    }
+
+    /// An overlay-only row still declares its window, so a thread already on it
+    /// does not read 200k.
+    #[test]
+    fn an_overlay_only_row_still_declares_its_window() {
+        for id in ["claude-fable-5-1", "claude-fable-5", "claude-opus-5"] {
+            assert_eq!(
+                coding_agent_context_window(CodingAgent::ClaudeCode, id),
+                Some(1_000_000),
+                "{id}"
+            );
+        }
     }
 
     // ── The backend's own context window ───────────────────────────────────

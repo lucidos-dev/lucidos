@@ -387,9 +387,10 @@ fn both_teardown_sites_consult_the_preserve_guard() {
     );
     // And the guard must actually receive that binding rather than some other
     // expression. The call spans a few lines, so look at its argument list.
+    // An effort restart keeps the park too, so it joins the gate by `||`.
     let guard_call = &source[guard_at..(guard_at + 240).min(source.len())];
     assert!(
-        guard_call.contains("is_shutdown,"),
+        guard_call.contains("is_shutdown || effort_restart,"),
         "the preserve guard must be passed the widened `is_shutdown`; its \
          argument list reads:\n{guard_call}"
     );

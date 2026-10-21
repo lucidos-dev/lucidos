@@ -1,5 +1,6 @@
 import { test as base, request as pwRequest } from '@playwright/test';
 import type { APIRequestContext, BrowserContext, Page as PlaywrightPage } from '@playwright/test';
+import { coverageDir, recordCoverage, type CoverageRecorder } from './coverage';
 import { HARNESS_DEVICE_ID, registerHarnessDevice } from './harnessDevice';
 
 export { expect } from '@playwright/test';
@@ -72,6 +73,8 @@ async function preflightWebKitContext(context: BrowserContext, baseURL: string |
   }
 }
 
+const coverageRecorders = new WeakMap<BrowserContext, CoverageRecorder>();
+
 export const test = base.extend({
   // Every spec taking `{ request }` gets a context that identifies itself. See
   // `harnessDevice.ts` for why the harness registers rather than the gate
@@ -90,9 +93,13 @@ export const test = base.extend({
 
     if (!isMobileWebKit) {
       const ready = await createContext();
+      const dir = coverageDir();
+      const recorder = dir && browserName === 'chromium' ? recordCoverage(ready.context, dir) : undefined;
+      if (recorder) coverageRecorders.set(ready.context, recorder);
       try {
         await use(ready.context);
       } finally {
+        await recorder?.flush(testInfo);
         await ready.close();
       }
       return;
@@ -127,5 +134,10 @@ export const test = base.extend({
     } finally {
       await ready.close();
     }
+  },
+  // The test's page waits until coverage records it, so its first script counts.
+  page: async ({ page, context }, use) => {
+    await coverageRecorders.get(context)?.started(page);
+    await use(page);
   },
 });

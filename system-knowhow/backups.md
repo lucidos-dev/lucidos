@@ -1,6 +1,6 @@
 ---
 name: Backups
-description: Workspace backups: coverage, the encrypted archive, the schedule, the encryption key needed to restore, retention, staleness, and provider scopes. Load for "when is my next backup", "back up to Dropbox", "change the backup time", "is my backup stale", or a restore.
+description: Workspace backups: coverage, the encrypted archive, the schedule, the backup key needed to restore, retention, staleness, and provider scopes. Load for "when is my next backup", "back up to Dropbox", "change the backup time", "is my backup stale", or a restore.
 ---
 
 # Backups
@@ -12,7 +12,8 @@ machine.
 ## What a backup contains
 
 The pipeline is: `pg_dump` the workspace database → `tar` the workspace files →
-`zstd` compress → `AES-256-GCM` encrypt → upload to the provider.
+`zstd` compress → seal with [age](https://age-encryption.org) to the workspace's
+*backup recipient* → upload to the provider. The archive ends in `.age`.
 
 Included:
 
@@ -73,7 +74,7 @@ this flow goes wrong:
 
 | What | Where | What lives there |
 |---|---|---|
-| **The backup itself** | Settings → System → Backup | Provider dropdown, *Back up now*, the schedule, retention, the encryption key, and a health card (last run, last cloud backup, staleness). The dropdown opens on the configured `backup_provider` and **writes** it: picking one there is the same act as `set_preference(key="backup_provider", …)`. |
+| **The backup itself** | Settings → System → Backup | Provider dropdown, *Back up now*, the schedule, retention, the backup key (set up, verify, rotate), and a health card (last run, last cloud backup, staleness). The dropdown opens on the configured `backup_provider` and **writes** it: picking one there is the same act as `set_preference(key="backup_provider", …)`. |
 | **The provider account** | **Settings → Accounts** | The *Connected accounts* list. This is the ONLY place a Google / Dropbox account is connected, and the only place its OAuth app registration is stored. |
 
 The Backup page has no account UI. When the selected provider has no connected
@@ -149,15 +150,38 @@ a warning when the last good backup is stale, never happened, or was never set
 up. The line goes quiet for a workspace that is not running. It answers "is my
 data safe?" at a glance; `get_backup_status` holds the detail.
 
-## Encryption key
+## Backup key
 
-A per-workspace key encrypts each backup. The first backup that needs one
-creates it: a manual backup, turning a schedule on, or a scheduled run. Lucidos
-then notifies the user to store it. It **cannot be recovered** and is **required
-to restore**. The user can view and copy it in Settings → System → Backup.
+Each backup is sealed to the workspace's *backup recipient*, an age public key.
+Only the matching **backup key** (`AGE-SECRET-KEY-1…`) opens it. Lucidos never
+stores the backup key, so nothing on this machine can open a backup.
+
+- **Setup.** In Settings → System → Backup, the user creates a backup key.
+  Lucidos shows it once, with Copy. Backups stay off until the user pastes the
+  whole key back, which proves they saved it. A user who already has an age
+  identity can paste its public key (`age1…`) instead, with no paste-back.
+- **Not set up.** With no backup key, a scheduled backup skips and the user gets
+  a "Backups are not set up" notice. A manual backup is refused with the same
+  message. Send the user to Settings → System → Backup. You cannot create the
+  key for them: it must reach their hands and nobody else's.
+- **Verify.** The user pastes the key to check it still matches. A notice
+  suggests this once a year.
+- **Rotate.** A new key pair, behind the same paste-back. New backups use it.
+  Older backups still need the older key.
+- **Lost key.** It **cannot be recovered**, and neither can the backups sealed
+  to it. Tell the user to keep it in a password manager.
+- **Opening a backup without Lucidos.** It is a standard age file:
+  `age -d -i key.txt backup.age > backup.tar.zst`.
+
+**Older workspaces.** Before age, each workspace had a base64 key that Lucidos
+stored and showed in Settings, and archives ended in `.enc`. Such a workspace
+keeps backing up with that key until the user sets up a backup key. A weekly
+notice asks them to switch. The switch screen shows the old key one last time,
+then Lucidos forgets it. Old `.enc` backups still need that old key.
 
 ## Restore
 
 Restore is **not** an engine operation, and the agent does not do it. It
 happens in the **workspace picker**: the gateway provisions a new workspace and
-unpacks the archive into it. Point the user there.
+unpacks the archive into it. Point the user there. The picker takes a `.age`
+backup with its backup key, or an older `.enc` backup with its base64 key.

@@ -28,6 +28,9 @@ pub const PLUGIN_ARCHIVE_EXT: &str = ".lucidos-plugin";
 /// also the limit in characters.
 pub(crate) const MAX_ID_LEN: usize = 64;
 
+/// The longest `setup_reason`, in characters.
+pub const MAX_SETUP_REASON_LEN: usize = 200;
+
 /// Parsed `manifest.toml` after validation. Fields beyond v1 are kept on the
 /// raw `serde_json::Value` so they round-trip into the event payload.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +50,13 @@ pub struct PluginManifest {
     /// on the same turn as the install. Free-form markdown -- the author writes
     /// it; the engine does not interpret it.
     pub setup: Option<String>,
+    /// The *setup revision*: a positive integer an author raises to ask for
+    /// `setup` to run again on update, 0 when the manifest has none. Only a
+    /// revision greater than the installed one re-runs setup.
+    pub setup_revision: u64,
+    /// One line saying why this revision asks for a re-run. Set only with a
+    /// `setup_revision`.
+    pub setup_reason: Option<String>,
     /// Topical categories the author tagged this plugin with (e.g. `finance`,
     /// `health`). A *controlled vocabulary* (see [`PLUGIN_CATEGORIES`]): values
     /// here are as authored — unknown ones are filtered + flagged at catalog
@@ -125,6 +135,9 @@ pub enum ValidationError {
     ItemNamedLikeBuildOutput(String),
     /// A widget folder a plugin may not ship: `(apps/<id>, reason)`.
     InvalidWidget(String, String),
+    /// A `setup_revision` or `setup_reason` that install refuses:
+    /// `(field, reason)`.
+    InvalidSetupField(&'static str, String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -163,6 +176,9 @@ impl std::fmt::Display for ValidationError {
             }
             Self::InvalidWidget(path, reason) => {
                 write!(f, "{path}/ is not a widget a plugin can ship: {reason}")
+            }
+            Self::InvalidSetupField(field, reason) => {
+                write!(f, "manifest.toml field {field} is not valid: {reason}")
             }
             Self::ItemNamedLikeBuildOutput(path) => write!(
                 f,
@@ -232,6 +248,7 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         .get("setup")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let (setup_revision, setup_reason) = parse_setup_revision(table, setup.as_deref())?;
 
     // Categories are normalised (lowercase + trim) but NOT controlled-set
     // checked here — an unknown tag is filtered + flagged at scan time so it
@@ -260,10 +277,58 @@ pub fn parse_manifest(toml_text: &str) -> Result<PluginManifest, ValidationError
         description,
         source,
         setup,
+        setup_revision,
+        setup_reason,
         categories,
         media,
         raw,
     })
+}
+
+/// Read and validate `setup_revision` and `setup_reason`. An absent revision is
+/// 0. A revision needs a `setup` with text to re-run, and a reason needs a
+/// revision to explain.
+fn parse_setup_revision(
+    table: &toml::map::Map<String, toml::Value>,
+    setup: Option<&str>,
+) -> Result<(u64, Option<String>), ValidationError> {
+    let invalid = |field, reason: &str| ValidationError::InvalidSetupField(field, reason.into());
+    let revision = match table.get("setup_revision") {
+        None => 0,
+        Some(v) => match v.as_integer().and_then(|n| u64::try_from(n).ok()) {
+            Some(n) if n > 0 => n,
+            _ => return Err(invalid("setup_revision", "expected a positive integer")),
+        },
+    };
+    if revision > 0 && setup.is_none_or(|s| s.trim().is_empty()) {
+        return Err(invalid(
+            "setup_revision",
+            "it asks to run `setup` again, and the manifest has no `setup` text",
+        ));
+    }
+    let reason = match table.get("setup_reason") {
+        None => None,
+        Some(_) if revision == 0 => {
+            return Err(invalid("setup_reason", "it needs a `setup_revision`"))
+        }
+        Some(v) => {
+            let text = v.as_str().map(str::trim).unwrap_or_default();
+            if text.is_empty() {
+                return Err(invalid("setup_reason", "expected a non-empty string"));
+            }
+            if text.contains(['\n', '\r']) {
+                return Err(invalid("setup_reason", "expected a single line"));
+            }
+            if text.chars().count() > MAX_SETUP_REASON_LEN {
+                return Err(invalid(
+                    "setup_reason",
+                    &format!("at most {MAX_SETUP_REASON_LEN} characters"),
+                ));
+            }
+            Some(text.to_string())
+        }
+    };
+    Ok((revision, reason))
 }
 
 /// Loose check for "looks like a git remote" — used to reject plainly bad

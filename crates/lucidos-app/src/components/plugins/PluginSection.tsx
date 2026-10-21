@@ -39,6 +39,7 @@ export function pluginPanelHeader({ status, receiptAt, name, version, descriptio
  *  list, so they must read even when it is shut. */
 export function PluginSection({
   label,
+  detail,
   count,
   defaultOpen = false,
   tone,
@@ -47,6 +48,8 @@ export function PluginSection({
   children,
 }: {
   label: string;
+  /** A muted aside after the label, readable while the section is shut. */
+  detail?: string;
   count?: number;
   defaultOpen?: boolean;
   /** `danger` marks a section whose files confirming destroys. */
@@ -68,7 +71,10 @@ export function PluginSection({
         <span class="plugin-install-chevron" aria-hidden="true">
           <ChevronRightIcon size="1rem" />
         </span>
-        <span class="plugin-install-label">{label}</span>
+        <span class="plugin-install-label">
+          {label}
+          {detail && <span class="plugin-install-label-detail"> · {detail}</span>}
+        </span>
         {count !== undefined && <span class="plugin-install-count">{count}</span>}
       </button>
       <Disclosure open={open}>

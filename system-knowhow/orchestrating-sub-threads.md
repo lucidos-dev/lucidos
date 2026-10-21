@@ -69,6 +69,11 @@ reading.
 **Do not spawn to save money on the same model, or for context hygiene.** The
 data tested both priors and neither survived.
 
+**A batch of small fixes splits by kind, not by count.** Mechanical edits go
+inline in one pass, and the rest go to coding agents. The rule and its worked
+example live in `system-knowhow/workspace-audit.md` § Inline or a coding
+agent, and hold for any batch, audit or not.
+
 **The *home thread* is the exception: it starts a thread for work.** It
 answers a question or a quick lookup itself, and gives anything more its own
 thread. The reason is parallelism and a free Home, not cost: the user talks
@@ -112,10 +117,12 @@ A long child's rounds cost about 27% MORE than inline ones. So a short child
 never recovers the fixed cost, and a long child loses the per-round edge that
 would let it. **On the same model, the measured data showed no crossover.**
 
-**Spawning to a cheaper model can pay, past a real threshold.** Sonnet 5 is
-0.6x Opus ($3/$15 against $5/$25), not 1/5. Haiku 4.5 at $1/$5 is the 1/5
-model. Caches are model-scoped, so a Sonnet child gets nothing from an Opus
-workspace prefix and always writes its floor cold.
+**Spawning to a cheaper model can pay, past a real threshold.** For a coding
+agent, the *intelligence ladder* gives each rung's cost as a rough multiple
+of the default rung. A refused pick lists the rungs, and `lucidos
+intelligence-ladder` prints them with their bands. Caches are model-scoped, so a child on another
+model gets nothing from your workspace prefix and always writes its floor cold.
+For a model at about 0.6x the cost per round:
 
 | If the weaker model needs… | Break-even |
 |---|---|
@@ -124,7 +131,7 @@ workspace prefix and always writes its floor cold.
 | More than about 2.3x the rounds | Never |
 
 **Plan against 21.** Nobody has measured the round multiplier: 30 days held 8
-Sonnet calls against 18,936 Opus calls.
+calls on the cheaper model against 18,936 on the dearer one.
 
 **`follow_up_child_thread` is the mitigation that works.** More work to an
 existing child spreads its cold start over more rounds. It is already in use:
@@ -134,6 +141,24 @@ Ten children with something to say are ten re-entries through your one context,
 at $0.504 each. That is the price of one judge and one shared record, accepted
 rather than solved. Two levers, both yours: spawn fewer children, or stay
 unsubscribed and read the log on your own schedule.
+
+### Picking the child's rung
+
+The cost table above argues only for going down. Judge difficulty first:
+
+| The task | Rung |
+|---|---|
+| You are unsure | Omit `model` and `reasoning_effort`: the default rung |
+| Settled and fully specified: named files, a known fix | Lower |
+| Open design choices, or code that is risky to touch | Higher |
+
+Err up, not down. A child that is too weak costs a wasted run plus the rework.
+A child that is too strong costs only the price difference.
+
+On complex work a coding agent plans first and recommends an implementer on
+its plan card. Your pick still runs the planning, and the build too unless
+the user picks another rung there. The user can change any rung in the
+thread's rung control.
 
 ### Child or top-thread
 

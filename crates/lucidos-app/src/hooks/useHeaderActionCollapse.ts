@@ -96,7 +96,7 @@ export function computeHeaderCollapse(input: HeaderCollapseInput): HeaderCollaps
 export interface MeasuredHeaderRow {
   /** The row's padding-box width, which its centred box spans. */
   clientWidth: number;
-  /** Padding the actions stop short of: the docked Home rail toggle's room. */
+  /** Padding the actions stop short of: the docked dashboard rail toggle's room. */
   trailingPadding: number;
   titleWidth: number;
   iconWidth: number;

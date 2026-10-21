@@ -1,6 +1,9 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, hideHomeRail, minThreadPane, navigateToApp, openThreadDrawer, stampOverlayBuild, DRAWER_TOGGLE_LABEL } from './helpers';
+import { assertHealthy, hideDashboardRail, minThreadPane, navigateToApp, openThreadDrawer, stampOverlayBuild, DRAWER_TOGGLE_LABEL } from './helpers';
 import { THREAD_ROW_LEAD_CONTROLS } from '../src/store/paneMinimums';
+
+// Reads real motion, so it opts out of the calm default (playwright.config.ts).
+test.use({ reducedMotion: 'no-preference' });
 
 /** Clamped divider drags (SplitLayout / DrawerDivider + splitHelpers; ADR 0056):
  *  a drag is clamped to the pane minimums as it moves, so it stops at the wall
@@ -31,8 +34,10 @@ const BELOW_FLOOR_X = 150;
 // FROM. It has to clear the drawer's floor by a wide margin, and the floor is
 // 320 at these projects' 16px root now that it no longer varies by client
 // (ADR 0058): opening at the default would put the drawer on its wall already,
-// and a drag that cannot move proves nothing about a clamp.
-const OPEN_DRAWER_WIDTH = 420;
+// and a drag that cannot move proves nothing about a clamp. It must also leave
+// the split both pane floors, 858px with Home leading the row, or the Canvas
+// yields (ADR 0495): 1280 less the drawer and its 3px divider.
+const OPEN_DRAWER_WIDTH = 400;
 
 test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -125,7 +130,7 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
       localStorage.setItem('lucidos-thread-drawer-width', String(width));
     }, OPEN_DRAWER_WIDTH);
-    await hideHomeRail(page);
+    await hideDashboardRail(page);
     await navigateToApp(page);
   });
 
@@ -282,17 +287,31 @@ test.describe('Split layout: dividers clamp at the pane minimums', () => {
   });
 
   test('widening the drawer stops at the thread pane\'s minimum, not past it', async ({ page }) => {
-    await openDrawerAndSettle(page);
     // The drawer drag holds the content pane at a constant pixel width, so every
     // pixel the drawer gains comes out of the THREAD pane. That is the less
     // obvious end of the drawer's clamp, and the one a ceiling-less version
-    // squeezed to nothing.
-    await dragDivider(page, '.drawer-divider', 900, { release: false });
+    // squeezed to nothing. At 1280 the split clears its floors by 19px, so the
+    // thread pane starts on its wall and the drag cannot travel. A wider window
+    // and a wider thread pane give it room.
+    await page.setViewportSize({ width: 1600, height: 800 });
+    await openDrawerAndSettle(page);
+    await dragDivider(page, '.split-divider', 1200);
+    await page.waitForTimeout(SETTLE_MS);
+    await expect(page.locator('.pane-content'), 'the Canvas yielded before the drag')
+      .not.toHaveClass(/pane-collapsed/);
+
+    await dragDivider(page, '.drawer-divider', 1500, { release: false });
     await page.evaluate(() => new Promise(requestAnimationFrame));
     const during = await threadPaneWidth(page);
     const floor = await minThreadPane(page);
     expect(during, `mid-drag the thread pane sat at ${during}`)
       .toBeGreaterThanOrEqual(floor - 2);
+    expect(await drawerWidth(page), 'the drawer never widened, so no clamp was reached')
+      .toBeGreaterThan(OPEN_DRAWER_WIDTH + 100);
+    const content = await page.evaluate(() =>
+      document.querySelector('.pane-content')!.getBoundingClientRect().width);
+    expect(content, `the drawer took its width from the Canvas, which sat at ${content}`)
+      .toBeGreaterThanOrEqual(MIN_CONTENT_PANE);
 
     await page.mouse.up();
     await page.waitForTimeout(SETTLE_MS);
@@ -447,6 +466,10 @@ async function threadsHeaderGeometry(page: Page) {
 }
 
 test.describe('Threads header: a pane-centred title, and a band that answers no double-click', () => {
+  // Beside a WIDE_DRAWER, 1280 leaves the split less than its two pane floors
+  // (858px), and the Canvas yields (ADR 0495). This window leaves it 937.
+  test.use({ viewport: { width: 1440, height: 800 } });
+
   test.beforeEach(async ({ page, context }) => {
     await assertHealthy(page);
     await context.addInitScript((w) => {
@@ -454,7 +477,7 @@ test.describe('Threads header: a pane-centred title, and a band that answers no 
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
       localStorage.setItem('lucidos-thread-drawer-width', String(w));
     }, WIDE_DRAWER);
-    await hideHomeRail(page);
+    await hideDashboardRail(page);
     await navigateToApp(page);
   });
 

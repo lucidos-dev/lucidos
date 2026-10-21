@@ -235,48 +235,61 @@ pub async fn thread_widgets(
     let folded = fold_thread_widgets(&widget_event_rows(pool, thread_id).await?);
     let mut widgets = Vec::with_capacity(folded.len());
     for widget in folded {
-        let app = match app_manager.get_app(&widget.app_id) {
-            Ok(app) => app,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                log!(
-                    "[Widgets] Skipping {} in the thread's widgets: {}",
-                    widget.app_id,
-                    e
-                );
-                continue;
-            }
-            Err(e) => return Err(format!("reading widget '{}': {e}", widget.app_id).into()),
+        let Some(app) = listed_widget(app_manager, &widget.app_id)? else {
+            continue;
         };
-        let origin_plugin_id = app.origin_plugin().map(str::to_string);
         widgets.push(ThreadWidget {
-            app_id: widget.app_id,
-            params: widget.params,
-            label: widget.label,
-            name: app.name,
-            icon: app.icon,
-            reusable: app.reusable,
-            origin_plugin_id,
-            built_in: app.built_in,
-            reveal: app.reveal,
-            sizes: app.sizes,
-            transparent: app.transparent,
             pinned: widget.pinned,
             shown_event_id: widget.shown_event_id,
+            ..ThreadWidget::of(app, widget.params, widget.label)
         });
     }
     Ok(widgets)
 }
 
+/// The widget a stored event names, or `None` when it no longer lists: its
+/// folder is gone, or its manifest does not parse, as for the apps list. Any
+/// other read failure fails, since it says nothing about whether it exists.
+pub(crate) fn listed_widget(
+    app_manager: &AppManager,
+    app_id: &str,
+) -> Result<Option<App>, BoxError> {
+    match app_manager.get_app(app_id) {
+        Ok(app) => Ok(Some(app)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            log!("[Widgets] Skipping {app_id}: {e}");
+            Ok(None)
+        }
+        Err(e) => Err(format!("reading widget '{app_id}': {e}").into()),
+    }
+}
+
+impl ThreadWidget {
+    /// One instance of `app`, unpinned, as its manifest describes it.
+    pub(crate) fn of(app: App, params: Option<WidgetParams>, label: Option<String>) -> Self {
+        Self {
+            origin_plugin_id: app.origin_plugin().map(str::to_string),
+            app_id: app.id,
+            params,
+            label,
+            name: app.name,
+            icon: app.icon,
+            reusable: app.reusable,
+            built_in: app.built_in,
+            reveal: app.reveal,
+            sizes: app.sizes,
+            transparent: app.transparent,
+            pinned: false,
+            shown_event_id: None,
+        }
+    }
+}
+
 /// The widget this id names, or why it cannot be used. Only a missing folder
 /// or manifest means there is no such widget.
-fn widget(app_manager: &AppManager, app_id: &str) -> Result<App, WidgetCheckFailed> {
-    let app = app_manager.get_app(app_id).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => {
-            Refused(format!("No widget '{}' exists", app_id))
-        }
-        _ => ReadFailed(format!("reading widget '{app_id}': {e}").into()),
-    })?;
+pub(crate) fn widget(app_manager: &AppManager, app_id: &str) -> Result<App, WidgetCheckFailed> {
+    let app = existing_app(app_manager, app_id, "widget")?;
     if !app.is_widget() {
         return Err(Refused(format!(
             "'{}' is an app, not a widget. Open an app with navigate_ui.",
@@ -284,6 +297,25 @@ fn widget(app_manager: &AppManager, app_id: &str) -> Result<App, WidgetCheckFail
         )));
     }
     Ok(app)
+}
+
+/// What a dashboard tile can be: a widget, or an app that shows as a shortcut.
+/// Only a missing folder or manifest means there is no such thing.
+pub(crate) fn tile_app(app_manager: &AppManager, app_id: &str) -> Result<App, WidgetCheckFailed> {
+    existing_app(app_manager, app_id, "widget or app")
+}
+
+fn existing_app(
+    app_manager: &AppManager,
+    app_id: &str,
+    what: &str,
+) -> Result<App, WidgetCheckFailed> {
+    app_manager.get_app(app_id).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => {
+            Refused(format!("No {what} '{app_id}' exists"))
+        }
+        _ => ReadFailed(format!("reading {what} '{app_id}': {e}").into()),
+    })
 }
 
 /// Whether these params fit what the widget's manifest declares: no unknown
@@ -514,40 +546,29 @@ impl std::fmt::Display for WidgetCheckFailed {
 
 use WidgetCheckFailed::{ReadFailed, Refused};
 
-/// What a checked widget change must do besides writing its event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct WidgetChangePlan {
-    /// Pin to Home on another thread's own widget makes it reusable first, so
-    /// deleting that thread never silently empties a Home board tile (ADR 0432).
-    pub make_reusable: bool,
-}
-
-/// Whether a widget change can happen, and what it must do first.
+/// Whether a widget change can happen.
 pub async fn check_widget_change(
     pool: &PgPool,
     app_manager: &AppManager,
     change: WidgetChange,
     instance: &WidgetInstance,
     thread_id: Uuid,
-) -> Result<WidgetChangePlan, WidgetCheckFailed> {
+) -> Result<(), WidgetCheckFailed> {
     let app = widget(app_manager, &instance.app_id)?;
     if !thread_exists(pool, thread_id).await.map_err(ReadFailed)? {
         return Err(Refused(format!("No thread {} exists", thread_id)));
     }
-    let pin_to_home = matches!(change, WidgetChange::Pin { .. })
-        && crate::engine::home_thread::is_home_thread(pool, thread_id)
-            .await
-            .map_err(|e| ReadFailed(e.into()))?;
-    // A new instance must be one this thread may hold. One the thread already
-    // holds stays pinnable, even if its widget stopped being reusable since.
-    let check_new = || -> Result<WidgetChangePlan, WidgetCheckFailed> {
-        let make_reusable = pin_to_home && check_widget_owner(&app, thread_id).is_err();
-        if !make_reusable {
-            check_widget_owner(&app, thread_id)?;
-        }
-        check_widget_params(&app, instance.params.as_ref()).map_err(Refused)?;
-        Ok(WidgetChangePlan { make_reusable })
-    };
+    // Home's old pins seed the dashboards, so a change there would move them
+    // (ADR 0496).
+    if crate::engine::home_thread::is_home_thread(pool, thread_id)
+        .await
+        .map_err(|e| ReadFailed(e.into()))?
+    {
+        return Err(Refused(
+            "Home has no shelf. Add the widget to a dashboard, or remove it from one, instead."
+                .into(),
+        ));
+    }
     if let WidgetChange::Pin {
         shown_event_id: Some(event_id),
     } = change
@@ -568,16 +589,14 @@ pub async fn check_widget_change(
     );
     let key = instance.key();
     let pinned = widgets.iter().find(|w| w.key() == key).map(|w| w.pinned);
-    let plan = match (change, pinned) {
-        (WidgetChange::Pin { .. }, None) => check_new()?,
-        // Home held it before: a pin again still makes it reusable, or deleting
-        // its thread would empty the tile.
-        (WidgetChange::Pin { .. }, Some(false)) if pin_to_home => WidgetChangePlan {
-            make_reusable: check_widget_owner(&app, thread_id).is_err(),
-        },
-        _ => WidgetChangePlan::default(),
-    };
     match (change, pinned) {
+        // A new instance must be one this thread may hold. One the thread
+        // already holds stays pinnable, even if its widget stopped being
+        // reusable since.
+        (WidgetChange::Pin { .. }, None) => {
+            check_widget_owner(&app, thread_id)?;
+            check_widget_params(&app, instance.params.as_ref()).map_err(Refused)
+        }
         (WidgetChange::Pin { .. }, Some(true)) => Err(Refused(format!(
             "Widget {} is already pinned to this thread's shelf",
             instance.describe()
@@ -590,7 +609,7 @@ pub async fn check_widget_change(
             "Widget {} is not pinned to this thread's shelf",
             instance.describe()
         ))),
-        _ => Ok(plan),
+        _ => Ok(()),
     }
 }
 
@@ -622,11 +641,15 @@ pub async fn check_set_reusable(
             app_id, plugin
         )));
     }
-    if pinned_to_home_from_elsewhere(pool, &app).await? {
+    if let Some(dashboard) = crate::engine::dashboard::dashboard_holding(pool, app_id)
+        .await
+        .map_err(ReadFailed)?
+    {
         return Err(Refused(format!(
-            "Widget '{}' is pinned to Home. Unpin it from Home first, \
+            "Widget '{}' is on the {} dashboard. Remove it from there first, \
              or deleting its thread would empty the tile.",
-            app_id
+            app_id,
+            dashboard.as_str()
         )));
     }
     let origin_exists = match app.origin_thread() {
@@ -643,47 +666,9 @@ pub async fn check_set_reusable(
     Ok(())
 }
 
-/// Carry out a checked widget change: make the widget reusable when the plan
-/// says so, then write its event. Answers whether it made the widget reusable.
-pub async fn apply_widget_change(
-    app_manager: &AppManager,
-    event_bus: &EventBus,
-    plan: WidgetChangePlan,
-    change: WidgetChange,
-    instance: WidgetInstance,
-    thread_id: Uuid,
-    actor: Option<MessageOrigin>,
-) -> Result<bool, BoxError> {
-    // A second pin racing the first finds the widget reusable already.
-    let make_reusable = plan.make_reusable && !app_manager.get_app(&instance.app_id)?.reusable;
-    if make_reusable {
-        app_manager
-            .set_widget_reusable(event_bus, &instance.app_id, true, actor.clone())
-            .await?;
-    }
-    emit_widget_change(event_bus, change, instance, thread_id, actor).await?;
-    Ok(make_reusable)
-}
-
-/// Whether Home pins this widget while another thread owns it: then that
-/// thread's deletion would remove the widget from under its tile.
-async fn pinned_to_home_from_elsewhere(
-    pool: &PgPool,
-    app: &App,
-) -> Result<bool, WidgetCheckFailed> {
-    let home = crate::engine::home_thread::home_thread_id(pool)
-        .await
-        .map_err(|e| ReadFailed(e.into()))?;
-    let Some(home) = home.filter(|h| app.origin_thread() != Some(*h)) else {
-        return Ok(false);
-    };
-    let widgets = fold_thread_widgets(&widget_event_rows(pool, home).await.map_err(ReadFailed)?);
-    Ok(widgets.iter().any(|w| w.pinned && w.app_id == app.id))
-}
-
 /// Write the one thread event a checked widget change consists of. No file
 /// and no commit: unpinning is never destructive.
-async fn emit_widget_change(
+pub async fn emit_widget_change(
     event_bus: &EventBus,
     change: WidgetChange,
     instance: WidgetInstance,

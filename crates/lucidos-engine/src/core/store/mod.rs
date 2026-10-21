@@ -13,7 +13,9 @@ pub(crate) use messages::{
     synthesize_tool_use_id, tool_called_event_id_of, with_event_address, CachedSummary,
     ResumeToolPair, RESUME_VERBATIM_TOOL_TAIL,
 };
-pub use messages::{format_child_thread_completed_block, ChangeStatuses};
+pub use messages::{
+    format_child_report_filed_block, format_child_thread_completed_block, ChangeStatuses,
+};
 use sqlx::PgPool;
 pub(crate) use threads::format_display_title;
 pub use threads::{
@@ -336,18 +338,21 @@ impl EventStore {
         event_type: Option<&str>,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        thread_id: Option<Uuid>,
     ) -> Result<(i64, i64), sqlx::Error> {
         let (count, bytes): (i64, Option<i64>) = sqlx::query_as(
             "SELECT COUNT(*)::bigint, SUM(octet_length(payload::text))::bigint FROM events \
              WHERE ($1::text IS NULL OR event_type = $1) \
              AND ($2::timestamptz IS NULL OR created > $2) \
              AND ($3::timestamptz IS NULL OR created < $3) \
+             AND ($5::uuid IS NULL OR thread_id = $5) \
              AND event_type <> ALL($4)",
         )
         .bind(event_type)
         .bind(since)
         .bind(until)
         .bind(ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
+        .bind(thread_id)
         .fetch_one(&self.pool)
         .await?;
         Ok((count, bytes.unwrap_or(0)))
@@ -362,12 +367,14 @@ impl EventStore {
         &self,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        thread_id: Option<Uuid>,
     ) -> Result<Vec<(String, i64, i64)>, sqlx::Error> {
         let rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
             "SELECT event_type, COUNT(*)::bigint, SUM(octet_length(payload::text))::bigint \
              FROM events \
              WHERE ($1::timestamptz IS NULL OR created > $1) \
              AND ($2::timestamptz IS NULL OR created < $2) \
+             AND ($4::uuid IS NULL OR thread_id = $4) \
              AND event_type <> ALL($3) \
              GROUP BY event_type \
              ORDER BY COUNT(*) DESC, event_type ASC",
@@ -375,6 +382,7 @@ impl EventStore {
         .bind(since)
         .bind(until)
         .bind(ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
+        .bind(thread_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows

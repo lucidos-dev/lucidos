@@ -18,7 +18,7 @@ differ in when they load, what authority they carry, and what they cost.
 | Layer | Where | Loads | Authority |
 |---|---|---|---|
 | Engine system prompt | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` | every session | system prompt |
-| Always-loaded instructions | `CLAUDE.md` + unscoped `.claude/rules/*.md` | every session | user message, after the system prompt |
+| Always-loaded instructions | `CLAUDE.md` + unscoped `.claude/rules/*.md` | every session | user message, after the system prompt (system prompt for a verified Claude Code session, below) |
 | Path-scoped rules | `.claude/rules/*.md` with `paths:` | when Claude reads a matching file | user message |
 | Skills | `.claude/skills/*/SKILL.md`, `.claude/commands/*.md` | description every session, body on invocation | user message |
 
@@ -29,6 +29,17 @@ a user message *after* the system prompt, while the engine appends its rules to
 the system prompt itself. Where the two say the same thing, the engine copy is
 the authoritative one. They should almost never say the same thing: see
 § Which surface owns a rule.
+
+**A verified Claude Code session gets the always-loaded set in the system prompt.**
+Claude Code's user message names the worktree. Every fresh session therefore
+rewrote it to the prompt cache. The engine checks the *mirror key* of the session's
+files and Claude Code version. When it is verified, the engine excludes those
+files from Claude Code's loading. It appends them after the engine prompt,
+where the cache shares them across worktrees.
+
+Verification compares the engine's mirror with Claude
+Code's own transcript record (ADR 0513). An unverified session loads them as
+described above.
 
 **`CLAUDE.md` reaches both backends; `.claude/rules/` does not.** Codex reads
 `CLAUDE.md`. Both Codex drivers point codex's project-doc fallback list at it
@@ -184,9 +195,30 @@ non-splits, as worked examples of where the line is:
 
 The test that decides it: **name a file in the rule's scope that cannot change
 anything the rule says.** If one exists, the rule is over-scoped and that
-content wants its own narrower rule. If none does, the rule is the right shape
-however large it is, and shrinking it means deleting or compressing content
-rather than moving it.
+content wants its own narrower rule. If none does, the rule is the right shape,
+and shrinking it means deleting or compressing content rather than moving it.
+The ceiling below decides how large is too large.
+
+### The per-file ceiling
+
+A scoped rule arrives whole as a `nested_memory` attachment on the first
+matching read. It then rides every later call of the session, and Claude Code
+injects it again after each compaction. A fleet measurement over 30 days put
+path-scoped rules at about 14% of billed input. One read of a 100 KB rule added
+47k tokens to a single session.
+
+`CONTEXT_BUDGET_SCOPED_CEILING` in `scripts/lib/context_budget.sh` caps each
+scoped rule at 16,000 bytes. The gate is `scripts/check-context-budget.sh`.
+
+- **A rule keeps conventions only.** Each bullet says what a reader must not
+  break and links where the reason lives: an ADR, a script header or the code.
+  Delete a passage that restates its home. Move rationale with no home to a
+  `docs/` page, rewritten to pass the prose gate.
+- **A rule over the ceiling is listed in `CONTEXT_BUDGET_SCOPED_EXCEPTIONS`**
+  at its measured size. A listed rule may shrink and may not grow. Slimming it
+  under the ceiling means deleting its entry, since the gate fails a stale one.
+- **Cited headings survive.** Other files cite a rule as
+  `rules/<name>.md § <section>`. Grep the rule name before removing a heading.
 
 Prefer a narrower **rule** to a **skill** for this. A skill body loads only when
 the model chooses it from a description, while a path-scoped rule arrives
@@ -207,7 +239,7 @@ file is touched.
 ## The context budget
 
 `scripts/check-context-budget.sh` measures the always-loaded set and fails on
-two arms. `/harden` Phase 4.5 runs it for every diff, docs-only included, since
+two arms, then holds each path-scoped rule to a third (§ The per-file ceiling). `/harden` Phase 4.5 runs it for every diff, docs-only included, since
 a docs-only diff is exactly the change that grows it.
 
 - **Size.** The set must stay at or under `CONTEXT_BUDGET_CEILING` in
@@ -220,7 +252,8 @@ a docs-only diff is exactly the change that grows it.
   not, and it fires on all four ways that happens: a `globs:` key, a `path:`
   typo, a `paths:` of exactly `**`, and frontmatter that never closes.
 
-`./scripts/check-context-budget.sh --report` prints the set without failing.
+`./scripts/check-context-budget.sh --report` prints the set and every scoped
+rule without failing.
 Fixing a size failure means moving content, not raising the number.
 
 `.claude/hooks/log-instructions-loaded.sh` records the other half: an

@@ -17,6 +17,7 @@ import {
   matchesEvent,
   eventToBinding,
   isBindableChord,
+  isComposerEnterChord,
   type Binding,
   type ShortcutId,
 } from '../../utils/shortcuts';
@@ -151,6 +152,7 @@ export type RecordOutcome =
   | { kind: 'modifier' }
   | { kind: 'cancel' }
   | { kind: 'invalid' }
+  | { kind: 'composer' }
   | { kind: 'conflict'; withId: ShortcutId }
   | { kind: 'ok'; binding: Binding };
 
@@ -161,6 +163,7 @@ export function recordChord(e: EventLike & { key: string }, id: ShortcutId): Rec
   if (e.key === 'Escape') return { kind: 'cancel' };
   const binding = eventToBinding(e);
   if (!isBindableChord(binding)) return { kind: 'invalid' };
+  if (isComposerEnterChord(binding)) return { kind: 'composer' };
   const conflict = matchShortcut(e, id);
   if (conflict) return { kind: 'conflict', withId: conflict };
   return { kind: 'ok', binding };

@@ -10,7 +10,7 @@ use serde::Serialize;
 use super::reach::Reach;
 use super::{model_source, needs_vision, AuxModelSource, ContextPurpose};
 use crate::engine::summary_tree::{default_effort_for, COMPACTOR_DEFAULTS};
-use crate::llm::model_registry::{reads_images, ModelRegistry};
+use crate::llm::model_registry::{reads_images, GenerationRule, ModelRegistry};
 
 /// Where a selection's model came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -25,35 +25,50 @@ pub enum ModelSource {
     ChatModel,
 }
 
+impl ModelSource {
+    /// How far a call on this selection may move within its model's
+    /// *lineage*. Only a default was measured for its purpose, so only a
+    /// default never steps back to an older generation.
+    pub(crate) fn generation_rule(self) -> GenerationRule {
+        match self {
+            Self::Default => GenerationRule::NamedOrNewer,
+            Self::Preference | Self::ChatModel => GenerationRule::AnyGeneration,
+        }
+    }
+}
+
 /// What every auxiliary purpose falls back to after its own catalog default,
-/// cheapest first. Between them they reach Vertex, OpenAI, Anthropic and
-/// OpenRouter; each has a registry row naming its routes.
-pub(crate) const AUX_FALLBACKS: &[&str] =
-    &["gemini-3-flash-preview", "gpt-5.4-mini", "claude-haiku-4-5"];
+/// cheapest first. Between them they reach Vertex, OpenAI and OpenRouter; each
+/// has a registry row naming its routes. An Anthropic-only install reaches
+/// `BACKGROUND_MODEL` before them.
+pub(crate) const AUX_FALLBACKS: &[&str] = &["gpt-6-luna", "gemini-3.1-flash-lite"];
 
 /// The operator's override of every purpose's first choice but the judge's.
 const EXTRACTION_MODEL_ENV: &str = "LUCIDOS_EXTRACTION_MODEL";
 
-/// The first of `candidates` that `reach` serves.
+/// The first of `candidates` that `reach` serves as a default: itself or a
+/// newer generation, never an older one.
 fn first_reachable<'a>(
     candidates: impl IntoIterator<Item = &'a str>,
     registry: &ModelRegistry,
     reach: &Reach,
 ) -> Option<&'a str> {
+    let rule = ModelSource::Default.generation_rule();
     candidates
         .into_iter()
-        .find(|model| reach.serves(registry, model))
+        .find(|model| reach.serves(registry, model, rule))
 }
 
 /// What a purpose's measured comparison put ahead of its catalog default.
 fn purpose_lead(purpose: ContextPurpose) -> Vec<&'static str> {
     match purpose {
         // `docs/plans/2026-10-06-memory-tasks-model-comparison.md`.
-        ContextPurpose::Memory => vec!["gpt-5.6-luna"],
+        ContextPurpose::Memory => vec!["gpt-6-luna"],
         // `lucidos-eval read-decision`, recorded in ADR 0426.
-        ContextPurpose::ReadDecision => vec!["gemini-3.8-flash", "gpt-5.6-luna"],
-        // `lucidos-eval wake-decision`, recorded in ADR 0448.
-        ContextPurpose::WakeDecision => vec!["gemini-3.8-flash", "gpt-6.1-sol", "gpt-5.6-luna"],
+        ContextPurpose::ReadDecision => vec!["gemini-3.8-flash", "gpt-6-luna"],
+        // `lucidos-eval wake-decision`, recorded in ADR 0448. Its catalog
+        // default, the third measured model, follows.
+        ContextPurpose::WakeDecision => vec!["gemini-3.8-flash", "gpt-6.1-sol"],
         // The two summary writers share one measured list.
         ContextPurpose::ConversationSummary => {
             COMPACTOR_DEFAULTS.iter().map(|entry| entry.model).collect()

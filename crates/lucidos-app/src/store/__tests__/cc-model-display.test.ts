@@ -255,6 +255,49 @@ describe('exchangeReasoningEffort', () => {
     const exchanges = groupIntoExchanges(events);
     expect(exchangeReasoningEffort(exchanges[0])).toBeUndefined();
   });
+
+  /** The user picked xhigh mid-turn, and every call after it still ran at
+   *  medium. The row names what ran, never the pick. */
+  describe('names the effort in force, not a pick', () => {
+    const pick = { kind: 'device', device_id: 'test-device' };
+    const capture = (effort: string, extra: Record<string, unknown> = {}) => ({
+      type: 'ContextCaptured',
+      channel: 'claude_code',
+      model: 'claude-opus-5-6',
+      reasoning_effort: effort,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      ...extra,
+    }) as unknown as StoredEvent;
+
+    it('reads the newest main-session capture over a later pick', () => {
+      const events = eventsMap([
+        [1, { type: 'MessageReceived', text: 'fix', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
+        [2, { type: 'CodingAgentSettingsChanged', model: 'claude-opus-5-6', reasoning_effort: 'medium', created: '2026-01-01T00:00:02Z' }],
+        [3, capture('medium')],
+        [4, { type: 'CodingAgentSettingsChanged', reasoning_effort: 'xhigh', actor: pick, created: '2026-01-01T00:00:04Z' } as unknown as StoredEvent],
+        [5, capture('medium')],
+      ]);
+      expect(exchangeReasoningEffort(groupIntoExchanges(events)[0])).toBe('medium');
+    });
+
+    it('skips a pick before the first call, keeping the spawn setting', () => {
+      const events = eventsMap([
+        [1, { type: 'MessageReceived', text: 'fix', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
+        [2, { type: 'CodingAgentSettingsChanged', reasoning_effort: 'medium', created: '2026-01-01T00:00:02Z' }],
+        [3, { type: 'CodingAgentSettingsChanged', reasoning_effort: 'xhigh', actor: pick, created: '2026-01-01T00:00:03Z' } as unknown as StoredEvent],
+      ]);
+      expect(exchangeReasoningEffort(groupIntoExchanges(events)[0])).toBe('medium');
+    });
+
+    it('ignores a sub-agent call', () => {
+      const events = eventsMap([
+        [1, { type: 'MessageReceived', text: 'fix', channel: 'claude_code', created: '2026-01-01T00:00:01Z' }],
+        [2, capture('medium')],
+        [3, capture('low', { parent_tool_use_id: 'toolu_1' })],
+      ]);
+      expect(exchangeReasoningEffort(groupIntoExchanges(events)[0])).toBe('medium');
+    });
+  });
 });
 
 /** A trigger fire is a chat turn whose starter event is `TriggerStarted` rather

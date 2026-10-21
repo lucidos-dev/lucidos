@@ -181,11 +181,6 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     expr: /scaledDurationMs\(MODAL_FADE_MS\) \+ MODAL_FADE_SLACK_MS/,
     what: "removes a closed modal's exit drawing once its fade has run",
   },
-  {
-    file: '../../components/layout/SplitLayout.tsx',
-    expr: /scaledDurationMs\(PANE_TRANSITION_MS\) \+ 100/,
-    what: "migrates the split once the Home board's rail has slid in",
-  },
   // The only entry whose transition is INLINE rather than a token. The FLIP
   // writes `transform` and `height` durations onto the element itself, so
   // nothing in the CSS carries the scale for it. Both come off the same

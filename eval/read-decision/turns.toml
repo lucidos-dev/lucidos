@@ -672,7 +672,8 @@ read = true
 #
 # Copied in shape from real trigger runs the forced call read as yeses (plan
 # `docs/plans/2026-10-14-trigger-runs-out-of-review.md`). `pushed` lists the
-# notifications the turn sent before its reply.
+# notifications the turn sent before its reply. A push replaces the read,
+# unless the reply holds a failure the push does not mention.
 
 [[turn]]
 kind = "trigger-nothing"
@@ -798,7 +799,7 @@ Today's dashboard is ready in [Dashboard](app:daily-dashboard), and the push wen
 read = false
 
 [[turn]]
-kind = "trigger-pushed-more"
+kind = "trigger-pushed"
 source = "trigger"
 message = "[SCHEDULED TRIGGER FIRE: trigger \"Reply targets\" (id: t-009)]\n\nFind me the people who publicly described a problem my product solves, so I can reply to them. Keep only the ones worth my time, with a line each on what they said and what I'd be replying to."
 pushed = [{ title = "2 reply targets", message = "Alex (tracker #4512): the agent forgets project conventions overnight. Sam (tracker #4530): scheduled runs finished but nothing showed where." }]
@@ -813,10 +814,10 @@ This morning's scan turned up two people worth answering. Both are on the [Repli
 - **What they said:** their scheduled runs finished, but the results landed nowhere they look.
 - **What you'd reply to:** a run that reports back where you already work. Keep it to two sentences.
 """
-read = true
+read = false
 
 [[turn]]
-kind = "trigger-pushed-more"
+kind = "trigger-pushed"
 source = "trigger"
 message = "[SCHEDULED TRIGGER FIRE: trigger \"Weekly learning sweep\" (id: t-010)]\n\nRun a learning sweep over the last 7 days and write me a report. Only push me if something new shows up, and when you do, tapping it should take me straight to this run so I can read it."
 pushed = [{ title = "Weekly sweep: 1 new pattern", message = "The heat pump script crashed 10 times in 6 days while reading device status. No fix has landed." }]
@@ -827,10 +828,10 @@ I found one new problem this week, so I sent you a push. Tapping it opens this r
 
 **The fix:** retry the status read once, and skip a device that still fails instead of ending the run. It is one function, and I can start a coding session for it if you want.
 """
-read = true
+read = false
 
 [[turn]]
-kind = "trigger-pushed-more"
+kind = "trigger-pushed"
 source = "trigger"
 message = "[SCHEDULED TRIGGER FIRE: trigger \"Inbox triage\" (id: t-002)]\n\nTriage my inbox using my rules, and only tell me about mail that actually needs me."
 pushed = [{ title = "Inbox: 3 need you", message = "3 new messages need you. Open the run for details." }]
@@ -842,6 +843,18 @@ reply = """
 - **School:** the trip form for the 14th needs a signature by Friday.
 
 Everything else matched your rules: 6 newsletters marked read, 2 offers deleted.
+"""
+read = false
+
+[[turn]]
+kind = "trigger-pushed-failure"
+source = "trigger"
+message = "[SCHEDULED TRIGGER FIRE: trigger \"Daily price check\" (id: t-001)]\n\nCheck the official prices from every supplier against my price table. If a price changed, record it and tell me what changed."
+pushed = [{ title = "Prices changed", message = "Supplier A: item X up from 0.10 to 0.12 per unit from today." }]
+reply = """
+Item X went up at Supplier A, and I sent you a notification about it.
+
+I could not check Supplier C: its price page returned 401 three times, so its key has probably expired. Its prices are unchecked until you renew the key.
 """
 read = true
 

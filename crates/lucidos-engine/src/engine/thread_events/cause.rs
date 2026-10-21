@@ -27,11 +27,44 @@ pub enum CancelCause {
     /// frontend renders this neutrally — like the chat/CC follow-up — instead of
     /// the "Canceled ✕" + "Response canceled" panel that `UserStop` gets.
     SupersededByFollowup,
+    /// The user picked a new reasoning effort on a Claude Code session, which
+    /// takes effort only at spawn. The engine interrupted the turn and resumes
+    /// it at the new effort (`claude_code::control::effort_restart`). A redirect,
+    /// so it renders neutrally, like `SupersededByFollowup`.
+    EffortRestart,
     /// Pre-typed-cause legacy event, or a now-removed cause string (e.g. the
     /// retired `stale_settle` cancel cause that's now an abort cause). Catches
     /// anything unrecognized so old DB rows replay cleanly. Never emit fresh.
     #[serde(other)]
     Unknown,
+}
+
+impl CancelCause {
+    pub const ALL: [Self; 5] = [
+        Self::UserStop,
+        Self::UserAction,
+        Self::SupersededByFollowup,
+        Self::EffortRestart,
+        Self::Unknown,
+    ];
+
+    /// The serialized name, as stored in an event's `cause` field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserStop => "user_stop",
+            Self::UserAction => "user_action",
+            Self::SupersededByFollowup => "superseded_by_followup",
+            Self::EffortRestart => "effort_restart",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether the engine interrupted the turn to carry the work on, rather
+    /// than the user abandoning it. A redirect renders neutrally, wakes no
+    /// parent, and is not the user's Stop.
+    pub fn is_redirect(self) -> bool {
+        matches!(self, Self::SupersededByFollowup | Self::EffortRestart)
+    }
 }
 
 /// Why a `ResponseAborted` was emitted. Aborts are system-driven cleanup:

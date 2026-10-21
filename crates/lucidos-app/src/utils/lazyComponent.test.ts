@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ComponentType } from 'preact';
 
@@ -8,7 +9,19 @@ vi.mock('./clientLog', () => ({
   postClientLog: (...args: unknown[]) => postClientLog(...args),
 }));
 
-import { chunkGroup, lazyComponent, lazyModule, whenLoaded } from './lazyComponent';
+import { importedChunkOf, chunkGroup, lazyComponent, lazyModule, whenLoaded } from './lazyComponent';
+
+describe('importedChunkOf', () => {
+  it('reads the chunk out of the loader Vite builds', () => {
+    // The shape `vite build` emits for `lazyComponent(() => import('./X'))`.
+    const built = '()=>Te(()=>import("./WidgetMenu-uwJKaJJ3.js"),__vite__mapDeps([0,1]),import.meta.url).then(e=>e.WidgetMenuItems)';
+    expect(importedChunkOf({ toString: () => built } as () => unknown)).toBe('./WidgetMenu-uwJKaJJ3.js');
+  });
+
+  it('is null for a loader that imports nothing itself', () => {
+    expect(importedChunkOf(() => Promise.resolve(null))).toBeNull();
+  });
+});
 
 /**
  * `preload()` is how a chunk loads before anything mounts it: the shell chunk
@@ -60,7 +73,51 @@ describe('lazyComponent.preload', () => {
     expect(postClientLog).toHaveBeenCalledTimes(1);
     expect(postClientLog).toHaveBeenCalledWith('chunk', 'load_failed', {
       message: 'SyntaxError: Unexpected end of script',
+      importedChunk: null,
     });
+    error.mockRestore();
+  });
+
+  // WebKit's "Importing a module script failed." names no URL. The log names
+  // the imported chunk from the loader's source.
+  function failingBuiltLoader() {
+    // Vitest rewrites a real `import()`, so the loader wears the built source.
+    return Object.assign(
+      () => Promise.reject(new TypeError('Importing a module script failed.')),
+      { toString: () => '()=>Te(()=>import("./doesNotExist-AbC123.js"),[],import.meta.url)' },
+    );
+  }
+
+  it('names the imported chunk, and probes it once the failure is shown', async () => {
+    postClientLog.mockClear();
+    reloadForStaleChunk.mockReturnValueOnce(false);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('gone', { status: 404, headers: { 'content-type': 'text/plain' } }),
+    );
+    await lazyComponent(failingBuiltLoader()).preload();
+    await vi.waitFor(() => expect(postClientLog).toHaveBeenCalledTimes(2));
+    expect(postClientLog.mock.calls[0][2]).toMatchObject({ importedChunk: './doesNotExist-AbC123.js' });
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(/\/assets\/doesNotExist-AbC123\.js$/);
+    expect(postClientLog.mock.calls[1]).toEqual(['chunk', 'probe', expect.objectContaining({
+      importedChunk: './doesNotExist-AbC123.js',
+      status: 404,
+      contentType: 'text/plain',
+      bytes: 4,
+    })]);
+    fetchSpy.mockRestore();
+    error.mockRestore();
+  });
+
+  // The reload tears the page down mid-probe, and a load it heals needs none.
+  it('does not probe a failure the reload takes over', async () => {
+    postClientLog.mockClear();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    await lazyComponent(failingBuiltLoader()).preload();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(postClientLog).toHaveBeenCalledTimes(1);
+    fetchSpy.mockRestore();
     error.mockRestore();
   });
 

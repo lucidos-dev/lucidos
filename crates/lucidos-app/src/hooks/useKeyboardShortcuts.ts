@@ -377,7 +377,7 @@ export function useKeyboardShortcuts(): void {
       // turn-nav leaves it), toggles the expand/collapse of the highlighted
       // (nav-focus-marked) turn. Gated on `.thread-content` being the direct target
       // so a focused link/button inside a response keeps its native Enter, and the
-      // prompt textarea keeps Enter-to-send. ⌘⇧Enter (maximizePaneGroup) is already
+      // prompt textarea keeps its own Enter rule. ⌘⇧Enter (maximizePaneGroup) is already
       // claimed by the registry above; only unmodified Enter reaches here. Consumes
       // the key only when a turn was actually toggled.
       if (

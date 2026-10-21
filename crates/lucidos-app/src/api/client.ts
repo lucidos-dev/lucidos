@@ -4,6 +4,7 @@
 
 export * from './client/_core';
 export * from './client/chat';
+export * from './client/claudeGateway';
 export * from './client/changes';
 export * from './client/apps';
 export * from './client/data';

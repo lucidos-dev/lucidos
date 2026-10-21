@@ -9,18 +9,18 @@ use crate::api::internal::CLIENT_LOG_MAX_BATCH;
 use crate::api::presence_pong::PresenceOutcome;
 use crate::api::proxy_timeout::CLIENT_WAIT_SECS;
 use crate::api::threads::archive_all::MAX_IDS;
+use crate::api::{SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL};
 use crate::core::apps::WidgetSize;
 use crate::core::preference_catalog::MEMORY_MODULE_WHILE_UNSET;
 use crate::engine::agent_recovery::{
     AUTO_RECOVERY_AFTER_HANG_REASON, AUTO_RESUME_AFTER_API_ERROR_REASON,
-    AUTO_RESUME_AFTER_SWITCH_REASON, ENGINE_RESTART_INTERRUPT_REASON, HARDEN_REQUESTED_REASON,
-    USER_CLICKED_CONTINUE_REASON,
+    AUTO_RESUME_AFTER_SWITCH_REASON, EFFORT_RESTART_REASON, ENGINE_RESTART_INTERRUPT_REASON,
+    HARDEN_REQUESTED_REASON, USER_CLICKED_CONTINUE_REASON,
 };
 use crate::engine::agent_session::side_question::SIDE_QUESTION_TIMEOUT;
 use crate::engine::claude_code::{
     BROAD_ALLOW_INEFFECTIVE, CC_PROTECTED_PATH_MARKERS, CODEX_BACKEND_TOOLS, SESSION_PATH_TOOLS,
 };
-use crate::engine::successor::HANDOFF_REQUEST;
 use crate::engine::summary_tree::log::EntryKind;
 use crate::engine::thread_events::{KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON};
 use crate::engine::thread_triage::archive_all::{PINNED_SUB_THREAD, SAME_FAMILY};
@@ -76,6 +76,14 @@ pub(super) fn render() -> String {
 
     ts.from("api/internal.rs");
     ts.export("CLIENT_LOG_MAX_BATCH", CLIENT_LOG_MAX_BATCH);
+    ts.from("api/history.rs");
+    let keepalive_ms = SSE_KEEPALIVE_INTERVAL.as_millis();
+    ts.renamed(
+        "SSE_KEEPALIVE_INTERVAL",
+        "SSE_KEEPALIVE_INTERVAL_MS",
+        keepalive_ms,
+    );
+    ts.export("SSE_KEEPALIVE_EVENT", quoted(SSE_KEEPALIVE_EVENT));
     ts.from("engine/widgets.rs");
     ts.export("WIDGET_PARAMS_MAX_BYTES", WIDGET_PARAMS_MAX_BYTES);
     ts.from("core/apps.rs");
@@ -136,6 +144,7 @@ pub(super) fn render() -> String {
             ENGINE_RESTART_INTERRUPT_REASON,
         ),
         ("HARDEN_REQUESTED_REASON", HARDEN_REQUESTED_REASON),
+        ("EFFORT_RESTART_REASON", EFFORT_RESTART_REASON),
     ];
     for (name, value) in reasons {
         ts.export(name, quoted(value));
@@ -193,9 +202,6 @@ pub(super) fn render() -> String {
         "PRESENCE_OUTCOMES_BY_STRENGTH",
         list(&outcomes),
     );
-
-    ts.from("engine/successor.rs");
-    ts.export("HANDOFF_REQUEST", quoted(HANDOFF_REQUEST));
 
     let mut out = ts.out;
     out.push_str("/** `SECTIONS` in `voice/sections.rs`. */\n");

@@ -114,6 +114,7 @@ describe('no preference default is restated outside the catalog', () => {
     // Guards the filter itself: a catalog shape change that empties the list
     // would otherwise pass every file vacuously.
     expect(DISTINCTIVE_DEFAULTS).toContain(PREFERENCE_CATALOG.chat_model.fallback);
+    expect(DISTINCTIVE_DEFAULTS).toContain(PREFERENCE_CATALOG.trigger_model.fallback);
     expect(DISTINCTIVE_DEFAULTS).toContain(PREFERENCE_CATALOG.voice_resident_sections.fallback);
   });
 

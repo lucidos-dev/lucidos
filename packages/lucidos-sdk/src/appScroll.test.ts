@@ -120,7 +120,7 @@ describe('installAppScrollReport', () => {
     const addWin = vi.spyOn(window, 'addEventListener');
     cleanup = installAppScrollReport();
     onScroll = addDoc.mock.calls.find(([type]) => type === 'scroll')?.[1] as typeof onScroll;
-    onResize = addWin.mock.calls.find(([type]) => type === 'resize')?.[1] as typeof onResize;
+    onResize = addWin.mock.calls.find(([type]) => String(type) === 'resize')?.[1] as typeof onResize;
     windowListeners = new Map(addWin.mock.calls.map(([type, listener, options]) =>
       [type, { listener: listener as (e: unknown) => void, options }]));
     return addDoc;

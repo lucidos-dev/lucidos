@@ -1,5 +1,5 @@
 import { test, expect, type Locator, type Page } from './fixtures';
-import { assertHealthy, hideHomeRail, minThreadPane, navigateToApp, newThread, revealSteps, sendMessage, waitForResponse } from './helpers';
+import { assertHealthy, hideDashboardRail, minThreadPane, navigateToApp, newThread, revealSteps, sendMessage, waitForResponse } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
 /** The step row's context counter collapses to the bare percentage when the ROW
@@ -68,7 +68,7 @@ test.describe('Step context counter width gate', () => {
       localStorage.setItem('lucidos-split-ratio', '0.4');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
     });
-    await hideHomeRail(page);
+    await hideDashboardRail(page);
     await navigateToApp(page);
 
     const counter = await counterOfFirstStep(page);

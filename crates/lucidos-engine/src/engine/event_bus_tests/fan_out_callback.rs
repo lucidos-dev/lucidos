@@ -1691,43 +1691,46 @@ async fn missing_parent_row_leaves_the_callback_pending() {
 /// turn, and the parent may spawn a replacement.
 ///
 /// Coding-agent lane: a Codex follow-up (always) or an urgent Claude Code one,
-/// both through `arm_followup_redirect`. The chat lane is the companion test
-/// below; the discrimination itself is cause-only, so the two must agree.
+/// both through `arm_followup_redirect`, and a Claude Code effort restart. The
+/// chat lane is the companion test below; the discrimination itself is
+/// cause-only, so the two must agree.
 #[tokio::test]
 async fn a_coding_agent_redirect_does_not_report_a_cancellation_to_the_parent() {
+    use crate::engine::thread_events::CancelCause;
     let (pool, db_name) = setup_test_db().await;
     let (bus, mut callback_rx) = EventBus::new(pool.clone());
 
-    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
-    emit_cc_session_started(&bus, child_id).await;
+    for cause in [
+        CancelCause::SupersededByFollowup,
+        CancelCause::EffortRestart,
+    ] {
+        let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+        emit_cc_session_started(&bus, child_id).await;
 
-    emit_response_canceled_with_cause(
-        &bus,
-        child_id,
-        crate::engine::thread_events::CancelCause::SupersededByFollowup,
-    )
-    .await;
+        emit_response_canceled_with_cause(&bus, child_id, cause).await;
+        // The run loop idles after every Result, the redirected one included.
+        emit_cc_idled(&bus, child_id, false, None).await;
 
-    assert_eq!(
-        count_completion_cards(&pool, parent_id).await,
-        0,
-        "a SupersededByFollowup cancel is a redirect, not a completion: it \
-         must persist no ChildThreadCompleted on the parent"
-    );
-    assert!(
-        callback_rx.try_recv().is_err(),
-        "a SupersededByFollowup cancel must not wake the parent"
-    );
-    // The in-tx reconcile is cause-agnostic and still runs, so no counter
-    // drifts while the child is between turns; the follow-up's own
-    // `MessageReceived` re-increments when the redirected turn starts.
-    assert_active_children(
-        &pool,
-        parent_id,
-        0,
-        "the in-tx reconcile still runs for a redirect cancel",
-    )
-    .await;
+        assert_eq!(
+            count_completion_cards(&pool, parent_id).await,
+            0,
+            "a {cause:?} cancel and its idle are a redirect, not a completion: \
+             they must persist no ChildThreadCompleted on the parent"
+        );
+        assert!(
+            callback_rx.try_recv().is_err(),
+            "a {cause:?} cancel must not wake the parent"
+        );
+        // A redirect keeps the child running, so the in-tx reconcile still
+        // counts it while it is between turns.
+        assert_active_children(
+            &pool,
+            parent_id,
+            1,
+            "the redirected child is still in flight for the parent",
+        )
+        .await;
+    }
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -1771,8 +1774,8 @@ async fn a_chat_child_redirect_does_not_report_a_cancellation_to_the_parent() {
     assert_active_children(
         &pool,
         parent_id,
-        0,
-        "the in-tx reconcile is cause-agnostic and still runs on the chat lane too",
+        1,
+        "the redirected chat child stays in flight for the parent too",
     )
     .await;
 
@@ -1780,31 +1783,18 @@ async fn a_chat_child_redirect_does_not_report_a_cancellation_to_the_parent() {
     teardown_test_db(&db_name).await;
 }
 
-/// The redirect's transient counter window, pinned so it is understood rather
-/// than rediscovered.
+/// A redirect keeps the child in flight, so the parent's count never dips.
 ///
-/// A `SupersededByFollowup` cancel sends no card (the test above), but its
-/// projection arm is cause-agnostic: it settles the child to idle and
-/// reconciles the parent from ground truth, so the parent's
-/// `active_children_count` really does read 0 between the interrupt landing and
-/// the redirected turn's `MessageReceived`. On the Codex lane that window can
-/// be up to `REDIRECT_INTERRUPT_MAX_WAIT`, because the lane waits for the
-/// interrupted turn to reach a boundary before emitting.
+/// A `SupersededByFollowup` cancel sends no card, and the child keeps its
+/// `running` status between the interrupt and the redirected turn's start. On
+/// the Codex lane that gap can last up to `REDIRECT_INTERRUPT_MAX_WAIT`. The
+/// parent's `active_children_count` stays at 1 for all of it. A parent that
+/// ends its own turn inside the gap still shows "waiting for children".
 ///
-/// What the window costs and does not cost: the parent can end its own turn
-/// inside it and show idle rather than "waiting for children" until the
-/// redirected turn starts. Nothing is lost. The message is not dropped, the
-/// card is not skipped, and the counter is not permanently wrong: the
-/// redirected turn's start re-increments, its terminal reports, and every
-/// terminal reconciles from ground truth rather than by delta. The parent is
-/// still woken by the redirected turn's own completion.
-///
-/// Recorded as an accepted transient in ADR 0043 rather than closed here.
-/// Closing it would mean not settling the child to idle on this cause, which
-/// is a change to a contract-tested lifecycle transition and is deliberately
-/// outside the phase that introduced the discrimination.
+/// The redirected turn then reports once, and every terminal reconciles the
+/// count from ground truth.
 #[tokio::test]
-async fn a_codex_redirect_dips_the_parent_count_then_restores_it() {
+async fn a_redirect_keeps_the_parent_count_while_the_child_is_between_turns() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, mut callback_rx) = EventBus::new(pool.clone());
 
@@ -1812,8 +1802,7 @@ async fn a_codex_redirect_dips_the_parent_count_then_restores_it() {
     emit_cc_session_started(&bus, child_id).await;
     assert_active_children(&pool, parent_id, 1, "the child is working").await;
 
-    // The interrupt lands. The child settles to idle and the parent's count
-    // reconciles from ground truth, which is the dip.
+    // The interrupt lands. The child keeps its status, so the count holds.
     emit_response_canceled_with_cause(
         &bus,
         child_id,
@@ -1823,9 +1812,8 @@ async fn a_codex_redirect_dips_the_parent_count_then_restores_it() {
     assert_active_children(
         &pool,
         parent_id,
-        0,
-        "the dip: the interrupted turn settled the child before the redirected \
-         one started",
+        1,
+        "no dip: the redirected child is still in flight",
     )
     .await;
     assert_eq!(
@@ -1834,16 +1822,10 @@ async fn a_codex_redirect_dips_the_parent_count_then_restores_it() {
         "and no card, so the parent is not told its child was canceled"
     );
 
-    // The lane reaches the boundary and emits the follow-up. The child is back
-    // in flight and the parent's count is restored.
+    // The lane reaches the boundary and emits the follow-up. The count is
+    // unchanged and the redirected turn owes the parent a card.
     emit_cc_message_received(&bus, child_id, None, "go the other way").await;
-    assert_active_children(
-        &pool,
-        parent_id,
-        1,
-        "restored the moment the redirect starts",
-    )
-    .await;
+    assert_active_children(&pool, parent_id, 1, "the redirect started").await;
     assert!(
         read_callback_pending(&pool, child_id).await,
         "and the redirected turn owes the parent a card"

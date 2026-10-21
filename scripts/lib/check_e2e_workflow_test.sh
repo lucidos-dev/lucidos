@@ -66,6 +66,8 @@ test_each_broken_limit_is_refused() {
         "s = s.replace(\"branches: ['e2e/**', 'main']\", \"branches: ['e2e/**', 'main', 'rc/**']\")")"
     expect_refused "the engine job saving a cache" "job engine may save a cache" "$(doctored engine-save \
         'i = s.index("  engine:"); j = s.index("save-if: false", i); s = s[:j] + "save-if: true" + s[j + 14:]')"
+    expect_refused "a test job saving a cache with actions/cache/save" "job macos saves a cache with actions/cache/save" "$(doctored macos-save \
+        'i = s.index("  macos:"); j = s.index("actions/cache/restore@", i); s = s[:j] + "actions/cache/save@" + s[j + 22:]')"
     expect_refused "the engine job running without the plan" "job engine does not need the plan job" "$(doctored engine-needs \
         'i = s.index("  engine:"); j = s.index("    needs: plan\n", i); s = s[:j] + s[j + 16:]')"
     expect_refused "the engine job running unasked" "only when the plan asks for it" "$(doctored engine-unasked \
@@ -76,8 +78,14 @@ test_each_broken_limit_is_refused() {
         "s = s.replace(\"&& startsWith(github.ref, 'refs/heads/e2e/')\", '')")"
     expect_refused "an action pinned by tag" "action not pinned by commit" "$(doctored tag-pin \
         's = s.replace("actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "actions/checkout@v4", 1)')"
+    expect_refused "an actions write permission" "actions: read" "$(doctored actions-write \
+        's = s.replace("  actions: read", "  actions: write")')"
     expect_refused "an artifact kept longer" "retention-days: 1" "$(doctored retention \
         's = s.replace("retention-days: 1", "retention-days: 7", 1)')"
+    expect_refused "a reused engine kept longer" "retention-days: 7" "$(doctored engine-retention \
+        's = s.replace("retention-days: 7", "retention-days: 30", 1)')"
+    expect_refused "target/ state kept longer" "retention-days: 2" "$(doctored target-retention \
+        's = s.replace("retention-days: 2", "retention-days: 7", 1)')"
     expect_refused "webkit off macOS" "macos-15" "$(doctored webkit \
         's = s.replace("fromJSON(needs.plan.outputs.macos)", "fromJSON(needs.plan.outputs.linux)")')"
 }

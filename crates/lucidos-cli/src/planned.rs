@@ -14,71 +14,147 @@ use crate::hardened::{git_context, run_git};
 use crate::http::client as http_client;
 use crate::workspace::{BoxError, Workspace};
 
-/// What picking an `Implement in a new thread` option does. Printed only
-/// when this thread's measured context calls for the option ([`card_shape`]).
-pub(crate) const NEW_THREAD_HANDOFF: &str = "Picking an `Implement in a new thread` option \
-    approves the plan: run `lucidos planned approve` here, then hand the build to a successor \
-    thread with `lucidos successor spawn --narrative <file>`. Add only the flags that differ \
-    from this thread's implementer: `--coding-agent <backend>`, `--coding-agent-model <model id>`, \
-    `--reasoning-effort <level>`. An omitted flag keeps this thread's, so picking this thread's \
-    implementer adds none. Pass model ids, not picker labels (`claude-sonnet-5-5`, not `Sonnet 5.5`). A typed \
-    reply naming another implementer works the same way. Lucidos refuses a model or effort the \
-    backend does not offer, and lists the ones it does. `lucidos successor --help` has the \
-    narrative format. The narrative names the plan path and says the user approved it here, so \
-    the builder builds it phase by phase without asking again. The successor's branch starts at \
-    this branch's last commit, so it already holds the plan, and the approved marker carries \
-    over. End your turn with the link it prints. If the handoff is refused for authority, run \
-    the `lucidos ask-owner-approval` it names, then retry. `Approve here` builds in this thread \
-    instead.";
+/// What picking an `Implement in a new thread` option does at an offered
+/// checkpoint run named by `flags`. Printed only when the card may offer one.
+/// The flow's own decision comes first, since only the flow knows what it is.
+fn new_thread_handoff(flags: &str) -> String {
+    format!(
+        "Picking an `Implement in a new thread` option is the user's decision here. First do \
+         what your flow says that decision does: a plan flow approves the plan. Then hand the \
+         work to a successor thread with `lucidos successor spawn --narrative <file> {flags}`, \
+         adding `--build-chain` when your flow says so. Add only the flags that differ from this \
+         thread's implementer: `--coding-agent <backend>`, `--coding-agent-model <model id>`, \
+         `--reasoning-effort <level>`. An omitted flag keeps this thread's, so picking this \
+         thread's implementer adds none. Pass the model id the ladder prints, never its picker \
+         label. A typed reply naming another implementer works the same way. Lucidos refuses a \
+         pick off the intelligence ladder, and lists the rungs. `lucidos successor --help` has \
+         the narrative format. The \
+         narrative says what the user decided here, and quotes your flow's remaining checkpoint \
+         instructions so the successor keeps running them. The successor's branch starts at this \
+         branch's last commit. End your turn with the link it prints. The pick is also the \
+         owner's consent to the handoff, so a handoff after the pick needs no approval card. \
+         After a typed reply, a handoff refused for authority needs the `lucidos \
+         ask-owner-approval` it names, then a retry. Your flow's option to stay carries on in \
+         this thread."
+    )
+}
 
-/// How the planning agent picks the successor's implementer. Whether to offer
-/// a new thread is the measured context's call; which implementer is the
-/// agent's, because only the agent has read the plan.
-const IMPLEMENTER_CHOICE: &str = "Recommend the successor's implementer too: backend, model and \
-    reasoning effort, by your judgement of the plan. A fully specified plan with settled \
-    decisions suits a cheaper model, such as Sonnet. A plan that leaves design judgement to the \
-    builder keeps this thread's model. Say why in one line of your message. Offer, in order: \
-    `Implement in a new thread: <implementer> (Recommended)`; `Implement in a new thread: \
-    <this thread's implementer>`, only when it differs; `Approve here`; then a real fork of the \
-    plan if it has one. That is never more than 4 options, and never `Request changes`. Name an \
-    implementer by the model's picker label and the effort, for example `Sonnet 5.5, high`. Name \
-    the backend only when it is not this thread's, for example `Codex GPT-5.6 Sol, high`.";
+/// The option that keeps the work in this thread, which the flow names.
+const STAY_OPTION: &str = "your flow's option to stay in this thread (`Approve here` for a plan, \
+    else `Continue here`)";
 
-/// The plan-approval card's options under the floor: today's shape.
-const FLOOR_SHAPE: &str = "Offer `Approve` / `Request changes`. The option pair is a floor: if \
-    the plan offers a real fork, that fork takes the second slot and `Request changes` is \
-    dropped rather than carried as a third.";
+/// How the agent picks the successor's implementer. The rung is the agent's
+/// judgement, because only the agent has read the work left (ADR 0486). It
+/// names no model and no effort: those live on the ladder (ADR 0500).
+const IMPLEMENTER_CHOICE: &str = "Recommend the successor's implementer by your judgement of \
+    the work left, such as a plan, as a rung on the intelligence ladder above. A higher rung is \
+    more intelligent, costs more and runs longer. Turn intelligence down for settled work: a \
+    fully specified plan with settled decisions suits a lower rung. Turn it up for hard or open \
+    work: work that leaves design judgement to the builder keeps this thread's rung or takes a \
+    higher one. Every call reads the whole context again, so a rung above what the work needs \
+    costs on every turn. Say why in one line of your message. Name a rung by its picker label \
+    and effort, as the ladder prints them. Name the backend only when it is not this thread's.";
 
-/// The card's options, as this thread's measured context decides them. The
-/// engine owns the threshold, so this never compares a number itself. An
-/// unknown size offers today's shape and says the size is unknown.
-pub(crate) fn card_shape(reading: crate::successor::ContextReading) -> String {
-    use crate::successor::ContextReading;
+/// The paying card's options: the estimate alone calls for a new thread.
+fn paying_options() -> String {
+    format!(
+        "Offer, in order: `Implement in a new thread: <implementer> (Recommended)`; `Implement \
+         in a new thread: <this thread's implementer>`, only when it differs; {STAY_OPTION}; \
+         then a real fork of the decision if it has one. That is never more than 4 options, and \
+         never `Request changes`."
+    )
+}
+
+/// The card's options when the handoff does not pay. A fresh thread then
+/// saves only through a lower rung, so it never offers this thread's own
+/// (ADR 0497). A thread with a rung above it may also raise (ADR 0499).
+fn lower_options(raise: bool) -> String {
+    let lower = format!(
+        "If your pick is a lower rung than this thread's, offer, in order: `Implement in a new \
+         thread: <implementer> (Recommended)`; {STAY_OPTION}; then a real fork of the decision \
+         if it has one. That is never `Request changes`."
+    );
+    if !raise {
+        return format!("{lower} Otherwise:");
+    }
+    format!(
+        "{lower} Else, if the work is hard or long, a higher rung builds it better: offer \
+         `Implement in a new thread: <a higher rung> (Recommended)`; {STAY_OPTION}; then a real \
+         fork of the decision if it has one. That is never more than 3 options, and never \
+         `Request changes`. Raise one or two rungs, never to the top for a builder. Otherwise:"
+    )
+}
+
+/// The card with no new thread to offer.
+const FLOOR: &str = "Ask the question your flow asks here, with its own options, and offer no \
+    new thread. A plan's is `Approve` / `Request changes`, where a real fork takes the second \
+    slot. If your flow asks no question here, carry on and ask nothing.";
+
+/// The offered card's shape at the checkpoint run named by `flags`. Two
+/// reasons offer a new thread: the engine's *handoff estimate* says it pays,
+/// or, at any size, a lower rung than this thread's, as the agent picks it
+/// (ADR 0497). A thread with a rung above its own may also raise (ADR 0499).
+/// The engine decides whether it pays and owns the ladder, so this compares
+/// neither itself. An unreadable reply offers the floor and says so.
+pub(crate) fn card_shape(reading: crate::successor::ContextReading, flags: &str) -> String {
+    use crate::intelligence_ladder::Ladder;
+    use crate::successor::{ContextReading, Implementer};
+    let runs_on = |implementer: Option<&Implementer>, ladder: Option<&Ladder>| {
+        let runs = implementer
+            .map(|i| format!("This thread runs on {}.", i.describe()))
+            .unwrap_or_else(|| {
+                "Lucidos could not read this thread's implementer, so name the model you run on."
+                    .to_string()
+            });
+        let ladder = ladder.map(Ladder::render).unwrap_or_else(|| {
+            "Lucidos could not read the intelligence ladder: run `lucidos intelligence-ladder` \
+             before you recommend."
+                .to_string()
+        });
+        format!("{runs}\n\n{ladder}\n\n")
+    };
+    let size = |tokens: Option<u64>| {
+        tokens
+            .map(|t| format!("{}k tokens", t / 1000))
+            .unwrap_or_else(|| "unmeasured".to_string())
+    };
     match reading {
         ContextReading::Read {
-            offer: true,
+            can_hand_off: true,
+            pays: true,
             input_tokens,
             implementer,
-        } => {
-            let size = input_tokens
-                .map(|t| format!("{}k tokens", t / 1000))
-                .unwrap_or_else(|| "large".to_string());
-            let runs_on = implementer
-                .map(|i| format!("This thread runs on {}.", i.describe()))
-                .unwrap_or_else(|| {
-                    "Lucidos could not read this thread's implementer, so name the model you run \
-                     on."
-                    .to_string()
-                });
-            format!(
-                "This thread's context is {size}, large enough that the build belongs in a \
-                 fresh thread. {runs_on} {IMPLEMENTER_CHOICE} {NEW_THREAD_HANDOFF}"
-            )
-        }
-        ContextReading::Read { offer: false, .. } => FLOOR_SHAPE.to_string(),
+            ladder,
+        } => format!(
+            "The handoff estimate says a fresh thread pays here: this thread's context is {}. \
+             {}{IMPLEMENTER_CHOICE} {} {}",
+            size(input_tokens),
+            runs_on(implementer.as_ref(), ladder.as_ref()),
+            paying_options(),
+            new_thread_handoff(flags)
+        ),
+        ContextReading::Read {
+            can_hand_off: true,
+            input_tokens,
+            implementer,
+            ladder,
+            ..
+        } => format!(
+            "This thread's context is {}, where the handoff estimate says a fresh thread does \
+             not pay, so a new thread pays off only through its implementer. {}\
+             {IMPLEMENTER_CHOICE} {} {FLOOR} {}",
+            size(input_tokens),
+            runs_on(implementer.as_ref(), ladder.as_ref()),
+            lower_options(
+                ladder
+                    .as_ref()
+                    .is_some_and(Ladder::has_higher_intelligence_rung)
+            ),
+            new_thread_handoff(flags)
+        ),
+        ContextReading::Read { .. } => FLOOR.to_string(),
         ContextReading::Unknown => format!(
-            "{FLOOR_SHAPE} Lucidos could not read this thread's context size, so it offers no \
-             new thread."
+            "{FLOOR} Lucidos could not read this thread's context, so it offers no new thread."
         ),
     }
 }
@@ -171,10 +247,8 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         // the Lucidos MCP server, and sending either after the other's tool
         // would strand a proposed plan with no way to get it approved.
         MarkKind::Plan(p) => println!(
-            "Plan recorded (awaiting approval): {} ({}). Summarize it in your message, then ask for approval with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex), not in prose. The card's question is one short line that never repeats the summary. {} Once approved, run `lucidos planned approve`.",
-            branch,
-            p,
-            card_shape(crate::successor::read_own_context(ws))
+            "Plan recorded (awaiting approval): {} ({}). Run the approval checkpoint in the `implementation-plan` skill (§ Asking for approval) and offer the options it prints. Ask with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex), not in prose. Put the plan summary on the card's question itself, with the ask on its last line: the user never sees a message that also calls a tool. On a re-ask, carry what changed. Run `lucidos planned approve` only after the user taps an approving option or types a plain approval. A typed question or suggestion is a request for changes: revise the plan, run `lucidos planned mark --plan` again, and ask again.",
+            branch, p
         ),
         MarkKind::Simple(r) => println!("Simple change acknowledged: {} ({})", branch, r),
         // The reminder is the only enforcement of the lane's other two
@@ -214,7 +288,9 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
         let text = resp
             .text()
             .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
-        return Err(format!("POST {} returned {}: {}", url, status, text).into());
+        return Err(approval_refusal(&text)
+            .unwrap_or_else(|| format!("POST {} returned {}: {}", url, status, text))
+            .into());
     }
     let body: serde_json::Value = resp
         .json()
@@ -244,6 +320,17 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
         );
     }
     Ok(())
+}
+
+/// The engine's own words when it refuses an approval the user has not given.
+/// The agent then reads what to do, not an HTTP status. `None` for any other
+/// error body.
+fn approval_refusal(body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    if body.get("reason")?.as_str()? != "no-plan-approval" {
+        return None;
+    }
+    Some(body.get("error")?.as_str()?.to_string())
 }
 
 /// The status line the `implementation-plan` skill writes into a new plan.
@@ -328,6 +415,183 @@ pub(crate) fn cmd_state(ws: &Workspace) -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intelligence_ladder::{IntelligenceRung, Ladder};
+    use crate::successor::{ContextReading, Implementer};
+
+    const FLAGS: &str = "--at plan-approval --progress 0/4";
+
+    /// A three-rung ladder with the thread on `current`.
+    fn ladder(current: Option<usize>) -> Ladder {
+        let step = |model: &str, effort: &str| IntelligenceRung {
+            model: model.into(),
+            effort: effort.into(),
+            label: model.into(),
+            intelligence: Some("1×".into()),
+            cost: Some("1×".into()),
+            time: None,
+            is_default: false,
+        };
+        Ladder {
+            surface: "claude-code".into(),
+            intelligence_rungs: vec![
+                step("m-a", "low"),
+                step("m-b", "medium"),
+                step("m-c", "high"),
+            ],
+            current,
+            reference: None,
+        }
+    }
+
+    fn reading(pays: Option<bool>, ladder: Option<Ladder>) -> ContextReading {
+        match pays {
+            None => ContextReading::Unknown,
+            Some(pays) => ContextReading::Read {
+                input_tokens: Some(240_000),
+                can_hand_off: true,
+                pays,
+                implementer: Some(Implementer {
+                    coding_agent: "claude-code".into(),
+                    model: Some("m-b".into()),
+                    reasoning_effort: Some("medium".into()),
+                }),
+                ladder,
+            },
+        }
+    }
+
+    /// I8: the raise clause needs a readable verdict that does not pay and a
+    /// rung above the thread's own. The lower pick (ADR 0497) stays on every
+    /// card that does not pay.
+    #[test]
+    fn the_raise_clause_needs_a_non_paying_thread_with_a_higher_rung() {
+        for (pays, ladder, raise) in [
+            (Some(false), Some(ladder(Some(0))), true),
+            (Some(false), Some(ladder(Some(1))), false),
+            (Some(false), Some(ladder(Some(2))), false),
+            (Some(false), Some(ladder(None)), false),
+            (Some(false), None, false),
+            (Some(true), Some(ladder(Some(0))), false),
+            (None, Some(ladder(Some(0))), false),
+        ] {
+            let shape = card_shape(reading(pays, ladder.clone()), FLAGS);
+            assert_eq!(
+                shape.contains("`Implement in a new thread: <a higher rung> (Recommended)`"),
+                raise,
+                "{pays:?} {ladder:?}: {shape}"
+            );
+            if raise {
+                assert!(shape.contains("never to the top for a builder"), "{shape}");
+                assert!(shape.contains("never `Request changes`"), "{shape}");
+            }
+            assert_eq!(
+                shape.contains("If your pick is a lower rung than this thread's"),
+                pays == Some(false),
+                "{pays:?} {ladder:?}: {shape}"
+            );
+        }
+    }
+
+    /// The model and effort names live on the ladder, never in the guidance
+    /// (ADR 0500). Scans the principle and both cards with no ladder
+    /// rendered, for every model the menus list and every effort word.
+    #[test]
+    fn the_implementer_guidance_names_no_model_and_no_effort() {
+        let mut texts = vec![
+            IMPLEMENTER_CHOICE.to_string(),
+            lower_options(true),
+            paying_options(),
+        ];
+        for pays in [true, false] {
+            texts.push(card_shape(reading(Some(pays), None), FLAGS));
+        }
+        let mut banned: Vec<String> = Vec::new();
+        for menu in [
+            crate::spawn_thread::CC_MENU,
+            crate::spawn_thread::CODEX_MENU,
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(menu).expect("menu parses");
+            for row in parsed["models"].as_array().expect("models") {
+                let value = row["value"].as_str().expect("value");
+                if value == "default" {
+                    continue;
+                }
+                let label = row["label"].as_str().expect("label");
+                banned.push(value.to_string());
+                banned.push(label.to_string());
+                banned.push(label.split(' ').next().unwrap_or(label).to_string());
+            }
+        }
+        let words = |text: &str| -> Vec<String> {
+            text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.')
+                .map(|w| w.trim_matches('.').to_string())
+                .collect()
+        };
+        for text in &texts {
+            // The thread's own implementer line quotes what it runs on.
+            let text = text.replace("claude-code with model m-b at medium effort", "");
+            for name in &banned {
+                assert!(!text.contains(name.as_str()), "names {name:?}: {text}");
+            }
+            for word in words(&text) {
+                assert!(
+                    !crate::spawn_thread::EFFORT_LEVELS.contains(&word.as_str()),
+                    "names the effort {word:?}: {text}"
+                );
+            }
+        }
+    }
+
+    /// I8: only a paying verdict recommends a new thread on this thread's own
+    /// implementer, whatever the size.
+    #[test]
+    fn a_new_thread_on_this_implementer_needs_a_paying_verdict() {
+        let paying = card_shape(reading(Some(true), Some(ladder(Some(1)))), FLAGS);
+        for needle in [
+            "The handoff estimate says a fresh thread pays here",
+            "240k tokens",
+            "This thread runs on claude-code with model m-b at medium effort.",
+            "intelligence ladder, least to most intelligent",
+            "[this thread]",
+            "`Implement in a new thread: <implementer> (Recommended)`",
+            "`Implement in a new thread: <this thread's implementer>`, only when it differs",
+            "`Approve here` for a plan",
+            "never more than 4 options, and never `Request changes`",
+            "by your judgement of the work left",
+            "a fully specified plan with settled decisions suits a lower rung",
+            "lucidos successor spawn --narrative <file> --at plan-approval --progress 0/4`",
+            "adding `--build-chain` when your flow says so",
+            "a plan flow approves the plan",
+            "remaining checkpoint instructions",
+            "picking this thread's implementer adds none",
+        ] {
+            assert!(paying.contains(needle), "missing {needle:?}: {paying}");
+        }
+        let large_but_not_paying = card_shape(reading(Some(false), None), FLAGS);
+        assert!(
+            !large_but_not_paying.contains("<this thread's implementer>"),
+            "{large_but_not_paying}"
+        );
+        assert!(large_but_not_paying.contains("does not pay"));
+    }
+
+    #[test]
+    fn a_thread_that_cannot_hand_off_gets_the_floor() {
+        let closed = ContextReading::Read {
+            input_tokens: Some(400_000),
+            can_hand_off: false,
+            pays: true,
+            implementer: None,
+            ladder: None,
+        };
+        let shape = card_shape(closed, FLAGS);
+        assert_eq!(shape, FLOOR);
+        assert!(shape.contains("`Approve` / `Request changes`"));
+        assert!(!shape.contains("Implement in a new thread"), "{shape}");
+        let unknown = card_shape(ContextReading::Unknown, FLAGS);
+        assert!(unknown.starts_with(FLOOR));
+        assert!(unknown.contains("could not read this thread's context"));
+    }
 
     #[test]
     fn approval_flips_only_the_proposed_status_line() {
@@ -341,6 +605,22 @@ mod tests {
             None,
             "a plan written before the status line existed is left alone"
         );
+    }
+
+    #[test]
+    fn a_refused_approval_shows_the_engines_words_alone() {
+        let refusal = r#"{"error":"Revise the plan.","reason":"no-plan-approval"}"#;
+        assert_eq!(
+            approval_refusal(refusal).as_deref(),
+            Some("Revise the plan.")
+        );
+        for other in [
+            r#"{"error":"busy","reason":"apply_in_progress"}"#,
+            r#"{"error":"no reason"}"#,
+            "approve_plan: pool closed",
+        ] {
+            assert_eq!(approval_refusal(other), None, "{other}");
+        }
     }
 
     #[test]

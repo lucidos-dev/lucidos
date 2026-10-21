@@ -4,8 +4,9 @@ import {
   assertHealthy, pickComposeDestination, sendFollowUp,
   waitForActionPanel, newThread, waitForCCToFinish,
   assertUserMessagesVisible, userMessageBody, USER_MSG_SELECTOR,
-  isMobileViewport, clickVisibleElement, waitForVisibleInput,
+  waitForVisibleInput,
 } from './helpers';
+import { psql } from './db-helpers';
 
 test.describe('Claude Code interaction', () => {
   test.beforeEach(async ({ page }) => {
@@ -38,6 +39,27 @@ test.describe('Claude Code interaction', () => {
     const response = page.locator('.response-content:visible').first();
     const text = await response.textContent();
     expect(text!.trim().length).toBeGreaterThan(0);
+  });
+
+  // ADR 0491: the branch left the shared system prompt, so a fresh session
+  // learns it from the session context in its first message.
+  test('a fresh session names its branch from the session context', async ({ page }) => {
+    await navigateToApp(page);
+    await newThread(page);
+    await pickComposeDestination(page);
+
+    const since = psql(`SELECT now()`).trim();
+    const msg = uniqueMessage('cc-branch');
+    await sendMessage(page, `Name your session's branch, exactly as written and nothing else. Do not create any files. (${msg})`);
+    await expect(userMessageBody(page)).toContainText(msg, { timeout: 15_000 });
+    await waitForCCToFinish(page);
+
+    const branch = psql(
+      `SELECT payload->>'branch' FROM events WHERE event_type='SessionStarted' ` +
+      `AND created > '${since}'::timestamptz ORDER BY sequence DESC LIMIT 1`,
+    ).trim();
+    expect(branch).toMatch(/^lucidos-/);
+    await expect(page.locator('.response-content:visible').first()).toContainText(branch, { timeout: 120_000 });
   });
 
   test('send follow-up to idle Claude Code session', async ({ page }) => {
@@ -106,14 +128,7 @@ test.describe('Claude Code interaction', () => {
     await pickComposeDestination(page);
     await expect(page.locator('.compose-destination-picker .dropdown-sizer > :first-child:visible').first()).toHaveText('Lucidos source');
 
-    // Send via the same viewport gate sendMessage uses: Enter on desktop,
-    // click Send on mobile (mobile disables Enter-to-submit so the soft
-    // keyboard can insert newlines).
-    if (isMobileViewport(page)) {
-      await clickVisibleElement(page, 'button[aria-label="Send message"]');
-    } else {
-      await input.press('Enter');
-    }
+    await input.press('Enter');
 
     // The CC-specific "Archive" action panel only appears for Claude Code
     // threads — Lucidos chats stream a response and stop, no action panel.

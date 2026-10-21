@@ -105,7 +105,7 @@ against the live media query, with none of them. In the shell that is
 every edit of the active theme's file. In an app frame it is `paint`, run by
 every shell push and every preference fetch.
 
-A mobile-webkit run of `system-theme-follows-os.spec.ts` caught it. The test
+A mobile-webkit run of `system-theme-follows-os-all.spec.ts` caught it. The test
 hid the page and flipped the OS to light. Startup's preference load, slow on
 that runner, landed afterwards and painted the hidden page light. On an iPhone
 the same repaint can land inside the snapshot pass.

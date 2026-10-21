@@ -1,7 +1,9 @@
 import { signal, computed, batch, type ReadonlySignal, type Signal } from '@preact/signals';
 import type { WidgetParams } from '../utils/widgetParams';
 import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
+import { gapClearedProgress, gapRefreshedVersion } from './eventGap';
 import { minDrawerWidth } from './paneMinimums';
+import { armRestoreGuard, readGuardedFocus } from './restoreGuard';
 import { DRAWER_GROUPING_KEY, SELECTED_ONGOING_GROUP_KEY, THREAD_DRAWER_WIDTH_KEY } from './drawerKeys';
 import type {
   ThreadQueueResponse,
@@ -19,6 +21,7 @@ import type {
   HistoricalTriggerInfo,
   App,
   MarketplaceCatalog,
+  ConfirmAlternative,
   ConfirmState,
   ConfirmDetails,
   ConfirmVariant,
@@ -240,7 +243,7 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 // `system` is the System submenu, the list of the sub-pages below it. Overview
 // is one of those sub-pages and holds `system-overview`, so it is reached as a
 // row like every sibling.
-export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'prompt-footprint' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
+export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'models' | 'intelligence' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'prompt-footprint' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -314,6 +317,9 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
 // Groups are contiguous and rendered as headings. They add no tap depth.
 export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
   { key: 'models', label: 'Models', group: 'Assistant' },
+  // Beside Models: which model and effort each agent may pick, and what
+  // the picks cost. Models is the catalogue they are drawn from.
+  { key: 'intelligence', label: 'Intelligence', group: 'Assistant' },
   { key: 'permissions', label: 'Permissions', group: 'Assistant' },
   // Beside Permissions, because the two answer the same question from
   // different ends: which tools the agent is offered, and which of those it
@@ -433,8 +439,8 @@ export function aliasRetiredSettingsSubview(raw: string): string {
   localStorage.removeItem('lucidos-plugins-tab');
 }
 const savedMenuItem = localStorage.getItem('lucidos-active-menu-item');
-/** A device with no saved panel opens Files. The Home board has its own
- *  place: the rail on desktop, Home's face on a phone. */
+/** A device with no saved panel opens Files. The dashboard has its own
+ *  place: the rail on desktop, the dashboard sheet on a phone. */
 export const activeMenuItem = signal<MenuItem>(
   savedMenuItem && (MENU_ITEMS as readonly string[]).includes(savedMenuItem)
     ? (savedMenuItem as MenuItem)
@@ -738,8 +744,10 @@ export function clampThreadDrawerWidth(): void {
   threadDrawerWidth.value = min;
   localStorage.setItem(THREAD_DRAWER_WIDTH_KEY, String(min));
 }
+// Read through the restore guard: a launch never restores a thread the last
+// session died showing.
 export const focusedThreadId = signal<string | null>(
-  localStorage.getItem(FOCUSED_THREAD_KEY)
+  readGuardedFocus(FOCUSED_THREAD_KEY)
 );
 
 /** Single setter that keeps focusedThreadId and FOCUSED_THREAD_KEY in lockstep.
@@ -757,6 +765,7 @@ export function setFocusedThread(id: string | null): void {
   // clears its own await here.
   if (awaitedThreadId.peek() !== id) awaitedThreadId.value = null;
   focusedThreadId.value = id;
+  armRestoreGuard(id);
   if (id) {
     localStorage.setItem(FOCUSED_THREAD_KEY, id);
   } else {
@@ -1095,30 +1104,34 @@ export function notReadyReason(thread: ThreadState | undefined): UnproposedReaso
   return agentHoldsUnreadMessage(thread) ? null : change.reason;
 }
 
+/** The cache state the *Successor card* shows for: the engine's verdict for a
+ *  warm prompt cache or a cold one. */
+export type SuccessorOffer = 'warm' | 'cold';
+
 /** What the composer offers a large coding-agent thread at a clean idle. The
- *  engine's context reading decides the size (`offer`, `nudge`).
- *
- *  - `send`: an Apply landed and the user typed a new request, so it can go
- *    to a fresh *successor thread* instead.
- *  - `continue`: an empty composer on a thread past the nudge, so the agent
- *    can hand off.
+ *  engine's context reading carries the verdict for each cache state, and the
+ *  card picks the state by the clock: warm until `cold_at`, cold from then on.
  *
  *  A clean idle has nothing pending, no open card, no running turn, no event
- *  wait and no queued message. `null` otherwise. */
+ *  wait and no queued message. `null` otherwise, and when the verdict for the
+ *  current cache state says a handoff does not pay. */
 export function successorOffer(
   thread: ThreadState | undefined,
   context: ThreadContext | null,
-  draft: { text: string; imageCount: number },
-): 'send' | 'continue' | null {
-  if (!thread || !context || thread.meta.channel !== 'claude_code') return null;
+  now: number,
+): SuccessorOffer | null {
+  if (!thread || !context?.card || thread.meta.channel !== 'claude_code') return null;
   if (thread.meta.successor || thread.meta.section === 'archived') return null;
   if (effectiveThreadStatus(thread) !== 'idle' || thread.meta.liveEventWaitCount > 0) return null;
   if (thread.meta.codingAgentChangeState.kind !== 'none' || agentHoldsUnreadMessage(thread)) return null;
-  const typed = draft.text.trim() !== '';
-  if (typed && draft.imageCount === 0 && context.offer && context.applied) return 'send';
-  if (!typed && draft.imageCount === 0 && context.nudge) return 'continue';
-  return null;
+  const { warm, cold, cold_at: coldAt } = context.card;
+  const state: SuccessorOffer = coldAt !== undefined && Date.parse(coldAt) > now ? 'warm' : 'cold';
+  return (state === 'warm' ? warm : cold) ? state : null;
 }
+
+/** The thread whose Successor card is on screen, or `null`. A model pick on
+ *  that thread aims the successor and switches nothing here. */
+export const successorCardThreadId = signal<string | null>(null);
 
 /** Whether an idle coding agent still holds the newest message unread, so its
  *  next turn starts by itself (ADR 0268). A message queued behind a turn that
@@ -1828,14 +1841,16 @@ export function changeIsReady(change: Change): boolean {
   return change.apply_ready;
 }
 
-/** Pending changes the reader can act on now: the ready ones. A change still
- *  waiting on its thread is the standing apply's business, so it raises no
- *  badge. `null` until the list loads: a cold load or an outage must not draw
- *  a `0`. */
+/** Pending changes the reader can act on now: the ready ones the lane does not
+ *  hold and no apply has started. A change still waiting on its thread is the
+ *  standing apply's business, and one already landing needs nothing, so
+ *  neither raises the badge. `null` until the list loads: a cold load or an
+ *  outage must not draw a `0`. */
 export const actionableChangeCount = computed<number | null>(() => {
   const loadable = changes.value;
   if (loadable.status !== 'loaded') return null;
-  return loadable.data.filter(changeIsReady).length;
+  const inFlight = inFlightChangeIds.value;
+  return loadable.data.filter((c) => changeIsReady(c) && !inFlight.has(c.id)).length;
 });
 /** Every change id currently being applied: the single source of truth,
  *  combining `applyingChangeIds`, `applyingNowThreadIds` and the unresolved
@@ -1853,6 +1868,16 @@ export const busyChangeIds = computed(() => {
       if (c.thread_id && threadIds.has(c.thread_id)) ids.add(c.id);
     }
   }
+  return ids;
+});
+/** Every change id an apply has started or the landing lane holds: the
+ *  Changes panel's Applying section. Such a change is neither offered Apply nor
+ *  counted by Apply All (ADR 0463). */
+export const inFlightChangeIds = computed(() => {
+  const ids = new Set(busyChangeIds.value);
+  const lane = landingLane.value;
+  for (const id of lane.waiting) ids.add(id);
+  for (const id of lane.open_batch?.members ?? []) ids.add(id);
   return ids;
 });
 /** Thread IDs that own a pending change currently being applied: the reverse of
@@ -2175,7 +2200,7 @@ function collapsedSectionsStore<Id extends string>(key: string) {
   return { ids, toggle };
 }
 
-export type ChangesSectionId = 'ready' | 'not-finished' | 'set-aside' | 'applied';
+export type ChangesSectionId = 'applying' | 'ready' | 'not-finished' | 'set-aside' | 'applied';
 export const {
   ids: collapsedChangesSectionIds,
   toggle: toggleChangesSectionCollapsed,
@@ -2564,14 +2589,13 @@ export function dismissToast(idOrKey: number | string) {
 
 /** Every caller states whether confirming destroys something, so a safe action
  *  can never inherit a red button by default. */
-export interface ConfirmOptions {
+export type ConfirmOptions = ConfirmAlternative & {
   variant: ConfirmVariant;
   title?: string;
   cancelLabel?: string;
-  extraAction?: ToastAction;
   details?: ConfirmDetails;
   acknowledge?: boolean;
-}
+};
 
 /** The chunk the confirm and prompt dialogs draw from. `App` registers it, so
  *  a dialog turns visible only once it can draw (ADR 0436). Unregistered, as
@@ -2619,7 +2643,7 @@ export function showConfirm(
         cancelLabel: options.cancelLabel,
         variant: options.variant,
         resolve,
-        extraAction: options.extraAction,
+        ...(options.choices ? { choices: options.choices } : { extraAction: options.extraAction }),
         details: options.details,
         acknowledge: options.acknowledge,
       };
@@ -2772,33 +2796,37 @@ export * from './backgroundActivity';
 
 // --- Memory rebuild progress ---
 /** Updated from SSE memory_rebuilding events. null = not rebuilding. */
-export const memoryRebuildProgress = signal<{ processed: number; total: number; percent: number } | null>(null);
+export const memoryRebuildProgress = gapClearedProgress<{ processed: number; total: number; percent: number }>();
 
 /** Updated from SSE BackupProgress events. null = not backing up. */
-export const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
+export const backupProgress = gapClearedProgress<{ phase: string; progress: number; total: number }>();
 
 /** Bumped on every terminal backup SSE event (BackupCompleted AND
  *  BackupFailed). BackupSection re-fetches `/backup/status` when this changes
  *  so the health card reflects the new last-run outcome. */
-export const backupStatusVersion = signal(0);
+export const backupStatusVersion = gapRefreshedVersion();
+
+/** Bumped on `BackupRecipientSet`: a backup key setup finished, or the user
+ *  set their own age public key. BackupSection re-reads `/backup/recipient`. */
+export const backupRecipientVersion = gapRefreshedVersion();
 
 /** How far Disk Usage's recommended cleanup has got. `null` = no pass running;
  *  `total` 0 = running, count not known yet. Mirrors `backupProgress`: set by
  *  the Free tap, `RecommendedCleanupStarted` and `RecommendedCleanupProgress`,
  *  cleared by the terminal event, and re-read from `/disk-usage/summary`. */
-export const recommendedCleanupProgress = signal<{ done: number; total: number } | null>(null);
+export const recommendedCleanupProgress = gapClearedProgress<{ done: number; total: number }>();
 
-/** Bumped when a recommended cleanup ends, and on an SSE reconnect. The Disk
- *  Usage page re-reads its figures on it. */
-export const diskUsageVersion = signal(0);
+/** Bumped when a recommended cleanup ends. The Disk Usage page re-reads its
+ *  figures on it. */
+export const diskUsageVersion = gapRefreshedVersion();
 
-/** Bumped on an app change or open, a preference change, and an SSE
- *  reconnect. The Workspace Prompt Footprint page re-reads its report on it. */
-export const promptFootprintVersion = signal(0);
+/** Bumped on an app change or open, and a preference change. The Workspace
+ *  Prompt Footprint page re-reads its report on it. */
+export const promptFootprintVersion = gapRefreshedVersion();
 
 /** Bumped on `ModelNotServedObserved`: a provider no longer serves a model a
  *  background task ran on. The background rows re-read what runs (ADR 0403). */
-export const backgroundModelsVersion = signal(0);
+export const backgroundModelsVersion = gapRefreshedVersion();
 
 /** Bumped when a `PreferencesChanged` carries one of the three keys the Backup
  *  page renders: `backup_provider`, `backup_schedule`, `backup_retention`.
@@ -2813,7 +2841,13 @@ export const backgroundModelsVersion = signal(0);
  *  Without either, the panel reads its three values once on mount and nothing
  *  moves them. An agent writing `backup_provider`, or the same page open on a
  *  second device, then leaves the dropdown showing the old destination. */
-export const backupPreferencesVersion = signal(0);
+export const backupPreferencesVersion = gapRefreshedVersion();
+
+/** Bumped on a `PreferencesChanged` for a key the intelligence ladder reads.
+ *  Settings → Coding agents fetches the served ladder, which the preferences
+ *  cache cannot answer: the engine merges those keys with the shipped ladder
+ *  and the measured long-prompt share. */
+export const intelligenceLadderVersion = gapRefreshedVersion();
 
 /** Bumped on every `McpServerRegistered` / `McpServerUpdated` /
  *  `McpServerRemoved` / `McpServerStopped` / `McpServerDisabledToolsChanged`
@@ -2821,7 +2855,7 @@ export const backupPreferencesVersion = signal(0);
  *  Servers re-reads `/mcp/servers` on it. A server the agent registers, or a
  *  tool switched off on another device, then reaches the open page
  *  (ADR 0118). */
-export const mcpServersVersion = signal(0);
+export const mcpServersVersion = gapRefreshedVersion();
 
 /** Bumped on every `PreferencesChanged` frame carrying `response_styles`.
  *  Settings re-reads `/response-styles` on it.
@@ -2831,24 +2865,24 @@ export const mcpServersVersion = signal(0);
  *  merges what it ships with what the user saved, and only the engine holds
  *  the shipped half. So the cached preference map cannot answer, and the page
  *  has to ask again (ADR 0118). */
-export const responseStylesVersion = signal(0);
+export const responseStylesVersion = gapRefreshedVersion();
 
 /** Bumped on every `WebhookCreated` / `WebhookUpdated` / `WebhookDeleted`
  *  frame. Settings → Webhooks re-reads its list on it. Hooks are created and
  *  disabled from the CLI as often as from this page, so the open page was
  *  otherwise stale for the whole session. */
-export const webhooksVersion = signal(0);
+export const webhooksVersion = gapRefreshedVersion();
 
 /** Bumped on every `MemoryCorrected` frame. The Memory Inspector re-reads its
  *  stats and entries on it, because a correction removes entries it may be
  *  showing. */
-export const memoryEntriesVersion = signal(0);
+export const memoryEntriesVersion = gapRefreshedVersion();
 
 /** Bumped when a Tree backfill completes or resets, and on `ThreadsDeleted`.
  *  The summary tree browser re-reads on it. Progress frames do not bump it:
  *  the compactor sends one per built node, and the panel refresh covers a
  *  backfill under way. */
-export const summaryTreesVersion = signal(0);
+export const summaryTreesVersion = gapRefreshedVersion();
 
 /** Whether the public path a webhook delivery arrives on is reachable, per
  *  address family.
@@ -2883,15 +2917,15 @@ export const webhookRefusals = signal<Loadable<RefusalReading>>({ status: 'not-l
  *  already, so re-reading the other one costs one request. Keying it would
  *  put a routing decision in the arm, which is one more thing to keep in
  *  sync. */
-export const permissionGrantsVersion = signal(0);
+export const permissionGrantsVersion = gapRefreshedVersion();
 
 /** Bumped on every `HandshakeScriptApproved` frame. The file preview re-reads
  *  which auth handshake scripts may run. So the warning on an unapproved one
  *  clears the moment an approval lands, on every open client (ADR 0118). */
-export const handshakeScriptsVersion = signal(0);
+export const handshakeScriptsVersion = gapRefreshedVersion();
 
 /** Updated from SSE RecoveryProgress events. null = not recovering. */
-export const recoveryProgress = signal<{ completed: number; total: number } | null>(null);
+export const recoveryProgress = gapClearedProgress<{ completed: number; total: number }>();
 
 // --- Update available ---
 export const updateAvailable = signal(false);

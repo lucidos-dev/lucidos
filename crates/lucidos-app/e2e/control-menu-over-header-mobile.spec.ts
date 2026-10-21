@@ -1,7 +1,7 @@
 import { test, expect } from './fixtures';
 import {
   apiRequest, assertHealthy, clickVisibleElement, navigateToApp, newThread,
-  pickComposeDestination,
+  pickComposeDestination, ensureSlashCommandsReported,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -30,6 +30,7 @@ test.describe('the composer command menu on a short phone viewport', () => {
   });
 
   test('paints its head over the header', async ({ page }) => {
+    await ensureSlashCommandsReported(page);
     const restore = page.viewportSize();
     await page.setViewportSize({ width: restore?.width ?? 390, height: KEYBOARD_UP_HEIGHT });
     await navigateToApp(page);
@@ -42,7 +43,7 @@ test.describe('the composer command menu on a short phone viewport', () => {
     const panel = page.locator('.control-dropdown:visible');
     await expect(async () => {
       if (await panel.count() === 0) {
-        await clickVisibleElement(page, '.commands-btn-active:not(.lucidos-commands-btn)');
+        await clickVisibleElement(page, '.commands-btn-active');
       }
       await expect(panel).toHaveCount(1, { timeout: 2_000 });
     }).toPass({ timeout: 20_000 });

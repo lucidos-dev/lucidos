@@ -3,6 +3,8 @@
 //! notification dedup helper.
 
 use crate::api::SharedEngine;
+use crate::core::backup::crypto::SealingKey;
+use crate::core::backup::recipient;
 use crate::core::keep_awake::{self, AwakeHold, Work};
 use crate::scheduler::notifications::SettingsPage;
 
@@ -55,7 +57,7 @@ pub(crate) async fn run_backup(
     pool: &sqlx::PgPool,
     workspace: &std::path::Path,
     database_url: &str,
-    key: &[u8],
+    key: SealingKey,
     provider: &dyn crate::core::backup::BackupProvider,
 ) {
     use crate::core::backup;
@@ -192,24 +194,13 @@ async fn persist_last_run(pool: &sqlx::PgPool, run: &crate::core::backup::Backup
     }
 }
 
-/// Load the workspace's backup key, creating one if absent, and tell the user
-/// when this call created it.
-///
-/// The key is excluded from every archive, so a user who never saw it cannot
-/// restore after losing the machine. Every path that mints a key the user is
-/// not looking at goes through here: the scheduled run, a manual backup and
-/// turning a schedule on. Only `POST /backup/key` calls `ensure_key` directly,
-/// because it hands the new key straight to the user's screen.
-pub(crate) async fn ensure_backup_key(
-    engine: &SharedEngine,
-    workspace: &std::path::Path,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let (key, is_new) = crate::core::backup::crypto::ensure_key(workspace)?;
-    if is_new {
-        log!("[Backup] No backup key found; generated a new encryption key");
-        notify_backup_key_generated(engine).await;
-    }
-    Ok(key)
+/// The refusal a backup meets when the workspace has neither a backup
+/// recipient nor a legacy key. Nothing is sealed under a key nobody saved.
+pub(crate) fn backups_not_set_up_message() -> String {
+    format!(
+        "Backups are not set up yet. Open {} and create a backup key.",
+        SettingsPage::BACKUP.link()
+    )
 }
 
 /// Execute a scheduled backup. Called by the cron job.
@@ -238,21 +229,58 @@ pub(super) async fn run_scheduled_backup(engine: SharedEngine, provider_id: Stri
         }
     };
 
-    // A scheduled backup must never silently skip just because the user hasn't
-    // triggered a manual backup first.
-    let key = match ensure_backup_key(&engine, &workspace).await {
-        Ok(k) => k,
+    // Never skip in silence: a workspace that cannot seal is told why.
+    let state = match recipient::load(pool).await {
+        Ok(state) => state,
         Err(e) => {
-            log!("[Backup] Failed to load or generate key: {}", e);
-            notify_backup_failure(
+            let msg = format!("Cannot read the backup recipient: {e}");
+            log!("[Backup] {}", msg);
+            notify_backup_failure(&engine, &provider_id, &msg).await;
+            return;
+        }
+    };
+    let key = match recipient::sealing_key(pool, &workspace).await {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            log!("[Backup] Skipping scheduled backup: backups are not set up");
+            notify_once(
                 &engine,
-                &provider_id,
-                &format!("Failed to load or generate backup key: {}", e),
+                BACKUPS_NOT_SET_UP_TITLE,
+                &backups_not_set_up_message(),
+                DAY_SECS,
             )
             .await;
             return;
         }
+        Err(e) => {
+            let msg = format!("Cannot load the backup key: {e}");
+            log!("[Backup] {}", msg);
+            notify_backup_failure(&engine, &provider_id, &msg).await;
+            return;
+        }
     };
+    // A pending switch never pauses a backup. It only asks, once a week.
+    match &key {
+        SealingKey::Legacy(_) => {
+            notify_once(
+                &engine,
+                SWITCH_PENDING_TITLE,
+                &switch_pending_message(),
+                WEEK_SECS,
+            )
+            .await
+        }
+        SealingKey::Recipient(_) if verify_is_due(&state) => {
+            notify_once(
+                &engine,
+                VERIFY_DUE_TITLE,
+                &verify_due_message(),
+                VERIFY_REMINDER_SECS,
+            )
+            .await
+        }
+        SealingKey::Recipient(_) => {}
+    }
 
     let database_url = crate::core::database_url();
     run_backup(
@@ -261,17 +289,76 @@ pub(super) async fn run_scheduled_backup(engine: SharedEngine, provider_id: Stri
         pool,
         &workspace,
         &database_url,
-        &key,
+        key,
         provider.as_ref(),
     )
     .await;
 }
 
-const BACKUP_KEY_GENERATED_TITLE: &str = "Backup key created — store it safely";
+const DAY_SECS: i64 = 24 * 60 * 60;
+const WEEK_SECS: i64 = 7 * DAY_SECS;
+/// How long a held backup key goes unchecked before the drill is suggested.
+const VERIFY_REMINDER_SECS: i64 = 365 * DAY_SECS;
+
+const BACKUPS_NOT_SET_UP_TITLE: &str = "Backups are not set up";
+const SWITCH_PENDING_TITLE: &str = "Switch your backups to a new backup key";
+const VERIFY_DUE_TITLE: &str = "Check that you still have your backup key";
+
+fn verify_is_due(state: &recipient::RecipientState) -> bool {
+    state
+        .secs_unproven()
+        .is_some_and(|secs| secs >= VERIFY_REMINDER_SECS)
+}
+
+fn switch_pending_message() -> String {
+    format!(
+        "Your backups still use the old backup key. With a new backup key, nothing on \
+         this computer can open your backups. Open {} to switch.",
+        SettingsPage::BACKUP.link()
+    )
+}
+
+fn verify_due_message() -> String {
+    format!(
+        "A backup is only as good as the key that opens it. Open {} and paste your \
+         backup key to check you still have it.",
+        SettingsPage::BACKUP.link()
+    )
+}
+
+/// Notify unless a notification with this title went out within `window_secs`.
+async fn notify_once(engine: &SharedEngine, title: &str, message: &str, window_secs: i64) {
+    if notified_within(engine, title, window_secs).await {
+        return;
+    }
+    emit_backup_notification(engine, title, message, SettingsPage::BACKUP.tap()).await;
+}
+
+/// Whether a notification titled `title` went out within `window_secs`.
+///
+/// The window is resolved by the database (ADR 0053): `notifications.created_at`
+/// is stamped by Postgres, so an engine-computed cutoff would compare the host
+/// clock against the database clock. A lookup that could not run is UNKNOWN,
+/// not "already notified": it reads as no, so a DB hiccup costs a duplicate
+/// banner rather than the notice itself.
+async fn notified_within(engine: &SharedEngine, title: &str, window_secs: i64) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM notifications \
+         WHERE title = $1 AND created_at > now() - make_interval(secs => $2))",
+    )
+    .bind(title)
+    .bind(window_secs as f64)
+    .fetch_one(engine.pool())
+    .await
+    .unwrap_or_else(|e| {
+        log!("[Backup] Notification dedup lookup failed: {}", e);
+        false
+    })
+}
 
 /// Emit a backup notification (DB row + SSE) and fan it out to every device via
-/// web push. Shared by the failure and key-generated paths so both surface
-/// identically and differ only in title / message / tap destination.
+/// web push. Shared by every backup notice so each surfaces identically and
+/// differs only in title / message / tap destination.
 async fn emit_backup_notification(
     engine: &SharedEngine,
     title: &str,
@@ -319,32 +406,8 @@ fn backup_failure_page(readiness: Option<&crate::core::backup::ProviderReadiness
     }
 }
 
-/// The key-generated body. It links the Backup page, where the key can be
-/// revealed and copied.
-fn backup_key_generated_message() -> String {
-    format!(
-        "Lucidos created a new encryption key for your backups. \
-         Store it somewhere safe: you need it to restore, and it cannot be recovered. \
-         Open {} to view and copy it.",
-        SettingsPage::BACKUP.link()
-    )
-}
-
-/// Notify the user that a backup path generated a fresh encryption key they
-/// never saw, so they must store it: it cannot be recovered and is required to
-/// restore.
-async fn notify_backup_key_generated(engine: &SharedEngine) {
-    emit_backup_notification(
-        engine,
-        BACKUP_KEY_GENERATED_TITLE,
-        &backup_key_generated_message(),
-        SettingsPage::BACKUP.tap(),
-    )
-    .await;
-}
-
 const BACKUP_FAILURE_TITLE: &str = "Backup failed";
-const BACKUP_FAILURE_DEDUP_MINUTES: i64 = 30;
+const BACKUP_FAILURE_DEDUP_SECS: i64 = 30 * 60;
 
 /// Compose the failure notification's body: what to do about it, then why it
 /// happened.
@@ -393,30 +456,10 @@ fn backup_failure_body(
 /// and only the body varies: a title that named the cause would let a
 /// cause-alternating failure notify on every single run.
 pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &str, error: &str) {
-    let pool = engine.pool();
-    // The window is resolved by the database (ADR 0053): `notifications.created_at`
-    // is stamped by Postgres, so an engine-computed cutoff would compare the host
-    // clock against the database clock. A container clock ahead of the host would
-    // suppress a failure the user needs to see.
-    let recent: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM notifications \
-         WHERE title = $1 AND created_at > now() - make_interval(secs => $2))",
-    )
-    .bind(BACKUP_FAILURE_TITLE)
-    .bind((BACKUP_FAILURE_DEDUP_MINUTES * 60) as f64)
-    .fetch_one(pool)
-    .await
-    .unwrap_or_else(|e| {
-        // A dedup lookup that could not run is UNKNOWN, not "already notified":
-        // fall through to notifying, so a DB hiccup costs a duplicate banner
-        // rather than the backup failure report itself.
-        log!("[Backup] Failure-notification dedup lookup failed: {}", e);
-        false
-    });
-
-    if recent {
+    if notified_within(engine, BACKUP_FAILURE_TITLE, BACKUP_FAILURE_DEDUP_SECS).await {
         return;
     }
+    let pool = engine.pool();
 
     // A readiness lookup that cannot answer must not cost the user the
     // notification itself: the failure is the thing worth telling them about,
@@ -453,8 +496,9 @@ pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &s
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_failure_body, backup_failure_page, backup_key_generated_message,
-        describe_backup_failure, spoken_duration, time_asleep, BACKUP_FAILURE_TITLE,
+        backup_failure_body, backup_failure_page, backups_not_set_up_message,
+        describe_backup_failure, spoken_duration, switch_pending_message, time_asleep,
+        verify_due_message, verify_is_due, BACKUP_FAILURE_TITLE,
     };
     use std::time::Duration;
 
@@ -693,40 +737,33 @@ mod tests {
             let body = backup_failure_body(Some("Dropbox"), readiness, "e");
             assert!(body.contains(LINK), "{readiness:?}: {body}");
         }
-        // The sibling notification points at the same page and must agree.
-        let key_message = backup_key_generated_message();
-        assert!(key_message.contains(LINK), "{key_message}");
+        // The sibling notices point at the same page and must agree.
+        for message in [
+            backups_not_set_up_message(),
+            switch_pending_message(),
+            verify_due_message(),
+        ] {
+            assert!(message.contains(LINK), "{message}");
+        }
     }
 
-    /// A key the user never saw makes every backup unrestorable once the
-    /// machine is lost, because the key file is excluded from the archive.
-    /// Turning a schedule on and a manual backup both minted one silently, so
-    /// the first scheduled run found it existing and sent no notification.
-    /// Only `POST /backup/key`, which shows the key, may mint around the helper.
+    /// The drill is suggested a year after the last proof, and never for a
+    /// recipient whose age the database could not state.
     #[test]
-    fn every_unattended_key_mint_goes_through_the_notifying_helper() {
-        use crate::test_support::source_scan::production_sources;
-        let allowed = [
-            ("core/backup/crypto.rs", usize::MAX),
-            ("scheduler/backup.rs", 1),
-            ("api/backup.rs", 1),
-        ];
-        for (rel, text) in production_sources() {
-            let calls =
-                text.matches("crypto::ensure_key(").count() + text.matches(" ensure_key(").count();
-            if calls == 0 {
-                continue;
-            }
-            let limit = allowed
-                .iter()
-                .find(|(path, _)| *path == rel)
-                .map(|(_, n)| *n)
-                .unwrap_or(0);
-            assert!(
-                calls <= limit,
-                "{rel} mints a backup key {calls} time(s) without notifying the user; \
-                 call scheduler::ensure_backup_key instead"
-            );
-        }
+    fn the_verify_reminder_waits_a_year() {
+        use crate::core::backup::recipient::RecipientState;
+        let state = |secs| RecipientState {
+            secs_since_verified: secs,
+            ..RecipientState::default()
+        };
+        assert!(!verify_is_due(&state(None)));
+        assert!(!verify_is_due(&state(Some(364 * 24 * 3600))));
+        assert!(verify_is_due(&state(Some(365 * 24 * 3600))));
+        // An own key never proven counts from when it was set.
+        let own_key = RecipientState {
+            secs_since_set: Some(365 * 24 * 3600),
+            ..RecipientState::default()
+        };
+        assert!(verify_is_due(&own_key));
     }
 }

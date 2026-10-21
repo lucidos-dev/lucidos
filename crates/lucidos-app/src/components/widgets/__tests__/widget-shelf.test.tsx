@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
  * The widget shelf draws a chip per pinned widget in a thread's title row.
- * Home draws none: its pinned widgets are tiles on the Home board (ADR 0466),
- * so a chip there would repeat them.
+ * Home draws none: it takes no pins, since its widgets go on a dashboard
+ * (ADR 0496).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -11,7 +11,9 @@ import type { ThreadWidget } from '../../../api/client/widgets';
 import { threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { threadWidgets } from '../../../store/widgets';
-import { WidgetShelf } from '../WidgetShelf';
+import { OpenShelfWidget, WidgetShelf } from '../WidgetShelf';
+import { WidgetMenuItems } from '../widgetMenuChunks';
+import { APP_FRAME_MENU_EVENT } from '../../../store/actions/widget-frame-bridge';
 
 let host: HTMLDivElement;
 
@@ -50,5 +52,28 @@ describe('the widget shelf', () => {
   it('draws nothing on Home', () => {
     act(() => { render(<WidgetShelf threadId="home" />, host); });
     expect(host.querySelector('.widget-shelf')).toBeNull();
+  });
+});
+
+describe('the open shelf widget', () => {
+  beforeEach(async () => {
+    await WidgetMenuItems.preload();
+    act(() => { render(<OpenShelfWidget threadId="t1" entry={widget('fares')} onClose={() => {}} />, host); });
+  });
+
+  const menuItems = () => [...document.querySelectorAll('.thread-overflow-menu [role="menuitem"]')].map((b) => b.textContent);
+
+  it("a right-click on its panel opens the widget's menu", () => {
+    const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 30, clientY: 40 });
+    act(() => { host.querySelector('.widget-bar')!.dispatchEvent(e); });
+    expect(e.defaultPrevented).toBe(true);
+    expect(menuItems()).toContain('Unpin from shelf');
+  });
+
+  it("a right-click its frame forwards opens the same menu", () => {
+    act(() => {
+      host.querySelector('iframe')!.dispatchEvent(new CustomEvent(APP_FRAME_MENU_EVENT, { detail: { x: 30, y: 40 }, bubbles: true }));
+    });
+    expect(menuItems()).toContain('Unpin from shelf');
   });
 });

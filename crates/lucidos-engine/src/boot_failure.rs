@@ -80,10 +80,11 @@ pub fn embedded_versions(migrator: &Migrator) -> Vec<i64> {
 /// the gateway respawning, so classifying a *transient* error as terminal converts
 /// a workspace that would have recovered on its own into a dead one. Only failures
 /// that re-run identically forever qualify: a database ahead of this binary, a
-/// migration whose content no longer matches, a half-applied migration. A dropped
-/// connection mid-migration (`Execute` / `ExecuteMigration`) or an unreadable
-/// migration source is exactly what the supervisor's retry exists for, so it stays
-/// unreported and the existing crash-recovery path handles it.
+/// migration whose content no longer matches, a half-applied migration, a
+/// statement the server rejects with a deterministic SQLSTATE
+/// ([`terminal_database_error_message`]). A dropped connection or an unreadable
+/// migration source is what the supervisor's retry exists for. It stays
+/// unreported, and the existing crash-recovery path handles it.
 ///
 /// Pure, so the wording is unit-tested without a database. `applied` and
 /// `embedded` are the recorded and compiled-in version lists; they are only
@@ -137,12 +138,60 @@ pub fn terminal_migration_message(
             "Lucidos {engine_version} cannot open this workspace: migration {version} is only \
              partially applied to its database and must be repaired by hand."
         ),
-        // Everything else — a dropped connection mid-migration, an unreadable
-        // migration source, a failing statement — may well succeed on the next
-        // attempt. Staying silent leaves the supervisor's respawn in charge, which
-        // is the behavior that recovers a workspace from a transient fault.
+        MigrateError::ExecuteMigration(source, version) => {
+            return terminal_database_error_message(
+                source,
+                &format!("migration {version}"),
+                engine_version,
+            )
+        }
+        MigrateError::Execute(source) => {
+            return terminal_database_error_message(source, "the migration check", engine_version)
+        }
+        // Everything else, such as an unreadable migration source, may well
+        // succeed on the next attempt. Staying silent leaves the supervisor's
+        // respawn in charge, which recovers a workspace from a transient fault.
         _ => return None,
     })
+}
+
+/// SQLSTATE classes a retry can clear: connection loss (08), rollback (40),
+/// resource limits (53), a lock or busy object (55), operator shutdown (57)
+/// and system faults (58). Every other class fails the same way each time.
+const TRANSIENT_SQLSTATE_CLASSES: [&str; 6] = ["08", "40", "53", "55", "57", "58"];
+
+/// The longest server message a report carries.
+const MAX_SERVER_MESSAGE_BYTES: usize = 300;
+
+/// Report a **deterministic** database error, or return `None`.
+///
+/// `None` means a retry could clear it (a dropped connection, a deadlock) or
+/// that `err` carries no SQLSTATE.
+///
+/// The report names the step, the SQLSTATE and the server's primary message. It
+/// never carries `detail`, `hint` or `where`. For a constraint violation the
+/// detail is the failing row, which can hold an email address or a token.
+pub fn terminal_database_error_message(
+    err: &sqlx::Error,
+    step: &str,
+    engine_version: &str,
+) -> Option<String> {
+    let sqlx::Error::Database(db) = err else {
+        return None;
+    };
+    let code = db.code()?;
+    if TRANSIENT_SQLSTATE_CLASSES
+        .iter()
+        .any(|class| code.starts_with(class))
+    {
+        return None;
+    }
+    let message = db.message().lines().next().unwrap_or_default();
+    let message = &message[..message.floor_char_boundary(MAX_SERVER_MESSAGE_BYTES)];
+    Some(format!(
+        "Lucidos {engine_version} cannot open this workspace: {step} failed with database \
+         error {code}: {message}. Starting again will not change this."
+    ))
 }
 
 /// The message for a database whose schema was wiped after it was migrated
@@ -318,6 +367,156 @@ mod tests {
             .is_none(),
             "a transient source/IO fault must stay retryable",
         );
+    }
+
+    #[derive(Debug)]
+    struct ServerError {
+        code: &'static str,
+        message: String,
+    }
+
+    impl std::fmt::Display for ServerError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for ServerError {}
+
+    impl sqlx::error::DatabaseError for ServerError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.code.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn server_error(code: &'static str, message: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(ServerError {
+            code,
+            message: message.to_string(),
+        }))
+    }
+
+    /// Reporting stops the gateway respawning, so each of these must stay
+    /// retryable, including an error that carries no SQLSTATE.
+    #[test]
+    fn transient_database_errors_stay_retryable() {
+        for code in [
+            "08006", "40001", "40P01", "53300", "55P03", "57P01", "58030",
+        ] {
+            let err = server_error(code, "transient");
+            assert!(
+                terminal_database_error_message(&err, "migration 1", VERSION).is_none(),
+                "{code} must stay retryable"
+            );
+            assert!(
+                terminal_migration_message(
+                    &MigrateError::ExecuteMigration(server_error(code, "transient"), 1),
+                    &[],
+                    &[],
+                    VERSION
+                )
+                .is_none(),
+                "{code} in a migration must stay retryable"
+            );
+        }
+        let io = sqlx::Error::Io(std::io::Error::other("connection reset"));
+        assert!(terminal_database_error_message(&io, "migration 1", VERSION).is_none());
+        assert!(
+            terminal_database_error_message(&sqlx::Error::PoolTimedOut, "x", VERSION).is_none()
+        );
+    }
+
+    #[test]
+    fn a_failing_migration_statement_is_terminal_and_names_version_code_and_message() {
+        let msg = terminal_migration_message(
+            &MigrateError::ExecuteMigration(
+                server_error(
+                    "P0001",
+                    "retire_model: successor claude-fable-5-1 has no models row",
+                ),
+                20261018074151,
+            ),
+            &[],
+            &[],
+            VERSION,
+        )
+        .expect("a deterministic SQL error is terminal");
+        assert!(msg.contains("migration 20261018074151"), "{msg}");
+        assert!(msg.contains("P0001"), "{msg}");
+        assert!(
+            msg.contains("successor claude-fable-5-1 has no models row"),
+            "{msg}"
+        );
+        assert!(msg.contains(VERSION), "{msg}");
+    }
+
+    #[test]
+    fn a_long_multi_line_server_message_is_cut_to_one_bounded_line() {
+        let long = format!("first line\nsecond line\n{}", "é".repeat(400));
+        let msg = terminal_database_error_message(&server_error("23514", &long), "step", VERSION)
+            .expect("terminal");
+        assert!(msg.contains("first line"), "{msg}");
+        assert!(!msg.contains("second line"), "{msg}");
+        let long_line = "é".repeat(400);
+        let msg =
+            terminal_database_error_message(&server_error("23514", &long_line), "step", VERSION)
+                .expect("terminal");
+        assert!(msg.len() < 450, "{msg}");
+    }
+
+    /// The 07:46 incident: a `CHECK` violation whose `detail` held a contributor's
+    /// email and a token prefix. The real server error must yield a message with
+    /// none of it.
+    #[tokio::test]
+    async fn a_check_violation_report_carries_no_row_data() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        sqlx::raw_sql(
+            "CREATE TABLE boot_failure_probe (email text, token text, \
+             CONSTRAINT probe_sealed CHECK (token LIKE 'sealed:%'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let err = sqlx::query(
+            "INSERT INTO boot_failure_probe VALUES ('person@example.test', 'plain-refresh-token')",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("the CHECK refuses a plain token");
+        let sqlx::Error::Database(db) = &err else {
+            panic!("expected a database error: {err:?}");
+        };
+        let pg = db.downcast_ref::<sqlx::postgres::PgDatabaseError>();
+        assert!(
+            pg.detail()
+                .is_some_and(|d| d.contains("person@example.test")),
+            "the server detail carries the row, which is why the report drops it"
+        );
+
+        let msg = terminal_database_error_message(&err, "the secret check at boot", VERSION)
+            .expect("23514 is terminal");
+        assert!(msg.contains("23514"), "{msg}");
+        assert!(msg.contains("probe_sealed"), "{msg}");
+        assert!(!msg.contains("person@example.test"), "{msg}");
+        assert!(!msg.contains("plain-refresh-token"), "{msg}");
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 
     #[test]

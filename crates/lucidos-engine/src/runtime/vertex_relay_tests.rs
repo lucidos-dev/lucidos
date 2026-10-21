@@ -445,3 +445,100 @@ async fn each_chunk_streams_through_as_it_arrives() {
     let second = response.chunk().await.unwrap().unwrap();
     assert_eq!(&second[..], b"second\n");
 }
+
+// ── The prompt-cache probe changes nothing the relay forwards ──────────────
+// `docs/plans/2026-10-18-claude-code-cache-probe.md`
+
+const SSE_CHUNKS: [&str; 3] = [
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"cache_read_input_tokens\":0}}}\n\n",
+    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+];
+
+/// A body the relay leaves alone: the model is not always-thinking, and the
+/// spacing and key order are odd on purpose.
+const ODD_BODY: &[u8] =
+    br#"{ "messages": [ {"role" :"user","content":"hi"} ],  "tools":[{"z":1,"a":2}] }"#;
+const UNREWRITTEN_PATH: &str =
+    "projects/p-1/locations/eu/publishers/anthropic/models/claude-haiku-5-5:streamRawPredict";
+
+/// The upstream sends the first SSE chunk, then holds the rest until the test
+/// has read it, and records the request body it received.
+#[tokio::test]
+async fn a_probed_call_forwards_the_same_bytes_without_buffering() {
+    install_secret();
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let record = received.clone();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+    let app = Router::new().fallback(move |request_body: Bytes| {
+        let (record, release_rx) = (record.clone(), release_rx.clone());
+        async move {
+            record.lock().unwrap().extend_from_slice(&request_body);
+            let rx = release_rx.lock().await.take().expect("one request");
+            let chunks = futures::stream::unfold(Some((0usize, rx)), |state| async move {
+                let (i, rx) = state?;
+                if i == 1 {
+                    rx.await.ok()?;
+                    return Some((
+                        Ok::<_, std::io::Error>(SSE_CHUNKS[1]),
+                        Some((2, tokio::sync::oneshot::channel().1)),
+                    ));
+                }
+                match i {
+                    0 => Some((Ok(SSE_CHUNKS[0]), Some((1, rx)))),
+                    2 => Some((Ok(SSE_CHUNKS[2]), None)),
+                    _ => None,
+                }
+            });
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Body::from_stream(chunks),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let port = test_relay().await;
+    let url = relay_base_url(port, Uuid::new_v4(), Some(&base)).unwrap();
+    let mut response = client()
+        .post(format!("{url}/{UNREWRITTEN_PATH}"))
+        .header("authorization", "Bearer ya29.x")
+        .body(ODD_BODY)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), response.chunk())
+        .await
+        .expect("the first chunk arrives while the rest is still held")
+        .unwrap()
+        .unwrap();
+    assert_eq!(&first[..], SSE_CHUNKS[0].as_bytes());
+    release_tx.send(()).unwrap();
+    let mut rest = Vec::new();
+    while let Some(chunk) = response.chunk().await.unwrap() {
+        rest.extend_from_slice(&chunk);
+    }
+    assert_eq!(rest, [SSE_CHUNKS[1], SSE_CHUNKS[2]].concat().into_bytes());
+    assert_eq!(received.lock().unwrap().as_slice(), ODD_BODY);
+}
+
+#[tokio::test]
+async fn a_body_the_probe_cannot_read_still_goes_through() {
+    install_secret();
+    let (base, seen) = fake_upstream(StatusCode::OK, "plain text, not SSE").await;
+    let port = test_relay().await;
+    let url = relay_base_url(port, Uuid::new_v4(), Some(&base)).unwrap();
+    let response = client()
+        .post(format!("{url}/{UNREWRITTEN_PATH}"))
+        .body("not json at all")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "plain text, not SSE");
+    assert_eq!(seen.lock().unwrap()[0].body, b"not json at all");
+}

@@ -1,21 +1,39 @@
-//! The *fix thread*: the one coding-agent thread a red main check opens.
+//! The *fix thread*: the one coding-agent thread a red main check opens, and
+//! the *flaky fix thread* a pass with flaky tests opens.
 //!
-//! It is an ordinary independent thread in the Lucidos repo. Its first prompt
-//! carries what failed, where to read the run, and the changes that landed in
-//! the range. Its change goes through the landing lane like any other, and
-//! when one lands the red closes.
+//! Each is an ordinary independent thread in the Lucidos repo. Its first
+//! prompt carries what failed, where to read the run, and the changes that
+//! landed in the range. Its change goes through the landing lane like any
+//! other, and when one lands the thread's check closes.
 
 use std::path::Path;
 
 use uuid::Uuid;
 
-use super::state::RedCheck;
+use super::state::{CheckRange, FailedTest, FlakyFix, RedCheck};
+use crate::engine::successor::Implementer;
+use crate::engine::thread_events::EngineReason;
+use crate::runtime::CodingAgent;
 
 /// A change that landed in a check's range, for the fix thread's prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LandedChange {
     pub(crate) thread_id: Uuid,
     pub(crate) title: String,
+}
+
+/// The model a fix thread runs on: a named cause and a short log need no more.
+const FIX_THREAD_MODEL: &str = "claude-sonnet-5-5";
+const FIX_THREAD_EFFORT: &str = "medium";
+
+/// The implementer a red check's fix thread opens on. The workspace's own
+/// default decides nothing here.
+pub(crate) fn fix_thread_implementer() -> Implementer {
+    Implementer {
+        coding_agent: CodingAgent::ClaudeCode,
+        model: Some(FIX_THREAD_MODEL.into()),
+        reasoning_effort: Some(FIX_THREAD_EFFORT.into()),
+    }
 }
 
 /// How many characters of the summary a fix thread's title carries.
@@ -25,36 +43,134 @@ const LISTED_CHANGES: usize = 30;
 
 /// The fix thread's title: what is red.
 pub(crate) fn fix_thread_title(summary: &str) -> String {
-    let line = summary.lines().next().unwrap_or("").trim();
-    let cut = line.floor_char_boundary(TITLE_SUMMARY_CHARS);
-    let ellipsis = if cut < line.len() { "…" } else { "" };
-    format!("Fix main: {}{ellipsis}", &line[..cut])
+    format!(
+        "Fix main: {}",
+        cut_to_title(summary.lines().next().unwrap_or(""))
+    )
 }
 
-/// The fix thread's first prompt. `landed` is what landed in the red check's
-/// range, or `None` when git could not list it.
+/// The flaky fix thread's title: the first flaky test, and how many more.
+pub(crate) fn flaky_fix_thread_title(flaky: &[FailedTest]) -> String {
+    let first = flaky.first().map_or("", |test| test.name.as_str());
+    let more = match flaky.len() {
+        0 | 1 => String::new(),
+        n => format!(" and {} more", n - 1),
+    };
+    format!("Fix flaky: {}{more}", cut_to_title(first))
+}
+
+fn cut_to_title(line: &str) -> String {
+    let line = line.trim();
+    let cut = line.floor_char_boundary(TITLE_SUMMARY_CHARS);
+    let ellipsis = if cut < line.len() { "…" } else { "" };
+    format!("{}{ellipsis}", &line[..cut])
+}
+
+/// A fix thread to open: the thread, its first prompt and title, who runs it,
+/// and the reason its first message carries.
+pub(crate) struct FixThreadOpening {
+    pub(crate) thread_id: Uuid,
+    pub(crate) prompt: String,
+    pub(crate) title: String,
+    pub(crate) implementer: Implementer,
+    pub(crate) reason: EngineReason,
+}
+
+/// The red check's fix thread. `landed` is what landed in the check's range,
+/// or `None` when git could not list it.
+pub(crate) fn red_opening(
+    red: &RedCheck,
+    landed: Option<&[LandedChange]>,
+    workspace: &str,
+) -> FixThreadOpening {
+    FixThreadOpening {
+        thread_id: red.fix_thread_id,
+        prompt: build_fix_thread_prompt(red, landed, workspace),
+        title: fix_thread_title(&red.summary),
+        implementer: fix_thread_implementer(),
+        reason: EngineReason::MainCheckRed,
+    }
+}
+
+/// The flaky fix thread of a check that passed with flaky tests.
+pub(crate) fn flaky_opening(
+    flaky: &FlakyFix,
+    landed: Option<&[LandedChange]>,
+    workspace: &str,
+) -> FixThreadOpening {
+    FixThreadOpening {
+        thread_id: flaky.fix_thread_id,
+        prompt: build_flaky_fix_thread_prompt(flaky, landed, workspace),
+        title: flaky_fix_thread_title(&flaky.flaky),
+        implementer: fix_thread_implementer(),
+        reason: EngineReason::MainCheckFlaky,
+    }
+}
+
+/// The fix thread's first prompt.
 pub(crate) fn build_fix_thread_prompt(
     red: &RedCheck,
     landed: Option<&[LandedChange]>,
     workspace: &str,
 ) -> String {
-    let range = &red.range;
     let mut prompt = format!(
         "The main check failed on main at {to}. It ran the engine suite and every e2e suite \
          on GitHub against a stripped copy of main.\n\n\
          What failed: {summary}\n",
-        to = range.to_sha,
+        to = red.range.to_sha,
         summary = red.summary,
     );
-    if let Some(url) = &red.run_url {
+    push_run_url(&mut prompt, red.run_url.as_deref());
+    if red.failures.is_empty() {
+        if !red.tail.trim().is_empty() {
+            prompt.push_str(&format!(
+                "\nThe end of the failing output:\n```\n{}\n```\n",
+                red.tail.trim_end()
+            ));
+        }
+    } else {
+        push_failures(&mut prompt, "The failed tests", &red.failures);
+    }
+    push_range(&mut prompt, &red.range, landed, workspace);
+    prompt.push_str(FIX_RULES);
+    prompt.push_str(RED_ENDING);
+    prompt
+}
+
+/// The flaky fix thread's first prompt: the red prompt, framed as flaky.
+pub(crate) fn build_flaky_fix_thread_prompt(
+    flaky: &FlakyFix,
+    landed: Option<&[LandedChange]>,
+    workspace: &str,
+) -> String {
+    let mut prompt = format!(
+        "The main check passed on main at {to}, but {n} test(s) failed once and passed on a \
+         retry. They are flaky. Nothing is red, and no check waits on you. The check ran the \
+         engine suite and every e2e suite on GitHub against a stripped copy of main.\n",
+        to = flaky.range.to_sha,
+        n = flaky.flaky.len(),
+    );
+    push_run_url(&mut prompt, flaky.run_url.as_deref());
+    push_failures(&mut prompt, "The flaky tests", &flaky.flaky);
+    push_range(&mut prompt, &flaky.range, landed, workspace);
+    prompt.push_str(FIX_RULES);
+    prompt.push_str(FLAKY_ENDING);
+    prompt
+}
+
+fn push_run_url(prompt: &mut String, run_url: Option<&str>) {
+    if let Some(url) = run_url {
         prompt.push_str(&format!("The run: {url}\n"));
     }
-    if !red.tail.trim().is_empty() {
-        prompt.push_str(&format!(
-            "\nThe end of the failing output:\n```\n{}\n```\n",
-            red.tail.trim_end()
-        ));
-    }
+}
+
+/// The range the check covered, and the changes that landed in it.
+fn push_range(
+    prompt: &mut String,
+    range: &CheckRange,
+    landed: Option<&[LandedChange]>,
+    workspace: &str,
+) {
     prompt.push_str(&format!(
         "\nIt covers what landed in {from}..{to}",
         from = range.from_sha,
@@ -74,12 +190,32 @@ pub(crate) fn build_fix_thread_prompt(
         }
         None => prompt.push_str(". Git could not list the changes in it.\n"),
     }
-    prompt.push_str(
-        "\nFind the cause and fix it on your own branch, with a test that fails without the \
-         fix. Run `/harden`, then end your turn. The maintainer applies your change. The \
-         red closes when it lands, and the next check covers it.",
-    );
-    prompt
+}
+
+/// What a fix thread must not do, and what it does instead.
+const FIX_RULES: &str =
+    "\nThe check runs on Linux, and the failure may be Linux only. Find the cause and \
+     fix it on your own branch, with a test that fails without the fix.\n\n\
+     A timing failure is a race to find, not a number to raise. Raise a timeout, a retry \
+     count or a frame allowance only for a measured reason, and state the measurement in \
+     the commit.\n\n\
+     Once you know the cause, this is a handoff checkpoint: run `lucidos successor offer \
+     --at root-cause` and follow what it prints.\n\n\
+     Run `/harden`, then end your turn. The maintainer applies your change. ";
+const RED_ENDING: &str = "The red closes when it lands, and the next check covers it.";
+const FLAKY_ENDING: &str = "This thread closes when it lands, or when the maintainer \
+     archives or deletes it. Adding a retry to a flaky test is no fix.";
+
+/// One entry per test: its suite, its name, and the head of its error.
+fn push_failures(prompt: &mut String, heading: &str, tests: &[FailedTest]) {
+    prompt.push_str(&format!("\n{heading} ({}):\n", tests.len()));
+    for test in tests {
+        prompt.push_str(&format!("- {}: {}\n", test.suite, test.name));
+        let detail = test.detail.trim();
+        if !detail.is_empty() {
+            prompt.push_str(&format!("```\n{detail}\n```\n"));
+        }
+    }
 }
 
 /// The changes whose landing merges sit on `main`'s first-parent line in
@@ -141,6 +277,7 @@ mod tests {
             },
             summary: "Failed: engine, browser chromium.".into(),
             tail: tail.into(),
+            failures: Vec::new(),
             run_url: run_url.map(str::to_string),
             fix_thread_id: Uuid::nil(),
         }
@@ -173,6 +310,70 @@ mod tests {
         ] {
             assert!(prompt.contains(needle), "missing {needle:?} in:\n{prompt}");
         }
+    }
+
+    fn failure(suite: &str, name: &str, detail: &str) -> FailedTest {
+        FailedTest {
+            suite: suite.into(),
+            name: name.into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// The failed tests lead, and the raw tail stays out once they parsed.
+    #[test]
+    fn the_prompt_lists_every_failed_test_in_place_of_the_tail() {
+        let mut check = red("totals only", None);
+        check.failures = vec![
+            failure("engine", "engine::a::b", "panicked at a.rs:1"),
+            failure("browser chromium", "e2e/x.spec.ts:3:1 › opens", ""),
+        ];
+        let prompt = build_fix_thread_prompt(&check, Some(&[]), "myws");
+        for needle in [
+            "The failed tests (2):",
+            "- engine: engine::a::b\n```\npanicked at a.rs:1\n```",
+            "- browser chromium: e2e/x.spec.ts:3:1 › opens\n",
+        ] {
+            assert!(prompt.contains(needle), "missing {needle:?} in:\n{prompt}");
+        }
+        assert!(!prompt.contains("totals only"));
+    }
+
+    /// A timing failure is a race, and the prompt says so.
+    #[test]
+    fn the_prompt_forbids_the_symptom_fix_and_names_linux() {
+        let prompt = build_fix_thread_prompt(&red("", None), Some(&[]), "myws");
+        for needle in [
+            "runs on Linux",
+            "race to find",
+            "Raise a timeout, a retry count or a frame allowance only for a measured reason",
+        ] {
+            assert!(prompt.contains(needle), "missing {needle:?} in:\n{prompt}");
+        }
+    }
+
+    /// The fix thread's implementer is one the pickers offer, so it cannot
+    /// rot into a refusal at the first red.
+    #[test]
+    fn the_fix_thread_implementer_is_one_the_backend_offers() {
+        let implementer = fix_thread_implementer();
+        let model = implementer.model.as_deref();
+        assert_eq!(
+            crate::runtime::validate_coding_agent_model(implementer.coding_agent, model),
+            Ok(model.map(str::to_string))
+        );
+        let effort = implementer.reasoning_effort.as_deref();
+        assert_eq!(
+            crate::runtime::validate_coding_agent_effort(implementer.coding_agent, model, effort),
+            Ok(effort.map(str::to_string))
+        );
+    }
+
+    #[test]
+    fn the_prompt_names_the_handoff_checkpoint() {
+        let prompt = build_fix_thread_prompt(&red("", None), Some(&[]), "myws");
+        assert!(prompt.contains("handoff checkpoint"));
+        assert!(prompt.contains("`lucidos successor offer --at root-cause`"));
     }
 
     #[test]

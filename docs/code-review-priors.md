@@ -15,6 +15,29 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **Two engines never write one workspace database at once.** A reviewer
+  reports a race between an overlapping old and new engine. One example is the
+  gateway telemetry cursor's opt-out flag, cleared by one engine while the
+  other sets it. The engine takes the workspace's exclusive owner lock in
+  `main.rs` before anything stateful (ADR 0438). So a successor starts only
+  once its predecessor has died. Re-flag only a writer outside the engine.
+
+- **No withdraw beats the stranded redelivery, though its lookup runs before
+  the spawn.** A reviewer reports that a Remove during the startup tombstones
+  a message the early snapshot then redelivers. Such a Remove waits in the run
+  loop's withdraw channel, which the loop reads only after the redelivery is
+  queued and marked unforwarded. The claim path needs the thread claim, which
+  the starting run holds (ADR 0506). Re-flag only if a tombstone path bypasses
+  both.
+
+- **An unmeasured context takes the plan card's small branch.** A reviewer
+  reports that `card_shape` (`crates/lucidos-cli/src/planned.rs`) offers a new
+  thread when `input_tokens` is null, and asks for the plain floor. That is the
+  design: the small card offers a new thread only for a cheaper implementer,
+  which pays off at any size (ADR 0497). A handoff needs only `can_hand_off`.
+  Only an unreadable engine reply (`ContextReading::Unknown`) keeps the floor.
+  Re-flag only if the small card offers this thread's own implementer.
+
 - **A lane batch's integration branch may carry commits beyond its landing
   merges.** A reviewer reports that the landing check finds each member's
   landing merge anywhere on the first-parent range, so extra or reordered
@@ -1020,7 +1043,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `crates/lucidos-engine/src/api/webhooks.rs`, ADR 0143.)
 
 - **`AuthType::Secret` stays in the `CRED_*` fan-out, unlike `oauth_client`.** A
-  reviewer reads the one exclusion in `credential_env_vars` and proposes a
+  reviewer reads the one exclusion in `named_credential_env_vars` and proposes a
   second. A webhook signing secret has exactly one reader, `verify`, which reads
   the table. So the `oauth_client` reasoning looks to apply: broadcast into
   every `run_bash` / `run_python` / scheduled script for no reader.
@@ -1241,6 +1264,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   on every keystroke. Re-flag only if the Text tab stops saying it was cut.
   (`engine/text_search.rs`, ADR 0383.)
 
+- **A session's first prompt writes no `CodingAgentPromptSent`.** A reviewer
+  reads `undelivered_input`'s exclusion of messages a `CodingAgentPromptSent`
+  names as dropping the opening prompt too. The spawn hands the first prompt
+  straight to the ledger and the agent (`run_session/run.rs`, "The first prompt
+  is the first owed input"). Only a forwarded follow-up writes the event.
+  Re-flag only if the spawn path starts writing one for its first prompt.
+  (`agent_recovery/undelivered_input.rs`.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -1320,6 +1351,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **A feed notice that takes `meta` still appears when SSE sets its field in
+  place.** A reviewer applies the cache-warm-line fix to `StoppedChildNotice`,
+  `ContinuedInNotice` and `ContinuedFromNotice`, since SSE mutates `meta`. But
+  `@preact/signals`' `shouldComponentUpdate` skips a render only when the last
+  render read a signal or held hook state, and a notice rendering null did
+  neither. Once shown, `successorLinkTitle` reads `threadMap`, which every SSE
+  flush replaces. `CacheWarmLine` broke because it holds hook state. Re-flag
+  only a notice that gains a hook or reads a signal before its null return.
+
 - **The memory choice's Use Tree is enabled for a model the estimate cannot
   price.** A reviewer reports that Use Tree waits only for the estimate, so an
   unpriced compactor model starts Tree with no price shown. That matches the
@@ -1332,7 +1372,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   MCP tool switch, a row intent, a notification read) and asks to resend it.
   ADR 0437 settles that a refused write shows the server's state and says why
   with a toast, and a retry is the path it replaced. Re-flag only a failure
-  that drops the intent with no toast.
+  that drops the intent with no toast. The one resend allowed is
+  `retryTransient` on an idempotent write, such as the notification read: it
+  runs before any verdict, because a timeout or a lost connection is not one.
 
 - **A keepMounted modal's exit drawing does not bring back the iOS ghost
   pixels.** A reviewer cites the file-search fixes and reads the fading copy
@@ -2223,7 +2265,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   "workspace name gone from the brand" regression. (Desktop has no spacer siblings
   and a fixed-width brand-label with its own slack, so the sum is a no-op there.)
   Guarded by
-  `e2e/mobile-threads-title-alignment.spec.ts` (center ≈ row middle + left edge ≥
+  `e2e/mobile-threads-title-alignment-all.spec.ts` (center ≈ row middle + left edge ≥
   leading cluster). Re-flag only if the title loses `position:absolute` (regresses
   to off-center) or the content actions lose their `z-index` lift. The content
   title's tap tooltip (`e2e/tooltip-swipe-dismiss-mobile.spec.ts`) works because
@@ -2528,7 +2570,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   not. Re-flag only with a measurement showing an engine that stores a
   fractional `scrollTop` it was handed.
   (`components/chat/CreateThreadView.tsx`,
-  `e2e/turn-control-holds-the-reader-still.spec.ts`.)
+  `e2e/turn-control-holds-the-reader-still-all.spec.ts`.)
 
 - **Multiplication inside `calc()`, custom properties included, is not an
   unsupported-browser risk here** (2026-08-12, Codex). The context viewer's
@@ -3117,6 +3159,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Scripts (bash)
 
+- **A cargo test command may carry several name filters.** A reviewer reports
+  that `test-engine.sh -- -- --exact a b` fails because libtest accepts one
+  positional filter. libtest takes any number, and `--exact` applies to each,
+  so `hs_engine_tests_command` retries every failed test in one run.
+
+- **The engine input manifest reads absolute dep-info paths.** A reviewer
+  reports that `engine_manifest.sh` drops relative dep-info paths when run
+  outside the repository root. Cargo writes absolute paths into an uplifted
+  `.d` file unless `build.dep-info-basedir` is set, and this repo sets none.
+  Re-flag only if that setting appears.
+
 - **The stale debug object prune checks cargo's lock, then deletes without
   holding it.** A reviewer reports a race: a cargo takes `.cargo-lock` after
   the last check in `prune_stale_debug_objects` and loses objects mid-link. But
@@ -3358,7 +3411,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   process.
 
   Both ends of that incident are NAV specs. Neither
-  `coding-agent-question.spec.ts` (the leak) nor `drafts.spec.ts` (the victim)
+  `coding-agent-question.spec.ts` (the leak) nor `drafts-all.spec.ts` (the victim)
   calls `pickComposeDestination`, so both land in the navigation phase whichever
   order runs. What the split changed there was alphabetical distance: it removes
   the CC-destination files that used to sit between them, which brings the victim
@@ -3594,7 +3647,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Pinned by `api::sdk::tests::iframe_body_is_sized_from_the_type_scale`,
   `styles/__tests__/text-defaults-guard.test.ts`, and the rendered
-  `e2e/type-scale.spec.ts`. Re-flag if any of the three defaults goes missing,
+  `e2e/type-scale-all.spec.ts`. Re-flag if any of the three defaults goes missing,
   or if a `font` shorthand appears on the control rule.
   (`crates/lucidos-engine/src/api/sdk_iframe.css`, `styles/global/base.css`.)
 
@@ -4492,3 +4545,55 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   empty string. `try_stored` does not, so a caller reading the raw row filters
   blank itself. Re-flag only a `try_stored` caller that skips that filter.
   (`core/preferences.rs`, `llm/judgment/endpoint.rs`.)
+
+- **Libtest takes many positional filters.** A reviewer sees the shard rerun
+  pass every failed test name as a positional argument to one `cargo test`
+  call and says libtest accepts only one. It accepts any number: each is a
+  filter, and `--exact` makes each an exact name. The rerun then checks that
+  the passed count equals the name count, so an unmatched name cannot pass.
+  Re-flag only a runner that is not libtest. (`scripts/lib/e2e_flaky.sh`.)
+
+- **A successor title ending in a small number reads as a chain position.**
+  A reviewer sees `successor_title` strip a trailing ` (N)` from a title the
+  user wrote, such as "Investigate retry (2)", and wants chain metadata
+  instead. The owner chose this rule: the title carries the position, and a
+  user title that ends in a small parenthesised number is deliberately
+  ignored. Only 2 to 99 counts, so a year is safe. Re-flag only a successor
+  title that loses text other than a chain suffix. (`engine/successor.rs`.)
+
+- **The agent role password rotates at every boot, by design.** A reviewer
+  sees `agent_role::provision` set a new password per boot and argues two
+  engines on one database invalidate each other's `LUCIDOS_DATABASE_URL`. One
+  engine serves a workspace database. Two overlap only for a switch, where
+  the old one is going away and its open connections keep working (ADR 0509).
+  Re-flag only a design where two engines serve one database for good. (`core/agent_role.rs`.)
+
+- **A sealed value with the right key id is trusted at boot.** A reviewer
+  wants the boot check or `secrets discard` to open every sealed value, to
+  catch a truncated ciphertext. Only the engine role writes a secret column,
+  so a corrupt one means a damaged database, not a lost key. Its read fails
+  loudly, and saving it again fixes it, while a lost key loses every secret
+  at once. Re-flag only a writer that can store a value the key cannot open.
+  (`core/secret_store/boot.rs`.)
+
+- **A null effort in the switch estimate means "unchanged".** A reviewer reads
+  `fetchSwitchEstimate(..., null)` as a reset to the default effort that the
+  estimate then misses. On a coding-agent thread the Default row sends only
+  `set_model` and never `set_reasoning_effort`, so the effort really does stay.
+  A chat pair carries a null effort only for a model with no effort tiers.
+  Re-flag only a pick that clears an effort the thread already holds.
+  (`api/client/successor.ts`.)
+
+- **A failed new-chat folder pick toasts even after the reader moved on.**
+  `prefillNewChatDestination` shows the warning before its focus guard, on
+  purpose. The guard only stops the picks from landing on another draft. The
+  requester's failed request is still news to the reader. Re-flag only a
+  toast that fires for a request nobody made.
+  (`store/actions/newChatPrefill.ts`.)
+
+- **`refreshApps` in a new-chat prefill is not a second reload restore.** A
+  reviewer reads it as able to reopen the saved app over the new chat. The
+  restore is a one-shot inside `loadApps`, which boot already ran or has in
+  flight, and `refreshApps` joins that load. Reading the list through
+  `listApps` instead breaks the Loadable guard.
+  (`store/actions/newChatPrefill.ts`.)

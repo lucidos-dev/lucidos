@@ -1,4 +1,4 @@
-import type { WidgetSize } from '../generated/thread-event-wire';
+import type { TileSize, WidgetSize } from '../generated/thread-event-wire';
 import { errorDetail } from '../utils/errorDetail';
 import type { PluginLocalChangesResult } from '../api/client/apps';
 import type { WebhookIngress, WebhookRefusals } from '../api/client/webhooks';
@@ -10,7 +10,14 @@ import type {
   FormRequestOutcome,
   QuestionOption,
 } from './thread-events/thread-event-types';
-import type { ApiUsage, ContextProducer, ContextSection, RecalledMemory } from '../generated/thread-event-wire';
+import type {
+  ApiUsage,
+  ContextProducer,
+  ContextSection,
+  MessageOrigin,
+  PluginSetupOccasion,
+  RecalledMemory,
+} from '../generated/thread-event-wire';
 import type { Tap } from '@lucidos/sdk';
 
 // Generated from the Rust payload types. Re-exported so a consumer reaching
@@ -295,6 +302,14 @@ type ResponseEventKind =
     }
   | { type: 'section_break'; channel: string }
   | {
+      /** The engine restarted the agent mid-turn and the turn carried on,
+       *  from a `ContinuationStarted` folded into the turn it continued. Only
+       *  an effort pick folds today (`foldsAsEffortRestart`). */
+      type: 'restart';
+      reason: string;
+      actor?: MessageOrigin;
+    }
+  | {
       /** An agent-sent message a coding agent holds until a human replies
        *  (ADR 0256). `released` flips once its `HeldMessageReleased` lands. */
       type: 'held_message';
@@ -534,6 +549,8 @@ export type { EventSubscription };
 export interface TriggerInfo {
   id: string;
   name: string;
+  /** Stable kebab-case id, the directory of its knowhow. */
+  slug: string;
   cron_expressions: string[];
   timezone: string;
   paused: boolean;
@@ -678,7 +695,17 @@ export function deriveTriggerType(trigger: TriggerInfo): TriggerType {
 /** How a stored credential is used. Every value but `secret` says how the
  *  credential is SENT. A `secret` is sent nowhere: it is a shared secret with no
  *  transport role, fed to a computation such as a webhook's HMAC. */
-export type AuthType = 'api_key' | 'bearer' | 'basic' | 'password' | 'oauth_client' | 'email_password' | 'secret';
+export type AuthType =
+  | 'api_key'
+  | 'bearer'
+  | 'basic'
+  | 'password'
+  | 'oauth_client'
+  | 'email_password'
+  | 'secret'
+  /** The token that reads every *secret reference*. Settings, 1Password owns
+   *  it, so the Credentials list leaves it out. */
+  | 'onepassword_service_account';
 
 // A credential
 export interface CredentialInfo {
@@ -698,6 +725,9 @@ export interface CredentialInfo {
   /** Custom env var name the credential's secret is exposed under, overriding
    *  the default `CRED_<NAME>`. `null` when using the default. */
   env_var_name?: string | null;
+  /** Whether a secret field holds a *secret reference* (`op://…`), read from
+   *  1Password on each use rather than stored here. */
+  secret_reference: boolean;
 }
 
 // Email account server settings (no password) — used to pre-fill the edit form
@@ -818,11 +848,11 @@ export interface App {
   built_in?: boolean;
   /** A widget's *widget sizes*, first the default (ADR 0432). Absent for an app. */
   sizes?: WidgetSize[];
-  /** A widget whose Home board tile is see-through, so it draws its own shape. */
+  /** A widget whose dashboard tile is see-through, so it draws its own shape. */
   transparent?: boolean;
 }
 
-export type { WidgetSize };
+export type { TileSize, WidgetSize };
 
 /** One name a widget takes in its params (`engine::core::AppParam`). */
 export interface AppParam {
@@ -883,7 +913,20 @@ export interface PluginMedia {
 /** Red for an action that destroys something, blue for everything else. */
 export type ConfirmVariant = 'danger' | 'default';
 
-export interface ConfirmState {
+/** A confirm that weighs two ways forward draws them as *confirm choices*: two cards, each
+ *  explaining itself, with Cancel alone in the foot. The OK card resolves true;
+ *  the alternative runs `onClick`, then resolves false, like an extra action. */
+export interface ConfirmChoices {
+  okDetail: string;
+  alternative: { label: string; detail: string; onClick: () => void };
+}
+
+/** A confirm offers an extra button or confirm choices, never both. */
+export type ConfirmAlternative =
+  | { extraAction?: ToastAction; choices?: never }
+  | { choices: ConfirmChoices; extraAction?: never };
+
+export type ConfirmState = ConfirmAlternative & {
   visible: boolean;
   message: string;
   okLabel: string;
@@ -891,14 +934,13 @@ export interface ConfirmState {
   cancelLabel?: string;
   variant?: ConfirmVariant;
   resolve?: (value: boolean) => void;
-  extraAction?: ToastAction;
   details?: ConfirmDetails;
   /** An ACKNOWLEDGEMENT: news the user has to read, with nothing to decide. It
    *  drops the Cancel button, because a second button that means the same as
    *  the first is a choice the user does not have. Escape and an outside click
    *  still resolve, and they resolve TRUE: there is no "no" to express. */
   acknowledge?: boolean;
-}
+};
 
 /** A long operation the user cannot work through, narrated as a modal.
  *
@@ -1172,6 +1214,10 @@ export interface PluginInstallRequest {
   /** Subset of `files` that already exist under `data/` and would be
    *  overwritten. Highlight separately from the rest. */
   overwrites: string[];
+  /** `data/`-relative paths the previous version shipped and this one dropped,
+   *  which confirming deletes. Edited ones also appear in `local_changes`.
+   *  Absent on a request staged before the engine sent it. */
+  removes?: string[];
   /** True when this plugin is already installed, so confirming updates it.
    *  Read from its install record, never from `overwrites`. Absent on a
    *  request staged before the engine sent it. */
@@ -1179,9 +1225,13 @@ export interface PluginInstallRequest {
   /** Optional post-install instruction text from the manifest. Render as
    *  markdown so the LLM-shippable instructions wrap nicely. */
   setup?: string | null;
-  /** Per-file outcome for every shipped path the user has locally edited. Lets
-   *  the panel say what an update keeps and what it loses BEFORE they confirm.
-   *  Empty for a fresh install and for an untouched plugin. */
+  /** The setup thread confirming would start, decided by the same function
+   *  confirm uses. Null when it would start none, absent on a request staged
+   *  before the engine sent it. */
+  setup_run?: PluginSetupOccasion | null;
+  /** Per-file outcome for every path the user has locally edited that the
+   *  update overwrites or removes. Lets the panel say what an update keeps and
+   *  what it loses BEFORE they confirm. Empty for a fresh install. */
   local_changes?: PluginLocalChange[];
   plugin_id: string;
   plugin_version: string;
@@ -1200,8 +1250,15 @@ export interface PluginInstallRequest {
  *    is saved aside and upstream lands.
  *  - `restored`: the user had DELETED the file and upstream still ships it, so
  *    it comes back. No copy is saved, because a deletion has no content. Its
- *    own outcome so that `replaced` always implies a saved copy exists. */
-export type PluginLocalChangeOutcome = 'merged' | 'conflict' | 'replaced' | 'restored';
+ *    own outcome so that `replaced` always implies a saved copy exists.
+ *  - `removed`: the new version no longer ships the file, so it is deleted
+ *    after the edit is saved aside. The keep control cannot change this. */
+export type PluginLocalChangeOutcome =
+  | 'merged'
+  | 'conflict'
+  | 'replaced'
+  | 'restored'
+  | 'removed';
 
 export interface PluginLocalChange {
   path: string;
@@ -1218,6 +1275,8 @@ export interface PluginInstallReceipt {
   at: string;
   summary: string;
   installed_files: string[];
+  /** Files the update deleted because this version dropped them. */
+  removed_files?: string[];
   /** What the install actually did to the user's local edits. Absent when it
    *  met none. The engine's answer, not the staged request's guess. */
   local_changes?: PluginLocalChangesResult;

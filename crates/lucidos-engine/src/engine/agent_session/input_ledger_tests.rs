@@ -481,3 +481,44 @@ fn a_session_that_ends_first_closes_the_waiter() {
         Err(tokio::sync::oneshot::error::TryRecvError::Closed)
     );
 }
+
+/// The strand repro. An effort pick interrupted a new session's first turn
+/// before Claude Code read its prompt, and no read ever came. Owing the prompt
+/// kept the process up, and the effort resume never ran.
+#[test]
+fn an_interrupt_before_the_first_read_owes_nothing() {
+    let mut ledger = InputLedger::new();
+    let prompt_event = Uuid::new_v4();
+    ledger.forwarded(vec![prompt_event], &sent("Hey"), None);
+
+    ledger.observe(&result());
+    assert_eq!(ledger.turn_interrupted(), [prompt_event]);
+    ledger.turn_ended();
+    assert_eq!(at_idle(&ledger), TerminateDecision::Terminate);
+}
+
+/// Claude Code reads its queue after an interrupt, so only the input the
+/// interrupt discarded stops being owed. A turn that read its input discards
+/// nothing.
+#[test]
+fn an_interrupt_keeps_the_inputs_queued_behind_the_turn_owed() {
+    let (prompt, queued) = (sent("Hey"), sent("and also"));
+    let prompt_event = Uuid::new_v4();
+    let mut unread_first = InputLedger::new();
+    unread_first.forwarded(vec![prompt_event], &prompt, None);
+    unread_first.forwarded(vec![Uuid::new_v4()], &queued, None);
+    unread_first.observe(&result());
+    assert_eq!(unread_first.turn_interrupted(), [prompt_event]);
+    unread_first.turn_ended();
+    assert!(unread_first.owes(queued.uuid));
+    assert!(!unread_first.owes(prompt.uuid));
+
+    let mut read_first = InputLedger::new();
+    read_first.forwarded(vec![Uuid::new_v4()], &prompt, None);
+    read_first.observe(&read(&prompt));
+    read_first.forwarded(vec![Uuid::new_v4()], &queued, None);
+    read_first.observe(&result());
+    assert!(read_first.turn_interrupted().is_empty());
+    read_first.turn_ended();
+    assert!(read_first.owes(queued.uuid));
+}

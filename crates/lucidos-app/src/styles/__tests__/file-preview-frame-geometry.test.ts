@@ -21,7 +21,7 @@
  * A source scan rather than a browser test, matching the sibling geometry
  * guards: what regresses here is which declaration is written, and the visible
  * symptom (a nested scrollbar) needs a tall file in a real preview to show up at
- * all. `e2e/repo-files.spec.ts` exercises the preview end to end.
+ * all. `e2e/repo-files-all.spec.ts` exercises the preview end to end.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project

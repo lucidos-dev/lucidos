@@ -2,17 +2,21 @@
 //! trying (ADR 0014, 2026-07-29 + 2026-08-03 addenda).
 //!
 //! The sibling [`crate::boot_phase`] narrates boot *progress*; this narrates a
-//! boot that did not get there. Two producers write one of these:
+//! boot that did not get there. Three producers write one of these:
 //!
 //!   * **engine-reported** and always [`Terminal`]: a dying engine POSTs the
 //!     reason to `/~/api/v1/control/workspaces/:id/boot-failure` on its way out,
 //!     canonically a database migrated by a NEWER Lucidos (see the engine's own
 //!     `boot_failure.rs`). The engine only reports what it has classified as
 //!     unfixable, so the gateway stops respawning immediately.
-//!   * **gateway-observed**, either kind: Postgres provisioning failed. The
-//!     gateway classifies it via [`crate::postgres::ProvisionErrorKind`], so an
+//!   * **gateway-observed**, either kind: Postgres provisioning or the engine
+//!     spawn failed. [`crate::postgres::ProvisionErrorKind`] classifies it. An
 //!     environment condition that can clear (Docker Desktop still starting) is
-//!     [`Retrying`] while one that cannot (no `docker` on PATH) is [`Terminal`].
+//!     [`Retrying`], while one that cannot (no `docker` on PATH) is [`Terminal`].
+//!   * **the give-up**, always [`Terminal`]: the restart budget ran out. The
+//!     last provisioning attempt or the supervisor restates a cause that could
+//!     have cleared ([`BootFailure::gave_up`]). With none recorded, the
+//!     supervisor records a cause-less one ([`BootFailure::gave_up_without_cause`]).
 //!
 //! The distinction is not cosmetic: it decides both whether the supervisor
 //! retries and which splash the user gets. A [`Terminal`] failure renders
@@ -77,6 +81,13 @@ impl BootFailure {
                 attempts
             )),
         }
+    }
+
+    /// The give-up when no cause is recorded: the last attempt spawned an
+    /// engine that exited before it was healthy. No count, because the attempt
+    /// counter does not include a first spawn that succeeded.
+    pub fn gave_up_without_cause() -> Self {
+        Self::terminal("The engine kept stopping before it was ready.")
     }
 
     /// Whether the supervisor should stop here. The one input
@@ -155,6 +166,15 @@ mod tests {
         // give-up restatement would only bury it under attempt bookkeeping.
         let f = BootFailure::terminal("A newer Lucidos migrated this database.");
         assert_eq!(f.gave_up(5), f);
+    }
+
+    /// An engine that kept exiting before it could report why. Without a
+    /// terminal failure the splash would poll "Starting…" forever.
+    #[test]
+    fn giving_up_with_no_cause_is_still_terminal() {
+        let f = BootFailure::gave_up_without_cause();
+        assert!(f.is_terminal());
+        assert!(!f.message().contains("Retrying"), "{}", f.message());
     }
 
     #[test]

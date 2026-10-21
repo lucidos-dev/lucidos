@@ -1,4 +1,5 @@
 @import './chat/input-messages.css';
+@import './chat/rung-control.css';
 @import './chat/response.css';
 @import './chat/waiting-indicator.css';
 @import './chat/voice-call.css';

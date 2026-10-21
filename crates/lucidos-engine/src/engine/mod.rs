@@ -10,6 +10,7 @@ mod archive_request;
 pub mod auto_compact_trial;
 pub(crate) mod aux_purpose;
 mod background_build;
+pub(crate) mod cache_ttl;
 pub mod cc_permission;
 pub mod cc_question_wait;
 pub(crate) mod cc_settings;
@@ -18,6 +19,7 @@ pub mod change_summary_consumer;
 pub mod changelog;
 pub(in crate::engine) mod chat;
 pub(crate) mod claude_code;
+pub(crate) mod claude_gateway_sign_in;
 pub(crate) mod command_guard;
 pub(crate) mod command_judge;
 pub use command_judge::{classify_for_eval as classify_command_for_eval, EvalVerdict};
@@ -39,8 +41,10 @@ pub mod form_requests;
 pub mod frontend_preview;
 mod frontend_refresh;
 pub use frontend_refresh::register_as_build_watch_consumer;
+pub mod dashboard;
 pub(crate) mod git_ops;
-pub mod home_board;
+pub mod handoff_estimate;
+pub(crate) mod handoff_history;
 pub mod home_thread;
 pub mod http;
 pub(crate) mod image_size_hint;
@@ -72,6 +76,7 @@ pub mod standing_apply;
 pub mod successor;
 pub mod summary_tree;
 pub mod supervisor_respawn_sidecar;
+pub mod switch_estimate;
 pub(crate) mod text_search;
 pub mod thread_events;
 pub(crate) mod thread_family;
@@ -115,7 +120,7 @@ pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
 pub(crate) use change_ops::SET_ASIDE_APPLY_REFUSAL;
 pub(crate) use landing_lane::LaneRemoval;
 pub(crate) use main_check::{
-    CloseRefusal as MainCheckCloseRefusal, MainCheckSnapshot, RedCloseReason,
+    CloseRefusal as MainCheckCloseRefusal, FailedTest, MainCheckSnapshot, RedCloseReason,
 };
 // The child-follow-up vocabulary, re-exported for the HTTP route in
 // `api::threads::follow_up`, which is outside `engine`. Only the ack and the
@@ -669,6 +674,9 @@ pub struct LucidosEngine {
     /// App UI captures waiting for an answer. `capture_app` / `refresh_app`
     /// insert one; `POST /api/v1/app-capture` resolves it.
     pub(crate) pending_captures: Arc<tools::app_capture::PendingCaptures>,
+    /// The Claude gateway sign-in in progress, if any. Allowed-ephemeral: a
+    /// restart mid-sign-in only means starting again.
+    pub(crate) claude_gateway_sign_in: Arc<claude_gateway_sign_in::ClaudeGatewaySignIn>,
     /// Plugin installs awaiting user confirmation in the install panel.
     /// Key: install_id (UUID). Value: staged plugin tree + manifest. Inserted
     /// when `install_plugin` returns the `[PLUGIN_INSTALL_REQUEST]` sentinel;
@@ -694,6 +702,9 @@ pub struct LucidosEngine {
     pub frontend_origin: std::sync::Mutex<Option<String>>,
     /// Active coding-agent sessions keyed by thread_id.
     pub(crate) agent_sessions: Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
+    /// The device and preferences block each coding-agent conversation last
+    /// read. A cache: an empty map only costs one repeated block.
+    pub(crate) sent_device_contexts: Arc<agent_context::SentDeviceContexts>,
     /// The changes an apply holds right now. See `change_ops::apply_claim`.
     pub(crate) apply_claims: Arc<change_ops::apply_claim::ApplyClaims>,
     /// The live workspace *view snapshots* of the Tree memory module, one per
@@ -813,12 +824,12 @@ pub struct LucidosEngine {
     /// a call cannot outlive the process holding its socket, and the boot sweep
     /// settles what a dead one left behind.
     pub voice_sessions: crate::voice::registry::LiveVoiceSessions,
-    /// Threads with a name being generated right now.
+    /// Threads with a namer at work: generating a name, or waiting to retry one.
     ///
-    /// A thread is named once, and `thread_has_title` alone cannot hold that:
-    /// naming takes a model call, so two askers a second apart both read "no
-    /// name yet" and both write one. Two follow-up messages sent a second
-    /// apart are exactly that.
+    /// A thread is named once, and the namer's "no title yet" read alone cannot
+    /// hold that: naming takes a model call, so two askers a second apart both
+    /// read "no name yet" and both write one. Two follow-up messages sent a
+    /// second apart are exactly that.
     ///
     /// Transient, like every other guard here. A process that dies mid-name
     /// simply leaves the thread nameable again, which is the safe direction.
@@ -1143,6 +1154,9 @@ fn provider_config_trigger(event: &event_bus::BusEvent) -> Option<String> {
         {
             Some(format!("the '{key}' preference"))
         }
+        BusEvent::System(
+            SystemEvent::ClaudeGatewaySignedIn { .. } | SystemEvent::ClaudeGatewaySignedOut { .. },
+        ) => Some("the Claude gateway sign-in".to_string()),
         _ => None,
     }
 }
@@ -1163,14 +1177,14 @@ fn provider_config_read(
 
 /// Hot-swap the engine's active LLM provider when its configuration changes.
 ///
-/// Two kinds of change qualify, because a provider is configured two ways. A
-/// `Credential{Created,Updated,Deleted}` for a service in
-/// [`crate::llm::PROVIDER_CREDENTIAL_SERVICES`], and a `PreferencesChanged` for
-/// a key in [`crate::llm::PROVIDER_PREFERENCE_KEYS`]. The keyless OpenCode Free
-/// tier has no credential at all, so a credential-only watch would leave its
-/// toggle needing a restart.
+/// Three kinds of change qualify, because a provider is configured three ways.
+/// A `Credential{Created,Updated,Deleted}` for a service in
+/// [`crate::llm::PROVIDER_CREDENTIAL_SERVICES`], a `PreferencesChanged` for a
+/// key in [`crate::llm::PROVIDER_PREFERENCE_KEYS`], and a Claude gateway
+/// sign-in or sign-out. The keyless OpenCode Free tier has no credential at
+/// all, so a credential-only watch would leave its toggle needing a restart.
 ///
-/// Either way, re-resolve `select_provider` against current DB state via
+/// Each way, re-resolve `select_provider` against current DB state via
 /// [`crate::llm::build_active_provider`] and swap the shared provider handle in
 /// place. A first-run user who configures a provider in Settings → Models →
 /// Providers then gets a working chat with NO restart. Removing the last one
@@ -1196,62 +1210,94 @@ fn spawn_provider_config_subscriber(
                 MirrorRead::Stop => break,
                 MirrorRead::Refresh(trigger) => trigger,
             };
-            match crate::llm::build_active_provider(Some(&pool), &ctx).await {
-                Ok(crate::llm::ProviderBuildOutcome::Install {
-                    llm,
-                    web_search,
-                    selection,
-                }) => {
-                    match llm_handle.write() {
-                        Ok(mut guard) => {
-                            *guard = llm;
-                            log!(
-                                "[Providers] active LLM provider swapped to {:?} after {} changed, no restart",
-                                selection,
-                                trigger
-                            );
-                        }
-                        Err(e) => {
-                            log!("[Providers] provider swap skipped (lock poisoned): {}", e)
-                        }
-                    }
-                    // Swapped in the same pass as the LLM provider: adding an
-                    // Anthropic or OpenAI key must enable web_search without a
-                    // restart, exactly as it enables chat.
-                    match web_search_handle.write() {
-                        Ok(mut guard) => {
-                            let ids = web_search.backend_ids();
-                            *guard = web_search;
-                            log!(
-                                "[Providers] web search backends now: {}",
-                                if ids.is_empty() {
-                                    "none configured".to_string()
-                                } else {
-                                    ids.join(" → ")
-                                }
-                            );
-                        }
-                        Err(e) => {
-                            log!("[Providers] web search swap skipped (lock poisoned): {}", e)
-                        }
-                    }
-                }
-                Ok(crate::llm::ProviderBuildOutcome::FailFast) => {
+            swap_in_rebuilt_providers(&pool, &ctx, &llm_handle, &web_search_handle, &trigger).await;
+        }
+    });
+}
+
+/// Makes the Claude gateway access. Each one reads the stored sign-in
+/// from `pool`, and announces a sign-in the gateway rejected on `event_bus`.
+pub(crate) fn claude_gateway_access_factory(
+    pool: sqlx::PgPool,
+    event_bus: event_bus::EventBus,
+) -> crate::llm::claude_gateway::GatewayAccessFactory {
+    let refresh_lock = Arc::new(crate::llm::claude_gateway::tokens::RefreshLock::default());
+    Arc::new(move |origin| {
+        Arc::new(
+            crate::llm::claude_gateway::tokens::StoredGatewayAccess::new(
+                pool.clone(),
+                event_bus.clone(),
+                origin,
+                refresh_lock.clone(),
+            ),
+        )
+    })
+}
+
+/// Rebuild the active LLM provider and search chain, and swap both in place.
+/// `trigger` names what changed, for the log. A failed or `FailFast` rebuild
+/// keeps the current providers.
+pub(crate) async fn swap_in_rebuilt_providers(
+    pool: &sqlx::PgPool,
+    ctx: &crate::llm::ProviderBuildContext,
+    llm_handle: &std::sync::RwLock<Arc<dyn crate::llm::LlmProvider>>,
+    web_search_handle: &std::sync::RwLock<Arc<crate::llm::WebSearchChain>>,
+    trigger: &str,
+) {
+    match crate::llm::build_active_provider(Some(pool), ctx).await {
+        Ok(crate::llm::ProviderBuildOutcome::Install {
+            llm,
+            web_search,
+            selection,
+        }) => {
+            match llm_handle.write() {
+                Ok(mut guard) => {
+                    *guard = llm;
                     log!(
-                        "[Providers] {} changed and left no provider configured, with LUCIDOS_BOOT_WITHOUT_PROVIDER off. Keeping the current provider (a restart would fail-fast)",
+                        "[Providers] active LLM provider swapped to {:?} after {} changed, no restart",
+                        selection,
                         trigger
                     );
                 }
                 Err(e) => {
+                    log!("[Providers] provider swap skipped (lock poisoned): {}", e)
+                }
+            }
+            // Swapped in the same pass as the LLM provider: adding an
+            // Anthropic or OpenAI key must enable web_search without a
+            // restart, exactly as it enables chat.
+            match web_search_handle.write() {
+                Ok(mut guard) => {
+                    let ids = web_search.backend_ids();
+                    *guard = web_search;
                     log!(
-                        "[Providers] provider rebuild after {} changed failed: {}. Keeping current provider",
-                        trigger,
-                        e
+                        "[Providers] web search backends now: {}",
+                        if ids.is_empty() {
+                            "none configured".to_string()
+                        } else {
+                            ids.join(" → ")
+                        }
                     );
+                }
+                Err(e) => {
+                    log!("[Providers] web search swap skipped (lock poisoned): {}", e)
                 }
             }
         }
-    });
+        Ok(crate::llm::ProviderBuildOutcome::FailFast) => {
+            log!(
+                "[Providers] {} changed and left no provider configured, with LUCIDOS_BOOT_WITHOUT_PROVIDER off. Keeping the current provider (a restart would fail-fast)",
+                trigger
+            );
+        }
+        Err(e) => {
+            log!(
+                "[Providers] provider rebuild after {} changed failed: {}. Keeping current provider",
+                trigger,
+                e
+            );
+        }
+    }
 }
 
 /// One-shot migration: WASM auth signers used to live under

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
 # check-context-budget.sh: fail if the always-loaded instruction set has grown
-# past its ceiling, or if a rule that should be path-scoped has silently become
-# resident. The deterministic half of "keep CLAUDE.md small"; the semantic half
-# is a judgment call this script cannot make, so it only measures.
+# past its ceiling, if a rule that should be path-scoped has silently become
+# resident, or if a path-scoped rule is over its per-file ceiling. The
+# deterministic half of "keep CLAUDE.md small"; the semantic half is a judgment
+# call this script cannot make, so it only measures.
 #
 #   ./scripts/check-context-budget.sh            # gate
-#   ./scripts/check-context-budget.sh --report   # print the set, never fail
+#   ./scripts/check-context-budget.sh --report   # print both sets, never fail
 #
 # Run by `/harden` Phase 4.5 for EVERY diff, including docs-only ones. Docs-only
 # is precisely the diff that grows this set, so a docs-only skip would exempt
@@ -20,7 +21,7 @@
 # over is caught by the next branch to run the gate, the same reason
 # check-adrs.sh runs unconditionally.
 #
-# Exit status: 0 clean, 1 over budget or unexpected membership OR the scan could
+# Exit status: 0 clean, 1 over budget, over a scoped ceiling or unexpected membership OR the scan could
 # not run. A gate that cannot run must never read as clean.
 
 set -uo pipefail
@@ -70,6 +71,13 @@ if [ -z "$SCAN" ]; then
     exit 1
 fi
 
+SCOPED_SCAN="$(context_budget_scan_scoped "$REPO_ROOT")"
+SCOPED_SCAN_RC=$?
+if [ "$SCOPED_SCAN_RC" -ne 0 ]; then
+    echo "ERROR: the path-scoped rule scan failed (status $SCOPED_SCAN_RC), so nothing was verified." >&2
+    exit 1
+fi
+
 TOTAL=0
 FOUND=()
 while IFS=$'\t' read -r bytes path; do
@@ -99,6 +107,40 @@ for want in "${CONTEXT_BUDGET_EXPECTED_ALWAYS[@]}"; do
     [ "$present" -eq 0 ] && MISSING+=("$want")
 done
 
+# Scoped arm. A rule is over when it exceeds its limit (its listed exception,
+# else the ceiling). An exception is stale when its rule is gone, is no longer
+# scoped, or fits under the ceiling, so slimming a rule forces its entry out.
+SCOPED_COUNT=0
+SCOPED_LARGEST=0
+SCOPED_OVER=()
+while IFS=$'\t' read -r bytes path; do
+    [ -n "$path" ] || continue
+    SCOPED_COUNT=$((SCOPED_COUNT + 1))
+    [ "$bytes" -gt "$SCOPED_LARGEST" ] && SCOPED_LARGEST=$bytes
+    limit="$(context_budget_scoped_limit "$path")"
+    [ "$bytes" -gt "$limit" ] && SCOPED_OVER+=("$path is $bytes bytes, over its $limit limit by $((bytes - limit))")
+done <<<"$SCOPED_SCAN"
+
+SCOPED_STALE=()
+for entry in ${CONTEXT_BUDGET_SCOPED_EXCEPTIONS[@]+"${CONTEXT_BUDGET_SCOPED_EXCEPTIONS[@]}"}; do
+    path="${entry%:*}"
+    now="$(printf '%s\n' "$SCOPED_SCAN" | awk -F'\t' -v p="$path" '$2 == p { print $1 }')"
+    if [ -z "$now" ]; then
+        SCOPED_STALE+=("$path is listed but is not a path-scoped rule")
+    elif [ "$now" -le "$CONTEXT_BUDGET_SCOPED_CEILING" ]; then
+        SCOPED_STALE+=("$path is $now bytes, under the $CONTEXT_BUDGET_SCOPED_CEILING ceiling, so its exception is stale")
+    fi
+done
+
+print_scoped_set() {
+    printf '%s\n' "$SCOPED_SCAN" | while IFS=$'\t' read -r bytes path; do
+        [ -n "$path" ] || continue
+        printf '  %7s  %s\n' "$bytes" "$path"
+    done
+    printf '  scoped ceiling %s per file, %s listed exception(s)\n' \
+        "$CONTEXT_BUDGET_SCOPED_CEILING" "${#CONTEXT_BUDGET_SCOPED_EXCEPTIONS[@]}"
+}
+
 print_set() {
     printf '%s\n' "$SCAN" | while IFS=$'\t' read -r bytes path; do
         printf '  %7s  %s\n' "$bytes" "$path"
@@ -110,6 +152,9 @@ print_set() {
 if [ "$REPORT_ONLY" -eq 1 ]; then
     echo "Always-loaded instruction set, in bytes:"
     print_set
+    echo
+    echo "Path-scoped rules, in bytes (each loads whole on the first matching Read):"
+    print_scoped_set
     exit 0
 fi
 
@@ -164,9 +209,39 @@ if [ "$TOTAL" -gt "$CONTEXT_BUDGET_CEILING" ]; then
     FAILED=1
 fi
 
+if [ ${#SCOPED_OVER[@]} -gt 0 ]; then
+    {
+        echo
+        echo "✗ BLOCKED: ${#SCOPED_OVER[@]} path-scoped rule(s) are over their per-file limit:"
+        printf '    %s\n' "${SCOPED_OVER[@]}"
+        echo
+        echo "  Claude Code injects a scoped rule whole on the first Read of a matching"
+        echo "  file, and again after each compaction, so its size is re-read on every"
+        echo "  later call of that session."
+        echo
+        echo "  $CONTEXT_BUDGET_SCOPED_ADVICE"
+        echo
+        echo "  Raising a limit is allowed and is a deliberate act: say in the commit"
+        echo "  message why this rule is worth its size."
+    } >&2
+    FAILED=1
+fi
+
+if [ ${#SCOPED_STALE[@]} -gt 0 ]; then
+    {
+        echo
+        echo "✗ BLOCKED: ${#SCOPED_STALE[@]} entry(ies) in CONTEXT_BUDGET_SCOPED_EXCEPTIONS are stale:"
+        printf '    %s\n' "${SCOPED_STALE[@]}"
+        echo
+        echo "  Delete the entry from scripts/lib/context_budget.sh. The list only shortens."
+    } >&2
+    FAILED=1
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     exit 1
 fi
 
 echo "✓ always-loaded context $TOTAL/$CONTEXT_BUDGET_CEILING bytes across ${#FOUND[@]} files"
+echo "✓ path-scoped rules: $SCOPED_COUNT files, largest $SCOPED_LARGEST bytes (ceiling $CONTEXT_BUDGET_SCOPED_CEILING, ${#CONTEXT_BUDGET_SCOPED_EXCEPTIONS[@]} listed exceptions)"
 exit 0

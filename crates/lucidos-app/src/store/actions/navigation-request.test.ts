@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from '@lucidos/sdk';
-import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories, findRequest } from '../store';
+import { SETTINGS_SUBVIEW_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay, repositories, findRequest, focusedThreadId } from '../store';
 
 // Spy on showToast but keep the rest of the store real — navigation-request.ts
 // reads the nav lists + settingsSubviewLabel at module load to build its
@@ -26,7 +26,8 @@ const openAppById = vi.fn();
 // The `new-chat` branch leaves a fullscreen app panel on a split layout, so the
 // contract sweep below reaches this even though it never opens an app.
 const exitAppFullscreen = vi.fn(() => false);
-vi.mock('./apps', () => ({ openAppById, exitAppFullscreen }));
+const refreshApps = vi.fn(async () => {});
+vi.mock('./apps', () => ({ openAppById, exitAppFullscreen, refreshApps }));
 
 const openFilePreview = vi.fn();
 const openUrl = vi.fn();
@@ -47,11 +48,13 @@ const pushNavState = vi.fn();
 vi.mock('./navigation', () => ({ pushNavState }));
 
 const revealContentPane = vi.fn();
-vi.mock('./pane', () => ({ revealContentPane }));
+vi.mock('./pane', () => ({ revealContentPane, showDashboardRail: vi.fn() }));
 
 const ensureFocusedComposeThread = vi.fn(() => 'new-thread-id');
 const updateCompose = vi.fn();
-vi.mock('./compose', () => ({ ensureFocusedComposeThread, updateCompose }));
+const applyDestination = vi.fn();
+const updateComposeSelection = vi.fn();
+vi.mock('./compose', () => ({ ensureFocusedComposeThread, updateCompose, applyDestination, updateComposeSelection }));
 
 const focusPromptNow = vi.fn();
 vi.mock('../../components/chat/promptFocus', () => ({ focusPromptNow }));
@@ -144,6 +147,50 @@ describe('handleNavigationRequest — settings sub-sections', () => {
       expect.stringContaining('Unknown settings section'),
       'error',
     );
+  });
+});
+
+describe('handleNavigationRequest — new-chat destination prefill', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/repos/example-repo' }] };
+    // The mocked ensureFocusedComposeThread focuses nothing, so stand in for it.
+    focusedThreadId.value = 'new-thread-id';
+  });
+
+  afterEach(() => {
+    repositories.value = { status: 'not-loaded' };
+    focusedThreadId.value = null;
+  });
+
+  it('leaves the destination alone for a bare new-chat', () => {
+    expect(handleNavigationRequest({ target: 'new-chat', prompt: 'hello' })).toBeUndefined();
+    expect(updateCompose).toHaveBeenCalledWith('new-thread-id', { text: 'hello' });
+    expect(applyDestination).not.toHaveBeenCalled();
+    expect(updateComposeSelection).not.toHaveBeenCalled();
+  });
+
+  it('aims the NEW draft at the folder and agent, and keeps the prompt', () => {
+    handleNavigationRequest(
+      { target: 'new-chat', prompt: 'Work on PR #123', coding_agent: 'codex', folder: 'example-repo' },
+      { source: 'an app' },
+    );
+    expect(updateCompose).toHaveBeenCalledWith('new-thread-id', { text: 'Work on PR #123' });
+    expect(applyDestination).toHaveBeenCalledWith('new-thread-id', { kind: 'coding', scope: { kind: 'external', repoId: 'repo-1' } });
+    expect(updateComposeSelection).toHaveBeenCalledWith('new-thread-id', { codingAgent: 'codex' });
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('opens the chat with its prompt and warns when the folder names nothing', async () => {
+    const pending = handleNavigationRequest(
+      { target: 'new-chat', prompt: 'Work on PR #123', folder: 'no-such-repo' },
+      { source: 'an app' },
+    );
+    expect(pending).toBeInstanceOf(Promise);
+    await pending;
+    expect(updateCompose).toHaveBeenCalledWith('new-thread-id', { text: 'Work on PR #123' });
+    expect(applyDestination).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith(expect.stringContaining('requested by an app'), 'error');
   });
 });
 

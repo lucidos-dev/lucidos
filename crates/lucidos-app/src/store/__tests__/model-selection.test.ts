@@ -346,8 +346,8 @@ describe('useModelSelection', () => {
  *  OpenRouter one stops at `high`, since that server has no `xhigh`. */
 function dualRouted(configured: Record<string, boolean>, defaultProvider: string): ModelChoice {
   return {
-    value: 'claude-opus-5-5',
-    label: 'Opus 5.5',
+    value: 'claude-opus-5-6',
+    label: 'Opus 5.6',
     reasoningEfforts: ['low', 'high', 'xhigh'],
     providers: [
       { value: 'vertex', label: 'Vertex', configured: configured.vertex, reasoningEfforts: ['low', 'high', 'xhigh'] },
@@ -393,10 +393,10 @@ describe('the provider step', () => {
     });
     // The effort in force snaps onto what OpenRouter accepts.
     expect(selection.effort).toBe('high');
-    expect(selection.label).toBe('Opus 5.5 · High · OpenRouter');
-    selection.pick('claude-opus-5-5|low', 'vertex');
-    expect(patches).toEqual([{ model: 'claude-opus-5-5', reasoningEffort: 'low', provider: 'vertex' }]);
-    expect(pairLabelOf(selection.rows, 'claude-opus-5-5|low', 'vertex')).toBe('Opus 5.5 · Low · Vertex');
+    expect(selection.label).toBe('Opus 5.6 · High · OpenRouter');
+    selection.pick('claude-opus-5-6|low', 'vertex');
+    expect(patches).toEqual([{ model: 'claude-opus-5-6', reasoningEffort: 'low', provider: 'vertex' }]);
+    expect(pairLabelOf(selection.rows, 'claude-opus-5-6|low', 'vertex')).toBe('Opus 5.6 · Low · Vertex');
   });
 
   it('names the backend even when there is no choice to make', () => {
@@ -406,7 +406,7 @@ describe('the provider step', () => {
       onChange: () => {},
     });
     expect(selection.rows[0].providers).toEqual([]);
-    expect(selection.label).toBe('Opus 5.5 · High · Vertex');
+    expect(selection.label).toBe('Opus 5.6 · High · Vertex');
     // Every row's muted note names where a pick of it would go, beside any
     // description the model already carries.
     expect(selection.rows[0].description).toBe('Vertex');
@@ -415,13 +415,13 @@ describe('the provider step', () => {
   });
 
   it('names no backend on a surface that has none', () => {
-    expect(formatPair('Opus 5.5', 'High', null)).toBe('Opus 5.5 · High');
+    expect(formatPair('Opus 5.6', 'High', null)).toBe('Opus 5.6 · High');
   });
 
   // Claude Code's picker is what Claude Code lists now, so a thread can stay
   // pinned to a model the list has dropped. It keeps a name, not a bare id.
   it('names a selected model no row offers through labelFor', () => {
-    const offered = { value: 'opus', label: 'Opus 5.5', description: '', reasoningEfforts: ['high'] };
+    const offered = { value: 'opus', label: 'Opus 5.6', description: '', reasoningEfforts: ['high'] };
     const named = useModelSelection({
       models: [offered], vocabulary: LUCIDOS, model: 'claude-opus-5@default', effort: null,
       labelFor: (id) => (id === 'claude-opus-5@default' ? 'Opus 5' : id), onChange: () => {},

@@ -25,7 +25,7 @@ import {
 vi.mock('../../../api/client', () => ({
   getPreferences: vi.fn(),
   setPreference: vi.fn().mockResolvedValue(undefined),
-  retryTransientRead: (read: () => Promise<unknown>) => read(),
+  retryTransient: (read: () => Promise<unknown>) => read(),
   isTransientFetchError: (err: unknown) => err instanceof DOMException
     && (err.name === 'AbortError' || err.name === 'TimeoutError'),
 }));

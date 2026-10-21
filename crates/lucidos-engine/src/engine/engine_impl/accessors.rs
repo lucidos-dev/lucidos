@@ -393,15 +393,20 @@ impl LucidosEngine {
     }
 
     /// Approve a `Proposed` plan, flipping it to `Planned` so the gate passes.
-    /// Returns whether a proposed row was flipped. Called by the
-    /// `/api/v1/internal/approve-plan` endpoint that `lucidos planned approve`
-    /// hits after the user approves the plan in chat.
+    /// Returns whether a proposed row was flipped, or why the user's approval
+    /// is missing. Called by the `/api/v1/internal/approve-plan` endpoint that
+    /// `lucidos planned approve` hits after the user approves the plan.
     pub(crate) async fn approve_plan(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
-    ) -> Result<Option<crate::engine::git_ops::ApprovedPlan>, sqlx::Error> {
-        crate::engine::git_ops::approve_plan(&self.pool, repo_root, branch_name).await
+        caller_thread: Option<&str>,
+    ) -> Result<
+        Option<crate::engine::git_ops::ApprovedPlan>,
+        crate::engine::git_ops::PlanApprovalError,
+    > {
+        crate::engine::git_ops::approve_plan(&self.pool, repo_root, branch_name, caller_thread)
+            .await
     }
 
     /// Borrow the event store for sharing with read-only handlers.
@@ -509,7 +514,8 @@ impl LucidosEngine {
     }
 
     /// Which provider backends are actually configured (`vertex`/`anthropic`/
-    /// `openai`/`openrouter`/`xai`/`opencode-free`/`local`), or `None` to mean
+    /// `openai`/`openrouter`/`xai`/`opencode-free`/`local`/`claude-gateway`),
+    /// or `None` to mean
     /// "don't filter" (mock /
     /// no routing). Reflects a runtime swap (reads the live provider). Surfaced
     /// by `/health` as `configured_providers` so the frontend filters the model
@@ -518,6 +524,36 @@ impl LucidosEngine {
         self.current_provider()
             .configured_providers()
             .map(|kinds| kinds.iter().map(|k| k.as_str().to_string()).collect())
+    }
+
+    /// The providers this engine's router holds. A router that reports no
+    /// list filters nothing, so every provider counts.
+    pub(crate) fn configured_provider_kinds(
+        &self,
+    ) -> Vec<crate::llm::model_registry::ProviderKind> {
+        self.current_provider()
+            .configured_providers()
+            .unwrap_or_else(|| crate::llm::model_registry::ProviderKind::ALL.to_vec())
+    }
+
+    /// The registry and the configured backends, which the intelligence
+    /// ladders read.
+    pub(crate) fn model_routes(&self) -> crate::runtime::intelligence_ladder::ModelRoutes {
+        crate::runtime::intelligence_ladder::ModelRoutes {
+            registry: self.model_registry().clone(),
+            configured: self.configured_provider_kinds(),
+        }
+    }
+
+    /// Run the one-time upgrade from the registry's `enabled` flag to the chat
+    /// intelligence ladder. A boot step: it needs the registry loaded.
+    pub async fn upgrade_chat_ladder_from_enabled(&self) {
+        crate::runtime::chat_ladder::upgrade_from_enabled(
+            self.pool(),
+            &self.event_bus,
+            &self.model_routes(),
+        )
+        .await;
     }
 }
 

@@ -79,6 +79,7 @@ impl LucidosEngine {
                             prompt,
                             None,
                             origin_id,
+                            &[],
                             None,
                             &cancel_token,
                             None,

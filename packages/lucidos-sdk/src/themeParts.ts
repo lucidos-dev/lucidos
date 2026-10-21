@@ -111,6 +111,8 @@ function canonical(slot: Slot, value: string): string {
       return value === 'normal' ? value : boundedLength(slot, value, g.unit, g.min, g.max);
     case 'length':
       return boundedLength(slot, value, g.unit, g.min, g.max);
+    case 'weight':
+      return value === 'normal' ? value : boundedWeight(value, g.min, g.max);
     case 'keyword':
       if (!g.values.includes(value)) refuse(`${slot.property} takes ${g.values.join(', ')}.`);
       return value;
@@ -125,6 +127,15 @@ function boundedLength(slot: Slot, value: string, unit: PartUnit, min: number, m
   if (v > max) refuse(`${shown} is over the ${withUnit(max, unit)} cap.`);
   if (v < min) refuse(`${shown} is under the ${withUnit(min, unit)} floor.`);
   return shown;
+}
+
+function boundedWeight(value: string, min: number, max: number): string {
+  if (value.includes('(')) refuse(notAllowed(value));
+  const v = plainNumber(value);
+  if (v === null) refuse(`'${value}' is not a weight.`);
+  if (v > max) refuse(`${num(v)} is over the ${num(max)} cap.`);
+  if (v < min) refuse(`${num(v)} is under the ${num(min)} floor.`);
+  return num(v);
 }
 
 function isAngle(token: string): boolean {

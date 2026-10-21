@@ -2,6 +2,7 @@ use super::memory::{jaccard_similarity, KEYWORD_BOOST, KEYWORD_SIMILARITY_PROXY}
 use super::thread_events::RecalledMemory;
 use super::LucidosEngine;
 use crate::core::store::types::Step;
+use crate::llm::provider::replace_image_blocks;
 use crate::llm::{ContentBlock, Message, MessageContent};
 use crate::memory::{EmbeddingProvider, MemoryEntry, QueryClassification};
 use uuid::Uuid;
@@ -269,8 +270,7 @@ pub(crate) fn tool_definitions_chars(tools: &[crate::llm::provider::ToolDefiniti
         .sum()
 }
 
-/// Chars in what one single-shot round sends: an intent sub-loop round, or a
-/// side question's.
+/// Chars in what one auxiliary model call sends, such as a side question's.
 ///
 /// The same three parts a turn's own capture counts: the system prompt, the
 /// messages, and the tool schemas. The tools are included because they are
@@ -322,7 +322,8 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
                     // A tail block is text on the wire and is billed as text.
                     ContentBlock::Text { text }
                     | ContentBlock::EngineTail { text }
-                    | ContentBlock::MemoryView { text } => text.len(),
+                    | ContentBlock::MemoryView { text }
+                    | ContentBlock::StableContext { text } => text.len(),
                     ContentBlock::ToolUse {
                         id, name, input, ..
                     } => id.len() + name.len() + input.to_string().len(),
@@ -337,25 +338,6 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
                 .sum()
         }
     }
-}
-
-/// Replace every `ContentBlock::Image` in `blocks` with a text placeholder
-/// produced by `placeholder()`. Returns total base64 bytes removed (used for
-/// logging by callers).
-pub(super) fn replace_image_blocks(
-    blocks: &mut [ContentBlock],
-    placeholder: impl Fn() -> String,
-) -> usize {
-    let mut stripped = 0usize;
-    for block in blocks.iter_mut() {
-        if let ContentBlock::Image { data, .. } = block {
-            stripped += data.len();
-            *block = ContentBlock::Text {
-                text: placeholder(),
-            };
-        }
-    }
-    stripped
 }
 
 /// What a [`trim_context_if_needed`] call actually did to the messages.

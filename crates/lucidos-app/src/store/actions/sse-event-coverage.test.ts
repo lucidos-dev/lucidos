@@ -78,7 +78,7 @@ const NO_UI_STATE: Record<string, string> = {
   CredentialRevealed: 'an audit record of a read. Nothing changed',
   BackupKeyRevealed:
     'an audit record of a read. The Backup page already holds what it was '
-    + 'handed, and `key/exists` is what labels its button',
+    + 'handed, and `/backup/recipient` says whether a legacy key exists',
   HandshakeScriptScopeBound:
     'a one-time record that a script\'s minted token got a scope. Its sibling '
     + '`CredentialScopeInferred` takes an arm because the credentials list '

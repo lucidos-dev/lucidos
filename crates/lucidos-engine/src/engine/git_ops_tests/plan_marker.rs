@@ -472,6 +472,49 @@ async fn plan_marker_consumed_returns_to_missing() {
     teardown_test_db(&db_name).await;
 }
 
+/// I10 (ADR 0505): a re-plan on an approved branch re-proposes it, so the
+/// edit gate closes until the user approves the new plan.
+#[tokio::test]
+async fn re_marking_an_approved_plan_proposes_it_again() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db_name) = setup_test_db().await;
+    let (_tmp, repo_path) = make_test_repo().await;
+    let head_sha = current_head_sha(&repo_path).await.unwrap();
+    let mark = |path: &'static str| {
+        let (pool, repo_path, head_sha) = (pool.clone(), repo_path.clone(), head_sha.clone());
+        async move {
+            record_planned(
+                &pool,
+                &repo_path,
+                "feature",
+                PlanMarkerKind::Proposed,
+                Some(path),
+                None,
+                &[],
+                &head_sha,
+            )
+            .await
+            .unwrap();
+        }
+    };
+    mark("docs/plans/first.md").await;
+    approve_plan(&pool, &repo_path, "feature", None)
+        .await
+        .unwrap();
+    assert!(satisfies(
+        plan_marker_state(&pool, &repo_path, "feature").await
+    ));
+
+    mark("docs/plans/second.md").await;
+    assert_eq!(
+        plan_marker_state(&pool, &repo_path, "feature").await,
+        PlanMarkerState::Present(PlanMarkerKind::Proposed),
+        "an approved marker never survives a re-mark"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// A plan-only Apply lands an unapproved plan. Its `proposed` marker must
 /// survive, or the approval that follows finds nothing to flip.
 #[tokio::test]
@@ -498,7 +541,9 @@ async fn consuming_leaves_a_proposed_marker_for_the_approval() {
         PlanMarkerState::Present(PlanMarkerKind::Proposed),
     );
     assert_eq!(
-        approve_plan(&pool, &repo_path, "feature").await.unwrap(),
+        approve_plan(&pool, &repo_path, "feature", None)
+            .await
+            .unwrap(),
         Some(ApprovedPlan {
             plan_path: Some("docs/plans/x.md".into())
         }),
@@ -583,7 +628,7 @@ async fn proposed_plan_does_not_satisfy_gate_until_approved() {
     );
 
     // Approve flips proposed -> planned and now satisfies the gate.
-    let approved = approve_plan(&pool, &repo_path, "feature")
+    let approved = approve_plan(&pool, &repo_path, "feature", None)
         .await
         .unwrap()
         .is_some();
@@ -611,7 +656,7 @@ async fn approve_plan_is_targeted_and_preserves_plan_path() {
     let head_sha = current_head_sha(&repo_path).await.unwrap();
 
     // No row: approve is a no-op and must not fabricate a marker.
-    assert!(approve_plan(&pool, &repo_path, "feature")
+    assert!(approve_plan(&pool, &repo_path, "feature", None)
         .await
         .unwrap()
         .is_none());
@@ -634,7 +679,7 @@ async fn approve_plan_is_targeted_and_preserves_plan_path() {
     .await
     .unwrap();
     assert!(
-        approve_plan(&pool, &repo_path, "feature")
+        approve_plan(&pool, &repo_path, "feature", None)
             .await
             .unwrap()
             .is_none(),
@@ -658,7 +703,7 @@ async fn approve_plan_is_targeted_and_preserves_plan_path() {
     )
     .await
     .unwrap();
-    assert!(approve_plan(&pool, &repo_path, "feature")
+    assert!(approve_plan(&pool, &repo_path, "feature", None)
         .await
         .unwrap()
         .is_some());

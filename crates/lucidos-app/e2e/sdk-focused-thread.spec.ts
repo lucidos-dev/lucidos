@@ -1,11 +1,11 @@
 import { randomUUID } from 'crypto';
 import { test, expect, type Page } from './fixtures';
-import { apiRequest, assertHealthy, clickThreadRow, isMobileViewport, navigateToApp, newThread, openThreadDrawer } from './helpers';
+import { apiRequest, assertHealthy, clickThreadRow, navigateToApp, newThread, openThreadDrawer } from './helpers';
 import { ensureHomeThread, psql } from './db-helpers';
 
 /**
- * `lucidos.ui.focusedThread()` and `onFocusedThreadChange()` from a Home board
- * tile in the desktop rail, beside another thread. The tile's widget belongs to
+ * `lucidos.ui.focusedThread()` and `onFocusedThreadChange()` from a tile on
+ * the desktop dashboard, beside another thread. The tile's widget came from
  * Home, so the value must follow the thread pane and never name Home.
  *
  * The widget re-reads the getter on every push, so each step checks both the
@@ -70,34 +70,31 @@ test.describe('The focused thread in the SDK', () => {
     psql([
       `DELETE FROM events WHERE thread_id IN (${threads})`,
       `DELETE FROM thread_summaries WHERE thread_id IN (${threads})`,
-      `DELETE FROM events WHERE event_type IN ('WidgetShown', 'WidgetPinned') AND payload->>'app_id' = '${appId}'`,
     ].join(';\n'));
+    await apiRequest(page).post('/api/v1/widgets/dashboard-remove', { data: { app_id: appId, dashboard: 'desktop' } });
     for (const path of written) await apiRequest(page).delete(`/api/v1/data/${path}`);
   });
 
-  test('a Home board tile follows the thread pane, not its own thread', async ({ page }) => {
-    // The rail is desktop-only. A phone shows the board only as Home's face,
-    // so no other thread is in the pane beside it (ADR 0466).
-    test.skip(isMobileViewport(page), 'the Home rail is desktop-only');
+  test('a dashboard tile follows the thread pane, not its own thread', async ({ page }) => {
     const home = ensureHomeThread();
     const threadA = randomUUID();
     const threadB = randomUUID();
     const now = new Date().toISOString();
 
     await writeFile(page, `apps/${appId}/index.html`, WIDGET_HTML);
-    await writeFile(page, `apps/${appId}/manifest.json`, JSON.stringify({ name: 'E2E focused thread', kind: 'widget', origin_thread_id: home }));
+    await writeFile(page, `apps/${appId}/manifest.json`, JSON.stringify({ name: 'E2E focused thread', kind: 'widget', reusable: true, origin_thread_id: home }));
     psql([
       ...seedThread(threadA, 'E2E focus A', now),
       ...seedThread(threadB, 'E2E focus B', now),
-      event('WidgetShown', home, `{"app_id":"${appId}"}`, now),
-      event('WidgetPinned', home, `{"app_id":"${appId}"}`, now),
     ].join(';\n'));
+    const added = await apiRequest(page).post('/api/v1/widgets/dashboard-add', { data: { app_id: appId, dashboard: 'desktop' } });
+    expect(added.ok(), `add ${appId}: ${await added.text()}`).toBeTruthy();
 
-    // Thread A open, with Home's widget on the board in the rail beside it.
+    // Thread A open, with Home's widget on the dashboard in the rail beside it.
     await page.evaluate((tid) => localStorage.setItem('lucidos-focused-thread', tid), threadA);
     await navigateToApp(page);
 
-    const frameSelector = `.home-rail .home-board-tile[data-home-tile^="${appId}?"] iframe[data-role="app-ui-frame"]`;
+    const frameSelector = `.dashboard-rail .dashboard-tile[data-dashboard-tile^="${appId}?"] iframe[data-role="app-ui-frame"]`;
     await expect(page.locator(frameSelector)).toHaveAttribute('src', new RegExp(`/app/${appId}/`), { timeout: 15_000 });
     const widget = page.frameLocator(frameSelector);
     const read = widget.locator('#read');

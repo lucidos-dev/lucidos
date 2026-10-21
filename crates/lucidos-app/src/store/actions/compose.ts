@@ -37,7 +37,7 @@ import {
   resolveCcReasoningEffort,
   type ComposeSelectionOverride,
 } from '../composeSelections';
-import { scopeRepoName, type ComposeDestination } from '../composeDestination';
+import { scopeRepoName, threadScope, type ComposeDestination } from '../composeDestination';
 import { makeOptimisticThreadState, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread, isTransientFetchError, type ComposePutResult } from '../../api/client';
@@ -878,6 +878,26 @@ export function seedSuggestion(text: string): string {
  *  stepped off, never overwritten, as in `seedSuggestion`. */
 export function composeInFreshDraft(text: string, imageHashes: string[]): void {
   stepOffDraftInProgress();
+  const threadId = prefillCompose(text);
+  if (imageHashes.length > 0) updateCompose(threadId, { image_hashes: imageHashes });
+  requestPromptCaretToEnd();
+}
+
+/** Open a fresh draft aimed at the same coding target and backend as `source`,
+ *  with no carry-over. The thread's unsent text and images move into it, so the
+ *  user can still pick the model and reasoning before they send. Nothing is
+ *  sent. A second press, once the focus left `source`, changes nothing. */
+export function startFreshDraft(source: ThreadMeta): void {
+  if (focusedThreadId.value !== source.id) return;
+  const { text, image_hashes: imageHashes } = getDraft(source.id);
+  const carried = text.trim() !== '' || imageHashes.length > 0;
+  if (carried) updateCompose(source.id, { text: '', image_hashes: [] });
+  unfocusThread();
+  const scope = threadScope(source);
+  if (scope) applyDestination(null, { kind: 'coding', scope });
+  // A legacy row with no backend is a Claude Code thread.
+  updateComposeSelection(null, { codingAgent: source.codingAgent ?? 'claude-code' });
+  if (!carried) return;
   const threadId = prefillCompose(text);
   if (imageHashes.length > 0) updateCompose(threadId, { image_hashes: imageHashes });
   requestPromptCaretToEnd();

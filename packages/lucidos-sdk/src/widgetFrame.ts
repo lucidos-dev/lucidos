@@ -7,17 +7,19 @@
  * push on {@link WIDGET_CHANNEL} once it loads. Only then does this report,
  * so an app in the Canvas pane posts nothing.
  *
- * On a Home board tile, a tap posts {@link WIDGET_TAP_MESSAGE_TYPE}, so a
- * touch device can show the tile's menu.
+ * A frame the host marks with `menu` forwards an unclaimed right-click as
+ * {@link WIDGET_MENU_MESSAGE_TYPE}, so the host opens the widget's own menu.
+ * Content keeps the native menu by the host's own rule (`contextMenu.ts`).
  *
- * The push names the place the frame shows in and, on the Home board, the
+ * The push names the place the frame shows in and, on the dashboard, the
  * tile's *widget size* (ADR 0432). Both are stamped on `<html>`, so most
  * widgets adapt in CSS alone, and `lucidos.widget` reads them. A tile the
- * board hides is told `visible: false` before it unloads, so it can stop its
+ * dashboard hides is told `visible: false` before it unloads, so it can stop its
  * timers.
  */
 
 import { onHostPush } from './_bridge';
+import { opensContextMenu, selectionCovers, shouldSuppressContextMenu, textAt, type Point } from './contextMenu';
 import { runIsolated } from './_isolate';
 import { WIDGET_SIZES } from './generated/engine-constants';
 
@@ -27,22 +29,27 @@ export const WIDGET_CHANNEL = 'widget';
 /** What a widget frame posts when its content size changes. */
 export const WIDGET_CONTENT_SIZE_MESSAGE_TYPE = 'lucidos:ui:size';
 
-/** What a Home board tile's frame posts on a tap: a primary
- *  press that lifts before it travels past {@link PRESS_MOVE_TOLERANCE_PX}. */
-export const WIDGET_TAP_MESSAGE_TYPE = 'lucidos:ui:widget-tap';
+/** What a frame marked `menu` posts to open the widget's menu: on a
+ *  right-click, and on a finger held still on a dashboard tile. */
+export const WIDGET_MENU_MESSAGE_TYPE = 'lucidos:ui:widget-menu';
 
-/** What a Home board tile's frame posts when a finger holds still on it, so
- *  the host can enter edit mode (ADR 0432). */
-export const WIDGET_HOLD_MESSAGE_TYPE = 'lucidos:ui:widget-hold';
+/** A {@link WIDGET_MENU_MESSAGE_TYPE} message. `at` is where a pointer pressed,
+ *  in the frame's own viewport. A hold or a keyboard-raised menu has none.
+ *  `held` says a finger is still down. Its lift may bring a click the host
+ *  sees once the menu inerts the frame, and the menu must spend that click. */
+export interface WidgetMenuRequest {
+  type: typeof WIDGET_MENU_MESSAGE_TYPE;
+  at?: Point;
+  held?: true;
+}
 
 /** Where a still press stops being a tap, host and frame alike. */
 export const LONG_PRESS_DELAY_MS = 450;
 
-/** Pointer travel that cancels a press, so it is neither a tap nor a hold: a
- *  drag or a scroll. */
+/** Pointer travel that cancels a hold: a drag or a scroll. */
 export const PRESS_MOVE_TOLERANCE_PX = 10;
 
-/** The `<html>` attribute naming the tile's widget size on the Home board. */
+/** The `<html>` attribute naming the tile's widget size on the dashboard. */
 export const WIDGET_SIZE_ATTRIBUTE = 'data-widget-size';
 
 /** The `<html>` attribute naming where the widget shows. */
@@ -50,11 +57,11 @@ export const WIDGET_PLACE_ATTRIBUTE = 'data-widget-place';
 
 /** Every place a widget frame shows in (ADRs 0407, 0415, 0432, 0466). A
  *  reply's embed is an inline widget, so it shows `inline`. */
-export const WIDGET_PLACES = ['inline', 'shelf', 'option', 'home'] as const;
+export const WIDGET_PLACES = ['inline', 'shelf', 'option', 'dashboard'] as const;
 
 export type WidgetPlace = (typeof WIDGET_PLACES)[number];
 
-/** One of the three sizes a widget takes as a Home board tile. */
+/** One of the three sizes a widget takes as a dashboard tile. */
 export type WidgetSize = (typeof WIDGET_SIZES)[number];
 
 /** What the host pushes on {@link WIDGET_CHANNEL}. Every field is optional,
@@ -63,6 +70,8 @@ export interface WidgetPush {
   place?: WidgetPlace;
   size?: WidgetSize;
   visible?: boolean;
+  /** The host opens a widget menu for this frame, so a right-click goes there. */
+  menu?: boolean;
 }
 
 export interface ContentSize {
@@ -92,7 +101,7 @@ function placeOf(data: unknown): WidgetPlace | null {
   return WIDGET_PLACES.includes(place as WidgetPlace) ? (place as WidgetPlace) : null;
 }
 
-/** A Home board tile never scrolls inside (ADR 0432), whatever stylesheet the
+/** A dashboard tile never scrolls inside (ADR 0432), whatever stylesheet the
  *  widget links. Inline and constant, so no stylesheet is built (ADR 0307). */
 function holdStillInTile(inTile: boolean): void {
   for (const el of [document.documentElement, document.body]) {
@@ -111,6 +120,20 @@ let installed = false;
 let size: WidgetSize | null = null;
 let place: WidgetPlace | null = null;
 let visible = true;
+let menu = false;
+// The press that may raise the next `contextmenu`, taken in its capture phase.
+let menuPress = false;
+let selectionAtPress = false;
+// What the capture phase took for the `contextmenu` now dispatching.
+let menuFromPointer = false;
+let menuOverSelection = false;
+// A primary press that has not lifted yet.
+let primaryDown = false;
+// A held finger's press, which a `contextmenu` arriving first cancels.
+let endHold: (() => void) | null = null;
+// Set once a hold opened the menu: the platform's own long-press menu that
+// may follow it is swallowed, so one press opens one menu.
+let heldOpenedMenu = false;
 const sizeListeners = new Set<(size: WidgetSize | null) => void>();
 const visibilityListeners = new Set<(visible: boolean) => void>();
 
@@ -118,39 +141,89 @@ function notify<T>(listeners: Set<(value: T) => void>, value: T): void {
   for (const cb of [...listeners]) runIsolated(() => cb(value));
 }
 
-/** A press on a Home board tile. A lift that has not travelled past the
- *  tolerance is a tap, so a touch screen can show the tile's menu. A finger
- *  held still is a hold instead, which enters edit mode. A finger that scrolls
- *  the board gets a cancel, so it is neither. */
+function postMenuRequest(at?: Point): void {
+  const request: WidgetMenuRequest = { type: WIDGET_MENU_MESSAGE_TYPE };
+  if (at) request.at = at;
+  else if (primaryDown) request.held = true;
+  window.parent.postMessage(request, '*');
+}
+
+/** A finger held still on a dashboard tile marked `menu` opens the menu. A
+ *  finger that lifts, scrolls the dashboard or travels past the tolerance
+ *  cancels the hold. */
 function trackPress(down: PointerEvent): void {
-  if (place !== 'home' || !down.isPrimary) return;
+  if (place !== 'dashboard' || !down.isPrimary || down.pointerType === 'mouse' || !menu) return;
   const end = () => {
     clearTimeout(timer);
+    if (endHold === end) endHold = null;
     window.removeEventListener('pointermove', move, true);
-    window.removeEventListener('pointerup', lift, true);
-    window.removeEventListener('pointercancel', cancel, true);
+    window.removeEventListener('pointerup', release, true);
+    window.removeEventListener('pointercancel', release, true);
   };
-  const timer = down.pointerType !== 'mouse'
-    ? setTimeout(() => {
-      end();
-      window.parent.postMessage({ type: WIDGET_HOLD_MESSAGE_TYPE }, '*');
-    }, LONG_PRESS_DELAY_MS)
-    : undefined;
+  const timer = setTimeout(() => {
+    end();
+    heldOpenedMenu = true;
+    postMenuRequest();
+  }, LONG_PRESS_DELAY_MS);
+  endHold = end;
   const move = (e: PointerEvent) => {
     if (e.pointerId !== down.pointerId) return;
     if (Math.hypot(e.screenX - down.screenX, e.screenY - down.screenY) > PRESS_MOVE_TOLERANCE_PX) end();
   };
-  const lift = (e: PointerEvent) => {
-    if (e.pointerId !== down.pointerId) return;
-    end();
-    window.parent.postMessage({ type: WIDGET_TAP_MESSAGE_TYPE, pointerType: down.pointerType }, '*');
-  };
-  const cancel = (e: PointerEvent) => {
+  const release = (e: PointerEvent) => {
     if (e.pointerId === down.pointerId) end();
   };
   window.addEventListener('pointermove', move, true);
-  window.addEventListener('pointerup', lift, true);
-  window.addEventListener('pointercancel', cancel, true);
+  window.addEventListener('pointerup', release, true);
+  window.addEventListener('pointercancel', release, true);
+}
+
+/** Capture phase, so a widget that stops propagation cannot hide its press.
+ *  Only a menu press measures the selection, as the host's policy does. */
+function notePress(e: PointerEvent): void {
+  heldOpenedMenu = false;
+  primaryDown = e.isPrimary !== false && e.button === 0;
+  menuPress = opensContextMenu(e);
+  selectionAtPress = menuPress && selectionCovers(window.getSelection(), { x: e.clientX, y: e.clientY });
+}
+
+function noteLift(e: PointerEvent): void {
+  if (e.isPrimary !== false) primaryDown = false;
+}
+
+/** In the capture phase, which no widget handler can stop, so a press is
+ *  spent by its own `contextmenu` even when the widget claims it. */
+function takeMenuPress(): void {
+  menuFromPointer = menuPress;
+  menuOverSelection = selectionAtPress;
+  menuPress = selectionAtPress = false;
+  endHold?.();
+}
+
+/** On `window` in the bubble phase, so the widget's own handlers on an
+ *  element or the document run first and can claim the event. */
+function forwardContextMenu(e: MouseEvent): void {
+  // A button down that this frame never saw pressed means a pointer raised it
+  // elsewhere: the press that closed the host's open menu never reaches here.
+  // A finger this frame saw land stays a hold.
+  const fromPointer = menuFromPointer || (!primaryDown && e.buttons !== 0);
+  const heldSelection = menuOverSelection;
+  if (heldOpenedMenu) {
+    heldOpenedMenu = false;
+    e.preventDefault();
+    return;
+  }
+  if (!menu) return;
+  const point = { x: e.clientX, y: e.clientY };
+  // A menu raised by the keyboard had no press, and its point means nothing.
+  const textUnderPointer = () => !fromPointer || textAt(e.target, point);
+  if (!shouldSuppressContextMenu(e, heldSelection, textUnderPointer)) return;
+  e.preventDefault();
+  // Undo the word WebKit selected on the way in. The press found no
+  // selection under the pointer, so one there now is WebKit's.
+  const selection = window.getSelection();
+  if (selectionCovers(selection, point)) selection?.removeAllRanges();
+  postMenuRequest(fromPointer ? point : undefined);
 }
 
 /** Start reporting once the host marks this frame a widget. A later push
@@ -173,17 +246,24 @@ export function installWidgetFrame(): void {
   };
   onHostPush(WIDGET_CHANNEL, (data) => {
     if (window.parent === window) return;
-    place = placeOf(data);
+    const nextPlace = placeOf(data);
     const nextSize = sizeOf(data);
     const nextVisible = (data as { visible?: unknown } | null)?.visible !== false;
+    menu = (data as { menu?: unknown } | null)?.menu === true;
     // A new place can relay out the widget even at the same size, and the host
     // waits for a report there.
     last = '';
-    stamp(WIDGET_PLACE_ATTRIBUTE, place);
-    holdStillInTile(place === 'home');
-    stamp(WIDGET_SIZE_ATTRIBUTE, nextSize);
+    // Write `<html>` only when the host's value changes. Rewriting a value
+    // still queues a mutation record. A widget observer that answers each
+    // record with a write of its own would then loop forever.
+    if (nextPlace !== place) {
+      if ((nextPlace === 'dashboard') !== (place === 'dashboard')) holdStillInTile(nextPlace === 'dashboard');
+      place = nextPlace;
+      stamp(WIDGET_PLACE_ATTRIBUTE, place);
+    }
     if (nextSize !== size) {
       size = nextSize;
+      stamp(WIDGET_SIZE_ATTRIBUTE, size);
       notify(sizeListeners, size);
     }
     if (nextVisible !== visible) {
@@ -194,6 +274,11 @@ export function installWidgetFrame(): void {
       installed = true;
       if (document.body) new ResizeObserver(schedule).observe(document.body);
       document.addEventListener('pointerdown', trackPress, { capture: true, passive: true });
+      document.addEventListener('pointerdown', notePress, { capture: true, passive: true });
+      document.addEventListener('pointerup', noteLift, { capture: true, passive: true });
+      document.addEventListener('pointercancel', noteLift, { capture: true, passive: true });
+      window.addEventListener('contextmenu', takeMenuPress, true);
+      window.addEventListener('contextmenu', forwardContextMenu);
     }
     schedule();
   });
@@ -201,7 +286,7 @@ export function installWidgetFrame(): void {
 
 /** `lucidos.widget`: what the host told this widget about where it shows. */
 export const widget = {
-  /** The tile's widget size on the Home board, `null` anywhere else. */
+  /** The tile's widget size on the dashboard, `null` anywhere else. */
   size(): WidgetSize | null {
     return size;
   },
@@ -213,14 +298,14 @@ export const widget = {
     return () => sizeListeners.delete(callback);
   },
 
-  /** Where the widget shows: `home`, `inline`, `shelf` or `option`.
+  /** Where the widget shows: `dashboard`, `inline`, `shelf` or `option`.
    *  `null` outside a widget place, such as the Canvas. */
   place(): WidgetPlace | null {
     return place;
   },
 
   /** False while the host keeps the frame loaded but out of sight, as a
-   *  hidden Home board does before it unloads. */
+   *  hidden dashboard does before it unloads. */
   visible(): boolean {
     return visible;
   },
@@ -239,6 +324,9 @@ export function _resetWidgetFrameForTesting(): void {
   size = null;
   place = null;
   visible = true;
+  menu = menuPress = selectionAtPress = menuFromPointer = menuOverSelection = false;
+  primaryDown = heldOpenedMenu = false;
+  endHold?.();
   sizeListeners.clear();
   visibilityListeners.clear();
   for (const attribute of [WIDGET_SIZE_ATTRIBUTE, WIDGET_PLACE_ATTRIBUTE]) {

@@ -166,7 +166,7 @@ pub(crate) async fn tree_backfill_estimate(
     // and the index-served measured-usage read hides beside it.
     let (counts, measured) =
         tokio::try_join!(estimate::counts(pool), estimate::measured_for_catalog(pool),)?;
-    let configured = consumer::configured_providers(engine);
+    let configured = engine.configured_provider_kinds();
     Ok(estimate::estimate(
         &counts,
         &measured,

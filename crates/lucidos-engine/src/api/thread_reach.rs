@@ -486,13 +486,24 @@ pub(in crate::api) async fn refuse_without_authority(
     target: Option<Uuid>,
     verb: ThreadReachVerb,
 ) -> Result<(), ThreadReachError> {
+    pass_authority(bus, headers, target, verb).await.map(drop)
+}
+
+/// [`refuse_without_authority`], naming the authority that let the act
+/// through. A successor records it as its *handoff consent* (ADR 0507).
+pub(in crate::api) async fn pass_authority(
+    bus: &EventBus,
+    headers: &HeaderMap,
+    target: Option<Uuid>,
+    verb: ThreadReachVerb,
+) -> Result<PassedAuthority, ThreadReachError> {
     let SubprocessOrigin::Subprocess {
         source_thread_id,
         emitting_trigger_id,
         ..
     } = crate::api::actor::subprocess_origin(headers)
     else {
-        return Ok(());
+        return Ok(PassedAuthority::Untokened);
     };
     weigh_authority(
         bus,
@@ -520,7 +531,9 @@ pub(crate) async fn refuse_thread_without_authority(
     target: Option<Uuid>,
     verb: ThreadReachVerb,
 ) -> Result<(), ThreadReachError> {
-    weigh_authority(bus, Some(caller_thread_id), None, target, verb).await
+    weigh_authority(bus, Some(caller_thread_id), None, target, verb)
+        .await
+        .map(drop)
 }
 
 /// Which authority of its own a caller holds for an act, before any *owner
@@ -533,6 +546,17 @@ pub(crate) enum HeldAuthority {
     OwnSubtree,
     /// The caller carries the owner's standing instruction (clause 5).
     StandingInstruction,
+}
+
+/// Which authority let an act through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassedAuthority {
+    /// The caller presented no thread-bound token: a device, or the machine.
+    Untokened,
+    /// Authority of the caller's own.
+    Held(HeldAuthority),
+    /// The caller spent an owner approval for this one act (ADR 0387).
+    OwnerApproval,
 }
 
 /// Clauses 3 and 5, over the two authenticated facts about the caller.
@@ -570,27 +594,25 @@ async fn weigh_authority(
     emitting_trigger_id: Option<&str>,
     target: Option<Uuid>,
     verb: ThreadReachVerb,
-) -> Result<(), ThreadReachError> {
-    match authority_held(
+) -> Result<PassedAuthority, ThreadReachError> {
+    let held = authority_held(
         bus.pool(),
         source_thread_id,
         emitting_trigger_id,
         target,
         verb,
     )
-    .await?
-    {
-        Some(HeldAuthority::NoneNeeded | HeldAuthority::OwnSubtree) => return Ok(()),
-        Some(HeldAuthority::StandingInstruction) => {
+    .await?;
+    if let Some(held) = held {
+        if held == HeldAuthority::StandingInstruction {
             crate::log!(
                 "[ThreadReach] Allowed on the owner's standing instruction: caller {:?} may {} {:?}",
                 source_thread_id,
                 verb.word(),
                 target
             );
-            return Ok(());
         }
-        None => {}
+        return Ok(PassedAuthority::Held(held));
     }
 
     // An approval names one thread's act, so a threadless caller holds none.
@@ -604,7 +626,7 @@ async fn weigh_authority(
                 verb.word(),
                 target
             );
-            return Ok(());
+            return Ok(PassedAuthority::OwnerApproval);
         }
     }
 

@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-/** The agent-menu shortcut presses the composer row's own anchor.
+/** The model-and-effort shortcut presses the composer row's own button.
  *
- *  So the menu opens exactly as a click opens it, on whichever backend the
- *  row anchors. A button laid out at zero size is not the one on screen.
+ *  So the list opens exactly as a click opens it. Only the rung control holds
+ *  the model: the row's `/` anchor never opens it. A button laid out at zero
+ *  size is not the one on screen.
  *
  *  Plan: `docs/plans/2026-10-01-shortcuts-for-every-toggle.md`. */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -14,12 +15,13 @@ vi.mock('../../../utils/elementVisibility', async (importOriginal) => {
 });
 
 import { openAgentMenu } from '../promptFocus';
+import { rungFoldOpenRequest } from '../controlMenuRequests';
 
-function anchor(visible: boolean): { button: HTMLButtonElement; clicks: () => number } {
+function anchor(visible: boolean, className = 'rung-trigger'): { button: HTMLButtonElement; clicks: () => number } {
   const row = document.createElement('div');
   row.className = 'prompt-actions-row';
   const button = document.createElement('button');
-  button.className = 'icon-btn header-icon commands-btn';
+  button.className = className;
   button.dataset.visible = visible ? 'yes' : 'no';
   let count = 0;
   button.addEventListener('click', () => { count++; });
@@ -30,10 +32,11 @@ function anchor(visible: boolean): { button: HTMLButtonElement; clicks: () => nu
 
 beforeEach(() => {
   document.body.innerHTML = '';
+  rungFoldOpenRequest.value = null;
 });
 
 describe('openAgentMenu', () => {
-  it('presses the visible anchor and skips one laid out at zero size', () => {
+  it('presses the visible rung control and skips one laid out at zero size', () => {
     const hidden = anchor(false);
     const shown = anchor(true);
     openAgentMenu();
@@ -45,5 +48,19 @@ describe('openAgentMenu', () => {
     const hidden = anchor(false);
     openAgentMenu();
     expect(hidden.clicks()).toBe(0);
+  });
+
+  it('never presses the `/` anchor, which holds no model', () => {
+    const slash = anchor(true, 'icon-btn header-icon commands-btn');
+    openAgentMenu();
+    expect(slash.clicks()).toBe(0);
+  });
+
+  it('asks for the list against the ⋯ when the row has folded the pill', () => {
+    const more = anchor(true, 'prompt-actions-more');
+    more.button.setAttribute('data-fold-key', '');
+    openAgentMenu();
+    expect(rungFoldOpenRequest.value).toBe(more.button);
+    expect(more.clicks()).toBe(0);
   });
 });

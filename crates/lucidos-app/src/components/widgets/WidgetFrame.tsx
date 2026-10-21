@@ -3,7 +3,8 @@ import { WIDGET_CHANNEL, type ContentSize, type WidgetPlace, type WidgetPush, ty
 import { AppFrame } from '../apps/AppFrame';
 import { appUrl } from '../../api/client';
 import { postToAppFrame } from '../../store/actions/app-bridge';
-import { APP_FRAME_SIZE_EVENT } from '../../store/actions/widget-frame-bridge';
+import { APP_FRAME_MENU_EVENT, APP_FRAME_SIZE_EVENT } from '../../store/actions/widget-frame-bridge';
+import type { ViewportPoint } from '../../hooks/useAnchoredPopover';
 import { watchOnScreen } from '../../hooks/useOnScreenInTranscript';
 import { holdAcrossRelayout } from '../chat/scrollState';
 import { widgetRefreshKey } from '../../store/widgets';
@@ -11,6 +12,8 @@ import type { AppReveal } from '../../store/types';
 import { cacheBust } from '../apps/AppFrame';
 import { widgetInstanceKey, type WidgetParams } from '../../utils/widgetParams';
 import { claimWidgetFrame } from './widgetFrameBudget';
+import { decideHeight, initialHeightGuard } from './widgetHeightGuard';
+import { postClientLog } from '../../utils/clientLog';
 
 /** The frame's height before the widget reports one, in CSS pixels. */
 export const DEFAULT_WIDGET_HEIGHT_PX = 240;
@@ -74,7 +77,7 @@ function holdWhatFollows(box: HTMLElement): (() => void) | null {
   };
 }
 
-/** Watch whether `el` crosses the viewport. A Home board tile scrolls in its
+/** Watch whether `el` crosses the viewport. A dashboard tile scrolls in its
  *  own pane, never the transcript, so the transcript's band cannot answer. */
 function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): () => void {
   if (typeof IntersectionObserver !== 'function') {
@@ -101,20 +104,26 @@ function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): 
  *  option and mounts the same way.
  *
  *  A `shelf` frame drops open under the title. It is on screen by definition,
- *  so it mounts at once, and it caps its height. A `home` frame fills its Home
- *  board tile, whose size class sets the box: a report never sizes it
- *  (ADR 0432). It mounts once on screen, and a hidden board holds it as an
+ *  so it mounts at once, and it caps its height. A `dashboard` frame fills
+ *  its dashboard tile, whose size class sets the box: a report never sizes it
+ *  (ADR 0432). It mounts once on screen, and a hidden dashboard holds it as an
  *  off-screen transcript frame is held. Every place shares one cap on mounted
  *  frames (`widgetFrameBudget.ts`).
  *
  *  `params` are the instance's *widget params*, carried in the frame URL.
- *  `size` is a Home board tile's widget size, and `visible` false while a
+ *  `size` is a dashboard tile's widget size, and `visible` false while a
  *  loaded frame is out of sight. Both and the place are pushed to the frame on
  *  load and on each change.
  *
- *  `onHeight` hears the frame's height on mount and on each report, and
- *  `onSize` the whole size, saying whether the widget reported it. */
-export function WidgetFrame({ appId, params, reveal, place, size, visible = true, onHeight, onSize }: {
+ *  A report sizes the frame only through the widget height guard
+ *  (`widgetHeightGuard.ts`), at most once per animation frame.
+ *  `onHeight` hears the frame's height on mount and on each applied report,
+ *  and `onSize` the whole size, saying whether the widget reported it.
+ *
+ *  `onMenu` opens the widget's menu. Given one, the frame is marked `menu`, so
+ *  an unclaimed right-click inside it lands there, at its point in the
+ *  viewport. A frame with no menu leaves its right-click alone. */
+export function WidgetFrame({ appId, params, reveal, place, size, visible = true, onHeight, onSize, onMenu }: {
   appId: string;
   params?: WidgetParams;
   reveal: AppReveal;
@@ -123,6 +132,7 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   visible?: boolean;
   onHeight?: (px: number) => void;
   onSize?: (size: ContentSize, fromReport: boolean) => void;
+  onMenu?: (at?: ViewportPoint) => void;
 }) {
   const [host, setHost] = useState<HTMLDivElement | null>(null);
   const frame = useRef<HTMLIFrameElement | null>(null);
@@ -139,7 +149,7 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   const [inView, setInView] = useState(eager);
   useEffect(() => {
     if (eager || !host) return undefined;
-    return place === 'home' ? watchInViewport(host, setInView) : watchOnScreen(transcriptBox(host), setInView);
+    return place === 'dashboard' ? watchInViewport(host, setInView) : watchOnScreen(transcriptBox(host), setInView);
   }, [host, eager, place]);
   const showing = inView && visible;
   useEffect(() => {
@@ -152,20 +162,56 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
     return () => clearTimeout(release);
   }, [showing, eager]);
 
+  // Lives for the mount, so a remount follows its widget afresh.
+  const guard = useRef(initialHeightGuard(height));
+  const onSizeRef = useRef(onSize);
+  onSizeRef.current = onSize;
+  const onMenuRef = useRef(onMenu);
+  onMenuRef.current = onMenu;
+  const hasMenu = onMenu !== undefined;
+
+  useEffect(() => {
+    if (!host) return undefined;
+    const open = (e: Event) => onMenuRef.current?.((e as CustomEvent<ViewportPoint | null>).detail ?? undefined);
+    host.addEventListener(APP_FRAME_MENU_EVENT, open);
+    return () => host.removeEventListener(APP_FRAME_MENU_EVENT, open);
+  }, [host]);
+
   useEffect(() => {
     if (!host) return;
-    const onReport = (e: Event) => {
-      const reported = (e as CustomEvent<ContentSize>).detail;
-      lastSizes.set(instanceKey, reported);
-      // Taken while the old height is laid out. A shelf or board frame
+    let pending: ContentSize | null = null;
+    let frameRequest = 0;
+    const apply = (now: number) => {
+      frameRequest = 0;
+      if (!pending) return;
+      const reported = pending;
+      pending = null;
+      const { state, decision } = decideHeight(guard.current, reported.height, now);
+      guard.current = state;
+      if (decision.kind === 'ignore') return;
+      if (decision.kind === 'lock') {
+        postClientLog('widget', 'height guard locked a frame', {
+          app: appId, place, reason: decision.reason, reported: reported.height, held: decision.height,
+        });
+      }
+      const size = { ...reported, height: decision.height };
+      lastSizes.set(instanceKey, size);
+      // Taken while the old height is laid out. A shelf or dashboard frame
       // is outside the transcript, so its height moves nothing in it.
-      pendingHold.current = eager || place === 'home' ? null : holdWhatFollows(transcriptBox(host));
-      setHeight(reported.height);
-      onSize?.(reported, true);
+      pendingHold.current = eager || place === 'dashboard' ? null : holdWhatFollows(transcriptBox(host));
+      setHeight(size.height);
+      onSizeRef.current?.(size, true);
+    };
+    const onReport = (e: Event) => {
+      pending = (e as CustomEvent<ContentSize>).detail;
+      if (!frameRequest) frameRequest = requestAnimationFrame(apply);
     };
     host.addEventListener(APP_FRAME_SIZE_EVENT, onReport);
-    return () => host.removeEventListener(APP_FRAME_SIZE_EVENT, onReport);
-  }, [host, instanceKey, eager, place, onSize]);
+    return () => {
+      host.removeEventListener(APP_FRAME_SIZE_EVENT, onReport);
+      cancelAnimationFrame(frameRequest);
+    };
+  }, [host, appId, instanceKey, eager, place]);
 
   useLayoutEffect(() => {
     pendingHold.current?.();
@@ -182,11 +228,12 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   const mark = (el: HTMLIFrameElement) => {
     const push: WidgetPush = { place, visible };
     if (size) push.size = size;
+    if (hasMenu) push.menu = true;
     return postToAppFrame(el, WIDGET_CHANNEL, push);
   };
   useEffect(() => {
     if (frame.current) mark(frame.current);
-  }, [place, size, visible]);
+  }, [place, size, visible, hasMenu]);
 
   // Evicted by the shared cap: drawn again when it next comes on screen.
   useEffect(() => {
@@ -196,10 +243,15 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   // A change to the widget's files bumps this, which remounts the frame on a
   // fresh URL, as the Canvas pane's refresh key does.
   const refreshKey = widgetRefreshKey(appId);
+  // Each fresh document gets a fresh guard: a reload or a redraw after
+  // eviction may be a fixed widget, so an old lock must not hold it.
+  useEffect(() => {
+    if (held) guard.current = initialHeightGuard(height);
+  }, [held, refreshKey]);
   const url = appUrl(appId, undefined, undefined, params);
   const src = refreshKey > 0 ? cacheBust(url, refreshKey) : url;
   return (
-    <div ref={setHost} class={`widget-frame widget-frame-${place}`} style={place === 'home' ? undefined : { height: `${height}px` }}>
+    <div ref={setHost} class={`widget-frame widget-frame-${place}`} style={place === 'dashboard' ? undefined : { height: `${height}px` }}>
       {held && (
         <AppFrame
           key={refreshKey}

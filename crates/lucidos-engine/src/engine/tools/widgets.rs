@@ -1,24 +1,26 @@
 //! Handler for the grouped `widgets` tool: the agent's path to every action
-//! on a thread's widgets and its shelf (ADRs 0402, 0407). The schema is built
-//! from the capability parity manifest; the HTTP routes in `api/widgets.rs`
-//! share the same checks in `engine::widgets`.
+//! on a thread's widgets, its shelf and the dashboards (ADRs 0402, 0407,
+//! 0496). The schema is built from the capability parity manifest; the HTTP
+//! routes in `api/widgets.rs` share the same checks.
 
 use uuid::Uuid;
 
 use super::LucidosEngine;
-use crate::engine::home_board;
-use crate::engine::thread_events::{ArrangedTile, LayoutClass};
+use crate::engine::dashboard::{self, DashboardChange, DashboardTile, DashboardView};
+use crate::engine::thread_events::{ArrangedTile, Dashboard};
 use crate::engine::widgets::{self, WidgetChange, WidgetInstance};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const ACTIONS: &str = "list, thread, pin, unpin, make_reusable, stop_reusing, board, arrange";
+const ACTIONS: &str = "list, thread, pin, unpin, make_reusable, stop_reusing, dashboard, \
+                       add_to_dashboard, remove_from_dashboard, arrange";
 
 impl LucidosEngine {
     pub(crate) async fn execute_widgets(
         &self,
         args: &serde_json::Value,
         thread_id: Uuid,
+        device_id: Option<&str>,
     ) -> Result<String, BoxError> {
         let action = args["action"].as_str().map(str::trim).unwrap_or("");
         match action {
@@ -35,8 +37,20 @@ impl LucidosEngine {
             }
             "make_reusable" => self.widgets_set_reusable(args, thread_id, true).await,
             "stop_reusing" => self.widgets_set_reusable(args, thread_id, false).await,
-            "board" => self.widgets_board(layout(args)?).await,
-            "arrange" => self.widgets_arrange(args, thread_id).await,
+            "dashboard" => {
+                let which = self.named_dashboard(args, thread_id, device_id).await?;
+                let view = dashboard::dashboard(&self.pool, &self.app_manager, which).await?;
+                Ok(describe_dashboard(&view))
+            }
+            "add_to_dashboard" => {
+                self.widgets_dashboard_change(DashboardChange::Add, args, thread_id, device_id)
+                    .await
+            }
+            "remove_from_dashboard" => {
+                self.widgets_dashboard_change(DashboardChange::Remove, args, thread_id, device_id)
+                    .await
+            }
+            "arrange" => self.widgets_arrange(args, thread_id, device_id).await,
             "" => Err(format!("action is required (one of: {ACTIONS})").into()),
             other => Err(format!("unknown action '{other}'. Use one of: {ACTIONS}.").into()),
         }
@@ -99,19 +113,11 @@ impl LucidosEngine {
         let instance = WidgetInstance::from_args(args)?;
         let app_id = instance.app_id.clone();
         let thread_id = target_thread(args, caller)?;
-        let plan = widgets::check_widget_change(
-            &self.pool,
-            &self.app_manager,
-            change,
-            &instance,
-            thread_id,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        let made_reusable = widgets::apply_widget_change(
-            &self.app_manager,
+        widgets::check_widget_change(&self.pool, &self.app_manager, change, &instance, thread_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        widgets::emit_widget_change(
             &self.event_bus,
-            plan,
             change,
             instance,
             thread_id,
@@ -119,10 +125,6 @@ impl LucidosEngine {
         )
         .await?;
         Ok(match change {
-            WidgetChange::Pin { .. } if made_reusable => format!(
-                "Made widget '{app_id}' reusable and pinned it to Home, \
-                 so it stays on the Home board if its thread is deleted."
-            ),
             WidgetChange::Pin { .. } => {
                 format!("Pinned widget '{app_id}' to thread {thread_id}'s shelf.")
             }
@@ -159,73 +161,121 @@ impl LucidosEngine {
 }
 
 impl LucidosEngine {
-    async fn widgets_board(&self, layout: LayoutClass) -> Result<String, BoxError> {
-        let board = home_board::home_board(&self.pool, &self.app_manager, layout).await?;
-        Ok(describe_board(&board))
+    /// The dashboard the agent names, else the last used device's.
+    async fn named_dashboard(
+        &self,
+        args: &serde_json::Value,
+        thread_id: Uuid,
+        device_id: Option<&str>,
+    ) -> Result<Dashboard, BoxError> {
+        let device = self.last_used_device(thread_id, device_id).await;
+        Ok(
+            dashboard::resolve_dashboard(&self.pool, args["dashboard"].as_str(), device.as_deref())
+                .await?,
+        )
+    }
+
+    async fn widgets_dashboard_change(
+        &self,
+        change: DashboardChange,
+        args: &serde_json::Value,
+        caller: Uuid,
+        device_id: Option<&str>,
+    ) -> Result<String, BoxError> {
+        let which = self.named_dashboard(args, caller, device_id).await?;
+        let instance = WidgetInstance::from_args(args)?;
+        let app_id = instance.app_id.clone();
+        let plan = dashboard::check_dashboard_change(
+            &self.pool,
+            &self.app_manager,
+            change,
+            which,
+            &instance,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let made_reusable = dashboard::apply_dashboard_change(
+            &self.app_manager,
+            &self.event_bus,
+            plan,
+            change,
+            which,
+            instance,
+            Some(super::agent_tool_actor(caller)),
+        )
+        .await?;
+        let name = which.as_str();
+        Ok(match change {
+            DashboardChange::Add if made_reusable => format!(
+                "Made widget '{app_id}' reusable and added it to the {name} dashboard, \
+                 so it stays there if its thread is deleted."
+            ),
+            DashboardChange::Add => format!("Added '{app_id}' to the {name} dashboard."),
+            DashboardChange::Remove => {
+                format!("Removed '{app_id}' from the {name} dashboard.")
+            }
+        })
     }
 
     async fn widgets_arrange(
         &self,
         args: &serde_json::Value,
         caller: Uuid,
+        device_id: Option<&str>,
     ) -> Result<String, BoxError> {
-        let layout = layout(args)?;
-        let tiles: Vec<ArrangedTile> =
-            serde_json::from_value(args["tiles"].clone()).map_err(|e| {
-                format!("tiles must be a list of {{app_id, params?, size, hidden?}}: {e}")
-            })?;
-        let home = home_board::check_arrangement(&self.pool, &self.app_manager, &tiles)
+        let which = self.named_dashboard(args, caller, device_id).await?;
+        let tiles: Vec<ArrangedTile> = serde_json::from_value(args["tiles"].clone())
+            .map_err(|e| format!("tiles must be a list of {{app_id, params?, size}}: {e}"))?;
+        dashboard::check_arrangement(&self.pool, &self.app_manager, which, &tiles)
             .await
             .map_err(|e| e.to_string())?;
-        home_board::emit_arrangement(
+        dashboard::emit_arrangement(
             &self.event_bus,
-            home,
-            layout,
+            which,
             tiles,
             Some(super::agent_tool_actor(caller)),
         )
         .await?;
-        let board = home_board::home_board(&self.pool, &self.app_manager, layout).await?;
+        let view = dashboard::dashboard(&self.pool, &self.app_manager, which).await?;
         Ok(format!(
-            "Arranged the Home board.\n{}",
-            describe_board(&board)
+            "Arranged the {} dashboard.\n{}",
+            which.as_str(),
+            describe_dashboard(&view)
         ))
     }
 }
 
-fn layout(args: &serde_json::Value) -> Result<LayoutClass, BoxError> {
-    Ok(LayoutClass::from_arg(
-        args["layout"].as_str().unwrap_or(""),
-    )?)
-}
-
-/// One line per tile, in board order, with the sizes each widget takes.
-fn describe_board(board: &home_board::HomeBoard) -> String {
-    if board.tiles.is_empty() {
-        return format!(
-            "The {} Home board is empty: nothing is pinned to Home.",
-            board.layout.as_str()
-        );
+/// One line per tile, in order, with the sizes each widget takes. An app
+/// shortcut is always a quarter.
+fn describe_dashboard(view: &DashboardView) -> String {
+    let name = view.dashboard.as_str();
+    if view.tiles.is_empty() {
+        return format!("The {name} dashboard is empty.");
     }
-    let mut out = format!("The {} Home board, in order:", board.layout.as_str());
-    for tile in &board.tiles {
-        let w = &tile.widget;
-        let sizes: Vec<&str> = w.sizes.iter().map(|s| s.as_str()).collect();
-        out.push_str(&format!(
-            "\n- {} (id: `{}`), {}, takes {}",
-            w.label.as_ref().unwrap_or(&w.name),
-            w.app_id,
-            tile.size.as_str(),
-            sizes.join(", ")
-        ));
-        if let Some(params) = &w.params {
-            out.push_str(&format!(
-                ", params {}",
-                widgets::canonical_widget_params(params)
-            ));
-        }
-        if tile.hidden {
-            out.push_str(", hidden");
+    let mut out = format!("The {name} dashboard, in order:");
+    for tile in &view.tiles {
+        match tile {
+            DashboardTile::Widget { widget: w, size } => {
+                let sizes: Vec<&str> = w.sizes.iter().map(|s| s.as_str()).collect();
+                out.push_str(&format!(
+                    "\n- {} (id: `{}`), {}, takes {}",
+                    w.label.as_ref().unwrap_or(&w.name),
+                    w.app_id,
+                    size.as_str(),
+                    sizes.join(", ")
+                ));
+                if let Some(params) = &w.params {
+                    out.push_str(&format!(
+                        ", params {}",
+                        widgets::canonical_widget_params(params)
+                    ));
+                }
+            }
+            DashboardTile::App(app) => out.push_str(&format!(
+                "\n- {} (id: `{}`), app shortcut, quarter",
+                app.label.as_ref().unwrap_or(&app.name),
+                app.app_id
+            )),
         }
     }
     out
@@ -250,7 +300,7 @@ fn target_thread(args: &serde_json::Value, caller: Uuid) -> Result<Uuid, BoxErro
 /// The actions the handler recognises. A test pins them to the manifest.
 #[cfg(test)]
 pub(crate) fn recognized_actions() -> Vec<&'static str> {
-    ACTIONS.split(", ").collect()
+    ACTIONS.split(',').map(str::trim).collect()
 }
 
 #[cfg(test)]

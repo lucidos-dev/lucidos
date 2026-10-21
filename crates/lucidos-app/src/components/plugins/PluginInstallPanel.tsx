@@ -1,11 +1,12 @@
 import { useState } from 'preact/hooks';
 import { activeInlineForm } from '../../store/store';
 import type { PluginInstallForm } from '../../store/store';
-import type { PluginLocalChangeOutcome } from '../../store/types';
+import type { PluginInstallRequest, PluginLocalChangeOutcome } from '../../store/types';
 import {
   cancelPluginInstallAction,
   confirmPluginInstallAction,
 } from '../../store/actions/plugin-install';
+import { describeSetupRunNote } from '../../utils/engineEventExplainers';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { NO_ENGINE_REQUIREMENT_SENTENCE } from './engineRequirement';
 import { PluginFileList } from './PluginFileList';
@@ -31,7 +32,15 @@ const LOCAL_CHANGE_LABEL: Record<PluginLocalChangeOutcome, string> = {
   conflict: 'Cannot merge, your version is saved aside',
   replaced: 'Replaced, your version is saved aside',
   restored: 'You deleted this, the new version brings it back',
+  removed: 'No longer shipped. Removed, your version is saved aside',
 };
+
+/** Outcomes the keep control cannot change. A restore has no edit to keep or
+ *  drop. Keeping a removed file in place would leave a stale copy loading. */
+const KEEP_CONTROL_EXEMPT: ReadonlySet<PluginLocalChangeOutcome> = new Set([
+  'restored',
+  'removed',
+]);
 
 /** What the panel promises for one edited file, under the current keep control.
  *
@@ -45,21 +54,19 @@ export function localChangeLabel(
   outcome: PluginLocalChangeOutcome,
   keepLocal: boolean,
 ): string {
-  // A restore is untouched by the keep control: the user deleted the file, so
-  // there is no edit to keep or drop, and nothing gets saved aside either way.
-  if (outcome === 'restored' || keepLocal) return LOCAL_CHANGE_LABEL[outcome];
+  if (KEEP_CONTROL_EXEMPT.has(outcome) || keepLocal) return LOCAL_CHANGE_LABEL[outcome];
   return LOCAL_CHANGE_LABEL.replaced;
 }
 
-/** Overwrites with no local edit of their own. An edited path gets its own row
- *  stating its own outcome. Listing it again under the blunt "will be replaced"
- *  heading would contradict that row. */
-export function plainOverwrites(
-  overwrites: string[],
+/** Paths with no local edit of their own. An edited path gets its own row
+ *  stating its own outcome. Listing it again under a blunt "Files to replace"
+ *  or "Files to remove" heading would contradict that row. */
+export function pathsWithoutOwnRow(
+  paths: string[],
   changes: { path: string }[],
 ): string[] {
   const edited = new Set(changes.map((c) => c.path));
-  return overwrites.filter((f) => !edited.has(f));
+  return paths.filter((f) => !edited.has(f));
 }
 
 function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
@@ -77,7 +84,8 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
 
   const overwriteSet = new Set(req.overwrites);
   const newFiles = req.files.filter((f) => !overwriteSet.has(f));
-  const replacedOutright = plainOverwrites(req.overwrites, localChanges);
+  const replacedOutright = pathsWithoutOwnRow(req.overwrites, localChanges);
+  const removedOutright = pathsWithoutOwnRow(req.removes ?? [], localChanges);
   const isUpdate = req.is_update === true;
 
   // The action fns resolve the panel themselves (into a receipt on success,
@@ -203,20 +211,50 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
           />
         )}
 
+        {removedOutright.length > 0 && (
+          <PluginFileList
+            label="Files to remove"
+            files={removedOutright}
+            tone="danger"
+            note="The new version no longer ships these files. Updating deletes them."
+          />
+        )}
+
         {newFiles.length > 0 && (
           <PluginFileList label="New files" files={newFiles} />
         )}
 
         {req.setup && (
-          <PluginSection label="Setup steps">
-            <div
-              class="plugin-install-setup-body markdown-content"
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(req.setup) }}
-            />
-          </PluginSection>
+          <SetupStepsSection
+            setup={req.setup}
+            request={req}
+            note={isUpdate && req.setup_run !== undefined ? describeSetupRunNote(req.setup_run) : undefined}
+          />
         )}
       </div>
     </div>
+  );
+}
+
+/** The plugin's setup steps, folded. They are written for the Lucidos Agent,
+ *  which carries them out in a setup thread and asks the user only for what it
+ *  needs. Open and unlabelled, they read like a to-do list for the user.
+ *
+ *  An update whose setup did not change seeds no thread (`setup_run: null`), so
+ *  its heading promises no run. */
+function SetupStepsSection({ setup, request, note }: {
+  setup: string;
+  request: PluginInstallRequest;
+  note?: string;
+}) {
+  const runs = !(request.is_update === true && request.setup_run === null);
+  return (
+    <PluginSection label="Agent setup steps" detail={runs ? 'run for you' : undefined} note={note}>
+      <div
+        class="plugin-install-setup-body markdown-content"
+        dangerouslySetInnerHTML={{ __html: renderMarkdown(setup) }}
+      />
+    </PluginSection>
   );
 }
 
@@ -230,9 +268,8 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
  *  because a receipt is a page in the nav history. The header's back arrow is
  *  how you leave it, same as any other panel page.
  *
- *  The plugin's setup instructions stay on it, since they are the one thing the
- *  user may still need after the install and the setup thread is a pane away
- *  rather than in front of them.
+ *  The plugin's setup steps stay on it, folded, as a record of what the setup
+ *  thread works through.
  *
  *  Exported for its unit test, which renders it directly: the suite's VNode walk
  *  stops at function components (the confirm branch's hooks would throw), so it
@@ -276,6 +313,11 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
                 {' '}{local.restored.join(', ')}.
               </p>
             )}
+            {(local.removed ?? []).length > 0 && (
+              <p class="plugin-install-note">
+                No longer shipped, so removed: {local.removed!.join(', ')}.
+              </p>
+            )}
             {local.saved_paths.length > 0 && (
               <p class="plugin-install-note">
                 Your versions are saved under <code>data/artifacts/</code>, each
@@ -292,14 +334,11 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
           <PluginFileList label="Files installed" files={installed.installed_files} />
         )}
 
-        {req.setup && (
-          <PluginSection label="Setup steps" defaultOpen>
-            <div
-              class="plugin-install-setup-body markdown-content"
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(req.setup) }}
-            />
-          </PluginSection>
+        {(installed.removed_files ?? []).length > 0 && (
+          <PluginFileList label="Files removed" files={installed.removed_files!} />
         )}
+
+        {req.setup && <SetupStepsSection setup={req.setup} request={req} />}
       </div>
     </div>
   );

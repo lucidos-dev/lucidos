@@ -1,6 +1,7 @@
-//! Keeping a user's local edits across a plugin update.
+//! Keeping a user's local edits across a plugin update, and removing the files
+//! the new version dropped.
 //!
-//! Each test drives the real staging-then-confirm sequence: plan the merge
+//! Each test drives the real staging-then-confirm sequence: plan the update
 //! against the recorded baseline, resolve the panel's keep control, save aside
 //! whatever will be discarded, then run the writer. Nothing here shortcuts to
 //! the merge function alone, because the invariants that matter are about what
@@ -16,6 +17,18 @@ use crate::engine::tools::plugins::registry::PluginBaseline;
 use crate::triggers::config::TriggerRun;
 use crate::triggers::definition::TriggerDefinition;
 use std::path::PathBuf;
+
+/// The planner as staging calls it for a plugin that shares no path with
+/// another one.
+fn plan_for(ws: &Path, baseline: &PluginBaseline, planned: &[PlannedFile]) -> UpdatePlan {
+    super::plan_update(
+        ws,
+        &baseline.files,
+        Some(baseline),
+        planned,
+        &BTreeSet::new(),
+    )
+}
 
 const MANIFEST_V1: &str = r#"
 id = "demo"
@@ -122,6 +135,19 @@ fn committed_blob(ws: &Path, commit: &str, rel: &str) -> String {
     String::from_utf8(blob.content().to_vec()).unwrap()
 }
 
+/// Whether the install commit's tree holds `rel` at all.
+fn in_commit(ws: &Path, commit: &str, rel: &str) -> bool {
+    let repo = git2::Repository::open(ws).unwrap();
+    let tree = repo
+        .revparse_single(commit)
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .tree()
+        .unwrap();
+    tree.get_path(Path::new(&format!("data/{}", rel))).is_ok()
+}
+
 /// What a confirmed update did to the user's edits, for assertions.
 #[derive(Debug)]
 struct UpdateOutcome {
@@ -129,7 +155,12 @@ struct UpdateOutcome {
     conflicted: Vec<String>,
     replaced: Vec<String>,
     restored: Vec<String>,
+    removed: Vec<String>,
     saved_paths: Vec<String>,
+    /// Every path the staged preview said the confirm would delete.
+    removes: Vec<String>,
+    /// Every path the writer deleted.
+    removed_files: Vec<String>,
 }
 
 /// Fresh install: no baseline, so no merge plan and no local changes.
@@ -155,6 +186,28 @@ async fn update(
     baseline: &PluginBaseline,
     keep_local_changes: bool,
 ) -> UpdateOutcome {
+    update_over(
+        ws,
+        bus,
+        manifest,
+        files,
+        &baseline.files,
+        Some(baseline),
+        keep_local_changes,
+    )
+    .await
+}
+
+/// [`update`] over any previous record, a legacy one with no baseline included.
+async fn update_over(
+    ws: &Path,
+    bus: &MockEventBus,
+    manifest: &str,
+    files: &[(&str, &[u8])],
+    recorded: &[String],
+    baseline: Option<&PluginBaseline>,
+    keep_local_changes: bool,
+) -> UpdateOutcome {
     // The version doubles as the staging directory name, so a fixture names it
     // once and the two cannot drift.
     let version = crate::core::plugins::parse_manifest(manifest)
@@ -162,7 +215,7 @@ async fn update(
         .version;
     let root = stage(ws, &version, manifest, files);
     let (_, planned) = validate_tree(&root).expect("staged tree must validate");
-    let plan = super::plan_local_changes(ws, baseline, &planned);
+    let plan = super::plan_update(ws, recorded, baseline, &planned, &BTreeSet::new());
     assert!(
         plan.detect_drift(ws).is_none(),
         "the plan was just built, so nothing can have drifted yet"
@@ -170,25 +223,34 @@ async fn update(
     let resolved = plan.resolve(keep_local_changes);
     let saved_paths = super::save_discarded(ws, "demo", &version, &resolved).expect("save aside");
     let writes = LocalChangeWrites::from_resolved(&resolved, saved_paths.clone());
-    let outcome = UpdateOutcome {
-        merged: writes.merged_paths(),
-        conflicted: writes.conflicted.clone(),
-        replaced: writes.replaced.clone(),
-        restored: writes.restored.clone(),
-        saved_paths,
-    };
-    install_from_unpacked_with_bus(
+    let merged = writes.merged_paths();
+    let conflicted = writes.conflicted.clone();
+    let replaced = writes.replaced.clone();
+    let restored = writes.restored.clone();
+    let removed = writes.removed.clone();
+    let removes = plan.removes();
+    let write = install_from_unpacked_with_bus(
         ws,
         bus,
         &root,
         InstallContext {
             local: writes,
+            removals: removes.clone(),
             ..InstallContext::plain(SourceType::Archive, true)
         },
     )
     .await
     .expect("update must succeed");
-    outcome
+    UpdateOutcome {
+        merged,
+        conflicted,
+        replaced,
+        restored,
+        removed,
+        saved_paths,
+        removes,
+        removed_files: write.removed_files,
+    }
 }
 
 /// The whole point: upstream changes the top of the file, the user owns the
@@ -480,7 +542,7 @@ async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
         ],
     );
     let (_, planned) = validate_tree(&root).unwrap();
-    let plan = super::plan_local_changes(&ws, &base, &planned);
+    let plan = plan_for(&ws, &base, &planned);
 
     let listed: Vec<String> = plan
         .preview_json()
@@ -546,7 +608,7 @@ async fn a_file_dropped_for_matching_upstream_is_still_drift_checked() {
         &[("knowhow/notes.md", published.as_bytes())],
     );
     let (_, planned) = validate_tree(&root).unwrap();
-    let plan = super::plan_local_changes(&ws, &base, &planned);
+    let plan = plan_for(&ws, &base, &planned);
     assert!(
         plan.preview_json().as_array().unwrap().is_empty(),
         "nothing to decide, so nothing to list"
@@ -759,7 +821,7 @@ async fn a_merged_file_keeps_the_shipped_executable_bit() {
     .unwrap();
 
     let (_, planned) = validate_tree(&root).unwrap();
-    let plan = super::plan_local_changes(&ws, &base, &planned);
+    let plan = plan_for(&ws, &base, &planned);
     let resolved = plan.resolve(true);
     let saved = super::save_discarded(&ws, "demo", "2.0.0", &resolved).unwrap();
     let writes = LocalChangeWrites::from_resolved(&resolved, saved);
@@ -869,7 +931,7 @@ async fn confirm_refuses_when_local_content_changed_since_staging() {
         &[("knowhow/notes.md", NOTES_V2.as_bytes())],
     );
     let (_, planned) = validate_tree(&root).unwrap();
-    let plan = super::plan_local_changes(&ws, &base, &planned);
+    let plan = plan_for(&ws, &base, &planned);
     assert!(
         plan.detect_drift(&ws).is_none(),
         "clean right after staging"
@@ -1027,5 +1089,357 @@ async fn user_added_app_file_upstream_now_ships_is_a_conflict() {
             "artifacts/plugin-local-changes/demo/v2.0.0/apps/demo/extra.js"
         ),
         "console.log('mine')\n"
+    );
+}
+
+const TOPIC: &str = "# Topic\nhow to do the thing\n";
+
+/// The reported case: v2 moved a knowhow file out of its app folder. Both
+/// copies used to survive, and the stale one kept loading. Only the new path
+/// may remain, on disk and in the install commit.
+#[tokio::test]
+async fn a_moved_file_ends_up_only_at_its_new_path() {
+    let (_tmp, ws) = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(
+        &ws,
+        &bus,
+        &[
+            ("apps/demo/index.html", b"<h1>v1</h1>\n"),
+            ("apps/demo/knowhow/topic.md", TOPIC.as_bytes()),
+        ],
+    )
+    .await;
+    let base = baseline(
+        &bus,
+        &["apps/demo/index.html", "apps/demo/knowhow/topic.md"],
+    );
+
+    let outcome = update(
+        &ws,
+        &bus,
+        MANIFEST_V2,
+        &[
+            ("apps/demo/index.html", b"<h1>v2</h1>\n"),
+            ("knowhow/topic.md", TOPIC.as_bytes()),
+        ],
+        &base,
+        true,
+    )
+    .await;
+
+    let old = "apps/demo/knowhow/topic.md".to_string();
+    assert_eq!(outcome.removes, vec![old.clone()]);
+    assert_eq!(outcome.removed_files, vec![old.clone()]);
+    assert!(
+        outcome.removed.is_empty() && outcome.saved_paths.is_empty(),
+        "an unedited file needs no copy: {outcome:?}"
+    );
+    assert!(!data_path(&ws, &old).exists(), "the old copy must be gone");
+    assert!(
+        !data_path(&ws, "apps/demo/knowhow").exists(),
+        "the folder it leaves empty is pruned"
+    );
+    assert_eq!(read_data(&ws, "knowhow/topic.md"), TOPIC);
+
+    let commit = recorded_install_commit(&bus);
+    assert!(
+        !in_commit(&ws, &commit, &old),
+        "the install commit holds only what v2 ships"
+    );
+    assert_eq!(committed_blob(&ws, &commit, "knowhow/topic.md"), TOPIC);
+    let repo = git2::Repository::open(&ws).unwrap();
+    let status = repo.status_file(Path::new(&format!("data/{old}"))).ok();
+    assert!(
+        status.is_none_or(|s| s.is_empty()),
+        "the deletion is committed, not left in the working tree: {status:?}"
+    );
+
+    let recorded_removal = bus.emitted_events().iter().rev().find_map(|e| match e {
+        BusEvent::System(SystemEvent::PluginInstalled { files_removed, .. }) => {
+            Some(files_removed.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(recorded_removal, Some(vec![old]), "the event records it");
+}
+
+/// Only recorded paths are candidates. A file the user added beside a dropped
+/// one is theirs, so it stays, and so does its folder.
+#[tokio::test]
+async fn a_user_file_beside_a_dropped_one_survives() {
+    let (_tmp, ws) = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(
+        &ws,
+        &bus,
+        &[
+            ("apps/demo/index.html", b"<h1>v1</h1>\n"),
+            ("apps/demo/knowhow/topic.md", TOPIC.as_bytes()),
+        ],
+    )
+    .await;
+    write_data(&ws, "apps/demo/knowhow/mine.md", "my own notes\n");
+    let base = baseline(
+        &bus,
+        &["apps/demo/index.html", "apps/demo/knowhow/topic.md"],
+    );
+
+    let outcome = update(
+        &ws,
+        &bus,
+        MANIFEST_V2,
+        &[("apps/demo/index.html", b"<h1>v2</h1>\n")],
+        &base,
+        true,
+    )
+    .await;
+
+    assert_eq!(outcome.removed_files, vec!["apps/demo/knowhow/topic.md"]);
+    assert!(!data_path(&ws, "apps/demo/knowhow/topic.md").exists());
+    assert_eq!(
+        read_data(&ws, "apps/demo/knowhow/mine.md"),
+        "my own notes\n"
+    );
+}
+
+/// An edited file the new version drops is saved aside, whole and as a patch,
+/// then removed. The keep control cannot keep it: a dropped file left in place
+/// is exactly the stale copy this exists to prevent.
+#[tokio::test]
+async fn an_edited_dropped_file_is_saved_aside_then_removed() {
+    let (_tmp, ws) = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(
+        &ws,
+        &bus,
+        &[
+            ("knowhow/notes.md", NOTES.as_bytes()),
+            ("knowhow/old.md", NOTES.as_bytes()),
+        ],
+    )
+    .await;
+    let ours = notes_with_user_section(NOTES);
+    write_data(&ws, "knowhow/old.md", &ours);
+    let base = baseline(&bus, &["knowhow/notes.md", "knowhow/old.md"]);
+    let v2: &[(&str, &[u8])] = &[("knowhow/notes.md", NOTES_V2.as_bytes())];
+
+    let root = stage(&ws, "preview", MANIFEST_V2, v2);
+    let (_, planned) = validate_tree(&root).unwrap();
+    let staged = plan_for(&ws, &base, &planned);
+    assert_eq!(
+        staged.preview_json(),
+        serde_json::json!([{ "path": "knowhow/old.md", "outcome": "removed" }]),
+        "the panel names it before confirm"
+    );
+    assert!(
+        staged
+            .resolve(false)
+            .iter()
+            .all(|c| c.outcome == LocalChangeOutcome::Removed),
+        "switching the keep control off does not change a removal"
+    );
+
+    let outcome = update(&ws, &bus, MANIFEST_V2, v2, &base, true).await;
+
+    assert_eq!(outcome.removed, vec!["knowhow/old.md".to_string()]);
+    assert_eq!(outcome.removed_files, vec!["knowhow/old.md".to_string()]);
+    assert!(!data_path(&ws, "knowhow/old.md").exists());
+    let saved = "artifacts/plugin-local-changes/demo/v2.0.0/knowhow/old.md";
+    assert_eq!(read_data(&ws, saved), ours, "the whole file is kept");
+    let patch = read_data(&ws, &format!("{saved}.patch"));
+    assert!(
+        patch.contains("## Outlook snapshot"),
+        "and the edit as a patch: {patch}"
+    );
+}
+
+/// A legacy record has no install commit, so no edit can be ruled out. Every
+/// dropped file still on disk is saved aside whole, then removed.
+#[tokio::test]
+async fn a_legacy_record_saves_every_dropped_file_aside() {
+    let (_tmp, ws) = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(
+        &ws,
+        &bus,
+        &[
+            ("knowhow/notes.md", NOTES.as_bytes()),
+            ("knowhow/old.md", TOPIC.as_bytes()),
+        ],
+    )
+    .await;
+    let recorded = ["knowhow/notes.md".to_string(), "knowhow/old.md".to_string()];
+
+    let outcome = update_over(
+        &ws,
+        &bus,
+        MANIFEST_V2,
+        &[("knowhow/notes.md", NOTES_V2.as_bytes())],
+        &recorded,
+        None,
+        true,
+    )
+    .await;
+
+    assert_eq!(outcome.removed, vec!["knowhow/old.md".to_string()]);
+    assert!(!data_path(&ws, "knowhow/old.md").exists());
+    let saved = "artifacts/plugin-local-changes/demo/v2.0.0/knowhow/old.md";
+    assert_eq!(read_data(&ws, saved), TOPIC);
+    assert!(
+        !data_path(&ws, &format!("{saved}.patch")).exists(),
+        "with no baseline there is nothing to diff against"
+    );
+    assert_eq!(
+        read_data(&ws, "knowhow/notes.md"),
+        NOTES_V2,
+        "a shipped file is still plainly replaced"
+    );
+}
+
+/// The paths an update must never delete, whatever the record says.
+#[tokio::test]
+async fn paths_an_update_must_not_delete_are_skipped() {
+    let (_tmp, ws) = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(
+        &ws,
+        &bus,
+        &[
+            ("knowhow/notes.md", NOTES.as_bytes()),
+            ("knowhow/shared.md", TOPIC.as_bytes()),
+            ("knowhow/gone.md", TOPIC.as_bytes()),
+            ("triggers/watch/trigger.toml", TRIGGER_TOML.as_bytes()),
+        ],
+    )
+    .await;
+    std::fs::remove_file(data_path(&ws, "knowhow/gone.md")).unwrap();
+    // A tampered record: paths outside the content dirs, present on disk so
+    // only the guard can be what skips them.
+    write_data(&ws, "config/secrets.json", "{}");
+    std::fs::write(ws.join("outside.md"), "x").unwrap();
+    let recorded: Vec<String> = [
+        "knowhow/notes.md",
+        "knowhow/shared.md",
+        "knowhow/gone.md",
+        "triggers/watch/trigger.toml",
+        "config/secrets.json",
+        "../outside.md",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let base = PluginBaseline {
+        commit: recorded_install_commit(&bus),
+        files: recorded.clone(),
+    };
+    let others: BTreeSet<&str> = ["knowhow/shared.md"].into();
+
+    let root = stage(
+        &ws,
+        "v2",
+        MANIFEST_V2,
+        &[("knowhow/notes.md", NOTES_V2.as_bytes())],
+    );
+    let (_, planned) = validate_tree(&root).unwrap();
+    let plan = super::plan_update(&ws, &recorded, Some(&base), &planned, &others);
+
+    assert!(
+        plan.removes().is_empty(),
+        "shared, missing, trigger and unsafe paths are all skipped: {:?}",
+        plan.removes()
+    );
+    assert!(plan.preview_json().as_array().unwrap().is_empty());
+}
+
+/// A case-only rename names one file on a case-insensitive volume. Removing
+/// the old spelling would delete the file the update just wrote.
+#[tokio::test]
+async fn a_case_only_rename_is_not_removed() {
+    let (_tmp, ws) = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(&ws, &bus, &[("knowhow/Topic.md", TOPIC.as_bytes())]).await;
+    let base = baseline(&bus, &["knowhow/Topic.md"]);
+
+    let root = stage(
+        &ws,
+        "v2",
+        MANIFEST_V2,
+        &[("knowhow/topic.md", TOPIC.as_bytes())],
+    );
+    let (_, planned) = validate_tree(&root).unwrap();
+    let plan = plan_for(&ws, &base, &planned);
+
+    assert!(plan.removes().is_empty(), "{:?}", plan.removes());
+}
+
+/// Unedited means the install commit holds these exact bytes. A recorded file
+/// the commit lacks, for one an ignore rule kept out, is saved aside first.
+#[tokio::test]
+async fn a_dropped_file_the_install_commit_lacks_is_saved_aside() {
+    let (_tmp, ws) = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
+    write_data(&ws, "knowhow/uncommitted.md", "only on disk\n");
+    // The Modified scan covers only the baseline's own files, so it cannot see
+    // this path. The plan must not read that silence as "unedited".
+    let base = baseline(&bus, &["knowhow/notes.md"]);
+    let recorded = [
+        "knowhow/notes.md".to_string(),
+        "knowhow/uncommitted.md".to_string(),
+    ];
+
+    let root = stage(
+        &ws,
+        "v2",
+        MANIFEST_V2,
+        &[("knowhow/notes.md", NOTES_V2.as_bytes())],
+    );
+    let (_, planned) = validate_tree(&root).unwrap();
+    let plan = super::plan_update(&ws, &recorded, Some(&base), &planned, &BTreeSet::new());
+
+    assert_eq!(
+        plan.preview_json(),
+        serde_json::json!([{ "path": "knowhow/uncommitted.md", "outcome": "removed" }])
+    );
+}
+
+/// Nothing is deleted on a judgment the user did not see. A dropped file that
+/// changes inside the staging window refuses the confirm, edited or not.
+#[tokio::test]
+async fn a_dropped_file_changed_after_staging_refuses_the_confirm() {
+    let (_tmp, ws) = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(
+        &ws,
+        &bus,
+        &[
+            ("knowhow/notes.md", NOTES.as_bytes()),
+            ("knowhow/old.md", TOPIC.as_bytes()),
+        ],
+    )
+    .await;
+    let base = baseline(&bus, &["knowhow/notes.md", "knowhow/old.md"]);
+
+    let root = stage(
+        &ws,
+        "v2",
+        MANIFEST_V2,
+        &[("knowhow/notes.md", NOTES.as_bytes())],
+    );
+    let (_, planned) = validate_tree(&root).unwrap();
+    let plan = plan_for(&ws, &base, &planned);
+    assert_eq!(plan.removes(), vec!["knowhow/old.md".to_string()]);
+    assert!(plan.preview_json().as_array().unwrap().is_empty());
+    assert!(
+        plan.detect_drift(&ws).is_none(),
+        "clean right after staging"
+    );
+
+    write_data(&ws, "knowhow/old.md", "a late edit\n");
+    assert_eq!(
+        plan.detect_drift(&ws).as_deref(),
+        Some("knowhow/old.md"),
+        "a late edit to a file about to be removed must stop the confirm"
     );
 }

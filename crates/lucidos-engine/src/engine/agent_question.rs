@@ -1083,13 +1083,18 @@ pub(crate) fn build_hook_answers(
     };
     let mut map = serde_json::Map::with_capacity(arr.len());
     for (i, q) in arr.iter().enumerate() {
-        // Key on the same `question` field the card renders, so the answer-map
-        // key the LLM reads back matches the text the user saw. The
+        // Key on the exact `question` string, untrimmed: Claude Code looks each
+        // answer up with `Object.hasOwn` on the string it sent, so a trimmed
+        // key reads as "did not answer". The card shows the trimmed text. The
         // "(unknown question)" fallback is defensive only — walk_question_batch
         // already rejected any entry missing a `question`, so it's unreachable
         // in the normal flow.
-        let raw_text = crate::engine::agent_session::question_text(q)
-            .unwrap_or_else(|| "(unknown question)".to_string());
+        let raw_text = q
+            .get("question")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("(unknown question)")
+            .to_string();
         let key = if map.contains_key(&raw_text) {
             crate::log!(
                 "[AskUserQuestion] duplicate question text in tool input — disambiguating with suffix: {raw_text:?}"

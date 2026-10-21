@@ -1,10 +1,12 @@
 import { useRef, useCallback, useEffect, useLayoutEffect } from 'preact/hooks';
-import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RATIO_KEY, scaledDurationMs } from '../../store/store';
-import { homeRailShown } from '../../store/homeRail';
+import { splitRatio, focusedPane, SPLIT_RATIO_KEY } from '../../store/store';
 import { focusPane, toggleSplitFromDivider } from '../../store/actions/pane';
 import { homeThreadId } from '../../store/actions/homeThread';
-import { setSplitRatio, clampSplitRatio, migratedSplitRatio, beginPaneResize, endPaneResize, PANE_TRANSITION_MS } from './splitHelpers';
-import { splitBounds } from '../../store/paneMinimums';
+import { clampSplitRatio, splitFitsBothPanes } from './splitHelpers';
+import {
+  beginPaneResize, drawnDrawerShown, drawnDrawerWidth, drawnSplitRatio, endPaneResize, layoutGeometry, measureLayout,
+} from './drawnLayout';
+import { splitBounds, THREAD_ROW } from '../../store/paneMinimums';
 import { startDividerDrag } from './dividerDrag';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import type { ComponentChildren } from 'preact';
@@ -19,59 +21,35 @@ const dividerDblGate = createDblClickGate();
 export function SplitLayout({ threadPane, contentPane }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Bring a persisted ratio that is no longer legal up to the floor, ONCE, as
-  // soon as the split has a width. `migratedSplitRatio` explains why nothing
-  // else would. A ResizeObserver rather than a bare layout-effect read: the
-  // first frame can measure 0 while the shell is still sizing, and a migration
-  // that silently skips itself there is no migration at all. It disconnects on
-  // the first usable width, so a later window resize is untouched.
+  // The drawn layout needs the window's width and every floor at every moment.
+  // The Conversation row's height is rem, so a UI-scale change resizes it too.
   useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const migrate = (width: number) => {
-      if (width <= 2) return false;
-      const next = migratedSplitRatio(splitRatio.value, width, splitBounds());
-      if (next !== null) setSplitRatio(next);
-      return true;
-    };
-    if (migrate(container.getBoundingClientRect().width)) return;
-    const observer = new ResizeObserver(() => {
-      if (migrate(container.getBoundingClientRect().width)) observer.disconnect();
-    });
+    measureLayout();
+    window.addEventListener('resize', measureLayout);
+    const observer = new ResizeObserver(measureLayout);
     observer.observe(container);
-    return () => observer.disconnect();
+    const brandRow = document.querySelector(THREAD_ROW);
+    if (brandRow) observer.observe(brandRow);
+    return () => {
+      window.removeEventListener('resize', measureLayout);
+      observer.disconnect();
+      layoutGeometry.value = null;
+    };
   }, []);
 
-  // Home leading the header raises the Conversation floor (paneMinimums), and
-  // the home thread usually loads after the migration above ran. So its arrival
-  // migrates again, a frame later, once the header has drawn the button the
-  // floor reads.
+  // Home leading the header raises the Conversation floor (paneMinimums). It
+  // resizes nothing, so it is measured a frame after the header draws it.
   const homeShown = homeThreadId.value !== null;
   useEffect(() => {
-    if (!homeShown) return;
     const frame = requestAnimationFrame(() => {
-      const container = containerRef.current;
-      if (!container) return;
-      const next = migratedSplitRatio(splitRatio.value, container.getBoundingClientRect().width, splitBounds());
-      if (next !== null) setSplitRatio(next);
+      measureLayout();
     });
     return () => cancelAnimationFrame(frame);
   }, [homeShown]);
 
-  // Showing the Home board's rail takes its width from the split, as a
-  // narrower window would. So it migrates too, once the shell's padding has
-  // finished sliding and the split has its final width.
-  const railShown = homeRailShown.value;
-  useEffect(() => {
-    if (!railShown) return;
-    const timer = setTimeout(() => {
-      const container = containerRef.current;
-      if (!container) return;
-      const next = migratedSplitRatio(splitRatio.value, container.getBoundingClientRect().width, splitBounds());
-      if (next !== null) setSplitRatio(next);
-    }, scaledDurationMs(PANE_TRANSITION_MS) + 100);
-    return () => clearTimeout(timer);
-  }, [railShown]);
+  const ratio = drawnSplitRatio.value;
 
   const onDividerDown = useCallback((e: PointerEvent) => {
     dividerDblGate.record();
@@ -92,6 +70,8 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
     // So the header icon groups they swap cannot dance between hosts as the
     // pointer wiggles across a pane edge, where the snap merely postponed the
     // flip to release. The 1px floor/ceiling that stood in for this is gone.
+    // A split too narrow for both floors has no position but collapsed, so
+    // there the drag moves nothing and never draws a squeezed pane.
     //
     // Measured ONCE: the bounds derive from the root font size, which a drag
     // cannot change, and each read is a forced style recalc on the hot path the
@@ -100,7 +80,7 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
     const bounds = splitBounds();
     const onMove = (e: PointerEvent) => {
       const rect = container.getBoundingClientRect();
-      if (rect.width <= 1) return;
+      if (!splitFitsBothPanes(rect.width, bounds)) return;
       splitRatio.value = clampSplitRatio(e.clientX - rect.left, rect.width, bounds);
     };
 
@@ -115,14 +95,14 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
     toggleSplitFromDivider();
   }, []);
 
-  const ratio = splitRatio.value;
   const threadCollapsed = ratio === 0;
   const contentCollapsed = ratio >= 1;
 
   // Expose split ratio and thread-drawer offset so the header can compute divider position
-  // Hide drawer when thread pane is collapsed but don't mutate threadDrawerOpen — so it restores on expand
-  const drawerVisible = threadDrawerOpen.value && !threadCollapsed;
-  const contentOffset = drawerVisible ? threadDrawerWidth.value : 0;
+  // The drawer yields with the Conversation, and for room, without writing
+  // `threadDrawerOpen`, so it comes back when the room does.
+  const drawerVisible = drawnDrawerShown.value;
+  const contentOffset = drawerVisible ? drawnDrawerWidth.value : 0;
   document.documentElement.style.setProperty('--split-ratio', String(ratio));
   document.documentElement.style.setProperty('--content-offset', `${contentOffset}px`);
   document.documentElement.toggleAttribute('data-thread-collapsed', threadCollapsed);

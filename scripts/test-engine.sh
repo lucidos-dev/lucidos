@@ -52,6 +52,10 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # The workspaces' image and user: PG_IMAGE and PG_USER.
 # shellcheck source=scripts/lib/workspace_constants.sh
 source "$SCRIPT_DIR/lib/workspace_constants.sh"
+# shellcheck source=scripts/lib/pg_client_version.sh
+source "$SCRIPT_DIR/lib/pg_client_version.sh"
+# shellcheck source=scripts/lib/pg_ready.sh
+source "$SCRIPT_DIR/lib/pg_ready.sh"
 # A fixed password, unlike the shared cluster's minted one: this container holds
 # only throwaway test databases, and it listens on loopback alone.
 TEST_PG_PASSWORD="lucidos"
@@ -131,14 +135,10 @@ ensure_test_pg() {
     fi
 
     echo -n "[test-db] waiting for Postgres"
-    for _ in $(seq 1 30); do
-        if docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" >/dev/null 2>&1; then
-            echo " ready"
-            return 0
-        fi
-        echo -n "."
-        sleep 1
-    done
+    if wait_pg_ready "$PG_CONTAINER" "$PG_USER" 30; then
+        echo " ready"
+        return 0
+    fi
     echo ""
     echo "ERROR: test Postgres did not become ready in 30s" >&2
     docker logs --tail 30 "$PG_CONTAINER" >&2 || true
@@ -184,6 +184,16 @@ sweep_orphan_test_dbs() {
 }
 
 ensure_test_pg
+
+# The preflight tests dump through the host's pg_dump, which refuses a server
+# newer than itself. Say so here rather than as three failed tests.
+SERVER_VERSION="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc 'SHOW server_version')"
+CLIENT_VERSION="$(pg_dump --version 2>/dev/null || true)"
+if ! pg_client_covers_server "$CLIENT_VERSION" "$SERVER_VERSION"; then
+    echo "ERROR: the host pg_dump (${CLIENT_VERSION:-not found}) is older than the test server ($SERVER_VERSION)." >&2
+    echo "       Install a PostgreSQL client of the server's major version and put it on PATH." >&2
+    exit 1
+fi
 
 # Reclaim leaked test databases after the run completes (covers normal exit plus
 # SIGINT/SIGTERM); a previous run hard-killed before its trap fired is caught by

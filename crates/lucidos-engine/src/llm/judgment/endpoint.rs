@@ -203,7 +203,7 @@ impl SystemOneEndpoint {
                 } else {
                     "clef-flash"
                 };
-                let credential = stored_credential(pool, self.credential_service())
+                let (credential, token) = stored_credential(pool, self.credential_service())
                     .await
                     .ok_or("no Cloudflare Workers AI token is stored")?;
                 let base = credential
@@ -215,7 +215,7 @@ impl SystemOneEndpoint {
                     "the Cloudflare Workers AI credential names no account. Save it again in \
                      Settings → Models → Providers",
                 )?;
-                (url, model.to_string(), Some(credential.auth_value))
+                (url, model.to_string(), Some(token))
             }
             Self::Custom => {
                 let url = prefs::SYSTEM_ONE_CUSTOM_URL
@@ -231,8 +231,8 @@ impl SystemOneEndpoint {
                 // Local provider's does. A moved URL must not carry it along.
                 let key = stored_credential(pool, self.credential_service())
                     .await
-                    .filter(|c| credential_scope_covers(&c.base_urls, &url))
-                    .map(|c| c.auth_value);
+                    .filter(|(c, _)| credential_scope_covers(&c.base_urls, &url))
+                    .map(|(_, key)| key);
                 (url, model, key)
             }
         })
@@ -249,7 +249,11 @@ pub(crate) fn openrouter_system_one_url() -> String {
 async fn openrouter_api_key(pool: &PgPool) -> Option<String> {
     let service = SystemOneEndpoint::OpenRouter.credential_service();
     let credential = match CredentialStore::get(pool, service).await {
-        Ok(credential) => credential.map(|c| (c.auth_type, c.auth_value)),
+        Ok(Some(c)) => c
+            .secret_or_log(pool, "[Judgment]")
+            .await
+            .map(|secret| (c.auth_type, secret)),
+        Ok(None) => None,
         Err(e) => {
             log!(
                 "[Judgment] Could not read the '{}' credential: {}",
@@ -278,19 +282,26 @@ pub(crate) fn workers_ai_url(scope: &str, model: &str) -> Option<String> {
 /// Returns `None` rather than an error, because no key is the ordinary state
 /// of a workspace and not a fault.
 pub(crate) async fn typesafe_api_key(pool: &PgPool) -> Option<String> {
-    if let Some(credential) = stored_credential(pool, TYPESAFE_CREDENTIAL_SERVICE).await {
-        return Some(credential.auth_value);
+    if let Some((_, key)) = stored_credential(pool, TYPESAFE_CREDENTIAL_SERVICE).await {
+        return Some(key);
     }
     std::env::var(TYPESAFE_API_KEY_ENV)
         .ok()
         .filter(|k| !k.trim().is_empty())
 }
 
-/// A stored credential with a non-blank secret, or `None`. A read error logs.
-async fn stored_credential(pool: &PgPool, service: &str) -> Option<crate::core::Credential> {
+/// A stored credential and its non-blank secret, or `None`. A read error
+/// logs, and so does a secret reference that cannot be read.
+async fn stored_credential(
+    pool: &PgPool,
+    service: &str,
+) -> Option<(crate::core::Credential, String)> {
     match CredentialStore::get(pool, service).await {
-        Ok(Some(c)) if !c.auth_value.trim().is_empty() => Some(c),
-        Ok(_) => None,
+        Ok(Some(c)) => {
+            let secret = c.secret_or_log(pool, "[Judgment]").await?;
+            (!secret.trim().is_empty()).then_some((c, secret))
+        }
+        Ok(None) => None,
         Err(e) => {
             log!(
                 "[Judgment] Could not read the '{}' credential: {}",

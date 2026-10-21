@@ -20,26 +20,29 @@ import { updateCompose, updateComposeSelection, sendCompose, sendFollowup, ensur
 import { focusPane } from '../../store/actions/pane';
 import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
-import { tooltipWithShortcut, matchShortcut } from '../../store/actions/keybindings';
+import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { getDraft } from '../../store/composeDrafts';
 import { askSideQuestion, routeSideQuestion, sideQuestionModeOn } from '../../store/sideQuestions';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSideQuestion } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon, WarningIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
-import { codingAgentMenuOpenRequest } from './controlMenuRequests';
+import { codingAgentMenuOpenRequest, rungFoldOpenRequest } from './controlMenuRequests';
 import { isComposeContext, PromptRowControls, promptRowToggles } from './PromptRowControls';
+import { LazyRungControl } from './LazyRungControl';
+import { RUNG_FOLD_KEY, RungMenuIcon } from './RungButtons';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
 import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../hooks/usePromptActionCollapse';
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
 import { composerBannerState, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
-import { composeHasContent, sideQuestionModeActive, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, threadHasConversation, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, sideQuestionModeActive, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, threadHasConversation, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, composerEnterSends, type UploadSendIntent } from './prompt-input-helpers';
+import { currentComposerEnterKey } from '../../store/actions/preferences';
 import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
 import { SplitButton } from '../shared/SplitButton';
 import { NotReadyStrip } from './NotReadyStrip';
-import { SuccessorStrip } from './SuccessorStrip';
+import { lazyComponent } from '../../utils/lazyComponent';
 export * from './prompt-input-helpers';
 import { composeHandlers } from './composeHandlers';
 import { focusIfNeeded } from '../../utils/dom';
@@ -64,6 +67,10 @@ import { attachImageToActiveDraft } from './attachToDraft';
 import { PendingUploadChip } from './PendingUploadChip';
 import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
 import { isImeComposingKey } from '../../utils/ime';
+import { passSendGate, sendGateAsks } from './rungSwitch';
+
+/** The card draws only on a large thread at a clean idle, so its code loads off the first-paint set. */
+const SuccessorCard = lazyComponent(() => import('./SuccessorCard').then((m) => m.SuccessorCard));
 
 const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
@@ -456,9 +463,7 @@ export function PromptInput() {
       }
       return;
     }
-    // A modified Enter a shortcut claims (⌥↵ toggles side-question mode) is
-    // the shortcut's, so it must not also send.
-    if (e.key === 'Enter' && !e.shiftKey && !isMobile() && matchShortcut(e) === null) {
+    if (composerEnterSends(e, currentComposerEnterKey(), isMobile())) {
       e.preventDefault();
       if (hasPendingMultiQ) void submitMultiAnswer();
       else void submit();
@@ -596,6 +601,7 @@ export function PromptInput() {
       askComposerSideQuestion(threadId, sideQuestion.question, currentImages);
       return;
     }
+    if (threadId && sendGateAsks(threadId) && !await passSendGate(threadId)) return;
     if (threadId && uploadInFlight) {
       // A queued send still flips the button to the optimistic Cancel — settle.
       armCancelSettle();
@@ -1314,6 +1320,9 @@ export function PromptInput() {
       // destructive, it rules on the gate: a press that travelled is refused
       // on both paths. It must never cancel `mousedown` to hold that click.
       // On iOS a cancelled event stops the rest of the synthesized sequence.
+      onTouchStart={answerCancelActivate.onTouchStart}
+      onTouchMove={answerCancelActivate.onTouchMove}
+      onTouchCancel={answerCancelActivate.onTouchCancel}
       onTouchEnd={answerCancelActivate.onTouchEnd}
       onClick={answerCancelActivate.onClick}
       aria-label="Cancel"
@@ -1326,6 +1335,11 @@ export function PromptInput() {
     </button>
   ) : null;
 
+  // The rung control, for a coding agent and for the Lucidos Agent alike: a
+  // pill beside the send button, with a step at each end.
+  // A pending question or permission card has its own answer control, so it
+  // carries no pill.
+  const showsRungControl = !answersCard;
   // The row's right-hand members. With the banner suppressed the standalone
   // pair stands in. So a branch with commits always shows a Diff whatever the
   // coding agent's run-state, and a still-working thread can still arm an apply
@@ -1391,7 +1405,7 @@ export function PromptInput() {
   // The two STATUS readouts head it: an action the thumb reaches for outranks a
   // readout, and a folded readout still says its state in words on its menu
   // row. The follow and call toggles are LAST, so their fixed slots hold at
-  // every width that can show them.
+  // every width that can show them. The rung pill is the one exception, below.
   //
   // Only the control menu and the send button never fold, and those two fit at
   // any width the app supports. So a row too narrow for its members is not a
@@ -1490,10 +1504,25 @@ export function PromptInput() {
   foldActions.push(...bannerActions);
   const toggles = promptRowToggles(promptCodingAgent, inComposeContext, focusedThread);
   foldActions.push(...toggles.fold);
+  // The rung pill renders in the cluster and not in the middle, so it joins
+  // the order after `middleActions` is taken. Before the first send, picking a
+  // model is the row's main job, so it folds LAST of all. In a started thread
+  // the change actions and toggles outrank it, so it folds FIRST.
+  if (showsRungControl) {
+    const rungAction: HeaderActionSpec = {
+      key: RUNG_FOLD_KEY,
+      dataRole: 'rung-control',
+      label: 'Model and effort',
+      icon: () => <RungMenuIcon />,
+      onMenuClick: (anchor) => { if (anchor) rungFoldOpenRequest.value = anchor; },
+    };
+    if (inComposeContext) foldActions.push(rungAction);
+    else foldActions.unshift(rungAction);
+  }
 
   // Where each member renders. The cluster declares a gap and the rest of the
   // row does not. So a member folding out of the cluster takes a gap with it.
-  const clusterKeys = new Set(bannerActions.map((a) => a.key));
+  const clusterKeys = new Set([...bannerActions.map((a) => a.key), RUNG_FOLD_KEY]);
   const foldSignature = foldActions.map((a) => a.key).join(' ');
   const foldKeys = useMemo(() => foldActions.map((a) => a.key), [foldSignature]);
   const foldGroups = useMemo<FoldGroup[]>(
@@ -1577,7 +1606,7 @@ export function PromptInput() {
         </div>
       </Disclosure>
       <NotReadyStrip key="not-ready" />
-      <SuccessorStrip key="successor" />
+      <SuccessorCard key="successor" />
       <div key="prompt-box" class="prompt-box">
         <div class="prompt-row">
           <textarea
@@ -1619,8 +1648,6 @@ export function PromptInput() {
             codingAgent={promptCodingAgent}
             codingAgentThreadId={codingAgentControlThreadId}
             composeThreadId={composeControlThreadId}
-            lucidosThreadId={focusedThreadId.value ?? undefined}
-            composeContext={inComposeContext}
             toggles={toggles.row.filter(standing)}
             attrsFor={foldAttrs}
           />
@@ -1639,7 +1666,18 @@ export function PromptInput() {
           {middleActions.filter(standing).map((a) => (
             <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
           ))}
+          {/* The pill leads the cluster, so the action (Send, Apply, Archive) holds the right edge. */}
           <div class="prompt-actions-right">
+            {showsRungControl && (
+              <LazyRungControl
+                threadId={promptCodingAgent === null ? focusedThreadId.value ?? undefined : codingAgentControlThreadId}
+                composeThreadId={composeControlThreadId}
+                composeContext={inComposeContext}
+                codingAgent={promptCodingAgent}
+                folded={foldedKeys.has(RUNG_FOLD_KEY)}
+                rowAttrs={foldAttrs(RUNG_FOLD_KEY)}
+              />
+            )}
             {bannerActions.filter(standing).map((a) => (
               <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
             ))}

@@ -7,7 +7,7 @@
  *  event for that thread arrives over SSE. */
 
 import { signal } from '@preact/signals';
-import type { ThreadWidget } from '../api/client/widgets';
+import type { DashboardTile, ThreadWidget } from '../api/client/widgets';
 import type { App, Loadable } from './types';
 import { widgetInstanceKey, type WidgetParams } from '../utils/widgetParams';
 
@@ -38,6 +38,11 @@ export function threadWidget(threadId: string, appId: string, params?: WidgetPar
 /** A thread widget's instance key. */
 export function threadWidgetKey(widget: ThreadWidget): string {
   return widgetInstanceKey(widget.app_id, widget.params);
+}
+
+/** A dashboard tile's key: a widget instance's, or an app's (it has no params). */
+export function dashboardTileKey(tile: DashboardTile): string {
+  return tile.kind === 'widget' ? threadWidgetKey(tile) : widgetInstanceKey(tile.app_id, undefined);
 }
 
 export function widgetRefreshKey(appId: string): number {

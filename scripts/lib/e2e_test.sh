@@ -23,6 +23,23 @@ source "$SCRIPT_DIR/e2e.sh"
 source "$SCRIPT_DIR/flock_test_support.sh"
 
 # ── prune_orphan_worktree_dirs ────────────────────────────────────────
+test_the_debug_switch_reads_zero_as_off() {
+    echo "test: LUCIDOS_E2E_DEBUG=1 picks the debug engine, and 0 or unset the release one"
+    local value got
+    for value in unset 0 1; do
+        got="$(
+            unset RELEASE
+            if [ "$value" = unset ]; then unset LUCIDOS_E2E_DEBUG; else export LUCIDOS_E2E_DEBUG="$value"; fi
+            # shellcheck source=/dev/null # the same lib, re-read for its source-time choice
+            source "$SCRIPT_DIR/e2e.sh" >/dev/null 2>&1
+            echo "${RELEASE:-debug}"
+        )"
+        local want=1
+        [ "$value" != 1 ] || want=debug
+        if [ "$got" = "$want" ]; then pass "LUCIDOS_E2E_DEBUG=$value builds $got"; else fail "LUCIDOS_E2E_DEBUG=$value built $got"; fi
+    done
+}
+
 test_prune_removes_empty_dir() {
     echo "test: prune_orphan_worktree_dirs removes empty dirs"
     local wt_root="$E2E_WORKSPACE/.lucidos/worktrees"
@@ -379,6 +396,29 @@ test_frontend_build_stale_via_root_lockfile() {
     fi
 }
 
+# coverage_build_calls <coverage-var> <with-map>: builds run over a fresh dist/.
+coverage_build_calls() {
+    local saved_fe="$FRONTEND_DIR" saved_proj="$_E2E_PROJECT_DIR"
+    setup_frontend_sandbox "coverage-$1-$2"
+    touch_build_inputs 202601010000
+    touch -t 202601020000 "$FRONTEND_DIR/dist/index.html"
+    [ "$2" = map ] && : > "$FRONTEND_DIR/dist/index.js.map"
+    LUCIDOS_E2E_COVERAGE="$1" ensure_frontend_built >"$FE_OUT" 2>&1
+    FRONTEND_DIR="$saved_fe"; _E2E_PROJECT_DIR="$saved_proj"
+    echo "$BUILD_CALLS"
+}
+
+test_frontend_build_follows_the_coverage_variable() {
+    echo "test: dist/ holds sourcemaps exactly when LUCIDOS_E2E_COVERAGE asks for them"
+    local got
+    got="$(coverage_build_calls 1 none)"
+    if [ "$got" = 1 ]; then pass "coverage over a dist with no map rebuilds"; else fail "coverage over a dist with no map ran $got builds (expected 1)"; fi
+    got="$(coverage_build_calls 1 map)"
+    if [ "$got" = 0 ]; then pass "coverage over a coverage build reuses it"; else fail "coverage over a coverage build ran $got builds (expected 0)"; fi
+    got="$(coverage_build_calls "" map)"
+    if [ "$got" = 1 ]; then pass "a plain run over a coverage build rebuilds"; else fail "a plain run over a coverage build ran $got builds (expected 1)"; fi
+}
+
 test_frontend_build_staleness_check_fails_open() {
     echo "test: a failing filesystem walk degrades to 'not stale', it does not abort the run"
     local saved_fe="$FRONTEND_DIR" saved_proj="$_E2E_PROJECT_DIR" rc
@@ -690,6 +730,52 @@ test_ensure_workspace_running_builds_the_frontend_before_the_engine() {
     fi
 }
 
+test_a_cached_engine_is_reused_without_cargo() {
+    echo "test: a cached build that matches the tree is published, and no cargo runs"
+    local out
+    out="$(
+        unset LUCIDOS_E2E_ENGINE_BUILT
+        cache="$SANDBOX/cache-hit"
+        mkdir -p "$cache"
+        engine_cache_find() { echo "$cache"; }
+        engine_cache_store() { echo "store"; }
+        publish_launch_binaries() { echo "publish $1"; }
+        build_or_find_engine() { echo "find BUILD=${BUILD:-}"; }
+        generate_build_outputs() { echo "codegen $REUSED_CODEGEN_BIN"; }
+        build_e2e_engine_once
+        echo "built=${LUCIDOS_E2E_ENGINE_BUILT:-}"
+    )"
+    local want
+    want="publish $SANDBOX/cache-hit"$'\n'"find BUILD="$'\n'"codegen $SANDBOX/cache-hit/lucidos-codegen"$'\n'"built=1"
+    if [ "$(printf '%s\n' "$out" | grep -v '^Engine:')" = "$want" ]; then
+        pass "the cached build is published and rendered with, with no compile"
+    else
+        fail "the reuse path ran: $out"
+    fi
+}
+
+test_a_cache_miss_builds_and_files_the_build() {
+    echo "test: a cache miss compiles once and files the build"
+    local out
+    out="$(
+        unset LUCIDOS_E2E_ENGINE_BUILT
+        engine_cache_find() { :; }
+        engine_cache_store() { echo "store $2"; }
+        publish_launch_binaries() { echo "publish"; }
+        build_or_find_engine() { echo "find BUILD=${BUILD:-}"; }
+        generate_build_outputs() { echo "codegen$REUSED_CODEGEN_BIN"; }
+        RELEASE=1 ENGINE_CARGO_PROFILE="" build_e2e_engine_once
+        echo "built=${LUCIDOS_E2E_ENGINE_BUILT:-}"
+    )"
+    local want
+    want="find BUILD=1"$'\n'"store $PROJECT_DIR/target/release"$'\n'"codegen"$'\n'"built=1"
+    if [ "$out" = "$want" ]; then
+        pass "a miss builds, files the release build and renders with the fresh codegen"
+    else
+        fail "the miss path ran: $out"
+    fi
+}
+
 # ── the sandbox contract itself ───────────────────────────────────────
 # Every test above aims at $E2E_WORKSPACE, which this file pins to a sandbox
 # BEFORE sourcing e2e.sh. That pin is load-bearing well beyond worktree pruning:
@@ -800,7 +886,7 @@ test_every_mobile_webkit_spec_filter_selects_exactly_one_file() {
     for f in "$e2e_dir"/*.spec.ts; do
         [ -e "$f" ] || continue
         base="$(basename "$f")"
-        case "$base" in *-desktop.spec.ts) continue ;; esac
+        project_runs_spec mobile-webkit "$base" || continue
         specs+=("$base")
     done
     if [ "${#specs[@]}" -eq 0 ]; then
@@ -828,13 +914,16 @@ test_every_mobile_webkit_spec_filter_selects_exactly_one_file() {
 }
 
 # ── project_runs_spec ─────────────────────────────────────────────────
-test_project_runs_spec_mirrors_test_ignore() {
-    echo "test: project_runs_spec skips exactly the projects that testIgnore a spec"
+test_project_runs_spec_reads_the_suffix() {
+    echo "test: project_runs_spec reads the suffix the way playwright.config.ts does"
     local row project spec want got
     for row in \
         "chromium chat.spec.ts yes" \
-        "mobile chat.spec.ts yes" \
-        "mobile-webkit chat.spec.ts yes" \
+        "mobile chat.spec.ts no" \
+        "mobile-webkit chat.spec.ts no" \
+        "chromium drafts-all.spec.ts yes" \
+        "mobile drafts-all.spec.ts yes" \
+        "mobile-webkit e2e/drafts-all.spec.ts yes" \
         "chromium header-desktop.spec.ts yes" \
         "mobile header-desktop.spec.ts no" \
         "mobile-webkit e2e/header-desktop.spec.ts no" \
@@ -849,25 +938,6 @@ test_project_runs_spec_mirrors_test_ignore() {
             fail "$project runs $spec: expected $want, got $got"
         fi
     done
-}
-
-# The helper restates playwright.config.ts, so pin the config to what it says.
-test_project_runs_spec_matches_the_playwright_config() {
-    echo "test: playwright.config.ts still carries the testIgnore patterns project_runs_spec mirrors"
-    local config n
-    config="$(cd "$SCRIPT_DIR/../.." && pwd)/crates/lucidos-app/playwright.config.ts"
-    n=$(grep -c "testIgnore: /-mobile\\\\.spec\\\\.ts\$/," "$config")
-    if [ "$n" = 1 ]; then
-        pass "one project ignores -mobile specs"
-    else
-        fail "expected one -mobile testIgnore in $config, found $n"
-    fi
-    n=$(grep -c "testIgnore: /-desktop\\\\.spec\\\\.ts\$/," "$config")
-    if [ "$n" = 2 ]; then
-        pass "two projects ignore -desktop specs"
-    else
-        fail "expected two -desktop testIgnores in $config, found $n"
-    fi
 }
 
 # ── e2e_browser_projects / e2e_browser_lock_projects ──────────────────
@@ -908,6 +978,10 @@ test_lock_projects_follow_the_arguments() {
         _check_lock_projects "" "" "composer-row-fit-mobile.spec.ts"
     EXPECT="chromium" WHY="-f on a desktop-only spec" \
         _check_lock_projects "" "" "app-frame-can-copy-desktop.spec.ts"
+    EXPECT="chromium,mobile,mobile-webkit" WHY="-f twice, one per kind" \
+        _check_lock_projects "" "" "composer-row-fit-mobile.spec.ts app-frame-can-copy-desktop.spec.ts"
+    EXPECT="chromium,mobile" WHY="-f twice with --no-webkit" \
+        _check_lock_projects "" 1 "chat.spec.ts composer-row-fit-mobile.spec.ts"
     unset -f _check_lock_projects
 }
 
@@ -1328,6 +1402,33 @@ test_the_fresh_reset_runs_between_the_engine_stop_and_the_boot() {
     if [ "$plain" = "stop settle boot " ]; then pass "a plain reset leaves the tree alone"; else fail "plain order was '$plain'"; fi
 }
 
+test_the_e2e_database_alone_skips_the_commit_flush() {
+    echo "test: the recreated e2e database waits for no WAL flush at commit, set on it alone, before the boot"
+    local order
+    order="$(
+        e2e_workspace_env() { :; }
+        setup_postgres() { :; }
+        stop_e2e_engine() { :; }
+        settle_e2e_workspace_tree() { :; }
+        workspace_database_name() { echo lucidos_e2e-test; }
+        _drop_shared_database() { :; }
+        _create_shared_database() { echo create; }
+        shared_pg_psql() {
+            case "$*" in
+                (*"ALTER DATABASE"*) echo "alter $*" ;;
+                (*to_regclass*) echo f ;;
+            esac
+        }
+        ensure_workspace_running() { echo boot; }
+        reset_e2e_database 2>/dev/null | grep -E '^(create|alter|boot)' | tr '\n' '|'
+    )"
+    case "$order" in
+        "create|alter postgres "*'ALTER DATABASE "lucidos_e2e-test" SET synchronous_commit = off|boot|')
+            pass "create, then the setting on that database, then the boot" ;;
+        *) fail "sequence was '$order'" ;;
+    esac
+}
+
 test_only_the_start_of_a_run_asks_for_a_fresh_workspace() {
     echo "test: a run asks for a fresh workspace once, at its start, and never under --no-reset"
     local n
@@ -1351,8 +1452,7 @@ test_playwright_filter_anchors_the_basename
 test_playwright_filter_escapes_regex_metacharacters
 test_playwright_filter_does_not_match_a_longer_sibling
 test_every_mobile_webkit_spec_filter_selects_exactly_one_file
-test_project_runs_spec_mirrors_test_ignore
-test_project_runs_spec_matches_the_playwright_config
+test_project_runs_spec_reads_the_suffix
 test_browser_projects_match_the_playwright_config
 test_lock_projects_follow_the_arguments
 test_mem_sample_env_follows_the_run_id
@@ -1371,6 +1471,7 @@ test_frontend_build_missing_dist_rebuilds
 test_frontend_build_stale_dist_rebuilds
 test_frontend_build_stale_via_workspace_local_sdk
 test_frontend_build_stale_via_root_lockfile
+test_frontend_build_follows_the_coverage_variable
 test_frontend_build_staleness_check_fails_open
 test_frontend_build_fresh_dist_reused
 test_report_prints_every_exit_code
@@ -1388,6 +1489,8 @@ test_totals_refuse_an_empty_log
 test_no_sourced_lib_leaks_a_loop_variable
 test_ensure_workspace_running_does_not_leak_loop_index
 test_ensure_workspace_running_builds_the_frontend_before_the_engine
+test_a_cached_engine_is_reused_without_cargo
+test_a_cache_miss_builds_and_files_the_build
 test_tree_assert_passes_a_run_that_leaves_nothing
 test_tree_assert_fails_on_a_left_behind_file
 test_tree_assert_fails_on_an_uncommitted_delete
@@ -1399,7 +1502,9 @@ test_tree_reset_keeps_only_lucidos
 test_tree_reset_refuses_a_running_engine
 test_tree_reset_refuses_a_workspace_that_is_not_disposable
 test_the_fresh_reset_runs_between_the_engine_stop_and_the_boot
+test_the_e2e_database_alone_skips_the_commit_flush
 test_only_the_start_of_a_run_asks_for_a_fresh_workspace
+test_the_debug_switch_reads_zero_as_off
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ $FAIL -eq 0 ]

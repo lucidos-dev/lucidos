@@ -1,5 +1,5 @@
 import { test, expect, type Locator } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy } from './helpers';
 
 /** Resolve once the container's scroll position has stopped changing.
  *
@@ -40,7 +40,6 @@ test.describe('Keyboard scrolling of the conversation (desktop)', () => {
   });
 
   test('transcript is focusable + keyboard-scrollable, Space is not stolen, and ⌘↑ traverses turns', async ({ page }) => {
-    test.skip(isMobileViewport(page), 'keyboard scroll + turn nav are desktop-only');
 
     // A short viewport so even a modest transcript overflows → deterministic
     // scroll-position assertions.

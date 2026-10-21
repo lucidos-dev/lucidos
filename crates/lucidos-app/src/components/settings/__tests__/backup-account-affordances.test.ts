@@ -7,7 +7,7 @@
  * Backup page instead. It must be an affordance, not a path.
  *
  * The same page also gained a hand-off to the agent, which can do the connecting
- * itself and knows the parts the page cannot enforce (saving the encryption key).
+ * itself and knows the parts the page cannot enforce (saving the backup key).
  *
  * Source-scan rather than a mounted render, for the same reason as
  * `external-links-row-reachable.test.ts`: `BackupSection` pulls in the backup
@@ -84,7 +84,7 @@ describe('the chat hand-off', () => {
       source.indexOf('askLucidosToSetUpBackups') + 900,
     );
     expect(prompt).toContain('connect the account');
-    expect(prompt).toContain('encryption key');
+    expect(prompt).toContain('backup key');
   });
 
   // Routed through the shared navigation entry point so it clears the settings
@@ -213,6 +213,7 @@ describe('the provider dropdown reflects and writes the configured destination',
  */
 describe('the Backup section is laid out by CSS, not by inline styles', () => {
   const raw = readFileSync(resolve(here, '../BackupSection.tsx'), 'utf8');
+  const keyPanel = readFileSync(resolve(here, '../BackupKeyPanel.tsx'), 'utf8');
 
   it('carries no static inline style attribute', () => {
     // `style={`width: ${pct}%`}` on the progress bar is deliberately excluded:
@@ -223,15 +224,13 @@ describe('the Backup section is laid out by CSS, not by inline styles', () => {
 
   it('gives every row a class', () => {
     for (const cls of [
-      'backup-provider-access',
       'backup-blocked-state',
       'backup-actions-row',
-      'backup-schedule-hint',
-      'backup-key-row',
-      'backup-key-value',
-      'backup-key-warning',
     ]) {
       expect(raw).toContain(`class="${cls}"`);
+    }
+    for (const cls of ['backup-key', 'backup-key-actions', 'backup-key-value', 'backup-key-warning']) {
+      expect(keyPanel).toContain(`class="${cls}"`);
     }
   });
 

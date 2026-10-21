@@ -116,6 +116,7 @@ lift() { # <function> [<script>, default scripts/e2e-browser.sh]
 
 lift merge_rc
 lift e2e_spec_spawns_claude_code "$E2E_LIB_SH"
+lift project_runs_spec "$(dirname "$E2E_LIB_SH")/e2e_projects.sh"
 lift webkit_chunk_size
 lift memory_resume_budget
 lift recover_after_memory_stop
@@ -267,22 +268,23 @@ STUB_RESET_RC=0
 reset_e2e_database() { echo "engine: fresh database"; return "$STUB_RESET_RC"; }
 
 # ── the fixture ─────────────────────────────────────────────────────────
-# Two CC specs, three nav specs, and one *-desktop.spec.ts that also calls the CC
-# helper. The desktop one must be excluded before the partition, or a chunk
-# landing entirely on testIgnore'd files exits "no tests found".
+# Two CC specs, three nav specs, and two desktop-only specs that also call the
+# CC helper: one -desktop, one unsuffixed. They must be excluded before the
+# partition, or a chunk landing entirely on ignored files exits "no tests found".
 FAKE="$SANDBOX/app"
 mkdir -p "$FAKE/e2e"
-printf 'await pickComposeDestination(page)\n' > "$FAKE/e2e/coding-agent.spec.ts"
-printf 'await pickComposeDestination(page)\n' > "$FAKE/e2e/model-switching.spec.ts"
-printf 'await page.goto("/")\n' > "$FAKE/e2e/chat.spec.ts"
-printf 'await page.goto("/")\n' > "$FAKE/e2e/drafts.spec.ts"
-printf 'await page.goto("/")\n' > "$FAKE/e2e/scroll-memory.spec.ts"
+printf 'await pickComposeDestination(page)\n' > "$FAKE/e2e/coding-agent-all.spec.ts"
+printf 'await pickComposeDestination(page)\n' > "$FAKE/e2e/model-switching-all.spec.ts"
+printf 'await page.goto("/")\n' > "$FAKE/e2e/chat-all.spec.ts"
+printf 'await page.goto("/")\n' > "$FAKE/e2e/drafts-all.spec.ts"
+printf 'await page.goto("/")\n' > "$FAKE/e2e/scroll-memory-all.spec.ts"
 printf 'await pickComposeDestination(page)\n' > "$FAKE/e2e/settings-backup-navigation-desktop.spec.ts"
+printf 'await pickComposeDestination(page)\n' > "$FAKE/e2e/plain-desktop-only.spec.ts"
 
 NAV_ONLY="$SANDBOX/nav-only"
 mkdir -p "$NAV_ONLY/e2e"
-printf 'await page.goto("/")\n' > "$NAV_ONLY/e2e/chat.spec.ts"
-printf 'await page.goto("/")\n' > "$NAV_ONLY/e2e/drafts.spec.ts"
+printf 'await page.goto("/")\n' > "$NAV_ONLY/e2e/chat-all.spec.ts"
+printf 'await page.goto("/")\n' > "$NAV_ONLY/e2e/drafts-all.spec.ts"
 
 # A wider fixture for the chunk-range cases: two CC specs (one chunk) and eight
 # nav specs (four chunks at size 2). Four nav chunks is the smallest count where a
@@ -290,10 +292,10 @@ printf 'await page.goto("/")\n' > "$NAV_ONLY/e2e/drafts.spec.ts"
 # carry-over discharge actually takes.
 RANGE="$SANDBOX/range"
 mkdir -p "$RANGE/e2e"
-printf 'await pickComposeDestination(page)\n' > "$RANGE/e2e/coding-agent.spec.ts"
-printf 'await pickComposeDestination(page)\n' > "$RANGE/e2e/model-switching.spec.ts"
+printf 'await pickComposeDestination(page)\n' > "$RANGE/e2e/coding-agent-all.spec.ts"
+printf 'await pickComposeDestination(page)\n' > "$RANGE/e2e/model-switching-all.spec.ts"
 for n in 1 2 3 4 5 6 7 8; do
-    printf 'await page.goto("/")\n' > "$RANGE/e2e/nav$n.spec.ts"
+    printf 'await page.goto("/")\n' > "$RANGE/e2e/nav$n-all.spec.ts"
 done
 
 # Chunk size 2 against the fixture: CC is one chunk, nav is two. That gives the
@@ -355,13 +357,15 @@ test_both_phases_still_shard() {
 }
 
 test_desktop_specs_are_excluded_from_both_phases() {
-    echo "test: a *-desktop.spec.ts never reaches a chunk"
+    echo "test: a desktop-only spec never reaches a chunk"
     reset_stubs
     drive_in "$FAKE" "$OUT/desktop.out" || true
     # The fixture's desktop spec calls the CC helper, so an exclusion applied
     # after the partition instead of before it would put it in phase 1.
     assert_silent_about "$OUT/desktop.out" "settings-backup-navigation-desktop" \
         "the desktop spec is excluded before the partition, not after"
+    assert_silent_about "$OUT/desktop.out" "plain-desktop-only" \
+        "an unsuffixed spec is excluded before the partition too"
     assert_says "$OUT/desktop.out" "phase 1/2: 2 CC-subprocess specs" "the CC count excludes it"
 }
 
@@ -434,7 +438,7 @@ test_the_real_inventory_puts_cc_first() {
     for f in "$e2e_dir"/*.spec.ts; do
         [ -e "$f" ] || continue
         base="$(basename "$f")"
-        case "$base" in *-desktop.spec.ts) continue ;; esac
+        project_runs_spec mobile-webkit "$base" || continue
         if grep -q "pickComposeDestination" "$f" 2>/dev/null; then
             cc=$((cc + 1))
         else

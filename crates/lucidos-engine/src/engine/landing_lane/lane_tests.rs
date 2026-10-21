@@ -143,6 +143,53 @@ async fn a_change_is_queued_until_it_lands_or_leaves() {
     teardown_test_db(&db).await;
 }
 
+/// Apply All reads lane membership from events, for any thread: a queued
+/// pending change is held, and one that was unqueued, landed or never queued
+/// is not.
+#[tokio::test]
+async fn lane_held_changes_names_the_queued_pending_changes_only() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (thread_a, thread_b) = (Uuid::new_v4(), Uuid::new_v4());
+    start_cc_session(&bus, thread_a, "work-a", None).await;
+    start_cc_session(&bus, thread_b, "work-b", None).await;
+    let (queued, unqueued, landed, idle) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    for (thread, change, branch) in [
+        (thread_a, queued, "work-a"),
+        (thread_a, unqueued, "work-a2"),
+        (thread_b, landed, "work-b"),
+        (thread_b, idle, "work-b2"),
+    ] {
+        propose(&bus, thread, change, branch).await;
+    }
+    for (thread, change) in [(thread_a, queued), (thread_a, unqueued), (thread_b, landed)] {
+        emit(&bus, thread, queued_event(change, "snap")).await;
+    }
+    emit(
+        &bus,
+        thread_a,
+        ThreadEvent::ChangeUnqueued {
+            change_id: unqueued.to_string(),
+            reason: UnqueueReason::Removed,
+        },
+    )
+    .await;
+    emit(&bus, thread_b, applied(landed, Some("landing"))).await;
+
+    let held = lane_held_changes(&pool, &[queued, unqueued, landed, idle])
+        .await
+        .unwrap();
+    assert_eq!(held, std::collections::HashSet::from([queued]));
+    assert!(lane_held_changes(&pool, &[]).await.unwrap().is_empty());
+
+    teardown_test_db(&db).await;
+}
+
 /// Remove takes a waiting change out with `ChangeUnqueued { removed }`. The
 /// change is queued nowhere after it, and recovery does not rebuild it.
 #[tokio::test]
@@ -603,6 +650,10 @@ fn apply_all_opens_its_press_first_and_always_submits_it() {
     let seeded = run.find(".start_apply_all_batch(").expect("seeds");
     let first = run.find(".apply_batch_member(").expect("applies");
     assert!(seeded < first, "the press opens before its first member");
+    let filtered = run
+        .find(".drop_changes_already_applying(")
+        .expect("filters out what the lane holds");
+    assert!(filtered < seeded, "the filter runs before the batch seeds");
 
     let advance = fn_body(&driver, "advance_apply_all_batch");
     let submitted = advance
@@ -622,6 +673,23 @@ fn apply_all_opens_its_press_first_and_always_submits_it() {
         left < told,
         "its members leave the lane before the queue passes"
     );
+}
+
+/// A restart never hands the lane's member back to `apply_change`: recovery
+/// asks the lane before it drives anything, and a laned member only waits.
+/// Applying it would take the claim the restored lane needs, and fail the
+/// lane batch with "being applied elsewhere".
+#[test]
+fn recovery_leaves_a_laned_member_to_the_lane() {
+    let driver = production("engine/apply_all_driver.rs");
+    let recover = fn_body(&driver, "recover_apply_all_batches");
+    let asked = recover.find("lane_held_changes(").expect("asks the lane");
+    let restored = recover
+        .find("progress.restore_laned(")
+        .expect("restores a laned member beside the queue");
+    let owner = recover.find("self.recovered_owner(").expect("owners");
+    let driven = recover.find("self.spawn_batch_member(").expect("drives");
+    assert!(asked < restored && restored < owner && owner < driven);
 }
 
 /// A change the lane queues tells its Apply All press, whoever handed it

@@ -1,6 +1,7 @@
 use super::*;
-use crate::engine::aux_purpose::NotServed;
+use crate::engine::aux_purpose::seed_not_served;
 use crate::llm::model_registry::ProviderKind;
+use crate::llm::not_served::NotServedLedger;
 use crate::test_support::{setup_test_db, teardown_test_db};
 
 const HAIKU: &str = "claude-haiku-4-5";
@@ -65,10 +66,36 @@ async fn a_default_that_moved_on_is_recorded_without_a_notification() {
         .await;
     assert_eq!(count(&pool, NOT_SERVED_EVENT).await, 1);
     assert_eq!(count(&pool, "NotificationCreated").await, 0);
+    let ledger = NotServedLedger::default();
+    seed_not_served(&pool, &ledger).await;
     assert_eq!(
-        NotServed::recent(&pool).await,
-        NotServed::of(&[(ProviderKind::Vertex, HAIKU)])
+        ledger.snapshot(),
+        vec![(ProviderKind::Vertex, HAIKU.to_string())]
     );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The router sent Haiku 5.5 for a pick of the retired Haiku 4.5, and Vertex
+/// refused it. The record names 5.5, the model that refused, so 4.5 stays in
+/// reach (I5).
+#[tokio::test]
+async fn a_redirected_refusal_names_the_model_the_router_sent() {
+    let (pool, db_name) = setup_test_db().await;
+    let sent = "claude-haiku-5-5";
+    let stamped = ModelNotServed::new("Vertex has no `claude-haiku-5-5`")
+        .refused_by(ProviderKind::Anthropic, sent);
+    recorder(&pool, ModelSource::Preference)
+        .not_served(HAIKU, &stamped, None)
+        .await;
+    let payload: serde_json::Value =
+        sqlx::query_scalar("SELECT payload->'data' FROM events WHERE event_type = $1")
+            .bind(NOT_SERVED_EVENT)
+            .fetch_one(&pool)
+            .await
+            .expect("the event");
+    assert_eq!(payload["model"], sent);
+    assert_eq!(payload["provider"], "anthropic");
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

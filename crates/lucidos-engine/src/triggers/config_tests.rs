@@ -1091,6 +1091,23 @@ fn from_created_payload_side_effect_grant_defaults_empty_and_skips_unknown() {
     );
 }
 
+/// A secret read has no wire form, so no stored grant can name it.
+#[test]
+fn a_side_effect_grant_never_carries_a_secret_read() {
+    use crate::engine::command_guard::SideEffectCategory;
+    let payload = json!({
+        "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "x" },
+        "side_effect_grant": ["secret_read", "SecretRead", "email"],
+    });
+    assert_eq!(
+        TriggerConfig::from_created_payload(&payload)
+            .unwrap()
+            .side_effect_grant,
+        vec![SideEffectCategory::Email]
+    );
+}
+
 #[test]
 fn apply_update_replaces_and_clears_side_effect_grant() {
     use crate::engine::command_guard::SideEffectCategory;
@@ -1378,6 +1395,51 @@ fn normalize_route_setting_does_not_judge_the_model_id() {
     );
 }
 
+/// A model sometimes writes JSON null as the string "null", and a CLI flag can
+/// only ever send a string. Both mean Default, never a pin no backend knows.
+#[test]
+fn normalize_route_setting_reads_the_literal_null_as_default() {
+    for raw in ["null", "NULL", " Null "] {
+        assert_eq!(normalize_route_setting(Some(raw)), None, "{raw:?}");
+    }
+}
+
+/// `none` is a real reasoning tier, so the null spelling must not swallow it.
+#[test]
+fn the_none_tier_is_not_read_as_null() {
+    assert_eq!(
+        validate_trigger_reasoning_effort(Some("none")),
+        Ok(Some("none".to_string()))
+    );
+}
+
+#[test]
+fn validate_trigger_reasoning_effort_reads_the_literal_null_as_default() {
+    assert_eq!(validate_trigger_reasoning_effort(Some("null")), Ok(None));
+}
+
+/// Events already hold `"model": "null"` from before the fix. Replay reads
+/// them as unpinned, which is the only thing their callers can have meant.
+#[test]
+fn a_stored_null_string_replays_as_unpinned() {
+    let created = created_with(json!({
+        "model": "null", "reasoning_effort": "null", "provider": "null"
+    }));
+    assert_eq!(created.model, None);
+    assert_eq!(created.reasoning_effort, None);
+    assert_eq!(created.provider, None);
+
+    let mut updated = created_with(json!({
+        "model": "claude-sonnet-5", "reasoning_effort": "low", "provider": "vertex"
+    }));
+    updated.apply_update(&json!({
+        "model": "null", "reasoning_effort": "null", "provider": "null"
+    }));
+    assert_eq!(updated.model, None);
+    assert_eq!(updated.reasoning_effort, None);
+    assert_eq!(updated.provider, None);
+}
+
 #[test]
 fn validate_trigger_reasoning_effort_accepts_the_tiers_and_default() {
     assert_eq!(validate_trigger_reasoning_effort(None), Ok(None));
@@ -1493,6 +1555,27 @@ fn provider_update_null_clears_the_pin() {
     let existing = pinned_trigger();
     assert_eq!(
         resolve_trigger_provider_update(&registry, &existing, None, Some(None)),
+        Ok(Some(None))
+    );
+}
+
+/// The string "null" clears like JSON null, rather than failing as an unknown
+/// provider. With the model also "null" the whole pin goes back to Default.
+#[test]
+fn provider_update_null_string_clears_the_pin() {
+    let registry = two_route_registry();
+    let existing = pinned_trigger();
+    assert_eq!(
+        resolve_trigger_provider_update(&registry, &existing, None, Some(Some("null"))),
+        Ok(Some(None))
+    );
+    assert_eq!(
+        resolve_trigger_provider_update(
+            &registry,
+            &existing,
+            Some(Some("null")),
+            Some(Some("null"))
+        ),
         Ok(Some(None))
     );
 }

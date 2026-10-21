@@ -48,7 +48,8 @@ impl LoadedKnowhow {
         self.turns_since_body > 0
     }
 
-    /// Why the doc is still here, for the block and the Context viewer row.
+    /// Why the doc is still here, for the `[KNOWHOW RETENTION]` block and the
+    /// Context viewer row.
     pub(crate) fn retention_note(&self) -> String {
         match IDLE_TURNS_BEFORE_UNLOAD.saturating_sub(self.idle_turns) {
             0 => "leaves after this turn unless loaded again".to_string(),

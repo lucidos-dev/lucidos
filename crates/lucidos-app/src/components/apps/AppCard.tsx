@@ -6,6 +6,7 @@ import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
 import { PinButton } from '../shared/PinButton';
 import { useRowActionsGesture } from '../shared/useRowActionsGesture';
 import { useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { DashboardItem } from '../widgets/DashboardItem';
 
 interface AppRowProps {
   app: App;
@@ -60,7 +61,7 @@ export function AppRow({ app, onOpen, onEdit, onDelete }: Partial<AppRowProps>) 
             ariaLabel={`Actions for ${app.name}`}
             stopPropagation
             hostOpener={gesture.hostOpener}
-            items={(ctx) => appMenuItems(ctx, { onEdit, onDelete })}
+            items={(ctx) => appMenuItems(ctx, { app, onEdit, onDelete })}
           />
         )}
       </div>
@@ -68,11 +69,12 @@ export function AppRow({ app, onOpen, onEdit, onDelete }: Partial<AppRowProps>) 
   );
 }
 
-/** Edit, then Delete on its own below a divider, as in the thread menu. The
- *  row's own pin toggle covers pinning, so the menu does not repeat it. */
+/** Edit and Add to dashboard, then Delete on its own below a divider, as in
+ *  the thread menu. The row's own pin toggle covers pinning, so the menu does
+ *  not repeat it. */
 function appMenuItems(
   { run }: OverflowMenuContext,
-  { onEdit, onDelete }: Pick<Partial<AppRowProps>, 'onEdit' | 'onDelete'>,
+  { app, onEdit, onDelete }: Pick<Partial<AppRowProps>, 'onEdit' | 'onDelete'> & { app: App },
 ) {
   return (
     <>
@@ -80,6 +82,7 @@ function appMenuItems(
         <EditIcon />
         Edit
       </button>
+      <DashboardItem tile={{ appId: app.id, name: app.name }} noun="app" run={run} />
       <div class="thread-overflow-divider" role="separator" />
       <button type="button" class="thread-overflow-item thread-overflow-item-danger" role="menuitem" onClick={run(() => onDelete?.())}>
         <TrashIcon />

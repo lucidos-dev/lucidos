@@ -26,9 +26,9 @@ import { fileURLToPath } from 'node:url';
 //
 // A source scan rather than a render test because every property here is
 // cascade- and layout-resolved, which jsdom does not do. The rendered halves
-// are covered by e2e/prompt-transcript-alignment.spec.ts (the field's two
+// are covered by e2e/prompt-transcript-alignment-all.spec.ts (the field's two
 // content insets now match, measured geometrically on both sides) and
-// e2e/drafts.spec.ts (the button still clears).
+// e2e/drafts-all.spec.ts (the button still clears).
 const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 const composerCss = readFileSync(

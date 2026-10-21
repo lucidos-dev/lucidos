@@ -755,14 +755,22 @@ fn reserved_type_names_match_event_type() {
             from_sha: "a".into(),
             to_sha: "b".into(),
         },
+        MainCheckRunLinked {
+            check_id: Uuid::nil(),
+            run_url: "u".into(),
+            branch: "e2e/x".into(),
+        },
         MainCheckPassed {
             check_id: Uuid::nil(),
             run_url: None,
+            flaky: Vec::new(),
+            flaky_fix_thread_id: None,
         },
         MainCheckFailed {
             check_id: Uuid::nil(),
             summary: "s".into(),
             tail: String::new(),
+            failures: Vec::new(),
             run_url: None,
             fix_thread_id: Uuid::nil(),
         },
@@ -922,8 +930,10 @@ fn reserved_type_names_match_event_type() {
             auth_type: "api_key".into(),
             actor: None,
         },
-        BackupKeyRevealed {
-            minted: false,
+        BackupKeyRevealed { actor: None },
+        BackupRecipientSet {
+            recipient: "age1example".into(),
+            own_key: false,
             actor: None,
         },
     ];
@@ -1039,4 +1049,27 @@ fn a_live_generate_image_call_keeps_the_prompt_its_image_is_described_by() {
     });
     assert_eq!(event["args"]["prompt"], "a red bicycle");
     assert!(event.get("args_stripped").is_none());
+}
+
+/// A `MainCheckFailed` stored before `failures` existed still deserializes, and
+/// a red with none serializes without the field.
+#[test]
+fn a_main_check_failed_row_without_failures_still_reads() {
+    let old = serde_json::json!({
+        "type": "MainCheckFailed",
+        "data": {
+            "check_id": Uuid::nil(),
+            "summary": "s",
+            "tail": "t",
+            "fix_thread_id": Uuid::nil(),
+        }
+    });
+    let event: SystemEvent = serde_json::from_value(old).unwrap();
+    let SystemEvent::MainCheckFailed { failures, .. } = &event else {
+        panic!("not a MainCheckFailed: {event:?}");
+    };
+    assert!(failures.is_empty());
+    assert!(serde_json::to_value(&event).unwrap()["data"]
+        .get("failures")
+        .is_none());
 }

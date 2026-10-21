@@ -441,8 +441,8 @@ Call `send_notification` only when there is something the user wants to hear abo
 
 End every run with your own read decision, `request_read`:
 
-- **`read: false`** when the run found nothing new, however much you checked. Also `false` when a notification you sent already carried the news, so the reply only repeats it.
-- **`read: true`** only when the reply holds something the user would miss without reading it: a finding no push carried, a failure, or a decision only they can make. The thread then waits under Review until the user has read its reply.
+- **`read: false`** when the run found nothing new, however much you checked. Also `false` once you sent a notification: the notification is how the user hears, and they do not need both. The one exception is a failure the notification does not mention.
+- **`read: true`** only when the reply holds something the user would miss without reading it: a finding no notification carried, a failure, or a decision only they can make. The thread then waits under Review until the user has read its reply.
 
 A run you leave undecided is decided by a background call, which reads more runs as worth reading than you would. So decide it yourself.
 
@@ -474,12 +474,18 @@ If the request doesn't clearly land in one of the rows above, **ask** (Question 
 
 ## Which model the run uses: `model` and `reasoning_effort`
 
-An intent trigger fires on the account chat defaults (Settings → Models →
-Chat & triggers) unless it says otherwise. Set `model` to pin it to a specific
+An intent trigger fires on the account's *trigger model* (the `trigger_model`
+preference, Settings → Models → Chat & triggers) unless it says otherwise. That
+default is separate from the chat model, so Opus in chat does not make every
+unattended fire run on Opus. Set `model` to pin it to a specific
 chat model and `reasoning_effort` to pin its thinking budget
-(`none|low|medium|high|xhigh|max`); omit either, or send null, to go back to the
-account default. The two are independent: pinning the model leaves the effort on
-the account setting, and the reverse.
+(`none|low|medium|high|xhigh|max`). The two are independent: pinning the model
+leaves the effort on the account setting, and the reverse.
+
+To unpin, send null: `update_trigger(trigger_id, model=null, reasoning_effort=null)`.
+The trigger then follows the account trigger model again. The CLI spells it
+`--model null --reasoning-effort null`, and `provider` clears the same way. An
+update that omits a field leaves that pin as it is.
 
 Script triggers have no model. They run no LLM, so these fields and `provider`
 below are ignored there, and the form hides them.
@@ -488,21 +494,21 @@ below are ignored there, and the form hides them.
 |---|---|
 | "use something cheap for this", "it's just a digest" | a low-cost model, often with a low `reasoning_effort` |
 | "this one needs to be thorough", "use the best model" | the stronger model, and usually a higher `reasoning_effort` |
-| nothing about models | omit both, so the trigger follows the account default |
+| nothing about models | omit both, so the trigger follows the account trigger model |
 
 Pin a model only when the user asked for one. A pinned trigger stops following
-the account default, so a workspace-wide model change no longer reaches it. A
+the account trigger model, so a workspace-wide model change no longer reaches it. A
 model pin with no `reasoning_effort` runs that model at the account's tier for
 it, else its default effort.
 
 Like the `chat_model` preference, the model id is **not checked against the
-registry at save**, since a model can be disabled or deleted later. A wrong id
+registry at save**, since a model can be deleted later. A wrong id
 fails at fire time, as a normal trigger-failure notification. Use
 `manage_models(action='list')` to see the real ids.
 
 The model and effort a run actually used are recorded on its `TriggerStarted`
 event, so the trigger's thread shows what it ran on and a follow-up there
-continues on the same model rather than snapping to the account default.
+continues on the same model rather than snapping to the account chat model.
 
 ### Which backend serves the model: `provider`
 
@@ -615,6 +621,8 @@ When the engine fires a script trigger that subscribes to a domain event, it set
 | `TRIGGER_EVENT_THREAD_ID` | Only for *thread-scoped* source events | The thread the source event lives on. Pass to `lucidos notify --tap navigate --thread-id` so the push deep-links to the originating conversation instead of the trigger's own thread (which is `LUCIDOS_THREAD_ID`). |
 
 The trigger's own thread is `LUCIDOS_THREAD_ID`, the same env var every spawned subprocess gets. `TRIGGER_EVENT_THREAD_ID` is the *source* event's thread, a different one. Mix them up and the push deep-links into the trigger's own thread instead of where the user needs to act.
+
+**A script trigger gets a credential only when its script file names it.** Write `os.environ["CRED_GITHUB"]` literally, or declare a name built at run time with a header comment, `# lucidos-credentials: CRED_A CRED_B`. Run `lucidos credentials list` for the names. See `best-practices` § Credentials in subprocesses.
 
 ### Worked example: push when any subscribed event fires
 
@@ -843,7 +851,7 @@ Never claim "I'll delete it after it runs" without one of the above.
 **derived read-model** of the trigger's definition. It mirrors the durable
 subset of its config (`name`, `slug`, `schedule`, `timezone`, `run`, `on`,
 `app_id`, `go_to_review`, `group_id`, `side_effect_grant`, `mcp_servers`,
-`model`, `reasoning_effort`, `provider`). A trigger on the account chat defaults
+`model`, `reasoning_effort`, `provider`). A trigger on the account trigger model
 omits the last three. The engine maintains it from the trigger events: written on
 create/update, removed on delete, rebuilt from events on boot (ADR 0019).
 Runtime and identity fields (`id`, `last_run`, `last_run_status`, `paused`) are

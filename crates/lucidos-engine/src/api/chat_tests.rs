@@ -414,6 +414,104 @@ fn a_follow_up_is_not_judged_here() {
     assert!(require_input_to_create(true, "", &[]).is_ok());
 }
 
+// A new coding-agent thread's `cc_model` is checked against the backend's list,
+// by the same function the `run_coding_agent` tool uses. `lucidos spawn-thread`
+// reaches this route, and it ran any id before.
+
+#[test]
+fn a_new_coding_agent_thread_with_an_unoffered_model_is_refused() {
+    let err = require_offered_coding_agent_model(false, Some(true), None, Some("claude-sonnet-9"))
+        .expect_err("an id no list offers must fail the create");
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        Err(err.message),
+        crate::runtime::validate_coding_agent_model(
+            crate::runtime::CodingAgent::ClaudeCode,
+            Some("claude-sonnet-9")
+        ),
+        "the route and the tool refuse with one text"
+    );
+}
+
+#[test]
+fn the_route_checks_the_model_against_the_requested_backend() {
+    let err = require_offered_coding_agent_model(
+        false,
+        Some(true),
+        Some(crate::runtime::CodingAgent::Codex),
+        Some("claude-sonnet-5"),
+    )
+    .expect_err("a Claude id is not a Codex model");
+    assert!(err.message.contains("codex"), "{}", err.message);
+}
+
+#[test]
+fn a_follow_up_on_a_started_thread_keeps_an_unlisted_model() {
+    assert!(
+        require_offered_coding_agent_model(true, Some(true), None, Some("claude-sonnet-9")).is_ok()
+    );
+}
+
+#[test]
+fn a_model_on_a_chat_agent_request_is_not_judged_here() {
+    for use_coding_agent in [None, Some(false)] {
+        assert!(require_offered_coding_agent_model(
+            false,
+            use_coding_agent,
+            None,
+            Some("claude-sonnet-9")
+        )
+        .is_ok());
+    }
+}
+
+#[test]
+fn an_offered_or_absent_model_passes() {
+    for model in [None, Some(""), Some("claude-opus-5-5[1m]"), Some("haiku")] {
+        assert!(
+            require_offered_coding_agent_model(false, Some(true), None, model).is_ok(),
+            "{model:?}"
+        );
+    }
+}
+
+/// The tool, the route and the picker read one list. The refusal text names the
+/// offered ids in list order, and every picker row is one of them.
+#[test]
+fn the_tool_the_route_and_the_picker_share_one_list() {
+    use crate::runtime::{coding_agent_model_options, validate_coding_agent_model, CodingAgent};
+    let offered = coding_agent_model_options(CodingAgent::ClaudeCode);
+    let tool = validate_coding_agent_model(CodingAgent::ClaudeCode, Some("claude-sonnet-9"))
+        .expect_err("no row offers it");
+    let route =
+        require_offered_coding_agent_model(false, Some(true), None, Some("claude-sonnet-9"))
+            .expect_err("the route refuses the same id");
+    assert_eq!(route.message, tool);
+
+    let listed = tool
+        .split_once("Choose one of: ")
+        .expect("the refusal lists the offered rows")
+        .1;
+    let refused_ids: Vec<&str> = listed
+        .split(", ")
+        .map(|row| row.split(" (runs ").next().unwrap_or(row))
+        .collect();
+    let offered_ids: Vec<&str> = offered.iter().map(|o| o.value.as_str()).collect();
+    assert_eq!(refused_ids, offered_ids);
+
+    let definitions = crate::runtime::claude_code::cc_command_definitions();
+    let served = definitions[0]["params"][0]["options"]
+        .as_array()
+        .expect("set_model has options");
+    for row in served {
+        let value = row["value"].as_str().expect("a served row has a value");
+        assert!(
+            offered_ids.contains(&value),
+            "the picker serves {value}, which is not offered"
+        );
+    }
+}
+
 fn base_req(mode: ActorMode) -> ChatRequest {
     ChatRequest {
         message: "hi".into(),

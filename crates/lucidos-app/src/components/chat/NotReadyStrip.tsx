@@ -125,21 +125,24 @@ export function NotReadyStrip() {
 function ContinuedHereLink({ successor }: { successor: SuccessorLink | null }) {
   return (
     <p class="continued-here" data-role="continued-here">
-      {successor ? (
-        <>
-          {'Continued '}
-          <button
-            type="button"
-            class="continued-here-link"
-            data-tooltip={successorLinkTitle(successor) ?? undefined}
-            onClick={() => focusThreadOrBootstrap(successor.thread_id)}
-          >
-            here
-          </button>
-        </>
-      ) : (
-        'Continued in a new thread'
-      )}
+      <ArrowIcon />
+      <span>
+        {successor ? (
+          <>
+            {'Continued '}
+            <button
+              type="button"
+              class="continued-here-link"
+              data-tooltip={successorLinkTitle(successor) ?? undefined}
+              onClick={() => focusThreadOrBootstrap(successor.thread_id)}
+            >
+              here
+            </button>
+          </>
+        ) : (
+          'Continued in a new thread'
+        )}
+      </span>
     </p>
   );
 }
@@ -152,6 +155,15 @@ async function startHardening(threadId: string): Promise<void> {
   } catch (err) {
     showToast(`Failed to start hardening: ${errorDetail(err)}`, 'error');
   }
+}
+
+function ArrowIcon() {
+  return (
+    <svg class="continued-here-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="5" y1="12" x2="19" y2="12" />
+      <polyline points="12 5 19 12 12 19" />
+    </svg>
+  );
 }
 
 function WarningIcon() {

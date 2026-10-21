@@ -16,25 +16,188 @@ const SAFE_PREFERENCE_KEYS: &[&str] = &[
     "font-size",
     prefs::PUSH_NOTIFICATIONS.key(),
     prefs::CHAT_MODEL.key(),
+    prefs::TRIGGER_MODEL.key(),
     prefs::CHAT_REASONING_EFFORTS.key(),
     prefs::IMAGE_MODEL.key(),
 ];
 
+/// The facts the user environment block states, before they are worded.
+///
+/// The chat agent renders it into every request. A coding agent keeps each
+/// message in its transcript, so it gets a block only when the conversation
+/// does not already hold this one ([`SentDeviceContexts`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct DeviceContext {
+    /// The last used device's lines, empty when no device is known.
+    device_lines: Vec<String>,
+    known_devices: Vec<SeenDevice>,
+    preference_lines: Vec<String>,
+    has_device_id: bool,
+}
+
+/// What a block says apart from how fresh it is. Two blocks with an equal
+/// fingerprint tell the agent the same thing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextFingerprint(String);
+
+impl DeviceContext {
+    /// The last used device is the one when the block is built. A later answer
+    /// in the same live turn can move it, so the header says when.
+    /// `navigate_ui` resolves it again at call time.
+    pub(crate) fn render(&self) -> String {
+        if self.device_lines.is_empty()
+            && self.known_devices.is_empty()
+            && self.preference_lines.is_empty()
+        {
+            return String::new();
+        }
+
+        let mut out = String::from("[USER DEVICE & PREFERENCES]\n");
+        if !self.device_lines.is_empty() {
+            out.push_str("Last used device (when this context was built):\n");
+            out.push_str(&self.device_lines.join("\n"));
+            out.push('\n');
+        } else {
+            out.push_str("Last used device: unavailable for this turn.\n");
+        }
+        if !self.known_devices.is_empty() {
+            let known_device_lines: Vec<String> =
+                self.known_devices.iter().map(format_known_device).collect();
+            out.push_str("Known devices, most recently seen first:\n");
+            out.push_str(&known_device_lines.join("\n"));
+            out.push('\n');
+        }
+
+        if !self.preference_lines.is_empty() {
+            if self.has_device_id {
+                out.push_str(
+                    "Effective preferences for this device (global plus device-specific overrides):\n",
+                );
+            } else {
+                out.push_str("Global user-facing preferences:\n");
+            }
+            out.push_str(&self.preference_lines.join("\n"));
+            out.push('\n');
+        }
+
+        out.push_str(
+            "Use these facts when interpreting user-facing UI/UX requests. \
+             Apps should respect the theme mode, theme, font, UI scale and motion (key animations on \
+             `data-motion`). Style with the theme variables, never hardcoded colours, so \
+             the theme applies. Use rem/em-sized layout where user scale should apply.\n",
+        );
+        out.push_str("[END USER DEVICE & PREFERENCES]");
+        out
+    }
+
+    /// Covers the last used device, the preferences and the set of known
+    /// devices. Leaves out ages, "visible now" and list order, which move
+    /// without telling the agent anything new.
+    pub(crate) fn fingerprint(&self) -> ContextFingerprint {
+        let mut known: Vec<(&str, &str, Option<&str>)> = self
+            .known_devices
+            .iter()
+            .map(|d| (d.id.as_str(), d.label.as_str(), d.details.as_deref()))
+            .collect();
+        known.sort();
+        let facts = (
+            &self.device_lines,
+            self.has_device_id,
+            &self.preference_lines,
+            known,
+        );
+        ContextFingerprint(
+            serde_json::to_string(&facts).expect("strings and booleans always serialize"),
+        )
+    }
+}
+
+/// A block the next message carries, with what to remember once the agent
+/// has read it.
+pub(crate) struct DeviceBlock {
+    pub(crate) text: String,
+    pub(crate) fingerprint: ContextFingerprint,
+}
+
+/// The block one coding-agent conversation last read.
+struct SentDeviceContext {
+    /// The backend session id the block went to, as `Init` reported it.
+    conversation: String,
+    fingerprint: ContextFingerprint,
+}
+
+/// What each coding-agent thread's conversation last read, so an unchanged
+/// block is not sent again.
+///
+/// The transcript is the truth and this map only remembers what it holds, so
+/// losing it costs one extra block and never a missing one. An engine restart
+/// empties it.
+#[derive(Default)]
+pub(crate) struct SentDeviceContexts(std::sync::Mutex<HashMap<Uuid, SentDeviceContext>>);
+
+impl SentDeviceContexts {
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, SentDeviceContext>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The block to put in front of the next message, or `None` when the
+    /// conversation already holds an equal one. A conversation the engine has
+    /// not seen `Init` name (`None`) always gets the block. `unread` lists
+    /// blocks queued but not yet read: one that differs would be the agent's
+    /// latest, so it forces a send.
+    pub(crate) fn block_for(
+        &self,
+        thread_id: Uuid,
+        conversation: Option<&str>,
+        unread: &[ContextFingerprint],
+        context: &DeviceContext,
+    ) -> Option<DeviceBlock> {
+        let text = context.render();
+        if text.is_empty() {
+            return None;
+        }
+        let fingerprint = context.fingerprint();
+        let held = self.entries().get(&thread_id).is_some_and(|sent| {
+            Some(sent.conversation.as_str()) == conversation && sent.fingerprint == fingerprint
+        }) && unread.iter().all(|queued| *queued == fingerprint);
+        (!held).then_some(DeviceBlock { text, fingerprint })
+    }
+
+    /// Call once the agent has read an input carrying the block.
+    pub(crate) fn record(
+        &self,
+        thread_id: Uuid,
+        conversation: &str,
+        fingerprint: ContextFingerprint,
+    ) {
+        self.entries().insert(
+            thread_id,
+            SentDeviceContext {
+                conversation: conversation.to_string(),
+                fingerprint,
+            },
+        );
+    }
+
+    /// Compaction can drop the block from the agent's summary.
+    pub(crate) fn forget(&self, thread_id: Uuid) {
+        self.entries().remove(&thread_id);
+    }
+}
+
 /// Build the user environment block shared by the chat agent and coding-agent
 /// sessions, for an already resolved device. It is intentionally compact and
-/// allowlisted: `preferences` also stores operational values such as VAPID
-/// keys. Callers go through [`build_user_device_preferences_context_for_turn`].
-async fn build_user_device_preferences_context(pool: &PgPool, device_id: Option<&str>) -> String {
-    let device_section = build_device_lines(pool, device_id).await;
-    let known_device_lines = build_known_device_lines(pool).await;
-    let preference_lines = build_preference_lines(pool, device_id).await;
-
-    render_user_device_preferences_context(
-        device_section,
-        known_device_lines,
-        preference_lines,
-        device_id.is_some(),
-    )
+/// allowlisted: `preferences` also stores the engine's own bookkeeping. Callers go through [`build_user_device_preferences_context_for_turn`].
+async fn build_user_device_preferences_context(
+    pool: &PgPool,
+    device_id: Option<&str>,
+) -> DeviceContext {
+    DeviceContext {
+        device_lines: build_device_lines(pool, device_id).await,
+        known_devices: build_known_devices(pool).await,
+        preference_lines: build_preference_lines(pool, device_id).await,
+        has_device_id: device_id.is_some(),
+    }
 }
 
 /// The events a user acts through inside a turn. Each carries the device it
@@ -95,7 +258,7 @@ pub(crate) async fn build_user_device_preferences_context_for_turn(
     thread_id: Uuid,
     turn_anchor: Option<Uuid>,
     turn_device: Option<&str>,
-) -> String {
+) -> DeviceContext {
     let device = last_used_device(pool, thread_id, turn_anchor, turn_device).await;
     build_user_device_preferences_context(pool, device.as_deref()).await
 }
@@ -105,55 +268,6 @@ const KNOWN_DEVICES_LIMIT: i64 = 5;
 /// A device unseen for longer than this is left out of the list.
 const KNOWN_DEVICES_WITHIN_DAYS: i32 = 30;
 
-/// `device_section` is the last used device when the block is built. A later
-/// answer in the same live turn can move it, so the header says when.
-/// `navigate_ui` resolves it again at call time.
-fn render_user_device_preferences_context(
-    device_section: Vec<String>,
-    known_device_lines: Vec<String>,
-    preference_lines: Vec<String>,
-    has_device_id: bool,
-) -> String {
-    if device_section.is_empty() && known_device_lines.is_empty() && preference_lines.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::from("[USER DEVICE & PREFERENCES]\n");
-    if !device_section.is_empty() {
-        out.push_str("Last used device (when this context was built):\n");
-        out.push_str(&device_section.join("\n"));
-        out.push('\n');
-    } else {
-        out.push_str("Last used device: unavailable for this turn.\n");
-    }
-    if !known_device_lines.is_empty() {
-        out.push_str("Known devices, most recently seen first:\n");
-        out.push_str(&known_device_lines.join("\n"));
-        out.push('\n');
-    }
-
-    if !preference_lines.is_empty() {
-        if has_device_id {
-            out.push_str(
-                "Effective preferences for this device (global plus device-specific overrides):\n",
-            );
-        } else {
-            out.push_str("Global user-facing preferences:\n");
-        }
-        out.push_str(&preference_lines.join("\n"));
-        out.push('\n');
-    }
-
-    out.push_str(
-        "Use these facts when interpreting user-facing UI/UX requests. \
-         Apps should respect the theme mode, theme, font, UI scale and motion (key animations on \
-         `data-motion`). Style with the theme variables, never hardcoded colours, so \
-         the theme applies. Use rem/em-sized layout where user scale should apply.\n",
-    );
-    out.push_str("[END USER DEVICE & PREFERENCES]");
-    out
-}
-
 /// Build context for a coding-agent input from the persisted event that caused
 /// it. That event anchors the turn.
 pub(crate) async fn build_user_device_preferences_context_for_origin(
@@ -161,7 +275,7 @@ pub(crate) async fn build_user_device_preferences_context_for_origin(
     event_store: &EventStore,
     thread_id: Uuid,
     origin_id: Uuid,
-) -> String {
+) -> DeviceContext {
     let device_id = match event_store.get_event_by_id(origin_id).await {
         Ok(Some(row)) => device_from_event_row(&row),
         Ok(None) => None,
@@ -230,9 +344,9 @@ async fn build_device_lines(pool: &PgPool, device_id: Option<&str>) -> Vec<Strin
 
 /// A failed read leaves the list out rather than failing the turn. The last
 /// used device above still stands, and `navigate_ui` defaults to it.
-async fn build_known_device_lines(pool: &PgPool) -> Vec<String> {
+async fn build_known_devices(pool: &PgPool) -> Vec<SeenDevice> {
     match DeviceStore::recently_seen(pool, KNOWN_DEVICES_LIMIT, KNOWN_DEVICES_WITHIN_DAYS).await {
-        Ok(devices) => devices.iter().map(format_known_device).collect(),
+        Ok(devices) => devices,
         Err(e) => {
             log!(
                 "[AgentContext] Failed to list known devices for agent context: {}",
@@ -354,20 +468,26 @@ mod tests {
         )
         .await
         .unwrap();
-        // Written through the guarded silent door, matching production: a
-        // transport secret is not a setting, so it must not announce.
-        PreferenceStore::set_silent(&pool, prefs::VAPID_KEYS.key(), r#"{"private":"secret"}"#)
-            .await
-            .unwrap();
+        // Written through the guarded silent door, matching production:
+        // engine bookkeeping is not a setting, so it must not announce.
+        PreferenceStore::set_silent(
+            &pool,
+            prefs::BACKUP_LAST_RUN.key(),
+            r#"{"status":"secret"}"#,
+        )
+        .await
+        .unwrap();
 
-        let context = build_user_device_preferences_context(&pool, Some("device-ios")).await;
+        let context = build_user_device_preferences_context(&pool, Some("device-ios"))
+            .await
+            .render();
 
         assert!(context.contains("- id: device-ios"));
         assert!(context.contains("- label: Ios pwa"));
         assert!(context.contains("- theme-mode: light"));
         assert!(context.contains("- ui-scale: 125"));
         assert!(context.contains("Safari") || context.contains("iOS"));
-        assert!(!context.contains("vapid"));
+        assert!(!context.contains(prefs::BACKUP_LAST_RUN.key()));
         assert!(!context.contains("secret"));
         assert!(
             context.contains("- Ios pwa (id device-ios): Safari/604.1 on iOS; seen just now"),
@@ -395,11 +515,15 @@ mod tests {
         .await
         .unwrap();
 
-        let on_device = build_user_device_preferences_context(&pool, Some("device-ios")).await;
+        let on_device = build_user_device_preferences_context(&pool, Some("device-ios"))
+            .await
+            .render();
         assert!(on_device.contains("- theme: mono"), "{on_device}");
         assert!(!on_device.contains("- theme: minimal"), "{on_device}");
 
-        let global = build_user_device_preferences_context(&pool, None).await;
+        let global = build_user_device_preferences_context(&pool, None)
+            .await
+            .render();
         assert!(global.contains("- theme: minimal"), "{global}");
 
         pool.close().await;
@@ -428,12 +552,11 @@ mod tests {
 
     #[test]
     fn the_closing_guidance_tells_apps_to_respect_the_theme() {
-        let context = render_user_device_preferences_context(
-            vec![],
-            vec![],
-            vec!["- theme: nord".to_string()],
-            false,
-        );
+        let context = DeviceContext {
+            preference_lines: vec!["- theme: nord".to_string()],
+            ..Default::default()
+        }
+        .render();
         assert!(
             context
                 .contains("Apps should respect the theme mode, theme, font, UI scale and motion"),
@@ -514,12 +637,13 @@ mod tests {
     /// navigate actually uses.
     #[test]
     fn the_block_names_the_last_used_device_and_lists_known_devices() {
-        let context = render_user_device_preferences_context(
-            vec!["- id: device-ios".to_string()],
-            vec!["- My MacBook (id laptop): seen just now".to_string()],
-            vec![],
-            true,
-        );
+        let context = DeviceContext {
+            device_lines: vec!["- id: device-ios".to_string()],
+            known_devices: vec![macbook()],
+            has_device_id: true,
+            ..Default::default()
+        }
+        .render();
         assert!(
             context.contains("Last used device (when this context was built):\n- id: device-ios"),
             "{context}"
@@ -533,12 +657,11 @@ mod tests {
     /// the list, or it cannot aim `navigate_ui` at any device on purpose.
     #[test]
     fn a_turn_with_no_device_still_lists_known_devices() {
-        let context = render_user_device_preferences_context(
-            vec![],
-            vec!["- My MacBook (id laptop): seen just now".to_string()],
-            vec![],
-            false,
-        );
+        let context = DeviceContext {
+            known_devices: vec![macbook()],
+            ..Default::default()
+        }
+        .render();
         assert!(
             context.contains("Last used device: unavailable"),
             "{context}"
@@ -548,19 +671,20 @@ mod tests {
 
     #[test]
     fn context_block_includes_device_and_effective_user_preferences() {
-        let context = render_user_device_preferences_context(
-            vec![
+        let context = DeviceContext {
+            device_lines: vec![
                 "- id: device-ios".to_string(),
                 "- label: Ios pwa".to_string(),
                 "- details: Safari/604.1 on iOS".to_string(),
             ],
-            vec![],
-            vec![
+            preference_lines: vec![
                 "- theme-mode: light".to_string(),
                 "- ui-scale: 125".to_string(),
             ],
-            true,
-        );
+            has_device_id: true,
+            ..Default::default()
+        }
+        .render();
 
         assert!(context.contains("[USER DEVICE & PREFERENCES]"));
         assert!(context.contains("- id: device-ios"));
@@ -578,8 +702,8 @@ mod tests {
             (prefs::UI_SCALE.key().to_string(), "125".to_string()),
             (prefs::LANGUAGE.key().to_string(), "".to_string()),
             (
-                prefs::VAPID_KEYS.key().to_string(),
-                r#"{"private":"secret"}"#.to_string(),
+                prefs::BACKUP_LAST_RUN.key().to_string(),
+                r#"{"status":"secret"}"#.to_string(),
             ),
         ]);
 
@@ -589,15 +713,13 @@ mod tests {
         assert!(context.contains("- theme-mode: light"));
         assert!(context.contains("- ui-scale: 125"));
         assert!(!context.contains(prefs::LANGUAGE.key()));
-        assert!(!context.contains("vapid"));
+        assert!(!context.contains(prefs::BACKUP_LAST_RUN.key()));
         assert!(!context.contains("secret"));
     }
 
     #[test]
     fn context_is_empty_when_no_device_or_safe_preferences_exist() {
-        let context = render_user_device_preferences_context(vec![], vec![], vec![], false);
-
-        assert_eq!(context, "");
+        assert_eq!(DeviceContext::default().render(), "");
     }
 
     #[test]
@@ -636,5 +758,250 @@ mod tests {
 
         assert!(text.starts_with("[USER DEVICE & PREFERENCES]"));
         assert!(text.ends_with("Build the app."));
+    }
+
+    fn macbook() -> SeenDevice {
+        SeenDevice {
+            id: "laptop".into(),
+            label: "My MacBook".into(),
+            details: Some("Chrome/149.0.0.0 on macOS".into()),
+            seen_secs_ago: 5,
+            visible_now: true,
+        }
+    }
+
+    fn phone() -> SeenDevice {
+        SeenDevice {
+            id: "phone".into(),
+            label: "My iPhone".into(),
+            details: None,
+            seen_secs_ago: 7200,
+            visible_now: false,
+        }
+    }
+
+    fn dark_on_laptop() -> DeviceContext {
+        DeviceContext {
+            device_lines: vec!["- id: laptop".into(), "- label: My MacBook".into()],
+            known_devices: vec![macbook(), phone()],
+            preference_lines: vec!["- theme-mode: dark".into()],
+            has_device_id: true,
+        }
+    }
+
+    /// I3: only a change the agent could act on re-sends the block.
+    #[test]
+    fn a_fingerprint_ignores_ages_visibility_and_list_order() {
+        let before = dark_on_laptop();
+        let mut later = dark_on_laptop();
+        later.known_devices = vec![
+            SeenDevice {
+                seen_secs_ago: 9000,
+                ..phone()
+            },
+            SeenDevice {
+                seen_secs_ago: 3600,
+                visible_now: false,
+                ..macbook()
+            },
+        ];
+        assert_ne!(before.render(), later.render(), "the wording does move");
+        assert_eq!(before.fingerprint(), later.fingerprint());
+    }
+
+    /// I3: each fact the agent reads aloud or acts on moves the fingerprint.
+    #[test]
+    fn a_fingerprint_moves_with_every_fact_the_agent_acts_on() {
+        let base = dark_on_laptop().fingerprint();
+        let changed: [(&str, DeviceContext); 7] = [
+            (
+                "last used device",
+                DeviceContext {
+                    device_lines: vec!["- id: phone".into(), "- label: My iPhone".into()],
+                    ..dark_on_laptop()
+                },
+            ),
+            (
+                "a preference",
+                DeviceContext {
+                    preference_lines: vec!["- theme-mode: light".into()],
+                    ..dark_on_laptop()
+                },
+            ),
+            (
+                "device-vs-global header",
+                DeviceContext {
+                    has_device_id: false,
+                    ..dark_on_laptop()
+                },
+            ),
+            (
+                "a known device label",
+                DeviceContext {
+                    known_devices: vec![
+                        SeenDevice {
+                            label: "Work MacBook".into(),
+                            ..macbook()
+                        },
+                        phone(),
+                    ],
+                    ..dark_on_laptop()
+                },
+            ),
+            (
+                "a known device's details",
+                DeviceContext {
+                    known_devices: vec![
+                        SeenDevice {
+                            details: Some("Safari on macOS".into()),
+                            ..macbook()
+                        },
+                        phone(),
+                    ],
+                    ..dark_on_laptop()
+                },
+            ),
+            (
+                "a device appearing",
+                DeviceContext {
+                    known_devices: vec![
+                        macbook(),
+                        phone(),
+                        SeenDevice {
+                            id: "tablet".into(),
+                            ..phone()
+                        },
+                    ],
+                    ..dark_on_laptop()
+                },
+            ),
+            (
+                "a device leaving",
+                DeviceContext {
+                    known_devices: vec![macbook()],
+                    ..dark_on_laptop()
+                },
+            ),
+        ];
+        for (what, context) in changed {
+            assert_ne!(context.fingerprint(), base, "{what} must re-send the block");
+        }
+    }
+
+    const FIRST: &str = "session-1";
+
+    /// I1: a conversation the engine has not seen `Init` name always gets the
+    /// block, even when the thread remembers an equal one for another.
+    #[test]
+    fn a_new_conversation_always_gets_the_block() {
+        let sent = SentDeviceContexts::default();
+        let thread = Uuid::new_v4();
+        let context = dark_on_laptop();
+        let block = sent
+            .block_for(thread, None, &[], &context)
+            .expect("fresh thread");
+        sent.record(thread, FIRST, block.fingerprint);
+
+        assert!(
+            sent.block_for(thread, None, &[], &context).is_some(),
+            "no id yet"
+        );
+        assert!(
+            sent.block_for(thread, Some("session-2"), &[], &context)
+                .is_some(),
+            "another conversation holds nothing"
+        );
+    }
+
+    /// I2: the one case that omits the block.
+    #[test]
+    fn an_unchanged_block_is_not_sent_again_to_the_same_conversation() {
+        let sent = SentDeviceContexts::default();
+        let thread = Uuid::new_v4();
+        let context = dark_on_laptop();
+        let block = sent.block_for(thread, Some(FIRST), &[], &context).unwrap();
+        assert!(block.text.starts_with("[USER DEVICE & PREFERENCES]"));
+        assert!(
+            sent.block_for(thread, Some(FIRST), &[], &context).is_some(),
+            "nothing counts as sent until the agent has read it"
+        );
+        sent.record(thread, FIRST, block.fingerprint);
+
+        assert!(sent.block_for(thread, Some(FIRST), &[], &context).is_none());
+        let mut aged = dark_on_laptop();
+        aged.known_devices[0].seen_secs_ago = 600;
+        assert!(sent.block_for(thread, Some(FIRST), &[], &aged).is_none());
+        assert!(
+            sent.block_for(Uuid::new_v4(), Some(FIRST), &[], &context)
+                .is_some(),
+            "another thread has its own memory"
+        );
+    }
+
+    #[test]
+    fn a_changed_block_is_sent_again_and_replaces_the_remembered_one() {
+        let sent = SentDeviceContexts::default();
+        let thread = Uuid::new_v4();
+        sent.record(thread, FIRST, dark_on_laptop().fingerprint());
+        let light = DeviceContext {
+            preference_lines: vec!["- theme-mode: light".into()],
+            ..dark_on_laptop()
+        };
+
+        let block = sent
+            .block_for(thread, Some(FIRST), &[], &light)
+            .expect("changed");
+        assert!(block.text.contains("- theme-mode: light"));
+        sent.record(thread, FIRST, block.fingerprint);
+        assert!(sent.block_for(thread, Some(FIRST), &[], &light).is_none());
+        assert!(
+            sent.block_for(thread, Some(FIRST), &[], &dark_on_laptop())
+                .is_some(),
+            "going back is a change too"
+        );
+    }
+
+    /// I4: compaction may drop the block from the agent's summary.
+    #[test]
+    fn compaction_makes_the_next_message_carry_the_block_again() {
+        let sent = SentDeviceContexts::default();
+        let thread = Uuid::new_v4();
+        let context = dark_on_laptop();
+        sent.record(thread, FIRST, context.fingerprint());
+        assert!(sent.block_for(thread, Some(FIRST), &[], &context).is_none());
+
+        sent.forget(thread);
+        assert!(sent.block_for(thread, Some(FIRST), &[], &context).is_some());
+    }
+
+    /// I2: a queued block that differs becomes the agent's latest, so the
+    /// next message restates its own.
+    #[test]
+    fn a_differing_unread_block_makes_the_next_message_carry_its_own() {
+        let sent = SentDeviceContexts::default();
+        let thread = Uuid::new_v4();
+        let context = dark_on_laptop();
+        sent.record(thread, FIRST, context.fingerprint());
+        let light = DeviceContext {
+            preference_lines: vec!["- theme-mode: light".into()],
+            ..dark_on_laptop()
+        };
+
+        let queued = [light.fingerprint()];
+        assert!(sent
+            .block_for(thread, Some(FIRST), &queued, &context)
+            .is_some());
+        let equal = [context.fingerprint()];
+        assert!(sent
+            .block_for(thread, Some(FIRST), &equal, &context)
+            .is_none());
+    }
+
+    #[test]
+    fn an_empty_context_has_no_block_to_send() {
+        let sent = SentDeviceContexts::default();
+        assert!(sent
+            .block_for(Uuid::new_v4(), Some(FIRST), &[], &DeviceContext::default())
+            .is_none());
     }
 }

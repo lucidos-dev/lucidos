@@ -5,6 +5,8 @@
   GitHub mode the default. ADR 0388 moves the Claude Code specs that need no
   real session onto GitHub, against a fake.
 - **Date**: 2026-10-07
+- **Amended by**: [0536](0536-fast-test-loop.md): the workflow token
+  also gets `actions: read`, to find a reusable engine.
 
 ## Context
 

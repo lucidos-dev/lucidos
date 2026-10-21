@@ -26,7 +26,9 @@ import {
 const {
   BUDGET_LINE_PREFIX: WATCHER_PREFIX,
   DEV_BUILD_WATCH_ENV: WATCHER_ENV,
+  BROKEN_ALERT_GRACE_MS,
   alertTransition,
+  createBuildAlerts,
   budgetAlert,
   budgetAlerts,
   budgetFromLine,
@@ -53,6 +55,75 @@ describe('when a build outcome is announced', () => {
     // that fails is news. One that succeeds recovered nothing.
     expect(alertTransition(null, false)).toBe('broken');
     expect(alertTransition(null, true)).toBeNull();
+  });
+});
+
+describe('a failure that heals within the grace period', () => {
+  // An Apply's merge can catch a build half-written. The next build is green a
+  // second later, and a "failing" then "green again" pair is pure noise.
+  function harness() {
+    const raised: { title: string; message: string }[] = [];
+    const delays: number[] = [];
+    const build = { running: false };
+    let pendingFire: (() => void) | null = null;
+    const alerts = createBuildAlerts({
+      raise: (alert: { title: string; message: string }) => raised.push(alert),
+      setTimer: (fire: () => void, ms: number) => { pendingFire = fire; delays.push(ms); return 1; },
+      clearTimer: () => { pendingFire = null; },
+      buildRunning: () => build.running,
+    });
+    const elapse = () => { const fire = pendingFire; pendingFire = null; fire?.(); };
+    return { raised, alerts, elapse, delays, build };
+  }
+
+  it('says nothing when the next build is green inside the grace period', () => {
+    const { raised, alerts, elapse } = harness();
+    alerts.record(true, null);
+    alerts.record(false, 'X is not exported');
+    alerts.record(true, null);
+    elapse();
+    expect(raised).toEqual([]);
+  });
+
+  it('announces a failure that outlives the grace period, with its latest error', () => {
+    const { raised, alerts, elapse } = harness();
+    alerts.record(false, 'first error');
+    alerts.record(false, 'second error');
+    elapse();
+    expect(raised).toHaveLength(1);
+    expect(raised[0].title).toBe('Frontend build is failing');
+    expect(raised[0].message).toContain('second error');
+  });
+
+  it('announces the recovery only of a failure it announced', () => {
+    const { raised, alerts, elapse } = harness();
+    alerts.record(false, 'broken');
+    elapse();
+    alerts.record(true, null);
+    expect(raised.map((a) => a.title)).toEqual([
+      'Frontend build is failing',
+      'Frontend build is green again',
+    ]);
+  });
+
+  it('holds the failure for the whole grace period', () => {
+    const { alerts, delays } = harness();
+    alerts.record(false, 'broken');
+    expect(delays).toEqual([BROKEN_ALERT_GRACE_MS]);
+  });
+
+  it('waits out a build still running when the grace period ends', () => {
+    // A rebuild that runs `npm ci` can outlast the grace period and still heal.
+    const { raised, alerts, elapse, delays, build } = harness();
+    alerts.record(false, 'broken');
+    build.running = true;
+    elapse();
+    expect(raised).toEqual([]);
+    expect(delays).toEqual([BROKEN_ALERT_GRACE_MS, BROKEN_ALERT_GRACE_MS]);
+    build.running = false;
+    alerts.record(true, null);
+    elapse();
+    expect(raised).toEqual([]);
   });
 });
 

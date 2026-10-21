@@ -10,7 +10,7 @@
  *
  * jsdom runs no animations, so these tests pin the DOM states the CSS keys on.
  * The frames themselves are covered by
- * `e2e/threads-header-filter-transitions.spec.ts`.
+ * `e2e/threads-header-filter-transitions-all.spec.ts`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';

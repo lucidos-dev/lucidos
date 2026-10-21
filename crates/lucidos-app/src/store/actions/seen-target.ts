@@ -27,12 +27,12 @@ import {
   mobileView,
   panelOverlay,
   settingsSubview,
-  splitRatio,
   readRequestStanding,
   threadMap,
   unreadNotifications,
 } from '../store';
 import type { MobileView, PanelOverlay, SettingsSubview } from '../store';
+import { drawnSplitRatio } from '../../components/layout/drawnLayout';
 import type { MenuItem } from '../types';
 import { isInViewport, isReplyEndInViewport, lastExchangeOf, viewportIsMobile } from '../../utils/viewport';
 import { markReplySeen } from '../../api/threads';
@@ -77,18 +77,18 @@ export interface VisitLocation {
   settingsSubview: SettingsSubview;
   mobile: boolean;
   mobileView: MobileView;
-  splitRatio: number;
+  drawnSplitRatio: number;
 }
 
 /** Is the Conversation pane on screen? Mobile navigates between panes, so only
  *  the current one is. Desktop shows both unless the split collapsed one. */
 export function threadPaneOnScreen(loc: VisitLocation): boolean {
-  return loc.mobile ? loc.mobileView === 'thread' : loc.splitRatio > 0;
+  return loc.mobile ? loc.mobileView === 'thread' : loc.drawnSplitRatio > 0;
 }
 
 /** Is the Canvas pane on screen? The mirror of `threadPaneOnScreen`. */
 export function contentPaneOnScreen(loc: VisitLocation): boolean {
-  return loc.mobile ? loc.mobileView === 'content' : loc.splitRatio < 1;
+  return loc.mobile ? loc.mobileView === 'content' : loc.drawnSplitRatio < 1;
 }
 
 /** The place the Canvas pane shows, or null when it shows nothing a
@@ -302,7 +302,7 @@ function currentLocation(): VisitLocation {
     settingsSubview: settingsSubview.value,
     mobile: viewportIsMobile.value,
     mobileView: mobileView.value,
-    splitRatio: splitRatio.value,
+    drawnSplitRatio: drawnSplitRatio.value,
   };
 }
 

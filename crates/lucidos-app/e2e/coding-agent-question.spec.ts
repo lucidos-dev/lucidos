@@ -1,5 +1,5 @@
 import { test, expect, type APIRequestContext } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, isMobileViewport } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -512,7 +512,6 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
   // prompt's own thread-switch focus, which is the half that races if either
   // side decides independently.
   test('first option takes visible keyboard focus, arrows step, Enter answers', async ({ page, request }) => {
-    test.skip(isMobileViewport(page), 'choice-card keyboard focus is desktop-only (no hardware keyboard on mobile)');
     await assertHealthy(page);
 
     const suffix = randomUUID().slice(0, 8);

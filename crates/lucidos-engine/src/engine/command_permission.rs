@@ -83,6 +83,7 @@ pub fn derive_command_allow_pattern(
 /// Bash routes to [`command_guard::grant_covers_command`], the one predicate
 /// the coding-agent session lane also uses, so the two cannot drift. Python
 /// takes the coarse `Python` pattern: the python tool has no finer sub-scope.
+/// It covers no secret read, which no grant covers.
 pub fn command_is_allowed(
     tool_name: &str,
     command: &str,
@@ -93,9 +94,16 @@ pub fn command_is_allowed(
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
             command_guard::grant_covers_command("Bash", command, site, allowed)
         }
-        tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => allowed("Python"),
+        tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => {
+            !command_guard::command_reads_secret(command) && allowed("Python")
+        }
         _ => false,
     }
+}
+
+/// Whether a bash or python tool call reads a secret path.
+fn tool_call_reads_secret(tool_name: &str, input: &Value) -> bool {
+    command_guard::command_text(tool_name, input).is_some_and(command_guard::command_reads_secret)
 }
 
 fn bash_narrow_pattern(command: &str) -> Option<String> {
@@ -210,11 +218,12 @@ fn trigger_block_refusal(
     if let Some(why) = summary.map(str::trim).filter(|s| !s.is_empty()) {
         msg.push_str(&format!("\n\nWhy it was gated: {why}"));
     }
-    msg.push_str(&format!(
-        "\n\nTo allow it, grant the \"{label}\" side-effect on the trigger (in the trigger's \
-         settings) and re-run.",
-        label = category.label(),
-    ));
+    let remedy = if category.is_grantable() {
+        grantable_remedy(category)
+    } else {
+        ungrantable_remedy().to_string()
+    };
+    msg.push_str(&format!("\n\n{remedy}"));
     // The verbatim command goes LAST, after the one-line summary and the remedy.
     // A push notification body is this same string, and the OS preview shows only
     // its first couple of lines: the summary and the remedy are what a glance
@@ -227,6 +236,24 @@ fn trigger_block_refusal(
         ));
     }
     msg
+}
+
+/// What to tell the user when a grant can allow a command a trigger tried.
+/// The judge can misjudge a command, so the check comes before the grant: a
+/// grant given for a misjudgement lets every later command of that kind run.
+fn grantable_remedy(category: SideEffectCategory) -> String {
+    format!(
+        "Check what the command does first. If it does not do this, the guard misjudged it: you \
+         need no grant, so run the trigger again. If the trigger really must do this, grant the \
+         \"{label}\" side-effect in the trigger's settings and re-run.",
+        label = category.label(),
+    )
+}
+
+/// What to tell the user when no grant can allow a command a trigger tried.
+fn ungrantable_remedy() -> &'static str {
+    "No side-effect grant can allow this. Name a credential (CRED_*) in the command to \
+     use a stored secret instead."
 }
 
 /// A fence long enough that `excerpt` cannot break out of its code block: one
@@ -546,7 +573,7 @@ fn action_for_lane(
                 // trigger (Phase 5). An irreversible command always has a
                 // category — default `Other` if the judge didn't tag one.
                 let cat = category.unwrap_or(SideEffectCategory::Other);
-                if grant.contains(&cat) {
+                if cat.is_grantable() && grant.contains(&cat) {
                     GuardAction::Proceed
                 } else {
                     GuardAction::FailTrigger(cat)
@@ -639,9 +666,9 @@ fn judged(
 
 impl LucidosEngine {
     /// The command guard's pre-dispatch decision for one bash/python tool call
-    /// (ADR 0002). Always `Proceed` when the guard is off (`ctx.enabled` false),
-    /// so the agentic loop can gate the whole feature on the `command_guard`
-    /// preference without branching itself.
+    /// (ADR 0002). With the guard off (`ctx.enabled` false) only a secret read
+    /// is gated. Everything else is `Proceed`, so the agentic loop needs no
+    /// branch of its own on the `command_guard` preference.
     ///
     /// Resolves the final [`RiskLane`] via the static fast-path and — for the
     /// ambiguous middle on a chat channel — the LLM judge (or the static
@@ -675,7 +702,8 @@ impl LucidosEngine {
         meta: &EventMeta,
         cancel_token: &CancellationToken,
     ) -> GuardDecision {
-        if !ctx.enabled {
+        // A secret read is gated even with the guard off, since it ships off.
+        if !ctx.enabled && !tool_call_reads_secret(tool_name, input) {
             return GuardDecision::Proceed;
         }
         // `None` → the turn was canceled while the judge was running.
@@ -950,6 +978,11 @@ impl LucidosEngine {
                 lane,
                 summary: None,
                 category: None,
+            }),
+            StaticVerdict::SettledIrreversible(category) => Some(JudgedClassification {
+                lane: RiskLane::IrreversibleDanger,
+                summary: Some(format!("May perform {}.", category.reason())),
+                category: Some(category),
             }),
             StaticVerdict::NeedsJudge(ji) => {
                 tokio::select! {
@@ -1513,10 +1546,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_secret_read_fails_a_trigger_even_when_every_category_is_granted() {
+        let ch = Some(EventChannel::Trigger);
+        let cat = Some(SideEffectCategory::SecretRead);
+        // A grant can never deserialize to `SecretRead`, so this one is
+        // forged to show the lane refuses it on its own.
+        let forged = &[SideEffectCategory::SecretRead, SideEffectCategory::Other];
+        assert_eq!(
+            action_for_lane(RiskLane::IrreversibleDanger, ch, cat, forged),
+            GuardAction::FailTrigger(SideEffectCategory::SecretRead)
+        );
+        assert_eq!(
+            action_for_lane(RiskLane::IrreversibleDanger, None, cat, forged),
+            GuardAction::Ask
+        );
+    }
+
+    #[test]
+    fn no_stored_grant_covers_a_secret_read_on_the_chat_lane() {
+        let all = |_: &str| true;
+        for (tool, text) in [
+            (tn::RUN_BASH, "cat ~/.lucidos/secret-keys/db"),
+            (
+                tn::RUN_BASH_BACKGROUND,
+                "cat $HOME/.lucidos/pg-shared-password",
+            ),
+            (
+                tn::RUN_PYTHON,
+                "open('/Users/me/.lucidos/secret-keys/db').read()",
+            ),
+            (
+                tn::RUN_PYTHON_BACKGROUND,
+                "open('/Users/me/.lucidos/pg-shared-password')",
+            ),
+        ] {
+            assert!(
+                !command_is_allowed(tool, text, TEXT_ONLY, all),
+                "{tool}: {text}"
+            );
+        }
+        assert!(command_is_allowed(
+            tn::RUN_PYTHON,
+            "print(1)",
+            TEXT_ONLY,
+            all
+        ));
+    }
+
+    #[test]
+    fn a_secret_read_is_detected_on_every_command_tool() {
+        assert!(tool_call_reads_secret(
+            tn::RUN_BASH,
+            &serde_json::json!({ "command": "cat ~/.lucidos/secret-keys/db" })
+        ));
+        assert!(tool_call_reads_secret(
+            tn::RUN_PYTHON,
+            &serde_json::json!({ "code": "open('/home/u/.lucidos/pg-shared-password')" })
+        ));
+        assert!(!tool_call_reads_secret(
+            tn::RUN_BASH,
+            &serde_json::json!({ "command": "ls -la" })
+        ));
+    }
+
     // --- trigger_block_refusal: the message the user reads out of context ---
 
     fn bash_input(cmd: &str) -> Value {
         serde_json::json!({ "command": cmd })
+    }
+
+    #[test]
+    fn a_secret_read_refusal_offers_no_grant() {
+        let msg = trigger_block_refusal(
+            SideEffectCategory::SecretRead,
+            tn::RUN_BASH,
+            &bash_input("cat ~/.lucidos/secret-keys/db"),
+            None,
+        );
+        assert!(msg.contains(ungrantable_remedy()), "{msg}");
+        assert!(!msg.contains(MISJUDGED), "{msg}");
+        assert!(!msg.contains("grant the"), "{msg}");
+    }
+
+    /// The opening of the grantable remedy, which names the misjudgement.
+    const MISJUDGED: &str = "Check what the command does first.";
+
+    /// A block is often a misjudgement, so the remedy names that path first
+    /// and offers the grant only for a real need.
+    #[test]
+    fn a_grantable_refusal_names_the_misjudgement_before_the_grant() {
+        let msg = trigger_block_refusal(
+            SideEffectCategory::OutOfWorkspaceDestruction,
+            tn::RUN_BASH,
+            &bash_input("python3 - <<'E'\nopen('data/x','w')\nE"),
+            Some("Overwrites files outside the workspace."),
+        );
+        let misjudged = msg.find(MISJUDGED).expect("misjudgement line");
+        let grant = msg
+            .find(SideEffectCategory::OutOfWorkspaceDestruction.label())
+            .expect("the grant names its label");
+        assert!(misjudged < grant, "{msg}");
+        assert!(msg.contains("misjudged"), "{msg}");
+        assert!(msg.contains("no grant"), "{msg}");
+        assert!(!msg.contains("To allow it"), "{msg}");
     }
 
     #[test]
@@ -1588,7 +1721,7 @@ mod tests {
             Some("Charges a payment endpoint."),
         );
         let why = msg.find("Why it was gated").expect("summary line");
-        let remedy = msg.find("To allow it").expect("remedy line");
+        let remedy = msg.find(MISJUDGED).expect("remedy line");
         let tried = msg.find("What it tried").expect("command block");
         assert!(why < remedy && remedy < tried, "{msg}");
     }

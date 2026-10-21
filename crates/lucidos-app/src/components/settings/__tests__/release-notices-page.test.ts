@@ -143,10 +143,9 @@ describe('the answered half', () => {
  * Every unresolved notice can be answered from here, action or no action.
  *
  * `action_label` is optional in `release-notices.toml`, and the actions block
- * used to hang off it. A notice carrying none could then be answered only in
- * the modal, which Escape closes for the page's life. The *System attention badge*
- * points at this tab, so the reader would have arrived at a dot with nothing
- * to press.
+ * used to hang off it. A notice carrying none could then be answered nowhere.
+ * The *System attention badge* points at this tab, so the reader would have
+ * arrived at a dot with nothing to press.
  *
  * A source scan rather than a render: the section fetches on mount and pulls
  * the store in, the reason `settings-nav-structure.test.ts` gives.
@@ -157,12 +156,16 @@ describe('answering a notice from the panel', () => {
     expect(SECTION).toContain('acknowledgeReleaseNotice(notice)');
   });
 
-  it('keeps the action button conditional on the notice authoring one', () => {
-    expect(SECTION).toContain('{notice.action_label && (');
+  /** A deferred action draws no button and says which notice carries it.
+   *  `releaseNoticeActionLabel` owns the rule, tested in the store. */
+  it('draws the action through the deferral rule, and explains a missing one', () => {
+    expect(SECTION).toContain('releaseNoticeActionLabel(notice)');
+    expect(SECTION).toContain('{actionLabel && (');
+    expect(SECTION).toContain('comes with a later notice');
   });
 
   it('leaves a resolved row its action button', () => {
-    expect(SECTION).toContain("{(notice.action_label || state !== 'resolved') && (");
+    expect(SECTION).toContain("{(actionLabel || state !== 'resolved') && (");
   });
 
   /** **Got it is not the action, so answering does not spend it.** An answered

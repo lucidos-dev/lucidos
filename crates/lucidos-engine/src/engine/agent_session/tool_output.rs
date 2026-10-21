@@ -10,9 +10,11 @@ use std::collections::HashMap;
 /// The text a `CodingAgentToolResult` stores for one tool's output.
 ///
 /// Whole, with two cleanups. A NUL byte would fail the jsonb insert and lose
-/// the event. A Postgres password gets the mask the call's args already get.
-pub(super) fn stored_tool_output(output: &str) -> String {
-    crate::core::redact_postgres_secrets(&crate::core::sanitize_for_jsonb(output))
+/// the event. And the subprocess mask runs over it, with `secrets` from
+/// `runtime::spawn_env::session_secret_values`, so a token the agent printed
+/// stays inside the agent's own process.
+pub(super) fn stored_tool_output(output: &str, secrets: &[String]) -> String {
+    crate::core::redact_subprocess_output(&crate::core::sanitize_for_jsonb(output), secrets)
 }
 
 /// Each open tool call's name, by `tool_use_id`.
@@ -42,33 +44,68 @@ mod tests {
     fn a_long_output_is_stored_whole() {
         let output = "line of cargo test output\n".repeat(200);
         assert!(output.chars().count() > 5_000);
-        assert_eq!(stored_tool_output(&output), output);
+        assert_eq!(stored_tool_output(&output, &[]), output);
     }
 
     #[test]
     fn a_short_output_is_stored_unchanged() {
-        assert_eq!(stored_tool_output("ok"), "ok");
+        assert_eq!(stored_tool_output("ok", &[]), "ok");
     }
 
     #[test]
     fn multibyte_output_survives_whole() {
         let output = "æøå 🦀 ".repeat(100);
-        assert_eq!(stored_tool_output(&output), output);
+        assert_eq!(stored_tool_output(&output, &[]), output);
     }
 
     #[test]
     fn nul_bytes_are_removed_so_the_insert_cannot_fail() {
-        let stored = stored_tool_output("before\u{0}after");
+        let stored = stored_tool_output("before\u{0}after", &[]);
         assert!(!stored.contains('\u{0}'), "got {stored:?}");
         assert!(stored.contains("before") && stored.contains("after"));
     }
 
     #[test]
     fn a_postgres_password_is_masked() {
-        let stored =
-            stored_tool_output("DATABASE_URL=postgres://lucidos:hunter2@localhost:5432/db");
+        let stored = stored_tool_output(
+            "DATABASE_URL=postgres://lucidos:hunter2@localhost:5432/db",
+            &[],
+        );
         assert!(!stored.contains("hunter2"), "got {stored:?}");
         assert!(stored.contains("postgres://lucidos:***@localhost"));
+    }
+
+    /// A token the agent printed, by shape or by the session's own values,
+    /// never reaches the stored event.
+    #[test]
+    fn a_printed_token_and_a_session_secret_are_masked() {
+        let secrets = vec!["session-origin-token-value".to_string()];
+        let stored = stored_tool_output(
+            "GH_TOKEN=ghp_Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7d\n\
+             LUCIDOS_AGENT_ORIGIN_TOKEN=session-origin-token-value",
+            &secrets,
+        );
+        assert_eq!(
+            stored,
+            "GH_TOKEN=ghp_[REDACTED]\nLUCIDOS_AGENT_ORIGIN_TOKEN=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn a_token_in_a_tool_call_input_is_masked() {
+        let secrets = vec!["session-origin-token-value".to_string()];
+        let mut input = serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer ghp_Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7d'",
+            "nested": ["psql postgres://lucidos:hunter2@localhost/db", "session-origin-token-value"],
+        });
+        crate::core::redact_subprocess_output_in_json(&mut input, &secrets);
+        assert_eq!(
+            input,
+            serde_json::json!({
+                "command": "curl -H 'Authorization: Bearer ghp_[REDACTED]'",
+                "nested": ["psql postgres://lucidos:***@localhost/db", "[REDACTED]"],
+            })
+        );
     }
 
     #[test]

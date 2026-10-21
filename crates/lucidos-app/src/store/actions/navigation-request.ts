@@ -12,7 +12,8 @@ import { holdFocusedPaneWhileTyping, releaseTypingHold, revealContentPane } from
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
 import { openRepoFileLink } from './repoFileLink';
-import { revealHomeBoard } from './homeBoardNav';
+import { prefillNewChatDestination } from './newChatPrefill';
+import { revealDashboard } from './dashboardNav';
 import { fileFindScope, requestFind } from './find-request';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { isMobile } from '../../utils/viewport';
@@ -118,8 +119,8 @@ export function describeNavTarget(nav: {
       return 'your installed plugins';
     case 'thread-queue':
       return 'the Thread Queue';
-    case 'home-board':
-      return 'the Home board';
+    case 'dashboard':
+      return 'the dashboard';
     case 'files':
     case 'apps':
     case 'triggers':
@@ -150,6 +151,10 @@ export function handleNavigationRequest(nav: {
   id?: string;
   event_id?: string;
   prompt?: string;
+  /** A new-chat prefill: the coding agent backend (`claude-code` | `codex`). */
+  coding_agent?: string;
+  /** A new-chat prefill: a registered repository (name or id) or `data/apps/<id>`. */
+  folder?: string;
 }, opts?: {
   source?: string;
   /** A query to open Find in file on, from the cited line. Frontend-only:
@@ -158,8 +163,8 @@ export function handleNavigationRequest(nav: {
 }): Promise<unknown> | void {
   const navAppId = nav.app_id;
   switch (nav.target) {
-    case 'home-board':
-      revealHomeBoard();
+    case 'dashboard':
+      revealDashboard();
       break;
     case 'files':
     case 'apps':
@@ -378,7 +383,7 @@ export function handleNavigationRequest(nav: {
       // the wrong layout's) prompt-input element. Mirrors the keyboard
       // shortcut path in useKeyboardShortcuts.ts.
       requestAnimationFrame(() => focusPromptNow());
-      break;
+      return prefillNewChatDestination(id, nav, opts?.source);
     }
     case 'url':
       if (!nav.url) {

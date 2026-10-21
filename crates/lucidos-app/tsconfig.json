@@ -22,6 +22,7 @@
       "@/*": ["src/*"],
       "@lucidos/app-scroll": ["../../packages/lucidos-sdk/src/appScroll.ts"],
       "@lucidos/appearance": ["../../packages/lucidos-sdk/src/appearance.ts"],
+      "@lucidos/context-menu": ["../../packages/lucidos-sdk/src/contextMenu.ts"],
       "@lucidos/engine-constants": ["../../packages/lucidos-sdk/src/generated/engine-constants.ts"],
       "@lucidos/event-stream": ["../../packages/lucidos-sdk/src/eventStream.ts"],
       "@lucidos/find": ["../../packages/lucidos-sdk/src/find.ts"],

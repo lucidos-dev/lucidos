@@ -59,6 +59,17 @@ impl ApplyClaims {
         self.claim(change_id, true)
     }
 
+    /// Whether an apply holds `change_id` now. A holder whose merge session
+    /// handed its duty off holds nothing, as in [`Self::try_claim`].
+    pub(crate) fn is_held(&self, change_id: Uuid) -> bool {
+        self.held().get(&change_id).is_some_and(|holder| {
+            !holder
+                .handed_off
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        })
+    }
+
     /// Set what a release the lane waits on calls, once, at lane start.
     pub(crate) fn on_lane_wait_release(&self, release: impl Fn(Uuid) + Send + Sync + 'static) {
         if self.lane_wait_release.set(Box::new(release)).is_err() {
@@ -215,6 +226,25 @@ mod tests {
             claims.try_claim(change).is_some(),
             "the change is free once the first apply lets go"
         );
+    }
+
+    /// A held change reads held until the claim drops, or until its session
+    /// hands the duty off.
+    #[test]
+    fn is_held_follows_the_claim_and_its_handoff() {
+        let claims = Arc::new(ApplyClaims::default());
+        let change = Uuid::new_v4();
+        assert!(!claims.is_held(change));
+        let claim = claims.try_claim(change).expect("free change");
+        assert!(claims.is_held(change));
+        let flag = Arc::new(AtomicBool::new(false));
+        claim.carried_by_session(flag.clone());
+        assert!(claims.is_held(change));
+        flag.store(true, Ordering::Release);
+        assert!(!claims.is_held(change));
+        flag.store(false, Ordering::Release);
+        drop(claim);
+        assert!(!claims.is_held(change));
     }
 
     /// A merge session wedged past the watchdog keeps its claim until its run

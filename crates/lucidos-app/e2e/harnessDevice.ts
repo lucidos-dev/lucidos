@@ -69,7 +69,7 @@ export function registerHarnessDevice(ctx: APIRequestContext): Promise<void> {
  * `registerCurrentDevice`). `api::mutating_gate` refuses a device id that names
  * no row (ADR 0169). So a mutating call fired right after navigation can beat
  * the registration and come back 401. That is the mobile-webkit
- * notifications.spec.ts flake, where a loaded host widens the window.
+ * notifications-all.spec.ts flake, where a loaded host widens the window.
  *
  * No user_agent, so the upsert's COALESCE keeps whatever the app registered.
  */

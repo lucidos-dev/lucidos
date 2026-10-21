@@ -8,7 +8,7 @@ import { dirname, resolve, relative } from 'node:path';
 
 /**
  * `.list-row-details` is a FLEX row whose 0.75rem gap is the separator between
- * metadata fields (see `.claude/rules/frontend.md` § List rows). Flex blockifies
+ * metadata fields (see `.claude/rules/frontend-css.md` § List rows). Flex blockifies
  * every inline child, so a *sentence* placed in that slot loses normal inline
  * wrapping: each `<strong>`/`<code>` becomes its own flex item, the gap opens
  * holes mid-sentence, and the punctuation that follows the element is stranded

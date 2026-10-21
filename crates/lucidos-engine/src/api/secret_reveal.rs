@@ -26,8 +26,8 @@
 //! | Route | Verdict |
 //! |---|---|
 //! | `GET /credential-value` | guarded here |
-//! | `GET /backup/key` | guarded here |
-//! | `POST /backup/key` | guarded here; it is idempotent, so it returns the same plaintext |
+//! | `GET /backup/key` | guarded here (the legacy key) |
+//! | `POST /backup/recipient/setup` | hands back a backup key this call minted, never a stored one. The engine keeps only its public half |
 //! | `GET /oauth/:provider/access-token` | deliberately app-facing, as `lucidos.oauth.getAccessToken`. Short-lived, and the refresh token stays engine-side |
 //! | `POST /webhooks`, `PUT /webhooks` | hand back a secret this call minted, never a stored one. A read cannot reach it |
 //! | `GET /credentials`, `GET /oauth/accounts`, `GET /email-account` | carry no plaintext |

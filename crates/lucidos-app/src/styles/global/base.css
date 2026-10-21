@@ -21,6 +21,18 @@ html {
     -webkit-tap-highlight-color: transparent;
 }
 
+/* The desktop shell never scrolls as a page: `.app-shell` is the viewport and
+   every pane scrolls inside itself. `overflow` stops a wheel scroll chaining
+   past a pane's end, and `overscroll-behavior` stops WebKit rubber-banding the
+   root. Script can still scroll a hidden root, so utils/shellScrollGuard.ts
+   snaps any offset back. The phone layout locks `html` in styles/mobile.css. */
+@media (--desktop-layout) {
+    html {
+        overflow: hidden;
+        overscroll-behavior: none;
+    }
+}
+
 :root {
     /* Font stacks */
     --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
@@ -382,6 +394,10 @@ html {
        focus-ring-width.test.ts holds every definition's band to the width. */
     --focus-ring-width: 0.1875rem;
     --focus-ring: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 55%, transparent);
+    /* How far a phone's action button takes a tap past each side (mobile.css).
+       It is scrollable overflow, so a box with a button flush to its edge
+       reserves this much room there. */
+    --tap-reach-inline: 0.25rem;
 }
 
 /* A finger needs a bigger target than a pointer, so the floating chevrons grow
@@ -578,9 +594,8 @@ html, html[data-theme-mode="dark"] {
     --header-control-veil-hover: 12%;
     --header-control-veil-active: 22%;
     --header-control-veil-active-hover: 30%;
-    /* Off, so the bar reads as one seamless header across the pane splits. The
-       divider geometry is kept (panels/shell.css), so a theme can turn it on. */
-    --header-divider: transparent;
+    /* The pane dividers' own colour, so each runs unbroken to the window top. */
+    --header-divider: var(--border-color);
     --header-badge-bg: #ffffff;
     --header-badge-fg: var(--brand-blue-deep);
 
@@ -790,7 +805,7 @@ button {
    FIXED pixel size that does not move with the user's ui-scale at all. Every
    one of those hand-written declarations was somebody noticing one control look
    wrong; this is the default they were each standing in for. (Caught live by
-   e2e/type-scale.spec.ts: `.welcome-dismiss` sized itself from a token and
+   e2e/type-scale-all.spec.ts: `.welcome-dismiss` sized itself from a token and
    still painted in Arial.)
 
    LONGHANDS, never the `font` shorthand. The shorthand resets `font-weight` and

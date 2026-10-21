@@ -15,7 +15,7 @@ test.describe('SSE live streaming', () => {
     // Wait for a visible response-content with non-empty text — waiting only
     // for the element to exist races the first textContent snapshot below
     // against the first streamed chunk, leaving firstSnapshot empty (flaky
-    // toBeTruthy, esp. on WebKit).
+    // toBeTruthy).
     await page.waitForFunction(() => {
       const els = document.querySelectorAll('.response-content');
       return Array.from(els).some(el => {

@@ -141,10 +141,9 @@ pub struct TriggerConfig {
     /// (`None`) is never touched by a plugin's lifecycle.
     pub plugin_id: Option<String>,
     /// The **trigger model**: the chat model this trigger's intent fires on.
-    /// `None` (the default) means "use the account `chat_model` preference",
-    /// which is what every trigger did before the field existed, so an absent
-    /// value is the no-change case for existing workspaces. Only consulted on
-    /// the [`TriggerRun::Intent`] path: a script trigger runs no LLM.
+    /// `None` (the default) means "use the account `trigger_model` preference".
+    /// Only consulted on the [`TriggerRun::Intent`] path: a script trigger runs
+    /// no LLM.
     pub model: Option<String>,
     /// Reasoning effort for this trigger's intent fires, one of
     /// [`crate::core::preference_catalog::REASONING_EFFORTS`]. `None` = the
@@ -177,12 +176,16 @@ pub fn is_valid_provider(provider: &str) -> bool {
     crate::llm::ProviderKind::from_name(provider).is_some()
 }
 
-/// Normalize a submitted or stored model / reasoning effort pin: trim, and
-/// read blank as "Default" (`None`). Blank is exactly how the form's Default
-/// option travels, and `Some("")` must never be stored: the chat route resolver
-/// reads any `Some` as a genuine override and would hand an empty model id to
-/// the provider. Shared with the `run_thread` spawn pins, so a trigger and a
-/// chat-spawned child read the same value the same way.
+/// Normalize a submitted or stored model / reasoning effort / provider pin:
+/// trim, and read blank or the literal `null` as "Default" (`None`). Blank is
+/// how the form's Default option travels. `null` is how a CLI flag spells
+/// JSON null, and a model sometimes writes JSON null as that string too. No
+/// model id, tier or provider is called `null`. Neither may ever be stored: the
+/// chat route resolver reads any `Some` as a genuine override. Shared with the
+/// `run_thread` spawn pins, so a trigger and a chat-spawned child agree.
+///
+/// Replay goes through here too, so an event stored before the `null` rule
+/// reads back as unpinned, which is what its caller asked for.
 ///
 /// Deliberately does NOT check the model against the registry, matching the
 /// `chat_model` preference (`PrefValue::Text`) and `ChatRequest.model`. A model
@@ -192,7 +195,7 @@ pub fn is_valid_provider(provider: &str) -> bool {
 /// make.
 pub fn normalize_route_setting(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
         .map(str::to_string)
 }
 
@@ -500,8 +503,8 @@ impl TriggerConfig {
             .filter(|s| !s.is_empty())
             .map(String::from);
         // Absent on every trigger created before the per-trigger model existed,
-        // which reads back as "use the account chat defaults": the behavior
-        // those triggers already had. A stored effort outside the closed set is
+        // which reads back as "use the account defaults": the trigger model
+        // default, and the tier stored for that model. A stored effort outside the closed set is
         // dropped rather than honored. The API and the LLM tool both reject one
         // at the boundary, so this only fires on a hand-edited event row.
         let model = read_trimmed_string(payload, "model");
@@ -727,10 +730,10 @@ impl TriggerConfig {
             self.mcp_servers = parse_mcp_servers(payload.get("mcp_servers"));
         }
         // model / reasoning_effort: explicit null clears back to the account
-        // chat default, a string sets, absent leaves as-is. The same triple
+        // default, a string sets, absent leaves as-is. The same triple
         // state as app_id and group_id, so a rename-only update can't wipe the
-        // trigger's model. A string that trims to empty clears too: blank IS
-        // how the form's "Default" option travels.
+        // trigger's model. A blank or `"null"` string clears too, per
+        // `normalize_route_setting`.
         if let Some(v) = payload.get("model") {
             if v.is_null() {
                 self.model = None;

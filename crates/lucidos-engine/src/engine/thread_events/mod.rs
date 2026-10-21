@@ -11,11 +11,12 @@ mod apply_now;
 mod capture;
 mod cause;
 mod channel;
+mod dashboard;
 mod emit;
 mod event;
 mod event_impl;
 mod form_request;
-mod home_board;
+mod keep_alive_status;
 mod mcp;
 mod memory;
 mod meta;
@@ -25,7 +26,7 @@ mod todo;
 mod triage;
 
 pub use actor::{
-    ActorMode, AgentParticipant, EngineReason, EventWaitOutcome, MessageOrigin,
+    ActorMode, AgentParticipant, EngineReason, EventWaitOutcome, MessageOrigin, PluginSetupCause,
     PluginSetupOccasion, ThreadDirection, CACHE_KEEP_ALIVE_REASON_KIND,
 };
 pub use agent_exit::{CodingAgentExit, CodingAgentExitStage};
@@ -33,20 +34,21 @@ pub use apply_now::ApplyNowOutcome;
 pub use capture::CaptureFormat;
 pub use cause::{AbortCause, CancelCause, EventWaitCancelCause, UnproposedReason, UnqueueReason};
 pub use channel::{EventChannel, TriggerInvocation};
+pub use dashboard::{ArrangedTile, Dashboard, LegacyArrangedTile};
 pub use event::ThreadEvent;
 pub use event_impl::{
     not_a_keep_alive_idle_sql, KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON,
 };
 pub use form_request::FormRequestOutcome;
-pub use home_board::{ArrangedTile, LayoutClass};
+pub use keep_alive_status::{CacheKeepAliveNotKeptReason, CacheKeepAliveStatus};
 pub use mcp::McpEnablementSource;
 pub use memory::RecalledMemory;
 pub use meta::EventMeta;
 pub(crate) use question::with_image_note;
 pub use question::{AnswerKind, OwnerApproval, QuestionOption, WidgetEmbed};
 pub use session::{
-    ChildCompletionStatus, IntegratedBranch, SessionEndReason, SubThreadPendingChange,
-    VoiceSessionEndReason, WakeMode,
+    ChildCompletionStatus, HandoffConsent, IntegratedBranch, SessionEndReason,
+    SubThreadPendingChange, VoiceSessionEndReason, WakeMode,
 };
 pub use todo::{TodoItem, TodoStatus};
 pub use triage::TriageProposalEntry;

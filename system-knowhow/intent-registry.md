@@ -1,6 +1,6 @@
 ---
 name: Intent Registry (source of "Available Intents")
-description: How the engine builds the "Available Intents" list it exposes via execute_intent: filesystem-driven, no cache, no projection. Trigger files in apps/<app>/triggers/ also count as intents, the usual source of "phantom intent" confusion.
+description: How the engine builds the "Available Intents" list and how load_knowhow runs one: filesystem-driven, no cache, no projection. Trigger files in apps/<app>/triggers/ also count as intents, the usual source of "phantom intent" confusion.
 ---
 
 # Intent Registry
@@ -16,12 +16,20 @@ If an intent ID shows in the prompt but not under `apps/<app>/intents/`, **check
 | Source | ID format | Notes |
 |---|---|---|
 | `data/apps/<app>/intents/<name>.md` | `<app>/<name>` | App-scoped intents the user invokes on demand. |
-| `data/apps/<app>/triggers/<name>.md` | `<app>/<name>` | App-scoped trigger procedures. **Also exposed as intents**: the LLM can invoke them via `execute_intent` even when the trigger isn't firing. |
+| `data/apps/<app>/triggers/<name>.md` | `<app>/<name>` | App-scoped trigger procedures. **Also exposed as intents**: the LLM can run them through `load_knowhow` even when the trigger isn't firing. |
 | `data/triggers/<dir>/*.md` | `<stem>` (filename without `.md`) | Standalone trigger procedures. Same dual role: schedule fires the procedure; the LLM can also invoke it on demand. |
 
 There is no top-level `data/intents/` source. The registry silently ignores files placed there.
 
-`IntentStore::load(id)` searches the same paths when `execute_intent(id)` runs. So the loader and the prompt agree by construction: anything listed is loadable, and anything loadable is listed.
+`IntentStore::load(id)` searches the same paths when `load_knowhow(id)` finds no knowhow doc with that id. So the loader and the prompt agree by construction: anything listed is loadable, and anything loadable is listed.
+
+## Running an intent: `load_knowhow`, in the same turn
+
+An intent runs in the thread that asks for it (ADR 0534). `load_knowhow(<intent id>)` returns the intent body, then the docs its `knowhow:` frontmatter names, then, for an app intent, the app's own knowhow. The turn then does the steps itself, on its own model.
+
+- **A knowhow doc wins an id clash.** `load_knowhow` resolves the id as knowhow first, so a doc at `data/knowhow/<id>.md`, or `data/apps/<app>/knowhow/<name>.md` for an app intent, hides the intent. The intents section of `system-knowhow/workspace-audit` flags it.
+- **Use `run_thread` only when the work needs its own context.** A child thread follows its caller's model, effort and provider unless the call pins its own.
+- **The retired `execute_intent` tool** answers with a refusal that names the `load_knowhow` call to make instead.
 
 ## Why trigger files double as intents
 
@@ -29,11 +37,9 @@ A trigger has two parts: *when to fire* (the schedule, in the `TriggerCreated` e
 
 So an audit that walks only `apps/<app>/intents/` reports trigger-derived IDs as "phantom" intents. They are real, and live next door under `triggers/`.
 
-## An empty registry means no `execute_intent` tool at all
+## An empty registry lists no intents
 
-The tool is **capability-gated** (ADR 0088). A workspace with an empty registry gets no `execute_intent`, because no id exists to pass it. So "the tool is missing" and "the registry found nothing" are one fact. The fix for both is a `.md` file under one of the three sources.
-
-The gate depends on the workspace, never the thread, so every thread in a workspace agrees about it. It also opens by itself: the first intent file makes the tool appear on the next turn, with nothing to restart.
+A workspace with an empty registry gets no "Available Intents" section. The fix is a `.md` file under one of the three sources. The first intent file shows on the next turn, with nothing to restart.
 
 ## Invalidation
 

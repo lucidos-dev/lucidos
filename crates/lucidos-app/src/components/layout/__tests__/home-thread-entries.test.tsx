@@ -12,10 +12,10 @@ import { focusedThreadId, threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { threadHeaderActions, threadHeaderHomeAction } from '../ThreadHeaderActions';
 import { HomeMenuGroup } from '../BrandMenuRows';
-import { HomeRailToggle } from '../../home/HomeRail';
+import { DashboardRailToggle } from '../../dashboard/DashboardRail';
 import { act } from 'preact/test-utils';
-import { homeBoards } from '../../../store/homeBoard';
-import { homeRailShown, setHomeRailShown } from '../../../store/homeRail';
+import { dashboards } from '../../../store/dashboards';
+import { dashboardRailShown, setDashboardRailShown } from '../../../store/dashboardRail';
 
 function seedThreads(withHome: boolean): void {
   const map = new Map([['other', makeThreadState('other')]]);
@@ -47,7 +47,7 @@ describe('the desktop thread header', () => {
   });
 });
 
-describe('the Home rail toggle', () => {
+describe('the dashboard rail toggle', () => {
   let host: HTMLDivElement;
 
   beforeEach(() => {
@@ -62,34 +62,34 @@ describe('the Home rail toggle', () => {
 
   it('renders nothing before the thread list has Home', () => {
     seedThreads(false);
-    render(<HomeRailToggle />, host);
+    render(<DashboardRailToggle />, host);
     expect(host.innerHTML).toBe('');
-    expect(document.documentElement.hasAttribute('data-home-rail-toggle')).toBe(false);
+    expect(document.documentElement.hasAttribute('data-dashboard-rail-toggle')).toBe(false);
   });
 
   it('shows once Home exists, and shows and hides the rail', () => {
     seedThreads(true);
-    setHomeRailShown(true);
-    render(<HomeRailToggle />, host);
-    const button = host.querySelector<HTMLButtonElement>('button.home-rail-toggle')!;
-    expect(button.getAttribute('aria-label')).toBe('Hide Home board');
+    setDashboardRailShown(true);
+    render(<DashboardRailToggle />, host);
+    const button = host.querySelector<HTMLButtonElement>('button.dashboard-rail-toggle')!;
+    expect(button.getAttribute('aria-label')).toBe('Hide dashboard');
     expect(button.getAttribute('aria-pressed')).toBe('true');
-    expect(document.documentElement.hasAttribute('data-home-rail-toggle')).toBe(true);
+    expect(document.documentElement.hasAttribute('data-dashboard-rail-toggle')).toBe(true);
     act(() => button.click());
-    expect(homeRailShown.value).toBe(false);
-    expect(button.getAttribute('aria-label')).toBe('Show Home board');
+    expect(dashboardRailShown.value).toBe(false);
+    expect(button.getAttribute('aria-label')).toBe('Show dashboard');
   });
 
-  it('is offered with the rail hidden and the board empty, so the rail can come back', () => {
+  it('is offered with the rail hidden and the dashboard empty, so the rail can come back', () => {
     seedThreads(true);
-    setHomeRailShown(false);
-    homeBoards.value = new Map([['desktop', { status: 'loaded', data: { tiles: [] } as never }]]);
-    render(<HomeRailToggle />, host);
-    const button = host.querySelector<HTMLButtonElement>('button.home-rail-toggle')!;
-    expect(button.getAttribute('aria-label')).toBe('Show Home board');
-    expect(document.documentElement.hasAttribute('data-home-rail-toggle')).toBe(true);
+    setDashboardRailShown(false);
+    dashboards.value = new Map([['desktop', { status: 'loaded', data: { tiles: [] } as never }]]);
+    render(<DashboardRailToggle />, host);
+    const button = host.querySelector<HTMLButtonElement>('button.dashboard-rail-toggle')!;
+    expect(button.getAttribute('aria-label')).toBe('Show dashboard');
+    expect(document.documentElement.hasAttribute('data-dashboard-rail-toggle')).toBe(true);
     act(() => button.click());
-    expect(homeRailShown.value).toBe(true);
+    expect(dashboardRailShown.value).toBe(true);
   });
 });
 

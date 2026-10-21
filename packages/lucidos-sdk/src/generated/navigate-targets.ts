@@ -6,7 +6,7 @@
 // derives from this file, so the LLM tool schema and the SDK can never drift.
 
 export const NAVIGATE_TARGETS = [
-  'home-board',
+  'dashboard',
   'files',
   'apps',
   'app-store',
@@ -29,6 +29,7 @@ export type NavigateTarget = (typeof NAVIGATE_TARGETS)[number];
 
 export const SETTINGS_VIEW_TARGETS = [
   'models',
+  'intelligence',
   'permissions',
   'mcp',
   'coding-agents',
@@ -51,3 +52,9 @@ export const SETTINGS_VIEW_TARGETS = [
   'debugging',
 ] as const;
 export type SettingsViewTarget = (typeof SETTINGS_VIEW_TARGETS)[number];
+
+export const CODING_AGENT_TARGETS = [
+  'claude-code',
+  'codex',
+] as const;
+export type CodingAgentTarget = (typeof CODING_AGENT_TARGETS)[number];

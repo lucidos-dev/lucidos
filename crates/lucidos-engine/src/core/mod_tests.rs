@@ -1,21 +1,20 @@
 use super::*;
 
-#[test]
-fn an_unparseable_boot_url_gives_no_handle() {
-    assert_eq!(read_only_database_url("not a url at all"), None);
-    assert_eq!(read_only_database_url("http://wrong/scheme"), None);
-    assert_eq!(
-        read_only_database_url("postgres://host-but-no-database"),
-        None
-    );
+/// The read-only rendering of `url`, as the agent role's URL is rendered.
+fn read_only_database_url(url: &str) -> Option<String> {
+    lucidos_pg_url::PgUrl::parse(url)
+        .map(|url| url.read_only_url())
+        .ok()
 }
 
+/// The handle is the agent role's URL that boot recorded, never the engine's.
 #[test]
-fn the_cached_handle_renders_the_boot_url() {
-    assert_eq!(
-        lucidos_database_url_env(),
-        read_only_database_url(&database_url()).map(|url| (LUCIDOS_DATABASE_URL.to_string(), url))
-    );
+fn the_handle_is_the_agent_role_url_boot_recorded() {
+    crate::test_support::install_agent_database_url();
+    let (name, url) = lucidos_database_url_env().expect("boot recorded one");
+    assert_eq!(name, LUCIDOS_DATABASE_URL);
+    assert_eq!(url, crate::test_support::AGENT_DATABASE_URL);
+    assert_ne!(read_only_database_url(&database_url()), Some(url));
 }
 
 /// The engine pool reads the same URL through sqlx, which must reach the
@@ -138,104 +137,6 @@ fn redact_secret_values_leaves_text_without_secrets_alone() {
     let secrets = vec!["never-present-token".to_string()];
     let text = "nothing sensitive here";
     assert_eq!(redact_secret_values(text, &secrets), text);
-}
-
-#[test]
-fn injected_secret_values_picks_the_secret_bearing_names_only() {
-    let env = vec![
-        ("CRED_GITHUB".to_string(), "ghp_tokenvalue".to_string()),
-        ("GITHUB_TOKEN".to_string(), "ghp_tokenvalue".to_string()),
-        ("CRED_DB_USERNAME".to_string(), "reporter".to_string()),
-        ("CRED_DB_PASSWORD".to_string(), "hunter2pw".to_string()),
-        (
-            "OAUTH_GOOGLE_ACCESS_TOKEN".to_string(),
-            "ya29.opaque".to_string(),
-        ),
-        (
-            "OAUTH_GOOGLE_EMAIL".to_string(),
-            "user@example.com".to_string(),
-        ),
-        (
-            "LUCIDOS_AGENT_ORIGIN_TOKEN".to_string(),
-            "aa11bb22cc33dd44".to_string(),
-        ),
-        ("LUCIDOS_WORKSPACE".to_string(), "/Users/me/ws".to_string()),
-    ];
-    let mut picked = injected_secret_values(&env);
-    picked.sort();
-    assert_eq!(
-        picked,
-        vec![
-            "aa11bb22cc33dd44".to_string(),
-            "ghp_tokenvalue".to_string(),
-            "hunter2pw".to_string(),
-            "ya29.opaque".to_string(),
-        ],
-        "a username, an OAuth email and the workspace path are not secrets"
-    );
-}
-
-/// The redaction must never rewrite a word the tool output legitimately uses.
-///
-/// Masking by value is safe only while the value is unique to the secret. Every
-/// dev and e2e workspace uses the literal Postgres password `lucidos`. So does
-/// the user, the database, the binary and every path. Masking it turned
-/// `ls ~/workspaces/dev` into a listing of `[REDACTED]`. So the database
-/// handle is masked whole, and its parts survive elsewhere.
-#[test]
-fn the_database_handle_is_masked_whole_and_its_parts_survive() {
-    let handle = format!(
-        "postgresql://lucidos:lucidos@localhost:5432/lucidos_dev?options={}",
-        lucidos_pg_url::READ_ONLY_OPTION
-    );
-    let env = vec![
-        (LUCIDOS_DATABASE_URL.to_string(), handle.to_string()),
-        ("CRED_REAL".to_string(), "ghp_uniquevalue".to_string()),
-    ];
-    let mut picked = injected_secret_values(&env);
-    picked.sort();
-    assert_eq!(
-        picked,
-        vec!["ghp_uniquevalue".to_string(), handle.to_string()]
-    );
-    let result = format!(
-        "LUCIDOS_DATABASE_URL={handle}\n\
-         ls /Users/me/workspaces/dev/.lucidos: lucidos-engine lucidos_dev"
-    );
-    assert_eq!(
-        redact_secret_values(&result, &injected_secret_values(&env)),
-        "LUCIDOS_DATABASE_URL=[REDACTED]\n\
-         ls /Users/me/workspaces/dev/.lucidos: lucidos-engine lucidos_dev",
-        "an `env` dump hides the handle, and ordinary output survives"
-    );
-}
-
-/// The whole point: a tool result that echoed an injected secret must not reach
-/// the event store carrying it. `curl -v`, `env` and `set -x` all do this.
-#[test]
-fn an_echoed_credential_does_not_survive_into_the_tool_result() {
-    let env = vec![
-        ("CRED_GITHUB".to_string(), "ghp_tokenvalue".to_string()),
-        ("GITHUB_TOKEN".to_string(), "ghp_tokenvalue".to_string()),
-        (
-            "OAUTH_GOOGLE_ACCESS_TOKEN".to_string(),
-            "ya29.opaque".to_string(),
-        ),
-        (
-            "OAUTH_GOOGLE_EMAIL".to_string(),
-            "user@example.com".to_string(),
-        ),
-    ];
-    let result = "> Authorization: Bearer ghp_tokenvalue\n[stderr]\nGITHUB_TOKEN=ghp_tokenvalue\nya29.opaque";
-    let redacted = redact_secret_values(result, &injected_secret_values(&env));
-    assert!(!redacted.contains("ghp_tokenvalue"), "{redacted}");
-    assert!(!redacted.contains("ya29.opaque"), "{redacted}");
-    // The custom alias shares its value with the canonical name, so masking by
-    // value covers it without the selector having to know the alias.
-    assert_eq!(redacted.matches("[REDACTED]").count(), 3);
-    // A non-secret injected value is left alone: masking it would corrupt
-    // output the script legitimately printed.
-    assert!(redacted.contains("GITHUB_TOKEN="));
 }
 
 #[test]
@@ -972,7 +873,7 @@ fn both_tool_call_emit_sites_redact_before_describing() {
         (
             "agent_session/run_session/run.rs",
             include_str!("../engine/agent_session/run_session/run.rs"),
-            "redact_postgres_secrets_in_json(&mut input)",
+            "redact_subprocess_output_in_json(&mut input, &tool_result_secrets)",
             "describe_cc_tool(&name, &input)",
         ),
         (
@@ -980,12 +881,6 @@ fn both_tool_call_emit_sites_redact_before_describing() {
             include_str!("../engine/agentic_loop/helpers.rs"),
             "redact_postgres_secrets_in_json(&mut redacted_args)",
             "describe_tool(&tool_call.name, &redacted_args)",
-        ),
-        (
-            "agentic_loop_special_tool.rs",
-            include_str!("../engine/agentic_loop_special_tool.rs"),
-            "redact_postgres_secrets_in_json(&mut redacted_args)",
-            "describe_tool(&tc.name, &redacted_args)",
         ),
     ] {
         let find = |needle: &str| {
@@ -1035,6 +930,13 @@ fn test_describe_tool_result_failure_truncates() {
     let result = describe_tool_result("any_tool", &long_err, false);
     let expected = format!("{}...", &"x".repeat(120));
     assert_eq!(result, Some(expected));
+}
+
+/// History rebuild still labels a stored call of the retired tool.
+#[test]
+fn a_retired_execute_intent_result_still_reads_done() {
+    let result = describe_tool_result("execute_intent", "Calendar is clear.", true);
+    assert_eq!(result, Some("Done".to_string()));
 }
 
 #[test]

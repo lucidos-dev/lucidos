@@ -39,6 +39,7 @@ function trigger(id: string, name: string): TriggerInfo {
   return {
     id,
     name,
+    slug: id,
     cron_expressions: ['0 9 * * *'],
     timezone: 'UTC',
     paused: false,
