@@ -397,9 +397,17 @@ warm_npm() {
     ensure_npm_deps "$PROJECT_DIR" "workspace dependencies"
 }
 
+# The runner image preinstalls the Microsoft apt source, and nothing here
+# installs from it. When packages.microsoft.com answers 403, every apt-get
+# update fails, install-deps included, and the whole shard with it.
+drop_microsoft_apt_source() {
+    sudo rm -f "${APT_SOURCES_DIR:-/etc/apt/sources.list.d}"/microsoft*
+}
+
 # One apt chain, so dpkg never runs twice at once. install-deps refreshes the
 # package lists, and the second install reuses them.
 warm_apt() {
+    drop_microsoft_apt_source
     if [ "$1" = browser ]; then
         npx --yes "playwright@$(locked_playwright_version)" install-deps chromium || return 1
     else

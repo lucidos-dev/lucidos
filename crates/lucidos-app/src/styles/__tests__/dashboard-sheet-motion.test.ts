@@ -36,8 +36,17 @@ describe('the dashboard sheet motion', () => {
 
   it('meets the app header with no gap, line or corner', () => {
     const panel = rule('.dashboard-sheet-panel').props;
-    expect(panel.get('top')).toBe('var(--app-header-bottom)');
+    expect(panel.get('inset')).toBe('0');
     expect(panel.has('border-top')).toBe(false);
     expect(panel.has('border-radius')).toBe(false);
+  });
+
+  // iOS Safari tints the status bar from the topmost fixed box on the top
+  // edge. A transparent one there makes it blur the header instead.
+  it('keeps its fixed layer off the top edge, below the header', () => {
+    const sheet = rule('.dashboard-sheet').props;
+    expect(sheet.get('position')).toBe('fixed');
+    expect(sheet.get('top')).toBe('var(--app-header-bottom)');
+    expect(sheet.has('inset')).toBe(false);
   });
 });

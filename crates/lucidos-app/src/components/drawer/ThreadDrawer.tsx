@@ -8,7 +8,7 @@ import { appliedThreadFilter, type ThreadFilterSelection } from '../../store/app
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
-import { threadFilterPanelOpen, setThreadFilterPaneVisible, closeThreadFilterPanel } from '../../store/threadFilterPanel';
+import { threadFilterPanelOpen, closeThreadFilterPanel } from '../../store/threadFilterPanel';
 import { ThreadFilterCover } from './ThreadFilterCover';
 import { LeavingViewSnapshot, type LeavingDrawing } from './LeavingViewDrawing';
 import { focusPane, showThreadList } from '../../store/actions/pane';
@@ -822,14 +822,6 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     useEffect(() => {
         highlightedKey.value = null;
     }, [activeView]);
-
-    // The filter panel is a view OF this pane and keeps its open state through
-    // a collapse, as the drawer's other views do. Only its Escape entry follows
-    // visibility, so a hidden panel never eats the next Escape. Runs at mount
-    // too, for a boot with the drawer collapsed.
-    useEffect(() => {
-        setThreadFilterPaneVisible(visible);
-    }, [visible]);
 
     const openWidth = `${drawnDrawerWidth.value}px`;
     return (

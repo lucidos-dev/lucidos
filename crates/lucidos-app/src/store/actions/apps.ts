@@ -19,6 +19,7 @@ import {
 } from '../store';
 import { nativeFullscreenElement } from '../appFullscreenHost';
 import { APP_FRAME_ISOLATED } from '../../components/apps/appFrameSandbox';
+import { warmAppIcons } from '../../components/shared/AppIcon';
 import { askFrame } from './app-bridge';
 import { CANVAS_APP_FRAME_SELECTOR } from '../../utils/appFrame';
 import { reloadWidgetFrames } from '../widgets';
@@ -94,6 +95,7 @@ async function loadAppsInner(): Promise<void> {
     // so one cancelled fetch strands every surface that reads it.
     const apps = await retryTransient(() => listAppsApi());
     appsList.value = { status: 'loaded', data: apps };
+    warmAppIcons(apps);
 
     // Restore previously open app window on reload, once per page load (see
     // `appWindowRestoreAttempted` above).

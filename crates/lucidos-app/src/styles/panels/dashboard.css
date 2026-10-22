@@ -255,13 +255,17 @@
     cursor: pointer;
 }
 
-/* A name wraps onto a second line before it is cut. */
+/* A name wraps onto a second line before it is cut. It always reserves both
+   lines, so a one-line name puts its icon at the same height as a two-line
+   name beside it. */
 .app-shortcut-name {
+    --app-shortcut-name-lines: 2;
     display: -webkit-box;
     -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
+    -webkit-line-clamp: var(--app-shortcut-name-lines);
+    line-clamp: var(--app-shortcut-name-lines);
     max-width: 100%;
+    min-height: calc(var(--app-shortcut-name-lines) * 1lh);
     overflow: hidden;
     overflow-wrap: anywhere;
     text-align: center;
@@ -273,8 +277,7 @@
    for full cells, keeps the name to one line. */
 @container (max-height: 4.25rem) {
     .app-shortcut-name {
-        -webkit-line-clamp: 1;
-        line-clamp: 1;
+        --app-shortcut-name-lines: 1;
     }
 }
 
@@ -386,9 +389,15 @@
    (components/dashboard/DashboardSheet.tsx). */
 
 @media (--phone-layout) {
+    /* Starts below the header, never at the top edge. iOS Safari tints the
+       status bar from the topmost fixed box there, and this one stays mounted
+       and transparent once closed, so on the edge it would blur the header. */
     .dashboard-sheet {
         position: fixed;
-        inset: 0;
+        top: var(--app-header-bottom);
+        left: 0;
+        right: 0;
+        bottom: 0;
         z-index: var(--z-control-panel);
         pointer-events: none;
     }
@@ -397,10 +406,7 @@
        mounted. */
     .dashboard-sheet-panel {
         position: absolute;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        top: var(--app-header-bottom);
+        inset: 0;
         overflow-y: auto;
         overscroll-behavior: contain;
         padding-bottom: var(--safe-area-bottom);

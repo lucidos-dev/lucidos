@@ -1,5 +1,6 @@
 import type { Signal } from '@preact/signals';
-import { threadFilterPanelOpen } from '../../store/threadFilterPanel';
+import { useLayoutEffect } from 'preact/hooks';
+import { threadFilterPanelOpen, setThreadFilterPaneVisible } from '../../store/threadFilterPanel';
 import { drawerGrouping, type DrawerGrouping } from '../../store/store';
 import { ThreadFilterPanel } from '../layout/ThreadFilterPanel';
 import { NavigationCover } from '../shared/NavigationCover';
@@ -25,12 +26,17 @@ export function drawerSwapKey(filtersOpen: boolean, grouping: DrawerGrouping): s
  *  while shut, so opening costs no render. Everything else (Escape, the overlay
  *  stack, the drawer's keys, the pressed Filter button) follows the open
  *  SIGNAL. A shut cover is `inert`, so it takes no pointer and no focus. So is
- *  an open one on a collapsed drawer, since the panel stays open there. */
+ *  an open one on a collapsed drawer, since the panel stays open there. Only
+ *  its Escape entry follows `paneVisible`, so a hidden panel never eats Escape. */
 export function ThreadFilterCover({ paneVisible, leaving }: {
   paneVisible: boolean;
   leaving: Signal<LeavingDrawing | null>;
 }) {
   const open = threadFilterPanelOpen.value;
+  // In the commit that makes the cover inert, so no Escape lands between the
+  // drawer hiding and the panel leaving the stack. Runs at mount too, for a
+  // boot with the drawer collapsed.
+  useLayoutEffect(() => setThreadFilterPaneVisible(paneVisible), [paneVisible]);
   const swapKey = drawerSwapKey(open, drawerGrouping.value);
   return (
     <>

@@ -550,7 +550,7 @@ impl TriggerConfig {
     }
 
     /// This trigger's timezone, falling back to UTC on an unparseable name.
-    fn timezone_or_utc(&self) -> chrono_tz::Tz {
+    pub(crate) fn timezone_or_utc(&self) -> chrono_tz::Tz {
         self.timezone.parse().unwrap_or_else(|_| {
             log!(
                 "[Triggers] Invalid timezone '{}' for trigger {}, using UTC",
@@ -586,13 +586,19 @@ impl TriggerConfig {
     /// Empty if the trigger is paused, has no cron expressions, or has no
     /// future match.
     pub fn next_runs(&self, n: usize) -> Vec<DateTime<Utc>> {
+        self.next_runs_after(Utc::now(), n)
+    }
+
+    /// [`Self::next_runs`] with the clock as an argument.
+    pub fn next_runs_after(&self, now: DateTime<Utc>, n: usize) -> Vec<DateTime<Utc>> {
         if self.paused || self.schedule.is_empty() {
             return Vec::new();
         }
         let schedules = self.parsed_schedules();
-        crate::engine::tools::scheduler::next_occurrences_multi(
+        crate::engine::tools::scheduler::next_occurrences_after(
             &schedules,
             self.timezone_or_utc(),
+            now,
             n,
         )
         .into_iter()
@@ -603,7 +609,7 @@ impl TriggerConfig {
     /// A diagnosis when this trigger's schedule can never fire, for the errored
     /// state in the panel and the boot warning.
     ///
-    /// Deliberately independent of `paused`, unlike [`Self::next_run`]: a paused
+    /// Deliberately independent of `paused`, unlike [`Self::next_runs`]: a paused
     /// trigger with a dead schedule is still misconfigured, and resuming it would
     /// change nothing. Also deliberately all-or-nothing: one live expression means
     /// the trigger genuinely fires, so flagging it because a *sibling* expression

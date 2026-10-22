@@ -1182,6 +1182,23 @@ test_each_job_warms_only_what_it_needs() {
     fi
 }
 
+test_the_apt_warm_up_drops_the_microsoft_source() {
+    echo "test: the apt warm-up removes the Microsoft source before any apt-get update"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" dir="$SANDBOX/apt-sources" log="$SANDBOX/apt-order"
+    mkdir -p "$dir"
+    : >"$dir/microsoft-prod.list"
+    : >"$dir/other.list"
+    rm -f "$log"
+    APT_SOURCES_DIR="$dir" APT_ORDER_LOG="$log" bash -c '
+        source "$1"; sudo() { if [ "$1" = apt-get ]; then ls "$APT_SOURCES_DIR" | tr "\n" " " >>"$APT_ORDER_LOG"; else "$@"; fi; }
+        warm_apt api' _ "$shard" >/dev/null 2>&1
+    if [ "$(cat "$log" 2>/dev/null)" = "other.list other.list " ] && [ ! -e "$dir/microsoft-prod.list" ]; then
+        pass "apt-get ran with only other.list left"
+    else
+        fail "apt-get saw '$(cat "$log" 2>/dev/null)'"
+    fi
+}
+
 test_a_shard_installs_only_its_own_browser() {
     echo "test: Chromium shards install the headless shell alone, and the WebKit shard WebKit alone"
     local shard="$SCRIPT_DIR/../e2e-github-shard.sh" got
@@ -1259,6 +1276,7 @@ test_the_engine_lookup_names_the_newest_matching_build
 test_a_failed_lookup_lets_the_build_run
 test_restored_target_state_ages_its_unchanged_inputs
 test_each_job_warms_only_what_it_needs
+test_the_apt_warm_up_drops_the_microsoft_source
 test_a_shard_installs_only_its_own_browser
 test_the_macos_cache_keys_name_the_pinned_builds
 

@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
-import { AppIcon, ListedAppIcon, MONOGRAM_HUES, monogramHue, monogramLetter } from './AppIcon';
+import { AppIcon, ListedAppIcon, MONOGRAM_HUES, monogramHue, monogramLetter, warmAppIcons } from './AppIcon';
+import { appFileUrl } from '../../api/client/apps';
 import { appsList } from '../../store/store';
 import type { App } from '../../store/types';
 
@@ -123,5 +124,30 @@ describe('AppIcon after a failed load', () => {
       appsList.value = { status: 'loaded', data: [] };
     });
     expect(host.querySelector('img')?.getAttribute('src')).toMatch(/assets\/icon\.svg$/);
+  });
+});
+
+describe('warmAppIcons', () => {
+  let started: string[];
+
+  beforeEach(() => {
+    started = [];
+    vi.stubGlobal('Image', class {
+      set src(value: string) { started.push(value); }
+    });
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('starts each listed icon once, so a menu opened later draws it at once', () => {
+    const apps = [
+      { id: 'habit-tracker', name: 'Habit Tracker', icon: 'icon.svg' },
+      { id: 'demo-director', name: 'Demo Director' },
+    ] as App[];
+
+    warmAppIcons(apps);
+    warmAppIcons(apps);
+
+    expect(started).toEqual([appFileUrl('habit-tracker', 'icon.svg')]);
   });
 });

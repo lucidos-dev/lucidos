@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.50.4 — 2026-10-22
+
+### Fixed
+- App shortcut icons on the dashboard line up in one row, whether the app name takes one line or two.
+- The header on iPhone stays sharp at the top of the dashboard and no longer blurs into the Dynamic Island.
+- App icons show at once when a list of apps opens, also on a phone over a remote connection.
+- When a trigger run fails, its notice names the real next run, in your timezone, and no longer promises a retry that never comes.
 ## v0.50.3 — 2026-10-22
 
 ### Changed

@@ -4,6 +4,7 @@ use crate::api::SharedEngine;
 use crate::engine::thread_events::TriggerInvocation;
 use crate::scheduler::trigger_id_to_uuid;
 use crate::triggers::{TriggerConfig, TriggerRun};
+use chrono::Datelike;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
@@ -196,6 +197,46 @@ fn clamp_result_summary(summary: &str) -> String {
 /// than as a visible failure.
 fn failure_notification_message(body: &str) -> String {
     clamp_result_summary(body)
+}
+
+/// The body of a temporary-failure notification. It states what really
+/// happens next, read off the trigger's own schedule at `now`. Nothing retries
+/// a failed run, so only a future cron fire may be named as the next run.
+///
+/// The time shows in `user_tz`, else in the trigger's own zone. It always
+/// names the zone, since a trigger can be stored in UTC.
+///
+/// The notice leads and the error follows, so the clamp in
+/// [`emit_failure_notification`] can only cut the error.
+fn transient_failure_message(
+    config: &TriggerConfig,
+    reason: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    user_tz: Option<chrono_tz::Tz>,
+) -> String {
+    let notice = if config.paused {
+        "This trigger is paused, so it will not run again on its own. \
+         Use Run once to try again."
+            .to_string()
+    } else if let Some(next) = config.next_runs_after(now, 1).first() {
+        let tz = user_tz.unwrap_or_else(|| config.timezone_or_utc());
+        let local = next.with_timezone(&tz);
+        let format = if local.year() == now.with_timezone(&tz).year() {
+            "%a %-d %b at %H:%M %Z"
+        } else {
+            "%a %-d %b %Y at %H:%M %Z"
+        };
+        format!("The next scheduled run is {}.", local.format(format))
+    } else if !config.on.is_empty() {
+        "This run will not be retried. The trigger runs again on its next \
+         matching event. Use Run once to try now."
+            .to_string()
+    } else {
+        "This trigger has no future run, so it will not run again on its own. \
+         Use Run once to try again."
+            .to_string()
+    };
+    format!("Temporary error. {notice} Error: {reason}")
 }
 
 /// Emit a `NotificationCreated` for a trigger failure and send push to all devices.
@@ -451,7 +492,8 @@ async fn execute_llm_task(
             let title = format!("{}{}", config.name, ERROR_TITLE_SUFFIX);
             let reason = crate::triggers::ensure_non_empty_error(&err_str, &config.name);
             let message = if is_transient {
-                format!("Transient error (will retry on next schedule): {}", reason)
+                let user_tz = engine.user_timezone().await.parse().ok();
+                transient_failure_message(config, &reason, chrono::Utc::now(), user_tz)
             } else {
                 reason
             };
@@ -702,14 +744,125 @@ mod tests {
     #[test]
     fn the_transient_llm_failure_message_is_clamped_too() {
         let provider_body = "<html>".repeat(200_000);
-        let message = failure_notification_message(&format!(
-            "Transient error (will retry on next schedule): {provider_body}"
+        let config = trigger(json!({ "schedule": ["0 0 8 * * *"] }));
+        let message = failure_notification_message(&transient_failure_message(
+            &config,
+            &provider_body,
+            failed_at(),
+            None,
         ));
 
         assert_eq!(message.chars().count(), RESULT_SUMMARY_MAX_CHARS);
         assert!(
-            message.starts_with("Transient error (will retry on next schedule):"),
-            "the retry notice survives the clamp"
+            message.starts_with("Temporary error. The next scheduled run is"),
+            "the next-run notice survives the clamp: {message}"
+        );
+    }
+
+    /// A trigger in Oslo, built from a `TriggerCreated` payload plus `extra`.
+    fn trigger(extra: serde_json::Value) -> TriggerConfig {
+        let mut payload = json!({
+            "trigger_id": "t1", "name": "T", "timezone": "Europe/Oslo",
+            "run": { "type": "intent", "intent": "x" },
+        });
+        for (key, value) in extra.as_object().expect("extra is an object") {
+            payload[key] = value.clone();
+        }
+        TriggerConfig::from_created_payload(&payload).expect("valid trigger payload")
+    }
+
+    /// One minute after a 08:00 Oslo fire on 22 Oct 2026 (CEST, UTC+2).
+    fn failed_at() -> chrono::DateTime<chrono::Utc> {
+        "2026-10-22T06:01:00Z".parse().unwrap()
+    }
+
+    const REASON: &str = "could not reach the sign-in server";
+
+    /// A one-shot cron matches nothing in the future, so nothing runs it again.
+    #[test]
+    fn a_one_shot_trigger_with_no_future_fire_promises_no_retry() {
+        let config = trigger(json!({ "schedule": ["0 0 8 22 10 * 2026"] }));
+        let message = transient_failure_message(&config, REASON, failed_at(), None);
+
+        assert_eq!(
+            message,
+            format!(
+                "Temporary error. This trigger has no future run, so it will not run \
+                 again on its own. Use Run once to try again. Error: {REASON}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_recurring_trigger_names_its_next_run_in_local_time() {
+        let config = trigger(json!({ "schedule": ["0 0 8 * * *"] }));
+        let message = transient_failure_message(&config, REASON, failed_at(), None);
+
+        assert_eq!(
+            message,
+            format!(
+                "Temporary error. The next scheduled run is Fri 23 Oct at 08:00 CEST. Error: {REASON}"
+            )
+        );
+    }
+
+    /// A trigger stored in UTC must not show its UTC wall clock to a user in
+    /// Oslo as if it were theirs.
+    #[test]
+    fn the_next_run_shows_in_the_users_timezone() {
+        let config = trigger(json!({ "schedule": ["0 0 8 * * *"], "timezone": "UTC" }));
+        let message =
+            transient_failure_message(&config, REASON, failed_at(), Some(chrono_tz::Europe::Oslo));
+
+        assert!(
+            message.contains("The next scheduled run is Thu 22 Oct at 10:00 CEST."),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_next_run_in_another_year_names_the_year() {
+        let config = trigger(json!({ "schedule": ["0 0 8 1 1 *"] }));
+        let message = transient_failure_message(&config, REASON, failed_at(), None);
+
+        assert!(
+            message.contains("The next scheduled run is Fri 1 Jan 2027 at 08:00 CET."),
+            "got: {message}"
+        );
+    }
+
+    /// An event trigger does run again, but only on its next event. This run
+    /// is not retried, so the message must not promise that it is.
+    #[test]
+    fn an_event_only_trigger_promises_no_retry_of_this_run() {
+        let config = trigger(json!({ "on": [{ "event_type": "DataImported" }] }));
+        let message = transient_failure_message(&config, REASON, failed_at(), None);
+
+        assert_eq!(
+            message,
+            format!(
+                "Temporary error. This run will not be retried. The trigger runs again \
+                 on its next matching event. Use Run once to try now. Error: {REASON}"
+            )
+        );
+    }
+
+    /// A paused trigger fires on neither cron nor events, whatever it holds.
+    #[test]
+    fn a_paused_trigger_promises_no_retry() {
+        let config = trigger(json!({
+            "schedule": ["0 0 8 * * *"],
+            "on": [{ "event_type": "DataImported" }],
+            "paused": true,
+        }));
+        let message = transient_failure_message(&config, REASON, failed_at(), None);
+
+        assert_eq!(
+            message,
+            format!(
+                "Temporary error. This trigger is paused, so it will not run again on \
+                 its own. Use Run once to try again. Error: {REASON}"
+            )
         );
     }
 

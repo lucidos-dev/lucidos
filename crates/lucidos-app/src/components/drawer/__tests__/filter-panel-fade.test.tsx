@@ -83,6 +83,17 @@ describe('the filter panel swaps under a navigation cover, and the signal leads'
     expect(onStack()).toBe(true);
   });
 
+  it('leaves the Escape stack in the commit that hides the drawer, before any passive effect', () => {
+    act(() => { openThreadFilterPanel(); });
+    expect(onStack()).toBe(true);
+    // No `act`: it would flush passive effects, which is what this must not need.
+    render(<ThreadFilterCover paneVisible={false} leaving={leaving} />, host);
+    expect(cover().hasAttribute('inert')).toBe(true);
+    expect(onStack()).toBe(false);
+    render(<ThreadFilterCover paneVisible leaving={leaving} />, host);
+    expect(onStack()).toBe(true);
+  });
+
   it('mounts no navigation cover on the first render, so a restored panel shows at once', () => {
     expect(navCover()).toBeNull();
   });

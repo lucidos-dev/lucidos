@@ -1,7 +1,7 @@
 //! Serve a file over HTTP with cache validators and byte-range support.
 //!
-//! The one caller of `serve_file` is `GET /api/v1/data/*path`, which serves
-//! everything from a 2 KB markdown note to an 80 MB video artifact. Three
+//! `serve_file` answers `GET /api/v1/data/*path`, app files and plugin media.
+//! Those range from a 2 KB app icon to an 80 MB video artifact. Three
 //! properties the callers depend on:
 //!
 //! - **Validators, because `Cache-Control: no-cache` needs something to

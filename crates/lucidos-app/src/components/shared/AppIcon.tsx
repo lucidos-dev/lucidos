@@ -1,6 +1,7 @@
 import { useState } from 'preact/hooks';
 import { appFileUrl } from '../../api/client/apps';
 import { appsList } from '../../store/store';
+import type { App } from '../../store/types';
 
 /** The theme hues a monogram tile may wear. Each is a theme variable, so the
  *  tile follows the theme (ADR 0414). */
@@ -68,6 +69,21 @@ export function AppIcon({ appId, name, icon, src: given, class: extra }: AppIcon
       {monogramLetter(name)}
     </span>
   );
+}
+
+const warmedIcons = new Set<string>();
+
+/** Fetch every listed app icon once per page, before any surface draws it. A
+ *  page reuses an image it has already fetched. A menu of many apps then opens
+ *  with every icon in place, rather than one round trip later. */
+export function warmAppIcons(apps: App[]): void {
+  for (const app of apps) {
+    if (!app.icon) continue;
+    const src = appFileUrl(app.id, app.icon);
+    if (warmedIcons.has(src)) continue;
+    warmedIcons.add(src);
+    new Image().src = src;
+  }
 }
 
 /** `AppIcon` for a surface that knows only the app's id, such as a search hit.

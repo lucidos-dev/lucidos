@@ -437,6 +437,7 @@ pub(super) async fn serve_app_file(
     State(state): State<AppState>,
     Path((app_id, file_path)): Path<(String, String)>,
     Query(query): Query<AppUiPreviewQuery>,
+    request_headers: HeaderMap,
 ) -> Response {
     if !is_valid_id(&app_id) {
         return (StatusCode::BAD_REQUEST, "Invalid ID").into_response();
@@ -445,12 +446,6 @@ pub(super) async fn serve_app_file(
     if is_path_traversal(&file_path) {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
-
-    let ext = std::path::Path::new(&file_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let content_type = content_type_for_ext(ext);
 
     // WIP-preview: serve from the named thread's worktree.
     let full_path = if let Some(thread_id) = query.thread_id.as_deref() {
@@ -468,23 +463,33 @@ pub(super) async fn serve_app_file(
         state.app_manager.app_file_path(&app_id, &file_path)
     };
 
-    match std::fs::read(&full_path) {
-        Ok(content) => {
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            if let Some(value) = attachment_disposition(query.download, &file_path)
-                .and_then(|d| HeaderValue::from_str(&d).ok())
-            {
-                headers.insert(header::CONTENT_DISPOSITION, value);
-            }
-            (headers, content).into_response()
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "File not found").into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    app_file_response(&full_path, &file_path, query.download, &request_headers).await
+}
+
+/// Answer for one app file, with validators under the engine-wide `no-cache`.
+/// A browser then revalidates an icon rather than downloading it again, and
+/// still sees an edited file at once.
+async fn app_file_response(
+    full_path: &std::path::Path,
+    file_path: &str,
+    download: Option<u8>,
+    request_headers: &HeaderMap,
+) -> Response {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let mut response =
+        super::file_response::serve_file(full_path, content_type_for_ext(ext), request_headers)
+            .await;
+    if let Some(value) =
+        attachment_disposition(download, file_path).and_then(|d| HeaderValue::from_str(&d).ok())
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
     }
+    response
 }
 
 /// `Content-Disposition: attachment` when the request asked to download.
@@ -802,5 +807,40 @@ mod tests {
         assert_eq!(attachment_disposition(Some(1), "a\"b.txt"), None);
         assert_eq!(attachment_disposition(Some(1), "a\r\nX-Evil: 1"), None);
         assert_eq!(attachment_disposition(Some(1), ""), None);
+    }
+
+    #[tokio::test]
+    async fn an_app_file_revalidates_rather_than_downloading_again() {
+        // Every surface that lists apps draws their icons from this route. A
+        // `no-store` answer refetched each one on every page load, so a menu of
+        // forty apps opened blank on a phone.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.svg");
+        std::fs::write(&path, "<svg/>").unwrap();
+
+        let first = app_file_response(&path, "icon.svg", None, &HeaderMap::new()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers().get(header::CACHE_CONTROL), None);
+        let etag = first.headers().get(header::ETAG).expect("etag").clone();
+
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, etag);
+        let again = app_file_response(&path, "icon.svg", None, &conditional).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn a_download_of_an_app_file_still_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        let response = app_file_response(&path, "payload.txt", Some(1), &HeaderMap::new()).await;
+        assert_eq!(
+            response.headers().get(header::CONTENT_DISPOSITION),
+            Some(&HeaderValue::from_static(
+                "attachment; filename=\"payload.txt\""
+            ))
+        );
     }
 }

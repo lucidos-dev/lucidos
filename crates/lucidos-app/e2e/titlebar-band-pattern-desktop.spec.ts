@@ -47,9 +47,25 @@ async function setTheme(page: Page, theme: string): Promise<void> {
   expect(res.ok(), `theme=${theme}`).toBe(true);
 }
 
-/** Set the theme and wait until its band switch is on the document. */
+/** What the three themes under test, and the starting one, differ in: a theme
+ *  sets the page background, the header fill, or both. */
+const readPalette = (page: Page) =>
+  page.evaluate(() => {
+    const style = getComputedStyle(document.documentElement);
+    return ['--bg-primary', '--header-gradient'].map(name => style.getPropertyValue(name).trim()).join('|');
+  });
+
+/** Set the theme and wait until it is painted. The band switch cannot prove
+ *  that for a theme that leaves it at `0`, which the page already has. So a
+ *  theme other than the starting `lucidos` must also move the background. Then
+ *  the swap's transition lock must lift. */
 async function applyTheme(page: Page, theme: string): Promise<void> {
+  const startPalette = await readPalette(page);
   await setTheme(page, theme);
+  if (theme !== 'lucidos') {
+    await expect.poll(() => readPalette(page), { message: `${theme} repainted the page` }).not.toBe(startPalette);
+  }
+  await expect(page.locator('html[data-theme-swap]')).toHaveCount(0);
   await expect.poll(
     () => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--titlebar-strip-continues').trim()),
     { message: `${theme} reached the document` },

@@ -426,8 +426,9 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     expect(toggled, 'drawer toggle was visible').toBe(true);
 
     // The panel stays open behind the hidden drawer, but an Escape must not
-    // close a panel nobody can see.
-    await expect(openCover).toHaveCount(1);
+    // close a panel nobody can see. The cover goes inert in the commit that
+    // takes the panel off the Escape stack, so wait for that, not for the count.
+    await expect(page.locator('.thread-filter-cover[data-open][inert]')).toHaveCount(1);
     await page.keyboard.press('Escape');
     await expect(openCover).toHaveCount(1);
 
