@@ -1474,12 +1474,17 @@ pub enum ThreadEvent {
     /// `tool_name` is one of the bash/python tools; `command` is the inspected
     /// command text (the bash `command` or python `code`); `summary` is the
     /// card's one-line description. Persisted so the card survives reload.
+    /// `grant_head` is the head a bash grant stores, after any leading `cd`
+    /// into the workspace root drops. The card cannot know the root, so it
+    /// labels its narrow and session buttons with it. `None` for python.
     CommandPermissionRequested {
         request_id: String,
         tool_use_id: String,
         tool_name: String,
         command: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_head: Option<String>,
     },
     /// User resolved a `CommandPermissionRequested` (or the engine resolved it
     /// as superseded / orphaned). Chat counterpart of

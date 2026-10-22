@@ -1083,15 +1083,6 @@ describe('a missed press says why no face took it', () => {
     expect(line.watchableCount).toBe(0);
   });
 
-  it('calls the invisible placeholder by its own name, not disabled', () => {
-    settleHealthy();
-    send.disabled = true;
-    send.classes = ['action-btn', 'send-cancel-morph', 'morph-placeholder'];
-    atPoint = send;
-    fire('touchstart', touch(row, 350, 420));
-    expect(lines()[0].under).toBe('placeholder-face');
-  });
-
   it('says nothing was under a tap on empty row space', () => {
     settleHealthy();
     atPoint = row;

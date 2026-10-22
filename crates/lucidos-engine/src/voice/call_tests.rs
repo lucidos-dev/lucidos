@@ -3778,6 +3778,7 @@ async fn a_permission_card_is_put_to_the_caller_out_loud_in_every_lane() {
                 tool_name: "run_bash".to_string(),
                 command: "gh release delete v1".to_string(),
                 summary: "Deletes a published release.".to_string(),
+                grant_head: None,
             },
             "Deletes a published release.",
             "command:req-cmd#allow-once",
@@ -3918,6 +3919,7 @@ async fn a_permission_settled_mid_call_is_appended_and_never_asked_again() {
                     tool_name: "run_bash".to_string(),
                     command: "gh release delete v1".to_string(),
                     summary: "Deletes a published release.".to_string(),
+                    grant_head: None,
                 },
             )
             .await;

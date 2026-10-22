@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::agent_session::side_question::SIDE_QUESTION_MAX_TURNS;
 
 fn collect_envs(
     cmd: &tokio::process::Command,
@@ -1277,7 +1278,7 @@ fn every_spawn_shape_disallows_the_tools_that_promise_later_work() {
     let resumed = collect_args(&session_command(&args, None));
     let settings = PathBuf::from("/tmp/ws/.lucidos/cc-side-question-settings.json");
     let side_question = collect_args(
-        &build_side_question_command(&args, None, &settings)
+        &build_session_copy_command(&args, None, &settings, SIDE_QUESTION_MAX_TURNS)
             .unwrap()
             .cmd,
     );
@@ -1427,7 +1428,8 @@ fn side_question_command_copies_the_session_without_persisting() {
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
     };
-    let copy_command = build_side_question_command(&args, None, &settings).unwrap();
+    let copy_command =
+        build_session_copy_command(&args, None, &settings, SIDE_QUESTION_MAX_TURNS).unwrap();
     let session_command = build_command(&args, None).unwrap();
     let copy = argv(&copy_command.cmd);
     let session = argv(&session_command.cmd);
@@ -1438,7 +1440,10 @@ fn side_question_command_copies_the_session_without_persisting() {
     };
     assert_eq!(value_of(&copy, "--resume").as_deref(), Some("sess-9"));
     assert!(copy.iter().any(|a| a == "--no-session-persistence"));
-    assert!(copy.iter().any(|a| a == "--max-turns"));
+    assert_eq!(
+        value_of(&copy, "--max-turns"),
+        Some(SIDE_QUESTION_MAX_TURNS.to_string())
+    );
     assert!(
         !copy.iter().any(|a| a == "--tools"),
         "the tool list must match"
@@ -1505,7 +1510,7 @@ fn build_command_exports_the_add_dir_list_for_the_agent_guard() {
     let settings = PathBuf::from("/tmp/ws/.lucidos/cc-side-question-settings.json");
     for cmd in [
         session_command(&args, None),
-        build_side_question_command(&args, None, &settings)
+        build_session_copy_command(&args, None, &settings, SIDE_QUESTION_MAX_TURNS)
             .expect("the command builds")
             .cmd,
     ] {
@@ -1880,7 +1885,7 @@ fn a_side_question_copy_moves_the_files_over_its_own_settings() {
         .join(".lucidos/cc-side-question-settings.json");
     let own_json = crate::engine::cc_settings::build_cc_side_question_settings_json(&[]);
     std::fs::write(&own, &own_json).unwrap();
-    let copy = build_side_question_command(&args, None, &own).unwrap();
+    let copy = build_session_copy_command(&args, None, &own, SIDE_QUESTION_MAX_TURNS).unwrap();
     let argv = collect_args(&copy.cmd);
     let settings: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(flag_value(&argv, "--settings").unwrap()).unwrap(),

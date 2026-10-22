@@ -1,31 +1,37 @@
-//! The *cache keep-alive*: keep an idle Claude Code session's prompt cache warm
-//! while it waits.
+//! The *cache keep-alive*: keep a waiting Claude Code session's prompt cache
+//! warm.
 //!
 //! The cache lives 5 minutes or 1 hour from the start of the last request. A
 //! longer wait makes the wake-up re-write the whole context. So the engine
-//! resumes a waiting idle session with a hidden nudge just before its cache
-//! would expire. It waits on a *keep-warm* event wait or on a working child
-//! thread. The agent answers in a word and idles again.
+//! beats just before the cache would expire, by one of two routes:
+//!
+//! - **Resume.** An idle session waiting on a *keep-warm* event wait or a
+//!   working child gets a hidden nudge. It answers in a word and idles again.
+//! - **Session copy.** A live session parked on a question card or permission
+//!   prompt blocks mid-turn, so a copy of it reads the same cached prefix. The
+//!   session, its transcript and its card never hear of it.
+//!
+//! Rules both routes keep:
 //!
 //! - **The TTL is observed, never guessed.** Claude Code's usage block splits
 //!   each cache write by lifetime. An unknown TTL beats as 5 minutes.
-//! - **Timing comes from persisted events**, so a restart causes no burst.
-//! - **A beat never contends for the thread.** It skips a live, held or busy
+//! - **Timing comes from persisted events**, so a restart causes no burst. A
+//!   copy beat's capture moves the anchor as a turn request does.
+//! - **A resume never contends for the thread.** It skips a live, held or busy
 //!   thread, and one a person owes an answer.
-//! - **A child parked on the user keeps nobody warm.** That wait has no bound.
-//!   Its answer restarts the beats only while the parent's cache is still warm.
+//! - **A child parked on the user keeps nobody warm.** Its parent wakes only
+//!   when a child finishes, long after the answer.
 //! - **A `no-wake` child keeps nobody warm.** Its clean finish never wakes the
 //!   parent, so nothing would read the warm cache. A build chain is one.
-//! - **The turn is invisible; the status is not.** `event_bus_projection_keep_alive`
-//!   keeps each ping off the summary row, and the run session proposes nothing
-//!   for it. The tick writes one *cache keep-alive status* per thread instead,
-//!   only on a change (`sync_status`).
-//! - **The budget is break-even.** The engine gives up once the beats spent
-//!   would cost a cache rewrite. The ratio comes from the session's model.
+//! - **The beats are invisible; the status is not.** The tick writes one *cache
+//!   keep-alive status* per waiting thread, only on a change (`sync_status`).
+//!   A parked thread shows none.
+//! - **Every run gives up.** `cache_keep_alive_mode` picks the rule: break-even
+//!   by default, half of it for a parked wait, or this workspace's cheapest cap.
 //!
 //! Why a keep-alive and not the 1-hour TTL: ADR 0470. Why the window follows
 //! the observed TTL: ADR 0479. Why the budget follows the model's prices:
-//! ADR 0489. Why it shows one status and never the pings: ADR 0529.
+//! ADR 0489. Why it shows one status: ADR 0529. Why a copy beat: ADR 0547.
 
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
@@ -34,6 +40,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use super::wait_durations::WaitDurations;
 use super::LiveWait;
 use crate::engine::cache_ttl::CacheTtl;
 use crate::engine::event_bus::{BusEvent, EventBus};
@@ -42,7 +49,7 @@ use crate::engine::thread_events::{
     EventMeta, MessageOrigin, ThreadEvent, WakeMode, CACHE_KEEP_ALIVE_REASON_KIND,
     KEEP_ALIVE_IDLE_REASON,
 };
-use crate::engine::thread_lifecycle::ThreadStatus;
+use crate::engine::thread_lifecycle::{ThreadStatus, WAITING_FOR_USER_ANSWER_EVENTS};
 use crate::engine::{LucidosEngine, PreEmittedOrigin};
 use crate::llm::model_prices::{cache_shares_of, CacheShares};
 use crate::runtime::CodingAgent;
@@ -78,12 +85,157 @@ impl CacheTtl {
         self.write_share(cache) / cache.read
     }
 
-    /// How long after the wait began the engine gives up, in seconds: the
-    /// beats that cost one rewrite, at one beat per window. Past it, a wake
-    /// that finds the cache expired pays at most two rewrites in all.
-    pub(super) fn give_up_after_secs(self, cache: CacheShares) -> f64 {
-        self.rewrite_in_beats(cache) * self.beat_window().start()
+    /// The seconds between two beats.
+    pub(super) fn beat_every_secs(self) -> f64 {
+        *self.beat_window().start()
     }
+}
+
+/// The values of `cache_keep_alive_mode`, as the catalog lists them.
+pub const CACHE_KEEP_ALIVE_MODES: &[&str] = &[
+    CacheKeepAliveMode::Default.as_str(),
+    CacheKeepAliveMode::WorkspaceData.as_str(),
+    CacheKeepAliveMode::Off.as_str(),
+];
+
+/// The `cache_keep_alive_mode` preference, parsed: when a keep-alive run gives up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheKeepAliveMode {
+    /// Break-even for an event wait, half of it for a parked one.
+    Default,
+    /// The cap that would have cost least over this workspace's last 30 days.
+    WorkspaceData,
+    /// No beats and no status.
+    Off,
+}
+
+impl CacheKeepAliveMode {
+    const ALL: [Self; 3] = [Self::Default, Self::WorkspaceData, Self::Off];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::WorkspaceData => "workspace-data",
+            Self::Off => "off",
+        }
+    }
+
+    /// A value outside [`CACHE_KEEP_ALIVE_MODES`] reads as `default`, the
+    /// catalog default.
+    pub fn parse(value: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.as_str() == value)
+            .unwrap_or(Self::Default)
+    }
+}
+
+/// The kinds a keep-warm wait watches, one bit per [`KEEP_WARM_EVENT_TYPES`]
+/// entry. Two waits on the same kinds are the same wait type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct KeepWarmKinds(u8);
+
+impl KeepWarmKinds {
+    /// The kinds of a wait watching `kinds`. `None` when it watches nothing,
+    /// or a kind that is not keep-warm.
+    pub(crate) fn of<'a>(kinds: impl IntoIterator<Item = &'a str>) -> Option<Self> {
+        let mut bits = 0u8;
+        for kind in kinds {
+            let index = KEEP_WARM_EVENT_TYPES.iter().position(|k| *k == kind)?;
+            bits |= 1 << index;
+        }
+        (bits != 0).then_some(Self(bits))
+    }
+
+    /// What working children wait for.
+    fn child_finish() -> Self {
+        Self::of(["ChildThreadCompleted"]).expect("a keep-warm kind")
+    }
+}
+
+/// The card a parked session waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ParkedCard {
+    Question,
+    Permission,
+}
+
+impl ParkedCard {
+    const ALL: [Self; 2] = [Self::Question, Self::Permission];
+
+    /// The event that parks a Claude Code session on this card.
+    pub(crate) const fn event_type(self) -> &'static str {
+        match self {
+            Self::Question => "UserQuestionAsked",
+            Self::Permission => "CodingAgentPermissionRequest",
+        }
+    }
+
+    /// The card `event_type` parks a session on. `None` for any other event,
+    /// including the Lucidos Agent's parkings.
+    pub(crate) fn of_event_type(event_type: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|card| card.event_type() == event_type)
+    }
+}
+
+/// What a wait waits for. Waits of one type share one give-up point under
+/// `workspace-data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum WaitType {
+    /// A live session parked on a card.
+    Parked(ParkedCard),
+    /// An event wait, or working children.
+    Events(KeepWarmKinds),
+}
+
+/// What decides when a keep-alive run gives up: the preference, with what
+/// `workspace-data` reads.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum GiveUpRule<'a> {
+    Default,
+    /// The cheapest cap over these durations. A type with too few waits keeps
+    /// the default.
+    WorkspaceData(&'a WaitDurations),
+    Off,
+}
+
+impl<'a> GiveUpRule<'a> {
+    pub(super) fn of(mode: CacheKeepAliveMode, durations: &'a WaitDurations) -> Self {
+        match mode {
+            CacheKeepAliveMode::Default => Self::Default,
+            CacheKeepAliveMode::WorkspaceData => Self::WorkspaceData(durations),
+            CacheKeepAliveMode::Off => Self::Off,
+        }
+    }
+}
+
+/// How many beats a run may spend before it gives up, or `None` when it
+/// spends none. [`decide`] and [`status`] both read it (I3).
+fn budget_beats(c: &Candidate, rule: GiveUpRule) -> Option<f64> {
+    let ttl = c.ttl();
+    let break_even = ttl.rewrite_in_beats(c.cache);
+    let wait_type = wait_type(c)?;
+    let default = match wait_type {
+        WaitType::Parked(_) => break_even / 2.0,
+        WaitType::Events(_) => break_even,
+    };
+    match rule {
+        GiveUpRule::Off => None,
+        GiveUpRule::Default => Some(default),
+        GiveUpRule::WorkspaceData(durations) => Some(
+            durations
+                .cap_beats(wait_type, ttl.beat_every_secs(), break_even)
+                .map_or(default, f64::from),
+        ),
+    }
+}
+
+/// How long after the wait began the engine gives up, in seconds: the budget
+/// at one beat per window.
+fn give_up_after_secs(c: &Candidate, rule: GiveUpRule) -> Option<f64> {
+    Some(budget_beats(c, rule)? * c.ttl().beat_every_secs())
 }
 
 /// What the agent reads. It must answer without a tool call, or the turn costs
@@ -91,6 +243,14 @@ impl CacheTtl {
 const KEEP_ALIVE_PROMPT: &str = "Cache keep-alive from the Lucidos engine. You are still \
     waiting, and nothing has arrived. Do nothing: run no command, call no tool, and send no \
     read decision. Reply with the single word: waiting.";
+
+/// How long a copy beat may run. A beat fires by the end of its window, so a
+/// copy still running a minute later has missed the cache lifetime anyway.
+const KEEP_ALIVE_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A copy beat's model turns. A stray tool call then ends the copy rather than
+/// paying for a second read of the whole context.
+const KEEP_ALIVE_COPY_MAX_TURNS: usize = 1;
 
 /// The in-memory guard against a second beat while the first one's request is
 /// still on its way. Lost on restart, which is harmless: a beat in flight then
@@ -111,9 +271,13 @@ pub(super) struct Candidate {
     pub claim: ThreadClaim,
     /// A person owes the thread an answer, so a turn would supersede the card.
     pub awaiting_user: bool,
+    /// The card it waits on, when its latest parking was a Claude Code one.
+    pub parked: Option<Parked>,
     /// Seconds since the newest of its live waits that watch keep-warm kinds
     /// only was armed. `None` when it holds no such wait.
     pub keep_warm_wait_secs: Option<f64>,
+    /// The kinds that newest wait watches.
+    pub keep_warm_kinds: KeepWarmKinds,
     pub children: ActiveChildren,
     /// Seconds since the last turn request started. `None` when it never ran.
     pub secs_since_request: Option<f64>,
@@ -123,6 +287,19 @@ pub(super) struct Candidate {
     pub cache_ttl: Option<CacheTtl>,
     /// What the prompt cache of the model that wrote it charges.
     pub cache: CacheShares,
+}
+
+/// A session parked mid-turn on a card. It blocks on the engine's reply, so
+/// only a copy of it can beat.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Parked {
+    pub card: ParkedCard,
+    /// Seconds since the turn request that asked started. The session never
+    /// idles while parked, so the wait's clock starts there.
+    pub secs: f64,
+    /// The engine remembers what the session's spawn appended. Without it a
+    /// copy misses the session's cached prefix.
+    pub copy_ready: bool,
 }
 
 /// The thread's active child threads, as the keep-alive weighs them. An active
@@ -145,16 +322,31 @@ pub(super) enum ActiveChildren {
 /// The selection's verdict.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Beat {
-    /// Resume the session now.
-    Send,
+    /// Beat now, by this route.
+    Send(BeatRoute),
     Skip(SkipReason),
+}
+
+/// How a beat reaches the session's cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BeatRoute {
+    /// Resume the idle session with the hidden prompt.
+    Resume,
+    /// Ask a copy of the parked session, which reads the same cached prefix.
+    /// The parked session itself never hears of it (ADR 0082).
+    SessionCopy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SkipReason {
     NotClaudeCode,
+    /// The `cache_keep_alive_mode` preference is `off`.
+    Disabled,
     Busy,
+    /// A person owes an answer, and no live session holds the thread.
     AwaitingUser,
+    /// Parked, but a copy would miss the cache: no appended prompt is known.
+    NoCopyPrompt,
     ChildrenAwaitingUser,
     OnlyNoWakeChildren,
     NothingToWaitFor,
@@ -166,25 +358,31 @@ pub(super) enum SkipReason {
 
 /// Decide one thread's beat. Pure, so every condition and boundary is
 /// table-tested (I5).
-pub(super) fn decide(c: &Candidate) -> Beat {
+pub(super) fn decide(c: &Candidate, rule: GiveUpRule) -> Beat {
     use SkipReason::*;
     if c.coding_agent != CodingAgent::ClaudeCode {
         return Beat::Skip(NotClaudeCode);
     }
-    if c.claim == ThreadClaim::Busy {
-        return Beat::Skip(Busy);
-    }
-    if c.awaiting_user {
-        return Beat::Skip(AwaitingUser);
-    }
+    let route = match (c.claim, c.awaiting_user, c.parked) {
+        (ThreadClaim::Busy, true, Some(parked)) if !parked.copy_ready => {
+            return Beat::Skip(NoCopyPrompt)
+        }
+        (ThreadClaim::Busy, true, Some(_)) => BeatRoute::SessionCopy,
+        (ThreadClaim::Busy, _, _) => return Beat::Skip(Busy),
+        (ThreadClaim::Free, true, _) => return Beat::Skip(AwaitingUser),
+        (ThreadClaim::Free, false, _) => BeatRoute::Resume,
+    };
     let waiting_secs = match waiting_secs(c) {
         Ok(secs) => secs,
         Err(reason) => return Beat::Skip(reason),
     };
-    let ttl = c.ttl();
-    if waiting_secs > ttl.give_up_after_secs(c.cache) {
+    let Some(give_up_after) = give_up_after_secs(c, rule) else {
+        return Beat::Skip(Disabled);
+    };
+    if waiting_secs > give_up_after {
         return Beat::Skip(PastCutOff);
     }
+    let ttl = c.ttl();
     let Some(secs) = c.secs_since_request else {
         return Beat::Skip(NoRequestYet);
     };
@@ -195,27 +393,35 @@ pub(super) fn decide(c: &Candidate) -> Beat {
     if c.secs_since_beat.is_some_and(|s| s < *window.start()) {
         return Beat::Skip(BeatInFlight);
     }
-    Beat::Send
+    Beat::Send(route)
 }
 
-/// How long the thread has waited for something worth keeping warm, or why it
-/// waits for nothing that is.
-fn waiting_secs(c: &Candidate) -> Result<f64, SkipReason> {
-    let children_wait_secs = match c.children {
-        ActiveChildren::Working { wait_secs } => Some(wait_secs),
-        ActiveChildren::None | ActiveChildren::AllAwaitingUser | ActiveChildren::OnlyNoWake => None,
-    };
+/// The wait the keep-alive measures: how long it has run and its type, or why
+/// the thread waits for nothing worth keeping warm.
+fn measured_wait(c: &Candidate) -> Result<(f64, WaitType), SkipReason> {
+    if let Some(parked) = c.parked.filter(|_| c.awaiting_user) {
+        return Ok((parked.secs, WaitType::Parked(parked.card)));
+    }
+    let events = WaitType::Events(c.keep_warm_kinds);
+    let children = WaitType::Events(KeepWarmKinds::child_finish());
     // The most recent start wins: a fresh wait keeps a thread warm even when
     // its children have run for hours.
-    match (c.keep_warm_wait_secs, children_wait_secs) {
-        (Some(a), Some(b)) => Ok(a.min(b)),
-        (Some(a), None) | (None, Some(a)) => Ok(a),
-        (None, None) => Err(match c.children {
-            ActiveChildren::AllAwaitingUser => SkipReason::ChildrenAwaitingUser,
-            ActiveChildren::OnlyNoWake => SkipReason::OnlyNoWakeChildren,
-            ActiveChildren::None | ActiveChildren::Working { .. } => SkipReason::NothingToWaitFor,
-        }),
+    match (c.keep_warm_wait_secs, c.children) {
+        (Some(a), ActiveChildren::Working { wait_secs: b }) if b < a => Ok((b, children)),
+        (Some(a), _) => Ok((a, events)),
+        (None, ActiveChildren::Working { wait_secs }) => Ok((wait_secs, children)),
+        (None, ActiveChildren::AllAwaitingUser) => Err(SkipReason::ChildrenAwaitingUser),
+        (None, ActiveChildren::OnlyNoWake) => Err(SkipReason::OnlyNoWakeChildren),
+        (None, ActiveChildren::None) => Err(SkipReason::NothingToWaitFor),
     }
+}
+
+fn waiting_secs(c: &Candidate) -> Result<f64, SkipReason> {
+    measured_wait(c).map(|(secs, _)| secs)
+}
+
+pub(super) fn wait_type(c: &Candidate) -> Option<WaitType> {
+    measured_wait(c).ok().map(|(_, wait_type)| wait_type)
 }
 
 impl Candidate {
@@ -251,8 +457,17 @@ pub(super) struct Spent {
 /// The *cache keep-alive status* of one thread. Pure, and it reads the same
 /// inputs as [`decide`], so the two agree on every candidate (I3). A thread
 /// claim never changes it: [`sync_status`] leaves a busy thread's status alone.
-pub(super) fn status(c: &Candidate, at: &Anchors, spent: Spent) -> Option<CacheKeepAliveStatus> {
-    if c.coding_agent != CodingAgent::ClaudeCode || c.awaiting_user {
+/// A parked thread shows none, so no exchange opens beside its card (ADR 0540).
+pub(super) fn status(
+    c: &Candidate,
+    rule: GiveUpRule,
+    at: &Anchors,
+    spent: Spent,
+) -> Option<CacheKeepAliveStatus> {
+    if c.coding_agent != CodingAgent::ClaudeCode
+        || c.awaiting_user
+        || matches!(rule, GiveUpRule::Off)
+    {
         return None;
     }
     let waiting_secs = match waiting_secs(c) {
@@ -271,7 +486,8 @@ pub(super) fn status(c: &Candidate, at: &Anchors, spent: Spent) -> Option<CacheK
     };
     let since = wait_began_at(c, at)?;
     let ttl = c.ttl();
-    let give_up_after = ttl.give_up_after_secs(c.cache);
+    let budget = budget_beats(c, rule)?;
+    let give_up_after = give_up_after_secs(c, rule)?;
     let give_up_at = since + chrono::Duration::milliseconds((give_up_after * 1000.0) as i64);
     if waiting_secs > give_up_after {
         return Some(CacheKeepAliveStatus::Stopped {
@@ -281,12 +497,12 @@ pub(super) fn status(c: &Candidate, at: &Anchors, spent: Spent) -> Option<CacheK
             context_tokens: spent.context_tokens,
         });
     }
-    let window_start = chrono::Duration::milliseconds((*ttl.beat_window().start() * 1000.0) as i64);
+    let window_start = chrono::Duration::milliseconds((ttl.beat_every_secs() * 1000.0) as i64);
     Some(CacheKeepAliveStatus::Warming {
         since,
         beats: spent.beats,
-        budget_beats: ttl.rewrite_in_beats(c.cache).floor() as u32,
-        beat_every_secs: *ttl.beat_window().start() as u32,
+        budget_beats: budget.floor() as u32,
+        beat_every_secs: ttl.beat_every_secs() as u32,
         cost_usd: spent.cost_usd,
         context_tokens: spent.context_tokens,
         next_beat_at: at.request_started_at.map(|t| t + window_start),
@@ -305,20 +521,18 @@ fn wait_began_at(c: &Candidate, at: &Anchors) -> Option<DateTime<Utc>> {
     }
 }
 
-/// The latest `armed_at` among `waits` that watch keep-warm kinds only.
-pub(super) fn keep_warm_armed_at<'a>(
+/// The newest of `waits` that watch keep-warm kinds only: when it was armed,
+/// and what it watches.
+pub(super) fn newest_keep_warm_wait<'a>(
     waits: impl IntoIterator<Item = &'a LiveWait>,
-) -> Option<DateTime<Utc>> {
+) -> Option<(DateTime<Utc>, KeepWarmKinds)> {
     waits
         .into_iter()
-        .filter(|w| {
-            !w.on.is_empty()
-                && w.on
-                    .iter()
-                    .all(|s| KEEP_WARM_EVENT_TYPES.contains(&s.event_type.as_str()))
+        .filter_map(|w| {
+            let kinds = KeepWarmKinds::of(w.on.iter().map(|s| s.event_type.as_str()))?;
+            Some((w.armed_at, kinds))
         })
-        .map(|w| w.armed_at)
-        .max()
+        .max_by_key(|(armed_at, _)| *armed_at)
 }
 
 /// One thread's row, as the tick reads it.
@@ -330,8 +544,12 @@ struct CandidateRow {
     has_active_children: bool,
     has_working_children: bool,
     has_no_wake_working_children: bool,
+    /// The event of its latest parking, when it waits on the user.
+    parked_by: Option<String>,
+    /// Since the last refresh: a turn request or a copy beat.
     secs_since_request: Option<f64>,
     request_started_at: Option<DateTime<Utc>>,
+    secs_since_turn_request: Option<f64>,
     secs_since_idle: Option<f64>,
     idle_at: Option<DateTime<Utc>>,
     last_write_tokens: Option<i64>,
@@ -352,6 +570,12 @@ impl CandidateRow {
         cache_shares_of(self.last_write_model.as_deref().unwrap_or_default())
     }
 
+    /// The card its session is parked on. `None` when its latest parking was
+    /// not a Claude Code one.
+    fn parked_card(&self) -> Option<ParkedCard> {
+        ParkedCard::of_event_type(self.parked_by.as_deref()?)
+    }
+
     fn active_children(&self) -> ActiveChildren {
         match (
             self.has_active_children,
@@ -368,18 +592,23 @@ impl CandidateRow {
     }
 }
 
-/// Every thread that holds a live wait or active children, with what the
-/// selection reads. Ages of database rows are computed in SQL (ADR 0053). The
-/// latest real idle is the latest `CodingAgentIdled` no keep-alive turn wrote.
-/// [`read_candidates`] binds it. The TTL and the model come from the latest
-/// capture of the session's own that wrote to the cache. A cache hit keeps an
-/// entry's lifetime, and a sub-agent may run on another TTL or model. A Codex
-/// thread never writes one, so it skips the look-up rather than scan its whole
-/// history.
+/// Every thread that holds a live wait or active children, and every
+/// non-Codex thread parked on the user, with what the selection reads. Ages of
+/// database rows are computed in SQL (ADR 0053).
+///
+/// - The latest real idle is the latest `CodingAgentIdled` no keep-alive turn
+///   wrote. [`read_candidates`] binds it.
+/// - The last refresh is the later of the last turn request and the last copy
+///   beat. Each starts at its capture's `created` minus its duration.
+/// - The TTL and the model come from the latest capture of the session's own
+///   that wrote to the cache. A cache hit keeps an entry's lifetime, and a
+///   sub-agent may run on another TTL or model. A Codex thread never writes
+///   one, so it skips the look-up rather than scan its whole history.
 const CANDIDATES_SQL: &str = r#"
 SELECT ts.thread_id,
        ts.coding_agent,
        ts.status = $3 AS awaiting_user,
+       p.event_type AS parked_by,
        EXISTS (SELECT 1 FROM thread_summaries c
                 WHERE c.parent_thread_id = ts.thread_id
                   AND c.wake_mode IS DISTINCT FROM $6
@@ -392,8 +621,9 @@ SELECT ts.thread_id,
                 WHERE c.parent_thread_id = ts.thread_id
                   AND c.wake_mode = $6
                   AND c.status = $4) AS has_no_wake_working_children,
-       EXTRACT(EPOCH FROM now() - r.started)::float8 AS secs_since_request,
-       r.started AS request_started_at,
+       EXTRACT(EPOCH FROM now() - GREATEST(r.started, k.started))::float8 AS secs_since_request,
+       GREATEST(r.started, k.started) AS request_started_at,
+       EXTRACT(EPOCH FROM now() - r.started)::float8 AS secs_since_turn_request,
        EXTRACT(EPOCH FROM now() - i.created)::float8 AS secs_since_idle,
        i.created AS idle_at,
        w.written AS last_write_tokens,
@@ -410,6 +640,22 @@ SELECT ts.thread_id,
           AND e.event_type = 'ContextCaptured'
           AND COALESCE(e.payload->>'purpose', 'turn') = 'turn'
         ORDER BY e.sequence DESC LIMIT 1) r ON true
+  LEFT JOIN LATERAL (
+       SELECT e.created
+              - make_interval(secs => COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000)
+              AS started
+         FROM events e
+        WHERE e.thread_id = ts.thread_id
+          AND e.event_type = 'ContextCaptured'
+          AND e.payload->>'purpose' = $7
+        ORDER BY e.sequence DESC LIMIT 1) k ON true
+  LEFT JOIN LATERAL (
+       SELECT e.event_type
+         FROM events e
+        WHERE ts.status = $3
+          AND e.thread_id = ts.thread_id
+          AND e.event_type = ANY($8)
+        ORDER BY e.sequence DESC LIMIT 1) p ON true
   LEFT JOIN LATERAL (
        SELECT e.created
          FROM events e
@@ -430,7 +676,9 @@ SELECT ts.thread_id,
           AND (e.payload->'usage'->>'cache_creation_tokens')::bigint > 0
         ORDER BY e.sequence DESC LIMIT 1) w ON true
  WHERE ts.is_coding_agent
-   AND (ts.thread_id = ANY($1) OR ts.active_children_count > 0)
+   AND (ts.thread_id = ANY($1)
+        OR ts.active_children_count > 0
+        OR (ts.status = $3 AND ts.coding_agent IS DISTINCT FROM $5))
 "#;
 
 /// What the pings since `$2` spent, and the session's last turn context. A
@@ -517,15 +765,17 @@ const STALE_STATUS_SQL: &str = "SELECT thread_id FROM thread_summaries \
 
 /// Write the thread's *cache keep-alive status* when it changed (I4). A busy
 /// thread keeps the one it has: a beat's own turn holds the thread, and every
-/// call of a real turn moves the request anchor.
+/// call of a real turn moves the request anchor. A parked session holds the
+/// thread too, but shows no status.
 async fn sync_status(
     bus: &EventBus,
     thread_id: Uuid,
     candidate: &Candidate,
+    rule: GiveUpRule<'_>,
     anchors: &Anchors,
     stored: Option<CacheKeepAliveStatus>,
 ) {
-    if candidate.claim == ThreadClaim::Busy {
+    if candidate.claim == ThreadClaim::Busy && !candidate.awaiting_user {
         return;
     }
     let spent = match wait_began_at(candidate, anchors) {
@@ -538,7 +788,7 @@ async fn sync_status(
         },
         None => Spent::default(),
     };
-    let next = status(candidate, anchors, spent);
+    let next = status(candidate, rule, anchors, spent);
     if next != stored {
         emit_status(bus, thread_id, next).await;
     }
@@ -577,7 +827,8 @@ async fn emit_status(bus: &EventBus, thread_id: Uuid, status: Option<CacheKeepAl
     }
 }
 
-/// The candidates: `waiting` threads, plus every parent with active children.
+/// The candidates: `waiting` threads, every parent with active children, and
+/// every thread parked on the user.
 async fn read_candidates(
     pool: &sqlx::PgPool,
     waiting: &[Uuid],
@@ -589,6 +840,8 @@ async fn read_candidates(
         .bind(ThreadStatus::Running.as_str())
         .bind(CodingAgent::Codex.as_str())
         .bind(WakeMode::NoWake.as_str())
+        .bind(crate::engine::ContextPurpose::CacheKeepAlive.wire())
+        .bind(WAITING_FOR_USER_ANSWER_EVENTS)
         .fetch_all(pool)
         .await
 }
@@ -604,11 +857,21 @@ impl LucidosEngine {
         for wait in &snapshot {
             by_thread.entry(wait.thread_id).or_default().push(wait);
         }
-        let armed_at: HashMap<Uuid, DateTime<Utc>> = by_thread
+        let newest: HashMap<Uuid, (DateTime<Utc>, KeepWarmKinds)> = by_thread
             .into_iter()
-            .filter_map(|(thread_id, waits)| Some((thread_id, keep_warm_armed_at(waits)?)))
+            .filter_map(|(thread_id, waits)| Some((thread_id, newest_keep_warm_wait(waits)?)))
             .collect();
-        let waiting: Vec<Uuid> = armed_at.keys().copied().collect();
+        let waiting: Vec<Uuid> = newest.keys().copied().collect();
+        let mode = CacheKeepAliveMode::parse(
+            &crate::core::prefs::CACHE_KEEP_ALIVE_MODE
+                .read(&self.pool)
+                .await,
+        );
+        if mode == CacheKeepAliveMode::WorkspaceData {
+            self.refresh_wait_durations_when_due();
+        }
+        let durations = self.keep_alive_durations.current();
+        let rule = GiveUpRule::of(mode, &durations);
         let rows = match read_candidates(&self.pool, &waiting).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -618,32 +881,49 @@ impl LucidosEngine {
         };
         let candidates: Vec<Uuid> = rows.iter().map(|row| row.thread_id).collect();
         for row in rows {
+            let wait = newest.get(&row.thread_id).copied();
             let candidate = Candidate {
                 coding_agent: CodingAgent::parse(row.coding_agent.as_deref().unwrap_or("")),
                 claim: self.keep_alive_claim(row.thread_id).await,
                 awaiting_user: row.awaiting_user,
-                keep_warm_wait_secs: armed_at
-                    .get(&row.thread_id)
-                    .map(|at| (now - *at).num_milliseconds() as f64 / 1000.0),
+                parked: self.parked_of(&row),
+                keep_warm_wait_secs: wait
+                    .map(|(at, _)| (now - at).num_milliseconds() as f64 / 1000.0),
+                keep_warm_kinds: wait.map(|(_, kinds)| kinds).unwrap_or_default(),
                 children: row.active_children(),
                 secs_since_request: row.secs_since_request,
                 secs_since_beat: self.secs_since_keep_alive_beat(row.thread_id),
                 cache_ttl: row.cache_ttl(),
                 cache: row.cache(),
             };
-            // The beat's own turn now holds the thread, so the next idle tick
-            // writes the status, with the ping priced.
-            if decide(&candidate) == Beat::Send {
-                self.send_keep_alive(row.thread_id).await;
-                continue;
+            match decide(&candidate, rule) {
+                // The beat's own turn now holds the thread, so the next idle
+                // tick writes the status, with the ping priced.
+                Beat::Send(BeatRoute::Resume) => {
+                    self.send_keep_alive(row.thread_id).await;
+                    continue;
+                }
+                Beat::Send(BeatRoute::SessionCopy) => {
+                    self.send_keep_alive_copy(row.thread_id);
+                    continue;
+                }
+                Beat::Skip(_) => {}
             }
             let anchors = Anchors {
-                keep_warm_armed_at: armed_at.get(&row.thread_id).copied(),
+                keep_warm_armed_at: wait.map(|(at, _)| at),
                 idle_at: row.idle_at,
                 request_started_at: row.request_started_at,
             };
             let stored = row.stored_status.map(|s| s.0);
-            sync_status(&self.event_bus, row.thread_id, &candidate, &anchors, stored).await;
+            sync_status(
+                &self.event_bus,
+                row.thread_id,
+                &candidate,
+                rule,
+                &anchors,
+                stored,
+            )
+            .await;
         }
         clear_stale_statuses(&self.event_bus, &candidates).await;
     }
@@ -662,6 +942,16 @@ impl LucidosEngine {
         } else {
             ThreadClaim::Free
         }
+    }
+
+    /// The card the row's session is parked on, timed from the turn request
+    /// that asked.
+    fn parked_of(&self, row: &CandidateRow) -> Option<Parked> {
+        Some(Parked {
+            card: row.parked_card()?,
+            secs: row.secs_since_turn_request?,
+            copy_ready: self.remembers_cc_system_prompt(row.thread_id),
+        })
     }
 
     fn secs_since_keep_alive_beat(&self, thread_id: Uuid) -> Option<f64> {
@@ -742,6 +1032,78 @@ impl LucidosEngine {
                 crate::log!("[KeepAlive] Keep-alive turn failed for thread {thread_id}: {e}");
             }
         });
+    }
+
+    /// Beat a parked session by asking a copy of it, in the background. The
+    /// parked session, its transcript and its card never hear of it (I1).
+    fn send_keep_alive_copy(self: &Arc<Self>, thread_id: Uuid) {
+        self.keep_alive_beats
+            .lock()
+            .unwrap()
+            .insert(thread_id, std::time::Instant::now());
+        crate::log!(
+            "[KeepAlive] Asking a copy of parked thread {thread_id} to keep its prompt cache warm"
+        );
+        let engine = self.clone();
+        tokio::spawn(async move { engine.ask_keep_alive_copy(thread_id).await });
+    }
+
+    /// Ask the copy, then record what it cost. The capture's `duration_ms`
+    /// dates the copy's launch, which the next beat's timing reads.
+    async fn ask_keep_alive_copy(&self, thread_id: Uuid) {
+        let copy = match self.session_copy(thread_id).await {
+            Ok(copy) => copy,
+            Err(e) => {
+                crate::log!("[KeepAlive] No session copy for thread {thread_id}: {e:?}");
+                return;
+            }
+        };
+        // Checked at the tick too. An eviction since then would cost a full
+        // rewrite for nothing.
+        if !copy.shares_the_prefix() {
+            crate::log!("[KeepAlive] Thread {thread_id} lost its appended prompt; no copy beat");
+            return;
+        }
+        let launched = std::time::Instant::now();
+        let ask = crate::runtime::claude_code::SessionCopyAsk {
+            max_turns: KEEP_ALIVE_COPY_MAX_TURNS,
+            deadline: tokio::time::Instant::now() + KEEP_ALIVE_COPY_TIMEOUT,
+            timeout_message: format!(
+                "the copy did not answer within {} seconds",
+                KEEP_ALIVE_COPY_TIMEOUT.as_secs()
+            ),
+        };
+        let args = copy.spawn_args(self.workspace_path(), thread_id);
+        let reply =
+            match crate::runtime::claude_code::ask_session_copy(args, KEEP_ALIVE_PROMPT, &[], ask)
+                .await
+            {
+                Ok(reply) => reply,
+                Err(e) => {
+                    crate::log!("[KeepAlive] Copy beat failed for thread {thread_id}: {e}");
+                    return;
+                }
+            };
+        let detail = crate::engine::model_call::CallDetail {
+            reasoning_effort: copy.effort().map(str::to_string),
+            duration_ms: u64::try_from(launched.elapsed().as_millis()).ok(),
+            ..Default::default()
+        };
+        crate::engine::AuxCapture::new(
+            &self.event_bus,
+            thread_id,
+            crate::engine::ContextPurpose::CacheKeepAlive,
+        )
+        .record_usage_detailed(
+            &copy.model_of(&reply),
+            KEEP_ALIVE_PROMPT.chars().count(),
+            reply.usage,
+            detail,
+        )
+        .await;
+        if let Err(e) = reply.answer {
+            crate::log!("[KeepAlive] Copy beat for thread {thread_id} ended without a word: {e}");
+        }
     }
 }
 

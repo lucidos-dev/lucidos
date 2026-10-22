@@ -17,6 +17,7 @@
 //! left unresolved across a restart is cleared by
 //! [`recover_orphan_command_permission_requests`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -110,6 +111,28 @@ fn bash_narrow_pattern(command: &str) -> Option<String> {
     command_guard::first_command_token(command).map(|head| format!("Bash({head}:*)"))
 }
 
+/// The command a grant derives from: [`command_guard::grant_command`] for bash,
+/// which [`command_guard::grant_covers_command`] matches too. Python code is
+/// read as written.
+fn grant_source<'c>(tool_name: &str, command: &'c str, site: CommandSite<'_>) -> Cow<'c, str> {
+    match tool_name {
+        tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => command_guard::grant_command(command, site),
+        _ => Cow::Borrowed(command),
+    }
+}
+
+/// The head the card's narrow and session buttons name, for a bash command.
+/// It is the head [`record_command_allow_grant`] stores, so the label and the
+/// grant agree.
+fn grant_head(tool_name: &str, command: &str, site: CommandSite<'_>) -> Option<String> {
+    match tool_name {
+        tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
+            command_guard::first_command_token(&grant_source(tool_name, command, site))
+        }
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Persisted allowlist file (`agent-allowed-commands`)
 // ---------------------------------------------------------------------------
@@ -125,7 +148,9 @@ pub fn record_command_allow_grant(
     command: &str,
     scope: AllowScope,
 ) {
-    let Some(pattern) = derive_command_allow_pattern(tool_name, command, scope) else {
+    let site = CommandSite::Workspace(engine.workspace_path());
+    let source = grant_source(tool_name, command, site);
+    let Some(pattern) = derive_command_allow_pattern(tool_name, &source, scope) else {
         return;
     };
     match scope {
@@ -1091,6 +1116,7 @@ impl LucidosEngine {
                             tool_name: tool_name.to_string(),
                             command: command_for_event,
                             summary,
+                            grant_head: grant_head(tool_name, &command, site),
                         },
                         meta: meta.clone(),
                     },
@@ -1279,6 +1305,70 @@ mod tests {
                 Some("Python".to_string())
             );
         }
+    }
+
+    /// The card labels its buttons with `grant_head`, and a click stores the
+    /// pattern derived from the same source, so the two cannot disagree.
+    #[test]
+    fn a_root_cd_grant_stores_the_head_the_card_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(dir.path());
+        let cmd = format!("cd {} && python3 x.py", dir.path().display());
+        let head = grant_head(tn::RUN_BASH, &cmd, site);
+        assert_eq!(head.as_deref(), Some("python3"));
+        for scope in [AllowScope::Narrow, AllowScope::Session] {
+            let source = grant_source(tn::RUN_BASH, &cmd, site);
+            assert_eq!(
+                derive_command_allow_pattern(tn::RUN_BASH, &source, scope),
+                Some("Bash(python3:*)".to_string())
+            );
+        }
+        let moved = format!("cd {}/sub && python3 x.py", dir.path().display());
+        assert_eq!(
+            grant_head(tn::RUN_BASH, &moved, site).as_deref(),
+            Some("cd")
+        );
+    }
+
+    /// A card persisted before `grant_head` existed still loads, and a python
+    /// card writes no `grant_head` key.
+    #[test]
+    fn grant_head_is_optional_on_the_wire() {
+        let old = serde_json::json!({
+            "type": "CommandPermissionRequested",
+            "request_id": "r", "tool_use_id": "t", "tool_name": "run_bash",
+            "command": "ls", "summary": "s",
+        });
+        let event: ThreadEvent = serde_json::from_value(old.clone()).unwrap();
+        assert!(matches!(
+            event,
+            ThreadEvent::CommandPermissionRequested {
+                grant_head: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&event).unwrap(), old);
+    }
+
+    /// Nothing runs after the `cd`, so the grant reads the command as written.
+    /// The card then names `cd`, which is what the click stores and matches.
+    #[test]
+    fn a_root_cd_before_nothing_keeps_its_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(dir.path());
+        let cmd = format!("cd {} && > notes.txt", dir.path().display());
+        assert_eq!(grant_head(tn::RUN_BASH, &cmd, site).as_deref(), Some("cd"));
+        let cd = |p: &str| p == "Bash(cd:*)";
+        assert!(command_is_allowed(tn::RUN_BASH, &cmd, site, cd));
+    }
+
+    #[test]
+    fn python_code_keeps_its_text_and_names_no_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(dir.path());
+        let code = format!("cd {} && python3 x.py", dir.path().display());
+        assert_eq!(grant_source(tn::RUN_PYTHON, &code, site), code);
+        assert_eq!(grant_head(tn::RUN_PYTHON, &code, site), None);
     }
 
     #[test]

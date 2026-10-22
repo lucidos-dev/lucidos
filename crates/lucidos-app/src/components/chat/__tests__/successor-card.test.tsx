@@ -2,7 +2,8 @@
 /**
  * The Successor card on top of the composer, offering a *successor thread* to a
  * large coding-agent thread. It shows only at a clean idle, and only where the
- * engine's verdict for the current cache state says a handoff pays.
+ * engine's verdict for the current cache state says a handoff pays. It also
+ * waits for the user to start writing in the composer.
  */
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -27,6 +28,7 @@ import { continueInSuccessor } from '../../../store/actions/successor';
 import {
   focusedThreadId, successorCardPick, successorCardThreadId, successorOffer, threadMap, toasts,
 } from '../../../store/store';
+import { clearDraft, patchDraft } from '../../../store/composeDrafts';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import type { StoredEvent } from '../../../store/thread-events';
 
@@ -137,13 +139,18 @@ describe('SuccessorCard', () => {
     threadMap.value = new Map();
     focusedThreadId.value = null;
     successorCardPick.value = null;
+    clearDraft('t1');
+    clearDraft('t2');
     toasts.value = [];
     vi.clearAllMocks();
   });
 
-  async function mount(meta: MetaOverrides = {}): Promise<HTMLElement> {
+  const type = (threadId: string, text: string) => patchDraft(threadId, { text });
+
+  async function mount(meta: MetaOverrides = {}, { typed = true } = {}): Promise<HTMLElement> {
     threadMap.value = new Map([['t1', idleThread(meta)]]);
     focusedThreadId.value = 't1';
+    if (typed) type('t1', 'next step');
     const host = document.createElement('div');
     document.body.appendChild(host);
     hosts.push(host);
@@ -164,6 +171,18 @@ describe('SuccessorCard', () => {
     expect(labels).toEqual(['Continue with context', 'Start fresh', 'Stay here']);
     expect(option(host, 'Start fresh').textContent).toContain('no carry-over');
     expect(successorCardThreadId.value).toBe('t1');
+  });
+
+  it('waits for the user to write in the composer, and hides again when it is cleared', async () => {
+    const host = await mount({}, { typed: false });
+    expect(fetchThreadContext).toHaveBeenCalledTimes(1);
+    expect(successorCardThreadId.value).toBeNull();
+    await act(async () => { type('t1', 'x'); });
+    expect(option(host, 'Stay here')).toBeDefined();
+    expect(successorCardThreadId.value).toBe('t1');
+    await act(async () => { type('t1', ''); });
+    expect(successorCardThreadId.value).toBeNull();
+    expect(fetchThreadContext).toHaveBeenCalledTimes(1);
   });
 
   it('continues with no implementer when nothing is picked', async () => {

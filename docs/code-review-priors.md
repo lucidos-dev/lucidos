@@ -15,6 +15,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **A working-children wait is tuned from `ChildThreadCompleted` event
+  waits.** A reviewer reports that `workspace-data` never samples a parent
+  waiting on working children, so that type always falls back. The type is
+  `WaitType::Events` of `ChildThreadCompleted` alone, the same type an event
+  wait on that kind has. `DURATIONS_SQL` samples those event waits, so the
+  two share one duration list (ADR 0547). Re-flag only if the two types part.
+  (`event_wait/keep_alive.rs`, `wait_durations.rs`.)
+
 - **Two engines never write one workspace database at once.** A reviewer
   reports a race between an overlapping old and new engine. One example is the
   gateway telemetry cursor's opt-out flag, cleared by one engine while the

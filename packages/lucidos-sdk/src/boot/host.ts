@@ -2,14 +2,14 @@
  * Entry point for the app shell's boot script, inlined into `index.html`'s
  * `<head>` by the `lucidos-appearance-boot` Vite plugin.
  *
- * The shared program plus the two things that are the SHELL's and not the
- * appearance contract's: the boot-splash gradient, and the theme mode telemetry
- * channel. Keeping them here is what lets the contract stay identical between
+ * The shared program plus the three things that are the SHELL's and not the
+ * appearance contract's: the boot-splash gradient, the status bar colour, and
+ * the theme mode telemetry channel. Keeping them here is what lets the contract stay identical between
  * the shell and every app iframe.
  */
 import { applyAppearanceBoot } from './appearanceBoot';
 import { wsLocalGet } from '../_storage';
-import { THEME_MODE_ATTRIBUTE, THEME_MODE_STORAGE_KEY } from '../appearance';
+import { THEME_MODE_ATTRIBUTE, THEME_MODE_STORAGE_KEY, statusBarColor } from '../appearance';
 
 /**
  * The brand gradient, painted on the document canvas during boot.
@@ -50,6 +50,14 @@ const boot = applyAppearanceBoot({
 // After the shared program, which sets the flat background: same end state as
 // setting it inline there, and it keeps the gradient out of the contract.
 document.documentElement.style.background = SPLASH_BACKGROUND;
+
+// The status bar continues the header from the first frame. The shared program
+// laid the theme's and the overrides' tokens inline. `paintThemeColor`
+// (store/actions/preferences.ts) resolves a token that is not a literal.
+document.querySelector('meta[name="theme-color"]')?.setAttribute(
+  'content',
+  statusBarColor(document.documentElement.style.getPropertyValue('--header-bar-top'), boot.resolved),
+);
 
 // Always-on theme mode flash telemetry: POST breadcrumbs to engine.log so a reported
 // flash can be traced to the transition that preceded it. The bug being hunted

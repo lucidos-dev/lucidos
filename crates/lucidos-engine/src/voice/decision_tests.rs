@@ -340,6 +340,7 @@ fn asks_to_run(request_id: &str) -> ThreadEvent {
         tool_name: "run_bash".to_string(),
         command: "gh release delete v1".to_string(),
         summary: "Deletes a published release.".to_string(),
+        grant_head: None,
     }
 }
 

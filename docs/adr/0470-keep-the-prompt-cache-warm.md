@@ -13,6 +13,8 @@
   5-minute beat fires at 230 s, so its request lands near 4.5 minutes.
 - **Amended by**: [0529](0529-keep-alive-shows-one-status.md). Each ping still
   leaves no trace, but one aggregate status now shows the keep-alive.
+- **Amended by**: [0547](0547-keep-alive-beats-a-parked-session-by-copy.md). A
+  session parked on a card is now kept warm by asking a copy of it.
 
 ## Context
 

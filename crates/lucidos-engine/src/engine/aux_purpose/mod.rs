@@ -224,7 +224,8 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
         ContextPurpose::IntentLoop
         | ContextPurpose::MemoryCorrection
         | ContextPurpose::ArtifactSummary
-        | ContextPurpose::SideQuestion => return AuxModelSource::AgentModel,
+        | ContextPurpose::SideQuestion
+        | ContextPurpose::CacheKeepAlive => return AuxModelSource::AgentModel,
         ContextPurpose::Title => AuxModelPrefs {
             model: &prefs::MODEL_TITLE,
             reasoning: Some(&prefs::REASONING_TITLE),
@@ -534,8 +535,8 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         | ContextPurpose::CommandJudge
         | ContextPurpose::ReadDecision
         | ContextPurpose::WakeDecision => SHORT_CALL_BUDGET,
-        // Eight that never ask. None is an auxiliary HTTP call this module
-        // times: a turn and the four `AgentModel` purposes run on the agent's
+        // Nine that never ask. None is an auxiliary HTTP call this module
+        // times: a turn and the five `AgentModel` purposes run on the agent's
         // own provider and its timeout, and the talker holds a socket. Web
         // search times its own backends, and the proxy its own forwards.
         ContextPurpose::Turn
@@ -544,6 +545,7 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         | ContextPurpose::MemoryCorrection
         | ContextPurpose::ArtifactSummary
         | ContextPurpose::SideQuestion
+        | ContextPurpose::CacheKeepAlive
         | ContextPurpose::WebSearch
         | ContextPurpose::Proxy => SHORT_CALL_BUDGET,
     }
@@ -696,6 +698,7 @@ pub(crate) const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::Proxy,
     ContextPurpose::ReadDecision,
     ContextPurpose::WakeDecision,
+    ContextPurpose::CacheKeepAlive,
 ];
 
 #[cfg(test)]
@@ -733,10 +736,11 @@ mod tests {
                 | ContextPurpose::WebSearch
                 | ContextPurpose::Proxy
                 | ContextPurpose::ReadDecision
-                | ContextPurpose::WakeDecision => {}
+                | ContextPurpose::WakeDecision
+                | ContextPurpose::CacheKeepAlive => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 21);
+        assert_eq!(ALL_PURPOSES.len(), 22);
     }
 
     /// The key an unset handle inherits, if any.
@@ -782,6 +786,7 @@ mod tests {
                             | ContextPurpose::MemoryCorrection
                             | ContextPurpose::ArtifactSummary
                             | ContextPurpose::SideQuestion
+                            | ContextPurpose::CacheKeepAlive
                     ),
                     "{:?} claims to run the agent's own model",
                     purpose

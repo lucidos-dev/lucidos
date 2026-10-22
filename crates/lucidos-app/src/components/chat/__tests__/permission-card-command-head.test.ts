@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { commandHead } from '../PermissionCard';
+import { commandGrantHead, commandHead } from '../PermissionCard';
 
 /** `commandHead` labels the permission card's narrow and session buttons, and
  *  the engine derives the pattern it actually STORES from the same command.
@@ -104,5 +104,28 @@ describe('commandHead mirrors the engine grant derivation', () => {
     expect(commandHead("bash -c 'echo hi'`rm -rf /`")).toBe('bash');
     // A plain `$VAR` is not a substitution and must not truncate the script.
     expect(commandHead("bash -c 'ls '$HOME")).toBe('ls');
+  });
+});
+
+/** Only the engine knows the workspace root, so only it can drop a leading
+ *  `cd <root> &&`. The card names the head the engine sends. */
+describe('commandGrantHead', () => {
+  const card = { request_id: 'r', tool_use_id: 't', summary: 's' };
+
+  it('prefers the head the engine sent', () => {
+    expect(commandGrantHead({
+      ...card,
+      tool_name: 'run_bash',
+      command: 'cd /Users/me/ws && python3 x.py',
+      grant_head: 'python3',
+    })).toBe('python3');
+  });
+
+  it('reads the command on a card from before the field', () => {
+    expect(commandGrantHead({ ...card, tool_name: 'run_bash', command: 'git push' })).toBe('git');
+  });
+
+  it('names no head for python', () => {
+    expect(commandGrantHead({ ...card, tool_name: 'run_python', command: 'print(1)' })).toBeNull();
   });
 });

@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts, llmConfigured } from '../store';
-import { currentComposerEnterKey, setComposerEnterKey } from './preferences';
+import { applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
 import { PREF_COMPOSER_ENTER_KEY } from '@lucidos/preference-catalog';
 import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import { MEMORY_MODULE_WHILE_UNSET } from '@lucidos/engine-constants';
-import { SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS } from '@lucidos/appearance';
+import { SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_HEADER_TOP } from '@lucidos/appearance';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -37,6 +37,11 @@ vi.mock('../../utils/tauri', () => ({
   setTitlebarColor: setTitlebarColorMock,
   windowReadyToShow: windowReadyToShowMock,
 }));
+
+// The test environment has no canvas, so a token resolves to whatever a test
+// says. Null means no stylesheet defines it, which takes the fallback.
+const resolvedTokenHexMock = vi.hoisted(() => vi.fn((_name: string): string | null => null));
+vi.mock('../../utils/cssColor', () => ({ resolvedTokenHex: resolvedTokenHexMock }));
 
 describe('currentThemeMode: localStorage fallback', () => {
   beforeEach(() => {
@@ -888,11 +893,10 @@ describe('applyThemeMode: native title-bar tint (Tauri)', () => {
 
   it('tints the title bar the header-top blue per theme inside Tauri', () => {
     platformMocks.isTauri = true;
-    // Mirrors --header-gradient's top stop in styles/global/base.css.
     applyThemeMode('light');
-    expect(setTitlebarColorMock).toHaveBeenLastCalledWith('#1a6fd0');
+    expect(setTitlebarColorMock).toHaveBeenLastCalledWith(THEME_MODE_HEADER_TOP.light);
     applyThemeMode('dark');
-    expect(setTitlebarColorMock).toHaveBeenLastCalledWith('#15549e');
+    expect(setTitlebarColorMock).toHaveBeenLastCalledWith(THEME_MODE_HEADER_TOP.dark);
   });
 
   it('tells the shell the page is ready to show, Tauri only', () => {
@@ -906,6 +910,49 @@ describe('applyThemeMode: native title-bar tint (Tauri)', () => {
     platformMocks.isTauri = true;
     applyThemeMode('light');
     expect(windowReadyToShowMock).toHaveBeenCalled();
+  });
+});
+
+describe('theme-color: the bar above the page continues the header (ADR 0548)', () => {
+  // The test document is a stub with no <head>, so the tag is a stand-in.
+  let themeColor: string | undefined;
+  let querySpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    themeColor = undefined;
+    const meta = { setAttribute: (name: string, value: string) => { if (name === 'content') themeColor = value; } };
+    querySpy = vi.spyOn(document, 'querySelector').mockImplementation(
+      (selector: string) => (selector === 'meta[name="theme-color"]' ? meta : null) as Element | null,
+    );
+    resolvedTokenHexMock.mockImplementation(() => null);
+  });
+
+  afterEach(() => {
+    resolvedTokenHexMock.mockImplementation(() => null);
+    applyStyleOverrides({});
+    querySpy.mockRestore();
+  });
+
+  const headerTopIs = (hex: string) => (name: string) => (name === '--header-bar-top' ? hex : null);
+
+  it("takes the mode's header colour while no stylesheet defines the token", () => {
+    applyThemeMode('light');
+    expect(themeColor).toBe(THEME_MODE_HEADER_TOP.light);
+    applyThemeMode('dark');
+    expect(themeColor).toBe(THEME_MODE_HEADER_TOP.dark);
+  });
+
+  it('takes the painted header token, so a theme and the iOS nudge reach the bar', () => {
+    resolvedTokenHexMock.mockImplementation(headerTopIs('#15579c'));
+    applyThemeMode('dark');
+    expect(themeColor).toBe('#15579c');
+  });
+
+  it('follows a style override of the header token', () => {
+    applyThemeMode('dark');
+    resolvedTokenHexMock.mockImplementation(headerTopIs('#336699'));
+    applyStyleOverrides({ '--header-bar-top': '#336699' });
+    expect(themeColor).toBe('#336699');
   });
 });
 

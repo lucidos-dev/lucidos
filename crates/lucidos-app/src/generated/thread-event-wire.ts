@@ -280,7 +280,8 @@ export type ContextPurpose =
   | 'web_search'
   | 'proxy'
   | 'read_decision'
-  | 'wake_decision';
+  | 'wake_decision'
+  | 'cache_keep_alive';
 
 /** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
  *  in the LLM API call: the system prompt, prior messages (verbatim resume
@@ -2519,7 +2520,10 @@ export type ThreadEvent =
    *  in-process on `Engine.pending_command_permission` (no MCP subprocess).
    *  `tool_name` is one of the bash/python tools; `command` is the inspected
    *  command text (the bash `command` or python `code`); `summary` is the
-   *  card's one-line description. Persisted so the card survives reload. */
+   *  card's one-line description. Persisted so the card survives reload.
+   *  `grant_head` is the head a bash grant stores, after any leading `cd`
+   *  into the workspace root drops. The card cannot know the root, so it
+   *  labels its narrow and session buttons with it. `None` for python. */
   | {
       type: 'CommandPermissionRequested';
       request_id: string;
@@ -2527,6 +2531,7 @@ export type ThreadEvent =
       tool_name: string;
       command: string;
       summary: string;
+      grant_head?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */

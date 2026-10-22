@@ -9,7 +9,7 @@ import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installNoAutofill } from './utils/noAutofill';
-import { currentAutocorrect } from './store/actions/preferences';
+import { currentAutocorrect, paintThemeColor } from './store/actions/preferences';
 import { installNoDrag } from './utils/noDrag';
 import { installNativeContextMenuPolicy } from './utils/nativeContextMenu';
 import { installNoKeyCodeText } from './utils/noKeyCodeText';
@@ -88,6 +88,10 @@ if (isTouchDevice()) {
 if (isIOSPwa()) {
   document.documentElement.classList.add('ios-pwa');
 }
+// The stylesheet is in now, and so is the nudge above. The boot script could
+// tint the status bar only from a literal token, so this tints it from the
+// resolved header colour.
+paintThemeColor();
 installSafeAreaFloor();
 
 installActionBtnBlurListener();

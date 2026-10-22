@@ -284,25 +284,13 @@ describe('canceledPressReport: the system took the gesture', () => {
 // A diagnostic that cries wolf gets ignored. What is excluded is a press the
 // app drops on purpose, and NOT a face the previous probe simply did not name.
 describe('faceExclusion: every actionable face in the row', () => {
-  const LIVE = { disabled: false, placeholder: false };
+  const LIVE = { disabled: false };
 
   it('watches an enabled face', () => {
     expect(faceExclusion(LIVE)).toBe('watchable');
   });
 
-  it('ignores the invisible placeholder that holds the row height', () => {
-    expect(faceExclusion({ ...LIVE, placeholder: true })).toBe('placeholder');
-  });
-
-  it('names the placeholder ahead of disabled, since that mode is both', () => {
-    // Placeholder mode renders `disabled` as well, so the two overlap. The
-    // specific answer is the one a report can act on.
-    expect(faceExclusion({ disabled: true, placeholder: true })).toBe('placeholder');
-    expect(faceExclusion({ disabled: true, placeholder: false })).toBe('disabled');
-    expect(faceExclusion({ disabled: false, placeholder: false })).toBe('watchable');
-  });
-
-  it('ignores a disabled face, which is a settling Stop or a busy Apply', () => {
+  it('ignores a disabled face: an empty Send, a settling Stop or a busy Apply', () => {
     expect(faceExclusion({ ...LIVE, disabled: true })).toBe('disabled');
   });
 });
@@ -317,8 +305,6 @@ describe('underFingerReason: why no watchable face took the press', () => {
   it('names an excluded action face, which is the one that matters', () => {
     expect(underFingerReason({ actionFace: 'disabled', otherButton: false }))
       .toBe('disabled-face');
-    expect(underFingerReason({ actionFace: 'placeholder', otherButton: false }))
-      .toBe('placeholder-face');
   });
 
   it('tells a control button apart from an action face', () => {
@@ -362,7 +348,6 @@ describe('missEarnsRelayout: which missed presses the lift relays out for', () =
     // purpose. Neither is a dead composer.
     expect(missEarnsRelayout('other-button')).toBe(false);
     expect(missEarnsRelayout('disabled-face')).toBe(false);
-    expect(missEarnsRelayout('placeholder-face')).toBe(false);
   });
 });
 
@@ -424,7 +409,7 @@ describe('screenOffset: where the finger is against where the page says it is', 
 describe('morphStateOf: what "the send button" was showing', () => {
   // "The button is there, it just doesn't work" is a claim about this, and no
   // line has ever carried it.
-  const base = { present: true, placeholder: false, disabled: false, label: 'Send message' };
+  const base = { present: true, disabled: false, label: 'Send message' };
 
   it('reads a live Send', () => {
     expect(morphStateOf(base)).toBe('send');
@@ -438,8 +423,8 @@ describe('morphStateOf: what "the send button" was showing', () => {
     expect(morphStateOf({ ...base, disabled: true, label: 'Cancel' })).toBe('disabled');
   });
 
-  it('reads the invisible placeholder ahead of the disabled it also carries', () => {
-    expect(morphStateOf({ ...base, placeholder: true, disabled: true })).toBe('placeholder');
+  it('reads the empty composer\'s Send as disabled', () => {
+    expect(morphStateOf({ ...base, disabled: true })).toBe('disabled');
   });
 
   it('reads answer mode, where the morph is not rendered at all', () => {

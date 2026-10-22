@@ -72,6 +72,7 @@ import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
+import { CacheKeepAliveSection } from './CacheKeepAliveSection';
 import { IntelligenceLinkRow, IntelligencePage } from './IntelligencePage';
 import { SystemPage } from './SystemPage';
 import { SystemSubmenu } from './SystemSubmenu';
@@ -964,6 +965,7 @@ export function SettingsView() {
       <>
         <CodingAgentBinariesSection />
         <CodingAgentPermissionSection />
+        <CacheKeepAliveSection />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="coding-agents:intelligence">Intelligence ladders</div>
           <IntelligenceLinkRow>Which model and effort an agent may pick for Claude Code and Codex</IntelligenceLinkRow>

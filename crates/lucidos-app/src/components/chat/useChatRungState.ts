@@ -25,7 +25,7 @@ import { openIntelligenceLadder } from '../../store/actions/menu';
 import { errorDetail } from '../../utils/errorDetail';
 import { providerStepOptions, providerStepCommit } from '../shared/ModelSelectionPicker';
 import type { RungProviderStep } from './RungPicker';
-import { rungFaces, rungLockedReason, stepTargets, type ShownRung } from './rungControlParts';
+import { rungFaces, rungIntelligence, rungLockedReason, stepTargets, type ShownRung } from './rungControlParts';
 import { LADDER_LINK_VALUE, rungListRows } from './rungRows';
 import { askRungSwitch } from './rungSwitch';
 
@@ -141,6 +141,7 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     name: labelOf(modelValue),
     effort: selection.effort,
     position: at === -1 ? null : { at: at + 1, of: onRungs.length },
+    intelligence: at === -1 ? null : rungIntelligence(onRungs[at]),
   };
   // A rung can run its model with or without the 1M context window, so it
   // reserves both labels whichever model is in force now.

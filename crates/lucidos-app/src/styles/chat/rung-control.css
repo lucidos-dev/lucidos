@@ -10,16 +10,12 @@
  * IT NEVER RESIZES ON A STEP: every face a step can land on sits in one grid
  * cell, hidden but for the face in force, so the widest sets the width.
  *
- * ON A NARROW BAR IT SHEDS: the effort goes first and the rung's position
- * badge (`3/7`) appears, then the model name goes, leaving the badge. A pair off
- * the ladder has no badge, so it keeps its name. A row with no room for even
- * that folds the pill into the ⋯ menu, after every icon to its left. The bar's
- * own width decides, through the row as a container, so the thresholds are rem
- * and scale with the UI. */
-
-.prompt-actions-row {
-    container: prompt-row / inline-size;
-}
+ * ON A NARROW BAR IT SHEDS, BEFORE ANY ICON FOLDS: the effort goes first and
+ * the rung's intelligence badge (`1.12×`) appears, then the model name goes,
+ * leaving the badge. A rung with no estimate, or a pair off the ladder, has no
+ * badge, so it keeps its name. Only then do icons fold into the ⋯ menu, the
+ * pill last. The row's fold measures and stamps the level as `data-shed`
+ * (`usePromptActionCollapse`), so width alone decides. */
 
 .rung-control {
     --rung-height: 1.75rem;
@@ -63,7 +59,7 @@
     visibility: hidden;
 }
 
-.rung-position {
+.rung-intelligence {
     display: none;
     align-items: center;
     height: 1rem;
@@ -74,11 +70,6 @@
     font-size: var(--font-size-2xs);
     font-weight: 600;
     font-variant-numeric: tabular-nums;
-}
-
-.rung-position-of {
-    color: var(--text-muted);
-    font-weight: 500;
 }
 
 .rung-pill .rung-trigger svg:last-child {
@@ -191,18 +182,13 @@
 
 /* ── Shedding ── */
 
-@container prompt-row (max-width: 24.5rem) {
-    .rung-effort {
-        display: none;
-    }
-
-    .rung-position {
-        display: inline-flex;
-    }
+[data-shed="1"] .rung-effort,
+[data-shed="2"] .rung-effort,
+[data-shed="2"] .rung-face:has(> .rung-intelligence) .rung-name {
+    display: none;
 }
 
-@container prompt-row (max-width: 19.5rem) {
-    .rung-face:has(> .rung-position) .rung-name {
-        display: none;
-    }
+[data-shed="1"] .rung-intelligence,
+[data-shed="2"] .rung-intelligence {
+    display: inline-flex;
 }

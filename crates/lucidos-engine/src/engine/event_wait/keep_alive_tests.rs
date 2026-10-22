@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::core::event_subscription::EventSubscription;
+use crate::core::prefs::PrefDefault;
 use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::WakeMode;
 use crate::engine::types::{ContextProducer, ContextPurpose};
@@ -23,7 +24,9 @@ fn due() -> Candidate {
         coding_agent: CodingAgent::ClaudeCode,
         claim: ThreadClaim::Free,
         awaiting_user: false,
+        parked: None,
         keep_warm_wait_secs: Some(10.0 * MINUTE),
+        keep_warm_kinds: kinds(&["BackgroundBashCompleted"]),
         children: ActiveChildren::None,
         secs_since_request: Some(240.0),
         secs_since_beat: None,
@@ -41,6 +44,26 @@ fn due_on_the_hour() -> Candidate {
     }
 }
 
+/// A session parked on a question card it asked about with the request 240 s
+/// ago. Its session still holds the thread, and a copy would share its prefix.
+fn parked() -> Candidate {
+    Candidate {
+        claim: ThreadClaim::Busy,
+        awaiting_user: true,
+        parked: Some(Parked {
+            card: ParkedCard::Question,
+            secs: 240.0,
+            copy_ready: true,
+        }),
+        keep_warm_wait_secs: None,
+        ..due()
+    }
+}
+
+fn kinds(kinds: &[&str]) -> KeepWarmKinds {
+    KeepWarmKinds::of(kinds.iter().copied()).expect("keep-warm kinds")
+}
+
 /// Where a TTL's beat window starts, in seconds.
 fn window_start(ttl: CacheTtl) -> f64 {
     *ttl.beat_window().start()
@@ -50,9 +73,19 @@ fn skip(reason: SkipReason) -> Beat {
     Beat::Skip(reason)
 }
 
+/// The verdict under the `default` rule, which most cases here pin.
+fn decide(c: &Candidate) -> Beat {
+    super::decide(c, GiveUpRule::Default)
+}
+
+/// The status under the `default` rule.
+fn status(c: &Candidate, at: &Anchors, spent: Spent) -> Option<CacheKeepAliveStatus> {
+    super::status(c, GiveUpRule::Default, at, spent)
+}
+
 #[test]
 fn a_due_thread_beats() {
-    assert_eq!(decide(&due()), Beat::Send);
+    assert_eq!(decide(&due()), Beat::Send(BeatRoute::Resume));
 }
 
 #[test]
@@ -129,8 +162,8 @@ fn the_window_and_the_cut_off_hold_at_their_boundaries() {
         ..due()
     };
     assert_eq!(decide(&at(229.9)), skip(SkipReason::OutsideWindow));
-    assert!(decide(&at(230.0)) == Beat::Send);
-    assert!(decide(&at(260.0)) == Beat::Send);
+    assert!(decide(&at(230.0)) == Beat::Send(BeatRoute::Resume));
+    assert!(decide(&at(260.0)) == Beat::Send(BeatRoute::Resume));
     assert_eq!(decide(&at(260.1)), skip(SkipReason::OutsideWindow));
 
     let beaten = |secs: f64| Candidate {
@@ -138,7 +171,7 @@ fn the_window_and_the_cut_off_hold_at_their_boundaries() {
         ..due()
     };
     assert_eq!(decide(&beaten(229.0)), skip(SkipReason::BeatInFlight));
-    assert!(decide(&beaten(230.0)) == Beat::Send);
+    assert!(decide(&beaten(230.0)) == Beat::Send(BeatRoute::Resume));
 }
 
 /// The budget in beats is the write rate over the read rate of the session's
@@ -146,7 +179,14 @@ fn the_window_and_the_cut_off_hold_at_their_boundaries() {
 /// began.
 #[test]
 fn the_budget_is_the_rewrite_cost_in_beats() {
-    let secs = |model: &str, ttl: CacheTtl| ttl.give_up_after_secs(cache_shares_of(model));
+    let secs = |model: &str, ttl: CacheTtl| {
+        let c = Candidate {
+            cache_ttl: Some(ttl),
+            cache: cache_shares_of(model),
+            ..due()
+        };
+        give_up_after_secs(&c, GiveUpRule::Default).expect("a budget")
+    };
     let cases = [
         ("claude-opus-5-5", 25.0, 40.0),
         ("claude-opus-5-5[1m]", 25.0, 40.0),
@@ -185,7 +225,7 @@ fn an_unknown_model_and_ttl_get_the_shortest_budget() {
         keep_warm_wait_secs: Some(secs),
         ..unknown.clone()
     };
-    assert!(decide(&waiting(budget - 0.1)) == Beat::Send);
+    assert!(decide(&waiting(budget - 0.1)) == Beat::Send(BeatRoute::Resume));
     assert_eq!(decide(&waiting(budget + 0.1)), skip(SkipReason::PastCutOff));
 }
 
@@ -210,8 +250,14 @@ fn the_cut_off_holds_at_the_budget() {
             keep_warm_wait_secs: Some(secs),
             ..base.clone()
         };
-        assert!(decide(&waiting(budget - 0.1)) == Beat::Send, "{label}");
-        assert!(decide(&waiting(budget)) == Beat::Send, "{label}");
+        assert!(
+            decide(&waiting(budget - 0.1)) == Beat::Send(BeatRoute::Resume),
+            "{label}"
+        );
+        assert!(
+            decide(&waiting(budget)) == Beat::Send(BeatRoute::Resume),
+            "{label}"
+        );
         assert_eq!(
             decide(&waiting(budget + 0.1)),
             skip(SkipReason::PastCutOff),
@@ -229,8 +275,8 @@ fn the_budget_follows_the_sessions_model() {
         cache: cache_shares_of(model),
         ..due()
     };
-    assert!(decide(&waiting("claude-fable-5-1")) == Beat::Send);
-    assert!(decide(&waiting("claude-opus-5-5")) == Beat::Send);
+    assert!(decide(&waiting("claude-fable-5-1")) == Beat::Send(BeatRoute::Resume));
+    assert!(decide(&waiting("claude-opus-5-5")) == Beat::Send(BeatRoute::Resume));
     assert_eq!(
         decide(&waiting("claude-opus-5")),
         skip(SkipReason::PastCutOff),
@@ -249,8 +295,8 @@ fn the_window_follows_the_observed_ttl() {
     assert_eq!(decide(&hour(210.0)), skip(SkipReason::OutsideWindow));
     assert_eq!(decide(&hour(260.0)), skip(SkipReason::OutsideWindow));
     assert_eq!(decide(&hour(3299.9)), skip(SkipReason::OutsideWindow));
-    assert!(decide(&hour(3300.0)) == Beat::Send);
-    assert!(decide(&hour(3360.0)) == Beat::Send);
+    assert!(decide(&hour(3300.0)) == Beat::Send(BeatRoute::Resume));
+    assert!(decide(&hour(3360.0)) == Beat::Send(BeatRoute::Resume));
     assert_eq!(decide(&hour(3360.1)), skip(SkipReason::OutsideWindow));
 
     let unknown = |secs: f64| Candidate {
@@ -259,8 +305,8 @@ fn the_window_follows_the_observed_ttl() {
         ..due()
     };
     assert_eq!(decide(&unknown(229.9)), skip(SkipReason::OutsideWindow));
-    assert!(decide(&unknown(230.0)) == Beat::Send);
-    assert!(decide(&unknown(260.0)) == Beat::Send);
+    assert!(decide(&unknown(230.0)) == Beat::Send(BeatRoute::Resume));
+    assert!(decide(&unknown(260.0)) == Beat::Send(BeatRoute::Resume));
     assert_eq!(decide(&unknown(260.1)), skip(SkipReason::OutsideWindow));
     assert_eq!(decide(&unknown(3300.0)), skip(SkipReason::OutsideWindow));
     let unknown_beaten = Candidate {
@@ -275,7 +321,7 @@ fn the_window_follows_the_observed_ttl() {
         ..due_on_the_hour()
     };
     assert_eq!(decide(&beaten(3299.0)), skip(SkipReason::BeatInFlight));
-    assert!(decide(&beaten(3300.0)) == Beat::Send);
+    assert!(decide(&beaten(3300.0)) == Beat::Send(BeatRoute::Resume));
 }
 
 /// Working children are the second trigger, and the later start wins.
@@ -288,7 +334,7 @@ fn children_keep_a_parent_warm_and_the_later_start_wins() {
         },
         ..due()
     };
-    assert!(decide(&parent) == Beat::Send);
+    assert!(decide(&parent) == Beat::Send(BeatRoute::Resume));
 
     let both = Candidate {
         keep_warm_wait_secs: Some(10.0 * MINUTE),
@@ -298,7 +344,7 @@ fn children_keep_a_parent_warm_and_the_later_start_wins() {
         ..due()
     };
     assert!(
-        decide(&both) == Beat::Send,
+        decide(&both) == Beat::Send(BeatRoute::Resume),
         "a fresh wait keeps a long-running parent warm"
     );
 
@@ -307,7 +353,7 @@ fn children_keep_a_parent_warm_and_the_later_start_wins() {
         ..due()
     };
     assert!(
-        decide(&parked) == Beat::Send,
+        decide(&parked) == Beat::Send(BeatRoute::Resume),
         "a parked child does not cancel the parent's own keep-warm wait"
     );
 }
@@ -345,11 +391,294 @@ fn an_answer_restarts_the_beats_only_while_the_parents_cache_is_warm() {
                     cache_ttl: Some(ttl),
                     ..due()
                 };
-                decide(&parent) == Beat::Send
+                decide(&parent) == Beat::Send(BeatRoute::Resume)
             });
             assert_eq!(beat, first_beat, "{label} on {ttl:?}");
         }
     }
+}
+
+// --- A session parked on a card (I1, I2) ---
+
+fn parked_for(secs: f64) -> Candidate {
+    Candidate {
+        parked: parked().parked.map(|p| Parked { secs, ..p }),
+        ..parked()
+    }
+}
+
+#[test]
+fn a_parked_session_beats_through_a_copy() {
+    assert_eq!(decide(&parked()), Beat::Send(BeatRoute::SessionCopy));
+    let permission = Candidate {
+        parked: parked().parked.map(|p| Parked {
+            card: ParkedCard::Permission,
+            ..p
+        }),
+        ..parked()
+    };
+    assert_eq!(decide(&permission), Beat::Send(BeatRoute::SessionCopy));
+}
+
+/// Whatever its ages, a parked session is never resumed: a turn would
+/// supersede its card (ADR 0082).
+#[test]
+fn a_parked_session_is_never_resumed() {
+    for parked_secs in (0..=200).map(|m| f64::from(m) * MINUTE) {
+        for request in (0..=40).map(|t| f64::from(t) * 10.0) {
+            let c = Candidate {
+                secs_since_request: Some(request),
+                ..parked_for(parked_secs)
+            };
+            assert_ne!(decide(&c), Beat::Send(BeatRoute::Resume), "{c:?}");
+        }
+    }
+}
+
+#[test]
+fn every_condition_can_stop_a_parked_beat() {
+    let cases: Vec<(&str, Candidate, Beat)> = vec![
+        (
+            "a Codex thread",
+            Candidate {
+                coding_agent: CodingAgent::Codex,
+                ..parked()
+            },
+            skip(SkipReason::NotClaudeCode),
+        ),
+        (
+            "a park that outlived its session",
+            Candidate {
+                claim: ThreadClaim::Free,
+                ..parked()
+            },
+            skip(SkipReason::AwaitingUser),
+        ),
+        (
+            "a session whose appended prompt the engine forgot",
+            Candidate {
+                parked: parked().parked.map(|p| Parked {
+                    copy_ready: false,
+                    ..p
+                }),
+                ..parked()
+            },
+            skip(SkipReason::NoCopyPrompt),
+        ),
+        (
+            "a card that is not a Claude Code park",
+            Candidate {
+                parked: None,
+                ..parked()
+            },
+            skip(SkipReason::Busy),
+        ),
+        (
+            "a copy whose request is still on its way",
+            Candidate {
+                secs_since_beat: Some(30.0),
+                ..parked()
+            },
+            skip(SkipReason::BeatInFlight),
+        ),
+        (
+            "a refresh younger than the window",
+            Candidate {
+                secs_since_request: Some(100.0),
+                ..parked()
+            },
+            skip(SkipReason::OutsideWindow),
+        ),
+    ];
+    for (label, candidate, expected) in cases {
+        assert_eq!(decide(&candidate), expected, "{label}");
+    }
+}
+
+/// A parked wait gives up at half the break-even budget, timed from the
+/// request that asked. Human answers thin out with time, so later beats mostly
+/// pay for cards nobody answers.
+#[test]
+fn a_parked_wait_gives_up_at_half_the_break_even_budget() {
+    let cases = [
+        ("a 5-minute cache", CacheTtl::FiveMinutes, 240.0, 12.5),
+        ("a 1-hour cache", CacheTtl::OneHour, 3310.0, 20.0),
+    ];
+    for (label, ttl, request, beats) in cases {
+        let budget = beats * window_start(ttl);
+        let waiting = |secs: f64| Candidate {
+            cache_ttl: Some(ttl),
+            secs_since_request: Some(request),
+            ..parked_for(secs)
+        };
+        let copy = Beat::Send(BeatRoute::SessionCopy);
+        assert_eq!(decide(&waiting(budget)), copy, "{label}");
+        assert_eq!(
+            decide(&waiting(budget + 0.1)),
+            skip(SkipReason::PastCutOff),
+            "{label}"
+        );
+    }
+}
+
+/// `off` beats nothing, on any wait.
+#[test]
+fn off_beats_nothing() {
+    let working = Candidate {
+        keep_warm_wait_secs: None,
+        children: ActiveChildren::Working {
+            wait_secs: 20.0 * MINUTE,
+        },
+        ..due()
+    };
+    for c in [due(), due_on_the_hour(), parked(), working] {
+        assert_eq!(
+            super::decide(&c, GiveUpRule::Off),
+            skip(SkipReason::Disabled),
+            "{c:?}"
+        );
+    }
+}
+
+/// Sixty bash waits that each needed two beats: `workspace-data` caps that
+/// type at two.
+fn short_bash_waits() -> WaitDurations {
+    let bash = WaitType::Events(kinds(&["BackgroundBashCompleted"]));
+    let secs = 2.5 * window_start(CacheTtl::FiveMinutes);
+    WaitDurations::from_samples((0..60).map(|_| (bash, secs)))
+}
+
+/// `workspace-data` gives up at the cap this workspace's own waits price
+/// cheapest. A type with too few waits keeps the default.
+#[test]
+fn workspace_data_gives_up_at_the_tuned_cap() {
+    let beat_every = window_start(CacheTtl::FiveMinutes);
+    let question = WaitType::Parked(ParkedCard::Question);
+    let cards = WaitDurations::from_samples((0..60).map(|_| (question, 3.5 * beat_every)));
+    let rule = GiveUpRule::WorkspaceData(&cards);
+    let copy = Beat::Send(BeatRoute::SessionCopy);
+    assert_eq!(super::decide(&parked_for(3.0 * beat_every), rule), copy);
+    assert_eq!(
+        super::decide(&parked_for(3.0 * beat_every + 0.1), rule),
+        skip(SkipReason::PastCutOff)
+    );
+
+    for minutes in 0..=200 {
+        let c = Candidate {
+            keep_warm_wait_secs: Some(f64::from(minutes) * MINUTE),
+            ..due()
+        };
+        assert_eq!(super::decide(&c, rule), decide(&c), "{c:?}");
+    }
+
+    let bash = short_bash_waits();
+    let tuned = GiveUpRule::WorkspaceData(&bash);
+    let waiting = |secs: f64| Candidate {
+        keep_warm_wait_secs: Some(secs),
+        ..due()
+    };
+    assert_eq!(
+        super::decide(&waiting(2.0 * beat_every), tuned),
+        Beat::Send(BeatRoute::Resume)
+    );
+    assert_eq!(
+        super::decide(&waiting(2.0 * beat_every + 0.1), tuned),
+        skip(SkipReason::PastCutOff)
+    );
+}
+
+/// The type is the one of the wait the clock measures: the card when parked,
+/// else the newer of the event wait and the working children.
+#[test]
+fn the_wait_type_is_the_measured_waits() {
+    let bash = WaitType::Events(kinds(&["BackgroundBashCompleted"]));
+    let children = WaitType::Events(kinds(&["ChildThreadCompleted"]));
+    let working = |wait_secs: f64| ActiveChildren::Working { wait_secs };
+    let cases: Vec<(&str, Candidate, Option<WaitType>)> = vec![
+        ("an event wait", due(), Some(bash)),
+        (
+            "a question card",
+            parked(),
+            Some(WaitType::Parked(ParkedCard::Question)),
+        ),
+        (
+            "children alone",
+            Candidate {
+                keep_warm_wait_secs: None,
+                children: working(MINUTE),
+                ..due()
+            },
+            Some(children),
+        ),
+        (
+            "an event wait newer than the children's",
+            Candidate {
+                children: working(20.0 * MINUTE),
+                ..due()
+            },
+            Some(bash),
+        ),
+        (
+            "children newer than the event wait",
+            Candidate {
+                children: working(MINUTE),
+                ..due()
+            },
+            Some(children),
+        ),
+        (
+            "nothing worth keeping warm",
+            Candidate {
+                keep_warm_wait_secs: None,
+                ..due()
+            },
+            None,
+        ),
+    ];
+    for (label, candidate, expected) in cases {
+        assert_eq!(wait_type(&candidate), expected, "{label}");
+    }
+}
+
+#[test]
+fn the_mode_reads_back_its_catalog_values() {
+    for value in CACHE_KEEP_ALIVE_MODES {
+        assert_eq!(CacheKeepAliveMode::parse(value).as_str(), *value);
+    }
+    assert_eq!(
+        CacheKeepAliveMode::parse("sometimes"),
+        CacheKeepAliveMode::Default
+    );
+}
+
+#[test]
+fn the_catalog_default_is_the_default_mode() {
+    let PrefDefault::Value(value) = crate::core::prefs::CACHE_KEEP_ALIVE_MODE.spec.default else {
+        panic!("the mode preference has a value default");
+    };
+    assert_eq!(
+        CacheKeepAliveMode::parse(value),
+        CacheKeepAliveMode::Default
+    );
+}
+
+#[test]
+fn each_mode_picks_its_rule() {
+    let bash = short_bash_waits();
+    let c = Candidate {
+        keep_warm_wait_secs: Some(2.0 * window_start(CacheTtl::FiveMinutes) + 0.1),
+        ..due()
+    };
+    let decide_under = |mode| super::decide(&c, GiveUpRule::of(mode, &bash));
+    assert_eq!(decide_under(CacheKeepAliveMode::Default), decide(&c));
+    assert_eq!(
+        decide_under(CacheKeepAliveMode::WorkspaceData),
+        skip(SkipReason::PastCutOff)
+    );
+    assert_eq!(
+        decide_under(CacheKeepAliveMode::Off),
+        super::decide(&c, GiveUpRule::Off)
+    );
 }
 
 fn wait_on(kinds: &[&str], armed_minutes_ago: i64) -> LiveWait {
@@ -376,13 +705,27 @@ fn only_a_wait_on_keep_warm_kinds_alone_counts() {
     let bash = wait_on(&["BackgroundBashCompleted"], 5);
     let mixed = wait_on(&["BackgroundBashCompleted", "E2ETestsPassed"], 1);
     let other = wait_on(&["E2ETestsPassed"], 1);
-    assert_eq!(keep_warm_armed_at([&bash]), Some(bash.armed_at));
-    assert_eq!(keep_warm_armed_at([&mixed, &other]), None);
+    let bash_wait = Some((bash.armed_at, kinds(&["BackgroundBashCompleted"])));
+    assert_eq!(newest_keep_warm_wait([&bash]), bash_wait);
+    assert_eq!(newest_keep_warm_wait([&mixed, &other]), None);
     assert_eq!(
-        keep_warm_armed_at([&bash, &mixed]),
-        Some(bash.armed_at),
+        newest_keep_warm_wait([&bash, &mixed]),
+        bash_wait,
         "an unlisted kind disqualifies its own wait only"
     );
+}
+
+/// The newest keep-warm wait names the wait type, whatever the older ones
+/// watch. Two waits on the same kinds share a type, in any order.
+#[test]
+fn the_newest_keep_warm_wait_names_the_kinds() {
+    let lock = wait_on(&["E2ELockReleased"], 9);
+    let agent = wait_on(&["ChangeApplied", "CodingAgentIdled"], 2);
+    assert_eq!(
+        newest_keep_warm_wait([&lock, &agent]).map(|(_, k)| k),
+        Some(kinds(&["CodingAgentIdled", "ChangeApplied"]))
+    );
+    assert_eq!(KeepWarmKinds::of([]), None, "a wait on nothing");
 }
 
 /// Each kind must be one a wait can hold. The two lock releases are domain
@@ -765,15 +1108,24 @@ fn kind_of(status: &Option<CacheKeepAliveStatus>) -> StatusKind {
 }
 
 /// The status each verdict must come with. A skip that only waits for the
-/// next beat keeps the thread warming.
-fn status_kind_for(beat: &Beat) -> StatusKind {
+/// next beat keeps the thread warming. `off` and a parked thread show none.
+/// A claim hides the rest of the verdict, so a busy thread takes the status of
+/// its free twin.
+fn status_kind_for(rule: GiveUpRule, c: &Candidate, beat: &Beat) -> StatusKind {
+    if matches!(rule, GiveUpRule::Off) || c.awaiting_user {
+        return StatusKind::Absent;
+    }
     match beat {
-        Beat::Send
+        Beat::Skip(SkipReason::Busy) => {
+            let free = Candidate {
+                claim: ThreadClaim::Free,
+                ..c.clone()
+            };
+            status_kind_for(rule, &free, &super::decide(&free, rule))
+        }
+        Beat::Send(_)
         | Beat::Skip(
-            SkipReason::Busy
-            | SkipReason::NoRequestYet
-            | SkipReason::OutsideWindow
-            | SkipReason::BeatInFlight,
+            SkipReason::NoRequestYet | SkipReason::OutsideWindow | SkipReason::BeatInFlight,
         ) => StatusKind::Warming,
         Beat::Skip(SkipReason::PastCutOff) => StatusKind::Stopped,
         Beat::Skip(SkipReason::ChildrenAwaitingUser) => {
@@ -783,7 +1135,11 @@ fn status_kind_for(beat: &Beat) -> StatusKind {
             StatusKind::NotKept(CacheKeepAliveNotKeptReason::NoWakeChildren)
         }
         Beat::Skip(
-            SkipReason::NotClaudeCode | SkipReason::AwaitingUser | SkipReason::NothingToWaitFor,
+            SkipReason::NotClaudeCode
+            | SkipReason::Disabled
+            | SkipReason::AwaitingUser
+            | SkipReason::NoCopyPrompt
+            | SkipReason::NothingToWaitFor,
         ) => StatusKind::Absent,
     }
 }
@@ -842,6 +1198,25 @@ fn one_candidate_per_verdict() -> Vec<Candidate> {
             secs_since_beat: Some(30.0),
             ..due()
         },
+        parked(),
+        Candidate {
+            parked: parked().parked.map(|p| Parked {
+                copy_ready: false,
+                ..p
+            }),
+            ..parked()
+        },
+        Candidate {
+            parked: parked().parked.map(|p| Parked {
+                secs: 10.0 * 3600.0,
+                ..p
+            }),
+            ..parked()
+        },
+        Candidate {
+            secs_since_request: Some(100.0),
+            ..parked()
+        },
     ]
 }
 
@@ -850,13 +1225,23 @@ fn one_candidate_per_verdict() -> Vec<Candidate> {
 #[test]
 fn the_status_agrees_with_the_beat_on_every_verdict() {
     let mut reached = Vec::new();
-    for candidate in one_candidate_per_verdict() {
-        let beat = decide(&candidate);
-        let status = status(&candidate, &anchors_of(&candidate), Spent::default());
-        assert_eq!(kind_of(&status), status_kind_for(&beat), "{beat:?}");
-        reached.push(beat);
+    let tuned = short_bash_waits();
+    for rule in [
+        GiveUpRule::Default,
+        GiveUpRule::WorkspaceData(&tuned),
+        GiveUpRule::Off,
+    ] {
+        for candidate in one_candidate_per_verdict() {
+            let beat = super::decide(&candidate, rule);
+            let status = super::status(&candidate, rule, &anchors_of(&candidate), Spent::default());
+            let want = status_kind_for(rule, &candidate, &beat);
+            assert_eq!(kind_of(&status), want, "{rule:?}: {beat:?}");
+            if !reached.contains(&beat) {
+                reached.push(beat);
+            }
+        }
     }
-    assert_eq!(reached.len(), 12, "every verdict is covered: {reached:?}");
+    assert_eq!(reached.len(), 14, "every verdict is covered: {reached:?}");
 }
 
 /// A warming status dates everything from the database's own stamps: the wait
@@ -899,7 +1284,7 @@ fn a_stopped_status_says_when_the_budget_ran_out() {
         cost_usd: 0.6,
         context_tokens: 262_000,
     };
-    let give_up = CacheTtl::FiveMinutes.give_up_after_secs(c.cache);
+    let give_up = give_up_after_secs(&c, GiveUpRule::Default).expect("a budget");
     assert_eq!(
         status(&c, &anchors_of(&c), spent),
         Some(CacheKeepAliveStatus::Stopped {
@@ -1096,10 +1481,26 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
     let candidate = due();
     let anchors = anchors_of(&candidate);
 
-    sync_status(&bus, thread_id, &candidate, &anchors, None).await;
+    sync_status(
+        &bus,
+        thread_id,
+        &candidate,
+        GiveUpRule::Default,
+        &anchors,
+        None,
+    )
+    .await;
     let written = stored_status(&pool, thread_id).await;
     assert_eq!(kind_of(&written), StatusKind::Warming);
-    sync_status(&bus, thread_id, &candidate, &anchors, written.clone()).await;
+    sync_status(
+        &bus,
+        thread_id,
+        &candidate,
+        GiveUpRule::Default,
+        &anchors,
+        written.clone(),
+    )
+    .await;
     assert_eq!(
         status_events(&pool, thread_id).await,
         1,
@@ -1116,7 +1517,15 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
         keep_warm_wait_secs: Some(1.0),
         ..candidate.clone()
     };
-    sync_status(&bus, thread_id, &busy, &anchors_of(&busy), written).await;
+    sync_status(
+        &bus,
+        thread_id,
+        &busy,
+        GiveUpRule::Default,
+        &anchors_of(&busy),
+        written,
+    )
+    .await;
     assert_eq!(
         status_events(&pool, thread_id).await,
         1,
@@ -1132,6 +1541,186 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
     clear_stale_statuses(&bus, &[]).await;
     assert_eq!(stored_status(&pool, thread_id).await, None);
     assert_eq!(status_events(&pool, thread_id).await, 2);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// --- A parked session, read back from events ---
+
+async fn age(pool: &sqlx::PgPool, event_id: Uuid, secs: f64) {
+    sqlx::query("UPDATE events SET created = now() - make_interval(secs => $2) WHERE id = $1")
+        .bind(event_id)
+        .bind(secs)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// What a copy beat records: a capture under its own purpose.
+fn copy_capture(duration_ms: u64) -> ThreadEvent {
+    let mut event = turn_capture(duration_ms);
+    if let ThreadEvent::ContextCaptured { purpose, .. } = &mut event {
+        *purpose = ContextPurpose::CacheKeepAlive;
+    }
+    event
+}
+
+fn question_asked() -> ThreadEvent {
+    ThreadEvent::UserQuestionAsked {
+        tool_use_id: "toolu_ask".to_string(),
+        cc_session_id: "cc-session".to_string(),
+        question: "Which one?".to_string(),
+        options: Vec::new(),
+        worktree_path: None,
+        multi_select: false,
+        owner_approval: None,
+    }
+}
+
+fn permission_requested() -> ThreadEvent {
+    ThreadEvent::CodingAgentPermissionRequest {
+        request_id: "perm-1".to_string(),
+        tool_use_id: "toolu_p".to_string(),
+        tool_name: "Bash".to_string(),
+        input: serde_json::json!({}),
+        summary: "Run a command".to_string(),
+    }
+}
+
+/// A copy beat refreshes the cache, so the next beat times from it. The
+/// parked wait still counts from the turn request that asked (I5).
+#[tokio::test]
+async fn a_copy_beat_moves_the_request_anchor_but_not_the_parked_clock() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/copy-anchor", None).await;
+    let turn = seed_thread_event(&bus, thread_id, turn_capture(10_000)).await;
+    age(&pool, turn, 600.0).await;
+    let row = || async {
+        read_candidates(&pool, &[thread_id])
+            .await
+            .unwrap()
+            .remove(0)
+    };
+
+    let before = row().await;
+    let secs = before.secs_since_request.expect("a request ran");
+    assert!(
+        (609.0..=615.0).contains(&secs),
+        "the turn's start, got {secs}"
+    );
+    assert_eq!(before.secs_since_turn_request, before.secs_since_request);
+
+    let copy = seed_thread_event(&bus, thread_id, copy_capture(20_000)).await;
+    age(&pool, copy, 100.0).await;
+    let after = row().await;
+    let secs = after.secs_since_request.expect("a request ran");
+    assert!(
+        (119.0..=125.0).contains(&secs),
+        "the copy's launch, got {secs}"
+    );
+    assert!(after.request_started_at > before.request_started_at);
+    let parked_secs = after.secs_since_turn_request.expect("a turn ran");
+    assert!(
+        (609.0..=615.0).contains(&parked_secs),
+        "the parked clock stays on the turn, got {parked_secs}"
+    );
+
+    let newer_turn = seed_thread_event(&bus, thread_id, turn_capture(1_000)).await;
+    age(&pool, newer_turn, 10.0).await;
+    let secs = row().await.secs_since_request.expect("a request ran");
+    assert!(
+        (10.0..=15.0).contains(&secs),
+        "a newer turn wins, got {secs}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A Claude Code thread parked on a card is a candidate with no wait and no
+/// children, and its card is its latest parking. A Codex one is not.
+#[tokio::test]
+async fn a_parked_session_is_a_candidate_with_its_card() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/parked", None).await;
+    seed_thread_event(&bus, thread_id, turn_capture(1_000)).await;
+    let candidate = || async {
+        read_candidates(&pool, &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.thread_id == thread_id)
+    };
+    assert!(
+        candidate().await.is_none(),
+        "a running thread waits for nothing"
+    );
+
+    seed_thread_event(&bus, thread_id, question_asked()).await;
+    set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
+    let row = candidate().await.expect("a parked session is a candidate");
+    assert!(row.awaiting_user);
+    assert_eq!(row.parked_card(), Some(ParkedCard::Question));
+    assert!(row.secs_since_turn_request.is_some());
+
+    seed_thread_event(&bus, thread_id, permission_requested()).await;
+    let row = candidate().await.expect("a parked session is a candidate");
+    assert_eq!(row.parked_card(), Some(ParkedCard::Permission));
+
+    set_status(&pool, thread_id, ThreadStatus::Running).await;
+    let row = candidate().await;
+    assert!(row.is_none(), "an answered card ends the candidacy");
+
+    set_status(&pool, thread_id, ThreadStatus::WaitingForUserAnswer).await;
+    sqlx::query("UPDATE thread_summaries SET coding_agent = $2 WHERE thread_id = $1")
+        .bind(thread_id)
+        .bind(CodingAgent::Codex.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(candidate().await.is_none(), "a parked Codex thread");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A parked thread shows no status, so a busy one drops the status it held
+/// before it asked (ADR 0540).
+#[tokio::test]
+async fn a_parked_session_drops_its_status() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/parked-status", None).await;
+    let waiting = due();
+    sync_status(
+        &bus,
+        thread_id,
+        &waiting,
+        GiveUpRule::Default,
+        &anchors_of(&waiting),
+        None,
+    )
+    .await;
+    let written = stored_status(&pool, thread_id).await;
+    assert_eq!(kind_of(&written), StatusKind::Warming);
+
+    let parked = parked();
+    sync_status(
+        &bus,
+        thread_id,
+        &parked,
+        GiveUpRule::Default,
+        &anchors_of(&parked),
+        written,
+    )
+    .await;
+    assert_eq!(stored_status(&pool, thread_id).await, None);
 
     pool.close().await;
     teardown_test_db(&db_name).await;

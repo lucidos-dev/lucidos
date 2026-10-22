@@ -1220,9 +1220,10 @@
    recipe is the tallest thing it draws.
 
    The gutter clears the safe area, which the gate has to do for itself. The
-   page is `viewport-fit=cover` under a translucent status bar, so an installed
-   app draws under the clock at the top and the home indicator at the bottom.
-   Nothing else insets this screen: it renders instead of the shell. */
+   page is `viewport-fit=cover`, so an installed app draws under the home
+   indicator, and under the clock where an older install keeps a translucent
+   status bar. Nothing else insets this screen: it renders instead of the
+   shell. */
 .pairing-gate {
   position: fixed;
   inset: 0;

@@ -1658,6 +1658,7 @@ export function describeInitiator(
               tool_name: ev.tool_name,
               command: ev.command,
               summary: ev.summary,
+              grant_head: ev.grant_head,
             }}
             resolved={resolved}
             terminated={responseTerminated}

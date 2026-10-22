@@ -553,3 +553,5 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0544: The Lucidos Agent's rung locks while a turn runs; a pick between turns is a ChatSettingsChanged on the engine](0544-lock-the-lucidos-agent-rung-during-a-turn.md)
 - [0545: A no-wake child files every report, failures and restart cuts included; amends 0451 and 0503.](0545-no-wake-child-files-every-report.md)
 - [0546: App bridge fetches share three slots, fairly across frames, and a /ui call skips the queue](0546-app-bridge-fetches-share-three-fair-slots.md)
+- [0547: The keep-alive beats a Claude Code session parked on a card by asking a session copy, and a cache_keep_alive_mode preference picks the give-up rule; amends ADR 0470's rejected alternative and 0489's single rule](0547-keep-alive-beats-a-parked-session-by-copy.md)
+- [0548: The iOS home-screen app runs below an opaque status bar, never black-translucent, since iOS 26+ blurs the page under a translucent one](0548-ios-home-screen-app-opaque-status-bar.md)

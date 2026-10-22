@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.50.5 — 2026-10-22
+
+### Changed
+- Choose how the prompt cache keep-alive runs: Default, Tuned to this workspace, or Off. Set it under Settings > Coding Agents.
+- The prompt cache stays warm while a coding-agent session waits on a question card or a permission prompt.
+- A card rises when you write in a thread that already handed off to a successor. Move the message to the newest thread of the chain, or send here anyway.
+- The Successor card shows only while the composer holds a message.
+- The model and effort pill names its intelligence band, and shortens before any composer icon folds away.
+- The Send button always shows, and dims when there is nothing to send.
+
+### Fixed
+- On the iPhone home-screen app with iOS 27, the header stays sharp under the status bar, and the status bar takes the header's colour, also during the gateway splash and under fullscreen apps.
+- A command that starts with `cd` into the workspace root is judged by what follows it, so a grant you gave matches the next time and stops asking again.
 ## v0.50.4 — 2026-10-22
 
 ### Fixed

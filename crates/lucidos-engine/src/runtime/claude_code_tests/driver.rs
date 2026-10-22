@@ -662,7 +662,7 @@ async fn a_call_open_when_the_process_dies_still_reports_its_usage() {
 
 #[test]
 fn side_question_result_reads_the_answer_and_every_failure() {
-    let answer = |line: &str| side_question_result(line).map(|(answer, _)| answer);
+    let answer = |line: &str| session_copy_result(line).map(|(answer, _)| answer);
     let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":" forty-two \n"}"#;
     assert_eq!(answer(ok), Some(Ok("forty-two".to_string())));
     let turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#;
@@ -684,7 +684,7 @@ fn side_question_result_reads_the_answer_and_every_failure() {
 #[test]
 fn side_question_result_keeps_the_usage_as_a_total() {
     let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"a","usage":{"input_tokens":2,"cache_read_input_tokens":17925,"cache_creation_input_tokens":625,"output_tokens":40}}"#;
-    let (_, usage) = side_question_result(line).unwrap();
+    let (_, usage) = session_copy_result(line).unwrap();
     let usage = usage.expect("usage reported");
     assert_eq!(usage.input_tokens, 2 + 17925 + 625);
     assert_eq!(usage.cache_read_tokens, 17925);
@@ -704,12 +704,15 @@ fn init_model_reads_only_the_init_line() {
 /// The one line a side question writes: the framing and the question in one
 /// text block, then each image as a base64 block.
 #[test]
-fn side_question_message_carries_the_question_then_each_image() {
+fn a_side_question_message_carries_the_question_then_each_image() {
     let image = crate::api::ChatImage {
         base64: "iVBORw0KGgo=".to_string(),
         mime_type: "image/png".to_string(),
     };
-    let line = side_question_message("what is this?", std::slice::from_ref(&image));
+    let line = session_copy_message(
+        &side_question_text("what is this?"),
+        std::slice::from_ref(&image),
+    );
     assert!(line.ends_with('\n'));
     let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(value["type"], "user");
@@ -868,6 +871,9 @@ async fn process_gone(pid: i32) -> bool {
     false
 }
 
+/// What a copy's asker reads when it runs past its deadline.
+const TIMED_OUT: &str = "the copy did not answer in time";
+
 #[tokio::test]
 async fn a_side_question_is_answered_past_unrelated_lines() {
     let dir = tempfile::tempdir().unwrap();
@@ -878,8 +884,13 @@ async fn a_side_question_is_answered_past_unrelated_lines() {
     );
     let child = spawn_cold_fake(&script);
     let pid = child.id().unwrap() as i32;
-    let answer =
-        ask_side_question_of(child, "q\n", deadline_in(std::time::Duration::from_secs(5))).await;
+    let answer = ask_session_copy_of(
+        child,
+        "q\n",
+        deadline_in(std::time::Duration::from_secs(5)),
+        TIMED_OUT,
+    )
+    .await;
     let reply = answer.unwrap();
     assert_eq!(reply.answer.unwrap(), "from the transcript");
     assert_eq!(reply.model.as_deref(), Some("m"));
@@ -908,9 +919,14 @@ async fn a_side_question_skips_a_result_from_before_it_was_read() {
         answer_side_question_script(&log, "after the notice")
     );
     let child = spawn_cold_fake(&script);
-    let reply = ask_side_question_of(child, "q\n", deadline_in(std::time::Duration::from_secs(5)))
-        .await
-        .unwrap();
+    let reply = ask_session_copy_of(
+        child,
+        "q\n",
+        deadline_in(std::time::Duration::from_secs(5)),
+        TIMED_OUT,
+    )
+    .await
+    .unwrap();
     assert_eq!(reply.answer.unwrap(), "after the notice");
 }
 
@@ -928,10 +944,11 @@ async fn a_side_question_that_never_answers_is_killed() {
     let child = spawn_cold_fake(&script);
     let pid = child.id().unwrap() as i32;
     wait_for_file(&grandchild).await;
-    let outcome = ask_side_question_of(
+    let outcome = ask_session_copy_of(
         child,
         "q\n",
         deadline_in(std::time::Duration::from_millis(500)),
+        TIMED_OUT,
     )
     .await;
     let err = outcome.expect_err("times out").to_string();
@@ -954,10 +971,15 @@ async fn a_side_question_that_never_answers_is_killed() {
 #[tokio::test]
 async fn a_side_question_process_that_exits_first_reports_it() {
     let child = spawn_cold_fake("read l; exit 3");
-    let err = ask_side_question_of(child, "q\n", deadline_in(std::time::Duration::from_secs(5)))
-        .await
-        .expect_err("no answer")
-        .to_string();
+    let err = ask_session_copy_of(
+        child,
+        "q\n",
+        deadline_in(std::time::Duration::from_secs(5)),
+        TIMED_OUT,
+    )
+    .await
+    .expect_err("no answer")
+    .to_string();
     assert!(err.contains("exited before it answered"), "got {err}");
 }
 
@@ -975,10 +997,11 @@ async fn an_abandoned_side_question_kills_its_process_group() {
     let child = spawn_cold_fake(&script);
     let pid = child.id().unwrap() as i32;
     wait_for_file(&grandchild).await;
-    let asked = ask_side_question_of(
+    let asked = ask_session_copy_of(
         child,
         "q\n",
         deadline_in(std::time::Duration::from_secs(60)),
+        TIMED_OUT,
     );
     let abandoned = tokio::time::timeout(std::time::Duration::from_millis(500), asked).await;
     assert!(abandoned.is_err(), "the asker gave up before any answer");

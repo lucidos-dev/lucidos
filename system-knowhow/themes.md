@@ -184,6 +184,10 @@ The header bar is fully tunable:
   `repeating-linear-gradient`. Setting it sets `--titlebar-strip-continues` to
   1, so on macOS the pattern runs on up through the title-bar band, lined up.
   `--titlebar-strip-bg` stays the solid colour under it and the window colour.
+- **`--header-bar-top` also colours the bar above the page.** It becomes the
+  page's `theme-color`, which tints the status bar of the installed iPhone or
+  iPad app and the browser toolbar on Android. Keep it the header's top
+  colour.
 
 Focus shows in four places, each with its own tokens in § Focus: the focused
 header's wash and underline, the phone's pane dot, and the navigation spotlight.

@@ -591,3 +591,44 @@ Implementation: `engine/command_guard.rs` (`command_names_path_outside`),
 `engine/command_judge_questions.rs`, `engine/command_permission.rs`
 (`grantable_remedy`), `eval/command-judge/commands.toml`. Plan:
 `docs/plans/2026-10-21-command-judge-marker-is-evidence.md`.
+
+## Addendum (2026-10-22): a cd into the workspace root is no move
+
+**Context.** Approval cards on the Lucidos Agent came far more often after
+0.50. The agent had started to prefix commands with `cd <workspace root> &&`.
+The judge read that `cd` as a move. Flash-Lite asked on the prefixed form 3
+of 3 runs, and passed the bare call every run.
+
+A thread grant also missed it. "Allow for this thread" stored `Bash(cd:*)`, and every head must be
+granted, so a `python3` grant never covered the prefixed form.
+
+**Decision.** The guard drops a proven no-op root `cd` before it judges a
+command or matches a grant (`without_root_cd`). Only `cd <root>` as the first
+command, followed by `&&`, `;` or a newline, drops. The target is a literal
+path, and on disk it must resolve to the root. Every other shape keeps its
+`cd`, which is the safe direction.
+
+What reads the dropped form, and what does not:
+
+| Reads the command after the drop | Reads the command as written |
+|---|---|
+| static classification after the hard gates, and the judge | the catastrophic deny-list and the secret read |
+| the head list a grant must cover | the fast-path refusal and the exec-wrapper check in the grant lane |
+| the head a grant stores, sent to the card as `grant_head` | the card's command text |
+
+Python tools never drop anything.
+
+**Why it is sound wherever the command starts.** The judge assumes a command
+starts in the root. `run_bash` starts there. `run_bash_background` may start
+elsewhere, but after a `cd <root>` that succeeds the rest runs in the root,
+which is exactly what the judge assumes. The `cd` only fails when the root is
+gone, and on disk the drop requires the target to resolve to the root.
+
+**Rejected.** Switching the judge model. The fix is deterministic and belongs
+in the guard, so the judge default stays Gemini 3.1 Flash-Lite.
+
+Implementation: `engine/command_guard.rs` (`without_root_cd`,
+`grant_covers_command`), `engine/command_permission.rs` (`grant_source`,
+`grant_head`), `ThreadEvent::CommandPermissionRequested`, `PermissionCard.tsx`
+(`commandGrantHead`). Plan:
+`docs/plans/2026-10-22-command-guard-drops-a-workspace-root-cd.md`.

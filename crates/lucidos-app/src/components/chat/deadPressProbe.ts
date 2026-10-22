@@ -697,7 +697,6 @@ function morphElement(): HTMLButtonElement | null {
 function readMorphState(el = morphElement()): MorphState {
   return morphStateOf({
     present: !!el,
-    placeholder: !!el?.classList.contains('morph-placeholder'),
     disabled: !!el?.disabled,
     label: el?.getAttribute('aria-label') ?? null,
   });
@@ -762,21 +761,15 @@ const FACE_SELECTOR = '.action-btn';
  *  typing-driven recovery for the rest of the episode. */
 const COMPOSER_SELECTOR = '.prompt-box';
 
-/** Why a face cannot take a press, or that it can. Two exclusions, each a press
- *  the app drops on purpose: a `morph-placeholder` is invisible and inert,
- *  holding the row's height, and a disabled face is a settling Stop or a busy
- *  Apply.
- *
- *  Placeholder is asked FIRST, because that mode renders disabled as well. The
- *  more specific of the two overlapping answers is the useful one.
+/** Why a face cannot take a press, or that it can. The one exclusion is a press
+ *  the app drops on purpose: a disabled face is an empty composer's Send, a
+ *  settling Stop or a busy Apply.
  *
  *  Structural rather than a DOM node so it tests without one. */
-export type FaceExclusion = 'watchable' | 'placeholder' | 'disabled';
+export type FaceExclusion = 'watchable' | 'disabled';
 
-export function faceExclusion(face: { disabled: boolean; placeholder: boolean }): FaceExclusion {
-  if (face.placeholder) return 'placeholder';
-  if (face.disabled) return 'disabled';
-  return 'watchable';
+export function faceExclusion(face: { disabled: boolean }): FaceExclusion {
+  return face.disabled ? 'disabled' : 'watchable';
 }
 
 /** What sat under a finger that no watchable face claimed.
@@ -793,13 +786,12 @@ export function faceExclusion(face: { disabled: boolean; placeholder: boolean })
  *  reached: the browser dispatched it elsewhere. Asked before `otherButton`,
  *  because the hit test at the point answers with that face, and it is a
  *  button. */
-export type UnderFinger = 'placeholder-face' | 'disabled-face' | 'live-face' | 'other-button' | 'nothing';
+export type UnderFinger = 'disabled-face' | 'live-face' | 'other-button' | 'nothing';
 
 export function underFingerReason(f: {
   actionFace: FaceExclusion | null;
   otherButton: boolean;
 }): UnderFinger {
-  if (f.actionFace === 'placeholder') return 'placeholder-face';
   if (f.actionFace === 'disabled') return 'disabled-face';
   if (f.actionFace === 'watchable') return 'live-face';
   if (f.otherButton) return 'other-button';
@@ -896,16 +888,14 @@ export function screenOffset(t: {
  *
  *  Read from the DOM rather than stamped by `PromptInput`, so the component
  *  keeps no diagnostic surface to remove when this module goes. */
-export type MorphState = 'absent' | 'placeholder' | 'disabled' | 'cancel' | 'send';
+export type MorphState = 'absent' | 'disabled' | 'cancel' | 'send';
 
 export function morphStateOf(m: {
   present: boolean;
-  placeholder: boolean;
   disabled: boolean;
   label: string | null;
 }): MorphState {
   if (!m.present) return 'absent';
-  if (m.placeholder) return 'placeholder';
   if (m.disabled) return 'disabled';
   return m.label === 'Cancel' ? 'cancel' : 'send';
 }
@@ -930,10 +920,7 @@ function allFaces(): HTMLButtonElement[] {
 }
 
 function exclusionOf(btn: HTMLButtonElement): FaceExclusion {
-  return faceExclusion({
-    disabled: btn.disabled,
-    placeholder: btn.classList.contains('morph-placeholder'),
-  });
+  return faceExclusion({ disabled: btn.disabled });
 }
 
 function watchableFaces(): HTMLButtonElement[] {
@@ -1615,7 +1602,7 @@ export function installDeadPressProbe(): void {
       });
       const point = { x: Math.round(touch.clientX), y: Math.round(touch.clientY) };
       // Measured against the WATCHABLE faces: a press the row could have taken
-      // is the question, and an inert placeholder answers it wrongly.
+      // is the question, and a disabled face answers it wrongly.
       const nearest = nearestFaceMiss(boxes, point);
       // One reading for this press, shared with whatever the lift writes about
       // it. See `PressContext`.

@@ -49,7 +49,7 @@ impl NotServedRecorder {
         .bind(NOT_SERVED_WINDOW.as_secs() as f64)
         .bind(provider)
         .bind(model)
-        .bind(purpose_wire(self.purpose))
+        .bind(self.purpose.wire())
         .bind(failed)
         .fetch_one(&self.pool)
         .await
@@ -142,14 +142,6 @@ impl NotServedReport for NotServedRecorder {
             self.notify(provider, model, refusal).await;
         }
     }
-}
-
-/// How the event payload spells `purpose`.
-fn purpose_wire(purpose: ContextPurpose) -> String {
-    serde_json::to_value(purpose)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
 }
 
 /// The task `purpose` names in prose: its capture's section name, lower-cased

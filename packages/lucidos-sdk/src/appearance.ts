@@ -68,6 +68,21 @@ export const THEME_MODE_BG: Record<ResolvedThemeMode, string> = {
   dark: '#07172e',
 };
 
+/** The shell header's top colour per resolved mode, as its stylesheet sets
+ *  `--header-bar-top`. It tints the bar above the page: the iOS status bar of
+ *  the installed app (ADR 0548), and Android's and the browsers' toolbars. */
+export const THEME_MODE_HEADER_TOP: Record<ResolvedThemeMode, string> = {
+  light: '#1a6fd0',
+  dark: '#15549e',
+};
+
+/** The status bar colour before any stylesheet has loaded. That is the
+ *  `--header-bar-top` a theme or an override laid inline, when it is a hex
+ *  literal, else the mode's. */
+export function statusBarColor(inlineHeaderTop: string, resolved: ResolvedThemeMode): string {
+  return hexLiteral(inlineHeaderTop.trim()) ?? THEME_MODE_HEADER_TOP[resolved];
+}
+
 /** A workspace font's id (ADR 0308): `ws-` and the directory it lives in
  *  under `data/fonts/`. */
 export type WorkspaceFontId = `ws-${string}`;
@@ -857,8 +872,13 @@ export function replaceInlineTokens(
  *  {@link THEME_MODE_BG}. Only a hex literal qualifies: this value is painted before
  *  any stylesheet resolves a `var()`. */
 export function themeBackground(tokens: Record<string, string>): string | null {
-  const bg = tokens['--bg-primary'];
-  return bg && /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(bg) ? bg : null;
+  return hexLiteral(tokens['--bg-primary']);
+}
+
+/** `value` when it is a hex colour literal, else null. Painting before any
+ *  stylesheet has loaded can use nothing else. */
+function hexLiteral(value: string | undefined): string | null {
+  return value && /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(value) ? value : null;
 }
 
 // --- Workspace fonts ---

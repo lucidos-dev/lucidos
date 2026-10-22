@@ -21,7 +21,7 @@ afterEach(() => {
   host.remove();
 });
 
-const shown = { name: 'Opus 5.5', effort: 'medium', position: null };
+const shown = { name: 'Opus 5.5', effort: 'medium', position: null, intelligence: null };
 
 function draw(props: Partial<Parameters<typeof RungButtons>[0]> = {}) {
   const onOpen = vi.fn();
@@ -68,22 +68,22 @@ describe('the pill', () => {
     expect(host.querySelector('.rung-label')).toBeNull();
   });
 
-  it('shows the position on the ladder as at/of, and says it to a screen reader', () => {
-    draw({ shown: { ...shown, position: { at: 3, of: 7 } } });
-    expect(host.querySelector('.rung-position')!.textContent).toBe('3/7');
+  it('badges the rung with its intelligence band, and says its place to a screen reader', () => {
+    draw({ shown: { ...shown, position: { at: 3, of: 7 }, intelligence: '1.12×' } });
+    expect(host.querySelector('.rung-intelligence')!.textContent).toBe('1.12×');
     expect(host.querySelector('.rung-trigger')!.getAttribute('aria-label'))
       .toBe('Model and effort: Opus 5.5, medium, rung 3 of 7. Choose another');
   });
 
-  it('draws no position for a pair the ladder lacks', () => {
-    draw();
-    expect(host.querySelector('.rung-position')).toBeNull();
+  it('draws no badge for a pair with no estimate', () => {
+    draw({ shown: { ...shown, position: { at: 3, of: 7 } } });
+    expect(host.querySelector('.rung-intelligence')).toBeNull();
   });
 
   it('reserves every other face behind the one in force, hidden from a screen reader', () => {
     const faces = [
-      { name: 'Sonnet 5.5', effort: 'high', position: { at: 4, of: 7 } },
-      { name: 'Haiku 5.5', effort: 'low', position: { at: 7, of: 7 } },
+      { name: 'Sonnet 5.5', effort: 'high', position: { at: 4, of: 7 }, intelligence: '0.96×' },
+      { name: 'Haiku 5.5', effort: 'low', position: { at: 7, of: 7 }, intelligence: '0.68×' },
     ];
     draw({ faces });
     const all = Array.from(host.querySelectorAll('.rung-label > .rung-face'));

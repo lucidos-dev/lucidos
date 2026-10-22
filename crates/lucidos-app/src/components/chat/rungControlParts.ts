@@ -17,6 +17,9 @@ export interface ShownRung {
   effort: string | null;
   /** Where the pair sits on the ladder, or null when the ladder lacks it. */
   position: RungPosition | null;
+  /** The rung's intelligence band (`1.12×`), the badge a narrow pill shows.
+   *  Null off the ladder or with no estimate, and the pill keeps its name. */
+  intelligence: string | null;
 }
 
 export interface ShownRungInput {
@@ -40,13 +43,19 @@ export function shownRung(input: ShownRungInput): ShownRung | null {
   if (!input.loaded) return null;
   const picked = input.model !== null && input.model !== 'default';
   const pair = picked ? { model: input.model as string, effort: input.effort } : input.defaultPair;
-  if (!pair) return { name: input.agentName, effort: null, position: null };
+  if (!pair) return { name: input.agentName, effort: null, position: null, intelligence: null };
   const at = input.rungs.findIndex((r) => isRung(input.options, r, pair.model, pair.effort));
   return {
     name: at === -1 ? input.modelLabel(pair.model) : input.rungs[at].label,
     effort: pair.effort,
     position: at === -1 ? null : { at: at + 1, of: input.rungs.length },
+    intelligence: at === -1 ? null : rungIntelligence(input.rungs[at]),
   };
+}
+
+/** The band label a rung's badge shows, or null when it has no estimate. */
+export function rungIntelligence(rung: Pick<CodingAgentLadderRung, 'intelligence'>): string | null {
+  return rung.intelligence?.label ?? null;
 }
 
 /** Every face a step can land the pill on, so the pill can reserve the
@@ -60,6 +69,7 @@ export function rungFaces(
       name,
       effort: rung.effort,
       position: { at: i + 1, of: rungs.length },
+      intelligence: rungIntelligence(rung),
     })),
   );
 }

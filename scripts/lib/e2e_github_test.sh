@@ -1185,17 +1185,50 @@ test_each_job_warms_only_what_it_needs() {
 test_the_apt_warm_up_drops_the_microsoft_source() {
     echo "test: the apt warm-up removes the Microsoft source before any apt-get update"
     local shard="$SCRIPT_DIR/../e2e-github-shard.sh" dir="$SANDBOX/apt-sources" log="$SANDBOX/apt-order"
-    mkdir -p "$dir"
+    mkdir -p "$dir" "$SANDBOX/apt-conf-unused"
     : >"$dir/microsoft-prod.list"
     : >"$dir/other.list"
     rm -f "$log"
-    APT_SOURCES_DIR="$dir" APT_ORDER_LOG="$log" bash -c '
+    APT_CONF_DIR="$SANDBOX/apt-conf-unused" APT_SOURCES_DIR="$dir" APT_ORDER_LOG="$log" bash -c '
         source "$1"; sudo() { if [ "$1" = apt-get ]; then ls "$APT_SOURCES_DIR" | tr "\n" " " >>"$APT_ORDER_LOG"; else "$@"; fi; }
         warm_apt api' _ "$shard" >/dev/null 2>&1
     if [ "$(cat "$log" 2>/dev/null)" = "other.list other.list " ] && [ ! -e "$dir/microsoft-prod.list" ]; then
         pass "apt-get ran with only other.list left"
     else
         fail "apt-get saw '$(cat "$log" 2>/dev/null)'"
+    fi
+}
+
+test_the_apt_warm_up_bounds_every_network_wait() {
+    echo "test: the apt warm-up sets apt timeouts and retries before any apt-get"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" dir="$SANDBOX/apt-conf" log="$SANDBOX/apt-conf-order"
+    mkdir -p "$dir" "$SANDBOX/apt-conf-sources"
+    rm -f "$log" "$dir"/*
+    APT_CONF_DIR="$dir" APT_SOURCES_DIR="$SANDBOX/apt-conf-sources" APT_ORDER_LOG="$log" bash -c '
+        source "$1"; sudo() { if [ "$1" = apt-get ]; then ls "$APT_CONF_DIR" | tr "\n" " " >>"$APT_ORDER_LOG"; else "$@"; fi; }
+        warm_apt api' _ "$shard" >/dev/null 2>&1
+    if [ "$(cat "$log" 2>/dev/null)" = "99-e2e-bounded-network 99-e2e-bounded-network " ] \
+        && grep -q 'Timeout "20"' "$dir/99-e2e-bounded-network" && grep -q 'Retries "2"' "$dir/99-e2e-bounded-network"; then
+        pass "apt-get ran with the timeout file in place"
+    else
+        fail "apt-get saw '$(cat "$log" 2>/dev/null)'"
+    fi
+}
+
+test_a_stalled_apt_attempt_is_cut_off_and_retried() {
+    echo "test: an apt attempt that hangs hits its deadline, and the next attempt runs"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" count="$SANDBOX/apt-attempts" out
+    mkdir -p "$SANDBOX/apt-retry-conf" "$SANDBOX/apt-retry-sources"
+    : >"$count"
+    out="$(APT_ATTEMPT_SECONDS=1 APT_CONF_DIR="$SANDBOX/apt-retry-conf" APT_SOURCES_DIR="$SANDBOX/apt-retry-sources" \
+        APT_COUNT="$count" bash -c '
+        source "$1"; sudo() { "$@"; }
+        apt_chain() { echo x >>"$APT_COUNT"; [ "$(wc -l <"$APT_COUNT")" -gt 1 ] || sleep 30; }
+        SECONDS=0; warm_apt api && echo "ok after ${SECONDS}s"' _ "$shard" 2>/dev/null)"
+    if [ "$(wc -l <"$count")" -eq 2 ] && [[ "$out" == "ok after "[0-9]s ]]; then
+        pass "the hung attempt was killed at its deadline, and the retry won ($out)"
+    else
+        fail "attempts $(wc -l <"$count"), output '$out'"
     fi
 }
 
@@ -1277,6 +1310,8 @@ test_a_failed_lookup_lets_the_build_run
 test_restored_target_state_ages_its_unchanged_inputs
 test_each_job_warms_only_what_it_needs
 test_the_apt_warm_up_drops_the_microsoft_source
+test_the_apt_warm_up_bounds_every_network_wait
+test_a_stalled_apt_attempt_is_cut_off_and_retried
 test_a_shard_installs_only_its_own_browser
 test_the_macos_cache_keys_name_the_pinned_builds
 

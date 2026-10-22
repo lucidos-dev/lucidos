@@ -299,14 +299,16 @@ pub fn cc_control_request_to_json(request: &ControlRequest, request_id: &str) ->
     .expect("ControlRequest serialization cannot fail")
 }
 
-/// The one stream-json line a side question writes: the instructions and the
-/// question as a text block, then each image as a base64 block.
-fn side_question_message(question: &str, images: &[crate::api::ChatImage]) -> String {
+/// The side question's text: its instructions, then the question.
+fn side_question_text(question: &str) -> String {
     let instructions = crate::engine::agent_session::side_question::SIDE_QUESTION_INSTRUCTIONS;
-    let mut content = vec![serde_json::json!({
-        "type": "text",
-        "text": format!("<system-reminder>{instructions}</system-reminder>\n\n{question}"),
-    })];
+    format!("<system-reminder>{instructions}</system-reminder>\n\n{question}")
+}
+
+/// The one stream-json line a session copy reads: `text` as a text block, then
+/// each image as a base64 block.
+fn session_copy_message(text: &str, images: &[crate::api::ChatImage]) -> String {
+    let mut content = vec![serde_json::json!({ "type": "text", "text": text })];
     content.extend(images.iter().map(|image| {
         let fitted = image.clone().fit_for_llm();
         serde_json::json!({
@@ -318,14 +320,14 @@ fn side_question_message(question: &str, images: &[crate::api::ChatImage]) -> St
         "type": "user",
         "message": { "role": "user", "content": content },
     }))
-    .expect("side question serialization cannot fail");
+    .expect("session copy message serialization cannot fail");
     line.push('\n');
     line
 }
 
-/// What a side question's copy answered, with what it cost.
+/// What a session copy answered, with what it cost.
 #[derive(Debug)]
-pub struct SideQuestionReply {
+pub struct SessionCopyReply {
     /// The answer, or why there is none.
     pub answer: Result<String, String>,
     /// The copy's usage, summed over its turns. `None` when it reported none.
@@ -379,7 +381,7 @@ fn result_usage(value: &serde_json::Value) -> Option<crate::engine::ApiUsage> {
 
 /// Read a stdout line as the copy's closing `result`: the answer or why there
 /// is none, and the usage it reports. `None` for any other line.
-fn side_question_result(
+fn session_copy_result(
     line: &str,
 ) -> Option<(Result<String, String>, Option<crate::engine::ApiUsage>)> {
     if !line.contains("\"result\"") {
@@ -519,20 +521,47 @@ impl Drop for ColdProcessGroup {
     }
 }
 
-/// Answer a side question from a copy of the thread's session.
-///
-/// The copy is the session's own command resumed with `--no-session-persistence`,
-/// so it reads the transcript and writes nothing back. It keeps the session's
-/// tools, model and system prompt, so the transcript reads from the prompt
-/// cache. Its settings refuse every tool. Its process group dies
-/// once it answers, fails, passes `deadline` or loses its asker.
-/// `args.resume_session_id` names the session and is required.
+/// Answer a side question from a copy of the thread's session, under the
+/// side question's turn cap. See [`ask_session_copy`].
 pub async fn ask_side_question(
     args: SpawnArgs<'_>,
     question: &str,
     images: &[crate::api::ChatImage],
     deadline: tokio::time::Instant,
-) -> Result<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SessionCopyReply, Box<dyn std::error::Error + Send + Sync>> {
+    use crate::engine::agent_session::side_question::{
+        side_question_timeout_message, SIDE_QUESTION_MAX_TURNS,
+    };
+    let copy = SessionCopyAsk {
+        max_turns: SIDE_QUESTION_MAX_TURNS,
+        deadline,
+        timeout_message: side_question_timeout_message("Claude Code"),
+    };
+    ask_session_copy(args, &side_question_text(question), images, copy).await
+}
+
+/// How long a session copy may run, and what its asker reads when it runs out.
+pub struct SessionCopyAsk {
+    /// Model turns the copy may take. A refused tool call costs one.
+    pub max_turns: usize,
+    pub deadline: tokio::time::Instant,
+    pub timeout_message: String,
+}
+
+/// Ask a copy of the thread's session one message, and read its reply.
+///
+/// The copy is the session's own command resumed with `--no-session-persistence`,
+/// so it reads the transcript and writes nothing back. It keeps the session's
+/// tools, model and system prompt, so the transcript reads from the prompt
+/// cache. Its settings refuse every tool. Its process group dies
+/// once it answers, fails, passes its deadline or loses its asker.
+/// `args.resume_session_id` names the session and is required.
+pub async fn ask_session_copy(
+    args: SpawnArgs<'_>,
+    text: &str,
+    images: &[crate::api::ChatImage],
+    copy: SessionCopyAsk,
+) -> Result<SessionCopyReply, Box<dyn std::error::Error + Send + Sync>> {
     if args.resume_session_id.is_none() {
         return Err("This thread has no Claude Code session to ask yet".into());
     }
@@ -546,39 +575,42 @@ pub async fn ask_side_question(
     let settings =
         crate::engine::cc_settings::write_cc_side_question_settings(args.workspace_path).await?;
     warm_claude_version(&args).await;
-    let mut command = build_side_question_command(&args, lucidos_cli_dir(), &settings)?;
+    let mut command =
+        build_session_copy_command(&args, lucidos_cli_dir(), &settings, copy.max_turns)?;
     let child = super::spawn_env::spawn_below_engine(&mut command.cmd)?;
-    ask_side_question_of(child, &side_question_message(question, images), deadline).await
+    let message = session_copy_message(text, images);
+    ask_session_copy_of(child, &message, copy.deadline, &copy.timeout_message).await
 }
 
-/// The side question's command: the session's own flags, resumed without
-/// persisting, capped in turns, under the settings that refuse every tool.
-fn build_side_question_command(
+/// A session copy's command: the session's own flags, resumed without
+/// persisting, capped at `max_turns`, under the settings that refuse every tool.
+fn build_session_copy_command(
     args: &SpawnArgs<'_>,
     cli_dir: Option<&Path>,
     settings: &Path,
+    max_turns: usize,
 ) -> std::io::Result<CcCommand> {
     let mut command = build_command_with_settings(args, cli_dir, settings)?;
     command
         .cmd
         .arg("--no-session-persistence")
         .arg("--max-turns")
-        .arg(crate::engine::agent_session::side_question::SIDE_QUESTION_MAX_TURNS.to_string());
+        .arg(max_turns.to_string());
     Ok(command)
 }
 
-/// Send the side question's `message` to `child` and wait for its `result`,
-/// then tear the process group down whatever happened. `child` must lead its
-/// own group.
+/// Send the copy's `message` to `child` and wait for its `result`, then tear
+/// the process group down whatever happened. `child` must lead its own group.
 ///
-/// Only a `result` after the question's replay answers it. A resumed session
+/// Only a `result` after the message's replay answers it. A resumed session
 /// may first close older work with an empty `result`, such as a background
 /// task it reports stopped.
-async fn ask_side_question_of(
+async fn ask_session_copy_of(
     mut child: Child,
     message: &str,
     deadline: tokio::time::Instant,
-) -> Result<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>> {
+    timeout_message: &str,
+) -> Result<SessionCopyReply, Box<dyn std::error::Error + Send + Sync>> {
     let group = ColdProcessGroup(child.id());
     let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
     let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
@@ -595,7 +627,7 @@ async fn ask_side_question_of(
         loop {
             line.clear();
             if reader.read_line(&mut line).await? == 0 {
-                return Err::<SideQuestionReply, Box<dyn std::error::Error + Send + Sync>>(
+                return Err::<SessionCopyReply, Box<dyn std::error::Error + Send + Sync>>(
                     "Claude Code exited before it answered".into(),
                 );
             }
@@ -604,9 +636,9 @@ async fn ask_side_question_of(
             } else if replays_an_input(&line) {
                 question_read = true;
             } else if let Some((answer, usage)) =
-                side_question_result(&line).filter(|_| question_read)
+                session_copy_result(&line).filter(|_| question_read)
             {
-                return Ok(SideQuestionReply {
+                return Ok(SessionCopyReply {
                     answer,
                     usage,
                     model,
@@ -615,23 +647,17 @@ async fn ask_side_question_of(
         }
     };
     let outcome = tokio::time::timeout_at(deadline, exchange).await;
-    tear_down_cold_child(group, &mut child, "side-question").await;
+    tear_down_cold_child(group, &mut child, "session copy").await;
 
-    let reply = outcome.map_err(|_| {
-        crate::engine::agent_session::side_question::side_question_timeout_message("Claude Code")
-    })?;
+    let reply = outcome.map_err(|_| timeout_message.to_string())?;
     let failure = match &reply {
         Err(e) => Some(e.to_string()),
-        Ok(SideQuestionReply { answer: Err(e), .. }) => Some(e.clone()),
+        Ok(SessionCopyReply { answer: Err(e), .. }) => Some(e.clone()),
         Ok(_) => None,
     };
     if let (Some(e), Some(stderr)) = (failure, child.stderr.take()) {
         let tail = StderrTail::spawn(stderr, Vec::new()).finish().await;
-        log!(
-            "[ClaudeCode] side question failed: {} (stderr: {})",
-            e,
-            tail
-        );
+        log!("[ClaudeCode] session copy failed: {} (stderr: {})", e, tail);
     }
     reply
 }

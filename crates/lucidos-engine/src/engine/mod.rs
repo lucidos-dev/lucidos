@@ -912,6 +912,9 @@ pub struct LucidosEngine {
     /// only: it stops a second beat while the first one's request is still
     /// on its way. The schedule itself derives from persisted events.
     pub(crate) keep_alive_beats: event_wait::KeepAliveBeats,
+    /// How long this workspace's keep-alive waits ran, for the
+    /// `workspace-data` give-up rule. A cache, rebuilt hourly from events.
+    pub(crate) keep_alive_durations: Arc<event_wait::WaitDurationsCache>,
 }
 
 /// RAII guard that removes a thread from active_threads when dropped.

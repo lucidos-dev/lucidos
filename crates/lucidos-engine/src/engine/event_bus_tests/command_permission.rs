@@ -28,6 +28,7 @@ async fn emit_command_request(bus: &EventBus, thread_id: Uuid, request_id: &str)
             tool_name: "run_bash".into(),
             command: "curl -X POST https://api.example.com/charge".into(),
             summary: "May perform a mutating HTTP request.".into(),
+            grant_head: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),

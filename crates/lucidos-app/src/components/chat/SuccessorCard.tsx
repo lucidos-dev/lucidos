@@ -6,6 +6,7 @@ import {
   threadMap, type SuccessorOffer,
 } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
+import { draftPresentThreadIds } from '../../store/composeDrafts';
 import { continueInSuccessor } from '../../store/actions/successor';
 import { startFreshDraft } from '../../store/actions/compose';
 import type { StoredEvent, ThreadState } from '../../store/thread-events';
@@ -68,7 +69,7 @@ function aimedLabel(model: string | null, effort: string | null): string | null 
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
-function CardOption({ label, desc, busyDesc, busy, disabled, onPick }: {
+export function CardOption({ label, desc, busyDesc, busy, disabled, onPick }: {
   label: string;
   desc: ComponentChildren;
   busyDesc: string;
@@ -88,7 +89,8 @@ function CardOption({ label, desc, busyDesc, busy, disabled, onPick }: {
 }
 
 /** A card on top of the composer offering a *successor thread* to a large
- *  coding-agent thread at a clean idle (`successorOffer`). It is drawn from the
+ *  coding-agent thread at a clean idle (`successorOffer`), once the user starts
+ *  writing in the composer. It is drawn from the
  *  question card's option classes. */
 export function SuccessorCard() {
   const threadId = focusedThreadId.value;
@@ -131,7 +133,9 @@ export function SuccessorCard() {
     return () => clearTimeout(timer);
   }, [coldAt]);
 
-  const offer = successorOffer(thread, context, Date.now());
+  // The card waits until the user starts a message, and shuts if they clear it.
+  const writing = threadId !== null && draftPresentThreadIds.value.has(threadId);
+  const offer = writing ? successorOffer(thread, context, Date.now()) : null;
   // Keyed on whether the card shows, not on its offer: a warm card turning
   // cold stays open and keeps its pick.
   const cardShows = offer !== null;

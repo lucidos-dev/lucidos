@@ -404,16 +404,55 @@ drop_microsoft_apt_source() {
     sudo rm -f "${APT_SOURCES_DIR:-/etc/apt/sources.list.d}"/microsoft*
 }
 
+# A stalled mirror made apt retry without a bound and hold the warm-up for
+# 900s. Every apt-get in the chain, install-deps' included, reads this file.
+bound_apt_network() {
+    printf 'Acquire::http::Timeout "20";\nAcquire::https::Timeout "20";\nAcquire::Retries "2";\n' \
+        | sudo tee "${APT_CONF_DIR:-/etc/apt/apt.conf.d}/99-e2e-bounded-network" >/dev/null
+}
+
+# run_with_deadline <seconds> <cmd...>: the command runs as its own process
+# group, and the whole group gets SIGTERM at the deadline. Returns 124 then.
+run_with_deadline() {
+    local seconds="$1" pid watchdog status
+    shift
+    set -m
+    "$@" &
+    pid=$!
+    set +m
+    (sleep "$seconds"; kill -TERM -- "-$pid") >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$pid" && status=0 || status=$?
+    if kill "$watchdog" 2>/dev/null; then
+        wait "$watchdog" 2>/dev/null || true
+    else
+        status=124
+    fi
+    return "$status"
+}
+
 # One apt chain, so dpkg never runs twice at once. install-deps refreshes the
 # package lists, and the second install reuses them.
-warm_apt() {
-    drop_microsoft_apt_source
+apt_chain() {
     if [ "$1" = browser ]; then
         npx --yes "playwright@$(locked_playwright_version)" install-deps chromium || return 1
     else
         sudo apt-get update -qq || return 1
     fi
     sudo apt-get install -y -qq ripgrep postgresql-client
+}
+
+# A slow mirror that keeps trickling bytes defeats every apt timeout, so each
+# attempt also gets a deadline, and a stalled one is retried.
+warm_apt() {
+    drop_microsoft_apt_source
+    bound_apt_network
+    local attempt
+    for attempt in 1 2 3; do
+        run_with_deadline "${APT_ATTEMPT_SECONDS:-240}" apt_chain "$1" && return 0
+        echo "apt warm-up attempt $attempt failed" >&2
+    done
+    return 1
 }
 
 # warm_browsers <project>: only the browser that project drives. A shard is

@@ -160,9 +160,9 @@ fn load_images(
         .collect()
 }
 
-/// What a side question's session copy needs: the thread's session and the
-/// flags its main session runs with.
-struct SessionCopy {
+/// What a session copy needs: the thread's session and the flags its main
+/// session runs with. Side questions and the cache keep-alive ask one.
+pub(crate) struct SessionCopy {
     cwd: PathBuf,
     session_id: String,
     /// What the session's latest spawn appended, when this engine saw it.
@@ -175,6 +175,59 @@ struct SessionCopy {
     binary_override: Option<String>,
     permission_mode: Option<String>,
     additional_directories: Vec<PathBuf>,
+}
+
+impl SessionCopy {
+    /// Whether the copy carries what the session's spawn appended. Without it
+    /// the copy's prefix differs from the session's, so it misses the cache.
+    pub(crate) fn shares_the_prefix(&self) -> bool {
+        self.system_prompt.is_some()
+    }
+
+    /// The copy's spawn: the session's own flags, resuming its session.
+    pub(crate) fn spawn_args<'a>(
+        &'a self,
+        workspace_path: &'a std::path::Path,
+        thread_id: Uuid,
+    ) -> crate::runtime::SpawnArgs<'a> {
+        crate::runtime::SpawnArgs {
+            worktree_path: &self.cwd,
+            coding_agent_kind: Default::default(),
+            workspace_path,
+            allowed_tools: Some(&self.allowed_tools),
+            system_prompt: self.system_prompt.as_deref(),
+            session_context: None,
+            resume_session_id: Some(&self.session_id),
+            model: self.model.as_deref(),
+            reasoning_effort: self.effort.as_deref(),
+            thread_id,
+            spawning_event_id: None,
+            repo_name: None,
+            interactive: false,
+            user_env_vars: &self.user_env,
+            account_pin: self.account_pin.as_ref(),
+            binary_override: self.binary_override.as_deref(),
+            permission_mode: self.permission_mode.as_deref(),
+            additional_directories: &self.additional_directories,
+            auto_compact: None,
+            notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+            agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+        }
+    }
+
+    /// The model to price a reply at: the one its copy named, else the
+    /// session's own.
+    pub(crate) fn model_of(&self, reply: &crate::runtime::claude_code::SessionCopyReply) -> String {
+        reply
+            .model
+            .clone()
+            .or_else(|| self.model.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    pub(crate) fn effort(&self) -> Option<&str> {
+        self.effort.as_deref()
+    }
 }
 
 /// Whether a side question with this id was already asked on the thread.
@@ -385,7 +438,7 @@ impl LucidosEngine {
     }
 
     /// Record the system prompt a Claude Code spawn appended, for the thread's
-    /// side questions. At most `REMEMBERED_CC_PROMPTS` are kept. An evicted
+    /// session copies. At most `REMEMBERED_CC_PROMPTS` are kept. An evicted
     /// thread asks uncached and without that prompt until its next spawn.
     pub(crate) fn remember_cc_system_prompt(&self, thread_id: Uuid, prompt: &str) {
         let mut prompts = self
@@ -398,6 +451,15 @@ impl LucidosEngine {
             }
         }
         prompts.insert(thread_id, prompt.to_string());
+    }
+
+    /// Whether this engine remembers what the thread's latest spawn appended,
+    /// so a copy of its session would share the session's prefix.
+    pub(crate) fn remembers_cc_system_prompt(&self, thread_id: Uuid) -> bool {
+        self.cc_system_prompts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&thread_id)
     }
 
     /// Startup recovery: fail every ask the previous process left unanswered,
@@ -446,44 +508,22 @@ impl LucidosEngine {
         deadline: tokio::time::Instant,
     ) -> Result<String, SideQuestionFailure> {
         let copy = self.session_copy(thread_id).await?;
-        let args = crate::runtime::SpawnArgs {
-            worktree_path: &copy.cwd,
-            coding_agent_kind: Default::default(),
-            workspace_path: self.workspace_path(),
-            allowed_tools: Some(&copy.allowed_tools),
-            system_prompt: copy.system_prompt.as_deref(),
-            session_context: None,
-            resume_session_id: Some(&copy.session_id),
-            model: copy.model.as_deref(),
-            reasoning_effort: copy.effort.as_deref(),
-            thread_id,
-            spawning_event_id: None,
-            repo_name: None,
-            interactive: false,
-            user_env_vars: &copy.user_env,
-            account_pin: copy.account_pin.as_ref(),
-            binary_override: copy.binary_override.as_deref(),
-            permission_mode: copy.permission_mode.as_deref(),
-            additional_directories: &copy.additional_directories,
-            auto_compact: None,
-            notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
-            agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
-        };
+        let args = copy.spawn_args(self.workspace_path(), thread_id);
         let reply =
             crate::runtime::claude_code::ask_side_question(args, question, images, deadline)
                 .await
                 .map_err(|e| SideQuestionFailure::Failed(e.to_string()))?;
         // The copy is a real model call, so its cost is recorded like any other.
-        let model = reply
-            .model
-            .or(copy.model)
-            .unwrap_or_else(|| "unknown".to_string());
         crate::engine::AuxCapture::new(
             &self.event_bus,
             thread_id,
             crate::engine::ContextPurpose::SideQuestion,
         )
-        .record_usage(&model, question.chars().count(), reply.usage)
+        .record_usage(
+            &copy.model_of(&reply),
+            question.chars().count(),
+            reply.usage,
+        )
         .await;
         reply.answer.map_err(SideQuestionFailure::Failed)
     }
@@ -493,7 +533,10 @@ impl LucidosEngine {
     /// The cwd is the thread's worktree while it exists. Claude Code finds a
     /// session by id from any cwd, so a cleaned-up worktree falls back to the
     /// workspace.
-    async fn session_copy(&self, thread_id: Uuid) -> Result<SessionCopy, SideQuestionFailure> {
+    pub(crate) async fn session_copy(
+        &self,
+        thread_id: Uuid,
+    ) -> Result<SessionCopy, SideQuestionFailure> {
         let pool = self.pool();
         let recorded_pin = super::lookup_pinned_cc_config_dir(pool, thread_id)
             .await

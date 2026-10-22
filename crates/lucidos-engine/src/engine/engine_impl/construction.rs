@@ -1583,6 +1583,7 @@ impl LucidosEngine {
             },
             live_waits: Arc::new(crate::engine::event_wait::LiveWaits::new()),
             keep_alive_beats: Default::default(),
+            keep_alive_durations: Default::default(),
             wait_reentry_tx: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 crate::engine::WAIT_REENTRY_RX.with(|cell| cell.borrow_mut().replace(rx));

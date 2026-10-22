@@ -30,7 +30,7 @@ const foldAt = (containerWidth: number, memberWidths: readonly number[] = ICONS)
     pinnedClusterCount: 1,
     gapPx: 0,
     moreWidth: ICON,
-  });
+  }).folded;
 
 describe('the composer row folds only when it has to', () => {
   it('folds nothing while every member fits', () => {
@@ -127,7 +127,7 @@ describe('a cluster member takes its gap with it', () => {
       pinnedClusterCount: 1,
       gapPx: GAP,
       moreWidth: ICON,
-    });
+    }).folded;
 
   it('charges a gap per adjacent pair the candidate leaves standing', () => {
     // Both standing: two members, the send, and the two gaps between them.
@@ -149,5 +149,56 @@ describe('a cluster member takes its gap with it', () => {
       expect(folded).toBeLessThanOrEqual(previous);
       previous = folded;
     }
+  });
+});
+
+describe('the shedding member shortens before anything folds', () => {
+  /** Three icons, then the rung pill last in fold order, 50 wide in full, 30
+   *  with the badge and name, 10 with the badge alone. */
+  const PILL = [50, 30, 10];
+  const settle = (containerWidth: number) =>
+    computePromptCollapse({
+      containerWidth,
+      pinnedWidth: PINNED,
+      memberWidths: [ICON, ICON, ICON, PILL[0]],
+      memberGroups: ['row', 'row', 'row', 'cluster'],
+      pinnedClusterCount: 1,
+      gapPx: 0,
+      moreWidth: ICON,
+      shedding: { index: 3, widths: PILL },
+    });
+
+  it('stands in full while everything fits', () => {
+    expect(settle(PINNED + 3 * ICON + PILL[0])).toEqual({ folded: 0, shed: 0 });
+  });
+
+  it('drops to badge and name before folding an icon', () => {
+    expect(settle(PINNED + 3 * ICON + PILL[1])).toEqual({ folded: 0, shed: 1 });
+  });
+
+  it('drops to the badge alone before folding an icon', () => {
+    // Folding two icons would fit too: the ⋯, one icon and the full pill.
+    expect(settle(PINNED + 3 * ICON + PILL[2])).toEqual({ folded: 0, shed: 2 });
+  });
+
+  it('folds only once the pill has nothing left to shed', () => {
+    // One box short of the badge-only row: folding two icons for the ⋯ fits.
+    expect(settle(PINNED + 2 * ICON + PILL[2])).toEqual({ folded: 2, shed: 2 });
+  });
+
+  it('answers the same whatever level is drawn now', () => {
+    // The pill's current box is not an input: only its per-level widths are.
+    const drawnShed = (memberWidth: number) =>
+      computePromptCollapse({
+        containerWidth: PINNED + 3 * ICON + PILL[1],
+        pinnedWidth: PINNED,
+        memberWidths: [ICON, ICON, ICON, memberWidth],
+        memberGroups: ['row', 'row', 'row', 'cluster'],
+        pinnedClusterCount: 1,
+        gapPx: 0,
+        moreWidth: ICON,
+        shedding: { index: 3, widths: PILL },
+      });
+    expect(PILL.map(drawnShed)).toEqual(PILL.map(() => ({ folded: 0, shed: 1 })));
   });
 });

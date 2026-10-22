@@ -27,6 +27,7 @@ import {
   SYSTEM_THEME_MODE_CONFIRM_MS,
   SYSTEM_THEME_MODE_SETTLE_MS,
   THEME_MODE_BG,
+  THEME_MODE_HEADER_TOP,
   clampUiScale,
   followSystemThemeMode,
   durationScaleFor,
@@ -47,6 +48,7 @@ import {
   repaintThemeMode,
   resolveThemeMode,
   resolveThemeModePreference,
+  statusBarColor,
   type FontId,
   type ThemeFonts,
   type WorkspaceFont,
@@ -101,6 +103,20 @@ describe('resolving a theme against the OS', () => {
   it('every resolved theme has a background to paint before any stylesheet', () => {
     expect(THEME_MODE_BG.light).toBe('#ffffff');
     expect(THEME_MODE_BG.dark).toBe('#07172e');
+  });
+});
+
+describe('the status bar colour before any stylesheet', () => {
+  it('takes a literal header top a theme or an override laid inline', () => {
+    expect(statusBarColor(' #2e7d32 ', 'dark')).toBe('#2e7d32');
+    expect(statusBarColor('#abc', 'light')).toBe('#abc');
+  });
+
+  it("takes the mode's header top when nothing literal was laid", () => {
+    expect(statusBarColor('', 'light')).toBe(THEME_MODE_HEADER_TOP.light);
+    expect(statusBarColor('', 'dark')).toBe(THEME_MODE_HEADER_TOP.dark);
+    expect(statusBarColor('color-mix(in oklab, var(--accent) 22%, black)', 'dark'))
+      .toBe(THEME_MODE_HEADER_TOP.dark);
   });
 });
 

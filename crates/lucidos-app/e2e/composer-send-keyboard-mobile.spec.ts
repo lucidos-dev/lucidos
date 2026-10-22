@@ -81,7 +81,7 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await input.fill(followUp);
       await expect(page.locator('html')).toHaveAttribute('data-keyboard-active', '');
 
-      const send = page.locator('button[aria-label="Send message"]:visible').first();
+      const send = page.locator('button[aria-label="Send message"]:visible:not(:disabled)').first();
       await expect(send).toBeVisible({ timeout: 10_000 });
 
       const probe = await page.evaluate(() => {
@@ -181,7 +181,7 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await input.focus();
       await input.fill(followUp);
 
-      const send = page.locator('button[aria-label="Send message"]:visible').first();
+      const send = page.locator('button[aria-label="Send message"]:visible:not(:disabled)').first();
       await expect(send).toBeVisible({ timeout: 10_000 });
 
       await page.evaluate(() => {
@@ -259,7 +259,7 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await input.focus();
       await input.fill(followUp);
 
-      const send = page.locator('button[aria-label="Send message"]:visible').first();
+      const send = page.locator('button[aria-label="Send message"]:visible:not(:disabled)').first();
       await expect(send).toBeVisible({ timeout: 10_000 });
       const box = await send.boundingBox();
       expect(box, 'the Send button never rendered').not.toBeNull();

@@ -497,6 +497,14 @@ export const PREF_CODING_AGENT_AUTO_COMPACT_TRIAL = {
   fallback: "off",
 } as const;
 
+export const PREF_CACHE_KEEP_ALIVE_MODE = {
+  key: "cache_keep_alive_mode",
+  scope: "global",
+  type: "enum",
+  values: ["default", "workspace-data", "off"],
+  fallback: "default",
+} as const;
+
 export const PREF_MODEL_CLAUDE_CODE = {
   key: "model_claude_code",
   scope: "global",
@@ -940,6 +948,7 @@ export const PREFERENCE_CATALOG = {
   "coding_agent_codex_path": PREF_CODING_AGENT_CODEX_PATH,
   "coding_agent_claude_permission_mode": PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
   "coding_agent_auto_compact_trial": PREF_CODING_AGENT_AUTO_COMPACT_TRIAL,
+  "cache_keep_alive_mode": PREF_CACHE_KEEP_ALIVE_MODE,
   "model_claude_code": PREF_MODEL_CLAUDE_CODE,
   "reasoning_claude_code": PREF_REASONING_CLAUDE_CODE,
   "model_codex": PREF_MODEL_CODEX,

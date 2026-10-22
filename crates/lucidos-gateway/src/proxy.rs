@@ -665,7 +665,6 @@ fn splash_page_html(label: &str, refresh_secs: Option<u32>, escape: bool) -> Str
     const HEAD_A: &str = r##"<!doctype html><html><head><meta charset="utf-8">
 "##;
     const HEAD_B: &str = r##"
-<meta name="theme-color" content="#0a4ea8">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><radialGradient id='g' gradientUnits='userSpaceOnUse' cx='30' cy='22' r='125'><stop offset='0' stop-color='%232d83e0'/><stop offset='1' stop-color='%230a4ea8'/></radialGradient></defs><rect width='100' height='100' rx='22' fill='url(%23g)'/><g transform='translate(13 13) scale(0.74)' fill='%23fff'><rect x='17' y='17' width='29' height='29' rx='7'/><rect x='17' y='54' width='29' height='29' rx='7'/><rect x='54' y='54' width='29' height='29' rx='7'/><path d='M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z'/></g></svg>">
 <title>"##;
     // Split again around the tab title: the failure page must not sit in the tab
@@ -757,9 +756,9 @@ stalled/failed pages, where there is nothing else left to offer). */
     let label = escape_html_text(label);
     let css = app_splash_css();
     let mark = app_mark_svg();
-    let viewport = app_viewport_meta();
+    let device_meta = app_device_meta();
     format!(
-        "{HEAD_A}{refresh_html}\n{viewport}{HEAD_B}{title}{STYLE_OPEN}{css}{GATEWAY_CSS_AND_BODY}\
+        "{HEAD_A}{refresh_html}\n{device_meta}{HEAD_B}{title}{STYLE_OPEN}{css}{GATEWAY_CSS_AND_BODY}\
          <div class=\"boot-splash\"{poll_attrs}>\n{mark}\
          {MARK_TO_LABEL}{label}</div>\n{escape_html}\n</div>\n</div>\n{HANDOVER}\n{SPLASH_POLLER}\n</body></html>"
     )
@@ -820,18 +819,20 @@ fn app_status_text() -> &'static str {
     slice_between(APP_INDEX_HTML, STATUS_OPEN, "</div>").unwrap_or("")
 }
 
-/// The app document's viewport and iOS home-screen `<meta>` tags, verbatim.
-/// They decide how tall the viewport is in an installed PWA, and the splash
-/// centres its mark in that viewport. A page with a different set lays out in
-/// a different viewport, so its mark sits higher and drops at the hand-over.
+/// The app document's viewport, iOS home-screen and `theme-color` `<meta>`
+/// tags, verbatim. They decide how tall the viewport is in an installed PWA,
+/// and the splash centres its mark in that viewport. A page with a different
+/// set lays out in a different viewport, so its mark sits higher and drops at
+/// the hand-over. `theme-color` colours the status bar above both pages.
 /// Lifted rather than copied, like the stylesheet, so the two cannot differ.
-fn app_viewport_meta() -> String {
+fn app_device_meta() -> String {
     APP_INDEX_HTML
         .lines()
         .map(str::trim)
         .filter(|line| {
             line.starts_with(r#"<meta name="viewport""#)
                 || line.starts_with(r#"<meta name="apple-mobile-web-app-"#)
+                || line.starts_with(r#"<meta name="theme-color""#)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -969,11 +970,14 @@ mod tests {
     /// tags, or the mark drops when the app document takes over.
     #[test]
     fn splash_page_lays_out_in_the_app_documents_viewport() {
-        let viewport = APP_INDEX_HTML
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with(r#"<meta name="viewport""#))
-            .expect("index.html must declare a viewport");
+        let app_tag = |prefix: &str| {
+            APP_INDEX_HTML
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("index.html must declare {prefix}"))
+        };
+        let viewport = app_tag(r#"<meta name="viewport""#);
         assert!(viewport.contains("viewport-fit=cover"), "{viewport}");
         let html = splash_page_html("Starting engine…", Some(2), false);
         assert!(html.contains(viewport), "{html}");
@@ -982,10 +986,14 @@ mod tests {
             1,
             "{html}"
         );
-        assert!(
-            html.contains(
-                r#"<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">"#
-            ),
+        let status_bar = app_tag(r#"<meta name="apple-mobile-web-app-status-bar-style""#);
+        assert!(html.contains(status_bar), "{html}");
+        // The bar keeps its colour when the app document takes over.
+        let theme_color = app_tag(r#"<meta name="theme-color""#);
+        assert!(html.contains(theme_color), "{html}");
+        assert_eq!(
+            html.matches(r#"<meta name="theme-color""#).count(),
+            1,
             "{html}"
         );
     }

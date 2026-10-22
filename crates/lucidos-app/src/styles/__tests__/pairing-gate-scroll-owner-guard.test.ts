@@ -54,10 +54,9 @@ describe('pairing gate scroll ownership', () => {
     expect(settled('pairing-gate', 'align-items'), 'this strands the column top').toBeUndefined();
   });
 
-  // The page is `viewport-fit=cover` under a translucent status bar, and this
-  // screen renders instead of the shell, so no other rule insets it. A flat
-  // gutter puts the title under the clock and the Pair button under the home
-  // indicator.
+  // The page is `viewport-fit=cover`, and this screen renders instead of the
+  // shell, so no other rule insets it. A flat gutter puts the Pair button under
+  // the home indicator, and the title under the clock on an older install.
   it('clears the safe area on every side', () => {
     const padding = settled('pairing-gate', 'padding') ?? '';
     for (const side of ['top', 'right', 'bottom', 'left']) {

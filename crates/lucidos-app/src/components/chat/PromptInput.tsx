@@ -33,10 +33,10 @@ import {
 } from './PromptRowControls';
 import { CODING_AGENT_MENU_FOLD_KEY, menuCodingAgent } from './ControlMenuTrigger';
 import { LazyRungControl } from './LazyRungControl';
-import { RUNG_FOLD_KEY, RungMenuIcon } from './RungButtons';
+import { RUNG_FOLD_KEY, RUNG_SHED_LEVELS, RungMenuIcon } from './RungButtons';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
-import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup } from '../../hooks/usePromptActionCollapse';
+import { FOLD_KEY_ATTR, SHED_ATTR, usePromptActionCollapse, type FoldGroup } from '../../hooks/usePromptActionCollapse';
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
 import { composerBannerState, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
@@ -74,6 +74,7 @@ import { passSendGate, sendGateAsks } from './rungSwitch';
 
 /** The card draws only on a large thread at a clean idle, so its code loads off the first-paint set. */
 const SuccessorCard = lazyComponent(() => import('./SuccessorCard').then((m) => m.SuccessorCard));
+const HandedOffCard = lazyComponent(() => import('./HandedOffCard').then((m) => m.HandedOffCard));
 
 const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
@@ -1353,7 +1354,6 @@ export function PromptInput() {
       key="send-cancel-morph"
       class={
         'action-btn send-cancel-morph send-cancel-round'
-        + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
         + (morphMode === 'cancel' && cancelSettling ? ' morph-settling' : '')
       }
       {...holdHandlers}
@@ -1364,7 +1364,6 @@ export function PromptInput() {
       onClick={morphActivate.onClick}
       aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel'
         : sideQuestionMode ? 'Ask side question' : 'Send message'}
-      aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
       tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}
       disabled={
         morphMode === 'send' ? false
@@ -1517,7 +1516,11 @@ export function PromptInput() {
     () => foldActions.map((a) => (clusterKeys.has(a.key) ? 'cluster' : 'row')),
     [foldSignature],
   );
-  const collapsedActions = usePromptActionCollapse(promptActionsAreaRef, foldKeys, foldGroups);
+  // The rung pill shortens to its badge before any member folds.
+  const { folded: collapsedActions, shed } = usePromptActionCollapse(
+    promptActionsAreaRef, foldKeys, foldGroups,
+    showsRungControl ? { key: RUNG_FOLD_KEY, levels: RUNG_SHED_LEVELS } : null,
+  );
   const hidden = foldActions.slice(0, collapsedActions);
   const foldedKeys = new Set(hidden.map((a) => a.key));
   /** Is this member still wearing its own box, rather than sitting in the ⋯? */
@@ -1623,6 +1626,7 @@ export function PromptInput() {
       </Disclosure>
       <NotReadyStrip key="not-ready" />
       <SuccessorCard key="successor" />
+      <HandedOffCard key="handed-off" />
       <div key="prompt-box" class="prompt-box">
         <div class="prompt-row">
           <textarea
@@ -1659,7 +1663,7 @@ export function PromptInput() {
           aria-hidden="true"
           onChange={handleFileSelect}
         />
-        <div class={rowClass} ref={promptActionsAreaRef}>
+        <div class={rowClass} ref={promptActionsAreaRef} {...{ [SHED_ATTR]: shed }}>
           {/* The ⋯ holds the folded members, which are always the leftmost
               ones, so it stands at the left edge where they were. */}
           {hidden.length > 0 && (

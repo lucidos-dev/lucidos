@@ -668,14 +668,20 @@ fn static_classify_at(
     // this, a wrapped command reads as head `bash`, skips the catastrophic
     // hard-block, and with the judge off falls through to Safe.
     let unwrapped = unwrap_shell_command(raw);
-    let cmd = unwrapped.as_ref();
-    if catastrophic_reason(cmd).is_some() {
+    if catastrophic_reason(&unwrapped).is_some() {
         return StaticVerdict::Settled(RiskLane::Catastrophic);
     }
     if command_reads_secret(raw) {
         return StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead);
     }
     let is_bash = matches!(tool_name, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND);
+    // The hard gates above read the command as written. Everything below
+    // reads it without a no-op `cd` into the root, as the bare call would.
+    let home = home_dir();
+    let cmd = is_bash
+        .then(|| after_root_cd(&unwrapped, root, disk, home.as_deref()))
+        .flatten()
+        .unwrap_or(unwrapped.as_ref());
     // Python declines are all ACTIVE signals: subprocess, eval, a network
     // write, a destruction call, a package install. None is an unlisted-head
     // omission, so the whole set is a refusal.
@@ -1042,6 +1048,92 @@ fn cd_destination(segment: &str) -> Option<String> {
                 _ => None,
             }
         })
+}
+
+/// `command` without a leading `cd` into the workspace root, or unchanged.
+///
+/// A command starts in the root already, so that `cd` moves nothing.
+/// Classification and grant matching read what runs after it, and the card
+/// still shows the command as written. A shell wrapper is unwrapped first.
+/// Only `cd <root>` followed by `&&`, `;` or a newline drops. Any other shape
+/// keeps its `cd`, since it either moves or may not run what follows.
+pub fn without_root_cd<'c>(command: &'c str, site: CommandSite<'_>) -> Cow<'c, str> {
+    let home = home_dir();
+    site.with_disk(|disk| without_root_cd_at(command, site.root(), disk, home.as_deref()))
+}
+
+/// The directory a leading `~` expands to. Commands inherit the engine's `HOME`.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// [`without_root_cd`] with the home directory a leading `~` expands to.
+fn without_root_cd_at<'c>(
+    command: &'c str,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+    home: Option<&Path>,
+) -> Cow<'c, str> {
+    let unwrapped = unwrap_shell_command(command);
+    match after_root_cd(&unwrapped, root, disk, home) {
+        Some(rest) => Cow::Owned(rest.to_string()),
+        None => Cow::Borrowed(command),
+    }
+}
+
+/// What `line` runs after a leading `cd` into `root`, or `None` when it does
+/// not start with one. On disk the target must resolve to the root.
+fn after_root_cd<'c>(
+    line: &'c str,
+    root: Option<&Path>,
+    disk: Option<OnDisk<'_>>,
+    home: Option<&Path>,
+) -> Option<&'c str> {
+    let root = root?;
+    let line = line.trim_start();
+    let sep = SEGMENT_SEP.find(line)?;
+    if !matches!(sep.as_str(), "&&" | ";" | "\n") {
+        return None;
+    }
+    let rest = line[sep.end()..].trim_start();
+    if rest.is_empty() || rest.starts_with(['&', '|', ';']) {
+        return None;
+    }
+    let operand = line[..sep.start()].trim_end().strip_prefix("cd")?;
+    if !operand.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let target = operand.trim_start();
+    if !target.starts_with(['"', '\'']) && target.contains(char::is_whitespace) {
+        return None;
+    }
+    let dir = literal_dir(target, home)?;
+    let is_root = match disk {
+        Some(d) => std::fs::canonicalize(&dir).is_ok_and(|real| real == d.root),
+        None => dir == root,
+    };
+    is_root.then_some(rest)
+}
+
+/// The absolute directory `token` names when the shell expands nothing in it
+/// but a leading unquoted `~`. One pair of quotes around it is fine. A `..`
+/// is refused: `cd` reads it before symlinks, and the disk check after.
+fn literal_dir(token: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let (word, quoted) = match token.chars().next() {
+        Some(q @ ('"' | '\'')) => (token.strip_prefix(q)?.strip_suffix(q)?, true),
+        _ => (token, false),
+    };
+    if word.contains(['"', '\'', '\\', '$', '`']) || word.contains(GLOB_CHARS) {
+        return None;
+    }
+    let dir = match word.strip_prefix('~') {
+        None => PathBuf::from(word),
+        Some(rest) if !quoted && (rest.is_empty() || rest.starts_with('/')) => {
+            home?.join(rest.trim_start_matches('/'))
+        }
+        Some(_) => return None,
+    };
+    (dir.is_absolute() && !dir.components().any(|c| c == Component::ParentDir)).then_some(dir)
 }
 
 /// The directory operands of a `cd`, without its flags and redirects. A bare
@@ -3435,6 +3527,9 @@ pub fn first_command_token(command: &str) -> Option<String> {
 /// head `timeout`, so `Bash(timeout:*)` would cover every program it wraps.
 /// Classification still reads it as an Omission, so the unattended lane keeps
 /// running `timeout 600 cargo test`; only the grant shortcut refuses.
+///
+/// The head list reads [`grant_command`], so a grant for `python3` covers
+/// `cd <root> && python3 x.py`. Every other check reads the command as written.
 pub fn grant_covers_command(
     label: &str,
     command: &str,
@@ -3454,8 +3549,20 @@ pub fn grant_covers_command(
     if segment_heads(command).iter().any(|h| is_exec_wrapper(h)) {
         return false;
     }
-    let heads = segment_heads_as_written(command);
+    let heads = segment_heads_as_written(&grant_command(command, site));
     !heads.is_empty() && heads.iter().all(|h| allowed(&format!("{label}({h}:*)")))
+}
+
+/// The command a grant reads its heads from: [`without_root_cd`], unless
+/// nothing runs after the dropped `cd`. Then the command as written, so the
+/// head the card names, the grant stores and the match reads stays `cd`.
+pub fn grant_command<'c>(command: &'c str, site: CommandSite<'_>) -> Cow<'c, str> {
+    let dropped = without_root_cd(command, site);
+    if segment_heads_as_written(&dropped).is_empty() {
+        Cow::Borrowed(command)
+    } else {
+        dropped
+    }
 }
 
 /// True when `head` execs the command in its own arguments.
@@ -6414,5 +6521,180 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
         ] {
             assert_eq!(lane(code), RiskLane::IrreversibleDanger, "{code}");
         }
+    }
+
+    // --- A leading cd into the workspace root -------------------------------
+
+    const HOME: &str = "/Users/me";
+
+    fn dropped_text_only(cmd: &str) -> String {
+        let root = Path::new("/Users/me/ws");
+        without_root_cd_at(cmd, Some(root), None, Some(Path::new(HOME))).into_owned()
+    }
+
+    #[test]
+    fn a_cd_into_the_exact_root_is_dropped() {
+        for cmd in [
+            "cd /Users/me/ws && ls data",
+            "cd /Users/me/ws; ls data",
+            "cd /Users/me/ws\nls data",
+            "  cd /Users/me/ws  &&  ls data",
+            "cd /Users/me/ws/ && ls data",
+            "cd /Users/me/ws/. && ls data",
+            "cd \"/Users/me/ws\" && ls data",
+            "cd '/Users/me/ws' && ls data",
+            "cd ~/ws && ls data",
+            "bash -lc 'cd /Users/me/ws && ls data'",
+        ] {
+            assert_eq!(dropped_text_only(cmd), "ls data", "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn a_root_with_a_space_drops_only_when_quoted() {
+        let root = Path::new("/Users/me/My Workspace");
+        let drop = |cmd| without_root_cd_at(cmd, Some(root), None, Some(Path::new(HOME)));
+        for cmd in [
+            "cd \"/Users/me/My Workspace\" && ls data",
+            "cd '/Users/me/My Workspace' ; ls data",
+            "cd\t\"/Users/me/My Workspace\"  && ls data",
+        ] {
+            assert_eq!(drop(cmd), "ls data", "{cmd:?}");
+        }
+        for cmd in [
+            "cd /Users/me/My Workspace && ls data",
+            "cd \"/Users/me/My Workspace\"x && ls data",
+            "cd \"/Users/me/My\" \"Workspace\" && ls data",
+            "cd\"/Users/me/My Workspace\" && ls data",
+        ] {
+            assert_eq!(drop(cmd), cmd, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn every_other_cd_shape_is_kept() {
+        for cmd in [
+            "cd /Users/me/ws || ls data",
+            "cd /Users/me/ws | ls data",
+            "cd /Users/me/ws & ls data",
+            "cd /Users/me/ws &&& ls data",
+            "cd /Users/me/ws/sub && ls data",
+            "cd .. && ls data",
+            "cd ws && ls data",
+            "cd /Users/me/ws/../other && ls data",
+            "cd /Users/me/ws/../ws && ls data",
+            "cd /Users/me && ls data",
+            "pushd /Users/me/ws && ls data",
+            "builtin cd /Users/me/ws && ls data",
+            "\\cd /Users/me/ws && ls data",
+            "(cd /Users/me/ws && ls data)",
+            "cd -P /Users/me/ws && ls data",
+            "cd /Users/me/ws extra && ls data",
+            "cd /Users/me/ws 2>&1 && ls data",
+            "cd /Users/me/ws > /dev/null && ls data",
+            "cd /Users/me/ws",
+            "cd /Users/me/ws && ",
+            "cd \"/Users/me/ws; ls\" ; rm x",
+            "cd /Users/me/ws\" ; rm x\"",
+            "cd \"~/ws\" && ls data",
+            "cd ~me/ws && ls data",
+            "cd $HOME/ws && ls data",
+            "cd /Users/me/w? && ls data",
+            "cd /Users/me/w\\s && ls data",
+            "ls data && cd /Users/me/ws && ls data",
+        ] {
+            assert_eq!(dropped_text_only(cmd), cmd, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn with_no_root_nothing_is_dropped() {
+        let cmd = "cd /Users/me/ws && ls data";
+        assert_eq!(without_root_cd(cmd, TEXT_ONLY), cmd);
+        assert_eq!(
+            without_root_cd_at(cmd, None, None, Some(Path::new(HOME))),
+            cmd
+        );
+    }
+
+    #[test]
+    fn on_disk_the_cd_must_resolve_to_the_root() {
+        let d = disk();
+        let ws = d.ws.display();
+        std::os::unix::fs::symlink(&d.ws, d.outside.join("to-ws")).unwrap();
+        d.link("out", &d.outside);
+        let site = CommandSite::Workspace(&d.ws);
+        let dropped = format!("cd {ws} && ls data");
+        assert_eq!(without_root_cd(&dropped, site), "ls data");
+        let via_link = format!("cd {} && ls data", d.outside.join("to-ws").display());
+        assert_eq!(without_root_cd(&via_link, site), "ls data");
+        for cmd in [
+            format!("cd {ws}/data && ls data"),
+            format!("cd {ws}/data/out && ls data"),
+            format!("cd {} && ls data", d.outside.display()),
+            format!("cd {ws}/missing && ls data"),
+        ] {
+            assert_eq!(without_root_cd(&cmd, site), cmd, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn the_hard_gates_see_through_a_root_cd() {
+        let d = disk();
+        let ws = d.ws.display();
+        for cmd in ["rm -rf /", "rm -rf ~", "dd if=/dev/zero of=/dev/disk0"] {
+            let prefixed = format!("cd {ws} && {cmd}");
+            assert_eq!(
+                d.static_lane(&prefixed),
+                StaticVerdict::Settled(RiskLane::Catastrophic),
+                "{prefixed}"
+            );
+        }
+        for cmd in ["cat ~/.ssh/id_rsa", "cat .env"] {
+            let prefixed = format!("cd {ws} && {cmd}");
+            assert_eq!(d.static_lane(&prefixed), d.static_lane(cmd), "{prefixed}");
+        }
+    }
+
+    #[test]
+    fn a_root_cd_reaches_the_judge_as_the_bare_command() {
+        let d = disk();
+        let call = "python3 .lucidos/tmp/slack_call.py '[[\"conversations_history\"]]'";
+        let prefixed = format!("cd {} && {call}", d.ws.display());
+        let StaticVerdict::NeedsJudge(ji) = d.static_lane(&prefixed) else {
+            panic!("{prefixed} must reach the judge");
+        };
+        assert_eq!(ji.command, call);
+        assert_eq!(d.static_lane(&prefixed), d.static_lane(call));
+        assert_eq!(
+            d.static_lane(&format!("cd {} && ls data", d.ws.display())),
+            StaticVerdict::Settled(RiskLane::Safe)
+        );
+    }
+
+    #[test]
+    fn a_grant_matches_the_heads_after_a_root_cd() {
+        let d = disk();
+        let site = CommandSite::Workspace(&d.ws);
+        let ws = d.ws.display();
+        let python = |p: &str| p == "Bash(python3:*)";
+        let cd_only = |p: &str| p == "Bash(cd:*)";
+        let prefixed = format!("cd {ws} && python3 x.py");
+        assert!(grant_covers_command("Bash", &prefixed, site, python));
+        let chained = format!("cd {ws} && python3 x.py && curl https://example.com");
+        assert!(!grant_covers_command("Bash", &chained, site, python));
+        assert!(!grant_covers_command("Bash", &prefixed, site, cd_only));
+        let moved = format!("cd {ws}/data && python3 x.py");
+        assert!(!grant_covers_command("Bash", &moved, site, python));
+    }
+
+    #[test]
+    fn a_secret_read_after_a_root_cd_is_never_granted() {
+        let d = disk();
+        let site = CommandSite::Workspace(&d.ws);
+        let cmd = format!("cd {} && cat ~/{}/k", d.ws.display(), SECRET_PATHS[0]);
+        assert!(!grant_covers_command("Bash", &cmd, site, |p: &str| {
+            p == "Bash(cat:*)" || p == "Bash"
+        }));
     }
 }

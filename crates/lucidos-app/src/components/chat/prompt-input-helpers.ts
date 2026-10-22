@@ -303,9 +303,9 @@ export function shouldClearSubmitting(status: ThreadStatus, uploadSendQueued: bo
 //   send        — visible, blue, click=submit          (up-arrow icon)
 //   cancel      — visible, red,  click=cancel exchange  (stop-square icon)
 //   canceling   — visible, red,  disabled               (stop-square icon, dimmed)
-//   placeholder — invisible (visibility:hidden, takes space) to keep row height
+//   empty       — visible, blue, disabled: nothing to send (up-arrow, dimmed)
 //   hidden      — not rendered; banner or section buttons own the slot
-type MorphMode = 'send' | 'cancel' | 'canceling' | 'placeholder' | 'hidden';
+type MorphMode = 'send' | 'cancel' | 'canceling' | 'empty' | 'hidden';
 
 export function computeMorphMode(args: {
   hasContent: boolean;
@@ -316,7 +316,7 @@ export function computeMorphMode(args: {
   if (args.hasContent) return 'send';
   if (args.cancelTargetId !== null) return args.isCanceling ? 'canceling' : 'cancel';
   if (args.hasBannerOrSectionButtons) return 'hidden';
-  return 'placeholder';
+  return 'empty';
 }
 
 // What the prompt-row action shows while the thread is `waiting_for_user_answer`

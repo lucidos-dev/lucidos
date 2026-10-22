@@ -6,39 +6,39 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
 
-// The rung control sheds on a narrow bar before it folds into the ⋯ menu:
-// the effort first, which brings in the position badge, then the model name,
-// leaving the badge. The row is the container, so the bar's own width decides,
-// in rem.
+// The rung control sheds on a narrow bar before anything folds into the ⋯
+// menu: the effort first, which brings in the intelligence badge, then the
+// model name, leaving the badge. The row's fold measures and stamps the level
+// as `data-shed`, so no width breakpoint lives here.
 const here: string = dirname(fileURLToPath(import.meta.url));
-const css: string = readFileSync(resolve(here, '../chat/rung-control.css'), 'utf-8');
+const css: string = readFileSync(resolve(here, '../chat/rung-control.css'), 'utf-8').replace(/\/\*[\s\S]*?\*\//g, '');
 
-/** The max-width, in rem, of the `@container prompt-row` block that hides `selector`. */
-function shedsBelow(selector: string): number {
-  const blocks = [...css.matchAll(/@container prompt-row \(max-width: ([\d.]+)rem\) \{([\s\S]*?)\n\}/g)];
-  const hit = blocks.find((b) => b[2].includes(selector) && b[2].includes('display: none'));
-  if (!hit) throw new Error(`nothing sheds ${selector}`);
-  return Number(hit[1]);
+/** The selectors of the rule whose body is exactly `body`. */
+function selectorsOf(body: string): string[] {
+  const hit = [...css.matchAll(/(^|\n)([^{}\n][^{}]*?) \{\s*([^}]*?)\s*\}/g)].find((m) => m[3] === body);
+  if (!hit) throw new Error(`no rule is exactly ${body}`);
+  return hit[2].split(',').map((s) => s.trim());
 }
 
 describe('the rung control sheds on a narrow bar', () => {
-  it('makes the prompt row the container it measures', () => {
-    expect(css).toMatch(/\.prompt-actions-row \{\s*container: prompt-row \/ inline-size;/);
+  it('keeps no width breakpoint: the fold decides', () => {
+    expect(css).not.toContain('@container');
   });
 
-  it('sheds the effort before the model name', () => {
-    expect(shedsBelow('.rung-effort')).toBeGreaterThan(shedsBelow('.rung-name'));
+  it('sheds the effort at level 1 and the name at level 2', () => {
+    expect(selectorsOf('display: none;')).toEqual([
+      '[data-shed="1"] .rung-effort',
+      '[data-shed="2"] .rung-effort',
+      '[data-shed="2"] .rung-face:has(> .rung-intelligence) .rung-name',
+    ]);
   });
 
-  it('keeps the model name on a face with no position badge', () => {
-    expect(css).toMatch(/\.rung-face:has\(> \.rung-position\) \.rung-name \{\s*display: none;/);
-  });
-
-  it('shows the position badge only once the effort sheds', () => {
-    expect(css).toMatch(/\n\.rung-position \{[^}]*display: none;/);
-    const effortBlock = [...css.matchAll(/@container prompt-row \(max-width: ([\d.]+)rem\) \{([\s\S]*?)\n\}/g)]
-      .find((b) => Number(b[1]) === shedsBelow('.rung-effort'))!;
-    expect(effortBlock[2]).toMatch(/\.rung-position \{\s*display: inline-flex;/);
+  it('shows the intelligence badge only once the pill sheds', () => {
+    expect(css).toMatch(/\n\.rung-intelligence \{[^}]*display: none;/);
+    expect(selectorsOf('display: inline-flex;')).toEqual([
+      '[data-shed="1"] .rung-intelligence',
+      '[data-shed="2"] .rung-intelligence',
+    ]);
   });
 
   it('never hides the caret', () => {

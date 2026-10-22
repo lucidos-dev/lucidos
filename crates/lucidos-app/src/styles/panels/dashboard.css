@@ -389,9 +389,10 @@
    (components/dashboard/DashboardSheet.tsx). */
 
 @media (--phone-layout) {
-    /* Starts below the header, never at the top edge. iOS Safari tints the
-       status bar from the topmost fixed box there, and this one stays mounted
-       and transparent once closed, so on the edge it would blur the header. */
+    /* Starts below the header, never at the top edge. iOS colours the status
+       bar from the topmost fixed box there, and this one stays mounted and
+       transparent once closed, so on the edge iOS would sample it, not the
+       header. */
     .dashboard-sheet {
         position: fixed;
         top: var(--app-header-bottom);

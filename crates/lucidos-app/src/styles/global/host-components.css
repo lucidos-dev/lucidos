@@ -519,23 +519,19 @@
 }
 
 /* Send → Cancel morph button. Always rendered at the same JSX position
- * across send/cancel/canceling/placeholder so Preact never unmounts the
+ * across send/cancel/canceling/empty so Preact never unmounts the
  * DOM node — class-driven mode changes let the .action-btn background-color
  * transition above animate the blue→red morph. min-width fits "Cancel..."
  * so the row doesn't jitter sideways when the label changes.
- * morph-placeholder keeps the row height stable when nothing else fills
- * the slot. The "hidden" mode is handled by not rendering the button at
- * all — snap-unmount, like the sibling section buttons — so the leave
- * path doesn't pop to the prompt frame edge. */
+ * The empty mode is a disabled Send, so typing fades it up from the
+ * `.action-btn:disabled` dim. The "hidden" mode is handled by not rendering
+ * the button at all, a snap-unmount like the sibling section buttons, so the
+ * leave path doesn't pop to the prompt frame edge. */
 .send-cancel-morph {
     transition:
         background-color var(--duration-emphasis),
         color var(--duration-normal),
         opacity var(--duration-normal);
-}
-.send-cancel-morph.morph-placeholder {
-    visibility: hidden;
-    pointer-events: none;
 }
 /* The Stop a send just morphed into is disabled for a moment, so a laggy second
  * tap on Send cannot cancel the turn (`armCancelSettle`). That guard is not a

@@ -7,6 +7,8 @@
   fixed 150 minutes after the wait began, for every model and both TTLs.
 - **Amended by**: [0492](0492-keep-alive-beat-lands-near-4-5-minutes.md). The
   5-minute beat window starts at 230 s, so its budget windows are 230 s each.
+- **Amended by**: [0547](0547-keep-alive-beats-a-parked-session-by-copy.md). A
+  parked wait gives up at half break-even, and a preference picks the rule.
 
 ## Context
 

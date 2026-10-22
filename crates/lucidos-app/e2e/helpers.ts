@@ -86,8 +86,11 @@ export async function setDevicePreference(page: Page, key: string, value: string
 }
 
 /** Open a Settings page through the navigate API, as the agent does.
- *  `view` is a `settings_view` value such as `appearance` or `system`. */
+ *  `view` is a `settings_view` value such as `appearance` or `system`.
+ *  Waits for the event stream first: the navigation is a transient event, so a
+ *  page still connecting never sees it and stays where it was. */
 export async function openSettingsView(page: Page, view: string): Promise<void> {
+  await waitForEventStream(page);
   const nav = await apiRequest(page).post('/api/v1/ui/navigate', {
     headers: { 'content-type': 'application/json' },
     data: { target: 'settings', params: { settings_view: view } },

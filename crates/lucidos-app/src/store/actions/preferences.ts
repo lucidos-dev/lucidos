@@ -5,7 +5,7 @@ import type { CodingAgent } from '../../api/types';
 import type { ThreadState } from '../thread-events';
 import { failedIfFresh } from '../types';
 import { getPreferences, setPreference, isTransientFetchError, retryTransient, getTheme, ApiError } from '../../api/client';
-import { resolvedHexColor } from '../../utils/cssColor';
+import { resolvedTokenHex } from '../../utils/cssColor';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
@@ -24,7 +24,7 @@ import {
 import {
   EMPTY_THEME, FONT_PREFERENCES, THEME_EFFECTS_STORAGE_KEY,
   THEME_KEY, THEME_STORAGE_KEY,
-  MOTION_STORAGE_KEY, THEME_MODE_ATTRIBUTE, THEME_MODE_BG,
+  MOTION_STORAGE_KEY, THEME_MODE_ATTRIBUTE, THEME_MODE_BG, THEME_MODE_HEADER_TOP,
   THEME_MODE_KEY, THEME_MODE_STORAGE_KEY, UI_SCALE_STORAGE_KEY,
   FONT_BOLD_ATTRIBUTE, FONT_FAMILY_STORAGE_KEY, WORKSPACE_FONT_STORAGE_KEY,
   clampUiScale, followSystemThemeMode, fontBoldMark, isWorkspaceFontId, themeBackground, themeTokenNames, parseResolvedTheme,
@@ -530,31 +530,22 @@ function paintThemeMode(mode: ThemeMode, resolved: ResolvedThemeMode, sampledLig
   document.documentElement.style.background = bg;
 
   setThemeTokens(themeTokens);
-  const themeActive = Object.keys(themeTokens).length > 0;
   // A theme background that is not a hex literal still has to reach the canvas.
   // The inline literal above would hide it, so the var takes its place.
   if (themeTokens['--bg-primary'] && !themeBackground(themeTokens)) {
     document.documentElement.style.background = 'var(--bg-primary)';
   }
 
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) {
-    meta.setAttribute('content', (themeActive && resolvedHexColor('var(--bg-primary)')) || bg);
-  }
-
   document.documentElement.style.colorScheme = resolved;
 
   // Tauri (packaged macOS): match the reclaimed title-bar band's behind-the-
-  // webview fallback (the window background) to the in-app header — the
-  // header-gradient top stop per mode (mirrors --header-gradient in
-  // styles/global/base.css, like the --bg-primary literal above; the visible
+  // webview fallback (the window background) to the in-app header (the visible
   // band itself is the CSS .titlebar-strip). Best-effort and cosmetic: it runs
   // whenever the mode is applied (incl. startup / OS appearance changes) with no
   // user-facing surface, and a failed call self-heals on the next applyThemeMode, so
   // a toast would be wrong.
   if (isTauri()) {
-    const defaultTitlebar = resolved === 'light' ? '#1a6fd0' : '#15549e';
-    const titlebar = (themeActive && resolvedHexColor('var(--titlebar-strip-bg)')) || defaultTitlebar;
+    const titlebar = resolvedTokenHex('--titlebar-strip-bg') ?? THEME_MODE_HEADER_TOP[resolved];
     setTitlebarColor(titlebar).catch((e) => console.warn('[titlebar] tint failed', e));
     // The mode is resolved and on the document, so a window shown now shows a
     // page in the user's appearance. The shell keeps the launch window hidden until
@@ -568,7 +559,19 @@ function paintThemeMode(mode: ThemeMode, resolved: ResolvedThemeMode, sampledLig
   // This just wrote --bg-primary and the theme inline and swapped the token
   // block wholesale, so any override of a themed token goes back on top.
   reapplyStyleOverrides();
+  paintThemeColor();
   appearanceVersion.value++;
+}
+
+/** Tint the bar above the page with the header's top colour: the iOS status
+ *  bar of the installed app (ADR 0548), and Android's and the browsers'
+ *  toolbars. Read from the painted token, so a theme, a style override and the
+ *  iOS dark-mode nudge in base.css all reach it. */
+export function paintThemeColor(): void {
+  document.querySelector('meta[name="theme-color"]')?.setAttribute(
+    'content',
+    resolvedTokenHex('--header-bar-top') ?? THEME_MODE_HEADER_TOP[paintedThemeMode.value],
+  );
 }
 
 // --- Theme (a named set of token values, docs/plans/2026-09-26-looks.md) ---
@@ -906,6 +909,7 @@ export function applyStyleOverrides(map: Record<string, string>): void {
     root.style, appliedOverrideNames, valid, activeTheme[paintedThemeMode.value],
   );
   localStorage.setItem(STYLE_OVERRIDES_STORAGE_KEY, serializeStyleOverrides(map));
+  paintThemeColor();
   appearanceVersion.value++;
   // A retuned --font-size-* or spacing token moves the root font size's
   // consumers. So the remote owes the same two derived measurements a scale
@@ -1729,6 +1733,19 @@ export function currentCodingAgentPermissionMode(): CcPermissionMode {
 
 export function setCodingAgentPermissionMode(mode: CcPermissionMode): Promise<void> {
   return savePreference('coding_agent_claude_permission_mode', mode);
+}
+
+/** When the cache keep-alive gives up on a waiting Claude Code session. */
+export const CACHE_KEEP_ALIVE_MODES = PREFERENCE_CATALOG.cache_keep_alive_mode.values;
+export type CacheKeepAliveMode = PreferenceValues<'cache_keep_alive_mode'>;
+
+/** Workspace-scoped. */
+export function currentCacheKeepAliveMode(): CacheKeepAliveMode {
+  return currentPreference('cache_keep_alive_mode');
+}
+
+export function setCacheKeepAliveMode(mode: CacheKeepAliveMode): Promise<void> {
+  return savePreference('cache_keep_alive_mode', mode);
 }
 
 // --- New-workspace welcome + starter suggestions ---

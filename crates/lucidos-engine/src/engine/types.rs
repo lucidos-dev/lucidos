@@ -470,6 +470,11 @@ pub enum ContextPurpose {
     /// The user can point it at a System One model with
     /// `judgment_wake_decision`.
     WakeDecision,
+    /// One *copy beat* of the cache keep-alive: a Claude Code session copy
+    /// asked for one word while its session is parked on a card. It runs the
+    /// session's own model. Its `duration_ms` dates the request that refreshed
+    /// the cache.
+    CacheKeepAlive,
 }
 
 /// SQL predicate over an `events` row: true for an *auxiliary capture*, a
@@ -484,6 +489,14 @@ impl ContextPurpose {
     /// Skip-serializing predicate: a turn capture writes no `purpose` key.
     pub(crate) fn is_turn(&self) -> bool {
         matches!(self, Self::Turn)
+    }
+
+    /// How the event payload spells `purpose`, for SQL to match on.
+    pub(crate) fn wire(self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
     }
 
     /// Section name for the one body-less section an auxiliary capture
@@ -512,6 +525,7 @@ impl ContextPurpose {
             Self::Proxy => "Proxied Request",
             Self::ReadDecision => "Read Decision Request",
             Self::WakeDecision => "Wake Decision Request",
+            Self::CacheKeepAlive => "Cache Keep-Alive Request",
         }
     }
 }

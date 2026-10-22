@@ -679,6 +679,8 @@ interface CommandPermissionEvent {
   tool_name: string;
   command: string;
   summary: string;
+  /** The head the engine stores for a bash grant. Absent on an older card. */
+  grant_head?: string;
 }
 
 interface CommandPermissionBodyProps {
@@ -842,6 +844,14 @@ export function commandHead(command: string): string | null {
   return base || null;
 }
 
+/** The head a bash command card's narrow and session buttons name. The engine
+ *  sends it as `grant_head`, since only it knows the workspace root a leading
+ *  `cd` may drop. An older card falls back to `commandHead`. */
+export function commandGrantHead(event: CommandPermissionEvent): string | null {
+  if (!BASH_TOOLS.has(event.tool_name)) return null;
+  return event.grant_head ?? commandHead(event.command);
+}
+
 /** Body of a `CommandPermissionRequested` divider exchange. */
 export function CommandPermissionBody({ event, resolved, terminated }: CommandPermissionBodyProps) {
   const { effective, mark, decide } = usePermissionDecide(
@@ -856,7 +866,7 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
   const answered = effective !== undefined;
 
   const isBash = BASH_TOOLS.has(event.tool_name);
-  const head = isBash ? commandHead(event.command) : null;
+  const head = commandGrantHead(event);
   // Bash gets a narrow `Bash(<head>:*)` sub-scope; Python is coarse (no narrow).
   const narrow = isBash && head ? `Bash(${head}:*)` : null;
   const sessionLabelText = isBash ? (head ? `${head} …` : null) : 'Python';

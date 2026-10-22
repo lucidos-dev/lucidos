@@ -1333,7 +1333,7 @@ The row is a synthetic `SpokenReplyGenerated` marked `_liveReply`, appended past
 See also: *live utterance*, *live speech mark*, *call phase*, ADR 0174.
 
 ### Session copy
-What answers a Claude Code *side question*: the thread's own `claude` command, resumed with `--no-session-persistence` under a settings file whose PreToolUse hook refuses every tool. It keeps the session's tools and appended system prompt, so it reads the transcript from the prompt cache. It writes nothing back to the session (ADR 0324). Code: `SessionCopy` and `session_copy` in `engine/agent_session/side_question.rs`, `ask_side_question` in `runtime/claude_code.rs`.
+What answers a Claude Code *side question*: the thread's own `claude` command, resumed with `--no-session-persistence` under a settings file whose PreToolUse hook refuses every tool. It keeps the session's tools and appended system prompt, so it reads the transcript from the prompt cache. It writes nothing back to the session (ADR 0324). A *copy beat* asks one too. Code: `SessionCopy` and `session_copy` in `engine/agent_session/side_question.rs`, `ask_session_copy` in `runtime/claude_code.rs`, which `ask_side_question` wraps.
 
 ### Session clock
 The one timeline a Live call is measured on. Both transcript deltas carry `start_ms` and `end_ms` against it. So a caller fragment and a talker fragment can be placed against each other, whatever order they arrived in (ADR 0198).
@@ -2450,13 +2450,21 @@ Anthropic allows four breakpoints and Lucidos spends all four: the last tool, th
 ### Keep-alive run
 How the engine runs a *cache keep-alive* (`engine/event_wait/keep_alive.rs`). The user-facing term is in `system-knowhow/glossary.md`.
 
-- **When.** The thread holds a live event wait whose every subscription is a *keep-warm kind*. Or it has a `running` child thread whose *wake mode* is not `no-wake`. The wait began within the *keep-alive budget* ago. Its last request started 200 to 260 s ago on a 5-minute cache, or 3300 to 3360 s ago on a 1-hour one.
+- **When.** The thread holds a live event wait whose every subscription is a *keep-warm kind*, or a `running` child thread whose *wake mode* is not `no-wake`. Or its live session is parked on a question card or a permission prompt, which takes a *copy beat*. The wait began within the *keep-alive budget* ago. Its last refresh, a turn request or a copy beat, started 230 to 260 s ago on a 5-minute cache. On a 1-hour one it started 3300 to 3360 s ago.
 - **Observed TTL.** The TTL of the session's latest cache write, from `usage.cache_creation_1h_tokens` on its `ContextCaptured`. A sub-agent's write does not count. An unknown TTL beats as 5 minutes, the side that keeps the cache (ADR 0479). A fresh session has no write yet, so its session context states the *repo TTL*: the latest such write among the repo's threads in the last 7 days (`cache_ttl::repo_cache_ttl`, ADR 0511).
-- **Never** on Codex, on a question or permission card, or on a live, held or busy thread. Nor for children that all wait on the user: a child parked on a question, permission or plan approval card keeps no parent warm. Its answer restarts the beats only while the window is still ahead. Nor for a `no-wake` child, such as a build chain's successor: its clean finish never wakes the parent, so nothing would read the warm cache.
+- **Never** on Codex, under `cache_keep_alive_mode` `off`, or on a live, held or busy thread unless it is parked. Nor on a parked thread with no live session or no remembered appended prompt. Nor for children that all wait on the user: a child parked on a question, permission or plan approval card keeps no parent warm. Its answer restarts the beats only while the window is still ahead. Nor for a `no-wake` child, such as a build chain's successor: its clean finish never wakes the parent, so nothing would read the warm cache.
 - **Its own run.** It claims the thread as `ClaimFor::KeepAlive`. While that run is live it reads as a hold. A real input waits the few seconds until it ends, then opens its own turn.
 - **Invisible.** Its anchor is a `PromptInjected` with engine reason `cache_keep_alive`. The run marks `thread_summaries.keep_alive_turn`, and the projection, the parent fan-in, the turn end and the transcript all skip the turn. Its `CodingAgentIdled` carries `reason: "cache_keep_alive"`, which no wait or trigger matches. A card the agent raises anyway ends the keep-alive. What the user sees instead is the *cache keep-alive status*.
 
-Why a keep-alive and not the 1-hour TTL: ADR 0470. Why it follows the observed TTL: ADR 0479. Why its budget follows the model's prices: ADR 0489. Why it shows one status and never the pings: ADR 0529.
+Why a keep-alive and not the 1-hour TTL: ADR 0470. Why it follows the observed TTL: ADR 0479. Why its budget follows the model's prices: ADR 0489. Why it shows one status and never the pings: ADR 0529. Why a parked session takes a copy beat: ADR 0547.
+
+### Copy beat
+A *keep-alive run*'s beat for a Claude Code session parked mid-turn on a question card or a permission prompt (`BeatRoute::SessionCopy`). The session blocks on the engine's reply, so the engine asks a *session copy* the keep-alive prompt instead. The copy reads the parked session's cached prefix, and that read refreshes the cache entry.
+
+- **Bounded.** One model turn (`KEEP_ALIVE_COPY_MAX_TURNS`), killed after 60 s (`KEEP_ALIVE_COPY_TIMEOUT`).
+- **Recorded.** A `ContextCaptured` with purpose `cache_keep_alive` and its wall-clock `duration_ms`. The next beat times from it.
+- **Invisible to the session.** No `PromptInjected` anchor, no turn, no status. The card stays as it was.
+- **Needs the remembered appended prompt** (`remembers_cc_system_prompt`). Without it the copy would miss the cache, so the thread gets no copy beat.
 
 ### Cache keep-alive status
 What the *keep-alive run* does for one waiting thread, as its tick last saw it (`CacheKeepAliveStatus`, `thread_events/keep_alive_status.rs`). The tick is its one writer: a pure `status()` beside `decide()`, sharing its arithmetic. It emits `CacheKeepAliveStatusChanged` only on a change, which projects into `thread_summaries.cache_keep_alive_status` and rides the thread aggregate. Three states:
@@ -2471,7 +2479,9 @@ Absent when the thread has nothing to keep warm, and on Codex threads. A thread 
 The dashed line `Cache warm · 4m left` that closes the feed of a thread waiting on the user while its prompt cache is still warm (`CacheWarmLine`, `components/chat/CacheKeepAlive.tsx`). The engine answers how long is left (`GET /api/v1/threads/:thread_id/cache-warmth`, `warm_remaining_secs` in `engine/switch_estimate.rs`), the same rule that prices a switch. The client holds no TTL: it counts down locally and reads again when the thread's status or events change. It shows only while the thread is idle or awaits an answer, with none in flight, and never while a keep-alive card counts down. The `cache_warm_line` preference (Settings → System → Debugging, on by default) turns it off, and the read with it. A cold cache, a thread that never wrote one (Codex), any other status and a failed read draw nothing.
 
 ### Keep-alive budget
-How long a *keep-alive run* keeps beating, counted from the wait's start. It is the break-even of the session's model: the beats that cost one cache rewrite. That is the TTL's write rate over its read rate, times its beat window start (200 s on 5 minutes, 3300 s on 1 hour). The rates come from the *price table*, read for the model of the capture that decides the TTL. An unknown model prices at the standard multipliers, the shortest budget (ADR 0489).
+How long a *keep-alive run* keeps beating, counted from the wait's start. Under `cache_keep_alive_mode` `default` it is the break-even of the session's model: the beats that cost one cache rewrite. That is the TTL's write rate over its read rate, times its beat window start (230 s on 5 minutes, 3300 s on 1 hour). The rates come from the *price table*, read for the model of the capture that decides the TTL. An unknown model prices at the standard multipliers, the shortest budget (ADR 0489).
+
+A parked wait gets half of it, and its clock starts at the turn request that asked. Under `workspace-data` the budget is the cheapest cap over this workspace's last 30 days of waits of the same type: the card, or the kinds an event wait watches (`WaitType`, `wait_durations.rs`). It never exceeds twice break-even, and a type with under 50 waits keeps the default. `budget_beats` is the one function `decide` and `status` both read (ADR 0547).
 
 ### Price table (mechanism)
 The user-facing *price table* is defined in `system-knowhow/glossary.md`. In code it is `llm::model_prices` (ADR 0525).

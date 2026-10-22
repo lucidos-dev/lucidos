@@ -25,6 +25,10 @@ export interface RungControlProps {
 /** The pill's name in the row's fold, which remembers its width. */
 export const RUNG_FOLD_KEY = 'rung';
 
+/** How far the pill shortens before the row folds anything: full, then badge
+ *  and name, then the badge alone (`styles/chat/rung-control.css`). */
+export const RUNG_SHED_LEVELS = 3;
+
 /** A ladder glyph for the folded pill's ⋯ menu row. */
 export function RungMenuIcon() {
   return (
@@ -36,14 +40,12 @@ export function RungMenuIcon() {
   );
 }
 
-/** `3/7 Opus 5.5 · medium`. A narrow bar sheds the effort and then the name,
- *  and only a narrow bar shows the position (`.rung-position`). */
+/** `1.12× Opus 5.5 · medium`. A narrow bar sheds the effort and then the
+ *  name, and only a narrow bar shows the intelligence badge. */
 function RungFace({ shown }: { shown: ShownRung }) {
   return (
     <>
-      {shown.position && (
-        <span class="rung-position">{shown.position.at}<span class="rung-position-of">/{shown.position.of}</span></span>
-      )}
+      {shown.intelligence && <span class="rung-intelligence">{shown.intelligence}</span>}
       <span class="rung-name">{shown.name}</span>
       {shown.effort && <span class="rung-effort">{` · ${shown.effort}`}</span>}
     </>

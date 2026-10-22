@@ -56,7 +56,7 @@ async function openThreadWithDraft(page: Page, title: string): Promise<void> {
   const input = page.locator(`${PANE} [data-role="prompt-input"]`).first();
   await input.focus();
   await input.fill('line one\nline two\nline three\nline four');
-  await expect(page.locator(`${PANE} button[aria-label="Send message"]`)).toBeVisible();
+  await expect(page.locator(`${PANE} button[aria-label="Send message"]:not(:disabled)`)).toBeVisible();
 }
 
 test.describe('A mobile follow-up send moves as one piece', () => {

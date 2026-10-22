@@ -1126,6 +1126,17 @@ pub const CODING_AGENT_AUTO_COMPACT_TRIAL: Pref<Text> = Pref::text(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const CACHE_KEEP_ALIVE_MODE: Pref<Text> = Pref::text(PrefSpec {
+    key: "cache_keep_alive_mode",
+    label: "Cache keep-alive",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(crate::engine::event_wait::keep_alive::CACHE_KEEP_ALIVE_MODES),
+    default: PrefDefault::Value("default"),
+    description: "When the cache keep-alive gives up on a waiting Claude Code session. 'default' beats an event wait or working children until the beats cost one cache rewrite (break-even), and a session parked on a question card or permission prompt until half of that. 'workspace-data' gives up at the point that would have cost least over this workspace's last 30 days, per wait type, and keeps the default for a type with under 50 waits. 'off' sends no beats, so every wait past the cache lifetime pays its rewrite.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const MODEL_CLAUDE_CODE: Pref<Text> = Pref::text(PrefSpec {
     key: "model_claude_code",
     label: "Claude Code default model",
@@ -1946,6 +1957,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &CODING_AGENT_CODEX_PATH.spec,
     &CODING_AGENT_CLAUDE_PERMISSION_MODE.spec,
     &CODING_AGENT_AUTO_COMPACT_TRIAL.spec,
+    &CACHE_KEEP_ALIVE_MODE.spec,
     &MODEL_CLAUDE_CODE.spec,
     &REASONING_CLAUDE_CODE.spec,
     &MODEL_CODEX.spec,

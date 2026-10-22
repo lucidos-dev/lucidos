@@ -9,8 +9,8 @@ const base = {
 };
 
 describe('computeMorphMode', () => {
-  it('placeholder when nothing else owns the slot', () => {
-    expect(computeMorphMode(base)).toBe('placeholder');
+  it('a disabled Send when there is nothing to send and nothing else owns the slot', () => {
+    expect(computeMorphMode(base)).toBe('empty');
   });
 
   it('hidden when banner or section buttons own the slot', () => {
