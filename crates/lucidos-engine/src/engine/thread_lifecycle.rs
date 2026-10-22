@@ -324,6 +324,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "SessionStarted"
         | "ContinuationStarted"
         | "CodingAgentSettingsChanged"
+        | "ChatSettingsChanged"
         | "CodingAgentCompacted"
         | "SuccessorThreadSpawned"
         | "HandoffCheckpointReached"
@@ -452,7 +453,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // timeline, never a turn: the stopped child is alive, and the parent
         // stays asleep until the `ChildThreadCompleted` that settles it.
         "ChildThreadStopped" => EventClass::Metadata,
-        // A clean report its child said needs no action now. A note on the
+        // A report its wake mode or wake decision filed. A note on the
         // parent's timeline, never a turn: the parent reads it next turn.
         "ChildReportFiled" => EventClass::Metadata,
         // The edge to a child was cut (ADR 0278). Bookkeeping on the former
@@ -579,6 +580,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "FormRequestResolved",
         "McpConsentRequested",
         "CodingAgentSettingsChanged",
+        "ChatSettingsChanged",
         "CodingAgentCompacted",
         "SuccessorThreadSpawned",
         "HandoffCheckpointReached",
@@ -857,6 +859,11 @@ pub fn resolve_transition(
         "McpPermissionResolved" => match thread_type {
             ThreadType::Chat => no_change,
             ThreadType::CodingAgent => violation("McpPermissionResolved is chat-only"),
+        },
+        // A rung pick between turns (ADR 0544). Only the Lucidos Agent reads it.
+        "ChatSettingsChanged" => match thread_type {
+            ThreadType::Chat => no_change,
+            ThreadType::CodingAgent => violation("ChatSettingsChanged is chat-only"),
         },
         // Events legal for both, no section change
         "MessageReceived"

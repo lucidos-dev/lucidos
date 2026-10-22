@@ -93,6 +93,20 @@ describe('horizontalDragClaimed', () => {
   it('is claimed by a touch-action on an ancestor', () => {
     expect(horizontalDragClaimed(chain({ localName: 'div' }, { localName: 'canvas', touchAction: 'none' }), styleOf)).toBe(true);
   });
+
+  it.each(['html', 'body'])('is free under a page-wide pan-y on %s, which only stops the page panning sideways', (page) => {
+    expect(horizontalDragClaimed(chain({ localName: 'p' }, { localName: page, touchAction: 'pan-y' }), styleOf)).toBe(false);
+    expect(horizontalDragClaimed(chain({ localName: 'p' }, { localName: page, touchAction: 'pan-y pinch-zoom' }), styleOf)).toBe(false);
+  });
+
+  it('is claimed by a page-wide none, which takes every drag', () => {
+    expect(horizontalDragClaimed(chain({ localName: 'p' }, { localName: 'body', touchAction: 'none' }), styleOf)).toBe(true);
+  });
+
+  it('is claimed by a pan-y carousel inside the page', () => {
+    const carousel = { localName: 'div', touchAction: 'pan-y' };
+    expect(horizontalDragClaimed(chain({ localName: 'img' }, carousel, { localName: 'body', touchAction: 'pan-y' }), styleOf)).toBe(true);
+  });
 });
 
 // The test env has no TouchEvent, so a plain Event carries the fields read.

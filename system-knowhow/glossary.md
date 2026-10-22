@@ -157,7 +157,7 @@ One *chat thread* per workspace, titled "Home", that never ends: **Home's chat**
 
 **It starts a thread for work.** Home answers a question or a quick lookup itself, and gives anything more its own *sub-thread*. So the work runs in parallel, and Home stays free for your next message. A conversation that needs your answers, such as the *setup interview*, stays in Home. A sub-thread's findings reach you in its own thread, so a thread Home starts has the *wake mode* `no-wake` unless Home asks for more.
 
-Its clean report is a *filed report*, which Home reads on its next turn, and *Review* lists the thread when it is worth reading. A failure still wakes Home.
+Its report is a *filed report*, which Home reads on its next turn, and *Review* lists the thread when it is worth reading. A failure is filed too: the sub-thread shows it in Blocked.
 
 **You open it from Home, not from the thread list.** The Home icon leads the thread pane's header, with New thread beside it, and opens it. On a phone it sits beside the Lucidos mark, and the menu that the thread drawer's mark opens carries Home as its first row. The *thread drawer* draws no row for it, but its *sub-threads* show in the drawer's sections as threads of their own.
 
@@ -190,7 +190,7 @@ See also: *child follow-up*, *read marker*.
 A *coding-agent thread* that ended its turn while waiting on an event, with work on its branch that no *change* carries yet. The agent is still working, so the engine holds the proposal until the wait re-opens the thread and the agent finishes (ADR 0395). Until then the thread cannot be archived or deleted. **Stop waiting** proposes the work at once.
 
 ### Child thread
-A direct descendant *thread* created by a `relation: "child"` spawn (`run_thread` / `run_coding_agent` / `lucidos spawn-thread --relation child`). When the child terminates, it reports to the *parent thread*, so the parent never waits. Its *wake mode*, set by the spawn, says whether the report resumes the parent: a failure always does, and a clean report follows the mode, else it is a *filed report*. A child spawned before wake modes existed has none, and its *wake decision* says it instead.
+A direct descendant *thread* created by a `relation: "child"` spawn (`run_thread` / `run_coding_agent` / `lucidos spawn-thread --relation child`). When the child terminates, it reports to the *parent thread*, so the parent never waits. Its *wake mode*, set by the spawn, says whether the report resumes the parent. Under `no-wake` nothing does, a failure included: every report is a *filed report*. Under the other modes a failure always does, and a clean report follows the mode. A child spawned before wake modes existed has none, and its *wake decision* says it instead.
 
 A crash that cuts the child's turn reports it as `interrupted`, since nothing resumes it. A child is a *sub-thread*; the reverse isn't true. A *child follow-up* from the parent earns another report when that turn ends.
 
@@ -358,7 +358,8 @@ once and you get a notice.
 The public half of a workspace's *backup key* pair, an age public key starting
 `age1`. Every new backup is sealed to it. Lucidos stores only this half, so it
 can make backups but never open them. Set it up under **Settings → System →
-Backup**, or paste an age public key you already own.
+Backup**, or paste an age public key you already own. That page shows it once
+it is set, so another workspace can use the same backup key.
 
 ### Backup key
 The private key that opens a workspace's backups, starting `AGE-SECRET-KEY-1`.
@@ -394,7 +395,7 @@ The CLI has `lucidos widgets dashboard`, `dashboard-add`, `dashboard-remove` and
 See also: *dashboard sheet*, *home thread*, *app shortcut*, *widget size*, *widget shelf*, *last used device*, ADR 0432, ADR 0455, ADR 0466, ADR 0496, ADR 0532, ADR 0538.
 
 ### Dashboard sheet
-The phone *dashboard* drawn over the open thread. A button on the right of the Lucidos mark in the thread header toggles it, with or without a thread open. It rises from the bottom edge and hangs 0.75rem below the header, so a strip of the thread shows above it. That strip dims, while the header and its button stay clear. A tap on the button or on the dim closes it.
+The phone *dashboard* drawn over the open thread. A button on the right of the Lucidos mark in the thread header toggles it, with or without a thread open. It fades in under the header and fills the screen below it. No gap, edge line or corner sets it apart, so the header and the dashboard read as one surface. A tap on the button closes it. While open, the button wears the threads Filter button's on look.
 
 **Opening it never changes the thread you are in.** A *widget* tile that asks which thread is focused gets the thread under the sheet, so a thread-aware tile describes that thread. Moving to another thread or pane closes the sheet. It keeps its tiles live while closed, so a reopen shows them as they were.
 
@@ -1214,15 +1215,15 @@ A *sub-thread* that another agent started reports to that agent. When its report
 A no changes nothing you see, and never clears an earlier read request you have not read yet.
 
 ### Wake mode
-What a *child thread*'s clean finish does to its *parent thread*, declared by the spawn: `wake_mode` on `run_thread` and `run_coding_agent`, `--wake-mode` on `lucidos spawn-thread --relation child`.
+What a *child thread*'s report does to its *parent thread*, declared by the spawn: `wake_mode` on `run_thread` and `run_coding_agent`, `--wake-mode` on `lucidos spawn-thread --relation child`.
 
-- `no-wake`: the user reads the result, and the parent may still want it. A clean report is a *filed report*, which the parent reads on its next turn.
+- `no-wake`: the user reads the result in the child, and the parent may still want it. Every report is a *filed report*, which the parent reads on its next turn. A failure or an `interrupted` turn is filed too, since the child shows it in Blocked.
 - `wake`: the parent needs the result to continue, so every report wakes it.
 - `wake-when-all-done`: the parent combines several results. A clean report wakes it only when no other child of that batch is still working. The earlier ones are filed.
 
 A parent that will not act on the result spawns a *top-thread* instead, which sends no report.
 
-A child of the *home thread* defaults to `no-wake`, and a child of any other thread to `wake`. A failure, a cancel, an `interrupted` turn, an archive and a discard wake the parent under every mode. The mode lasts the child's life: a *child follow-up* keeps it, so a parent that needs an answer from a `no-wake` child spawns a new one with `wake`. A top spawn takes none. Stored as `thread_summaries.wake_mode`, from the child's first `MessageReceived`.
+A child of the *home thread* defaults to `no-wake`, and a child of any other thread to `wake`. Under `wake` and `wake-when-all-done`, a failure, a cancel, an `interrupted` turn, an archive and a discard wake the parent. The mode lasts the child's life: a *child follow-up* keeps it, so a parent that needs an answer from a `no-wake` child spawns a new one with `wake`. A top spawn takes none. Stored as `thread_summaries.wake_mode`, from the child's first `MessageReceived`.
 See also: *wake decision*, *filed report*.
 
 ### Wake decision
@@ -1236,7 +1237,7 @@ A child with a wake mode makes no wake decision: the tool is not offered, and a 
 See also: *wake mode*, *filed report*, *read decision*.
 
 ### Filed report
-A *child thread*'s clean report, delivered to its *parent thread* without waking it. Its *wake mode* is `no-wake`, or it is an early report of a `wake-when-all-done` batch, or its *wake decision* said no. The event is `ChildReportFiled`, with the same content as the waking `ChildThreadCompleted`. It starts no turn and moves no thread in the drawer. The parent reads it on its next turn: a chat parent in its history, a coding-agent parent at the front of its next prompt.
+A *child thread*'s report, delivered to its *parent thread* without waking it. Its *wake mode* is `no-wake`, which files every report, failures included. Or it is a clean early report of a `wake-when-all-done` batch, or a clean one its *wake decision* said no to. The event is `ChildReportFiled`, with the same content as the waking `ChildThreadCompleted`. It starts no turn and moves no thread in the drawer. The parent reads it on its next turn: a chat parent in its history, a coding-agent parent at the front of its next prompt.
 
 In the parent's chat it wears the child report card with the line "Filed without waking this thread".
 See also: *wake mode*, *wake decision*, *child thread*.
@@ -2009,6 +2010,8 @@ A ladder with an owner's saved order wears a **Customised** mark, and **Reset** 
 The prompt-bar control for choosing a thread's model and effort. It is a small pill beside the send button, showing the model, effort ("Opus 5.5 · medium") and a chevron. The ‹ and › at its ends step one rung down or up the list, and the pill keeps one width as it steps. The compose view and a started thread draw the same pill. A narrow bar sheds the effort, which brings in the rung's place on the ladder ("3/7"), then the model name. A phone draws the steps smaller.
 
 It opens a list of *intelligence rungs* from the thread's own *intelligence ladder*: each estimated rung that is on, and the pair in force when it sits off the ladder. Then come the rungs with no estimate, under *Not estimated*, and a link to **Settings → Intelligence** last. Pick one row to set model and effort together. On the Lucidos Agent, a rung whose model has a choice of backend then asks for the *preferred provider*. Codex has no slash menu, so its `/` button stays dimmed.
+
+On a started Lucidos Agent thread, the model and effort stay fixed while a turn runs, waits on a question or is paused. The control then says why instead of changing. A pick between turns is saved at once, and the next turn runs on it, from any device, however that turn starts.
 
 There is no Default row: while nothing is picked, the ladder's default rung wears the checkmark in its own place in the list. The pill never reads "Default" either. With no model of its own, a thread names its *default implementer*. When none is set, it names the backend ("Codex"), whose own config picks.
 

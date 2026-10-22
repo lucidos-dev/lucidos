@@ -108,7 +108,9 @@ fn a_backup_key_parses_its_own_recipient() {
     let parsed = parse_backup_key(&backup_key_text(&identity)).unwrap();
     assert_eq!(parsed.to_public().to_string(), recipient.to_string());
     assert_eq!(
-        parse_recipient(&recipient.to_string()).unwrap().to_string(),
+        parse_pasted_recipient(&recipient.to_string())
+            .unwrap()
+            .to_string(),
         recipient.to_string()
     );
 }
@@ -124,6 +126,58 @@ fn a_bad_key_error_never_repeats_the_pasted_text() {
         .unwrap()
         .to_string();
     assert!(!err.contains("plainly"), "{err}");
+}
+
+/// The own-key step wants a public key. A backup key pasted there is told
+/// apart, and no message repeats the paste or a raw bech32 reason.
+#[test]
+fn a_bad_recipient_error_names_the_public_key_and_never_repeats_the_paste() {
+    let (identity, recipient) = generate_key_pair();
+    let backup_key = backup_key_text(&identity);
+    let err = parse_pasted_recipient(&backup_key)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("secret backup key"), "{err}");
+    assert!(err.contains("age1"), "{err}");
+    let lowercase = backup_key.to_ascii_lowercase();
+    let err = parse_pasted_recipient(&lowercase)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("secret backup key"), "{err}");
+    let key_file = format!("# created: now\n# public key: {recipient}\n{backup_key}\n");
+    let err = parse_pasted_recipient(&key_file).err().unwrap().to_string();
+    assert!(err.contains("secret backup key"), "{err}");
+
+    let damaged = format!("{}x", recipient);
+    for pasted in [
+        backup_key.as_str(),
+        lowercase.as_str(),
+        key_file.as_str(),
+        damaged.as_str(),
+        "plainly-not-a-key",
+        "",
+    ] {
+        let err = parse_pasted_recipient(pasted).err().unwrap().to_string();
+        assert!(!err.contains("HRP"), "{err}");
+        assert!(!err.contains("checksum"), "{err}");
+        if !pasted.is_empty() {
+            assert!(!err.contains(pasted), "{err}");
+        }
+    }
+    let err = parse_pasted_recipient(&damaged).err().unwrap().to_string();
+    assert!(err.contains("not a valid age public key"), "{err}");
+}
+
+#[test]
+fn a_recipient_parses_with_surrounding_whitespace() {
+    let (_, recipient) = generate_key_pair();
+    let pasted = format!("  {recipient}\n");
+    assert_eq!(
+        parse_pasted_recipient(&pasted).unwrap().to_string(),
+        recipient.to_string()
+    );
 }
 
 #[test]

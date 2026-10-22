@@ -632,6 +632,36 @@ describe("applyThemeMode('system'): following the OS", () => {
     expect(mqListeners).toHaveLength(1);
   });
 
+  it('keeps a flip a repaint raced, instead of swapping the query out from under it', () => {
+    // A media query announces only a change made after it exists. A repaint
+    // between the flip and its dispatch, such as the startup theme re-lay,
+    // used to replace the query. The new one was born on the new appearance,
+    // so it announced nothing.
+    const queries: Array<{ born: boolean; listeners: Array<() => void> }> = [];
+    (window as any).matchMedia = () => {
+      const query = { born: mqLight, listeners: [] as Array<() => void> };
+      queries.push(query);
+      return {
+        get matches() { return mqLight; },
+        addEventListener: (_t: string, fn: () => void) => { query.listeners.push(fn); },
+        removeEventListener: (_t: string, fn: () => void) => {
+          query.listeners = query.listeners.filter((l) => l !== fn);
+        },
+      };
+    };
+    applyThemeMode('system');
+    painted = [];
+
+    mqLight = true;
+    applyThemeMode('system');
+    for (const query of queries) {
+      if (query.born !== mqLight) query.listeners.forEach((fn) => fn());
+    }
+    settle();
+
+    expect(painted).toContain('light');
+  });
+
   it('applies an OS flip announced while the page is visible', () => {
     applyThemeMode('system');
     painted = [];

@@ -181,10 +181,10 @@ describe('the icon says which state it is in', () => {
     expect(control().querySelector('svg')?.getAttribute('fill')).toBe('currentColor');
   });
 
-  it('takes the row\'s active class once armed', () => {
-    expect(control().className).not.toContain('active');
+  it('wears the armed tone, pressed or not', () => {
+    expect(control().getAttribute('data-tone')).toBe('armed');
     standingApplyThreadIds.value = new Set([THREAD]);
-    expect(control().className).toContain('active');
+    expect(control().getAttribute('data-tone')).toBe('armed');
   });
 });
 

@@ -415,7 +415,7 @@ pub async fn set_own_backup_recipient(
     Json(req): Json<OwnRecipientRequest>,
 ) -> Result<Json<BackupKeysResponse>, ApiError> {
     let actor = check_recipient_access(&state, &headers).await?;
-    let own = backup::crypto::parse_recipient(&req.recipient)
+    let own = backup::crypto::parse_pasted_recipient(&req.recipient)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     recipient::use_own(&state.pool, &state.engine.event_bus, &own, Some(actor))
         .await

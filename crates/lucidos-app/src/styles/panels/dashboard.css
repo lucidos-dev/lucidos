@@ -381,77 +381,40 @@
 
 /* --- The dashboard sheet: the phone dashboard over the open thread ---
 
-   It hangs below the app header, which carries its toggle and stays clear of
-   the dim (components/dashboard/DashboardSheet.tsx). */
+   It meets the app header's bottom edge with no gap, line or corner, so the
+   two read as one surface. The header carries its toggle
+   (components/dashboard/DashboardSheet.tsx). */
 
 @media (--phone-layout) {
     .dashboard-sheet {
-        --sheet-gap: 0.75rem;
-        /* 1.25rem in the default theme, and a theme's own surface radius scales it. */
-        --sheet-corner-radius: calc(var(--radius-surface) * 5 / 3);
         position: fixed;
         inset: 0;
         z-index: var(--z-control-panel);
         pointer-events: none;
     }
 
-    .dashboard-sheet-dim {
-        position: absolute;
-        left: 0;
-        right: 0;
-        top: var(--app-header-bottom);
-        height: var(--sheet-gap);
-        background: var(--scrim);
-        opacity: 0;
-        transition: opacity var(--duration-slow) ease;
-    }
-
-    .dashboard-sheet.is-open .dashboard-sheet-dim {
-        opacity: 1;
-    }
-
-    /* Rises from the bottom edge. Closed, it rests below the window and hidden,
-       its tiles still mounted. */
+    /* Fades in and out in place. Closed, it is hidden with its tiles still
+       mounted. */
     .dashboard-sheet-panel {
         position: absolute;
         left: 0;
         right: 0;
         bottom: 0;
-        top: calc(var(--app-header-bottom) + var(--sheet-gap));
+        top: var(--app-header-bottom);
         overflow-y: auto;
         overscroll-behavior: contain;
         padding-bottom: var(--safe-area-bottom);
         background: var(--bg-primary);
-        border-top: 1px solid var(--border-color);
-        border-radius: var(--sheet-corner-radius) var(--sheet-corner-radius) 0 0;
-        box-shadow: var(--shadow-up);
         pointer-events: auto;
         visibility: hidden;
-        transform: translateY(100%);
-        transition: transform var(--duration-slow) cubic-bezier(0.2, 0.8, 0.2, 1),
-            visibility 0s linear var(--duration-slow);
+        opacity: 0;
+        transition: opacity var(--duration-normal) ease,
+            visibility 0s linear var(--duration-normal);
     }
 
     .dashboard-sheet.is-open .dashboard-sheet-panel {
         visibility: visible;
-        transform: none;
-        transition: transform var(--duration-slow) cubic-bezier(0.2, 0.8, 0.2, 1);
-    }
-
-    :root[data-motion="reduce"] .dashboard-sheet-panel {
-        transform: none;
-        opacity: 0;
-        transition: opacity var(--duration-fast) ease,
-            visibility 0s linear var(--duration-fast);
-    }
-
-    :root[data-motion="reduce"] .dashboard-sheet.is-open .dashboard-sheet-panel {
         opacity: 1;
-        transition: opacity var(--duration-fast) ease;
-    }
-
-    .dashboard-sheet-toggle[aria-pressed="true"] {
-        color: var(--text-primary);
-        background: var(--bg-hover);
+        transition: opacity var(--duration-normal) ease;
     }
 }

@@ -9,6 +9,7 @@ import { BLOCKER_REASON, isDescendantBlocker, type BlockedRefusal } from '../../
 import { exitItems, threadBlocker } from '../../store/actions/threadBlockers';
 import type { ThreadState } from '../../store/thread-events';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
 import { ArchiveIcon, CheckIcon, CurrentIcon, DiffIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
 import type { HeaderActionSpec } from '../layout/headerActions';
@@ -674,7 +675,7 @@ export function DiffButton({ threadId, attrs }: { threadId: string; attrs?: Reco
  *  cancel the one it carries (ADR 0168 clause 5).
  *
  *  An ICON toggle, wearing the shape the follow toggle beside it already wears
- *  (`PromptRowControls`). As a green pill it took over half a phone's prompt
+ *  (`followLiveEdgeAction`). As a green pill it took over half a phone's prompt
  *  row. No label short enough to fix that still said what it does.
  *
  *  The word survives twice over, because the label was the only explanation a
@@ -706,11 +707,12 @@ export function StandingApplyButton({
   const busy = armingStandingApplyThreadIds.value.has(threadId);
   const armed = standingApplyThreadIds.value.has(threadId);
   return (
-    <button
+    <ToggleIconButton
       {...attrs}
-      class={`icon-btn header-icon${armed ? ' active' : ''}`}
+      tone="armed"
+      pressed={armed}
+      class="header-icon"
       data-role="standing-apply"
-      aria-pressed={armed}
       aria-label={action.label}
       data-tooltip={tooltipWithShortcut(action.tooltip ?? action.label, 'applyChange')}
       data-tooltip-longpress=""
@@ -720,6 +722,6 @@ export function StandingApplyButton({
       }}
     >
       <StandingApplyIcon armed={armed} />
-    </button>
+    </ToggleIconButton>
   );
 }

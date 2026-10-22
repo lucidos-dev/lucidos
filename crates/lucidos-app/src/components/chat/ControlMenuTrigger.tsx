@@ -1,8 +1,8 @@
 /**
- * The composer row's anchor button, a coding agent's `/` menu. The menu draws
- * it, and so does the placeholder `PromptRowControls` shows while the menu's
- * code is on its way (ADR 0436). One definition, so the placeholder is the same
- * box, label and tooltip as the button that replaces it.
+ * The button of a coding agent's `/` menu, the composer row's leftmost member.
+ * The menu draws it, and so does the placeholder shown while the menu's code is
+ * on its way (ADR 0436). One definition, so the placeholder is the same box,
+ * label and tooltip as the button that replaces it.
  */
 
 import type { ComponentChildren } from 'preact';
@@ -16,6 +16,24 @@ import { CODING_AGENT_NAME } from './agentExitCopy';
  *  live thread's Claude Code, else what the compose draft picked. */
 export function menuCodingAgent(codingAgent: CodingAgent | null | undefined, threadId?: string, composeThreadId?: string): CodingAgent {
   return codingAgent ?? (threadId ? 'claude-code' : resolveCodingAgent(composeThreadId));
+}
+
+/** The menu's name in the row's fold, which remembers its width. */
+export const CODING_AGENT_MENU_FOLD_KEY = 'coding-agent-menu';
+
+/** What the menu receives from the composer row. */
+export interface CodingAgentMenuProps {
+  threadId?: string;
+  /** The focused COMPOSING draft's id, set only while composing (mutually
+   *  exclusive with `threadId`, which is the active-session id). The commands
+   *  are scoped to this draft's repo. */
+  composeThreadId?: string;
+  codingAgent?: CodingAgent | null;
+  /** True once the row has folded the menu into the ⋯: it then draws no box
+   *  and opens its panel against the ⋯. */
+  folded?: boolean;
+  /** The row's attributes for the button, so the row can measure and fold it. */
+  rowAttrs?: Record<string, string>;
 }
 
 export function codingAgentMenuLabel(agent: CodingAgent): string {

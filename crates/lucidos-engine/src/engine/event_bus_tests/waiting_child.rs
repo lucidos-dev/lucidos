@@ -362,3 +362,61 @@ async fn stopping_the_last_wait_on_a_crashed_child_sends_nothing() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// How many `ChildReportFiled` rows sit on `parent_id`.
+async fn count_filed_reports(pool: &PgPool, parent_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ChildReportFiled'",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A `no-wake` child's held card is filed when its last wait ends: the parent
+/// declared at the spawn that it does not act on this child.
+#[tokio::test]
+async fn a_no_wake_childs_held_card_is_filed() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) =
+        spawn_parent_child_with_mode(&bus, EventChannel::ClaudeCode, Some(WakeMode::NoWake)).await;
+    emit_cc_session_started(&bus, child_id).await;
+    let wait_id = emit_wait_started(&bus, child_id).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+
+    emit_wait_canceled(&bus, child_id, wait_id, EventWaitCancelCause::UserStop).await;
+
+    assert_eq!(count_completion_cards(&pool, parent_id).await, 0);
+    assert_eq!(count_filed_reports(&pool, parent_id).await, 1);
+    assert_eq!(drain_callbacks(&mut callback_rx), 0);
+    assert!(!callback_pending(&pool, child_id).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Archiving a waiting `no-wake` child files its canceled card, and starts no
+/// parent turn.
+#[tokio::test]
+async fn archiving_a_waiting_no_wake_child_files_its_card() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) =
+        spawn_parent_child_with_mode(&bus, EventChannel::ClaudeCode, Some(WakeMode::NoWake)).await;
+    emit_cc_session_started(&bus, child_id).await;
+    emit_wait_started(&bus, child_id).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+
+    bus.settle_child(child_id, ChildSettle::Archived).await;
+
+    assert_eq!(count_completion_cards(&pool, parent_id).await, 0);
+    assert_eq!(count_filed_reports(&pool, parent_id).await, 1);
+    assert_eq!(drain_callbacks(&mut callback_rx), 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

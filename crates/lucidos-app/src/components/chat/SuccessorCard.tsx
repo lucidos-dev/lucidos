@@ -8,8 +8,9 @@ import {
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { continueInSuccessor } from '../../store/actions/successor';
 import { startFreshDraft } from '../../store/actions/compose';
-import type { ThreadState } from '../../store/thread-events';
+import type { StoredEvent, ThreadState } from '../../store/thread-events';
 import { displayModelName } from '../../store/thread-events/exchange';
+import { isAuxiliaryCapture } from '../../store/thread-events/exchange-grouping';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatTokens } from '../../utils/formatTokens';
 import { Disclosure } from '../shared/Disclosure';
@@ -22,13 +23,22 @@ type Choice = 'continue' | 'fresh' | 'stay';
  *  thread holds an open change, so the change state is part of the read key. */
 const CARD_EVENTS: ReadonlySet<string> = new Set(['ContextCaptured', 'CodingAgentCompacted', 'SuccessorOfferDeclined']);
 
+/** Whether `event` can change the card, as `MAIN_SESSION_CAPTURE` in
+ *  `engine/successor.rs` reads it. An auxiliary or sub-agent capture leaves
+ *  the size alone, and a re-read rolls the card shut and open. */
+function movesCard(event: StoredEvent): boolean {
+  if (!CARD_EVENTS.has(event.type)) return false;
+  if (event.type !== 'ContextCaptured') return true;
+  return !isAuxiliaryCapture(event) && !event.parent_tool_use_id && event.usage?.input_tokens != null;
+}
+
 /** When to re-read the focused thread's context: once per idle, after its
  *  newest model call, compaction, decline or change of its change state.
  *  `null` while a turn runs, so a busy turn reads nothing. */
 function contextReadKey(thread: ThreadState | undefined): string | null {
   if (!thread || thread.meta.channel !== 'claude_code' || effectiveThreadStatus(thread) !== 'idle') return null;
   let newest = -1;
-  for (const [seq, event] of thread.events) if (CARD_EVENTS.has(event.type) && seq > newest) newest = seq;
+  for (const [seq, event] of thread.events) if (seq > newest && movesCard(event)) newest = seq;
   return `${thread.meta.id}:${newest}:${thread.meta.codingAgentChangeState.kind}`;
 }
 

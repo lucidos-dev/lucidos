@@ -21,6 +21,7 @@ import { ChevronDownIcon, ChevronUpIcon, GripIcon, StarIcon } from '../shared/ic
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText, useSkeleton } from '../shared/Skeleton';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 import {
   draggedRung, keepPricesCurrentTrigger, KEEP_PRICES_CURRENT_SLUG, LADDER_SURFACES, ladderAnchor, ladderOverride,
   movedRung, percent, toggledRung, type PriceCheckCadence,
@@ -586,15 +587,14 @@ function LadderRow({
         <BandCell label="Time" band={rung?.time} loaded={!!rung} />
         <span class="ladder-actions">
           <SkBlock w="1.5rem" h="1.5rem" round>
-            <button
-              type="button"
-              class={`icon-btn${rung?.is_default ? ' ladder-default' : ''}`}
+            <ToggleIconButton
+              tone="glyph"
+              pressed={!!rung?.is_default}
               aria-label={rung?.is_default ? `${name} is the default` : `Make ${name} the default`}
-              aria-pressed={!!rung?.is_default}
               onClick={onStar}
             >
               <StarIcon filled={!!rung?.is_default} />
-            </button>
+            </ToggleIconButton>
           </SkBlock>
           <span class="ladder-order">
             {!sk && (

@@ -1,9 +1,8 @@
-import { Fragment } from 'preact';
 import type { CodingAgent } from '../../api/types';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { focusedThreadId, threadMap } from '../../store/store';
 import type { ThreadState } from '../../store/thread-events/thread-meta';
-import { renderHeaderAction, type HeaderActionSpec } from '../layout/headerActions';
+import type { HeaderActionSpec } from '../layout/headerActions';
 import { FollowLiveEdgeIcon } from '../shared/icons';
 import { callToggleAction } from './CallToggle';
 import { pressCallToggle } from '../../store/voice';
@@ -11,20 +10,20 @@ import { callIsOffered } from '../../voice/callOffer';
 import { resolveCodingAgent } from '../../store/composeSelections';
 import { effectiveCodingAgentBackend } from './promptToggleMode';
 import { lazyComponent } from '../../utils/lazyComponent';
-import { pressControlMenu } from './controlMenuRequests';
-import { CodingAgentIcon, ControlMenuTrigger, codingAgentMenuLabel, menuCodingAgent } from './ControlMenuTrigger';
+import { codingAgentCommandsReady, codingAgentFoldOpenRequest, pressControlMenu } from './controlMenuRequests';
+import {
+  CODING_AGENT_MENU_FOLD_KEY, CodingAgentIcon, ControlMenuTrigger, codingAgentMenuLabel, menuCodingAgent,
+  type CodingAgentMenuProps,
+} from './ControlMenuTrigger';
 import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
 
 /** The coding-agent menu's button, drawn until the menu's code arrives. A
  *  press is held for the menu, which takes it as it mounts (ADR 0436). */
-function CodingAgentMenuPlaceholder({ codingAgent, threadId, composeThreadId }: {
-  codingAgent?: CodingAgent | null;
-  threadId?: string;
-  composeThreadId?: string;
-}) {
+function CodingAgentMenuPlaceholder({ codingAgent, threadId, composeThreadId, folded, rowAttrs }: CodingAgentMenuProps) {
+  if (folded) return null;
   const agent = menuCodingAgent(codingAgent, threadId, composeThreadId);
   return (
-    <div class="control-menu" data-row-item>
+    <div class="control-menu" {...rowAttrs}>
       <ControlMenuTrigger label={codingAgentMenuLabel(agent)} onClick={(e) => pressControlMenu('coding-agent', e.currentTarget as Element)}>
         <CodingAgentIcon agent={agent} />
       </ControlMenuTrigger>
@@ -38,78 +37,60 @@ export const LazyCodingAgentControlMenu = lazyComponent(
   CodingAgentMenuPlaceholder,
 );
 
-/** The row's leading controls: a coding agent's `/` menu as its anchor, and
- *  whichever of the two fixed toggles are still standing. A Lucidos Agent
- *  thread has no menu, since its model pick is the rung control's.
- *
- *  **The slots are fixed.** The control menu is the row's anchor, the follow
- *  toggle is next and the call toggle after it. What is fixed is the POSITION,
- *  so a reader reaching for one finds it in the same place on every thread.
- *  The follow toggle once sat after the indicators, which moved it under the
- *  thumb depending on what the thread happened to be doing.
- *
- *  **Only the anchor never folds.** The two toggles fold LAST, after every
- *  other member, so their slots hold at every width that can show them. That is
- *  what the pin was protecting, and a glyph off the screen protects nothing.
- *  The floor is the anchor and the send control, which fit anywhere.
- *
- *  A Fragment, deliberately: `.prompt-actions-row` is a flex row and its
- *  children are diffed positionally (see `prompt-vdom-keys.test.ts`).
- *
- *  Plan: `docs/plans/2026-09-19-the-composer-row-is-one-row.md`. */
-export function PromptRowControls({
-  codingAgent,
-  codingAgentThreadId,
-  composeThreadId,
-  toggles,
-  attrsFor,
-}: {
-  /** The focused thread's resolved coding-agent backend, or `null` for a
-   *  Lucidos Agent thread (`effectiveCodingAgentBackend`). */
-  codingAgent: CodingAgent | null;
-  /** The active coding-agent session's thread id (absent for a draft). */
-  codingAgentThreadId: string | undefined;
-  /** The composing draft's id (absent for an active thread), which keys the
-   *  per-draft model / effort / scope picks. */
-  composeThreadId: string | undefined;
-  /** The fixed toggles still wearing their own box, in slot order. */
-  toggles: readonly HeaderActionSpec[];
-  /** The row attributes each member carries, by key. */
-  attrsFor: (key: string) => Record<string, string>;
-}) {
-  return (
-    <>
-      {codingAgent !== null && (
-        <LazyCodingAgentControlMenu
-          threadId={codingAgentThreadId}
-          composeThreadId={composeThreadId}
-          codingAgent={codingAgent}
-        />
-      )}
-      {toggles.map((a) => (
-        <Fragment key={a.key}>{renderHeaderAction(a, attrsFor(a.key))}</Fragment>
-      ))}
-    </>
-  );
+/** The coding-agent menu as a member of the row's fold. Folded, its ⋯ row asks
+ *  the menu, which stays mounted, to open against the ⋯. It wears the button's
+ *  classes, so it dims the same way until the commands arrive. */
+export function codingAgentMenuAction(agent: CodingAgent): HeaderActionSpec {
+  return {
+    key: CODING_AGENT_MENU_FOLD_KEY,
+    dataRole: 'coding-agent-menu',
+    extraClass: codingAgentCommandsReady.value ? 'commands-btn commands-btn-active' : 'commands-btn',
+    label: codingAgentMenuLabel(agent),
+    icon: () => <CodingAgentIcon agent={agent} />,
+    onMenuClick: (anchor) => { if (anchor) codingAgentFoldOpenRequest.value = anchor; },
+  };
 }
 
-/** The two fixed toggles, in both orders the row needs them in.
+/** The composer row's foldable members, left to right, split by where each
+ *  renders. The row takes them in this order, and so does the fold.
  *
- *  One function, so the fold and the row cannot disagree about which of them
- *  exists. `row` is slot order, follow then call. `fold` is fold order, call
- *  then follow: the follow toggle is the only control rendering in every state,
- *  so it is the last thing to leave the row. */
+ *  **The fold takes a prefix, so the leftmost member folds first.** The ⋯
+ *  stands at the left edge, where the folded members came from. So a fold never
+ *  moves a standing member across the row.
+ *
+ *  Nothing here reads the thread's state. So the rung pill outlasts the menu
+ *  and the image in compose context and in a started thread alike.
+ *
+ *  Plan: `docs/plans/2026-10-21-coding-agent-menu-folds-before-the-model-picker.md`. */
+export function composerRowMembers(m: {
+  /** The coding-agent menu, absent on a Lucidos Agent thread. */
+  codingAgentMenu: HeaderActionSpec | null;
+  attachImage: HeaderActionSpec;
+  /** The todo and waiting indicators and the WIP preview that are shown. */
+  readouts: readonly HeaderActionSpec[];
+  /** Clear draft, present only while there is a draft to clear. */
+  clearDraft: HeaderActionSpec | null;
+  toggles: readonly HeaderActionSpec[];
+  rung: HeaderActionSpec | null;
+  banner: readonly HeaderActionSpec[];
+}): { row: HeaderActionSpec[]; cluster: HeaderActionSpec[] } {
+  const present = (a: HeaderActionSpec | null): a is HeaderActionSpec => a !== null;
+  return {
+    row: [m.codingAgentMenu, m.attachImage, ...m.readouts, m.clearDraft, ...m.toggles].filter(present),
+    cluster: [m.rung, ...m.banner].filter(present),
+  };
+}
+
+/** The row's toggles, left to right: the call toggle where a call is offered,
+ *  then the follow toggle, which renders in every state. */
 export function promptRowToggles(
   codingAgent: CodingAgent | null,
   composeContext: boolean,
   thread: ThreadState | undefined,
-): { row: HeaderActionSpec[]; fold: HeaderActionSpec[] } {
+): HeaderActionSpec[] {
   const follow = followLiveEdgeAction(composeContext);
   const call = callToggleAction(callIsOffered(thread, codingAgent));
-  return {
-    row: call ? [follow, call] : [follow],
-    fold: call ? [call, follow] : [follow],
-  };
+  return call ? [call, follow] : [follow];
 }
 
 /** The follow toggle.
@@ -143,9 +124,7 @@ export function followLiveEdgeAction(composeContext: boolean): HeaderActionSpec 
     ),
     icon: () => <FollowLiveEdgeIcon armed={followOn} />,
     active: followOn,
-    // The row paints each toggle from its own `data-role`, so this asks for the
-    // bare `active` those rules select on rather than the header's frame.
-    activeClass: 'active',
+    tone: 'glyph',
     keepsFocus: true,
     onClick: () => setFollowLiveEdge(!followOn),
   };

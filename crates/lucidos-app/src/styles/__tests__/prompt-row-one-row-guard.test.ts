@@ -79,3 +79,15 @@ describe('the row can never draw a second line', () => {
     expect(rules).not.toMatch(/\.is-stacked\b/);
   });
 });
+
+describe('the row holds its height whatever stands', () => {
+  /** Folded down to a short Unarchive or send button, the row would shrink.
+   *  The transcript's scroll end moves with it, and a reader parked at the
+   *  bottom is clamped up. The rendered half is the WebKit run of
+   *  `e2e/transcript-reopens-on-the-same-turn-all.spec.ts`. */
+  it('is one icon tap target tall, plus its bottom padding', () => {
+    const row = rowRules.find((r) => r.selector === '.prompt-actions-row' && r.props.has('min-height'));
+    expect(row?.props.get('min-height')).toBe('calc(var(--icon-tap-target) + 0.5rem)');
+    expect(row?.props.get('padding')).toMatch(/ 0\.5rem [^ ]+$/);
+  });
+});

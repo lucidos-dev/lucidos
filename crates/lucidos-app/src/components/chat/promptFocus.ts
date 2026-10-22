@@ -49,12 +49,17 @@ export function openAgentMenu(): void {
       return;
     }
   }
+  const more = visibleMoreTrigger();
+  if (more) rungFoldOpenRequest.value = more;
+}
+
+/** The composer row's visible ⋯ trigger, the box a folded member opens its
+ *  panel against. Null while nothing is folded. */
+export function visibleMoreTrigger(): HTMLElement | null {
   for (const more of document.querySelectorAll<HTMLElement>('.prompt-actions-row [data-fold-key=""]')) {
-    if (isElementVisible(more)) {
-      rungFoldOpenRequest.value = more;
-      return;
-    }
+    if (isElementVisible(more)) return more;
   }
+  return null;
 }
 
 /**

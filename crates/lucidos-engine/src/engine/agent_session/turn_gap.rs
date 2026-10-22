@@ -75,8 +75,8 @@
 //! `ChildThreadStopped` is covered for the same reason. Unlike its sibling
 //! `ChildThreadCompleted` it wakes nothing, so no turn carries it (ADR 0252).
 //! `ChildThreadDetached` too: the user moved a child out, and nothing wakes
-//! the agent to say so (ADR 0278). And `ChildReportFiled`, a clean report its
-//! child said needs no action now: this note is how a coding-agent parent
+//! the agent to say so (ADR 0278). And `ChildReportFiled`, a report its wake
+//! mode or wake decision filed: this note is how a coding-agent parent
 //! reads it, in full, once.
 //!
 //! `BackgroundBashCompleted` is covered too, minus the ones an event wait

@@ -30,7 +30,6 @@ import { getDraft } from '../composeDrafts';
 import { reopenEmptyDraft, updateCompose } from './compose';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { bumpThreadEvents } from '../threadActivity';
-import { getThreadModelOverride, clearThreadModelOverride } from '../threadModelSelections';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 import { formatThreadLabel } from './thread-label';
 import { revealThreadPane } from './pane';
@@ -437,13 +436,12 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
   const body: ChatRequestBody = {
     message,
     mode: 'human',
-    // Per-thread memory: send an explicit model ONLY when there's an override —
-    // a compose first-send (`modelOverride`) or this thread's pending pick.
-    // Otherwise omit it so the backend reuses the thread's last recorded model
-    // (`resolve_chat_overrides_for_thread`), falling back to the account default
-    // for a brand-new thread. Sending `currentModel` here was the bug: it forced
-    // the global default onto every follow-up.
-    model: options?.modelOverride ?? getThreadModelOverride(threadId).model,
+    // Per-thread memory: send an explicit model ONLY for a compose first-send
+    // (`modelOverride`). A started thread's pick is already recorded on the
+    // engine (`POST /api/v1/chat/settings`), so a follow-up omits it. The
+    // backend then reuses the thread's last recorded pair, or the account
+    // default for a brand-new thread.
+    model: options?.modelOverride,
     device_id: getDeviceId(),
     // reasoning_effort is set below: chat threads send it only when there's an
     // override or a per-thread pick (else the backend reuses the thread's last
@@ -511,13 +509,13 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
     if (options?.ccModelOverride) body.cc_model = options.ccModelOverride;
     if (options?.ccReasoningEffortOverride) body.reasoning_effort = options.ccReasoningEffortOverride;
   } else {
-    // Chat thread: an explicit override or this thread's pending pick; otherwise
-    // omit so the backend reuses the thread's last effort (?? account default).
-    const effort = options?.reasoningEffortOverride ?? getThreadModelOverride(threadId).reasoningEffort;
+    // Chat thread: only a compose override; otherwise omit so the backend
+    // reuses the thread's last effort (?? account default).
+    const effort = options?.reasoningEffortOverride;
     if (effort) body.reasoning_effort = effort;
-    // Same rule for the backend: only an explicit pick is sent, so the thread's
-    // memory and then the model's own default decide otherwise.
-    const provider = options?.providerOverride ?? getThreadModelOverride(threadId).provider;
+    // Same rule for the backend: the thread's memory and then the model's own
+    // default decide without an override.
+    const provider = options?.providerOverride;
     if (provider) body.provider = provider;
   }
 
@@ -565,10 +563,6 @@ async function postSend(send: {
   const accepted = (): SendOutcome => {
     forgetUnsentMessageRecord(eventId);
     schedulePendingCleanup(threadId, eventId);
-    // The pick (if any) is now stamped on the sent message and becomes the
-    // thread's remembered value; drop the ephemeral pending override so future
-    // resolves come from the thread's events (no-op for CC / no pick).
-    clearThreadModelOverride(threadId);
     void retireWelcomeAfterUse(threadMap.value.values());
     return 'sent';
   };

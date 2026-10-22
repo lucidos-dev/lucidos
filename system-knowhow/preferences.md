@@ -52,9 +52,11 @@ The effort is remembered per model. Resolution order for the model the turn
 runs on: explicit per-request override → the thread's last tier on that model
 → that model's entry in `chat_reasoning_efforts` → its *default effort*. A
 model with no default effort sends none. Switching a thread to another model
-never carries the old model's tier. To change a *running* thread's model or
-effort, use its *rung control* in the compose bar. That writes a
-per-thread value and never touches this account default.
+never carries the old model's tier. To change a *started* thread's model or
+effort, use its *rung control* in the compose bar between turns. That
+records a per-thread `ChatSettingsChanged` and never touches this account
+default. While a turn runs the control is locked, and the next turn runs on the
+pick.
 
 `chat_reasoning_efforts` REPLACES THE WHOLE LIST. Read the current value first
 and send it back with your edit applied, or the other models lose their tiers.

@@ -152,12 +152,12 @@ describe('the call control shows which phase it is in', () => {
     expect(new Set(looks).size, looks.join('\n')).toBe(PHASES.length);
   });
 
-  it('keeps the on-state class for every phase a call exists in', () => {
+  it('stays pressed for every phase a call exists in', () => {
     mount('idle');
-    expect(control().className).not.toContain('active');
+    expect(control().getAttribute('aria-pressed')).toBe('false');
     for (const phase of PHASES.filter((p) => p !== 'idle')) {
       mount(phase);
-      expect(control().className, phase).toContain('active');
+      expect(control().getAttribute('aria-pressed'), phase).toBe('true');
     }
   });
 });

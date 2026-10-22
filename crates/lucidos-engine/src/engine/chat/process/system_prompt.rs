@@ -572,7 +572,7 @@ EVENTS (the `events` tool):
 
 PARALLEL WORK (FAN-OUT):
 - run_coding_agent starts a coding-agent thread for code work; run_thread starts a Lucidos thread for non-code work; follow_up_child_thread steers a child you already spawned, and `threads` 'detach_child' stops waiting for one. You can only address your own DIRECT children, which the `threads` tool's 'list' action lists with `my_children: true`.
-- A DIRECT CHILD REPORTS BACK ON ITS OWN: when it finishes, fails, is canceled or is cut by an engine crash, its status, summary and pending change ids reach THIS thread. A failure always re-opens it. A clean report follows the spawn's `wake_mode`: 'wake' re-opens it, 'wake-when-all-done' once the last such child finishes, 'no-wake' FILES it for your next turn. Default: 'no-wake' from the home thread, 'wake' elsewhere. The mode lasts the child's life. Say what you're waiting for and END YOUR TURN.
+- A DIRECT CHILD REPORTS BACK ON ITS OWN: when it finishes, fails, is canceled or is cut by an engine crash, its status, summary and pending change ids reach THIS thread. The spawn's `wake_mode` decides: 'wake' re-opens it for any report, 'wake-when-all-done' for a failure or once the last such child finishes, 'no-wake' FILES every report for your next turn. Default: 'no-wake' from the home thread, 'wake' elsewhere. The mode lasts the child's life. Say what you're waiting for and END YOUR TURN.
 - WON'T ACT ON THE RESULT? relation='top': a child's report costs you a turn.
 - NEVER `await_event` ON YOUR OWN CHILD's `CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`: a second wake for one finish.
 - `interrupted` means a crash cut its turn and nothing resumes it: follow_up_child_thread continues it. Only same-workspace children spawned with these tools report; a grandchild reports to your child, not you.
@@ -1709,7 +1709,11 @@ mod tests {
     /// Raised by 201 to a measured 132,511 for the `coding_agent` and `folder`
     /// args of `navigate_ui`'s `new-chat` target. Both descriptions were cut
     /// to one clause first.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 132_511;
+    ///
+    /// Raised by 279 to a measured 132,790 for the routing line of
+    /// `system-knowhow/stored-secrets`. The agent role cannot see secret
+    /// columns, so without it the agent concluded secrets were not stored.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 132_790;
 
     /// The gate set the ratchet bills.
     ///
@@ -2535,11 +2539,11 @@ mod tests {
             "`CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`",
             "`interrupted`",
             "a grandchild reports to your child, not you",
-            // I12 of the wake-mode plan: the modes, the defaults, and that a
-            // failure always wakes.
-            "A failure always re-opens it",
-            "follows the spawn's `wake_mode`",
-            "'no-wake' FILES it for your next turn",
+            // I12 of the wake-mode plan: the modes, the defaults, and when a
+            // failure wakes (ADR 0545).
+            "'wake' re-opens it for any report",
+            "The spawn's `wake_mode` decides",
+            "'no-wake' FILES every report for your next turn",
             "Default: 'no-wake' from the home thread, 'wake' elsewhere",
             "The mode lasts the child's life",
             // ADR 0473: work this thread will not act on is a top-thread.

@@ -1096,6 +1096,65 @@ export async function composerControl(page: Page, selector: string): Promise<Loc
   return page.locator(`.thread-overflow-menu ${selector}`).first();
 }
 
+/** Close the composer row's ⋯ menu, if `composerControl` left it open. Asks the
+ *  trigger, so an Escape never reaches the prompt, where it stops the turn. */
+export async function closeComposerFold(page: Page): Promise<void> {
+  const open = page.locator(`${COMPOSER_FOLD_TRIGGER}[aria-expanded="true"]`);
+  if (await open.count() > 0) await page.keyboard.press('Escape');
+}
+
+/** Read a composer control wherever the fold put it, and close the ⋯ after. */
+async function readComposerControl<T>(
+  page: Page, selector: string, read: (control: Locator) => Promise<T>,
+): Promise<T> {
+  await closeComposerFold(page);
+  try {
+    return await read(await composerControl(page, selector));
+  } finally {
+    await closeComposerFold(page);
+  }
+}
+
+/** Whether the coding-agent menu has its commands, standing or folded. Its ⋯
+ *  row wears the button's classes, so a folded one is read behind the ⋯. */
+export function codingAgentCommandsReady(page: Page): Promise<boolean> {
+  return readComposerControl(page, '.commands-btn',
+    (control) => control.evaluate((el) => el.classList.contains('commands-btn-active')));
+}
+
+/** A composer toggle's state, `'true'` or `'false'`, standing or folded. A row
+ *  button says `aria-pressed`, a menu row `aria-checked`. */
+export function composerToggleState(page: Page, selector: string): Promise<string | null> {
+  return readComposerControl(page, selector,
+    async (toggle) => {
+      // Short, so a control that is not there yet fails one poll, not the test.
+      const quick = { timeout: 2_000 };
+      return await toggle.getAttribute('aria-pressed', quick) ?? await toggle.getAttribute('aria-checked', quick);
+    });
+}
+
+/** Press a composer control wherever the row's fold has put it. A row still
+ *  settling can fold the control away after it was found, so each try finds it
+ *  again. */
+export async function pressComposerControl(page: Page, selector: string): Promise<void> {
+  await expect(async () => {
+    await closeComposerFold(page);
+    await (await composerControl(page, selector)).click({ timeout: 2_000 });
+  }).toPass({ timeout: 15_000 });
+}
+
+const FOLLOW_TOGGLE = '[data-role="follow-live-edge"]';
+
+/** The follow toggle's state, standing or folded. */
+export function followToggleState(page: Page): Promise<string | null> {
+  return composerToggleState(page, FOLLOW_TOGGLE);
+}
+
+/** Press the follow toggle wherever the row's fold has put it. */
+export function pressFollowToggle(page: Page): Promise<void> {
+  return pressComposerControl(page, FOLLOW_TOGGLE);
+}
+
 export async function assertHealthy(page: Page): Promise<void> {
   const response = await page.request.get('/api/v1/health');
   expect(response.ok()).toBeTruthy();

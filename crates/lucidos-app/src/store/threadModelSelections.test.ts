@@ -1,15 +1,11 @@
-/** Per-thread model/effort memory: a thread resolves `pending pick ?? its last
- *  message ?? the account default`, a pick on one thread never touches another
- *  or the account preference, and clearing drops back to the message-derived
- *  value. These pin the "this thread only" + "backend-authoritative fallback"
- *  decisions from docs/plans/2026-07-03-per-thread-model-memory.md. */
+/** Per-thread model/effort memory: a thread resolves `its newest starter or
+ *  pick ?? the account default`, and a pick on one thread never touches another
+ *  or the account preference. These pin the "this thread only" and
+ *  "backend-authoritative fallback" decisions from
+ *  docs/plans/2026-07-03-per-thread-model-memory.md. */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  _resetThreadModelSelectionsForTesting,
-  clearThreadModelOverride,
-  getThreadModelOverride,
   lastThreadModel,
-  patchThreadModelOverride,
   resolveActiveThreadModel,
   resolveActiveThreadProvider,
   resolveActiveThreadReasoningEffort,
@@ -37,12 +33,11 @@ function resetAccount(): void {
 resetAccount();
 
 afterEach(() => {
-  _resetThreadModelSelectionsForTesting();
   threadMap.value = new Map();
   resetAccount();
 });
 
-describe('resolveActiveThreadModel: pending ?? last message ?? account default', () => {
+describe('resolveActiveThreadModel: newest starter or pick ?? account default', () => {
   it('falls back to the account default with no override and no messages', () => {
     currentModel.value = 'account-model';
     expect(resolveActiveThreadModel('t-1')).toBe('account-model');
@@ -89,20 +84,33 @@ describe('resolveActiveThreadModel: pending ?? last message ?? account default',
     expect(resolveActiveThreadModel('t-legacy')).toBe('account-model');
   });
 
-  it('a pending pick wins over both the last message and the account default', () => {
+  it('a ChatSettingsChanged pick after the last message wins over it', () => {
     currentModel.value = 'account-model';
-    seedThread('t-1', [[1, { type: 'MessageReceived', model: 'last-model' }]]);
-    patchThreadModelOverride('t-1', { model: 'picked-model' });
+    seedThread('t-1', [
+      [1, { type: 'MessageReceived', model: 'last-model' }],
+      [2, { type: 'ChatSettingsChanged', model: 'picked-model' }],
+    ]);
     expect(resolveActiveThreadModel('t-1')).toBe('picked-model');
+  });
+
+  it('a message after a pick wins over the pick', () => {
+    seedThread('t-1', [
+      [1, { type: 'ChatSettingsChanged', model: 'picked-model' }],
+      [2, { type: 'MessageReceived', model: 'later-model' }],
+    ]);
+    expect(resolveActiveThreadModel('t-1')).toBe('later-model');
   });
 });
 
-describe('resolveActiveThreadReasoningEffort: pending ?? memory for the model ?? account', () => {
-  it('last tier on the same model ?? account tier; pending pick wins', () => {
+describe('resolveActiveThreadReasoningEffort: memory for the model ?? account', () => {
+  it('last tier on the same model ?? account tier; a later pick wins', () => {
     expect(resolveActiveThreadReasoningEffort('t-1', 'account-model')).toBe('high');
     seedThread('t-1', [[1, { type: 'MessageReceived', model: 'account-model', reasoning_effort: 'low' }]]);
     expect(resolveActiveThreadReasoningEffort('t-1', 'account-model')).toBe('low');
-    patchThreadModelOverride('t-1', { reasoningEffort: 'max' });
+    seedThread('t-1', [
+      [1, { type: 'MessageReceived', model: 'account-model', reasoning_effort: 'low' }],
+      [2, { type: 'ChatSettingsChanged', model: 'account-model', reasoning_effort: 'max' }],
+    ]);
     expect(resolveActiveThreadReasoningEffort('t-1', 'account-model')).toBe('max');
   });
 
@@ -134,35 +142,14 @@ describe('resolveActiveThreadReasoningEffort: pending ?? memory for the model ??
 
 describe('a pick is per-thread and never writes the account preference', () => {
   it('picking on thread A leaves thread B and the account default untouched', () => {
-    patchThreadModelOverride('A', { model: 'A-model', reasoningEffort: 'low' });
-    // Thread B (no override, no messages) still resolves the account default.
+    seedThread('A', [[1, { type: 'ChatSettingsChanged', model: 'A-model', reasoning_effort: 'low' }]]);
+    expect(resolveActiveThreadModel('A')).toBe('A-model');
+    // Thread B (no events) still resolves the account default.
     expect(resolveActiveThreadModel('B')).toBe('account-model');
     expect(resolveActiveThreadReasoningEffort('B', 'account-model')).toBe('high');
     // The account preference is untouched.
     expect(currentModel.value).toBe('account-model');
     expect(preferences.value).toEqual({ status: 'loaded', data: { chat_reasoning_efforts: ACCOUNT_EFFORTS } });
-  });
-
-  it('a later patch preserves earlier fields', () => {
-    patchThreadModelOverride('t-1', { model: 'm' });
-    patchThreadModelOverride('t-1', { reasoningEffort: 'e' });
-    expect(getThreadModelOverride('t-1')).toEqual({ model: 'm', reasoningEffort: 'e' });
-  });
-});
-
-describe('clearThreadModelOverride', () => {
-  it('drops the pending pick so resolution falls to the last message', () => {
-    currentModel.value = 'account-model';
-    seedThread('t-1', [[1, { type: 'MessageReceived', model: 'last-model' }]]);
-    patchThreadModelOverride('t-1', { model: 'picked-model' });
-    expect(resolveActiveThreadModel('t-1')).toBe('picked-model');
-    clearThreadModelOverride('t-1');
-    expect(resolveActiveThreadModel('t-1')).toBe('last-model');
-  });
-
-  it('is a no-op for an unknown / null thread', () => {
-    expect(() => clearThreadModelOverride('none')).not.toThrow();
-    expect(() => clearThreadModelOverride(null)).not.toThrow();
   });
 });
 
@@ -176,9 +163,11 @@ describe('resolveActiveThreadProvider: a backend is remembered with its model', 
     expect(resolveActiveThreadProvider('t-1', 'sonnet')).toBeNull();
   });
 
-  it("prefers this thread's pending pick for the same model", () => {
-    seedThread('t-1', [[1, { type: 'MessageReceived', model: 'opus', provider: 'vertex' }]]);
-    patchThreadModelOverride('t-1', { model: 'opus', provider: 'anthropic' });
+  it("prefers this thread's newer pick for the same model", () => {
+    seedThread('t-1', [
+      [1, { type: 'MessageReceived', model: 'opus', provider: 'vertex' }],
+      [2, { type: 'ChatSettingsChanged', model: 'opus', provider: 'anthropic' }],
+    ]);
     expect(resolveActiveThreadProvider('t-1', 'opus')).toBe('anthropic');
     // Another thread never sees it.
     expect(resolveActiveThreadProvider('t-2', 'opus')).toBeNull();

@@ -13,10 +13,9 @@
  * ON A NARROW BAR IT SHEDS: the effort goes first and the rung's position
  * badge (`3/7`) appears, then the model name goes, leaving the badge. A pair off
  * the ladder has no badge, so it keeps its name. A row with no room for even
- * that folds the pill into the ⋯ menu: last of the row's members before the
- * first send, first of them in a started thread. The
- * bar's own width decides, through the row as a container, so the thresholds
- * are rem and scale with the UI. */
+ * that folds the pill into the ⋯ menu, after every icon to its left. The bar's
+ * own width decides, through the row as a container, so the thresholds are rem
+ * and scale with the UI. */
 
 .prompt-actions-row {
     container: prompt-row / inline-size;

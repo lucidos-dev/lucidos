@@ -25,6 +25,7 @@ use crate::engine::summary_tree::log::EntryKind;
 use crate::engine::thread_events::{KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON};
 use crate::engine::thread_triage::archive_all::{PINNED_SUB_THREAD, SAME_FAMILY};
 use crate::engine::widgets::WIDGET_PARAMS_MAX_BYTES;
+use crate::engine::TURN_RUNNING_REASON;
 use crate::llm::judgment::endpoint::{
     SystemOneEndpoint, CLOUDFLARE_ACCOUNTS_PREFIX, CLOUDFLARE_WORKERS_AI_CREDENTIAL_SERVICE,
     OPENROUTER_JEV_MODEL, SYSTEM_ONE_CUSTOM_CREDENTIAL_SERVICE, TYPESAFE_API_KEY_ENV,
@@ -116,6 +117,8 @@ pub(super) fn render() -> String {
     );
     ts.from("api/frontend_snapshot.rs");
     ts.export("SOURCE_COMMIT_FILE", quoted(SOURCE_COMMIT_FILE));
+    ts.from("engine/chat/rung.rs");
+    ts.export("TURN_RUNNING_REASON", quoted(TURN_RUNNING_REASON));
 
     ts.from("engine/claude_code/mod.rs");
     ts.export("BROAD_ALLOW_INEFFECTIVE", list(BROAD_ALLOW_INEFFECTIVE));

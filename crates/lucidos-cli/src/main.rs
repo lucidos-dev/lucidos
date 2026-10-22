@@ -114,8 +114,8 @@ enum Command {
     /// (`BackupCompleted`), a workspace domain event. NOT for
     /// external state with no Lucidos event, which has nothing to deliver, and
     /// NOT for a thread you spawned as your own child: its report reaches this
-    /// thread on its own. A failure re-opens this thread, and a clean report
-    /// follows the `--wake-mode` you spawned it with. Await a
+    /// thread on its own. The `--wake-mode` you spawned it with decides: a
+    /// failure re-opens this thread unless it is `no-wake`. Await a
     /// completion only for a thread that is not your own child, named with a
     /// `child_thread_id` condition, on `ChildThreadCompleted` and
     /// `ChildReportFiled`. A
@@ -1325,11 +1325,11 @@ pub(crate) struct SpawnThreadArgs {
     /// Lucidos-source child, from a Lucidos-source coding-agent thread.
     #[arg(long)]
     pub(crate) integrated: bool,
-    /// With `--relation child`: what the child's clean finish does to the
+    /// With `--relation child`: what the child's report does to the
     /// calling thread. `wake` wakes it, `wake-when-all-done` wakes it when the
     /// last child spawned that way finishes, and `no-wake` files the report.
     /// Omitted, the engine picks the parent's default: `no-wake` from the home
-    /// thread, else `wake`. A failure always wakes it.
+    /// thread, else `wake`. A failure wakes it under every mode but `no-wake`.
     #[arg(long)]
     pub(crate) wake_mode: Option<String>,
     /// Use `http://` instead of `https://`. Test-only. Hidden from --help.

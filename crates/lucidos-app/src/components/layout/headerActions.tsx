@@ -2,6 +2,7 @@ import { Fragment } from 'preact';
 import type { ComponentChild, ComponentChildren } from 'preact';
 import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
 import { keepFocusOnPress } from '../../utils/dom';
+import { ToggleIconButton, type ToggleTone } from '../shared/ToggleIconButton';
 
 /** One header action as DATA, so the same record renders either as a full-size
  *  header icon button or as a row inside the collapsed ⋯ overflow menu. `icon`
@@ -37,12 +38,11 @@ export interface HeaderActionSpec {
    *  only on the header button disappears the moment the action folds. The
    *  composer's toggles are addressed this way. */
   dataRole?: string;
-  /** Toggled-on state, adds `filter-active` (apps/plugins search). */
+  /** The toggle's on-state. A spec that declares one renders a
+   *  `ToggleIconButton`, which says it in `aria-pressed`. */
   active?: boolean;
-  /** Class for the on-state, when `filter-active`'s frame is wrong. The
-   *  composer's toggles each take their own paint keyed on `data-role`, so they
-   *  ask for the bare `active` those rules select on. */
-  activeClass?: string;
+  /** How the on-state looks. Defaults to the framed chip Filter wears. */
+  tone?: ToggleTone;
   /** The press leaves focus where it is, so a field being typed in keeps the
    *  iOS keyboard up. For a toggle the reader presses mid-sentence. */
   keepsFocus?: boolean;
@@ -76,7 +76,8 @@ export interface HeaderActionSpec {
 export function renderHeaderAction(a: HeaderActionSpec, attrs: Record<string, string> = {}): ComponentChild {
   const rowAttrs = a.dataRole ? { ...attrs, 'data-role': a.dataRole } : attrs;
   if (a.render) return a.render(rowAttrs);
-  const cls = `icon-btn header-icon${a.extraClass ? ` ${a.extraClass}` : ''}${a.active ? ` ${a.activeClass ?? 'filter-active'}` : ''}`;
+  const sizeClass = `header-icon${a.extraClass ? ` ${a.extraClass}` : ''}`;
+  const cls = `icon-btn ${sizeClass}`;
   const tooltip = a.tooltip ?? a.label;
   // The spread leads, so the rendering's own class and labels always win over a
   // host's attributes rather than the other way round.
@@ -96,18 +97,24 @@ export function renderHeaderAction(a: HeaderActionSpec, attrs: Record<string, st
       </button>
     );
   }
+  const buttonProps = {
+    ...rowAttrs,
+    onClick: a.onClick,
+    onMouseDown: a.keepsFocus ? keepFocusOnPress : undefined,
+    'aria-label': a.label,
+    'data-tooltip': tooltip,
+  };
   // A spec that declares an on-state is a TOGGLE, and says so. Colour is the
   // only channel the button itself has, and no screen reader reads it.
+  if (a.active !== undefined) {
+    return (
+      <ToggleIconButton {...buttonProps} class={sizeClass} pressed={a.active} tone={a.tone}>
+        {a.icon()}
+      </ToggleIconButton>
+    );
+  }
   return (
-    <button
-      {...rowAttrs}
-      class={cls}
-      onClick={a.onClick}
-      onMouseDown={a.keepsFocus ? keepFocusOnPress : undefined}
-      aria-label={a.label}
-      aria-pressed={a.active}
-      data-tooltip={tooltip}
-    >
+    <button {...buttonProps} class={cls}>
       {a.icon()}
     </button>
   );

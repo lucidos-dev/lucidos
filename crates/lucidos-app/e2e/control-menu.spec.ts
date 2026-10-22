@@ -1,6 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import {
-  apiRequest, assertHealthy, blurActiveElement, clickVisibleElement, ensureOnThreadPane,
+  apiRequest, assertHealthy, blurActiveElement, closeComposerFold, codingAgentCommandsReady, composerControl, ensureOnThreadPane,
   getHeaderTop, navigateToApp, newThread, pickComposeDestination, pickDropdownOption,
   ensureSlashCommandsReported, openRungList, sendMessage, uniqueMessage, waitForActionPanel, waitForVisibleInput,
 } from './helpers';
@@ -65,9 +65,9 @@ test.describe('Coding-agent control menu', () => {
     // model pick is the rung control's.
     expect(await hasVisibleElement(page, '.commands-btn')).toBe(false);
 
-    // Toggle to Claude mode — control button appears
+    // Toggle to Claude mode: the control appears, in the row or behind its ⋯
     await pickComposeDestination(page);
-    expect(await hasVisibleElement(page, '.commands-btn')).toBe(true);
+    await expect(await composerControl(page, '.commands-btn')).toBeVisible();
   });
 
   test('"/" opens control command dropdown in compose view', async ({ page }) => {
@@ -76,8 +76,8 @@ test.describe('Coding-agent control menu', () => {
     await newThread(page);
     await pickComposeDestination(page);
 
-    // Wait for coding-agent commands to load (button gets 'active' class when ready)
-    await waitForVisible(page, '.commands-btn-active', 15_000);
+    // Wait for coding-agent commands to load (the control gets 'active' when ready)
+    await expect.poll(() => codingAgentCommandsReady(page), { timeout: 15_000 }).toBe(true);
 
     // Type "/" — should open the control command dropdown
     await typeSlash(page);
@@ -134,10 +134,15 @@ test.describe('Coding-agent control menu', () => {
 
     // Codex has no slash commands, so its `/` button is drawn but inert, and
     // its model pick is the rung control's.
-    const codexControls = page.locator('.commands-btn[aria-label="Codex controls"]:visible').first();
-    await expect(codexControls).toBeVisible({ timeout: 15_000 });
-    await expect(codexControls).not.toHaveClass(/commands-btn-active/);
-    await expect(page.locator('.commands-btn[aria-label="Claude Code controls"]:visible')).toHaveCount(0);
+    // The control may stand in the row or sit behind its ⋯, so it is read by
+    // its accessible name, which both renderings share.
+    await expect(async () => {
+      await closeComposerFold(page);
+      const codexControls = await composerControl(page, '.commands-btn');
+      await expect(codexControls).toHaveAccessibleName('Codex controls', { timeout: 1_000 });
+      await expect(codexControls).not.toHaveClass(/commands-btn-active/);
+    }).toPass({ timeout: 15_000 });
+    await closeComposerFold(page);
     await openRungList(page);
     await page.keyboard.press('Escape');
     await expect.poll(() => commandUrls.some((u) => {
@@ -146,7 +151,7 @@ test.describe('Coding-agent control menu', () => {
         && url.searchParams.get('coding_agent') === 'codex';
     })).toBe(true);
 
-    await codexControls.click();
+    await (await composerControl(page, '.commands-btn')).click();
     await page.waitForTimeout(250);
     await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
 
@@ -175,7 +180,7 @@ test.describe('Coding-agent control menu', () => {
       await pickComposeDestination(page);
 
       // Wait for coding-agent commands to load
-      await waitForVisible(page, '.commands-btn-active', 15_000);
+      await expect.poll(() => codingAgentCommandsReady(page), { timeout: 15_000 }).toBe(true);
 
       // Blur any auto-focused element so header is visible
       await blurActiveElement(page);
@@ -186,12 +191,12 @@ test.describe('Coding-agent control menu', () => {
 
       expect(await getHeaderTop(page)).toBeGreaterThanOrEqual(0);
 
-      // Open the coding-agent commands dropdown via button click
-      await clickVisibleElement(page, '.commands-btn');
+      // Open the coding-agent commands dropdown from its control, standing or
+      // behind the ⋯. A folded one has no button left to press again, so
+      // Escape closes it either way.
+      await (await composerControl(page, '.commands-btn')).click();
       await waitForVisible(page, '.control-dropdown');
-
-      // Close the dropdown by clicking the button again
-      await clickVisibleElement(page, '.commands-btn');
+      await page.keyboard.press('Escape');
 
       // Wait for dropdown to disappear
       await page.waitForFunction(() => {

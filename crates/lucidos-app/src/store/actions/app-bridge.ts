@@ -30,6 +30,7 @@ import { appFrameFor, appIdForFrame } from '../../utils/appFrame';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import { rawStorageKey } from '../../utils/workspaceStorage';
 import { focusedThreadId, showToast } from '../store';
+import { BRIDGED_FETCH_SLOTS, FetchLanes } from './bridgedFetchLanes';
 // The app half of the protocol. Relative, because the barrel does not export
 // the bridge; it has no import-time side effects.
 import {
@@ -150,14 +151,31 @@ function headersToRecord(headers: Headers): Record<string, string> {
  *  behind this check rather than the boundary itself (ADR 0231). */
 export const APP_ID_HEADER = 'x-lucidos-app-id';
 
-/** Make one engine call for an app, and flatten the answer for the wire. */
-async function bridgedFetch(wire: WireRequest, appId: string | null): Promise<unknown> {
+/** The answer to a call with no `timeoutMs`. */
+const DEFAULT_FETCH_TIMEOUT_MS = 30000;
+
+/** What a click sends. These calls skip the slots: they are rare and short, and
+ *  one waiting behind an app's background work is the delay a user feels. */
+const USER_INTENT_PREFIX = '/ui/';
+
+/** The path this call may take, or an error naming why it may not. */
+function admittedPath(wire: WireRequest, appId: string | null): string {
   const method = wire.method || 'GET';
   const resolved = resolveBridgePath(wire.path, method, appId);
   if (resolved === null) {
     throw new Error(`The app bridge does not carry ${method} ${wire.path}`);
   }
-  const path = stampDeviceScope(resolved);
+  return stampDeviceScope(resolved);
+}
+
+/** Make one engine call for an app, and flatten the answer for the wire. */
+async function sendBridgedFetch(
+  wire: WireRequest,
+  path: string,
+  appId: string | null,
+  timeoutMs: number,
+): Promise<unknown> {
+  const method = wire.method || 'GET';
   const registration = registrationToAwait(`${API}${path}`, method);
   if (registration) await registration;
   const res = await fetch(`${API}${path}`, {
@@ -168,7 +186,7 @@ async function bridgedFetch(wire: WireRequest, appId: string | null): Promise<un
       ...(appId ? { [APP_ID_HEADER]: appId } : {}),
     },
     body: fromWireBody(wire.body),
-    signal: AbortSignal.timeout(wire.timeoutMs || 30000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   return {
     status: res.status,
@@ -176,6 +194,22 @@ async function bridgedFetch(wire: WireRequest, appId: string | null): Promise<un
     headers: headersToRecord(res.headers),
     body: await res.arrayBuffer(),
   };
+}
+
+let fetchLanes = new FetchLanes<HTMLIFrameElement>(BRIDGED_FETCH_SLOTS);
+
+/** Make one engine call for an app frame, in its turn. */
+function bridgedFetch(
+  wire: WireRequest,
+  appId: string | null,
+  frame: HTMLIFrameElement,
+): Promise<unknown> {
+  const path = admittedPath(wire, appId);
+  const timeoutMs = wire.timeoutMs || DEFAULT_FETCH_TIMEOUT_MS;
+  if (path.startsWith(USER_INTENT_PREFIX)) return sendBridgedFetch(wire, path, appId, timeoutMs);
+  return fetchLanes.enqueue(frame, Date.now() + timeoutMs, (remainingMs) =>
+    sendBridgedFetch(wire, path, appId, remainingMs),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -547,7 +581,7 @@ async function runOp(
   frame: HTMLIFrameElement,
 ): Promise<unknown> {
   switch (op) {
-    case 'fetch': return bridgedFetch(args as WireRequest, appIdForFrame(frame));
+    case 'fetch': return bridgedFetch(args as WireRequest, appIdForFrame(frame), frame);
     case 'sse.open':
       sseSubscribers.set(source, { frame, types: listenedTypes(args) });
       if (hostStreamOpen) postStreamTo(source, { kind: 'open' });
@@ -609,5 +643,6 @@ export function installAppBridge(): () => void {
  *  cases. Not part of the runtime surface. */
 export function _resetAppBridgeForTesting(): void {
   sseSubscribers.clear();
+  fetchLanes = new FetchLanes(BRIDGED_FETCH_SLOTS);
   hostStreamOpen = false;
 }

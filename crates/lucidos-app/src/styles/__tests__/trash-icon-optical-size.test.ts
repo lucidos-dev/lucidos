@@ -171,7 +171,10 @@ const callerRules = [
 describe('the nominal glyph size is declared per band, on the shared tap target', () => {
   it('keeps the tap target on one rule and puts a nominal on each class it names', () => {
     expect(bandRule, 'no rule shares a declaration across all three bands').toBeDefined();
-    expect(bandRule!.props.get('--icon-tap-target'), 'the shared target is not 2.25rem').toBe('2.25rem');
+    // The target is on :root, so the composer row can read it too.
+    const root = cssRules(baseCss).find(r => r.selector === ':root' && r.props.has('--icon-tap-target'));
+    expect(root?.props.get('--icon-tap-target'), 'the shared target is not 2.25rem').toBe('2.25rem');
+    expect(bandRule!.props.has('--icon-tap-target'), 'the band rule shadows the root target').toBe(false);
     // The bands take different nominals, so one riding the shared rule would be
     // a default that silently reaches all of them again.
     expect(bandRule!.props.has('--icon-glyph'), 'the shared rule sets one nominal for every band').toBe(false);

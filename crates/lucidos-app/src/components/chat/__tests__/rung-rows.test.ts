@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  LADDER_LINK_VALUE, NO_ESTIMATE_NOTE, NOT_ESTIMATED_SECTION, OFF_LADDER_NOTE, RUNG_SECTION, rungListRows, rungRowPair, type RungListInput,
+  LADDER_LINK_VALUE, NO_ESTIMATE_NOTE, filterRungRows, NOT_ESTIMATED_SECTION, OFF_LADDER_NOTE, RUNG_SECTION, rungListRows, rungRowPair, type RungListInput,
 } from '../rungRows';
 import type { CodingAgentLadderRung } from '../../../api/client';
 import { encodePair } from '../../../store/modelSelection';
@@ -64,6 +64,14 @@ describe('rungListRows', () => {
 
   it('commits nothing for the ladder link', () => {
     expect(rungRowPair(LADDER_LINK_VALUE)).toBeNull();
+  });
+
+  it('filters on every term of the label, and always keeps the ladder link', () => {
+    const { rows } = rungListRows(input());
+    const kept = (query: string) => filterRungRows(rows, query).map((r) => r.label);
+    expect(kept('opus high')).toEqual(['Opus 5.6 · high', 'Edit the intelligence ladder']);
+    expect(kept('nothing like it')).toEqual(['Edit the intelligence ladder']);
+    expect(kept('  ')).toEqual(rows.map((r) => r.label));
   });
 
   it('checks the default rung, in its own place, while nothing is picked or recorded', () => {

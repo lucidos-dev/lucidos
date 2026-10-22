@@ -270,6 +270,9 @@ mod tree_backfill_test;
 #[path = "api_support/follow_up_test.rs"]
 mod follow_up_test;
 
+#[path = "api_support/chat_settings_test.rs"]
+mod chat_settings_test;
+
 #[path = "api_support/detach_test.rs"]
 mod detach_test;
 

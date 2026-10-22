@@ -546,6 +546,10 @@ impl PreferenceStore {
     /// trigger thread report the account default however the trigger was
     /// pinned, and a human follow-up there would silently switch models.
     ///
+    /// A rung pick between turns (`ChatSettingsChanged`) counts too. So the
+    /// next turn runs on it, whether a person, a child report or a wake starts
+    /// it.
+    ///
     /// `exclude_event_id` drops the in-flight turn's own `MessageReceived` when
     /// it was pre-emitted upstream (`pre_emitted_origin` == `events.id`), so we
     /// never read the current turn as its own "previous" value. DB errors are
@@ -562,22 +566,22 @@ impl PreferenceStore {
         exclude_event_id: Option<Uuid>,
         model_override: Option<&str>,
     ) -> ResolvedModelSelection {
-        // Starter thread-event payloads are flat (see `ThreadEvent::to_payload`),
-        // so `payload->>'model'` reads the field directly on both variants.
+        // These thread-event payloads are flat (see `ThreadEvent::to_payload`),
+        // so `payload->>'model'` reads the field directly on all three variants.
         // `aggregate_id` is text; bind the thread id as its string.
         //
         let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
             r#"
-            WITH starters AS (
+            WITH stamped AS (
               SELECT sequence, payload
                 FROM events
                WHERE aggregate_id = $1
-                 AND event_type IN ('MessageReceived', 'TriggerStarted')
+                 AND event_type IN ('MessageReceived', 'TriggerStarted', 'ChatSettingsChanged')
                  AND ($2::uuid IS NULL OR id <> $2)
             ),
             remembered AS (
               SELECT payload->>'model' AS model
-                FROM starters
+                FROM stamped
                WHERE payload->>'model' <> ''
                ORDER BY sequence DESC
                LIMIT 1
@@ -588,13 +592,13 @@ impl PreferenceStore {
             SELECT
               (SELECT model FROM remembered) AS model,
               (SELECT payload->>'reasoning_effort'
-                 FROM starters
+                 FROM stamped
                 WHERE payload->>'reasoning_effort' <> ''
                   AND payload->>'model' IS NOT DISTINCT FROM (SELECT model FROM running)
                 ORDER BY sequence DESC
                 LIMIT 1) AS effort,
               (SELECT payload->>'provider'
-                 FROM starters
+                 FROM stamped
                 WHERE payload->>'provider' <> ''
                   AND payload->>'model' IS NOT DISTINCT FROM (SELECT model FROM running)
                 ORDER BY sequence DESC
@@ -1802,6 +1806,62 @@ mod tests {
         let named = resolve().await;
         assert_eq!(named.model.as_deref(), Some("model-b"));
         assert_eq!(named.reasoning_effort, None);
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A rung pick between turns, as `record_chat_settings` writes it.
+    async fn insert_chat_settings_changed(
+        pool: &PgPool,
+        thread_id: Uuid,
+        model: &str,
+        effort: Option<&str>,
+        provider: Option<&str>,
+    ) {
+        let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        crate::test_support::seed_thread_event(
+            &bus,
+            thread_id,
+            crate::engine::thread_events::ThreadEvent::ChatSettingsChanged {
+                model: model.to_string(),
+                reasoning_effort: effort.map(str::to_string),
+                provider: provider.map(str::to_string),
+            },
+        )
+        .await;
+    }
+
+    /// The next turn runs the recorded pick, however it starts.
+    #[tokio::test]
+    async fn a_recorded_pick_wins_over_the_last_starter() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_starter(&pool, tid, Some("model-a"), Some("low"), Some("vertex")).await;
+        insert_chat_settings_changed(&pool, tid, "model-b", Some("high"), Some("openai")).await;
+        let resolved = PreferenceStore::last_thread_chat_settings(&pool, tid, None, None).await;
+        assert_eq!(resolved.model.as_deref(), Some("model-b"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(resolved.provider.as_deref(), Some("openai"));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A pick's effort and provider stay with its model, and a later starter
+    /// on another model supersedes the pick.
+    #[tokio::test]
+    async fn a_picked_effort_stays_tied_to_its_model() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        insert_chat_settings_changed(&pool, tid, "model-a", Some("max"), Some("vertex")).await;
+        insert_starter(&pool, tid, Some("model-b"), None, None).await;
+        let resolved = PreferenceStore::last_thread_chat_settings(&pool, tid, None, None).await;
+        assert_eq!(resolved.model.as_deref(), Some("model-b"));
+        assert_eq!(resolved.reasoning_effort, None);
+        assert_eq!(resolved.provider, None);
+        let back =
+            PreferenceStore::last_thread_chat_settings(&pool, tid, None, Some("model-a")).await;
+        assert_eq!(back.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(back.provider.as_deref(), Some("vertex"));
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

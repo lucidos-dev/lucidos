@@ -1,4 +1,6 @@
-import { chatModels, intelligenceLadderVersion, settingsScrollTarget, showToast } from '../../store/store';
+import {
+  chatModels, effectiveThreadStatus, intelligenceLadderVersion, showToast, threadMap,
+} from '../../store/store';
 import {
   getComposeSelectionOverride, resolveModel, resolveProvider, resolveReasoningEffort,
 } from '../../store/composeSelections';
@@ -6,7 +8,6 @@ import {
   resolveActiveThreadModel,
   resolveActiveThreadProvider,
   resolveActiveThreadReasoningEffort,
-  patchThreadModelOverride,
 } from '../../store/threadModelSelections';
 import { updateComposeSelection } from '../../store/actions/compose';
 import {
@@ -14,17 +15,17 @@ import {
   PROVIDER_DEFAULT_EFFORT_LABEL, rememberProvider,
 } from '../../store/actions/models';
 import { accountChatEffort } from '../../store/actions/preferences';
-import { fetchSwitchEstimate, getChatLadder } from '../../api/client';
+import { ApiError, fetchSwitchEstimate, getChatLadder, recordChatSettings } from '../../api/client';
+import { TURN_RUNNING_REASON } from '@lucidos/engine-constants';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { decodePair, encodePair, pairLabelOf } from '../../store/modelSelection';
 import { displayModelName } from '../../store/thread-events/exchange';
-import { openSettingsSubview } from '../../store/actions/menu';
+import { openIntelligenceLadder } from '../../store/actions/menu';
 import { errorDetail } from '../../utils/errorDetail';
-import { ladderAnchor } from '../settings/intelligenceLadder';
 import { providerStepOptions, providerStepCommit } from '../shared/ModelSelectionPicker';
 import type { RungProviderStep } from './RungPicker';
-import { rungFaces, stepTargets, type ShownRung } from './rungControlParts';
+import { rungFaces, rungLockedReason, stepTargets, type ShownRung } from './rungControlParts';
 import { LADDER_LINK_VALUE, rungListRows } from './rungRows';
 import { askRungSwitch } from './rungSwitch';
 
@@ -42,18 +43,32 @@ export interface ChatRungStateProps {
   composeContext: boolean;
 }
 
+/** Whether the engine refused a pick because a turn runs. */
+function isTurnRunningRefusal(err: unknown): boolean {
+  return err instanceof ApiError && (err.body as { reason?: unknown } | undefined)?.reason === TURN_RUNNING_REASON;
+}
+
 /** What the rung control knows about the Lucidos Agent thread it belongs to:
  *  the chat ladder's rungs, the pair in force, and how a pick commits.
  *
  *  A draft's pick is the draft's own override (or the pending slot before a
- *  draft exists). An active thread's pick is that thread's pending override,
- *  which its next message carries. Neither reaches the account preference, so
- *  a pick never leaks to another draft or thread. */
+ *  draft exists). A started thread's pick is recorded on the engine, and only
+ *  between turns: while a turn runs the rung is locked (ADR 0544). Neither
+ *  reaches the account preference, so a pick never leaks to another draft or
+ *  thread. */
 export function useChatRungState({ threadId, composeContext: perDraft }: ChatRungStateProps) {
   // Idempotent render-path kick-off so the picker shows the live DB-backed
   // registry; `chatModelOptions()` falls back to the static MODELS list until
   // it lands. `loadChatModels` single-flights via setLoadingIfFresh.
   if (chatModels.value.status === 'not-loaded') void loadChatModels();
+
+  /** Why a started thread's rung cannot change now, read at call time. */
+  const lockedNow = (): string | null => {
+    if (perDraft || !threadId) return null;
+    const thread = threadMap.value.get(threadId);
+    return rungLockedReason(thread ? effectiveThreadStatus(thread) : null);
+  };
+  const lockedReason = lockedNow();
 
   const modelValue = perDraft ? resolveModel(threadId) : resolveActiveThreadModel(threadId);
   const effortValue = perDraft
@@ -70,19 +85,17 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     ? (model === modelValue ? resolveProvider(threadId) : null)
     : resolveActiveThreadProvider(threadId, model));
 
-  /** Where a pick lands. The backend binds here too, and is ALSO remembered on
-   *  the model's row, since the last provider picked for a model is remembered
-   *  per model. */
-  function applyPick(patch: ModelSelectionPatch) {
-    const write = {
+  /** A draft's pick lands on the draft. The backend binds here too, and is
+   *  ALSO remembered on the model's row, since the last provider picked for a
+   *  model is remembered per model. */
+  function applyDraftPick(patch: ModelSelectionPatch) {
+    updateComposeSelection(threadId ?? null, {
       model: patch.model,
       // `undefined` drops this draft's own tier.
       reasoningEffort: patch.reasoningEffort ?? undefined,
       // `undefined` clears a pick the new model cannot use.
       provider: patch.provider ?? undefined,
-    };
-    if (perDraft) updateComposeSelection(threadId ?? null, write);
-    else if (threadId) patchThreadModelOverride(threadId, write);
+    });
     if (patch.provider) void rememberProvider(patch.model, patch.provider);
   }
 
@@ -94,7 +107,7 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     providerFor,
     effortFor,
     unsetEffortLabel: PROVIDER_DEFAULT_EFFORT_LABEL,
-    onChange: applyPick,
+    onChange: applyDraftPick,
   });
 
   const ladder = useLoadableFetch(getChatLadder, [intelligenceLadderVersion.value], {
@@ -194,18 +207,43 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     return choice === 'switch';
   }
 
+  /** Record a started thread's pick on the engine. A turn may start while the
+   *  user reads the switch dialog, so the lock is checked again after it. */
+  async function recordStartedPick(startedThreadId: string, encoded: string, provider: string | undefined) {
+    const label = pairLabelOf(selection.rows, encoded, provider);
+    if (!await startedPickProceeds(startedThreadId, encoded, provider, label)) return false;
+    const locked = lockedNow();
+    if (locked) {
+      showToast(locked, 'info');
+      return false;
+    }
+    const pair = decodePair(encoded);
+    try {
+      await recordChatSettings(startedThreadId, {
+        model: pair.model,
+        reasoningEffort: pair.effort ?? undefined,
+        provider,
+      });
+    } catch (err) {
+      if (isTurnRunningRefusal(err)) showToast(rungLockedReason('running')!, 'info');
+      else showToast(`Could not switch to ${label}: ${errorDetail(err)}`, 'error');
+      return false;
+    }
+    if (provider) void rememberProvider(pair.model, provider);
+    return true;
+  }
+
   async function pick(encoded: string, provider?: string, quiet = false) {
     const label = pairLabelOf(selection.rows, encoded, provider);
-    if (!perDraft && threadId && !await startedPickProceeds(threadId, encoded, provider, label)) return;
-    selection.pick(encoded, provider);
+    if (perDraft || !threadId) selection.pick(encoded, provider);
+    else if (!await recordStartedPick(threadId, encoded, provider)) return;
     if (!quiet) showToast(`Model: ${label}`, 'success');
   }
 
   /** Commit a row: a rung, or the ladder link out to Settings > Intelligence. */
   function pickRung(value: string, provider?: string) {
     if (value === LADDER_LINK_VALUE) {
-      openSettingsSubview('intelligence');
-      settingsScrollTarget.value = ladderAnchor('chat');
+      openIntelligenceLadder('chat');
       return;
     }
     const commit = rungPick(value, provider);
@@ -217,11 +255,16 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
   /** Move one row up (-1) or down (1) the rung list, saying nothing more: the
    *  label shows the new pair. */
   function step(direction: -1 | 1) {
+    const locked = lockedNow();
+    if (locked) {
+      showToast(locked, 'info');
+      return;
+    }
     const target = direction === -1 ? steps.prev : steps.next;
     if (target === null) return;
     const commit = rungPick(target);
     void pick(commit.encoded, undefined, true);
   }
 
-  return { shown, faces, rungList, providerStep, pickRung, steps, step };
+  return { shown, faces, rungList, providerStep, pickRung, steps, step, lockedReason };
 }

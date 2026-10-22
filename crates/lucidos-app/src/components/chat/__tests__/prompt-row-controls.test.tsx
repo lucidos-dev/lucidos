@@ -1,84 +1,74 @@
-/** The prompt row's three leading slots, and the order that is their contract.
+/** The composer row's order, which is also its fold order.
  *
- *  A coding agent's control menu anchors the row. The follow toggle is next and
- *  the call toggle after it, and each keeps its slot on every thread. A Lucidos
- *  Agent thread has no menu, so the follow toggle leads. The follow toggle
- *  once sat after the indicators. It was third on a Lucidos thread, second on a
- *  coding-agent one and fourth with a subscription armed. It is the only
- *  control here rendering in every state, so it is the one that must not move.
+ *  The fold takes a prefix, so the leftmost member folds first. The user asked
+ *  for the Claude menu and attach image to fold before the model picker. They
+ *  also asked that a fold follow the order the row is arranged in.
  *
- *  The two toggles DO fold, last of everything, which is the same rule seen
- *  from the other end. A slot holds at every width that can show it, and a
- *  glyph off the screen protects nothing.
- *
- *  Plan: `docs/plans/2026-09-19-the-composer-row-is-one-row.md`. */
+ *  Plan: `docs/plans/2026-10-21-coding-agent-menu-folds-before-the-model-picker.md`. */
 import { describe, expect, it } from 'vitest';
-import { Fragment } from 'preact';
 import type { ComponentChildren, VNode } from 'preact';
 import { FollowLiveEdgeIcon } from '../../shared/icons';
+import type { HeaderActionSpec } from '../../layout/headerActions';
 import {
-  followLiveEdgeAction, LazyCodingAgentControlMenu as CodingAgentControlMenu,
-  PromptRowControls, promptRowToggles,
+  codingAgentMenuAction, composerRowMembers, followLiveEdgeAction, promptRowToggles,
 } from '../PromptRowControls';
+import { CODING_AGENT_MENU_FOLD_KEY } from '../ControlMenuTrigger';
+import { RUNG_FOLD_KEY } from '../RungButtons';
 import { callIsOffered } from '../../../voice/callOffer';
 import type { ThreadState } from '../../../store/thread-events/thread-meta';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: unknown }> {}
 
-/** The cluster's rendered children, by component, in document order.
- *
- *  Walks the returned tree rather than mounting it: these are function
- *  components, so an unmounted vnode carries the component itself as `type`,
- *  which is exactly the identity the assertions are about. Nothing here needs a
- *  DOM, a store or a signal.
- *
- *  `Fragment` is skipped rather than reported, and that is the point of the
- *  walk: a fragment emits no DOM, so the cluster's children ARE the row's
- *  children whichever branch they came wrapped in.
- */
-function componentsIn(node: ComponentChildren): unknown[] {
-  if (node === null || node === undefined || typeof node === 'boolean') return [];
-  if (typeof node === 'string' || typeof node === 'number') return [];
-  if (Array.isArray(node)) return node.flatMap(componentsIn);
-  const vnode = node as AnyVNode;
-  const self = typeof vnode.type === 'function' && vnode.type !== Fragment ? [vnode.type] : [];
-  return [...self, ...componentsIn(vnode.props?.children)];
-}
+const spec = (key: string): HeaderActionSpec => ({ key, label: key, icon: () => null });
 
-const row = (codingAgent: 'claude-code' | 'codex' | null) =>
-  PromptRowControls({
-    codingAgent,
-    codingAgentThreadId: codingAgent ? 'thread-1' : undefined,
-    composeThreadId: undefined,
-    // Nothing folded, which is the state the order contract is about.
-    toggles: promptRowToggles(codingAgent, false, undefined).row,
-    attrsFor: () => ({}),
+/** Every member present, as on a busy coding-agent thread. */
+const members = (codingAgent: boolean) => composerRowMembers({
+  codingAgentMenu: codingAgent ? codingAgentMenuAction('claude-code') : null,
+  attachImage: spec('attach-image'),
+  readouts: [spec('waiting'), spec('wip')],
+  clearDraft: spec('prompt-clear'),
+  toggles: [spec('call-toggle'), spec('follow-live-edge')],
+  rung: spec(RUNG_FOLD_KEY),
+  banner: [spec('diff'), spec('apply')],
+});
+
+/** Left to right, which is the order the fold takes them in. */
+const order = (codingAgent: boolean) => {
+  const { row, cluster } = members(codingAgent);
+  return [...row, ...cluster].map((a) => a.key);
+};
+
+describe('the composer row order', () => {
+  it('runs from the Claude menu to the banner, as arranged', () => {
+    expect(order(true)).toEqual([
+      CODING_AGENT_MENU_FOLD_KEY, 'attach-image', 'waiting', 'wip', 'prompt-clear',
+      'call-toggle', 'follow-live-edge', RUNG_FOLD_KEY, 'diff', 'apply',
+    ]);
   });
 
-const cluster = (codingAgent: 'claude-code' | 'codex' | null) => componentsIn(row(codingAgent));
+  /** It reads no thread state, so this holds in compose context and in a
+   *  started thread alike. */
+  it('folds the Claude menu and attach image before the model picker', () => {
+    const keys = order(true);
+    expect(keys.indexOf(CODING_AGENT_MENU_FOLD_KEY)).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
+    expect(keys.indexOf('attach-image')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
+  });
 
-describe('PromptRowControls', () => {
-  /** The `/` menu belongs to a coding agent. A Lucidos Agent thread has no
-   *  slash commands, and its model pick is the rung control's. */
+  it('puts the follow toggle right before the model picker', () => {
+    const keys = order(true);
+    expect(keys.indexOf(RUNG_FOLD_KEY) - keys.indexOf('follow-live-edge')).toBe(1);
+  });
+
+  it('renders the model picker and the banner in the right-hand cluster', () => {
+    expect(members(true).cluster.map((a) => a.key)).toEqual([RUNG_FOLD_KEY, 'diff', 'apply']);
+  });
+
+  /** A Lucidos Agent thread has no slash commands, and its model pick is the
+   *  rung control's. */
   it('offers the coding-agent menu to a coding-agent thread alone', () => {
-    expect(cluster('claude-code')).toContain(CodingAgentControlMenu);
-    expect(cluster(null)).not.toContain(CodingAgentControlMenu);
+    expect(order(false)[0]).toBe('attach-image');
+    expect(order(false)).not.toContain(CODING_AGENT_MENU_FOLD_KEY);
   });
-
-  /** `.prompt-actions-row` is a flex row whose children are diffed
-   *  positionally, so the order is part of the contract.
-   *
-   *  The follow toggle shows up here as its ICON, the one function component
-   *  inside the `<button>` this walk can see. The call toggle is its own
-   *  component, so it shows up under its own name. */
-  it('puts the menu first and the follow toggle after it', () => {
-    // Voice ships off, so the call toggle draws nothing here and contributes no
-    // member. Its slot after the follow toggle is the contract, asserted on the
-    // fold order below.
-    expect(cluster(null)).toEqual([FollowLiveEdgeIcon]);
-    expect(cluster('claude-code')).toEqual([CodingAgentControlMenu, FollowLiveEdgeIcon]);
-  });
-
 });
 
 /** The follow toggle's on-state must not rest on colour alone. A theme without
@@ -102,26 +92,19 @@ describe('the follow toggle shows its state by shape', () => {
   });
 });
 
-describe('the two fixed toggles', () => {
-  /** Two views of one pair, so the fold and the row cannot disagree about which
-   *  of them exists. */
-  it('are the same members in both orders', () => {
-    const { row: slots, fold } = promptRowToggles(null, false, undefined);
-    expect([...slots].sort()).toEqual([...fold].sort());
-  });
-
-  /** The follow toggle is the only control rendering in every state, so it is
-   *  the LAST thing to leave the row. */
-  it('fold call first and follow last', () => {
-    const { fold } = promptRowToggles(null, false, undefined);
-    expect(fold[fold.length - 1].key).toBe('follow-live-edge');
+describe('the row toggles', () => {
+  /** The follow toggle renders in every state, so it closes the row's left
+   *  side, right before the model picker. */
+  it('end with the follow toggle', () => {
+    const toggles = promptRowToggles(null, false, undefined);
+    expect(toggles[toggles.length - 1].key).toBe('follow-live-edge');
   });
 
   /** A call reaches the Lucidos Agent and nothing else (ADR 0165). Voice ships
    *  off, so the member is absent either way here. What this pins is that the
    *  factory is asked, rather than the composer deciding for itself. */
   it('offer no call member on a coding-agent thread', () => {
-    expect(promptRowToggles('claude-code', false, undefined).fold.map((a) => a.key))
+    expect(promptRowToggles('claude-code', false, undefined).map((a) => a.key))
       .not.toContain('call-toggle');
   });
 });

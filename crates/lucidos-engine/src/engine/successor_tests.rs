@@ -42,10 +42,11 @@ fn a_successor_takes_its_old_threads_place() {
     assert_eq!(child.spawning_event_id, Some(spawned_by));
 }
 
-/// I6: a build chain's builder is a `no-wake` child of the planner, so its
-/// clean report is filed and opens no planner turn. A failure still wakes it.
+/// I6: a build chain's builder is a `no-wake` child of the planner, so every
+/// report it sends is filed and opens no planner turn. That includes a
+/// failure and a restart cut (ADR 0545).
 #[test]
-fn a_build_chain_member_files_a_clean_report() {
+fn a_build_chain_member_files_every_report() {
     use crate::engine::event_bus::Delivery;
     use crate::engine::thread_events::{ChildCompletionStatus, WakeMode};
     let planner = Uuid::new_v4();
@@ -53,8 +54,10 @@ fn a_build_chain_member_files_a_clean_report() {
     assert_eq!(placement.parent_thread_id, Some(planner));
     assert_eq!(placement.wake_mode, Some(WakeMode::NoWake));
     let report = |status| Delivery::for_report(status, placement.wake_mode, None, false);
-    assert_eq!(report(ChildCompletionStatus::Success), Delivery::File);
-    assert_eq!(report(ChildCompletionStatus::Failure), Delivery::Wake);
+    use ChildCompletionStatus::*;
+    for status in [Success, Failure, NoChanges, Canceled, Interrupted] {
+        assert_eq!(report(status), Delivery::File, "{status:?}");
+    }
 }
 
 fn implementer(agent: CodingAgent, model: Option<&str>, effort: Option<&str>) -> Implementer {

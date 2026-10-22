@@ -5,7 +5,6 @@ import { showToast, codingAgentSessionVersion, scopeToRepoId, engineRestarting }
 import { resolveScope } from '../../store/composeSelections';
 import { sendMessage } from '../../store/actions/chat';
 import { fetchCodingAgentCommands, type CodingAgentCommandsResponse } from '../../api/client';
-import type { CodingAgent } from '../../api/types';
 import { isTextInput, keepFocusOnPress } from '../../utils/dom';
 import { hasCoarsePointer, viewportIsMobile } from '../../utils/viewport';
 import { errorDetail } from '../../utils/errorDetail';
@@ -15,8 +14,14 @@ import { whenStepSettled } from '../../hooks/panelStepMorph';
 import { useFocusWhenPlaced } from '../../hooks/useFocusWhenPlaced';
 import { keyboardHolder, returnKeyboard } from '../shared/keyboardHandoff';
 import { ControlFilter, FrontendPreviewSection, controlMenuParts } from './controlMenuParts';
-import { codingAgentMenuOpenRequest, takeControlMenuPress } from './controlMenuRequests';
-import { CodingAgentIcon, ControlMenuTrigger, codingAgentMenuLabel, menuCodingAgent } from './ControlMenuTrigger';
+import {
+  codingAgentCommandsReady, codingAgentFoldOpenRequest, codingAgentMenuOpenRequest, takeControlMenuPress,
+  useControlMenuCloseRequests,
+} from './controlMenuRequests';
+import {
+  CodingAgentIcon, ControlMenuTrigger, codingAgentMenuLabel, menuCodingAgent, type CodingAgentMenuProps,
+} from './ControlMenuTrigger';
+import { visibleMoreTrigger } from './promptFocus';
 import { usePendingOpen } from '../../hooks/usePendingOpen';
 import { loadFrontendPreview } from '../../store/actions/frontend-preview';
 import { failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../../store/types';
@@ -52,19 +57,12 @@ function hasAnyCommands(builtin: string[], skill: string[]): boolean {
 
 type ListItem = { name: string };
 
-interface Props {
-  threadId?: string;
-  /** The focused COMPOSING draft's id, set only while composing (mutually
-   *  exclusive with `threadId`, which is the active-session id). The commands
-   *  are scoped to this draft's repo. */
-  composeThreadId?: string;
-  codingAgent?: CodingAgent | null;
-}
-
 /** The `/` menu: a coding agent's slash commands and skills, and the frontend
  *  preview. The model and effort are not here. They are the rung control's. */
-export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent }: Props) {
+export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent, folded = false, rowAttrs }: CodingAgentMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
+  // Folded, the ⋯ is the only box left to anchor against.
+  const foldAnchorRef = useRef<HTMLElement | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const retryTimerRef = useRef<number | null>(null);
@@ -90,6 +88,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const isClaudeCode = resolvedCodingAgent === 'claude-code';
   const effectiveBuiltinCommands = isClaudeCode ? builtinCommands.value : [];
   const effectiveSkillCommands = isClaudeCode ? skillCommands.value : [];
+  const commandsReady = hasAnyCommands(effectiveBuiltinCommands, effectiveSkillCommands);
 
   function clearRetryTimer() {
     if (retryTimerRef.current !== null) {
@@ -169,11 +168,18 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       });
   }
 
+  /** The box the panel opens against: the menu's own, or the ⋯ while folded. */
+  function anchorBox(): HTMLElement | null {
+    if (!folded) return menuRef.current;
+    if (!foldAnchorRef.current?.isConnected) foldAnchorRef.current = visibleMoreTrigger();
+    return foldAnchorRef.current;
+  }
+
   /** Open the command menu with an optional filter. `typed` is true when a
    *  typed "/" opened it, so the typing continues in the filter. */
   function openMenu(filterText = '', typed = false) {
     if (!hasAnyCommands(effectiveBuiltinCommands, effectiveSkillCommands)) return;
-    const trigger = menuRef.current;
+    const trigger = anchorBox();
     if (!trigger) return;
     // Read at the press: the holder is whatever had the keyboard then.
     const holder = keyboardHolder();
@@ -210,6 +216,34 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   useEffect(() => {
     if (takeControlMenuPress('coding-agent')) openMenu();
   }, []);
+
+  // A fold or unfold moves the anchor to another box. An open panel is shut
+  // then, not left pinned to the box that went.
+  const wasFolded = useRef(folded);
+  useEffect(() => {
+    if (wasFolded.current !== folded) close();
+    wasFolded.current = folded;
+  }, [folded]);
+  useControlMenuCloseRequests(open, close);
+
+  useEffect(() => {
+    codingAgentCommandsReady.value = commandsReady;
+  }, [commandsReady]);
+  useEffect(() => () => { codingAgentCommandsReady.value = false; }, []);
+
+  // The ⋯ menu row for a folded menu asks for the panel against the ⋯. The ⋯
+  // has closed by then, so a tap with nothing to open says why.
+  useSignalEffect(() => {
+    const anchor = codingAgentFoldOpenRequest.value;
+    if (!folded || !anchor) return;
+    codingAgentFoldOpenRequest.value = null;
+    if (!untracked(() => codingAgentCommandsReady.value)) {
+      showToast(isClaudeCode ? 'Claude Code commands are still loading' : 'Codex has no slash commands', 'info');
+      return;
+    }
+    foldAnchorRef.current = anchor;
+    openMenu();
+  });
 
   // Re-fetch commands when a Claude Code session starts/resumes (SSE-driven).
   // useSignalEffect required — see comment below re: Preact signal optimization.
@@ -261,15 +295,16 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   // Layout check: `App` mounts only the active layout's pane tree (desktop XOR
   // mobile), so exactly one instance of this menu exists. It can still be
   // unlaid-out on the frame the request arrives (zero-size bounding rect), and
-  // the menu anchors its overlay to that box, so wait for a real one.
+  // the menu anchors its overlay to that box, so wait for a real one. Folded,
+  // that box is the ⋯.
   useSignalEffect(() => {
     const req = codingAgentMenuOpenRequest.value;
     if (req !== null) {
-      const el = menuRef.current;
-      if (!el || el.getBoundingClientRect().width === 0) {
-        // Layout may not have finalized yet — retry after next frame
-        if (el) requestAnimationFrame(() => {
-          if (codingAgentMenuOpenRequest.value !== null && el.getBoundingClientRect().width > 0) {
+      const laidOut = (el: HTMLElement | null) => el !== null && el.getBoundingClientRect().width > 0;
+      if (!laidOut(anchorBox())) {
+        // Layout may not have finalized yet, so retry after the next frame.
+        requestAnimationFrame(() => {
+          if (codingAgentMenuOpenRequest.value !== null && laidOut(anchorBox())) {
             codingAgentMenuOpenRequest.value = null;
             openMenu(req, true);
           }
@@ -310,8 +345,9 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
 
   // A phone gives the panel the header palette width (.control-dropdown), so
   // it centres in the pane rather than hanging from its button.
+  const anchorEl = folded ? foldAnchorRef.current : menuRef.current;
   const pos = useAnchoredPosition(
-    open.value ? menuRef.current : null,
+    open.value ? anchorEl : null,
     panelRef,
     '.thread-pane',
     viewportIsMobile.value ? 'container-center' : 'start',
@@ -393,24 +429,28 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   }
 
   return (
-    <div class="control-menu" data-row-item ref={menuRef}>
-      {/* Never disabled: openMenu() guards against empty commands instead.
-          disabled={...} caused intermittent UX issues during Claude Code session startup races. */}
-      <ControlMenuTrigger
-        label={codingAgentMenuLabel(resolvedCodingAgent)}
-        extraClass={hasAnyCommands(effectiveBuiltinCommands, effectiveSkillCommands) ? 'commands-btn-active' : undefined}
-        onClick={() => {
-          if (open.value) { close(); return; }
-          if (pendingOpen.takeBack()) return;
-          openMenu();
-        }}
-      >
-        <CodingAgentIcon agent={resolvedCodingAgent} />
-      </ControlMenuTrigger>
+    <>
+      {!folded && (
+        <div class="control-menu" {...rowAttrs} ref={menuRef}>
+          {/* Never disabled: openMenu() guards against empty commands instead.
+              disabled={...} caused intermittent UX issues during Claude Code session startup races. */}
+          <ControlMenuTrigger
+            label={codingAgentMenuLabel(resolvedCodingAgent)}
+            extraClass={commandsReady ? 'commands-btn-active' : undefined}
+            onClick={() => {
+              if (open.value) { close(); return; }
+              if (pendingOpen.takeBack()) return;
+              openMenu();
+            }}
+          >
+            <CodingAgentIcon agent={resolvedCodingAgent} />
+          </ControlMenuTrigger>
+        </div>
+      )}
       <Overlay
         open={open.value}
         onClose={close}
-        anchor={menuRef.current}
+        anchor={anchorEl}
         backdrop={false}
         // Portaled so it can lay over the header: a mobile swipe pane clips at
         // its own edge and caps any z-index inside it.
@@ -461,6 +501,6 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
           {threadId && !q && <FrontendPreviewSection threadId={threadId} />}
         </div>
       </Overlay>
-    </div>
+    </>
   );
 }

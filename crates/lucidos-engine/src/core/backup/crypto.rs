@@ -91,10 +91,18 @@ pub fn parse_backup_key(text: &str) -> Result<age::x25519::Identity, BoxError> {
         .map_err(|_| "not a valid backup key: it should start with AGE-SECRET-KEY-1".into())
 }
 
-/// Parse a backup recipient (`age1…`).
-pub fn parse_recipient(text: &str) -> Result<age::x25519::Recipient, BoxError> {
-    age::x25519::Recipient::from_str(text.trim())
-        .map_err(|e| format!("not a valid age public key (it should start with age1): {e}").into())
+/// Parse a backup recipient (`age1…`) the user pasted. The error never repeats
+/// the pasted text. A paste holding a backup key anywhere, such as a whole key
+/// file, gets its own message: the user holds the right key in the wrong form.
+pub fn parse_pasted_recipient(text: &str) -> Result<age::x25519::Recipient, BoxError> {
+    let text = text.trim();
+    age::x25519::Recipient::from_str(text).map_err(|_| {
+        if text.to_ascii_uppercase().contains(AGE_KEY_PREFIX) {
+            "that is a secret backup key: paste its public key, which starts with age1".into()
+        } else {
+            "not a valid age public key: paste the whole key that starts with age1".into()
+        }
+    })
 }
 
 /// A fresh key pair. The caller shows the backup key once and keeps only the

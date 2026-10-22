@@ -816,7 +816,8 @@ export type VoiceSessionEndReason =
   | 'engine_shutdown';
 
 /** What a child's clean finish does to its parent, declared by the spawn: the
- *  child's *wake mode* (ADR 0451). A failure wakes the parent under every mode.
+ *  child's *wake mode* (ADR 0451). A failure wakes the parent under every mode
+ *  but `NoWake`, which files every report (ADR 0545).
  *  Full reasoning is on the Rust variant. */
 export type WakeMode =
   | 'no-wake'
@@ -2286,6 +2287,22 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The user picked a Lucidos Agent thread's model and effort between turns
+   *  (ADR 0544 for the lock). The thread's next turn runs on it, however it
+   *  starts: `last_thread_chat_settings` reads it beside the starters. The
+   *  payload is flat, like a starter's. The actor rides on `EventMeta`. */
+  | {
+      type: 'ChatSettingsChanged';
+      model: string;
+      reasoning_effort?: string;
+      provider?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   | {
       type: 'PromptInjected';
       text: string;
@@ -2668,11 +2685,13 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A child thread's clean report, filed on the **parent** without waking
-   *  it: the child's *wake decision* said the parent need not act now.
-   *  Same payload as `ChildThreadCompleted`, emitted by the same fan-in in
-   *  its place. It starts no turn and moves no status. The parent reads it
-   *  on its next turn. Only a `success` or `no_changes` finish is ever filed. */
+  /** A child thread's report, filed on the **parent** without waking it.
+   *  A `no-wake` child files every report, whatever its status (ADR 0545).
+   *  Under another mode only a clean one files: an early batch report, or
+   *  one whose *wake decision* said the parent need not act now. Same
+   *  payload as `ChildThreadCompleted`, emitted by the same fan-in in its
+   *  place. It starts no turn and moves no status. The parent reads it on
+   *  its next turn. */
   | {
       type: 'ChildReportFiled';
       child_thread_id: string;
@@ -3372,6 +3391,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ChangeHardened: true,
   ChangeSummarized: true,
   CodingAgentSettingsChanged: true,
+  ChatSettingsChanged: true,
   PromptInjected: true,
   CredentialRequested: true,
   PluginInstallRequested: true,

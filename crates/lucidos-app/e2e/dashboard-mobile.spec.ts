@@ -64,21 +64,18 @@ async function openHome(page: Page): Promise<void> {
   await expect(toggle(page)).toBeVisible({ timeout: 15_000 });
 }
 
-/** Open the sheet from its button and wait for the rise to finish. */
+/** Open the sheet from its button and wait for the fade to finish. */
 async function openSheet(page: Page): Promise<void> {
   await toggle(page).click();
   await expect(sheet(page)).toBeVisible();
-  await expect(sheet(page)).toHaveCSS('transform', 'none');
+  await expect(sheet(page)).toHaveCSS('opacity', '1');
 }
 
 /** The app header's bottom edge, in px. */
 const headerBottom = (page: Page) => page.evaluate(() => document.querySelector('.app-header')!.getBoundingClientRect().bottom);
 
-/** The sheet's top edge, and the 0.75rem gap it keeps below the app header, in px. */
-const sheetEdges = (page: Page) => page.evaluate(() => ({
-  top: document.querySelector('.dashboard-sheet-panel')!.getBoundingClientRect().top,
-  gap: parseFloat(getComputedStyle(document.documentElement).fontSize) * 0.75,
-}));
+/** The sheet's top edge, in px. */
+const sheetTop = (page: Page) => page.evaluate(() => document.querySelector('.dashboard-sheet-panel')!.getBoundingClientRect().top);
 
 test.describe('The dashboard sheet on a phone', () => {
   let a: string;
@@ -110,7 +107,33 @@ test.describe('The dashboard sheet on a phone', () => {
     await expect(sheet(page)).toHaveCount(0);
   });
 
-  test('the button opens the sheet over Home below the header, and the hash stays put', async ({ page }) => {
+  test('the pressed button wears the same paint as Filter on the header bar', async ({ page }) => {
+    await openHome(page);
+    await openSheet(page);
+    await page.mouse.move(0, 0);
+    await expect(toggle(page)).toHaveAttribute('aria-pressed', 'true');
+
+    // Filter is a framed toggle, so a framed probe on the same bar is its paint.
+    // Polled, because the chip fades in under a transition.
+    const paints = () => page.evaluate(() => {
+      const paint = (el: Element) => {
+        const style = getComputedStyle(el);
+        return { color: style.color, background: style.backgroundColor };
+      };
+      const probe = document.createElement('button');
+      probe.className = 'icon-btn header-icon';
+      probe.dataset.tone = 'framed';
+      probe.setAttribute('aria-pressed', 'true');
+      document.querySelector('.mobile-thread-header')!.append(probe);
+      const filter = paint(probe);
+      probe.remove();
+      return { filter, dashboard: paint(document.querySelector('.mobile-thread-header .dashboard-sheet-toggle')!) };
+    });
+    await expect.poll(async () => (await paints()).dashboard).toEqual((await paints()).filter);
+    expect((await paints()).dashboard.background, 'a pressed toggle wears a chip').not.toBe('rgba(0, 0, 0, 0)');
+  });
+
+  test('the button opens the sheet over Home, flush below the header, and the hash stays put', async ({ page }) => {
     await addToDashboard(page, a);
     await openHome(page);
     const hash = await page.evaluate(() => location.hash);
@@ -118,15 +141,14 @@ test.describe('The dashboard sheet on a phone', () => {
     await openSheet(page);
     await expect(tile(page, a)).toBeVisible();
     expect(await page.evaluate(() => location.hash)).toBe(hash);
-    const sheet = await sheetEdges(page);
-    expect(sheet.top).toBeCloseTo((await headerBottom(page)) + sheet.gap, 0);
+    expect(await sheetTop(page)).toBeCloseTo(await headerBottom(page), 0);
   });
 
   for (const [name, title] of [
     ['a short title', 'E2E short'],
     ['a long title', 'E2E a long thread title that has to wrap onto a second line on a narrow phone screen'],
   ] as const) {
-    test(`over a thread with ${name}, the sheet hangs from the header, and focus stays`, async ({ page }) => {
+    test(`over a thread with ${name}, the sheet meets the header, and focus stays`, async ({ page }) => {
       const threadId = seedChatThread({ turns: 1, needles: [], title });
       try {
         await addToDashboard(page, a);
@@ -136,8 +158,7 @@ test.describe('The dashboard sheet on a phone', () => {
 
         const hash = await page.evaluate(() => location.hash);
         await openSheet(page);
-        const sheet = await sheetEdges(page);
-        expect(sheet.top).toBeCloseTo((await headerBottom(page)) + sheet.gap, 0);
+        expect(await sheetTop(page)).toBeCloseTo(await headerBottom(page), 0);
         expect(await page.evaluate(() => location.hash)).toBe(hash);
         expect(await page.evaluate(() => localStorage.getItem('lucidos-focused-thread'))).toBe(threadId);
       } finally {
@@ -154,16 +175,6 @@ test.describe('The dashboard sheet on a phone', () => {
     await toggle(page).click();
     await expect(sheet(page)).toBeHidden();
     await expect(toggle(page)).toHaveAttribute('aria-pressed', 'false');
-  });
-
-  test('a tap on the dim above the sheet closes it', async ({ page }) => {
-    await openHome(page);
-    await openSheet(page);
-    const bottom = await headerBottom(page);
-    const { gap } = await sheetEdges(page);
-
-    await page.mouse.click(8, bottom + gap / 2);
-    await expect(sheet(page)).toBeHidden();
   });
 
   /** Invariant: closing and reopening the sheet never reloads a tile. */

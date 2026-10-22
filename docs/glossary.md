@@ -235,6 +235,21 @@ That is what left the trigger detail page showing an old group after three
 and the pause defers rather than drops: see the allowlist editors. See also
 *subscribing surface*.
 
+### Toggle icon button
+The one icon button that toggles, `ToggleIconButton` in
+`crates/lucidos-app/src/components/shared/ToggleIconButton.tsx`. Its on-state
+is `aria-pressed`, the only hook any sheet paints from, and its look is a
+`data-tone`. Five tones, a closed set: `framed` (accent glyph in a chip, the
+default and Filter's look), `glyph` (accent glyph, no chip: Pin, Follow), `armed`
+(green glyph, no chip: a standing Apply), `quiet` (neutral chip: turn controls)
+and `live` (green glyph in a green chip: a call that is up).
+
+Each tone is painted once per surface: `host-components.css` for the page and
+`panels/shell.css` for the header bar, so a toggle cannot wear the page paint on
+the blue bar. A new look is a new tone, never a local rule beside one toggle.
+`toggle-icon-single-source.test.ts` fails a hand-pressed `icon-btn` and a local
+on-state rule. A text choice (`pill-bar-btn`, `question-option`) is not one.
+
 ### Pending intent
 A user's optimistic write, held beside the server state rather than written
 into it, and laid over that state wherever it renders (ADR 0437). The server's
@@ -1563,6 +1578,8 @@ The `postMessage` channel an *app frame* reaches the host over, for what an opaq
 
 The host is the trusted side and three rules keep it that way. It forwards only what *route reach* marks app-reachable, because it attaches the user's device to what it sends. A blind forwarder would be a confused deputy wearing the user's actor. It resolves the path before checking it, so a `%2e%2e` cannot land somewhere the check never saw. And it strips any `x-lucidos-*` the app supplied, before stamping the real device id and the calling app's id.
 
+The host runs at most three bridged `fetch` calls at once across all frames, so one busy app cannot fill the shell's connection pool. A free slot goes to the frame with the fewest calls running. A `/ui/*` call skips the queue. A call whose deadline passes while queued is never sent (ADR 0546).
+
 Storage is namespaced (`appbridge:<app id>:<sdk|app>:`) and holds no host key, so the device id stays out of the frame. The host names the app from its own frame element, so one app cannot reach another's *app storage*. A read that must be device-scoped names the device instead, as `@device`, and the host substitutes the id on `/preferences` only.
 
 ### Appearance push
@@ -1881,7 +1898,7 @@ Every event keeps that true. Anything that would slide the edge out from under a
 
 `keepTheLiveEdge` has one term of its own, RIDING, and three stand-downs. It waits out a tween, which is going somewhere the reader asked for more recently. It waits out a *deep-link anchor* in flight, whose landing decides the ride. And it waits out an *anchor write*, where `honourAnchoredMutation` has already retired a ride the hold left off the edge.
 
-Exactly one CONTROL arms it, and it is the reader's: the **follow toggle** in the prompt area. It is `setFollowLiveEdge(true)`, rendered by `PromptRowControls` in the second slot of `.prompt-actions-row`, directly after the backend's control menu. It wears a horseshoe MAGNET, poles down over the line that is the live edge. The arrow-onto-a-line it used to wear is `DownloadIcon`, one row above on the thread header. The reader either presses the toggle here, or pressed it earlier and carried it in as the *follow seed*. A reader who has pressed NEITHER way also rides, the seed shipping armed, which is the one arm no press stands behind.
+Exactly one CONTROL arms it, and it is the reader's: the **follow toggle** in the prompt area. It is `setFollowLiveEdge(true)`, a member of `.prompt-actions-row` (`followLiveEdgeAction` in `PromptRowControls.tsx`), standing right before the rung pill. It wears a horseshoe MAGNET, poles down over the line that is the live edge. The arrow-onto-a-line it used to wear is `DownloadIcon`, one row above on the thread header. The reader either presses the toggle here, or pressed it earlier and carried it in as the *follow seed*. A reader who has pressed NEITHER way also rides, the seed shipping armed, which is the one arm no press stands behind.
 
 Nothing else does. Not either chevron, which navigate and nothing else. Not a *submit* in any of its five shapes, which get the *submit landing* instead. Not an SSE sync confirming a pending message. Not a change applied, a granted permission, a coding-agent action, a lazy load, a deep link, or a thread opening. Nor the question card ARRIVING, which is the agent's doing.
 
@@ -2699,11 +2716,13 @@ The poll rides the *Perf instrumentation* toggle and is off by default. The othe
 ### Composer fold
 The `.prompt-actions-row` contract: it is ONE row, nothing leaves its box, and the way it gives way is to move members into a `⋯` overflow menu. Three mechanisms used to disagree about that. A sub-row lift and a `flex-wrap` on the right-hand cluster are gone, and the fold is the only one left.
 
-Exactly two members never fold: the control menu first and the send button last. Those two fit at any width the app supports, so a row too narrow for its members is not a state it can settle in. Everything between them folds.
+Exactly one member never folds: the send button, or the answer control standing in for it. It fits at any width the app supports, so a row too narrow for its members is not a state it can settle in. Everything else folds, and the `⋯` stands at the row's left edge.
 
-Fold order, first to fold: todo indicator, waiting indicator, WIP preview, attach image, clear draft. Then the banner's members: Diff, the standing apply, the change actions. Then the call toggle, and the follow toggle last. That is the row's own order, so a row with room to spare looks unchanged. The fold takes a PREFIX, so the last member standing is the one nearest the thumb.
+Fold order is the row's own order, left to right: the coding-agent menu, attach image, the todo and waiting indicators, the WIP preview, clear draft, the call toggle, the follow toggle. Then the right-hand cluster: the rung pill, then the banner's members (Diff, the standing apply, the change actions). The fold takes a PREFIX, so the leftmost member folds first and the last one standing is the one nearest the send button. A fold therefore never moves a standing member across the row, and a row with room to spare looks unchanged.
 
-The two toggles fold LAST, which is what keeps their fixed second and third slots at every width that can show them. A slot the row cannot draw protects nothing.
+The row holds one icon tap target of height whatever stands (`min-height` on `.prompt-actions-row`). A row folded down to a short Unarchive button would otherwise shrink, and the transcript's scroll end would move with it.
+
+The coding-agent menu and the rung stay mounted while folded. Their `⋯` rows open their panels against the `⋯` trigger, and a typed `/` still opens the menu.
 
 `computePromptCollapse` takes WIDTHS rather than counts, because an icon box sits beside an Apply split button several times its size. It walks every count from 0 to N and takes the smallest that fits. No rule says "never fold one": folding one icon saves nothing and will not fit, while folding one wide button saves its width.
 
@@ -2711,7 +2730,7 @@ The two toggles fold LAST, which is what keeps their fixed second and third slot
 
 A foldable member carries its `data-role` and its `extraClass` on BOTH renderings, so one selector reaches it wherever it landed. A folded status readout says in words on its menu row what its colour and pulse said in the row. Its panel is mounted by the composer rather than by the control (`TodoPanelHost`, `WaitingPanelHost`), since the control unmounts when it folds. A menu row anchors that panel to the `⋯` trigger, which `OverflowMenuContext` carries.
 
-Implementation: `crates/lucidos-app/src/hooks/usePromptActionCollapse.ts`. Plan: `docs/plans/2026-09-19-the-composer-row-is-one-row.md`.
+Implementation: `crates/lucidos-app/src/hooks/usePromptActionCollapse.ts`. Plans: `docs/plans/2026-09-19-the-composer-row-is-one-row.md`, `docs/plans/2026-10-21-coding-agent-menu-folds-before-the-model-picker.md`.
 
 ### Native cursor mirroring (retired)
 A mechanism that shipped in v0.30.2 and was reverted the same day. It forwarded the hovered element's computed CSS `cursor` to `Window::set_cursor_icon` over IPC. The aim was to end a supposed race between tao and WebKit over the packaged app's cursor.
@@ -2809,7 +2828,7 @@ It is deliberately **not** an `<Overlay>`: a pane view floats over nothing, so i
 
 Being up is a state OF THE DRAWER, so it survives a reload the way the *drawer grouping* and channel selection do. The key is `localStorage['lucidos-thread-filter-panel-open']`, cleared rather than written `false` for the default, so a pristine state restores pristine. It survives a drawer collapse too: reopening the drawer lands back on the filters. Only the Escape entry follows visibility. `ThreadDrawer` reports it through `setThreadFilterPaneVisible`, so a panel on a collapsed drawer holds no stack entry and never eats an Escape.
 
-The threads header carries its title ("Filters") and its toggle, and that toggle is also the way out. While the panel is up the toggle is pressed (`view-selector-active`, from `filterButtonState`). Pressed means open and nothing else, and the glyph keeps reporting the filter, so a filtered list never looks like a panel left open. The panel itself carries neither a title row nor a footer, so while it is up its cover IS the pane's scroller. The cover takes `.thread-drawer-list`'s own padding, which puts the rows, headings and hover bands on the thread rows' own column and edges.
+The threads header carries its title ("Filters") and its toggle, and that toggle is also the way out. While the panel is up the toggle is pressed (`aria-pressed`, from `filterButtonState`). Pressed means open and nothing else, and the glyph keeps reporting the filter, so a filtered list never looks like a panel left open. The panel itself carries neither a title row nor a footer, so while it is up its cover IS the pane's scroller. The cover takes `.thread-drawer-list`'s own padding, which puts the rows, headings and hover bands on the thread rows' own column and edges.
 
 The covered list stays mounted, but it renders and pages from the *applied thread filter*, which holds still while the panel covers it. So a run of ticks settles into one reload at the close. It replaced the anchored **Filter dropdown** on 2026-08-08. On 2026-08-09 it dropped its own Close footer for the header's Filter button. Its status list went to the *drawer grouping* (ADR 0393).
 
@@ -3963,7 +3982,7 @@ The account's *reasoning effort* for each chat model: the `chat_reasoning_effort
 ### Per-thread model memory
 A Lucidos Agent (chat) thread reuses the *model* and *reasoning effort* it last ran with. It does not snap back to the account default on each new message.
 
-The durable record is the `model` / `reasoning_effort` the backend stamps on every `MessageReceived`. A *trigger thread* has no `MessageReceived`, so its `TriggerStarted` carries them instead. Without that, a thread on a pinned *trigger model* would report the account default.
+The durable record is the `model` / `reasoning_effort` the backend stamps on every `MessageReceived`. A *trigger thread* has no `MessageReceived`, so its `TriggerStarted` carries them instead. Without that, a thread on a pinned *trigger model* would report the account default. A *rung control* pick between turns writes a `ChatSettingsChanged`, read the same way (see *chat rung lock*).
 
 Resolution runs in `PreferenceStore::resolve_chat_overrides_for_thread` via `last_thread_chat_settings`, excluding the in-flight turn. The model:
 
@@ -3981,11 +4000,18 @@ The effort, for the model the turn runs on:
 
 A tier is remembered WITH its model, so a thread switched to another model never carries it (ADR 0390).
 
-It is **backend-authoritative**: a follow-up with no override reuses the thread's value for any caller (chat UI, triggers, API). On the frontend the in-thread control menu resolves the same chain (`resolveActiveThreadModel` / `resolveActiveThreadReasoningEffort` in `store/threadModelSelections.ts`, ending in `accountChatEffort`). A pick there writes only THIS thread's ephemeral pending override, never the account preference.
+It is **backend-authoritative**: a follow-up with no override reuses the thread's value for any caller (chat UI, triggers, API). On the frontend the *rung control* resolves the same chain from the thread's events (`resolveActiveThreadModel` / `resolveActiveThreadReasoningEffort` in `store/threadModelSelections.ts`, ending in `accountChatEffort`). A pick there is recorded on the engine for THIS thread, never as the account preference. The browser holds no pending pick.
 
 A pinned *preferred provider* is remembered the same way, but WITH its model. `provider` comes from the newest starter stamped beside the model the turn runs on. So switching a thread from Opus to Sonnet drops the backend picked for Opus. Only a pin is stamped, never a backend the row chose, so removing a credential cannot strand a thread that never chose one.
 
 Distinct from the coding agent's per-thread model, which is session-bound via `CodingAgentSettingsChanged`. See `docs/plans/2026-07-03-per-thread-model-memory.md`.
+
+### Chat rung lock
+A Lucidos Agent thread's model and effort stay fixed while a turn runs: while the turn-start gate is held, or the status is `running`, `waiting_for_user_answer` or `paused` (`engine/chat/rung.rs`). `POST /api/v1/chat/settings` refuses a pick then with 409 and `reason: "turn-running"` (`TURN_RUNNING_REASON`), and records nothing. A send that carries its own model, effort or provider mid-turn gets the same 409. One that races a turn's start queues behind it, and runs next on its own pair.
+
+Between turns a pick is recorded (`record_pick`) as a `ChatSettingsChanged` carrying the user's actor. It holds the RESOLVED pair (`resolve_chat_pair`), never the raw request. The next turn reads it through `last_thread_chat_settings`, however that turn starts: a send, a child's report or a wake.
+
+The turn-start gate (`TurnStartGate`) serialises a pick against a turn starting, so a turn never starts between a pick's check and its write. A message injected into a running turn is stamped with that turn's live pair, so its `MessageReceived` names the model that answered it. The coding-agent counterpart is the *rung lock* of ADR 0542; this extension is ADR 0544.
 
 ### trigger model
 The *model* (and, paired with it, the reasoning effort) a *trigger*'s intent fires on, when the trigger pins one instead of following the account default. Stored as `TriggerConfig::model` / `reasoning_effort`, both `Option<String>`, in the `TriggerCreated` / `TriggerUpdated` payload and projected into `trigger.toml`. There is no table and no migration: triggers are event-sourced. `None` means the *trigger model default*, and for the effort the account's tier for the model the fire runs on, else that model's *default effort*. So a trigger may pin one and inherit the other, and a model pin alone runs that model at its own tier. **Intent triggers only**: a `TriggerRun::Script` trigger runs no LLM, and the write path forces both to `None` for one.

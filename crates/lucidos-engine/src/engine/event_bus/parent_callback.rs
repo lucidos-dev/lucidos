@@ -5,9 +5,8 @@
 //! surface the parent to inbox, and emit the typed `ChildThreadCompleted` onto
 //! the parent thread.
 //!
-//! A clean finish whose child said its parent need not act is *filed* instead:
-//! a `ChildReportFiled` lands on the parent, with no wake, no status write and
-//! no callback. See [`Delivery`].
+//! A report its wake mode or wake decision files lands as a `ChildReportFiled`
+//! instead, with no wake, no status write and no callback. See [`Delivery`].
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -213,10 +212,13 @@ pub(crate) enum Delivery {
 }
 
 impl Delivery {
-    /// How one report is delivered (ADR 0451). Only a clean finish can file.
+    /// How one report is delivered (ADR 0451, as amended by ADR 0545).
     ///
-    /// - A recorded yes wakes under every mode. For a declared child only the
-    ///   engine records one: a turn it cut short, or an empty reply.
+    /// - `NoWake` files every report, whatever its status. The user reads a
+    ///   failure or a restart cut in the child itself.
+    /// - Under any other mode only a clean finish can file, and a recorded
+    ///   yes wakes. For a declared child only the engine records one: a turn
+    ///   it cut short, or an empty reply.
     /// - A declared mode decides the rest. `WakeWhenAllDone` files while
     ///   another child of its batch still works.
     /// - With no mode, the wake decision does: a recorded no files, and an
@@ -231,16 +233,26 @@ impl Delivery {
             status,
             ChildCompletionStatus::Success | ChildCompletionStatus::NoChanges
         );
-        if !clean || parent_wake_requested == Some(true) {
-            return Self::Wake;
-        }
+        let woken = !clean || parent_wake_requested == Some(true);
         match wake_mode {
-            Some(WakeMode::Wake) => Self::Wake,
             Some(WakeMode::NoWake) => Self::File,
+            _ if woken => Self::Wake,
+            Some(WakeMode::Wake) => Self::Wake,
             Some(WakeMode::WakeWhenAllDone) if batch_still_working => Self::File,
             Some(WakeMode::WakeWhenAllDone) => Self::Wake,
             None if parent_wake_requested == Some(false) => Self::File,
             None => Self::Wake,
+        }
+    }
+
+    /// How a card the engine owes outside a turn's own terminal is delivered:
+    /// a settle's canceled card, or the card held while an event wait was
+    /// live. No turn decided anything for it, so only the mode counts.
+    fn for_owed_card(wake_mode: Option<WakeMode>) -> Self {
+        if wake_mode == Some(WakeMode::NoWake) {
+            Self::File
+        } else {
+            Self::Wake
         }
     }
 }
@@ -821,6 +833,7 @@ impl EventBus {
         if defer_unproposed_work && row.holds_unproposed_work() {
             return;
         }
+        let delivery = Delivery::for_owed_card(row.wake_mode());
         // Idle only. A failed or paused child still owes its parent a card,
         // and the next resume or the settle carries it with the real status.
         let ChildRow {
@@ -865,8 +878,7 @@ impl EventBus {
             },
             summary: cap_summary(summary, SUCCESS_SUMMARY_CAP),
             terminal_event_id: None,
-            // Its turn ended holding a wait, so it decided nothing to file on.
-            delivery: Delivery::Wake,
+            delivery,
         })
         .await;
     }
@@ -914,6 +926,8 @@ impl EventBus {
         child_thread_id: Uuid,
         settled_by: ChildSettle,
     ) -> Option<OwedChildCard> {
+        let row = self.load_child_row(child_thread_id).await?;
+        let delivery = Delivery::for_owed_card(row.wake_mode());
         let ChildRow {
             parent_thread_id: Some(parent_id),
             title,
@@ -923,7 +937,7 @@ impl EventBus {
             status,
             parent_is_coding_agent,
             ..
-        } = self.load_child_row(child_thread_id).await?
+        } = row
         else {
             return None;
         };
@@ -938,7 +952,7 @@ impl EventBus {
             status: ChildCompletionStatus::Canceled,
             summary: settled_by.summary().to_string(),
             terminal_event_id: None,
-            delivery: Delivery::Wake,
+            delivery,
         }))
     }
 
@@ -1097,7 +1111,7 @@ impl EventBus {
         }
     }
 
-    /// File a clean report on the parent without waking it: no status write,
+    /// File a report on the parent without waking it: no status write,
     /// no inbox move and no callback. The emit's own projection settles the
     /// child's marker. A failed emit leaves the marker set, so the child's
     /// next terminal tries again.
@@ -1116,7 +1130,7 @@ impl EventBus {
             .reported_integrated_branch(child_thread_id, status)
             .await;
         crate::log!(
-            "[FanOut] Child {} said its parent {} need not act: filing its report",
+            "[FanOut] Child {}'s report does not wake its parent {}: filing it",
             child_thread_id,
             parent_id
         );
@@ -1458,13 +1472,22 @@ impl EventBus {
         // so an unscoped `e.aggregate_id::uuid` JOIN would then fail this sweep
         // with `invalid input syntax for type uuid` on EVERY later boot, and every
         // child-completion wake lost to a restart would strand its parent forever.
+        //
+        // A card from a `no-wake` child is never re-fired. It was written
+        // before such a child stopped waking its parent (ADR 0545), and its
+        // wake now would start the very turn that rule removes. The child is
+        // matched as text, so a malformed id selects the card and reaches the
+        // per-row skip below instead of failing the sweep.
         let rows: Vec<(Uuid, String, Option<String>, bool)> = match sqlx::query_as(
             "SELECT e.id, e.aggregate_id, e.payload->>'child_thread_id', p.is_coding_agent \
              FROM events e \
              JOIN thread_summaries p ON p.thread_id = e.aggregate_id::uuid \
+             LEFT JOIN thread_summaries c \
+               ON c.thread_id::text = e.payload->>'child_thread_id' \
              WHERE e.aggregate = 'thread' \
                AND e.event_type = 'ChildThreadCompleted' \
                AND p.state IS DISTINCT FROM 'discarded' \
+               AND c.wake_mode IS DISTINCT FROM $3 \
                AND NOT EXISTS ( \
                  SELECT 1 FROM events later \
                  WHERE later.aggregate = 'thread' \
@@ -1476,6 +1499,7 @@ impl EventBus {
         )
         .bind(crate::engine::thread_events::ThreadEvent::PARENT_NOTE_EVENT_TYPES)
         .bind(crate::engine::thread_events::ThreadEvent::SIDE_QUESTION_EVENT_TYPES)
+        .bind(WakeMode::NoWake.as_str())
         .fetch_all(&self.pool)
         .await
         {

@@ -104,7 +104,7 @@ describe('the vision toggle', () => {
     const looker = model({ id: 'claude-opus-5-6', label: 'Opus 5.6', vision: true });
     const out = vnodeToText(modelManagerList([looker, OPUS_5], false, () => {}));
     expect(out).toContain('aria-label="Opus 5.6 reads images" data-tooltip="Reads images"');
-    expect(out).toMatch(/aria-pressed="true"[^>]*aria-label="Opus 5.6 reads images"/);
-    expect(out).toMatch(/aria-pressed="false"[^>]*aria-label="Opus 5 \(1M\) reads images"/);
+    expect(out).toMatch(/pressed="true"[^>]*aria-label="Opus 5.6 reads images"/);
+    expect(out).toMatch(/pressed="false"[^>]*aria-label="Opus 5 \(1M\) reads images"/);
   });
 });

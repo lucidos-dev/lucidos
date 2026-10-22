@@ -24,6 +24,7 @@ import { REDUCED_MOTION_ROOT, cssRules, isReducedMotionRule, type CssRule } from
 const here = dirname(fileURLToPath(import.meta.url));
 const css = readFileSync(resolve(here, '../chat/input-messages.css'), 'utf8');
 const rules = cssRules(css);
+const toneRules = cssRules(readFileSync(resolve(here, '../global/host-components.css'), 'utf8'));
 
 /** The four phases a call is in when the control is on screen and not idle. */
 const PHASES = ['connecting', 'listening', 'speaking', 'ending'] as const;
@@ -217,10 +218,8 @@ describe('a connect that dwells stops claiming progress', () => {
 });
 
 describe('the colour says what is happening, the pointer what a press does', () => {
-  /** The live paint every non-idle phase starts from. */
-  const live = rules.find(
-    (r) => r.selector.endsWith('.active[data-role="call-toggle"]') && r.props.has('color'),
-  );
+  /** The live paint every non-idle phase starts from: the `live` tone. */
+  const live = toneRules.find((r) => r.selector === '.icon-btn[aria-pressed="true"][data-tone="live"]');
 
   /** Every hover rule the call toggle declares, in source order. */
   const hovers = rules.filter(

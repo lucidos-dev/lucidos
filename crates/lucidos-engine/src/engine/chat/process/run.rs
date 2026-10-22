@@ -360,29 +360,39 @@ impl LucidosEngine {
         // turn's already-persisted MessageReceived (`events.id`); exclude it so
         // the per-thread lookup reads the PRIOR message, not this one. In the
         // normal path it's `None` and the current turn isn't emitted until later.
+        // A Lucidos Agent turn holds its thread's gate from here until its
+        // starter is recorded. A rung pick then lands before the pair resolves,
+        // or sees this turn and refuses (`chat::rung`).
+        let keep_alive = pre_emitted_origin.is_some_and(PreEmittedOrigin::is_keep_alive);
+        let mut turn_start = match thread_id {
+            Some(tid) if use_coding_agent != Some(true) && !keep_alive => {
+                Some(self.turn_start_gate.hold(tid).await)
+            }
+            _ => None,
+        };
         let router = self.current_provider();
         let configured = router.configured_providers();
-        let resolved = resolve_route_overrides(
-            &self.pool,
-            crate::core::ModelDefaults {
-                registry: &self.model_registry,
-                fallback_model: router.default_model(),
-            },
-            |kind| configured.as_ref().is_none_or(|set| set.contains(&kind)),
-            use_coding_agent,
-            thread_id,
-            pre_emitted_origin.map(PreEmittedOrigin::event_id),
-            crate::core::ResolvedModelSelection {
-                model: model_override.map(str::to_string),
-                reasoning_effort: reasoning_effort.map(str::to_string),
-                provider: provider_override.map(str::to_string),
-            },
-        )
-        .await;
-        let model_override = resolved.model.as_deref();
-        let reasoning_effort = resolved.reasoning_effort.as_deref();
-        let provider_override = resolved.provider.as_deref();
-        let chosen_provider = resolved.as_selection().provider;
+        let requested = crate::core::ResolvedModelSelection {
+            model: model_override.map(str::to_string),
+            reasoning_effort: reasoning_effort.map(str::to_string),
+            provider: provider_override.map(str::to_string),
+        };
+        let resolve_pair =
+            |starter: Option<PreEmittedOrigin>, overrides: crate::core::ResolvedModelSelection| {
+                resolve_route_overrides(
+                    &self.pool,
+                    crate::core::ModelDefaults {
+                        registry: &self.model_registry,
+                        fallback_model: router.default_model(),
+                    },
+                    |kind| configured.as_ref().is_none_or(|set| set.contains(&kind)),
+                    use_coding_agent,
+                    thread_id,
+                    starter.map(PreEmittedOrigin::event_id),
+                    overrides,
+                )
+            };
+        let mut resolved = resolve_pair(pre_emitted_origin, requested.clone()).await;
 
         // Generate a per-request ID for ProcessResult tracking
         let request_id = Uuid::new_v4();
@@ -603,7 +613,6 @@ impl LucidosEngine {
         // question free-form path above, this does NOT consume the message —
         // the typed text still routes to CC below as a normal follow-up.
         // A keep-alive is invisible, so it must not move any card either.
-        let keep_alive = pre_emitted_origin.is_some_and(PreEmittedOrigin::is_keep_alive);
         if use_coding_agent == Some(true)
             && !is_new_thread
             && !user_message.is_empty()
@@ -759,8 +768,12 @@ impl LucidosEngine {
                     self.claim_thread_for_spawn(thread_id, coding_agent).await?
                 };
                 if let Some(claim) = claim {
-                    self.name_requested_settings(&claim, cc_model, reasoning_effort)
-                        .await;
+                    self.name_requested_settings(
+                        &claim,
+                        cc_model,
+                        resolved.reasoning_effort.as_deref(),
+                    )
+                    .await;
                     spawn_claim = Some(claim);
                     break;
                 }
@@ -1024,6 +1037,15 @@ impl LucidosEngine {
                     admitted = Some(registration);
                     break;
                 }
+                // A turn that started after `chat_submit` checked may run another
+                // pair than this message asks for. Then the message queues and
+                // runs next on its own pair, rather than losing its override.
+                if requested != crate::core::ResolvedModelSelection::default()
+                    && resolve_pair(pre_emitted_origin, Default::default()).await != resolved
+                {
+                    log!("[Chat] Thread {thread_id}: the live turn runs another pair, so this message queues");
+                    break;
+                }
                 // Emit MessageReceived FIRST — same ordering guarantee as the CC
                 // fast-path. The agentic loop emits PromptInjected when it
                 // picks up the injection; without this ordering, PromptInjected
@@ -1040,6 +1062,15 @@ impl LucidosEngine {
                 let inject_kind = if let Some(pre) = pre_emitted_origin {
                     pre.inject_kind()
                 } else {
+                    // The live turn answers this message, so it names that
+                    // turn's pair. `chat_submit` refused an override naming
+                    // another one before anything was recorded.
+                    let live = self
+                        .resolve_chat_pair(
+                            thread_id,
+                            crate::core::ResolvedModelSelection::default(),
+                        )
+                        .await;
                     let emit_result = self
                         .event_bus
                         .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -1053,9 +1084,9 @@ impl LucidosEngine {
                                 spawning_event_id,
                                 wake_mode,
                                 mode,
-                                model_override,
-                                reasoning_effort,
-                                provider_override,
+                                live.model.as_deref(),
+                                live.reasoning_effort.as_deref(),
+                                live.provider.as_deref(),
                                 origin.clone(),
                                 voice_session_id,
                             ),
@@ -1168,8 +1199,23 @@ impl LucidosEngine {
                     ));
                 }
             },
-            None => self.register_thread_queued(thread_id).await,
+            // The wait can outlast a long turn, so the gate is free meanwhile.
+            // The pair resolves again under it once this turn owns the thread.
+            None => match turn_start.take() {
+                Some(gate) => {
+                    drop(gate);
+                    let registration = self.register_thread_queued(thread_id).await;
+                    turn_start = Some(self.turn_start_gate.hold(thread_id).await);
+                    resolved = resolve_pair(pre_emitted_origin, requested.clone()).await;
+                    registration
+                }
+                None => self.register_thread_queued(thread_id).await,
+            },
         };
+        let model_override = resolved.model.as_deref();
+        let reasoning_effort = resolved.reasoning_effort.as_deref();
+        let provider_override = resolved.provider.as_deref();
+        let chosen_provider = resolved.as_selection().provider;
 
         // Trigger-driven runs hand the scheduler's per-trigger cancel down here.
         // Forward it onto the per-thread token so deleting/disabling/updating the
@@ -1281,8 +1327,9 @@ impl LucidosEngine {
             emit_result.event_id
         };
         // Recorded, and the thread is registered, so a later input now queues
-        // behind this turn rather than racing it. Release it.
+        // behind this turn rather than racing it. Release it, and the gate.
         drop(input_turn.take());
+        drop(turn_start);
 
         // Publish this turn's anchor on the handle. Everything below stamps
         // `request_event_id: Some(origin_id)` on its events and on its own

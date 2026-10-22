@@ -1,4 +1,4 @@
-import { Fragment } from 'preact';
+import { Fragment, type VNode } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { Disclosure } from '../shared/Disclosure';
@@ -27,8 +27,11 @@ import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSideQuestion } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon, WarningIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
-import { codingAgentMenuOpenRequest, rungFoldOpenRequest } from './controlMenuRequests';
-import { isComposeContext, PromptRowControls, promptRowToggles } from './PromptRowControls';
+import { closeControlMenus, codingAgentMenuOpenRequest, rungFoldOpenRequest } from './controlMenuRequests';
+import {
+  codingAgentMenuAction, composerRowMembers, isComposeContext, LazyCodingAgentControlMenu, promptRowToggles,
+} from './PromptRowControls';
+import { CODING_AGENT_MENU_FOLD_KEY, menuCodingAgent } from './ControlMenuTrigger';
 import { LazyRungControl } from './LazyRungControl';
 import { RUNG_FOLD_KEY, RungMenuIcon } from './RungButtons';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
@@ -91,6 +94,7 @@ function closeFoldedPanels(): void {
   attachMenuOpen.value = false;
   closeTodoPanel();
   closeWaitingPanel();
+  closeControlMenus();
 }
 /** 1x length of the compose-destination row's fade-out, mirroring
  *  `.input-toggles-wrapper`'s `transition: opacity var(--duration-slow)` in
@@ -262,7 +266,6 @@ function wipPreviewAction(ft: ThreadState | undefined): HeaderActionSpec | null 
       </svg>
     ),
     active: wipOn,
-    activeClass: 'active',
     onClick: () => {
       if (wipOn) {
         // Revert to live. pushNavState captures wipPreviewThreadId into the new
@@ -1396,28 +1399,20 @@ export function PromptInput() {
   const rowClass = bannerState
     ? 'prompt-actions-row thread-action-buttons'
     : 'prompt-actions-row';
-  // ── The row's FOLDABLE members, in FOLD ORDER ──
+  // ── The row's FOLDABLE members, left to right ──
   //
-  // One list, and the fold takes a PREFIX of it. So the head goes into the ⋯
-  // menu first, and the last member standing is the one nearest the thumb. The
-  // order is also the row's own, so a row with room to spare is unchanged.
-  //
-  // The two STATUS readouts head it: an action the thumb reaches for outranks a
-  // readout, and a folded readout still says its state in words on its menu
-  // row. The follow and call toggles are LAST, so their fixed slots hold at
-  // every width that can show them. The rung pill is the one exception, below.
-  //
-  // Only the control menu and the send button never fold, and those two fit at
-  // any width the app supports. So a row too narrow for its members is not a
-  // state this can settle in.
-  const foldActions: HeaderActionSpec[] = [];
+  // `composerRowMembers` orders them, and the fold takes a PREFIX of that
+  // order. Only the send button, or the answer control in its place, never
+  // folds. It fits at any width the app supports, so a row too narrow for its
+  // members is not a state this can settle in.
+  const readouts: HeaderActionSpec[] = [];
   const todoAction = promptCodingAgent === null ? todoIndicatorAction() : null;
-  if (todoAction) foldActions.push(todoAction);
+  if (todoAction) readouts.push(todoAction);
   const waitingAction = waitingIndicatorAction();
-  if (waitingAction) foldActions.push(waitingAction);
+  if (waitingAction) readouts.push(waitingAction);
   const wipAction = wipPreviewAction(focusedThread);
-  if (wipAction) foldActions.push(wipAction);
-  foldActions.push({
+  if (wipAction) readouts.push(wipAction);
+  const attachImageAction: HeaderActionSpec = {
     key: 'attach-image',
     dataRole: 'attach-image',
     label: 'Attach image',
@@ -1472,57 +1467,50 @@ export function PromptInput() {
         </Overlay>
       </div>
     ),
-  });
+  };
   // CLEAR THE DRAFT, deliberately not a second control on the right edge. What
   // the corner placement cost the field, and why this one carries no rule of
   // its own, is in `__tests__/composer-single-right-anchor.test.ts`.
   //
   // It joins the list only while there is a draft to clear, so the row reserves
   // no box for it.
-  if (hasText) {
-    foldActions.push({
-      key: 'prompt-clear',
-      extraClass: 'prompt-clear',
-      label: 'Clear draft',
-      icon: () => <ClearIcon />,
-      onClick: () => {
-        const el = inputRef.current;
-        if (!el) return;
-        writeComposerValue(el, '');
-        const id = focusedThreadId.value;
-        if (id) updateCompose(id, { text: '' });
-        autoResize();
-        el.focus();
-      },
-    });
-  }
-  // Everything pushed so far renders at the ⋯'s own position, between the fixed
-  // toggles and the right-hand cluster.
-  const middleActions = foldActions.slice();
-  // The right-hand members, then the two fixed toggles. Those fold LAST, which
-  // is what keeps their slots stable at every width that can hold them.
-  foldActions.push(...bannerActions);
-  const toggles = promptRowToggles(promptCodingAgent, inComposeContext, focusedThread);
-  foldActions.push(...toggles.fold);
-  // The rung pill renders in the cluster and not in the middle, so it joins
-  // the order after `middleActions` is taken. Before the first send, picking a
-  // model is the row's main job, so it folds LAST of all. In a started thread
-  // the change actions and toggles outrank it, so it folds FIRST.
-  if (showsRungControl) {
-    const rungAction: HeaderActionSpec = {
+  const clearDraftAction: HeaderActionSpec | null = hasText ? {
+    key: 'prompt-clear',
+    extraClass: 'prompt-clear',
+    label: 'Clear draft',
+    icon: () => <ClearIcon />,
+    onClick: () => {
+      const el = inputRef.current;
+      if (!el) return;
+      writeComposerValue(el, '');
+      const id = focusedThreadId.value;
+      if (id) updateCompose(id, { text: '' });
+      autoResize();
+      el.focus();
+    },
+  } : null;
+  const members = composerRowMembers({
+    codingAgentMenu: promptCodingAgent === null ? null : codingAgentMenuAction(
+      menuCodingAgent(promptCodingAgent, codingAgentControlThreadId, composeControlThreadId),
+    ),
+    attachImage: attachImageAction,
+    readouts,
+    clearDraft: clearDraftAction,
+    toggles: promptRowToggles(promptCodingAgent, inComposeContext, focusedThread),
+    rung: showsRungControl ? {
       key: RUNG_FOLD_KEY,
       dataRole: 'rung-control',
       label: 'Model and effort',
       icon: () => <RungMenuIcon />,
       onMenuClick: (anchor) => { if (anchor) rungFoldOpenRequest.value = anchor; },
-    };
-    if (inComposeContext) foldActions.push(rungAction);
-    else foldActions.unshift(rungAction);
-  }
+    } : null,
+    banner: bannerActions,
+  });
+  const foldActions = [...members.row, ...members.cluster];
 
   // Where each member renders. The cluster declares a gap and the rest of the
   // row does not. So a member folding out of the cluster takes a gap with it.
-  const clusterKeys = new Set([...bannerActions.map((a) => a.key), RUNG_FOLD_KEY]);
+  const clusterKeys = new Set(members.cluster.map((a) => a.key));
   const foldSignature = foldActions.map((a) => a.key).join(' ');
   const foldKeys = useMemo(() => foldActions.map((a) => a.key), [foldSignature]);
   const foldGroups = useMemo<FoldGroup[]>(
@@ -1530,13 +1518,41 @@ export function PromptInput() {
     [foldSignature],
   );
   const collapsedActions = usePromptActionCollapse(promptActionsAreaRef, foldKeys, foldGroups);
-  const foldedKeys = new Set(foldActions.slice(0, collapsedActions).map((a) => a.key));
   const hidden = foldActions.slice(0, collapsedActions);
+  const foldedKeys = new Set(hidden.map((a) => a.key));
   /** Is this member still wearing its own box, rather than sitting in the ⋯? */
   const standing = (a: HeaderActionSpec) => !foldedKeys.has(a.key);
   /** The row attributes a member carries: the measurement marker, and the name
    *  the width cache remembers it by once it folds. */
   const foldAttrs = (key: string) => ({ 'data-row-item': 'fold', [FOLD_KEY_ATTR]: key });
+  // These two own a panel, so they stay mounted while folded and open it
+  // against the ⋯. Every other member renders only while it stands.
+  const mountedWhileFolded: Record<string, (folded: boolean) => VNode> = {
+    [CODING_AGENT_MENU_FOLD_KEY]: (folded) => (
+      <LazyCodingAgentControlMenu
+        threadId={codingAgentControlThreadId}
+        composeThreadId={composeControlThreadId}
+        codingAgent={promptCodingAgent}
+        folded={folded}
+        rowAttrs={foldAttrs(CODING_AGENT_MENU_FOLD_KEY)}
+      />
+    ),
+    [RUNG_FOLD_KEY]: (folded) => (
+      <LazyRungControl
+        threadId={promptCodingAgent === null ? focusedThreadId.value ?? undefined : codingAgentControlThreadId}
+        composeThreadId={composeControlThreadId}
+        composeContext={inComposeContext}
+        codingAgent={promptCodingAgent}
+        folded={folded}
+        rowAttrs={foldAttrs(RUNG_FOLD_KEY)}
+      />
+    ),
+  };
+  const renderMember = (a: HeaderActionSpec) => {
+    const mounted = mountedWhileFolded[a.key];
+    if (mounted) return <Fragment key={a.key}>{mounted(foldedKeys.has(a.key))}</Fragment>;
+    return standing(a) ? <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment> : null;
+  };
   // A fold moves controls between the row and the ⋯ menu, so an open popover's
   // anchor can leave the DOM under it. A panel pinned to a detached box is
   // positioned against nothing. Close them all on a step rather than pick.
@@ -1644,16 +1660,8 @@ export function PromptInput() {
           onChange={handleFileSelect}
         />
         <div class={rowClass} ref={promptActionsAreaRef}>
-          <PromptRowControls
-            codingAgent={promptCodingAgent}
-            codingAgentThreadId={codingAgentControlThreadId}
-            composeThreadId={composeControlThreadId}
-            toggles={toggles.row.filter(standing)}
-            attrsFor={foldAttrs}
-          />
-          {/* The ⋯ holds every folded member, from BOTH ends of the row, and it
-              sits here so a surviving right-hand button still renders on the
-              right. Folding never moves a button across the row. */}
+          {/* The ⋯ holds the folded members, which are always the leftmost
+              ones, so it stands at the left edge where they were. */}
           {hidden.length > 0 && (
             <OverflowMenu
               ariaLabel="More actions"
@@ -1663,24 +1671,10 @@ export function PromptInput() {
               items={(ctx) => hidden.map((a) => renderMenuAction(a, ctx))}
             />
           )}
-          {middleActions.filter(standing).map((a) => (
-            <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
-          ))}
+          {members.row.map(renderMember)}
           {/* The pill leads the cluster, so the action (Send, Apply, Archive) holds the right edge. */}
           <div class="prompt-actions-right">
-            {showsRungControl && (
-              <LazyRungControl
-                threadId={promptCodingAgent === null ? focusedThreadId.value ?? undefined : codingAgentControlThreadId}
-                composeThreadId={composeControlThreadId}
-                composeContext={inComposeContext}
-                codingAgent={promptCodingAgent}
-                folded={foldedKeys.has(RUNG_FOLD_KEY)}
-                rowAttrs={foldAttrs(RUNG_FOLD_KEY)}
-              />
-            )}
-            {bannerActions.filter(standing).map((a) => (
-              <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment>
-            ))}
+            {members.cluster.map(renderMember)}
             {answersCard ? answerControl : sendButton}
           </div>
         </div>

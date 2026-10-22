@@ -22,6 +22,28 @@ export const LADDER_LINK_LABEL = 'Edit the intelligence ladder';
 export const LADDER_LINK_NOTE = 'Settings › Intelligence. Add or remove rungs.';
 export const OFF_LADDER_NOTE = 'Not on your ladder';
 
+/** The last row of every list a ladder decides: the rung lists and the
+ *  Settings model fields. */
+export const LADDER_LINK_ROW: ControlOption = {
+  value: LADDER_LINK_VALUE,
+  label: LADDER_LINK_LABEL,
+  description: LADDER_LINK_NOTE,
+  drilldown: true,
+  section: LADDER_LINK_SECTION,
+};
+
+/** Narrow the rung list to a query, the way the model step narrows: every
+ *  term must appear in the row's label. The ladder link always stays, since
+ *  a rung the filter cannot find is the case it exists for. */
+export function filterRungRows(rows: readonly ControlOption[], query: string): ControlOption[] {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return rows.filter((row) => {
+    if (row.value === LADDER_LINK_VALUE) return true;
+    const hay = row.label.toLowerCase();
+    return terms.every((t) => hay.includes(t));
+  });
+}
+
 /** A model id with its context-window twin folded in: `claude-opus-5-5[1m]`
  *  runs the same rung as `claude-opus-5-5`. */
 function withoutContextTwin(model: string): string {
@@ -109,13 +131,7 @@ export function rungListRows(input: RungListInput): { rows: ControlOption[]; cur
     });
   }
   for (const rung of rungs.filter((r) => !r.estimated)) rows.push(rungRow(rung, NOT_ESTIMATED_SECTION));
-  rows.push({
-    value: LADDER_LINK_VALUE,
-    label: LADDER_LINK_LABEL,
-    description: LADDER_LINK_NOTE,
-    drilldown: true,
-    section: LADDER_LINK_SECTION,
-  });
+  rows.push(LADDER_LINK_ROW);
   return { rows, current };
 }
 

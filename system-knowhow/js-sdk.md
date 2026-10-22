@@ -77,6 +77,12 @@ bridge. The engine says which endpoints an app may call and refuses the rest
 `.session`, which stand in for `localStorage` and `sessionStorage`
 (§ `lucidos.storage`). State every device should see goes in `lucidos.data`.
 
+**The bridge runs three calls at a time, fairly across apps.** A burst of calls
+(a `lucidos.proxy` per list row, say) only queues your own work, so a click is
+never stuck behind it. A `lucidos.ui` call, such as a navigation, goes first, past the queue. A call
+that waits past its `timeout` is never sent. Fetch lists in a few calls rather
+than one per row, because the slots stay three however you write it.
+
 **Your own files load normally: a separate `app.js`, `style.css` or image is
 fine.** The opaque origin costs your frame the device credential on every
 subresource, and the gateway asks for it. So the engine gives your document a
@@ -283,6 +289,10 @@ stays out of the way of a drag that is not a pane swipe:
 - call `preventDefault()` on the `touchstart` or `touchmove`;
 - give the element a `touch-action` that keeps the sideways pan, such as
   `touch-action: pan-y` on a carousel or `none` on a canvas.
+
+On `<html>` or `<body>`, `touch-action: pan-y` is no claim. Page-wide, it
+only stops the page panning sideways, and the pane swipe still works.
+`none` there claims every drag in the app.
 
 ### Dynamic bars
 

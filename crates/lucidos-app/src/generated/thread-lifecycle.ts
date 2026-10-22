@@ -96,6 +96,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   FormRequestResolved: 'metadata',
   McpConsentRequested: 'activity',
   CodingAgentSettingsChanged: 'metadata',
+  ChatSettingsChanged: 'metadata',
   CodingAgentCompacted: 'metadata',
   SuccessorThreadSpawned: 'metadata',
   HandoffCheckpointReached: 'metadata',

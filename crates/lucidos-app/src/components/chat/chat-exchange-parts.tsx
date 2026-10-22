@@ -13,6 +13,7 @@ import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import { CommitList } from '../shared/CommitList';
 import { Disclosure } from '../shared/Disclosure';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { DisclosureChevron } from '../shared/DisclosureChevron';
 import type { AbortCause, CancelCause, ChangeLifecycleType, EngineReason, EventSubscription, EventWaitReason, EventWaitCancelCause, Exchange, MessageOrigin, StoredEvent, SubscriptionGroup } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
@@ -689,18 +690,18 @@ function collapseControl(
 ): ComponentChildren {
   const label = collapsed ? 'Expand this turn' : 'Collapse this turn';
   return (
-    <button
-      type="button"
-      class="icon-btn turn-control-collapse"
+    <ToggleIconButton
+      tone="glyph"
+      class="turn-control-collapse"
       data-role="toggle-collapsed"
       disabled={!collapsible}
-      aria-pressed={collapsed}
+      pressed={collapsed}
       aria-label={label}
       data-tooltip={label}
       onClick={onToggle}
     >
       <CollapseTurnIcon collapsed={collapsed} />
-    </button>
+    </ToggleIconButton>
   );
 }
 
@@ -885,28 +886,26 @@ export function turnControls({
   const stepsLabel = stepsOn ? 'Hide steps' : 'Show steps';
   return (
     <span class="turn-controls">
-      <button
-        type="button"
-        class="icon-btn"
+      <ToggleIconButton
+        tone="quiet"
         data-role="toggle-details"
-        aria-pressed={detailsOn}
+        pressed={detailsOn}
         aria-label={detailsLabel}
         data-tooltip={detailsLabel}
         onClick={onToggleDetails}
       >
         <FullResponseIcon />
-      </button>
-      <button
-        type="button"
-        class="icon-btn"
+      </ToggleIconButton>
+      <ToggleIconButton
+        tone="quiet"
         data-role="toggle-steps"
-        aria-pressed={stepsOn}
+        pressed={stepsOn}
         aria-label={stepsLabel}
         data-tooltip={stepsLabel}
         onClick={onToggleSteps}
       >
         <StepLogIcon />
-      </button>
+      </ToggleIconButton>
       {collapseControl({ collapsed, collapsible, onToggle: onToggleCollapsed })}
     </span>
   );

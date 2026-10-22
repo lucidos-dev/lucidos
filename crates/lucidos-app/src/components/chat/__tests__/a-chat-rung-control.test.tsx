@@ -4,11 +4,12 @@
  * agent's, listing the chat ladder's rungs. A draft's pick is the draft's own.
  * A pick on a started thread asks the engine whether it rebuilds a warm cache,
  * and asks the user before it does. A chat thread has no successor, so the
- * choice is Keep or Switch anyway.
+ * choice is Keep or Switch anyway. The engine records the pick, and refuses it
+ * while a turn runs, when the pill is locked.
  */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
-import type { SwitchEstimate } from '../../../api/client';
+import type { ChatSettingsPick, SwitchEstimate } from '../../../api/client';
 import type { IntelligenceLadder, ModelInfo, ServedIntelligenceRung } from '../../../api/types';
 
 import { DEFAULT_CHAT_MODEL } from '../../../store/models';
@@ -18,6 +19,7 @@ import { DEFAULT_CHAT_MODEL } from '../../../store/models';
 const OPUS = DEFAULT_CHAT_MODEL;
 
 const fetchSwitchEstimate = vi.fn<() => Promise<SwitchEstimate>>();
+const recordChatSettings = vi.fn<(threadId: string, pick: ChatSettingsPick) => Promise<void>>(async () => {});
 
 const served = (model: string, label: string, effort: string, on = true): ServedIntelligenceRung => ({
   model, label, effort, on, estimated: true, intelligence: null, cost: null, time: null, is_default: false,
@@ -49,11 +51,12 @@ vi.mock('../../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client')>()),
   fetchSwitchEstimate,
   getChatLadder,
+  recordChatSettings,
 }));
-const openSettingsSubview = vi.fn();
+const openIntelligenceLadder = vi.fn();
 vi.mock('../../../store/actions/menu', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/menu')>()),
-  openSettingsSubview,
+  openIntelligenceLadder,
 }));
 vi.mock('../../../store/actions/models', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/models')>()),
@@ -65,9 +68,11 @@ const { RungControl } = await import('../RungControl');
 const { ConfirmDialog } = await import('../../shared/ConfirmDialog');
 const { controlMenuParts } = await import('../controlMenuParts');
 const {
-  confirmState, settleConfirm, threadMap, toasts, currentModel, settingsScrollTarget, chatModels,
+  confirmState, settleConfirm, threadMap, toasts, currentModel, chatModels,
 } = await import('../../../store/store');
-const { getThreadModelOverride, _resetThreadModelSelectionsForTesting } = await import('../../../store/threadModelSelections');
+const { ApiError } = await import('../../../api/client');
+const { rungLockedReason } = await import('../rungControlParts');
+const { TURN_RUNNING_REASON } = await import('@lucidos/engine-constants');
 const { getComposeSelectionOverride, clearComposeSelection } = await import('../../../store/composeSelections');
 const { makeThreadState } = await import('../../../store/actions/threads-test-helpers');
 const { MODELS } = await import('../../../store/models');
@@ -124,6 +129,17 @@ async function pickHaiku(): Promise<void> {
   await settle();
 }
 
+/** The model the engine was asked to record for `t1`, if any. */
+function recordedModel(): string | undefined {
+  return recordChatSettings.mock.calls.find(([id]) => id === 't1')?.[1].model;
+}
+
+function setStatus(status: 'idle' | 'running' | 'waiting_for_user_answer' | 'paused'): void {
+  threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { channel: 'chat', status, state: 'active' } })]]);
+}
+
+const LOCKED = rungLockedReason('running')!;
+
 function renderControl(props: { threadId?: string; composeContext: boolean }): void {
   render(<><RungControl {...props} codingAgent={null} /><ConfirmDialog /></>, host);
 }
@@ -141,7 +157,6 @@ afterEach(() => {
   host.remove();
   settleConfirm(false);
   threadMap.value = new Map();
-  _resetThreadModelSelectionsForTesting();
   clearComposeSelection('d1');
   toasts.value = [];
 });
@@ -185,7 +200,8 @@ describe('a pick on a started thread', () => {
     await pickHaiku();
     expect(fetchSwitchEstimate).toHaveBeenCalledWith('t1', HAIKU, expect.anything());
     expect(confirmState.value.visible).toBe(false);
-    expect(getThreadModelOverride('t1').model).toBe(HAIKU);
+    expect(recordedModel()).toBe(HAIKU);
+    expect(toasts.value.some(t => t.type === 'success' && t.message.includes('Haiku 5.5'))).toBe(true);
   });
 
   it('asks first when the pick rebuilds the cache, with the engine figure and no handoff', async () => {
@@ -196,7 +212,7 @@ describe('a pick on a started thread', () => {
     expect(dialog).toContain('about $0.42');
     expect(dialog).not.toMatch(/slow/i);
     expect(dialog).not.toMatch(/hand off|new thread/i);
-    expect(getThreadModelOverride('t1').model, 'nothing is picked before an answer').toBeUndefined();
+    expect(recordedModel(), 'nothing is picked before an answer').toBeUndefined();
   });
 
   it('keeps the pair on Keep', async () => {
@@ -204,7 +220,7 @@ describe('a pick on a started thread', () => {
     await pickHaiku();
     click('.confirm-dialog button', 'Keep');
     await settle();
-    expect(getThreadModelOverride('t1').model).toBeUndefined();
+    expect(recordedModel()).toBeUndefined();
   });
 
   it('keeps the pair on a dismissal', async () => {
@@ -212,7 +228,7 @@ describe('a pick on a started thread', () => {
     await pickHaiku();
     settleConfirm(false);
     await settle();
-    expect(getThreadModelOverride('t1').model).toBeUndefined();
+    expect(recordedModel()).toBeUndefined();
   });
 
   it('applies the pick on Switch anyway', async () => {
@@ -220,14 +236,78 @@ describe('a pick on a started thread', () => {
     await pickHaiku();
     click('.confirm-dialog button', 'Switch anyway');
     await settle();
-    expect(getThreadModelOverride('t1').model).toBe(HAIKU);
+    expect(recordedModel()).toBe(HAIKU);
   });
 
   it('applies nothing and says so when the estimate cannot be read', async () => {
     fetchSwitchEstimate.mockRejectedValue(new Error('engine down'));
     await pickHaiku();
-    expect(getThreadModelOverride('t1').model).toBeUndefined();
+    expect(recordedModel()).toBeUndefined();
     expect(toasts.value.some(t => t.type === 'error' && t.message.includes('engine down'))).toBe(true);
+  });
+
+  it('records nothing when a turn starts while the estimate is read', async () => {
+    fetchSwitchEstimate.mockImplementation(async () => {
+      setStatus('running');
+      return KEEPS_CACHE;
+    });
+    await pickHaiku();
+    expect(recordChatSettings).not.toHaveBeenCalled();
+    expect(toasts.value.some(t => t.type === 'info' && t.message === LOCKED)).toBe(true);
+  });
+
+  it('says why, and claims no switch, when the engine refuses because a turn runs', async () => {
+    fetchSwitchEstimate.mockResolvedValue(KEEPS_CACHE);
+    recordChatSettings.mockRejectedValueOnce(
+      new ApiError(409, 'locked', { error: 'locked', reason: TURN_RUNNING_REASON }),
+    );
+    await pickHaiku();
+    expect(toasts.value.some(t => t.type === 'info' && t.message === LOCKED)).toBe(true);
+    expect(toasts.value.some(t => t.type === 'success')).toBe(false);
+  });
+
+  it('shows an error when the engine refuses for another reason', async () => {
+    fetchSwitchEstimate.mockResolvedValue(KEEPS_CACHE);
+    recordChatSettings.mockRejectedValueOnce(new ApiError(400, 'bad effort'));
+    await pickHaiku();
+    expect(toasts.value.some(t => t.type === 'error' && t.message.includes('bad effort'))).toBe(true);
+    expect(toasts.value.some(t => t.type === 'success')).toBe(false);
+  });
+
+  it('follows a pick made on another device', async () => {
+    const thread = threadMap.value.get('t1')!;
+    const events = new Map(thread.events);
+    events.set(10, { type: 'ChatSettingsChanged', model: HAIKU, reasoning_effort: 'low' });
+    threadMap.value = new Map([['t1', { ...thread, events }]]);
+    await settle();
+    expect(host.querySelector('.rung-pill .rung-name')!.textContent).toContain('Haiku 5.5');
+  });
+});
+
+describe('a started thread while a turn runs', () => {
+  for (const status of ['running', 'waiting_for_user_answer', 'paused'] as const) {
+    it(`locks the pill while ${status}: every part says why and records nothing`, async () => {
+      setStatus(status);
+      renderControl({ threadId: 't1', composeContext: false });
+      await settle();
+      const pill = host.querySelector('.rung-pill')!;
+      expect(pill.hasAttribute('data-locked')).toBe(true);
+      for (const part of Array.from(pill.querySelectorAll<HTMLElement>('button'))) {
+        toasts.value = [];
+        part.click();
+        await settle();
+        expect(toasts.value.map(t => t.message), part.className).toContain(LOCKED);
+      }
+      expect(document.querySelector('.control-option'), 'the list stays shut').toBeNull();
+      expect(fetchSwitchEstimate).not.toHaveBeenCalled();
+      expect(recordChatSettings).not.toHaveBeenCalled();
+    });
+  }
+
+  it('leaves a draft\'s pill unlocked', async () => {
+    renderControl({ threadId: 'd1', composeContext: true });
+    await settle();
+    expect(host.querySelector('.rung-pill')!.hasAttribute('data-locked')).toBe(false);
   });
 });
 
@@ -306,8 +386,7 @@ describe('the chat rows', () => {
     await openList();
     click('.control-option', 'Edit the intelligence ladder');
     await settle();
-    expect(openSettingsSubview).toHaveBeenCalledWith('intelligence');
-    expect(settingsScrollTarget.value).toBe('intelligence:ladder-chat');
+    expect(openIntelligenceLadder).toHaveBeenCalledWith('chat');
     expect(getComposeSelectionOverride('d1').model).toBeUndefined();
   });
 

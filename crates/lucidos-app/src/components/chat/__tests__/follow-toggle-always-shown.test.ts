@@ -44,11 +44,11 @@ describe('the follow toggle is always shown', () => {
     expect(toggleBlock()).toContain("dataRole: 'follow-live-edge'");
   });
 
-  /** It folds LAST of everything, which is what keeps its second slot at every
-   *  width that can show it. A glyph off the screen protects nothing. */
-  it('is the last member the fold takes', () => {
-    expect(source).toMatch(/fold: call \? \[call, follow\] : \[follow\],/);
-    expect(prompt).toMatch(/foldActions\.push\(\.\.\.toggles\.fold\);/);
+  /** It closes the row's toggles, after the call toggle, so it folds after
+   *  everything to its left and before the rung pill. */
+  it('is the last of the row toggles', () => {
+    expect(source).toMatch(/return call \? \[call, follow\] : \[follow\];/);
+    expect(prompt).toMatch(/toggles: promptRowToggles\(/);
   });
 
   it('renders the seed in compose context and the live follow everywhere else', () => {
@@ -57,9 +57,9 @@ describe('the follow toggle is always shown', () => {
     );
   });
 
-  // Its fixed SECOND slot in the row is pinned behaviourally next door, in
-  // `prompt-row-controls.test.tsx`, which walks the rendered cluster rather
-  // than the source.
+  // Its place in the row, right before the rung pill, is pinned behaviourally
+  // next door, in `prompt-row-controls.test.tsx`, which walks the members
+  // rather than the source.
 
   it('drives every visual and accessible affordance off that one resolved state', () => {
     // Three places said `followingLiveEdge.value` before, and a partial edit

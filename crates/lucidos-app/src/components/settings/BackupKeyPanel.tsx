@@ -6,10 +6,12 @@ import { errorDetail } from '../../utils/errorDetail';
 import { formatDurationPhrase } from '../../utils/formatTime';
 import { Disclosure } from '../shared/Disclosure';
 import { Explainer } from '../shared/Explainer';
+import { CopyIcon } from '../shared/icons';
 import { SkeletonProvider, SkBlock, SkText } from '../shared/Skeleton';
 import {
   confirmBackupKey,
   getBackupKey,
+  getBackupKeys,
   setOwnBackupRecipient,
   startBackupKeySetup,
   verifyBackupKey,
@@ -27,6 +29,15 @@ export type KeyStep =
   | { kind: 'own' };
 
 const PENDING_LINE = 'A new backup key is waiting for you to paste it back.';
+
+/** Why a paste into the own-key step cannot be sent, or `null` to let the
+ *  engine judge it. A backup key never leaves the browser from this step,
+ *  even inside a pasted key file, whose comment lines come first. */
+export function publicKeyPasteProblem(pasted: string): string | null {
+  return pasted.toUpperCase().includes('AGE-SECRET-KEY-')
+    ? 'That is your secret backup key. Paste its public key instead, which starts with age1.'
+    : null;
+}
 
 /** What seals backups now, in one line. A pending switch away from a legacy key
  *  or from no key names only the switch, since that is the next step. */
@@ -69,8 +80,10 @@ function backupKeyTitle(): VNode {
           need the key you saved.
         </p>
         <p>
-          Already use age? When you set up or switch keys, pick <strong>Use my own age public key</strong> and
-          paste a public key that starts with <code>age1</code>.
+          Already have a backup key, from another workspace or from age? Pick <strong>Use my own age public
+          key</strong> and paste its public key, which starts with <code>age1</code>. Another Lucidos workspace
+          shows its public key here, under Backup key. With age, <code>age-keygen -y</code> prints it from your key
+          file.
         </p>
       </Explainer>
     </span>
@@ -127,8 +140,20 @@ export function BackupKeyPanel({
     }
   }
 
+  /** A setup and a verify write state the engine does not announce
+   *  (`announced_surfaces.rs`), so the panel re-reads it after either one.
+   *  Its failure has its own toast, so it never hides the write's success. */
+  async function rereadKeys() {
+    try {
+      onKeysChanged(await getBackupKeys());
+    } catch (err) {
+      showToast(`Failed to re-read the backup key status: ${errorDetail(err)}`, 'error');
+    }
+  }
+
   const startSetup = () => void run(async () => {
     go({ kind: 'show-new', backupKey: await startBackupKeySetup() });
+    await rereadKeys();
   }, 'Failed to create a backup key');
 
   const revealLegacy = () => void run(async () => {
@@ -145,12 +170,19 @@ export function BackupKeyPanel({
     if (await verifyBackupKey(pasted.trim())) {
       go({ kind: 'idle' });
       showToast('That backup key opens your backups', 'success');
+      await rereadKeys();
     } else {
       showToast('That backup key does not open your backups. Look for the one you saved, or rotate to a new one.', 'error');
     }
   }, 'Failed to check the backup key');
 
   const useOwn = () => void run(async () => {
+    const problem = publicKeyPasteProblem(pasted);
+    if (problem) {
+      setPasted('');
+      showToast(problem, 'error');
+      return;
+    }
     onKeysChanged(await setOwnBackupRecipient(pasted.trim()));
     go({ kind: 'idle' });
     showToast('Backups now use your own age key', 'success');
@@ -162,12 +194,20 @@ export function BackupKeyPanel({
     </button>
   );
 
-  /** Leads its row, apart from the step's own buttons on the right. */
-  function copyButton(key: string, copied: string) {
+  function reveal(key: string, label: string, copied: string) {
     return (
-      <button class="action-btn backup-key-copy" onClick={() => copyToClipboard(key, copied)}>
-        Copy
-      </button>
+      <div class="backup-key-reveal">
+        <span class="backup-key-value">{key}</span>
+        <button
+          type="button"
+          class="icon-btn backup-key-copy"
+          aria-label={label}
+          data-tooltip={label}
+          onClick={() => copyToClipboard(key, copied)}
+        >
+          <CopyIcon />
+        </button>
+      </div>
     );
   }
 
@@ -195,11 +235,8 @@ export function BackupKeyPanel({
               This is your old backup key. Your old <code>.enc</code> backups still need it, and after the
               switch Lucidos forgets it. Save it now if you have not already.
             </p>
-            <div class="backup-key-reveal">
-              <span class="backup-key-value">{step.legacyKey}</span>
-            </div>
+            {reveal(step.legacyKey, 'Copy old backup key', 'Old backup key copied')}
             <div class="backup-key-actions">
-              {copyButton(step.legacyKey, 'Old backup key copied')}
               {cancel}
               <button class="action-btn" disabled={busy} onClick={() => go({ kind: 'own' })}>
                 Use my own age public key
@@ -217,14 +254,11 @@ export function BackupKeyPanel({
               Save this backup key somewhere safe, such as your password manager. Lucidos shows it only now
               and cannot recover it. Without it, nobody can restore your backups.
             </p>
-            <div class="backup-key-reveal">
-              <span class="backup-key-value">{step.backupKey}</span>
-            </div>
+            {reveal(step.backupKey, 'Copy backup key', 'Backup key copied')}
             {keys.recipient && (
               <p class="backup-key-note">Your older backups still need your previous backup key.</p>
             )}
             <div class="backup-key-actions">
-              {copyButton(step.backupKey, 'Backup key copied')}
               {cancel}
               <button class="action-btn action-btn-confirm" onClick={() => go({ kind: 'paste' })}>
                 I saved it
@@ -266,8 +300,10 @@ export function BackupKeyPanel({
         return (
           <>
             <p class="backup-key-note">
-              Paste the public key of an age identity you already hold. New backups are sealed to it, and only
-              your matching private key opens them.
+              Paste the public key of a backup key you already hold. It starts with <code>age1</code>. New
+              backups are sealed to it, and only your backup key opens them. Another Lucidos workspace shows its
+              public key in Settings, System, Backup, under Backup key. With age, <code>age-keygen -y</code>{' '}
+              prints it from your key file.
             </p>
             {pasteField('age1…')}
             <div class="backup-key-actions">
@@ -333,7 +369,17 @@ export function BackupKeyPanel({
         <div class="backup-key-status" data-state={backupsCanSeal(keys) && !keys.legacy_key ? 'ok' : 'warn'}>
           {backupKeyStatusLine(keys)}
         </div>
-        <div class="backup-key-actions">{idleActions()}</div>
+        {keys.recipient && (
+          <>
+            <p class="backup-key-note">
+              Public key. Paste it into another workspace to seal its backups to the same backup key.
+            </p>
+            {reveal(keys.recipient, 'Copy public key', 'Public key copied')}
+          </>
+        )}
+        <div class="backup-key-actions">
+          {idleActions()}
+        </div>
       </Disclosure>
       <Disclosure open={body !== null} bodyClass="backup-key-step">
         {body}

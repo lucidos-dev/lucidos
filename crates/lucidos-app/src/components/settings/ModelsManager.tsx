@@ -5,6 +5,7 @@ import { Dropdown } from '../shared/Dropdown';
 import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { Disclosure } from '../shared/Disclosure';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -86,16 +87,16 @@ function modelMeta(m: ModelInfo, editorOpen: boolean, editing?: RouteEditing) {
       {/* The *vision flag*. Chat sends images and image description runs
           only on models that read images, so this is where a wrong seed gets
           fixed. */}
-      <button
-        type="button"
-        class="icon-btn model-vision-toggle"
-        aria-pressed={m.vision}
+      <ToggleIconButton
+        tone="glyph"
+        class="model-vision-toggle"
+        pressed={m.vision}
         aria-label={`${m.label} reads images`}
         data-tooltip={m.vision ? 'Reads images' : 'Text only. Tap if it reads images'}
         onClick={() => void setModelVision(m.id, !m.vision)}
       >
         <ImageIcon />
-      </button>
+      </ToggleIconButton>
       {editing && (
         <button
           class="action-btn"

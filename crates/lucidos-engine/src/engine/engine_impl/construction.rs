@@ -1592,6 +1592,7 @@ impl LucidosEngine {
             pending_app_spawn: std::sync::Mutex::new(HashMap::new()),
             input_order: Default::default(),
             accepted_messages: Default::default(),
+            turn_start_gate: Default::default(),
             cc_startup_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             mcp_manager,
             pending_cc_permission: Arc::new(std::sync::Mutex::new(

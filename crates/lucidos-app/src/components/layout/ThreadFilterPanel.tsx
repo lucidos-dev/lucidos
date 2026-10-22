@@ -45,7 +45,7 @@ export const FILTER_BUTTON_GLYPHS: Readonly<Record<FilterGlyph, IconType>> = {
 /** Everything the threads-header Filter button looks like, on both layouts: its
  *  glyph and whether it is pressed.
  *
- *  PRESSED (the `view-selector-active` highlight) means the panel is open, and
+ *  PRESSED (`aria-pressed`, the toggle's highlight) means the panel is open, and
  *  nothing else: a filtered list must not look like a panel left open. The
  *  GLYPH says whether thread types narrow the list, open or closed. It carries
  *  no count: the Blocked count rides on the grouping button.

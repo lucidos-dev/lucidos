@@ -422,6 +422,130 @@ describe('the installed router', () => {
     });
   });
 
+  describe('fetch lanes: one busy app cannot fill the shell pool', () => {
+    /** A fetch that settles when the test says so. */
+    interface Held { url: string; resolve: () => void; reject: (e: Error) => void }
+    let held: Held[];
+    let other: HTMLIFrameElement;
+
+    beforeEach(() => {
+      held = [];
+      fetchMock.mockImplementation((url: string) => new Promise<Response>((resolve, reject) => {
+        held.push({ url: String(url), resolve: () => resolve(new Response('{}')), reject });
+      }));
+      other = document.createElement('iframe');
+      other.setAttribute('data-role', 'app-ui-frame');
+      other.setAttribute('src', '/app/other-app/');
+      document.body.appendChild(other);
+    });
+
+    afterEach(() => {
+      other.remove();
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    });
+
+    const callWith = (path: string, timeoutMs = 1000, method = 'GET') => ({
+      type: 'lucidos:bridge',
+      id: path,
+      op: 'fetch',
+      args: { path, method, headers: {}, body: { kind: 'none' }, timeoutMs },
+    });
+
+    /** Let every queued microtask and the dispatch it triggers run. */
+    const settleTick = () => new Promise((r) => setTimeout(r, 0));
+
+    it('sends three at a time, and the next one when a slot frees', async () => {
+      for (let i = 0; i < 10; i++) deliver(frame.contentWindow, callWith(`/threads/list?n=${i}`));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      await settleTick();
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+
+      held[0].resolve();
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+      await settleTick();
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(held[3].url).toContain('n=3');
+    });
+
+    it('sends a /ui call at once, with every slot busy and a backlog queued', async () => {
+      for (let i = 0; i < 6; i++) deliver(frame.contentWindow, callWith(`/threads/list?n=${i}`));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+      deliver(frame.contentWindow, callWith('/ui/navigate', 1000, 'POST'));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+      expect(held[3].url).toContain('/ui/navigate');
+    });
+
+    it('gives a free slot to the other frame before the first frame backlog', async () => {
+      for (let i = 0; i < 6; i++) deliver(frame.contentWindow, callWith(`/threads/list?from=a&n=${i}`));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      deliver(other.contentWindow, callWith('/threads/list?from=b'));
+
+      held[0].resolve();
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+      expect(held[3].url).toContain('from=b');
+    });
+
+    it('frees the slot on a network error, an abort and an HTTP error', async () => {
+      for (let i = 0; i < 6; i++) deliver(frame.contentWindow, callWith(`/threads/list?n=${i}`));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+      held[0].reject(new TypeError('Failed to fetch'));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+      held[1].reject(new DOMException('aborted', 'AbortError'));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+      held[2].resolve();
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(6));
+    });
+
+    it('rejects a request whose deadline passed in the queue, and never sends it', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const win = frame.contentWindow as Window;
+      const posted: unknown[] = [];
+      vi.spyOn(win, 'postMessage').mockImplementation((m: unknown) => { posted.push(m); });
+
+      for (let i = 0; i < 3; i++) deliver(win, callWith(`/threads/list?n=${i}`, 1000));
+      deliver(win, callWith('/threads/list?late', 1000));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+      vi.setSystemTime(Date.now() + 2000);
+      held[0].resolve();
+      await vi.waitFor(() => expect(posted).toContainEqual(
+        expect.objectContaining({ type: BRIDGE_REPLY_TYPE, id: '/threads/list?late', ok: false }),
+      ));
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('gives a sent request only the time that was left', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      const timeout = vi.spyOn(AbortSignal, 'timeout');
+
+      for (let i = 0; i < 3; i++) deliver(frame.contentWindow, callWith(`/threads/list?n=${i}`, 5000));
+      deliver(frame.contentWindow, callWith('/threads/list?waited', 5000));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+      vi.setSystemTime(Date.now() + 2000);
+      held[0].resolve();
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+      // `waitFor` polls under the faked clock, so the exact figure drifts a little.
+      const [remaining] = timeout.mock.lastCall as [number];
+      expect(remaining).toBeLessThanOrEqual(3000);
+      expect(remaining).toBeGreaterThan(2000);
+    });
+
+    it('drops the backlog of a frame that unmounted', async () => {
+      for (let i = 0; i < 3; i++) deliver(frame.contentWindow, callWith(`/threads/list?from=a&n=${i}`));
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+      deliver(other.contentWindow, callWith('/threads/list?from=b'));
+      other.remove();
+
+      held[0].resolve();
+      await settleTick();
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    });
+  });
+
   it('answers the focused thread from the shell, null included', async () => {
     const posted: unknown[] = [];
     const win = frame.contentWindow as Window;

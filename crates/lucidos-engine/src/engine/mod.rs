@@ -136,6 +136,8 @@ pub(crate) use chat::child_follow_up::{
 pub(crate) use chat::input_order::{
     overtaken_message, InputAdmission, InputOrder, InputPosition, InputTurn, OVERTAKEN_REASON,
 };
+pub use chat::rung::ChatSettingsOutcome;
+pub(crate) use chat::rung::{TURN_RUNNING_MESSAGE, TURN_RUNNING_REASON};
 pub(crate) use chat::PreEmittedOrigin;
 pub(crate) use chat::{generate_thread_title, title_call, IMAGE_DESCRIPTION_PROMPT};
 #[cfg(test)]
@@ -734,6 +736,8 @@ pub struct LucidosEngine {
     /// Client event ids `POST /chat/stream` already accepted, so a re-post
     /// starts nothing. See `chat::accepted_messages`.
     pub(crate) accepted_messages: chat::accepted_messages::AcceptedMessages,
+    /// Orders a Lucidos Agent turn's start with a rung pick. See `chat::rung`.
+    pub(crate) turn_start_gate: chat::rung::TurnStartGate,
     /// Limits concurrent CC process startups to prevent CPU contention.
     /// Acquired before spawn_or_resume(), released after Init event.
     cc_startup_semaphore: Arc<tokio::sync::Semaphore>,

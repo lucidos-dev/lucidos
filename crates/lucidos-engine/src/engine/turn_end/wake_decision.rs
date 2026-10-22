@@ -121,14 +121,17 @@ impl WakeDecision {
                 "Your clean report wakes it once no other child of its batch is still working."
             }
             WakeMode::NoWake => {
-                "Your clean report is filed, and it reads it on its next turn. If you need \
-                 the user, ask on your own card."
+                "Every report you send is filed, a failure too, and it reads them on its next \
+                 turn. If you need the user, ask on your own card."
             }
+        };
+        let failure = match mode {
+            WakeMode::NoWake => "",
+            WakeMode::Wake | WakeMode::WakeWhenAllDone => " A failure still wakes it.",
         };
         format!(
             "Nothing recorded. Your parent declared your wake mode, `{}`, when it spawned you, \
-             so this turn's report follows it and this call changes nothing. {effect} A \
-             failure still wakes it.",
+             so this turn's report follows it and this call changes nothing. {effect}{failure}",
             mode.as_str()
         )
     }
@@ -221,7 +224,8 @@ impl WakeDuty {
 pub(crate) enum TurnFinish {
     /// The agent finished with a reply. Carries the status the fan-in reports.
     Finished(ChildCompletionStatus),
-    /// The engine ended the turn short: a cap or a broken loop. It always wakes.
+    /// The engine ended the turn short: a cap or a broken loop. It wakes under
+    /// every mode but `no-wake`.
     CutShort,
 }
 
@@ -235,8 +239,8 @@ pub(crate) struct OwedReport {
     wake_mode: Option<WakeMode>,
     /// Whether another child of its `wake-when-all-done` batch still works.
     batch_still_working: bool,
-    /// The child ends its turn holding an event wait, so the card waits too,
-    /// and that held card always wakes.
+    /// The child ends its turn holding an event wait, so the card waits too.
+    /// That held card wakes under every mode but `no-wake`.
     holds_live_wait: bool,
 }
 
@@ -281,7 +285,7 @@ impl OwedReport {
             // The fan-in holds the card until the wait ends, so this turn end
             // delivers nothing.
             _ if self.holds_live_wait => false,
-            TurnFinish::CutShort => true,
+            TurnFinish::CutShort => self.wake_mode != Some(WakeMode::NoWake),
             TurnFinish::Finished(status) => {
                 Delivery::for_report(
                     status,
@@ -491,7 +495,8 @@ pub(crate) enum WakeStep {
 /// an undeclared child that finished with a reply is ever asked.
 pub(crate) fn wake_step(owed: &OwedReport, reply: &str, finish: TurnFinish) -> WakeStep {
     match finish {
-        // A short-cut turn wakes even over the agent's own no, and any mode.
+        // A short-cut turn records a yes even over the agent's own no. The
+        // fan-in honours it under every mode but `no-wake`.
         TurnFinish::CutShort => WakeStep::Record(WakeDecision::Requested),
         _ if owed.decision.is_some() || owed.holds_live_wait => WakeStep::Skip,
         TurnFinish::Finished(_) if reply.trim().is_empty() => {

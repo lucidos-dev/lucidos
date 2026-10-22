@@ -43,6 +43,9 @@ export const MEMORY_MODULE_WHILE_UNSET = "classic" as const;
 /** `SOURCE_COMMIT_FILE` in `api/frontend_snapshot.rs`. */
 export const SOURCE_COMMIT_FILE = "source-commit";
 
+/** `TURN_RUNNING_REASON` in `engine/chat/rung.rs`. */
+export const TURN_RUNNING_REASON = "turn-running";
+
 /** `BROAD_ALLOW_INEFFECTIVE` in `engine/claude_code/mod.rs`. */
 export const BROAD_ALLOW_INEFFECTIVE = ["Edit", "ExitPlanMode", "NotebookEdit", "Write"] as const;
 

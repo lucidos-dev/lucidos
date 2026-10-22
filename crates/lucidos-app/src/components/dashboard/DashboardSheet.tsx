@@ -9,6 +9,7 @@ import { prefetchWhenIdle } from '../../utils/idlePrefetch';
 import { lazyComponent } from '../../utils/lazyComponent';
 import { viewportIsMobile } from '../../utils/viewport';
 import { DashboardIcon } from '../shared/icons';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 
 const Dashboard = lazyComponent(() => import('./Dashboard').then((m) => m.Dashboard));
 prefetchWhenIdle(Dashboard);
@@ -32,15 +33,9 @@ export function DashboardSheetToggle() {
   const open = dashboardSheetOpen.value;
   const label = open ? 'Hide dashboard' : 'Show dashboard';
   return (
-    <button
-      type="button"
-      class="icon-btn header-icon dashboard-sheet-toggle"
-      onClick={toggleDashboardSheet}
-      aria-label={label}
-      aria-pressed={open}
-    >
+    <ToggleIconButton class="header-icon dashboard-sheet-toggle" onClick={toggleDashboardSheet} aria-label={label} pressed={open}>
       <DashboardIcon />
-    </button>
+    </ToggleIconButton>
   );
 }
 
@@ -53,8 +48,8 @@ function visibleToggle(): HTMLElement | null {
  *
  *  It never moves focus, so a thread-aware tile describes the thread underneath.
  *  The first open mounts it, and it then stays mounted, inert and hidden, so a
- *  reopen finds its tiles live. It hangs below the app header, which stays
- *  clear of the dim. */
+ *  reopen finds its tiles live. It meets the app header's bottom edge, and the
+ *  header stays live above it. */
 export function DashboardSheet() {
   const open = dashboardSheetOpen.value && viewportIsMobile.value;
   const everOpened = useRef(false);
@@ -62,7 +57,7 @@ export function DashboardSheet() {
   const panelRef = useRef<HTMLDivElement>(null);
   const [toggle, setToggle] = useState<HTMLElement | null>(null);
   // Lags the first open by one layout pass. The closed frame is styled first,
-  // so the rise has a start to move from.
+  // so the fade has a start opacity to move from.
   const [drawnOpen, setDrawnOpen] = useState(false);
 
   useLayoutEffect(() => {
@@ -94,7 +89,6 @@ export function DashboardSheet() {
   if (!everOpened.current || typeof document === 'undefined') return null;
   return createPortal(
     <div class={`dashboard-sheet${drawnOpen ? ' is-open' : ''}`}>
-      <div class="dashboard-sheet-dim" />
       <div
         ref={panelRef}
         class="dashboard-sheet-panel"

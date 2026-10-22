@@ -741,6 +741,9 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // A failed model call is telemetry for the gateway export. No step draws it
   // (docs/adr/0510-claude-gateway-managed-settings-and-telemetry.md).
   'ModelCallFailed',
+  // A rung pick between turns names the NEXT turn's pair. `threadModelSelections`
+  // reads it from the thread's events, never from a turn's steps.
+  'ChatSettingsChanged',
 ]);
 
 /** True for a `ContextCaptured` recording an *auxiliary model call* rather

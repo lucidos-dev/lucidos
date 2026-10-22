@@ -1,6 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import type { Locator, Route } from '@playwright/test';
-import { navigateToApp, assertHealthy, disarmFollowSeed, waitForScrollSettled } from './helpers';
+import { navigateToApp, assertHealthy, disarmFollowSeed, waitForScrollSettled, followToggleState } from './helpers';
 import { psql, seedStepHeavyThread } from './db-helpers';
 
 /** A native scrollbar drag holds the content still while older turns arrive.
@@ -227,8 +227,7 @@ test.describe('The desktop transcript on its native scrollbar', () => {
     await openThread(page, threadId, { armed: true });
     const transcript = page.locator('.thread-content').first();
     await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
-    await expect(page.locator('button[data-role="follow-live-edge"]:visible').first())
-      .toHaveAttribute('aria-pressed', 'true');
+    await expect.poll(() => followToggleState(page)).toBe('true');
     await waitForScrollSettled(page);
     const x = await gutterX(transcript);
 

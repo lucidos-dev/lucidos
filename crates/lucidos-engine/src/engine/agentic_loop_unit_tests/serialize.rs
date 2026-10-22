@@ -309,7 +309,7 @@ mod relation_tests {
     fn each_child_spawn_text_states_what_its_wake_mode_does() {
         let child = Uuid::new_v4();
         let text = |mode| Relation::Child(mode).run_thread_success_text(child, "dev");
-        assert!(text(WakeMode::NoWake).contains("does NOT resume this conversation"));
+        assert!(text(WakeMode::NoWake).contains("no finish resumes this conversation, not even"));
         assert!(text(WakeMode::WakeWhenAllDone).contains("the last one to finish resumes"));
         assert!(text(WakeMode::Wake).contains("automatically resumes"));
         let queued = Relation::Child(WakeMode::NoWake).queued_spawn_text("Thread", child, 2);

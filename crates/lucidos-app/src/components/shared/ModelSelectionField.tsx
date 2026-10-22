@@ -3,7 +3,7 @@ import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
 import { DropdownChevron, dropdownPanelStyle } from './Dropdown';
-import { ModelSelectionPicker } from './ModelSelectionPicker';
+import { ModelSelectionPicker, type PickerLink } from './ModelSelectionPicker';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import type { ModelChoice, TierChoice } from '../../store/modelSelection';
 import { focusIfNeeded } from '../../utils/dom';
@@ -29,6 +29,7 @@ export function ModelSelectionField({
   unsetEffortLabel,
   defaultEffortLabel,
   disabled,
+  link,
   onChange,
 }: {
   /** The section label over the picker's model step. */
@@ -43,6 +44,8 @@ export function ModelSelectionField({
   unsetEffortLabel?: string;
   defaultEffortLabel?: (model: string) => string;
   disabled?: boolean;
+  /** A last row that navigates instead of picking. */
+  link?: PickerLink;
   onChange: (patch: ModelSelectionPatch) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -107,6 +110,7 @@ export function ModelSelectionField({
         <ModelSelectionPicker
           label={label}
           selection={selection}
+          link={link && { option: link.option, onChoose: () => { close(); link.onChoose(); } }}
           onPick={(encoded, pickedProvider) => {
             selection.pick(encoded, pickedProvider);
             closeAfterPick();

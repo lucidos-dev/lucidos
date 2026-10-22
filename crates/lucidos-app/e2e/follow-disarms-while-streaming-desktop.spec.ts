@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, disarmFollowSeed } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy, disarmFollowSeed, followToggleState, pressFollowToggle } from './helpers';
 
 /** Scrolling away from a reply IN FLIGHT retires the standing follow.
  *
@@ -56,7 +56,6 @@ test.describe('Scrolling away from a live reply retires the follow (desktop)', (
     await navigateToApp(page);
 
     const tc = page.locator('.thread-content.visible:visible').first();
-    const toggle = page.locator('button[data-role="follow-live-edge"]:visible').first();
     const atBottom = () => tc.evaluate(el => el.scrollTop + el.clientHeight >= el.scrollHeight - 2);
     const overflow = () => tc.evaluate(el => el.scrollHeight - el.clientHeight);
 
@@ -84,8 +83,8 @@ test.describe('Scrolling away from a live reply retires the follow (desktop)', (
 
     // Arm the ride. On a settled thread the toggle still takes the reader to the
     // live edge, which is where the turn under test has to start from.
-    await toggle.click();
-    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await pressFollowToggle(page);
+    await expect.poll(() => followToggleState(page)).toBe('true');
     await expect.poll(atBottom).toBe(true);
 
     // THE TURN UNDER TEST. Not awaited: the whole point is to act while it runs.
@@ -109,7 +108,7 @@ test.describe('Scrolling away from a live reply retires the follow (desktop)', (
 
     // The toggle goes off BY ITSELF. It renders the follow rather than owning
     // it, so this is the module's disarm surfacing, not a second rule.
-    await expect(toggle).toHaveAttribute('aria-pressed', 'false', { timeout: 5_000 });
+    await expect.poll(() => followToggleState(page), { timeout: 5_000 }).toBe('false');
 
     // And the ride really stopped: the rest of the reply arrives without
     // dragging the reader back down.

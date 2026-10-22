@@ -222,8 +222,12 @@ describe('on the overlay build the leading control only steps sideways', () => {
     // copy comes first.
     const height = iconBox!.props.get('height')!;
     const named = /^var\((--[\w-]+)\)$/.exec(height)?.[1];
-    const resolved = named ? button.map(r => r.props.get(named)).find(v => v !== undefined) : height;
-    expect(resolved, `${named} is declared on no .icon-btn.header-icon rule`).toBeDefined();
+    // Failing that, from :root in base.css, where the shared target lives.
+    const baseRoot = cssRules(styles('global/base.css')).filter(r => r.selector === ':root' && !r.atRules);
+    const resolved = named
+      ? [...button, ...baseRoot].map(r => r.props.get(named)).find(v => v !== undefined)
+      : height;
+    expect(resolved, `${named} is declared on no .icon-btn.header-icon rule and not on :root`).toBeDefined();
     expect(root?.props.get('--header-icon-box'), '--header-icon-box drifted from the button')
       .toBe(resolved);
   });

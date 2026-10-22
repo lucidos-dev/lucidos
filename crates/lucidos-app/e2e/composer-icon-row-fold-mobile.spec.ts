@@ -2,6 +2,7 @@ import { test, expect } from './fixtures';
 import {
   COMPOSER_FOLD_TRIGGER,
   assertHealthy,
+  closeComposerFold,
   composerControl,
   navigateToApp,
   setVoiceEnabled,
@@ -9,7 +10,8 @@ import {
 } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
-/** The composer row folds its middle into a ⋯ menu when it runs short of room.
+/** The composer row folds from its left end into a ⋯ menu when it runs short
+ *  of room.
  *
  *  A browser test, because the decision is a MEASUREMENT. The math is unit
  *  tested in `src/hooks/usePromptActionCollapse.test.ts`, and the wiring by
@@ -17,13 +19,12 @@ import { ensureHomeThread } from './db-helpers';
  *  real row at a real width actually folds, and whether a folded control still
  *  works when the user reaches it through the menu.
  *
- *  It also pins the half that must NOT happen. The row's three fixed controls
- *  stay standing however narrow it gets, so the follow toggle keeps the second
- *  slot a prior fix gave it.
+ *  It also pins the order. The first fold takes attach image, the leftmost
+ *  member here, and leaves the follow toggle on its right standing.
  *
  *  Voice is ON for this file, which is the reported case: a call toggle is one
- *  more pinned box, and the row was reported crowded with one standing. It goes
- *  off again in `afterAll`, per the helper's own rule.
+ *  more box, and the row was reported crowded with one standing. It goes off
+ *  again in `afterAll`, per the helper's own rule.
  *
  *  Plan: `docs/plans/2026-09-19-composer-icon-row-overflow-menu.md`. */
 
@@ -51,7 +52,7 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     await page.close();
   });
 
-  test('folds, keeps the three fixed controls, and still clears the draft', async ({ page }) => {
+  test('folds from the left, keeps the toggles longest, and still clears the draft', async ({ page }) => {
     const restore = page.viewportSize();
     // The call toggle stands only on the home thread (ADR 0362).
     const home = ensureHomeThread();
@@ -69,20 +70,22 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     for (const width of WIDTH_LADDER) {
       await page.setViewportSize({ width, height: restore?.height ?? 812 });
       // The fold follows a resize measurement, so it lands a frame later.
-      // The pill folds before attach, so wait for attach to have left too.
       const folded = await expect.poll(async () => (await more.count()) > 0 && (await attach.count()) === 0, { timeout: 1_000 })
         .toBe(true).then(() => true, () => false);
       if (folded) { foldedAt = width; break; }
     }
     expect(foldedAt, `the row never folded, down to ${WIDTH_LADDER.at(-1)}px`).toBeGreaterThan(0);
 
-    // The ⋯ took the head of the foldable list, so attach left the row. The
-    // two fixed toggles and the send button did not. A Lucidos Agent thread has
-    // no `/` menu, since its model pick is the rung control's.
+    // The ⋯ took the left end of the row, so attach left it. The toggles stand
+    // right of it, and so does the send button. A Lucidos Agent thread has no
+    // `/` menu, since its model pick is the rung control's.
     await expect(attach).toHaveCount(0);
     await expect(page.locator('.prompt-actions-row .control-menu:visible')).toHaveCount(0);
     await expect(follow).toHaveCount(1);
-    await expect(page.locator('.prompt-actions-row [data-role="call-toggle"]:visible')).toHaveCount(1);
+    // The call toggle stands just left of follow. One ladder step can fold it
+    // with attach and clear, so it may stand or sit behind the ⋯.
+    await expect(await composerControl(page, '[data-role="call-toggle"]')).toBeVisible();
+    await closeComposerFold(page);
     await expect(page.locator('.send-cancel-morph:visible')).toHaveCount(1);
 
     // The same selector reaches a folded action behind the ⋯, which is the
@@ -97,15 +100,17 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     await clear.click();
     await expect.poll(() => input.inputValue()).toBe('');
 
-    // Widening hands the icons back. The ⋯ may stay: a started thread folds the
-    // rung pill first, and a phone row can be too narrow for it.
-    await page.setViewportSize({ width: restore?.width ?? 390, height: restore?.height ?? 812 });
-    await expect.poll(() => attach.count()).toBe(1);
+    // Widening hands the icons back, when the row folded only below the start
+    // width. A phone row can fold at the start width already, since the rung
+    // pill outlasts the icons. The ⋯ may stay for the same reason.
+    // The ladder opens above a phone's own width, so the row may have folded at
+    // a width the viewport never held. Widen to at least that one.
+    const startWidth = Math.max(restore?.width ?? 390, foldedAt);
+    await page.setViewportSize({ width: startWidth, height: restore?.height ?? 812 });
+    if (foldedAt < startWidth) await expect.poll(() => attach.count()).toBe(1);
     await expect(follow).toHaveCount(1);
-    if (await more.count() > 0) {
-      await expect(await composerControl(page, '[data-role="rung-control"]')).toBeVisible();
-      await page.keyboard.press('Escape');
-    }
+    // The rung pill stands right of follow, and the fold takes a prefix.
+    await expect(page.locator('.prompt-actions-row .rung-pill:visible')).toHaveCount(1);
 
     await assertHealthy(page);
   });

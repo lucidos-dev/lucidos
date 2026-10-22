@@ -156,10 +156,6 @@
     visibility: hidden;
 }
 
-.ladder-default {
-    color: var(--accent);
-}
-
 /* An off rung stays in its place, dimmed, with its switch at full strength so
    turning it back on reads as the obvious action. */
 .ladder-row-off .ladder-grid > :not(.ladder-actions),

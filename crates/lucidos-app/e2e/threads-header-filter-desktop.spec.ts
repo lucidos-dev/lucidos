@@ -275,7 +275,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await expect(glyph.locator('line, circle')).toHaveCount(0);
     await expect(glyph).toHaveAttribute('fill', 'none');
     const funnel = await glyph.innerHTML();
-    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
+    await expect(filterBtn).toHaveAttribute('aria-pressed', 'false');
     await expect(filterBtn).toHaveAttribute('aria-expanded', 'false');
 
     await filterBtn.click();
@@ -284,7 +284,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // Open, it is the same funnel, pressed, and no X. At the far end of the
     // header an X reads as "close this pane".
     expect(await glyph.innerHTML(), 'opening swapped the funnel').toBe(funnel);
-    await expect(filterBtn).toHaveClass(/view-selector-active/);
+    await expect(filterBtn).toHaveAttribute('aria-pressed', 'true');
     // The accessible NAME does not change with it: this is a disclosure, and
     // aria-expanded is what carries the state.
     await expect(filterBtn).toHaveAttribute('aria-expanded', 'true');
@@ -296,7 +296,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await expect(page.locator('.threads-header .threads-header-title')).toHaveText('Folders');
     await expect(page.locator('.thread-drawer .thread-drawer-list')).toBeVisible();
     expect(await glyph.innerHTML()).toBe(funnel);
-    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
+    await expect(filterBtn).toHaveAttribute('aria-pressed', 'false');
   });
 
   test('pressed means the panel is open, and the glyph says whether types narrow the list', async ({ page }) => {
@@ -314,7 +314,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     // Narrowing by thread type fills the funnel, the same glyph pressed or
     // released.
     await filterBtn.click();
-    await expect(filterBtn).toHaveClass(/view-selector-active/);
+    await expect(filterBtn).toHaveAttribute('aria-pressed', 'true');
     const lucidos = panel.locator(
       '.thread-filter-option:not(.thread-filter-option-child)', { hasText: 'Lucidos' },
     );
@@ -322,7 +322,7 @@ test.describe('Threads-header unified Filter control — desktop layout', () => 
     await expect(glyph).toHaveAttribute('fill', 'currentColor');
     await filterBtn.click();
     await expect(panel).toBeHidden();
-    await expect(filterBtn).not.toHaveClass(/view-selector-active/);
+    await expect(filterBtn).toHaveAttribute('aria-pressed', 'false');
     await expect(glyph).toHaveAttribute('fill', 'currentColor');
 
     // The filter shapes Folders only. Under Ongoing the button fades out in

@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import {
-  apiRequest, assertHealthy, clickVisibleElement, navigateToApp, newThread,
+  apiRequest, assertHealthy, composerControl, navigateToApp, newThread,
   pickComposeDestination, ensureSlashCommandsReported,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
@@ -37,13 +37,14 @@ test.describe('the composer command menu on a short phone viewport', () => {
     await newThread(page);
     await pickComposeDestination(page);
 
-    // The destination pick reloads the commands, and the button can read ready
+    // The destination pick reloads the commands, and the control can read ready
     // on the old list and then drop it. A tap then opens nothing, so tap until
-    // the menu is up rather than trusting one ready check.
+    // the menu is up rather than trusting one ready check. The control may sit
+    // behind the row's ⋯.
     const panel = page.locator('.control-dropdown:visible');
     await expect(async () => {
       if (await panel.count() === 0) {
-        await clickVisibleElement(page, '.commands-btn-active');
+        await (await composerControl(page, '.commands-btn')).click();
       }
       await expect(panel).toHaveCount(1, { timeout: 2_000 });
     }).toPass({ timeout: 20_000 });

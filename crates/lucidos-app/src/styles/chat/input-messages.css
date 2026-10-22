@@ -486,6 +486,10 @@
     display: flex;
     align-items: flex-end;
     padding: 0 0.75rem 0.5rem 0.5rem;
+    /* One icon box tall whatever stands, plus this row's bottom padding. A row
+     * folded down to a short Unarchive button would otherwise shrink, and the
+     * transcript's scroll end with it, so a reader parked there gets moved. */
+    min-height: calc(var(--icon-tap-target) + 0.5rem);
     /* Anchor for absolutely-positioned fade-out children. The row width is
      * stable across cluster reflows, unlike .prompt-actions-right (which has
      * margin-left:auto and shifts when its leftmost child leaves flow). */
@@ -543,50 +547,10 @@
     margin-block: -0.375rem;
 }
 
-/* The prompt row's TOGGLES in their on-state. Each already carried `.active`
- * and `aria-pressed`, and `.active` styled nothing at all, so the WIP toggle
- * announced its state to a screen reader and to nobody else.
- *
- * They take DIFFERENT on-state paints, so each is selected by its own
- * `data-role` rather than by a shared `.active` (which would have to be a
- * negation to tell them apart, and would read as a rule about the follow toggle
- * while styling the other one). A new toggle in this row therefore has to opt
- * into one of the shapes below; it inherits none of them by accident.
- *
- * WIP PREVIEW: framed, the same paint as `.icon-btn.filter-active`
- * (host-components.css). Not a blanket `.icon-btn.active`, which would also
- * frame `.pin-btn.active`, whose own rule takes the accent and NO frame
- * on purpose. */
-.prompt-actions-row .icon-btn.header-icon.active[data-role="wip-preview-toggle"] {
-    color: var(--accent);
-    background: var(--bg-tertiary);
-    border-radius: calc(var(--radius-control) * 0.75);
-}
-
-@media (hover: hover) {
-    .prompt-actions-row .icon-btn.header-icon.active[data-role="wip-preview-toggle"]:hover {
-        background: var(--bg-quaternary);
-        color: var(--accent);
-    }
-}
-
-/* FOLLOW: the `.pin-btn.active` shape instead, accent only and no frame.
- * Following the live edge is a standing mode that is on for most of a thread's
- * life, and a filled box held down that long at the end of a row of otherwise
- * unframed icons reads as a button jammed in rather than as a mode. The accent
- * and the magnet's own fill carry the state, the fill for looks whose accent is
- * the text colour (Mono). The ordinary `.icon-btn:hover` background still
- * applies transiently, like every icon-btn. No hover override is needed to keep
- * the accent: this selector (0,5,0) already outranks `.icon-btn:hover` (0,2,0),
- * so the color holds under the pointer. */
-.prompt-actions-row .icon-btn.header-icon.active[data-role="follow-live-edge"] {
-    color: var(--accent);
-}
-
-/* WAITING: the follow toggle's shape again, accent only and no frame, but with
- * no `.active` to hang it on. The waiting indicator is not a toggle: it renders
- * only while the thread is parked on a subscription or on a sub-thread, so its
- * presence IS the on-state and there is no second state to tell apart.
+/* WAITING: the `glyph` tone's look, accent only and no frame, on a control that
+ * is no toggle. The waiting indicator renders only while the thread is parked
+ * on a subscription or on a sub-thread, so its presence IS the on-state and
+ * there is no second state to tell apart.
  *
  * The token is `--accent`, deliberately, and not `--accent-notable`, the
  * neutral tone this palette keeps for a waiting STATUS. This is the armed thing
@@ -597,9 +561,9 @@
 
 /* CALL: a third shape, and the only one in this row that is not blue.
  *
- * The two above are modes the reader arms and forgets. A call is neither: it
- * holds the microphone open and it is spending money, so it says so for as long
- * as it runs.
+ * The `glyph` and `framed` tones are modes the reader arms and forgets. A call
+ * is neither: it holds the microphone open and it is spending money, so it says
+ * so for as long as it runs.
  *
  * GREEN is a call that is up, the whole way through, which is what every
  * presence light means. RED is the hang-up. It appears under the POINTER only,
@@ -607,14 +571,10 @@
  * (ADR 0209). The hover rules sit at the end of the phase group below, so one
  * promise beats every phase's own paint.
  *
- * Framed, like the WIP toggle, because a call is temporary and wants the box. */
-.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"] {
-    color: var(--accent-green);
-    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
-    border-radius: calc(var(--radius-control) * 0.75);
-}
-
-/* CALL PHASES. The rule above is the LIVE paint, and it was the only one a
+ * Framed, because a call is temporary and wants the box. Its resting paint is
+ * the `live` tone (ToggleIconButton.tsx), and the phases below refine it.
+ *
+ * CALL PHASES. The `live` tone is the LIVE paint, and it was the only one a
  * call had. It covered four phases, two of which are work rather than a steady
  * mode: the connect takes seconds and the hang-up takes a network round trip.
  * Both read as a dead press, and a caller reported exactly that.
@@ -638,7 +598,7 @@
  * pulse, chat/todo-list.css). */
 
 /* CONNECTING: arriving. It names no colour of its own, because the live paint
- * above is already the green a call is placed in on every phone. What it adds
+ * is already the green a call is placed in on every phone. What it adds
  * is the pulse, so the wait reads as work while the microphone opens and the
  * session comes up.
  *
@@ -669,7 +629,7 @@
  * The pulse stops and the glyph comes up to FULL, where the pulsing connect
  * rests dim. A control at full and holding still is not mid-progress, and that
  * is what tells this from the plain connect once the motion is gone. */
-.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-wait] {
+.prompt-actions-row .icon-btn.header-icon[aria-pressed="true"][data-role="call-toggle"][data-call-wait] {
     color: var(--accent-notable);
     background: color-mix(in srgb, var(--accent-notable) 15%, transparent);
 }
@@ -686,7 +646,7 @@
  * The deeper fill is the whole difference at rest, which is what keeps the two
  * live phases apart with the motion taken away. LISTENING adds nothing at all:
  * the caller has the floor, and a control at rest is what says so. */
-.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="speaking"] {
+.prompt-actions-row .icon-btn.header-icon[aria-pressed="true"][data-role="call-toggle"][data-call-phase="speaking"] {
     background: color-mix(in srgb, var(--accent-green) 35%, transparent);
 }
 
@@ -703,7 +663,7 @@
  * It rests DIMMER than the connect, and the frame all but drains away, which is
  * what tells the two apart once the motion is gone. One is being placed, the
  * other is running down. */
-.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="ending"] {
+.prompt-actions-row .icon-btn.header-icon[aria-pressed="true"][data-role="call-toggle"][data-call-phase="ending"] {
     color: var(--text-muted);
     background: color-mix(in srgb, var(--accent-green) 8%, transparent);
     cursor: default;
@@ -728,20 +688,20 @@
    that rule, the tinted frame vanishes under the pointer at the moment the
    reader is aiming at it. */
 @media (hover: hover) {
-    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"]:hover {
+    .prompt-actions-row .icon-btn.header-icon[aria-pressed="true"][data-role="call-toggle"]:hover {
         color: var(--accent-red);
         background: color-mix(in srgb, var(--accent-red) 25%, transparent);
     }
 
     /* Deeper, so the floor still reads under the pointer. */
-    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="speaking"]:hover {
+    .prompt-actions-row .icon-btn.header-icon[aria-pressed="true"][data-role="call-toggle"][data-call-phase="speaking"]:hover {
         background: color-mix(in srgb, var(--accent-red) 40%, transparent);
     }
 
     /* A dead control brightens under the pointer for nobody, and it must not
        promise a hang-up it will not perform. So ENDING keeps its resting paint
        and takes no red at all. */
-    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"][data-call-phase="ending"]:hover {
+    .prompt-actions-row .icon-btn.header-icon[aria-pressed="true"][data-role="call-toggle"][data-call-phase="ending"]:hover {
         color: var(--text-muted);
         background: color-mix(in srgb, var(--accent-green) 8%, transparent);
     }
@@ -790,25 +750,15 @@
     opacity: 0.55;
 }
 
-/* STANDING APPLY: the follow toggle's shape again, accent only and no frame,
- * but GREEN. Arming one is an Apply the owner presses early, and every other
- * Apply in the app is `--accent-green` (`.action-btn-confirm`), so the colour
- * says which action is waiting rather than only that a mode is on. No frame,
- * because it stays armed for the rest of the thread's life. The flag's own
- * fill carries the state too, so the two states differ in shape as well. */
-.prompt-actions-row .icon-btn.header-icon.active[data-role="standing-apply"] {
-    color: var(--accent-green);
-}
-
 /* THE ROW IS ONE ROW, and a second one is unrepresentable rather than merely
  * avoided. This cluster used to carry `flex-wrap: wrap-reverse` as a safety
  * net, beside an `is-stacked` column variant that lifted the Diff button onto a
  * sub-row. Both drew a second line above a phone's keyboard, and the two
  * disagreed with the fold about which of them should give way.
  *
- * The fold is the only mechanism now. Every member between the control menu and
- * the send button folds into the ⋯ menu, so there is always a count the row can
- * hold and nothing is left to wrap. */
+ * The fold is the only mechanism now. Every member but the send button folds
+ * into the ⋯ menu, so there is always a count the row can hold and nothing is
+ * left to wrap. */
 .prompt-actions-right {
     --send-round-size: 1.625rem;
     position: relative;
@@ -2159,46 +2109,18 @@ button.initiator-actor,
     stroke-width: 1.75;
 }
 
-/* Hover lifts a control's glyph to secondary and draws NO chip. The chip is
-   the ON state here, and it is the shared `.icon-btn` hover colour. A hover
-   chip would make an off control under the cursor read as on.
+/* Hover lifts an OFF control's glyph to secondary and draws NO chip. The chip
+   is the ON state here (the `quiet` tone, host-components.css), and it is the
+   shared `.icon-btn` hover colour. A hover chip would make an off control
+   under the cursor read as on.
 
-   Out-specifies the shared hover and the muted default above (2 classes + a
-   pseudo-class). The ON rule below out-specifies this one too, since its
-   `:not()` argument counts, so a pressed control keeps its chip while hovered. */
+   Written for `[aria-pressed="false"]`, so a pressed control keeps its tone
+   under the pointer. Pinned by styles/__tests__/turn-control-pressed-chip.test.ts. */
 @media (hover: hover) {
-    .turn-controls .icon-btn:hover {
+    .turn-controls .icon-btn[aria-pressed="false"]:hover {
         color: var(--text-secondary);
         background: transparent;
     }
-}
-
-/* On: the glyph sits on a pressed chip, the toolbar-toggle look. The chip is
-   the quiet hover grey, deliberately NOT the accent chip that the app bar's
-   active icons wear (.icon-btn.filter-active in host-components.css). These
-   repeat on every turn, and a column of accent chips reads as a column of
-   alerts. Secondary glyphs match the status text, so the pair never outshouts
-   the executor label beside it.
-
-   The collapse control is excluded, and the scope split is why. For the pair
-   it belongs to, the chip means "on, and you are seeing MORE". Their off state
-   looks like nothing at all. Without the chip, a turn with no steps drawn looks
-   the same as a turn whose steps are hidden. A chip on
-   the collapse control would mean the turn is FOLDED, the same cue inverted,
-   sitting beside the two it contradicts. So it never takes the chip, and
-   `aria-pressed` carries the state for a screen reader.
-   Pinned by styles/__tests__/turn-control-pressed-chip.test.ts. */
-.turn-controls .icon-btn[aria-pressed="true"]:not(.turn-control-collapse) {
-    color: var(--text-secondary);
-    background: var(--bg-hover);
-}
-
-/* Folded: the plus glyph is lit, with no chip. A fold draws nothing under the
-   header, so this glyph is the only thing on screen saying the turn has more.
-   It stays lit under hover: it matches the hover rule's specificity and comes
-   after it. */
-.turn-controls .turn-control-collapse[aria-pressed="true"] {
-    color: var(--accent);
 }
 
 .initiator-body {

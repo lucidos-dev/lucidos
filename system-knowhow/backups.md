@@ -158,8 +158,13 @@ stores the backup key, so nothing on this machine can open a backup.
 
 - **Setup.** In Settings → System → Backup, the user creates a backup key.
   Lucidos shows it once, with Copy. Backups stay off until the user pastes the
-  whole key back, which proves they saved it. A user who already has an age
-  identity can paste its public key (`age1…`) instead, with no paste-back.
+  whole key back, which proves they saved it. A user who already has a backup
+  key picks "Use my own age public key" instead. They paste its public key
+  (`age1…`), with no paste-back. That step never takes the backup key itself.
+- **Finding the public key.** Once set up, Settings → System → Backup shows the
+  workspace's public key under Backup key, with Copy. So the user can seal a
+  second workspace to the same backup key. For a key made with the `age` tool,
+  `age-keygen -y key.txt` prints it.
 - **Not set up.** With no backup key, a scheduled backup skips and the user gets
   a "Backups are not set up" notice. A manual backup is refused with the same
   message. Send the user to Settings → System → Backup. You cannot create the

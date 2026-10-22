@@ -760,11 +760,13 @@ const SYSTEM_THEME_MODE_RESUME_EVENTS: ReadonlyArray<readonly [EventTarget, stri
 ];
 
 /** Subscribe to the OS appearance while the preference is `system`, and to
- *  nothing at all otherwise. Called from every paint, so it tears the previous
- *  registration down first and is safe to run repeatedly. Only leaving `system`
- *  cancels a pending read. */
+ *  nothing at all otherwise. Called from every paint, so it is safe to run
+ *  repeatedly. A paint under `system` keeps the live query. A new query starts
+ *  on the current appearance, so it never announces a flip the old one had
+ *  not yet delivered. Only leaving `system` cancels a pending read. */
 function syncSystemThemeModeListener(mode: ThemeMode): void {
   const { schedule } = systemThemeModeFollower;
+  if (mode === 'system' && systemThemeModeQuery !== null) return;
   systemThemeModeQuery?.removeEventListener('change', schedule);
   systemThemeModeQuery = null;
   for (const [target, type] of SYSTEM_THEME_MODE_RESUME_EVENTS) {

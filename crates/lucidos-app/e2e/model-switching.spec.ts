@@ -2,7 +2,7 @@ import { test, expect, Page } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
   sendMessage, waitForActionPanel, openRungList, readRungRows, pickRung, currentRungValue,
-  splitRungValue,
+  splitRungValue, codingAgentCommandsReady, composerControl,
 } from './helpers';
 
 // `sw.js` serves the commands and estimate GETs. Once the worker controls the
@@ -90,10 +90,8 @@ test.describe('Model switching', () => {
     // This test only needs the dropdown visible — idle session is fine
     await setupIdleCCThread(page);
 
-    const cmdBtn = page.locator('.commands-btn:visible').first();
-    await expect(cmdBtn).toBeVisible({ timeout: 10_000 });
-
-    await cmdBtn.click();
+    await expect.poll(() => codingAgentCommandsReady(page), { timeout: 10_000 }).toBe(true);
+    await (await composerControl(page, '.commands-btn')).click();
 
     const dropdown = page.locator('.control-dropdown:visible').first();
     await expect(dropdown).toBeVisible({ timeout: 5_000 });

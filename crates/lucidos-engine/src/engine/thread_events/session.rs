@@ -126,7 +126,8 @@ pub enum HandoffConsent {
 }
 
 /// What a child's clean finish does to its parent, declared by the spawn: the
-/// child's *wake mode* (ADR 0451). A failure wakes the parent under every mode.
+/// child's *wake mode* (ADR 0451). A failure wakes the parent under every mode
+/// but `NoWake`, which files every report (ADR 0545).
 ///
 /// A child spawned with no mode (before modes existed) has none, and its turns
 /// fall back to the *wake decision*.

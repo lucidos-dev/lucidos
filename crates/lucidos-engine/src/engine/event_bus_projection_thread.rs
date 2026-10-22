@@ -1775,6 +1775,7 @@ impl EventBus {
             | ThreadEvent::ChildrenCountChanged { .. }
             | ThreadEvent::MissingHardeningDetected { .. }
             | ThreadEvent::CodingAgentSettingsChanged { .. }
+            | ThreadEvent::ChatSettingsChanged { .. }
             // Passive bookkeeping for the background cleanup worker
             // (Phase 10.2). Persisted to the events stream for audit /
             // debugging but produces no projection side effects.

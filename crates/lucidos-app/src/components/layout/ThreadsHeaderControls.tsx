@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { CrossfadeStack } from '../shared/CrossfadeStack';
 import { GlyphBadge } from '../shared/GlyphBadge';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { labelWithBlockedCount } from '../shared/ThreadToggleButton';
 import { FolderIcon, InboxIcon } from '../shared/icons';
 import { FILTER_BUTTON_GLYPHS, filterButtonState, type FilterGlyph } from './ThreadFilterPanel';
@@ -41,20 +42,18 @@ export function ThreadFilterButton({ class: extraClass, tooltip }: { class?: str
     panelOpen: open,
     channelFilterActive: threadFilterActive.value,
   });
-  const classes = ['icon-btn', 'header-icon', 'filter-btn'];
-  if (extraClass) classes.push(extraClass);
-  if (pressed) classes.push('view-selector-active');
   return (
     <span class="filter-slot" data-shown={shown ? '' : undefined} inert={!shown}>
-      <button
-        class={classes.join(' ')}
+      <ToggleIconButton
+        class={`header-icon filter-btn${extraClass ? ` ${extraClass}` : ''}`}
+        pressed={pressed}
         onClick={toggleThreadFilterPanel}
         aria-label="Filter threads"
         aria-expanded={open}
         data-tooltip={tooltip}
       >
         <FilterButtonGlyph glyph={glyph} />
-      </button>
+      </ToggleIconButton>
     </span>
   );
 }

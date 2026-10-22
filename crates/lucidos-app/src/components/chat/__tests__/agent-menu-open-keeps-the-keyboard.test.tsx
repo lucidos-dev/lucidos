@@ -97,19 +97,23 @@ describe('the rung list under a finger', () => {
   it.each([
     ['a coding agent', () => <RungControl codingAgent="claude-code" />],
     ['the Lucidos Agent', () => <RungControl codingAgent={null} composeContext />],
-  ] as const)('leaves the keyboard with the prompt on %s', async (_name, control) => {
+  ] as const)('hands the keyboard to the filter and back on %s', async (_name, control) => {
     const prompt = document.createElement('textarea');
     document.body.appendChild(prompt);
     await act(async () => { render(control(), host); });
     await frame();
     prompt.focus();
 
-    act(() => { host.querySelector<HTMLButtonElement>('.rung-trigger')!.click(); });
+    const trigger = host.querySelector<HTMLButtonElement>('.rung-trigger')!;
+    act(() => { trigger.click(); });
     await frame();
     expect(document.querySelector('.control-option')).not.toBeNull();
-    // The rung list has no field to type in, so a finger's keyboard has no
-    // reason to leave the prompt.
-    expect(document.querySelector('.control-filter')).toBeNull();
+    // The filter box takes the keyboard straight from the prompt, as the
+    // model picker's does, so it never drops.
+    expect(document.activeElement).toBe(document.querySelector('.control-filter'));
+
+    act(() => { trigger.click(); });
+    await frame();
     expect(document.activeElement).toBe(prompt);
     prompt.remove();
   });

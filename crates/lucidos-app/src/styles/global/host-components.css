@@ -242,13 +242,13 @@
    the only part that varies: `--icon-tap-target` is the tap target, grown
    deliberately after the trash was reported unhittable on mobile (and after the
    `.edge-swipe-right` overlay fix), so a band that wants a smaller icon turns
-   the glyph down and leaves the target alone. It is declared per class below, on
-   selectors this rule's own list carries, so a nominal can never be set on
-   something that is not one of these tap targets. */
+   the glyph down and leaves the target alone. The target lives on :root
+   (base.css). The nominal is declared per class below, on selectors this rule's
+   own list carries, so a nominal can never be set on something that is not one
+   of these tap targets. */
 .icon-btn.header-icon,
 .icon-btn.row-icon,
 .icon-btn.inline-icon {
-    --icon-tap-target: 2.25rem;
     position: relative;
     justify-content: center;
 }
@@ -409,16 +409,38 @@
     stroke-width: calc(2 * var(--trash-ink) / var(--pencil-ink));
 }
 
-.icon-btn.filter-active,
-.icon-btn.view-selector-active {
+/* TOGGLE ICON BUTTONS: the page paint of each tone (ToggleIconButton.tsx).
+   `aria-pressed="true"` is the only on-state hook. The header bar repaints every
+   tone in panels/shell.css, so a toggle never wears the page paint on the blue
+   bar. A new look is a new tone, never a local rule beside a toggle
+   (toggle-icon-single-source.test.ts). */
+.icon-btn[aria-pressed="true"][data-tone="framed"] {
     color: var(--accent);
     background: var(--bg-tertiary);
     border-radius: calc(var(--radius-control) * 0.75);
 }
 
+.icon-btn[aria-pressed="true"][data-tone="glyph"] {
+    color: var(--accent);
+}
+
+.icon-btn[aria-pressed="true"][data-tone="armed"] {
+    color: var(--accent-green);
+}
+
+.icon-btn[aria-pressed="true"][data-tone="quiet"] {
+    color: var(--text-secondary);
+    background: var(--bg-hover);
+}
+
+.icon-btn[aria-pressed="true"][data-tone="live"] {
+    color: var(--accent-green);
+    background: color-mix(in srgb, var(--accent-green) 15%, transparent);
+    border-radius: calc(var(--radius-control) * 0.75);
+}
+
 @media (hover: hover) {
-    .icon-btn.filter-active:hover,
-    .icon-btn.view-selector-active:hover {
+    .icon-btn[aria-pressed="true"][data-tone="framed"]:hover {
         background: var(--bg-quaternary);
         color: var(--accent);
     }
@@ -1027,15 +1049,6 @@ html[data-theme-mode="dark"] .split-button.open::before {
    "failed must look different from empty" (.claude/rules/frontend.md). */
 .thread-overflow-note-error {
     color: var(--accent-red);
-}
-
-/* A pinned PinButton: the icon is already filled (PinIcon filled), so the
- * accent-colored filled silhouette alone signals the pinned state. No
- * frame/background tint (the hover background still applies transiently, like
- * every icon-btn). Shared by the drawer rows, the thread title headers and the
- * apps panel rows. */
-.pin-btn.active {
-    color: var(--accent);
 }
 
 /* Back/forward history popover — long-press or right-click on a nav chevron

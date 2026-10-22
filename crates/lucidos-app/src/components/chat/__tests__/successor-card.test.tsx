@@ -267,6 +267,24 @@ describe('SuccessorCard', () => {
     expect(fetchThreadContext).toHaveBeenCalledTimes(2);
   });
 
+  it('stays open through captures that leave the size alone, and re-reads on a measured turn capture', async () => {
+    const host = await mount();
+    const grow = async (event: object) => {
+      const thread = threadMap.value.get('t1')!;
+      const next = idleThread({}, [...thread.events.values(), { ...capture, ...event } as StoredEvent]);
+      await act(async () => { threadMap.value = new Map([['t1', next]]); });
+      await act(async () => { await Promise.resolve(); });
+    };
+    const usage = { input_tokens: 412_000 };
+    await grow({ usage, purpose: 'summary_compaction', producer: 'auxiliary' });
+    await grow({ usage, parent_tool_use_id: 'toolu_1' });
+    await grow({ purpose: 'turn' });
+    expect(option(host, 'Stay here')).toBeDefined();
+    expect(fetchThreadContext).toHaveBeenCalledTimes(1);
+    await grow({ usage, purpose: 'turn' });
+    expect(fetchThreadContext).toHaveBeenCalledTimes(2);
+  });
+
   it('draws nothing when the context read fails', async () => {
     vi.mocked(fetchThreadContext).mockRejectedValue(new Error('engine down'));
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

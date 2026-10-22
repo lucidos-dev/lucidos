@@ -25,8 +25,8 @@ export type FoldGroup = 'row' | 'cluster';
 export interface PromptCollapseInput {
   /** The row's content width. */
   containerWidth: number;
-  /** Everything that never folds, summed: the control menu, the send button and
-   *  the gaps the right-hand cluster declares. */
+  /** Everything that never folds, summed: the send button (or the answer
+   *  control) and the gaps the right-hand cluster declares. */
   pinnedWidth: number;
   /** Each foldable member's width, in FOLD ORDER. The fold takes a prefix. */
   memberWidths: readonly number[];
@@ -54,9 +54,9 @@ export interface PromptCollapseInput {
  * The fold takes a PREFIX, so the count always names the members earliest in
  * fold order. The last one standing is the one nearest the send button.
  *
- * Nothing fits at all? Return N, every member folded. The caller pins only two
- * members, the control menu and the send button. Those fit at any width the app
- * supports, so that answer is always a row the box can hold.
+ * Nothing fits at all? Return N, every member folded. The caller pins only the
+ * send button, or the answer control standing in for it. That fits at any width
+ * the app supports, so this answer is always a row the box can hold.
  *
  * The cluster's GAPS are counted from the candidate, never from the DOM. A
  * folded cluster member takes its gap with it, so reading the rendered subtree

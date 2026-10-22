@@ -137,6 +137,28 @@ export async function removeQueuedMessage(threadId: string, messageId: string): 
   await throwIfNotOk(res);
 }
 
+export interface ChatSettingsPick {
+  model: string;
+  reasoningEffort?: string;
+  provider?: string;
+}
+
+/** Record the pair a Lucidos Agent thread's next turn runs. The engine
+ *  answers 409 with reason `TURN_RUNNING_REASON` while a turn runs. */
+export async function recordChatSettings(threadId: string, pick: ChatSettingsPick): Promise<void> {
+  const res = await mutatingFetch(`${API}/chat/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      thread_id: threadId,
+      model: pick.model,
+      reasoning_effort: pick.reasoningEffort,
+      provider: pick.provider,
+    }),
+  });
+  await throwIfNotOk(res);
+}
+
 /** Start an Apply Now. Answers with the thread's summary version once the
  *  apply's start landed (ADR 0437). Absent from an engine that predates it. */
 export async function applyNow(threadId: string): Promise<{ summary_version?: number | null }> {

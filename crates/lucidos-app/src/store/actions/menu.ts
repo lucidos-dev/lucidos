@@ -8,6 +8,8 @@ import {
 } from '../store';
 import { settingsViewKey } from '../../components/layout/contentViewKey';
 import { credentialAnchor } from '../../components/credentials/credentialAnchor';
+import { ladderAnchor } from '../../components/settings/intelligenceLadder';
+import type { LadderSurface } from '../../api/types';
 import { resetContentScroll } from '../savedScroll';
 import type { PanelOverlay } from '../store';
 import { revealContentPane } from './pane';
@@ -210,4 +212,10 @@ export function openConnectedAccountsSettings(provider?: string, scopes?: string
 export function openCredentialSettings(credentialId: string): void {
   settingsScrollTarget.value = credentialAnchor(credentialId);
   openSettingsSubview('accounts');
+}
+
+/** Deep-link to one surface's ladder in Settings > Intelligence. */
+export function openIntelligenceLadder(surface: LadderSurface): void {
+  settingsScrollTarget.value = ladderAnchor(surface);
+  openSettingsSubview('intelligence');
 }

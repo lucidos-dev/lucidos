@@ -535,7 +535,7 @@ A workspace on another install is not a sibling: a packaged app and a dev checko
 
 Pick `--relation child` only when the calling thread will act on the result. A child's report costs the caller a turn or a filed report, and a top-thread costs it nothing (`system-knowhow/orchestrating-sub-threads.md` § Child or top-thread).
 
-`--wake-mode` sets the child's *wake mode*, so it needs `--relation child`. `wake` re-opens this thread for every report: use it when you need the result to continue. `wake-when-all-done` files each clean report until no other child of the batch still works, then wakes you. `no-wake` files every clean report, for a result the user reads that you may still want next turn. Omitted, it is `wake`, or `no-wake` when the calling thread is the home thread. A failure wakes you under every mode, the mode lasts the child's life, and the engine refuses any other value.
+`--wake-mode` sets the child's *wake mode*, so it needs `--relation child`. `wake` re-opens this thread for every report: use it when you need the result to continue. `wake-when-all-done` files each clean report until no other child of the batch still works, then wakes you. `no-wake` files every report, failures included, for a result the user reads in the child that you may still want next turn. Omitted, it is `wake`, or `no-wake` when the calling thread is the home thread. A failure wakes you under every mode but `no-wake`, the mode lasts the child's life, and the engine refuses any other value.
 
 **A spawn needs something to say.** A blank `--message` with no `--image` exits non-zero before any request, and the target engine refuses one with a 400 too. No thread is created either way. The usual cause is `--message "$(cat brief.md)"` where `brief.md` was never written, so guard it: `test -s brief.md && lucidos spawn-thread … --message "$(cat brief.md)"`.
 
@@ -670,9 +670,9 @@ API, a file another process may write): nothing would be delivered, so poll.
 
 **And never subscribe to your own child's completion.** A thread spawned with
 `lucidos spawn-thread --relation child` reports to this one on its own. When it
-fails, or its *wake mode* wakes you, the engine emits `ChildThreadCompleted`
+fails under any mode but `no-wake`, or its *wake mode* wakes you, the engine emits `ChildThreadCompleted`
 here and re-opens this thread with the child's status, summary,
-`pending_change_ids` and `sub_thread_pending_changes`. A clean report its mode
+`pending_change_ids` and `sub_thread_pending_changes`. A report its mode
 files lands as a `ChildReportFiled`, which re-opens nothing: you read it at the
 front of your next prompt. So when you need the result to continue, pass
 `--wake-mode wake`. A wait on your own child buys nothing and costs two things:

@@ -9,7 +9,7 @@ import { usePendingOpen } from '../../hooks/usePendingOpen';
 import { viewportIsMobile } from '../../utils/viewport';
 import { keyboardHolder, returnKeyboard } from '../shared/keyboardHandoff';
 import { RungPicker, controlMenuParts } from './controlMenuParts';
-import { rungFoldOpenRequest, takeControlMenuPress } from './controlMenuRequests';
+import { rungFoldOpenRequest, takeControlMenuPress, useControlMenuCloseRequests } from './controlMenuRequests';
 import { RungButtons, type RungControlProps } from './RungButtons';
 import type { ShownRung } from './rungControlParts';
 import { useChatRungState } from './useChatRungState';
@@ -78,6 +78,7 @@ function RungShell({ folded, rowAttrs, shown, faces, step, lockedReason = null, 
     if (wasFolded.current !== folded) close();
     wasFolded.current = folded;
   }, [folded]);
+  useControlMenuCloseRequests(open, close);
 
   // The ⋯ menu row for a folded control asks for the list against the ⋯.
   useSignalEffect(() => {
@@ -181,9 +182,11 @@ function ChatRungControl({ folded, rowAttrs, threadId, composeContext }: RungCon
       shown={chat.shown}
       faces={chat.faces}
       step={{
-        prev: chat.steps.prev === null ? null : () => chat.step(-1),
-        next: chat.steps.next === null ? null : () => chat.step(1),
+        // A locked step still answers a press, to say why.
+        prev: chat.steps.prev === null && chat.lockedReason === null ? null : () => chat.step(-1),
+        next: chat.steps.next === null && chat.lockedReason === null ? null : () => chat.step(1),
       }}
+      lockedReason={chat.lockedReason}
     >
       {({ close, keyboardHolder: holder }) => (
         <RungPicker

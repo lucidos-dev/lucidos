@@ -42,52 +42,79 @@ test.describe('The home thread from the phone header', () => {
     await expectHomeOpen(page);
   });
 
+  /** Sets the scale and measures the header in ONE synchronous page task. The
+   *  app re-applies the saved scale on every preferences load, and a refetch
+   *  landing between a separate write and read reverts ours. Nothing can land
+   *  inside one task, so a measurement taken at the wrong root size is retried. */
+  async function measureAtScale(page: Page, scale: number, rootPx: number) {
+    const handle = await page.waitForFunction(
+      ([s, px]) => {
+        const root = document.documentElement;
+        root.style.setProperty('--user-ui-scale', `${s}%`);
+        if (getComputedStyle(root).fontSize !== `${px}px`) return null;
+        const header = document.querySelector('.mobile-thread-header')!;
+        const box = (sel: string) => header.querySelector(sel)!.getBoundingClientRect();
+        const probe = document.createElement('div');
+        probe.style.width = 'var(--header-mark-group-gap-max)';
+        document.body.appendChild(probe);
+        const max = probe.getBoundingClientRect().width;
+        probe.remove();
+        const row = box('.mobile-header-row');
+        const group = box('.header-mark-group');
+        const home = box('.home-thread-btn');
+        const mark = box('.brand-mark-slot');
+        const dash = box('.dashboard-sheet-toggle');
+        return {
+          max,
+          homeGap: mark.left - home.right,
+          dashGap: dash.left - mark.right,
+          offset: (mark.left + mark.right) / 2 - (row.left + row.right) / 2,
+          backClearance: group.left - box('button[aria-label="Previous thread"]').right,
+          forwardClearance: box('button[aria-label="Next thread"]').left - group.right,
+        };
+      },
+      [scale, rootPx] as const,
+      { timeout: 30_000 },
+    );
+    return handle.jsonValue();
+  }
+
+  async function expectGroupAtScale(page: Page, scale: number, rootPx: number, roomy: boolean): Promise<void> {
+    const m = await measureAtScale(page, scale, rootPx);
+    for (const [side, gap] of [['Home', m.homeGap], ['dashboard', m.dashGap]] as const) {
+      if (roomy) {
+        expect(gap, `ui-scale ${scale}: ${side} gap ${gap.toFixed(1)} is not the max ${m.max.toFixed(1)}`).toBeCloseTo(m.max, 0);
+      } else {
+        expect(gap, `ui-scale ${scale}: ${side} gap ${gap.toFixed(1)} did not close up`).toBeCloseTo(0, 0);
+      }
+    }
+    expect(Math.abs(m.offset), `ui-scale ${scale}: the mark sits ${m.offset}px off the row middle`).toBeLessThan(1);
+    expect(m.backClearance, `ui-scale ${scale}: the back chevron overlaps the group`).toBeGreaterThan(0);
+    expect(m.forwardClearance, `ui-scale ${scale}: the forward chevron overlaps the group`).toBeGreaterThan(0);
+  }
+
   test('the group spreads out when the row has room, and touches when it has none', async ({ page }) => {
     // The app writes the scale itself once preferences load, so wait for that
-    // write before ours, or ours is reverted under the measurement.
+    // write before ours.
     await page.waitForFunction(() => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 });
     await expect(page.locator('.mobile-thread-header .header-mark-group .home-thread-btn')).toBeVisible();
 
-    const measure = () => page.evaluate(() => {
-      const header = document.querySelector('.mobile-thread-header')!;
-      const box = (sel: string) => header.querySelector(sel)!.getBoundingClientRect();
-      const probe = document.createElement('div');
-      probe.style.width = 'var(--header-mark-group-gap-max)';
-      document.body.appendChild(probe);
-      const max = probe.getBoundingClientRect().width;
-      probe.remove();
-      const row = box('.mobile-header-row');
-      const group = box('.header-mark-group');
-      const home = box('.home-thread-btn');
-      const mark = box('.brand-mark-slot');
-      const dash = box('.dashboard-sheet-toggle');
-      return {
-        max,
-        homeGap: mark.left - home.right,
-        dashGap: dash.left - mark.right,
-        offset: (mark.left + mark.right) / 2 - (row.left + row.right) / 2,
-        backClearance: group.left - box('button[aria-label="Previous thread"]').right,
-        forwardClearance: box('button[aria-label="Next thread"]').left - group.right,
-      };
+    await expectGroupAtScale(page, 100, 16, true);
+    await expectGroupAtScale(page, 200, 32, false);
+  });
+
+  test('a preferences apply that reverts the scale between tasks cannot skew the measurement', async ({ page }) => {
+    await expect(page.locator('.mobile-thread-header .header-mark-group .home-thread-btn')).toBeVisible();
+    // Stands in for the app's re-apply on a preferences refetch: it undoes any
+    // scale other than 100% as soon as the writing task ends.
+    await page.evaluate(() => {
+      const root = document.documentElement;
+      new MutationObserver(() => {
+        if (root.style.getPropertyValue('--user-ui-scale') !== '100%') root.style.setProperty('--user-ui-scale', '100%');
+      }).observe(root, { attributes: true, attributeFilter: ['style'] });
     });
 
-    for (const [scale, rootPx, roomy] of [[100, 16, true], [200, 32, false]] as const) {
-      await page.evaluate((s) => document.documentElement.style.setProperty('--user-ui-scale', `${s}%`), scale);
-      await expect
-        .poll(() => page.evaluate(() => getComputedStyle(document.documentElement).fontSize))
-        .toBe(`${rootPx}px`);
-      const m = await measure();
-      for (const [side, gap] of [['Home', m.homeGap], ['dashboard', m.dashGap]] as const) {
-        if (roomy) {
-          expect(gap, `ui-scale ${scale}: ${side} gap ${gap.toFixed(1)} is not the max ${m.max.toFixed(1)}`).toBeCloseTo(m.max, 0);
-        } else {
-          expect(gap, `ui-scale ${scale}: ${side} gap ${gap.toFixed(1)} did not close up`).toBeCloseTo(0, 0);
-        }
-      }
-      expect(Math.abs(m.offset), `ui-scale ${scale}: the mark sits ${m.offset}px off the row middle`).toBeLessThan(1);
-      expect(m.backClearance, `ui-scale ${scale}: the back chevron overlaps the group`).toBeGreaterThan(0);
-      expect(m.forwardClearance, `ui-scale ${scale}: the forward chevron overlaps the group`).toBeGreaterThan(0);
-    }
+    await expectGroupAtScale(page, 200, 32, false);
   });
 
   test('only the thread drawer\'s menu carries a Home row', async ({ page }) => {

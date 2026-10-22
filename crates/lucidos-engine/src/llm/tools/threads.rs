@@ -186,7 +186,7 @@ const FOLLOW_UP_CHILD_THREAD_DESCRIPTION: &str = concat!(
     "child cap never refuses it, so reviving a child beats spawning another. ",
     "Refer to the child by TITLE in anything the user reads. Returns at once, ",
     "even when held, so issue it and end your turn. A no-wake child's ",
-    "clean report never wakes you.\n\n",
+    "report never wakes you.\n\n",
     "By default the message QUEUES: a mid-turn child reads it at its next natural break, ",
     "which inside a long tool call can be many minutes, and nothing in flight is thrown away. ",
     "urgent: true stops the child's current turn instead. On a CODEX child urgent changes ",

@@ -236,29 +236,25 @@ impl crate::engine::LucidosEngine {
             return None;
         }
 
-        // Stamp the same resolved model / effort the turn would have stamped,
-        // so per-thread model memory reads back an unchanged value. The turn
-        // re-resolves with this event excluded, landing on the same answer.
-        let resolved = crate::core::PreferenceStore::resolve_chat_overrides_for_thread(
-            self.pool(),
-            crate::core::ModelDefaults {
-                registry: self.model_registry(),
-                fallback_model: self.current_provider().default_model(),
-            },
-            Some(thread_id),
-            None,
-            crate::core::ResolvedModelSelection {
-                model: model.map(str::to_string),
-                reasoning_effort: reasoning_effort.map(str::to_string),
-                provider: provider.map(str::to_string),
-            },
-        )
-        .await;
+        // Stamp the pair the turn resolves, so per-thread model memory reads
+        // back an unchanged value. The turn re-resolves with this event
+        // excluded, landing on the same answer. The gate keeps a rung pick
+        // from landing between the resolve and the emit (`chat::rung`).
+        let _turn_start = self.turn_start_gate.hold(thread_id).await;
         let crate::core::ResolvedModelSelection {
             model,
             reasoning_effort,
             provider,
-        } = resolved;
+        } = self
+            .resolve_chat_pair(
+                thread_id,
+                crate::core::ResolvedModelSelection {
+                    model: model.map(str::to_string),
+                    reasoning_effort: reasoning_effort.map(str::to_string),
+                    provider: provider.map(str::to_string),
+                },
+            )
+            .await;
 
         use crate::engine::thread_events::{EventChannel, EventMeta};
         let emitted = self

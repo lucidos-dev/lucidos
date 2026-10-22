@@ -43,6 +43,7 @@ Each `--duration-*` token is its 1x literal times `var(--duration-scale)`. That 
 
 - **Every icon-only button needs an `aria-label`.**
 - **An icon that belongs to a label never wraps away from it.** Put the icon in a plain `display: inline` wrapper whose `::before` is `content: '\2060'` (U+2060 WORD JOINER). Generated content, never a text node. `.explainer-slot` is the example.
+- **An icon toggle renders through `ToggleIconButton`** (`aria-pressed`, a `tone`). A new look is a new tone, never a local rule (`toggle-icon-single-source.test.ts`).
 - **Tab title**: `(count) Lucidos`.
 - **No system dialogs**: use `showToast(msg, type)` and `await showConfirm(msg, okLabel, { variant })`. `variant` is required: `'danger'` only for an action that loses something for good, else `'default'`.
 - **A dialog message is ONE string, and a blank line is a paragraph.** Render it through `<DialogMessage message={…} />` (`components/shared/DialogMessage.tsx`). Never hand-roll a `<p class="confirm-message">` or use `white-space: pre-line`. A change to the paragraph rule updates `system-knowhow/js-sdk.md` § Confirmation dialogs and § Prompts in the same commit.

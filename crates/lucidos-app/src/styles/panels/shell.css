@@ -2165,11 +2165,15 @@
    on the same element. Do not hoist the wash to a token on `.pane-header`. The
    browser substitutes a var() inside a custom property where that property is
    DECLARED, so the hoisted copy bakes in the resting 0%. */
-.app-header .icon-btn.filter-active,
-.app-header .icon-btn.view-selector-active {
+.app-header .icon-btn[aria-pressed="true"]:not([data-tone="glyph"]) {
     --header-control-veil: var(--header-control-veil-active);
     color: var(--header-fg);
     background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
+}
+
+/* A glyph tone wears no chip anywhere, so on the bar it only lights. */
+.app-header .icon-btn[aria-pressed="true"][data-tone="glyph"] {
+    color: var(--header-fg);
 }
 
 .app-header .icon-btn:focus-visible,
@@ -2201,8 +2205,7 @@
         background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
     }
 
-    .app-header .icon-btn.filter-active:hover,
-    .app-header .icon-btn.view-selector-active:hover {
+    .app-header .icon-btn[aria-pressed="true"]:not([data-tone="glyph"]):hover {
         --header-control-veil: var(--header-control-veil-active-hover);
         color: var(--header-fg);
         background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
@@ -2311,7 +2314,7 @@
     will-change: opacity;
 }
 
-.app-header .icon-btn.view-selector-active .crossfade-glyph {
+.app-header .icon-btn[aria-pressed="true"] .crossfade-glyph {
     opacity: 1;
 }
 

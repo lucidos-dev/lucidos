@@ -535,8 +535,8 @@ const CODEX_CLI_RULE: &str = "\n\n\
     blocks nothing. The engine re-opens this thread with a follow-up message when the event \
     lands, or tells you the deadline passed. Use it instead of a sleep-and-recheck loop \
     whenever you wait on something the engine persists (a change appearing, a trigger \
-    firing). NOT for a child you spawned: a failure re-opens this thread, and so does a clean \
-    report under `--wake-mode wake`, the default. `no-wake` files it for your next turn. \
+    firing). NOT for a child you spawned: under `--wake-mode wake`, the default, a failure or a \
+    clean report re-opens this thread. `no-wake` files every report. \
     Do NOT poll for it afterwards, and do NOT keep the session alive waiting.\n\
     - `lucidos event-waits list` / `... cancel [--wait-id <id>|--all]`: read or stop this \
     thread's subscriptions. Nothing tells you when one ends, so `list` before claiming you \
@@ -2264,7 +2264,7 @@ mod tests {
             assert!(WAKE_DECISION_RULE.contains(needle), "missing {needle:?}");
         }
         for needle in [
-            "files it for your next turn",
+            "`no-wake` files every report",
             "`--wake-mode wake`, the default",
             // ADR 0473: work this thread will not act on is a top-thread.
             "Add `--relation child` only to act on its result",

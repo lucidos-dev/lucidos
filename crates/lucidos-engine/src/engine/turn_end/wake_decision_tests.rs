@@ -299,8 +299,9 @@ fn owed(holds_live_wait: bool) -> OwedReport {
 }
 
 /// Whether a report wakes the parent follows the fan-in's own delivery rule
-/// for a finished turn (ADR 0446, I3). A cut-short turn wakes. A held card
-/// waits for its event wait, so this turn end wakes nothing.
+/// for a finished turn (ADR 0446, I3). A cut-short turn wakes, unless the
+/// child is `no-wake` (ADR 0545). A held card waits for its event wait, so
+/// this turn end wakes nothing.
 #[test]
 fn the_report_wakes_the_parent_exactly_as_the_fan_in_delivers_it() {
     use ChildCompletionStatus::*;
@@ -337,6 +338,14 @@ fn the_report_wakes_the_parent_exactly_as_the_fan_in_delivers_it() {
     }
     let no = Some(WakeDecision::NotRequested);
     assert!(owed(false).wakes_parent(TurnFinish::CutShort, no));
+    let no_wake = OwedReport {
+        wake_mode: Some(WakeMode::NoWake),
+        ..owed(false)
+    };
+    assert!(
+        !no_wake.wakes_parent(TurnFinish::CutShort, None),
+        "a no-wake child's cut-short turn is filed too"
+    );
     let yes = Some(WakeDecision::Requested);
     assert!(!owed(true).wakes_parent(TurnFinish::Finished(Success), yes));
 }

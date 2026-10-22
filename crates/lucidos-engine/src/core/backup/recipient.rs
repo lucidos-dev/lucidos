@@ -169,9 +169,10 @@ fn recipient_set(recipient: String, own_key: bool, actor: Option<MessageOrigin>)
 /// not set up, and nothing may be sealed.
 pub async fn sealing_key(pool: &PgPool, workspace: &Path) -> Result<Option<SealingKey>, BoxError> {
     if let Some(recipient) = load(pool).await?.recipient {
-        return Ok(Some(SealingKey::Recipient(crypto::parse_recipient(
-            &recipient,
-        )?)));
+        let recipient = recipient.parse().map_err(|e| {
+            format!("the stored backup recipient is not a valid age public key: {e}")
+        })?;
+        return Ok(Some(SealingKey::Recipient(recipient)));
     }
     Ok(BackupKeyStore::for_engine(workspace)?
         .load()?

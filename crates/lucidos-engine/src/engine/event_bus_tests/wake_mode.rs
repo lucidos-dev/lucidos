@@ -74,23 +74,24 @@ async fn parent_row(pool: &PgPool, thread_id: Uuid) -> (String, String) {
         .unwrap()
 }
 
-/// I2 and I3 as a table: a declared mode decides only a clean finish, and a
-/// recorded yes wakes under every mode.
+/// I2 and I3 as a table. `no-wake` files every report, whatever its status
+/// and whatever the engine recorded. The other modes decide only a clean
+/// finish, and a recorded yes wakes under them.
 #[test]
-fn a_wake_mode_decides_only_a_clean_finish() {
+fn no_wake_files_everything_and_the_other_modes_decide_a_clean_finish() {
     use ChildCompletionStatus::*;
     for status in [Success, Failure, NoChanges, Canceled, Interrupted] {
         let clean = matches!(status, Success | NoChanges);
         for mode in WakeMode::ALL {
             for batch_still_working in [false, true] {
                 for recorded in [None, Some(false), Some(true)] {
-                    let files = clean
-                        && recorded != Some(true)
-                        && match mode {
-                            WakeMode::NoWake => true,
-                            WakeMode::Wake => false,
-                            WakeMode::WakeWhenAllDone => batch_still_working,
-                        };
+                    let files = match mode {
+                        WakeMode::NoWake => true,
+                        WakeMode::Wake => false,
+                        WakeMode::WakeWhenAllDone => {
+                            clean && recorded != Some(true) && batch_still_working
+                        }
+                    };
                     let expected = if files {
                         Delivery::File
                     } else {
@@ -129,13 +130,29 @@ async fn a_no_wake_report_is_filed_without_a_decision() {
     teardown_test_db(&db_name).await;
 }
 
-/// I2: a no-wake child that fails still wakes its parent.
+/// The newest `ChildReportFiled` on `parent_id`: its status.
+async fn newest_filed_status(pool: &PgPool, parent_id: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT payload->>'status' FROM events \
+          WHERE aggregate_id = $1 AND event_type = 'ChildReportFiled' \
+          ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// I1: a no-wake child that fails files its report. The user reads the
+/// failure in the child, so the parent's row stays as it was.
 #[tokio::test]
-async fn a_failed_no_wake_child_still_wakes() {
+async fn a_failed_no_wake_child_files_its_report() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, mut callback_rx) = EventBus::new(pool.clone());
     let (parent_id, child_id) =
         spawn_parent_child_with_mode(&bus, EventChannel::Chat, Some(WakeMode::NoWake)).await;
+    emit(&bus, parent_id, reply("Started a thread for it.")).await;
+    let before = parent_row(&pool, parent_id).await;
 
     emit(
         &bus,
@@ -147,16 +164,18 @@ async fn a_failed_no_wake_child_still_wakes() {
     )
     .await;
 
-    assert_eq!(count_on(&pool, parent_id, "ChildThreadCompleted").await, 1);
-    assert_eq!(drain_callbacks(&mut callback_rx), 1);
+    assert_eq!(count_on(&pool, parent_id, "ChildThreadCompleted").await, 0);
+    assert_eq!(newest_filed_status(&pool, parent_id).await, "failure");
+    assert_eq!(drain_callbacks(&mut callback_rx), 0, "no parent turn");
+    assert_eq!(parent_row(&pool, parent_id).await, before);
 
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
 
-/// I3: the engine's own yes (a cut-short turn) wakes even a no-wake parent.
+/// I1: the engine's own yes (a cut-short turn) files under no-wake too.
 #[tokio::test]
-async fn an_engine_recorded_wake_beats_no_wake() {
+async fn an_engine_recorded_wake_still_files_under_no_wake() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, mut callback_rx) = EventBus::new(pool.clone());
     let (parent_id, child_id) =
@@ -165,8 +184,127 @@ async fn an_engine_recorded_wake_beats_no_wake() {
     emit(&bus, child_id, ThreadEvent::ParentWakeRequested).await;
     emit(&bus, child_id, reply("Stopped at the iteration cap.")).await;
 
-    assert_eq!(count_on(&pool, parent_id, "ChildThreadCompleted").await, 1);
+    assert_eq!(count_on(&pool, parent_id, "ChildThreadCompleted").await, 0);
+    assert_eq!(count_on(&pool, parent_id, "ChildReportFiled").await, 1);
+    assert_eq!(drain_callbacks(&mut callback_rx), 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// I2, the reported regression. A build chain's planner handed off and idled.
+/// A restart then cut its `no-wake` chain member mid-turn. The planner was not
+/// running, so the cut must not start a planner turn: the `interrupted`
+/// report is filed once, and a second boot re-fires nothing.
+#[tokio::test]
+async fn a_restart_cut_chain_member_does_not_start_its_handed_off_planner() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+    let (planner, member) =
+        spawn_parent_child_with_mode(&bus, EventChannel::ClaudeCode, Some(WakeMode::NoWake)).await;
+    emit_cc_session_started(&bus, planner).await;
+    emit_cc_idled(&bus, planner, true, None).await;
+    sqlx::query("UPDATE thread_summaries SET successor_thread_id = $2 WHERE thread_id = $1")
+        .bind(planner)
+        .bind(member)
+        .execute(&pool)
+        .await
+        .unwrap();
+    emit_cc_session_started(&bus, member).await;
+    let before = parent_row(&pool, planner).await;
+    assert_eq!(before.0, "idle");
+
+    emit_cc_recovery_pair(&bus, member).await;
+
+    assert_eq!(count_on(&pool, planner, "ChildThreadCompleted").await, 0);
+    assert_eq!(
+        count_on(&pool, planner, "ChildReportFiled").await,
+        1,
+        "the abort files once, and the recovery idle after it adds nothing"
+    );
+    assert_eq!(newest_filed_status(&pool, planner).await, "interrupted");
+    assert_eq!(
+        drain_callbacks(&mut callback_rx),
+        0,
+        "no planner start request"
+    );
+    assert_eq!(parent_row(&pool, planner).await, before);
+    drop(bus);
+
+    let (rebooted, mut reboot_rx) = EventBus::new(pool.clone());
+    assert_eq!(rebooted.refire_unprocessed_child_completions().await, 0);
+    assert_eq!(drain_callbacks(&mut reboot_rx), 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// I3: an orchestrator that declared `wake` still hears of a restart cut.
+#[tokio::test]
+async fn a_restart_cut_wake_child_still_wakes_its_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+    let (parent_id, child_id) =
+        spawn_parent_child_with_mode(&bus, EventChannel::ClaudeCode, Some(WakeMode::Wake)).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    emit_cc_recovery_pair(&bus, child_id).await;
+
+    assert_eq!(
+        newest_completion_card(&pool, parent_id).await.0,
+        "interrupted"
+    );
+    assert_eq!(count_on(&pool, parent_id, "ChildReportFiled").await, 0);
     assert_eq!(drain_callbacks(&mut callback_rx), 1);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A `ChildThreadCompleted` written for `child_id` before this rule, left as
+/// `parent_id`'s last word: the shape the boot sweep reads.
+async fn emit_legacy_card(bus: &EventBus, parent_id: Uuid, child_id: Uuid) {
+    emit(
+        bus,
+        parent_id,
+        ThreadEvent::ChildThreadCompleted {
+            child_thread_id: child_id,
+            child_thread_title: Some("child task".into()),
+            status: ChildCompletionStatus::Interrupted,
+            summary: "cut".into(),
+            pending_change_ids: vec![],
+            sub_thread_pending_changes: vec![],
+            integrated_branch: None,
+        },
+    )
+    .await;
+}
+
+/// I5: the boot sweep re-fires no card a `no-wake` child left under the old
+/// rule, on any boot. A card from any other child still re-fires.
+#[tokio::test]
+async fn the_boot_sweep_skips_a_legacy_no_wake_card() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (quiet_parent, no_wake_child) =
+        spawn_parent_child_with_mode(&bus, EventChannel::Chat, Some(WakeMode::NoWake)).await;
+    let (waking_parent, wake_child) =
+        spawn_parent_child_with_mode(&bus, EventChannel::Chat, Some(WakeMode::Wake)).await;
+    emit_legacy_card(&bus, quiet_parent, no_wake_child).await;
+    emit_legacy_card(&bus, waking_parent, wake_child).await;
+    drop(bus);
+
+    for boot in 1..=2 {
+        let (rebooted, mut rx) = EventBus::new(pool.clone());
+        assert_eq!(
+            rebooted.refire_unprocessed_child_completions().await,
+            1,
+            "boot {boot}"
+        );
+        let cb = rx.try_recv().expect("the wake child's card re-fires");
+        assert_eq!(cb.parent_thread_id, waking_parent, "boot {boot}");
+        assert_eq!(drain_callbacks(&mut rx), 0, "boot {boot}");
+    }
 
     pool.close().await;
     teardown_test_db(&db_name).await;

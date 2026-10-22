@@ -267,7 +267,7 @@ const HOME_THREAD_CONTEXT: &str = "[THREAD CONTEXT]\n\
      when you will act on its result. A child started here defaults to wake_mode \
      'no-wake': its clean report is filed for your next turn. Pass 'wake' when \
      you need the result to continue, or 'wake-when-all-done' to combine \
-     several. A failure always wakes you.\n\
+     several. A no-wake child's failure is filed too: the child shows it.\n\
      From here follow_up_child_thread reaches ANY thread in this workspace, \
      coding-agent threads included, not only your own children. A thread you did \
      not spawn reports to its own parent, so read its reply later with \
@@ -532,7 +532,7 @@ mod tests {
         assert!(HOME_THREAD_CONTEXT.contains("defaults to wake_mode 'no-wake'"));
         assert!(HOME_THREAD_CONTEXT.contains("Pass 'wake' when you need the result"));
         assert!(HOME_THREAD_CONTEXT.contains("'wake-when-all-done' to combine several"));
-        assert!(HOME_THREAD_CONTEXT.contains("A failure always wakes you"));
+        assert!(HOME_THREAD_CONTEXT.contains("A no-wake child's failure is filed too"));
     }
 
     /// ADR 0473: work the user reads is a top-thread, so Home pays for no

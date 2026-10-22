@@ -1,6 +1,7 @@
 /**
- * The dashboard sheet rises from the bottom edge, and under reduced motion it
- * only fades. Source scans of panels/dashboard.css, like the rail's chrome test.
+ * The dashboard sheet fades in place, on a scaled duration, so reduced motion
+ * needs no rule of its own. Source scans of panels/dashboard.css, like the
+ * rail's chrome test.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -22,29 +23,21 @@ function rule(selector: string): CssRule {
 }
 
 describe('the dashboard sheet motion', () => {
-  it('rests below the window and rises on a scaled transform transition', () => {
+  it('fades in place on a scaled opacity transition, and never slides', () => {
     const closed = rule('.dashboard-sheet-panel').props;
-    expect(closed.get('transform')).toBe('translateY(100%)');
-    expect(closed.get('transition')).toContain('transform var(--duration-slow)');
+    expect(closed.get('opacity')).toBe('0');
+    expect(closed.get('visibility')).toBe('hidden');
+    expect(closed.get('transition')).toContain('opacity var(--duration-normal)');
+    expect(closed.has('transform')).toBe(false);
     const open = rule('.dashboard-sheet.is-open .dashboard-sheet-panel').props;
-    expect(open.get('transform')).toBe('none');
+    expect(open.get('opacity')).toBe('1');
+    expect(open.get('visibility')).toBe('visible');
   });
 
-  it('fades the dim alongside, on the same scaled duration', () => {
-    expect(rule('.dashboard-sheet-dim').props.get('transition')).toContain('opacity var(--duration-slow)');
-  });
-
-  it('only fades under reduced motion: no transform moves', () => {
-    const reduced = rule(':root[data-motion="reduce"] .dashboard-sheet-panel').props;
-    expect(reduced.get('transform')).toBe('none');
-    expect(reduced.get('transition')).not.toContain('transform');
-    expect(reduced.get('transition')).toContain('opacity');
-    const reducedOpen = rule(':root[data-motion="reduce"] .dashboard-sheet.is-open .dashboard-sheet-panel').props;
-    expect(reducedOpen.get('opacity')).toBe('1');
-  });
-
-  it('hangs below the app header, which the dim never reaches into', () => {
-    expect(rule('.dashboard-sheet-dim').props.get('top')).toBe('var(--app-header-bottom)');
-    expect(rule('.dashboard-sheet-panel').props.get('top')).toBe('calc(var(--app-header-bottom) + var(--sheet-gap))');
+  it('meets the app header with no gap, line or corner', () => {
+    const panel = rule('.dashboard-sheet-panel').props;
+    expect(panel.get('top')).toBe('var(--app-header-bottom)');
+    expect(panel.has('border-top')).toBe(false);
+    expect(panel.has('border-radius')).toBe(false);
   });
 });

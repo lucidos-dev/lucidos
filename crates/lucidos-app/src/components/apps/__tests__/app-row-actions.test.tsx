@@ -142,7 +142,6 @@ describe.each([['desktop', false], ['phone', true]])('the pin toggle on a %s row
     mount(mobile);
     expect(pin().getAttribute('aria-label')).toBe('Pin Habit Tracker');
     expect(pin().getAttribute('aria-pressed')).toBe('false');
-    expect(pin().classList.contains('active')).toBe(false);
     expect(pin().querySelector('svg')!.getAttribute('fill')).toBe('none');
   });
 
@@ -151,9 +150,9 @@ describe.each([['desktop', false], ['phone', true]])('the pin toggle on a %s row
     mount(mobile);
     expect(pin().getAttribute('aria-label')).toBe('Unpin Habit Tracker');
     expect(pin().getAttribute('aria-pressed')).toBe('true');
-    // `.pin-btn.active` paints the accent, as on a thread row.
+    // The `glyph` tone paints the accent, as on a thread row.
     expect(pin().classList.contains('pin-btn')).toBe(true);
-    expect(pin().classList.contains('active')).toBe(true);
+    expect(pin().getAttribute('data-tone')).toBe('glyph');
     expect(pin().querySelector('svg')!.getAttribute('fill')).toBe('currentColor');
   });
 

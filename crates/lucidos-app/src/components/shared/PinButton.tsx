@@ -1,7 +1,8 @@
 import { PinIcon } from './icons';
+import { ToggleIconButton } from './ToggleIconButton';
 
 /** The pin toggle every pinnable row and title draws: an outline pin while
- *  unpinned, a filled accent pin (`.pin-btn.active`) while pinned. The host
+ *  unpinned, a filled accent pin (the `glyph` tone) while pinned. The host
  *  owns what pinning means and names the button for both states.
  *
  *  `stopPropagation` is for hosts whose container has its own click handler (a
@@ -19,19 +20,19 @@ export function PinButton({ pinned, label, tooltip, onToggle, stopPropagation, e
   tabIndex?: number;
 }) {
   return (
-    <button
-      type="button"
+    <ToggleIconButton
       tabIndex={tabIndex}
-      class={`icon-btn header-icon pin-btn${pinned ? ' active' : ''}${extraClass ? ` ${extraClass}` : ''}`}
+      tone="glyph"
+      pressed={pinned}
+      class={`header-icon pin-btn${extraClass ? ` ${extraClass}` : ''}`}
       onClick={(e) => {
         if (stopPropagation) e.stopPropagation();
         onToggle();
       }}
-      aria-pressed={pinned}
       aria-label={label}
       data-tooltip={tooltip}
     >
       <PinIcon filled={pinned} />
-    </button>
+    </ToggleIconButton>
   );
 }

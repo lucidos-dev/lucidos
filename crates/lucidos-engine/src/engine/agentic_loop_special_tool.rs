@@ -216,9 +216,9 @@ fn child_report_contract(mode: WakeMode) -> &'static str {
              finish resumes this conversation. A failure resumes it at once."
         }
         WakeMode::NoWake => {
-            "Its wake_mode is \"no-wake\": a clean finish does NOT resume this \
-             conversation, since the user reads the result in that thread. Its report \
-             is filed for your next turn, and a failure still resumes this conversation."
+            "Its wake_mode is \"no-wake\": no finish resumes this conversation, not even \
+             a failure, since the user reads the result in that thread. Its report is \
+             filed for your next turn."
         }
     }
 }

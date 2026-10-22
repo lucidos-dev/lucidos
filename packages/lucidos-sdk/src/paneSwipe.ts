@@ -122,6 +122,18 @@ export function claimsHorizontalPan(touchAction: string): boolean {
   return !touchAction.split(/\s+/).includes('pan-x');
 }
 
+/** Whether a `touch-action` keeps the vertical pan. */
+function keepsVerticalPan(touchAction: string): boolean {
+  return touchAction.split(/\s+/).some((v) => v === 'pan-y' || v === 'pan-up' || v === 'pan-down');
+}
+
+/** Whether a page root's `touch-action` claims the sideways drag. A page-wide
+ *  `pan-y` only stops the page panning sideways, so only one that also drops
+ *  the vertical pan, such as `none`, claims it. */
+function pageClaimsHorizontalPan(touchAction: string): boolean {
+  return claimsHorizontalPan(touchAction) && !keepsVerticalPan(touchAction);
+}
+
 /** The part of an element the claim check reads. */
 export interface DragNode {
   localName?: string;
@@ -141,7 +153,9 @@ export function horizontalDragClaimed(target: DragNode | null, styleOf: StyleOf)
     if (node.localName === 'input' && node.type === 'range') return true;
     const style = styleOf(node);
     if (!style) continue;
-    if (claimsHorizontalPan(style.touchAction)) return true;
+    const isPageRoot = node.localName === 'html' || node.localName === 'body';
+    const claims = isPageRoot ? pageClaimsHorizontalPan : claimsHorizontalPan;
+    if (claims(style.touchAction)) return true;
     const overflows = (node.scrollWidth ?? 0) > (node.clientWidth ?? 0);
     if (overflows && (style.overflowX === 'auto' || style.overflowX === 'scroll')) return true;
   }

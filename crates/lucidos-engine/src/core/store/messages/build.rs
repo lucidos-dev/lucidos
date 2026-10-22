@@ -213,8 +213,8 @@ pub fn format_child_thread_completed_block(event: &EventRow, statuses: &ChangeSt
 }
 
 /// What a filed report says about itself, after the card's own note.
-pub(crate) const REPORT_FILED_NOTE: &str = "\nThis report did not wake you: the child said \
-     you need not act on it right away, so it was filed. You read it now, at the start of \
+pub(crate) const REPORT_FILED_NOTE: &str = "\nThis report did not wake you, so it was filed: \
+     its wake mode or the child's own decision said so. You read it now, at the start of \
      your next turn. Act on it if your work needs it.";
 
 /// Format a persisted `ChildReportFiled` event row as the `[CHILD THREAD REPORT

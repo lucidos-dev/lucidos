@@ -185,7 +185,7 @@ describe('the rim is painted once', () => {
   });
 
   it('hover and pressed raise the wrapper to opaque, as they do the other icons', () => {
-    expect(rule(shell, '.app-header .icon-btn.view-selector-active .crossfade-glyph').props.get('opacity')).toBe('1');
+    expect(rule(shell, '.app-header .icon-btn[aria-pressed="true"] .crossfade-glyph').props.get('opacity')).toBe('1');
     expect(rule(shell, '.app-header .icon-btn:hover:where(:not(:disabled)) .crossfade-glyph').props.get('opacity'))
       .toBe('1');
   });

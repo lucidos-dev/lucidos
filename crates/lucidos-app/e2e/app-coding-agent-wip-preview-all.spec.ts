@@ -1,5 +1,7 @@
-import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, ensureMobileView } from './helpers';
+import { test, expect, type Page } from './fixtures';
+import {
+  navigateToApp, assertHealthy, composerToggleState, ensureMobileView, pressComposerControl,
+} from './helpers';
 import { createIframeAppFixture, createAppCCThreadWithChange, cleanupCCThread, git } from './db-helpers';
 
 /** Where the app frame currently is, asked of the driver.
@@ -10,6 +12,17 @@ import { createIframeAppFixture, createAppCCThreadWithChange, cleanupCCThread, g
  *  `src` attribute stops doing the moment `location.replace` is used. */
 function appFrameUrl(page: import('@playwright/test').Page): string {
   return page.frames().map((f) => f.url()).find((u) => u.includes('/app/')) ?? '';
+}
+
+const WIP_TOGGLE = '[data-role="wip-preview-toggle"]';
+
+/** Wait for the WIP toggle, standing in the row or behind its ⋯. */
+async function expectWipToggle(page: Page, pressed?: boolean): Promise<void> {
+  await expect(async () => {
+    const state = await composerToggleState(page, WIP_TOGGLE);
+    expect(state).not.toBeNull();
+    if (pressed !== undefined) expect(state).toBe(String(pressed));
+  }).toPass({ timeout: 10_000 });
 }
 
 test.describe('App coding-agent thread — WIP app preview toggle', () => {
@@ -69,20 +82,19 @@ test.describe('App coding-agent thread — WIP app preview toggle', () => {
 
       // The WIP preview toggle button appears when (a) focused thread is an
       // app cc thread AND (b) the panel-overlay shows that app.
-      const toggle = page.locator('[data-role="wip-preview-toggle"]:visible').first();
-      await expect(toggle).toBeVisible({ timeout: 10_000 });
+      await expectWipToggle(page);
 
       // Click → the frame navigates to `?thread_id=<id>`. The navigation is a
       // `location.replace`, to avoid session-history pollution (WebKit #9166),
       // so the iframe's `src` attribute never changes and cannot be read for
       // the answer. `appFrameUrl` asks the driver, which an isolated frame
       // does not refuse the way `contentWindow.location` does.
-      await toggle.click();
+      await pressComposerControl(page, WIP_TOGGLE);
       await expect.poll(() => appFrameUrl(page), { timeout: 5_000 })
         .toContain(`thread_id=${seeded.threadId}`);
 
       // Click again → reverts to live.
-      await toggle.click();
+      await pressComposerControl(page, WIP_TOGGLE);
       await expect.poll(() => appFrameUrl(page), { timeout: 5_000 })
         .not.toContain('thread_id=');
     } finally {
@@ -128,13 +140,11 @@ test.describe('App coding-agent thread — WIP app preview toggle', () => {
 
       // The toggle is visible from the thread alone (no app open in the panel)
       // and starts in the live (inactive) state.
-      const toggle = page.locator('[data-role="wip-preview-toggle"]:visible').first();
-      await expect(toggle).toBeVisible({ timeout: 10_000 });
-      await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+      await expectWipToggle(page, false);
 
       // Click → opens the app in the panel-overlay AND points its iframe at the
       // worktree-served WIP URL (`?thread_id=<id>`).
-      await toggle.click();
+      await pressComposerControl(page, WIP_TOGGLE);
       await expect.poll(() => appFrameUrl(page), { timeout: 10_000 })
         .toContain(`thread_id=${seeded.threadId}`);
 
@@ -146,7 +156,7 @@ test.describe('App coding-agent thread — WIP app preview toggle', () => {
       await ensureMobileView(page, 'thread');
 
       // Click again → reverts to live (app stays open, no thread_id).
-      await toggle.click();
+      await pressComposerControl(page, WIP_TOGGLE);
       await expect.poll(() => appFrameUrl(page), { timeout: 5_000 })
         .not.toContain('thread_id=');
     } finally {

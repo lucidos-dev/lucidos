@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Locator } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, showGrouping, showOngoingGroup, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, clickThreadRow, threadRowFor, isMobileViewport, composerControl } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, showGrouping, showOngoingGroup, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, clickThreadRow, threadRowFor, isMobileViewport, composerControl, closeComposerFold } from './helpers';
 import { clearAllThreads, psql } from './db-helpers';
 
 /** Send a first message, then click Compose and type a draft. Returns the
@@ -52,6 +52,13 @@ async function clickThreadNav(page: Page, ariaLabel: 'Previous thread' | 'Next t
  *  A narrow compose row folds it into the ⋯ before the rung pill. */
 async function clearDraft(page: Page): Promise<void> {
   await (await composerControl(page, 'button.prompt-clear')).click();
+}
+
+/** The clear-X is offered, standing in the row or folded behind the ⋯. It is
+ *  gated on the prompt having text, so it is the visible artifact of a draft. */
+async function expectClearDraftOffered(page: Page): Promise<void> {
+  await expect(await composerControl(page, 'button.prompt-clear')).toBeVisible();
+  await closeComposerFold(page);
 }
 
 test.describe('Per-thread drafts', () => {
@@ -400,8 +407,7 @@ test.describe('Per-thread drafts', () => {
     await input.fill('thread follow-up to discard');
 
     // The clear-X is visible whenever the prompt has text (compose or followup)
-    const clearBtn = page.locator('button.prompt-clear:visible');
-    await expect(clearBtn).toHaveCount(1);
+    await expectClearDraftOffered(page);
 
     // Clear the follow-up text. For an active thread this is a local clear that
     // keeps the thread intact, never a server-side delete. That would 409 on an
@@ -504,8 +510,7 @@ test.describe('Per-thread drafts', () => {
     await expect(reloadedInput).toHaveValue('persists with focus', { timeout: 10_000 });
     // The clear-X is gated on composeText.length > 0, so it is the visible
     // artifact when the text is missing while the draft state still shows.
-    const clearBtn = page.locator('button.prompt-clear:visible');
-    await expect(clearBtn).toHaveCount(1);
+    await expectClearDraftOffered(page);
   });
 
   test('compose draft survives page reload — same thread id, not a new one', async ({ page }) => {

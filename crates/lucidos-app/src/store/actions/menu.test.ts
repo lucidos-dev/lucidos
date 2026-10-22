@@ -10,6 +10,7 @@ import {
   mobileView,
 } from '../store';
 import type { App } from '../types';
+import { ladderAnchor } from '../../components/settings/intelligenceLadder';
 
 // Mock navigation to spy on pushNavState
 const pushNavState = vi.fn();
@@ -50,7 +51,7 @@ vi.mock('../../api/client', () => ({
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
-const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting, openCacheWarmLineSetting } = await import('./menu');
+const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting, openCacheWarmLineSetting, openIntelligenceLadder } = await import('./menu');
 
 const fakeApp: App = {
   id: 'trip-planner',
@@ -379,6 +380,26 @@ describe('Debugging row deep links', () => {
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('debugging');
     expect(settingsScrollTarget.value).toBe('debugging:cache-warm-line');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('openIntelligenceLadder', () => {
+  beforeEach(() => {
+    activeMenuItem.value = 'files';
+    settingsSubview.value = 'main';
+    settingsScrollTarget.value = null;
+    panelOverlay.value = null;
+    pushNavState.mockClear();
+    revealContentPane.mockClear();
+  });
+
+  it('lands on one surface ladder in Settings > Intelligence', () => {
+    openIntelligenceLadder('codex');
+    expect(activeMenuItem.value).toBe('settings');
+    expect(settingsSubview.value).toBe('intelligence');
+    expect(settingsScrollTarget.value).toBe(ladderAnchor('codex'));
     expect(revealContentPane).toHaveBeenCalledTimes(1);
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });

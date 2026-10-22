@@ -5,6 +5,8 @@
 - **Amends**: [0434](0434-sub-threads-wake-parents-only-when-needed.md)
 - **Amended by**: [0473: A thread spawns a top-thread when no report is needed](0473-a-thread-spawns-a-top-thread-when-no-report-is-needed.md).
   Work this thread will not act on is a top-thread, not a `no-wake` child.
+- **Amended by**: [0545: A no-wake child files every report](0545-no-wake-child-files-every-report.md).
+  A `no-wake` child's failure, cancel or interruption is filed too.
 
 Plan: `docs/plans/2026-10-12-the-spawn-declares-the-wake-mode.md`.
 

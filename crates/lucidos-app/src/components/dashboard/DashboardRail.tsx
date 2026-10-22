@@ -8,6 +8,7 @@ import { minDashboardRailPx, splitBounds } from '../../store/paneMinimums';
 import { splitRatio, SPLIT_RATIO_KEY } from '../../store/store';
 import { lazyComponent } from '../../utils/lazyComponent';
 import { DashboardIcon } from '../shared/icons';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { viewportIsMobile } from '../../utils/viewport';
 import { startDividerDrag } from '../layout/dividerDrag';
 import { clampSplitRatio, clampToRange, dashboardRailCeiling } from '../layout/splitHelpers';
@@ -95,17 +96,16 @@ export function DashboardRailToggle() {
   const label = shown ? 'Hide dashboard' : 'Show dashboard';
   return (
     <div class="dashboard-rail-toggle-slot">
-      <button
-        type="button"
-        class="icon-btn header-icon dashboard-rail-toggle"
+      <ToggleIconButton
+        class="header-icon dashboard-rail-toggle"
         onClick={blocked ? undefined : toggleDashboardRail}
         aria-label={label}
-        aria-pressed={shown}
+        pressed={shown}
         aria-disabled={blocked || undefined}
         data-tooltip={blocked ? DASHBOARD_TOO_NARROW : label}
       >
         <DashboardIcon />
-      </button>
+      </ToggleIconButton>
     </div>
   );
 }

@@ -5,10 +5,10 @@ import {
 } from './helpers';
 import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 
-// A started thread's rung pill is the FIRST member the row folds into the ⋯
-// menu. On a 320px row it goes there beside the change actions, and its menu
-// row still opens the rung list. Before the first send it is the LAST, so a
-// narrow compose row folds everything else and keeps the pill.
+// The row folds left to right, and the rung pill stands right of every icon.
+// So the Claude menu leaves before it. On a 320px row the pill goes into the ⋯
+// too, and its menu row still opens the rung list. A narrow compose row has no
+// change actions, so it folds every other member and keeps the pill.
 // Desktop-only (`-desktop.spec.ts`): see change-actions-split-desktop.spec.ts.
 
 test.describe('The rung pill folds into the ⋯ menu', () => {
@@ -30,6 +30,8 @@ test.describe('The rung pill folds into the ⋯ menu', () => {
 
       const row = page.locator('.prompt-actions-row:visible');
       await expect(row.locator('.rung-pill')).toHaveCount(0);
+      // The Claude menu stands left of the pill, so it folded first.
+      await expect(row.locator('.commands-btn')).toHaveCount(0);
       await row.locator('[data-fold-key=""]').click();
       await page.locator('.thread-overflow-item[data-role="rung-control"]:visible').click();
       await expect(page.locator('.control-dropdown:visible .control-item').first()).toBeVisible();

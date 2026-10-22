@@ -1,5 +1,6 @@
 import type { ComponentChildren } from 'preact';
 import { ModelSelectionField } from '../shared/ModelSelectionField';
+import type { PickerLink } from '../shared/ModelSelectionPicker';
 import type { ModelSelectionPatch } from '../../hooks/useModelSelection';
 import type { ModelChoice, TierChoice } from '../../store/modelSelection';
 
@@ -23,6 +24,7 @@ export function ModelSelectionRow({
   unsetEffortLabel,
   defaultEffortLabel,
   disabled,
+  link,
   onChange,
 }: {
   label: string;
@@ -50,6 +52,8 @@ export function ModelSelectionRow({
   /** Names a Default row that drops the stored tier. */
   defaultEffortLabel?: (model: string) => string;
   disabled?: boolean;
+  /** A last row that navigates instead of picking. */
+  link?: PickerLink;
   onChange: (patch: ModelSelectionPatch) => void;
 }) {
   return (
@@ -69,6 +73,7 @@ export function ModelSelectionRow({
         unsetEffortLabel={unsetEffortLabel}
         defaultEffortLabel={defaultEffortLabel}
         disabled={disabled}
+        link={link}
         onChange={onChange}
       />
     </div>

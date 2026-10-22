@@ -3,7 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-16
 - **Amends**: [0474](0474-successor-threads.md), [0493](0493-a-plan-cards-new-thread-pick-is-owner-consent.md)
-- **Amended by**: [0507: A successor inherits the consent that started it](0507-successor-inherits-handoff-consent.md)
+- **Amended by**: [0507: A successor inherits the consent that started it](0507-successor-inherits-handoff-consent.md), [0545: A no-wake child files every report](0545-no-wake-child-files-every-report.md)
 
 ## Context
 

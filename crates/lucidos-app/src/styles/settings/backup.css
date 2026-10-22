@@ -142,22 +142,24 @@
     font-family: var(--font-mono);
 }
 
-/* The revealed key gets the full width in a box of its own. Beside a button
-   it wrapped into a narrow column on a phone. */
+/* The revealed key gets the full width in a box of its own, with its copy
+   icon inside on the right. */
 .backup-key-reveal {
-    padding: var(--space-sm) var(--space-md);
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    padding: var(--space-sm) var(--space-sm) var(--space-sm) var(--space-md);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-control);
     background: var(--bg-secondary);
 }
 
-/* Copy leads the row; the step's own buttons pack right. */
 .backup-key-copy {
-    margin-right: auto;
+    margin-left: auto;
 }
 
 /* The revealed key. Monospace and fully selectable: the user is here to copy it
-   somewhere safe, and the Copy button next to it is not the only way people do
+   somewhere safe, and the copy icon next to it is not the only way people do
    that. */
 .backup-key-value {
     font-size: var(--font-size-xs);

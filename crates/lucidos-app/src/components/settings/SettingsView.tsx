@@ -88,7 +88,7 @@ import { LoadableError } from '../shared/LoadableError';
 import { LoadableToggle } from '../shared/LoadableToggle';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
-import { openSettingsSubview } from '../../store/actions/menu';
+import { openIntelligenceLadder, openSettingsSubview } from '../../store/actions/menu';
 import { focusFirstFocusableWithin } from '../layout/paneFocus';
 import { formatTimeAgo } from '../../utils/formatTime';
 import type { ImageModel } from '../../store/actions/preferences';
@@ -96,6 +96,15 @@ import { Disclosure } from '../shared/Disclosure';
 import { errorDetail } from '../../utils/errorDetail';
 import { motionPreference, scrollBehavior } from '../../utils/motion';
 import { themeEffectsPreference } from '../../utils/themeEffects';
+import { LADDER_LINK_ROW } from '../chat/rungRows';
+import type { PickerLink } from '../shared/ModelSelectionPicker';
+
+/** The chat ladder decides which models Chat model and Trigger model list,
+ *  so both end on a link to it. */
+const CHAT_LADDER_LINK: PickerLink = {
+  option: LADDER_LINK_ROW,
+  onChoose: () => openIntelligenceLadder('chat'),
+};
 
 /** Turn scope URLs into short human-readable labels. */
 function formatScopes(scopes: string): string {
@@ -1178,6 +1187,7 @@ export function SettingsView() {
             effortFor={accountChatEffort}
             unsetEffortLabel={PROVIDER_DEFAULT_EFFORT_LABEL}
             defaultEffortLabel={(m) => defaultTierLabel(modelDefaultEffort(m))}
+            link={CHAT_LADDER_LINK}
             onChange={(p) => {
               void setChatModelSelection(p);
               if (p.provider) void rememberProvider(p.model, p.provider);
@@ -1193,6 +1203,7 @@ export function SettingsView() {
             effortFor={accountChatEffort}
             unsetEffortLabel={PROVIDER_DEFAULT_EFFORT_LABEL}
             defaultEffortLabel={(m) => defaultTierLabel(modelDefaultEffort(m))}
+            link={CHAT_LADDER_LINK}
             onChange={(p) => {
               void setTriggerModelSelection(p);
               if (p.provider) void rememberProvider(p.model, p.provider);

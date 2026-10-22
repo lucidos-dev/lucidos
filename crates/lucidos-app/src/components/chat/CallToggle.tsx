@@ -38,6 +38,7 @@
 import { useRef } from 'preact/hooks';
 import { CallIcon } from '../shared/icons';
 import { OverflowMenu } from '../shared/OverflowMenu';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { lazyComponent } from '../../utils/lazyComponent';
 import { prefetchWhenIdle } from '../../utils/idlePrefetch';
 import type { HeaderActionSpec } from '../layout/headerActions';
@@ -141,13 +142,14 @@ export function CallToggle({ available = true, attrs }: { available?: boolean; a
   if ((!voiceEnabled() || !available) && !on) return null;
   return (
     <>
-      <button
+      <ToggleIconButton
         {...attrs}
-        class={`icon-btn header-icon${on ? ' active' : ''}`}
+        tone="live"
+        pressed={on}
+        class="header-icon"
         data-role="call-toggle"
         data-call-phase={phase}
         data-call-wait={waiting ? 'microphone' : undefined}
-        aria-pressed={on}
         aria-disabled={dead}
         aria-label={PRESS_NAME[phase]}
         data-tooltip={waiting ? WAITING_TOOLTIP : tooltipFor(phase)}
@@ -160,7 +162,7 @@ export function CallToggle({ available = true, attrs }: { available?: boolean; a
         onClick={press.onClick}
       >
         <CallIcon />
-      </button>
+      </ToggleIconButton>
       {/* Out of flow, so it takes no room in the prompt row and is no item of
           it. Empty while idle, so the first state a call reaches is an
           announcement rather than a change nobody heard the start of. */}

@@ -20,6 +20,7 @@ import type { ComponentChildren, VNode } from 'preact';
 import { InitiatorPanel, ResponsePanel, turnControls } from '../chat-exchange-parts';
 import type { InitiatorDescriptor } from '../ChatExchange';
 import { Disclosure } from '../../shared/Disclosure';
+import { ToggleIconButton } from '../../shared/ToggleIconButton';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: unknown }> {}
 
@@ -93,23 +94,22 @@ describe('turnControls', () => {
     }
   });
 
-  it('makes every control a real button', () => {
+  it('makes every control a toggle icon button', () => {
     // Keyboard reachability, and the right semantics for a toggle.
     for (const role of ROLES) {
       const btn = findByRole(controls(), role)!;
-      expect(btn.type, role).toBe('button');
-      expect(btn.props.type, role).toBe('button');
+      expect(btn.type, role).toBe(ToggleIconButton);
     }
   });
 
-  it('states each control in aria-pressed', () => {
+  it('states each control as pressed', () => {
     // The CSS keys the pressed chip off this same attribute, so a
     // control that stops reporting its state also stops looking like it has one.
     const off = controls();
-    for (const role of ROLES) expect(findByRole(off, role)!.props['aria-pressed'], role).toBe(false);
+    for (const role of ROLES) expect(findByRole(off, role)!.props.pressed, role).toBe(false);
 
     const on = controls({ detailsOn: true, stepsOn: true, collapsed: true });
-    for (const role of ROLES) expect(findByRole(on, role)!.props['aria-pressed'], role).toBe(true);
+    for (const role of ROLES) expect(findByRole(on, role)!.props.pressed, role).toBe(true);
   });
 
   it('names every control, since none of them carries visible text', () => {
@@ -289,9 +289,9 @@ describe('InitiatorPanel collapse control', () => {
 
   it('turns its glyph around and reports aria-pressed, exactly as the response one', () => {
     const folded = findByRole(panel({ collapsed: true }), 'toggle-collapsed')!;
-    expect(folded.props['aria-pressed']).toBe(true);
+    expect(folded.props.pressed).toBe(true);
     expect((folded.props.children as AnyVNode).props.collapsed).toBe(true);
-    expect(findByRole(panel(), 'toggle-collapsed')!.props['aria-pressed']).toBe(false);
+    expect(findByRole(panel(), 'toggle-collapsed')!.props.pressed).toBe(false);
   });
 
   it('puts it between the actor chip and the meta cluster, where the response has its run', () => {

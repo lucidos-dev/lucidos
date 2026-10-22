@@ -42,9 +42,9 @@ const response: CodingAgentCommandsResponse = {
   ],
 } as unknown as CodingAgentCommandsResponse;
 
-const { setChatModelSelection, openSettingsSubview } = vi.hoisted(() => ({
+const { setChatModelSelection, openIntelligenceLadder } = vi.hoisted(() => ({
   setChatModelSelection: vi.fn(),
-  openSettingsSubview: vi.fn(),
+  openIntelligenceLadder: vi.fn(),
 }));
 
 vi.mock('../../../api/client', async (importOriginal) => ({
@@ -58,10 +58,9 @@ vi.mock('../../../store/actions/preferences', async (importOriginal) => ({
 
 vi.mock('../../../store/actions/menu', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/menu')>()),
-  openSettingsSubview,
+  openIntelligenceLadder,
 }));
 
-const { settingsScrollTarget } = await import('../../../store/store');
 const { RungControl } = await import('../RungControl');
 const { controlMenuParts } = await import('../controlMenuParts');
 
@@ -139,8 +138,7 @@ describe('the rung list', () => {
     await openRungList('d1');
     click('.control-option', 'Edit the intelligence ladder');
     await settle();
-    expect(openSettingsSubview).toHaveBeenCalledWith('intelligence');
-    expect(settingsScrollTarget.value).toBe('intelligence:ladder-claude-code');
+    expect(openIntelligenceLadder).toHaveBeenCalledWith('claude-code');
     expect(getComposeSelectionOverride('d1').ccModel ?? null).toBeNull();
   });
 

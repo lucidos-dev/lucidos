@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, assertHealthy, disarmFollowSeed, hideDashboardRail } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, assertHealthy, disarmFollowSeed, hideDashboardRail, followToggleState, pressFollowToggle } from './helpers';
 
 /** The transcript's scroll position belongs to the reader: the app moves it only
  *  when the reader asks, and exactly ONE of those asks is STANDING rather than
@@ -130,9 +130,8 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     // the chevron it stays pressed, which is the visible difference between a
     // journey and a mode. One button cannot be go-there, stay-here and
     // stop-staying at once, which is why these are two controls.
-    const toggle = page.locator('button[data-role="follow-live-edge"]:visible').first();
-    await toggle.click();
-    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await pressFollowToggle(page);
+    await expect.poll(() => followToggleState(page)).toBe('true');
     await expect.poll(atBottom).toBe(true);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
 
@@ -156,13 +155,13 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     await growLastTurn();
     await expect.poll(atBottom).toBe(true);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
-    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await expect.poll(() => followToggleState(page)).toBe('true');
 
     // Taking the ride back writes NO scroll: turning the follow off means "leave
     // me where I am reading", not "put me back where I was".
     const riding = await tc.evaluate(el => el.scrollTop);
-    await toggle.click();
-    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+    await pressFollowToggle(page);
+    await expect.poll(() => followToggleState(page)).toBe('false');
     await expect.poll(() => tc.evaluate(el => el.scrollTop)).toBe(riding);
 
     // And with the ride off, the next grow leaves them behind: that is the
@@ -175,7 +174,7 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     await page.locator('button.scroll-to-bottom.visible').click();
     await expect.poll(atBottom).toBe(true);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
-    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect.poll(() => followToggleState(page)).toBe('false');
   });
 
   /** The DEFAULT, which is the half the journey above cannot see. That test
@@ -191,12 +190,11 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     await navigateToApp(page);
 
     const tc = page.locator('.thread-content.visible:visible').first();
-    const toggle = page.locator('button[data-role="follow-live-edge"]:visible').first();
     const atBottom = () => tc.evaluate(el => el.scrollTop + el.clientHeight >= el.scrollHeight - 2);
 
     // The compose view has no transcript to describe, so the toggle shows the
     // SEED there. Lit before anything is sent is the whole of the default.
-    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await expect.poll(() => followToggleState(page)).toBe('true');
 
     // And it CARRIES on the thread that compose becomes. The reply lands the
     // reader on the live edge. The same send leaves an unarmed reader up at the
@@ -205,7 +203,7 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     await waitForResponse(page);
     await expect.poll(() => tc.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(100);
     await expect.poll(atBottom).toBe(true);
-    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await expect.poll(() => followToggleState(page)).toBe('true');
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(0);
   });
 });

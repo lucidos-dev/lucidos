@@ -64,16 +64,15 @@ function textRowSpan(): string {
 
 /** The clear-draft ACTION's own source.
  *
- *  It is a `HeaderActionSpec` now, not JSX: the row's middle folds into a ⋯
- *  menu, and a spec is what renders either as the icon or as a menu row. So the
- *  span runs from the push that adds it to that push's close.
+ *  It is a `HeaderActionSpec`, not JSX: the row folds into a ⋯ menu, and a spec
+ *  renders either as the icon or as a menu row. So the span runs from the
+ *  declaration to the spec's close.
  *
- *  Anchored on the key, and closed on a four-space `});`. A bare `'});'` search
- *  would stop inside the handler, at `updateCompose(id, { text: '' });`, and
- *  every assertion below would then read half a spec. */
+ *  Closed on a two-space `} : null;`. A bare `'}'` search would stop inside the
+ *  handler, and every assertion below would then read half a spec. */
 function clearSpec(): string {
-  const span = /foldActions\.push\(\{\n\s+key: 'prompt-clear'[\s\S]*?\n {4}\}\);/.exec(promptSource);
-  if (!span) throw new Error('no prompt-clear action is pushed onto foldActions in PromptInput.tsx');
+  const span = /const clearDraftAction: HeaderActionSpec \| null = hasText \? \{\n\s+key: 'prompt-clear'[\s\S]*?\n {2}\} : null;/.exec(promptSource);
+  if (!span) throw new Error('no clearDraftAction spec in PromptInput.tsx');
   return span[0];
 }
 
@@ -109,15 +108,17 @@ describe('the composer has one control on its right edge', () => {
     expect(at('<OverflowMenu')).toBeLessThan(at('<div class="prompt-actions-right">'));
   });
 
-  it('keeps the clear action last of the row\'s MIDDLE', () => {
-    // The fold takes a PREFIX, so a later member folds later. What may follow
-    // clear is the right-hand cluster and the two fixed toggles, both of which
-    // fold after it by design.
-    const spec = clearSpec();
-    const after = promptSource.slice(promptSource.indexOf(spec) + spec.length);
-    expect(after).toMatch(/const middleActions = foldActions\.slice\(\);/);
-    expect(after.slice(0, after.indexOf('const middleActions')))
-      .not.toMatch(/foldActions\.push\(/);
+  // The fold takes a prefix of the same list the row renders. So the ⋯ always
+  // holds the leftmost members, and it stands first, where they were.
+  it('renders the row from the list the fold takes its prefix of', () => {
+    expect(promptSource).toContain('const foldActions = [...members.row, ...members.cluster];');
+    expect(at('<OverflowMenu')).toBeLessThan(at('{members.row.map(renderMember)}'));
+    expect(at('{members.row.map(renderMember)}')).toBeLessThan(at('<div class="prompt-actions-right">'));
+  });
+
+  it('hands the clear action to the one row order', () => {
+    // `composerRowMembers` places it; `prompt-row-controls.test.tsx` pins where.
+    expect(promptSource).toMatch(/clearDraft: clearDraftAction,/);
   });
 });
 
@@ -126,7 +127,7 @@ describe('the clear button is one of the prompt row icons', () => {
     // `renderHeaderAction` gives every action the shared box, and `extraClass`
     // adds the hook the drafts e2e clicks. It reaches the ⋯ row too.
     expect(clearSpec()).toMatch(/extraClass: 'prompt-clear'/);
-    expect(headerActionsSource).toMatch(/icon-btn header-icon\$\{a\.extraClass/);
+    expect(headerActionsSource).toMatch(/header-icon\$\{a\.extraClass/);
     expect(headerActionsSource).toMatch(/thread-overflow-item\$\{a\.extraClass/);
   });
 
@@ -145,7 +146,7 @@ describe('the clear button is one of the prompt row icons', () => {
   // a row that had nothing to clear. On a phone that reservation is what pushed
   // the Diff button off a row that could otherwise hold it.
   it('renders only while there is a draft to clear', () => {
-    expect(promptSource).toMatch(/if \(hasText\) \{\n\s+foldActions\.push\(\{\n\s+key: 'prompt-clear'/);
+    expect(clearSpec()).toMatch(/= hasText \? \{/);
     expect(clearSpec()).not.toMatch(/\binvisible\b/);
   });
 

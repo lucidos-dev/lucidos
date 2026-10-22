@@ -177,7 +177,7 @@ conn = psycopg.connect(os.environ["LUCIDOS_DATABASE_URL"])
 ```
 
 - **It is read-only by default.** Every transaction opens read-only, so an accidental `DROP`, `DELETE` or `CREATE` fails with `cannot execute … in a read-only transaction`. A deliberate write opts in per transaction: `BEGIN READ WRITE; …; COMMIT;`.
-- **It cannot read stored secrets.** It signs in as an agent role with no access to secret columns, such as `credentials.auth_value` or OAuth tokens. A query naming one fails with `permission denied`. Reach a secret through its `CRED_*` variable or the proxy instead. Every other column reads as usual.
+- **It cannot read stored secrets.** It signs in as an agent role with no access to secret columns, such as `credentials.auth_value` or OAuth tokens. A query naming one fails with `permission denied`. Reach a secret through its `CRED_*` variable or the proxy instead. Every other column reads as usual. How secrets are stored: `system-knowhow/stored-secrets`.
 - **Never put the URL or a password on the command line.** The command is recorded in the tool call. Naming the variable keeps the password out, and tool output masks the URL's value.
 - **Bare `psql` reaches nothing.** The engine sets no `PGHOST` / `PGUSER` / `PGDATABASE` defaults and passes on no `DATABASE_URL` of its own. So an unset variable, as in `psql "$STAGING_URL"`, fails instead of landing on the workspace database.
 - **A project's own database is yours to configure.** Set its `DATABASE_URL` or `PG*` names as environment variables (next section); the engine no longer reserves them.

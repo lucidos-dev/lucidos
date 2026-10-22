@@ -9,6 +9,7 @@ import { viewportIsMobile } from '../../utils/viewport';
 import { Overlay } from '../shared/Overlay';
 import { WrapTextIcon } from '../shared/icons';
 import { SurfaceHead } from '../shared/Surface';
+import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { FilePreviewInline } from './FilePreviewInline';
 import { RepoFileContent, previewGitRef } from './RepoFilePreview';
 import { previewFilePath, previewFileName } from '../../utils/previewPath';
@@ -157,15 +158,15 @@ export function FilePreviewModal() {
               </button>
             )}
             {canWrap && (
-              <button
-                class={`icon-btn file-preview-wrap-toggle${wrapOn ? ' filter-active' : ''}`}
+              <ToggleIconButton
+                class="file-preview-wrap-toggle"
+                pressed={wrapOn}
                 aria-label={wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines'}
-                aria-pressed={wrapOn}
                 data-tooltip={wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines'}
                 onClick={() => { filePreviewWrap.value = !wrapOn; }}
               >
                 <WrapTextIcon />
-              </button>
+              </ToggleIconButton>
             )}
             <button class="accent-link" onClick={escalateFilePreviewModal}>
               Open in Files

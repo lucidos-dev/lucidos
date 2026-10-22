@@ -135,6 +135,13 @@ export function pickerFocusTarget(
   return opts.searching && !opts.tierStep ? 'filter' : 'list';
 }
 
+/** A row that navigates rather than picks, such as the link to the ladder
+ *  that decides which models a field lists. */
+export interface PickerLink {
+  option: ControlOption;
+  onChoose: () => void;
+}
+
 /** Which step a picker shows for an opened model. */
 type OpenStep = { model: string; step: 'tiers' } | { model: string; step: 'providers'; effort: string | null };
 
@@ -160,6 +167,7 @@ export function ModelSelectionPicker({
   describeModel,
   back,
   keyboardHolder = null,
+  link,
   onPick,
 }: {
   /** The section label over the model step. The tier step names the model. */
@@ -176,6 +184,8 @@ export function ModelSelectionPicker({
    *  (`keyboardHolder`). The filter box takes the keyboard from it, and the
    *  host hands it back on close. */
   keyboardHolder?: HTMLElement | null;
+  /** A last row on the model step that goes somewhere instead of picking. */
+  link?: PickerLink;
   /** One encoded pair, plus the backend when the provider step chose one. The
    *  host applies the whole selection and closes. */
   onPick: (encoded: string, provider?: string) => void;
@@ -192,7 +202,10 @@ export function ModelSelectionPicker({
   const highlight = useSignal(0);
 
   const visible = filterModelRows(selection.rows, filter.value);
-  const modelOptions = modelStepOptions(visible, selection, describeModel);
+  const modelOptions = [
+    ...modelStepOptions(visible, selection, describeModel),
+    ...(link ? [link.option] : []),
+  ];
   const openRow = selection.rows.find((r) => r.value === open.value?.model) ?? null;
   const openStep = openRow ? open.value : null;
   const stepOptions = !openStep || !openRow
@@ -287,6 +300,10 @@ export function ModelSelectionPicker({
       } else {
         onPick(option.value);
       }
+      return;
+    }
+    if (link && option.value === link.option.value) {
+      link.onChoose();
       return;
     }
     const row = selection.rows.find((r) => r.value === option.value);

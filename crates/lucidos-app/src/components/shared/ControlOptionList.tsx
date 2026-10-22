@@ -121,7 +121,8 @@ export function ControlOptionList({
           {back.label}
         </button>
       )}
-      {!options.some((opt) => opt.section) && <div class="control-section-label">{label}</div>}
+      {/* The list label heads the rows before the first section. */}
+      {!options[0]?.section && <div class="control-section-label">{label}</div>}
       {options.length === 0 && <div class="control-empty">No matches</div>}
       {options.map((opt, index) => {
         const isCurrent = opt.value === currentValue;

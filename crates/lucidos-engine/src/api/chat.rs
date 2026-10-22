@@ -1046,24 +1046,31 @@ pub(super) async fn chat_submit(
         }
     }
 
-    // A provider is a choice, honoured or refused. A name that is not a
-    // backend is refused here, before it can be stamped as thread memory. So is
-    // one the named model has no route on.
-    if let Some(provider) = request.provider.as_deref() {
-        let Some(kind) = crate::llm::ProviderKind::from_name(provider) else {
-            return Err(ApiError::bad_request(
-                crate::llm::model_registry::unknown_provider_message(provider),
-            ));
+    refuse_unroutable_provider(
+        &state,
+        request.model.as_deref(),
+        request.provider.as_deref(),
+    )?;
+
+    // A message for a running Lucidos Agent turn is answered by that turn, so
+    // it cannot name another pair (the rung lock, `chat::rung`).
+    let chat_thread = existing_thread_row
+        .as_ref()
+        .filter(|(_, source, ..)| source != crate::engine::thread_lifecycle::CODING_AGENT_SOURCE)
+        .and(target_thread_id);
+    if let (Some(tid), false) = (chat_thread, request.use_coding_agent == Some(true)) {
+        let overrides = crate::core::ResolvedModelSelection {
+            model: request.model.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
+            provider: request.provider.clone(),
         };
-        if let Some(model) = request.model.as_deref() {
-            if crate::llm::model_registry::route_on(state.engine.model_registry(), model, kind)
-                .is_none()
-            {
-                return Err(ApiError::bad_request(format!(
-                    "Model '{model}' has no route on provider '{provider}'. Pick one of the \
-                     model's own providers, or leave provider unset"
-                )));
-            }
+        if state
+            .engine
+            .mid_turn_override_differs(tid, overrides)
+            .await
+            .map_err(|e| ApiError::internal(format!("Could not read thread {tid}: {e}")))?
+        {
+            return Err(turn_running_refusal());
         }
     }
 
@@ -1814,6 +1821,125 @@ pub(super) async fn chat_submit(
         .map_err(|e| ApiError::internal(format!("The message could not be dispatched: {e}")))?
 }
 
+/// A provider is a choice, honoured or refused. A name that is not a backend
+/// is refused before it can be stamped as thread memory. So is one the named
+/// model has no route on.
+fn refuse_unroutable_provider(
+    state: &AppState,
+    model: Option<&str>,
+    provider: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    let Some(kind) = crate::llm::ProviderKind::from_name(provider) else {
+        return Err(ApiError::bad_request(
+            crate::llm::model_registry::unknown_provider_message(provider),
+        ));
+    };
+    match model {
+        Some(model)
+            if crate::llm::model_registry::route_on(state.engine.model_registry(), model, kind)
+                .is_none() =>
+        {
+            Err(ApiError::bad_request(format!(
+                "Model '{model}' has no route on provider '{provider}'. Pick one of the \
+                 model's own providers, or leave provider unset"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Body of `POST /api/v1/chat/settings`. One request carries the whole pair,
+/// so a turn cannot start between its halves.
+#[derive(Deserialize)]
+pub(super) struct ChatSettingsRequest {
+    thread_id: String,
+    model: String,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// Record a rung pick on a Lucidos Agent thread. Its next turn runs on it,
+/// however that turn starts. While a turn runs, the rung is locked and this
+/// refuses with 409 and `reason: "turn-running"`.
+pub(super) async fn chat_settings(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<ChatSettingsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let thread_id = Uuid::parse_str(&request.thread_id)
+        .map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
+    crate::api::thread_reach::refuse_without_authority(
+        &state.engine.event_bus,
+        &headers,
+        Some(thread_id),
+        crate::api::thread_reach::ThreadReachVerb::Control,
+    )
+    .await?;
+    let actor = super::actor::user_actor(&headers, None);
+    let model = request.model.trim();
+    if model.is_empty() {
+        return Err(ApiError::bad_request("model must name a model"));
+    }
+    if let Some(effort) = request.reasoning_effort.as_deref() {
+        if crate::llm::reasoning::tier(effort).is_none() {
+            return Err(ApiError::bad_request(format!(
+                "reasoning_effort '{effort}' is not a level. Use one of: {}",
+                crate::llm::reasoning::EFFORT_LADDER.join(", ")
+            )));
+        }
+    }
+    refuse_unroutable_provider(&state, Some(model), request.provider.as_deref())?;
+    if super::intelligence_ladder::is_agent_caller(&headers, actor.as_ref()) {
+        super::intelligence_ladder::refuse_off_ladder(
+            &state,
+            crate::runtime::intelligence_ladder::LadderSurface::Chat,
+            Some(model),
+            request.reasoning_effort.as_deref(),
+        )
+        .await?;
+    }
+    let source: Option<String> =
+        sqlx::query_scalar("SELECT source FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_optional(state.engine.pool())
+            .await
+            .map_err(|e| ApiError::internal(format!("Could not read thread {thread_id}: {e}")))?;
+    match source.as_deref() {
+        None => return Err(ApiError::not_found(format!("No thread {thread_id}"))),
+        Some(crate::engine::thread_lifecycle::CODING_AGENT_SOURCE) => {
+            return Err(ApiError::bad_request(
+                "A coding-agent thread picks its model through /api/v1/claude-code/control",
+            ))
+        }
+        Some(_) => {}
+    }
+    let pick = crate::core::ResolvedModelSelection {
+        model: Some(model.to_string()),
+        reasoning_effort: request.reasoning_effort,
+        provider: request.provider,
+    };
+    match state
+        .engine
+        .record_chat_settings(thread_id, pick, actor)
+        .await
+        .map_err(|e| ApiError::internal(format!("Could not record the pick: {e}")))?
+    {
+        crate::engine::ChatSettingsOutcome::Recorded => Ok(Json(serde_json::json!({ "ok": true }))),
+        crate::engine::ChatSettingsOutcome::TurnRunning => Err(turn_running_refusal()),
+    }
+}
+
+/// The 409 for a pick or an override that would change a running turn's pair.
+pub(super) fn turn_running_refusal() -> ApiError {
+    use crate::engine::{TURN_RUNNING_MESSAGE, TURN_RUNNING_REASON};
+    ApiError::new(StatusCode::CONFLICT, TURN_RUNNING_MESSAGE).with_reason(TURN_RUNNING_REASON)
+}
+
 #[derive(Deserialize)]
 pub(super) struct CancelChatQuery {
     thread_id: Option<String>,
@@ -1925,6 +2051,7 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/chat/stream", post(chat_submit))
         .route("/chat/cancel", post(cancel_chat))
+        .route("/chat/settings", post(chat_settings))
         .route("/chat/queued-message/remove", post(remove_queued_message))
 }
 

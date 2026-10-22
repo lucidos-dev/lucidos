@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.50.3 — 2026-10-22
+
+### Changed
+- Copy backup keys with the icon inside the key box.
+- Type to filter the model picker. Settings model fields link directly to the model ladder.
+- A Lucidos Agent thread's model and effort pill locks while a turn runs, as a coding-agent thread's does. The pick is recorded on the engine, so every device shows the same one.
+- On a phone, the dashboard sheet runs up to the header and fades in place. Its header button lights like Filter.
+- Every icon toggle shares one look across the app.
+- The composer row folds from the left when space runs out: the Claude menu and attach image go first, and send always stays.
+- The own-key backup step accepts an existing age key, private or public, pasted anywhere in the text. It shows the public key and says where to find it. Only the public key is stored.
+
+### Fixed
+- App clicks stay responsive while another app makes many requests.
+- Backup setup refreshes the key state after setup or verification. A failed refresh keeps a newly generated key visible.
+- After a restart, a handed-off thread whose sub-thread reported back no longer starts on its own with a false error.
+- The context size on the Successor card holds steady while sub-agents and background work run.
+- Swiping between panes works over an app or widget in the canvas, even when the page sets its own touch handling.
+- The composer row keeps one steady height whatever controls stand in it.
+- Following the system theme no longer misses a quick light and dark switch.
 ## v0.50.1 — 2026-10-21
 
 ### Added

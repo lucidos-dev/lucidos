@@ -97,12 +97,12 @@ describe('the composer wires both indicators as foldable members', () => {
     expect(prompt).toMatch(/const waitingAction = waitingIndicatorAction\(\);/);
   });
 
-  /** They head the list, so they are the first things the ⋯ menu takes. An
-   *  action the thumb reaches for outranks a readout. */
-  it('puts them at the head of the foldable list', () => {
-    const todoAt = prompt.indexOf('if (todoAction) foldActions.push(todoAction);');
-    const waitingAt = prompt.indexOf('if (waitingAction) foldActions.push(waitingAction);');
-    const wipAt = prompt.indexOf('if (wipAction) foldActions.push(wipAction);');
+  /** They follow the coding-agent menu and attach image, so the ⋯ menu takes
+   *  them right after those two. */
+  it('puts them in the row in todo, waiting, WIP order', () => {
+    const todoAt = prompt.indexOf('if (todoAction) readouts.push(todoAction);');
+    const waitingAt = prompt.indexOf('if (waitingAction) readouts.push(waitingAction);');
+    const wipAt = prompt.indexOf('if (wipAction) readouts.push(wipAction);');
     expect(todoAt).toBeGreaterThan(-1);
     expect(waitingAt).toBeGreaterThan(todoAt);
     expect(wipAt).toBeGreaterThan(waitingAt);
@@ -121,7 +121,7 @@ describe('the composer wires both indicators as foldable members', () => {
    *  it anchors, so re-pressing it would stack one over the other. */
   it('retires every composer popover on a fold step and on a ⋯ open', () => {
     expect(prompt).toMatch(
-      /function closeFoldedPanels\(\): void \{\s*attachMenuOpen\.value = false;\s*closeTodoPanel\(\);\s*closeWaitingPanel\(\);\s*\}/,
+      /function closeFoldedPanels\(\): void \{\s*attachMenuOpen\.value = false;\s*closeTodoPanel\(\);\s*closeWaitingPanel\(\);\s*closeControlMenus\(\);\s*\}/,
     );
     expect(prompt).toMatch(/useEffect\(closeFoldedPanels, \[collapsedActions\]\);/);
     expect(prompt).toMatch(/onOpen=\{closeFoldedPanels\}/);

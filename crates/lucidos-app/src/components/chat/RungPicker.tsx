@@ -3,9 +3,12 @@ import { useEffect, useRef } from 'preact/hooks';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
 import { useFocusWhenPlaced } from '../../hooks/useFocusWhenPlaced';
 import { whenStepSettled } from '../../hooks/panelStepMorph';
-import { hasCoarsePointer } from '../../utils/viewport';
+import { hasCoarsePointer, isTouchDevice } from '../../utils/viewport';
+import { isTextInput } from '../../utils/dom';
 import { ControlOptionList, selectedOptionIndex, wrapHighlight, type ControlOption } from '../shared/ControlOptionList';
-import { pickerKeyAction } from '../shared/ModelSelectionPicker';
+import { pickerFocusTarget, pickerKeyAction, pickerShowsFilter } from '../shared/ModelSelectionPicker';
+import { isTypeaheadKey } from '../shared/typeahead';
+import { filterRungRows } from './rungRows';
 
 /** A rung's backends, the preferred-provider step a host opens after the rung
  *  is picked. `current` is the backend in force for that model. */
@@ -26,7 +29,9 @@ export function centredScrollTop(panel: HTMLElement, row: HTMLElement): number {
  *  model picker does.
  *
  *  The host owns what a pick means, including the ladder link row. It hands
- *  over the rows from `rungListRows`, and the value that wears the checkmark. */
+ *  over the rows from `rungListRows`, and the value that wears the checkmark.
+ *
+ *  Typing filters the rungs, exactly as the model picker filters models. */
 export function RungPicker({
   label,
   rows,
@@ -52,17 +57,30 @@ export function RungPicker({
   onPick: (value: string, provider?: string) => void;
 }) {
   const listRef = useRef<HTMLDivElement>(null);
+  const filterRef = useRef<HTMLInputElement>(null);
+  const filter = useSignal('');
+  // Latches on the first printable keystroke, as the model picker's does.
+  const searching = useSignal(false);
   // Open on the rung in force.
   const highlight = useSignal(selectedOptionIndex(rows, current));
   /** The rung whose backends are showing, or `null` on the rung list. */
   const openRung = useSignal<string | null>(null);
   const step = openRung.value === null ? null : providerStep?.(openRung.value) ?? null;
-  const shownRows = step ? step.options : rows;
+  const visible = filterRungRows(rows, filter.value);
+  const shownRows = step ? step.options : visible;
+  const showsFilter = pickerShowsFilter({
+    searching: searching.value, touch: isTouchDevice(), keyboard: keyboardHolder !== null,
+  });
 
   useFocusWhenPlaced(() => {
-    if (hasCoarsePointer()) return keyboardHolder;
-    return listRef.current;
-  }, []);
+    const target = pickerFocusTarget({
+      tierStep: step !== null, searching: searching.value, touch: hasCoarsePointer(),
+      keyboard: keyboardHolder !== null,
+    });
+    if (target === 'holder') return keyboardHolder;
+    if (target === 'filter') return filterRef.current;
+    return target === 'list' ? listRef.current : null;
+  }, [openRung.value, searching.value]);
 
   // The list opens with the rung in force mid-panel, so its neighbours show on
   // both sides. After that the keyboard only nudges the row into view. The
@@ -82,7 +100,7 @@ export function RungPicker({
   }, [highlight.value, openRung.value]);
 
   function backToRungs() {
-    highlight.value = Math.max(0, rows.findIndex((r) => r.value === openRung.value));
+    highlight.value = Math.max(0, visible.findIndex((r) => r.value === openRung.value));
     openRung.value = null;
   }
 
@@ -105,7 +123,17 @@ export function RungPicker({
 
   function handleKeyDown(e: KeyboardEvent) {
     const action = pickerKeyAction(e.key);
-    if (action === null) return;
+    if (action === null) {
+      // A printable key reaching the LIST reveals the box and types into it.
+      // Keys typed INTO the box bubble through here too, and it owns those.
+      if (step || isTextInput(e.target) || !isTypeaheadKey(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      searching.value = true;
+      filter.value += e.key;
+      highlight.value = 0;
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     if (action === 'choose') {
@@ -136,12 +164,18 @@ export function RungPicker({
   return (
     <ControlOptionList
       label={label}
-      options={rows}
+      options={visible}
       currentValue={current}
       highlightIndex={highlight.value}
       disabled={disabled}
       listRef={listRef}
       back={back}
+      filter={showsFilter ? {
+        value: filter.value,
+        placeholder: 'Filter models…',
+        inputRef: filterRef,
+        onInput: (value) => { filter.value = value; highlight.value = 0; },
+      } : undefined}
       onKeyDown={handleKeyDown}
       onPick={choose}
       onHighlight={(i) => { highlight.value = i; }}

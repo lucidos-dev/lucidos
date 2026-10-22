@@ -18,6 +18,7 @@ import {
   type HeaderActionSpec,
 } from '../headerActions';
 import { OverflowMenu, type OverflowMenuContext } from '../../shared/OverflowMenu';
+import { ToggleIconButton } from '../../shared/ToggleIconButton';
 
 type Props = Record<string, unknown>;
 const propsOf = (node: ComponentChild): Props => (node as VNode<Props>).props;
@@ -55,21 +56,21 @@ describe('data-role travels with the action', () => {
 });
 
 describe('a toggle says so, on both sides', () => {
-  it('paints the row button with filter-active by default', () => {
-    expect(propsOf(renderHeaderAction(spec({ active: true }))).class)
-      .toContain('filter-active');
+  it('renders a toggle through ToggleIconButton, framed by default', () => {
+    const node = renderHeaderAction(spec({ active: true })) as VNode<Props>;
+    expect(node.type).toBe(ToggleIconButton);
+    expect(node.props.tone).toBeUndefined();
+    expect(node.props.class).toBe('header-icon');
   });
 
-  /** The composer paints each toggle from its own `data-role`, and the header's
-   *  frame would fight those rules. */
-  it('takes the class the spec asks for instead', () => {
-    expect(propsOf(renderHeaderAction(spec({ active: true, activeClass: 'active' }))).class)
-      .toBe('icon-btn header-icon active');
+  /** The composer's toggles each pick the tone their look needs. */
+  it('hands the tone of the spec on', () => {
+    expect(propsOf(renderHeaderAction(spec({ active: true, tone: 'glyph' }))).tone).toBe('glyph');
   });
 
   it('announces the row button as pressed, in either state', () => {
-    expect(propsOf(renderHeaderAction(spec({ active: true })))['aria-pressed']).toBe(true);
-    expect(propsOf(renderHeaderAction(spec({ active: false })))['aria-pressed']).toBe(false);
+    expect(propsOf(renderHeaderAction(spec({ active: true }))).pressed).toBe(true);
+    expect(propsOf(renderHeaderAction(spec({ active: false }))).pressed).toBe(false);
   });
 
   it('leaves a plain action unpressed rather than off', () => {

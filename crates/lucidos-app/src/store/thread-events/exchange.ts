@@ -283,8 +283,8 @@ export function exchangeUserImageHashes(exchange: Exchange): string[] {
  *  shows model/effort while the response is still streaming.
  *
  *  Both starter kinds carry that metadata and both are read here, mirroring
- *  `threadModelSelections`' newest-starter lookup and the backend's
- *  `IN ('MessageReceived', 'TriggerStarted')`: a chat turn starts with
+ *  `threadModelSelections`' newest-pair lookup and the backend's
+ *  starter kinds in `last_thread_chat_settings`: a chat turn starts with
  *  `MessageReceived`, a trigger fire starts with `TriggerStarted` and emits no
  *  `MessageReceived` at all. Reading only the former left a firing trigger's
  *  Executor section with no Model and no Effort row for the whole run, even

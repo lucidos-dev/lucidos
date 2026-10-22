@@ -1272,6 +1272,18 @@ pub enum ThreadEvent {
         claude_config_dir_explicit: Option<bool>,
     },
 
+    /// The user picked a Lucidos Agent thread's model and effort between turns
+    /// (ADR 0544 for the lock). The thread's next turn runs on it, however it
+    /// starts: `last_thread_chat_settings` reads it beside the starters. The
+    /// payload is flat, like a starter's. The actor rides on `EventMeta`.
+    ChatSettingsChanged {
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+
     // A prompt fed into the agentic loop outside the ordinary send path, mid-turn
     // or as a new turn's opening. `mode` names the sender: a human interjection,
     // an agent's follow-up into its child thread, or the engine (a resume note,
@@ -1612,11 +1624,13 @@ pub enum ThreadEvent {
         integrated_branch: Option<super::IntegratedBranch>,
     },
 
-    /// A child thread's clean report, filed on the **parent** without waking
-    /// it: the child's *wake decision* said the parent need not act now.
-    /// Same payload as `ChildThreadCompleted`, emitted by the same fan-in in
-    /// its place. It starts no turn and moves no status. The parent reads it
-    /// on its next turn. Only a `success` or `no_changes` finish is ever filed.
+    /// A child thread's report, filed on the **parent** without waking it.
+    /// A `no-wake` child files every report, whatever its status (ADR 0545).
+    /// Under another mode only a clean one files: an early batch report, or
+    /// one whose *wake decision* said the parent need not act now. Same
+    /// payload as `ChildThreadCompleted`, emitted by the same fan-in in its
+    /// place. It starts no turn and moves no status. The parent reads it on
+    /// its next turn.
     ChildReportFiled {
         child_thread_id: uuid::Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]

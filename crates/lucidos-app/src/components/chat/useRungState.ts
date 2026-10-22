@@ -1,7 +1,7 @@
 import { useSignal, useSignalEffect, untracked } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import {
-  showToast, settingsScrollTarget, codingAgentSessionVersion, scopeToRepoId, engineRestarting, threadMap,
+  showToast, codingAgentSessionVersion, scopeToRepoId, engineRestarting, threadMap,
   effectiveThreadStatus, successorCardThreadId, successorCardPick,
 } from '../../store/store';
 import { resolveScope, getComposeSelectionOverride } from '../../store/composeSelections';
@@ -17,8 +17,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../../store/types';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import { decodePair, type ModelChoice, type TierChoice } from '../../store/modelSelection';
-import { openSettingsSubview } from '../../store/actions/menu';
-import { ladderAnchor } from '../settings/intelligenceLadder';
+import { openIntelligenceLadder } from '../../store/actions/menu';
 import { displayModelName } from '../../store/thread-events/exchange';
 import { LADDER_LINK_VALUE, rungListRows } from './rungRows';
 import { rungFaces, rungLockedReason, shownRung, stepTargets, type ShownRung } from './rungControlParts';
@@ -358,8 +357,7 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
   /** Commit a rung, or follow the ladder link out to the editor. */
   function pickRung(value: string) {
     if (value === LADDER_LINK_VALUE) {
-      openSettingsSubview('intelligence');
-      settingsScrollTarget.value = ladderAnchor(agent);
+      openIntelligenceLadder(agent);
       return;
     }
     const label = rungList.rows.find(r => r.value === value)?.label ?? value;

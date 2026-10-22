@@ -23,8 +23,8 @@ rule, whether you hear a second argument: all yours to decide.
 |---|---|---|
 | Parent to its own direct child | `follow_up_child_thread` | An instruction. The only instruction-bearing edge. |
 | The home thread to any thread | `follow_up_child_thread` | An instruction, from the user's own thread. No report comes back to Home unless it spawned the thread. |
-| Child to parent | `ChildThreadCompleted`, at a terminal turn that failed, or a clean one its *wake mode* says wakes the parent | A report. Re-opens the parent. |
-| Child to parent | `ChildReportFiled`, at a clean terminal turn its wake mode files (`no-wake`, or an early batch report) | A report. Re-opens nothing: the parent reads it next turn. |
+| Child to parent | `ChildThreadCompleted`, at a terminal turn its *wake mode* says wakes the parent: a failure under any mode but `no-wake`, a clean finish under `wake`, or a batch's last clean finish | A report. Re-opens the parent. |
+| Child to parent | `ChildReportFiled`, at a terminal turn its wake mode files (every report under `no-wake`, or a clean early batch report) | A report. Re-opens nothing: the parent reads it next turn. |
 | Child to parent | `ChildThreadStopped`, when a user Stop pauses the child | A note. Re-opens nothing. |
 | Parent and child | `ChildThreadDetached`, when the child moves to top level | The edge is cut. Re-opens nothing. |
 | Any thread to any thread's events | `await_event`, the `events` query | Facts. Never an instruction. |
@@ -172,8 +172,8 @@ none of it:
 
 | Child cost | When |
 |---|---|
-| A parent re-entry, $0.504 above | Every clean finish under `wake`, the default outside Home. Every failure under any mode. |
-| A filed report in your context | Every clean finish under `no-wake`. It stays in your transcript for good, and Home's never ends. |
+| A parent re-entry, $0.504 above | Every clean finish under `wake`, the default outside Home. Every failure under any mode but `no-wake`. |
+| A filed report in your context | Every report under `no-wake`, failures included. It stays in your transcript for good, and Home's never ends. |
 | One of your child slots | While it runs. |
 
 In the Lucidos development workspace, children re-opened a parent 927 times in
@@ -210,7 +210,7 @@ not argue with it. Tell your parent what you saw and carry on.
    file is your mistake: no lease or lock stops them both writing.
 2. **Decide what you need to see.** A child's domain events re-open you only if
    you subscribed. Its terminal always reports. It re-opens you through
-   `ChildThreadCompleted` when it failed, or when its wake mode wakes you (see
+   `ChildThreadCompleted` when its wake mode wakes you (see
    § How a report reaches the parent). Four terminals send no card at all: a mid-turn steer, a transient upstream failure the
    engine is already resuming past, a turn ending on an event wait, and a user
    Stop. After the first three the child is still working, and reports at the
@@ -247,7 +247,7 @@ not argue with it. Tell your parent what you saw and carry on.
 
 ## How a report reaches the parent
 
-The spawn declares the child's *wake mode*: what its clean finish does to you.
+The spawn declares the child's *wake mode*: what its report does to you.
 Pass `wake_mode` to `run_thread` or `run_coding_agent`, or `--wake-mode` to
 `lucidos spawn-thread --relation child`.
 
@@ -255,13 +255,15 @@ Pass `wake_mode` to `run_thread` or `run_coding_agent`, or `--wake-mode` to
 |---|---|---|
 | `wake` | You need the result to continue: a pipeline step, a check you act on. | Wakes you with a `ChildThreadCompleted`. |
 | `wake-when-all-done` | You combine several results, such as a fan-out you merge. | Is filed while another child of the batch still works. The last one wakes you. |
-| `no-wake` | The user reads the result, and you may still want it next turn. If you will not, a top-thread is cheaper (see § Child or top-thread). | Is filed as a `ChildReportFiled`. Nothing re-opens. |
+| `no-wake` | The user reads the result, and you may still want it next turn. If you will not, a top-thread is cheaper (see § Child or top-thread). | Is filed as a `ChildReportFiled`. Nothing re-opens, not even for a failure. |
 
 - **Defaults.** A child of the home thread defaults to `no-wake`, since its
   work is for the user and *Review* lists it. A child of any other thread
   defaults to `wake`. The spawn result names the mode that applied.
-- **A failure always wakes**, under every mode: a `failure`, a `canceled` or
-  `interrupted` card, an archive, a discard, and a turn the engine cut short.
+- **A failure wakes you under `wake` and `wake-when-all-done`**: a `failure`, a
+  `canceled` or `interrupted` card, an archive, a discard, and a turn the
+  engine cut short. Under `no-wake` all of these are filed: the child shows
+  its own failure in Blocked, and the user continues it there (ADR 0545).
 - **A filed report is not lost.** A chat parent reads it as a
   `[CHILD THREAD REPORT FILED]` block on its next turn. A coding-agent parent
   reads it at the front of its next prompt.

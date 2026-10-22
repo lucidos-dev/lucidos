@@ -331,6 +331,9 @@ html {
     --icon-size-sm: 0.875rem;
     --icon-size-md: 1rem;
     --icon-size-lg: 1.25rem;
+    /* The icon buttons' shared tap target (host-components.css). On :root so
+       the composer row can hold itself one target tall. */
+    --icon-tap-target: 2.25rem;
 
     /* Type scale — the only sanctioned font sizes. Snap to the nearest step;
        don't reintroduce eyeballed in-between values (0.8/0.85/0.72rem …). The

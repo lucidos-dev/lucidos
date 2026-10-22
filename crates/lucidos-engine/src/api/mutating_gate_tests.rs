@@ -46,6 +46,7 @@ const GATED_ROUTES: &[&str] = &[
     "/changes/lane/cancel",
     "/chat/cancel",
     "/chat/queued-message/remove",
+    "/chat/settings",
     "/claude-code/apply-now",
     "/claude-code/control",
     "/claude-code/discard",

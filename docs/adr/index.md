@@ -550,3 +550,6 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0541: A refused local e2e run gives up at once with exit 75; /harden reads it as SKIP and the main check runs the specs; nothing waits for the e2e lock; supersedes 0057's subscribe-and-wait](0541-a-busy-e2e-lock-is-given-up.md)
 - [0542: A coding-agent thread's model and effort lock while a turn runs; a pick between turns is recorded at once](0542-coding-agent-rung-locks-during-a-turn.md)
 - [0543: The update address is one gateway setting; a local rc channel tests an update before publishing](0543-update-address-is-a-gateway-setting.md)
+- [0544: The Lucidos Agent's rung locks while a turn runs; a pick between turns is a ChatSettingsChanged on the engine](0544-lock-the-lucidos-agent-rung-during-a-turn.md)
+- [0545: A no-wake child files every report, failures and restart cuts included; amends 0451 and 0503.](0545-no-wake-child-files-every-report.md)
+- [0546: App bridge fetches share three slots, fairly across frames, and a /ui call skips the queue](0546-app-bridge-fetches-share-three-fair-slots.md)

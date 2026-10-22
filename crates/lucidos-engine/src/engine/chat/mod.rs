@@ -14,6 +14,7 @@ pub(crate) mod queued_recovery;
 pub(crate) mod recovery;
 mod recursion_guard;
 pub(crate) mod rerun;
+pub(crate) mod rung;
 mod spawn;
 mod title;
 

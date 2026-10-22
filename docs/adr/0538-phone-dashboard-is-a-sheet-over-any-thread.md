@@ -94,3 +94,16 @@ title and the widget shelf.
   stay clear and tappable.
 - Points 1 to 3, 5 and 6 are unchanged. Plan:
   `docs/plans/2026-10-21-dashboard-toggle-in-thread-header.md`.
+
+## Amendment, 2026-10-21: the sheet fades in place, flush under the header
+
+The maintainer asked for a seamless sheet. It now meets the app header's bottom
+edge and fades in and out where it stands.
+
+- **Point 4 changes:** no gap, no dim, no rounded corners and no shadow. The
+  sheet fills the pane below the header, so a tap on the button is the way out.
+- **Point 5 changes:** the motion is an opacity fade, not a rise from the bottom
+  edge.
+- **The button's on-state** is the header bar's `framed` toggle look, the one
+  Filter wears (`docs/plans/2026-10-21-one-toggle-icon-button.md`).
+- Points 1 to 3 and 6 are unchanged.

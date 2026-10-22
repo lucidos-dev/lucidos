@@ -97,6 +97,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/changes/for-repo/:repo_id", Host, &[]),
     ("/chat/cancel", Host, &[]),
     ("/chat/queued-message/remove", Host, &[]),
+    ("/chat/settings", Host, &[]),
     ("/chat/stream", Host, &[]),
     ("/claude-code/apply-now", Host, &[]),
     ("/claude-code/commands", Host, &[]),
