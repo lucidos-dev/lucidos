@@ -1,0 +1,383 @@
+/** Resize a textarea to fit its content, returning true if the height changed.
+ *
+ *  Every path stands down while the box has no width, and re-runs when the
+ *  width changes: see {@link boxWidth} and {@link useWidthRemeasure}.
+ *
+ *  Four paths to avoid collapsing the textarea to height:0 on every keystroke:
+ *  - Paste: text jumped by >1 char → collapse to 0 for fresh measurement
+ *  - Fast: content fits and text didn't shrink → no-op (zero reflows)
+ *  - Growth: content overflows → grow directly (one reflow)
+ *  - Shrink: text deleted → collapse to 0 to measure true content height */
+
+import { useEffect, useRef } from 'preact/hooks';
+import type { RefObject } from 'preact';
+import { isReducedMotion, scaledDurationMs } from '../../utils/motion';
+
+/** The textarea's height ease on a compose-draft switch, at 1x. It rides the
+ *  Animation speed slider, and so does the safety net that outlives it. */
+const HEIGHT_EASE_MS = 300;
+const HEIGHT_EASE_SLACK_MS = 100;
+
+const cache = new WeakMap<HTMLTextAreaElement, { height: number; len: number }>();
+
+/** The box's own laid-out width, or 0 when it has none.
+ *
+ *  Zero is a width the composer really takes: a collapsed pane keeps it in
+ *  layout at `visibility: hidden` rather than unmounting it. Measuring there is
+ *  not merely inaccurate. A textarea wears the UA's `overflow-wrap: break-word`,
+ *  so with no room every CHARACTER takes a line of its own. Even the short
+ *  placeholder then measures past the `max-height: 40vh` cap. What gets written
+ *  is a composer tall enough to eat the pane it reopens into. */
+function boxWidth(el: HTMLTextAreaElement): number {
+  return el.getBoundingClientRect?.().width ?? 0;
+}
+
+/** The height the box needs to show its PLACEHOLDER whole, or 0 when it has
+ *  none / is showing a value instead.
+ *
+ *  A textarea sizes to its VALUE, so a placeholder that wraps is simply painted
+ *  past the bottom edge and clipped (the composer is `overflow-y: hidden`).
+ *  Short placeholders always fit; the answering one is the longest of the three
+ *  and wraps in a narrowed thread pane (`minThreadPanePx()` is 338px at a 16px
+ *  root, narrower than a phone) and at large UI scales. That is why it is measured rather than
+ *  reserved as a CSS floor: the number of lines is a function of the box width,
+ *  the user's font family and a UI scale that runs 75%-200%, and no fixed rem
+ *  value covers that grid.
+ *
+ *  Measured on a clone rather than by borrowing the real element's `value`,
+ *  which would fire the editing pipeline and, on iOS, leave the keyboard's
+ *  shift state stale (see `.claude/rules/frontend-css.md` on programmatic clears). */
+function placeholderHeight(el: HTMLTextAreaElement): number {
+  const parent = el.parentElement;
+  if (!el.placeholder || el.value.length > 0 || !parent || !el.cloneNode) return 0;
+  const probe = el.cloneNode() as HTMLTextAreaElement;
+  probe.value = el.placeholder;
+  // Out of flow at the real width, floors and caps off, so scrollHeight is the
+  // wrapped text's own height. `data-role` goes: for the one synchronous moment
+  // the probe is attached, it must not answer a prompt-input query.
+  probe.removeAttribute?.('data-role');
+  Object.assign(probe.style, {
+    position: 'absolute', visibility: 'hidden', boxSizing: 'border-box',
+    width: `${boxWidth(el)}px`,
+    height: '0', minHeight: '0', maxHeight: 'none',
+  });
+  parent.appendChild(probe);
+  const needed = probe.scrollHeight;
+  probe.remove();
+  return needed;
+}
+
+/** Apply final height, manage overflow-y, cache, return whether height changed. */
+function applyHeight(el: HTMLTextAreaElement, measured: number, prevHeight: number, curLen: number): boolean {
+  const contentHeight = Math.max(measured, placeholderHeight(el));
+  el.style.height = contentHeight + 'px';
+  el.style.overflowY = 'hidden';
+  const rendered = el.offsetHeight;
+  cache.set(el, { height: rendered, len: curLen });
+  if (rendered < contentHeight) {
+    el.style.overflowY = 'auto';
+  } else {
+    el.scrollTop = 0;
+  }
+  return rendered !== prevHeight;
+}
+
+export function resizeTextarea(el: HTMLTextAreaElement): boolean {
+  // Nothing measured at zero width is worth keeping (see `boxWidth`). Leave the
+  // height AND the cache alone: `useWidthRemeasure` measures again the moment
+  // the box has a width to measure at.
+  if (boxWidth(el) === 0) return false;
+  const cached = cache.get(el);
+  const prevHeight = cached?.height ?? 0;
+  const prevLen = cached?.len ?? -1;
+  const curLen = el.value.length;
+
+  // Paste / autocomplete: text jumped by more than one character.
+  // Collapse to 0 so scrollHeight is measured fresh, not against stale height.
+  if (prevLen >= 0 && curLen - prevLen > 1) {
+    abandonHeightAnimation(el);
+    el.style.height = '0';
+    return applyHeight(el, el.scrollHeight, prevHeight, curLen);
+  }
+
+  const scrollH = el.scrollHeight;
+  const clientH = el.clientHeight;
+
+  // Fast path: content fits and text didn't shrink — height is already correct.
+  // Skip on first call (prevHeight === 0) so we always set an initial height.
+  if (prevHeight > 0 && scrollH <= clientH && curLen >= prevLen) {
+    if (cached) cached.len = curLen;
+    return false;
+  }
+
+  // Every path below writes a height for the new value, which makes an
+  // in-flight ease's target wrong. Its last frame would snap the box back.
+  abandonHeightAnimation(el);
+
+  // Growth: content overflows — grow without collapsing.
+  if (scrollH > clientH) {
+    return applyHeight(el, scrollH, prevHeight, curLen);
+  }
+
+  // Shrink: text deleted, content fits — collapse to measure true height.
+  el.style.height = '0';
+  return applyHeight(el, el.scrollHeight, prevHeight, curLen);
+}
+
+/** Force a fresh measurement, bypassing the fast path.
+ *
+ *  {@link resizeTextarea} decides what to do from the VALUE (did it grow, shrink,
+ *  jump), so it no-ops when the value is unchanged, even if what the box has to
+ *  fit changed underneath it. The PLACEHOLDER is exactly that case: swapping the
+ *  short compose one for the answering sentence (and back, when the question is
+ *  answered) never touches the value, so without this the box keeps the height
+ *  measured for the previous placeholder, clipping the new one on the way in and
+ *  sitting two lines tall on the way out.
+ *
+ *  Callers must stand down while {@link isTextareaHeightAnimating} is true. */
+export function remeasureTextarea(el: HTMLTextAreaElement): boolean {
+  if (boxWidth(el) === 0) return false;
+  const prevHeight = cache.get(el)?.height ?? 0;
+  el.style.height = '0';
+  return applyHeight(el, el.scrollHeight, prevHeight, el.value.length);
+}
+
+/** Cancels the in-flight height animation on a given textarea, if any. Keyed by
+ *  element so a rapid second switch can tear the first animation's listener +
+ *  timer down before starting its own — otherwise the stale `finish` would fire
+ *  later and snap the box back to the previous switch's target height. */
+const pendingHeightAnim = new WeakMap<HTMLTextAreaElement, () => void>();
+
+/** True while {@link animateTextareaHeightFrom} owns this textarea's height.
+ *
+ *  Anything that would write a freshly measured height must stand down until it
+ *  finishes. The animation works by inverting (park the box at the height it
+ *  came FROM, then transition to the target it already rests at), so a write
+ *  landing in that window puts the box AT the target before the transition
+ *  starts and the ease plays out over no distance at all: transition engaged,
+ *  nothing moved. Standing down loses nothing, because the target the animation
+ *  is easing toward was itself measured after the change.
+ *
+ *  That last sentence is the whole condition, and a WIDTH change fails it: the
+ *  target was measured at the old width. See {@link abandonHeightAnimation}. */
+export function isTextareaHeightAnimating(el: HTMLTextAreaElement): boolean {
+  return pendingHeightAnim.has(el);
+}
+
+/** Drop an in-flight height ease, leaving the box wherever it currently rests.
+ *
+ *  For the one change {@link isTextareaHeightAnimating} must not be met with a
+ *  stand-down. The ease is heading for a height the new width has invalidated,
+ *  so waiting it out lands on a wrong number. Skipping the measurement strands
+ *  it there instead: the observer fires on a width change, and the width has
+ *  already finished changing. Abandon the ease and measure. */
+function abandonHeightAnimation(el: HTMLTextAreaElement): void {
+  pendingHeightAnim.get(el)?.();
+}
+
+/** Cancel a height transition the ease already started.
+ *
+ *  Clearing `transition` is not enough in WebKit. A transition that started in
+ *  the same frame keeps running, and the next measurement reads its height
+ *  instead of the content's. The box then keeps the height of the text just
+ *  sent. A typed answer followed at once by a new question does exactly this. */
+function stopHeightTransition(el: HTMLTextAreaElement): void {
+  for (const animation of el.getAnimations?.() ?? []) {
+    if ((animation as CSSTransition).transitionProperty === 'height') animation.cancel();
+  }
+}
+
+/** Smoothly animate a textarea's height from a previous inline height to the one
+ *  it currently rests at. The caller must have ALREADY applied the final height
+ *  (e.g. via {@link resizeTextarea}) before calling — we read `el.style.height`
+ *  as the target, invert to `fromHeight`, then transition back. Used for the
+ *  draft→draft compose switch so the box eases to the new draft's size instead of
+ *  snapping. Both endpoints are CSS `height` strings (not offsetHeight), so the
+ *  interpolation is box-sizing-agnostic and lands exactly where resizeTextarea
+ *  left it. No-op if the height didn't change. */
+export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: string): void {
+  // A switch mid-animation supersedes the previous one — tear it down first so
+  // its listener/timer can't later clobber this run's target height.
+  pendingHeightAnim.get(el)?.();
+
+  const target = el.style.height;
+  if (!target || !fromHeight || target === fromHeight) return;
+
+  el.style.transition = 'none';
+  el.style.height = fromHeight;
+  void el.offsetHeight; // commit the start height before transitioning
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let raf1: number | undefined;
+  let raf2: number | undefined;
+  let started = false;
+  /** The frames below are the only thing that starts the ease, and a hidden tab
+   *  SUSPENDS them. The box would then sit at `fromHeight` with the ease
+   *  pending for as long as the tab is away. That is the safety net's own case
+   *  going unanswered, so land the box and let go instead.
+   *
+   *  Visibility is the discriminator, and a second timer cannot be. A timer
+   *  cannot tell a suspended frame from a late one, and cancelling a late one
+   *  is the bug the net was moved to fix. */
+  const onHidden = () => {
+    if (!started && document.visibilityState === 'hidden') finish();
+  };
+  const cancel = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    // Cancel the pending frames too — a same-frame re-switch calls cancel()
+    // before raf1 fires, so without this the stale inner rAF would still add a
+    // finish listener that never gets removed.
+    if (raf1 !== undefined) cancelAnimationFrame(raf1);
+    if (raf2 !== undefined) cancelAnimationFrame(raf2);
+    el.removeEventListener('transitionend', finish);
+    document.removeEventListener('visibilitychange', onHidden);
+    el.style.transition = '';
+    stopHeightTransition(el);
+    pendingHeightAnim.delete(el);
+  };
+  const finish = (e?: TransitionEvent) => {
+    if (e && (e.target !== el || e.propertyName !== 'height')) return;
+    cancel();
+    el.style.height = target;
+  };
+  pendingHeightAnim.set(el, cancel);
+  document.addEventListener('visibilitychange', onHidden);
+
+  raf1 = requestAnimationFrame(() => {
+    raf2 = requestAnimationFrame(() => {
+      started = true;
+      el.addEventListener('transitionend', finish);
+      el.style.transition = `height ${scaledDurationMs(HEIGHT_EASE_MS)}ms ease`;
+      el.style.height = target;
+      // Safety net if transitionend never fires (e.g. tab hidden mid-switch).
+      //
+      // Armed HERE, with the transition, and never at the call above. The ease
+      // does not begin until this frame, so a fuse lit two frames earlier is
+      // racing its own START rather than outliving it. A main thread busy past
+      // the fuse then runs the expired timer BEFORE these pending frames, and
+      // `finish` cancels them: the box snaps to the target having never
+      // animated. That is a slow device, and under a loaded e2e suite it is the
+      // `prompt-flip-height` flake.
+      //
+      // The window before this frame is covered by `onHidden`, which is the
+      // only case that can keep the frame from arriving at all.
+      timer = setTimeout(finish, scaledDurationMs(HEIGHT_EASE_MS) + HEIGHT_EASE_SLACK_MS);
+    });
+  });
+}
+
+/** Ease a box the composer just emptied down to the height it now needs.
+ *
+ *  A send, a side question and a typed answer each empty the box. A snap drops
+ *  everything docked above it in one frame. On a phone the transcript's bottom
+ *  padding follows the prompt, so the whole thread jumps with it. */
+export function easeEmptiedTextarea(el: HTMLTextAreaElement): void {
+  const fromHeight = el.style.height;
+  remeasureTextarea(el);
+  if (!isReducedMotion()) animateTextareaHeightFrom(el, fromHeight);
+}
+
+/** Re-measure for a new placeholder, re-aiming an ease already under way.
+ *
+ *  A typed answer empties the box, and its placeholder swaps on the render
+ *  after. The ease's target was measured with the old placeholder. Standing
+ *  down would strand the box at that height. Writing the new one straight away
+ *  would end the ease in a snap. So it eases on from where it is now. */
+export function remeasureTextareaForPlaceholder(el: HTMLTextAreaElement): void {
+  if (!isTextareaHeightAnimating(el)) {
+    remeasureTextarea(el);
+    return;
+  }
+  // The resolved height follows box-sizing, as the inline height does.
+  const current = getComputedStyle(el).height;
+  abandonHeightAnimation(el);
+  remeasureTextarea(el);
+  animateTextareaHeightFrom(el, current);
+}
+
+/** Watch one box and re-measure it on a WIDTH change. Returns the teardown.
+ *
+ *  Width ONLY. Our own height write re-enters the observer, so acting on a
+ *  height change would loop. */
+function observeWidth(el: HTMLTextAreaElement): { el: HTMLTextAreaElement; stop: () => void } {
+  let lastWidth = boxWidth(el);
+  const observer = new ResizeObserver(() => {
+    const width = boxWidth(el);
+    if (width === lastWidth) return;
+    lastWidth = width;
+    // The one writer that does NOT stand down for an in-flight ease, because
+    // this change is what makes the ease's target wrong. See
+    // `abandonHeightAnimation`.
+    abandonHeightAnimation(el);
+    remeasureTextarea(el);
+  });
+  observer.observe(el);
+  return { el, stop: () => observer.disconnect() };
+}
+
+/** Re-measure whenever the box's own WIDTH changes.
+ *
+ *  A measured height is only ever right for the width it was measured at: the
+ *  same text and the same placeholder take more lines in a narrow box than a
+ *  wide one. {@link resizeTextarea} decides everything from the VALUE, so a
+ *  width change is invisible to it. Without this the box keeps a height that
+ *  belongs to a pane width it no longer has: clipped after a narrowing, and
+ *  left too tall after a widening. Everything that moves the composer's edges
+ *  feeds in here, with no per-cause listener to forget: a divider drag, the
+ *  window, the thread drawer opening, a pane collapsing to zero and coming back.
+ *
+ *  The first effect carries NO dependency array, because the box can arrive,
+ *  leave and come back on any render: the trigger form unmounts its Intent
+ *  field whenever the run type changes. A mount-only effect would read `null`
+ *  once and never look again, leaving that field unobserved for good. Tracking
+ *  the element is what re-attaches, and it is also what keeps a re-render from
+ *  churning a live observer, since an unchanged element returns early. */
+export function useWidthRemeasure(ref: RefObject<HTMLTextAreaElement | null>) {
+  const attached = useRef<{ el: HTMLTextAreaElement; stop: () => void } | null>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (el === (attached.current?.el ?? null)) return;
+    attached.current?.stop();
+    attached.current = el ? observeWidth(el) : null;
+  });
+
+  // Unmount only. The effect above owns every element swap before that.
+  useEffect(() => () => {
+    attached.current?.stop();
+    attached.current = null;
+  }, []);
+}
+
+/** Re-measure when root font metrics change (UI scale, font family, font load).
+ *  resizeTextarea() sets height in px — goes stale when root font-size changes
+ *  (e.g. after loadPreferences applies the user's UI scale on page reload). */
+export function useFontMetricsResize(onResize: () => void) {
+  useEffect(() => {
+    const root = document.documentElement;
+    let lastScale = root.style.getPropertyValue('--user-ui-scale');
+    let lastFont = root.style.getPropertyValue('--font-ui');
+    let rafId: number | null = null;
+
+    const observer = new MutationObserver(() => {
+      const scale = root.style.getPropertyValue('--user-ui-scale');
+      const font = root.style.getPropertyValue('--font-ui');
+      if (scale !== lastScale || font !== lastFont) {
+        lastScale = scale;
+        lastFont = font;
+        if (rafId === null) {
+          rafId = requestAnimationFrame(() => { rafId = null; onResize(); });
+        }
+      }
+    });
+    observer.observe(root, { attributes: true, attributeFilter: ['style'] });
+
+    document.fonts.addEventListener('loadingdone', onResize);
+
+    return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      observer.disconnect();
+      document.fonts.removeEventListener('loadingdone', onResize);
+    };
+  }, []);
+}

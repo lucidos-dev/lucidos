@@ -1,0 +1,17 @@
+{
+  "run_id": "20261023-172321-fa9b",
+  "coverage": false,
+  "suites": [
+    "browser"
+  ],
+  "api_args": [],
+  "browser": {
+    "projects": [
+      "mobile-webkit"
+    ],
+    "specs": [
+      "mobile-thread-content-all.spec.ts"
+    ],
+    "pw_args": []
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../src/greet.ts", "../src/unused.ts", "../src/main.ts"],
+  "sourcesContent": ["export function greet(name: string): string {\n  return `hello ${name}`;\n}\n", "export function neverCalled(): number {\n  return 42;\n}\n", "import { greet } from './greet';\nimport { neverCalled } from './unused';\n\nfunction start(): void {\n  document.title = greet('coverage');\n}\n\n(window as unknown as { later: () => number }).later = neverCalled;\nstart();\n"],
+  "mappings": ";;;AAAO,WAAS,MAAM,MAAsB;AAC1C,WAAO,SAAS,IAAI;AAAA,EACtB;;;ACFO,WAAS,cAAsB;AACpC,WAAO;AAAA,EACT;;;ACCA,WAAS,QAAc;AACrB,aAAS,QAAQ,MAAM,UAAU;AAAA,EACnC;AAEA,EAAC,OAA8C,QAAQ;AACvD,QAAM;",
+  "names": []
+}

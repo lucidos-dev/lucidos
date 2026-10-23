@@ -1,0 +1,28 @@
+{
+  "name": "Ember",
+  "description": "Warm charcoal and a glowing orange accent, with a deep gradient header and a soft wash on the focused pane.",
+  "author": "Look Studio",
+  "credit": "A Look Studio original, after embers in a dark hearth.",
+  "family": "warm",
+  "tokens": {
+    "--radius-control": "0.625rem",
+    "--radius-surface": "0.875rem"
+  },
+  "dark": {
+    "--bg-primary": "#1c1714",
+    "--text-primary": "#ece3da",
+    "--accent": "#e8834a",
+    "--accent-yellow": "#e3b85c",
+    "--header-bar-top": "#3a2418",
+    "--header-bar-bottom": "#241a15",
+    "--header-fg": "#f6e9dd"
+  },
+  "light": {
+    "--bg-primary": "#fbf6f1",
+    "--text-primary": "#2b211b",
+    "--accent": "#c2571f",
+    "--header-bar-top": "#c2571f",
+    "--header-bar-bottom": "#a34616",
+    "--header-fg": "#fff7f0"
+  }
+}
