@@ -1,0 +1,30 @@
+[package]
+name = "lucidos-engine-socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The engine socket: the Unix socket every engine binds, and the only way the
+# gateway reaches one. The engine binds it and the gateway connects to it, and
+# neither may depend on the other (ADR 0014 §1). So the path and the peer check
+# live here, once. Two copies of a socket path drift into a workspace the
+# gateway can no longer reach, and two copies of the check drift into one that
+# trusts a stranger.
+#
+# The packaged Postgres cluster's socket directory sits in the same owner-only
+# run directory, so it comes from here too rather than from a second copy.
+
+[dependencies]
+lucidos-home = { path = "../lucidos-home" }
+lucidos-local-token = { path = "../lucidos-local-token" }
+libc = "0.2"
+sha2 = "0.10"
+tokio = { version = "1", features = ["net"] }
+
+[features]
+# Lets another crate's tests stage a listener held by a stranger.
+test-support = []
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "rt", "time"] }

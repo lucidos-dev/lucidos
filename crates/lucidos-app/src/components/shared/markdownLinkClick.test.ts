@@ -1,0 +1,210 @@
+// @vitest-environment jsdom
+// The sanitizer and the click both need a real DOM.
+
+// Clicks real rendered agent markdown through the shared router. The reported
+// bug: a notification body rendered `[changelog](artifacts/…)` as an
+// `a.artifact-link`, but its own click handler only knew app and trigger
+// links, so the tap did nothing. Every surface now shares this router.
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+
+const mocks = vi.hoisted(() => ({
+  openFilePreviewModal: vi.fn(),
+  openLocalFileOnConfirm: vi.fn(async () => {}),
+  openApp: vi.fn(),
+  openAppById: vi.fn(async () => {}),
+  navigateToTrigger: vi.fn(async () => {}),
+  handleNavigationRequest: vi.fn(),
+  openRepoFileLink: vi.fn(async () => {}),
+  showToast: vi.fn(),
+}));
+
+vi.mock('../../store/actions/artifacts', () => ({
+  openLocalFileOnConfirm: mocks.openLocalFileOnConfirm,
+}));
+vi.mock('../../store/actions/filePreviewModal', () => ({
+  openFilePreviewModal: mocks.openFilePreviewModal,
+}));
+vi.mock('../../store/actions/apps', () => ({
+  openApp: mocks.openApp,
+  openAppById: mocks.openAppById,
+}));
+vi.mock('../../store/actions/triggers', () => ({ navigateToTrigger: mocks.navigateToTrigger }));
+vi.mock('../../store/actions/navigation-request', () => ({
+  handleNavigationRequest: mocks.handleNavigationRequest,
+}));
+vi.mock('../../store/actions/repoFileLink', () => ({ openRepoFileLink: mocks.openRepoFileLink }));
+vi.mock('../../store/store', async () => {
+  const actual = await vi.importActual<typeof import('../../store/store')>('../../store/store');
+  return { ...actual, showToast: mocks.showToast };
+});
+
+import { handleMarkdownLinkClick } from './markdownLinkClick';
+import { linkifyPaths } from '../../utils/linkifyPaths';
+import { renderMarkdown } from '../../utils/renderMarkdown';
+import type { App } from '../../store/types';
+
+const APPS: App[] = [{ id: 'pr-understanding', name: 'PR Understanding', description: '', reveal: 'on-load', kind: 'app', reusable: false }];
+
+/** Render markdown the way the notification detail does (no known artifact
+ *  paths), click its first anchor, and report whether the default was stopped. */
+function clickFirstLink(markdown: string, source?: string): boolean {
+  const host = document.createElement('div');
+  host.innerHTML = linkifyPaths(renderMarkdown(markdown), [], APPS);
+  let prevented = false;
+  host.addEventListener('click', (e) => {
+    handleMarkdownLinkClick(e, APPS, source);
+    prevented = e.defaultPrevented;
+    // jsdom cannot navigate; stop a link the router left to the browser.
+    e.preventDefault();
+  });
+  document.body.appendChild(host);
+  const anchor = host.querySelector('a');
+  expect(anchor, `no anchor rendered for ${markdown}`).not.toBeNull();
+  anchor!.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  host.remove();
+  return prevented;
+}
+
+describe('handleMarkdownLinkClick', () => {
+  beforeEach(() => {
+    for (const m of Object.values(mocks)) m.mockClear();
+  });
+
+  it('opens an artifact link in the file preview modal (the reported bug)', () => {
+    const prevented = clickFirstLink(
+      'Changelog: [artifacts/releases/changelog-v0.40.1.md](artifacts/releases/changelog-v0.40.1.md)',
+      'a notification',
+    );
+    expect(prevented).toBe(true);
+    expect(mocks.openFilePreviewModal).toHaveBeenCalledWith({
+      file_path: 'artifacts/releases/changelog-v0.40.1.md', line: undefined, line_end: undefined,
+    });
+  });
+
+  // A data link's `#L` used to be cut off at render and again at click.
+  it.each([
+    ['an href line', '[the notes](artifacts/notes.md#L10-L20)', 10, 20],
+    ['a single href line', '[the notes](artifacts/notes.md#L7)', 7, undefined],
+    ['a label line', '[notes.md:10-20](artifacts/notes.md)', 10, 20],
+    ['an href line over a label line', '[notes.md:1-2](artifacts/notes.md#L10)', 10, undefined],
+  ])('keeps the cited lines of a data link from %s', (_label, markdown, line, lineEnd) => {
+    clickFirstLink(markdown);
+    expect(mocks.openFilePreviewModal).toHaveBeenCalledWith({
+      file_path: 'artifacts/notes.md', line, line_end: lineEnd,
+    });
+  });
+
+  it('hands a file:// link to the OS opener, behind the confirm', () => {
+    const prevented = clickFirstLink('[DMG](file:///Users/me/Lucidos.dmg)', 'a notification');
+    expect(prevented).toBe(true);
+    expect(mocks.openLocalFileOnConfirm).toHaveBeenCalledWith('file:///Users/me/Lucidos.dmg', 'a notification');
+  });
+
+  it('hands a bare file:// URL in prose to the OS opener, even under an email-shaped home folder', () => {
+    const prevented = clickFirstLink('DMG: file:///Users/me.x@example.com/p/Lucidos.dmg');
+    expect(prevented).toBe(true);
+    expect(mocks.openLocalFileOnConfirm).toHaveBeenCalledWith('file:///Users/me.x@example.com/p/Lucidos.dmg', undefined);
+  });
+
+  it('routes a trigger link with the surface named as its source', () => {
+    clickFirstLink('[Nightly digest](trigger:3f9b21c4-0a7e)', 'a notification');
+    expect(mocks.navigateToTrigger).toHaveBeenCalledWith('3f9b21c4-0a7e', 'a notification');
+  });
+
+  it('hands an app link its fragment and source', () => {
+    clickFirstLink('[Some report](app:pr-understanding#pr-1645)', 'a notification');
+    expect(mocks.openAppById).toHaveBeenCalledWith('pr-understanding', 'a notification', 'pr-1645');
+  });
+
+  it('opens a panel link', () => {
+    clickFirstLink('[Triggers](triggers)');
+    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith({ target: 'triggers' });
+  });
+
+  it('toasts an unresolvable relative link instead of reloading the workspace', () => {
+    const prevented = clickFirstLink('[gone](some/unknown/path)');
+    expect(prevented).toBe(true);
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('points nowhere in this workspace'),
+      'error',
+      expect.anything(),
+    );
+  });
+
+  // The reported bug: macOS got a `repo:` link and answered "unsupported
+  // scheme". The router claims it, with the repository named by id or name.
+  // The resolver gets the file, the ref and the cited lines.
+  it.each([
+    ['repo:lucidos:file:crates/lucidos-app/src/main.tsx', { locator: { repoId: 'lucidos', mode: 'file', ref: undefined, path: 'crates/lucidos-app/src/main.tsx' } }],
+    ['repo:6f1c2a90-0000-5000-8000-000000000001:file:README.md', { locator: { repoId: '6f1c2a90-0000-5000-8000-000000000001', mode: 'file', ref: undefined, path: 'README.md' } }],
+    ['repo:lucidos:file#origin/main:src/a.rs#L5', { locator: { repoId: 'lucidos', mode: 'file', ref: 'origin/main', path: 'src/a.rs' }, line: 5, lineEnd: undefined }],
+  ])('opens %s in the file preview modal', (href, target) => {
+    const prevented = clickFirstLink(`See [the file](${href}).`, 'a notification');
+    expect(prevented).toBe(true);
+    expect(mocks.openRepoFileLink).toHaveBeenCalledWith(
+      { line: undefined, lineEnd: undefined, ...target },
+      'a notification',
+      mocks.openFilePreviewModal,
+    );
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
+  it('decodes a repo link whose destination markdown percent-encoded', () => {
+    clickFirstLink('[notes](<repo:My Repo:file:docs/read me.md>)');
+    expect(mocks.openRepoFileLink).toHaveBeenCalledWith(
+      { locator: { repoId: 'My Repo', mode: 'file', ref: undefined, path: 'docs/read me.md' }, line: undefined, lineEnd: undefined },
+      undefined,
+      mocks.openFilePreviewModal,
+    );
+  });
+
+  // The reported link: the agent named the lines in the label only.
+  it.each([
+    ['[Consumer.kt:184-204](repo:svc:file:src/Consumer.kt)', 184, 204],
+    ['[Consumer.kt:184\u2013204](repo:svc:file:src/Consumer.kt)', 184, 204],
+    ['[Consumer.kt:7](repo:svc:file:src/Consumer.kt)', 7, undefined],
+    ['[Consumer.kt](repo:svc:file:src/Consumer.kt)', undefined, undefined],
+    ['[Consumer.kt:1-2](repo:svc:file:src/Consumer.kt#L184-L204)', 184, 204],
+  ])('takes the lines of %s from its href, else its label', (markdown, line, lineEnd) => {
+    clickFirstLink(markdown);
+    expect(mocks.openRepoFileLink).toHaveBeenCalledWith(
+      { locator: { repoId: 'svc', mode: 'file', ref: undefined, path: 'src/Consumer.kt' }, line, lineEnd },
+      undefined,
+      mocks.openFilePreviewModal,
+    );
+  });
+
+  it('toasts a malformed repo link in the app instead of handing it to the OS', () => {
+    const prevented = clickFirstLink('[broken](repo::file:src/main.rs)');
+    expect(prevented).toBe(true);
+    expect(mocks.openRepoFileLink).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('uses a scheme nothing here can open'),
+      'error',
+      expect.anything(),
+    );
+  });
+
+  it('leaves an https link to the browser', () => {
+    const prevented = clickFirstLink('[site](https://example.com)');
+    expect(prevented).toBe(false);
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+});
+
+describe('every surface rendering agent markdown uses the shared router', () => {
+  const here: string = dirname(fileURLToPath(import.meta.url));
+  it.each([
+    ['../notifications/NotificationDetailInline.tsx', "handleMarkdownLinkClick(e, apps, 'a notification')"],
+    ['../chat/ChatExchange.tsx', 'handleMarkdownLinkClick(e, apps)'],
+    ['../chat/SideQuestionCard.tsx', 'handleMarkdownLinkClick(e, loadedOr(appsList.value, []))'],
+  ])('%s', (path, call) => {
+    expect(readFileSync(resolve(here, path), 'utf-8')).toContain(call);
+  });
+});

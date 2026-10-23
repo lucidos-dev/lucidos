@@ -1,0 +1,206 @@
+{
+ "cwd": "mid/repo",
+ "user": "# Global rules\n\nA user file for the fixture.\n\n## Style\n\nWrite short sentences.",
+ "tree": {
+  "CLAUDE.md": "# Parent notes\n\nParent directory instruction.\n",
+  ".claude/rules/rr.md": "# Root rule\n\nRoot-level rule.\n",
+  "CLAUDE.local.md": "# Root local\n\nRoot-level local.\n",
+  "outside.md": "# Outside\n\nOutside the project.\n",
+  "mid/CLAUDE.md": "# Mid\n\nMid dir.\n",
+  "mid/.claude/CLAUDE.md": "# Mid dot\n\nMid dir .claude.\n",
+  "mid/.claude/rules/mr.md": "# Mid rule\n\nMid dir rule.\n",
+  "mid/CLAUDE.local.md": "# Mid local\n\nMid-level local.\n",
+  "mid/repo/CLAUDE.md": "---\ntitle: front on claude md\npaths: \"**/*.rs\"\n---\n# Repo\n\n<!-- a hidden comment -->\nVisible line.   \n\n<!-- multi\nline comment -->\nAfter multi-line.\n\n<!-- lead comment --> residue text\nInline <!-- inline --> comment stays?\n\nSee @docs/imp.md for more, and @docs/missing.md, and @docs/notes.txt , and @docs/data.json and @docs/code.py and @docs/frag.md#section and @./docs/dot.md.\nAgain @docs/imp.md and mail user@docs/other.md and `@docs/code.md` inline.\nExternal @../../outside.md here.\n\n```\n@docs/fenced.md\n<!-- kept in fence -->\n```\n\n    @docs/indented.md\n\n- list item @docs/listed.md\n\nDeep chain: @docs/d1.md\n\nTrailing blank lines follow.\n\n\n",
+  "mid/repo/docs/imp.md": "# Imported\n\nImported body. @nested.md\n",
+  "mid/repo/docs/nested.md": "# Nested import\n\nNested body.\n",
+  "mid/repo/docs/notes.txt": "plain text notes\n",
+  "mid/repo/docs/data.json": "{\"a\": 1}\n",
+  "mid/repo/docs/code.py": "print(1)\n",
+  "mid/repo/docs/frag.md": "# Frag\n\nfrag.\n",
+  "mid/repo/docs/dot.md": "# Dot\n\ndot.\n",
+  "mid/repo/docs/code.md": "# Code\n\nbody\n",
+  "mid/repo/docs/fenced.md": "# Fenced\n\nMust not appear.\n",
+  "mid/repo/docs/indented.md": "# Indented\n\nIndented code import.\n",
+  "mid/repo/docs/listed.md": "# Listed\n\nListed import.\n",
+  "mid/repo/docs/other.md": "# Other\n\nOther.\n",
+  "mid/repo/docs/d1.md": "# D1\n\nDepth 1.\n@d2.md\n",
+  "mid/repo/docs/d2.md": "# D2\n\nDepth 2.\n@d3.md\n",
+  "mid/repo/docs/d3.md": "# D3\n\nDepth 3.\n@d4.md\n",
+  "mid/repo/docs/d4.md": "# D4\n\nDepth 4.\n@d5.md\n",
+  "mid/repo/docs/d5.md": "# D5\n\nDepth 5.\n@d6.md\n",
+  "mid/repo/docs/d6.md": "# D6\n\nDepth 6.\n@d7.md\n",
+  "mid/repo/docs/d7.md": "# D7\n\nDepth 7.\n@d8.md\n",
+  "mid/repo/docs/d8.md": "# D8\n\nDepth 8.\n",
+  "mid/repo/docs/linked-target.md": "# Linked target\n\nVia symlink.\n",
+  "mid/repo/docs/localimp.md": "# Local import\n\nImported by local.\n",
+  "mid/repo/.claude/CLAUDE.md": "# Dot-claude file\n\nIn .claude/CLAUDE.md.\n",
+  "mid/repo/.claude/rules/a.md": "# Rule A\n\nAlways on A. @../../docs/listed.md\n",
+  "mid/repo/.claude/rules/scoped-string.md": "---\npaths: \"**/*.rs\"\n---\n# Scoped string\n\nOnly for rust.\n",
+  "mid/repo/.claude/rules/scoped-list.md": "---\npaths:\n  - \"**/*.rs\"\n---\n# Scoped list\n\nOnly for rust.\n",
+  "mid/repo/.claude/rules/empty-paths.md": "---\npaths:\n---\n# Empty paths\n\nEmpty paths key.\n",
+  "mid/repo/.claude/rules/globs.md": "---\nglobs: \"**/*.rs\"\n---\n# Globs\n\nglobs key.\n",
+  "mid/repo/.claude/rules/empty.md": "",
+  "mid/repo/.claude/rules/only-comment.md": "<!-- only a comment -->\n",
+  "mid/repo/.claude/rules/bom.md": "\ufeff# Bom\n\nHas a BOM.\n",
+  "mid/repo/.claude/rules/crlf.md": "# Crlf\r\n\r\nWindows endings.\r\n",
+  "mid/repo/.claude/rules/notes.txt": "not markdown\n",
+  "mid/repo/.claude/rules/sub/always.md": "# Sub always\n\nSub dir rule.\n",
+  "mid/repo/CLAUDE.local.md": "# Local\n\nLocal @docs/localimp.md\n",
+  "mid/repo/sub/CLAUDE.md": "# Nested file\n\nShould not load at start.\n"
+ },
+ "symlinks": {
+  "mid/repo/.claude/rules/linked.md": "../../docs/linked-target.md"
+ },
+ "recorded": [
+  {
+   "type": "User",
+   "path": "<config>/CLAUDE.md",
+   "content": "# Global rules\n\nA user file for the fixture.\n\n## Style\n\nWrite short sentences."
+  },
+  {
+   "type": "Project",
+   "path": "CLAUDE.md",
+   "content": "# Parent notes\n\nParent directory instruction."
+  },
+  {
+   "type": "Project",
+   "path": ".claude/rules/rr.md",
+   "content": "# Root rule\n\nRoot-level rule."
+  },
+  {
+   "type": "Local",
+   "path": "CLAUDE.local.md",
+   "content": "# Root local\n\nRoot-level local."
+  },
+  {
+   "type": "Project",
+   "path": "mid/CLAUDE.md",
+   "content": "# Mid\n\nMid dir."
+  },
+  {
+   "type": "Project",
+   "path": "mid/.claude/CLAUDE.md",
+   "content": "# Mid dot\n\nMid dir .claude."
+  },
+  {
+   "type": "Project",
+   "path": "mid/.claude/rules/mr.md",
+   "content": "# Mid rule\n\nMid dir rule."
+  },
+  {
+   "type": "Local",
+   "path": "mid/CLAUDE.local.md",
+   "content": "# Mid local\n\nMid-level local."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/CLAUDE.md",
+   "content": "# Repo\n\nVisible line.   \n\nAfter multi-line.\n\n residue text\nInline <!-- inline --> comment stays?\n\nSee @docs/imp.md for more, and @docs/missing.md, and @docs/notes.txt , and @docs/data.json and @docs/code.py and @docs/frag.md#section and @./docs/dot.md.\nAgain @docs/imp.md and mail user@docs/other.md and `@docs/code.md` inline.\nExternal @../../outside.md here.\n\n```\n@docs/fenced.md\n<!-- kept in fence -->\n```\n\n    @docs/indented.md\n\n- list item @docs/listed.md\n\nDeep chain: @docs/d1.md\n\nTrailing blank lines follow."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/imp.md",
+   "content": "# Imported\n\nImported body. @nested.md"
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/nested.md",
+   "content": "# Nested import\n\nNested body."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/notes.txt",
+   "content": "plain text notes"
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/data.json",
+   "content": "{\"a\": 1}"
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/code.py",
+   "content": "print(1)"
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/frag.md",
+   "content": "# Frag\n\nfrag."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/listed.md",
+   "content": "# Listed\n\nListed import."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/d1.md",
+   "content": "# D1\n\nDepth 1.\n@d2.md"
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/d2.md",
+   "content": "# D2\n\nDepth 2.\n@d3.md"
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/d3.md",
+   "content": "# D3\n\nDepth 3.\n@d4.md"
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/d4.md",
+   "content": "# D4\n\nDepth 4.\n@d5.md"
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/.claude/CLAUDE.md",
+   "content": "# Dot-claude file\n\nIn .claude/CLAUDE.md."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/.claude/rules/bom.md",
+   "content": "# Bom\n\nHas a BOM."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/.claude/rules/empty-paths.md",
+   "content": "# Empty paths\n\nEmpty paths key."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/docs/linked-target.md",
+   "content": "# Linked target\n\nVia symlink."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/.claude/rules/crlf.md",
+   "content": "# Crlf\r\n\r\nWindows endings."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/.claude/rules/sub/always.md",
+   "content": "# Sub always\n\nSub dir rule."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/.claude/rules/globs.md",
+   "content": "# Globs\n\nglobs key."
+  },
+  {
+   "type": "Project",
+   "path": "mid/repo/.claude/rules/a.md",
+   "content": "# Rule A\n\nAlways on A. @../../docs/listed.md"
+  },
+  {
+   "type": "Local",
+   "path": "mid/repo/CLAUDE.local.md",
+   "content": "# Local\n\nLocal @docs/localimp.md"
+  },
+  {
+   "type": "Local",
+   "path": "mid/repo/docs/localimp.md",
+   "content": "# Local import\n\nImported by local."
+  }
+ ]
+}

@@ -1,0 +1,26 @@
+# .gitleaksignore — allowlisted false positives
+# Reviewed 2026-06-25 before going public. All entries are dummy test
+# fixtures / documentation examples, NOT real credentials:
+#   * the canonical gitleaks example key used in proxy_tests.rs fixtures
+#     and in proxy.rs comments documenting the apis.json `secret = "..."` format
+#   * the literal words "VAPID/private" in a docs plan
+# Each line is a gitleaks finding Fingerprint (commit:file:rule:line).
+0033ff020f205f1664b89452db799014facd3a97:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:298
+021ffcfad0db84857e3572a090e29f6f413950e2:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:321
+103dfbfb9c21ce6f7ee5986fdef3019aa3822822:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:321
+12b5ac39cd5e9df384984a9d5b11f2e4d454be93:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:298
+3fabecfe86ae43979067cdfaac217dba146d46f4:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:298
+769b83864e2e18918f98e96e0819b4a22efff883:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:321
+888ac306ecc77fa07ae043d2ac7afebbf99ea0cc:docs/plans/2026-06-21-agent-device-preferences-context.md:generic-api-key:27
+9457309735e90c17427551b4cf57036d9b5252e6:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:321
+a67d812ea84a59552798fa62a088a6d407e5ace1:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:298
+b7b81c8f0dd6a19f3ae6de26fb5b635819783a1b:crates/lucidos-engine/src/api/proxy.rs:generic-api-key:985
+c0b6512823e35d646d3a76157c952e743d9dd437:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:298
+c2e81c29faf30f1a68ba5c115811dedeb2149ed0:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:321
+cd98834e3a587fbfdcf5f64b6b32c21210ee04d0:crates/lucidos-engine/src/api/proxy.rs:generic-api-key:1076
+defe7d8285cf217ebcc3697be70b7078aa6e978b:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:298
+df588f8d7fd09efd0a4e049ba8c43f188fede2d7:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:298
+e6d9333b42fa059c5c19a0e9a0fea976507ee28d:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:298
+e74641b47c3d72efac3d281f853ce5d1166758ad:crates/lucidos-engine/src/api/proxy.rs:generic-api-key:931
+f64d0fa966ab4b22609a3f35c17a79430a90414b:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:321
+f854cf73f2d5e1ce8c2ecf5ecf7315ccdc3e881b:crates/lucidos-engine/src/api/proxy_tests.rs:generic-api-key:321

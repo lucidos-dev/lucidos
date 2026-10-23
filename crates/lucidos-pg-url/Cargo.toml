@@ -1,0 +1,14 @@
+[package]
+name = "lucidos-pg-url"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# One reading of a Postgres connection URL, for the engine and the gateway.
+#
+# ADR 0014 §1 forbids `lucidos-gateway` from depending on `lucidos-engine`, and
+# the gateway links no sqlx. So the parser both sides share lives here, with
+# `urlencoding` as its only dependency.
+
+[dependencies]
+urlencoding = "2.1.3"
