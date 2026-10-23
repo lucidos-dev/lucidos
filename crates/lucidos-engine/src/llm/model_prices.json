@@ -1,0 +1,118 @@
+{
+  "_note": "The shipped price table (llm/model_prices.rs, ADR 0525). Rates are per million tokens in 'currency'. Each model holds a list of cards, its price history. A card is in force from its 'from' day (local time) until the next card's; a card with no 'from' is in force since the beginning. 'cache_write' is the 5-minute write; 'cache_write_1h' defaults to it. 'long' replaces the base rates for a call whose prompt reached 'threshold_tokens'. 'flex' is the Flex tier. 'unpriced_cache_shares' is what an unpriced model's cache costs, as shares of its input price. 'checked' is the day these prices were last checked against the providers' price pages. A workspace overrides cards in data/config/model-prices.json.",
+  "checked": "2026-10-16",
+  "currency": "USD",
+  "unpriced_cache_shares": { "read": 0.1, "write_5m": 1.25, "write_1h": 2.0 },
+  "models": {
+    "gpt-6.1-sol": [
+      {
+        "uncached_in": 2.0,
+        "cache_write": 2.5,
+        "cache_read": 0.1,
+        "out": 10.0,
+        "flex": { "uncached_in": 1.0, "cache_write": 1.25, "cache_read": 0.05, "out": 5.0 },
+        "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol; cache: https://developers.openai.com/api/docs/guides/prompt-caching; Flex: https://developers.openai.com/api/docs/pricing, the Flex table"
+      }
+    ],
+    "gemini-3.8-flash": [
+      {
+        "uncached_in": 0.75,
+        "cache_write": 0.75,
+        "cache_read": 0.075,
+        "out": 3.75,
+        "source": "https://ai.google.dev/gemini-api/docs/pricing, the introductory price. Implicit caching writes at no premium."
+      },
+      {
+        "from": "2027-01-01",
+        "uncached_in": 1.5,
+        "cache_write": 1.5,
+        "cache_read": 0.15,
+        "out": 7.5,
+        "source": "https://ai.google.dev/gemini-api/docs/pricing: the price from 1 January 2027."
+      }
+    ],
+    "gpt-6-astra": [
+      { "uncached_in": 10.0, "cache_write": 12.5, "cache_read": 1.0, "out": 50.0, "long": { "threshold_tokens": 272000, "uncached_in": 20.0, "cache_write": 25.0, "cache_read": 2.0, "out": 75.0 }, "source": "https://developers.openai.com/api/docs/pricing. Cache writes bill at 1.25x input; a prompt over 272K input tokens bills the whole request at the long rates." }
+    ],
+    "gpt-6-sol": [
+      { "uncached_in": 2.0, "cache_write": 2.5, "cache_read": 0.2, "out": 10.0, "long": { "threshold_tokens": 272000, "uncached_in": 4.0, "cache_write": 5.0, "cache_read": 0.4, "out": 15.0 }, "source": "https://developers.openai.com/api/docs/pricing. Cache writes bill at 1.25x input; a prompt over 272K input tokens bills the whole request at the long rates." }
+    ],
+    "gpt-6-luna": [
+      { "uncached_in": 0.1, "cache_write": 0.125, "cache_read": 0.01, "out": 0.5, "long": { "threshold_tokens": 272000, "uncached_in": 0.2, "cache_write": 0.25, "cache_read": 0.02, "out": 0.75 }, "source": "https://developers.openai.com/api/docs/pricing. Cache writes bill at 1.25x input; a prompt over 272K input tokens bills the whole request at the long rates." }
+    ],
+    "gpt-5.6-sol": [
+      { "uncached_in": 4.0, "cache_write": 5.0, "cache_read": 0.4, "out": 20.0, "long": { "threshold_tokens": 272000, "uncached_in": 8.0, "cache_write": 10.0, "cache_read": 0.8, "out": 30.0 }, "source": "https://developers.openai.com/api/docs/pricing, the promotional price, in force through at least 2026-11-21. Cache writes bill at 1.25x input; a prompt over 272K input tokens bills the whole request at the long rates." }
+    ],
+    "gpt-5.6-terra": [
+      { "uncached_in": 2.0, "cache_write": 2.5, "cache_read": 0.2, "out": 12.0, "long": { "threshold_tokens": 272000, "uncached_in": 4.0, "cache_write": 5.0, "cache_read": 0.4, "out": 18.0 }, "source": "https://developers.openai.com/api/docs/pricing. Cache writes bill at 1.25x input; a prompt over 272K input tokens bills the whole request at the long rates." }
+    ],
+    "gpt-5.6-luna": [
+      { "uncached_in": 0.2, "cache_write": 0.25, "cache_read": 0.02, "out": 1.2, "long": { "threshold_tokens": 272000, "uncached_in": 0.4, "cache_write": 0.5, "cache_read": 0.04, "out": 1.8 }, "source": "https://developers.openai.com/api/docs/pricing. Cache writes bill at 1.25x input; a prompt over 272K input tokens bills the whole request at the long rates." }
+    ],
+    "gemini-3.1-pro-preview": [
+      { "uncached_in": 2.0, "cache_write": 2.0, "cache_read": 0.2, "out": 12.0, "long": { "threshold_tokens": 200000, "uncached_in": 4.0, "cache_write": 4.0, "cache_read": 0.4, "out": 18.0 }, "source": "https://ai.google.dev/gemini-api/docs/pricing. Implicit caching writes at no premium. A prompt over 200K tokens bills at the long rates." }
+    ],
+    "gemini-3.1-flash-lite": [
+      { "uncached_in": 0.25, "cache_write": 0.25, "cache_read": 0.025, "out": 1.5, "source": "https://ai.google.dev/gemini-api/docs/pricing. Implicit caching writes at no premium." }
+    ],
+    "grok-4.6": [
+      { "uncached_in": 2.0, "cache_write": 2.0, "cache_read": 0.5, "out": 6.0, "long": { "threshold_tokens": 200000, "inclusive": true, "uncached_in": 4.0, "cache_write": 4.0, "cache_read": 1.0, "out": 12.0 }, "source": "https://docs.x.ai/developers/models. Cache writes bill at the input rate. A prompt of 200K tokens or more bills at the long rates." }
+    ],
+    "claude-fable-5-1": [
+      { "uncached_in": 10.0, "cache_write": 12.5, "cache_write_1h": 20.0, "cache_read": 0.25, "out": 50.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-mythos-5-1": [
+      { "uncached_in": 10.0, "cache_write": 12.5, "cache_write_1h": 20.0, "cache_read": 0.25, "out": 50.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-fable-5": [
+      { "uncached_in": 10.0, "cache_write": 12.5, "cache_write_1h": 20.0, "cache_read": 1.0, "out": 50.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-mythos-5": [
+      { "uncached_in": 10.0, "cache_write": 12.5, "cache_write_1h": 20.0, "cache_read": 1.0, "out": 50.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-opus-5-5": [
+      { "uncached_in": 4.0, "cache_write": 5.0, "cache_write_1h": 8.0, "cache_read": 0.2, "out": 20.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-opus-5": [
+      { "uncached_in": 5.0, "cache_write": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5, "out": 25.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-opus-4-8": [
+      { "uncached_in": 5.0, "cache_write": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5, "out": 25.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-opus-4-7": [
+      { "uncached_in": 5.0, "cache_write": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5, "out": 25.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-opus-4-6": [
+      { "uncached_in": 5.0, "cache_write": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5, "out": 25.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-opus-4-5": [
+      { "uncached_in": 5.0, "cache_write": 6.25, "cache_write_1h": 10.0, "cache_read": 0.5, "out": 25.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-sonnet-5-5": [
+      { "uncached_in": 2.0, "cache_write": 2.5, "cache_write_1h": 4.0, "cache_read": 0.1, "out": 10.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-sonnet-5": [
+      { "uncached_in": 2.0, "cache_write": 2.5, "cache_write_1h": 4.0, "cache_read": 0.2, "out": 10.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-sonnet-4-6": [
+      { "uncached_in": 3.0, "cache_write": 3.75, "cache_write_1h": 6.0, "cache_read": 0.3, "out": 15.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-sonnet-4-5": [
+      { "uncached_in": 3.0, "cache_write": 3.75, "cache_write_1h": 6.0, "cache_read": 0.3, "out": 15.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ],
+    "claude-haiku-5-5": [
+      {
+        "uncached_in": 0.1,
+        "cache_write": 0.125,
+        "cache_write_1h": 0.2,
+        "cache_read": 0.01,
+        "out": 0.5,
+        "long": { "threshold_tokens": 100000, "uncached_in": 0.5, "cache_write": 0.625, "cache_write_1h": 1.0, "cache_read": 0.05, "out": 2.5 },
+        "source": "https://platform.claude.com/docs/en/about-claude/pricing. A prompt over 100,000 tokens pays the long rates for the whole request."
+      }
+    ],
+    "claude-haiku-4-5": [
+      { "uncached_in": 1.0, "cache_write": 1.25, "cache_write_1h": 2.0, "cache_read": 0.1, "out": 5.0, "source": "https://platform.claude.com/docs/en/about-claude/pricing" }
+    ]
+  }
+}

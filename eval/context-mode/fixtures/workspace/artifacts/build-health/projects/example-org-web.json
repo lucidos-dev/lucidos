@@ -1,0 +1,8 @@
+[
+  { "id": 1, "started": "2026-01-05T08:05:00+01:00", "branch": "main", "result": "fail", "seconds": 143 },
+  { "id": 2, "started": "2026-01-05T08:52:00+01:00", "branch": "main", "result": "pass", "seconds": 320 },
+  { "id": 3, "started": "2026-01-05T10:11:00+01:00", "branch": "feat/nav", "result": "pass", "seconds": 337 },
+  { "id": 4, "started": "2026-01-05T13:44:00+01:00", "branch": "feat/nav", "result": "fail", "seconds": 129 },
+  { "id": 5, "started": "2026-01-05T15:30:00+01:00", "branch": "main", "result": "pass", "seconds": 314 },
+  { "id": 6, "started": "2026-01-05T18:02:00+01:00", "branch": "main", "result": "pass", "seconds": 308 }
+]
