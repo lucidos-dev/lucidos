@@ -1,0 +1,82 @@
+//! Minimal HTTP error response shape for the gateway's control API.
+//!
+//! The engine has a richer `api::error::ApiError`; the gateway duplicates a tiny
+//! version (ADR 0014 §1 — no engine dependency). It is the response shape
+//! (`status` + `{"error": msg}` body) consumed structurally by its
+//! `IntoResponse` impl, not a domain error type.
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde_json::json;
+
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    /// 404, for a workspace slug this gateway does not have in its registry.
+    ///
+    /// Load-bearing rather than tidy. Several gateways run on one machine (the
+    /// dev one on 5251, the packaged `Lucidos.app` one on 5252), each owning a
+    /// different set of workspaces. A caller that posts to the wrong one must be
+    /// able to tell. A 202 for a slug that cannot exist tells it nothing. See
+    /// `scripts/stop.sh`, which reads this status.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    /// 403, for a caller that proved a credential this route does not accept.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    /// 409 — used by the restore flow when the derived/requested workspace name
+    /// collides with an existing one (the picker then asks for a different name)
+    /// or when a restore is already in progress.
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
+    /// 429, for the pairing route when wrong guesses have used up their budget.
+    ///
+    /// Distinct from a 400 so a person mid-pairing is not sent hunting a typo
+    /// that is not there (`auth::Redemption::Throttled`).
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(json!({ "error": self.message }))).into_response()
+    }
+}

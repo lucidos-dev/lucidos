@@ -1,0 +1,14 @@
+{
+  "id": "T4",
+  "fix": "e91c587137b91cbcae0cd762f568a0c7455baaf7",
+  "title": "fix(email): reading a message no longer marks it read on the mail server",
+  "withheld_test": {
+    "file": "withheld_test.rs",
+    "dest": "crates/lucidos-engine/src/core/eval_withheld_tests.rs",
+    "host": "crates/lucidos-engine/src/core/email.rs"
+  },
+  "needs_db": false,
+  "comment": "none",
+  "why": "Control. No comment near the RFC822 fetch argues for it; the only nearby justifying block is an unrelated 'Best-effort teardown' note on logout.",
+  "adaptation": "The fix's test also required EXAMINE and banned any flag-setting fetch, which pins the fix's shape. The withheld test keeps only the behaviour: after a read, an attachment fetch and a listing, the fake server's message is still unread."
+}
