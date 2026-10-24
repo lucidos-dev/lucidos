@@ -1,0 +1,9 @@
+[package]
+name = "lucidos-claude-code-managed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Where Claude Code reads its managed policy. The CLI reads managed agent
+# definitions there and the engine reads the managed gateway URL, so the path
+# lives in this leaf crate once. No dependencies, and it stays that way.
