@@ -1,0 +1,313 @@
+# Release notices: what a user has to KNOW or DO after upgrading.
+#
+# Most releases carry none, and that is the point. The modal only appears when
+# a release actually needs something from the reader, so it stays rare enough
+# to be read. What merely CHANGED belongs in CHANGELOG.md.
+#
+# Entries are OLDEST FIRST, and the file order is the order the reader is
+# walked through them in. Append at the end. Never reorder an entry, never
+# delete one, and never reuse an id: a workspace remembers the last notice it
+# resolved BY ID, and its place in this file is what "after that one" means.
+#
+# Fields, all validated at parse time by
+# crates/lucidos-engine/src/engine/release_notices.rs:
+#
+#   id             stable forever, kebab-case. Names the notice, not its release.
+#   since          the release this applies FROM, plain semver, no leading "v".
+#                  A floor, not a stamp: the notice is invisible until the
+#                  engine reports that version or newer. For UNRELEASED work
+#                  that is the NEXT PATCH, never a guess at the eventual number:
+#                  a floor already reached by the release that ships it, and a
+#                  higher one would hide the notice if a patch shipped first.
+#                  Pick a further one only to hold a notice back deliberately.
+#                  A dev build reports the next patch itself (it is past the
+#                  published RELEASE), so it shows such a notice before it
+#                  ships and you can read the real card. A shipped install is
+#                  never release-dirty and sees it on its own release.
+#   title          one line. The modal's heading and the panel row's label.
+#   body           markdown. A link is how a notice points at a settings page:
+#                  `[Settings > System > Memory](settings:memory)`.
+#   action_label   optional, and paired with action_prompt. Draws one button.
+#   action_prompt  optional. The button SENDS this sentence as a new message,
+#                  so write what the user would say, and make sure the knowhow
+#                  meant to answer it routes on those words. Say only enough to
+#                  REACH that knowhow. Spelling out what it will then do
+#                  restates what the recipe owns, and goes stale the day the
+#                  recipe moves.
+#   only_when      optional. A condition the workspace must meet, or the notice
+#                  is hidden as if unreleased. So never write "if you already
+#                  did this, ignore it": name the condition instead. The names
+#                  are `NoticeCondition` in release_notices.rs:
+#                    on-classic-memory   the workspace chose Classic memory.
+#                    has-intents         the workspace holds an intent.
+#   superseded_by  optional. The id of a LATER notice that replaces this one.
+#                  Once that notice, or one further down its own chain, is
+#                  reached and its only_when holds, this one is hidden as if
+#                  unreleased, answered or not. Add it when
+#                  a later release makes this notice's text false, instead of
+#                  editing a body some workspaces still read. If this notice
+#                  has an action, the later one must carry the same
+#                  action_prompt, so hiding it never takes a button away.
+#
+# One action per notice, at most. Two things to do is two notices, because
+# acting closes the modal and moves the reader on to the next one.
+#
+# Reuse an action_prompt verbatim when a notice asks for the same thing as an
+# earlier one. Among the notices a workspace owes, the modal draws a shared
+# action only on the last, so a reader who skipped releases runs it once.
+#
+# Ask for the full audit only when the break spans many checks. When one audit
+# check finds it, ask for a targeted run of that check, per
+# system-knowhow/workspace-audit.md § A targeted run. A full pass costs every
+# section.
+
+[[notice]]
+id = "run-a-workspace-audit"
+since = "0.29.0"
+title = "Run a workspace audit"
+body = """
+Lucidos keeps moving, and your workspace does not move with it. An app built \
+against an older SDK, a trigger subscribed to an event that has since been \
+renamed, a recipe still describing the old way to reach an API: all of them \
+keep sitting there, and a trigger on a renamed event simply stops firing with \
+nothing to see.
+
+A workspace audit sweeps what you have on disk and reports the drift. It \
+changes nothing on its own: it writes a report, and you decide what to fix.
+
+Worth doing now, and worth doing again after any release that moves a lot.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "deprecated-spawn-aliases-removed"
+since = "0.38.1"
+title = "Two deprecated spawn aliases were removed"
+body = """
+Two long-deprecated shortcuts are gone. `run_coding_agent` no longer accepts \
+`repo` (use `folder`), and `lucidos spawn-thread` no longer accepts `--parent` \
+(use `--relation child`). Both had carried a deprecation warning for a while.
+
+Almost every workspace already uses the new forms and needs nothing. But a \
+recipe, trigger or script that still passes an old form will now fail with a \
+clear rename error instead of running.
+
+A workspace audit finds any such straggler on disk and tells you the one-line \
+fix. Worth running once now.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "apps-run-isolated"
+since = "0.38.3"
+title = "Your apps now run isolated"
+body = """
+An app used to run in the same browser process as Lucidos itself, which is how \
+one busy app could freeze the whole page. Each app now gets its own process. It \
+can no longer hang the rest of Lucidos, and it can no longer read the shell, \
+your device id, or another app.
+
+The cost lands on apps that reached for the browser directly. An app that \
+stored something in `localStorage`, or called the engine with its own `fetch`, \
+loses that. Everything it does through `lucidos.*` is unchanged.
+
+**This one is quiet.** Most apps wrap a storage call in a `try`, so the app \
+still opens and simply stops remembering your settings. A workspace audit finds \
+every affected app and says what each one needs. Expect real changes rather \
+than renames, and a few that wait on us: an app reaching a corner of the API \
+the SDK does not cover yet has nothing to move onto.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "thread-summary-drops-coding-agent-applying"
+since = "0.40.2"
+title = "A thread field your apps could read was removed"
+body = """
+Thread summaries no longer carry `coding_agent_applying`. Lucidos never acted \
+on it, and it could stay `true` long after a merge had finished.
+
+An app, script or recipe that still reads it usually gets nothing back, with \
+no error to say so. A workspace audit finds any code that still reads it and \
+says what to do.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "cli-misrouted-looks-and-config"
+since = "0.40.2"
+title = "Some files you saved may be in the wrong folder"
+body = """
+`lucidos data write` used to file three folders under `artifacts/`: \
+`config/`, `auth-modules/` and `scripts/`. So an `apis.json` saved that way \
+never loaded, and a signer or script saved that way was never found. Nothing \
+said so.
+
+The command now writes each file where it belongs. A file saved before the \
+fix still sits under `artifacts/`, where nothing reads it. A workspace audit \
+finds any such file and says how to move it.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "spawn-thread-cc-model-removed"
+since = "0.40.2"
+title = "One old spawn flag was removed"
+body = """
+`lucidos spawn-thread` no longer accepts `--cc-model`. Use \
+`--coding-agent-model` instead, with the same value. The new name has been \
+documented since 0.39.2.
+
+A recipe, trigger or script that still passes the old flag will now fail with \
+an unknown-argument error instead of running. A workspace audit finds any \
+such call and says what to change.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "every-workspace-has-home"
+since = "0.47.2"
+title = "Every workspace now has Home"
+body = """
+Home is one conversation that never ends. Open it from the Home icon in the \
+thread header: at its start on desktop, beside the Lucidos mark on a phone. From Home, Lucidos can follow up any of your threads, and it \
+presses your buttons only when you ask it to in that message.
+
+It used to sit behind a switch under Experimental. The switch is gone, so \
+Home shows even if you had it off. Its history is still there.
+
+Home works when you write in it or talk to it out loud. It also works when \
+something it started for you comes back to it, such as a thread or a wait for \
+an event. It starts no work by itself. Work that belongs to no thread, such as \
+a summary of a file written outside any thread, records its cost on Home.
+"""
+
+[[notice]]
+id = "mcp-servers-reach-only-their-threads"
+since = "0.48.2"
+title = "MCP servers now reach only the threads that use them"
+body = """
+A running MCP server used to add its tools to every thread. Now a thread \
+switches a server on for itself when it needs it, so a thread that \
+never uses a server no longer pays for its tools.
+
+A trigger that uses an MCP server should list it in its MCP servers. Its fires \
+then have the server from the first step. A fire may call only a listed \
+server, or one with Auto-approve on. A call to any other server is refused, \
+and you get a notification naming the trigger.
+
+An audit of your triggers finds each one that used a server it does not list, \
+and says what to add.
+"""
+action_label = "Audit my triggers"
+action_prompt = "Audit my workspace's triggers."
+
+[[notice]]
+id = "home-board"
+since = "0.48.2"
+title = "Widgets pinned to Home now live on the Home board"
+superseded_by = "two-dashboards"
+body = """
+Home now has two faces: the Home board and the Home chat. Every widget you \
+pinned to Home is a tile on the board, live, at its default size.
+
+On a desktop, the board is a rail at the right edge of the window, beside \
+your threads. The button in the window's top-right corner hides the rail, \
+and the same button shows it again. Drag the rail's \
+edge to change its width. The Home icon opens the Home chat.
+
+On a phone, the Home icon opens Home on the board, with the prompt under it. \
+Tap the prompt to slide the chat up, and tap the Home icon again to slide it \
+back down.
+
+Holding the Home icon no longer lists Home's widgets. They are all on the \
+board now. Add on the board pins another widget to Home. Edit moves, resizes \
+and removes tiles. A tile's menu hides it on the kind of screen you use: a \
+desktop or a phone.
+"""
+
+[[notice]]
+id = "move-to-tree-memory"
+since = "0.48.2"
+title = "Tree memory is ready to try"
+only_when = "on-classic-memory"
+body = """
+A new workspace now asks which memory module to use. Yours stays on Classic, \
+which is almost free.
+
+Tree gives every turn a layered summary of the whole workspace and of the \
+thread. The agent can open any line down to the exact message. In our tests it \
+scored as well as Classic or better. It costs money: a compactor model writes \
+the summaries after each turn, so the cost grows with use and depends on the \
+model.
+
+To try it, open [Settings > System > Memory](settings:memory). Lucidos first \
+shows what the one-time summary of your workspace costs, and how long it takes. \
+Until it is done, turns stay on Classic.
+"""
+
+[[notice]]
+id = "workspace-database-handle"
+since = "0.48.2"
+title = "Scripts reach the workspace database through LUCIDOS_DATABASE_URL"
+body = """
+Lucidos no longer gives scripts, triggers and coding agents its database \
+login through the `PGHOST`, `PGUSER` and `DATABASE_URL` variables. A bare \
+`psql`, or a connection string left empty by mistake, used to land on your \
+workspace database. Now it reaches nothing.
+
+Scripts get `LUCIDOS_DATABASE_URL` instead, and it opens read-only. Use \
+`psql "$LUCIDOS_DATABASE_URL"`. A deliberate write starts with \
+`BEGIN READ WRITE`.
+
+A script or trigger that ran bare `psql` stops working until it names the \
+variable. An audit finds each one and says how to fix it.
+"""
+action_label = "Audit my workspace"
+action_prompt = "Audit my workspace for drift."
+
+[[notice]]
+id = "two-dashboards"
+since = "0.49.2"
+title = "The Home board is now two dashboards"
+body = """
+The Home board is now called the dashboard, and your phone and your desktop \
+each have their own. Each starts with the tiles it showed before. A tile you \
+hid on one kind of screen is not on that screen's dashboard.
+
+Add to dashboard, in a widget's menu, puts the widget on the dashboard of the \
+screen you tap it on. Remove from dashboard takes it off that one only. Edit \
+still moves and resizes tiles, and a tile no longer hides.
+
+A widget that checks whether it sits on the board now reads `dashboard` \
+where it read `home`, and the `home-board` page is now `dashboard`. Most \
+apps never use either. The button checks your apps for the old names only, \
+and swaps in the new ones.
+"""
+action_label = "Check my apps"
+action_prompt = "Run only the dashboard rename check on my apps, and fix what it finds."
+
+[[notice]]
+id = "intents-run-in-the-thread"
+since = "0.49.2"
+title = "Intents now run in the thread that asks for them"
+only_when = "has-intents"
+body = """
+An intent used to run in a separate step of its own, on the default model. Now \
+the thread that asks for it loads the intent's steps and does them itself, on \
+the thread's own model. A trigger fire works the same way.
+
+A child thread now follows its parent's model, effort and provider too, unless \
+you pin one for it.
+
+Knowhow or a trigger may still tell Lucidos to call `execute_intent`. That \
+call now fails with a hint. The button finds each place and rewrites it.
+"""
+action_label = "Fix old intent calls"
+action_prompt = "Run only the retired-tools audit check on my workspace, and fix what it finds."

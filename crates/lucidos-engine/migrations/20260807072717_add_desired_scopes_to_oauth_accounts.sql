@@ -1,0 +1,20 @@
+-- The scope set a connected account was ASKED for, beside the one it holds.
+--
+-- `scopes` is what the provider GRANTED (`core::oauth` prefers the token
+-- response's `scope`, falling back to what was requested only when the provider
+-- reports none). So a provider that refuses part of a request leaves no record
+-- anywhere of what the rest was, and the Reconnect button on Settings >
+-- Accounts, which re-requests `scopes`, could only ever ask for the narrowed set
+-- again. `prepare_oauth_flow` merges the request with the account's existing
+-- scopes, so passing the granted set made the merge `granted UNION granted`: a
+-- no-op by construction.
+--
+-- That is the button the engine's own Dropbox failure message names ("Enable the
+-- permission ... then reconnect the account in Settings > Accounts"), so the
+-- guided fix for a scope the App Console had not permitted was a dead end.
+--
+-- Nullable with no backfill, deliberately. NULL means "never recorded" for every
+-- account connected before this column existed; Reconnect falls back to
+-- something never narrower than today's behavior, and the first authorization
+-- after this lands records a real set.
+ALTER TABLE oauth_accounts ADD COLUMN IF NOT EXISTS desired_scopes TEXT;
