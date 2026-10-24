@@ -1,0 +1,32 @@
+<svg class="lx-diagram" viewBox="0 0 1200 710" role="img"
+     aria-labelledby="t-stream d-stream" xmlns="http://www.w3.org/2000/svg">
+  <title id="t-stream">Staying in sync</title>
+  <desc id="d-stream">The engine pushes one live stream. Desktop, phone and every open app UI draw from it, so a change lands on every screen at once. With nothing open the work carries on, and the new state is waiting in your apps and files when you come back. It can also notify you, on the events you choose.</desc>
+  <defs>
+    <marker id="lx-arrow-a-stream" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-aqua)"/>
+    </marker>
+  </defs>
+  <text x="40" y="54" text-anchor="start" font-size="17" font-weight="700" fill="var(--lx-ink-soft)" letter-spacing="2.5">STAYING IN SYNC</text>
+  <rect x="448" y="92" width="304" height="132" rx="20" fill="none" stroke="var(--lx-ink)" stroke-width="3.5" />
+  <text x="600.0" y="150" text-anchor="middle" font-size="28" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Engine</text>
+  <text x="600.0" y="186" text-anchor="middle" font-size="18" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">one live stream</text>
+  <rect x="92" y="396" width="268" height="152" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="3" />
+  <text x="226.0" y="458" text-anchor="middle" font-size="25" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Desktop</text>
+  <text x="226.0" y="494" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">chat beside the work</text>
+  <path d="M 600.0 224 C 600.0 320 226.0 296 226.0 392" fill="none" stroke="var(--lx-aqua)" stroke-width="3" marker-end="url(#lx-arrow-a-stream)"/>
+  <rect x="466" y="396" width="268" height="152" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="3" />
+  <text x="600.0" y="458" text-anchor="middle" font-size="25" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Phone</text>
+  <text x="600.0" y="494" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">the same panes, swiped</text>
+  <path d="M 600.0 224 C 600.0 320 600.0 296 600.0 392" fill="none" stroke="var(--lx-aqua)" stroke-width="3" marker-end="url(#lx-arrow-a-stream)"/>
+  <rect x="840" y="396" width="268" height="152" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="3" />
+  <text x="974.0" y="458" text-anchor="middle" font-size="25" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">An app UI</text>
+  <text x="974.0" y="494" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">drawing from the same data</text>
+  <path d="M 600.0 224 C 600.0 320 974.0 296 974.0 392" fill="none" stroke="var(--lx-aqua)" stroke-width="3" marker-end="url(#lx-arrow-a-stream)"/>
+  <text x="600" y="336" text-anchor="middle" font-size="20" font-weight="500" fill="var(--lx-aqua)" letter-spacing="0">one change, every screen</text>
+  <rect x="92" y="596" width="1016" height="82" rx="14" fill="none" stroke="var(--lx-orange)" stroke-width="2.5" stroke-dasharray="8 8" />
+  <text x="600" y="632" text-anchor="middle" font-size="22" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Nothing open? The work carries on</text>
+  <text x="600" y="662" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">You come back to the new state. It can also notify you, on the events you choose.</text>
+
+</svg>
