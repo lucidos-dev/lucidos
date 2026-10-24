@@ -1,0 +1,7 @@
+# term-regex	replacement	adr
+\bsuccessor[ \t]+threads?\b	successor session, or legacy successor thread for old rows	docs/adr/0560-successor-session-in-the-same-thread.md
+\bbuild[ \t]+chain\b	successor session in the planning thread	docs/adr/0560-successor-session-in-the-same-thread.md
+\bhandoff[ \t]+consent\b	a handoff needs no consent	docs/adr/0560-successor-session-in-the-same-thread.md
+\bexecute_intent\b	load_knowhow, then perform the intent in the asking thread	docs/adr/0534-intents-run-in-the-asking-thread.md
+\bspawn-successor\b	successor start	docs/adr/0560-successor-session-in-the-same-thread.md
+\bImplement[ \t]+in[ \t]+a[ \t]+new[ \t]+thread\b	Implement in a fresh session	docs/adr/0560-successor-session-in-the-same-thread.md

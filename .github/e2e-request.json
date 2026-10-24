@@ -1,0 +1,16 @@
+{
+  "run_id": "20261024-091810-b100",
+  "coverage": false,
+  "suites": [
+    "api"
+  ],
+  "api_args": [
+    "-f",
+    "successor"
+  ],
+  "browser": {
+    "projects": [],
+    "specs": [],
+    "pw_args": []
+  }
+}

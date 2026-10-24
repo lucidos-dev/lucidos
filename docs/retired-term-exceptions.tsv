@@ -1,0 +1,10 @@
+# path-glob	kind	context-regex	reason
+CHANGELOG.md	history	-	Published release history stays byte-identical; new entries use current terms.
+release-notices.toml	history	-	Versioned migration notices describe the releases that introduced them.
+docs/adr/*	history	-	Decision records preserve the original terminology and supersession context.
+docs/plans/*	history	-	Dated plans preserve decisions and the wording they commissioned us to replace.
+docs/investigations/*	history	-	Dated investigations preserve the evidence and terminology they measured.
+docs/audits/2026-10-23-system-knowhow-audit.md	history	-	The original audit findings remain evidence of drift before the corrections.
+crates/lucidos-engine/migrations/*.sql	history	-	Applied migrations are immutable and retain their original checksums and filenames.
+system-knowhow/glossary.md	literal	^### (Successor thread|Build chain|Handoff consent)$	Retired glossary headings retain the searchable spelling; their bodies explain retirement.
+crates/lucidos-app/src/generated/thread-event-wire.ts	literal	^\s*\| 'spawn-successor';$	The retired owner-approval verb must still parse from stored cards; codegen owns this union.

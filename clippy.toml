@@ -1,0 +1,6 @@
+# Lucidos creates temp files through `tempfile`, which makes them owner-only.
+# A fixed name in the shared temp dir is readable by other local users on Linux
+# and can be pre-planted as a symlink (ADR 0456).
+disallowed-methods = [
+    { path = "std::env::temp_dir", reason = "create temp files through `tempfile`, which makes them owner-only (ADR 0456)" },
+]
