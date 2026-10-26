@@ -1,8 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
   DEFAULT_PERMISSION_CHOICE,
-  inputTouchesProtectedPath,
-  narrowPattern,
   permissionButtonState,
   grantLabel,
   renderQuestion,
@@ -238,105 +236,23 @@ describe('renderQuestion, a Claude Code shell command', () => {
   });
 });
 
+/** The session button names what the engine-stamped pattern covers. */
 describe('sessionLabel', () => {
-  it('returns the basename for Edit/Write so the button stays compact on long paths', () => {
-    expect(
-      sessionLabel('Edit', { file_path: '/Users/me/repo/.claude/commands/harden.md' }),
-    ).toBe('harden.md');
-    expect(sessionLabel('Write', { file_path: '/tmp/new.txt' })).toBe('new.txt');
+  it('names a path grant by its basename, so a long path stays compact', () => {
+    expect(sessionLabel('Edit(/Users/me/repo/.claude/commands/harden.md)')).toBe('harden.md');
+    expect(sessionLabel('NotebookEdit(/tmp/nb.ipynb)')).toBe('nb.ipynb');
+    expect(sessionLabel('Edit(README.md)')).toBe('README.md');
   });
 
-  it('uses notebook_path for NotebookEdit', () => {
-    expect(sessionLabel('NotebookEdit', { notebook_path: '/tmp/nb.ipynb' })).toBe('nb.ipynb');
+  it('names a command grant by its head, so the scope reads per program', () => {
+    expect(sessionLabel('Bash(git:*)')).toBe('git …');
+    expect(sessionLabel('command_execution(git:*)')).toBe('git …');
+    expect(sessionLabel('command_execution(./scripts/check.sh:*)')).toBe('./scripts/check.sh …');
   });
 
-  it('falls back to the full path when no slash is present', () => {
-    expect(sessionLabel('Edit', { file_path: 'README.md' })).toBe('README.md');
-  });
-
-  it('returns "<first-token> …" for Bash so the user knows the scope is per-program, not per-command', () => {
-    expect(sessionLabel('Bash', { command: 'git status --short' })).toBe('git …');
-  });
-
-  it('treats Codex command_execution like Bash (same per-program session scope)', () => {
-    expect(sessionLabel('command_execution', { command: 'git push origin main' })).toBe('git …');
-  });
-
-  it('returns the plugin slug for Skill', () => {
-    expect(sessionLabel('Skill', { skill: 'superpowers:test-driven-development' })).toBe(
-      'superpowers:*',
-    );
-    expect(sessionLabel('Skill', { skill: 'loop' })).toBe('loop:*');
-  });
-
-  it('returns null when the input has no useful identifier', () => {
-    expect(sessionLabel('Edit', {})).toBeNull();
-    expect(sessionLabel('Bash', {})).toBeNull();
-    expect(sessionLabel('Read', { file_path: '/x' })).toBeNull();
-  });
-});
-
-describe('inputTouchesProtectedPath', () => {
-  // Mirror of the engine-side `input_touches_protected_path` helper.
-  // Restricted to Bash because that's the only tool empirically observed
-  // to surface a card on these paths under bare allowlist entries (see
-  // `CC_PROTECTED_PATH_MARKERS` doc in claude_code.rs for the probing
-  // summary). Read / Edit / cat on `~/.claude/skills/...` all
-  // auto-approved silently — so the filter would be dead code for them.
-  it('detects .claude/ inside Bash command', () => {
-    expect(
-      inputTouchesProtectedPath('Bash', { command: 'rm -rf /Users/me/.claude/skills/grill' }),
-    ).toBe(true);
-  });
-
-  it('detects .git/ inside Bash command', () => {
-    expect(inputTouchesProtectedPath('Bash', { command: 'cat .git/HEAD' })).toBe(true);
-  });
-
-  it('returns false for unrelated Bash commands', () => {
-    expect(inputTouchesProtectedPath('Bash', { command: 'git status --short' })).toBe(false);
-  });
-
-  it('does not match .gitignore or .claude_backup (trailing slash anchor)', () => {
-    expect(inputTouchesProtectedPath('Bash', { command: 'cat .gitignore' })).toBe(false);
-    expect(inputTouchesProtectedPath('Bash', { command: 'ls .claude_backup' })).toBe(false);
-  });
-
-  it('returns false for non-Bash tools regardless of input', () => {
-    // Read/Edit/Glob/Grep/NotebookEdit on `~/.claude/skills/...`
-    // auto-approved silently under bare allowlist entries — so the
-    // helper is Bash-only by design.
-    const path = '/Users/me/repo/.claude/commands/harden.md';
-    expect(inputTouchesProtectedPath('Edit', { file_path: path })).toBe(false);
-    expect(inputTouchesProtectedPath('Write', { file_path: path })).toBe(false);
-    expect(inputTouchesProtectedPath('Read', { file_path: path })).toBe(false);
-    expect(
-      inputTouchesProtectedPath('NotebookEdit', { notebook_path: '/repo/.git/x.ipynb' }),
-    ).toBe(false);
-    expect(inputTouchesProtectedPath('Glob', { pattern: '.claude/skills/**/*.md' })).toBe(false);
-    expect(inputTouchesProtectedPath('Grep', { path: '/repo/.git/', pattern: 'HEAD' })).toBe(false);
-    expect(inputTouchesProtectedPath('Skill', { skill: 'code-review:code-review' })).toBe(false);
-  });
-});
-
-describe('narrowPattern', () => {
-  it('returns null when Bash command targets a CC-protected path', () => {
-    expect(
-      narrowPattern('Bash', { command: 'rm -rf /Users/me/.claude/skills/grill' }),
-    ).toBeNull();
-  });
-
-  it('returns Bash(<token>:*) for ordinary commands', () => {
-    expect(narrowPattern('Bash', { command: 'git status' })).toBe('Bash(git:*)');
-  });
-
-  it('returns Skill(<plugin>:*) for Skill', () => {
-    expect(narrowPattern('Skill', { skill: 'superpowers:test' })).toBe('Skill(superpowers:*)');
-  });
-
-  it('returns null for tools without a narrow scope', () => {
-    expect(narrowPattern('Edit', { file_path: '/x' })).toBeNull();
-    expect(narrowPattern('Read', { file_path: '/x' })).toBeNull();
+  it('names a skill grant by its plugin glob, and a bare grant as itself', () => {
+    expect(sessionLabel('Skill(superpowers:*)')).toBe('superpowers:*');
+    expect(sessionLabel('Read')).toBe('Read');
   });
 });
 
@@ -405,6 +321,10 @@ describe('grantLabel', () => {
   });
   it('reads a skill grant as the plugin it covers', () => {
     expect(vnodeToText(grantLabel('Skill(meta:*)'))).toBe('Always allow skills from <code>meta</code>');
+  });
+  it('reads a trusted script grant as its path', () => {
+    expect(vnodeToText(grantLabel('Bash(./scripts/check.sh:*)')))
+      .toBe('Always allow <code>./scripts/check.sh</code> commands');
   });
   it('keeps a pattern it has no words for, rather than inventing some', () => {
     expect(vnodeToText(grantLabel('Read(/tmp/**)'))).toBe('Always allow <code>Read(/tmp/**)</code>');

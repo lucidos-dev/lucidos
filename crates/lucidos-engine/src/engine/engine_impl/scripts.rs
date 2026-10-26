@@ -115,9 +115,12 @@ impl LucidosEngine {
             .build_env_without_secrets(Some(thread_id), depth, None)
             .await;
         env_vars.extend(
-            crate::runtime::spawn_env::agent_compile_env(worktree)
-                .into_iter()
-                .map(|(key, value)| (key.to_string(), value)),
+            crate::runtime::spawn_env::agent_compile_env(
+                crate::runtime::spawn_env::AgentSandbox::Unsandboxed,
+                worktree,
+            )
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value)),
         );
         env_vars
     }

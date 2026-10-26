@@ -1,7 +1,6 @@
 /**
- * Continue on the *Successor card*. A cold cache focuses the successor at once.
- * A warm one waits for the agent to spawn it, and the wait ends with the
- * agent's turn. A message typed in a thread that already handed off moves
+ * Continue on the *Successor card* starts a *successor session* in the same
+ * thread. A message typed in a predecessor of a legacy successor thread moves
  * to the newest thread of its chain.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -28,49 +27,36 @@ function setThread(status: 'idle' | 'running', successor?: { thread_id: string; 
   threadMap.value = new Map([['old', thread]]);
 }
 
-const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve));
-
 describe('continueInSuccessor', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     focusedThreadId.value = 'old';
     setThread('idle');
+    clearDraft('old');
   });
 
-  it('focuses the successor at once on the brief path', async () => {
-    vi.mocked(postContinue).mockResolvedValue({ path: 'brief', successor_thread_id: 'new' } as never);
-    await continueInSuccessor('old');
-    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('new');
+  it('starts the successor session in place on either path', async () => {
+    for (const outcome of [{ path: 'brief', starts: 'now' }, { path: 'narrative' }] as const) {
+      vi.mocked(postContinue).mockResolvedValue(outcome);
+      await continueInSuccessor('old');
+      expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
+      expect(focusedThreadId.value).toBe('old');
+    }
   });
 
-  it('focuses the successor when the agent spawns it on the narrative path', async () => {
-    vi.mocked(postContinue).mockResolvedValue({ path: 'narrative' } as never);
+  it('sends the typed message and clears it once the engine took it', async () => {
+    vi.mocked(postContinue).mockResolvedValue({ path: 'narrative' });
+    patchDraft('old', { text: ' Add a toggle ' });
     await continueInSuccessor('old');
-    expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
-    setThread('running');
-    setThread('idle', { thread_id: 'new', title: 'Next' });
-    await flush();
-    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('new');
+    expect(postContinue).toHaveBeenCalledWith('old', 'Add a toggle', undefined);
+    expect(getDraft('old').text).toBe('');
   });
 
-  it('stops waiting when the agent turn ends without a spawn', async () => {
-    vi.mocked(postContinue).mockResolvedValue({ path: 'narrative' } as never);
-    await continueInSuccessor('old');
-    setThread('running');
-    setThread('idle');
-    await flush();
-    setThread('idle', { thread_id: 'later', title: 'A later handoff' });
-    await flush();
-    expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
-  });
-
-  it('leaves the focus alone when the user moved to another thread', async () => {
-    vi.mocked(postContinue).mockResolvedValue({ path: 'narrative' } as never);
-    await continueInSuccessor('old');
-    focusedThreadId.value = 'elsewhere';
-    setThread('idle', { thread_id: 'new', title: 'Next' });
-    await flush();
-    expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
+  it('keeps the typed message when the engine refuses', async () => {
+    vi.mocked(postContinue).mockRejectedValue(new Error('refused'));
+    patchDraft('old', { text: 'Add a toggle' });
+    await expect(continueInSuccessor('old')).rejects.toThrow('refused');
+    expect(getDraft('old').text).toBe('Add a toggle');
   });
 });
 

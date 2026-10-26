@@ -418,6 +418,9 @@ impl LlmProvider for MockProvider {
                 input_tokens: None,
                 cache_creation_tokens: None,
                 cache_creation_1h_tokens: None,
+                cache_creation_30m_tokens: None,
+                cache_creation_12h_tokens: None,
+                cache_creation_requested_ttl: None,
                 stable_prefix_fingerprint: None,
                 cache_read_tokens: None,
                 served_model: None,
@@ -427,6 +430,7 @@ impl LlmProvider for MockProvider {
                 unknown_sse_dropped: 0,
                 model_only_text: None,
                 progress_notes: Vec::new(),
+                prefill: None,
                 service_tier: None,
             });
         }
@@ -447,6 +451,9 @@ impl LlmProvider for MockProvider {
                 input_tokens: None,
                 cache_creation_tokens: None,
                 cache_creation_1h_tokens: None,
+                cache_creation_30m_tokens: None,
+                cache_creation_12h_tokens: None,
+                cache_creation_requested_ttl: None,
                 stable_prefix_fingerprint: None,
                 cache_read_tokens: None,
                 served_model: None,
@@ -456,6 +463,7 @@ impl LlmProvider for MockProvider {
                 unknown_sse_dropped: 0,
                 model_only_text: None,
                 progress_notes: Vec::new(),
+                prefill: None,
                 service_tier: None,
             });
         }
@@ -480,6 +488,9 @@ impl LlmProvider for MockProvider {
                 input_tokens: None,
                 cache_creation_tokens: None,
                 cache_creation_1h_tokens: None,
+                cache_creation_30m_tokens: None,
+                cache_creation_12h_tokens: None,
+                cache_creation_requested_ttl: None,
                 stable_prefix_fingerprint: None,
                 cache_read_tokens: None,
                 served_model: None,
@@ -489,6 +500,7 @@ impl LlmProvider for MockProvider {
                 unknown_sse_dropped: 0,
                 model_only_text: None,
                 progress_notes: Vec::new(),
+                prefill: None,
                 service_tier: None,
             });
         }
@@ -509,6 +521,9 @@ impl LlmProvider for MockProvider {
                 input_tokens: None,
                 cache_creation_tokens: None,
                 cache_creation_1h_tokens: None,
+                cache_creation_30m_tokens: None,
+                cache_creation_12h_tokens: None,
+                cache_creation_requested_ttl: None,
                 stable_prefix_fingerprint: None,
                 cache_read_tokens: None,
                 served_model: None,
@@ -518,6 +533,7 @@ impl LlmProvider for MockProvider {
                 unknown_sse_dropped: 0,
                 model_only_text: None,
                 progress_notes: Vec::new(),
+                prefill: None,
                 service_tier: None,
             });
         }
@@ -569,6 +585,9 @@ impl LlmProvider for MockProvider {
             input_tokens: None,
             cache_creation_tokens: None,
             cache_creation_1h_tokens: None,
+            cache_creation_30m_tokens: None,
+            cache_creation_12h_tokens: None,
+            cache_creation_requested_ttl: None,
             stable_prefix_fingerprint: None,
             cache_read_tokens: None,
             served_model: None,
@@ -578,6 +597,7 @@ impl LlmProvider for MockProvider {
             unknown_sse_dropped: 0,
             model_only_text: None,
             progress_notes: Vec::new(),
+            prefill: None,
             service_tier: None,
         })
     }

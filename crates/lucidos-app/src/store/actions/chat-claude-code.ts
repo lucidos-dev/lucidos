@@ -12,6 +12,7 @@ import {
 import { archiveRequestInFlight } from '../rowIntents';
 import { applyNow, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
 import { pendingAnswers, unsentPicks } from '../pendingDecisions';
+import { answerIsQuiet, askedOptions } from '../quietAnswer';
 import { sendFailureOf, withQuietRetries } from './sendRetry';
 import { inSendChain } from './sendChain';
 import type { AnswerKind } from '../thread-events';
@@ -169,8 +170,11 @@ export async function answerThreadQuestion(
   // doesn't settle as "Done" while the client's status still reads
   // `waiting_for_user_answer` (see `isRenderedThreadIdle`). Cleared by the
   // PromptInput effect once the real status leaves that state, or below when
-  // no resume is coming. Held through every quiet retry.
-  markThreadAnswering(threadId);
+  // no resume is coming. Held through every quiet retry. A quiet pick wakes
+  // nobody, so marking it would draw a resume that never comes.
+  if (!answerIsQuiet(answer, askedOptions(threadMap.value.get(threadId), toolUseId))) {
+    markThreadAnswering(threadId);
+  }
   // A new answer replaces a pick that was not sent.
   unsentPicks.clear(toolUseId);
   // In the thread's send chain, so a message typed after the tap cannot reach

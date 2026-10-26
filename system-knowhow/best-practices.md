@@ -163,6 +163,19 @@ Exception: the engine sets `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL` in eve
 
 Every subprocess output is masked: an injected value, a token in the engine's own environment, and well-known token shapes such as `ghp_…` come back as `[REDACTED]`. A token in the shell that started the engine never reaches a chat tool's environment. To use one there, store it as a credential.
 
+## Listing this machine's workspaces
+
+Read `system-knowhow/scripts/list-workspaces.sh` for the shipped helper.
+It queries the gateway's registered inventory and health, including stopped
+workspaces. A ports file records an assignment and proves no running process.
+
+Pass two positional arguments: the loopback gateway origin and the local token
+file path, normally `~/.lucidos/local-token`. The origin includes its scheme
+and gateway port; see `system-knowhow/remote-access.md` for identifying it.
+For a private HTTPS certificate, pass `--ca-file <trusted-ca.pem>` too.
+The helper reads the token from disk and never places its value in argv.
+Its output is a JSON-quoted name and health value, separated by a tab.
+
 ## The workspace database: `LUCIDOS_DATABASE_URL`
 
 A script, trigger or agent shell reaches the workspace's own database through one variable, `LUCIDOS_DATABASE_URL`. Pass it explicitly:
@@ -184,7 +197,7 @@ conn = psycopg.connect(os.environ["LUCIDOS_DATABASE_URL"])
 
 ## Environment variables: Per-Workspace Config
 
-For environment that must be the **same for every subprocess in this workspace**, define an **environment variable** (Settings → System → Environment variables). These are DB-backed, non-secret `NAME=value` pairs. The engine injects them as real env vars into every subprocess it spawns: `run_bash`, `run_python`, background tasks, scheduled scripts, triggers, and coding-agent (Claude Code / Codex) sessions.
+For environment that must be the **same for every subprocess in this workspace**, define an **environment variable** (Settings → System → Environment Variables). These are DB-backed, non-secret `NAME=value` pairs. The engine injects them as real env vars into every subprocess it spawns: `run_bash`, `run_python`, background tasks, scheduled scripts, triggers, and coding-agent (Claude Code / Codex) sessions.
 
 - **You (the agent) can list, set and delete them** with the grouped `env_vars` tool (`action: list | set | delete`; `set`/`delete` take `name`, `set` also `value`). The retired `set_environment_variable` name still works as an alias for `set`. The user can also edit them in Settings. Changes take effect on the **next** tool call or agent turn, with **no engine restart**.
   - Exception: the engine's *own* shell-outs read their vars at startup. For example, the Apply-time `git push` uses `GIT_SSH_COMMAND` / `GH_CONFIG_DIR`. A change reaches the engine's own git on the next restart. Tool and agent subprocesses see it immediately.
@@ -202,11 +215,11 @@ Setup is **partly interactive**. You can set the variables, but the user must co
 
 1. Pick a dedicated gh config dir and authenticate it once (user-run, opens a browser): `GH_CONFIG_DIR=<dir> gh auth login`.
 2. For SSH push, make sure the key referenced by `GIT_SSH_COMMAND` is registered on that GitHub account.
-3. Set `GH_CONFIG_DIR` and `GIT_SSH_COMMAND` with the `env_vars` tool (`action: set`), or in Settings → System → Environment variables.
+3. Set `GH_CONFIG_DIR` and `GIT_SSH_COMMAND` with the `env_vars` tool (`action: set`), or in Settings → System → Environment Variables.
 
 **Want a credential's secret under a specific env var name?** Give the credential a custom env var name, for a CLI or SDK that expects an exact variable. Its secret then also injects as e.g. `GITHUB_TOKEN`, and the default `CRED_<NAME>` still works. A call gets it only when it names the alias or `CRED_<NAME>`. Set it two ways:
 
-- In the credential editor (Settings → credential editor).
+- In the credential editor (Settings → Accounts → Credentials).
 - Up front, when the agent requests the credential. `request_credential` takes an optional `env_var_name` arg that pre-fills the modal's "Env var name" field. The user can still edit or clear it before saving.
 
 The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_*`, `OAUTH_*`, `PATH`, `LUCIDOS_*`). It works for single-value auth types only. A `password` credential ignores it, since it splits into `_USERNAME`/`_PASSWORD`.
@@ -215,11 +228,11 @@ The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_
 
 **A credential names every host it may be sent to.** Its Base URLs field is a set, one row per hostname, and the secret is refused at any host outside it. So a provider with API, clone and download traffic on different hostnames takes **one** credential naming all of them. Nothing is inferred from a hostname's spelling: name each in full. `request_credential` takes the whole set in `base_urls`. Asking for a host an existing credential does not cover reopens that credential, so the user never types the same secret twice.
 
-**A secret can stay in 1Password.** Any secret field in the credential editor has a **From 1Password** toggle. On, the field takes a *secret reference* (`op://vault/item/field`) instead of the value. Lucidos reads it through the `op` tool with a service account token, set up under **Settings → Accounts → 1Password**. You cannot see or set the token.
+**A secret can stay in 1Password.** Any secret field in the credential editor has a **From 1Password** toggle. On, the field takes a *secret reference* (`op://vault/item/field`) instead of the value. Lucidos reads it through the `op` utility with a service account token, set up under **Settings → Accounts → 1Password**. You cannot see or set the token.
 
 Nothing changes for a script or app: it still names `CRED_<NAME>` or calls the proxy. When the value cannot be read, the call fails or the variable is left out, and the result says why. Point the user at 1Password or that Settings section, not at the script.
 
-**Every secret the user enters is a credential.** A mailbox password is the `email_password` credential. A secret MCP server env value belongs in a credential too: `setup_mcp_server` takes `{"credential": "<name>"}` as that variable's value. Removing the server deletes a credential named `mcp-<server id>-<VAR>` that no other server names. A credential with any other name stays.
+**Every secret the user enters is a credential.** A mailbox password is the `email_password` credential. A secret MCP server env value belongs in a credential too: `mcp(action="setup")` takes `{"credential": "<name>"}` as that variable's value. Removing the server deletes a credential named `mcp-<server id>-<VAR>` that no other server names. A credential with any other name stays.
 
 The legacy `data/.env` file is retired. On the next engine startup, any existing `data/.env` moves into the environment-variables store and the file is removed.
 

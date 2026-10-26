@@ -16,6 +16,7 @@ import { installNoKeyCodeText } from './utils/noKeyCodeText';
 import { installStrayFileDropGuard } from './utils/strayFileDrop';
 import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { installSafeAreaFloor } from './utils/safeAreaFloor';
+import { installStatusBarBlurClearance } from './utils/statusBarBlurClearance';
 import { isTouchDevice } from './utils/viewport';
 import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
 import { invoke, windowReadyToShow } from './utils/tauri';
@@ -93,6 +94,7 @@ if (isIOSPwa()) {
 // resolved header colour.
 paintThemeColor();
 installSafeAreaFloor();
+installStatusBarBlurClearance();
 
 installActionBtnBlurListener();
 // Preferences have not loaded yet, so this is the mirror, or on when it is empty.

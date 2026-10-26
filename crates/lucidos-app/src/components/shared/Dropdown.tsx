@@ -6,7 +6,7 @@ import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
 import { SearchField } from './SearchField';
 import { SkeletonProvider, SkText } from './Skeleton';
-import { isTypeaheadSeedKey } from './typeahead';
+import { filterListItems, useListFilter } from './useListFilter';
 import { protectedClassFrom } from './protectedSurface';
 import { isTouchLayout, keyboardHolder, returnKeyboard } from './keyboardHandoff';
 
@@ -53,11 +53,9 @@ interface DropdownProps {
   onOpen?: () => void;
 }
 
-/** Filter options by a case-insensitive label substring. Empty query → the full
- *  list unchanged. Pure — exported for unit testing the type-to-search behavior. */
+/** Match the option name and description through the shared list filter. */
 export function filterDropdownOptions(options: DropdownOption[], query: string): DropdownOption[] {
-  const q = query.trim().toLowerCase();
-  return q ? options.filter(o => o.label.toLowerCase().includes(q)) : options;
+  return filterListItems(options, query);
 }
 
 /** Which element must hold focus while the menu is open. Whatever has focus
@@ -176,15 +174,9 @@ export function Dropdown({
   // `.mobile-swipe-pane` on mobile, where an `absolute`-positioned menu was
   // clipped at the pane edge regardless of placement direction).
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
-  const [filter, setFilter] = useState('');
-  // Latches true on the first printable keystroke while open and resets on
-  // close. Gates the filter box: it stays hidden (and unfocused — no blinking
-  // caret) until the user actually types, then appears and owns input.
-  const [searching, setSearching] = useState(false);
   const [focusedIndex, setFocusedIndex] = useState(-1);
   const [draft, setDraft] = useState(value);
   const ref = useRef<HTMLDivElement>(null);
-  const filterRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -196,6 +188,13 @@ export function Dropdown({
   const selected = options.find((o) => o.value === value);
   const open = anchor !== null;
   const pos = useAnchoredPosition(anchor, menuRef);
+  const listFilter = useListFilter({
+    enabled: !freeText,
+    escape: open && !freeText,
+    onChange: (query) => setFocusedIndex(nextEnabledIndex(filterDropdownOptions(options, query), -1, +1)),
+  });
+  const { query, inputRef: filterRef, searching, setQuery: setFilter } = listFilter;
+  const filter = query.value;
 
   // Sync draft when external value changes (and we're not actively editing)
   useEffect(() => {
@@ -230,7 +229,7 @@ export function Dropdown({
   useEffect(() => {
     if (!open) return;
     const target = openMenuFocusTarget({
-      freeText: !!freeText, searching, positioned: pos !== null, touch: isTouchLayout(),
+      freeText: !!freeText, searching: searching || keyboardHolderRef.current !== null, positioned: pos !== null, touch: isTouchLayout(),
     });
     if (target === 'input') {
       const frame = requestAnimationFrame(() => {
@@ -250,8 +249,7 @@ export function Dropdown({
     el?.scrollIntoView({ block: 'nearest' });
   }, [focusedIndex, open]);
 
-  // Every dropdown is searchable: typing while open filters the option list by
-  // label (case-insensitive substring) via the shared `filterDropdownOptions`.
+  // Filter before computing keyboard indices so hidden rows cannot be chosen.
   const filterOptions = (query: string) => filterDropdownOptions(options, query);
   const filtered = filterOptions(filter);
 
@@ -265,7 +263,6 @@ export function Dropdown({
   function hideMenu() {
     setAnchor(null);
     setFilter('');
-    setSearching(false);
     setFocusedIndex(-1);
   }
 
@@ -310,7 +307,7 @@ export function Dropdown({
     if (!ref.current) return;
     showMenu();
     keyboardHolderRef.current = keyboardHolder();
-    if (keyboardHolderRef.current) setSearching(true);
+    if (query.value) return;
     const currentIdx = options.findIndex((o) => o.value === value);
     // Seed at the saved value, or — when missing/stale or pointing at a
     // disabled row (stale scope that collides with a section header after
@@ -357,29 +354,12 @@ export function Dropdown({
       else selectFocusedAndClose();
       return;
     }
-    if (e.key === ' ' && !freeText) {
-      // Space opens a closed menu (like a native <select>/button). While open
-      // but not yet searching, swallow it so the trigger button's default
-      // space→click doesn't close the menu; once searching it falls through to
-      // the focused filter box as a literal space. (freeText is exempt — its
-      // trigger is a text input and must accept spaces, e.g. cron expressions.)
-      if (!open) { e.preventDefault(); openDropdown(); return; }
-      if (!searching) e.preventDefault();
+    if (e.key === ' ' && !freeText && !open) {
+      e.preventDefault();
+      openDropdown();
       return;
     }
-    // Typeahead: a printable key while not yet searching (focus is on the
-    // trigger button, not the filter box) opens the menu if needed, reveals the
-    // filter box, and seeds it. stopPropagation keeps this first keystroke from
-    // the global type-to-focus handler (which would write it into the prompt).
-    // Once searching, the focused filter input owns subsequent keystrokes.
-    if (isTypeaheadSeedKey(e, { freeText: !!freeText, searching })) {
-      e.preventDefault();
-      e.stopPropagation();
-      if (!open) openDropdown();
-      setSearching(true);
-      setFilter(e.key);
-      setFocusedIndex(nextEnabledIndex(filterOptions(e.key), -1, +1));
-    }
+    if (!freeText && listFilter.handleKeyDown(e) && !open) openDropdown();
   }
 
   return (
@@ -455,18 +435,13 @@ export function Dropdown({
         panelRef={menuRef}
         panelStyle={dropdownPanelStyle(anchor ? anchor.getBoundingClientRect().width : null, pos)}
       >
-          {!freeText && searching && (
+          {!freeText && listFilter.visible && (
             <div class="dropdown-filter-bar">
               <SearchField
                 inputRef={filterRef}
                 inputClass="dropdown-filter"
                 value={filter}
-                onInput={(e) => {
-                  const v = e.currentTarget.value;
-                  setFilter(v);
-                  // Highlight the first match so Enter picks the top result.
-                  setFocusedIndex(nextEnabledIndex(filterOptions(v), -1, +1));
-                }}
+                onInput={(e) => setFilter(e.currentTarget.value)}
                 onKeyDown={handleKeyDown}
                 placeholder="Filter…"
               />

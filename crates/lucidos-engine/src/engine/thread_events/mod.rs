@@ -40,15 +40,15 @@ pub use event_impl::{
     not_a_keep_alive_idle_sql, KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON,
 };
 pub use form_request::FormRequestOutcome;
-pub use keep_alive_status::{CacheKeepAliveNotKeptReason, CacheKeepAliveStatus};
+pub use keep_alive_status::{CacheKeepAliveNotKeptReason, CacheKeepAliveStatus, CapOdds};
 pub use mcp::McpEnablementSource;
 pub use memory::RecalledMemory;
 pub use meta::EventMeta;
 pub(crate) use question::with_image_note;
 pub use question::{AnswerKind, OwnerApproval, QuestionOption, WidgetEmbed};
 pub use session::{
-    ChildCompletionStatus, HandoffConsent, IntegratedBranch, SessionEndReason,
-    SubThreadPendingChange, VoiceSessionEndReason, WakeMode,
+    ChildCompletionStatus, FreshSessionReason, HandoffConsent, HandoffOpening, IntegratedBranch,
+    SessionContinuity, SessionEndReason, SubThreadPendingChange, VoiceSessionEndReason, WakeMode,
 };
 pub use todo::{TodoItem, TodoStatus};
 pub use triage::TriageProposalEntry;

@@ -1,7 +1,15 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { chatModels, configuredProviders } from '../store';
+import { describe, it, expect, afterEach, vi } from 'vitest';
+import { chatLadder, chatModels, configuredProviders } from '../store';
+import type { IntelligenceLadder } from '../../api/types';
+
+const getChatLadder = vi.hoisted(() => vi.fn<() => Promise<IntelligenceLadder>>());
+vi.mock('../../api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../api/client')>()),
+  getChatLadder,
+}));
 import {
   chatModelOptions,
+  loadChatLadder,
   clampEffortFor,
   isProviderConfigured,
   modelReasoningEfforts,
@@ -63,7 +71,60 @@ const ALL_TIERS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 afterEach(() => {
   chatModels.value = { status: 'not-loaded' };
+  chatLadder.value = { status: 'not-loaded' };
   configuredProviders.value = null;
+  getChatLadder.mockReset();
+});
+
+describe('loadChatLadder', () => {
+  const ladder = (source: string) => ({ source }) as IntelligenceLadder;
+
+  it('loads the ladder into the shared signal', async () => {
+    getChatLadder.mockResolvedValue(ladder('first'));
+    await loadChatLadder();
+    expect(chatLadder.value).toEqual({ status: 'loaded', data: ladder('first') });
+  });
+
+  it('keeps the old ladder shown while it re-reads', async () => {
+    getChatLadder.mockResolvedValue(ladder('first'));
+    await loadChatLadder();
+    let release!: (l: IntelligenceLadder) => void;
+    getChatLadder.mockReturnValue(new Promise((resolve) => { release = resolve; }));
+    const reread = loadChatLadder();
+    expect(chatLadder.value.status).toBe('loaded');
+    release(ladder('second'));
+    await reread;
+    expect(chatLadder.value).toEqual({ status: 'loaded', data: ladder('second') });
+  });
+
+  it('records a failed first read', async () => {
+    getChatLadder.mockRejectedValue(new Error('down'));
+    await loadChatLadder();
+    expect(chatLadder.value.status).toBe('failed');
+  });
+
+  it('keeps the ladder it has when a re-read fails', async () => {
+    getChatLadder.mockResolvedValue(ladder('first'));
+    await loadChatLadder();
+    getChatLadder.mockRejectedValue(new Error('down'));
+    await loadChatLadder();
+    expect(chatLadder.value).toEqual({ status: 'loaded', data: ladder('first') });
+  });
+});
+
+describe('loadChatLadder ordering', () => {
+  const ladder = (source: string) => ({ source }) as IntelligenceLadder;
+
+  it('lets a slow older read never overwrite a newer one', async () => {
+    let releaseOld!: (l: IntelligenceLadder) => void;
+    getChatLadder.mockReturnValueOnce(new Promise((resolve) => { releaseOld = resolve; }));
+    const older = loadChatLadder();
+    getChatLadder.mockResolvedValueOnce(ladder('newer'));
+    await loadChatLadder();
+    releaseOld(ladder('older'));
+    await older;
+    expect(chatLadder.value).toEqual({ status: 'loaded', data: ladder('newer') });
+  });
 });
 
 describe('chatModelOptions', () => {

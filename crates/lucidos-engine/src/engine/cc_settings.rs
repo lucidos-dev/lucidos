@@ -19,7 +19,8 @@ pub(crate) fn cc_settings_path_for_workspace(workspace_root: &Path) -> PathBuf {
 /// How long a coding agent waits for the user's answer, in seconds: 24 hours.
 /// The user may take minutes or hours. Every agent-side cap on that wait is
 /// lifted to this one value: CC's PreToolUse hook timeout (default 60 s), its
-/// `MCP_TOOL_TIMEOUT` and `MCP_TIMEOUT`, and Codex's `tool_timeout_sec`. A
+/// `MCP_TOOL_TIMEOUT` and `MCP_TIMEOUT`, Codex's `tool_timeout_sec`, and the
+/// `yield_time_ms` its prompt tells a question's `exec` cell to use. A
 /// shorter one forces a retry, which surfaces a duplicate card.
 pub(crate) const USER_ANSWER_WAIT_SECS: u64 = 86_400;
 

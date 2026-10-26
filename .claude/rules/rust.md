@@ -7,11 +7,12 @@ paths:
 
 # Rust Conventions
 
-- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Four are blessed, each because a caller branches on it:
+- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Five are blessed, each because a caller branches on it:
   - `LifecycleViolation` (`engine/thread_lifecycle.rs`): the EventBus rejection path fails fast on its typed payload.
   - `llm::ModelNotServed`: an unset default moves to its next model (ADR 0403).
   - `lucidos_engine_socket::ConnectError` and the gateway's `engine_hop::HopError`: a probe tells `Unreachable` from `Foreign` (ADR 0445).
   - `agent_session::start_failure::AgentStartFailure`: a coding-agent turn that could not begin. `agent_exit_of` attaches `agent_exit` to the `ResponseFailed` (ADR 0487).
+  - `llm::prefill::PrefillRefused`: the keep-alive's first-beat guard marks a provider that refused a prefill unable to prefill (ADR 0556).
   - `api::error::ApiError` is not an error type in this sense. It is the `/api/v1` response shape (`status` plus `{"error": msg}`), and handlers return `Result<_, ApiError>`. Internal code keeps the boxed trait object. `ApiError::with_reason` adds a `reason` slug for a refusal a client must tell apart.
   - A new custom type needs the same structural reason. "I want a typed error for this layer" is not one. If the caller only formats the error into a string, use the boxed trait object.
 - **Shared state:** `Arc<Mutex<T>>` for exclusive access, `Arc<RwLock<T>>` for read-heavy.

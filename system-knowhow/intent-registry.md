@@ -21,7 +21,11 @@ If an intent ID shows in the prompt but not under `apps/<app>/intents/`, **check
 
 There is no top-level `data/intents/` source. The registry silently ignores files placed there.
 
-`IntentStore::load(id)` searches the same paths when `load_knowhow(id)` finds no knowhow doc with that id. So the loader and the prompt agree by construction: anything listed is loadable, and anything loadable is listed.
+`IntentStore::load(id)` searches these roots when `load_knowhow(id)` finds no knowhow doc.
+Standalone loading first looks under `data/triggers/<id>/`, then picks a markdown
+file there. Listing instead derives the id from each filename's stem.
+Keep a standalone trigger's folder and filename stem identical, or a listed
+intent may not load under its advertised id.
 
 ## Running an intent: `load_knowhow`, in the same turn
 

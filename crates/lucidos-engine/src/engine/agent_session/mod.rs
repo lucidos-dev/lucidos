@@ -1,6 +1,8 @@
 mod apply_now;
 pub(crate) mod background_task;
+pub(crate) mod child_reports;
 pub(crate) mod coding_agent_kind;
+mod continuity;
 mod external_edits;
 pub(crate) mod external_watchdog;
 mod input_ledger;
@@ -36,12 +38,14 @@ pub(crate) use apply_now::{
     InPlaceMergeStart,
 };
 pub(crate) use external_edits::git_head_sha as external_edits_for_recovery_head_sha;
+pub(crate) use external_edits::worktree_serves_branch;
 // Engine construction passes the hung-tool ceiling to the external watchdog;
 // `lifecycle` is private, so re-export it here.
 pub(crate) use input_ledger::forwards_verbatim;
 pub(crate) use lifecycle::WATCHDOG_HUNG_TOOL_CEILING_MS;
 pub(crate) use parsing::{
-    option_embed_problem, parse_ask_user_question_inputs, question_text, ParsedQuestion,
+    option_embed_problem, parse_ask_user_question_inputs, question_text, strip_quiet_label_prefix,
+    ParsedQuestion,
 };
 pub(crate) use prompts::{
     build_lane_catch_up_prompt, build_lane_thread_prompt, build_merge_prompt, LaneMemberBrief,

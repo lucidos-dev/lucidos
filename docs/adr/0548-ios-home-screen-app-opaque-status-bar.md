@@ -1,6 +1,6 @@
 # 0548: The iOS home-screen app runs below an opaque status bar, never black-translucent, since iOS 26+ blurs the page under a translucent one
 
-- **Status**: Accepted
+- **Status**: Superseded by [0549](0549-ios-home-screen-app-translucent-status-bar-top-strip.md)
 - **Date**: 2026-10-22
 
 ## Context

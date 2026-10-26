@@ -1,3 +1,4 @@
+import type { CacheRebuild } from '../../api/client/successor';
 import { usd } from '../settings/treeBackfillFormat';
 
 export interface RungSwitchCopyInput {
@@ -7,7 +8,10 @@ export interface RungSwitchCopyInput {
   to: string;
   /** The engine's approximate one-time cost. `null` when it has none. */
   extraCostUsd: number | null;
-  /** Whether the confirm offers a new thread on the rung. The copy only
+  /** `unknown` when the cache may already be cold: the copy then says the
+   *  switch *may* reread the history. */
+  rebuild: CacheRebuild;
+  /** Whether the confirm offers a fresh session on the rung. The copy only
    *  advertises a handoff it offers. */
   canHandOff: boolean;
 }
@@ -37,18 +41,26 @@ function costClause(extraCostUsd: number | null): string {
     : ` It costs about ${usd(extraCostUsd)} more.`;
 }
 
-/** The words of the confirm a switch raises when it rebuilds a warm cache. The
- *  cost is a one-time re-read of the thread, so the copy never implies the
- *  thread runs slower afterwards. */
-export function rungSwitchCopy({ from, to, extraCostUsd, canHandOff }: RungSwitchCopyInput): RungSwitchCopy {
-  const rewrite = `Reads its whole history again, one time.${costClause(extraCostUsd)}`;
+/** The words of the confirm a switch raises when it rebuilds a warm cache, or
+ *  may. The cost is a one-time re-read of the thread, so the copy never
+ *  implies the thread runs slower afterwards. */
+export function rungSwitchCopy({ from, to, extraCostUsd, canHandOff, rebuild }: RungSwitchCopyInput): RungSwitchCopy {
+  const may = rebuild === 'unknown';
+  const cost = costClause(extraCostUsd);
+  const rewrite = may
+    ? `May read its whole history again, one time.${cost}`
+    : `Reads its whole history again, one time.${cost}`;
+  const handoffMessage = may
+    ? `The thread's prompt cache on ${from} may still be warm.`
+    : `The thread's prompt cache is warm on ${from}.`;
+  const switchMessage = may
+    ? `Switching to ${to} may make the thread read its whole history again, one time.${cost}`
+    : `Switching to ${to} makes the thread read its whole history again, one time.${cost}`;
   return {
     rewrite,
     title: `Switch to ${to}`,
-    message: canHandOff
-      ? `The thread's prompt cache is warm on ${from}.`
-      : `Switching to ${to} makes the thread read its whole history again, one time.${costClause(extraCostUsd)}`,
-    handoffLabel: 'Hand off to a new thread',
+    message: canHandOff ? handoffMessage : switchMessage,
+    handoffLabel: 'Hand off to a fresh session',
     handoffDetail: `Starts fresh on ${to} and carries on from where this one stands.`,
     switchHereLabel: 'Switch this thread',
     keepLabel: `Keep ${from}`,

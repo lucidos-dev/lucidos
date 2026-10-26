@@ -110,11 +110,12 @@ test.describe('Cascading archive — Archive button gating', () => {
 
     // Archive must NOT render while the CC sub-thread is running. Pin still
     // renders (it's independent of resolveActions and reads is_saved only).
-    // The Archive button has no aria-label — match its `.action-btn` class +
-    // exact "Archive" text. `:text-is` enforces an exact match so the "Archive..."
-    // spinner state (Archive in progress) doesn't accidentally satisfy the
+    // Match the `.action-btn` class and the exact "Archive" face word. A held-back
+    // face is aria-disabled and a busy one disabled, so neither satisfies the
     // "not present" assertion.
-    const archiveBtn = page.locator('button.action-btn:not([aria-disabled="true"]):text-is("Archive"):visible');
+    const archiveBtn = page.locator(
+      'button.action-btn:not([aria-disabled="true"]):not(:disabled):has(.action-slot-label:text-is("Archive")):visible',
+    );
     await expect(archiveBtn).toHaveCount(0, { timeout: 5_000 });
     // It shows held back instead, and a tap says why (ADR 0378).
     await expect(page.locator('button.action-btn-blocked[aria-disabled="true"]:visible')).toHaveCount(1);
@@ -143,7 +144,7 @@ test.describe('Cascading archive — Archive button gating', () => {
 
     // Now Archive must render — every gate is clear.
     await expect(
-      page.locator('button.action-btn:text-is("Archive"):visible').first(),
+      page.locator('button.action-btn:has(.action-slot-label:text-is("Archive")):visible').first(),
     ).toBeVisible({ timeout: 10_000 });
   });
 });

@@ -9,7 +9,9 @@
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: 4rem 1rem 3rem;
+  /* The lockup clears the status bar, and the phone's cutout, by a full
+     step. Desktop has no inset, so the 4rem floor keeps its spacing. */
+  padding: max(4rem, calc(var(--header-controls-top) + 2.5rem)) 1rem 3rem;
   overflow-y: auto;
   color: #fff;
   /* The gateway surface wears a neutral sans-serif rather than the app's
@@ -1220,10 +1222,9 @@
    recipe is the tallest thing it draws.
 
    The gutter clears the safe area, which the gate has to do for itself. The
-   page is `viewport-fit=cover`, so an installed app draws under the home
-   indicator, and under the clock where an older install keeps a translucent
-   status bar. Nothing else insets this screen: it renders instead of the
-   shell. */
+   page is `viewport-fit=cover` under a translucent status bar, so an installed
+   app draws under the clock at the top and the home indicator at the bottom.
+   Nothing else insets this screen: it renders instead of the shell. */
 .pairing-gate {
   position: fixed;
   inset: 0;

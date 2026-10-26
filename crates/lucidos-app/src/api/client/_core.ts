@@ -7,6 +7,7 @@ import { BASE_PATH } from '../../utils/basePath';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { registrationToAwait } from '../../utils/deviceRegistration';
 import { clampText } from '../../utils/clampText';
+import { trackRequest } from './requestsInFlight';
 
 // Base-path aware (ADR 0014): behind the workspace gateway the bundle is served
 // under `/<slug>/`, so every API URL must carry that prefix. `BASE_PATH` is
@@ -81,7 +82,12 @@ export async function mutatingFetch(url: string, init?: RequestInit): Promise<Re
   const registration = registrationToAwait(url, init?.method);
   if (registration) await registration;
   const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
-  return fetch(url, { ...init, headers });
+  const done = trackRequest(url);
+  try {
+    return await fetch(url, { ...init, headers });
+  } finally {
+    done();
+  }
 }
 
 /** Match the `TypeError` messages browsers throw for transport-layer fetch
@@ -271,6 +277,7 @@ async function fetchWithDefaults(url: string, init: RequestInit | undefined, tim
   const headers = { ...deviceIdHeader(), ...(init?.headers as Record<string, string> | undefined) };
   const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+  const done = trackRequest(url);
   try {
     return await fetch(url, { ...init, headers, signal });
   } catch (err) {
@@ -287,6 +294,8 @@ async function fetchWithDefaults(url: string, init: RequestInit | undefined, tim
       throw new DOMException(`Request timed out after ${timeoutMs}ms`, 'TimeoutError');
     }
     throw err;
+  } finally {
+    done();
   }
 }
 

@@ -242,6 +242,7 @@ async fn a_delivery_is_not_held_without_an_active_question() {
         thread_id,
         ThreadEvent::UserQuestionAnswered {
             tool_use_id: QUESTION.into(),
+            quiet: false,
             answer: AnswerKind::FreeText {
                 text: "yes".into(),
                 image_hashes: vec![],
@@ -299,6 +300,7 @@ async fn the_resume_collects_every_delivery_held_since_the_question() {
         thread_id,
         ThreadEvent::UserQuestionAnswered {
             tool_use_id: QUESTION.into(),
+            quiet: false,
             answer: AnswerKind::FreeText {
                 text: "yes".into(),
                 image_hashes: vec![],

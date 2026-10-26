@@ -96,7 +96,7 @@ export function describeContinuationReason(reason: string | undefined): string |
 
 /** Why the engine pings a waiting agent. The route popover and the
  *  transcript's keep-alive divider both say it. */
-export const CACHE_KEEP_ALIVE_EXPLAINER = 'The agent was waiting, so Lucidos nudged it to keep its prompt cache warm. Once that cache expires, after 5 minutes or an hour depending on how the agent is billed, its next step pays to read the whole conversation again.';
+export const CACHE_KEEP_ALIVE_EXPLAINER = 'The agent was waiting, so Lucidos pinged the model to keep its prompt cache warm. Once that cache expires, after 5 minutes or an hour depending on how the agent is billed, its next step pays to read the whole conversation again.';
 
 /** Why the engine acted, in plain words, for the route popover and a boundary
  *  card's Details. The heading ("Why Lucidos acted") is owned by the renderer. */
@@ -119,7 +119,9 @@ export function describeEngineReason(reason: EngineReason): string {
     case 'unmerged_integrated_work':
       return 'This thread’s work was meant to reach the project inside its parent’s change. That change was applied without it. Lucidos set the work aside so it is not lost. Bring it back from the Changes panel to apply it.';
     case 'successor_residue':
-      return 'This thread kept working after it continued in a successor thread. You applied or discarded the successor’s change without that later work, so Lucidos set the work aside to keep it. Bring it back from the Changes panel to apply it.';
+      return 'This thread kept working after it continued in a legacy successor thread. You applied or discarded the successor’s change without that later work, so Lucidos set the work aside to keep it. Bring it back from the Changes panel to apply it.';
+    case 'successor_session':
+      return 'The previous session in this thread handed off, so Lucidos started a fresh one to carry on with a clean context. Its first message is the handoff.';
     case 'merge_conflict':
       return 'Your changes conflict with newer changes in the project: a merge conflict. Lucidos asked the agent to resolve it before your changes can be applied.';
     case 'main_check_red':

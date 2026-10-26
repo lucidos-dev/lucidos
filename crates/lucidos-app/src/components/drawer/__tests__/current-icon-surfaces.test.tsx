@@ -10,7 +10,7 @@ import { act } from 'preact/test-utils';
 import { ThreadDrawer, setSectionCollapsed } from '../ThreadDrawer';
 import { ThreadGroupingButton } from '../../layout/ThreadsHeaderControls';
 import { ThreadOverflowItemsChunk, ThreadOverflowMenu } from '../../shared/ThreadOverflowMenu';
-import { getBannerActions, getWaitingState } from '../../chat/WaitingBanner';
+import { getWaitingState } from '../../chat/WaitingBanner';
 import { CurrentIcon, InboxIcon } from '../../shared/icons';
 import { threadMap, threadsLoaded, focusedThreadId, setDrawerGrouping } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
@@ -78,14 +78,12 @@ describe('the Current icon', () => {
     expect(item.querySelector('svg')!.outerHTML).toBe(markup(<CurrentIcon />));
   });
 
-  it('marks Move to Current on the composer row', () => {
+  it('leaves Move to Current off the composer row: the thread menu owns it', () => {
     threadMap.value = new Map([['t', makeThreadState('t', {
       meta: { channel: 'claude_code', status: 'idle', section: 'archived' },
     })]]);
     focusedThreadId.value = 't';
-    const members = getBannerActions(getWaitingState() as Parameters<typeof getBannerActions>[0]);
-    const unarchive = members.find(m => m.key === 'unarchive')!;
-    expect(markup(unarchive.icon())).toBe(markup(<CurrentIcon />));
+    expect(getWaitingState()).toBeNull();
   });
 });
 

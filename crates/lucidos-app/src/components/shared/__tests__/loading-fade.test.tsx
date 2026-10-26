@@ -1,13 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
 
-// LoadingFade calls useLingeringFlag (a render-time hook) at its top level, so it
-// can't be invoked as a plain function outside a real render. Stub the hook —
-// the bug under test is purely structural (how `children` is placed in the grid),
-// independent of the linger timing. `lingering` lets us drive whether the
+// LoadingFade calls useLingeringFlag and useMinimumVisibleFlag (render-time hooks)
+// at its top level, so it can't be invoked as a plain function outside a real
+// render. Stub them. The bug under test is purely structural (how `children` is
+// placed in the grid), independent of the linger and floor timing.
+// loading-fade-floor.test.tsx covers those. `lingering` lets us drive whether the
 // skeleton is mounted.
 const mocks = vi.hoisted(() => ({ lingering: false }));
 vi.mock('../../../hooks/useDelayedLoading', () => ({
   useLingeringFlag: () => mocks.lingering,
+  useMinimumVisibleFlag: (active: boolean) => active,
 }));
 
 import { LoadingFade } from '../LoadingFade';

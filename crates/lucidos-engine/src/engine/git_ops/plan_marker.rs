@@ -14,8 +14,8 @@
 //! that a follow-up commit does not invalidate, so the stored `head_sha` is
 //! diagnostic only.
 
-use super::canonical_repo_root;
 use super::plan_approval::{user_approved_plan, PlanApprovalError};
+use super::{canonical_repo_root, local_branch_exists};
 use std::path::Path;
 
 /// How many files a `BoundedSecurityFix` may name. The lane's whole claim is
@@ -261,7 +261,62 @@ pub(crate) async fn record_planned(
     Ok(())
 }
 
-/// Copy `from_branch`'s marker onto `to_branch`, a successor thread's fresh
+/// The branch `caller_thread`'s Apply lands in `repo_root`, when that is not
+/// `branch_name`.
+///
+/// A Lucidos or app thread keeps its engine-named branch through a
+/// `git switch -c`, so a marker on the side branch never reaches Apply. Three
+/// cases read `None`: an external thread, which adopts a renamed branch at idle;
+/// a caller with no session; and a tracked branch absent from `repo_root`. The
+/// last covers a rename, which the next spawn takes over, and another repo.
+pub(crate) async fn tracked_branch_elsewhere(
+    pool: &sqlx::PgPool,
+    repo_root: &Path,
+    caller_thread: &str,
+    branch_name: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let tracked = tracked_branch_named_otherwise(pool, caller_thread, branch_name).await?;
+    Ok(match tracked {
+        // Unknown never refuses: a stray marker costs a re-mark, a false
+        // refusal strands the agent.
+        Some(tracked)
+            if local_branch_exists(repo_root, &tracked)
+                .await
+                .or_unknown(false) =>
+        {
+            Some(tracked)
+        }
+        _ => None,
+    })
+}
+
+/// The newest session's branch, unless it is `branch_name` or the thread is
+/// external. A thread older than `coding_agent_kind` reads its durable
+/// `coding_agent_is_external_repo` flag instead.
+async fn tracked_branch_named_otherwise(
+    pool: &sqlx::PgPool,
+    caller_thread: &str,
+    branch_name: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT tracked FROM ( \
+            SELECT payload->>'branch' AS tracked, \
+                   COALESCE(payload->>'coding_agent_kind', '') = 'external' AS external \
+              FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'SessionStarted' \
+             ORDER BY sequence DESC LIMIT 1 \
+         ) newest \
+         WHERE NOT external AND tracked <> $2 \
+           AND NOT EXISTS (SELECT 1 FROM thread_summaries \
+                            WHERE thread_id::text = $1 AND coding_agent_is_external_repo)",
+    )
+    .bind(caller_thread)
+    .bind(branch_name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Copy `from_branch`'s marker onto `to_branch`, a legacy successor thread's fresh
 /// branch. The successor carries the same work, so the user's decision on it
 /// carries too. A branch that already holds a marker keeps its own.
 pub(crate) async fn carry_planned(

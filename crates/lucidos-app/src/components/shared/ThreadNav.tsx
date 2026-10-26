@@ -1,11 +1,12 @@
 import {
   canGoBackThread, canGoForwardThread, threadNavBack, threadNavForward,
-  threadNavHistory, threadNavGoTo,
+  threadNavHistory, threadNavGoTo, type ThreadNavEntry,
 } from '../../store/actions/thread-navigation';
 import { focusedThreadId, threadMap } from '../../store/store';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { NavChevron, type NavHistoryItem } from './NavChevron';
+import { DashboardIcon } from './icons';
 import { ThreadTypeIcon } from './ThreadTypeIcon';
 
 interface Props {
@@ -14,11 +15,15 @@ interface Props {
 
 /** A history row for one remembered thread — its title + a type glyph
  *  (Lucidos / Claude / Codex / trigger), derived from the live thread meta. */
-function threadNavItem(index: number, id: string): NavHistoryItem {
+function threadNavItem(index: number, { type, id }: ThreadNavEntry): NavHistoryItem {
   const thread = threadMap.value.get(id);
+  const title = thread ? threadDisplayTitle(thread) : 'Untitled Thread';
+  if (type === 'dashboard') {
+    return { key: `${index}:dashboard`, label: `Dashboard \u00b7 ${title}`, icon: <DashboardIcon />, onSelect: () => threadNavGoTo(index) };
+  }
   return {
     key: `${index}:${id}`,
-    label: thread ? threadDisplayTitle(thread) : 'Untitled Thread',
+    label: title,
     // `'unknown'`, not a plausible `'chat'`: a row whose thread has left the
     // map has no known channel. `ThreadTypeIcon` draws the Lucidos mark for
     // both, so the honest value costs nothing.
@@ -34,14 +39,14 @@ function threadBackItems(): NavHistoryItem[] {
   // top. Focused: the cursor IS the current thread, so Back starts one earlier.
   const top = focusedThreadId.value === null ? cursor : cursor - 1;
   const items: NavHistoryItem[] = [];
-  for (let i = top; i >= 0; i--) items.push(threadNavItem(i, stack[i].id));
+  for (let i = top; i >= 0; i--) items.push(threadNavItem(i, stack[i]));
   return items;
 }
 
 function threadForwardItems(): NavHistoryItem[] {
   const { stack, cursor } = threadNavHistory.value;
   const items: NavHistoryItem[] = [];
-  for (let i = cursor + 1; i < stack.length; i++) items.push(threadNavItem(i, stack[i].id));
+  for (let i = cursor + 1; i < stack.length; i++) items.push(threadNavItem(i, stack[i]));
   return items;
 }
 

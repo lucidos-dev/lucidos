@@ -412,10 +412,7 @@ impl VertexProvider {
         let location = self.current_location();
         let host = vertex_host(&location);
         if Self::is_claude_model(model) {
-            format!(
-                "https://{}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:streamRawPredict",
-                host, self.project_id, location, model
-            )
+            self.claude_endpoint(model)
         } else if Self::region_is_pinned(model) {
             self.global_gemini_endpoint(model)
         } else {
@@ -424,6 +421,18 @@ impl VertexProvider {
                 host, self.project_id, location, model
             )
         }
+    }
+
+    /// A Claude model's endpoint, which a turn and its prefill beat share.
+    fn claude_endpoint(&self, model: &str) -> String {
+        let location = self.current_location();
+        format!(
+            "https://{}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:streamRawPredict",
+            vertex_host(&location),
+            self.project_id,
+            location,
+            model
+        )
     }
 
     async fn get_access_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -530,6 +539,14 @@ impl LlmProvider for VertexProvider {
             self.chat_gemini(messages, tools, selection, system_prompt, on_token)
                 .await
         }
+    }
+
+    async fn prefill(
+        &self,
+        body: &crate::llm::prefill::PrefillBody,
+        _call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.prefill_claude(body).await
     }
 }
 

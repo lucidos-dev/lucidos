@@ -156,9 +156,9 @@ enum Command {
     ///
     /// The verbs, each with --thread: archive, cancel, continue, apply,
     /// discard, set-aside, bring-back, revert, control, ask-side-question,
-    /// dismiss-side-question, spawn-successor. A card never asks to answer
-    /// another card. Creating a top-thread and moving your own child to top
-    /// level need no approval.
+    /// dismiss-side-question. A card never asks to answer another card.
+    /// Creating a top-thread, moving your own child to top level and handing
+    /// off need no approval.
     #[command(name = "ask-owner-approval")]
     AskOwnerApproval {
         /// The act, in kebab-case: apply, archive, cancel, ...
@@ -284,8 +284,8 @@ enum Command {
         #[command(subcommand)]
         action: PlannedCmd,
     },
-    /// Continue this thread in a successor thread, which carries on with a
-    /// fresh context.
+    /// Continue this thread in a successor session: a fresh session in the
+    /// same thread.
     #[command(long_about = successor::HELP)]
     Successor {
         #[command(subcommand)]
@@ -865,6 +865,15 @@ enum ThreadsCmd {
         #[arg(long)]
         thread: String,
     },
+    /// Read the reports your child threads filed that you have not read yet,
+    /// as JSON, oldest first. Each report is handed over once: it is not
+    /// delivered again when your turn ends.
+    ///
+    /// A report that arrives while your turn runs waits for your next turn.
+    /// Most `lucidos` calls you make meanwhile say on stderr that one waits,
+    /// and `background-task wait` returns early with it. This reads it now.
+    /// Only works from inside a Lucidos coding-agent session.
+    ChildReports,
 }
 
 #[derive(Subcommand)]
@@ -1408,31 +1417,35 @@ enum SuccessorCmd {
         /// Offer the user a question card instead of deciding alone.
         #[arg(long)]
         ask: bool,
+        /// Declare the surface's default rung the floor for this run, as the
+        /// hardening flow does. A thread below it hands off onto it.
+        #[arg(long, conflicts_with = "ask")]
+        default_floor: bool,
     },
-    /// Start the successor from a handoff narrative file and print its link.
-    Spawn {
+    /// Start a successor session in this thread from a handoff narrative
+    /// file. `spawn` is a temporary alias (docs/temporary-measures.md).
+    #[command(alias = "spawn")]
+    Start {
         /// The handoff narrative, a markdown file with the six sections
         /// `lucidos successor --help` names.
         #[arg(long)]
         narrative: PathBuf,
-        /// Coding-agent backend for the successor. Defaults to this thread's.
+        /// Coding-agent backend for the successor session. Defaults to this
+        /// thread's.
         #[arg(long, value_enum)]
         coding_agent: Option<CliCodingAgent>,
-        /// Model for the successor (e.g. "sonnet", "gpt-5.6-sol"). Defaults
-        /// to this thread's on the same backend, else the backend's default.
+        /// Model for the successor session (e.g. "sonnet", "gpt-5.6-sol").
+        /// Defaults to this thread's on the same backend, else the backend's
+        /// default.
         #[arg(long = "coding-agent-model")]
         coding_agent_model: Option<String>,
-        /// Thinking level for the successor. Defaults to this thread's on the
-        /// same backend while the successor's model accepts it.
+        /// Thinking level for the successor session. Defaults to this thread's
+        /// on the same backend while its model accepts it.
         #[arg(
             long,
             value_parser = clap::builder::PossibleValuesParser::new(crate::spawn_thread::EFFORT_LEVELS)
         )]
         reasoning_effort: Option<String>,
-        /// On a top-level thread, start a build chain whose builder is a
-        /// child of this thread, which stays open. A flow says when.
-        #[arg(long)]
-        build_chain: bool,
         /// The automatic checkpoint this handoff happens at, as `offer`
         /// printed it.
         #[arg(long)]
@@ -1696,18 +1709,27 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Successor { action } => {
             let ws = resolve_from_env()?;
             match action {
-                SuccessorCmd::Offer { at, progress, ask } => {
-                    successor::cmd_offer(&ws, successor::CheckpointRun { name: at, progress }, ask)
+                SuccessorCmd::Offer {
+                    at,
+                    progress,
+                    ask,
+                    default_floor,
+                } => {
+                    let kind = if ask {
+                        successor::CheckpointKind::Offered
+                    } else {
+                        successor::CheckpointKind::Automatic { default_floor }
+                    };
+                    successor::cmd_offer(&ws, successor::CheckpointRun { name: at, progress }, kind)
                 }
-                SuccessorCmd::Spawn {
+                SuccessorCmd::Start {
                     narrative,
                     coding_agent,
                     coding_agent_model,
                     reasoning_effort,
-                    build_chain,
                     at,
                     progress,
-                } => successor::cmd_spawn(
+                } => successor::cmd_start(
                     &ws,
                     &narrative,
                     successor::ImplementerChoice {
@@ -1715,10 +1737,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                         model: coding_agent_model,
                         reasoning_effort,
                     },
-                    successor::SpawnPlacement {
-                        build_chain,
-                        at: at.map(|name| successor::CheckpointRun { name, progress }),
-                    },
+                    at.map(|name| successor::CheckpointRun { name, progress }),
                 )?,
             }
             Ok(0)
@@ -2063,6 +2082,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     urgent,
                 )?,
                 ThreadsCmd::Detach { thread } => threads::cmd_detach(&ws, &thread)?,
+                ThreadsCmd::ChildReports => threads::cmd_child_reports(&ws)?,
                 ThreadsCmd::Archive { thread } => threads::cmd_archive(&ws, &thread)?,
             }
             Ok(0)
@@ -2210,6 +2230,53 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    fn command_surface(command: &clap::Command) -> serde_json::Value {
+        let mut flags: Vec<_> = command
+            .get_arguments()
+            .flat_map(|arg| arg.get_long_and_visible_aliases().unwrap_or_default())
+            .collect();
+        flags.sort_unstable();
+        flags.dedup();
+        let mut children: Vec<_> = command.get_subcommands().map(command_surface).collect();
+        children.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        serde_json::json!({
+            "name": command.get_name(),
+            "hidden": command.is_hide_set(),
+            "aliases": command.get_all_aliases().collect::<Vec<_>>(),
+            "flags": flags,
+            "commands": children,
+        })
+    }
+
+    #[test]
+    fn agent_surface_includes_hidden_commands_and_flags() {
+        let mut command = Cli::command();
+        command.build();
+        let surface = command_surface(&command);
+        assert_eq!(surface["name"], "lucidos");
+        let children = surface["commands"].as_array().unwrap();
+        assert!(children.iter().any(|c| c["hidden"] == true));
+        assert!(children.iter().any(|c| c["name"] == "data"));
+        assert!(surface["flags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "help"));
+    }
+
+    #[test]
+    #[ignore]
+    fn write_agent_surface() {
+        let out = std::env::var_os("LUCIDOS_CODEGEN_OUT").expect("LUCIDOS_CODEGEN_OUT is set");
+        let mut command = Cli::command();
+        command.build();
+        std::fs::write(
+            PathBuf::from(out).join("cli-surface.json"),
+            serde_json::to_string_pretty(&command_surface(&command)).unwrap() + "\n",
+        )
+        .expect("CLI surface writes");
+    }
+
     fn subcommand_flags(path: &[&str]) -> Vec<String> {
         let mut cmd = Cli::command();
         for name in path {
@@ -2221,6 +2288,20 @@ mod tests {
         cmd.get_arguments()
             .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
             .collect()
+    }
+
+    /// The default floor is for automatic runs only: an offered run leaves
+    /// the choice to the user's card.
+    #[test]
+    fn the_default_floor_conflicts_with_an_offered_run() {
+        let offer = |extra: &[&str]| {
+            let mut args = vec!["lucidos", "successor", "offer", "--at", "pre-harden"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(offer(&["--default-floor"]).is_ok());
+        assert!(offer(&["--ask"]).is_ok());
+        assert!(offer(&["--ask", "--default-floor"]).is_err());
     }
 
     /// `threads follow-up` must offer no way to state who the caller is. The
@@ -2302,6 +2383,49 @@ mod tests {
             assert!(
                 rendered.contains("--active") && rendered.contains("--status"),
                 "the refusal must name both flags: {rendered}"
+            );
+        }
+    }
+
+    /// A repo flow written against an older CLI keeps working: `offer` keeps
+    /// its flags, and `spawn` still runs `start`.
+    #[test]
+    fn the_successor_flags_a_flow_calls_still_parse() {
+        let parse = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            match cli.command {
+                Command::Successor { action } => action,
+                _ => panic!("{argv:?} is not `successor`"),
+            }
+        };
+        assert!(matches!(
+            parse(&[
+                "lucidos",
+                "successor",
+                "offer",
+                "--at",
+                "plan-approval",
+                "--ask",
+                "--progress",
+                "0/4",
+            ]),
+            SuccessorCmd::Offer { ask: true, .. }
+        ));
+        for verb in ["start", "spawn"] {
+            let action = parse(&[
+                "lucidos",
+                "successor",
+                verb,
+                "--narrative",
+                "n.md",
+                "--at",
+                "phase-commit",
+                "--progress",
+                "2/5",
+            ]);
+            assert!(
+                matches!(&action, SuccessorCmd::Start { at: Some(at), .. } if at == "phase-commit"),
+                "{verb} does not run `start`"
             );
         }
     }

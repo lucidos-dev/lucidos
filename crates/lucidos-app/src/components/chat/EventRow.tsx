@@ -40,7 +40,7 @@ import { CheckIcon, ChevronRightIcon, CloseIcon } from '../shared/icons';
 /** Which of the four surfaces this is. Carried as `data-kind` for tests and
  *  for any kind-specific CSS; the row's LOOK never branches on it, which is
  *  what keeps the four coherent. */
-export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form' | 'change' | 'resume' | 'boundary' | 'cache';
+export type EventRowKind = 'wait' | 'delivery' | 'child' | 'trigger' | 'held' | 'form' | 'change' | 'resume' | 'session' | 'boundary' | 'cache';
 
 /** How the state WORD is tinted. The tint groups the word, it never replaces
  *  it: every state is legible as text, so the row survives a colourblind reader
@@ -152,6 +152,8 @@ export interface EventRowProps {
   heldNote?: string;
   /** `data-role`, for the tests and for e2e selectors. */
   role?: string;
+  /** The row's seq, for thread find (`data-find-row`). */
+  findRow?: number;
 }
 
 /** The row's markup, hookless so it stays a pure function of its state. Any
@@ -172,11 +174,12 @@ export function eventRowBody({
   actions,
   heldNote,
   role,
+  findRow,
 }: EventRowProps) {
   const shown = (facts ?? []).filter((f): f is EventRowFact => !!f);
   const Glyph = VERDICT_GLYPH[tone];
   const card = (
-    <div class="event-row" data-role={role} data-kind={kind} data-state={state} data-held={heldNote ? '' : undefined}>
+    <div class="event-row" data-role={role} data-kind={kind} data-state={state} data-held={heldNote ? '' : undefined} data-find-row={findRow}>
       {/* The subject and its verdict share the top line, so the card opens with
           one readable sentence and the state sits where the eye already is.
           They were stacked, which spent a whole line on a single word and made

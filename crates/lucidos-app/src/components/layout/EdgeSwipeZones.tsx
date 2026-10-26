@@ -9,7 +9,9 @@
  *  So the strip's touch gate (`gateStripTouch`) sees an edge touch and can
  *  `preventDefault()` it. That is the only way to suppress WebKit's native
  *  back/forward gesture in the standalone iOS PWA, since no CSS opt-out exists.
- *  See `shouldSuppressEdgeNavigation`. A pane swipe over an app needs no strip:
+ *  See `shouldSuppressEdgeNavigation`. The cancel also drops the click of a tap
+ *  on a row under the strip, so the gate replays that tap (`edgeTapReplay.ts`).
+ *  A pane swipe over an app needs no strip:
  *  the SDK posts drags from inside the frame (`frame-swipe-bridge.ts`), and the
  *  HTML artifact preview's bridge does the same.
  *

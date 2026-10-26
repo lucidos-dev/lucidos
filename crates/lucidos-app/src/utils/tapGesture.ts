@@ -119,13 +119,14 @@ const TOUCH_CLICK_WINDOW_MS = 500;
 /** Who took a touch press, said by whoever took it.
  *
  *  `served` is a button running its action inside the gesture. `swallowed` is
- *  the overlay contract eating the paired event of a dismissing tap.
+ *  the overlay contract eating the paired event of a dismissing tap. `refused`
+ *  is a lift landing on a face its press did not begin on.
  *
  *  The two are indistinguishable to an observer, which is the whole reason this
  *  exists. Both cancel the default, and the swallow also stops propagation at
  *  `document` in the capture phase. `deadPressProbe` read `defaultPrevented` as
  *  proof a path had worked and was wrong about both. It now asks here. */
-export type PressOutcome = 'served' | 'swallowed';
+export type PressOutcome = 'served' | 'swallowed' | 'refused';
 
 let lastPress: { outcome: PressOutcome; at: number } | null = null;
 
@@ -218,14 +219,16 @@ export interface TouchActivateOptions {
    *  press rather than asking. Absent means every click activates. */
   gate?: ActivationGate;
   /** A face whose action cannot be taken back. It RULES on the gate instead of
-   *  spending it, on the touch path as well as the click path.
+   *  spending it, on the touch path as well as the click path. A touch serves
+   *  only if the face at its lift is the face its press began on.
    *
    *  The touch path otherwise takes every press it is given, which is right for
    *  Send and wrong for Cancel: a scroll landing there would abort a live turn.
    *  Withholding the touch path altogether was the earlier answer, and it left
    *  Cancel with no path at all once iOS dropped the click.
    *
-   *  A thunk, because one node serves Send and Cancel. Read at the lift. */
+   *  A thunk, because one node serves Send and Cancel. Read at the press and
+   *  at the lift. */
   destructive?: () => boolean;
   /** Injected clock, so the twin window is testable without a real one. */
   now?: () => number;
@@ -286,7 +289,24 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
     at: number;
     movedPx: number;
     fingers: number;
+    /** The face the press began on. One node serves Send and Cancel, and a
+     *  late iOS lift can land after Send has morphed into Cancel. */
+    destructive: boolean;
+    /** A click already ran the action for this press, ahead of its lift. */
+    served: boolean;
   } | null = null;
+  /** One press is one activation, of the face it began on. A lift with no
+   *  press behind it may serve only a constructive face. */
+  function liftMayServe(p: typeof press): boolean {
+    if (p?.served) return false;
+    return (p?.destructive ?? false) === destructive();
+  }
+  /** A refused lift still ends its press: the gate forgets it, and the probe
+   *  learns a path took it rather than calling it dead. */
+  function refuse(p: typeof press): void {
+    opts.gate?.spend();
+    notePressOutcome(p?.served ? 'served' : 'refused');
+  }
   /** Fold this event's position of the press's own finger into its travel. */
   function travel(e: TouchPressLike): void {
     if (!press) return;
@@ -308,6 +328,8 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
         at: clock(),
         movedPx: 0,
         fingers: e.touches.length,
+        destructive: destructive(),
+        served: false,
       } : null;
     },
     onTouchMove(e: TouchPressLike): void {
@@ -323,6 +345,10 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
       press = null;
       if (!p || !contactOf(e, p.identifier)) return;
       if (!enabled()) return;
+      if (!liftMayServe(p)) {
+        refuse(p);
+        return;
+      }
       // A tap outside an open overlay only dismisses it (see `installPairedSwallow`).
       if (swallowedSince(p.at)) return;
       const tap = cancelledPressWasATap({
@@ -346,6 +372,7 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
       }, CANCELLED_TAP_SETTLE_MS);
     },
     onTouchEnd(e: TouchEventLike): void {
+      const p = press;
       press = null;
       if (!enabled()) return;
       // Cancel and record the twin BEFORE the gate rules, so a refused press
@@ -353,6 +380,10 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
       // would arrive with none behind it and run what was just refused.
       lastTouchAt = clock();
       e.preventDefault();
+      if (!liftMayServe(p)) {
+        refuse(p);
+        return;
+      }
       // A destructive face asks; every other face serves the press and spends
       // the gate's copy of it. See `ActivationGate` and `opts.destructive`.
       if (destructive()) {
@@ -381,6 +412,7 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
       // was starting a scroll. Unconditionally in front of BOTH paths it would
       // veto a constructive touch too, on the measurement named above.
       if (opts.gate && !opts.gate.pass()) return;
+      if (press) press.served = true;
       action();
     },
   };

@@ -581,6 +581,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -712,6 +713,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

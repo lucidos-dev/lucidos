@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: plugins
 description: The plugins audit section: the engine requirement on installed plugins and on plugin trees the workspace authors, and the setup_revision fields of those trees.
+sources: ["system-knowhow/plugins.md", "crates/lucidos-engine/src/engine/tools/plugins/*", "crates/lucidos-engine/src/core/plugins.rs", "crates/lucidos-engine/src/api/plugins.rs"]
 ---
 
 # Workspace audit section: plugins
@@ -45,7 +46,15 @@ Two surfaces, read differently. Per `system-knowhow/plugins.md` § "The `engine`
 
 **a. Installed plugins: not a grep, a tool call.** Call `plugins(action="check_updates")` (no `id`) once, every pass, and add a `plugins-engine` row with the count checked to the receipts. Per installed plugin, it reports `installed_version`, `latest_version`, `changed`, `source`, and the **latest** version's `engine_requirement` / `engine_compatible` / `engine_incompatible_reason`.
 
-That `engine_requirement` is the remote manifest's, not the installed one's (`crates/lucidos-engine/src/engine/tools/plugins/registry.rs::execute_check_plugin_updates` reads the freshly fetched manifest). The installed declaration lives on the `PluginInstalled` event. Query the `events` tool for `event_type="PluginInstalled"`. Keep the latest per plugin id with no later `PluginUninstalled`, as the `triggers` section reduces triggers. Read `payload.data.manifest.manifest.engine`, the nested path `system-knowhow/plugins.md` § `PluginInstalled` documents. Flag its absence, never the latest's.
+`engine_requirement` describes the remote manifest.
+`crates/lucidos-engine/src/engine/tools/plugins/registry.rs::check_plugin_updates_impl`
+reads that freshly fetched manifest.
+
+For the installed declaration, query `events` with `event_type="PluginInstalled"`.
+Keep the latest per plugin id with no later `PluginUninstalled`.
+Read `payload.data.manifest.manifest.engine`, as documented in
+`system-knowhow/plugins.md` § `PluginInstalled`. Flag its absence on the installed
+record, independently of the latest version's declaration.
 
 For each installed plugin whose own `engine` is absent:
 

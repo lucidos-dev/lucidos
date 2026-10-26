@@ -11,6 +11,7 @@
 //! `crate::llm::openai::OpenAiProvider` (and re-exported from `crate::llm`).
 
 use crate::core::AuthType;
+use crate::llm::cache_lifetime::CacheLifetime;
 use crate::llm::model_registry::{gpt_major_version, gpt_version};
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolCall, ToolDefinition,
@@ -261,6 +262,13 @@ impl OpenAiProvider {
     /// `Authorization: Bearer` header is omitted when `api_key` is empty so a
     /// keyless local server (Ollama / llama.cpp) isn't sent a bogus `Bearer `.
     fn request_headers(&self) -> Vec<(String, String)> {
+        let mut headers = self.caller_headers();
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+        headers
+    }
+
+    /// Auth and `extra_headers`: who calls, without the body's type.
+    fn caller_headers(&self) -> Vec<(String, String)> {
         let mut headers = Vec::new();
         if !self.api_key.is_empty() {
             headers.push((
@@ -269,13 +277,19 @@ impl OpenAiProvider {
             ));
         }
         headers.extend(self.extra_headers.iter().cloned());
-        headers.push(("Content-Type".to_string(), "application/json".to_string()));
         headers
     }
 
     /// Apply [`request_headers`](Self::request_headers) to a request builder.
-    fn apply_headers(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        for (name, value) in self.request_headers() {
+    fn apply_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        Self::with_headers(req, self.request_headers())
+    }
+
+    fn with_headers(
+        mut req: reqwest::RequestBuilder,
+        headers: Vec<(String, String)>,
+    ) -> reqwest::RequestBuilder {
+        for (name, value) in headers {
             req = req.header(name, value);
         }
         req
@@ -354,6 +368,7 @@ impl OpenAiProvider {
             })
             .collect::<Result<Vec<ToolCall>, String>>()?;
 
+        let (written_30m, written_12h) = meta.write_split();
         Ok(LlmResponse {
             content: final_content,
             tool_calls,
@@ -365,6 +380,10 @@ impl OpenAiProvider {
             // Anthropic models.
             cache_creation_tokens: meta.cache_write_tokens,
             cache_creation_1h_tokens: None,
+            cache_creation_30m_tokens: written_30m,
+            cache_creation_12h_tokens: written_12h,
+            // The Chat Completions flow fills it in for the markers it placed.
+            cache_creation_requested_ttl: None,
             stable_prefix_fingerprint: None,
             cache_read_tokens: meta.cache_read_tokens,
             served_model: meta.served_model,
@@ -376,6 +395,7 @@ impl OpenAiProvider {
             // Like Anthropic: text always rides in `content`, printable.
             model_only_text: None,
             progress_notes: Vec::new(),
+            prefill: None,
         })
     }
 }
@@ -400,6 +420,12 @@ struct StreamMeta {
     output_tokens: Option<u32>,
     cache_read_tokens: Option<u32>,
     cache_write_tokens: Option<u32>,
+    /// The Responses API's split of the write, as `ttl_30m_tokens` and
+    /// `ttl_12h_tokens` report it. Zeros stay: a zero part is evidence.
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
+    /// The `prompt_cache_options.ttl` the completed response echoes.
+    echoed_cache_ttl: Option<CacheLifetime>,
     /// The *served model*: what a chunk, or the completed response, names.
     served_model: Option<String>,
     /// The tier the completed response says served it.
@@ -440,6 +466,39 @@ impl StreamMeta {
         if let Some(written) = count("cache_write_tokens") {
             self.cache_write_tokens = Some(written);
         }
+        if let Some(split) = details.get("cache_write_tokens_details") {
+            let part = |field: &str| {
+                split
+                    .get(field)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| crate::llm::clamp_provider_token_count(n, "OpenAI"))
+            };
+            self.cache_write_30m_tokens = part("ttl_30m_tokens");
+            self.cache_write_12h_tokens = part("ttl_12h_tokens");
+        }
+    }
+
+    /// The write's 30-minute and 12-hour parts. The reported split wins.
+    /// Without one, the echoed TTL names the whole write's lifetime. A split
+    /// whose parts add up to more than the write is dropped, so its TTL
+    /// stays Unknown rather than claim tokens nobody wrote.
+    fn write_split(&self) -> (Option<u32>, Option<u32>) {
+        let Some(written) = self.cache_write_tokens else {
+            return (None, None);
+        };
+        let (split_30m, split_12h) = (self.cache_write_30m_tokens, self.cache_write_12h_tokens);
+        if split_30m.is_some() || split_12h.is_some() {
+            let named = u64::from(split_30m.unwrap_or(0)) + u64::from(split_12h.unwrap_or(0));
+            return match named <= u64::from(written) {
+                true => (split_30m, split_12h),
+                false => (None, None),
+            };
+        }
+        match self.echoed_cache_ttl {
+            Some(CacheLifetime::ThirtyMinutes) => (Some(written), None),
+            Some(CacheLifetime::TwelveHours) => (None, Some(written)),
+            _ => (None, None),
+        }
     }
 
     /// Pull usage + finish reason out of a Responses API `response.completed`
@@ -455,6 +514,9 @@ impl StreamMeta {
             .get("service_tier")
             .and_then(|t| t.as_str())
             .and_then(crate::llm::ServiceTier::from_wire);
+        self.echoed_cache_ttl = resp
+            .pointer("/prompt_cache_options/ttl")
+            .and_then(|ttl| serde_json::from_value(ttl.clone()).ok());
         if let Some(usage) = resp.get("usage") {
             if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
                 self.input_tokens = Some(crate::llm::clamp_provider_token_count(input, "OpenAI"));
@@ -505,9 +567,67 @@ impl LlmProvider for OpenAiProvider {
         }
     }
 
+    /// A beat goes to the endpoint its turn went to. [`prefill::send`] sets
+    /// the body's type, so only the caller headers go on here.
+    ///
+    /// [`prefill::send`]: crate::llm::prefill::send
+    async fn prefill(
+        &self,
+        body: &crate::llm::prefill::PrefillBody,
+        _call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let url = if self.should_use_responses(&body.wire_model) {
+            &self.responses_url
+        } else {
+            &self.chat_url
+        };
+        let builder = Self::with_headers(self.streaming_client.post(url), self.caller_headers());
+        let label = body
+            .provider
+            .as_ref()
+            .map_or(STREAM_LOG_TAG, |kind| kind.as_str());
+        crate::llm::prefill::send(builder, body, label).await
+    }
+
     fn default_model(&self) -> &str {
         &self.model
     }
+}
+
+/// The bodies a [`serve_recording`] server received, in order.
+#[cfg(test)]
+type RecordedBodies = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+/// An OpenAI-compatible server on `path` for the prefill tests. It answers a
+/// streamed request with `turn` and any other with `beat`, and records each
+/// body. Returns the base URL a provider takes.
+#[cfg(test)]
+async fn serve_recording(
+    path: &'static str,
+    turn: &'static str,
+    beat: &'static str,
+) -> (String, RecordedBodies) {
+    let bodies = RecordedBodies::default();
+    let record = bodies.clone();
+    let app = axum::Router::new().route(
+        path,
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let streamed = body["stream"] == true;
+            record.lock().unwrap().push(body);
+            async move {
+                if streamed {
+                    ([("content-type", "text/event-stream")], turn)
+                } else {
+                    ([("content-type", "application/json")], beat)
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/v1"), bodies)
 }
 
 #[cfg(test)]

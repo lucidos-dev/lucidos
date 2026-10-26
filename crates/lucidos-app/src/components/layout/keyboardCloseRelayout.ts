@@ -60,7 +60,8 @@ export function foldViewportReading(
   sample: ViewportSample,
 ): { watch: CoverWatch; closed: boolean; covered: boolean } {
   const full = sample.layoutViewport;
-  if (!Number.isFinite(full) || full <= 0 || !Number.isFinite(sample.height)) {
+  // A zero visual viewport is no reading (iOS 27 standalone), never a keyboard.
+  if (!Number.isFinite(full) || full <= 0 || !Number.isFinite(sample.height) || sample.height <= 0) {
     return { watch, closed: false, covered: false };
   }
   const live = watch === full ? watch : null;

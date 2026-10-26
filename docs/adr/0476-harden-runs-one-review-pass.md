@@ -2,6 +2,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-14
+- **Amended by**: [0558](0558-harden-other-model-review.md). "Plus Codex"
+  becomes "plus the other model": Claude reviews a Codex run.
 
 ## Context
 

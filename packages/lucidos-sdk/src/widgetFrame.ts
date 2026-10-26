@@ -19,6 +19,7 @@
  */
 
 import { onHostPush } from './_bridge';
+import { hapticTick } from './haptic';
 import { opensContextMenu, selectionCovers, shouldSuppressContextMenu, textAt, type Point } from './contextMenu';
 import { runIsolated } from './_isolate';
 import { WIDGET_SIZES } from './generated/engine-constants';
@@ -35,8 +36,9 @@ export const WIDGET_MENU_MESSAGE_TYPE = 'lucidos:ui:widget-menu';
 
 /** A {@link WIDGET_MENU_MESSAGE_TYPE} message. `at` is where a pointer pressed,
  *  in the frame's own viewport. A hold or a keyboard-raised menu has none.
- *  `held` says a finger is still down. Its lift may bring a click the host
- *  sees once the menu inerts the frame, and the menu must spend that click. */
+ *  `held` says a press has not delivered its click yet: a finger still down, or
+ *  a hold a busy frame read only at its lift. That click may reach the host
+ *  once the menu inerts the frame, and the menu must spend it. */
 export interface WidgetMenuRequest {
   type: typeof WIDGET_MENU_MESSAGE_TYPE;
   at?: Point;
@@ -143,17 +145,17 @@ function notify<T>(listeners: Set<(value: T) => void>, value: T): void {
   for (const cb of [...listeners]) runIsolated(() => cb(value));
 }
 
-/** iOS starts its own text selection just after a hold opens the menu. A
- *  hold turns selection off until the next press, so the menu comes alone. */
-function holdSelection(): void {
+/** iOS answers a resting finger with its own selection or link menu, while
+ *  ours opens. A held press turns both off until the next press, so the menu
+ *  comes alone. */
+function holdNativeLongPress(): void {
   const { style } = document.documentElement;
-  stylesBeforeHold ??= ['user-select', '-webkit-user-select'].map((property) =>
+  stylesBeforeHold ??= ['user-select', '-webkit-user-select', '-webkit-touch-callout'].map((property) =>
     [property, style.getPropertyValue(property), style.getPropertyPriority(property)]);
   for (const [property] of stylesBeforeHold) style.setProperty(property, 'none', 'important');
-  window.getSelection()?.removeAllRanges();
 }
 
-function releaseSelection(): void {
+function releaseNativeLongPress(): void {
   if (!stylesBeforeHold) return;
   const { style } = document.documentElement;
   for (const [property, value, priority] of stylesBeforeHold) {
@@ -170,42 +172,56 @@ function postMenuRequest(at?: Point): void {
   window.parent.postMessage(request, '*');
 }
 
-/** A finger held still on a dashboard tile marked `menu` opens the menu. A
- *  finger that lifts, scrolls the dashboard or travels past the tolerance
- *  cancels the hold. */
+/** A finger held still on a dashboard tile marked `menu` opens the menu, with a
+ *  haptic tick, while it is still down. A finger that lifts early, scrolls the
+ *  dashboard or travels past the tolerance cancels the hold.
+ *
+ *  The hold is read from the events' own times as well as a timer. A frame
+ *  busy through the whole press gets the lift before its timer can run. The
+ *  press turns off iOS's own long-press answer at once, and the next press
+ *  gives it back. A new press first ends one whose lift was lost. */
 function trackPress(down: PointerEvent): void {
+  endHold?.();
+  releaseNativeLongPress();
   if (place !== 'dashboard' || !down.isPrimary || down.pointerType === 'mouse' || !menu) return;
   const end = () => {
     clearTimeout(timer);
     if (endHold === end) endHold = null;
     window.removeEventListener('pointermove', move, true);
-    window.removeEventListener('pointerup', release, true);
-    window.removeEventListener('pointercancel', release, true);
+    window.removeEventListener('pointerup', lift, true);
+    window.removeEventListener('pointercancel', cancel, true);
   };
-  const timer = setTimeout(() => {
+  const openMenu = () => {
     end();
     heldOpenedMenu = true;
-    holdSelection();
+    window.getSelection()?.removeAllRanges();
+    hapticTick();
     postMenuRequest();
-  }, LONG_PRESS_DELAY_MS);
+  };
+  holdNativeLongPress();
+  const timer = setTimeout(openMenu, LONG_PRESS_DELAY_MS);
   endHold = end;
   const move = (e: PointerEvent) => {
     if (e.pointerId !== down.pointerId) return;
     if (Math.hypot(e.screenX - down.screenX, e.screenY - down.screenY) > PRESS_MOVE_TOLERANCE_PX) end();
   };
-  const release = (e: PointerEvent) => {
+  const lift = (e: PointerEvent) => {
+    if (e.pointerId !== down.pointerId) return;
+    if (e.timeStamp - down.timeStamp < LONG_PRESS_DELAY_MS) end();
+    else openMenu();
+  };
+  const cancel = (e: PointerEvent) => {
     if (e.pointerId === down.pointerId) end();
   };
   window.addEventListener('pointermove', move, true);
-  window.addEventListener('pointerup', release, true);
-  window.addEventListener('pointercancel', release, true);
+  window.addEventListener('pointerup', lift, true);
+  window.addEventListener('pointercancel', cancel, true);
 }
 
 /** Capture phase, so a widget that stops propagation cannot hide its press.
  *  Only a menu press measures the selection, as the host's policy does. */
 function notePress(e: PointerEvent): void {
   heldOpenedMenu = false;
-  releaseSelection();
   primaryDown = e.isPrimary !== false && e.button === 0;
   menuPress = opensContextMenu(e);
   selectionAtPress = menuPress && selectionCovers(window.getSelection(), { x: e.clientX, y: e.clientY });
@@ -350,7 +366,7 @@ export function _resetWidgetFrameForTesting(): void {
   visible = true;
   menu = menuPress = selectionAtPress = menuFromPointer = menuOverSelection = false;
   primaryDown = heldOpenedMenu = false;
-  releaseSelection();
+  releaseNativeLongPress();
   endHold?.();
   sizeListeners.clear();
   visibilityListeners.clear();

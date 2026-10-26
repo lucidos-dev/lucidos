@@ -20,7 +20,7 @@ import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { MobileThreadsPane } from './MobileThreadsPane';
 import { ThreadPane } from './ThreadPane';
-import { DashboardSheetToggle } from '../dashboard/DashboardSheet';
+import { DashboardPanelToggle } from '../dashboard/DashboardPanel';
 import { ContentPane } from './ContentPane';
 
 /** Configuration pairing a header with its corresponding pane component.
@@ -148,7 +148,7 @@ function MobileThreadHeader() {
           <span class="header-mark-group">
             <ThreadHeaderHomeButton />
             <BrandMenuButton />
-            <DashboardSheetToggle />
+            <DashboardPanelToggle />
           </span>
           <ThreadForwardButton />
         </div>

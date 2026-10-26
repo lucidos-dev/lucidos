@@ -448,7 +448,7 @@ deadline, its `Err` and a disabled toggle all resolve to the card.
 **A refusal is still not judgeable.** The rule three paragraphs up stands: a
 `fast_path_refused` shape never reaches the judge on the attended lane either.
 The judge is handed the command text alone, so it cannot see the refusal.
-`attended_escalation_allowed` is now the third permissive path denying it, after
+`attended_command_allowed` is now the third permissive path denying it, after
 the unattended lane and `grant_covers_command`.
 
 **Both command-guard toggles gate the LLM half.** The master `command_guard` and
@@ -456,7 +456,7 @@ the `command_guard_judge` sub-switch, in the order `agentic_loop::run` reads
 them. The master ships off, so the judge half of this gate ships off with it.
 The static half does not ask, and needs no model.
 
-Implementation: `engine/cc_permission.rs` (`attended_escalation_allowed`,
+Implementation: `engine/cc_permission.rs` (`attended_command_allowed`,
 `judge_escalation_lane`, `lane_allows_escalation`). Full reconnaissance:
 `docs/plans/2026-09-21-codex-sandbox-escapes-are-classified-before-carding.md`.
 
@@ -632,3 +632,84 @@ Implementation: `engine/command_guard.rs` (`without_root_cd`,
 `grant_head`), `ThreadEvent::CommandPermissionRequested`, `PermissionCard.tsx`
 (`commandGrantHead`). Plan:
 `docs/plans/2026-10-22-command-guard-drops-a-workspace-root-cd.md`.
+
+## Addendum (2026-10-22): the attended gate can allow `ReversibleDanger` for coding agents
+
+`command_guard_coding_agents` lets the attended coding-agent command gate allow
+`ReversibleDanger` and take a Claude Code `Bash` card, with no command
+checkpoint. The lanes above are unchanged for the Lucidos Agent. See
+[ADR 0005](0005-codex-app-server-protocol.md), 2026-10-22 addendum.
+
+## Addendum (2026-10-24): `gh` reads settle Safe, and a grant skips the reads around it
+
+**Context.** A Codex card asked about `cat …; ps …; rg …; gh run view … --json
+status`. Every part reads. `gh` mapped to `CloudCli` whatever its subcommand,
+so the line settled irreversible. The card then offered "Always allow `cat`
+commands". `cat` already settled Safe, so that grant added nothing, and no
+single click could cover the line.
+
+**Decision.**
+
+- A `gh` read settles Safe and carries no side-effect category, like a curl
+  GET (`GH_READ_ONLY_SUBCOMMANDS`, `gh_call_is_read_only`). Group and
+  subcommand must lead. `--web` and `auth status --show-token` act, so they
+  keep carding. A write, a local write such as `run download`, and `gh api`
+  keep `CloudCli`. `GH_CONFIG_DIR=`, `GH_PAGER=` and `GH_BROWSER=` join the
+  code-injecting preamble names.
+- `grant_covers_command` counts a segment the Safe fast path settles on its own
+  as covered. At least one segment must still be granted, so no grant set
+  answers for every read. A line holding `cd`, `pushd` or `popd` gets no Safe
+  credit: the fast path assumes the workspace, so `cd ~ && echo x >> .zshrc`
+  would pass. Every refusal before it still runs first.
+- A coding-agent card names the first head the fast path does not settle, else
+  the first head (`command_guard::grant_head`). The engine stamps it on
+  `CodingAgentPermissionRequest` as `grant_head`. The chat lane keeps its first
+  head.
+
+**Accepted widening.** On the Claude Code lane with
+`command_guard_coding_agents` off, a `git` grant now also covers a Safe read
+chained to it, such as `cat <outside path>; git status`. That read alone still
+cards. The Safe set is the one the chat lane already runs unasked, and a
+secret read is never covered.
+
+Plan: `docs/plans/2026-10-24-codex-read-only-gh-and-grant-head.md`.
+
+## Addendum (2026-10-24): a scratch write and a literal heredoc body are omissions
+
+**Context.** An attended Codex session carded, unjudged, on a handoff note: a
+quoted heredoc written to `/private/tmp`, then `lucidos successor start`. Two
+refusals caused it. The 2026-08-24 addendum accepted the first, a `/tmp` log
+redirect, reasoning about the unattended lane only. On the attended lane every
+such write became a card, while our own prompt steers agents to
+`${TMPDIR:-/tmp}` (ADR 0456). The second: a backtick in a heredoc body read as
+a substitution, even behind a quoted delimiter, where the body is literal text.
+
+**Decision.** Both move from refusal to omission. Neither settles `Safe`.
+
+- A *scratch target* (`docs/glossary.md`) is an omission: a redirect target
+  under `/tmp/`, `/private/tmp/` or macOS's `/var/folders/<a>/<b>/T/`. Each
+  segment below the prefix is plain text and none is `..`, so no `$`, backtick,
+  glob or brace (`is_scratch_target`). zsh writes a redirect to every word a
+  brace expands to, so `/tmp/{..,..}/x` would leave the dir. Any other outside
+  target, and any path that only starts like one, stays a refusal.
+- `${TMPDIR:-/tmp}/` is the form our prompt steers to. It counts only when the
+  engine's own `TMPDIR` is unset or a temp dir, and the line names `TMPDIR`
+  nowhere else (`tmpdir_trusted_for`). A bare `$TMPDIR` does not count: unset,
+  as on most Linux hosts, it names `/`.
+- The fast path skips the body and terminator line of each heredoc with a quoted
+  delimiter (`blank_literal_heredoc_bodies`). A skipped body forces at least an
+  omission, because the head may run its stdin as code (`sh <<'E'`). An opener
+  inside quotes or a comment is text, and a here-string opens no body.
+- Any shape where the walk could place a body differently from the shell skips
+  nothing. That covers a delimiter it cannot spell, a `<<` or newline inside
+  `${…}`, `$[…]` or `((…))`, and a backslash ending an unquoted body line.
+- The catastrophic scan, the secret-path scan, the destruction scope and the
+  out-of-workspace marker still read the whole command.
+
+**Accepted residual risk.** An unattended session runs an omission, so it can now
+write a scratch target. In the shared `/tmp`, another local user could plant a
+link there first. A personal machine has no such user, and macOS's per-user
+temp dir is mode 0700. A stored grant on the head (`Bash(cat:*)`) now covers a
+scratch write too, since `grant_covers_command` refuses only refusals.
+
+Plan: `docs/plans/2026-10-24-scratch-writes-reach-the-judge.md`.

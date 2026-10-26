@@ -303,12 +303,16 @@ pub(crate) async fn resume_sid_for_account(
 /// auto-detected resume session id is resolved WITHIN that account, so a thread
 /// that was mis-pinned onto another account by a toggle flip still resumes the
 /// session belonging to its original account rather than the globally-newest one.
+///
+/// `handoff_pending` wins over all of it: a *successor session* never resumes,
+/// and runs on the thread's own branch.
 pub(super) async fn resolve_resume_context(
     pool: &sqlx::PgPool,
     changes: &crate::core::changes_projection::ChangesProjection,
     thread_id: uuid::Uuid,
     caller_session_id: Option<String>,
     pinned_config_dir: Option<&str>,
+    handoff_pending: bool,
 ) -> (Option<String>, Option<String>) {
     let open_branch = changes
         .open_for_thread(thread_id)
@@ -324,6 +328,20 @@ pub(super) async fn resolve_resume_context(
         })
         .pop()
         .map(|c| c.branch_name);
+
+    // A *successor session* starts fresh on the thread's own branch.
+    if handoff_pending {
+        let branch = match open_branch {
+            Some(branch) => Some(branch),
+            None => lookup_session_branch_for_thread(pool, thread_id).await,
+        };
+        log!(
+            "[AgentSession] Thread {} handed off: a fresh session on branch {:?}",
+            thread_id,
+            branch
+        );
+        return (None, branch);
+    }
 
     if let Some(branch) = open_branch {
         let resume_sid = match caller_session_id {

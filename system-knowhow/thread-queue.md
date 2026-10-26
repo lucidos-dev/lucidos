@@ -191,8 +191,9 @@ On engine restart:
 - `queued` entries are reloaded as-is.
 - `admitted` entries are work the old process had already started, and **one
   rule covers all four kinds** (ADR 0133). An entry whose bound thread still
-  exists is **handed off** to thread-level recovery (CC auto-resume / chat
-  settle), never re-run. An entry that bound no thread **re-queues and
+  exists is **handed off** to thread-level recovery, never re-run by the queue.
+  A user-initiated switch resumes coding-agent and chat threads; a crash leaves
+  them paused for Continue. An entry that bound no thread **re-queues and
   re-fires**. A trigger fire binds its thread as soon as it creates one, so a
   fire that parked on a question never runs twice. A fire that died before
   creating one ran nothing, so it is still owed. A **script** fire creates no
@@ -263,8 +264,8 @@ Every other Thread Queue notification taps through to the **Thread Queue** panel
 - `GET /api/v1/thread-queue` → `{ entries, policy }`. `entries` are background
   rows (FIFO) plus the user-initiated occupants (`kind: "user-chat"`): running
   user threads, gate reservations and waiters;
-  `status` is `queued` or `admitted`. This endpoint and the `list_thread_queue`
-  LLM tool read the SAME merged view (`ThreadQueue::snapshot`), so the panel and
+  `status` is `queued` or `admitted`. This endpoint and the `thread_queue`
+  LLM tool's `list` action read the same merged view (`ThreadQueue::snapshot`), so the panel and
   the tool always agree on who occupies the pool.
 - `POST /api/v1/thread-queue/run-now` `{ entry_id }`: force-admit a background
   entry (user-initiated entries have no queue row).

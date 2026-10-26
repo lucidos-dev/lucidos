@@ -169,6 +169,17 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       const body = panel.locator('.initiator-body .permission-body').first();
       await expect(body.locator('.permission-command')).toHaveText('rm -rf /tmp/lucidos-deny-test');
 
+      // The card renders exactly the grants the engine stamped (ADR 0571).
+      const offer = JSON.parse(psql(
+        `SELECT COALESCE(payload->'grant_offer', '{}'::jsonb) FROM events WHERE aggregate_id = '${threadId}' AND event_type = 'CodingAgentPermissionRequest'`,
+      )) as { broad?: string; narrow?: string; session?: string };
+      expect(offer.broad).toBe('Bash');
+      await expect(body.locator('button', { hasText: /^Always allow$/ })).toHaveCount(1);
+      await expect(body.locator('button', { hasText: /^Allow for this thread$/ }))
+        .toHaveCount(offer.session ? 1 : 0);
+      await expect(body.locator('button', { hasText: /^Always allow .+ commands$/ }))
+        .toHaveCount(offer.narrow ? 1 : 0);
+
       await body.locator('button', { hasText: /^Deny$/ }).click();
 
       const resolved = await promptResponse;

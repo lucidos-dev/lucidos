@@ -126,14 +126,14 @@ Run the plan-approval checkpoint below first. It is Lucidos's copy of the defaul
 **Plan approval.** Before you ask for approval, run
 `lucidos successor offer --at plan-approval --ask --progress 0/<phases>`, where
 `<phases>` counts the plan's phases. Ask with your question tool, in the card
-shape it prints. The option to stay is `Approve here`. With no new-thread
+shape it prints. The option to stay is `Approve here`. With no fresh-session
 option, the floor is `Approve` / `Request changes`, and a real fork takes the
 second slot. A re-plan runs this checkpoint again before it asks again.
 
-**A new-thread pick.** It approves the plan: record the approval as this
-repository does. Then run `lucidos successor spawn --build-chain --narrative
-<file>` with the flags the checkpoint printed. The narrative names the plan's
-path, says the user approved it, and quotes the phase checkpoint below.
+**A fresh-session pick.** It approves the plan: record the approval as this
+repository does. Then run `lucidos successor start --narrative <file>` with
+the flags the checkpoint printed, and end your turn. The narrative names the
+plan's path, says the user approved it, and quotes the phase checkpoint below.
 
 **Phase commit.** After you commit a phase that another phase follows, run
 `lucidos successor offer --at phase-commit --progress <done>/<phases>`, where
@@ -141,14 +141,14 @@ path, says the user approved it, and quotes the phase checkpoint below.
 last phase.
 <!-- /default-flow: implementation-plan -->
 
-Use exactly one question, with the options the checkpoint prints. `Approve` is the first option unless that output leads with a new-thread option (§ Implement in a new thread). What goes in the second slot is a **floor, not a fixed shape**:
+Use exactly one question, with the options the checkpoint prints. `Approve` is the first option unless that output leads with a fresh-session option (§ Implement in a fresh session). What goes in the second slot is a **floor, not a fixed shape**:
 
 | Option | Meaning | When |
 |---|---|---|
-| `Approve` | Start implementing the plan as written. | First, unless the new-thread option leads; then it reads `Approve here`, second. |
+| `Approve` | Start implementing the plan as written. | First, unless the fresh-session option leads; then it reads `Approve here`, second. |
 | A fork of the plan (`Frontend only`, `Skip the migration`, …) | Approve a named variant. | Whenever the plan has a genuine fork: a narrower scope, one layer instead of two, a different approach. |
-| `Implement in a new thread: <implementer> (Recommended)` | Approve as written, and build in a *successor thread* on that implementer. | **Only as the approval checkpoint prints**: when the *handoff estimate* pays, or when your recommended implementer is a lower rung than this thread's. It then goes FIRST, then `Approve here`. A paying card may also name this thread's implementer second. May sit beside a fork, within 4 options. |
-| `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork and no new-thread option. Never alongside either. |
+| `Implement in a fresh session: <implementer> (Recommended)` | Approve as written, and build in a *successor session* on that implementer. | **Only as the approval checkpoint prints**: when the *handoff estimate* pays, or when your recommended implementer is a lower rung than this thread's. It then goes FIRST, then `Approve here`. A paying card may also name this thread's implementer second. May sit beside a fork, within 4 options. |
+| `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork and no fresh-session option. Never alongside either. |
 
 **The plan as written is the thorough, long-term fix.** The maintainer always prefers it to a narrower patch. So write the thorough variant as the plan, and offer the narrower one as the fork, never the reverse. An unattended run still stops at the decision, as a plan or under `Decisions:`: the preference picks which variant to recommend, not whether to ask.
 
@@ -208,18 +208,18 @@ A re-plan after approval re-runs `lucidos planned mark --plan <path>`, which pro
 
 If `Open Questions` contains a load-bearing unresolved decision, stop and ask the user instead of editing.
 
-### Implement in a new thread
+### Implement in a fresh session
 
-A planning thread that ran a long grill carries every question, picture and
+A planning session that ran a long grill carries every question, picture and
 draft into each later turn. The plan file already holds what a builder needs, so
-a fresh thread can start from it alone.
+a fresh session can start from it alone.
 
 The plan-approval checkpoint prints the card's options. Offer exactly what it
 prints:
 
 - **When the *handoff estimate* pays**, the paying card below. The estimate
   weighs this thread's context against the calls the phases left will take.
-- **When it does not pay**, a new thread only for a lower rung on the
+- **When it does not pay**, a fresh session only for a lower rung on the
   intelligence ladder than this thread's (ADR 0497). Otherwise the plain floor.
 - **When the engine could not be read, or the thread cannot hand off**, the plain
   floor.
@@ -241,46 +241,40 @@ costs on every turn.
 
 The paying card reads, never more than 4 options and never `Request changes`:
 
-1. `Implement in a new thread: <implementer> (Recommended)`, the rung named by
+1. `Implement in a fresh session: <implementer> (Recommended)`, the rung named by
    its picker label and effort as the ladder prints them.
-2. `Implement in a new thread: <this thread's implementer>`, only when it
+2. `Implement in a fresh session: <this thread's implementer>`, only when it
    differs.
 3. `Approve here`.
 4. A real fork of the plan, if it has one.
 
-A card that does not pay drops option 2: a new thread on this thread's
+A card that does not pay drops option 2: a fresh session on this thread's
 implementer then saves nothing.
 
 Name the backend only when it is not this thread's.
 
-Picking a new-thread option is an approval, asked once. The owner's pick on a
-device is also their consent to the handoff (ADR 0493), so it needs no owner
-approval card. A typed reply naming another implementer counts as an approval
-too, but a refused handoff then needs `lucidos ask-owner-approval`:
+Picking a fresh-session option is an approval, asked once. A handoff needs no
+owner approval card. A typed reply naming another implementer counts as an
+approval too:
 
 1. Run `lucidos planned approve` in this thread.
-2. Write a handoff narrative and run `lucidos successor spawn --build-chain
-   --narrative <file>` with the flags the checkpoint printed. Add only the flags
-   that differ from this thread's implementer: `--coding-agent`,
+2. Write a handoff narrative and run `lucidos successor start --narrative
+   <file>` with the flags the checkpoint printed. Add only the flags that
+   differ from this thread's implementer: `--coding-agent`,
    `--coding-agent-model`, `--reasoning-effort`. An omitted flag keeps this
    thread's, and ids go in, never picker labels.
    `lucidos successor --help` has the six sections. The narrative names the plan
    path, says the user approved it here, and quotes the phase checkpoint. The
-   builder then builds it phase by phase without asking again.
-3. End your turn with the link it prints.
+   successor session then builds it phase by phase without asking again.
+3. End your turn. The successor session starts in this thread once it ends.
 
-The successor's branch starts at this branch's last commit, so it already holds
-the plan, and the approved marker carries over. From a top-level planning
-thread the builder starts a *build chain* (ADR 0503). It is a `no-wake` child
-of this thread, which stays open and proposes nothing. Its successors join the
-chain under this thread, and need no owner approval card when the handoff
-estimate pays. From a child planning thread the builder takes this thread's
-place, so the parent still gets the report. The same text reaches the agent
-through the checkpoint, from `card_shape` and `new_thread_handoff` in
+The thread keeps its branch, so the plan and the approved marker stay in place.
+A parent keeps waiting on this thread. The same text reaches the agent through
+the checkpoint, from `card_shape` and `fresh_session_handoff` in
 `crates/lucidos-cli/src/planned.rs`.
 
 When the estimate does not pay and the thread has a rung above its own, the
 checkpoint also prints a raise clause. When no lower rung fits but the plan is hard or long, offer
-`Implement in a new thread: <a higher rung> (Recommended)` beside `Approve
+`Implement in a fresh session: <a higher rung> (Recommended)` beside `Approve
 here`. Go one or two rungs up, never to the top. If neither applies, keep
 `Approve` / `Request changes`.

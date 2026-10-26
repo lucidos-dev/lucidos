@@ -176,6 +176,16 @@ pub struct LlmResponse {
     /// cache. `None` when the provider split no write by lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_tokens: Option<u32>,
+    /// Part of `cache_creation_tokens`: OpenAI Responses' 30-minute write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_30m_tokens: Option<u32>,
+    /// Part of `cache_creation_tokens`: OpenAI Responses' 12-hour write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_12h_tokens: Option<u32>,
+    /// The cache lifetime the request's markers asked for. A provider reports
+    /// what it asked, and the router keeps it only on a route that honours it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_requested_ttl: Option<crate::llm::cache_lifetime::CacheLifetime>,
     /// Cache-read token count. `None` on providers that report none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u32>,
@@ -231,6 +241,10 @@ pub struct LlmResponse {
     /// user saw only these, and the full text never reached Lucidos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub progress_notes: Vec<String>,
+    /// What a *prefill beat* on this request sends. `None` from a provider
+    /// that cannot prefill, and on a request no beat may copy.
+    #[serde(skip)]
+    pub prefill: Option<crate::llm::prefill::PrefillPair>,
 }
 
 impl LlmResponse {
@@ -379,6 +393,17 @@ pub trait LlmProvider: Send + Sync {
         on_token: Option<TokenCallback>,
         call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Send one *prefill beat*: a body from a [`crate::llm::prefill::PrefillPair`]
+    /// this provider returned. The reply carries only its usage. A provider
+    /// that never returns a pair cannot prefill.
+    async fn prefill(
+        &self,
+        body: &crate::llm::prefill::PrefillBody,
+        _call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        Err(crate::llm::prefill::cannot_prefill(body.provider))
+    }
 
     /// Returns the default model name for this provider.
     fn default_model(&self) -> &str {

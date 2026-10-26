@@ -3,6 +3,8 @@ name: Setup Interview
 description: Use when the user wants Lucidos set up around their own life rather than a single answer, or asks what to use it for at all: "help me get the most out of Lucidos", "set me up", "build me a starting kit", "what should I use Lucidos for", "help me get started", "figure out what to build for me", "make my life better", "help me with my training", "coach me".
 ---
 
+<!-- domain-event: SetupInterviewCompleted: The setup-interview knowhow emits this domain event when the interview finishes. -->
+
 # Setup Interview
 
 Interview the user about their life, then **build them a real starting kit in
@@ -75,7 +77,7 @@ so do not start over:
 
 If it does not exist, this is a first run and the whole ladder applies.
 
-**Also read `technical_literacy` with `get_preferences`.** If it holds any
+**Also read `technical_literacy` with `preferences(action="get")`.** If it holds any
 value, `not-set` included, skip the literacy card. The user already answered,
 usually in the first-run setup or in Settings.
 
@@ -112,7 +114,7 @@ word for word. Translate them only when the user writes another language.
 detail comes back ("full depth"), which a level must not mean.
 
 **Store the answer at once** with
-`set_preference(key="technical_literacy", value=<level>)`, before the next card.
+`preferences(action="set", key="technical_literacy", value=<level>)`, before the next card.
 Word everything after it at that level. This is the response style's second
 part, so it also reaches every later thread, trigger and coding-agent session.
 
@@ -362,7 +364,7 @@ artifact.
 so a later thread can find this run without reading the artifact:
 
 ```
-emit_event("SetupInterviewCompleted", {
+events(action="emit", event_type="SetupInterviewCompleted", payload={
   "summary": "Setup interview: built <N> apps, <M> triggers",
   "artifact": "artifacts/setup-interview.md",
   "apps": ["reading-queue"],

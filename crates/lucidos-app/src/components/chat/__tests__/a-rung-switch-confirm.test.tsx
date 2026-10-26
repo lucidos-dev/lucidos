@@ -40,7 +40,7 @@ let hasActiveSession = true;
 const sendCodingAgentControl = vi.fn(() => Promise.resolve(true));
 const fetchSwitchEstimate = vi.fn<() => Promise<SwitchEstimate>>();
 const continueInSuccessor = vi.fn((_threadId: string, _message: string | undefined, _implementer?: unknown) =>
-  Promise.resolve({ path: 'brief' as const, successor_thread_id: 's1', link: '[Next](thread:ws/s1)' }));
+  Promise.resolve({ path: 'brief' as const, starts: 'now' as const }));
 const updateCompose = vi.fn();
 const focusThreadOrBootstrap = vi.fn();
 
@@ -74,8 +74,8 @@ const { makeThreadState } = await import('../../../store/actions/threads-test-he
 
 beforeAll(() => controlMenuParts.preload());
 
-const REBUILD: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: true, extra_cost_usd: 0.42 };
-const KEEPS_CACHE: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: false, extra_cost_usd: null };
+const REBUILD: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: 'yes', extra_cost_usd: 0.42 };
+const KEEPS_CACHE: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: 'no', extra_cost_usd: null };
 
 let host: HTMLDivElement;
 
@@ -151,7 +151,7 @@ describe('a rung pick on a started idle thread', () => {
     await startedPick(REBUILD);
     const cards = Array.from(document.querySelectorAll('.confirm-choice'));
     expect(cards.map(c => c.getAttribute('data-role'))).toEqual(['confirm-ok', 'confirm-extra']);
-    expect(cards[0].textContent).toBe('Hand off to a new threadStarts fresh on Opus 5.6 · high and carries on from where this one stands.');
+    expect(cards[0].textContent).toBe('Hand off to a fresh sessionStarts fresh on Opus 5.6 · high and carries on from where this one stands.');
     expect(cards[1].textContent).toContain('Switch this thread');
     expect(cards[1].textContent).toContain('about $0.42');
     expect(document.activeElement).toBe(cards[0]);
@@ -184,7 +184,7 @@ describe('a rung pick on a started idle thread', () => {
     expect(continueInSuccessor).not.toHaveBeenCalled();
   });
 
-  it('hands off to a new thread on the picked rung, with no message, and switches nothing', async () => {
+  it('hands off to a fresh session on the picked rung, with no message, and switches nothing', async () => {
     await startedPick(REBUILD);
     click('[data-role="confirm-ok"]');
     await settle();
@@ -192,7 +192,7 @@ describe('a rung pick on a started idle thread', () => {
       coding_agent_model: 'claude-opus-5-6',
       reasoning_effort: 'high',
     });
-    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('s1');
+    expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
     expect(sendCodingAgentControl).not.toHaveBeenCalled();
     expect(updateCompose).not.toHaveBeenCalled();
   });

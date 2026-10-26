@@ -285,6 +285,7 @@ async fn continuation_requested_turn_keeps_its_own_anchor() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),

@@ -42,10 +42,10 @@ export function primaryPointerIsDown(): boolean {
   return pressed;
 }
 
-/** A widget frame reports a finger still held inside it, which this document
- *  never saw go down. Once an overlay inerts the frame, the lift's click lands
- *  here, so an overlay opening now must count the press as its own. */
-export function notePressHeldInFrame(): void {
+/** A press this module cannot see go down, or has already seen lift, still owes
+ *  its click to the overlay opening now. A widget frame calls this for a finger
+ *  held inside it. */
+export function notePressOwesClick(): void {
   pressed = true;
 }
 
@@ -55,20 +55,20 @@ export function notePressHeldInFrame(): void {
  *  hit-tested again, so its click goes to whatever moved there. A tap's compat
  *  mouse events and its click share one task, so the next task follows them.
  *  A mouse press first waits for its pointerup, which shares a task with its
- *  mouseup and click. */
+ *  mouseup and click. A press that owes its click has already lifted, so it
+ *  waits for that click. */
 export function afterPressSettles(fn: () => void): void {
   if (!pressed) {
     setTimeout(fn, 0);
     return;
   }
+  const ends = ['pointerup', 'pointercancel', 'click'] as const;
   const settle = (e: Event) => {
     if (e.type !== 'blur' && !isPrimaryPress(e)) return;
-    document.removeEventListener('pointerup', settle, true);
-    document.removeEventListener('pointercancel', settle, true);
+    for (const type of ends) document.removeEventListener(type, settle, true);
     window.removeEventListener('blur', settle);
     setTimeout(fn, 0);
   };
-  document.addEventListener('pointerup', settle, true);
-  document.addEventListener('pointercancel', settle, true);
+  for (const type of ends) document.addEventListener(type, settle, true);
   window.addEventListener('blur', settle);
 }

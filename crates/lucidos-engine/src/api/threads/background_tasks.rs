@@ -6,6 +6,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 use super::parse_thread_id;
 use crate::api::AppState;
 use crate::engine::agent_session::background_task::BackgroundTaskStart;
+use crate::engine::agent_session::child_reports::ChildReport;
 use crate::engine::tools::bash_background::CompletionDelivery;
 
 type HandlerResult = Result<Json<serde_json::Value>, (StatusCode, String)>;
@@ -180,27 +182,73 @@ pub(in crate::api) async fn wait_for_background_task(
     Path((thread_id, task_id)): Path<(String, String)>,
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
-) -> HandlerResult {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     let thread_id = parse_thread_id(&thread_id)?;
     require_own_thread_agent(&headers, thread_id)?;
-    let output = state
+    let answer = state
         .engine
-        .background_task_wait_for_agent(thread_id, &task_id, query.max_secs)
+        .background_task_wait_for_agent(
+            thread_id,
+            &task_id,
+            query.max_secs,
+            crate::api::actor::user_actor(&headers, None),
+        )
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, e))?;
-    Ok(Json(wait_response(&task_id, output_json(&output))))
+    let mut response = Json(wait_response(
+        &task_id,
+        output_json(&answer.output),
+        &answer.child_reports,
+    ))
+    .into_response();
+    response
+        .extensions_mut()
+        .insert(super::child_reports::ChildReportsCarried);
+    Ok(response)
 }
 
 /// A finished task's record passes through as `output` prints it. A running
-/// one gains the next step, since the agent must call again.
-fn wait_response(task_id: &str, mut output: serde_json::Value) -> serde_json::Value {
-    if output["finished"] == serde_json::Value::Bool(false) {
-        output["message"] = serde_json::Value::String(format!(
+/// one gains the next step, since the agent must call again. Child reports the
+/// wait took ride along, and the message says so.
+fn wait_response(
+    task_id: &str,
+    mut output: serde_json::Value,
+    child_reports: &[ChildReport],
+) -> serde_json::Value {
+    let running = output["finished"] == serde_json::Value::Bool(false);
+    let message = match (running, child_reports.is_empty()) {
+        (true, true) => format!(
             "Still running. Re-issue `lucidos background-task wait {task_id}` in the \
              foreground."
-        ));
+        ),
+        (true, false) => format!(
+            "A child thread's report arrived, so this wait returned early: read it under \
+             `child_reports`. The task is still running. Re-issue `lucidos background-task \
+             wait {task_id}` in the foreground."
+        ),
+        (false, false) => {
+            "A child thread's report arrived: read it under `child_reports`.".to_string()
+        }
+        (false, true) => return output,
+    };
+    output["message"] = serde_json::Value::String(message);
+    if !child_reports.is_empty() {
+        output["child_reports"] = child_reports_json(child_reports);
     }
     output
+}
+
+/// The reports as the agent reads them, oldest first.
+pub(super) fn child_reports_json(child_reports: &[ChildReport]) -> serde_json::Value {
+    child_reports
+        .iter()
+        .map(|report| {
+            serde_json::json!({
+                "card_id": report.card_id,
+                "report": report.text,
+            })
+        })
+        .collect()
 }
 
 /// POST /api/v1/threads/:thread_id/background-tasks/:task_id/stop

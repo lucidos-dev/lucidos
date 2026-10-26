@@ -282,7 +282,7 @@ fn withheld(reason: UnproposedReason) -> &'static str {
              change carries it."
         }
         UnproposedReason::CarriedBySuccessor => {
-            "The work never becomes a change here: the thread continued in a successor thread, \
+            "The work never becomes a change here: the thread continued in a legacy successor thread, \
              whose change carries it."
         }
     }
@@ -2372,6 +2372,7 @@ mod tests {
             tool_name: "Edit".into(),
             input: serde_json::json!({}),
             summary: "Edit a file".into(),
+            grant_offer: None,
         });
         for event in [&terminal, &diff_flag, &idle, &permission_card] {
             assert_eq!(thread_to_resolve(event), Some(thread_id));

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import { currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileDynamicBars, setMobileDynamicBars, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCommandGuardCodingAgents, setCommandGuardCodingAgents, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 import { openScaleModal } from '../shared/scaleModalState';
@@ -56,6 +56,7 @@ import { fontOptions } from './fontOptions';
 import { WorkspaceFontsSection } from './WorkspaceFontsSection';
 import { workspaceFontList } from '../../store/actions/workspaceFonts';
 import { Explainer } from '../shared/Explainer';
+import { MobileDynamicBarsRow } from './MobileDynamicBarsRow';
 import { ThemePicker } from './ThemePicker';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { AllowlistEditor } from './AllowlistEditor';
@@ -67,12 +68,13 @@ import { WebhooksPage } from './WebhooksPage';
 import { MobileAccessPage } from './MobileAccessPage';
 import { usePairedDevices, revokePaired } from './pairedDevices';
 import { pairedRows, pairingIsKnown } from '../../store/actions/pairedDevices';
-import { buildDeviceRows, deviceRowName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
+import { SectionHeader } from '../shared/SectionHeader';
+import { buildDeviceRows, isUnusedDevice, deviceRowName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
 import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
-import { CacheKeepAliveSection } from './CacheKeepAliveSection';
+import { CacheKeepAlivePointer, CacheKeepAliveSection } from './CacheKeepAliveSection';
 import { IntelligenceLinkRow, IntelligencePage } from './IntelligencePage';
 import { SystemPage } from './SystemPage';
 import { SystemSubmenu } from './SystemSubmenu';
@@ -536,6 +538,7 @@ export function SettingsView() {
   const background = useBackgroundModels();
   usePanelRefresh('background models', background.refresh);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [unusedDevicesOpen, setUnusedDevicesOpen] = useState(false);
   const [oauthProvider, setOauthProvider] = useState('');
   const [oauthConnecting, setOauthConnecting] = useState(false);
   /** The scopes a deep link said this connection is for, or null for a bare
@@ -878,18 +881,31 @@ export function SettingsView() {
                 if (rows.length === 0) {
                   return <div class="empty-state">No devices registered</div>;
                 }
+                const unused = rows.filter(isUnusedDevice);
+                const drawRow = (row: DeviceRowModel) => (
+                  <DeviceRow
+                    key={row.id}
+                    row={row}
+                    editingId={editingId}
+                    setEditingId={setEditingId}
+                    onRevoke={revoke}
+                    gatewayAnswered={pairingIsKnown(paired.paired)}
+                  />
+                );
                 return (
                   <>
-                    {rows.map((row) => (
-                      <DeviceRow
-                        key={row.id}
-                        row={row}
-                        editingId={editingId}
-                        setEditingId={setEditingId}
-                        onRevoke={revoke}
-                        gatewayAnswered={pairingIsKnown(paired.paired)}
-                      />
-                    ))}
+                    {rows.filter((row) => !isUnusedDevice(row)).map(drawRow)}
+                    {unused.length > 0 && (
+                      <>
+                        <SectionHeader
+                          title="Unused devices"
+                          count={unused.length}
+                          collapsed={!unusedDevicesOpen}
+                          onToggle={() => setUnusedDevicesOpen((open) => !open)}
+                        />
+                        <Disclosure open={unusedDevicesOpen}>{unused.map(drawRow)}</Disclosure>
+                      </>
+                    )}
                   </>
                 );
               })()
@@ -965,7 +981,7 @@ export function SettingsView() {
       <>
         <CodingAgentBinariesSection />
         <CodingAgentPermissionSection />
-        <CacheKeepAliveSection />
+        <CacheKeepAlivePointer />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="coding-agents:intelligence">Intelligence ladders</div>
           <IntelligenceLinkRow>Which model and effort an agent may pick for Claude Code and Codex</IntelligenceLinkRow>
@@ -1008,6 +1024,7 @@ export function SettingsView() {
     const loaded = preferences.value.status === 'loaded';
     const guardOn = currentCommandGuard();
     const judgeOn = currentCommandGuardJudge();
+    const codingAgentsOn = currentCommandGuardCodingAgents();
     return (
       <div class="settings-section">
         {/* On the section title, not on the Command guard row: the copy is
@@ -1026,9 +1043,9 @@ export function SettingsView() {
               every command the agent runs goes straight through.
             </p>
             <p>
-              It does not gate a coding agent's tools. Claude Code asks through its own
-              permissions list below. Codex asks when a command has to escape its sandbox.
-              Lucidos answers the plain reads for you, whatever these toggles say.
+              By default it does not gate a coding agent's tools. Claude Code asks through
+              its own permissions list below. Codex asks when a command has to escape its
+              sandbox. Lucidos answers the plain reads for you, whatever these toggles say.
             </p>
             <p>
               The <strong>LLM judge</strong> places the commands the static check cannot.
@@ -1052,6 +1069,31 @@ export function SettingsView() {
             checked={judgeOn}
             disabled={!guardOn}
             onChange={(c) => void setCommandGuardJudge(c)}
+          />
+        </div>
+        <div class="settings-row settings-row-child" data-search-anchor="command-safety:coding-agents">
+          <span class="settings-row-label">
+            Enabled for coding agents
+            <Explainer title="Enabled for coding agents">
+              <p>
+                The guard also judges the commands of <strong>Claude Code</strong> and{' '}
+                <strong>Codex</strong>. A command it places as safe or reversible runs
+                without asking you. Irreversible and catastrophic commands still ask.
+              </p>
+              <p>
+                Nothing takes a checkpoint first, so a wrong reversible call has no undo.
+              </p>
+              <p>
+                Off, the guard leaves Claude Code commands to you, and answers only the
+                Codex commands it places as safe.
+              </p>
+            </Explainer>
+          </span>
+          <LoadableToggle
+            loaded={loaded}
+            checked={codingAgentsOn}
+            disabled={!guardOn}
+            onChange={(c) => void setCommandGuardCodingAgents(c)}
           />
         </div>
         {/* Every System One row is in this picker, not a switch beside it: a
@@ -1090,16 +1132,17 @@ export function SettingsView() {
           }
         />
         <AllowlistEditor
-          title="Claude Code permissions"
-          anchor="permissions:claude-code"
+          title="Coding agent permissions"
+          anchor="permissions:coding-agent"
           noun="tool permissions"
           placeholder="Bash(npm:*)"
           load={getCcAllowedTools}
           save={putCcAllowedTools}
           description={
             <>
-              Patterns passed to Claude Code as <code>--allowedTools</code>.
-              Use the <strong>Always allow</strong> buttons on permission prompts to add entries quickly. Changes apply to new Claude Code sessions.
+              Tools and commands coding agents may run without asking. Claude Code reads every line, Codex the command lines: <code>Bash(git:*)</code> covers <code>git</code> for both.
+              Use the <strong>Always allow</strong> buttons on permission prompts to add entries quickly. A line naming a shell such as <code>Bash(bash:*)</code> is ignored, since it would cover any command.
+              Claude Code reads changes in new sessions, Codex on its next prompt.
             </>
           }
         />
@@ -1339,6 +1382,7 @@ export function SettingsView() {
             />
           </Disclosure>
         </div>
+        <CacheKeepAliveSection />
         <VoiceSection />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:providers">Providers</div>
@@ -1521,26 +1565,7 @@ export function SettingsView() {
         {viewportIsMobile.value && (
           <div class="settings-section">
             <div class="settings-section-title" data-search-anchor="appearance:mobile">Mobile</div>
-            <div class="settings-row" data-search-anchor="appearance:mobile-dynamic-bars">
-              <span class="settings-row-label">
-                Dynamic bars
-                <Explainer title="Dynamic bars">
-                  <p>
-                    The header, the thread title and the prompt glide away as
-                    you scroll down a thread, and come back as you scroll up.
-                  </p>
-                  <p>Off, they stay in place.</p>
-                </Explainer>
-              </span>
-              <label class="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={currentMobileDynamicBars()}
-                  onChange={(e) => void setMobileDynamicBars((e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span class="toggle-slider" />
-              </label>
-            </div>
+            <MobileDynamicBarsRow />
           </div>
         )}
         {notificationsSection()}

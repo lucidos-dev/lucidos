@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: intents
 description: The intents audit section: frontmatter, knowhow ids that resolve, intents shadowed by a same-id knowhow doc, and user-facing tone.
+sources: ["system-knowhow/intent-registry.md", "crates/lucidos-engine/src/engine/chat/process/system_prompt.rs"]
 ---
 
 # Workspace audit section: intents

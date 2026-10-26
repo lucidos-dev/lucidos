@@ -83,10 +83,48 @@ fn the_start_response_tells_the_agent_what_to_do_next() {
 /// `output` prints, untouched.
 #[test]
 fn the_wait_response_adds_the_next_step_only_while_running() {
-    let running = wait_response("t5", serde_json::json!({"finished": false, "stdout": "a"}));
+    let running = wait_response(
+        "t5",
+        serde_json::json!({"finished": false, "stdout": "a"}),
+        &[],
+    );
     let msg = running["message"].as_str().unwrap();
     assert!(msg.contains("lucidos background-task wait t5"), "{msg}");
+    assert!(running.get("child_reports").is_none());
 
     let record = serde_json::json!({"finished": true, "exit_code": 0, "stdout": "b"});
-    assert_eq!(wait_response("t5", record.clone()), record);
+    assert_eq!(wait_response("t5", record.clone(), &[]), record);
+}
+
+/// A wait that took a child report carries it, and says to read it. A running
+/// task still says to wait again.
+#[test]
+fn the_wait_response_carries_the_reports_it_took() {
+    let report = ChildReport {
+        card_id: Uuid::new_v4(),
+        text: "[CHILD THREAD COMPLETED] review done".into(),
+        sent: "[CHILD THREAD COMPLETED] review done".into(),
+    };
+    let running = wait_response(
+        "t5",
+        serde_json::json!({"finished": false, "stdout": "a"}),
+        std::slice::from_ref(&report),
+    );
+    let msg = running["message"].as_str().unwrap();
+    assert!(msg.contains("child_reports"), "{msg}");
+    assert!(msg.contains("lucidos background-task wait t5"), "{msg}");
+    assert_eq!(running["child_reports"][0]["report"], report.text);
+    assert_eq!(
+        running["child_reports"][0]["card_id"],
+        report.card_id.to_string()
+    );
+    assert_eq!(running["stdout"], "a", "the task's output is untouched");
+
+    let finished = wait_response(
+        "t5",
+        serde_json::json!({"finished": true, "exit_code": 0}),
+        std::slice::from_ref(&report),
+    );
+    assert!(!finished["message"].as_str().unwrap().contains("Re-issue"));
+    assert_eq!(finished["child_reports"][0]["report"], report.text);
 }

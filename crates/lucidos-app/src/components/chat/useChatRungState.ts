@@ -1,5 +1,6 @@
+import { useEffect } from 'preact/hooks';
 import {
-  chatModels, effectiveThreadStatus, intelligenceLadderVersion, showToast, threadMap,
+  chatLadder, chatModels, effectiveThreadStatus, showToast, threadMap,
 } from '../../store/store';
 import {
   getComposeSelectionOverride, resolveModel, resolveProvider, resolveReasoningEffort,
@@ -11,21 +12,20 @@ import {
 } from '../../store/threadModelSelections';
 import { updateComposeSelection } from '../../store/actions/compose';
 import {
-  loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY,
+  loadChatLadder, loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY,
   PROVIDER_DEFAULT_EFFORT_LABEL, rememberProvider,
 } from '../../store/actions/models';
 import { accountChatEffort } from '../../store/actions/preferences';
-import { ApiError, fetchSwitchEstimate, getChatLadder, recordChatSettings } from '../../api/client';
+import { ApiError, fetchSwitchEstimate, recordChatSettings } from '../../api/client';
 import { TURN_RUNNING_REASON } from '@lucidos/engine-constants';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
-import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { decodePair, encodePair, pairLabelOf } from '../../store/modelSelection';
 import { displayModelName } from '../../store/thread-events/exchange';
 import { openIntelligenceLadder } from '../../store/actions/menu';
 import { errorDetail } from '../../utils/errorDetail';
 import { providerStepOptions, providerStepCommit } from '../shared/ModelSelectionPicker';
 import type { RungProviderStep } from './RungPicker';
-import { rungFaces, rungIntelligence, rungLockedReason, stepTargets, type ShownRung } from './rungControlParts';
+import { rungIntelligence, rungLockedReason, stepTargets, type ShownRung } from './rungControlParts';
 import { LADDER_LINK_VALUE, rungListRows } from './rungRows';
 import { askRungSwitch } from './rungSwitch';
 
@@ -61,6 +61,12 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
   // registry; `chatModelOptions()` falls back to the static MODELS list until
   // it lands. `loadChatModels` single-flights via setLoadingIfFresh.
   if (chatModels.value.status === 'not-loaded') void loadChatModels();
+  // The shared ladder loads at startup. This covers a surface mounted before
+  // that read began, and a mount after a failed read, which retries once.
+  if (chatLadder.value.status === 'not-loaded') void loadChatLadder();
+  useEffect(() => {
+    if (chatLadder.peek().status === 'failed') void loadChatLadder();
+  }, []);
 
   /** Why a started thread's rung cannot change now, read at call time. */
   const lockedNow = (): string | null => {
@@ -68,7 +74,12 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     const thread = threadMap.value.get(threadId);
     return rungLockedReason(thread ? effectiveThreadStatus(thread) : null);
   };
-  const lockedReason = lockedNow();
+  /** Says why when the rung is locked now, and reports whether it was. */
+  const refusedWhileLocked = (): boolean => {
+    const locked = lockedNow();
+    if (locked) showToast(locked, 'info');
+    return locked !== null;
+  };
 
   const modelValue = perDraft ? resolveModel(threadId) : resolveActiveThreadModel(threadId);
   const effortValue = perDraft
@@ -110,9 +121,7 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     onChange: applyDraftPick,
   });
 
-  const ladder = useLoadableFetch(getChatLadder, [intelligenceLadderVersion.value], {
-    keepLoadedWhileRefetching: true,
-  }).loadable;
+  const ladder = chatLadder.value;
   const served = ladder.status === 'loaded' ? ladder.data : null;
   const servedRungs = served?.rungs ?? [];
   const defaultRung = served?.default_rung ?? null;
@@ -137,18 +146,18 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
 
   // The model's own label, so a 1M context window stays named on the face.
   const at = onRungs.findIndex((r) => encodePair(r.model, r.effort) === rungList.current);
-  const shown: ShownRung = {
+  const face: ShownRung = {
     name: labelOf(modelValue),
     effort: selection.effort,
     position: at === -1 ? null : { at: at + 1, of: onRungs.length },
     intelligence: at === -1 ? null : rungIntelligence(onRungs[at]),
   };
-  // A rung can run its model with or without the 1M context window, so it
-  // reserves both labels whichever model is in force now.
-  const faces = rungFaces(onRungs, (rung) => {
-    const twins = selection.rows.filter((r) => withoutContextTwin(r.value) === withoutContextTwin(rung.model));
-    return twins.length > 0 ? twins.map((r) => r.label) : [labelOf(rung.model)];
-  });
+  // The face is whole once the ladder and the registry have each answered, or
+  // failed: the registry relabels the model and adds its context-window twins.
+  // Until then the pill stays unseen, so it draws once, whole.
+  const shown = [ladder, chatModels.value].every((read) => read.status === 'loaded' || read.status === 'failed')
+    ? face
+    : null;
 
   /** The model a rung's pick runs. A rung names the bare model, so picking the
    *  model in force keeps its context window: the window is part of the
@@ -198,26 +207,24 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
       showToast(`Could not check what switching to ${label} costs: ${errorDetail(err)}`, 'error');
       return false;
     }
-    if (!estimate.rebuilds_cache) return true;
+    if (estimate.rebuilds_cache === 'no') return true;
     const choice = await askRungSwitch({
       from: selection.label,
       to: label,
       extraCostUsd: estimate.extra_cost_usd,
+      rebuild: estimate.rebuilds_cache,
       canHandOff: false,
     });
     return choice === 'switch';
   }
 
   /** Record a started thread's pick on the engine. A turn may start while the
-   *  user reads the switch dialog, so the lock is checked again after it. */
+   *  user reads the switch dialog, so the lock is checked before and after it. */
   async function recordStartedPick(startedThreadId: string, encoded: string, provider: string | undefined) {
     const label = pairLabelOf(selection.rows, encoded, provider);
+    if (refusedWhileLocked()) return false;
     if (!await startedPickProceeds(startedThreadId, encoded, provider, label)) return false;
-    const locked = lockedNow();
-    if (locked) {
-      showToast(locked, 'info');
-      return false;
-    }
+    if (refusedWhileLocked()) return false;
     const pair = decodePair(encoded);
     try {
       await recordChatSettings(startedThreadId, {
@@ -256,16 +263,12 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
   /** Move one row up (-1) or down (1) the rung list, saying nothing more: the
    *  label shows the new pair. */
   function step(direction: -1 | 1) {
-    const locked = lockedNow();
-    if (locked) {
-      showToast(locked, 'info');
-      return;
-    }
+    if (refusedWhileLocked()) return;
     const target = direction === -1 ? steps.prev : steps.next;
     if (target === null) return;
     const commit = rungPick(target);
     void pick(commit.encoded, undefined, true);
   }
 
-  return { shown, faces, rungList, providerStep, pickRung, steps, step, lockedReason };
+  return { shown, rungList, providerStep, pickRung, steps, step };
 }

@@ -11,7 +11,7 @@ Lucidos owns two primitives they call: the *handoff checkpoint* and the
 *handoff estimate*. ADR 0505 records why.
 
 A checkpoint is a named point in a flow where the work may continue in a fresh
-*successor thread*. The engine knows no checkpoint by name. A flow names one by
+*successor session*, in the same thread. The engine knows no checkpoint by name. A flow names one by
 running a command at that point, and nothing else turns it on.
 
 ## Wiring a checkpoint
@@ -38,23 +38,19 @@ again from the default, so rename only when the step really changed.
 
 | Kind | Use it when | What it prints |
 |---|---|---|
-| Automatic | The flow asks the user nothing at this point. | The handoff steps, an owner approval ask, or "carry on". |
+| Automatic | The flow asks the user nothing at this point. | The handoff steps, or "carry on". |
 | Offered (`--ask`) | The flow already asks the user a question here. | The shape of that question's card. |
 
-An **automatic** checkpoint prints one of three things:
+An **automatic** checkpoint prints one of two things:
 
-- **Hand off**: the estimate pays, and no card is needed. The agent commits,
-  writes a *handoff narrative*, runs `lucidos successor spawn` with the same
-  `--at` and `--progress`, and ends its turn.
-- **Ask the owner**: the estimate pays, but the handoff needs the owner's
-  approval. The agent asks once, on an owner approval card. Allow once hands
-  off as above, and Don't allow carries on.
+- **Hand off**: the estimate pays. The agent writes a *handoff narrative*, runs
+  `lucidos successor start` with the same `--at` and `--progress`, and ends its
+  turn. A *successor session* then carries on in the same thread.
 - **Carry on**: the estimate does not pay. The agent asks nothing.
 
-Only a child thread can need the owner's approval. A *build chain* member, or a
-successor holding a *handoff consent*, never does (ADR 0507).
+A handoff never asks the owner for approval.
 
-An **offered** checkpoint folds a new-thread option into the flow's own
+An **offered** checkpoint folds a fresh-session option into the flow's own
 question. The flow names its option to stay, such as `Approve here`. It also
 says what a pick does before the handoff, such as approving the plan.
 
@@ -71,7 +67,7 @@ are `total - done`, else one.
 
 ## Keeping a flow running after a handoff
 
-The successor reads only the narrative and the files. So the narrative quotes
+The successor session reads only the narrative and the files. So the narrative quotes
 the flow's remaining checkpoint instructions, and the successor runs them in
 turn. Both outputs above say so. It starts at the step after the checkpoint
 that started it, and never runs that checkpoint again. A flow file the successor will load anyway

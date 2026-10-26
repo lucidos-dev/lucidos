@@ -78,13 +78,21 @@ when a Rust test failed, and Phase 4.5 then reports a false PASS. That has shipp
 a failing nightly. Redirect to a log, capture `$?` first, then read the log. A
 "tests pass" claim needs the real exit code and the `test result: ok.` line.
 
-## A silent Codex review is configuration
+## A silent other-model review is configuration
 
-The companion folds the real cause into one generic sentence, and the status line
-quotes it back from the reviewer's stderr. The CLI once moved its default model to
-one the local login could not reach, and every review then returned a 403.
-`codex login status` names the login, and a reachable `model` in
-`~/.codex/config.toml` fixes it.
+A `NO VERDICT` line is never a pass. The reviewer started and returned nothing,
+and the status line quotes its cause. Read the cause before calling it flaky.
+
+- **Codex.** The companion folds the real cause into one generic sentence, and
+  the status line quotes it back from the reviewer's stderr. The CLI once moved
+  its default model to one the local login could not reach, and every review
+  then returned a 403. `codex login status` names the login, and a reachable
+  `model` in `~/.codex/config.toml` fixes it.
+- **Claude.** The script quotes `result`, `subtype` and the served model from the
+  JSON result. `claude auth status` names the login. A config dir with no login
+  answers "Not signed in", including the default path set explicitly in
+  `CLAUDE_CONFIG_DIR`. So the script never sets that variable, and inherits what
+  the engine's own sessions inherit.
 
 ## Why a gate is unconditional
 

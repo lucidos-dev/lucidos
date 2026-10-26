@@ -115,9 +115,18 @@ export interface ApiUsage {
   /** Part of `cache_creation_tokens`: the tokens written to the 1-hour
    *  cache, billed at 2x base input rather than 1.25x. A Claude Code
    *  session and a Claude chat call on Anthropic or Vertex split a write by
-   *  lifetime, and every other producer leaves it absent. The cache
-   *  keep-alive reads the session's TTL from it. */
+   *  lifetime, and the rest of the write went to the 5-minute cache.
+   *  `CacheTtl::of_write` reads the call's TTL from the split. */
   cache_creation_1h_tokens?: number;
+  /** Part of `cache_creation_tokens`: the tokens OpenAI's Responses API
+   *  wrote to its 30-minute cache. With the 12-hour part it covers the write. */
+  cache_creation_30m_tokens?: number;
+  /** Part of `cache_creation_tokens`: the tokens OpenAI's Responses API
+   *  wrote to its 12-hour cache, billed above the 30-minute write. */
+  cache_creation_12h_tokens?: number;
+  /** The cache lifetime the request asked for, where the response split
+   *  nothing. The router sets it only for a route probes showed honours it. */
+  cache_creation_requested_ttl?: CacheLifetime;
 }
 
 /** How an Apply Now ended. Carried by `ApplyNowEnded`. */
@@ -134,11 +143,19 @@ export type AutoCompactArm =
 
 /** Why a waiting thread gets no keep-alive. */
 export type CacheKeepAliveNotKeptReason =
+  | 'codex'
+  | 'off'
   | 'no_wake_children'
-  | 'children_awaiting_user';
+  | 'children_awaiting_user'
+  | 'uncacheable_provider'
+  | 'restarted'
+  | 'past_give_up_time'
+  | 'nothing_pending'
+  | 'unattended_trigger'
+  | 'unknown_ttl';
 
-/** The keep-alive's state for one thread. Absent when the thread has nothing
- *  to keep warm. */
+/** The keep-alive's state for one thread, in the one grammar every surface
+ *  speaks: Warming, Stopped, Ended, Turned off, or Not kept. */
 export type CacheKeepAliveStatus =
   /** The engine pings the session, within its break-even budget. */
   | {
@@ -159,8 +176,17 @@ export type CacheKeepAliveStatus =
       next_beat_at?: string;
       /** When the engine stops pinging. */
       give_up_at: string;
+      /** What one ping costs: a cache read of the context. Absent for an
+       *  unpriced model, and on statuses stored before prices. */
+      ping_usd?: number;
+      /** What a reply after the cache goes cold pays to reread the context.
+       *  Absent like `ping_usd`. */
+      reread_usd?: number;
+      /** How past waits like this one ended, against the give-up cap.
+       *  Absent with no past wait to count. */
+      odds?: CapOdds;
     }
-  /** The engine stopped pinging: more pings would cost more than a rewrite. */
+  /** The engine stopped pinging at the give-up time set when the wait began. */
   | {
       state: 'stopped';
       at: string;
@@ -168,12 +194,66 @@ export type CacheKeepAliveStatus =
       cost_usd: number;
       /** The context the wake-up rereads instead. */
       context_tokens: number;
+      ping_usd?: number;
+      reread_usd?: number;
+      /** How often a ping went out, in seconds. Absent on statuses stored
+       *  before it. */
+      beat_every_secs?: number;
+      /** The odds the run's cap was chosen on. Absent like `beat_every_secs`. */
+      odds?: CapOdds;
+    }
+  /** The wait ended while the engine kept it warm. */
+  | {
+      state: 'ended';
+      /** When the wait it kept warm began. */
+      since: string;
+      /** When the wait ended. */
+      at: string;
+      beats: number;
+      cost_usd: number;
+      /** What the warm cache saved the next request: the reread price of the
+       *  run's context. Absent unless that request began while the cache was
+       *  still warm. */
+      saved_usd?: number;
+      /** The context the run kept warm. Absent on statuses stored before it. */
+      context_tokens?: number;
+      ping_usd?: number;
+      reread_usd?: number;
+      /** How often a ping went out, in seconds. Absent on statuses stored
+       *  before it. */
+      beat_every_secs?: number;
+      /** The odds the run's cap was chosen on. Absent like `beat_every_secs`. */
+      odds?: CapOdds;
+    }
+  /** The user turned the keep-alive off for this thread at `at`. */
+  | {
+      state: 'turned_off';
+      at: string;
+      beats: number;
+      cost_usd: number;
+      /** The context a reply after the cache goes cold rereads. */
+      context_tokens: number;
+      ping_usd?: number;
+      reread_usd?: number;
+      /** How often a ping went out, in seconds. Absent on statuses stored
+       *  before it. */
+      beat_every_secs?: number;
+      /** The odds the run's cap was chosen on. Absent like `beat_every_secs`. */
+      odds?: CapOdds;
     }
   /** The thread waits, and the engine does not keep it warm. */
   | {
       state: 'not_kept';
       reason: CacheKeepAliveNotKeptReason;
     };
+
+/** A lifetime a provider's cache offers. Every number a reader times or
+ *  prices from lives here, so an Unknown TTL cannot reach one. */
+export type CacheLifetime =
+  | '5m'
+  | '30m'
+  | '1h'
+  | '12h';
 
 /** How a failed call failed, from what the trace saw. Never the message: a
  *  provider's error body can echo request content. */
@@ -196,6 +276,19 @@ export type CancelCause =
   | 'superseded_by_followup'
   | 'effort_restart'
   | 'unknown';
+
+/** *Cap odds*: how this workspace's finished waits of one agent and wait type
+ *  ended, counted against a give-up cap. `slots` holds one entry per ping
+ *  count, from none up to the cap. */
+export interface CapOdds {
+  /** The finished waits counted. */
+  samples: number;
+  /** `slots[k]`: the waits that needed `k` pings, the cache still warm.
+   *  Slot 0 ended before the first ping. */
+  slots: number[];
+  /** The waits that outlasted the cap: they paid every ping and the reread. */
+  after_cap: number;
+}
 
 /** The file format a saved app capture is encoded in. The save path's
  *  extension picks it, and the app frame encodes the picture to match. */
@@ -355,10 +448,13 @@ export type EngineReason =
   /** An integrated sub-thread's parent landed a change that did not carry
    *  the sub-thread's work, so the engine set that work aside (ADR 0465). */
   | { kind: 'unmerged_integrated_work' }
-  /** A thread kept committing after it handed off to a successor thread.
+  /** A thread kept committing after it handed off to a legacy successor thread.
    *  The successor's change was resolved without that work, so the engine
    *  set it aside. */
   | { kind: 'successor_residue' }
+  /** The thread handed off, and the engine sent the handoff's opening to
+   *  start its *successor session*. */
+  | { kind: 'successor_session' }
   /** Engine opened a merge-conflict resolution: a Tier-2 or Tier-3 merge,
    *  or the lane thread of a lane batch. */
   | { kind: 'merge_conflict' }
@@ -462,12 +558,47 @@ export type FormRequestOutcome =
   | 'expired'
   | 'unknown';
 
-/** The *handoff consent* that let a child's successor start under its parent
- *  (ADR 0507). The successor inherits it for its own automatic handoffs. */
+/** Why a session on a thread that had one before started fresh. */
+export type FreshSessionReason =
+  | 'change-applied'
+  | 'change-discarded'
+  | 'session-ended'
+  | 'branch-gone'
+  | 'resume-failed'
+  | 'no-resumable-session';
+
+/** The grant patterns a permission card offers, one per "Always allow"-style
+ *  button. A missing pattern means no such button. The engine stamps it on the
+ *  request event, the card renders exactly these buttons, and a click stores
+ *  exactly the stamped pattern (ADR 0571). */
+export interface GrantOffer {
+  /** "Always allow": a persisted line, `Bash` or a bare tool name. */
+  broad?: string;
+  /** "Always allow `<head>` commands": a persisted line such as `Bash(git:*)`. */
+  narrow?: string;
+  /** "Allow for this thread": a pattern for this thread's session set. */
+  session?: string;
+}
+
+/** The retired *handoff consent* that let a child's legacy successor thread start
+ *  under its parent (ADR 0507). Kept so legacy `SuccessorThreadSpawned` events
+ *  still deserialize. A handoff needs no authority now. */
 export type HandoffConsent =
   | 'owner'
   | 'owner-approval'
   | 'carried';
+
+/** What a *successor session* starts from. */
+export type HandoffOpening =
+  | 'narrative'
+  | 'brief';
+
+/** What a user typed at the *Successor card*, and who typed it. The successor
+ *  session starts on it as that user's message. */
+export interface HandoffRequest {
+  message: string;
+  by: MessageOrigin;
+}
 
 /** The branch an integrated sub-thread hands up to its parent, named on the
  *  child's report. Set only when the child's work is hardened and waits for
@@ -476,6 +607,12 @@ export interface IntegratedBranch {
   branch_name: string;
   /** The head the child's `/harden` certified. */
   head_sha: string;
+}
+
+/** One model at one effort. */
+export interface IntelligenceRung {
+  model: string;
+  effort: string;
 }
 
 /** One tile of a legacy `HomeBoardArranged`, written before the two
@@ -668,6 +805,9 @@ export interface QuestionOption {
   /** The widget the option draws under its label row, lifted out of a
    *  *widget embed* in its description or preview (ADR 0415). */
   widget?: WidgetEmbed;
+  /** A *quiet option*: picking it records the answer and ends the turn
+   *  without waking the agent. */
+  quiet?: boolean;
 }
 
 /** One long-term memory the pre-turn recall injected into the turn's context,
@@ -685,6 +825,32 @@ export interface RecalledMemory {
 /** A provider's processing tier other than its standard one. */
 export type ServiceTier =
   | 'flex';
+
+/** Whether a coding-agent session carried the thread's earlier context. Carried
+ *  by `SessionStarted`, so the thread can say when a session started over. */
+export type SessionContinuity =
+  /** The thread's first session. There was nothing to carry. */
+  | { kind: 'first' }
+  /** The session resumed the previous one, so its context carried over. */
+  | { kind: 'resumed' }
+  /** The thread had a session before, and this one starts without it. */
+  | {
+      kind: 'fresh';
+      reason: FreshSessionReason;
+    }
+  /** A *successor session*: the thread handed off, and this session starts
+   *  from the handoff's opening. */
+  | {
+      kind: 'handoff';
+      /** The *handoff checkpoint* the handoff ran at, when one did. */
+      checkpoint?: string;
+      /** The checkpoint's progress, as `<done>/<total>`. */
+      progress?: string;
+      opening: HandoffOpening;
+      /** The opening itself, which the transcript folds under the session's
+       *  card. The first input may also carry the message that started it. */
+      message: string;
+    };
 
 /** One pending change held by a sub-thread of the thread a
  *  `ChildThreadCompleted` reports on: any descendant, not the thread itself.
@@ -1044,6 +1210,10 @@ export type ThreadEvent =
        *  `request-id` header). Absent when the response had none, and on
        *  every row written before the field existed. */
       request_id?: string;
+      /** The thread's *agent session* the call ran in, counted from 1. The
+       *  event bus stamps it at append, so a producer leaves it `None`.
+       *  Absent on every row written before the field existed. */
+      session?: number;
       /** Server dropped `sections` and `tools` here. The modal lazy-fetches them. */
       sections_stripped?: boolean;
       /** Links this event back to the request that opened the turn. */
@@ -1326,10 +1496,10 @@ export type ThreadEvent =
       /** App id when `coding_agent_kind == "app"`; `None` otherwise. */
       app_id?: string;
       /** Which backend drives this thread (`claude-code` | `codex`).
-       *  Locked in at first SessionStarted via the thread_summaries
-       *  projection (COALESCE keeps the existing value) so follow-ups and
-       *  recovery resume on the same backend. The default covers legacy rows,
-       *  which are all Claude Code. */
+       *  The thread_summaries projection follows the newest SessionStarted,
+       *  so follow-ups and recovery resume on its backend. Only a successor
+       *  session can change backends. The default covers legacy rows, which
+       *  are all Claude Code. */
       coding_agent?: CodingAgent;
       /** The thread is an *integrated sub-thread*: it folds into its
        *  parent's branch, runs the fast tier of `/harden` and proposes
@@ -1343,6 +1513,9 @@ export type ThreadEvent =
       /** The auto-compact trial arm this session ran in. Absent when the
        *  trial is off and on Codex. */
       auto_compact_arm?: AutoCompactArm;
+      /** Whether this session carried the thread's earlier context. Absent
+       *  on rows written before the field existed. */
+      continuity?: SessionContinuity;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1367,19 +1540,47 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** This thread handed off to a *successor thread*, which carries on with
-   *  a fresh context. Lands on the OLD thread. The successor's branch starts
-   *  at `base_sha`, this thread's last commit at the handoff. */
+  /** Legacy: this thread handed off to a *legacy successor thread*, which carried
+   *  on with a fresh context. Lands on the OLD thread. The successor's
+   *  branch starts at `base_sha`, this thread's last commit at the handoff.
+   *  Nothing emits it now: a handoff starts a successor session instead. */
   | {
       type: 'SuccessorThreadSpawned';
       successor_thread_id: string;
       base_sha: string;
-      /** The successor is the builder of a *build chain*: a `no-wake`
-       *  child of this thread, which stays open (ADR 0503). */
+      /** The successor was the builder of a retired *build chain*: a
+       *  `no-wake` child of this thread (ADR 0503). */
       starts_build_chain?: boolean;
-      /** The authority that let a successor placed under a parent start,
-       *  which it inherits for its own automatic handoffs (ADR 0507). */
+      /** The retired *handoff consent* that let a successor placed under a
+       *  parent start (ADR 0507). */
       handoff_consent?: HandoffConsent;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The thread handed off to a *successor session* in the same thread. The
+   *  current session ends at its turn end, and the next one starts fresh on
+   *  the same branch, with `message` as its first input. Pending until that
+   *  session's `SessionStarted`. */
+  | {
+      type: 'SessionHandedOff';
+      opening: HandoffOpening;
+      /** The opening itself: the *handoff narrative* or *handoff brief*,
+       *  framed for the new session. */
+      message: string;
+      checkpoint?: string;
+      progress?: string;
+      /** The *implementer* the successor session runs on. */
+      coding_agent: CodingAgent;
+      coding_agent_model?: string;
+      reasoning_effort?: string;
+      /** What the user typed at the *Successor card*, and who typed it. The
+       *  successor session starts on it as their message, and `message`
+       *  leaves it out. Older rows quote it inside `message` instead. */
+      request?: HandoffRequest;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1400,6 +1601,12 @@ export type ThreadEvent =
       offered?: boolean;
       /** The verdict. `None` when the engine could not make a reading. */
       pays?: boolean;
+      /** The run declared the *default floor*. */
+      default_floor?: boolean;
+      /** The default rung the run offered, for a thread below it. */
+      floor_rung?: IntelligenceRung;
+      /** The *risk rung* the run offered, just above the default. */
+      risk_rung?: IntelligenceRung;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1594,6 +1801,21 @@ export type ThreadEvent =
        *  nothing in front. It carried no turn-gap note, so the turn gap does
        *  not count it. */
       verbatim?: boolean;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The coding agent took a child's report mid-turn, through its own
+   *  `lucidos` call, before its driver delivered the queued copy. The engine
+   *  withdrew that copy, so the report reaches the agent once. Follows the
+   *  card, so the boot refire treats the card as handled. */
+  | {
+      type: 'ChildReportTaken';
+      /** The `ChildThreadCompleted` card whose report the agent took. */
+      input_event_id: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2437,6 +2659,10 @@ export type ThreadEvent =
       type: 'UserQuestionAnswered';
       tool_use_id: string;
       answer: AnswerKind;
+      /** The pick was a *quiet option*, so the turn ends without waking the
+       *  agent. The engine derives it from the asked options
+       *  (`agent_question::answer_is_quiet`); a client never sets it. */
+      quiet?: boolean;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2489,6 +2715,10 @@ export type ThreadEvent =
       /** The tool call's arguments, always a JSON object. */
       input: Record<string, unknown>;
       summary: string;
+      /** The grant each "Always allow"-style button stores (ADR 0571). `None`
+       *  on a card persisted before the engine stamped it, and on an
+       *  unattended auto-deny, which renders already answered. */
+      grant_offer?: GrantOffer;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2931,6 +3161,29 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The user turned the cache keep-alive off for this thread (ADR 0554).
+   *  It projects into `thread_summaries.cache_keep_alive_off_at`, and holds
+   *  until the thread's next real request. Metadata: it moves nothing. */
+  | {
+      type: 'CacheKeepAliveTurnedOff';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The user turned the cache keep-alive back on for this thread. It clears
+   *  `thread_summaries.cache_keep_alive_off_at`. */
+  | {
+      type: 'CacheKeepAliveTurnedOn';
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** A voice session opened on this thread (ADR 0148).
    *  Full reasoning is on the Rust variant. */
   | {
@@ -3343,6 +3596,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   SessionStarted: true,
   SessionEnded: true,
   SuccessorThreadSpawned: true,
+  SessionHandedOff: true,
   HandoffCheckpointReached: true,
   SuccessorOfferDeclined: true,
   SuccessorRequested: true,
@@ -3354,6 +3608,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   CodingAgentUserMessageSent: true,
   CodingAgentPromptSent: true,
   CodingAgentInputRead: true,
+  ChildReportTaken: true,
   CodingAgentInputDiscarded: true,
   MissingHardeningDetected: true,
   CodingAgentIdled: true,
@@ -3432,6 +3687,8 @@ const THREAD_EVENT_TYPE_FLAGS = {
   EventWaitExpired: true,
   EventWaitCanceled: true,
   CacheKeepAliveStatusChanged: true,
+  CacheKeepAliveTurnedOff: true,
+  CacheKeepAliveTurnedOn: true,
   VoiceSessionStarted: true,
   VoiceSessionEnded: true,
   SpokenReplyGenerated: true,

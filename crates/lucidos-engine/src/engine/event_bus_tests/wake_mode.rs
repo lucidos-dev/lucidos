@@ -192,7 +192,7 @@ async fn an_engine_recorded_wake_still_files_under_no_wake() {
     teardown_test_db(&db_name).await;
 }
 
-/// I2, the reported regression. A build chain's planner handed off and idled.
+/// I2, the reported regression. A retired build chain's planner handed off and idled.
 /// A restart then cut its `no-wake` chain member mid-turn. The planner was not
 /// running, so the cut must not start a planner turn: the `interrupted`
 /// report is filed once, and a second boot re-fires nothing.

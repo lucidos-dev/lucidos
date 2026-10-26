@@ -497,6 +497,41 @@ async fn three_concurrent_refreshes_make_one_request() {
     }
 }
 
+/// Ten callers that each stop listening while the origin is still answering:
+/// a window hidden or reloaded mid-fetch. The gateway drops each handler then.
+/// Every abandoned refresh used to send its own request and record none of
+/// them, which is the ten-in-one-minute burst one install sent.
+async fn abandoned_refreshes_make_one_request(force: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = origin_serving(
+        http_ok(r#"{"version":"99.0.0"}"#),
+        Duration::from_millis(300),
+    )
+    .await;
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
+
+    // At least the first caller gives up, since the origin takes ten times
+    // longer than it waits.
+    for _ in 0..10 {
+        let _ = tokio::time::timeout(Duration::from_millis(30), check.refresh(force)).await;
+    }
+    // The answer of the one request that went out still reaches the next caller.
+    let snapshot = check.refresh(false).await;
+    assert_eq!(origin.requests(), 1);
+    assert_eq!(snapshot["latest"]["version"], "99.0.0");
+}
+
+#[tokio::test]
+async fn abandoned_refreshes_make_one_request_between_them() {
+    abandoned_refreshes_make_one_request(false).await;
+}
+
+#[tokio::test]
+async fn abandoned_forced_checks_still_honour_the_floor() {
+    abandoned_refreshes_make_one_request(true).await;
+}
+
 #[tokio::test]
 async fn a_fresh_answer_is_not_re_polled() {
     let dir = tempfile::tempdir().unwrap();

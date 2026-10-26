@@ -1047,6 +1047,7 @@ pub fn run() {
             window_ready_to_show,
             app_window::start_window_drag,
             app_window::toggle_window_maximize,
+            app_window::set_window_fullscreen,
             app_window::set_window_title,
             app_window::show_workspace_window,
             mobile::get_connect_info,
@@ -1105,6 +1106,7 @@ pub fn run() {
                 tauri::WindowEvent::Destroyed if app_window::is_app_window(window.label()) => {
                     traffic_lights::unwatch(window.label());
                     window_screen::forget(window.label());
+                    app_window::forget_window_fullscreen(window.label());
                     // The SLOT is what this clears. The child webview itself
                     // dies with its host, which is now this window, and tauri
                     // drops it from the manager in `on_window_close`. Left
@@ -1178,6 +1180,7 @@ pub fn run() {
                         // can accumulate across a drag. `refit_webview` says
                         // what a frame of that costs.
                         app_window::refit_webview(app, window.label());
+                        app_window::report_window_fullscreen(window);
                     }
                     window_persist::note_windows_changed(app);
                 }

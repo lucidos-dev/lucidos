@@ -28,7 +28,7 @@ import {
   type LaneView,
   type MainCheckLine,
 } from '../../store/actions/landingLaneRow';
-import { focusThread } from '../../store/actions/threads';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { openEngineVersionToast } from '../../store/actions/engine-update';
 import { focusPane } from '../../store/actions/pane';
 import {
@@ -410,9 +410,10 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
   const pending: PendingCode = !engineVersionPending.value
     ? 'none'
     : engineRebuildWedged.value ? 'wedged' : 'pending';
+  // A fix thread or lane thread may be archived, so the page never loaded it.
   const openThread = (threadId: string) => {
     onClose();
-    focusThread(threadId);
+    focusThreadOrBootstrap(threadId);
   };
 
   return activityMenuGroup({

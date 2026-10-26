@@ -4,6 +4,50 @@ use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
 
 #[test]
+fn only_quiet_picks_with_nothing_typed_are_quiet() {
+    let quiet = QuestionOption {
+        quiet: true,
+        ..opt("opt-1", "Leave it")
+    };
+    let options = vec![
+        opt("opt-0", "Draft it"),
+        quiet.clone(),
+        QuestionOption {
+            id: "opt-2".into(),
+            ..quiet
+        },
+    ];
+    let multi = |ids: &[&str], text: Option<&str>| AnswerKind::MultiSelected {
+        option_ids: ids.iter().map(|id| id.to_string()).collect(),
+        text: text.map(str::to_string),
+        image_hashes: vec![],
+    };
+    let selected = |id: &str| AnswerKind::Selected {
+        option_id: id.into(),
+    };
+    let cases = [
+        (selected("opt-1"), true),
+        (selected("opt-0"), false),
+        (multi(&["opt-1", "opt-2"], None), true),
+        (multi(&["opt-1", "opt-2"], Some("  ")), true),
+        (multi(&["opt-1", "opt-0"], None), false),
+        (multi(&["opt-1"], Some("but add a link")), false),
+        (multi(&[], None), false),
+        (
+            AnswerKind::FreeText {
+                text: "Leave it".into(),
+                image_hashes: vec![],
+            },
+            false,
+        ),
+        (AnswerKind::Canceled, false),
+    ];
+    for (answer, expected) in cases {
+        assert_eq!(answer_is_quiet(&answer, &options), expected, "{answer:?}");
+    }
+}
+
+#[test]
 fn validate_answer_accepts_selected_and_freetext_and_canceled() {
     let opts = vec![opt("opt-0", "A"), opt("opt-1", "B")];
     // Single-select question accepts Selected/FreeText/Canceled.
@@ -300,6 +344,7 @@ async fn arm_question_resume_sets_flag_on_live_session() {
             text: "Y".into(),
             image_hashes: vec![],
         },
+        false,
     )
     .await;
     assert!(armed, "must report a live subprocess was armed");
@@ -331,6 +376,7 @@ async fn arm_question_resume_skips_exited_session() {
             text: "Y".into(),
             image_hashes: vec![],
         },
+        false,
     )
     .await;
     assert!(!armed, "an exited subprocess must not be armed");
@@ -358,6 +404,7 @@ async fn arm_question_resume_skips_absent_session() {
             text: "Y".into(),
             image_hashes: vec![],
         },
+        false,
     )
     .await;
     assert!(!armed, "an absent session must not be armed");
@@ -373,7 +420,8 @@ async fn arm_question_resume_skips_canceled_even_when_live() {
     map.insert(thread_id, session); // live
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
-    let armed = arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Canceled).await;
+    let armed =
+        arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Canceled, false).await;
     assert!(!armed, "Canceled must never arm a resume");
     assert!(
         !sessions
@@ -398,7 +446,8 @@ async fn arm_question_resume_arms_superseded_on_live_session() {
     map.insert(thread_id, session); // live
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
-    let armed = arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Superseded).await;
+    let armed =
+        arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Superseded, false).await;
     assert!(
         armed,
         "a superseded session keeps running, so it must be armed"
@@ -411,6 +460,38 @@ async fn arm_question_resume_arms_superseded_on_live_session() {
             .unwrap()
             .question_resume_pending,
         "without the flag the turn's post-answer output is dropped as stragglers"
+    );
+}
+
+/// A quiet pick ends the live turn with no reply. The session records it, so
+/// the run loop reads the empty `Result` as finished rather than as a killed
+/// tool. A later loud answer clears it, so a real empty reply still fails.
+#[tokio::test]
+async fn arm_question_resume_records_a_quiet_answer_on_a_live_session() {
+    let thread_id = Uuid::new_v4();
+    let mut map = HashMap::new();
+    let (session, _msg_rx) = make_session(false);
+    map.insert(thread_id, session); // live
+    let sessions = Arc::new(tokio::sync::Mutex::new(map));
+    let pick = AnswerKind::Selected {
+        option_id: "leave-it".into(),
+    };
+    let quiet_pending = || async {
+        sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .unwrap()
+            .quiet_answer_pending
+    };
+
+    assert!(arm_question_resume_if_live(&sessions, thread_id, &pick, true).await);
+    assert!(quiet_pending().await, "a quiet pick must be recorded");
+
+    assert!(arm_question_resume_if_live(&sessions, thread_id, &pick, false).await);
+    assert!(
+        !quiet_pending().await,
+        "a loud answer owes a reply, so it must clear the record"
     );
 }
 

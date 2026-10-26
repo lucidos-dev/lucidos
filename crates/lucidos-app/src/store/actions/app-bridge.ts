@@ -30,7 +30,7 @@ import { appFrameFor, appIdForFrame } from '../../utils/appFrame';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import { rawStorageKey } from '../../utils/workspaceStorage';
 import { focusedThreadId, showToast } from '../store';
-import { BRIDGED_FETCH_SLOTS, FetchLanes } from './bridgedFetchLanes';
+import { BRIDGED_FETCH_SLOTS, FetchLanes, type LanesSnapshot } from './bridgedFetchLanes';
 // The app half of the protocol. Relative, because the barrel does not export
 // the bridge; it has no import-time side effects.
 import {
@@ -197,6 +197,11 @@ async function sendBridgedFetch(
 }
 
 let fetchLanes = new FetchLanes<HTMLIFrameElement>(BRIDGED_FETCH_SLOTS);
+
+/** What the frames' engine calls are doing now. Read-only. */
+export function bridgedFetchSnapshot(): LanesSnapshot {
+  return fetchLanes.snapshot();
+}
 
 /** Make one engine call for an app frame, in its turn. */
 function bridgedFetch(

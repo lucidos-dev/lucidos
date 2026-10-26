@@ -133,8 +133,8 @@ type TouchStep =
 /** Drive one CDP touch press, every step sent in a single burst. Chromium only.
  *
  *  Awaiting each step lets a loaded host stretch the press past
- *  `LONG_PRESS_DELAY_MS`. The prompt's buttons then read a hold, and the lift
- *  turns on side-question mode instead of sending. */
+ *  `LONG_PRESS_DELAY_MS`, and a long-pressable control then reads a hold
+ *  instead of a tap. */
 export async function touchPress(page: Page, steps: TouchStep[]): Promise<void> {
   const cdp = await page.context().newCDPSession(page);
   await Promise.all(steps.map((s) => cdp.send('Input.dispatchTouchEvent', {
@@ -312,6 +312,19 @@ export async function waitForHeaderAtRest(page: Page): Promise<void> {
     win.__luHeaderSettle = { token, atRest };
     return atRest && prev?.token === token && prev.atRest;
   }, token, { timeout: 5_000 });
+}
+
+/** Wait until a dashboard can take a press: its live content has mounted and
+ *  settled, and no skeleton covers it.
+ *
+ *  The live content is waited for by presence. Before the dashboard's view
+ *  loads, no grid is mounted and no skeleton has passed its delay gate. So a
+ *  check for "no settling grid, no skeleton" passes at once. The skeleton then
+ *  shows over the grid for its minimum hold, and a press lands on it. */
+export async function waitForDashboardReady(dashboard: Locator): Promise<void> {
+  const live = dashboard.locator('.loading-fade > .loading-fade-content > :is(.dashboard-grid:not(.is-settling), .dashboard-empty)');
+  await expect(live).toHaveCount(1);
+  await expect(dashboard.locator('.loading-fade-skeleton:not(.loading-fade-out)')).toHaveCount(0);
 }
 
 /** Wait until the workspace has reported ready, which is when the boot splash
@@ -1275,27 +1288,31 @@ export async function waitForActionPanel(page: Page, buttonText: string, timeout
   return page.locator('.thread-action-buttons:visible').first();
 }
 
-/** Click a WaitingBanner change action by label, transparently across the two
- *  banner shapes. When an Apply action is present the banner is a split button
- *  (all viewports): the primary Apply face stays a direct button — locate that
- *  one directly, not via this helper — while Diff / Discard / Archive live in
- *  the caret menu. When there's no Apply (e.g. an idle CC thread with a diff but
- *  no pending change) the actions render as their own buttons. Tries the direct
- *  button first; otherwise opens the caret menu and clicks the matching item. */
+/** Click a banner action by label, across the action slot's shapes. Its face
+ *  is a direct button on the desktop layout, and the rest live in its menu. On
+ *  a phone every action, the face included, lives in the round button's menu.
+ *  Tries the direct button first; otherwise opens the menu and clicks the
+ *  matching item. */
 export async function clickChangeAction(
   page: Page,
   label: 'Discard' | 'Diff' | 'Archive',
   timeout = 15_000,
 ): Promise<void> {
-  const direct = page.locator(`.thread-action-buttons:visible button.action-btn:has-text("${label}")`).first();
+  // A phone's round button names its face in a hidden label, and a tap only
+  // opens its menu. So it is never the direct button.
+  const direct = page.locator(
+    `.thread-action-buttons:visible button.action-btn:not(.split-button-whole):has-text("${label}")`,
+  ).first();
   if (await direct.isVisible().catch(() => false)) {
     await direct.click();
     return;
   }
-  // Mobile split button: the action lives behind the caret.
-  const caret = page.locator('.thread-action-buttons:visible .split-button-caret').first();
-  await expect(caret).toBeVisible({ timeout });
-  await caret.click();
+  // The action lives in the menu: behind the caret, or the round button.
+  const opener = page.locator(
+    '.thread-action-buttons:visible .split-button-caret, .thread-action-buttons:visible .split-button-whole',
+  ).first();
+  await expect(opener).toBeVisible({ timeout });
+  await opener.click();
   await page.locator(`.split-button-menu:visible button:has-text("${label}")`).first().click();
 }
 

@@ -58,6 +58,7 @@ async fn seed_session_started(bus: &EventBus, thread_id: Uuid, session_id: &str,
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
     )
     .await;
@@ -106,8 +107,15 @@ async fn pending_change_after_session_ended_resumes_branch() {
     )
     .await;
 
-    let (sid, resume_branch) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(sid, None);
     assert_eq!(resume_branch, Some(branch.to_string()));
 
@@ -154,6 +162,7 @@ async fn pending_change_branch_with_idled_session_recovers_sid() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
     )
     .await;
@@ -174,10 +183,59 @@ async fn pending_change_branch_with_idled_session_recovers_sid() {
     )
     .await;
 
-    let (sid, resume_branch) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(sid, Some("wrong-session".to_string()));
     assert_eq!(resume_branch, Some(canonical_branch.to_string()));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A pending handoff never resumes: its successor session starts fresh. It
+/// still keeps the thread's branch, so the work carries on where it was.
+#[tokio::test]
+async fn a_pending_handoff_resumes_no_session_but_keeps_the_branch() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let branch = "claude-code/handing-off";
+    seed_session_started(&bus, thread_id, "sess-1", branch).await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: Some("sess-1".into()),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+        },
+    )
+    .await;
+    let resolve = |handoff_pending| {
+        resolve_resume_context(
+            &pool,
+            bus.changes_projection(),
+            thread_id,
+            None,
+            None,
+            handoff_pending,
+        )
+    };
+    assert_eq!(resolve(false).await.0, Some("sess-1".to_string()));
+    assert_eq!(resolve(true).await, (None, Some(branch.to_string())));
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -219,8 +277,15 @@ async fn pending_change_with_idled_session_recovers_cc_session_id() {
     )
     .await;
 
-    let (sid, resume_branch) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(
         sid,
         Some(session_id.to_string()),
@@ -267,8 +332,15 @@ async fn applied_change_falls_through_to_fresh_start() {
     )
     .await;
 
-    let (sid, resume_branch) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(sid, None);
     assert_eq!(resume_branch, None);
 
@@ -310,8 +382,15 @@ async fn cancel_then_idle_resumes_same_session() {
 
     // Auto-detect path (no caller sid): the most-recent closer is the idle, so
     // the resolver resumes the same session id on the SessionStarted branch.
-    let (sid, resume_branch) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(
         sid,
         Some(session_id.to_string()),
@@ -375,8 +454,15 @@ async fn no_pending_change_with_session_ended_after_idle_recovers_via_caller_sid
     // Bug repro: resolver with `None` returns `(None, None)` — the
     // auto-detect path sees SessionEnded as the latest lifecycle event
     // and refuses to resume.
-    let (sid_without_caller, branch_without_caller) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid_without_caller, branch_without_caller) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(
         sid_without_caller, None,
         "auto-detect must return None when latest is SessionEnded — \
@@ -401,6 +487,7 @@ async fn no_pending_change_with_session_ended_after_idle_recovers_via_caller_sid
         thread_id,
         recovered_sid,
         None,
+        false,
     )
     .await;
     assert_eq!(
@@ -714,8 +801,15 @@ async fn stale_resume_shadows_the_dead_sid_until_a_new_session_records_one() {
         lookup_latest_cc_session_id_for_config_dir(&pool, thread_id, cfg).await,
         None
     );
-    let (sid, resume_branch) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, Some(cfg)).await;
+    let (sid, resume_branch) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        Some(cfg),
+        false,
+    )
+    .await;
     assert_eq!(sid, None, "the retry must start a fresh session");
     assert_eq!(
         resume_branch,
@@ -820,6 +914,7 @@ async fn resolve_resume_context_resumes_session_under_pinned_account() {
         thread_id,
         None,
         pinned.as_deref(),
+        false,
     )
     .await;
     assert_eq!(
@@ -830,8 +925,15 @@ async fn resolve_resume_context_resumes_session_under_pinned_account() {
     assert_eq!(resume_branch, Some(branch.to_string()));
 
     // Sanity: without the pin (legacy), it would grab the globally-newest session B.
-    let (legacy_sid, _) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (legacy_sid, _) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        None,
+        false,
+    )
+    .await;
     assert_eq!(
         legacy_sid,
         Some("sess-B".to_string()),

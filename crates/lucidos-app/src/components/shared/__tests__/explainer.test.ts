@@ -110,7 +110,7 @@ describe('Explainer: opens at its icon, like the Waits panel', () => {
   });
 
   it('shares the anchored popover shell with the Waits panel, not a copy of it', () => {
-    expect(source).toMatch(/panelClass=\{`surface anchored-popover explainer-popover\$\{protectedClassFrom\(anchor\)\}`\}/);
+    expect(source).toMatch(/panelClass=\{`surface anchored-popover explainer-popover\$\{wide \? ' explainer-popover-wide' : ''\}\$\{protectedClassFrom\(anchor\)\}`\}/);
     expect(source).toMatch(/class="surface-body anchored-popover-body explainer-body"/);
     const rule = hostCss.match(/\.explainer-popover \{[\s\S]*?\n\}/)![0];
     for (const prop of ['position', 'z-index', 'display', 'overflow']) {

@@ -101,7 +101,10 @@ README names each file's source.
 
 1. **List the pairs.** Claude Code: the discovered list
    (`.lucidos/cc-models.json`) plus the curated rows. Codex: run
-   `codex app-server`, send `initialize`, then `model/list`. Chat: every
+   `codex app-server`, send `initialize`, then `model/list`. Copy each model's
+   `defaultReasoningEffort` into its row's `default_effort` in
+   `runtime/codex_menu_options.json`. A model the list no longer offers keeps
+   `medium`. Chat: every
    builtin registry model that is not retired, at the tiers
    `llm::reasoning::supported_efforts` gives it on any of its routes. Add each
    model to `MODELS` in the script, with its Epoch name and each surface's

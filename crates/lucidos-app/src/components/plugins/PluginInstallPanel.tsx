@@ -262,7 +262,7 @@ function SetupStepsSection({ setup, request, note }: {
   return (
     <PluginSection label="Agent setup steps" detail={runs ? 'run for you' : undefined} note={note}>
       <div
-        class="plugin-install-setup-body markdown-content"
+        class="plugin-install-setup-body markdown-content authored-html"
         dangerouslySetInnerHTML={{ __html: renderMarkdown(setup) }}
       />
     </PluginSection>

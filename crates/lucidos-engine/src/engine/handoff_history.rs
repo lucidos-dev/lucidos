@@ -3,8 +3,9 @@
 //! successor's context gets (ADR 0505).
 //!
 //! A sample runs from a `HandoffCheckpointReached` to the first *clean turn
-//! end* after it. When the thread hands off first, it follows into the
-//! successor, up to the successor's own clean turn end.
+//! end* after it. A handoff in between leaves it whole: the *successor
+//! session* carries on in the same thread. A legacy *successor thread* is
+//! followed up to its own clean turn end.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -33,6 +34,8 @@ const FRESH_CALL: i64 = 10;
 /// question stays open until a park-ending event, as the restart preserve
 /// guard reads it. Unread follows the composer's `agentHoldsUnreadMessage`:
 /// newer than the newest input read, and a thread with no reads holds none.
+/// The idle of a session that handed off is none: its successor session
+/// carries the work on.
 pub(crate) fn clean_turn_end_sql(idle: &str) -> String {
     let before_idle = |alias: &str| {
         format!("{alias}.thread_id = {idle}.thread_id AND {alias}.sequence < {idle}.sequence")
@@ -64,7 +67,11 @@ pub(crate) fn clean_turn_end_sql(idle: &str) -> String {
                      AND x.payload->>'removed_message_id' = m.id::text) \
                AND m.sequence > (SELECT max(src.sequence) FROM events h \
                      JOIN events src ON src.id = (h.payload->>'input_event_id')::uuid \
-                    WHERE {h_before} AND h.event_type = 'CodingAgentInputRead'))",
+                    WHERE {h_before} AND h.event_type = 'CodingAgentInputRead')) \
+         AND NOT EXISTS (SELECT 1 FROM events ho WHERE {ho_before} \
+               AND ho.event_type = 'SessionHandedOff' \
+               AND NOT EXISTS (SELECT 1 FROM events ss WHERE {ss_before} \
+                     AND {ho_ended}))",
         t_before = before_idle("t"),
         q_before = before_idle("q"),
         p_before = before_idle("p"),
@@ -74,6 +81,9 @@ pub(crate) fn clean_turn_end_sql(idle: &str) -> String {
         m_before = before_idle("m"),
         x_before = before_idle("x"),
         h_before = before_idle("h"),
+        ho_before = before_idle("ho"),
+        ss_before = before_idle("ss"),
+        ho_ended = crate::engine::successor::ends_handoff_sql("ss", "ho"),
     )
 }
 
@@ -238,15 +248,28 @@ pub(crate) async fn sample_calls(
     Ok(None)
 }
 
-/// The median context of recent successors at their tenth main-session call.
+/// The median context of recent *successor sessions* at their tenth
+/// main-session call. Legacy *successor threads* count too.
 pub(crate) async fn fresh_tokens_median(pool: &PgPool) -> Result<Option<f64>, sqlx::Error> {
+    let fresh_call = |thread: &str, after: &str| {
+        format!(
+            "(SELECT (c.payload->'usage'->>'input_tokens')::bigint FROM events c \
+               WHERE c.thread_id = {thread} AND c.sequence > {after} AND {MAIN_SESSION_CAPTURE} \
+               ORDER BY c.sequence OFFSET {} LIMIT 1)",
+            FRESH_CALL - 1
+        )
+    };
     let sql = format!(
-        "SELECT (SELECT (payload->'usage'->>'input_tokens')::bigint FROM events \
-                  WHERE thread_id = t.thread_id AND {MAIN_SESSION_CAPTURE} \
-                  ORDER BY sequence OFFSET {} LIMIT 1) \
-           FROM thread_summaries t WHERE t.successor_of IS NOT NULL \
-          ORDER BY t.created_at DESC LIMIT {RECENT_SAMPLES}",
-        FRESH_CALL - 1
+        "SELECT tokens FROM ( \
+           SELECT s.created AS started, {in_session} AS tokens FROM events s \
+            WHERE s.event_type = 'SessionStarted' \
+              AND s.payload->'continuity'->>'kind' = 'handoff' \
+           UNION ALL \
+           SELECT t.created_at, {in_thread} FROM thread_summaries t \
+            WHERE t.successor_of IS NOT NULL \
+         ) fresh ORDER BY started DESC LIMIT {RECENT_SAMPLES}",
+        in_session = fresh_call("s.thread_id", "s.sequence"),
+        in_thread = fresh_call("t.thread_id", "0"),
     );
     let tokens: Vec<Option<i64>> = sqlx::query_scalar(&sql).fetch_all(pool).await?;
     let tokens: Vec<f64> = tokens.into_iter().flatten().map(|t| t as f64).collect();

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts, llmConfigured } from '../store';
 import { applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
 import { PREF_COMPOSER_ENTER_KEY } from '@lucidos/preference-catalog';
-import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
+import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, currentMobileDynamicBars, setMobileDynamicBars, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import { MEMORY_MODULE_WHILE_UNSET } from '@lucidos/engine-constants';
 import { SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_HEADER_TOP } from '@lucidos/appearance';
@@ -678,6 +678,22 @@ describe("applyThemeMode('system'): following the OS", () => {
     expect(painted).toEqual(['light']);
   });
 
+  it('catches a flip that landed before the page subscribed', async () => {
+    // The boot script paints the OS appearance, and the bundle subscribes later.
+    // A media query announces only changes made after it exists.
+    // A flip in between reaches no listener, so the page would keep the old mode.
+    localStorage.setItem('lucidos-theme-mode', 'system');
+    attrs['data-theme-mode'] = 'dark';
+    mqLight = true;
+    vi.resetModules();
+    await import('./preferences');
+    painted = [];
+
+    settle();
+
+    expect(painted).toEqual(['light']);
+  });
+
   it('ignores a flip announced while the page is hidden', () => {
     applyThemeMode('system');
     painted = [];
@@ -913,7 +929,7 @@ describe('applyThemeMode: native title-bar tint (Tauri)', () => {
   });
 });
 
-describe('theme-color: the bar above the page continues the header (ADR 0548)', () => {
+describe('theme-color: the bar above the page continues the header', () => {
   // The test document is a stub with no <head>, so the tag is a stand-in.
   let themeColor: string | undefined;
   let querySpy: ReturnType<typeof vi.spyOn>;
@@ -2248,6 +2264,43 @@ describe('motion: the device-scoped calm switch', () => {
     expect(localStorage.getItem(KEY)).toBe('reduce');
     await saved;
     expect(spy).toHaveBeenCalledWith('motion', 'reduce', expect.any(String));
+  });
+});
+
+describe('mobile dynamic bars: always on in the installed iOS app', () => {
+  beforeEach(() => {
+    preferences.value = { status: 'loaded', data: {} };
+    platformMocks.isIOSPwa = false;
+  });
+
+  afterEach(() => {
+    platformMocks.isIOSPwa = false;
+    vi.restoreAllMocks();
+  });
+
+  it('is off while nothing is stored, as the catalog says', () => {
+    expect(currentMobileDynamicBars()).toBe(false);
+  });
+
+  it('follows the stored preference outside the installed iOS app', () => {
+    preferences.value = { status: 'loaded', data: { mobile_dynamic_bars: 'true' } };
+    expect(currentMobileDynamicBars()).toBe(true);
+    preferences.value = { status: 'loaded', data: { mobile_dynamic_bars: 'false' } };
+    expect(currentMobileDynamicBars()).toBe(false);
+  });
+
+  it('is on in the installed iOS app, whatever is stored', () => {
+    platformMocks.isIOSPwa = true;
+    preferences.value = { status: 'loaded', data: { mobile_dynamic_bars: 'false' } };
+    expect(currentMobileDynamicBars()).toBe(true);
+    preferences.value = { status: 'not-loaded' };
+    expect(currentMobileDynamicBars()).toBe(true);
+  });
+
+  it('still saves the preference for other devices', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    await setMobileDynamicBars(false);
+    expect(spy).toHaveBeenCalledWith('mobile_dynamic_bars', 'false', undefined);
   });
 });
 

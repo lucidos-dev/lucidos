@@ -1,6 +1,6 @@
 # 0343: Agent compiles go to their own sccache daemon and cache, so agent rustc runs below the engine and the Apply rebuild keeps full priority
 
-- **Status**: Accepted
+- **Status**: Accepted (a sandboxed session no longer uses the daemon: ADR 0567)
 - **Date**: 2026-10-01
 
 ## Context

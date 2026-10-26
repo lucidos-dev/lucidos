@@ -214,6 +214,21 @@ pub(crate) fn cmd_detach(ws: &Workspace, child_thread_id: &str) -> Result<(), Bo
     send_and_print("POST", &url, http_client()?.post(&url))
 }
 
+/// `lucidos threads child-reports`: take the child reports this thread's agent
+/// has not read yet. The engine withdraws each queued copy, so a report is
+/// read once.
+pub(crate) fn cmd_child_reports(ws: &Workspace) -> Result<(), BoxError> {
+    let thread_id = source_thread_id_from_env().ok_or(
+        "LUCIDOS_THREAD_ID is not set, so there is no thread to read child reports for. \
+         This subcommand only works from inside a Lucidos coding-agent session.",
+    )?;
+    let url = format!(
+        "{}/api/v1/threads/{thread_id}/child-reports/take",
+        ws.base_url()
+    );
+    send_and_print("POST", &url, http_client()?.post(&url))
+}
+
 /// `lucidos threads archive`: archive this thread or one of its own direct
 /// children (ADR 0310).
 ///

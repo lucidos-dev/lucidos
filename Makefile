@@ -1,4 +1,4 @@
-.PHONY: build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-crates test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
+.PHONY: build-local check lint lint-knowhow lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-crates test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -38,7 +38,17 @@ check: lint
 # Run every linter. THE clean-build lint gate, ordered cheapest first so a
 # finding surfaces immediately instead of after a full clippy pass: shell takes
 # under a second, the fmt check a few seconds, clippy minutes.
-lint: lint-shell lint-eval lint-fmt lint-rust
+lint: lint-shell lint-eval lint-knowhow lint-fmt lint-rust
+
+lint-knowhow:
+	@./scripts/check-knowhow-refs.sh & refs_pid=$$!; \
+	./scripts/check-retired-terms.sh & terms_pid=$$!; \
+	./scripts/check-audit-scans.sh & scans_pid=$$!; \
+	result=0; \
+	wait $$refs_pid || result=1; \
+	wait $$terms_pid || result=1; \
+	wait $$scans_pid || result=1; \
+	exit $$result
 
 # Fail if any tracked Rust file is not rustfmt-clean.
 #

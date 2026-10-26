@@ -21,8 +21,9 @@ When a service needs OAuth client credentials:
    provider in [`oauth-providers.json`](oauth-providers.json), that is all it
    needs: the engine fills in the endpoints from the row. With no client
    credentials yet, it opens the credential modal, prefilled. The user enters
-   only `client_id`, plus `client_secret` for a confidential/web client. Once
-   the client is saved, the same call runs the authorization.
+   only `client_id`, plus `client_secret` for a confidential/web client. Saving
+   does not start the authorization when you opened the modal. Wait for the
+   form to resolve as `completed`, then call `connect_oauth_account` again.
    **Do not call `request_credential(auth_type: "oauth_client")` first.** It is
    a second modal for the same value, and it once produced a duplicate credential.
 2. For a provider the registry does **not** know, pass the endpoints yourself:
@@ -47,10 +48,10 @@ user enable them in the provider's console (the result carries its link and
 instruction), then RECONNECT. Do not retry the same call first, and do not
 refresh the token: neither picks up a newly enabled scope.
 
-A provider in neither the registry nor your args leaves the user typing URLs by
-hand, so do that only when you cannot find it. **Better: find it via
-`web_search` and add a row to the JSON**, so the next connection is one step,
-for you and for the Connect button.
+For an unknown provider, find its endpoints with `web_search` and pass them to
+`connect_oauth_account`. They persist in its OAuth Client credential.
+The shipped registry is read-only to workspace agents; changing it requires a
+Lucidos source change.
 
 ### The credential is named for the provider, and typed `oauth_client`
 

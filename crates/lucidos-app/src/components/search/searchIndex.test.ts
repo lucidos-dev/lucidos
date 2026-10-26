@@ -29,6 +29,16 @@ afterEach(() => {
   platformMocks.isIOS = false;
 });
 
+describe('settings search: Thread Queue', () => {
+  it('finds the queue by capacity and opens its System panel', () => {
+    const results = getSettingsSearchResults('concurrency capacity', 50);
+    expect(results.some((result) => result.id === 'thread-queue')).toBe(true);
+    expect(findSettingsEntry('thread-queue')).toMatchObject({
+      subview: 'thread-queue', path: 'Settings → System', label: 'Thread Queue',
+    });
+  });
+});
+
 describe('settings search: the iOS-only Autocorrect row', () => {
   it('finds it on iPhone and iPad, by the symptom as well as the name', () => {
     platformMocks.isIOS = true;
@@ -87,7 +97,9 @@ describe('settings search — Permissions section', () => {
 
   it('finds both allowlist editors by name', () => {
     expect(getSettingsSearchResults('lucidos agent permissions', 20).some((r) => r.id === 'permissions:lucidos')).toBe(true);
-    expect(getSettingsSearchResults('claude code permissions', 20).some((r) => r.id === 'permissions:claude-code')).toBe(true);
+    for (const query of ['coding agent permissions', 'claude code permissions', 'codex permissions']) {
+      expect(getSettingsSearchResults(query, 20).some((r) => r.id === 'permissions:coding-agent'), query).toBe(true);
+    }
   });
 
   it('resolves a Command safety entry to the permissions subview with its anchor', () => {
@@ -99,7 +111,7 @@ describe('settings search — Permissions section', () => {
   it('resolves the allowlist editors to their anchors under the permissions subview', () => {
     expect(findSettingsEntry('permissions:lucidos')?.subview).toBe('permissions');
     expect(findSettingsEntry('permissions:lucidos')?.anchor).toBe('permissions:lucidos');
-    expect(findSettingsEntry('permissions:claude-code')?.anchor).toBe('permissions:claude-code');
+    expect(findSettingsEntry('permissions:coding-agent')?.anchor).toBe('permissions:coding-agent');
   });
 });
 

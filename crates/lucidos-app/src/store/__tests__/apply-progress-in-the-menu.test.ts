@@ -14,13 +14,13 @@ import type { Change } from '../../api/client';
 import { toasts, focusedThreadId, threadMap, changes, applyAllBatch, applyPhases } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
 import { makeThreadAggregate } from '../actions/threads-test-helpers';
-import { focusThread } from '../actions/threads';
+import { focusThreadOrBootstrap } from '../actions/threads';
 import { liveActivityRows } from '../actions/activityRows';
 
-// focusThread pulls Preact-coupled modules, so a landing is checked against a
+// The threads module pulls Preact-coupled modules, so a landing is checked against a
 // stub. Matches apply-change-toast.test.ts.
 vi.mock('../actions/threads', () => ({
-  focusThread: vi.fn(),
+  focusThreadOrBootstrap: vi.fn(),
   unfocusThread: vi.fn(),
 }));
 
@@ -175,7 +175,7 @@ describe('a single-thread apply', () => {
     emit({ type: 'ChangeApplied', change_id: 'c-1' });
 
     toasts.value.find((x) => x.key === KEY)!.onClick!();
-    expect(focusThread).toHaveBeenCalledWith('thread-A', { targetEventId: 'mcd-1' });
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('thread-A', { targetEventId: 'mcd-1' });
   });
 
   it('names no title it does not have', () => {

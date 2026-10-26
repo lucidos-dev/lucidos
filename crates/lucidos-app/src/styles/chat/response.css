@@ -738,18 +738,26 @@
 }
 
 .thread-skeleton-block {
+    --thread-sk-base: var(--bg-tertiary);
+    --thread-sk-shine: color-mix(in srgb, var(--accent) 18%, var(--bg-tertiary));
     border-radius: calc(var(--radius-control) * 0.8);
     background: linear-gradient(
         90deg,
-        var(--bg-tertiary) 25%,
-        color-mix(in srgb, var(--accent) 18%, var(--bg-tertiary)) 50%,
-        var(--bg-tertiary) 75%
+        var(--thread-sk-base) 25%,
+        var(--thread-sk-shine) 50%,
+        var(--thread-sk-base) 75%
     );
     background-size: 200% 100%;
     /* The sweep repaints every frame, so the block owns its layer
        (an-endless-repaint-owns-its-layer.test.ts). */
     will-change: transform;
     animation: shimmer 1.5s infinite;
+}
+
+/* Faint and neutral in dark mode, like `.sk-bar` (components.css). */
+html[data-theme-mode="dark"] .thread-skeleton-block {
+    --thread-sk-base: color-mix(in srgb, var(--bg-tertiary) 45%, var(--bg-primary));
+    --thread-sk-shine: var(--bg-tertiary);
 }
 
 .thread-skeleton-user {
@@ -1500,6 +1508,41 @@
     gap: 0.5rem;
     flex-wrap: wrap;
     justify-content: flex-end;
+}
+
+/* The link to the command guard settings sits at the row's start, away from the
+   decision buttons it must not be mistaken for. Muted text sized to its glyph,
+   so it never sets the row taller than the buttons. */
+.permission-settings-link {
+    margin-right: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0;
+    background: none;
+    border: none;
+    border-radius: var(--radius-control);
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+    transition: color var(--duration-normal);
+}
+
+.permission-settings-link svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+    flex-shrink: 0;
+}
+
+.permission-settings-link:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+
+@media (hover: hover) {
+    .permission-settings-link:hover {
+        color: var(--text-primary);
+    }
 }
 
 /* The gated half of what .question-option gets above: a LIVE permission card

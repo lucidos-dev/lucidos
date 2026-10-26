@@ -75,3 +75,12 @@ describe('the model step link', () => {
     expect(labels()).toEqual(['Opus', 'Haiku']);
   });
 });
+
+it('shows no matches while keeping the ladder link available', () => {
+  act(() => render(<Picker link={{ option: LADDER_LINK_ROW, onChoose: () => {} }} onPick={() => {}} />, host));
+  act(() => {
+    host.querySelector('.control-list')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', bubbles: true, cancelable: true }));
+  });
+  expect(host.textContent).toContain('No matches');
+  expect(labels()).toEqual([LADDER_LINK_LABEL]);
+});

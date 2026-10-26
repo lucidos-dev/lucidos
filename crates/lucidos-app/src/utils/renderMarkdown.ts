@@ -1,7 +1,10 @@
 import { marked } from 'marked';
 import type { Tokens } from 'marked';
 import DOMPurify from 'dompurify';
-import { BARE_EMAIL_ATTR, CODE_COPY_ATTR, COPY_ID_NONCE, WIDGET_EMBED_SLOT_ATTR, escapeHtmlAttr } from './markedConfig';
+import {
+  BARE_EMAIL_ATTR, CODE_COPY_ATTR, COPY_ID_NONCE, TASK_CHECKBOX_ATTR, WIDGET_EMBED_SLOT_ATTR, escapeHtmlAttr,
+  taskCheckboxTag,
+} from './markedConfig';
 import { COPY_ICON } from './copyIcons';
 import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
@@ -64,8 +67,9 @@ const LINK_DEFINITION_LABEL = /\[([^\]]*)\]:/g;
 const COPY_ID_ATTR = 'data-copy-id';
 
 // Every slot id carries `COPY_ID_NONCE` (markedConfig.ts), so content has no id
-// to forge. The nonce never reaches the DOM: `resolveCopyTargets` removes the
-// attribute it rides on, and `resolveCodeBlockCopy` removes the code one.
+// to forge. No copy nonce reaches the DOM: `resolveCopyTargets` removes the
+// attribute it rides on, and `resolveCodeBlockCopy` removes the code one. The
+// task checkbox keeps its nonce: see `removeAuthoredInputs`.
 
 /** The slot a `data-copy-id` names, or `undefined` when content wrote it. */
 function copyTextForSlot(attr: string | null, copyTexts: Map<number, string>): string | undefined {
@@ -112,10 +116,7 @@ function preprocessCopyBlocks(md: string, encodedTexts: Map<number, string>): st
     const label = escapeHtmlAttr(trimmed).replace(LINK_DEFINITION_LABEL, '&#91;$1]:');
 
     if (!isMultiline) {
-      return `<span class="copyable-block" ${COPY_ID_ATTR}="${COPY_ID_NONCE}-${id}">` +
-        label +
-        `<button type="button" class="copy-btn" aria-label="Copy to clipboard">${COPY_ICON}</button>` +
-        `</span>`;
+      return `<span class="copyable-block" ${COPY_ID_ATTR}="${COPY_ID_NONCE}-${id}">${label}</span>`;
     }
 
     return `<!--${COPY_MARKER}_START_${id}-->\n\n${label}\n\n<!--${COPY_MARKER}_END_${id}-->`;
@@ -126,26 +127,31 @@ function preprocessCopyBlocks(md: string, encodedTexts: Map<number, string>): st
 
 function postprocessCopyBlocks(html: string): string {
   return html.replace(COPY_MARKER_PATTERN, (_match, idStr: string, inner: string) =>
-    `<div class="copyable-block copyable-block-multi" ${COPY_ID_ATTR}="${COPY_ID_NONCE}-${idStr}">` +
-      inner.trim() +
-      `<button type="button" class="copy-btn" aria-label="Copy to clipboard">${COPY_ICON}</button>` +
-      `</div>`,
+    `<div class="copyable-block copyable-block-multi" ${COPY_ID_ATTR}="${COPY_ID_NONCE}-${idStr}">${inner.trim()}</div>`,
   );
 }
 
-/** Write each copy block's payload onto the sanitized tree, from the slot map.
+/** The renderer's Copy button. Never part of the markup the sanitizer sees,
+ *  which escapes every `<button>`, so a post-sanitizer pass adds it. */
+function copyButton(extraClass: string, label: string): string {
+  return `<button type="button" class="copy-btn${extraClass}" aria-label="${label}">${COPY_ICON}</button>`;
+}
+
+/** Write each copy block's payload onto the sanitized tree, from the slot map,
+ *  and give the block its Copy button.
  *
  *  Runs AFTER the sanitizer, which is the whole point: `data-copy-text` is
  *  forbidden there, so every surviving one was written here, from a slot this
  *  render allocated and named with `COPY_ID_NONCE`. An id content invented loses
- *  its attribute. The copy handler then reads that block as having no text,
- *  and `startClient` returns on the null. */
+ *  its attribute and gets no button. */
 function resolveCopyTargets(html: string, copyTexts: Map<number, string>): string {
   return inDom(html, [COPY_ID_ATTR], (body) => {
     for (const el of Array.from(body.querySelectorAll(`[${COPY_ID_ATTR}]`))) {
       const raw = copyTextForSlot(el.getAttribute(COPY_ID_ATTR), copyTexts);
       el.removeAttribute(COPY_ID_ATTR);
-      if (raw !== undefined) el.setAttribute('data-copy-text', raw);
+      if (raw === undefined) continue;
+      el.setAttribute('data-copy-text', raw);
+      el.insertAdjacentHTML('beforeend', copyButton('', 'Copy to clipboard'));
     }
   });
 }
@@ -173,10 +179,39 @@ function resolveCopyTargets(html: string, copyTexts: Map<number, string>): strin
  *  name-based attribute filter cannot see: `<animate attributeName="href"
  *  values="javascript:...">` animates a sibling `<a>`'s href.
  *
+ *  The form controls go because a form in normal flow still posts a typed
+ *  secret anywhere, however well its layout is contained. The one `<input>`
+ *  spared is the renderer's task checkbox, marked with `COPY_ID_NONCE`.
+ *
  *  `title`, `desc` and the MathML text elements stay out: each is real markup
  *  inside `<svg>` or `<math>`, which this regex cannot see. */
 const ESCAPE_TO_TEXT_TAG =
-  /<(\/?)(iframe|script|style|object|embed|applet|base|meta|link|xmp|plaintext|noscript|noembed|noframes|animate|animateTransform|set)([\s/][^>]*)?>/gi;
+  /<(\/?)(iframe|script|style|object|embed|applet|base|meta|link|xmp|plaintext|noscript|noembed|noframes|animate|animateTransform|set|form|button|select|textarea|input)([\s/][^>]*)?>/gi;
+
+const TASK_CHECKBOX_MARK = `${TASK_CHECKBOX_ATTR}="${COPY_ID_NONCE}"`;
+
+function escapeTagToText(tag: string, _close: string, name: string): string {
+  const isTaskCheckbox = name.toLowerCase() === 'input' && tag.includes(TASK_CHECKBOX_MARK);
+  return isTaskCheckbox ? tag : escapeHtmlAttr(tag);
+}
+
+/** Remove every `<input>` but the renderer's task checkbox: the backstop for
+ *  one the escape pass missed. `FORBID_TAGS` cannot hold `input`, since the
+ *  checkbox is one.
+ *
+ *  A kept checkbox is rebuilt from `taskCheckboxTag`, keeping only its checked
+ *  state. The nonce stays on the live checkbox, so content that learns it can
+ *  forge the mark, but never a `type`, `form` or `formaction`. */
+function removeAuthoredInputs(html: string): string {
+  return inDom(html, ['<input'], (body) => {
+    for (const input of Array.from(body.querySelectorAll('input'))) {
+      if (input.getAttribute(TASK_CHECKBOX_ATTR) === COPY_ID_NONCE) {
+        input.insertAdjacentHTML('beforebegin', taskCheckboxTag(input.hasAttribute('checked')));
+      }
+      input.remove();
+    }
+  });
+}
 
 /** The attribute NAMES whose value is fetched or navigated as a URL.
  *
@@ -236,21 +271,29 @@ const PURIFY_CONFIG = {
   // the default attribute allowlist drops.
   ADD_ATTR: ['target'],
   // Paired with `ESCAPE_TO_TEXT_TAG`, so a tag the escape pass misses is still
-  // removed. `style` and `animateTransform` are the two DOMPurify would
-  // otherwise keep. `animate` and `set` are already in its SVG denylist, and
-  // stay listed so this policy does not rest on that default.
-  FORBID_TAGS: ['style', 'animate', 'animateTransform', 'set'],
+  // removed. `style`, `animateTransform` and the form controls are ones
+  // DOMPurify would otherwise keep. `animate` and `set` are already in its SVG
+  // denylist, and stay listed so this policy does not rest on that default.
+  // `input` is missing on purpose: see `removeAuthoredInputs`.
+  FORBID_TAGS: [
+    'style', 'animate', 'animateTransform', 'set',
+    'form', 'button', 'select', 'textarea', 'option', 'optgroup', 'datalist',
+  ],
   // The two clipboard sources, which only `resolveCopyTargets` and
   // `resolveCodeBlockCopy` may write, and which DOMPurify's defaults would
   // otherwise let content author. See `COPY_ID_ATTR`.
   //
-  // `style` is NOT here. A kept `position: fixed` does let content paint its
-  // own chrome over the app, and `opacity: 0` does hide text from the reader.
-  // But this config is shared. `sanitizeHtmlFragments` also scrubs
-  // `SlidesPreview` and `RenderedDiff`, where authored markup carries inline
-  // style as its only styling channel. Forbidding it here silently unstyles
-  // every existing deck, so that hole wants a per-caller config.
-  FORBID_ATTR: ['data-copy-text', 'data-copy-code'],
+  // Then the top layer, which no containment clips: a popover and every
+  // invoker that opens one.
+  //
+  // `style` stays, as does `class`. Slides and diffs carry inline style as
+  // their only styling channel, and a host class can be as fixed as any
+  // style. The boundary is layout containment on every host element this
+  // output lands in (`.authored-html`, host-components.css).
+  FORBID_ATTR: [
+    'data-copy-text', 'data-copy-code',
+    'popover', 'popovertarget', 'popovertargetaction', 'command', 'commandfor',
+  ],
   ALLOWED_URI_REGEXP,
 };
 
@@ -270,22 +313,27 @@ export function sanitizeHtmlFragments(html: string): string {
     );
   }
   installUrlSchemeHook();
-  return resolveCodeBlockCopy(
-    DOMPurify.sanitize(html.replace(ESCAPE_TO_TEXT_TAG, escapeHtmlAttr), PURIFY_CONFIG),
-  );
+  const sanitized = DOMPurify.sanitize(html.replace(ESCAPE_TO_TEXT_TAG, escapeTagToText), PURIFY_CONFIG);
+  return resolveCodeBlockCopy(removeAuthoredInputs(sanitized));
 }
 
-/** Flag each code block the renderer wrote, so its Copy button copies its code.
+/** Flag each code block the renderer wrote, so its Copy button copies its
+ *  code, and give it that button.
  *
  *  The Copy button copies only inside `data-copy-code`, which the sanitizer
- *  forbids. So a lookalike wrapper that content wrote copies nothing, however
- *  it hides text inside. The renderer's own code is escaped text with no
- *  markup, so its `textContent` is exactly what the reader sees. */
+ *  forbids. So a lookalike wrapper that content wrote gets no button and
+ *  copies nothing, however it hides text inside. The renderer's own code is
+ *  escaped text with no markup, so its `textContent` is exactly what the
+ *  reader sees. */
 function resolveCodeBlockCopy(html: string): string {
   return inDom(html, [CODE_COPY_ATTR], (body) => {
     for (const el of Array.from(body.querySelectorAll(`[${CODE_COPY_ATTR}]`))) {
-      if (el.getAttribute(CODE_COPY_ATTR) === COPY_ID_NONCE) el.setAttribute('data-copy-code', '');
+      const isRenderers = el.getAttribute(CODE_COPY_ATTR) === COPY_ID_NONCE;
       el.removeAttribute(CODE_COPY_ATTR);
+      if (!isRenderers) continue;
+      el.setAttribute('data-copy-code', '');
+      el.querySelector(':scope > .code-block-header')
+        ?.insertAdjacentHTML('beforeend', copyButton(' code-block-copy-btn', 'Copy code'));
     }
   });
 }
@@ -535,12 +583,12 @@ const HTML_NS = 'http://www.w3.org/1999/xhtml';
 
 /** Whether a span may replace part of this text node and survive a re-parse.
  *  SVG and MathML text would eject an HTML span, and a text-only element such
- *  as `<textarea>` would show its markup as characters. Code is left alone. */
+ *  as `<title>` would show its markup as characters. Code is left alone. */
 function acceptsSpan(node: Text): boolean {
   const parent = node.parentElement;
   return parent !== null
     && parent.namespaceURI === HTML_NS
-    && parent.closest('code, pre, textarea, option, title') === null;
+    && parent.closest('code, pre, title') === null;
 }
 
 /** Wrap each unspaced em dash in `.em-dash-gap`, which pads it in CSS.
@@ -695,4 +743,4 @@ export function renderMarkdownInline(md: string): string {
 
 /** What the HTML spec calls interactive content, less what the sanitizer
  *  already drops. Any one of them inside an option `<button>` takes its tap. */
-const INTERACTIVE_ELEMENTS = 'a, button, input, select, textarea, label, details, audio, video';
+const INTERACTIVE_ELEMENTS = 'a, label, details, audio, video';

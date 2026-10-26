@@ -1,6 +1,6 @@
 # 0503: A plan card's new-thread pick starts a build chain under the planner: amends 0474 and 0493
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0560](0560-successor-session-in-the-same-thread.md): a plan card's pick starts a successor session in the planning thread, so there is no build chain.
 - **Date**: 2026-10-16
 - **Amends**: [0474](0474-successor-threads.md), [0493](0493-a-plan-cards-new-thread-pick-is-owner-consent.md)
 - **Amended by**: [0507: A successor inherits the consent that started it](0507-successor-inherits-handoff-consent.md), [0545: A no-wake child files every report](0545-no-wake-child-files-every-report.md)

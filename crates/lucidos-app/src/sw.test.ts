@@ -593,6 +593,20 @@ describe('Service Worker fetch handler — navigation shell (network-first)', ()
     expect(sw.mockCaches.open).toHaveBeenCalledWith(STAMPED_SHELL_CACHE);
   });
 
+  it('built: a back/forward navigation revalidates the shell instead of taking the HTTP cache copy', async () => {
+    // Chrome hands the worker a history navigation as `cache: 'force-cache'`.
+    // Passed through, it skips revalidation and boots the HTTP cache's shell
+    // from hours ago, with the bundles of that build.
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    sw.mockFetch.mockResolvedValue(new Response('fresh shell', { status: 200 }));
+    const event = makeEvent('https://example.com/', 'GET', 'navigate');
+    Object.assign(event.request, { cache: 'force-cache' });
+    sw.handlers.fetch(event);
+    await event.respondWith.mock.calls[0][0];
+    expect(sw.mockFetch).toHaveBeenCalledTimes(1);
+    expect(sw.mockFetch.mock.calls[0][1]).toEqual({ cache: 'no-cache' });
+  });
+
   it('built: navigate caches the fresh shell under the normalized / key (query stripped)', async () => {
     const sw = loadSw({ buildId: STAMPED_BUILD });
     sw.mockFetch.mockResolvedValue(new Response('fresh shell', { status: 200 }));

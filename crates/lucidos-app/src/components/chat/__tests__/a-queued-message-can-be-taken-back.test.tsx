@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
  * A queued message the agent has not read offers Edit and a bin, on a Lucidos
- * Agent thread and on a Claude Code thread. Codex cannot take a message back,
- * so its queued messages offer neither. See
+ * Agent thread and on a Claude Code thread. A Codex follow-up redirects the
+ * running turn at once, so its queued messages offer neither. See
  * docs/plans/2026-09-29-withdraw-a-queued-claude-code-message.md.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -36,7 +36,7 @@ afterEach(() => {
   host.remove();
 });
 
-function draw(threadIsCC: boolean, threadCodingAgent: CodingAgent = 'claude-code', isQueued = true): void {
+function draw(threadIsCC: boolean, sessionCodingAgent: CodingAgent = 'claude-code', isQueued = true): void {
   render(
     <ChatExchange
       exchange={queued}
@@ -47,7 +47,7 @@ function draw(threadIsCC: boolean, threadCodingAgent: CodingAgent = 'claude-code
       readMarker="sent"
       threadId="t1"
       threadIsCC={threadIsCC}
-      threadCodingAgent={threadCodingAgent}
+      sessionCodingAgent={sessionCodingAgent}
       threadIdle={false}
       threadAwaitingAnswer={false}
       threadCanceling={false}
@@ -74,7 +74,7 @@ describe('a queued message', () => {
     expect(bin()).not.toBeNull();
   });
 
-  it('offers neither on a Codex thread, which cannot take a message back', () => {
+  it('offers neither on a Codex thread, whose follow-up redirects the turn', () => {
     draw(true, 'codex');
     expect(host.textContent).toContain('Queued');
     expect(edit()).toBeNull();

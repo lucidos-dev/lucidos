@@ -319,6 +319,7 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -452,6 +453,7 @@ async fn cc_session_id_survives_engine_restart() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: artifacts
 description: The artifacts audit section: structural rules only, never the user content itself.
+sources: ["system-knowhow/best-practices.md", "system-knowhow/lucidos-cli.md"]
 ---
 
 # Workspace audit section: artifacts

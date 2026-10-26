@@ -30,7 +30,7 @@ use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionState};
 use crate::engine::claude_code::AllowScope;
 use crate::engine::command_guard::{
     self, CommandSite, GuardDecision, JudgeInput, JudgedClassification, RiskLane,
-    SideEffectCategory, StaticVerdict,
+    SideEffectCategory, StaticVerdict, TrustedHeads,
 };
 use crate::engine::command_judge::JudgeVerdict;
 use crate::engine::event_bus::{BusEvent, EventBus};
@@ -93,7 +93,7 @@ pub fn command_is_allowed(
 ) -> bool {
     match tool_name {
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
-            command_guard::grant_covers_command("Bash", command, site, allowed)
+            command_guard::grant_covers_command("Bash", command, site, &TrustedHeads::NONE, allowed)
         }
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => {
             !command_guard::command_reads_secret(command) && allowed("Python")
@@ -1094,7 +1094,13 @@ impl LucidosEngine {
         let dedup_key: DedupKey = (thread_id, tool_name.to_string(), canonical_input);
         let (request_id, mut rx, is_canonical) = {
             let mut pending = self.pending_command_permission.lock().unwrap();
-            pending.register_or_attach(dedup_key, thread_id, tool_name.to_string(), input.clone())
+            pending.register_or_attach(
+                dedup_key,
+                thread_id,
+                tool_name.to_string(),
+                input.clone(),
+                crate::engine::claude_code::GrantOffer::default(),
+            )
         };
 
         if is_canonical {

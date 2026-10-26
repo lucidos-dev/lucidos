@@ -8,6 +8,7 @@ use crate::test_support::{seed_thread_event, setup_test_db, start_cc_session, te
 use uuid::Uuid;
 
 const QUESTION: WaitType = WaitType::Parked(ParkedCard::Question);
+const CC: WaitAgent = WaitAgent::ClaudeCode;
 
 /// What a cap costs over `durations`, in beats, counted the slow way.
 fn cost_of(cap: u32, durations: &[f64], beat_every: f64, rewrite: f64) -> f64 {
@@ -76,18 +77,70 @@ fn the_search_matches_a_brute_force_count() {
     }
 }
 
+/// The odds count each wait in the slot of the beats it needed, and a wait
+/// past the cap after it. Beats every 100 s, a cap of 2.
+#[test]
+fn the_odds_count_each_wait_in_its_slot() {
+    let odds = CapOdds::of(&[10.0, 150.0, 250.0, 299.0, 300.0, 950.0], 100.0, 2);
+    assert_eq!(
+        odds,
+        CapOdds {
+            samples: 6,
+            slots: vec![1, 1, 2],
+            after_cap: 2,
+        }
+    );
+    assert_eq!(odds.cost_in_beats(3.0), 1.0 + 4.0 + 2.0 * (2.0 + 3.0));
+}
+
+/// The odds the status shows and the cap the search picks share one cost:
+/// for the chosen cap they agree with the slow count.
+#[test]
+fn the_odds_and_the_chosen_cap_agree_on_its_cost() {
+    let durations = [150.0, 250.0, 250.0, 950.0, 40.0, 3_000.0];
+    let cap = cheapest_cap(&durations, 100.0, 3.0);
+    assert_eq!(
+        CapOdds::of(&durations, 100.0, cap).cost_in_beats(3.0),
+        cost_of(cap, &durations, 100.0, 3.0)
+    );
+}
+
+/// An unbounded rewrite, from a cache read priced at nothing, still ends the
+/// search: no cap past the longest wait's need costs less.
+#[test]
+fn an_unbounded_rewrite_stops_at_the_longest_need() {
+    assert_eq!(cheapest_cap(&[150.0, 950.0], 100.0, f64::INFINITY), 9);
+}
+
+/// One past wait gives odds, where the tuned cap needs 50. None gives none.
+#[test]
+fn a_single_wait_gives_odds() {
+    let one = WaitDurations::from_samples([(CC, QUESTION, 150.0)]);
+    assert_eq!(one.cap_beats(CC, QUESTION, 100.0, 3.0), None);
+    assert_eq!(
+        one.odds(CC, QUESTION, 100.0, 1).map(|odds| odds.slots),
+        Some(vec![0, 1])
+    );
+    assert_eq!(one.odds(WaitAgent::Lucidos, QUESTION, 100.0, 1), None);
+}
+
 /// Under 50 waits of a type, the type keeps the default rule.
 #[test]
 fn too_few_waits_fall_back_to_the_default() {
-    let few = WaitDurations::from_samples((0..MIN_SAMPLES - 1).map(|_| (QUESTION, 150.0)));
-    assert_eq!(few.cap_beats(QUESTION, 100.0, 3.0), None);
-    let enough = WaitDurations::from_samples((0..MIN_SAMPLES).map(|_| (QUESTION, 150.0)));
-    assert_eq!(enough.cap_beats(QUESTION, 100.0, 3.0), Some(1));
+    let few = WaitDurations::from_samples((0..MIN_SAMPLES - 1).map(|_| (CC, QUESTION, 150.0)));
+    assert_eq!(few.cap_beats(CC, QUESTION, 100.0, 3.0), None);
+    let enough = WaitDurations::from_samples((0..MIN_SAMPLES).map(|_| (CC, QUESTION, 150.0)));
+    assert_eq!(enough.cap_beats(CC, QUESTION, 100.0, 3.0), Some(1));
     let permission = WaitType::Parked(ParkedCard::Permission);
     assert_eq!(
-        enough.cap_beats(permission, 100.0, 3.0),
+        enough.cap_beats(CC, permission, 100.0, 3.0),
         None,
         "another type"
+    );
+    assert_eq!(
+        enough.cap_beats(WaitAgent::Lucidos, QUESTION, 100.0, 3.0),
+        None,
+        "another agent"
     );
 }
 
@@ -126,6 +179,7 @@ fn asked(tool_use_id: &str) -> ThreadEvent {
 fn answered(tool_use_id: &str) -> ThreadEvent {
     ThreadEvent::UserQuestionAnswered {
         tool_use_id: tool_use_id.to_string(),
+        quiet: false,
         answer: AnswerKind::Selected {
             option_id: "a".to_string(),
         },
@@ -150,10 +204,10 @@ fn wait_started(wait_id: Uuid, kinds: &[&str]) -> ThreadEvent {
     }
 }
 
-fn sorted(durations: &WaitDurations, wait_type: WaitType) -> Vec<i64> {
+fn sorted(durations: &WaitDurations, agent: WaitAgent, wait_type: WaitType) -> Vec<i64> {
     let mut secs: Vec<i64> = durations
         .by_type
-        .get(&wait_type)
+        .get(&(agent, wait_type))
         .map(|d| d.iter().map(|s| s.round() as i64).collect())
         .unwrap_or_default();
     secs.sort_unstable();
@@ -190,6 +244,7 @@ async fn a_card_runs_from_ask_to_answer() {
             tool_name: "Bash".to_string(),
             input: serde_json::json!({}),
             summary: "Run a command".to_string(),
+            grant_offer: None,
         },
     )
     .await;
@@ -219,9 +274,9 @@ async fn a_card_runs_from_ask_to_answer() {
     seed_thread_event(&bus, codex, answered("toolu_codex")).await;
 
     let durations = read_wait_durations(&pool).await.unwrap();
-    assert_eq!(sorted(&durations, QUESTION), vec![120]);
+    assert_eq!(sorted(&durations, CC, QUESTION), vec![120]);
     assert_eq!(
-        sorted(&durations, WaitType::Parked(ParkedCard::Permission)),
+        sorted(&durations, CC, WaitType::Parked(ParkedCard::Permission)),
         vec![10]
     );
 
@@ -289,15 +344,53 @@ async fn an_event_wait_runs_from_start_to_resolution() {
     let durations = read_wait_durations(&pool).await.unwrap();
     let kinds = |k: &[&str]| WaitType::Events(KeepWarmKinds::of(k.iter().copied()).unwrap());
     assert_eq!(
-        sorted(&durations, kinds(&["BackgroundBashCompleted"])),
+        sorted(&durations, CC, kinds(&["BackgroundBashCompleted"])),
         vec![300]
     );
     assert_eq!(
-        sorted(&durations, kinds(&["ChangeApplied", "E2ELockReleased"])),
+        sorted(&durations, CC, kinds(&["ChangeApplied", "E2ELockReleased"])),
         vec![45],
         "the order of the kinds does not change the type"
     );
     assert_eq!(durations.by_type.len(), 2, "the other kind is dropped");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A Lucidos Agent thread's card and event wait count apart from Claude
+/// Code's, so each agent tunes its own give-up point.
+#[tokio::test]
+async fn a_lucidos_agent_thread_keeps_its_own_durations() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = crate::test_support::seed_chat_thread(&bus, "hi").await;
+    let ask = seed_thread_event(&bus, thread_id, asked("toolu_la")).await;
+    let answer = seed_thread_event(&bus, thread_id, answered("toolu_la")).await;
+    age(&pool, ask, 400).await;
+    age(&pool, answer, 100).await;
+    let wait = Uuid::new_v4();
+    let started = seed_thread_event(
+        &bus,
+        thread_id,
+        wait_started(wait, &["ChildThreadCompleted"]),
+    )
+    .await;
+    let expired = seed_thread_event(
+        &bus,
+        thread_id,
+        ThreadEvent::EventWaitExpired { wait_id: wait },
+    )
+    .await;
+    age(&pool, started, 90).await;
+    age(&pool, expired, 30).await;
+
+    let durations = read_wait_durations(&pool).await.unwrap();
+    let la = WaitAgent::Lucidos;
+    assert_eq!(sorted(&durations, la, QUESTION), vec![300]);
+    let children = WaitType::Events(KeepWarmKinds::of(["ChildThreadCompleted"]).unwrap());
+    assert_eq!(sorted(&durations, la, children), vec![60]);
+    assert!(sorted(&durations, CC, QUESTION).is_empty());
 
     pool.close().await;
     teardown_test_db(&db_name).await;

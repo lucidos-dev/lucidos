@@ -4,8 +4,13 @@
 //! unread at the end of the thread ([`undelivered_input`]). The resume then
 //! carries the input itself. A bare "Continue from where you left off" would
 //! ask the agent to resume work it was never told about.
+//!
+//! A thread whose agent never engaged is the extreme case: every prompt it
+//! holds is unread, engine-written ones included ([`resume_input`]).
 
 use uuid::Uuid;
+
+use super::USER_CLICKED_CONTINUE_REASON;
 
 /// What a coding agent was owed and never read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +37,94 @@ const SEARCHED_EVENT_TYPES: &[&str] = &[
 const SEARCH_WINDOW: i64 = 100;
 
 type Row = (Uuid, String, serde_json::Value);
+
+/// What a resume of `thread_id` carries as its input, or `None` for the bare
+/// continue message.
+///
+/// A thread whose agent never engaged has no conversation to resume, so every
+/// reason hands it the prompts it was never given. A thread whose agent engaged
+/// resumes its session, and only Continue replays what a failed start left
+/// unread.
+pub(crate) async fn resume_input(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    continue_reason: Option<&str>,
+) -> Option<UndeliveredInput> {
+    if agent_never_engaged(pool, thread_id).await {
+        return unengaged_input(pool, thread_id).await;
+    }
+    match continue_reason {
+        Some(USER_CLICKED_CONTINUE_REASON) => undelivered_input(pool, thread_id).await,
+        _ => None,
+    }
+}
+
+/// The events that prove the agent took an input in: it read one, or it
+/// answered. A session that opened and died first leaves none of them, however
+/// far its spawn got (`SessionStarted` is written before the first read).
+const AGENT_ENGAGED_EVENT_TYPES: &str = "'CodingAgentInputRead','CodingAgentTextStreamed',\
+    'CodingAgentThoughtStreamed','CodingAgentToolCalled','ResponseGenerated'";
+
+/// SQL boolean: no [`AGENT_ENGAGED_EVENT_TYPES`] event exists on the thread at
+/// `id_expr` (its `aggregate_id`, text). One definition for the resume input
+/// and the boot scan that queues the resume.
+pub(crate) fn agent_never_engaged_sql(id_expr: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM events g \
+          WHERE g.aggregate_id = {id_expr} \
+            AND g.event_type IN ({AGENT_ENGAGED_EVENT_TYPES}))"
+    )
+}
+
+/// Whether the agent never took an input in. An unreadable answer counts as
+/// no, so a failed probe never replays a prompt.
+async fn agent_never_engaged(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar(&format!("SELECT {}", agent_never_engaged_sql("$1")))
+        .bind(thread_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| {
+            crate::log!(
+                "[Recovery] Could not tell whether the agent of thread {} engaged: {}",
+                thread_id,
+                e
+            );
+            false
+        })
+}
+
+/// Every message of a thread whose agent never engaged, oldest first, minus the
+/// ones the user took back.
+async fn unengaged_input(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<UndeliveredInput> {
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT m.id, m.event_type, m.payload FROM events m \
+          WHERE m.thread_id = $1 AND m.event_type = 'MessageReceived' \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM events t \
+                 WHERE t.thread_id = $1 \
+                   AND t.event_type = 'QueuedMessageRemoved' \
+                   AND t.payload->>'removed_message_id' = m.id::text) \
+          ORDER BY m.sequence ASC",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_else(|e| {
+        crate::log!(
+            "[Recovery] Could not read the messages of unengaged thread {}: {}",
+            thread_id,
+            e
+        );
+        Vec::new()
+    });
+    joined(rows.iter().map(|(id, _, payload)| {
+        (
+            *id,
+            payload.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+            payload,
+        )
+    }))
+}
 
 /// The human messages the thread's latest failed starts left unread, oldest
 /// first, or `None` when the agent read everything it was sent.

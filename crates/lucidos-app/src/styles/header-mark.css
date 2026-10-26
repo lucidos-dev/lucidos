@@ -284,7 +284,7 @@
     grid-column: 2;
 }
 
-.header-mark-group > .dashboard-sheet-toggle {
+.header-mark-group > .dashboard-panel-toggle {
     grid-column: 3;
     justify-self: end;
 }

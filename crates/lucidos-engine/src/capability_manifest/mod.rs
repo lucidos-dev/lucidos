@@ -46,7 +46,9 @@
 //!
 //! `request_read` (ADR 0409) is absent for the same reason. It acts on the
 //! calling thread and takes no argument, so its CLI verb, `lucidos
-//! request-read`, is hand-wired over `$LUCIDOS_THREAD_ID` too.
+//! request-read`, is hand-wired over `$LUCIDOS_THREAD_ID` too. So is `lucidos
+//! threads child-reports` (ADR 0566): only a coding agent takes its own
+//! thread's reports, so no LLM tool or SDK facade has one to take.
 //!
 //! No SDK either: an app iframe is not a thread and holds no subscriptions of
 //! its own. The capability an app or a script actually wants there is the
@@ -760,6 +762,7 @@ mod tests {
         // `detach_child` stops waiting for a child (ADR 0278). `archive` closes
         // the caller or one of its children (ADR 0310). `drafts` and
         // `held_messages` say what a thread holds that nothing has sent.
+        // `cache_keep_alive` is the per-thread keep-alive switch (ADR 0554).
         // `triage` and `apply_triage` are thread triage (ADR 0349).
         assert_eq!(
             threads.actions(),
@@ -771,6 +774,7 @@ mod tests {
                 "search",
                 "detach_child",
                 "archive",
+                "cache_keep_alive",
                 "triage",
                 "apply_triage"
             ]

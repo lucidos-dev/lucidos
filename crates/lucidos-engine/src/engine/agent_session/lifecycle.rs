@@ -133,12 +133,18 @@ pub(super) enum TerminateDecision {
 /// A running background task is deliberately NOT a reason to stay alive. Its
 /// completion re-opens the thread through an *event wait*, which resumes a
 /// terminated session like any other follow-up.
+///
+/// A session that `handed_off` waits only for `unread`. Queued and promised
+/// follow-ups belong to the successor session: the idle exit drains them, and
+/// the turn they start reads the handoff's opening first.
 pub(super) fn terminate_decision(
     queued: usize,
     unread: u32,
     redirect_pending: bool,
+    handed_off: bool,
 ) -> TerminateDecision {
-    if queued > 0 || unread > 0 || redirect_pending {
+    let follow_up_coming = unread > 0 || (!handed_off && (queued > 0 || redirect_pending));
+    if follow_up_coming {
         TerminateDecision::KeepAliveForFollowup {
             queued,
             unread,

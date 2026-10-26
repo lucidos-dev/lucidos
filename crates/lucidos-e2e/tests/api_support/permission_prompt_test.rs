@@ -437,6 +437,60 @@ async fn permission_prompt_narrow_grant_binds_the_same_session() {
     let _ = waiter.await.expect("waiter task panicked");
 }
 
+/// The consent endpoint stores exactly the pattern the card stamped on its
+/// request event, for both persisted scopes. The card renders the same
+/// stamped pattern, so the button and the stored line cannot disagree
+/// (ADR 0571).
+#[tokio::test]
+async fn permission_prompt_stores_exactly_the_stamped_pattern() {
+    let _lock = lock_cc_allowed_tools().await;
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    for scope in ["narrow", "broad"] {
+        let _restore = empty_cc_allowed_tools(&client).await;
+        let head = format!("zzstamp{}", Uuid::new_v4().simple());
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread_summary(&pool, thread_id, "running").await;
+
+        persist_via_consent(
+            &client,
+            &pool,
+            thread_id,
+            "Bash",
+            json!({ "command": format!("{head} --x") }),
+            scope,
+        )
+        .await;
+
+        let (stamped,): (Option<String>,) = sqlx::query_as(
+            "SELECT payload->'grant_offer'->>$2 FROM events \
+             WHERE thread_id = $1 AND event_type = 'CodingAgentPermissionRequest' \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(thread_id)
+        .bind(scope)
+        .fetch_one(&pool)
+        .await
+        .expect("DB query failed");
+        let stamped = stamped.unwrap_or_else(|| panic!("the card must stamp a {scope} grant"));
+        let want = if scope == "broad" {
+            "Bash".to_string()
+        } else {
+            format!("Bash({head}:*)")
+        };
+        assert_eq!(stamped, want, "{scope}");
+        let after = read_cc_allowed_tools(&client).await;
+        assert_eq!(
+            count_line(&after, &stamped),
+            1,
+            "{scope} must store the stamped {stamped}; got:\n{after}"
+        );
+    }
+}
+
 /// `persist_scope: "broad"` on `Edit` (and Write/NotebookEdit) must NOT write
 /// the file: bare `Edit` in `--allowedTools` is silently ignored by CC's
 /// `acceptEdits` routing for out-of-cwd paths, so persisting it would mislead

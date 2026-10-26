@@ -111,6 +111,25 @@ mod sentinel_redaction_tests {
         );
     }
 
+    /// Nothing re-opens the thread when the user saves the form, so the result
+    /// must spell out the wait. The condition names THIS request, so an older
+    /// form closing cannot wake it.
+    #[test]
+    fn a_credential_sentinel_names_the_wait_for_its_own_request() {
+        let raw = format!(
+            "{CREDENTIAL_REQUEST_PREFIX}{}",
+            r#"{"service":"openai","prompt":"Enter API key","auth_type":"api_key"}"#
+        );
+        let m = from(tn::REQUEST_CREDENTIAL, &raw).expect("credential sentinel must match");
+        let ThreadEvent::CredentialRequested { request_id, .. } = m.event else {
+            panic!("expected CredentialRequested");
+        };
+        let redacted = m.redacted_text.expect("credential must redact for the LLM");
+        assert!(redacted.contains(tn::AWAIT_EVENT), "{redacted}");
+        assert!(redacted.contains("FormRequestResolved"), "{redacted}");
+        assert!(redacted.contains(&request_id.to_string()), "{redacted}");
+    }
+
     /// A WIDENING reopens a row that already holds its secret. Told it "saves
     /// the credential", the agent narrates a token the user need not type. That
     /// is the mis-narration the redaction's own comment block cites as the

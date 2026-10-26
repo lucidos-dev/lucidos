@@ -11,16 +11,16 @@ import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { StoppedChildNotice } from './StoppedChildNotice';
 import { ContinuedFromNotice, ContinuedInNotice } from './SuccessorNotice';
-import { currentCacheWarmLine } from '../../store/actions/preferences';
+import { currentCacheCards } from '../../store/actions/preferences';
 import { CacheWarmLine, cacheWarmLineEligible } from './CacheKeepAlive';
 import { sideQuestionsFor } from '../../store/sideQuestions';
 import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { ThreadTitleMenu, ThreadTitlePin } from './ThreadTitle';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
-import { computeExchanges, exchangeKey, exchangeResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
+import { computeExchanges, exchangeKey, drawnResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
 import { rowsDrawnByClamp } from '../../store/event-rendering';
 import { statusLabel } from '../../store/exchange-status';
-import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, isScrollbarHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollbarReleased, scrollbarReleased, deepLinkRenderAll, scrolledFromTop } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, isScrollHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollHoldReleased, scrollHoldReleased, deepLinkRenderAll, scrolledFromTop } from './scrollState';
 import { isElementVisible } from '../../utils/elementVisibility';
 import { EMPTY_FILL_LEDGER, WHOLE_THREAD, chargeFillRound, drawnRowsInWindow, fillRoundAllowed, settleFillLedger, anythingAbove, atScrollTop, clampedScrollTop, scrollAsksForOlder, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachRow, exchangeRenderCost, readingChaseAction, READING_CHASE_PAGE_SIZE, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type FillLedger, type RowsAt, type WindowEdge } from './threadWindow';
 import { transcriptScrolls } from './transcriptScrolls';
@@ -28,7 +28,7 @@ import { anchorTargetTop, readScrollAnchor, type ScrollAnchor } from './scrollAn
 import { useScrollMemory, readSavedScroll, type SavedScroll } from '../../hooks/useScrollMemory';
 import { threadScrollKey } from '../../store/savedScroll';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
-import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag, useLingeringFlag, useMinimumVisibleFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
 import { wholeHistoryLoaded, showThreadSkeletonNow, threadIsLoadingNow, type ThreadLoadingState } from './threadSkeletonGate';
 import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, repaintNudgeShift, settledScrollTop } from '../../utils/webkitRepaint';
@@ -340,7 +340,7 @@ export function locateReadingTarget(
         // A sub-agent's step is drawn inside its agent's row, so that row is its place.
         const names = (s: { call_event_id?: string; result_event_id?: string }) =>
             s.call_event_id === target.id || s.result_event_id === target.id;
-        const row = exchangeResponseEvents(ex, false, true).findIndex(
+        const row = drawnResponseEvents(ex, false, true, currentCacheCards()).findIndex(
             (r) => r.type === 'step' && (names(r) || !!r.children?.some(names)),
         );
         return { index: i, row: Math.max(0, row) };
@@ -383,7 +383,7 @@ function requestBackfill(
         prevScrollTop: settledScrollTop(el),
         anchor: null,
     });
-    settleOn(loadOlderThreadEvents(threadId, pageSize, () => scrollbarReleased(el)), threadId, onSettled);
+    settleOn(loadOlderThreadEvents(threadId, pageSize, () => scrollHoldReleased(el)), threadId, onSettled);
     return true;
 }
 
@@ -441,7 +441,7 @@ function requestWholeHistory(el: HTMLElement, threadId: string, onSettled: (adde
     if (wholeHistoryAskedByThread.has(threadId)) return;
     wholeHistoryAskedByThread.add(threadId);
     historyHoldByThread.set(threadId, wholeHistoryHold(el));
-    settleOn(ensureWholeThreadLoaded(threadId, () => scrollbarReleased(el)), threadId, onSettled);
+    settleOn(ensureWholeThreadLoaded(threadId, () => scrollHoldReleased(el)), threadId, onSettled);
 }
 
 /** Escalating retry delays for the empty-thread safety retry. */
@@ -661,8 +661,10 @@ export function threadEmptyStateBody(reason: EmptyReason, showReload: boolean) {
  *  (a sibling of `.thread-content` in the position:relative `.thread-content-wrap`).
  *  Living outside the scroll container lets it linger and crossfade OUT as the
  *  exchanges render underneath, rather than hard-swapping. `show` is the
- *  delay-gated loading flag; the overlay then lingers for the length of its own
- *  fade while fading. Decorative + pointer-events:none so it never blocks the
+ *  delay-gated loading flag; the overlay stays opaque for the shared minimum
+ *  (`useMinimumVisibleFlag`), then lingers for the length of its own fade while
+ *  fading. Its background is opaque, so the transcript never shows through a
+ *  held overlay. Decorative + pointer-events:none so it never blocks the
  *  content.
  *
  *  The fade is `opacity var(--duration-normal)`, whose 1x value is the constant
@@ -681,10 +683,11 @@ export function skeletonOverlayClass(show: boolean): string {
 }
 
 function ThreadSkeletonOverlay({ show }: { show: boolean }) {
-    const mounted = useLingeringFlag(show, scaledDurationMs(SKELETON_FADE_OUT_MS) + SKELETON_FADE_SLACK_MS);
+    const held = useMinimumVisibleFlag(show);
+    const mounted = useLingeringFlag(held, scaledDurationMs(SKELETON_FADE_OUT_MS) + SKELETON_FADE_SLACK_MS);
     if (!mounted) return null;
     return (
-        <div class={skeletonOverlayClass(show)} aria-hidden="true">
+        <div class={skeletonOverlayClass(held)} aria-hidden="true">
             <ThreadSkeleton />
         </div>
     );
@@ -897,10 +900,11 @@ export function ThreadView() {
     const showSteps = stepsExpanded.value;
     const showDetails = detailsExpanded.value;
     const folds = collapsedExchanges.value;
+    const cacheCards = currentCacheCards();
     const rowsDrawnAt: RowsAt = (index) => {
         const exchange = exchanges[index];
         if (!exchange || !threadId) return [];
-        return rowsDrawnByClamp(exchangeResponseEvents(exchange, false, true), {
+        return rowsDrawnByClamp(drawnResponseEvents(exchange, false, true, cacheCards), {
             showSteps,
             showDetails,
             folded: turnBodyFolded(folds, threadId, exchange),
@@ -1429,27 +1433,27 @@ export function ThreadView() {
                 // The window has reached the oldest turn this client HOLDS,
                 // which on a long thread is not the oldest turn there is. Fetch
                 // the page behind it; the effect below re-points the edge, and
-                // the reader's next scroll grows into what arrived. A held
-                // scrollbar lets it fetch, and holds its landing.
+                // the reader's next scroll grows into what arrived. A scroll
+                // hold lets it fetch, and holds its landing.
                 requestBackfill(el, threadId, exchangesRef.current, current, onHistoryRead);
                 return;
             }
-            // A held native scrollbar puts its own drag position back, which
-            // undoes the anchor write: the reader would jump by the height
-            // drawn. The release handler below reaches instead.
-            if (isScrollbarHeld(el)) {
+            // A held scrollbar undoes the anchor write, and a coasting finger
+            // loses its fling to it and snaps back (`isScrollHeld`). The
+            // release handler below reaches instead.
+            if (isScrollHeld(el)) {
                 owesGrow = true;
                 return;
             }
             growRenderWindow(el, threadId, exchangesRef.current, costs, current, rows, pendingExpandRef, bumpWindow);
         };
-        // The grow a scrollbar hold put off. A drag pinned at the top fires no
+        // The grow a scroll hold put off. A drag pinned at the top fires no
         // scroll event, so without this the thread locks there. Only a hold
         // that owes a grow reaches, so a click on padding draws nothing. A
         // frame later, so the drag has ended before the anchor write lands.
         let owesGrow = false;
         let releaseFrame = 0;
-        const unsubRelease = onScrollbarReleased((released) => {
+        const unsubRelease = onScrollHoldReleased((released) => {
             if (released !== el || !owesGrow) return;
             owesGrow = false;
             cancelAnimationFrame(releaseFrame);
@@ -1661,9 +1665,9 @@ export function ThreadView() {
         }
         storeEdge(threadId, anchored, exchanges);
         // A read that lands with no landing gate while the reader holds the
-        // scrollbar. The grow waits for the release: a held drag undoes its
-        // anchor write.
-        const grew = !isScrollbarHeld(el) && growRenderWindow(
+        // scroll. The grow waits for their next scroll: a held drag undoes its
+        // anchor write, and a fling dies on it.
+        const grew = !isScrollHeld(el) && growRenderWindow(
             el, threadId, exchanges, exchangeCostsRef.current, anchored,
             rowsDrawnAtRef.current, pendingExpandRef, bumpWindow,
         );
@@ -2010,7 +2014,7 @@ export function ThreadView() {
                             <CacheWarmLine
                                 key={threadId}
                                 threadId={threadId!}
-                                eligible={currentCacheWarmLine() && cacheWarmLineEligible(eventThread)}
+                                eligible={currentCacheCards() && cacheWarmLineEligible(eventThread)}
                                 eventCount={eventThread.events.size}
                             />
                         </div>
@@ -2073,7 +2077,7 @@ export function ThreadView() {
                             // one: a reader returning mid-fetch takes a hold
                             // for whatever read is running.
                             const el = areaRef.current;
-                            void ensureWholeThreadLoaded(threadId, el ? () => scrollbarReleased(el) : undefined).then((added) => {
+                            void ensureWholeThreadLoaded(threadId, el ? () => scrollHoldReleased(el) : undefined).then((added) => {
                                 settleHistoryRead(threadId, added, onHistoryRead);
                                 if (focusedThreadId.value !== threadId) return;
                                 pendingScrollTopRef.current = true;

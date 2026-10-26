@@ -51,12 +51,15 @@ describe('commandHead mirrors the engine grant derivation', () => {
     ["bash -lc 'git status' | tee log"],
     ['bash -lc "git status" && curl evil'],
     ["bash -lc 'git status' $(whoami)"],
-  ])('keeps the shell head when the tail can run more: %s', (command) => {
-    expect(commandHead(command)).toBe('bash');
+  ])('names no head when the tail can run more: %s', (command) => {
+    expect(commandHead(command)).toBeNull();
   });
 
-  it('keeps the shell head when there is no -c flag', () => {
-    expect(commandHead('bash deploy.sh')).toBe('bash');
+  // A shell head runs its arguments, so the engine stores no grant for it and
+  // the card offers none.
+  it('names no head when there is no -c flag', () => {
+    expect(commandHead('bash deploy.sh')).toBeNull();
+    expect(commandHead('\\bash deploy.sh')).toBeNull();
   });
 
   it('reads an unquoted script operand whole, as the engine does', () => {
@@ -67,7 +70,7 @@ describe('commandHead mirrors the engine grant derivation', () => {
   });
 
   it('does not treat a long option as the -c flag', () => {
-    expect(commandHead("bash --command 'curl x'")).toBe('bash');
+    expect(commandHead("bash --command 'curl x'")).toBeNull();
   });
 
   // A shell word JOINS adjacent quoted runs, and `'\''` is the POSIX idiom for
@@ -98,12 +101,31 @@ describe('commandHead mirrors the engine grant derivation', () => {
     expect(commandHead(command)).toBe(expected);
   });
 
-  it('keeps the shell head when a substitution is glued to the operand', () => {
+  it('names no head when a substitution is glued to the operand', () => {
     // The opener has to land in the TAIL, or the whole substitution vanishes.
-    expect(commandHead("bash -c 'echo hi'$(rm -rf /)")).toBe('bash');
-    expect(commandHead("bash -c 'echo hi'`rm -rf /`")).toBe('bash');
+    expect(commandHead("bash -c 'echo hi'$(rm -rf /)")).toBeNull();
+    expect(commandHead("bash -c 'echo hi'`rm -rf /`")).toBeNull();
     // A plain `$VAR` is not a substitution and must not truncate the script.
     expect(commandHead("bash -c 'ls '$HOME")).toBe('ls');
+  });
+
+  // Codex sometimes nests a second shell inside its own wrapper. The engine
+  // reads through every layer, so the card names the real command.
+  it.each([
+    [`/bin/zsh -lc "bash -c 'git push'"`, 'git'],
+    [`/bin/zsh -lc "bash -c 'sh -c ls'"`, 'ls'],
+  ])('reads through the nested shell in %s', (command, expected) => {
+    expect(commandHead(command)).toBe(expected);
+  });
+
+  it.each([
+    ['timeout 5 curl https://example.com/x'],
+    ['eval ls'],
+    ['source x.sh'],
+    ['. x.sh'],
+    [`/bin/zsh -lc "bash x.sh"`],
+  ])('names no head for a command that runs its arguments: %s', (command) => {
+    expect(commandHead(command)).toBeNull();
   });
 });
 

@@ -7,7 +7,7 @@ description: How Lucidos decides whether a notification reaches the user as an O
 
 This is the canonical spec for what happens when a `NotificationCreated` event is emitted. It says who gets an OS push, who gets an in-app toast, whose bell badge changes, and what gets auto-marked-read. The rules apply to every notification source: `send_notification` from the chat LLM, scheduler errors, trigger output and push-from-trigger.
 
-Tests carry the section IDs below (`s2_scenario_4_tab_in_background_tab_push_fires`), so a failing test points at the broken rule.
+Section 5 names the current test files and the behavior each one verifies.
 
 ## §1: Conceptual model
 
@@ -62,7 +62,7 @@ The `push_notifications` **preference** (the "on" switch in settings) only recor
 
 - **Settings → Appearance & Behavior → Notifications** carries it for the device the user is holding. Point them there.
 - **Settings → Devices** carries it per registered device. It is the only place to turn push off on a device they are *not* holding, since a page can only create its own subscription.
-- Both rows go through one entry point, `setDevicePushEnabled` in `store/actions/push.ts`. So does the `PushNotificationRequested` prompt the LLM `enable_push_notifications` tool raises.
+- Both rows go through one entry point, `setDevicePushEnabled` in `store/actions/push.ts`. So does the `PushNotificationRequested` prompt `preferences(action="set", key="push_notifications", value="enabled")` raises.
 - The browser handshake runs first. A refused permission leaves the flag off rather than recording an opt-in the OS will never honour.
 - Turning it on **from a phone** also offers to turn it off on the user's OTHER phones and tablets. One notification then stops buzzing several handsets. A desktop is never part of that offer, since a laptop and a phone are complementary surfaces. Cancelling leaves every device as it was.
 
@@ -188,6 +188,7 @@ The deadline is how long the engine waits for a page's report. A report that lan
 | `silenced` | In-app toasts are off, so the row waits on the bell badge. | yes |
 | `not_shown` | The shell is not in front of the reader (Rows 4 and 4b). | no |
 
+- A disconnected or otherwise unavailable workspace returns `not_shown` before checking shell activity.
 - The shell is in front when `shellIsActive()` holds: `isPageActive()` (visibilityState + hasFocus on desktop, visibilityState only on iOS PWA) and no app fullscreen.
 - Row 1 needs the source event in view. The page locates it in the DOM (`document.querySelector('[data-event-id="..."]')`). If absent (virtualized list, not rendered) it is not in view; if present → an `IntersectionObserver` / `getBoundingClientRect()` check.
   - The rect is intersected against the **transcript scroll container's** band, not the window's. The app header and the prompt region inset the transcript. An event behind either strip is inside `window.innerHeight` yet hidden, and calling it visible would suppress a needed notification.
@@ -272,7 +273,9 @@ Breaking this rule is invisible in development. On an iOS PWA over Tailscale one
   - The `panelOverlay` is written only with a real notification in hand, so a failed fetch leaves no phantom nav-stack entry. The pending id lives beside it in `notificationDetailPending`.
 - **`tap.kind === 'navigate'` to a thread** (the common case by far: 80% of notifications in a mature workspace). `focusThreadOrBootstrapResult` focuses synchronously when the thread is in `threadMap`.
   - Otherwise it focuses **optimistically** and reveals the thread pane before fetching metadata, so `ThreadView` renders its delay-gated skeleton instead of a dead interval.
-  - `bootstrappingThreadId` exempts that thread from ThreadView's stale-pointer cleanup, which would unfocus a thread absent from the map. A bootstrap that does not land restores the prior focus.
+  - `awaitedThreadId` protects optimistic focus from stale-pointer cleanup.
+    `releaseAwait` restores prior focus after failure. A queue-held thread stays
+    awaited until its metadata arrives.
   - The metadata comes from `GET /api/v1/threads/:id`, never the grouped `GET /api/v1/threads`. The grouped call assembles saved, recent archive, active, composing and family base, costing hundreds of milliseconds on a large workspace.
   - A cold push tap always meets an empty map, because the deep link dispatches while `loadAllThreads` is in flight. So this path runs on every such tap.
 
@@ -332,6 +335,7 @@ An app merely open in the content pane is unaffected: the shell around it render
 **`presentInAppNotification` applies the §4 row matrix, and returns what it did:**
 
 ```ts
+if (workspaceUnavailable()) return 'not_shown';
 if (!shellIsActive()) return 'not_shown';          // Rows 4 / 4b: bell badge only, the OS push is the surface.
 const onSource = target.event
   && focusedThreadId.value === target.thread
@@ -421,9 +425,12 @@ The Tauri desktop app embeds a WKWebView, which has no service worker and can't 
 
   The banner invokes the app's `show_native_notification` command (`utils/tauri.ts`). It passes the deep-link target in the SW-message shape (`notification_id` / `thread_id` / `event_id` / `tap`).
   - **The trayed-window case depends on the native-active bridge (§1).** Without it, a window trayed by macOS `orderOut:` keeps reporting `visibilityState='visible'` / `hasFocus()=true`. It then renders an invisible toast and reports `shown`, so the engine suppresses the push, leaving only the bell badge. With the bridge, a trayed or unfocused client reports inactive and gets the native banner. A window behind another app already reports inactive via `hasFocus()`, but only the bridge fixes the trayed case.
-  - **The bridge is SEEDED on page load, not just transition-driven.** The `native-window-active` cache (`utils/nativeWindow.ts`) defaults to `true`. Otherwise only the transition events Rust's `on_window_event` emits update it (`Focused` / `CloseRequested` / `show_main_window`).
+  - **The bridge is SEEDED on page load, not just transition-driven.** The `native-window-active` cache (`utils/nativeWindow.ts`) defaults to `true`. Otherwise only the transition events Rust's `on_window_event` emits update it (`Focused` / `tauri::WindowEvent::CloseRequested` / `show_main_window`).
   - Tauri does **not** replay those events to a late listener. A page reloaded while backgrounded or trayed would keep the `true` default, render an invisible toast, and suppress its own push. That covers a crash-watchdog reload (`lib.rs`), the "New version → Refresh" reload, and a cold or unfocused launch.
-  - So `startNativeWindowActiveTracking` first **pulls the authoritative AppKit state** via the `get_native_window_active` command (`focused && visible && !minimized`). Any read failure → `false`, the safe direction. It seeds the cache **before** registering the transition listener. Off-Tauri it's a no-op, and the cache stays `true`.
+  - `startNativeWindowActiveTracking` reads `get_native_window_active`
+    (`focused && visible && !minimized`) before registering its transition listener.
+    A failed read keeps the cached value, initially `true`, and still registers
+    the listener. Off-Tauri it does nothing and keeps `true`.
     - **The seed reads the CALLING page's own window, not `main`.** Tauri injects the calling `tauri::Window` into the command, as `focus_calling_window` and `window_ready_to_show` do. Reading `main` let a backgrounded second window seed itself **active** off a focused first one.
 - **Why a direct `objc2` `UNUserNotificationCenter` path, not a crate.** Two crates were tried and dropped.
   - `tauri-plugin-notification`'s desktop `show()` is fire-and-forget and never reports the click (its `onAction` is mobile-only), so it can't route taps.
@@ -435,7 +442,7 @@ The Tauri desktop app embeds a WKWebView, which has no service worker and can't 
   - It also drops the banner's stashed deep link from the in-process map, so a removed banner can't route.
   - Both arms take the workspace (see "A banner belongs to the workspace that raised it" below). `handleNativePushDismiss` gates on `isTauri()` + `sent_at_ms` freshness, with no active-window gate. Inert in `tauri dev` / off macOS, like `show`.
 
-**Enabling.** Desktop has no web-push subscription to create, and the macOS `UserNotifications` path has no JS-queryable permission. macOS shows banners per the app's authorization, requested once at startup (`notifications::setup`) and changeable in System Settings → Notifications. So "enabling push" on the Tauri app is a no-op success. That is the same `initPushSubscription` entry point the LLM `enable_push_notifications` tool and the settings toggle drive.
+**Enabling.** Desktop has no web-push subscription to create, and the macOS `UserNotifications` path has no JS-queryable permission. macOS shows banners per the app's authorization, requested once at startup (`notifications::setup`) and changeable in System Settings → Notifications. So "enabling push" on the Tauri app is a no-op success. That is the same `initPushSubscription` entry point `preferences(action="set", key="push_notifications", value="enabled")` and the settings toggle drive.
 
 **Native banners require a packaged `.app` build.** `UNUserNotificationCenter.currentNotificationCenter()` throws for a process with no bundle identifier. A `tauri dev` build is an unbundled `cargo run` binary, so `notifications::{setup,show}` both short-circuit on `tauri::is_dev()`. Native banners are inert in dev *on any macOS version*, and the dev notification channel is the browser's web push. A packaged build (`cargo tauri build`) uses the app's bundle identifier (`app.config().identifier`) and delivers. macOS prompts for authorization on first launch.
 
@@ -680,7 +687,7 @@ Google's [web.dev push-notifications-common-issues guide](https://web.dev/push-n
 In `crates/lucidos-engine/src/scheduler/push.rs::send_push_to_all_with_app`, after fanning out the real push, the engine:
 - reads each subscription's owning `devices.user_agent` and keeps macOS-Chromium devices (`is_mac_chromium`);
 - dedupes per `device_id`, since a multi-tab device has several subscriptions sharing one SW;
-- for each device, `tokio::spawn`s a task that sleeps `MAC_CHROMIUM_WAKE_DELAY` (3 seconds), then calls `send_wake_push_to_device(device_id, notification_id)`.
+- for each device, `tokio::spawn`s a task that sleeps `MAC_CHROMIUM_WAKE_DELAY` (3 seconds), then calls `scheduler::push::send_wake_push_to_device(device_id, notification_id)`.
 
 The wake's payload is byte-identical to the original push plus `wake: true`.
 
@@ -696,7 +703,7 @@ The SW push handler (`sw.js`, `push` event) branches on `data.wake === true`. It
 
 **Why 3 seconds.** It is short enough that a tap feels immediate, and long enough that Chrome doesn't coalesce the two pushes into one dispatch. The wake must be a separate `push` event to resurrect the worker. A real trace shows the queued click draining inside this window while `visibility: 'hidden'`.
 
-**UA gate is engine-side.** Device registration captures `devices.user_agent` (`POST /api/v1/devices/register`, called from `registerCurrentDevice` on every page load). See `api/settings.rs::register_device` and `core::DeviceStore::register`.
+**UA gate is engine-side.** Device registration captures `devices.user_agent` (`POST /api/v1/devices/register`, called from `registerCurrentDevice` on every page load). See `crates/lucidos-engine/src/api/settings.rs::register_device` and `core::DeviceStore::register`.
 - `PushSubscriptionStore::get_push_enabled` returns it alongside the subscription tuple, so the engine asks the page nothing per push.
 - Non-Mac-Chromium devices (Safari, iOS, Firefox, Tauri, Chrome on Windows / Linux) skip the wake entirely.
 - Devices with `user_agent = NULL` (legacy rows from before UA capture, or a registration race) are conservatively skipped; see `pick_mac_chromium_wake_targets`.
@@ -705,7 +712,7 @@ The SW push handler (`sw.js`, `push` event) branches on `data.wake === true`. It
 
 **Failure modes.** The spawned task lives for `~3 s + a web-push round-trip`.
 - The captured `Arc<LucidosEngine>` keeps the engine struct alive. But dropping the tokio runtime on shutdown aborts the task at its next `await`.
-- So surviving a restart depends on `graceful_shutdown(10 s)` outlasting the 3 s sleep. A wake fired in a restart's final ~3 s is aborted, and the next real push drains the queue.
+- So surviving a restart depends on `axum_server::Handle::graceful_shutdown` with a 10 s drain outlasting the 3 s sleep. A wake fired in a restart's final ~3 s is aborted, and the next real push drains the queue.
 - `Ok(0)` from `send_wake_push_to_device` means the notification was read meanwhile (the healthy read-skip), or the device unsubscribed. It is logged, not an error.
 - Per-device failures are isolated (one tokio task each).
 
@@ -723,6 +730,7 @@ The SW push handler (`sw.js`, `push` event) branches on `data.wake === true`. It
     - The `/assets/*` branch refuses to cache an HTML response (`isHtmlResponse`), so a deleted bundle's SPA fallback never poisons a hashed entry.
     - The navigation shell (`index.html`) is **network-first** (`networkFirstShell`). It is keyed by a normalized `/` request, so every scoped `?notification=…` variant shares one entry.
     - Online, the shell is fetched fresh, so it always references the bundles the server has now. A cache-first shell once pinned deleted bundles and turned iOS PWAs black (the thirteenth iteration).
+    - The fetch always passes `cache: 'no-cache'`. Chrome hands the worker a back/forward navigation as `force-cache`, and passed through, it booted the HTTP cache's shell of a build from hours earlier.
     - It falls back to the `install`-precached shell (fetched with `cache: 'reload'`) when offline or on a transient non-ok response (a 502 mid engine-restart). Only an ok, non-redirected response is ever cached, so a 502 serves the last good shell and never pins itself.
     - **Exception: any 503** is shown as-is. It is the gateway's "engine not serving" signal for a stopped, cold-booting or lazy-starting workspace (ADR 0014 §11).
     - A 503 carries the branded boot splash (ideally marked `X-Lucidos-Boot-Splash`) for a document navigation, or a plain "workspace stopped" body. A stale shell instead would 503-storm the down engine (a red connection dot, or a white screen).
@@ -786,7 +794,7 @@ The rules above are current. Code and docs cite these iterations by ordinal, so 
 - **Third**: deleted the two page-side layers. That broke iOS tap navigation, because the engine wake is macOS-Chrome only.
 - **Fourth**: moved the payload to Declarative Web Push (`web_push: 8030`), so Safari handles iOS taps natively.
 - **Fifth**: moved routing into `hash-deeplink-router.ts` and wired it to every resume signal. Coverage: `hash-deeplink-router.test.ts`.
-- **Sixth**: made the engine the single toast/push decision. `PresenceCheck` became a pure pong trigger, and `NotificationToastRequested` drives the toast, so a slow pong cannot cause "toast AND push".
+- **Sixth**: made the engine the single toast/push decision. `PresenceCheck` became a pure pong trigger. The now-retired event `NotificationToastRequested` drove the toast, so a slow pong could not cause "toast AND push".
 - **Seventh**: split the navigate URL by consumer. iOS gets a cross-document query URL, since it ignores a hash-only navigation to an open window. Coverage: `declarative_navigate_is_cross_document_query_url_for_ios` and `declarative_notification_data_carries_hash_navigate_url_for_chrome_sw` (engine `push_tests.rs`).
 - **Eighth**: gated the PresenceCheck on the live SSE-connection count as well as heartbeats. A long-foregrounded iOS PWA had stopped heartbeating and got pushes on top of itself.
 - **Ninth**: made warm-tab delivery `postMessage` on macOS Chrome. A fragment-only `client.navigate()` resolves but routes nothing. Coverage: the deep-link routing suite in `crates/lucidos-app/src/sw.test.ts`.
@@ -818,154 +826,45 @@ The rules above are current. Code and docs cite these iterations by ordinal, so 
 - **Twenty-fourth**: moved the quiet-cover decision into `<head>` (Net behaviour, mitigation 3), so a tap no longer flashes one frame of the blue launch splash. Coverage: "decides in <head>, before the splash markup can paint" in the `notification tap (boot-splash-quiet)` suite.
 - **Twenty-fifth**: reversed the sixth. A page that hid after answering lost both surfaces: its answer suppressed the push, and it dropped the later toast frame. Now the `PresenceCheck` carries the toast, and the page acts before it answers with an outcome. A desktop window that came forward since answering gets the toast, not a dropped banner. Why: ADR 0440. Coverage: `__tests__/presence-check-races.test.ts`.
 
-## §5: Test plan
+## §5: Verification
 
-Tests are named after the section ID of the rule they verify. A failing `s2_scenario_4_…` points directly at the row 4 entry in §2.
+Use the test files below as the coverage map. Test titles may change;
+the section numbers describe routing rules rather than a test-name convention.
 
-### §5.1: Unit tests
+### Engine and API
 
-**Engine (`crates/lucidos-engine/`):**
-- `s2_step_a_no_candidates_means_push_allowed`
-- `s2_step_a_a_handled_pong_means_push_not_allowed`
-- `s2_step_a_only_not_shown_pongs_means_push_allowed`
-- `s2_step_a_pong_timeout_means_push_allowed`
-- `s3_skip_presence_check_when_nobody_connected_and_no_candidate`: the gate is `max(sse_connections, candidate_count) == 0`
-- `s3_run_presence_check_when_sse_connected_even_with_no_candidate`: a connected SSE page runs the check even with zero `device_presence` candidates (iOS stale heartbeat)
-- `s3_expected_pong_count_is_max_of_both_signals`
-- `connect_increments_and_drop_decrements` / `clones_share_the_same_count` (`api::sse_connections`, the live SSE-connection counter)
-- `s3_all_candidates_pong_short_circuits_deadline`
-- `s3_first_suppressing_pong_settles_without_waiting_for_the_rest` / `s3_a_not_shown_pong_alone_does_not_settle`
-- `s3_only_not_shown_leaves_the_push_to_the_os` / `s3_pong_body_is_the_outcome_the_page_reports`
-- `s3_late_pong_after_decide_never_reopens_it`: a late pong, suppressing or not, never reopens the decision
-- `s4_5_ua_predicate_matches_chrome_on_macos`
-- `s4_5_ua_predicate_matches_edge_on_macos`
-- `s4_5_ua_predicate_excludes_safari_on_macos`
-- `s4_5_ua_predicate_excludes_chrome_on_windows`
-- `s4_5_ua_predicate_excludes_chrome_on_ios`
-- `s4_5_ua_predicate_excludes_firefox_on_macos`
-- `s4_5_ua_predicate_excludes_empty_ua`
-- `s4_5_pick_wake_targets_empty_input`
-- `s4_5_pick_wake_targets_only_mac_chromium`
-- `s4_5_pick_wake_targets_skips_no_device_id`
-- `s4_5_pick_wake_targets_skips_no_ua`
-- `s4_5_pick_wake_targets_dedupes_multi_tab`
-- `s4_5_crate_ceiling_constant_matches_what_build_actually_enforces`: pins `MAX_PUSH_PAYLOAD_BYTES` against the real `web_push` builder from both sides (3052 accepted, 3053 rejected), so a crate bump that moves the threshold fails here instead of silently dropping pushes
-- `s4_5_overflowing_body_still_builds_a_deliverable_message`: a 2862-char body, where the unguarded envelope reproduces `PayloadTooLarge` and the fitted one builds
-- `s4_5_truncated_body_is_marked_and_shorter_than_the_original`: the kept text is the original's prefix plus the `…` marker
-- `s4_5_short_body_passes_through_byte_identical`: the common case is untouched by the guard
-- `s4_5_truncation_is_utf8_safe_with_multibyte_content`: emoji at every offset around the cut point stays valid UTF-8 and under the ceiling
-- `s4_5_truncation_preserves_every_structural_envelope_field`: `web_push`, title, both navigate forms, `tag`, `data.*` and `app_badge` all survive the cut
-- `s4_5_wake_payload_of_an_overflowing_body_also_builds` / `s4_5_wake_budget_is_tighter_than_the_original_send`: the Layer-3 wake budgets for its own `wake: true` flag
-- `s4_5_envelope_alone_over_the_ceiling_degrades_instead_of_panicking`: an untruncatable title drops the body rather than underflowing the budget
-- `s4_5_body_fits_exactly_at_the_ceiling_is_not_truncated`: the boundary payload is deliverable, so it is passed through
-- `s4_5_wake_skipped_when_notification_already_read`: a notification read during the wake delay suppresses the wake; an unread one still fires
-- `presence_check_serializes_with_type_tag`: the check carries the toast content beside `deadline_ms` / `sent_at_ms`
-- `native_push_requested_serializes_with_type_tag`: the native-desktop SSE frame wire shape (`type: "NativePushRequested"` + content fields)
-- `native_push_requested_is_transient_on_notification_aggregate`: never persisted; lives on the `notification` aggregate
+- `crates/lucidos-engine/src/scheduler/push_tests.rs`: candidate selection,
+  pong outcomes, deadlines, multi-tab suppression and platform predicates.
+- `crates/lucidos-e2e/tests/api_support/notifications_presence_test.rs`:
+  the HTTP notification and presence protocol.
+- `crates/lucidos-engine/src/scheduler/push_test_log.rs` and
+  `crates/lucidos-engine/src/api/notifications.rs`: the test-only push log.
+  `GET /api/v1/_test/push-log` requires the `e2e-test-hooks` Cargo feature.
+  Production binaries omit this endpoint.
 
-**Frontend (`crates/lucidos-app/src/store/`):**
+### Frontend
 
-The native-desktop OS surface is exercised in `actions/native-push.test.ts`,
-driven by the `NativePushRequested` SSE. It covers the banner on Tauri when the
-frame is fresh and the shell is not in front, with the deep link forwarded in
-SW-message shape. It covers the two no-op gates: not Tauri and a stale frame. A
-window that came forward takes the in-app outcome instead of the banner. It
-covers the empty-title `Lucidos` fallback.
+Paths below are relative to `crates/lucidos-app/src/`.
 
-It also covers `setupNativePushTapRouting` **draining** the durable pending-tap
-stash (`take_pending_native_taps`) through `dispatchDeepLink`. All four triggers
-are exercised: the startup cold path, the `native-notification-tapped` warm
-signal, window `focus`, and page `visibilitychange`. So are a multi-tap drain,
-an empty-drain no-op and an off-Tauri no-op.
+| Test file | Coverage |
+|---|---|
+| `store/actions/in-app-notification-toast.test.ts` | The §4 row classifier and shell activity. |
+| `store/__tests__/presence-check-toast.test.ts` | PresenceCheck dispatch, toast outcomes, auto-read and overflow. |
+| `store/actions/presence-pong.test.ts` | Act before answering; ignore expired checks. |
+| `store/__tests__/presence-check-races.test.ts` | Visibility changes around a pong or native banner. |
+| `store/actions/push-device-toggle.test.ts` | Device opt-in, permission refusal and silencing other phones. |
+| `store/actions/notification-deeplink.test.ts` | Warm and cold notification routing. |
+| `store/actions/native-push.test.ts` | Native banner routing and freshness. |
+| `sw.test.ts` | Service-worker notification clicks and deep links. |
 
-Last comes the **workspace scoping** the page owes. It drains with its own
-`WORKSPACE_ID`, re-read per drain and `null` on a no-gateway engine. It
-dispatches everything handed back, and navigates nothing.
+### Browser
 
-The **window targeting** behind that is Rust-side, and unit-tested with
-`cargo test -p lucidos-app`. `choose_tap_target` (in `notifications.rs`) is
-covered on all five of its outcomes:
+`crates/lucidos-app/e2e/notifications-all.spec.ts` verifies closed detail panels,
+row navigation, infinite scrolling, event deep links, auto-read, toast preferences
+and the Declarative Web Push payload.
 
-- focusing a window already on the raising workspace, preferring `main`;
-- pointing a picker or root window at it;
-- aiming the boot navigation while the client is still starting;
-- opening a NEW window rather than taking one off another workspace;
-- falling back to the main window for an unattributed tap.
-
-Beside it, `tap_belongs_to` is covered leaving another workspace's tap in the
-stash. So is `window_context` reading the slug out of a window URL, which lives
-in `window_target.rs` with the URL helpers both window choosers share.
-
-The active-device **seed** is exercised in `utils/nativeWindow.test.ts`.
-`startNativeWindowActiveTracking` pulls `get_native_window_active` and seeds the
-cache, correcting the `true` default, before registering the transition
-listener. It keeps tracking transitions after, leaves the default on a failed
-seed, and is a no-op off-Tauri.
-
-The §4 row matrix is exercised in `__tests__/presence-check-toast.test.ts`, driven by the `PresenceCheck` SSE, with the outcome each row reports. It covers Row 1 auto-read, Row 2/3 toast, Row 4 hidden and Row 4b fullscreen no-toast, and null-event_id fall-through. It also covers the deadline gate, overflow folding, toasts off, and the `handleGlobalEvent('PresenceCheck')` wiring. The act-then-answer order lives in `actions/presence-pong.test.ts`. The two interleavings that once left the reader with no surface live in `__tests__/presence-check-races.test.ts`: a page that hides right after answering, and a desktop window that comes forward before its banner frame.
-
-- `s4_row1_focused_event_in_viewport_no_toast_no_badge_marks_read`
-- `s4_row2_focused_scrolled_away_toast_badge_no_mark_read`
-- `s4_row3_active_other_thread_toast_badge_no_mark_read`
-- `s4_row4_hidden_increments_badge_no_toast`
-- `s4_null_event_id_with_focused_thread_falls_through_to_row2_toast_and_badge`
-- `s4_null_event_id_with_other_thread_falls_through_to_row3_toast_and_badge`
-- `s2_visibilitychange_while_visible_refreshes_device_presence_for_ios_pwa_resume`
-- `s4_5_setup_routing_runs_handle_hash_location_on_visibilitychange_visible_for_ios_pwa_resume`
-- `s4_5_setup_routing_skips_dispatch_when_document_is_hidden`
-- `s4_5_setup_routing_runs_handle_hash_location_on_window_focus`
-- `s4_5_setup_routing_runs_handle_hash_location_on_pageshow_bfcache_restore`
-- `s4_5_setup_routing_runs_handle_hash_location_on_hashchange_warm_path`
-- `s4_5_setup_routing_teardown_removes_every_registered_listener`
-- `s4_5_setup_routing_teardown_clears_cold_start_timer`
-- `s4_5_handle_hash_location_dispatches_notification_navigate_target`
-- `s4_5_handle_hash_location_dispatches_query_url_for_ios_declarative_reload`
-- `s4_5_handle_hash_location_strips_deep_link_hash_after_dispatch_idempotent`
-- `s4_5_handle_hash_location_routes_bare_thread_hash_via_focus_thread_or_bootstrap`
-- `s4_5_handle_hash_location_noops_on_unrecognized_hash_anchor`
-
-**Service worker `notificationclick` routing (`crates/lucidos-app/src/sw.test.ts`, "deep-link routing" suite):** the macOS-Chrome warm-tap path (§4.5 "warm-tab routing").
-- A warm controlled tab is focused and gets the deep link via `postMessage`, NOT a fragment `client.navigate()`. A modal tap posts it too.
-- A cold tap (no open tab) opens a window at the engine-built hash URL.
-- Every tap marks the source notification read and closes the OS notification.
-
-**Multi-tab reconciliation (engine):**
-- `s2_multi_tab_one_shown_one_hidden_suppresses_push`
-- `s2_multi_tab_both_pong_event_in_viewport_marks_read_once_idempotent`
-
-### §5.2: API e2e (`crates/lucidos-e2e/tests/`)
-
-- `s3_notification_with_visible_device_emits_presence_check_sse`
-- `s3_notification_with_connected_sse_but_no_candidate_runs_presence_check`: an open SSE connection with ZERO `device_presence` candidates still triggers the PresenceCheck (iOS stale heartbeat)
-- `s3_notification_with_no_candidates_sends_push_immediately`: still skips when there is also no open SSE connection
-- `s3_presence_pong_endpoint_accepts_valid_payload`
-- `s4_a_shown_ack_suppresses_the_push_and_the_check_carries_the_toast`: the check carries the toast content, and a `shown` answer leaves zero `push_log` rows for that device.
-- `s4_a_not_shown_ack_leaves_the_push_to_the_os`: an answer alone suppresses nothing; a `not_shown` one gets the push.
-- `s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscription`: a connected page with NO web-push subscription still triggers the decision. On the push-allowed branch it receives a `NativePushRequested` frame carrying the notification id.
-
-### §5.3: Browser e2e (`crates/lucidos-app/e2e/notifications-all.spec.ts`)
-
-Per Lucidos's Playwright project setup (`chromium`, `mobile`, `mobile-webkit`), the scenarios that depend on platform behavior tag the project they apply to.
-
-- `s2_scenario_1_active_focused_event_in_viewport_no_push_no_toast_marked_read`
-- `s2_scenario_2_active_focused_scrolled_away_toast_badge_no_push`
-- `s2_scenario_3_active_other_thread_toast_badge_no_push`
-- `s2_scenario_4_tab_in_background_tab_push_fires_badge_updates`
-- `s2_scenario_5_tab_foreground_window_blurred_push_fires` *(chromium only: desktop hasFocus)*
-- `s2_scenario_6_tab_closed_push_fires`
-- `s2_scenario_7_two_devices_one_active_no_push_to_either`
-- `s2_scenario_8_two_devices_both_hidden_push_to_both`
-- `s2_scenario_9_ios_pwa_visible_no_push_to_either_device` *(mobile-webkit)*
-- `s2_scenario_10_ios_pwa_hidden_push_fires` *(mobile-webkit)*
-
-### §5.4: Test harness for OS push assertions
-
-Browser e2e need to assert "OS push WAS sent" / "WAS NOT sent" without waiting for FCM/APNs delivery. Plan:
-- Test-mode flag (env var or build-time feature) installs an in-memory push-transport stub. Real `web_push` calls instead append to an in-process `push_log` table keyed by `(device_id, notification_id, sent_at)` plus a `payload` column carrying the JSON bytes the real transport would have encrypted and sent. The payload column lets tests assert the Declarative Web Push envelope shape (`{web_push: 8030, notification: {…}}`) in addition to delivery.
-- Expose `GET /api/v1/_test/push-log?since=<iso>` (mounted only when test mode is on, behind the same gating as `setup_test_db`).
-- E2e helpers: `expectPushSent(page, notificationId, { deviceId?, timeoutMs? })` returns the recorded `PushLogEntry` (including the on-wire `payload` string) so tests can assert envelope shape, and `expectNoPushSent(page, notificationId, waitMs?)` proves suppression. Both poll via Playwright's `APIRequestContext` so the engine's self-signed localhost cert is trusted (Node's stricter `fetch` would reject).
-
-The stub also bypasses the real APNs/FCM credentials, so e2e doesn't need either.
+The suite uses `expectPushSent` from `e2e/helpers.ts` to inspect the test push log.
+It checks transport decisions without requiring live APNs or FCM credentials.
 
 ## §6: What this spec doesn't cover
 
@@ -984,4 +883,6 @@ The design removed code paths the old one relied on:
 - **`device_presence` is the candidate index only.** `record_visible` / `record_hidden` / the 30s heartbeat tell the engine whether to RUN the PresenceCheck, alongside the SSE count (§3).
 - **Deleted `DevicePresenceStore::any_visible()`.** The pong-based decision replaced the global suppression query.
 - **Test-mode push log endpoint** (`GET /api/v1/_test/push-log`) is gated by the Cargo feature flag `e2e-test-hooks`. The e2e workspace builds with it on; production binaries do not include the endpoint.
-- **Backwards compatibility: synchronous deploy.** The web app pulls the latest bundle on page load, so an active page always runs code that can pong. A missing pong times out to push-allowed, which covers the window between an engine restart and the next page load. A page still on an older bundle sends a pong the engine refuses (no `outcome`), which counts as no pong, so it gets the push.
+- **Older pages fall back to push.** An open page can retain an earlier bundle.
+  A missing pong, or an old pong without the required `outcome`, times out to
+  push-allowed. The next page load fetches the current bundle.

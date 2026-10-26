@@ -16,10 +16,11 @@ vi.mock('./thread-loading', async (importOriginal) => ({
 }));
 
 import { createPainter, type FindPainter } from '@lucidos/find';
-import { clearBand, markdownText, transcriptPassages, transcriptTarget } from './transcript-find';
+import { clearBand, transcriptTarget } from './transcript-find';
+import { freshText, markdownText, transcriptPassages } from './transcript-passages';
 import { transcriptRenderRequest } from './transcriptRenderRequest';
 import { ensureWholeThreadLoaded } from './thread-loading';
-import { collapsedExchanges, detailsExpanded, threadMap } from '../store';
+import { collapsedExchanges, collapsedInitiators, detailsExpanded, openSubAgentGroups, stepsExpanded, threadMap } from '../store';
 import { makeThreadState } from '../__tests__/thread-events-helpers';
 import type { ThreadEvent } from '../thread-events';
 
@@ -81,13 +82,24 @@ beforeEach(() => {
 
 describe('transcriptPassages', () => {
   it('reads every user message and reply chunk, in order, as drawn text', () => {
-    const passages = transcriptPassages(thread(conversation), markdownText);
-    expect(passages.map((p) => [p.userSeq, p.part, blocks(p.text)])).toEqual([
-      [1, { kind: 'user' }, ['Where is the apple?']],
-      [1, { kind: 'reply', seqs: [2], needsDetails: false }, ['The apple is on the table.', 'one apple pie']],
-      [3, { kind: 'user' }, ['And the pear?']],
-      [3, { kind: 'reply', seqs: [4], needsDetails: false }, ['No pear here.']],
+    const passages = transcriptPassages(thread(conversation), freshText);
+    expect(passages.map((p) => [p.userSeq, p.unfold, blocks(p.text)])).toEqual([
+      [1, { initiator: true }, ['Where is the apple?']],
+      [1, {}, ['The apple is on the table.', 'one apple pie']],
+      [3, { initiator: true }, ['And the pear?']],
+      [3, {}, ['No pear here.']],
     ]);
+  });
+
+  it('skips the engine message that opened a successor session, which its session card folds', () => {
+    const opening = 'Carry on from the handoff.';
+    const handoff = { kind: 'handoff', checkpoint: 'plan-approval', message: opening };
+    const passages = transcriptPassages(thread([
+      [1, { type: 'MessageReceived', channel: 'claude_code', text: opening, origin: { kind: 'engine', reason: { kind: 'successor_session' } } } as ThreadEvent],
+      [2, { type: 'SessionStarted', session_id: 's2', channel: 'claude_code', continuity: handoff } as ThreadEvent],
+      [3, { type: 'CodingAgentTextStreamed', channel: 'claude_code', text: 'Picking up.' } as ThreadEvent],
+    ]), freshText);
+    expect(passages.map((p) => p.where.selector)).toEqual(['.response-chunk[data-text-seq="3"]']);
   });
 });
 
@@ -180,9 +192,9 @@ describe('the transcript target', () => {
       [4, { type: 'ToolResult', name: 'read_file', result: 'ok', ...ref } as ThreadEvent],
       [5, { type: 'TextStreamed', text: 'The last word.', ...ref } as ThreadEvent],
     ]);
-    const passages = transcriptPassages(threadMap.value.get(ID)!, markdownText);
-    expect(passages.filter((p) => p.part.kind === 'reply').map((p) => p.part))
-      .toEqual([{ kind: 'reply', seqs: [2], needsDetails: true }, { kind: 'reply', seqs: [5], needsDetails: false }]);
+    const passages = transcriptPassages(threadMap.value.get(ID)!, freshText);
+    expect(passages.filter((p) => p.where.selector.startsWith('.response-chunk')).map((p) => [p.where.selector, p.unfold]))
+      .toEqual([['.response-chunk[data-text-seq="2"]', { details: true }], ['.response-chunk[data-text-seq="5"]', {}]]);
 
     document.body.innerHTML = `<div class="chat-exchange" data-thread-id="${ID}" data-user-seq="1">
       <div class="response-chunk" data-text-seq="2"><p>An early apple.</p></div></div>`;
@@ -192,6 +204,52 @@ describe('the transcript target', () => {
     expect(detailsExpanded.value).toBe(true);
     target.clear();
     expect(detailsExpanded.value, 'the reader\'s setting comes back').toBe(false);
+  });
+
+  it('finds a question card\'s option, and unfolds the card to step to it', async () => {
+    thread([
+      [1, { type: 'MessageReceived', text: 'Plan it' } as ThreadEvent],
+      [2, {
+        type: 'UserQuestionAsked', tool_use_id: 'q1', question: 'Approve?', multi_select: false,
+        options: [{ id: 'a', label: 'Approve', description: 'Approves the plan.' }],
+      } as ThreadEvent],
+    ]);
+    document.body.innerHTML = `<div class="chat-exchange" data-thread-id="${ID}" data-user-seq="2">
+      <div class="initiator-panel"><div class="initiator-body"><div class="question-body">
+        <div class="question-text markdown-content"><p>Approve?</p></div>
+        <div class="question-options"><button class="question-option">
+          <span class="question-option-label">Approve</span><span class="question-option-desc">Approves the plan.</span>
+        </button></div>
+      </div></div></div></div>`;
+    collapsedInitiators.value = new Set([`${ID}:2`]);
+    const painter = recordingPainter();
+    const target = transcriptTarget(ID, painter);
+    expect(await target.run('approves')).toEqual({ total: 1, current: 0, capped: false });
+    expect(await target.run('approves', 1)).toEqual({ total: 1, current: 1, capped: false });
+    expect(collapsedInitiators.value.has(`${ID}:2`)).toBe(false);
+    expect(painter.painted[painter.painted.length - 1]).toEqual({ ranges: ['Approves'], current: 0 });
+  });
+
+  it('turns steps on and opens a sub-agent group for a step row, and hands the setting back on close', async () => {
+    thread([
+      [1, { type: 'MessageReceived', text: 'Go' } as ThreadEvent],
+      [2, { type: 'CodingAgentToolCalled', name: 'Agent', args: { description: 'Review' }, tool_use_id: 'ag' } as ThreadEvent],
+      [3, { type: 'CodingAgentToolCalled', name: 'Grep', args: { pattern: 'needle' }, tool_use_id: 'c1', parent_tool_use_id: 'ag' } as ThreadEvent],
+      [4, { type: 'CodingAgentToolResult', name: '', result: 'ok', tool_use_id: 'c1', parent_tool_use_id: 'ag' } as ThreadEvent],
+      [5, { type: 'CodingAgentToolResult', name: '', result: 'ok', tool_use_id: 'ag' } as ThreadEvent],
+    ]);
+    document.body.innerHTML = `<div class="chat-exchange" data-thread-id="${ID}" data-user-seq="1">
+      <div class="inline-step" data-find-row="3"><button class="step-main"><span class="step-description">Search 'needle'</span></button></div>
+    </div>`;
+    stepsExpanded.value = false;
+    openSubAgentGroups.value = new Set();
+    const target = transcriptTarget(ID, recordingPainter());
+    expect(await target.run('needle', 1)).toEqual({ total: 1, current: 1, capped: false });
+    expect(stepsExpanded.value).toBe(true);
+    expect(openSubAgentGroups.value.has('ag')).toBe(true);
+    target.clear();
+    expect(stepsExpanded.value, 'the reader\'s setting comes back').toBe(false);
+    expect(openSubAgentGroups.value.has('ag'), 'a fold the step opened stays open').toBe(true);
   });
 
   it('never changes the transcript\'s markup', async () => {

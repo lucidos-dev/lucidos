@@ -84,10 +84,11 @@ test.describe('Cancel streaming response', () => {
     // and not `new TouchEvent()`: that constructor is illegal in WebKit, the
     // engine this case exists for. Same shape as `sdk-iframe-tooltip-all.spec.ts`.
     //
-    // A stationary `pointerdown` first, so the tap gate holds a real press and
-    // the lift is ruled a tap rather than waved through as press-less. That is
-    // what a finger does, and it also proves no earlier gesture left the gate
-    // holding an abort.
+    // A stationary `pointerdown` and a `touchstart` go first. Then the tap gate
+    // and the touch path both hold a real press, and the lift counts as a tap. A lift
+    // with no `touchstart` behind it is refused on a Cancel face, since a press
+    // serves only the face it began on. A finger sends both, and the pair also
+    // proves no earlier gesture left the gate holding an abort.
     await page.evaluate((sel) => {
       // The visible one: a mobile layout keeps every pane mounted at once.
       const el = Array.from(document.querySelectorAll<HTMLElement>(sel)).find(
@@ -104,7 +105,13 @@ test.describe('Cancel streaming response', () => {
       Object.defineProperty(down, 'screenY', { value: y });
       el.dispatchEvent(down);
 
-      const point = { identifier: 1, target: el, clientX: x, clientY: y };
+      const point = { identifier: 1, target: el, clientX: x, clientY: y, screenX: x, screenY: y };
+      const start = new Event('touchstart', { bubbles: true, cancelable: true, composed: true });
+      Object.defineProperty(start, 'touches', { value: [point] });
+      Object.defineProperty(start, 'targetTouches', { value: [point] });
+      Object.defineProperty(start, 'changedTouches', { value: [point] });
+      el.dispatchEvent(start);
+
       const up = new Event('touchend', { bubbles: true, cancelable: true, composed: true });
       Object.defineProperty(up, 'touches', { value: [] });
       Object.defineProperty(up, 'targetTouches', { value: [] });

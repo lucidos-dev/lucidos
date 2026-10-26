@@ -46,6 +46,24 @@ mod question_card_tests {
         assert!(refused_branch.contains("continue;"));
     }
 
+    /// A quiet pick ends the turn after its batch: the loop returns before it
+    /// appends the round and calls the model again.
+    #[test]
+    fn a_quiet_answer_ends_the_turn_before_the_next_model_call() {
+        let run = include_str!("../agentic_loop/run.rs");
+        assert!(run.contains("quiet_answer |= asked.quiet;"));
+        let quiet = run
+            .find("if quiet_answer && injection_rx.is_empty() {")
+            .unwrap();
+        let next_round = run
+            .find("// 1. Add the assistant's tool_use response as a message")
+            .unwrap();
+        assert!(quiet < next_round);
+        let branch = &run[quiet..next_round];
+        assert!(branch.contains("ResponseGenerated"));
+        assert!(branch.contains("return Ok(terminal_result("));
+    }
+
     const NOTE: &str = "I've drafted the refund message and the two links it needs.";
 
     /// A tool round whose text reached the user only as a summary tells the

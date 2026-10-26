@@ -30,7 +30,7 @@ const TOGGLE_ATTR = 'data-dashboard-rail-toggle';
 /** The desktop host of the `desktop` dashboard: a rail at the window's right
  *  edge, the full height of the window, beside the header and the panes. Its
  *  divider resizes it and its toggle hides it. A phone shows its own dashboard
- *  as a sheet instead, so the rail draws nothing there. */
+ *  as a panel instead, so the rail draws nothing there. */
 export function DashboardRail() {
   if (viewportIsMobile.value) return null;
   return <Rail />;
@@ -101,6 +101,7 @@ export function DashboardRailToggle() {
         onClick={blocked ? undefined : toggleDashboardRail}
         aria-label={label}
         pressed={shown}
+        tone="quiet"
         aria-disabled={blocked || undefined}
         data-tooltip={blocked ? DASHBOARD_TOO_NARROW : label}
       >

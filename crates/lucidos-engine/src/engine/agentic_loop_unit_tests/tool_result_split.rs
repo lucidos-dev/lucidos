@@ -10,8 +10,9 @@
 
 mod tool_result_split_tests {
     use super::super::{
-        build_tool_result_blocks, holds_explicitly_requested_image, parse_app_capture_marker,
-        split_tool_result, strip_app_capture_marker, take_answer_images, ToolOutput,
+        build_tool_result_blocks, holds_answer_images, holds_explicitly_requested_image,
+        parse_app_capture_marker, split_tool_result, strip_app_capture_marker, take_answer_images,
+        ToolOutput,
     };
     use crate::core::store::synthesize_tool_use_id;
     use crate::engine::tools::files::{parse_image_content_marker, EXPLICIT_IMAGE_RESULT_TEXT};
@@ -250,6 +251,26 @@ mod tool_result_split_tests {
             first_image > last_result,
             "images must come after every result"
         );
+    }
+
+    /// An answer's images pin their message for the rest of the turn. Unpinned,
+    /// trim pass 0 stripped them on the next model call. The agent then told
+    /// the user it could not load the screenshot it had just been shown.
+    #[test]
+    fn an_answer_s_images_pin_their_message() {
+        let with_image = ToolOutput {
+            images: vec![crate::api::ChatImage {
+                base64: PNG_1X1.to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+            ..out("call_1", "{\"Q\":\"A\"}".to_string())
+        };
+
+        assert!(holds_answer_images(&[
+            out("call_2", "plain".to_string()),
+            with_image
+        ]));
+        assert!(!holds_answer_images(&[out("call_2", "plain".to_string())]));
     }
 
     /// The confirm-flow redaction has to land on BOTH sides. It exists so the

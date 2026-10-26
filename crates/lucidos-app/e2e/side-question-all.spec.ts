@@ -5,7 +5,7 @@ import {
   navigateToApp, sendMessage, uniqueMessage, assertHealthy,
   pickComposeDestination, newThread, countExchanges, waitForActionPanel,
   waitForResponse, waitForVisibleInput, waitForStreamingToStart, isMobileViewport,
-  openThreadDrawer, ensureOnThreadPane, waitForPaneAtRest,
+  openThreadDrawer, ensureOnThreadPane, waitForPaneAtRest, composerControl,
 } from './helpers';
 import { psql, createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 
@@ -39,26 +39,21 @@ function seedWaitingCard(name: string, multiSelect = false) {
   return { threadId, changeId, branch, file, toolUseId, title: `${name} ${suffix}` };
 }
 
-/** Hold `button` long enough to turn on side-question mode. A mouse hold,
- *  which every project accepts. */
-async function holdButton(page: Page, button: Locator): Promise<void> {
-  const box = (await button.boundingBox())!;
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await page.mouse.down();
-  await page.waitForTimeout(700);
-  await page.mouse.up();
+/** Press the composer row's side-question toggle, wherever the fold put it. */
+async function pressSideQuestionToggle(page: Page): Promise<void> {
+  await (await composerControl(page, '[data-role="side-question-toggle"]')).click();
 }
 
 /** The round button that asks the box while side-question mode is on. */
 const roundAsk = (page: Page): Locator =>
-  page.locator('button.send-cancel-round[aria-label="Ask side question"]:visible').first();
+  page.locator('button.send-cancel-morph[aria-label="Ask side question"]:visible').first();
 
-/** Ask `question` as a side question: type it, hold Send to turn on the mode,
- *  then press the round Ask. */
-async function askBySendHold(page: Page, question: string): Promise<void> {
+/** Ask `question` as a side question: type it, press the toggle to turn on the
+ *  mode, then press the round Ask. */
+async function askByToggle(page: Page, question: string): Promise<void> {
   const input = await waitForVisibleInput(page, 15_000);
   await input.fill(question);
-  await holdButton(page, page.locator('[aria-label="Send message"]:visible').first());
+  await pressSideQuestionToggle(page);
   await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
   await roundAsk(page).click();
 }
@@ -90,7 +85,7 @@ test.describe('side questions in a Claude Code thread', () => {
     const exchangesBefore = await countExchanges(page);
     const postsBefore = chatPosts.length;
 
-    await askBySendHold(page, 'What codeword did you just say? Reply with the codeword only.');
+    await askByToggle(page, 'What codeword did you just say? Reply with the codeword only.');
 
     const card = page.locator('[data-role="side-question-card"]:visible').first();
     await expect(card).toBeVisible();
@@ -136,9 +131,9 @@ test.describe('side questions in a Claude Code thread', () => {
   });
 
   // While a question card waits, a typed draft turns the row's end button into
-  // Submit. Its hold turns on side-question mode with the draft kept, and the
+  // Submit. The toggle turns on side-question mode with the draft kept, and the
   // round Ask then asks it aside, never as an answer to the card.
-  test('holding Submit turns on the mode and the round Ask leaves the card waiting', async ({ page }) => {
+  test('the toggle turns on the mode and the round Ask leaves the card waiting', async ({ page }) => {
     const { threadId, changeId, branch, file, toolUseId, title } = seedWaitingCard('E2E Side Submit');
 
     const sideQuestionBodies: string[] = [];
@@ -168,14 +163,14 @@ test.describe('side questions in a Claude Code thread', () => {
       await input.fill('what does option two mean?');
       const submit = page.locator('button[aria-label="Submit answer"]:visible').first();
       await expect(submit).toBeVisible({ timeout: 10_000 });
-      await holdButton(page, submit);
+      await pressSideQuestionToggle(page);
 
       await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
       await expect(input).toHaveValue('what does option two mean?');
       // One Ask button in every state: the round one, never a square "Ask".
       await expect(roundAsk(page)).toBeVisible();
       await expect(page.locator('button[aria-label="Submit answer"]:visible')).toHaveCount(0);
-      // The hold's own release answered nothing.
+      // Turning the mode on answered nothing.
       expect(answerPosts).toEqual([]);
 
       await roundAsk(page).click();
@@ -188,11 +183,10 @@ test.describe('side questions in a Claude Code thread', () => {
     }
   });
 
-  // An empty box on a waiting card shows a lone Cancel. Its hold turns on
-  // side-question mode, as Stop's does, and the release never cancels. The
-  // mode then wins over the card: a typed box shows the round Ask, and asking
-  // leaves the card waiting.
-  test('holding Cancel on a waiting card starts a side question', async ({ page }) => {
+  // An empty box on a waiting card shows a lone Cancel. The toggle turns on
+  // side-question mode and cancels nothing. The mode then wins over the card:
+  // a typed box shows the round Ask, and asking leaves the card waiting.
+  test('the toggle on a waiting card starts a side question', async ({ page }) => {
     const { threadId, changeId, branch, file, toolUseId, title } = seedWaitingCard('E2E Side Cancel');
     const sideQuestionBodies: string[] = [];
     await page.route('**/api/v1/side-questions', (route) => {
@@ -223,15 +217,11 @@ test.describe('side questions in a Claude Code thread', () => {
       await expect(input).toHaveValue('');
       const cancel = page.locator('button.action-btn-danger[aria-label="Cancel"]:not(:disabled):visible').first();
       await expect(cancel).toBeVisible({ timeout: 10_000 });
-      const box = (await cancel.boundingBox())!;
-      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-      await page.mouse.down();
-      await page.waitForTimeout(700);
-      await page.mouse.up();
+      await pressSideQuestionToggle(page);
 
       await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
       await expect(input).toHaveAttribute('placeholder', 'Ask a side question…');
-      expect(answerOrStopPosts, 'the hold\'s release cancelled nothing').toEqual([]);
+      expect(answerOrStopPosts, 'turning the mode on cancelled nothing').toEqual([]);
 
       await input.fill('what does option one mean?');
       await roundAsk(page).click();
@@ -244,9 +234,9 @@ test.describe('side questions in a Claude Code thread', () => {
     }
   });
 
-  // Before any pick, a multi-select card's Submit reads disabled but still
-  // takes the hold, which turns on the mode and never answers.
-  test('holding a multi-select card\'s Submit turns on the mode, even before a pick', async ({ page }) => {
+  // Before any pick, a multi-select card shows a lone Cancel and no Submit. The
+  // toggle still turns on the mode and answers nothing.
+  test('the toggle turns on the mode on a multi-select card, even before a pick', async ({ page }) => {
     const { threadId, changeId, branch, file, toolUseId, title } = seedWaitingCard('E2E Side Multi Hold', true);
     const answerPosts: string[] = [];
     page.on('request', (req) => {
@@ -261,11 +251,12 @@ test.describe('side questions in a Claude Code thread', () => {
       const card = page.locator(`.question-body[data-tool-use-id="${toolUseId}"]`).first();
       await expect(card).toBeVisible({ timeout: 15_000 });
 
-      const multiSubmit = page.locator('button.split-button-primary[aria-label="Submit answer"]:visible');
-      await expect(multiSubmit).toHaveAttribute('aria-disabled', 'true', { timeout: 10_000 });
-      await holdButton(page, multiSubmit);
+      const cancel = page.locator('button.action-btn-danger[aria-label="Cancel"]:visible');
+      await expect(cancel).toBeVisible({ timeout: 10_000 });
+      await expect(page.locator('button[aria-label="Submit answer"]:visible')).toHaveCount(0);
+      await pressSideQuestionToggle(page);
       await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
-      await expect(multiSubmit).toHaveCount(0);
+      await expect(page.locator('button[aria-label="Submit answer"]:visible')).toHaveCount(0);
       expect(answerPosts).toEqual([]);
       await expect(card).toBeVisible();
     } finally {
@@ -274,7 +265,7 @@ test.describe('side questions in a Claude Code thread', () => {
   });
 
   // A multi-select card had no way in. The shortcut now turns on the mode
-  // there too. The card's split button steps aside, so the box asks.
+  // there too. Typing in the mode then shows the round Ask, not Submit.
   test('the Side question shortcut works on a multi-select card', async ({ page }) => {
     test.skip(isMobileViewport(page), 'Keyboard shortcuts are desktop only');
     const { threadId, changeId, branch, file, toolUseId, title } = seedWaitingCard('E2E Side Multi', true);
@@ -287,15 +278,14 @@ test.describe('side questions in a Claude Code thread', () => {
       const card = page.locator(`.question-body[data-tool-use-id="${toolUseId}"]`).first();
       await expect(card).toBeVisible({ timeout: 15_000 });
 
-      const multiSubmit = page.locator('button.split-button-primary[aria-label="Submit answer"]:visible');
-      await expect(multiSubmit).toBeVisible({ timeout: 10_000 });
+      await expect(page.locator('button.action-btn-danger[aria-label="Cancel"]:visible')).toBeVisible({ timeout: 10_000 });
       const input = await waitForVisibleInput(page, 15_000);
       await input.focus();
       await page.keyboard.press('Alt+Enter');
       await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
-      await expect(multiSubmit).toHaveCount(0);
       await page.keyboard.type('what does option two mean?');
       await expect(roundAsk(page)).toBeVisible();
+      await expect(page.locator('button[aria-label="Submit answer"]:visible')).toHaveCount(0);
       await expect(card).toBeVisible();
     } finally {
       cleanupCCThread(threadId, changeId, branch, file);
@@ -314,22 +304,22 @@ test.describe('side questions in a Claude Code thread', () => {
     await sendMessage(page, `Say exactly: "${uniqueMessage('side-refusal')}". Do not create any files.`);
     await waitForActionPanel(page, 'Archive', 120_000);
 
-    await askBySendHold(page, 'anything');
+    await askByToggle(page, 'anything');
     const card = page.locator('[data-role="side-question-card"]:visible').first();
     await expect(card).toHaveAttribute('data-status', 'failed');
     await expect(card.getByRole('alert')).toHaveText('Side questions are not available in Codex threads.');
   });
 });
 
-/** A Lucidos Agent thread answers from its own model (the mock, in e2e). Every
- *  hold turns on side-question mode, with any draft kept in the box. The
- *  release that ends a hold never also acts. */
+/** A Lucidos Agent thread answers from its own model (the mock, in e2e). The
+ *  toggle turns on side-question mode, with any draft kept in the box. No
+ *  composer button has a hold. */
 test.describe('side questions in a Lucidos Agent thread', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
-  test('holding Send turns on the mode with the draft kept, and Ask asks it', async ({ page }) => {
+  test('the toggle turns on the mode with the draft kept, and Ask asks it', async ({ page }) => {
     const chatPosts: string[] = [];
     page.on('request', (req) => {
       if (req.method() === 'POST' && /\/api\/v1\/chat\b/.test(req.url())) chatPosts.push(req.url());
@@ -344,11 +334,11 @@ test.describe('side questions in a Lucidos Agent thread', () => {
 
     const input = await waitForVisibleInput(page, 15_000);
     await input.fill('what did you just say?');
-    await holdButton(page, page.locator('[aria-label="Send message"]:visible').first());
+    await pressSideQuestionToggle(page);
 
     await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
     await expect(input).toHaveValue('what did you just say?');
-    // The hold's own release sent nothing.
+    // The toggle sent nothing.
     expect(chatPosts.length).toBe(postsBefore);
     await roundAsk(page).click();
 
@@ -361,9 +351,9 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     expect(chatPosts.length).toBe(postsBefore);
   });
 
-  // A mouse hold hands focus back to the composer, so the user types on and
-  // Enter asks the whole draft rather than sending it.
-  test('typing on after a hold, then Enter, asks the whole draft', async ({ page }) => {
+  // The toggle puts focus in the composer, so the user types on and Enter asks
+  // the whole draft rather than sending it.
+  test('typing on after the toggle, then Enter, asks the whole draft', async ({ page }) => {
     test.skip(isMobileViewport(page), 'Enter sends only on desktop; on a phone it is a newline');
     const chatPosts: string[] = [];
     page.on('request', (req) => {
@@ -380,7 +370,7 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     const input = await waitForVisibleInput(page, 15_000);
     await input.fill('what did');
     await input.focus();
-    await holdButton(page, page.locator('[aria-label="Send message"]:visible').first());
+    await pressSideQuestionToggle(page);
 
     await expect(page.locator('[data-role="side-question-mode"]:visible')).toBeVisible();
     await expect(input).toBeFocused();
@@ -425,10 +415,10 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     expect(sideQuestionPosts).toEqual([]);
   });
 
-  // Stop shows only over an empty box, and its hold turns on side-question
-  // mode. The release that ends the hold does not also stop the turn. The mode survives a reload, and its × leaves it with
-  // the text kept.
-  test('holding Stop turns on side-question mode and leaves the turn running', async ({ page }) => {
+  // Stop shows only over an empty box, and the toggle turns on side-question
+  // mode without stopping the turn. The mode survives a reload, and its × leaves
+  // it with the text kept.
+  test('the toggle turns on side-question mode and leaves the turn running', async ({ page }) => {
     const cancelPosts: string[] = [];
     page.on('request', (req) => {
       if (req.method() === 'POST' && /\/api\/v1\/chat\/cancel\b/.test(req.url())) cancelPosts.push(req.url());
@@ -442,11 +432,7 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     // Past the settle window, which holds a fresh Stop disabled.
     const stop = page.locator('button.send-cancel-morph[aria-label="Cancel"]:not(:disabled):visible').first();
     await expect(stop).toBeVisible({ timeout: 30_000 });
-    const box = (await stop.boundingBox())!;
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.down();
-    await page.waitForTimeout(700);
-    await page.mouse.up();
+    await pressSideQuestionToggle(page);
 
     const input = await waitForVisibleInput(page, 15_000);
     const pill = page.locator('[data-role="side-question-mode"]:visible');
@@ -524,5 +510,28 @@ test.describe('side questions in a Lucidos Agent thread', () => {
     await expect(input).toHaveValue('');
     await expect(pill).toHaveCount(0);
     expect(chatPosts.length).toBe(postsBefore);
+  });
+
+  // A long press on Send is a slow tap. A lost iOS lift once read as a hold on
+  // it and turned on the mode, so no composer button has a hold now.
+  test('a long press on Send sends the message and never turns on the mode', async ({ page }) => {
+    await navigateToApp(page);
+    await newThread(page);
+    await sendMessage(page, uniqueMessage('lucidos-send-long-press'));
+    await waitForResponse(page);
+    const exchangesBefore = await countExchanges(page);
+
+    const input = await waitForVisibleInput(page, 15_000);
+    await input.fill(uniqueMessage('lucidos-send-long-press-two'));
+    const send = page.locator('[aria-label="Send message"]:visible').first();
+    const box = (await send.boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.waitForTimeout(700);
+    await expect(page.locator('[data-role="side-question-mode"]:visible')).toHaveCount(0);
+    await page.mouse.up();
+
+    await expect.poll(() => countExchanges(page)).toBe(exchangesBefore + 1);
+    await expect(page.locator('[data-role="side-question-mode"]:visible')).toHaveCount(0);
   });
 });

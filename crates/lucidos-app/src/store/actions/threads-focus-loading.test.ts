@@ -38,7 +38,7 @@ import { threadScrollKey } from '../savedScroll';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
 import { archiveThreadCount, focusedPane, focusedThreadId, generatedTitleIds, mobileView, threadDrawerOpen, threadMap, threadsLoaded, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT } from '../store';
 import { _resetThreadOpenMarksForTesting, takeThreadOpenStart } from '../../utils/threadOpenMarks';
-import { closeDashboardSheet, dashboardSheetOpen, openDashboardSheet } from '../dashboards';
+import { closeDashboardPanel, dashboardPanelOpen, openDashboardPanel } from '../dashboards';
 import { loadAllThreads, loadThreadEvents } from './thread-loading';
 import { focusThread, handleSaveThread, unfocusThread } from './threads';
 import { _resetRowIntentsForTesting } from '../rowIntents';
@@ -83,7 +83,7 @@ beforeEach(() => {
   threadMap.value = new Map();
   _resetComposeDraftsForTesting();
   focusedThreadId.value = null;
-  closeDashboardSheet();
+  closeDashboardPanel();
   mobileView.value = 'thread';
   threadDrawerOpen.value = false;
   drawerOpen.value = false;
@@ -99,14 +99,14 @@ describe('focusThread', () => {
     expect(focusedThreadId.value).toBe('t1');
   });
 
-  it('closes the dashboard sheet, moving to another thread or not', () => {
+  it('closes the dashboard panel, moving to another thread or not', () => {
     focusThread('t1');
-    openDashboardSheet();
+    openDashboardPanel();
     focusThread('t2');
-    expect(dashboardSheetOpen.value).toBe(false);
-    openDashboardSheet();
+    expect(dashboardPanelOpen.value).toBe(false);
+    openDashboardPanel();
     focusThread('t2');
-    expect(dashboardSheetOpen.value).toBe(false);
+    expect(dashboardPanelOpen.value).toBe(false);
   });
 
   it('does not move the transcript, whatever it finds there', () => {

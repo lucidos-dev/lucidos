@@ -59,12 +59,6 @@ export interface HeaderActionSpec {
    *  clicked on unmounts as the menu closes, so the ⋯ is the only box left to
    *  anchor against. */
   onMenuClick?: (anchor: HTMLElement | null) => void;
-  /** The rows this member contributes to the ⋯ menu, when ONE row cannot carry
-   *  it. A composite control is several rows folded: the composer's change
-   *  split button holds an Apply face and a caret menu, and the caret's actions
-   *  would go with the fold. Defaults to the single row the fields above
-   *  describe. Each row supplies its own `key`. */
-  menuRows?: (ctx: OverflowMenuContext) => ComponentChildren;
 }
 
 /** Full-size header rendering.
@@ -135,7 +129,6 @@ function menuActionLabel(label: string): ComponentChild {
  *  closes the menu before firing (links keep their native navigation, `run`
  *  doesn't preventDefault). */
 export function renderMenuAction(a: HeaderActionSpec, ctx: OverflowMenuContext): ComponentChildren {
-  if (a.menuRows) return a.menuRows(ctx);
   const cls = `thread-overflow-item${a.extraClass ? ` ${a.extraClass}` : ''}`;
   // `data-role` travels with `extraClass`, for the same reason: a selector that
   // reaches only the header button stops resolving the moment the action folds.

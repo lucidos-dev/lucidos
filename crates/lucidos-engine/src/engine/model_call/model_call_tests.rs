@@ -256,6 +256,7 @@ fn turn_row(model: &str) -> impl FnOnce(TurnReport) -> ThreadEvent + '_ {
         stable_prefix_fingerprint: report.stable_prefix_fingerprint,
         ttft_ms: report.detail.ttft_ms,
         request_id: report.detail.request_id,
+        session: None,
     }
 }
 

@@ -150,48 +150,8 @@
     color: var(--text-secondary);
 }
 
-/* Where the not-ready strip would be for a handed-off thread. A hand-off is
-   no warning, so it takes the Successor card's neutral frame. */
-.continued-here {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin: 0 0 0.375rem;
-    padding: 0.375rem 0.75rem;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.75);
-    font-size: var(--font-size-xs);
-    font-family: var(--font-ui);
-    color: var(--text-secondary);
-}
-
-.continued-here-icon {
-    width: 0.875rem;
-    height: 0.875rem;
-    flex-shrink: 0;
-    color: var(--text-muted);
-}
-
-.continued-here-link {
-    padding: 0;
-    border: none;
-    background: none;
-    font-size: inherit;
-    color: var(--text-primary);
-    text-decoration: underline;
-    text-underline-offset: 0.15em;
-    cursor: pointer;
-}
-
-@media (hover: hover) {
-    .continued-here-link:hover {
-        color: var(--accent);
-    }
-}
-
 /* Above the prompt box like the not-ready strip. It is a question card in the
-   composer: an offer to continue a large thread in a successor thread, not a
+   composer: an offer to continue a large thread in a successor session, not a
    warning. */
 .successor-card {
     margin-bottom: 0.375rem;
@@ -228,8 +188,9 @@
     gap: 0.25rem;
     margin-bottom: 0.375rem;
     padding: 0.125rem 0.125rem 0.125rem 0.625rem;
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    /* Opaque: the pill sits over the transcript, which must not show through. */
+    background: color-mix(in srgb, var(--accent) 15%, var(--bg-secondary));
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--bg-secondary));
     border-radius: calc(var(--radius-control) * 2);
     font-size: var(--font-size-sm);
     color: var(--text-primary);
@@ -487,7 +448,7 @@
     align-items: flex-end;
     padding: 0 0.75rem 0.5rem 0.5rem;
     /* One icon box tall whatever stands, plus this row's bottom padding. A row
-     * folded down to a short Unarchive button would otherwise shrink, and the
+     * folded down to its action slot would otherwise shrink, and the
      * transcript's scroll end with it, so a reader parked there gets moved. */
     min-height: calc(var(--icon-tap-target) + 0.5rem);
     /* Anchor for absolutely-positioned fade-out children. The row width is
@@ -761,6 +722,9 @@
  * left to wrap. */
 .prompt-actions-right {
     --send-round-size: 1.625rem;
+    /* The action slot's desktop pill: wide enough for every face's word beside
+       its icon, and a caret when it has a menu (ADR 0573). */
+    --action-slot-width: 7.75rem;
     position: relative;
     display: flex;
     align-items: center;
@@ -811,16 +775,16 @@
     align-items: center;
 }
 
-/* The composer's leading control button wears the coding agent's mark: the
-   Claude mark or the Codex mark. A Lucidos Agent thread has no such button,
-   since its model pick is the rung control's. It is one of the prompt
+/* The composer's leading control button wears the Claude mark. A Lucidos
+   Agent or Codex thread has no such button: neither has slash commands, and
+   each model pick is the rung control's. It is one of the prompt
    bar's icons, not a brand badge, so it carries `.icon-btn.header-icon` like
    the todo / subscription / attach buttons beside it and inherits their box
    (2.25rem), their glyph size (--icon-size-lg), their baseline nudge and their
    gray. Every glyph therefore paints in `currentColor` and nothing here sets a
    colour: the row reads as one cluster instead of one badge and three icons.
-   The colored marks survive everywhere else they appear (thread rows,
-   transcript actor chips, nav history, the header mark).
+   The colored marks survive on the transcript actor chips and in nav
+   history. The drawer's thread rows paint them muted too.
 
    It needs no box rules of its own for the same reason: `flex-shrink` and the
    colour transition both come from `.icon-btn`, and the local
@@ -831,8 +795,8 @@
    is not the same SIZE. The row's other glyphs are drawn to one grid and each
    paints exactly 0.75 of its own viewBox (measured painted extent, stroke
    included: todo, the subscription clock and attach are 0.750 to three
-   decimals). The agent marks are foreign artwork and are not: Claude fills
-   0.997 of its box and Codex 0.880. So handing them `--icon-size-lg` painted
+   decimals). The Claude mark is foreign artwork and is not: it fills 0.997
+   of its box. So handing it `--icon-size-lg` painted
    Claude a third larger than the checkbox beside it, which is exactly how it
    looked and what it was reported as.
 
@@ -852,16 +816,6 @@
 
 .commands-btn .claude-icon {
     --mark-art-fill: 0.997;
-}
-
-.commands-btn .codex-icon {
-    /* The Codex mark strokes `--codex-mark` through a presentation attribute,
-       so it keeps that colour on other surfaces. An author rule beats a
-       presentation attribute, so this rule repaints it here alone. Its stroke
-       WIDTH stays as drawn. The fraction below puts the mark in a smaller box,
-       which thins the stroke to 1.76px against the checkbox's 1.67px. */
-    stroke: currentColor;
-    --mark-art-fill: 0.88;
 }
 
 /* Three classes, so this beats `.icon-btn.header-icon svg` (two) outright
@@ -1198,7 +1152,7 @@
     height: var(--scroll-chevron-glyph);
 }
 
-.scroll-to-top { top: max(calc(var(--safe-area-top) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
+.scroll-to-top { top: max(calc(var(--header-controls-top) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
 .scroll-to-bottom { bottom: 0.75rem; }
 
 .scroll-to-top.visible,
@@ -1643,39 +1597,146 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
 }
 
-/* A successor thread's links: "Continued from" opens the feed and "Continued
+/* A legacy successor thread's links: "Continued from" opens the feed and "Continued
    in" closes it, on the turns' content edge like the notice above. */
 .successor-notice {
     padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
 }
 
-/* The cache-warm line closes the feed of a thread waiting on the user: a
-   dashed rule either side of one muted sentence, on the turns' content edge. */
-.cache-keep-alive-divider {
+/* The cache-warm card closes the feed of a thread waiting on the user. The gap
+   below it is the transcript's bottom padding. The gap above is the last
+   turn's bottom padding plus this top padding, which tops it up to the same
+   height (e2e/cache-warm-line-gaps-all.spec.ts). */
+.cache-warm-card {
+    padding: calc(var(--prompt-fade) + var(--nav-focus-reach) - var(--turn-feed-pad-y)) var(--turn-body-inset) 0 0;
+}
+
+/* A thin meter of the pings spent against the break-even budget. The card,
+   the waiting panel and the explainer draw the same one. */
+.keep-alive-meter {
+    margin-top: var(--space-sm);
+    height: 0.1875rem;
+    border-radius: var(--radius-round);
+    background: var(--border-color);
+    overflow: hidden;
+}
+
+.keep-alive-meter > span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+}
+
+/* The explainer's keep-alive math: a toggle, then the slot table it rolls
+   open. The chevron turns with the roll. The meter above it keeps the
+   explainer's paragraph gap. */
+.explainer-body .keep-alive-meter {
+    margin-bottom: var(--space-md);
+}
+
+/* The fold keeps the explainer's paragraph gap below it, open or shut. */
+.keep-alive-math-fold {
+    margin-bottom: var(--space-md);
+}
+
+.keep-alive-math-fold:last-child {
+    margin-bottom: 0;
+}
+
+.keep-alive-math-toggle {
     display: flex;
     align-items: center;
-    gap: var(--space-sm);
-    padding: var(--turn-feed-pad-y) var(--turn-body-inset) 0 0;
+    gap: 0.25rem;
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+}
+
+.keep-alive-math-toggle svg {
+    flex-shrink: 0;
+    transition: transform var(--duration-normal) ease;
+}
+
+.keep-alive-math-toggle[aria-expanded='true'] svg {
+    transform: rotate(90deg);
+}
+
+.keep-alive-math-toggle:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    border-radius: calc(var(--radius-control) * 0.5);
+}
+
+.keep-alive-math {
+    width: 100%;
+    margin-top: var(--space-sm);
+    border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+}
+
+.keep-alive-math th,
+.keep-alive-math td {
+    padding: 0.125rem 0 0.125rem var(--space-sm);
+    text-align: right;
+    white-space: nowrap;
+}
+
+.keep-alive-math th:first-child,
+.keep-alive-math td:first-child {
+    padding-left: 0;
+    text-align: left;
+}
+
+.keep-alive-math th {
+    font-weight: normal;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-color);
+}
+
+/* The row a closed run landed in reads against the odds. */
+.keep-alive-math tr[data-landed='true'] td {
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+}
+
+.keep-alive-math tfoot td {
+    font-weight: 600;
+    color: var(--text-primary);
+    border-top: 1px solid var(--border-color);
+}
+
+.explainer-body .keep-alive-math-note {
+    margin-top: var(--space-sm);
     color: var(--text-muted);
     font-size: var(--font-size-sm);
-    font-variant-numeric: tabular-nums;
 }
 
-.cache-keep-alive-divider::before,
-.cache-keep-alive-divider::after {
-    content: '';
-    flex: 1 1 auto;
-    border-top: 1px dashed var(--border-color);
+/* A run that began under an unanswered question card draws below it, on the
+   same content edge as the turn's own panels. */
+.keep-alive-under-card {
+    padding: var(--turn-feed-pad-y) var(--turn-body-inset) var(--turn-feed-pad-y) 0;
 }
 
-.cache-keep-alive-divider > span {
-    flex: 0 1 auto;
-    text-align: center;
+/* The per-thread switch (ADR 0554), one button on the card, in the panel and
+   in the explainer. */
+.keep-alive-switch {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: var(--space-sm);
 }
 
-.cache-keep-alive-divider strong {
-    color: var(--text-secondary);
-    font-weight: 500;
+/* In the explainer it is a block of the copy, so it takes the paragraphs'
+   spacing above and below. */
+.explainer-body .keep-alive-switch {
+    margin: var(--space-md) 0;
+}
+
+.explainer-body .keep-alive-switch:last-child {
+    margin-bottom: 0;
 }
 
 /* Side-question answers (ADR 0320) sit where they were asked. Each is a nested

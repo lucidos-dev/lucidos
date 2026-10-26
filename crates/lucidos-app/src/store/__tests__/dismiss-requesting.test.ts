@@ -105,14 +105,13 @@ describe('Done dismiss does not flash Requesting state', () => {
     }
   });
 
-  it('offers Move to Current, and no change action, when the thread sits in the Archive section', () => {
-    // An archived thread is no longer a silent composer row (ADR 0378).
+  it('draws no banner when the thread sits in the Archive section', () => {
+    // The composer keeps Send, and the thread menu moves it back (ADR 0573).
     const thread = makeCCThread('t1', 'idle', 'archived');
     threadMap.value = new Map([['t1', thread]]);
     focusedThreadId.value = 't1';
 
-    const state = getWaitingState();
-    expect(state).toMatchObject({ type: 'actions', actions: [], unarchive: true });
+    expect(getWaitingState()).toBeNull();
   });
 
   it('returns actions when thread is waiting+inbox and NOT dismissing', () => {

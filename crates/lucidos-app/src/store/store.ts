@@ -59,7 +59,7 @@ import { resetContentScroll } from './savedScroll';
 import type { Change, ChangelogRelease, PendingCommits, ReleaseNoticeView, ThreadContext } from '../api/client';
 import type { UpdateRelay, ReleaseCheck } from '../api/client/control';
 import type { ApplyEstimates, LandingLane, MainCheck } from '../api/client/changes';
-import type { EnvironmentVariable, ModelInfo, ResponseStyle } from '../api/types';
+import type { EnvironmentVariable, IntelligenceLadder, ModelInfo, ResponseStyle } from '../api/types';
 import type { ChunkGate } from '../utils/lazyComponent';
 import { markSwUpdateDismissed, markEngineVersionDismissed } from '../hooks/sw-update';
 import { parseRepoPath } from './repoPath';
@@ -440,7 +440,7 @@ export function aliasRetiredSettingsSubview(raw: string): string {
 }
 const savedMenuItem = localStorage.getItem('lucidos-active-menu-item');
 /** A device with no saved panel opens Files. The dashboard has its own
- *  place: the rail on desktop, the dashboard sheet on a phone. */
+ *  place: the rail on desktop, the dashboard panel on a phone. */
 export const activeMenuItem = signal<MenuItem>(
   savedMenuItem && (MENU_ITEMS as readonly string[]).includes(savedMenuItem)
     ? (savedMenuItem as MenuItem)
@@ -839,18 +839,25 @@ export function threadChannelToFilterSource(channel: ThreadChannel): ThreadFilte
 }
 
 /** A persisted id set, or an empty set when the stored value is absent or
- *  malformed. Shared by the facet selections and the collapsed trigger groups. */
-function restoreIdSet(key: string): Set<string> {
+ *  malformed. Shared by the facet selections, the collapsed trigger groups and
+ *  the seen blocked threads. */
+export function restoreIdSet(key: string): Set<string> {
   try {
     const saved = localStorage.getItem(key);
     if (!saved) return new Set();
     const parsed = JSON.parse(saved);
     if (!Array.isArray(parsed)) return new Set();
     return new Set(parsed.filter((x): x is string => typeof x === 'string'));
-  } catch { return new Set(); }
+  } catch (err) {
+    // Startup probe at module load, where no toast surface exists yet. An
+    // empty set is each caller's default, and the next write replaces the bad
+    // payload. Logged so a lost selection is diagnosable.
+    console.warn(`[store] dropping malformed ${key} payload`, err);
+    return new Set();
+  }
 }
 
-function persistIdSet(key: string, next: Set<string>): void {
+export function persistIdSet(key: string, next: ReadonlySet<string>): void {
   localStorage.setItem(key, JSON.stringify([...next]));
 }
 
@@ -1205,16 +1212,18 @@ export function readRequestStanding(thread: ThreadState): boolean {
   return thread.meta.readRequested === true && !isMidTurn(effectiveThreadStatus(thread));
 }
 
-/** Count of threads where the agent is stuck waiting on the user (see
- *  `threadIsBlocked`), across the Current and Saved sections. Drives the
- *  selector's Blocked badge. */
-export const blockedThreadCount = computed(() => {
-  let count = 0;
+/** Ids of threads where the agent is stuck waiting on the user (see
+ *  `threadIsBlocked`), across the Current and Saved sections. */
+export const blockedThreadIds = computed<ReadonlySet<string>>(() => {
+  const ids = new Set<string>();
   for (const thread of threadMap.value.values()) {
-    if (threadIsBlocked(thread)) count++;
+    if (threadIsBlocked(thread)) ids.add(thread.meta.id);
   }
-  return count;
+  return ids;
 });
+
+/** Drives the selector's Blocked badge. */
+export const blockedThreadCount = computed(() => blockedThreadIds.value.size);
 
 export const activeExchanges = computed<Exchange[]>(() => {
   const id = focusedThreadId.value;
@@ -2114,6 +2123,10 @@ export const environmentVariables = signal<Loadable<EnvironmentVariable[]>>({ st
 
 // --- Chat model registry (Settings → Models; drives the Lucidos Agent picker) ---
 export const chatModels = signal<Loadable<ModelInfo[]>>({ status: 'not-loaded' });
+
+/** The served chat ladder, shared by every Lucidos Agent rung control. A control
+ *  that mounts draws its final width without a read of its own. */
+export const chatLadder = signal<Loadable<IntelligenceLadder>>({ status: 'not-loaded' });
 
 /** The merged *style library*, as the engine reports it. Read by the response
  *  style picker and by its editor, both in Settings. */

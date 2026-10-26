@@ -5,7 +5,7 @@ import {
 } from '@lucidos/widget-frame';
 import { appFrameFor } from '../../utils/appFrame';
 import { topPanelOverlay } from '../overlayStack';
-import { notePressHeldInFrame } from '../../utils/pointerPress';
+import { notePressOwesClick } from '../../utils/pointerPress';
 import type { ViewportPoint } from '../../hooks/useAnchoredPopover';
 
 /** Dispatched on the sending frame's own element, and bubbles to the
@@ -57,7 +57,7 @@ export function handleWidgetFrameMessage(event: MessageEvent): void {
     if (!frame || !inTopPanel(frame)) return;
     const at = data.at === undefined ? null : pointInViewport(frame, data.at);
     if (data.at !== undefined && !at) return;
-    if (data.held === true) notePressHeldInFrame();
+    if (data.held === true) notePressOwesClick();
     frame.dispatchEvent(new CustomEvent(APP_FRAME_MENU_EVENT, { detail: at, bubbles: true }));
   }
 }

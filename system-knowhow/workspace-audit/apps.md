@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: apps
 description: The apps audit section. SDK boilerplate and what an isolated app frame can no longer do. Escaping, theme names and hand-drawn controls. Choices drawn as buttons, touch hover, the ready signal and widget manifests.
+sources: ["system-knowhow/plugins.md", "system-knowhow/js-sdk.md", "system-knowhow/building-an-app.md", "system-knowhow/best-practices.md", "packages/lucidos-sdk/*", "crates/lucidos-app/src/styles/global/shared-components.css", "crates/lucidos-app/src/styles/global/surface.css", "crates/lucidos-app/src/styles/global/text-input.css", "crates/lucidos-engine/src/api/sdk.rs", "crates/lucidos-engine/src/api/sdk_iframe.css", "crates/lucidos-engine/src/api/sdk_iframe_control_theme_parts.css", "crates/lucidos-engine/src/api/sdk_iframe_shapes.css", "crates/lucidos-app/src/components/apps/appFrameSandbox.ts", "crates/lucidos-engine/src/api/app_reach.rs", "crates/lucidos-app/src/store/actions/app-bridge.ts", "crates/lucidos-engine/src/core/apps.rs", "crates/lucidos-app/src/components/apps/appFrameReveal.ts"]
 ---
 
 # Workspace audit section: apps
@@ -50,7 +51,7 @@ Per `system-knowhow/js-sdk.md`:
 
   A credential header written into app code belongs to the `cross-cutting` section.
 
-- **The app calling the engine with its own `fetch`.** Walk `data/apps/**/*.{js,ts,html}` for any engine call JavaScript makes itself: `fetch('/api/v1/events/query')`, `new URL('api/v1/events/query', document.baseURI)`, `new EventSource('/api/v1/events')`, `fetch(lucidos.apiUrl('/<suffix>'))`, and any `location.pathname`-splicing that rebuilds the workspace address. In the host shell none reaches the engine: the frame's origin is opaque and CORS refuses it. Severity **broken**. WebKit reports `Load failed` and Chromium a `TypeError`. The failure usually lands in a falling-back `catch`, so the symptom is stale data, not an error.
+- **The app calling the engine with its own `fetch`.** Walk `data/apps/**/*.{js,ts,html}` for any engine call JavaScript makes itself: `fetch('/api/v1/events/query')`, `new URL('api/v1/events/query', document.baseURI)`, `new EventSource('/api/v1/events')`, `fetch(lucidos.apiUrl('/<suffix>'))`, and any `location.pathname`-splicing that rebuilds the workspace address. In the host shell none reaches the engine: the frame's origin is opaque and CORS refuses it. Severity **broken**. WebKit reports `Load failed` and Chromium a `window.TypeError`. The failure usually lands in a falling-back `catch`, so the symptom is stale data, not an error.
 
   **`lucidos.apiUrl` is in that list deliberately.** Where an SDK method covers the endpoint, name that method. Otherwise the remedy is `lucidos.request('/<suffix>', init)`, which travels the bridge (ADR 0231). Never recommend `apiUrl` for a call: that moves a working app onto a pattern that cannot run. Reference: `system-knowhow/js-sdk.md` § `lucidos.request`.
 
@@ -58,9 +59,9 @@ Per `system-knowhow/js-sdk.md`:
 
   An `/api/v1/` path in a markup `src` / `href` attribute is correct and must NOT be flagged, nor is `apiUrl` building one. Five are exempt from the gateway's device gate: `sdk.js`, `sdk-prefs.js`, `sdk-iframe.css`, `sdk-iframe-audio.js`, and anything under `fonts/`. Behind a gateway, any OTHER `/api/v1/` path in a tag is refused: the frame's pass to its own files reaches no engine route. Severity: **broken**, and the remedy is the `lucidos.*` method that covers it.
 
-- **What an isolated app frame can no longer do.** In the host shell an app runs at an opaque origin, in its own renderer process, so it cannot freeze or read the shell. The price: the frame's own `fetch`, `EventSource` and browser storage all fail, and the SDK carries those three over a bridge. The bridge runs three calls at a time across all apps, so an app that fires one call per row only slows itself. Reference: `system-knowhow/js-sdk.md` § Setup, and *app frame* / *app bridge* in `docs/glossary.md`. Walk `data/apps/**/*.{js,ts,html}` for code that goes around it, skipping any vendored `node_modules/` tree:
+- **What an isolated app frame can no longer do.** In the host shell an app runs at an opaque origin, in its own renderer process, so it cannot freeze or read the shell. The price: the frame's own `fetch`, `window.EventSource` and browser storage all fail, and the SDK carries those three over a bridge. The bridge runs three calls at a time across all apps, so an app that fires one call per row only slows itself. Reference: `system-knowhow/js-sdk.md` § Setup, and *app frame* / *app bridge* in `docs/glossary.md`. Walk `data/apps/**/*.{js,ts,html}` for code that goes around it, skipping any vendored `node_modules/` tree:
 
-  - **Browser storage touched directly**: `localStorage`, `sessionStorage`, `document.cookie`, `indexedDB`. Each throws a `SecurityError` in the frame. The remedy is in § Rewriting an app for an isolated frame. Report the two shapes apart, because they fail differently:
+  - **Browser storage touched directly**: `localStorage`, `sessionStorage`, `document.cookie`, `indexedDB`. Each throws a browser exception with `name="SecurityError"` in the frame. The remedy is in § Rewriting an app for an isolated frame. Report the two shapes apart, because they fail differently:
     - **broken** where the call sits outside a `try`. The throw stops the script, so the app renders nothing.
     - **stale** where a `try` / `catch` wraps it, the common shape written for Safari private mode. The app runs and silently stops remembering anything.
   - **A read of the host realm**: `window.parent`, `parent.document`, `window.top`, or the device id lifted out of the shell's storage. All blocked. Severity: **broken**.
@@ -79,7 +80,7 @@ Per `system-knowhow/js-sdk.md`:
   - **A write to `/env-vars`**, through `lucidos.request` or the app's own `fetch`. The route opens `GET` only. A user env var reaches every command the agent runs, so a name the interpreter loads from would be host code execution. Severity: **broken**, since the call answers 403 and the app's settings never persist. § Remediation below carries the replacement.
   - **A write of a human-only preference**, through `lucidos.preferences.set` or a `PUT /preferences`. The route stays open, but two key classes are refused to an app. One the Lucidos Agent may not write either: `command_guard`, `max_tool_calls`, `network_bind`, `local_base_url`, the judge settings and the `provider_enabled_*` switches. One the agent may write but an app may not: the coding-agent paths and permission mode. These would let an app run its own script as the user, or read local-model chat. Severity: **broken** (403); § Remediation below carries the answer.
   - **A read or write of engine bookkeeping**, such as the last backup's outcome in `backup_last_run`. A preference read leaves it out, and an app's `PUT /preferences` naming it is refused. Severity: **broken** (403 on write, a missing key on read); § Remediation below carries the answer.
-  - **The app's own bundled file, fetched by a relative path.** `fetch('data/song.json')`, ``fetch(`audio/clips/${name}.json`)``, any `fetch` whose first argument is a relative path. The frame's origin is opaque, so the browser refuses it like an engine call: `Load failed` in WebKit, a `TypeError` in Chromium. It reads as safe, and the engine-fetch pattern misses it, since nothing in the string says `/api/v1`. Split the severity the way the failure does:
+  - **The app's own bundled file, fetched by a relative path.** `fetch('data/song.json')`, ``fetch(`audio/clips/${name}.json`)``, any `fetch` whose first argument is a relative path. The frame's origin is opaque, so the browser refuses it like an engine call: `Load failed` in WebKit, a `window.TypeError` in Chromium. It reads as safe, and the engine-fetch pattern misses it, since nothing in the string says `/api/v1`. Split the severity the way the failure does:
     - **broken** where the throw escapes setup, or the fetch is the app's only data path. The app renders an error banner, or nothing.
     - **stale** where a `catch` falls back to `lucidos.data` and the app keeps running, minus whatever the bundled file carried.
 
@@ -262,7 +263,7 @@ Hand a coding agent this table and the rules under it:
 - **Await `lucidos.storage.ready` before the first read.** Reads are
   synchronous after it. A read before it sees nothing stored, which is the very
   bug being fixed. Move the startup read after the `await`, and drop the
-  `try` / `catch` that hid the old `SecurityError`.
+  `try` / `catch` that hid the old exception with `name="SecurityError"`.
 - **Pick the store by who should see the value.** `lucidos.storage` is per
   device, like `localStorage`. `lucidos.data` is one store for every device.
   A sound toggle or a display currency is per device. A list the user curates

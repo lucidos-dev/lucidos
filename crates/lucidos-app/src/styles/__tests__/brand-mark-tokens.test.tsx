@@ -64,9 +64,9 @@ describe('the brand mark tokens', () => {
     }
   });
 
-  it('keep the Claude mark on --initiator-coding-agent and Codex on the light accent by default', () => {
+  it('keep the Claude mark on --initiator-coding-agent and Codex on the primary text colour by default', () => {
     expect(defaultOf('--claude-mark')).toBe('var(--initiator-coding-agent)');
-    expect(defaultOf('--codex-mark')).toBe('var(--accent-light)');
+    expect(defaultOf('--codex-mark')).toBe('var(--text-primary)');
   });
 });
 
@@ -97,13 +97,13 @@ describe('the Lucidos mark', () => {
 });
 
 describe('the Codex mark', () => {
-  it('strokes --codex-mark through a presentation attribute', () => {
-    // `.commands-btn .codex-icon` repaints it with an author rule, which an
-    // inline style would beat.
+  it('fills --codex-mark through a presentation attribute', () => {
+    // `.thread-row-agent .codex-icon` repaints it with an author rule, which
+    // an inline style would beat.
     const host = document.createElement('div');
     render(<CodexIcon />, host);
     const svg = host.querySelector('svg')!;
-    expect(svg.getAttribute('stroke')).toBe(withFallback('--codex-mark'));
+    expect(svg.getAttribute('fill')).toBe(withFallback('--codex-mark'));
     expect(svg.getAttribute('style')).toBeNull();
   });
 });

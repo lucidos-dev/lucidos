@@ -41,16 +41,14 @@ fn the_progress_parses_and_counts_the_units_left() {
     }
 }
 
-/// I2: a successor's title names the checkpoint as the flow passed it.
+/// A successor session records the progress in the form a flow passed it.
 #[test]
-fn a_checkpoint_labels_its_successor_title_by_its_own_name() {
-    let label = |progress| {
-        CheckpointRun::parse("phase-commit", progress)
-            .unwrap()
-            .title_label()
-    };
-    assert_eq!(label(Some("2/5")), "phase-commit 2/5");
-    assert_eq!(label(None), "phase-commit");
+fn a_checkpoint_progress_writes_back_the_form_it_parsed() {
+    let progress = CheckpointRun::parse("phase-commit", Some("2/5"))
+        .unwrap()
+        .progress
+        .unwrap();
+    assert_eq!(progress.to_string(), "2/5");
 }
 
 /// I4: never at or under the floor, whatever the calls left.
@@ -124,6 +122,7 @@ fn round_price() -> ModelPrice {
         read: 0.1,
         write_5m: 1.0,
         write_1h: 1.0,
+        write_12h: 1.0,
     };
     price.flex = None;
     price.long = None;
@@ -189,6 +188,109 @@ fn a_decline_holds_the_card_for_a_hundred_thousand_tokens() {
     assert!(!held(80_000), "a compaction lifts the hold");
 }
 
+/// Five rungs, least to most intelligent, as `FloorRungs::offered` reads them.
+fn five_rungs() -> Vec<IntelligenceRung> {
+    ["low", "medium", "high", "xhigh", "max"]
+        .map(|effort| IntelligenceRung::new("m", effort))
+        .to_vec()
+}
+
+fn rung(effort: &str) -> Option<IntelligenceRung> {
+    Some(IntelligenceRung::new("m", effort))
+}
+
+/// Floor I2, I5: below the default, a thread is offered the default and the
+/// rung above it. At the default, only the risk rung. At the risk rung or
+/// above, nothing.
+#[test]
+fn a_thread_below_the_default_is_offered_the_floor_and_the_risk_rung() {
+    let on = five_rungs();
+    let offered = |thread_at| FloorRungs::offered(&on, Some(1), thread_at);
+    assert_eq!(
+        offered(Some(0)),
+        FloorRungs {
+            floor_rung: rung("medium"),
+            risk_rung: rung("high"),
+        }
+    );
+    assert_eq!(
+        offered(Some(1)),
+        FloorRungs {
+            floor_rung: None,
+            risk_rung: rung("high"),
+        },
+        "at the default, never lowered or raised to it"
+    );
+    for above in [2, 3, 4] {
+        assert_eq!(offered(Some(above)), FloorRungs::default(), "{above}");
+    }
+}
+
+/// Floor I2: off the ladder, or with no default, nothing is offered.
+#[test]
+fn off_the_ladder_or_without_a_default_nothing_is_offered() {
+    let on = five_rungs();
+    assert_eq!(
+        FloorRungs::offered(&on, Some(1), None),
+        FloorRungs::default()
+    );
+    assert_eq!(
+        FloorRungs::offered(&on, None, Some(0)),
+        FloorRungs::default()
+    );
+}
+
+/// Floor I5: the risk rung is never the top, so a default second from the
+/// top, or at the top, offers no risk rung.
+#[test]
+fn the_risk_rung_is_never_the_top() {
+    let on = five_rungs();
+    assert_eq!(
+        FloorRungs::offered(&on, Some(3), Some(0)),
+        FloorRungs {
+            floor_rung: rung("xhigh"),
+            risk_rung: None,
+        }
+    );
+    assert_eq!(
+        FloorRungs::offered(&on, Some(4), Some(0)),
+        FloorRungs {
+            floor_rung: rung("max"),
+            risk_rung: None,
+        }
+    );
+}
+
+/// The shipped Claude Code ladder raises a Sonnet builder to the default,
+/// and offers the rung above it for risky work.
+#[test]
+fn the_shipped_ladder_offers_the_default_and_the_rung_above_it() {
+    use crate::runtime::intelligence_ladder::tests::served;
+    use crate::runtime::intelligence_ladder::LadderSurface;
+    let ladder = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
+    let sonnet = IntelligenceRung::new("claude-sonnet-5-5", "high");
+    let opus_at = |effort| Some(IntelligenceRung::new("claude-opus-5-5", effort));
+    assert_eq!(
+        FloorRungs::on_ladder(&ladder, Some(&sonnet)),
+        FloorRungs {
+            floor_rung: opus_at("medium"),
+            risk_rung: opus_at("high"),
+        }
+    );
+    assert_eq!(
+        FloorRungs::on_ladder(&ladder, None),
+        FloorRungs::default(),
+        "a thread with no rung is off the ladder"
+    );
+    let mut unclimbing = ladder.clone();
+    unclimbing.climbs = false;
+    assert_eq!(
+        FloorRungs::on_ladder(&unclimbing, Some(&sonnet)),
+        FloorRungs::default(),
+        "floor I2: a ladder that does not climb raises nobody"
+    );
+}
+
 mod db {
     use super::super::*;
     use crate::engine::event_bus::EventBus;
@@ -199,7 +301,11 @@ mod db {
             "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
              VALUES (gen_random_uuid(), 'ContextCaptured', $1, $2, 'thread', $2::text)",
         )
-        .bind(serde_json::json!({"model": model, "usage": {"input_tokens": tokens, "cache_creation_tokens": 1000}}))
+        .bind(serde_json::json!({"model": model, "usage": {
+            "input_tokens": tokens,
+            "cache_creation_tokens": 1000,
+            "cache_creation_1h_tokens": 0,
+        }}))
         .bind(thread_id)
         .execute(pool)
         .await
@@ -251,6 +357,85 @@ mod db {
         .unwrap();
         let verdict = handoff_verdict(&pool, thread, &pre_harden()).await.unwrap();
         assert_eq!(verdict.pays, Some(false));
+        let floored = record_checkpoint(
+            &bus,
+            &pool,
+            thread,
+            &pre_harden(),
+            false,
+            Some(offer()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            floored.rungs,
+            FloorRungs::default(),
+            "floor I3: an open change is never raised"
+        );
+
+        teardown_test_db(&db).await;
+    }
+
+    /// Rungs a `--default-floor` run read off a ladder.
+    fn offer() -> FloorRungs {
+        FloorRungs {
+            floor_rung: Some(IntelligenceRung::new("claude-opus-5-5", "medium")),
+            risk_rung: Some(IntelligenceRung::new("claude-opus-5-5", "high")),
+        }
+    }
+
+    async fn latest_payload(pool: &PgPool, thread_id: Uuid) -> serde_json::Value {
+        sqlx::query_scalar(
+            "SELECT payload FROM events \
+              WHERE thread_id = $1 AND event_type = 'HandoffCheckpointReached' \
+              ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Floor I1, I3: a run that declares the floor records the rungs it
+    /// offers, even with no reading, and one that does not records none.
+    #[tokio::test]
+    async fn a_floor_run_records_its_rungs_and_a_plain_run_none() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = seed_coding_thread(&bus, None).await;
+
+        let plain = record_checkpoint(&bus, &pool, thread, &pre_harden(), false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(plain.rungs, FloorRungs::default());
+        let payload = latest_payload(&pool, thread).await;
+        assert!(payload.get("default_floor").is_none(), "{payload}");
+        assert!(payload.get("floor_rung").is_none(), "{payload}");
+
+        let floored = record_checkpoint(
+            &bus,
+            &pool,
+            thread,
+            &pre_harden(),
+            false,
+            Some(offer()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(floored.pays, None, "no reading yet");
+        assert_eq!(floored.rungs, offer(), "a raise needs no reading");
+        let payload = latest_payload(&pool, thread).await;
+        assert_eq!(payload["default_floor"], true);
+        assert_eq!(
+            payload["floor_rung"],
+            serde_json::json!({"model": "claude-opus-5-5", "effort": "medium"})
+        );
+        assert_eq!(
+            payload["risk_rung"],
+            serde_json::json!({"model": "claude-opus-5-5", "effort": "high"})
+        );
 
         teardown_test_db(&db).await;
     }
@@ -264,7 +449,7 @@ mod db {
         let thread = seed_coding_thread(&bus, None).await;
         calls(&pool, thread, "claude-opus-5-5[1m]", 400_000).await;
         let run = CheckpointRun::parse("plan-approval", Some("0/4")).unwrap();
-        let verdict = record_checkpoint(&bus, &pool, thread, &run, true, None)
+        let verdict = record_checkpoint(&bus, &pool, thread, &run, true, None, None)
             .await
             .unwrap();
         assert_eq!(verdict.pays, Some(true));
@@ -332,6 +517,25 @@ mod db {
         let small = card(&pool, small).await;
         assert!(!small.warm && !small.cold, "never at the floor");
 
+        // A write with no split has no lifetime, so no time for the card to
+        // go cold. Its after-warm verdict claims no cold rewrite.
+        let unknown = seed_coding_thread(&bus, None).await;
+        sqlx::query(
+            "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+             VALUES (gen_random_uuid(), 'ContextCaptured', $1, $2, 'thread', $2::text)",
+        )
+        .bind(serde_json::json!({"model": "claude-opus-5-5", "usage": {
+            "input_tokens": 400_000,
+            "cache_creation_tokens": 1000,
+        }}))
+        .bind(unknown)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unknown = card(&pool, unknown).await;
+        assert!(unknown.cold_at.is_none());
+        assert_eq!(unknown.warm, warm.warm);
+
         teardown_test_db(&db).await;
     }
 
@@ -384,9 +588,37 @@ mod db {
     }
 }
 
-/// I2: the engine reads warmth from the seconds the cache has left.
+/// I2: the engine reads warmth from the seconds the cache has left, and an
+/// unknown lifetime stays unknown.
 #[test]
-fn a_cache_with_time_left_is_warm_and_any_other_is_cold() {
-    assert_eq!(CacheWarmth::of_remaining_secs(Some(1)), CacheWarmth::Warm);
-    assert_eq!(CacheWarmth::of_remaining_secs(None), CacheWarmth::Cold);
+fn a_cache_with_time_left_is_warm_and_an_unknown_one_is_unknown() {
+    use crate::engine::switch_estimate::CacheRemaining;
+    assert_eq!(
+        CacheWarmth::of_remaining(CacheRemaining::Warm(1)),
+        CacheWarmth::Warm
+    );
+    assert_eq!(
+        CacheWarmth::of_remaining(CacheRemaining::Cold),
+        CacheWarmth::Cold
+    );
+    assert_eq!(
+        CacheWarmth::of_remaining(CacheRemaining::Unknown),
+        CacheWarmth::Unknown
+    );
+}
+
+/// An unknown warmth claims neither the narrative turn's read nor a cold
+/// rewrite: only the calls left weigh.
+#[test]
+fn an_unknown_warmth_claims_neither_warm_nor_cold_costs() {
+    let at = |warmth| estimate(200_000, &opus(), 3, 30.0, 60_000.0, warmth);
+    let (warm, cold, unknown) = (
+        at(CacheWarmth::Warm),
+        at(CacheWarmth::Cold),
+        at(CacheWarmth::Unknown),
+    );
+    assert!(unknown.cost_usd < warm.cost_usd);
+    assert!(unknown.saving_usd < cold.saving_usd);
+    assert_eq!(unknown.cost_usd, cold.cost_usd);
+    assert_eq!(unknown.saving_usd, warm.saving_usd);
 }

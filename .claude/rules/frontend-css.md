@@ -41,17 +41,19 @@ Each `--duration-*` token is its 1x literal times `var(--duration-scale)`. That 
 
 ### Component rules
 
+- **One concept, one component, one wording.** Reuse what draws the nearest neighbour, never a one-off look. A transcript marker is an event card (`eventRowBody`), and every session start says "New session". A new look changes the shared component.
 - **Every icon-only button needs an `aria-label`.**
+- **Explain a control with `<Explainer>` ⓘ, not a hint line.**
 - **An icon that belongs to a label never wraps away from it.** Put the icon in a plain `display: inline` wrapper whose `::before` is `content: '\2060'` (U+2060 WORD JOINER). Generated content, never a text node. `.explainer-slot` is the example.
 - **An icon toggle renders through `ToggleIconButton`** (`aria-pressed`, a `tone`). A new look is a new tone, never a local rule (`toggle-icon-single-source.test.ts`).
 - **Tab title**: `(count) Lucidos`.
 - **No system dialogs**: use `showToast(msg, type)` and `await showConfirm(msg, okLabel, { variant })`. `variant` is required: `'danger'` only for an action that loses something for good, else `'default'`.
 - **A dialog message is ONE string, and a blank line is a paragraph.** Render it through `<DialogMessage message={…} />` (`components/shared/DialogMessage.tsx`). Never hand-roll a `<p class="confirm-message">` or use `white-space: pre-line`. A change to the paragraph rule updates `system-knowhow/js-sdk.md` § Confirmation dialogs and § Prompts in the same commit.
-- **No native tooltips**: use `data-tooltip="text"`. One implementation serves host and apps (`installTooltips()` in `packages/lucidos-sdk/src/tooltip.ts`).
+- **No native tooltips**: use `data-tooltip="text"`. Host and apps share `installTooltips()` (`packages/lucidos-sdk/src/tooltip.ts`).
 - **A tap paints no background.** Wrap every `:hover` rule in `@media (hover: hover)` or scope it under `body:not(.is-touch)`. No `:active` fill (a scale is fine). Never restate the tap-highlight reset in `base.css`. A cursor class set on `mouseenter` takes the same gate. Pinned by `touch-paints-no-press.test.ts`.
-- **No left-accent stripe on a card, callout, banner or notice, strictly forbidden.** That covers a coloured `border-left`, and a faux bar via `::before` or an inset `box-shadow`. Use bold text, a raised neutral surface (`--bg-tertiary`), spacing or an inline icon.
+- **No left-accent stripe on a card, callout, banner or notice, strictly forbidden.** That covers a coloured `border-left`, and a faux bar via `::before` or an inset `box-shadow`. Use bold text, a raised `--bg-tertiary` surface, spacing or an inline icon.
 - **Component CSS is split three ways by audience:**
-  - **Reusable (host + apps)** goes in `styles/global/shared-components.css`: the `.action-btn` family, `.icon-btn`, `.label`, `.title`, `.list-row*`, `.segmented-control`, `.pill-bar`, `.toggle-switch`, `.mini-spinner`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`, `h1`–`h6`, the dropdown classes. The engine `include_str!`s this exact file into `/api/v1/sdk-iframe.css` (`sdk.rs`), so a change ships to the host and every app at once. **Never copy these rules into `sdk_iframe.css`.** A component apps also need moves here, never an app-only copy (`exported-components-single-source.test.ts`). `surface.css` and `text-input.css` are served the same way. `iframe-css-no-shared-component-restyle.test.ts` bans a colour, background, border, radius, padding, font-size or box-shadow on their classes in `sdk_iframe.css`.
+  - **Reusable (host + apps)** goes in `styles/global/shared-components.css`: the `.action-btn` family, `.icon-btn`, `.label`, `.title`, `.list-row*`, `.segmented-control`, `.pill-bar`, `.toggle-switch`, `.mini-spinner`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`, `h1`–`h6`, the dropdown classes. The engine `include_str!`s this file into `/api/v1/sdk-iframe.css` (`sdk.rs`), so a change ships to host and apps at once. **Never copy these rules into `sdk_iframe.css`.** A component apps also need moves here, never an app-only copy (`exported-components-single-source.test.ts`). `surface.css` and `text-input.css` are served the same way. `iframe-css-no-shared-component-restyle.test.ts` bans a colour, background, border, radius, padding, font-size or box-shadow on their classes in `sdk_iframe.css`.
   - **Host chrome only (never served to apps)** goes in `styles/global/host-components.css`: the custom `<Dropdown>` positioning, `.nav-history-*`, `.send-cancel-*`, `.icon-btn` header variants. `global.css` imports it after `shared-components.css`.
   - **Iframe only** goes in `sdk_iframe.css`, or `sdk_iframe_shapes.css` for widget shapes.
   - **Structural host chrome** (`#app`, `body`, the `:root` token blocks) stays in `base.css`. The `#tooltip` rules live in `shared-components.css` (`tooltip-single-source.test.ts`).
@@ -73,21 +75,20 @@ Each `--duration-*` token is its 1x literal times `var(--duration-scale)`. That 
 - **`1rem` IS A HEADING in this app.** `--font-size-xl` is `1rem` ("section headings"). Body text is `--font-size-md` at `0.8125rem`. An app or HTML artifact body is `--font-size-sm` (ADR 0319). When text reads too big, look for a MISSING declaration first. The root font-size is `var(--user-ui-scale)`, never a scale step.
 - **A surface that names no `font-size` gets the body step from `base.css`. Do not remove its two defaults:** `body { font-size: var(--font-size-md) }` and `input, textarea, select, button { font-family: inherit; font-size: inherit }`.
   - **Never use the `font` shorthand** to give a control its font, and **never add `html` to the control rule.**
-  - The defaults are a net, not a licence to stop naming sizes.
 
   Pinned by `text-defaults-guard.test.ts` and `e2e/type-scale-all.spec.ts`.
-- **`font-size` takes a `--font-size-*` token, never a raw `rem`.** Pick the nearest token. A new size gets a token in *both* `:root` sources (`base.css` and `api/sdk_iframe.css`).
+- **`font-size` takes a `--font-size-*` token, never a raw `rem`.** A new size gets a token in *both* `:root` sources (`base.css` and `api/sdk_iframe.css`).
 - **A general-purpose design skill does not override this scale.** Take the type scale from `base.css`.
 - **Content-pane structural padding uses a `--space-*` token and one 1rem gutter.**
-  - **The scale** is `--space-{xs,sm,md,lg,xl}` (0.25/0.5/0.75/1/1.5rem), in `base.css` and mirrored in `api/sdk_iframe.css`. Keep the two blocks identical. Never redefine a step.
+  - **The scale** is `--space-{xs,sm,md,lg,xl}`, in `base.css` and mirrored in `api/sdk_iframe.css`. Keep the two blocks identical. Never redefine a step.
   - **Every content-pane view shares the `--space-lg` horizontal gutter** on its structural padding: the toolbar, list rows, empty states and headers. `/harden` flags a raw `padding: N rem` gutter.
   - **Carve-outs, each with a comment at the site:** full-bleed views (app-ui iframe, previews, diffs), the Files tree (`.file-item`), card-like elements (boxes, pills, chips, badges), inline controls, computed-px values, `1px` borders, `0` and `env()`.
 - **A content-pane column view reserves the scroll gutter while it fits.** `.content-pane-body` uses `overflow-y: scroll` plus `scrollbar-gutter: stable`, as `.thread-content` does. A full-bleed view is excluded. Pinned by `content-pane-scroll-gutter.test.ts` and `e2e/settings-column-holds-still-desktop.spec.ts`.
 - **Every content-pane view gets the *end space* below its last element, and no view sets its own** (`docs/glossary.md` § End space). One default-deny spacer in `panels/content.css` provides it. Never pin a column view to the pane's height. Never style a view root's `::after`. A new full-bleed view takes `content-view-full-bleed` and a row in `content-pane-end-space.test.ts`.
 - **Thread-pane surfaces share ONE content edge, scroll gutter included.** The transcript (`.thread-content`) and the composer (`.prompt-area` → `.prompt-input-container`) resolve to the same left and right insets. Four parts:
-  1. **The shared `--thread-pane-gutter`** on both sides of both surfaces. Never asymmetric.
+  1. **The shared `--thread-pane-gutter`** on both sides of both surfaces.
   2. **A `--turn-body-inset` padding** on the composer column and on the compose-empty `.welcome-hero`.
-  3. **`--scrollbar-gutter-width` added to the RIGHT inset of every NON-scrolling sibling.** `.thread-content` reserves it with `overflow-y: scroll` **and** `scrollbar-gutter: stable`. `utils/scrollbarGutter.ts` measures the live `.thread-content` element, never a detached clone, which is wrong on real iOS.
+  3. **`--scrollbar-gutter-width` added to the RIGHT inset of every NON-scrolling sibling.** `.thread-content` reserves it with `overflow-y: scroll` **and** `scrollbar-gutter: stable`.
   4. **The two NESTED surfaces share one text column.** A question or permission card (`.question-body`) and the composer box (`.prompt-box`) both put content on `--turn-surface-inset`, minus their OWN border. The composer's padding lives on `.prompt-row .prompt-textarea`. `--prompt-box-border-width` stays `2px`.
 
   A new docked surface joins parts 1 to 3, a nested one part 4 too. Guards: `e2e/prompt-transcript-alignment-all.spec.ts` and the tripwire in `utils/scrollbarGutter.test.ts`.
@@ -97,7 +98,7 @@ Each `--duration-*` token is its 1x literal times `var(--duration-scale)`. That 
   - Guard: `transcript-fade-scroll-gutter-guard.test.ts`. Examples: `chat/input-messages.css`, `.prompt-area::before` in `panels/content.css`.
 - **No `<select>`**: use `Dropdown` (`components/shared/Dropdown.tsx`).
 - **Every search or filter box is a `SearchField`** (`components/shared/SearchField.tsx`). A host recolours it through `--search-field-{bg,fg,muted}`. Never restyle the input.
-- **No `id` on dual-rendered components.** The header chrome has per-layout copies (`ControlPanel` renders in `AppHeader` and `MobileAppHeader`), and the layout swaps at the breakpoint. Use `data-role="name"` + `querySelectorAll`, or `getVisiblePromptInput()` in `promptFocus.ts`.
+- **No `id` on dual-rendered components.** The header chrome has per-layout copies (`ControlPanel` in `AppHeader` and `MobileAppHeader`), and they swap at the breakpoint. Use `data-role="name"` + `querySelectorAll`, or `getVisiblePromptInput()` in `promptFocus.ts`.
 - **A heavy-mount child with a copy in each layout skips the inactive one**: iframes, players, WebGL canvases, anything that fetches on mount. The parent forwards `layout: 'desktop' | 'mobile'`. The child renders only when `layout === (viewportIsMobile.value ? 'mobile' : 'desktop')` (`AppUiInline.tsx`).
 - **No `getElementById()`** except `#app`. Use `querySelector`.
 

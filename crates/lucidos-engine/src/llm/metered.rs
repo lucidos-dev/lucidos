@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use crate::llm::call_trace::{self, CallFailure};
 use crate::llm::image::{ImageProvider, ImageResult, ImageSize};
 use crate::llm::judgment::{Judgment, JudgmentProvider, Question};
+use crate::llm::prefill::PrefillBody;
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
 };
@@ -205,6 +206,48 @@ pub(crate) async fn chat<P: LlmProvider + ?Sized>(
         ttft_ms: trace
             .first_delta
             .map(|first| first.saturating_duration_since(started).as_millis() as u64),
+        request_id: trace.request_id.as_deref(),
+    })
+    .await;
+    Ok(response)
+}
+
+/// Send one *prefill beat* and record what it cost, under the model and
+/// effort its turn went out at. A failed beat records a failure, as a chat
+/// call does.
+pub(crate) async fn prefill<P: LlmProvider + ?Sized>(
+    sink: &dyn CostSink,
+    provider: &P,
+    body: &PrefillBody,
+) -> Result<LlmResponse, BoxError> {
+    let started = std::time::Instant::now();
+    let call = provider.prefill(body, CallToken::mint());
+    let (outcome, trace) = call_trace::scoped(within(sink, call)).await;
+    let effort = body.reasoning_effort.as_deref();
+    let response = match outcome {
+        Ok(response) => response,
+        Err(error) => {
+            sink.record_failure(CallFailed {
+                model: &body.model,
+                reasoning_effort: effort,
+                duration_ms: started.elapsed().as_millis() as u64,
+                attempts: trace.attempts,
+                failure: trace.failure(error.is::<tokio::time::error::Elapsed>()),
+                status_code: trace.status,
+                request_id: trace.request_id.as_deref(),
+                provider: trace.provider,
+            })
+            .await;
+            return Err(error);
+        }
+    };
+    sink.record(CallCost {
+        model: &body.model,
+        request_chars: body.request_chars(),
+        reported: Reported::Chat(&response),
+        reasoning_effort: effort,
+        duration_ms: Some(started.elapsed().as_millis() as u64),
+        ttft_ms: None,
         request_id: trace.request_id.as_deref(),
     })
     .await;

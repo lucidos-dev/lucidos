@@ -27,8 +27,8 @@ export const promptStopRequested = signal(false);
 export const promptSideQuestionRequested = signal(false);
 
 /** Why this thread cannot turn on side-question mode, or null when it can.
- *  The hold on the row's end button and the Side question shortcut share it.
- *  Both only ever turn the mode on, whatever the box holds. */
+ *  The row's side-question toggle and the Side question shortcut share it.
+ *  Both switch the mode, whatever the box holds. */
 export function sideQuestionBlocker(args: {
   threadStarted: boolean;
   isCodex: boolean;
@@ -323,24 +323,27 @@ export function computeMorphMode(args: {
 // (a pending user question OR permission). The morph button (computeMorphMode)
 // is NOT used in this state — this control replaces it so "Stop" is never the
 // prominent default while the agent is waiting on the user.
-//   canceling — disabled "Canceling…" (a Cancel is in flight)
-//   multi     — split button: Submit (N) primary + caret → red Cancel menu.
-//               Multi-select always shows Submit (disabled at zero selections),
-//               so the caret is the only place a Cancel fits — hence the split.
-//   submit    — lone green Submit: a freetext/custom answer has been typed.
-//   cancel    — lone red Cancel: nothing to submit (single-select / permission /
-//               empty freetext); the forward action lives in the card above.
-export type AnswerActionMode = 'canceling' | 'multi' | 'submit' | 'cancel';
+// Each mode is one lone button, so the control never means two things at once.
+//   canceling — disabled Cancel with a spinner (a Cancel is in flight)
+//   submit    — green Submit with a return arrow: an answer is ready. That is a
+//               typed answer, or a multi-select pick, text or image.
+//   cancel    — red Cancel with an X: nothing to submit (no pick, empty box,
+//               permission card); the forward action lives in the card above.
+export type AnswerActionMode = 'canceling' | 'submit' | 'cancel';
 
 export function computeAnswerActionMode(args: {
-  pendingMultiQ: boolean;
-  hasContent: boolean;
   isCanceling: boolean;
+  /** A typed answer to a card that is not multi-select. */
+  hasContent: boolean;
+  /** The pending multi-select card's draft, or null for any other card. */
+  multi: { pickedCount: number; text: string; imageCount: number } | null;
 }): AnswerActionMode {
   if (args.isCanceling) return 'canceling';
-  if (args.pendingMultiQ) return 'multi';
-  if (args.hasContent) return 'submit';
-  return 'cancel';
+  const { multi } = args;
+  const ready = multi
+    ? computeSubmitMultiCount(multi.pickedCount, multi.text) > 0 || multi.imageCount > 0
+    : args.hasContent;
+  return ready ? 'submit' : 'cancel';
 }
 
 // Prompt placeholders. Typing here while a question card is pending IS the

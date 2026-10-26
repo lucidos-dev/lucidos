@@ -43,22 +43,22 @@ function contextReadKey(thread: ThreadState | undefined): string | null {
   return `${thread.meta.id}:${newest}:${thread.meta.codingAgentChangeState.kind}`;
 }
 
-/** The ratio to a fresh thread, as the card says it: `6x`, `1.4x`. */
+/** The ratio to a fresh session, as the card says it: `6x`, `1.4x`. */
 function ratioLabel(ratio: number): string {
   return ratio >= 2 ? `${Math.round(ratio)}x` : `${ratio.toFixed(1)}x`;
 }
 
-const SUCCESSOR_QUESTION = 'Carry on in a new thread?';
+const SUCCESSOR_QUESTION = 'Carry on in a fresh session?';
 
 /** What the card says about the thread, from the engine's reading. */
 export function successorFinding(context: ThreadContext): string {
   const size = context.input_tokens === null ? 'This thread is large' : `This thread holds ${formatTokens(context.input_tokens)} tokens`;
-  const ratio = context.card ? ` (about ${ratioLabel(context.card.fresh_ratio)} a fresh thread)` : '';
+  const ratio = context.card ? ` (about ${ratioLabel(context.card.fresh_ratio)} a fresh session)` : '';
   return `${size}, and every reply rereads all of it${ratio}.`;
 }
 
-/** The model and effort picked under the card, as the successor will run them.
- *  `undefined` while nothing is picked, so the successor carries the old pair. */
+/** The model and effort picked under the card, as the successor session will
+ *  run them. `undefined` while nothing is picked, so it keeps the current pair. */
 function aimedImplementer(model: string | null, effort: string | null): SuccessorImplementer | undefined {
   if (!model && !effort) return undefined;
   return { ...(model && { coding_agent_model: model }), ...(effort && { reasoning_effort: effort }) };
@@ -88,7 +88,7 @@ export function CardOption({ label, desc, busyDesc, busy, disabled, onPick }: {
   );
 }
 
-/** A card on top of the composer offering a *successor thread* to a large
+/** A card on top of the composer offering a *successor session* to a large
  *  coding-agent thread at a clean idle (`successorOffer`), once the user starts
  *  writing in the composer. It is drawn from the
  *  question card's option classes. */
@@ -169,7 +169,7 @@ export function SuccessorCard() {
       if (choice === 'continue') await continueInSuccessor(target.threadId, aimedImplementer(model, effort));
       else await declineSuccessorOffer(target.threadId);
     } catch (err) {
-      const what = choice === 'continue' ? 'continue in a new thread' : 'keep this thread';
+      const what = choice === 'continue' ? 'continue in a fresh session' : 'keep this thread';
       showToast(`Could not ${what}: ${errorDetail(err)}`, 'error');
     } finally {
       setBusy(null);
@@ -187,8 +187,8 @@ export function SuccessorCard() {
           <div class="question-options">
             <CardOption
               label="Continue with context"
-              desc={`Carries the branch and what was learned. A message you type goes along as its first request.${aimed ? ` It runs on ${aimed}.` : ''}`}
-              busyDesc={last.offer === 'warm' ? 'Writing the handoff…' : 'Starting the new thread…'}
+              desc={`A fresh session in this thread, carrying what was learned. A message you type goes along as its first request.${aimed ? ` It runs on ${aimed}.` : ''}`}
+              busyDesc={last.offer === 'warm' ? 'Writing the handoff…' : 'Starting the fresh session…'}
               busy={busy === 'continue'}
               disabled={busy !== null}
               onPick={() => void choose(last, 'continue')}

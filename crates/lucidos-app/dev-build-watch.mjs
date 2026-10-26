@@ -13,8 +13,14 @@
 // from disk and runs the full plugin chain (atomic publish, sw-stamp, public
 // sync, build-id stamp), so the served dist/ can never drift from source. Builds
 // here are sub-second, so a full build per change costs nothing noticeable — and
-// the entire class of stale-CSS wedges is gone, with no watchdog, no age-based
-// recycle, and no staleness guard needed.
+// the entire class of stale-CSS wedges is gone, with no age-based recycle and
+// no staleness guard needed.
+//
+// **It notices when its own file-system events stop.** A recursive `fs.watch`
+// can go quiet while the process stays alive, and then no landing ever builds.
+// So a poll asks git whether the committed inputs moved. A change no event
+// announced means the watch is deaf: it re-creates its handles and builds. See
+// `docs/plans/2026-10-25-a-deaf-build-watch-heals-itself.md`.
 //
 // Lifecycle: workspace.sh:start_frontend_built launches this through
 // scripts/lib/build_watch_exec.pl, which hands it `.build-watch/watch.lock` to
@@ -47,15 +53,17 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, watch } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const APP_DIR = dirname(fileURLToPath(import.meta.url));
-const PROJECT_DIR = resolve(APP_DIR, '../..');
+export const PROJECT_DIR = resolve(APP_DIR, '../..');
 const DEPS_STATE = resolve(PROJECT_DIR, 'scripts/deps-state.sh');
 const STATE_DIR = resolve(APP_DIR, '.build-watch');
 const STATUS_FILE = resolve(STATE_DIR, 'status.json');
 const DEBOUNCE_MS = 200; // coalesce git-merge bursts (Apply touches many files at once)
+const POLL_MS = 10_000;
+const PROBE_TIMEOUT_MS = 5_000;
 
 // Both mirror `vite/chunkBudget.ts`, which this JS cannot import.
 // `dev-build-watch.test.ts` fails when they drift apart.
@@ -79,7 +87,7 @@ const ERROR_TAIL_BYTES = 8000;
 // The engine mirrors both lists in `files_have_client_update`
 // (crates/lucidos-engine/src/engine/git_ops/restart_detection.rs) to decide
 // whether an Apply waits for this watch to rebuild. Change them together.
-const watchDirs = [
+export const watchDirs = [
   resolve(APP_DIR, 'src'),
   resolve(APP_DIR, 'public'),
   resolve(APP_DIR, 'vite'),
@@ -90,7 +98,7 @@ const watchDirs = [
 // no build, installs nothing, and leaves `dist/` on the old tree until some
 // unrelated source edit happens along. A lockfile bump that FIXES a broken
 // build would never take effect on its own.
-const watchFiles = [
+export const watchFiles = [
   resolve(APP_DIR, 'index.html'),
   resolve(APP_DIR, 'vite.config.ts'),
   resolve(APP_DIR, 'package.json'),
@@ -259,6 +267,27 @@ export function budgetAlerts(within, chunkBudgets) {
   return { alerts, within: next };
 }
 
+/** The watched inputs as git pathspecs: relative to the project root, with `/`. */
+export function gitInputPaths(projectDir, absolutePaths) {
+  return absolutePaths.map((p) => relative(projectDir, p).split(sep).join('/'));
+}
+
+/**
+ * What one poll of the committed inputs should do.
+ *
+ * `built` is the fingerprint when the last build started, `current` the one
+ * now, and `eventSinceBuild` whether `fs.watch` spoke since. A change an event
+ * already scheduled is normal. A change with no event is a deaf watch.
+ *
+ * A `null` fingerprint means the probe could not run. That is unknown, never a
+ * change, so a non-git checkout or a busy host cannot loop builds.
+ */
+export function pollAction({ built, current, eventSinceBuild }) {
+  if (built === null || current === null) return 'none';
+  if (built === current || eventSinceBuild) return 'none';
+  return 'rearm-and-build';
+}
+
 // ── the watcher ─────────────────────────────────────────────────────────────
 
 function log(message) {
@@ -337,6 +366,23 @@ function raiseAlert({ title, message }) {
   }
 }
 
+/** The git object ids of the committed inputs at HEAD, or `null` when git could
+ *  not answer. `ls-tree` rather than `rev-parse`: a path absent from HEAD is
+ *  simply missing from its output instead of failing the whole probe. */
+function inputsFingerprint() {
+  try {
+    const out = spawnSync(
+      'git',
+      ['ls-tree', 'HEAD', '--', ...gitInputPaths(PROJECT_DIR, [...watchDirs, ...watchFiles])],
+      { cwd: PROJECT_DIR, encoding: 'utf8', timeout: PROBE_TIMEOUT_MS },
+    );
+    if (out.status !== 0 || typeof out.stdout !== 'string' || out.stdout === '') return null;
+    return out.stdout;
+  } catch {
+    return null;
+  }
+}
+
 let building = false;
 let pending = false;
 let child = null;
@@ -381,9 +427,16 @@ function viteBin() {
   return resolve(dirname(require.resolve('vite/package.json')), 'bin/vite.js');
 }
 
+/** The inputs' fingerprint when the last build started, and whether `fs.watch`
+ *  has spoken since. Together they tell a quiet repo from a deaf watch. */
+let builtFingerprint = null;
+let eventSinceBuild = false;
+
 function runBuild() {
   if (building) { pending = true; return; }
   building = true;
+  builtFingerprint = inputsFingerprint();
+  eventSinceBuild = false;
   const started = Date.now();
   const skippedInstall = ensureDeps();
   if (skippedInstall) log(skippedInstall);
@@ -443,6 +496,7 @@ function runBuild() {
 
 let timer = null;
 function schedule() {
+  eventSinceBuild = true;
   if (timer) clearTimeout(timer);
   timer = setTimeout(runBuild, DEBOUNCE_MS);
 }
@@ -468,8 +522,33 @@ function startWatching() {
   }
 }
 
-function shutdown() {
+function stopWatching() {
   for (const w of watchers) { try { w.close(); } catch { /* already closed */ } }
+  watchers.length = 0;
+}
+
+let probeFailing = false;
+function pollInputs() {
+  const current = inputsFingerprint();
+  if (current === null) {
+    if (!probeFailing) log('cannot read the committed inputs from git, so a deaf watch would go unnoticed');
+    probeFailing = true;
+    return;
+  }
+  probeFailing = false;
+  if (builtFingerprint === null) {
+    builtFingerprint = current;
+    return;
+  }
+  if (pollAction({ built: builtFingerprint, current, eventSinceBuild }) === 'none') return;
+  log('committed inputs changed with no file event since the last build: re-creating the watch and building');
+  stopWatching();
+  startWatching();
+  schedule();
+}
+
+function shutdown() {
+  stopWatching();
   if (child) child.kill('SIGTERM');
   process.exit(0);
 }
@@ -482,6 +561,7 @@ if (invokedDirectly) {
   // Initial build. workspace.sh waits for dist/index.html before starting the engine.
   runBuild();
   startWatching();
+  setInterval(pollInputs, POLL_MS).unref();
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }

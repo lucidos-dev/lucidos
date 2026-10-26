@@ -3,6 +3,7 @@ import {
   buildDeviceRows,
   deviceRowName,
   deviceRowSummary,
+  isUnusedDevice,
   submittedDeviceName,
 } from '../deviceList';
 import type { DeviceInfo } from '../../../api/types';
@@ -79,6 +80,25 @@ describe('buildDeviceRows', () => {
     const rows = buildDeviceRows([device('a'), device('b')], null, 'a');
     expect(rows.map((r) => r.id)).toEqual(['a', 'b']);
     expect(rows.every((r) => r.paired === undefined)).toBe(true);
+  });
+});
+
+describe('isUnusedDevice', () => {
+  const unusedIds = (devices: DeviceInfo[], pairedList: PairedDevice[]) =>
+    buildDeviceRows(devices, pairedList, 'me').filter(isUnusedDevice).map((r) => r.id);
+
+  it('folds a device with no push that is not paired', () => {
+    expect(unusedIds([device('stale')], [])).toEqual(['stale']);
+  });
+
+  it('keeps the current, push-enabled and paired devices out', () => {
+    const devices = [
+      device('me'),
+      device('pushy', { push_enabled: true }),
+      device('phone'),
+      device('stale'),
+    ];
+    expect(unusedIds(devices, [paired('phone')])).toEqual(['stale']);
   });
 });
 

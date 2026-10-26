@@ -27,7 +27,9 @@
    `.loading-fade-content` wrapper and the skeleton — share one grid cell
    (stacked); while loading the skeleton sizes the cell, once loaded the content
    sizes it and the skeleton goes absolute + fades out over the now-visible
-   content — a smooth exit with no blank frame and no withheld content. The
+   content — a smooth exit with no blank frame. While the minimum-visible floor
+   holds the skeleton after the load ended, the content keeps its layout but is
+   hidden (`loading-fade-held`), so it never draws beside the skeleton. The
    content is wrapped in a single element so a caller passing a fragment of N
    siblings doesn't flatten into N direct grid children (which would all stack in
    the one cell via the rule below — the Changes-panel double-text bug). */
@@ -39,6 +41,10 @@
 .loading-fade > * {
     grid-area: 1 / 1;
     min-width: 0;
+}
+
+.loading-fade-held > .loading-fade-content {
+    visibility: hidden;
 }
 
 .loading-fade-skeleton {
@@ -79,6 +85,14 @@
     will-change: transform;
     animation: shimmer 1.5s infinite;
     vertical-align: middle;
+}
+
+/* Dark themes have bright text and accents, so the light-mode mix glares.
+   Dark mode draws faint neutral bars instead. `:where` keeps this at class
+   specificity, so a surface override such as `.ws-picker .sk-bar` still wins. */
+:where(html[data-theme-mode="dark"]) .sk-bar {
+    --sk-base: color-mix(in srgb, currentColor 6%, transparent);
+    --sk-shine: color-mix(in srgb, currentColor 11%, transparent);
 }
 
 .sk-circle {
@@ -491,7 +505,7 @@
        keyboard is open and the header has slid off. It is inert on desktop and
        on any device without a top inset, where env() resolves to 0. */
     top: max(
-        calc(var(--safe-area-top) + 0.5rem),
+        calc(var(--header-controls-top) + 0.5rem),
         calc(var(--app-header-bottom) + 0.5rem)
     );
     left: 0;
@@ -1519,7 +1533,7 @@
         align-items: center;
         justify-content: center;
         position: fixed;
-        top: max(3.5rem, calc(1rem + var(--safe-area-top)));
+        top: max(3.5rem, calc(1rem + var(--header-controls-top)));
         right: calc(1rem + var(--safe-area-right));
         width: 3rem;
         height: 3rem;

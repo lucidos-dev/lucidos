@@ -23,6 +23,8 @@ export interface ExplainerProps {
    *  be left floating over the view it just sent the reader to. Nothing else
    *  closes it there, since a click inside the panel is not an outside click. */
   children: ComponentChildren | ((close: () => void) => ComponentChildren);
+  /** Opens a wider, taller popover, for copy that carries a table. */
+  wide?: boolean;
 }
 
 /**
@@ -99,7 +101,7 @@ export interface ExplainerProps {
  * in HTML, and hand-disabling every control in the fieldset instead (to drop
  * the `disabled` attribute from the fieldset itself) is the worse trade.
  */
-export function Explainer({ title, children }: ExplainerProps) {
+export function Explainer({ title, children, wide = false }: ExplainerProps) {
   // The anchor element, held in state rather than a ref so that resolving it on
   // mount re-renders and hands the real node to <Overlay> (a ref's `.current`
   // is still null on the render that opens).
@@ -124,7 +126,7 @@ export function Explainer({ title, children }: ExplainerProps) {
       anchor={anchor}
       backdrop={false}
       portal
-      panelClass={`surface anchored-popover explainer-popover${protectedClassFrom(anchor)}`}
+      panelClass={`surface anchored-popover explainer-popover${wide ? ' explainer-popover-wide' : ''}${protectedClassFrom(anchor)}`}
       // Hidden until the first measurement, so it never flashes at 0,0. The fit
       // is the pane's usable width, which the shell caps the panel to.
       panelStyle={pos

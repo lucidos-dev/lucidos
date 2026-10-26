@@ -1023,7 +1023,7 @@ pub(crate) fn match_sentinel(
                     payload,
                 })
             },
-            Some("Credential form sent to the user. It stays open in this thread until they save or cancel it, so wait for that. Do not chat-ask for the same value: the form resolves the request."),
+            Some("Credential form sent to the user. It stays open in this thread until they save or cancel it. Do not chat-ask for the same value: the form resolves the request."),
         ),
         (
             PLUGIN_INSTALL_REQUEST_PREFIX,
@@ -1070,6 +1070,7 @@ pub(crate) fn match_sentinel(
         let after = &text[prefix.len()..];
         let rel_start = after.find('{')?;
         let payload = after[rel_start..].to_string();
+        let event = ctor(payload.clone())?;
         let mut redacted_text = redacted.map(str::to_string);
         // Name the credential the modal is collecting. The redaction hides the
         // payload, so without this the model knows a modal opened but not what
@@ -1104,10 +1105,24 @@ pub(crate) fn match_sentinel(
                     });
                 }
             }
+            // Nothing re-opens the thread on save, so the agent must wait on
+            // this request's resolution rather than make the user its scheduler.
+            if let (ThreadEvent::CredentialRequested { request_id, .. }, Some(t)) =
+                (&event, redacted_text.as_mut())
+            {
+                t.push_str(&format!(
+                    " Nothing re-opens this thread when they save it. So before ending your turn, \
+                     call `{}` on `FormRequestResolved` with the condition `request_id` = \
+                     \"{request_id}\". Its `outcome` is `completed` (saved), `canceled`, \
+                     `superseded` (a user message or a newer form replaced it, so say nothing more) \
+                     or `expired`. Never ask the user to type or tap that they saved it.",
+                    tn::AWAIT_EVENT
+                ));
+            }
         }
         return Some(SentinelMatch {
             label,
-            event: ctor(payload)?,
+            event,
             redacted_text,
         });
     }
@@ -1772,10 +1787,10 @@ impl LucidosEngine {
 pub(crate) enum BreakerAction {
     /// Streak below threshold — execute the proposed call normally.
     None,
-    /// 3-4 consecutive failures of the same call: feed a STOP message back
-    /// to the model and skip executing the proposed (repeat) call.
+    /// Identical attempts 3-4 after failed executions: feed a STOP message
+    /// to the model without executing the proposed call.
     Warn,
-    /// 5+ consecutive failures: terminate the turn with a force-break.
+    /// Identical attempt 5 or later: terminate the turn with a force-break.
     Break,
 }
 
@@ -1804,10 +1819,9 @@ pub(crate) fn next_failure_streak(
     }
 }
 
-/// Map a consecutive-failure streak length onto the breaker action. Warn at
-/// 3-4 (give the model a STOP nudge with the results it already has), hard
-/// break at 5+ (it ignored the warnings). Both thresholds stay far below the
-/// default tool-call cap, the outer backstop.
+/// Map the attempt streak to a breaker action before executing the call.
+/// Warn on attempts 3-4 after failures; break on attempt 5 or later.
+/// Warnings skip execution, so the streak can grow after two actual failures.
 pub(crate) fn generic_breaker_action(failure_streak: usize) -> BreakerAction {
     if failure_streak >= 5 {
         BreakerAction::Break
@@ -2008,6 +2022,13 @@ pub(crate) fn push_explicit_image_pin(pins: &mut Vec<usize>, idx: usize) {
     if pins.len() > MAX_PINNED_EXPLICIT_IMAGES {
         pins.remove(0);
     }
+}
+
+/// Whether a round's outputs carry images the user attached to a question
+/// answer. Those are the user's own content, so their message pins with the
+/// turn's user messages and stays in vision for the rest of the turn.
+pub(crate) fn holds_answer_images(tool_outputs: &[ToolOutput]) -> bool {
+    tool_outputs.iter().any(|output| !output.images.is_empty())
 }
 
 /// Whether a freshly-built tool-result message holds an image the model
@@ -2323,8 +2344,7 @@ impl TurnTools {
         &self.defs
     }
 
-    /// Their names, for the `ContextCaptured` row and the inline-tool-call
-    /// repair's list of what the model is allowed to have meant.
+    /// Their names, for the `ContextCaptured` row.
     pub(crate) fn names(&self) -> &[String] {
         &self.names
     }

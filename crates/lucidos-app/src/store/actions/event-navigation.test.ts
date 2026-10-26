@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { focusedThreadId, threadMap, toasts } from '../store';
+import { signal } from '@preact/signals';
+import { focusedThreadId, setDrawerGrouping, setSelectedOngoingGroup, threadMap, threadSearchQuery, toasts } from '../store';
 import { ApiError } from '../../api/client';
 import type { ThreadState } from '../thread-events';
 
@@ -34,11 +35,16 @@ const focusThread = vi.hoisted(() => vi.fn());
 const landOnEvent = vi.hoisted(() => vi.fn());
 vi.mock('./threads', () => ({ focusThread, landOnEvent }));
 
+/** Whether the Conversation pane is on screen, which the hand-off waits on. */
+const paneOnScreen = signal(true);
+vi.mock('./seen-target', () => ({ threadPaneOnScreen: () => paneOnScreen.value }));
+
 const {
   _resetEventTargetCacheForTesting,
   ensureEventTargetResolved,
   eventHasTarget,
   jumpableEventId,
+  openListedThread,
   openOngoingThread,
   resolveEventTarget,
   showEventWhereItLives,
@@ -646,6 +652,77 @@ describe('openOngoingThread from Blocked', () => {
     threadMap.value = new Map([['waiting', waitingThread()]]);
     await settle();
 
+    expect(landOnEvent).not.toHaveBeenCalled();
+  });
+});
+
+/** Opening a row of the drawer's list, by a tap or by the archive and delete
+ *  hand-offs to the next row. */
+describe('openListedThread', () => {
+  beforeEach(() => {
+    resetAll();
+    paneOnScreen.value = true;
+    threadMap.value = new Map([['waiting', {
+      meta: { id: 'waiting', status: 'waiting_for_user_answer' },
+      events: new Map<number, unknown>([
+        [1, { type: 'MessageReceived', content: 'go', _eventId: 'start-1', created: '2026-08-06T10:00:00Z' }],
+        [2, { type: 'UserQuestionAsked', tool_use_id: 'tu-1', question: 'Which?', _eventId: 'q-1', created: '2026-08-06T10:00:01Z' }],
+      ]),
+      pendingUserMessages: [],
+      eventsLoaded: true,
+    } as unknown as ThreadState]]);
+    setDrawerGrouping('ongoing');
+    setSelectedOngoingGroup('blocked');
+    threadSearchQuery.value = '';
+  });
+
+  it('lands a Blocked row on its card, keeping the hand-off unrevealed', () => {
+    openListedThread('waiting', { revealPane: false });
+
+    expect(focusThread).toHaveBeenCalledWith('waiting', { revealPane: false });
+    expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1');
+  });
+
+  /** Behind a hidden pane the card has no box, so landing now would time out
+   *  and toast while the reader is still in the list. */
+  it('holds a hand-off behind a hidden pane until the pane is on screen', () => {
+    paneOnScreen.value = false;
+    focusThread.mockImplementation((id: string) => { focusedThreadId.value = id; });
+    openListedThread('waiting', { revealPane: false });
+    expect(landOnEvent).not.toHaveBeenCalled();
+
+    paneOnScreen.value = true;
+    expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1');
+  });
+
+  it('drops a held hand-off once the reader opens another thread', async () => {
+    paneOnScreen.value = false;
+    focusThread.mockImplementation((id: string) => { focusedThreadId.value = id; });
+    openListedThread('waiting', { revealPane: false });
+
+    focusedThreadId.value = 'elsewhere';
+    await settle();
+    focusedThreadId.value = 'waiting';
+    paneOnScreen.value = true;
+    expect(landOnEvent).not.toHaveBeenCalled();
+  });
+
+  it('opens a row of any other list as it was', () => {
+    setSelectedOngoingGroup('in-flight');
+    openListedThread('waiting');
+    setDrawerGrouping('folders');
+    setSelectedOngoingGroup('blocked');
+    openListedThread('waiting');
+
+    expect(focusThread).toHaveBeenCalledTimes(2);
+    expect(landOnEvent).not.toHaveBeenCalled();
+  });
+
+  it('opens a search result as it was', () => {
+    threadSearchQuery.value = 'which';
+    openListedThread('waiting');
+
+    expect(focusThread).toHaveBeenCalledOnce();
     expect(landOnEvent).not.toHaveBeenCalled();
   });
 });

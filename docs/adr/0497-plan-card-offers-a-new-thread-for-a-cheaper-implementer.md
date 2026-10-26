@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-16
+- **Amended by**: [0560: A handoff starts a successor session in the same thread](0560-successor-session-in-the-same-thread.md)
 
 ## Context
 

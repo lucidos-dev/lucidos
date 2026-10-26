@@ -1372,8 +1372,9 @@ async fn a_restart_prompts_an_unprompted_flaky_thread_once() {
     teardown_test_db(&fx.db).await;
 }
 
-/// Hand `old` off to a new thread, as `lucidos successor spawn` does: the old
-/// thread archives itself and the successor row links back to it.
+/// Hand `old` off to a legacy *successor thread*, as handoffs did before
+/// successor sessions: the old thread archives itself and the successor row
+/// links back to it.
 async fn hand_off(fx: &Fixture, old: Uuid) -> Uuid {
     let successor = Uuid::new_v4();
     start_cc_session(&fx.bus, old, "lucidos-old", None).await;

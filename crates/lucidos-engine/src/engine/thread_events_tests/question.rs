@@ -13,6 +13,7 @@ fn user_question_asked_serialization() {
                 description: Some("desc".into()),
                 preview: Some("![first](artifacts/first.png)".into()),
                 widget: None,
+                quiet: false,
             },
             QuestionOption {
                 id: "o2".into(),
@@ -20,6 +21,7 @@ fn user_question_asked_serialization() {
                 description: None,
                 preview: None,
                 widget: None,
+                quiet: false,
             },
         ],
         worktree_path: Some("/tmp/cc-abc".into()),
@@ -162,6 +164,7 @@ fn user_question_asked_carries_multi_select() {
 fn user_question_answered_selected_serialization() {
     let event = ThreadEvent::UserQuestionAnswered {
         tool_use_id: "tu_1".into(),
+        quiet: false,
         answer: AnswerKind::Selected {
             option_id: "o1".into(),
         },
@@ -177,6 +180,7 @@ fn user_question_answered_selected_serialization() {
 fn user_question_answered_free_text_serialization() {
     let event = ThreadEvent::UserQuestionAnswered {
         tool_use_id: "tu_1".into(),
+        quiet: false,
         answer: AnswerKind::FreeText {
             text: "let's do X".into(),
             image_hashes: vec![],
@@ -191,6 +195,7 @@ fn user_question_answered_free_text_serialization() {
 fn user_question_answered_canceled_serialization() {
     let event = ThreadEvent::UserQuestionAnswered {
         tool_use_id: "tu_1".into(),
+        quiet: false,
         answer: AnswerKind::Canceled,
     };
     let v = serde_json::to_value(&event).unwrap();
@@ -201,6 +206,7 @@ fn user_question_answered_canceled_serialization() {
 fn user_question_answered_multi_selected_serialization() {
     let event = ThreadEvent::UserQuestionAnswered {
         tool_use_id: "tu_1".into(),
+        quiet: false,
         answer: AnswerKind::MultiSelected {
             option_ids: vec!["opt-0".into(), "opt-2".into()],
             text: None,
@@ -239,6 +245,7 @@ fn user_question_answered_multi_selected_with_text_serialization() {
     // alongside the toggled option ids. Round-trips with `text` present.
     let event = ThreadEvent::UserQuestionAnswered {
         tool_use_id: "tu_2".into(),
+        quiet: false,
         answer: AnswerKind::MultiSelected {
             option_ids: vec!["opt-0".into()],
             text: Some("plus this".into()),
@@ -268,6 +275,7 @@ fn user_question_answered_multi_selected_with_text_serialization() {
 fn user_question_answered_event_type() {
     let event = ThreadEvent::UserQuestionAnswered {
         tool_use_id: "tu_1".into(),
+        quiet: false,
         answer: AnswerKind::Canceled,
     };
     assert_eq!(event.event_type(), "UserQuestionAnswered");

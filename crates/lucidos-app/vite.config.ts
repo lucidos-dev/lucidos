@@ -415,6 +415,10 @@ export default defineConfig({
       // WITHOUT the barrel, like the pane swipe above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/widget-frame': resolve(__dirname, '../../packages/lucidos-sdk/src/widgetFrame.ts'),
+      // The tick a hold gives when it opens a menu, host and widget frame
+      // alike. Reached WITHOUT the barrel, like the pane swipe above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/haptic': resolve(__dirname, '../../packages/lucidos-sdk/src/haptic.ts'),
       // One sound at a time: the frame's message, the host's pause channel, and
       // the helpers the host runs on its own document. Reached WITHOUT the
       // barrel, like the pane swipe above.

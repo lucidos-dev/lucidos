@@ -71,7 +71,8 @@ function flattenSlides(deck: SlidesDeck): FlatSlide[] {
  *  A `.slides` file is an artifact the model writes, and these fields reach the
  *  host origin through `dangerouslySetInnerHTML`. Setting `innerHTML` never runs
  *  a `<script>`, but it does fire an `<img onerror>`, so the deck gets the same
- *  scrub chat markdown gets.
+ *  scrub chat markdown gets. Each site also carries `.authored-html`, so a
+ *  deck's inline style stays inside its own box.
  *
  *  Every `dangerouslySetInnerHTML` in this file goes through here. Pinned by
  *  `SlidesPreview.test.ts`, which scans the source for a site that skipped it. */
@@ -91,11 +92,11 @@ function renderNode(node: ContentNode, key: number): preact.JSX.Element | null {
       );
 
     case 'html':
-      return <div class="slides-pv-html" key={key} dangerouslySetInnerHTML={{ __html: slideHtml(node.content) }} />;
+      return <div class="slides-pv-html authored-html" key={key} dangerouslySetInnerHTML={{ __html: slideHtml(node.content) }} />;
 
     case 'list':
       return (
-        <ul class="slides-pv-list" key={key}>
+        <ul class="slides-pv-list authored-html" key={key}>
           {node.items?.map((item, i) => <li key={i} dangerouslySetInnerHTML={{ __html: slideHtml(item) }} />)}
         </ul>
       );
@@ -106,7 +107,7 @@ function renderNode(node: ContentNode, key: number): preact.JSX.Element | null {
     case 'insight':
       return (
         <div class="slides-pv-insight" data-color={node.color} key={key}>
-          <span dangerouslySetInnerHTML={{ __html: slideHtml(node.text) }} />
+          <span class="slides-pv-insight-text authored-html" dangerouslySetInnerHTML={{ __html: slideHtml(node.text) }} />
         </div>
       );
 
@@ -149,7 +150,7 @@ function renderNode(node: ContentNode, key: number): preact.JSX.Element | null {
       );
 
     case 'tree':
-      return <pre class="slides-pv-tree" key={key} dangerouslySetInnerHTML={{ __html: slideHtml(node.content) }} />;
+      return <pre class="slides-pv-tree authored-html" key={key} dangerouslySetInnerHTML={{ __html: slideHtml(node.content) }} />;
 
     case 'skillChips':
       return (
@@ -183,7 +184,7 @@ function renderNode(node: ContentNode, key: number): preact.JSX.Element | null {
           <span class="slides-pv-takeaway-num">{node.num}</span>
           <div>
             <div class="slides-pv-takeaway-title">{node.title}</div>
-            {node.body && <div class="slides-pv-takeaway-body" dangerouslySetInnerHTML={{ __html: slideHtml(node.body) }} />}
+            {node.body && <div class="slides-pv-takeaway-body authored-html" dangerouslySetInnerHTML={{ __html: slideHtml(node.body) }} />}
           </div>
         </div>
       );
@@ -195,7 +196,7 @@ function renderNode(node: ContentNode, key: number): preact.JSX.Element | null {
       return <div class="slides-pv-vs-label" key={key}>{node.text}</div>;
 
     case 'archDiagram':
-      return <div class="slides-pv-diagram" key={key} dangerouslySetInnerHTML={{ __html: slideHtml(node.content) }} />;
+      return <div class="slides-pv-diagram authored-html" key={key} dangerouslySetInnerHTML={{ __html: slideHtml(node.content) }} />;
 
     default:
       return null;

@@ -17,10 +17,11 @@ use uuid::Uuid;
 
 use super::event_bus::{BusEvent, EventBus};
 use super::handoff_history::{calls_per_unit, fresh_tokens_median, thread_repo_sql, HistoryKey};
-use super::successor::{ThreadContext, MAIN_SESSION_CAPTURE};
-use super::switch_estimate::cache_remaining_secs;
+use super::successor::{current_session_capture_sql, ThreadContext};
+use super::switch_estimate::{cache_remaining, CacheRemaining};
 use super::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 use crate::llm::model_prices::{price_of, ModelPrice};
+use crate::runtime::intelligence_ladder::{IntelligenceLadder, IntelligenceRung};
 
 /// Context size, in input tokens, at or under which a handoff never pays.
 /// Estimates are noisy there, and a context this small still works well.
@@ -96,6 +97,13 @@ impl CheckpointProgress {
     }
 }
 
+/// The wire form `parse` reads: `<done>/<total>`.
+impl std::fmt::Display for CheckpointProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.done, self.total)
+    }
+}
+
 /// One checkpoint run, as the flow names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointRun {
@@ -116,15 +124,6 @@ impl CheckpointRun {
     pub fn units_left(&self) -> u32 {
         self.progress.map_or(1, |p| p.units_left())
     }
-
-    /// The checkpoint as a successor's title names it: the flow's name, and
-    /// its progress when the flow passed one.
-    pub fn title_label(&self) -> String {
-        match self.progress {
-            Some(p) => format!("{} {}/{}", self.name.as_str(), p.done, p.total),
-            None => self.name.as_str().to_string(),
-        }
-    }
 }
 
 /// Whether the old thread's prompt cache is warm when a handoff starts.
@@ -133,21 +132,24 @@ impl CheckpointRun {
 pub enum CacheWarmth {
     Warm,
     Cold,
+    /// No evidence gives the cache's lifetime, so it may be either.
+    Unknown,
 }
 
 impl CacheWarmth {
-    fn of_remaining_secs(remaining_secs: Option<i64>) -> Self {
-        match remaining_secs {
-            Some(_) => Self::Warm,
-            None => Self::Cold,
+    fn of_remaining(remaining: CacheRemaining) -> Self {
+        match remaining {
+            CacheRemaining::Warm(_) => Self::Warm,
+            CacheRemaining::Cold => Self::Cold,
+            CacheRemaining::Unknown => Self::Unknown,
         }
     }
 }
 
 /// Whether `thread_id`'s prompt cache is warm now.
 pub async fn cache_warmth(pool: &PgPool, thread_id: Uuid) -> Result<CacheWarmth, sqlx::Error> {
-    Ok(CacheWarmth::of_remaining_secs(
-        cache_remaining_secs(pool, thread_id).await?,
+    Ok(CacheWarmth::of_remaining(
+        cache_remaining(pool, thread_id).await?,
     ))
 }
 
@@ -191,6 +193,9 @@ pub(crate) fn estimate(
         CacheWarmth::Cold => {
             saving_usd += context_tokens as f64 * per_token(price.cache.write_5m);
         }
+        // Neither a narrative turn's warm read nor a cold rewrite can be
+        // claimed, so only the calls left weigh. The handoff takes the brief.
+        CacheWarmth::Unknown => {}
     }
     HandoffEstimate {
         pays: context_tokens > HANDOFF_FLOOR_TOKENS && saving_usd > cost_usd,
@@ -204,6 +209,53 @@ pub(crate) fn estimate(
     }
 }
 
+/// The rungs a checkpoint run that declares the *default floor* offers a
+/// thread. The agent hands off onto one of them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FloorRungs {
+    /// The surface's default rung, for a thread below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_rung: Option<IntelligenceRung>,
+    /// The rung just above the default, never the top, for a thread below
+    /// it. The agent takes it for security work or a costly one-way door.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_rung: Option<IntelligenceRung>,
+}
+
+impl FloorRungs {
+    /// What `on`, the rungs that are on from least to most intelligent,
+    /// offers a thread at `thread_at`, with the default at `default_at`.
+    pub(crate) fn offered(
+        on: &[IntelligenceRung],
+        default_at: Option<usize>,
+        thread_at: Option<usize>,
+    ) -> Self {
+        let (Some(default_at), Some(thread_at)) = (default_at, thread_at) else {
+            return Self::default();
+        };
+        let below = |at: usize| on.get(at).filter(|_| thread_at < at).cloned();
+        let risk_at = default_at + 1;
+        Self {
+            floor_rung: below(default_at),
+            risk_rung: below(risk_at).filter(|_| risk_at + 1 < on.len()),
+        }
+    }
+
+    /// What `ladder` offers a thread on `thread`. A ladder that does not
+    /// climb offers nothing: its order says nothing about intelligence.
+    pub fn on_ladder(ladder: &IntelligenceLadder, thread: Option<&IntelligenceRung>) -> Self {
+        if !ladder.climbs {
+            return Self::default();
+        }
+        let at = |rung: &IntelligenceRung| ladder.on_position_of(rung);
+        Self::offered(
+            &ladder.pairs(),
+            ladder.default_intelligence_rung.as_ref().and_then(at),
+            thread.and_then(at),
+        )
+    }
+}
+
 /// The engine's verdict for one thread at one checkpoint run.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HandoffVerdict {
@@ -214,6 +266,10 @@ pub struct HandoffVerdict {
     /// or a model with no price row. The agent then carries on.
     pub pays: Option<bool>,
     pub estimate: Option<HandoffEstimate>,
+    /// Empty unless the run declared the default floor, and the thread can
+    /// hand off and holds no open change.
+    #[serde(flatten)]
+    pub rungs: FloorRungs,
 }
 
 /// What a checkpoint run read off its thread, which its record keeps so a
@@ -233,7 +289,7 @@ pub async fn handoff_verdict(
     run: &CheckpointRun,
 ) -> Result<HandoffVerdict, sqlx::Error> {
     let readings = read_thread(pool, thread_id).await?;
-    verdict_from(pool, thread_id, run, &readings).await
+    verdict_from(pool, thread_id, run, &readings, FloorRungs::default()).await
 }
 
 async fn verdict_from(
@@ -241,20 +297,27 @@ async fn verdict_from(
     thread_id: Uuid,
     run: &CheckpointRun,
     readings: &Readings,
+    offered: FloorRungs,
 ) -> Result<HandoffVerdict, sqlx::Error> {
+    let context = super::successor::thread_context(pool, thread_id).await?;
+    let eligible = context.can_hand_off && !holds_open_change(pool, thread_id).await?;
     let unknown = HandoffVerdict {
         name: run.name.clone(),
         progress: run.progress,
         pays: None,
         estimate: None,
+        rungs: if eligible {
+            offered
+        } else {
+            FloorRungs::default()
+        },
     };
     let Some(inputs) = estimate_inputs(pool, thread_id, run.name.as_str(), readings).await? else {
         return Ok(unknown);
     };
     let warmth = cache_warmth(pool, thread_id).await?;
     let mut estimate = inputs.estimate(run.units_left(), warmth);
-    let context = super::successor::thread_context(pool, thread_id).await?;
-    estimate.pays &= context.can_hand_off && !holds_open_change(pool, thread_id).await?;
+    estimate.pays &= eligible;
     Ok(HandoffVerdict {
         pays: Some(estimate.pays),
         estimate: Some(estimate),
@@ -335,9 +398,11 @@ pub(crate) fn offer_held_back(declined_at: Option<u64>, current: u64) -> bool {
 pub struct CardVerdict {
     /// The card shows while the cache is warm.
     pub warm: bool,
-    /// The card shows once the cache is cold.
+    /// The card shows once the cache is cold, or at once when its lifetime is
+    /// unknown.
     pub cold: bool,
-    /// When the cache goes cold, `None` when it already is.
+    /// When the cache goes cold, `None` when it already is or its lifetime is
+    /// unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cold_at: Option<DateTime<Utc>>,
     /// How many times a fresh thread's context the old one holds, for the
@@ -367,27 +432,39 @@ pub async fn card_verdict(
     );
     let eligible = context.can_hand_off && !held && !holds_open_change(pool, thread_id).await?;
     let shows = |warmth| eligible && inputs.estimate(1, warmth).pays;
-    let remaining_secs = cache_remaining_secs(pool, thread_id).await?;
+    let remaining = cache_remaining(pool, thread_id).await?;
+    let after_warm = match remaining {
+        CacheRemaining::Unknown => CacheWarmth::Unknown,
+        CacheRemaining::Warm(_) | CacheRemaining::Cold => CacheWarmth::Cold,
+    };
+    let cold_at = match remaining {
+        CacheRemaining::Warm(secs) => Some(Utc::now() + chrono::Duration::seconds(secs)),
+        CacheRemaining::Cold | CacheRemaining::Unknown => None,
+    };
     Ok(Some(CardVerdict {
         warm: shows(CacheWarmth::Warm),
-        cold: shows(CacheWarmth::Cold),
-        cold_at: remaining_secs.map(|secs| Utc::now() + chrono::Duration::seconds(secs)),
+        cold: shows(after_warm),
+        cold_at,
         fresh_ratio: inputs.context_tokens as f64 / inputs.fresh_tokens.max(1.0),
     }))
 }
 
 /// Record `run` on `thread_id` as a `HandoffCheckpointReached`, and return
-/// its verdict. The record is the sample a later median reads.
+/// its verdict. The record is the sample a later median reads. `floor` is
+/// `Some` when the run declares the default floor, holding the rungs the
+/// ladder offers.
 pub async fn record_checkpoint(
     bus: &EventBus,
     pool: &PgPool,
     thread_id: Uuid,
     run: &CheckpointRun,
     offered: bool,
+    floor: Option<FloorRungs>,
     actor: Option<MessageOrigin>,
 ) -> Result<HandoffVerdict, Box<dyn std::error::Error + Send + Sync>> {
     let readings = read_thread(pool, thread_id).await?;
-    let verdict = verdict_from(pool, thread_id, run, &readings).await?;
+    let default_floor = floor.is_some();
+    let verdict = verdict_from(pool, thread_id, run, &readings, floor.unwrap_or_default()).await?;
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::HandoffCheckpointReached {
@@ -398,6 +475,9 @@ pub async fn record_checkpoint(
             reasoning_effort: readings.reasoning_effort,
             offered,
             pays: verdict.pays,
+            default_floor,
+            floor_rung: verdict.rungs.floor_rung.clone(),
+            risk_rung: verdict.rungs.risk_rung.clone(),
         },
         meta: EventMeta::with_actor(actor),
     })
@@ -416,8 +496,8 @@ async fn read_thread(pool: &PgPool, thread_id: Uuid) -> Result<Readings, sqlx::E
 }
 
 /// Whether `thread_id` holds a change the user may be applying: a pending
-/// one, one applying now, or one in the landing lane. A handoff withdraws a
-/// pending change, so an Apply waiting on this hardening would fail.
+/// one, one applying now, or one in the landing lane. A handoff starts new
+/// work on the branch, so an Apply waiting on this hardening would fail.
 async fn holds_open_change(pool: &PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
     let open: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM changes WHERE thread_id = $1 AND status = $2) \
@@ -444,15 +524,16 @@ async fn thread_repo(pool: &PgPool, thread_id: Uuid) -> Result<Option<String>, s
         .flatten())
 }
 
-/// The model of `thread_id`'s latest main-session call.
+/// The model of `thread_id`'s latest main-session call in its current session.
 pub(crate) async fn thread_model(
     pool: &PgPool,
     thread_id: Uuid,
 ) -> Result<Option<String>, sqlx::Error> {
     let sql = format!(
         "SELECT payload->>'model' FROM events \
-         WHERE thread_id = $1 AND {MAIN_SESSION_CAPTURE} \
-         ORDER BY sequence DESC LIMIT 1"
+         WHERE thread_id = $1 AND {} \
+         ORDER BY sequence DESC LIMIT 1",
+        current_session_capture_sql("$1")
     );
     Ok(sqlx::query_scalar::<_, Option<String>>(&sql)
         .bind(thread_id)
@@ -471,12 +552,13 @@ pub(crate) async fn thread_effort_in_force(
     let sql = format!(
         "SELECT COALESCE( \
            (SELECT payload->>'reasoning_effort' FROM events \
-             WHERE thread_id = $1 AND {MAIN_SESSION_CAPTURE} \
+             WHERE thread_id = $1 AND {} \
              ORDER BY sequence DESC LIMIT 1), \
            (SELECT payload->>'reasoning_effort' FROM events \
              WHERE thread_id = $1 AND event_type = 'CodingAgentSettingsChanged' \
                AND payload->>'reasoning_effort' IS NOT NULL \
-             ORDER BY sequence DESC LIMIT 1))"
+             ORDER BY sequence DESC LIMIT 1))",
+        current_session_capture_sql("$1")
     );
     sqlx::query_scalar::<_, Option<String>>(&sql)
         .bind(thread_id)

@@ -225,6 +225,7 @@ async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_id
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })
@@ -308,6 +309,7 @@ async fn spawn_cc_child(
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })
@@ -867,6 +869,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })
@@ -885,6 +888,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
                 description: None,
                 preview: None,
                 widget: None,
+                quiet: false,
             }],
             worktree_path: None,
             multi_select: false,
@@ -995,6 +999,7 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })

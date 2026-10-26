@@ -285,6 +285,7 @@ async fn user_question_lifecycle_propagates_count() {
         thread_id: child_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: "tu-1".into(),
+            quiet: false,
             answer: AnswerKind::FreeText {
                 text: "yes".into(),
                 image_hashes: vec![],
@@ -355,6 +356,7 @@ async fn cc_permission_lifecycle_propagates_attention_count() {
             tool_name: "Edit".into(),
             input: serde_json::json!({}),
             summary: "Edit file".into(),
+            grant_offer: None,
         },
         meta: EventMeta::NONE,
     })
@@ -495,6 +497,7 @@ async fn mixed_siblings_attention_counts_only_wfua_not_running() {
             tool_name: "Edit".into(),
             input: serde_json::json!({}),
             summary: "Edit file".into(),
+            grant_offer: None,
         },
         meta: EventMeta::NONE,
     })

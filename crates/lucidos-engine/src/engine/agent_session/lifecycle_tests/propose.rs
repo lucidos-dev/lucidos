@@ -52,9 +52,84 @@ fn normal_idle_during_shutdown_does_nothing() {
 #[test]
 fn terminate_decision_default_terminates() {
     assert_eq!(
-        terminate_decision(0, 0, false),
+        terminate_decision(0, 0, false, false),
         TerminateDecision::Terminate,
         "nothing queued, nothing owed, no reservation: terminate is the default"
+    );
+}
+
+/// A session that handed off exits at its idle even with a follow-up queued
+/// or promised. Kept alive, it would run that follow-up as a turn of its own
+/// before the successor session starts. The queued input instead drains to
+/// the successor session, whose opening it reads first.
+#[test]
+fn terminate_decision_handed_off_leaves_queued_follow_ups_to_the_successor() {
+    assert_eq!(
+        terminate_decision(2, 0, true, true),
+        TerminateDecision::Terminate,
+        "a handed-off session must not take another turn for a queued follow-up"
+    );
+}
+
+/// The other half: a handed-off session forwards no more input, so it stays
+/// queued for the idle exit to drain. Source-text, as the watchdog pins are.
+#[test]
+fn a_handed_off_session_forwards_no_more_input() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+    let arm = RUN_SRC
+        .find("msg_rx.recv(), if !handed_off =>")
+        .expect("the input arm must be off once the session handed off");
+    let body = &RUN_SRC[arm..];
+    let forward = body
+        .find("agent_input_tx.send(agent_input)")
+        .expect("the arm forwards");
+    let check = body
+        .find("successor::handoff_pending(")
+        .expect("the arm checks for a handoff");
+    assert!(
+        check < forward,
+        "the arm must check for a handoff before it forwards"
+    );
+}
+
+/// A handoff can end, for example by a Stop, and leave input queued. Every
+/// idle exit refreshes the loop's flag, so the input arm opens again rather
+/// than keeping a live subprocess that never reads its queue.
+#[test]
+fn every_idle_exit_refreshes_the_handoff_flag() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+    let exit = RUN_SRC
+        .find("async fn exit_idle_subprocess_unless_owed(")
+        .expect("the idle exit exists");
+    assert!(
+        RUN_SRC[exit..].contains("*handed_off = crate::engine::successor::handoff_pending("),
+        "the idle exit must write its handoff read back to the run loop"
+    );
+    for call in [
+        "self.exit_idle_subprocess_unless_owed(",
+        "self.idle_exit_ends_session(",
+    ] {
+        for (at, _) in RUN_SRC.match_indices(call) {
+            let line = &RUN_SRC[at..at + RUN_SRC[at..].find('\n').unwrap()];
+            assert!(
+                line.contains("&mut handed_off"),
+                "an idle exit must refresh the loop's flag: {line}"
+            );
+        }
+    }
+}
+
+/// An input the session forwarded before it handed off sits in the agent's own
+/// queue, and the agent reads it. Killing the process would lose it.
+#[test]
+fn terminate_decision_handed_off_still_waits_for_what_the_agent_was_sent() {
+    assert_eq!(
+        terminate_decision(1, 1, false, true),
+        TerminateDecision::KeepAliveForFollowup {
+            queued: 1,
+            unread: 1,
+            redirect_pending: false,
+        },
     );
 }
 
@@ -65,7 +140,7 @@ fn terminate_decision_default_terminates() {
 #[test]
 fn terminate_decision_queued_followup_keeps_alive() {
     assert_eq!(
-        terminate_decision(1, 0, false),
+        terminate_decision(1, 0, false, false),
         TerminateDecision::KeepAliveForFollowup {
             queued: 1,
             unread: 0,
@@ -81,7 +156,7 @@ fn terminate_decision_queued_followup_keeps_alive() {
 #[test]
 fn terminate_decision_armed_redirect_keeps_alive() {
     assert_eq!(
-        terminate_decision(0, 0, true),
+        terminate_decision(0, 0, true, false),
         TerminateDecision::KeepAliveForFollowup {
             queued: 0,
             unread: 0,

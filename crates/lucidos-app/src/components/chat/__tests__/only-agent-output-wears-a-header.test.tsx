@@ -36,7 +36,7 @@ function mount(exchange: Exchange, live = false, isContinuableAbort = false): vo
         isContinuableAbort={isContinuableAbort}
         threadId="tid"
         threadIsCC={true}
-        threadCodingAgent="claude-code"
+        sessionCodingAgent="claude-code"
         threadIdle={!live}
         threadAwaitingAnswer={false}
         threadCanceling={false}

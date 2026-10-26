@@ -453,11 +453,11 @@
       "group": "marks",
       "kind": "color",
       "label": "Codex mark",
-      "description": "The Codex logo's stroke. Follows the light accent by default.",
+      "description": "The Codex logo's fill. Follows the primary text colour by default, so it reads white on a dark theme.",
       "frames": false,
       "default": {
-        "dark": "var(--accent-light)",
-        "light": "var(--accent-light)"
+        "dark": "var(--text-primary)",
+        "light": "var(--text-primary)"
       }
     },
     {

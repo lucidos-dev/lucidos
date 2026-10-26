@@ -14,7 +14,7 @@ use serde_json::json;
 pub fn get_notification_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::SEND_NOTIFICATION.to_string(),
-        description: "Send a notification to the user. It always lands in the inbox. With the app open and focused on ANY device the OS push is suppressed on EVERY device and the active ones show an in-app toast; a push fires only when NO device is active. So a user chatting with you right now sees a toast, never a push: do not tell them to 'check your device for the push'.".to_string(),
+        description: "Send a notification; it always reaches the inbox. A shown toast, auto-read or silenced toasts mean OS push is suppressed on every device. Fullscreen can report not_shown, allowing push. Do not tell an active user to 'check your device for the push'.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {

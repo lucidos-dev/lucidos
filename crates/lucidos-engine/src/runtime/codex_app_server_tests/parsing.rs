@@ -778,3 +778,35 @@ fn token_usage_carries_the_effort_the_turn_was_sent_with() {
         "{evs:?}"
     );
 }
+
+/// The app-server reports the same write as `cacheWriteInputTokens`. Usage
+/// carries the uncached rest, and Codex names no lifetime.
+#[test]
+fn token_usage_maps_the_cache_write() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    let evs = note(
+        &mut t,
+        "thread/tokenUsage/updated",
+        serde_json::json!({"threadId": "t-1", "turnId": "u1", "tokenUsage": {
+            "last": {"inputTokens": 11974, "cachedInputTokens": 0,
+                     "cacheWriteInputTokens": 11971, "outputTokens": 40,
+                     "reasoningOutputTokens": 0, "totalTokens": 12014},
+            "total": {"inputTokens": 11974, "cachedInputTokens": 0,
+                      "cacheWriteInputTokens": 11971, "outputTokens": 40,
+                      "reasoningOutputTokens": 0, "totalTokens": 12014}
+        }}),
+    );
+    assert!(
+        matches!(
+            &evs[..],
+            [AgentEvent::Usage {
+                input_tokens: 3,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 11_971,
+                cache_creation_1h_tokens: None,
+                ..
+            }]
+        ),
+        "{evs:?}"
+    );
+}

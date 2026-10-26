@@ -1,5 +1,5 @@
-//! *Successor threads*: a coding-agent thread's context size, and the handoff
-//! to a new thread that carries on with a fresh context.
+//! *Successor sessions*: a coding-agent thread's context size, and the handoff
+//! to a fresh session in the same thread.
 //!
 //! - `GET /api/v1/threads/:thread_id/context`: the size and what it calls for.
 //! - `POST /api/v1/threads/:thread_id/handoff-checkpoints`: record a *handoff
@@ -11,11 +11,9 @@
 //! - `POST /api/v1/threads/:thread_id/successor-offer/decline`: the user chose
 //!   *Stay here* on the Successor card.
 //!
-//! The successor sits in the old thread's place (ADR 0168): top-level when the
-//! old thread was, else a child of the same parent with the same wake mode.
-//! A top-level plan card's handoff starts a *build chain* under the old thread
-//! instead (ADR 0503). Its branch starts at the old thread's last commit
-//! (`engine::successor::carried_base`).
+//! A handoff creates no thread, no branch and no change. It records
+//! `SessionHandedOff`, and the thread's next session starts fresh from its
+//! opening once the current run lets go of the thread.
 
 use axum::{
     extract::{Path, State},
@@ -28,26 +26,21 @@ use uuid::Uuid;
 use crate::api::actor::SubprocessOrigin;
 use crate::api::chat::chat_submit;
 use crate::api::error::ApiError;
-use crate::api::thread_reach::{
-    authority_held, pass_authority, HeldAuthority, PassedAuthority, ThreadReachError,
-    ThreadReachVerb,
-};
 use crate::api::AppState;
 use crate::api::ChatRequest;
 use crate::core::store::thread_link;
 use crate::engine::event_bus::BusEvent;
 use crate::engine::handoff_estimate::{
-    cache_warmth, card_verdict, handoff_verdict, record_checkpoint, CacheWarmth, CardVerdict,
-    CheckpointRun, HandoffVerdict,
+    cache_warmth, card_verdict, record_checkpoint, CacheWarmth, CardVerdict, CheckpointRun,
+    FloorRungs, HandoffVerdict,
 };
 use crate::engine::successor::{
-    build_chain, carried_consent, handoff_brief, missing_narrative_sections,
-    pending_successor_request, record_handoff, resolve_implementer, Handoff, Implementer,
-    ImplementerRequest, Placement, ThreadContext, HANDOFF_REQUEST,
+    handoff_brief, missing_narrative_sections, narrative_opening, pending_successor_request,
+    resolve_implementer, BriefCause, HandoffRequest, Implementer, ImplementerRequest,
+    ThreadContext, HANDOFF_REQUEST,
 };
-use crate::engine::thread_events::{
-    ActorMode, EventMeta, HandoffConsent, MessageOrigin, ThreadDirection, ThreadEvent,
-};
+use crate::engine::thread_events::{EventMeta, HandoffOpening, MessageOrigin, ThreadEvent};
+use crate::runtime::intelligence_ladder::{self, IntelligenceRung};
 
 fn parse_thread_id(raw: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(raw).map_err(|e| ApiError::bad_request(format!("Invalid thread id: {e}")))
@@ -65,20 +58,7 @@ pub(in crate::api) struct ThreadContextResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     card: Option<CardVerdict>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    handoff: Option<HandoffReading>,
-}
-
-/// The verdict at one checkpoint run, and whether the handoff would need an
-/// owner approval card from this caller.
-#[derive(Debug, Serialize)]
-pub(in crate::api) struct HandoffReading {
-    #[serde(flatten)]
-    verdict: HandoffVerdict,
-    without_card: bool,
-    /// The thread an owner approval card names, when the handoff needs one:
-    /// the parent the successor would sit under.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    approval_target: Option<Uuid>,
+    handoff: Option<HandoffVerdict>,
 }
 
 /// A checkpoint run as a flow names it: a name, and optionally the progress
@@ -107,10 +87,9 @@ impl CheckpointFields {
 async fn context_row(
     state: &AppState,
     thread_id: Uuid,
-) -> Result<(bool, Option<String>, Option<Uuid>), ApiError> {
+) -> Result<(bool, Option<String>), ApiError> {
     sqlx::query_as(
-        "SELECT is_coding_agent, coding_agent, parent_thread_id \
-         FROM thread_summaries WHERE thread_id = $1",
+        "SELECT is_coding_agent, coding_agent FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
     .fetch_optional(&state.pool)
@@ -124,7 +103,7 @@ pub(in crate::api) async fn thread_context(
     Path(thread_id): Path<String>,
 ) -> Result<Json<ThreadContextResponse>, ApiError> {
     let thread_id = parse_thread_id(&thread_id)?;
-    let (is_coding_agent, coding_agent, _) = context_row(&state, thread_id).await?;
+    let (is_coding_agent, coding_agent) = context_row(&state, thread_id).await?;
     let context = crate::engine::successor::thread_context(&state.pool, thread_id)
         .await
         .map_err(ApiError::db)?;
@@ -157,7 +136,7 @@ pub(in crate::api) async fn decline_successor_offer(
 ) -> Result<StatusCode, ApiError> {
     let thread_id = parse_thread_id(&thread_id)?;
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
-    let (is_coding_agent, _, _) = context_row(&state, thread_id).await?;
+    let (is_coding_agent, _) = context_row(&state, thread_id).await?;
     if !is_coding_agent {
         return Err(refusal(
             StatusCode::BAD_REQUEST,
@@ -191,7 +170,8 @@ pub(in crate::api) async fn decline_successor_offer(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A checkpoint run's body. `offered` marks a `--ask` run.
+/// A checkpoint run's body. `offered` marks a `--ask` run. `default_floor`
+/// marks a run that declares the *default floor*.
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct CheckpointRequest {
     name: String,
@@ -199,6 +179,26 @@ pub(in crate::api) struct CheckpointRequest {
     progress: Option<String>,
     #[serde(default)]
     offered: bool,
+    #[serde(default)]
+    default_floor: bool,
+}
+
+/// The rungs `thread_id`'s surface ladder offers it at a run that declares
+/// the default floor.
+async fn floor_rungs(state: &AppState, thread_id: Uuid) -> Result<FloorRungs, ApiError> {
+    let surface = state.engine.thread_coding_agent(thread_id).await.into();
+    let ladder =
+        intelligence_ladder::load(&state.pool, &state.engine.model_routes(), surface).await;
+    let thread = match state
+        .engine
+        .cc_thread_runs_on(thread_id)
+        .await
+        .map_err(ApiError::db)?
+    {
+        (Some(model), Some(effort)) => Some(IntelligenceRung::new(&model, &effort)),
+        _ => None,
+    };
+    Ok(FloorRungs::on_ladder(&ladder, thread.as_ref()))
 }
 
 /// Record a checkpoint run on a coding-agent thread and answer with the
@@ -213,7 +213,7 @@ pub(in crate::api) async fn record_handoff_checkpoint(
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
     let run = CheckpointRun::parse(&request.name, request.progress.as_deref())
         .map_err(ApiError::bad_request)?;
-    let (is_coding_agent, coding_agent, parent) = context_row(&state, thread_id).await?;
+    let (is_coding_agent, coding_agent) = context_row(&state, thread_id).await?;
     if !is_coding_agent {
         return Err(refusal(
             StatusCode::BAD_REQUEST,
@@ -233,22 +233,21 @@ pub(in crate::api) async fn record_handoff_checkpoint(
             ));
         }
     }
+    let floor = match request.default_floor {
+        true => Some(floor_rungs(&state, thread_id).await?),
+        false => None,
+    };
     let verdict = record_checkpoint(
         &state.engine.event_bus,
         &state.pool,
         thread_id,
         &run,
         request.offered,
+        floor,
         Some(actor),
     )
     .await
     .map_err(|e| ApiError::internal(format!("Could not record the checkpoint: {e}")))?;
-    let without_card = match parent {
-        None => true,
-        Some(parent) => {
-            hands_off_without_card(&state.pool, &headers, thread_id, parent, &run).await?
-        }
-    };
     let context = crate::engine::successor::thread_context(&state.pool, thread_id)
         .await
         .map_err(ApiError::db)?;
@@ -256,17 +255,13 @@ pub(in crate::api) async fn record_handoff_checkpoint(
         context,
         implementer: Some(thread_implementer(&state, thread_id, coding_agent.as_deref()).await?),
         card: None,
-        handoff: Some(HandoffReading {
-            verdict,
-            without_card,
-            approval_target: parent.filter(|_| !without_card),
-        }),
+        handoff: Some(verdict),
     }))
 }
 
 /// The implementer a coding-agent thread runs on: its backend, and the model
-/// and effort its calls use (`cc_thread_runs_on`). A successor carries these
-/// over.
+/// and effort its calls use (`cc_thread_runs_on`). A successor session carries
+/// these over.
 async fn thread_implementer(
     state: &AppState,
     thread_id: Uuid,
@@ -286,29 +281,24 @@ async fn thread_implementer(
     })
 }
 
-/// The agent's handoff: a *handoff narrative*, and optionally the successor's
-/// implementer. An agent names none, so the implementer the user picked at
-/// the *Successor card* applies (`pending_successor_request`).
+/// The agent's handoff: a *handoff narrative*, and optionally the successor
+/// session's implementer. An agent names none, so the implementer the user
+/// picked at the *Successor card* applies (`pending_successor_request`).
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct SuccessorRequest {
     #[serde(default)]
     narrative: String,
     #[serde(flatten)]
     implementer: ImplementerRequest,
-    /// A plan card's handoff: start a *build chain* under this thread when it
-    /// is top-level. A child keeps its place, so its parent still gets the
-    /// report.
-    #[serde(default)]
-    build_chain: bool,
-    /// The checkpoint run the handoff happens at, for a standing consent:
-    /// the build chain's, or a carried *handoff consent*.
+    /// The checkpoint run the handoff happens at, which the opening names so
+    /// the successor session skips it.
     #[serde(flatten)]
     checkpoint: CheckpointFields,
 }
 
 /// The *Successor card*'s Continue: the user's first request for the
-/// successor, if they typed one, and the implementer they picked. The body
-/// names no path: the engine picks it by cache warmth (ADR 0539).
+/// successor session, if they typed one, and the implementer they picked. The
+/// body names no path: the engine picks it by cache warmth (ADR 0539).
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct ContinueRequest {
     #[serde(default)]
@@ -317,25 +307,34 @@ pub(in crate::api) struct ContinueRequest {
     implementer: ImplementerRequest,
 }
 
+/// When the successor session starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(in crate::api) enum SessionStart {
+    /// The calling agent's turn holds the thread: the session starts once
+    /// that turn ends.
+    AfterThisTurn,
+    /// Nothing holds the thread, so the session starts now.
+    Now,
+}
+
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct SuccessorResponse {
-    successor_thread_id: Uuid,
-    /// A markdown link to the successor, as `lucidos spawn-thread` prints one.
-    link: String,
-    /// What the successor runs on, so the caller reports what it started.
+    /// What the successor session runs on, so the caller reports what it
+    /// started.
     implementer: Implementer,
-    /// The successor started a build chain under the old thread.
-    build_chain: bool,
+    starts: SessionStart,
 }
 
 /// Which way Continue went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(in crate::api) enum HandoffPath {
-    /// The cache was warm: the old agent is writing the narrative, and the
-    /// successor follows when it spawns.
+    /// The cache was warm: the agent is writing the narrative, and the
+    /// successor session follows its turn.
     Narrative,
-    /// The cache was cold: the successor started at once from a brief.
+    /// The cache was cold, or its lifetime unknown: the successor session
+    /// starts at once from a brief.
     Brief,
 }
 
@@ -343,7 +342,7 @@ impl HandoffPath {
     fn of_warmth(warmth: CacheWarmth) -> Self {
         match warmth {
             CacheWarmth::Warm => Self::Narrative,
-            CacheWarmth::Cold => Self::Brief,
+            CacheWarmth::Cold | CacheWarmth::Unknown => Self::Brief,
         }
     }
 }
@@ -351,20 +350,16 @@ impl HandoffPath {
 #[derive(Debug, Serialize)]
 pub(in crate::api) struct ContinueResponse {
     path: HandoffPath,
-    /// The successor, once it exists: at once on the brief path.
+    /// The handoff, once it is recorded: at once on the brief path.
     #[serde(flatten)]
     successor: Option<SuccessorResponse>,
 }
 
-/// The old thread, as the handoff reads it.
+/// The thread, as the handoff reads it.
 #[derive(sqlx::FromRow)]
-struct OldThread {
+struct HandingOffThread {
     is_coding_agent: bool,
     coding_agent: Option<String>,
-    cc_repo_id: Option<String>,
-    parent_thread_id: Option<Uuid>,
-    wake_mode: Option<String>,
-    spawning_event_id: Option<Uuid>,
     archive_state: String,
     successor_thread_id: Option<Uuid>,
     coding_agent_integrated: bool,
@@ -377,107 +372,100 @@ fn refusal(status: StatusCode, reason: &'static str, message: impl Into<String>)
     ApiError::new(status, message).with_reason(reason)
 }
 
-/// How a successor opens.
+/// How a successor session opens.
 enum Opening {
     /// The agent's *handoff narrative*, and the request the user recorded at
     /// the *Successor card*.
     Narrative {
         narrative: String,
-        request: Option<String>,
+        request: Option<HandoffRequest>,
     },
-    /// No narrative: the *handoff brief*, quoting the user's request if any.
-    Brief(Option<String>),
+    /// No narrative: the *handoff brief*, and the user's request if any.
+    Brief(Option<HandoffRequest>),
 }
 
-/// One handoff, as `start_successor` runs it.
-struct SuccessorStart {
-    old_id: Uuid,
+/// One handoff, as `hand_off` runs it.
+struct HandoffStart {
+    thread_id: Uuid,
     opening: Opening,
     implementer: ImplementerRequest,
     /// The agent itself named `implementer`, so it must be a rung.
     picked_by_agent: bool,
-    build_chain: bool,
     checkpoint: Option<CheckpointRun>,
 }
 
-/// The old thread, once it may hand off: the refusals every handoff shares.
+/// The thread, once it may hand off: the refusals every handoff shares.
 /// `require_idle` is the composer's: a stale tap must not hand off a thread
 /// whose turn has started since. The agent's own handoff runs inside its turn
 /// by design.
 async fn hand_off_candidate(
     state: &AppState,
-    old_id: Uuid,
+    thread_id: Uuid,
     require_idle: bool,
-) -> Result<(OldThread, String), ApiError> {
+) -> Result<(HandingOffThread, String), ApiError> {
     let pool = &state.pool;
-    let link = |title: &str, id: Uuid| {
-        format!(
-            "[{title}]({})",
-            thread_link(&state.engine.workspace_name(), id)
-        )
-    };
-    let old: OldThread = sqlx::query_as(
-        "SELECT is_coding_agent, coding_agent, cc_repo_id, parent_thread_id, wake_mode, \
-                spawning_event_id, archive_state, successor_thread_id, coding_agent_integrated, \
-                apply_in_flight, status, \
+    let thread: HandingOffThread = sqlx::query_as(
+        "SELECT is_coding_agent, coding_agent, archive_state, successor_thread_id, \
+                coding_agent_integrated, apply_in_flight, status, \
                 COALESCE(title, LEFT(first_message, 80)) AS title \
          FROM thread_summaries WHERE thread_id = $1",
     )
-    .bind(old_id)
+    .bind(thread_id)
     .fetch_optional(pool)
     .await
     .map_err(ApiError::db)?
-    .ok_or_else(|| ApiError::not_found(format!("Thread {old_id} does not exist")))?;
-    let old_title = old
+    .ok_or_else(|| ApiError::not_found(format!("Thread {thread_id} does not exist")))?;
+    let title = thread
         .title
         .clone()
-        .unwrap_or_else(|| "the earlier thread".to_string());
-    if !old.is_coding_agent {
+        .unwrap_or_else(|| "the thread".to_string());
+    if !thread.is_coding_agent {
         return Err(refusal(
             StatusCode::BAD_REQUEST,
             "not-coding-agent",
-            format!("\"{old_title}\" is not a coding-agent thread, so it has no successor."),
+            format!("\"{title}\" is not a coding-agent thread, so it has no successor session."),
         ));
     }
-    if old.coding_agent_integrated {
+    if thread.coding_agent_integrated {
         return Err(refusal(
             StatusCode::CONFLICT,
             "integrated",
-            format!("\"{old_title}\" is integrated into its parent, whose agent merges its branch. It hands off to no successor."),
+            format!("\"{title}\" is integrated into its parent, whose agent merges its branch. It hands off to no successor session."),
         ));
     }
-    if let Some(successor) = old.successor_thread_id {
+    if let Some(successor) = thread.successor_thread_id {
+        let link = format!(
+            "[its legacy successor thread]({})",
+            thread_link(&state.engine.workspace_name(), successor)
+        );
         return Err(refusal(
             StatusCode::CONFLICT,
             "already-handed-off",
-            format!(
-                "\"{old_title}\" already continued in {}.",
-                link("its successor", successor)
-            ),
+            format!("\"{title}\" already continued in {link}."),
         ));
     }
-    if old.archive_state == "archived" {
+    if thread.archive_state == "archived" {
         return Err(refusal(
             StatusCode::CONFLICT,
             "archived",
-            format!("\"{old_title}\" is archived. Unarchive it first."),
+            format!("\"{title}\" is archived. Unarchive it first."),
         ));
     }
-    if require_idle && old.status != "idle" {
+    if require_idle && thread.status != "idle" {
         return Err(refusal(
             StatusCode::CONFLICT,
             "thread-busy",
-            format!("\"{old_title}\" is working. Continue once it is idle."),
+            format!("\"{title}\" is working. Continue once it is idle."),
         ));
     }
-    if old.apply_in_flight {
+    if thread.apply_in_flight {
         return Err(refusal(
             StatusCode::CONFLICT,
             "applying",
-            format!("\"{old_title}\" is applying its change. Hand off once the apply ends."),
+            format!("\"{title}\" is applying its change. Hand off once the apply ends."),
         ));
     }
-    if crate::engine::successor::awaits_landing(pool, old_id)
+    if crate::engine::successor::awaits_landing(pool, thread_id)
         .await
         .map_err(ApiError::db)?
     {
@@ -485,23 +473,38 @@ async fn hand_off_candidate(
             StatusCode::CONFLICT,
             "awaiting-landing",
             format!(
-                "\"{old_title}\" has a change waiting in the landing lane. Hand off once it lands."
+                "\"{title}\" has a change waiting in the landing lane. Hand off once it lands."
             ),
         ));
     }
-    Ok((old, old_title))
+    if crate::engine::successor::pending_handoff(pool, thread_id)
+        .await
+        .map_err(ApiError::db)?
+        .is_some()
+    {
+        return Err(already_handing_off(&title));
+    }
+    Ok((thread, title))
+}
+
+fn already_handing_off(title: &str) -> ApiError {
+    refusal(
+        StatusCode::CONFLICT,
+        "handoff-pending",
+        format!("\"{title}\" already handed off. Its successor session starts once the current turn ends."),
+    )
 }
 
 /// A thread hands off only itself: an agent cannot hand off another thread's
-/// work. Answers whether the caller is the agent of `old_id`.
-fn caller_is_the_agent(headers: &HeaderMap, old_id: Uuid) -> Result<bool, ApiError> {
+/// work. Answers whether the caller is the agent of `thread_id`.
+fn caller_is_the_agent(headers: &HeaderMap, thread_id: Uuid) -> Result<bool, ApiError> {
     match crate::api::actor::subprocess_origin(headers) {
         SubprocessOrigin::Subprocess {
             source_thread_id, ..
-        } if source_thread_id != Some(old_id) => Err(refusal(
+        } if source_thread_id != Some(thread_id) => Err(refusal(
             StatusCode::FORBIDDEN,
             "not-your-thread",
-            "A thread can hand off only itself. Run `lucidos successor spawn` in the thread that continues.",
+            "A thread can hand off only itself. Run `lucidos successor start` in the thread that continues.",
         )),
         SubprocessOrigin::Subprocess { .. } => Ok(true),
         SubprocessOrigin::NotSubprocess => Ok(false),
@@ -515,7 +518,7 @@ pub(in crate::api) async fn spawn_successor(
     headers: HeaderMap,
     Json(request): Json<SuccessorRequest>,
 ) -> Result<Json<SuccessorResponse>, ApiError> {
-    let old_id = parse_thread_id(&thread_id)?;
+    let thread_id = parse_thread_id(&thread_id)?;
     let checkpoint = request.checkpoint.run()?;
     let missing = missing_narrative_sections(&request.narrative);
     if !missing.is_empty() {
@@ -530,7 +533,7 @@ pub(in crate::api) async fn spawn_successor(
     }
     // What the user asked for at the card, while the agent wrote this. The
     // agent names no implementer of its own, so the user's pick stands.
-    let pending = pending_successor_request(&state.pool, old_id)
+    let pending = pending_successor_request(&state.pool, thread_id)
         .await
         .map_err(ApiError::db)?
         .unwrap_or_default();
@@ -541,18 +544,17 @@ pub(in crate::api) async fn spawn_successor(
     } else {
         pending.implementer
     };
-    start_successor(
+    hand_off(
         &state,
         &headers,
-        SuccessorStart {
-            old_id,
+        HandoffStart {
+            thread_id,
             opening: Opening::Narrative {
                 narrative: request.narrative,
-                request: pending.message,
+                request: pending.request,
             },
             implementer,
             picked_by_agent,
-            build_chain: request.build_chain,
             checkpoint,
         },
     )
@@ -561,53 +563,56 @@ pub(in crate::api) async fn spawn_successor(
 }
 
 /// The *Successor card*'s Continue. The engine picks the path by the cache's
-/// warmth now. Warm: record the request and ask the old agent for its
-/// *handoff narrative*, and the successor follows when the agent spawns it.
-/// Cold: start the successor at once from a *handoff brief*, and wake nothing
-/// on the old thread (ADR 0539).
+/// warmth now. Warm: record the request and ask the agent for its *handoff
+/// narrative*, and the successor session follows when the agent hands off.
+/// Cold: start the successor session at once from a *handoff brief*, and wake
+/// nothing on the current session (ADR 0539).
 pub(in crate::api) async fn continue_in_successor(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     headers: HeaderMap,
     Json(request): Json<ContinueRequest>,
 ) -> Result<Json<ContinueResponse>, ApiError> {
-    let old_id = parse_thread_id(&thread_id)?;
+    let thread_id = parse_thread_id(&thread_id)?;
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
-    if caller_is_the_agent(&headers, old_id)? {
+    if caller_is_the_agent(&headers, thread_id)? {
         return Err(refusal(
             StatusCode::FORBIDDEN,
             "agent-caller",
-            "Continue is the user's card. An agent hands off with `lucidos successor spawn`.",
+            "Continue is the user's card. An agent hands off with `lucidos successor start`.",
         ));
     }
     let message = request
         .message
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
-    let (old, _) = hand_off_candidate(&state, old_id, true).await?;
+    let typed = message.clone().map(|message| HandoffRequest {
+        message,
+        by: actor.clone(),
+    });
+    let (thread, _) = hand_off_candidate(&state, thread_id, true).await?;
     // Refuse a pick the backend does not offer now. A warm tap would
-    // otherwise cost a narrative turn that the spawn then refuses.
+    // otherwise cost a narrative turn that the handoff then refuses.
     resolve_implementer(
-        &thread_implementer(&state, old_id, old.coding_agent.as_deref()).await?,
+        &thread_implementer(&state, thread_id, thread.coding_agent.as_deref()).await?,
         &request.implementer,
     )
     .map_err(|e| refusal(StatusCode::BAD_REQUEST, "implementer-not-offered", e))?;
     let path = HandoffPath::of_warmth(
-        cache_warmth(&state.pool, old_id)
+        cache_warmth(&state.pool, thread_id)
             .await
             .map_err(ApiError::db)?,
     );
     let successor = match path {
         HandoffPath::Brief => Some(
-            start_successor(
+            hand_off(
                 &state,
                 &headers,
-                SuccessorStart {
-                    old_id,
-                    opening: Opening::Brief(message),
+                HandoffStart {
+                    thread_id,
+                    opening: Opening::Brief(typed),
                     implementer: request.implementer,
                     picked_by_agent: false,
-                    build_chain: false,
                     checkpoint: None,
                 },
             )
@@ -617,7 +622,7 @@ pub(in crate::api) async fn continue_in_successor(
             request_narrative(
                 &state,
                 &headers,
-                old_id,
+                thread_id,
                 actor,
                 message,
                 request.implementer,
@@ -629,12 +634,12 @@ pub(in crate::api) async fn continue_in_successor(
     Ok(Json(ContinueResponse { path, successor }))
 }
 
-/// Record the user's request on the old thread, then ask its agent for the
+/// Record the user's request on the thread, then ask its agent for the
 /// *handoff narrative* as a user would.
 async fn request_narrative(
     state: &AppState,
     headers: &HeaderMap,
-    old_id: Uuid,
+    thread_id: Uuid,
     actor: MessageOrigin,
     message: Option<String>,
     implementer: ImplementerRequest,
@@ -643,7 +648,7 @@ async fn request_narrative(
         .engine
         .event_bus
         .emit(BusEvent::Thread {
-            thread_id: old_id,
+            thread_id,
             event: ThreadEvent::SuccessorRequested {
                 message,
                 coding_agent: implementer.coding_agent,
@@ -661,7 +666,8 @@ async fn request_narrative(
     let ask: ChatRequest = serde_json::from_value(serde_json::json!({
         "message": HANDOFF_REQUEST,
         "mode": actor.mode(),
-        "thread_id": old_id.to_string(),
+        "use_coding_agent": true,
+        "thread_id": thread_id.to_string(),
         "device_id": device_id,
     }))
     .map_err(|e| ApiError::internal(format!("Could not build the handoff request: {e}")))?;
@@ -670,31 +676,29 @@ async fn request_narrative(
         .map(|_ack| ())
 }
 
-/// Start the successor of `start.old_id`: record the handoff and queue its
-/// first message.
-async fn start_successor(
+/// Record `start.thread_id`'s handoff, then start its successor session once
+/// nothing holds the thread. A handoff is an act in the thread's own subtree,
+/// so it needs no authority.
+async fn hand_off(
     state: &AppState,
     headers: &HeaderMap,
-    start: SuccessorStart,
+    start: HandoffStart,
 ) -> Result<SuccessorResponse, ApiError> {
-    let SuccessorStart {
-        old_id,
+    let HandoffStart {
+        thread_id,
         opening,
         implementer: requested,
         picked_by_agent,
-        build_chain: wants_build_chain,
         checkpoint,
     } = start;
     let engine = &state.engine;
     let pool = &state.pool;
-    let workspace = engine.workspace_name();
-    let link = |title: &str, id: Uuid| format!("[{title}]({})", thread_link(&workspace, id));
 
-    let from_agent = caller_is_the_agent(headers, old_id)?;
-    let (old, old_title) =
-        hand_off_candidate(state, old_id, matches!(opening, Opening::Brief(_))).await?;
+    let from_agent = caller_is_the_agent(headers, thread_id)?;
+    let (thread, title) =
+        hand_off_candidate(state, thread_id, matches!(opening, Opening::Brief(_))).await?;
     let implementer = resolve_implementer(
-        &thread_implementer(state, old_id, old.coding_agent.as_deref()).await?,
+        &thread_implementer(state, thread_id, thread.coding_agent.as_deref()).await?,
         &requested,
     )
     .map_err(|e| refusal(StatusCode::BAD_REQUEST, "implementer-not-offered", e))?;
@@ -709,406 +713,87 @@ async fn start_successor(
         )
         .await?;
     }
-    let base_sha = carried_head(state, old_id, &old_title).await?;
 
-    // Last before any write: an owner approval this spends must not be
-    // wasted on a refusal above.
-    let build_chain = wants_build_chain && old.parent_thread_id.is_none();
-    let placement = if build_chain {
-        Placement::build_chain_under(old_id)
-    } else {
-        Placement::of_old_thread(
-            old.parent_thread_id,
-            old.wake_mode.as_deref(),
-            old.spawning_event_id,
-        )
-    };
-    let actor = crate::api::actor::user_actor(headers, None);
-    // A top-level successor is a top-thread, which needs no authority (ADR
-    // 0475). A child one is an act in its parent's subtree, unless a standing
-    // consent covers it (ADR 0503, 0507).
-    let handoff_consent = match placement.parent_thread_id {
-        None => None,
-        Some(parent) => match standing_consent(pool, old_id, parent, checkpoint.as_ref()).await? {
-            Some(StandingConsent::BuildChain) => None,
-            Some(StandingConsent::Carried) => Some(HandoffConsent::Carried),
-            None => {
-                let passed = pass_authority(
-                    &engine.event_bus,
-                    headers,
-                    Some(parent),
-                    ThreadReachVerb::SpawnSuccessor,
-                )
-                .await
-                .map_err(|e| authority_refusal(e, parent))?;
-                // A build chain's own consent covers its members, so its
-                // builder records none.
-                recorded_consent(passed, actor.as_ref()).filter(|_| !build_chain)
-            }
-        },
-    };
-
-    let (mode, origin) = if from_agent {
-        (
-            ActorMode::Agent,
-            Some(MessageOrigin::ThreadLink {
-                thread_id: old_id,
-                title: Some(old_title.clone()),
-                spawning_event_id: None,
-                mode: ActorMode::Agent,
-                direction: ThreadDirection::Parent,
-            }),
-        )
-    } else {
-        // The first message speaks as the credential: a device is the user,
-        // the local token is the machine. A mismatch would fail the spawn
-        // after the handoff is recorded.
-        let origin = actor.clone().ok_or_else(|| {
-            ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "A handoff needs a credential that names who asks.",
-            )
-        })?;
-        (origin.mode(), Some(origin))
-    };
-    let device_id = match &actor {
-        Some(MessageOrigin::Device { device_id }) => Some(device_id.clone()),
-        _ => None,
-    };
-
-    let old_link = link(&old_title, old_id);
-    let message = match opening {
-        Opening::Narrative { narrative, request } => narrative_opening(
-            &old_link,
-            checkpoint.as_ref(),
-            &narrative,
-            request.as_deref(),
+    let (kind, message, request) = match opening {
+        Opening::Narrative { narrative, request } => (
+            HandoffOpening::Narrative,
+            narrative_opening(checkpoint.as_ref().map(|c| c.name.as_str()), &narrative),
+            request,
         ),
-        Opening::Brief(request) => handoff_brief(
-            &old_link,
-            old_id,
-            request.as_deref(),
-            last_applied_summary(pool, old_id).await.as_deref(),
+        Opening::Brief(request) => (
+            HandoffOpening::Brief,
+            handoff_brief(
+                thread_id,
+                BriefCause::CacheCold,
+                request.is_some(),
+                last_applied_summary(pool, thread_id).await.as_deref(),
+            ),
+            request,
         ),
     };
 
-    // Every fallible read comes before the handoff is recorded, so a failure
-    // here leaves the old thread as it was.
-    let app_id: Option<String> = sqlx::query_scalar(
-        "SELECT payload->>'app_id' FROM events \
-         WHERE thread_id = $1 AND event_type = 'SessionStarted' \
-           AND payload->>'coding_agent_kind' = 'app' \
-         ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(old_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(ApiError::db)?
-    .flatten();
-    let successor_id = Uuid::new_v4();
-    let successor_title = crate::engine::successor::successor_title(
-        &old_title,
-        checkpoint
-            .as_ref()
-            .map(CheckpointRun::title_label)
-            .as_deref(),
-    );
-    let queued = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
-        depth: 0,
-        message,
-        thread_id: successor_id,
-        event_id: Some(Uuid::new_v4().to_string()),
-        image_hashes: Vec::new(),
-        device_id,
-        model: None,
-        reasoning_effort: implementer.reasoning_effort.clone(),
-        provider: None,
-        use_coding_agent: Some(true),
-        repo_id: if app_id.is_some() {
-            None
-        } else {
-            old.cc_repo_id
-        },
-        cc_model: implementer.model.clone(),
-        coding_agent: Some(implementer.coding_agent),
-        title: Some(successor_title.clone()),
-        mode,
-        origin: origin.clone(),
-        parent_thread_id: placement.parent_thread_id,
-        spawning_event_id: placement.spawning_event_id,
-        wake_mode: placement.wake_mode,
-        app_id,
-        integrated: false,
-    };
-
-    // One handoff per thread, across engines: the lock serializes two
-    // requests, and the second re-reads the link the first recorded.
+    // One handoff per session, across engines: the lock serializes two
+    // requests, and the second re-reads the handoff the first recorded.
     let mut claim = pool.begin().await.map_err(ApiError::db)?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-        .bind(format!("successor-handoff:{old_id}"))
+        .bind(format!("successor-handoff:{thread_id}"))
         .execute(&mut *claim)
         .await
         .map_err(ApiError::db)?;
-    if let Some(successor) = crate::engine::successor::successor_thread_of(pool, old_id)
+    if crate::engine::successor::pending_handoff(pool, thread_id)
         .await
         .map_err(ApiError::db)?
+        .is_some()
     {
-        return Err(refusal(
-            StatusCode::CONFLICT,
-            "already-handed-off",
-            format!(
-                "\"{old_title}\" already continued in {}.",
-                link("its successor", successor)
-            ),
-        ));
+        return Err(already_handing_off(&title));
     }
-    record_handoff(
-        &engine.event_bus,
-        pool,
-        old_id,
-        Handoff {
-            successor_thread_id: successor_id,
-            base_sha,
-            starts_build_chain: build_chain,
-            handoff_consent,
-        },
-        actor.clone(),
-    )
-    .await
-    .map_err(|e| ApiError::internal(format!("Could not record the handoff: {e}")))?;
+    engine
+        .event_bus
+        .emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::SessionHandedOff {
+                opening: kind,
+                message,
+                checkpoint: checkpoint.as_ref().map(|c| c.name.as_str().to_string()),
+                progress: checkpoint
+                    .as_ref()
+                    .and_then(|c| c.progress)
+                    .map(|p| p.to_string()),
+                coding_agent: implementer.coding_agent,
+                coding_agent_model: implementer.model.clone(),
+                reasoning_effort: implementer.reasoning_effort.clone(),
+                request,
+            },
+            meta: EventMeta::with_actor(crate::api::actor::user_actor(headers, None)),
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Could not record the handoff: {e}")))?;
     claim.commit().await.map_err(ApiError::db)?;
-    engine.thread_queue.submit(queued, origin, None).await;
+    engine.start_successor_session(thread_id);
 
     Ok(SuccessorResponse {
-        successor_thread_id: successor_id,
-        link: link(&successor_title, successor_id),
         implementer,
-        build_chain,
+        starts: if from_agent {
+            SessionStart::AfterThisTurn
+        } else {
+            SessionStart::Now
+        },
     })
 }
 
-/// A consent that lets a thread hand off under its parent with no owner
-/// approval card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StandingConsent {
-    /// The thread is a member of the parent's build chain (ADR 0503).
-    BuildChain,
-    /// The thread inherits the *handoff consent* its predecessor recorded
-    /// (ADR 0507).
-    Carried,
-}
-
-/// The standing consent `old_id` holds to hand off under `parent`. It holds
-/// only at a checkpoint run whose handoff estimate pays, and covers no
-/// other verb and no other target. A failed read is an error, never a yes.
-async fn standing_consent(
-    pool: &sqlx::PgPool,
-    old_id: Uuid,
-    parent: Uuid,
-    checkpoint: Option<&CheckpointRun>,
-) -> Result<Option<StandingConsent>, ApiError> {
-    let Some(checkpoint) = checkpoint else {
-        return Ok(None);
-    };
-    let in_chain = build_chain(pool, old_id)
-        .await
-        .map_err(ApiError::db)?
-        .is_some_and(|chain| chain.planner == parent);
-    let consent = if in_chain {
-        StandingConsent::BuildChain
-    } else if carried_consent(pool, old_id, parent)
-        .await
-        .map_err(ApiError::db)?
-        .is_some()
-    {
-        StandingConsent::Carried
-    } else {
-        return Ok(None);
-    };
-    let pays = handoff_verdict(pool, old_id, checkpoint)
-        .await
-        .map_err(ApiError::db)?
-        .pays
-        == Some(true);
-    if !pays {
-        return Ok(None);
-    }
-    crate::log!(
-        "[Successor] {} hands off under {} on a standing consent: {:?}",
-        old_id,
-        parent,
-        consent
-    );
-    Ok(Some(consent))
-}
-
-/// The *handoff consent* a spawn records for the authority that let it
-/// through. A caller with no token is the owner only on a device: the machine
-/// token names nobody. A thread's own subtree is its own authority, never the
-/// owner's.
-fn recorded_consent(
-    passed: PassedAuthority,
-    actor: Option<&MessageOrigin>,
-) -> Option<HandoffConsent> {
-    match passed {
-        PassedAuthority::Untokened => {
-            matches!(actor, Some(MessageOrigin::Device { .. })).then_some(HandoffConsent::Owner)
-        }
-        PassedAuthority::Held(HeldAuthority::StandingInstruction) => Some(HandoffConsent::Owner),
-        PassedAuthority::Held(HeldAuthority::OwnSubtree | HeldAuthority::NoneNeeded) => None,
-        PassedAuthority::OwnerApproval => Some(HandoffConsent::OwnerApproval),
-    }
-}
-
-/// Whether this caller may start `thread_id`'s successor under `parent` with
-/// no owner approval card: a standing consent, or authority of its own. The
-/// spawn will weigh the same headers.
-async fn hands_off_without_card(
-    pool: &sqlx::PgPool,
-    headers: &HeaderMap,
-    thread_id: Uuid,
-    parent: Uuid,
-    checkpoint: &CheckpointRun,
-) -> Result<bool, ApiError> {
-    if standing_consent(pool, thread_id, parent, Some(checkpoint))
-        .await?
-        .is_some()
-    {
-        return Ok(true);
-    }
-    let SubprocessOrigin::Subprocess {
-        source_thread_id,
-        emitting_trigger_id,
-        ..
-    } = crate::api::actor::subprocess_origin(headers)
-    else {
-        return Ok(true);
-    };
-    Ok(authority_held(
-        pool,
-        source_thread_id,
-        emitting_trigger_id.as_deref(),
-        Some(parent),
-        ThreadReachVerb::SpawnSuccessor,
-    )
-    .await?
-    .is_some())
-}
-
-/// A refused handoff names the approval that lets it through.
-fn authority_refusal(e: ThreadReachError, parent: Uuid) -> ApiError {
-    let approval = format!(
-        "`lucidos ask-owner-approval spawn-successor --thread {parent} --reason \"<why>\"`"
-    );
-    match e {
-        ThreadReachError::NoStandingInstruction(_) | ThreadReachError::OutOfReach { .. } => {
-            refusal(
-                StatusCode::FORBIDDEN,
-                "needs-owner-approval",
-                format!(
-                    "A successor sits in this thread's place, which is the workspace owner's \
-                     call in a turn they did not open. Run {approval}, ask with the id it \
-                     prints, and retry once the owner allows it."
-                ),
-            )
-        }
-        other => other.into(),
-    }
-}
-
-/// The old thread's last commit, which the successor's branch starts at.
-/// Refuses uncommitted work rather than leave it behind, and refuses when
-/// git cannot answer rather than guess.
-async fn carried_head(state: &AppState, old_id: Uuid, old_title: &str) -> Result<String, ApiError> {
-    let live = {
-        let sessions = state.engine.agent_sessions.lock().await;
-        crate::api::repositories::live_thread_worktree(sessions.get(&old_id))
-    };
-    let worktree = crate::api::repositories::resolve_diff_worktree(
-        &state.pool,
-        old_id,
-        live,
-        state.engine.workspace_path(),
-    )
-    .await
-    .ok_or_else(|| {
-        refusal(
-            StatusCode::CONFLICT,
-            "no-worktree",
-            format!(
-                "\"{old_title}\" has no worktree left on disk, so there is no branch to carry."
-            ),
-        )
-    })?;
-    let unknown = || {
-        refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "git-unanswered",
-            format!("Could not read the state of \"{old_title}\"'s worktree. Nothing changed; try again."),
-        )
-    };
-    use crate::engine::git_ops::GitAnswer;
-    match crate::engine::git_ops::worktree_dirtiness(&worktree).await {
-        GitAnswer::No => {}
-        GitAnswer::Yes => {
-            return Err(refusal(
-                StatusCode::CONFLICT,
-                "uncommitted-work",
-                format!("\"{old_title}\" has uncommitted changes. Commit them first, so the successor carries them."),
-            ))
-        }
-        GitAnswer::Unknown => return Err(unknown()),
-    }
-    crate::engine::git_ops::current_head_sha(&worktree)
-        .await
-        .ok_or_else(unknown)
-}
-
-/// A narrative successor's opening message. A successor started at a
-/// checkpoint begins at the step after it, so it never runs that one again.
-/// A request the user recorded at the card comes last.
-fn narrative_opening(
-    old_link: &str,
-    checkpoint: Option<&CheckpointRun>,
-    narrative: &str,
-    request: Option<&str>,
-) -> String {
-    let skip = checkpoint
-        .map(|c| {
-            format!(
-                " That thread handed off at the `{}` checkpoint, so skip that checkpoint \
-                 when your flow reaches it.",
-                c.name.as_str()
-            )
-        })
-        .unwrap_or_default();
-    let request = request
-        .map(|r| format!("\n\n---\nThe user's first request for you:\n\n{r}"))
-        .unwrap_or_default();
-    format!(
-        "This thread continues {old_link}. Its worktree starts at that thread's last \
-         commit, so it already holds all of its work. Read the handoff narrative below, \
-         then carry on from its next step.{skip}\n\n{narrative}{request}"
-    )
-}
-
-/// What the old thread's last applied change did, for the composer's
-/// successor. Best effort: a successor without it is still whole.
-async fn last_applied_summary(pool: &sqlx::PgPool, old_id: Uuid) -> Option<String> {
+/// What the thread's last applied change did, for a brief. Best effort: a
+/// brief without it is still whole.
+async fn last_applied_summary(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT COALESCE(summary, description) FROM changes \
          WHERE thread_id = $1 AND status = 'applied' \
          ORDER BY resolved_at DESC NULLS LAST LIMIT 1",
     )
-    .bind(old_id)
+    .bind(thread_id)
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!("[Successor] last applied change of {}: {}", old_id, e);
+        crate::log!("[Successor] last applied change of {}: {}", thread_id, e);
         None
     })
 }
-
-#[cfg(test)]
-#[path = "successor_tests.rs"]
-mod tests;

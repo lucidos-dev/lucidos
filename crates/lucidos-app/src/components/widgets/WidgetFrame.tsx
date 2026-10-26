@@ -14,6 +14,7 @@ import { widgetInstanceKey, type WidgetParams } from '../../utils/widgetParams';
 import { claimWidgetFrame } from './widgetFrameBudget';
 import { decideHeight, initialHeightGuard } from './widgetHeightGuard';
 import { postClientLog } from '../../utils/clientLog';
+import { widgetFrameState, type FrameState } from './widgetFrameState';
 
 /** The frame's height before the widget reports one, in CSS pixels. */
 export const DEFAULT_WIDGET_HEIGHT_PX = 240;
@@ -120,10 +121,14 @@ function watchInViewport(el: HTMLElement, onChange: (inView: boolean) => void): 
  *  `onHeight` hears the frame's height on mount and on each applied report,
  *  and `onSize` the whole size, saying whether the widget reported it.
  *
+ *  `onFrameState` hears where the frame stands (`widgetFrameState.ts`) on mount
+ *  and on each change. A dashboard waits on it to show once its frames have
+ *  loaded.
+ *
  *  `onMenu` opens the widget's menu. Given one, the frame is marked `menu`, so
  *  an unclaimed right-click inside it lands there, at its point in the
  *  viewport. A frame with no menu leaves its right-click alone. */
-export function WidgetFrame({ appId, params, reveal, place, size, visible = true, onHeight, onSize, onMenu }: {
+export function WidgetFrame({ appId, params, reveal, place, size, visible = true, onHeight, onSize, onFrameState, onMenu }: {
   appId: string;
   params?: WidgetParams;
   reveal: AppReveal;
@@ -132,6 +137,7 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   visible?: boolean;
   onHeight?: (px: number) => void;
   onSize?: (size: ContentSize, fromReport: boolean) => void;
+  onFrameState?: (state: FrameState) => void;
   onMenu?: (at?: ViewportPoint) => void;
 }) {
   const [host, setHost] = useState<HTMLDivElement | null>(null);
@@ -146,12 +152,16 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   const pendingHold = useRef<(() => void) | null>(null);
 
   // The card clips a tall frame, so the box to watch is the clip it draws in.
-  const [inView, setInView] = useState(eager);
+  // An answer belongs to the visibility it was given under: a frame shown again
+  // watches afresh, and until the new answer lands its place is unknown.
+  const [observed, setObserved] = useState<{ visible: boolean; inView: boolean } | null>(null);
   useEffect(() => {
     if (eager || !host) return undefined;
-    return place === 'dashboard' ? watchInViewport(host, setInView) : watchOnScreen(transcriptBox(host), setInView);
-  }, [host, eager, place]);
-  const showing = inView && visible;
+    const answer = (inView: boolean) => setObserved({ visible, inView });
+    return place === 'dashboard' ? watchInViewport(host, answer) : watchOnScreen(transcriptBox(host), answer);
+  }, [host, eager, place, visible]);
+  const inView = eager ? true : observed?.visible === visible ? observed.inView : null;
+  const showing = inView === true && visible;
   useEffect(() => {
     if (eager) return undefined;
     if (showing) {
@@ -169,6 +179,11 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   const onMenuRef = useRef(onMenu);
   onMenuRef.current = onMenu;
   const hasMenu = onMenu !== undefined;
+  const [revealed, setRevealed] = useState(false);
+  const frameState = widgetFrameState(inView, showing, revealed);
+  const onFrameStateRef = useRef(onFrameState);
+  onFrameStateRef.current = onFrameState;
+  useLayoutEffect(() => onFrameStateRef.current?.(frameState), [frameState]);
 
   useEffect(() => {
     if (!host) return undefined;
@@ -244,8 +259,10 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
   // fresh URL, as the Canvas pane's refresh key does.
   const refreshKey = widgetRefreshKey(appId);
   // Each fresh document gets a fresh guard: a reload or a redraw after
-  // eviction may be a fixed widget, so an old lock must not hold it.
+  // eviction may be a fixed widget, so an old lock must not hold it. It is
+  // covered anew too.
   useEffect(() => {
+    setRevealed(false);
     if (held) guard.current = initialHeightGuard(height);
   }, [held, refreshKey]);
   const url = appUrl(appId, undefined, undefined, params);
@@ -257,6 +274,8 @@ export function WidgetFrame({ appId, params, reveal, place, size, visible = true
           key={refreshKey}
           src={src}
           reveal={reveal}
+          label={{ app: appId, place }}
+          onRevealed={() => setRevealed(true)}
           // The mark that makes the SDK report the content size.
           onLoad={(el) => {
             frame.current = el;

@@ -267,8 +267,7 @@
     flex: 0 0 auto;
 }
 
-/* The Prompt cache section: what the keep-alive does, why, and a thin meter
-   of the pings spent against the break-even budget. */
+/* The Prompt cache section: what the keep-alive does, and why. */
 .waiting-panel-cache-line {
     color: var(--text-primary);
     font-size: var(--font-size-md);
@@ -280,20 +279,6 @@
     color: var(--text-muted);
     font-size: var(--font-size-sm);
     line-height: 1.4;
-}
-
-.waiting-panel-cache-meter {
-    margin-top: var(--space-sm);
-    height: 0.1875rem;
-    border-radius: var(--radius-round);
-    background: var(--border-color);
-    overflow: hidden;
-}
-
-.waiting-panel-cache-meter > span {
-    display: block;
-    height: 100%;
-    background: var(--accent);
 }
 
 /* The indicator's own paint is the accent, and it lives beside the row's other

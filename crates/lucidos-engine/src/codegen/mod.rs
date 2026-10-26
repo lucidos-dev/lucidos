@@ -7,14 +7,16 @@
 
 use std::path::Path;
 
+mod agent_surface;
 mod engine_constants;
 mod gateway_constants;
+mod knowhow_blocks;
 
 /// The command each generated file's header names.
 pub const REGENERATE: &str = "./scripts/codegen.sh";
 
 /// The folders the generated files land in, relative to the repo root.
-pub const GENERATED_DIRS: [&str; 3] = [APP, STYLES, SDK];
+pub const GENERATED_DIRS: [&str; 5] = [APP, STYLES, SDK, "docs/generated", ".codegen"];
 
 const APP: &str = "crates/lucidos-app/src/generated";
 const STYLES: &str = "crates/lucidos-app/src/styles/generated";
@@ -39,6 +41,16 @@ pub fn render_all(repo_root: &Path) -> Vec<GeneratedFile> {
     use crate::core::{fonts, preference_catalog, store::messages::spoken_merge, themes::parts};
     use crate::engine::{thread_events::ts_codegen, thread_lifecycle, title_match};
     vec![
+        file(
+            ".codegen",
+            "knowhow-blocks.json",
+            knowhow_blocks::render(repo_root),
+        ),
+        file(
+            "docs/generated",
+            "agent-surface.json",
+            agent_surface::render(),
+        ),
         file(APP, "thread-event-wire.ts", ts_codegen::render(repo_root)),
         file(
             APP,

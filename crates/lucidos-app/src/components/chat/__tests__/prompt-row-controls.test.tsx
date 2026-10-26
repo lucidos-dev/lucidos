@@ -5,12 +5,12 @@
  *  also asked that a fold follow the order the row is arranged in.
  *
  *  Plan: `docs/plans/2026-10-21-coding-agent-menu-folds-before-the-model-picker.md`. */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { FollowLiveEdgeIcon } from '../../shared/icons';
+import { FollowLiveEdgeIcon, SideQuestionIcon } from '../../shared/icons';
 import type { HeaderActionSpec } from '../../layout/headerActions';
 import {
-  codingAgentMenuAction, composerRowMembers, followLiveEdgeAction, promptRowToggles,
+  codingAgentMenuAction, composerRowMembers, followLiveEdgeAction, promptRowToggles, sideQuestionToggleAction,
 } from '../PromptRowControls';
 import { CODING_AGENT_MENU_FOLD_KEY } from '../ControlMenuTrigger';
 import { RUNG_FOLD_KEY } from '../RungButtons';
@@ -22,14 +22,14 @@ interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: un
 const spec = (key: string): HeaderActionSpec => ({ key, label: key, icon: () => null });
 
 /** Every member present, as on a busy coding-agent thread. */
-const members = (codingAgent: boolean) => composerRowMembers({
+const members = (codingAgent: boolean, hasText = true) => composerRowMembers({
   codingAgentMenu: codingAgent ? codingAgentMenuAction('claude-code') : null,
   attachImage: spec('attach-image'),
-  readouts: [spec('waiting'), spec('wip')],
-  clearDraft: spec('prompt-clear'),
-  toggles: [spec('call-toggle'), spec('follow-live-edge')],
+  readouts: [spec('todo-indicator'), spec('waiting'), spec('wip')],
+  clearDraft: hasText ? spec('prompt-clear') : null,
+  toggles: [spec('call-toggle'), spec('follow-live-edge'), spec('side-question')],
+  situational: [spec('thread-diff'), spec('standing-apply')],
   rung: spec(RUNG_FOLD_KEY),
-  banner: [spec('diff'), spec('apply')],
 });
 
 /** Left to right, which is the order the fold takes them in. */
@@ -39,11 +39,20 @@ const order = (codingAgent: boolean) => {
 };
 
 describe('the composer row order', () => {
-  it('runs from the Claude menu to the banner, as arranged', () => {
+  it('runs from the toggles to the model picker, as arranged', () => {
     expect(order(true)).toEqual([
-      CODING_AGENT_MENU_FOLD_KEY, 'attach-image', 'waiting', 'wip', 'prompt-clear',
-      'call-toggle', 'follow-live-edge', RUNG_FOLD_KEY, 'diff', 'apply',
+      'call-toggle', 'follow-live-edge', 'side-question', CODING_AGENT_MENU_FOLD_KEY,
+      'attach-image', 'todo-indicator', 'waiting', 'wip', 'prompt-clear',
+      'thread-diff', 'standing-apply', RUNG_FOLD_KEY,
     ]);
+  });
+
+  /** The picker holds its spot: what comes and goes stands left of it, so it
+   *  folds first and never pushes the picker. */
+  it('folds Diff and the standing apply before the model picker', () => {
+    const keys = order(true);
+    expect(keys.indexOf('thread-diff')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
+    expect(keys.indexOf('standing-apply')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
   });
 
   /** It reads no thread state, so this holds in compose context and in a
@@ -54,20 +63,36 @@ describe('the composer row order', () => {
     expect(keys.indexOf('attach-image')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
   });
 
-  it('puts the follow toggle right before the model picker', () => {
-    const keys = order(true);
-    expect(keys.indexOf(RUNG_FOLD_KEY) - keys.indexOf('follow-live-edge')).toBe(1);
+  it('keeps the other icons in their slots when clear draft appears or disappears', () => {
+    for (const codingAgent of [false, true]) {
+      const empty = members(codingAgent, false);
+      const typed = members(codingAgent, true);
+      expect(typed.row.map((a) => a.key)).toEqual([
+        ...empty.row.map((a) => a.key), 'prompt-clear',
+      ]);
+      expect(typed.cluster.map((a) => a.key)).toEqual(empty.cluster.map((a) => a.key));
+    }
   });
 
-  it('renders the model picker and the banner in the right-hand cluster', () => {
-    expect(members(true).cluster.map((a) => a.key)).toEqual([RUNG_FOLD_KEY, 'diff', 'apply']);
+  it('renders the situational members and the model picker in the right-hand cluster', () => {
+    expect(members(true).cluster.map((a) => a.key)).toEqual(['thread-diff', 'standing-apply', RUNG_FOLD_KEY]);
+  });
+
+  it('leads with the same toggles on a coding-agent thread as on a Lucidos Agent one', () => {
+    expect(order(true).slice(0, 3)).toEqual(order(false).slice(0, 3));
   });
 
   /** A Lucidos Agent thread has no slash commands, and its model pick is the
    *  rung control's. */
   it('offers the coding-agent menu to a coding-agent thread alone', () => {
-    expect(order(false)[0]).toBe('attach-image');
+    expect(order(false)[0]).toBe('call-toggle');
     expect(order(false)).not.toContain(CODING_AGENT_MENU_FOLD_KEY);
+  });
+
+  /** Codex has no slash commands, so its menu could never open. The row drew
+   *  it anyway, dimmed for good. */
+  it('offers no coding-agent menu to Codex', () => {
+    expect(codingAgentMenuAction('codex')).toBeNull();
   });
 });
 
@@ -93,19 +118,49 @@ describe('the follow toggle shows its state by shape', () => {
 });
 
 describe('the row toggles', () => {
-  /** The follow toggle renders in every state, so it closes the row's left
-   *  side, right before the model picker. */
-  it('end with the follow toggle', () => {
-    const toggles = promptRowToggles(null, false, undefined);
-    expect(toggles[toggles.length - 1].key).toBe('follow-live-edge');
+  const sideQuestion = sideQuestionToggleAction(false, () => {});
+
+  /** The follow toggle renders in every state, and the side-question toggle
+   *  stands right after it. */
+  it('put the follow toggle first with no call, and the side-question toggle after it', () => {
+    expect(promptRowToggles(null, false, undefined, sideQuestion).map((a) => a.key))
+      .toEqual(['follow-live-edge', sideQuestion.key]);
+  });
+
+  it('close on the follow toggle where no side question can be asked', () => {
+    const toggles = promptRowToggles(null, false, undefined, null);
+    expect(toggles.map((a) => a.key)).toEqual(['follow-live-edge']);
   });
 
   /** A call reaches the Lucidos Agent and nothing else (ADR 0165). Voice ships
    *  off, so the member is absent either way here. What this pins is that the
    *  factory is asked, rather than the composer deciding for itself. */
   it('offer no call member on a coding-agent thread', () => {
-    expect(promptRowToggles('claude-code', false, undefined).map((a) => a.key))
+    expect(promptRowToggles('claude-code', false, undefined, null).map((a) => a.key))
       .not.toContain('call-toggle');
+  });
+});
+
+describe('the side-question toggle', () => {
+  it('lights while the mode is on, and names the way back', () => {
+    const off = sideQuestionToggleAction(false, () => {});
+    const on = sideQuestionToggleAction(true, () => {});
+    expect([off.active, on.active]).toEqual([false, true]);
+    expect([off.label, on.label]).toEqual(['Ask a side question', 'Back to a normal message']);
+  });
+
+  it('is a glyph that keeps the keyboard up, and presses through the toggle it is given', () => {
+    const toggle = vi.fn();
+    const action = sideQuestionToggleAction(false, toggle);
+    expect(action.tone).toBe('glyph');
+    expect(action.keepsFocus).toBe(true);
+    action.onClick?.({} as never);
+    expect(toggle).toHaveBeenCalledOnce();
+  });
+
+  it('draws the circled question mark', () => {
+    const icon = sideQuestionToggleAction(false, () => {}).icon() as AnyVNode;
+    expect(icon.type).toBe(SideQuestionIcon);
   });
 });
 

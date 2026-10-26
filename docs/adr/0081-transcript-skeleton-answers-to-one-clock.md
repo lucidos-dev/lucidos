@@ -91,7 +91,7 @@ scope here. It is incremental rendering, a much larger change to
 pane returns. It was offered to the user alongside this removal and declined for
 now.
 
-**Withhold the rows until the skeleton has been visible for a minimum.** Already
-rejected across the whole app (`.claude/rules/frontend.md`): holding a loader
-means withholding ready content, which is what makes a slow surface feel
-sluggish.
+**Withhold the rows until the skeleton has been visible for a minimum.** Rejected
+here as a transcript-only hold. ADR 0555 later gave every loader a shared
+minimum-visible floor, held by the exit owner (`ThreadSkeletonOverlay` among
+them), which supersedes this clause. Nothing holds a skeleton AHEAD of the gate.

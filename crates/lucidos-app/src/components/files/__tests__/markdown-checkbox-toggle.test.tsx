@@ -128,27 +128,22 @@ describe('MarkdownDocument task-list checkboxes', () => {
     expect(boxes[0].disabled).toBe(true); // still mid-flight, not re-enabled
   });
 
-  it('leaves a raw authored <input type=checkbox> alone, and keeps indices correct around it', async () => {
-    // Raw HTML in markdown passes through unsanitized for this tag, so a
-    // hand-written checkbox renders right alongside real task items. It must
-    // never become clickable, and must not shift the real items' indices.
+  it('shows a raw authored <input type=checkbox> as text, and keeps indices correct around it', async () => {
+    // The sanitizer escapes every authored input, so it can neither become
+    // clickable nor shift the real items' indices.
     const content = 'before <input type="checkbox"> after\n\n- [ ] First\n- [ ] Second\n';
     const onToggleCheckbox = vi.fn(() => Promise.resolve(true));
     const host = mount(content, { editable: true, onToggleCheckbox });
     const all = checkboxes(host);
-    expect(all).toHaveLength(3);
-    await flushEffects(() => !all[1].disabled);
+    expect(all).toHaveLength(2);
+    expect(host.textContent).toContain('before <input type="checkbox"> after');
+    await flushEffects(() => !all[0].disabled);
 
-    expect(all[1].disabled).toBe(false); // First
-    expect(all[2].disabled).toBe(false); // Second
+    expect(all[0].disabled).toBe(false); // First
+    expect(all[1].disabled).toBe(false); // Second
 
-    // The raw checkbox is left exactly as authored: no `disabled` was added,
-    // and (unlike the real task items) clicking it never calls the handler.
-    all[0].click();
-    expect(onToggleCheckbox).not.toHaveBeenCalled();
-
-    all[2].click();
-    expect(onToggleCheckbox).toHaveBeenCalledExactlyOnceWith(1); // Second is task index 1, not 2
+    all[1].click();
+    expect(onToggleCheckbox).toHaveBeenCalledExactlyOnceWith(1);
   });
 
   it('reverts the checkbox and re-enables it when the save fails', async () => {

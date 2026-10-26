@@ -324,6 +324,26 @@ pub(crate) async fn try_adopt_renegade_branch(
     tracked_branch: &str,
     anchor: &IdleAnchor,
 ) -> Option<(String, String)> {
+    let current =
+        branch_continuing_tracked(repo_root, worktree_path, tracked_branch, anchor).await?;
+    let note = build_adoption_note(&current);
+    Some((current, note))
+}
+
+/// The worktree's current branch, when it provably continues `tracked_branch`
+/// under the proofs [`try_adopt_renegade_branch`] documents. `None` when the
+/// worktree is still on `tracked_branch`, or no proof holds.
+///
+/// Its other use is an internal thread's *side branch*. The agent ran
+/// `git switch -c` off its tracked branch, so the worktree is still the thread's
+/// own. The thread keeps tracking the engine-named branch, because Apply lands
+/// that one. See [`side_branch_note`].
+pub(crate) async fn branch_continuing_tracked(
+    repo_root: &Path,
+    worktree_path: &Path,
+    tracked_branch: &str,
+    anchor: &IdleAnchor,
+) -> Option<String> {
     // Read the branch ONCE and gate that value. A re-read can approve one
     // branch and hand the caller another, as `try_adopt_branch_at_idle` says.
     let current = worktree_current_branch(worktree_path).await?;
@@ -347,11 +367,26 @@ pub(crate) async fn try_adopt_renegade_branch(
             tracked_branch_continues_into_head(worktree_path, tracked_branch, provenance).await
         }
     };
-    if !proved {
-        return None;
-    }
-    let note = build_adoption_note(&current);
-    Some((current, note))
+    proved.then_some(current)
+}
+
+/// Whether the live worktree at `worktree_path` still belongs to the thread
+/// tracking `tracked_branch`: it is on that branch, or on a side branch that
+/// [`branch_continuing_tracked`] proves the agent cut from it.
+///
+/// Boot recovery asks this before it reuses the thread's worktree. Reading only
+/// the checked-out name skipped a thread whose agent had run `git switch -c`,
+/// so a user switch never resumed it.
+pub(crate) async fn worktree_serves_branch(
+    repo_root: &Path,
+    worktree_path: &Path,
+    tracked_branch: &str,
+    anchor: &IdleAnchor,
+) -> bool {
+    worktree_current_branch(worktree_path).await.as_deref() == Some(tracked_branch)
+        || branch_continuing_tracked(repo_root, worktree_path, tracked_branch, anchor)
+            .await
+            .is_some()
 }
 
 /// [`try_adopt_renegade_branch`] for the **idle** boundary rather than the
@@ -612,12 +647,22 @@ fn parse_reflog_line(line: &str) -> Option<ReflogEntry> {
     })
 }
 
-fn build_adoption_note(new_branch: &str) -> String {
+pub(crate) fn build_adoption_note(new_branch: &str) -> String {
     format!(
         "[Note from engine: while you were idle, your worktree was switched to branch '{0}' \
          (likely by a skill or external tool). It contains your prior work, so I've adopted \
          it as the new tracked branch — continuing on '{0}' from now on.]",
         new_branch
+    )
+}
+
+/// The note for an internal thread resumed on a side branch. The thread keeps
+/// `tracked`, so the agent must bring what it wants applied back onto it.
+pub(crate) fn side_branch_note(side_branch: &str, tracked: &str) -> String {
+    format!(
+        "[Note from engine: your worktree is on branch '{side_branch}', which you created from \
+         your thread branch '{tracked}'. Lucidos still tracks '{tracked}': Apply lands only \
+         '{tracked}'. Switch back to it, with any work you want applied, before you finish.]"
     )
 }
 

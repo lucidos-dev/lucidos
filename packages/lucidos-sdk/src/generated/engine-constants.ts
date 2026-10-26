@@ -46,17 +46,17 @@ export const SOURCE_COMMIT_FILE = "source-commit";
 /** `TURN_RUNNING_REASON` in `engine/chat/rung.rs`. */
 export const TURN_RUNNING_REASON = "turn-running";
 
-/** `BROAD_ALLOW_INEFFECTIVE` in `engine/claude_code/mod.rs`. */
-export const BROAD_ALLOW_INEFFECTIVE = ["Edit", "ExitPlanMode", "NotebookEdit", "Write"] as const;
+/** `GUARD_SHELLS` in `engine/command_guard.rs`. */
+export const GUARD_SHELLS = ["sh", "bash", "zsh", "dash", "ksh", "ash"] as const;
 
-/** `CC_PROTECTED_PATH_MARKERS` in `engine/claude_code/mod.rs`. */
-export const CC_PROTECTED_PATH_MARKERS = [".claude/", ".git/"] as const;
+/** `BENIGN_PREFIX_WORDS` in `engine/command_guard.rs`. */
+export const BENIGN_PREFIX_WORDS = ["sudo", "env", "command", "time", "nice", "builtin", "exec", "\\"] as const;
 
-/** `SESSION_PATH_TOOLS` in `engine/claude_code/mod.rs`. */
-export const SESSION_PATH_TOOLS = ["Edit", "Write", "NotebookEdit"] as const;
+/** `GRANTS_NOTHING_HEADS` in `engine/command_guard.rs`. */
+export const GRANTS_NOTHING_HEADS = ["sh", "bash", "zsh", "dash", "ksh", "ash", "arch", "nohup", "setsid", "caffeinate", "ionice", "stdbuf", "unbuffer", "eatmydata", "doas", "pkexec", "fakeroot", "unshare", "nsenter", "proot", "systemd-run", "strace", "ltrace", "dtruss", "watch", "parallel", "xargs", "busybox", "toybox", "gstdbuf", "gnice", "gxargs", "gionice", "timeout", "gtimeout", "chroot", "setarch", "taskset", "chrt", "su", "runuser", "script", "flock", "sudo", "env", "command", "time", "nice", "builtin", "exec", "\\", "eval", "source", "."] as const;
 
-/** `CODEX_BACKEND_TOOLS` in `engine/claude_code/mod.rs`. */
-export const CODEX_BACKEND_TOOLS = ["command_execution", "file_change"] as const;
+/** `MAX_SHELL_LAYERS` in `engine/command_guard.rs`. */
+export const MAX_SHELL_LAYERS = 4;
 
 /** `USER_CLICKED_CONTINUE_REASON` in `engine/agent_recovery/helpers.rs`. */
 export const USER_CLICKED_CONTINUE_REASON = "user_clicked_continue";

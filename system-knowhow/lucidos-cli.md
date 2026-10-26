@@ -3,6 +3,16 @@ name: Lucidos CLI (`lucidos`)
 description: The `lucidos` shell command, on PATH in every subprocess Lucidos spawns (Python, bash, Claude Code, Codex). It writes files under data/, emits and queries domain events, and awaits an event instead of polling. It applies pending changes and calls an external API through the engine proxy. It spawns threads, in this workspace or another (`spawn-thread --to <ws>`).
 ---
 
+<!-- domain-event: BuildSlotAcquired: The CLI emits this domain event when a contended host build acquires a slot. -->
+<!-- domain-event: BuildSlotWaiting: The CLI emits this domain event when a host build must wait for a slot. -->
+<!-- domain-event: ComfortStateImported: Example domain event emitted by a comfort-data import. -->
+
+<!-- domain-event: OuraSleepImported: Example domain event emitted by a wearable sleep-data import. -->
+
+<!-- domain-event: BuildSlotReleased: The CLI emits this domain event when a host build slot is released. -->
+<!-- domain-event: AnalysisCompleted: Example domain event emitted by an analysis script. -->
+<!-- domain-event: DataImported: Example domain event emitted by a data-import script. -->
+
 # `lucidos` CLI
 
 A shell command on the `PATH` of every subprocess Lucidos spawns: Python scripts, bash scripts, and coding-agent sessions (Claude Code or Codex). Use it when a script needs to:
@@ -81,6 +91,13 @@ App UIs in the browser use the JS SDK (`lucidos.data.*`, `lucidos.events.*`). Th
 **A fact worth keeping goes in `data/`, never in the agent's own memory directory.** Claude Code writes per-user memory under `$CLAUDE_CONFIG_DIR/projects/<cwd>/memory/`, outside both the worktree and the workspace. The engine never indexes it, and Codex, the user and the next session on another machine never read it. Write the fact to `knowhow/<topic>/`, or the relevant app's or plugin's knowhow, with `lucidos data write`. In the Lucidos repo itself, a convention for coding agents goes in `CLAUDE.md` or `.claude/rules/`, committed with the change.
 
 ## Subcommands
+
+### `lucidos help`
+
+Read help for the CLI or any command path. `lucidos help events query` and
+`lucidos events help query` describe the same command as `lucidos events query --help`.
+Every command group provides this generated help route. It mirrors the
+subcommands documented below and performs no action.
 
 ### Hidden: `lucidos coding-agent-diff-hook`
 
@@ -330,7 +347,7 @@ lucidos events query --type SomeEvent --after-event-id "$NEWEST_ID"
 
 ### `lucidos events count [--type T] [--since iso] [--until iso] [--thread-id UUID]`
 
-Count events by type/time without materialising payloads. Mirrors the `count_events` LLM tool. Two shapes:
+Count events by type/time without materialising payloads. Mirrors the `events(action="count")` LLM tool. Two shapes:
 
 - **With `--type`:** `{"count": N, "byte_total": B}` for that single type.
 - **Without `--type`:** `{"by_type": [{"event_type": "...", "count": N, "byte_total": B}, ...], "total_count": N, "total_byte_total": B}`, a per-type breakdown sorted by `count` desc.
@@ -397,7 +414,7 @@ $ lucidos threads list --my-children | jq -r '.[] | select(.pending_sub_thread_c
 
 Every row carries `pending_sub_thread_change_count`: the pending changes held by that thread's sub-threads at any depth, not its own. An orchestrating child that ran children of its own holds no change itself, so this is where the work below it shows. `lucidos changes list --sub-threads-of <uuid>` lists those changes.
 
-Use this when a script reacts to thread state ("is anything still running before I fire this trigger?"). It reads the projection's per-thread status, so never rebuild that from raw `query_events`.
+Use this when a script reacts to thread state ("is anything still running before I fire this trigger?"). It reads the projection's per-thread status, so never rebuild that from raw `events(action="query")`.
 
 ### `lucidos threads count [--active | --status <list>] [--source <list>] [--parent <uuid> | --my-children] [--has-draft [false]] [--change-state <state>]`
 
@@ -471,10 +488,11 @@ The ack prints as raw JSON on stdout, like every other `lucidos threads` subcomm
 - **You can only address your own DIRECT children.** No siblings, no grandchildren, no arbitrary thread. No flag says who you are: the engine reads the calling thread off the *thread-bound origin token* this subprocess was spawned with, then checks the child's own row. A thread that is not yours is a 403 whatever you claim.
 - **The *home thread* is the one exception.** It may address any thread in its workspace, coding-agent threads included, and the ack's `reach` reads `home`. A thread it did not spawn reports to its own parent, not to Home, so read its reply with `lucidos events` afterwards. Every other caller's ack reads `reach: own-child`.
 - **This is a boundary, not an obstacle.** Outside the home thread, if asked to message a thread you did not spawn, there is no other route. Say so, name the threads, and let the user send it (see the top of this file).
-- **It returns as soon as the message lands, and does not wait for the child.** The child reports back the usual way, as a completion card on its parent. The ack's `delivered_to` says which of four things happened:
+- **It returns as soon as the message lands, and does not wait for the child.** The child reports back the usual way, as a completion card on its parent. The ack's `delivered_to` says which of five things happened:
   - `running`: the child was mid-turn, so the message queues behind its work or steers it.
   - `interrupted`: you passed `--urgent`, and the child's turn is stopping so it reads you next.
   - `waiting-for-user-answer`: parked on a question or permission card, so **a human must answer before it reads this**.
+  - `held`: the child awaits a human reply; delivery resumes after that reply.
   - `revived`: it was not working, so a fresh turn starts now.
 
   `detail` says the same in a sentence.
@@ -502,7 +520,38 @@ $ lucidos threads detach --thread 9c1f2b40-...
 - **The former parent gets nothing more.** No completion card, no follow-up, and it leaves `--my-children`. A card the child earned before the move still arrives.
 - **It frees no child slot while the child runs.** The moved child counts against the former parent's cap until it finishes.
 - **It cannot be undone.**
-- A thread already at top level is a 409, and an unknown id a 404.
+- A device caller gets 409 for a top-level thread. An agent gets 403 when the
+  target is outside its direct children. A discarded child gets 409; an unknown
+  id gets 404.
+
+### `lucidos threads child-reports`
+
+Read the reports your child threads filed that you have not read yet. Wraps
+`POST /api/v1/threads/<id>/child-reports/take`, for the thread in
+`$LUCIDOS_THREAD_ID`.
+
+A child that finishes while your turn runs sends its report as your next
+input, and your agent reads input only between turns. So the report waits
+until the turn ends, even when you need it now. Your own `lucidos` calls carry
+it to you instead:
+
+- **Most `lucidos` calls note it on stderr**, in one line naming this
+  command. The call's own output is unchanged.
+- **`lucidos background-task wait` returns early** with the report under
+  `child_reports`.
+- **This command reads every waiting report now**, oldest first.
+
+```bash
+$ lucidos threads child-reports
+{"child_reports":[{"card_id":"7d2e…","report":"[CHILD THREAD COMPLETED] …"}],
+ "message":"Your children's reports, oldest first. They will not be delivered again."}
+```
+
+- **Each report reaches you once.** Taking it withdraws the queued copy, so it
+  is not delivered again when your turn ends. A report your agent already read
+  is not handed back, and an empty list means none waits.
+- **Nothing interrupts your turn.** The report waits for one of your calls.
+- Only the thread's own agent can take its reports.
 
 ### `lucidos threads archive --thread <current|child-uuid>`
 
@@ -555,7 +604,7 @@ The images travel inside the spawn request as base64, which the engine caps at 1
 - `--coding-agent-model <m>`: the model the coding agent runs on, as the ladder or the picker names it. The engine checks it against the backend's list when it creates the thread, and answers 400 with the valid ids. The CLI prints that answer and holds no list of its own. A follow-up on an existing thread is not checked.
 - `--reasoning-effort <level>`: how hard the coding agent thinks. One of `low`, `medium`, `high`, `xhigh`, `max`. It pins the level for this spawn only. It needs a coding-agent flag, and the CLI refuses an unknown level before sending anything. A chat-thread spawn reads a different ladder and does not take this flag.
 
-**An agent picks an intelligence rung.** From a coding-agent session, whatever `--mode` says, a model or effort you name must be an *intelligence rung* on the backend's *intelligence ladder*. Lucidos refuses any other pick with reason `off-intelligence-ladder`, and the CLI prints the ladder under the refusal. On Claude Code, a model with no effort is judged at that model's default effort. On Codex, name both. Naming neither runs on the *default implementer*: Opus 5.5 at `medium` for Claude Code unless the owner changed it, and Codex's own config for Codex.
+**An agent picks an intelligence rung.** From a coding-agent session, whatever `--mode` says, a model or effort you name must be an *intelligence rung* on the backend's *intelligence ladder*. Lucidos refuses any other pick with reason `off-intelligence-ladder`, and the CLI prints the ladder under the refusal. A model with no effort is judged at that model's default effort, on both backends. Naming neither runs on the *default implementer*: Opus 5.5 at `medium` for Claude Code and GPT-6.1 Sol at `medium` for Codex, unless the owner changed it.
 
 A chat thread's `--model` must be a rung on the Lucidos Agent's ladder (`lucidos intelligence-ladder --surface chat`). It is judged at the account's tier for that model, else its default effort.
 
@@ -616,7 +665,7 @@ $ lucidos intelligence-ladder
 The claude-code intelligence ladder, least to most intelligent. Intelligence, cost and time per task are rough multiples of claude-opus-5-5 at medium.
 1. Haiku 5.5, low (`--coding-agent-model claude-haiku-5-5 --reasoning-effort low`): intelligence 0.6×, cost 0.08×, time 0.4×
 …
-7. Opus 5.5, medium (`--coding-agent-model claude-opus-5-5 --reasoning-effort medium`): intelligence 1×, cost 1×, time 1× [default, this thread]
+7. Opus 5.5, medium (`--coding-agent-model claude-opus-5-5 --reasoning-effort medium`): intelligence 1.0×, cost 1.0×, time 1.0× [default, this thread]
 ```
 
 ### `lucidos model-prices`
@@ -639,8 +688,7 @@ It takes two steps, because a question card lives inside the turn that asks it:
 
 If the owner answers **Allow once**, do the act next, in this turn. The first matching call spends the approval. A second attempt, the same verb at another thread, or any other verb is refused again. The approval also ends when your thread's next turn starts. An engine resume and an event-wait wake do not count as one.
 
-- **Verbs**, each with `--thread <uuid>`: `archive`, `cancel`, `continue`, `apply`, `discard`, `set-aside`, `bring-back`, `revert`, `control`, `ask-side-question`, `dismiss-side-question`, and `spawn-successor`, naming your parent, to start your *successor thread* under it. `answer-question` and `resolve-permission` are refused: a card never asks to answer another card.
-- **A plan card's new-thread pick needs no card.** The owner's device pick of an option starting `Implement in a new thread` already allows one `spawn-successor` (ADR 0493). Ask for an approval only after a typed reply.
+- **Verbs**, each with `--thread <uuid>`: `archive`, `cancel`, `continue`, `apply`, `discard`, `set-aside`, `bring-back`, `revert`, `control`, `ask-side-question`, and `dismiss-side-question`. A handoff to a *successor session* needs no approval, and `spawn-successor` is retired. `answer-question` and `resolve-permission` are refused: a card never asks to answer another card.
 - **No approval for a spawn.** Creating a top-thread and moving your own child to top level need none (ADR 0475). `create-top-thread` and `detach-child` answer a 409 that says so.
 - **Refusals**: a 409 when you already hold the authority (inside your own subtree, or your turn carries the standing instruction). A 403 outside a coding-agent session. A 400 for a missing reason or a missing `--thread`.
 - **Only the owner can allow it.** An agent answering the card is refused, including the agent that asked. "Don't allow", Cancel, a typed reply, or no answer allows nothing.
@@ -793,6 +841,9 @@ its timeout is killed.
   output plus a `message` saying to wait again. Once it has finished, it is the
   final record, with `exit_code` and `status`. A `wait` that runs out of time
   never stops the task. `--max-secs` returns sooner, and the cap is 230.
+- **A child's report ends a `wait` early.** The answer then carries the report
+  under `child_reports`, and its `message` says to read it and wait again. See
+  [`lucidos threads child-reports`](#lucidos-threads-child-reports).
 - The re-open message carries each output stream's last 4000 bytes. `output
   <task_id>` prints more: what arrived since your last read while the task
   runs, and its final record once it has finished.
@@ -1476,8 +1527,8 @@ drops the preferred provider's route clears the preference with it.
 
 **Set `--context-window` on every model you add.** It is the model's context
 window in tokens, and it sizes the engine's context budget. Without it the
-engine guesses from the model id: `claude-*` is 200k unless the id carries
-`[1m]`, `gpt-5*` is 400k, anything else 200k. OpenRouter, xAI, Gemini and local
+engine guesses from the model id: any id containing `[1m]` gets 1M,
+`gpt-` ids with major version 5 or later get 400k; other ids get 200k. OpenRouter, xAI, Gemini and local
 ids get no rule, so a 1M model is trimmed at a fifth of what it holds.
 
 Set the window your model serves for this request, not its headline maximum.
@@ -1604,7 +1655,7 @@ List pending, set-aside and recently-applied *changes*. Wraps `GET /api/v1/chang
 $ lucidos changes list
 {"pending":[{"id":"fbcc4a3a-...","branch_name":"lucidos-claude-code-repo-lucidos-fix-...","description":"fix: …","status":"pending",...}],"set_aside":[],"applied":[...],"total_pending":1,"restart_required":false,"restart_groups":[],"client_update_available":false,"has_more_applied":false}
 
-# Find the single pending change's id (e.g. in a build → apply pipeline):
+# Find the single pending change's id (e.g. in a script that applies a pending change):
 $ CID=$(lucidos changes list | jq -r '.pending[0].id')
 $ lucidos changes apply "$CID"
 ```
@@ -1632,32 +1683,32 @@ $ lucidos changes list --my-sub-threads
 
 ### `lucidos changes apply <change-id>`
 
-Apply a pending *change* (a coding-agent-proposed branch waiting on the Apply button). Wraps `POST /api/v1/changes/<id>/apply` and echoes the engine's typed `ApplyChangeResult` JSON to stdout. Get the id from `lucidos changes list` (`.pending[].id`).
+Apply a pending *change* (a coding-agent-proposed branch waiting on the Apply button). Wraps `POST /api/v1/changes/<id>/apply` and echoes the engine's typed apply-result JSON to stdout. Get the id from `lucidos changes list` (`.pending[].id`).
 
 ```bash
 $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 {"status":"applied","change_id":"fbcc4a3a-...","thread_id":"1c1c34ef-...","message":"Change applied.","restart_required":false,"applied_commit":"9b1a...","previous_commit":"2a3b...","commits_applied":3,"files_changed":5}
 ```
 
-> **In-thread agent:** the chat Lucidos Agent has the `apply_change` LLM tool. It runs the same apply pipeline **in-process**. It stamps the apply as the agent, linked to the applying thread, so the route popover never mislabels it as "You". Use `apply_change` from a chat or trigger thread. Use this CLI from a `script:`-typed trigger or a bash or Python subprocess, which cannot call the in-process tool.
+> **In-thread agent:** the chat Lucidos Agent has the `changes(action="apply")` LLM tool. It runs the same apply pipeline **in-process**. It stamps the apply as the agent, linked to the applying thread, so the route popover never mislabels it as "You". Use `changes(action="apply")` from a chat or trigger thread. Use this CLI from a `script:`-typed trigger or a bash or Python subprocess, which cannot call the in-process tool.
 
-> **Both refusals below reach the LLM tool too.** `apply_change` asks the same gate this CLI's route asks (ADR 0233). A thread that has not settled, or a change with no files left, is refused there as well. The tool error names the way forward. It offers `apply_when_settled` only for a *settling* thread, because `apply_when_settled` refuses one parked on a question.
+> **Both refusals below reach the LLM tool too.** `changes(action="apply")` asks the same gate this CLI's route asks (ADR 0233). A thread that has not settled, or a change with no files left, is refused there as well. The tool error names the way forward. It offers `changes(action="apply_when_settled")` only for a *settling* thread, because `changes(action="apply_when_settled")` refuses one parked on a question.
 
-> **Applying work that has not finished:** the agent also has two *standing apply* actions. `apply_when_settled` takes one thread's change, applied the moment that thread finishes. `apply_as_they_settle` takes everything pending that has settled, plus every *settling* thread as each one lands. Both arm the same instruction the Apply control arms from the UI. Both wait through an event wait, and drop with a report if a thread stops on a question or fails. LLM-only, with no CLI form.
+> **Applying work that has not finished:** the agent also has two *standing apply* actions. `changes(action="apply_when_settled")` takes one thread's change, applied the moment that thread finishes. `changes(action="apply_as_they_settle")` takes everything pending that has settled, plus every *settling* thread as each one lands. Both arm the same instruction the Apply control arms from the UI. Both wait through an event wait, and drop with a report if a thread stops on a question or fails. LLM-only, with no CLI form.
 
 > **Only a proposal lands.** A standing apply also drops when the settle withholds the work (`ProposalWithheld`), and the report names the reason.
 
-> **Nothing to wait for, nothing armed.** `apply_when_settled` refuses a thread that has already settled with nothing pending, parked on a question, or failed. So never re-arm a thread whose change just landed.
+> **Nothing to wait for, nothing armed.** `changes(action="apply_when_settled")` refuses a thread that has already settled with nothing pending, parked on a question, or failed. So never re-arm a thread whose change just landed.
 
-> **Neither reaches a repo Lucidos does not apply into.** An *external-repo coding-agent thread* proposes no *change* at all, so `apply_when_settled` refuses one and the `apply_as_they_settle` sweep passes it over. That work is reviewed and pushed from the repo itself.
+> **Neither reaches a repo Lucidos does not apply into.** An *external-repo coding-agent thread* proposes no *change* at all, so `changes(action="apply_when_settled")` refuses one and the `changes(action="apply_as_they_settle")` sweep passes it over. That work is reviewed and pushed from the repo itself.
 
-> **Taking one back:** `cancel_standing_apply` is the off for both. With a `thread_id` it cancels that thread's instruction. Without one it cancels every standing apply in the workspace. The Changes panel's Not finished toggle cancels only the changes it lists. It stops future applies only: a change already merging or hardening keeps going, and nothing already applied is reverted. Cancelling a running Apply All batch is a different action.
+> **Taking one back:** `changes(action="cancel_standing_apply")` is the off for both. With a `thread_id` it cancels that thread's instruction. Without one it cancels every standing apply in the workspace. The Changes panel's Not finished toggle cancels only the changes it lists. It stops future applies only: a change already merging or hardening keeps going, and nothing already applied is reverted. Cancelling a running Apply All batch is a different action.
 
 > **Setting a change aside:** `set_aside` keeps a pending change for later, out of Review and Apply All, and lets its thread be archived. `bring_back` returns it to pending. Neither loses the branch. `set_aside` is refused where Discard is, and `apply` refuses a set-aside change until it is brought back. LLM-only, with no CLI form.
 
 > **Bringing back unfinished work:** an incomplete set-aside row, such as one the archive net filed, never returns to pending. `bring_back` withdraws it and decides again, and proposes under a fresh id only if the last turn finished.
 
-> **All six ask the same authority question the CLI does.** Applying a change from your own subtree needs nothing. Anything wider is the *workspace owner*'s, and the tool returns the refusal above rather than applying. `apply_as_they_settle` is always wider, since the sweep reaches every thread in the workspace, and so is a `cancel_standing_apply` naming no thread.
+> **All six ask the same authority question the CLI does.** Applying a change from your own subtree needs nothing. Anything wider is the *workspace owner*'s, and the tool returns the refusal above rather than applying. `changes(action="apply_as_they_settle")` is always wider, since the sweep reaches every thread in the workspace, and so is a `changes(action="cancel_standing_apply")` naming no thread.
 
 The response carries:
 
@@ -1675,7 +1726,7 @@ The CLI prints the JSON verbatim on stdout. It exits non-zero on a transport err
 Two 409s are refusals rather than errors, and both name the resolution:
 
 - The change's thread is still working: wait for it to idle.
-- The change has **no file changes left** (`file_count` is 0). Its branch's commits cancelled out, so there is nothing to merge: discard it with the Discard button. A build-then-apply script treats a zero-`file_count` entry in `lucidos changes list` as "nothing to apply", not a change to retry.
+- The change has **no file changes left** (`file_count` is 0). Its branch's commits cancelled out, so there is nothing to merge: discard it with the Discard button. A script applying changes treats a zero-`file_count` entry in `lucidos changes list` as "nothing to apply", not a change to retry.
 
 A 403 is the third refusal, about authority rather than state. Applying a change acts on the thread that proposed it, so a change from your own subtree needs nothing. A change from anywhere else is the *workspace owner*'s to apply. You may apply it only with their standing instruction: a turn they opened, or a trigger firing they authorized. Discard answers the same way. The body names both shapes, so read it rather than retrying.
 
@@ -1783,7 +1834,7 @@ Still waiting on: the release build to finish. Ending your turn leaves this thre
 
 A wait still live means the session is not finished: say so, or stand it down with `lucidos event-waits cancel`. From your own shell, `mark` stops nothing.
 
-`query` prints exactly one of the three words, because `/harden` Phase 0 and the `pre-push.sh` hook compare it literally. `sha` feeds `/harden`'s merge-only check: is every commit since that SHA a merge of main? Apply consumes the marker, so a freshly applied branch reads `MISSING`. `/harden` drives these, so you rarely call them by hand.
+`query` prints `FRESH`, `STALE`, `MISSING` or `NOT_NEEDED`, which `/harden` Phase 0 and the `pre-push.sh` hook compare literally. `sha` feeds `/harden`'s merge-only check: is every commit since that SHA a merge of main? Apply consumes the marker, so a freshly applied branch reads `MISSING`. `/harden` drives these, so you rarely call them by hand.
 
 ### `lucidos planned mark (--plan <path> | --simple "<reason>" | --security-fix "<reason>" --files <csv>)` / `lucidos planned approve` / `lucidos planned state`
 
@@ -1821,13 +1872,15 @@ lucidos planned state
 
 That option pair is a **floor**, not a fixed shape. The question tool needs at least two options, so `Request changes` fills the second slot only when the plan has no real fork. When it has one (a narrower scope, one layer instead of two), the fork takes the slot. `Request changes` is then dropped, not carried as a third option meaning only "I will type what I want changed".
 
-**The options come from the plan flow's approval checkpoint.** `mark --plan` records the marker only. Its output, and the edit gate's, point at the `implementation-plan` skill's approval checkpoint, `lucidos successor offer --at plan-approval --ask --progress 0/<phases>` (below). That prints the card: when the *handoff estimate* pays, it leads with `Implement in a new thread`, then `Approve here`. Otherwise it offers a new thread only for a lower or a higher *intelligence rung* on the *intelligence ladder*, beside the floor above.
+**The options come from the plan flow's approval checkpoint.** `mark --plan` records the marker only. Its output, and the edit gate's, point at the `implementation-plan` skill's approval checkpoint, `lucidos successor offer --at plan-approval --ask --progress 0/<phases>` (below). That prints the card: when the *handoff estimate* pays, it leads with `Implement in a fresh session`, then `Approve here`. Otherwise it offers a fresh session only for a lower or a higher *intelligence rung* on the *intelligence ladder*, beside the floor above.
 
-Picking an `Implement in a new thread` option approves the plan. The agent runs `lucidos planned approve`, then hands the build to a *successor thread* with `lucidos successor spawn --build-chain` (below). The narrative names the plan path and says the user approved it. The successor's branch starts at the planning branch's last commit, so it already holds the plan, and the approved marker carries over.
+Picking an `Implement in a fresh session` option approves the plan. The agent runs `lucidos planned approve`, then hands the build to a *successor session* in the same thread with `lucidos successor start` (below). The narrative names the plan path and says the user approved it. The thread keeps its branch, so the plan and the approved marker stay in place.
 
 **A re-plan re-proposes.** `mark --plan` on a branch with an approved plan sets the marker back to `proposed`. The edit gate then closes until the user approves the new plan. The plan flow runs its approval checkpoint again.
 
 Only after the user approves does the agent run `lucidos planned approve`, flipping `proposed` to `planned` (gate-satisfying). The engine checks this and refuses with a 409 (`no-plan-approval`). It wants a tapped approving option, or a typed plain approval such as `approve` or `lgtm`, given after the plan was proposed. A branch with no owning thread, such as a human's own, approves unchecked.
+
+**The marker belongs on the branch the thread applies.** In a Lucidos or app thread, Apply lands only the engine-named branch, even after a `git switch -c`. So `mark` and `approve` from a side branch refuse with a 409 (`marker-off-tracked-branch`) that names the branch to switch back to. Never cut a new branch for new work in such a thread. An external-repo thread is exempt, since it adopts a renamed branch.
 
 A tapped fork is an approval too: revise the plan file to that variant, re-commit, then flip it. A fork pick does not re-mark. A typed reply that asks, suggests or questions is a request for changes. Revise the plan file, re-commit, run `mark --plan` again, and ask again (the marker stays `proposed`).
 
@@ -1843,7 +1896,7 @@ Anything wider stays gated. The session commits its plan, leaves the marker `pro
 
 `planned`, `acknowledged_simple` and `bounded_security_fix` satisfy every gate. `proposed` and a missing marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). The `implementation-plan` skill drives `mark --plan` / `approve`, and `mark --simple` is the agent's escape hatch for a change too small to plan. `lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this, never invoked directly.
 
-### `lucidos successor offer --at <name> [--progress <done>/<total>] [--ask]`
+### `lucidos successor offer --at <name> [--progress <done>/<total>] [--ask | --default-floor]`
 
 Run a *handoff checkpoint* and print what to do. A repository names its checkpoints in its plan skill, review flow or agent instructions, and the engine knows none by name. `lucidos knowhow read system-knowhow/coding-agent-flows` shows how to wire one, and holds two default flows.
 
@@ -1853,86 +1906,82 @@ A refusal reads as an unknown reading, so the thread carries on. A 404 with an e
 
 - **`--at <name>`**: lowercase letters, digits and hyphens, up to 64. Runs of the same name in the same repository, on the same model and effort, are the history the estimate reads.
 - **`--progress <done>/<total>`**: the flow's units of work done. The estimate reads `total - done` units left, else one. A plan flow counts phases.
-- **`--ask`**: an offered checkpoint, which prints a question card. Without it the checkpoint is automatic, and asks the owner only when a handoff pays and needs their approval.
+- **`--ask`**: an offered checkpoint, which prints a question card. Without it the checkpoint is automatic and asks nothing.
+- **`--default-floor`**: an automatic run only, so it conflicts with `--ask`. It declares the surface's *default rung* the *default floor* for this run, as the hardening flow does. The engine then may name two rungs from the thread's *intelligence ladder*, each one only to a thread below it:
+  - the **floor rung**, the default rung itself;
+  - the ***risk rung***, the rung just above the default, never the top.
 
-An **automatic** checkpoint prints one of three things:
+  It names neither when the ladder does not climb, the thread runs off it, cannot hand off, or holds an open change. The CLI keeps no copy of the ladder: it prints the model and effort the engine returns.
 
-- **Hand off**: the estimate pays, and this thread needs no owner approval card. Commit, write a *handoff narrative*, then run `lucidos successor spawn --narrative <file>` with the same `--at` and `--progress` and no implementer flags. The narrative quotes the flow's remaining checkpoint instructions. End the turn with the link.
-- **Ask the owner**: the estimate pays, but the handoff needs an owner approval card. Run `lucidos ask-owner-approval spawn-successor --thread <parent> --reason "<why>"`, then ask with the id it prints. On Allow once, hand off as above. On Don't allow, carry on.
+An **automatic** checkpoint prints one of these:
+
+- **Hand off**: the estimate pays. Commit, write a *handoff narrative*, then run `lucidos successor start --narrative <file>` with the same `--at` and `--progress` and no implementer flags. The narrative quotes the flow's remaining checkpoint instructions. End the turn.
+- **Hand off on the floor rung**: the engine named a floor rung. Hand off as above even when the estimate does not pay, adding the `--coding-agent-model` and `--reasoning-effort` the output names.
+- **The risk rung**: when the engine names one, the output adds two tests, and the agent hands off on it instead when the change passes either. Say why in one line. With no other handoff due, carry on unless the change passes a test.
+  - **Security work**: a security or authority boundary, secrets, credentials, pairing, sandboxing, or what an agent may do.
+  - **A costly one-way door**: a migration or new stored format, a published contract, a release or install format, or destroyed work.
 - **Carry on**: the estimate does not pay, or Lucidos could not make a reading.
-
-A top-level thread, a *build chain* member, and a successor holding a *handoff consent* never need a card here. Another child needs `spawn-successor` authority of its own, as a turn the owner opened carries.
 
 An **offered** checkpoint prints the card's shape:
 
-- **The estimate pays**: offer `Implement in a new thread: <implementer> (Recommended)`, then this thread's implementer when it differs, then the flow's option to stay (`Approve here` for a plan, else `Continue here`), then a real fork. Never more than 4 options.
-- **It does not pay**: a new thread only for a lower *intelligence rung* on the *intelligence ladder* than this thread's (ADR 0497). For hard or long work, a thread with a rung above its own may also offer `Implement in a new thread: <a higher rung>` (ADR 0499). It goes one or two rungs up, never to the top. Otherwise the flow's own question.
-- **The thread cannot hand off, or the engine could not be read**: the flow's own question, and no new thread.
+- **The estimate pays**: offer `Implement in a fresh session: <implementer> (Recommended)`, then this thread's implementer when it differs, then the flow's option to stay (`Approve here` for a plan, else `Continue here`), then a real fork. Never more than 4 options.
+- **It does not pay**: a new session only for a lower *intelligence rung* on the *intelligence ladder* than this thread's (ADR 0497). For hard or long work, a thread with a rung above its own may also offer `Implement in a fresh session: <a higher rung>` (ADR 0499). It goes one or two rungs up, never to the top. Otherwise the flow's own question.
+- **The thread cannot hand off, or the engine could not be read**: the flow's own question, and no new session.
 
-The card prints this thread's implementer and the ladder with this thread's rung marked (`lucidos intelligence-ladder`). The agent recommends a rung by its judgement of the work left (ADR 0486, ADR 0500). It names the rung by picker label and effort, as the ladder prints them, and the backend only when it is not this thread's. Every new-thread option starts `Implement in a new thread`, so the owner's pick is consent to the handoff (ADR 0493). Picking one does what the flow says that decision does, then runs `lucidos successor spawn` below.
+The card prints this thread's implementer and the ladder with this thread's rung marked (`lucidos intelligence-ladder`). The agent recommends a rung by its judgement of the work left (ADR 0486, ADR 0500). It names the rung by picker label and effort, as the ladder prints them, and the backend only when it is not this thread's. Picking an `Implement in a fresh session` option does what the flow says that decision does, then runs `lucidos successor start` below.
 
-### `lucidos successor spawn --narrative <file>`
+### `lucidos successor start --narrative <file>`
 
-Continue this thread in a *successor thread*, which carries on with a fresh context. Use it when the user says "handoff this session" or picks an `Implement in a new thread` option. In a Lucidos thread, advice from anywhere to run `/clear` or to write a handoff file means this too. Wraps `POST /api/v1/threads/:id/successor` for `$LUCIDOS_THREAD_ID`, and prints the successor as a markdown link.
+Continue this thread in a *successor session*: a fresh session in this same thread, with a clean context. Use it when the user says "handoff this session" or picks an `Implement in a fresh session` option. In a Lucidos thread, advice from anywhere to run `/clear` or to write a handoff file means this too. Wraps `POST /api/v1/threads/:id/successor` for `$LUCIDOS_THREAD_ID`. `spawn` still runs as an alias of `start`, for flows written before the rename.
 
-1. **Commit your work.** The engine refuses a worktree with uncommitted changes, so nothing is left behind.
-2. **Write a *handoff narrative*** to a file outside the repo. It needs one markdown heading for each of: Outcomes, Decisions, Gotchas, State, Next step, Files. The engine names any it lacks and refuses the handoff.
-3. **Run the command, put the link in your final message, and end your turn.**
+1. **Write a *handoff narrative*** to a file outside the repo. It needs one markdown heading for each of: Outcomes, Decisions, Gotchas, State, Next step, Files. The engine names any it lacks and refuses the handoff.
+2. **Run the command, then end your turn.** The successor session starts in this thread once the turn ends, and reads the narrative first.
 
 ```bash
-lucidos successor spawn --narrative "$TMPDIR/handoff.md"
+lucidos successor start --narrative "$TMPDIR/handoff.md"
 
-# A plan flow's pick: start a build chain under this thread when it is top-level.
-lucidos successor spawn --build-chain --narrative "$TMPDIR/handoff.md"
-
-# At an automatic checkpoint, name it again so a chain member, or a successor holding a
-# handoff consent, needs no card:
-lucidos successor spawn --narrative "$TMPDIR/handoff.md" --at phase-commit --progress 2/5
+# At an automatic checkpoint, name it again, so the session skips that checkpoint:
+lucidos successor start --narrative "$TMPDIR/handoff.md" --at phase-commit --progress 2/5
 
 # Build on another rung (the plan card's pick), as `lucidos intelligence-ladder` prints it:
-lucidos successor spawn --narrative "$TMPDIR/handoff.md" \
+lucidos successor start --narrative "$TMPDIR/handoff.md" \
   --coding-agent-model <model id> --reasoning-effort <level>
 ```
 
-**The successor runs on this thread's implementer unless the command names another.** The three flags are spelled as on `spawn-thread`:
+**The successor session runs on this thread's implementer unless the command names another.** The three flags are spelled as on `spawn-thread`:
 
 | Flag | Omitted |
 |---|---|
 | `--coding-agent <claude-code\|codex>` | this thread's backend |
-| `--coding-agent-model <id>` | this thread's model on the same backend, else the backend's default implementer. Naming this thread's model without a `[1m]` suffix keeps its exact id, `[1m]` included, so the successor reads the same prompt cache |
-| `--reasoning-effort <low\|medium\|high\|xhigh\|max>` | this thread's effort on the same backend while the successor's model accepts it, else the backend's default implementer |
+| `--coding-agent-model <id>` | this thread's model on the same backend, else the backend's default implementer. Naming this thread's model without a `[1m]` suffix keeps its exact id, `[1m]` included, so the session reads the same prompt cache |
+| `--reasoning-effort <low\|medium\|high\|xhigh\|max>` | this thread's effort on the same backend while the new model accepts it, else the backend's default implementer |
 
-Pass model ids, not picker labels. The engine refuses a model or effort the backend does not offer, before anything is recorded, with reason `implementer-not-offered` and the offered list. A model or effort the agent names must also be a rung on the intelligence ladder. Otherwise the engine refuses with reason `off-intelligence-ladder`, and the command prints the ladder. Carrying this thread's own implementer over is never refused, even off the ladder, since the owner may have picked it by hand. The command prints the implementer the successor runs on, under its link.
+Pass model ids, not picker labels. The engine refuses a model or effort the backend does not offer, before anything is recorded, with reason `implementer-not-offered` and the offered list. A model or effort the agent names must also be a rung on the intelligence ladder. Otherwise the engine refuses with reason `off-intelligence-ladder`, and the command prints the ladder. Carrying this thread's own implementer over is never refused, even off the ladder, since the owner may have picked it by hand. The command prints the implementer the session runs on.
 
 What the handoff does:
 
-- **The successor's branch starts at this thread's last commit**, so its change carries all of this thread's work. This thread proposes nothing from then on: its work waits as *unproposed work* with reason `carried_by_successor`, and a pending change is withdrawn. The plan marker carries over to the successor's branch.
-- **The successor sits in this thread's place.** It is top-level if this thread is, otherwise a child of the same parent with the same wake mode. The parent then waits on the successor, and this thread files no report.
-- **`--build-chain` on a top-level thread starts a *build chain* instead.** The successor is a `no-wake` child of this thread, which stays open, proposes nothing and does not archive. On a child thread the flag changes nothing. The reply's `build_chain` says which happened.
-- **Authority follows the placement.** A top-level successor needs none, as `spawn-thread --relation top` needs none (ADR 0475). A child successor, from a turn the owner did not open, needs `spawn-successor` on the parent. A thread can hand off only itself.
-- **A child successor records the consent that started it** as its *handoff consent*: the owner's own decision, a spent owner approval, or a carried consent. At a checkpoint whose estimate pays, it then needs no card under the same parent. Its own successor carries the consent on (ADR 0507). A build chain consent and a machine-token caller record none.
-- **A build chain member needs no card under its planner** at an automatic checkpoint whose estimate pays (ADR 0503). Pass the `--at` and `--progress` flags `offer` printed, so the engine reruns the estimate for that checkpoint. The consent covers no other verb and no other target.
-- **A plan card's pick is that consent.** The owner's device pick of an `Implement in a new thread` option covers one successor, in the turn that offered the card (ADR 0493). A typed reply is not a pick, so it needs `lucidos ask-owner-approval spawn-successor`.
-- **This thread archives itself** once the successor's first session starts and nothing blocks the archive. Otherwise it stays open and shows where it continued.
-- **Refused** for a thread that is not a coding-agent thread, an *integrated sub-thread*, and a thread already handed off or archived. A second request racing a handoff waits for the first, then is refused as already handed off. Also for a change waiting in the *landing lane*, and a worktree git could not read.
+- **It records `SessionHandedOff`** and creates no thread, no branch and no change. The thread keeps its worktree, branch, plan marker and change, uncommitted work included.
+- **The current session ends with its turn**, and the successor session then starts in the same thread. Its first message is the narrative, and its `SessionStarted` records continuity `handoff`. Another message arriving first starts it too, with the narrative ahead of that message.
+- **The backend may change.** A session on Claude Code may hand off to Codex, and back. The thread's backend follows its newest session.
+- **A parent sees nothing change.** It keeps waiting on this thread, and hears from it once, at the real end.
+- **No authority is needed**, and no owner approval card is ever asked for. A thread can hand off only itself.
+- **Refused** for a thread that is not a coding-agent thread, an *integrated sub-thread*, or an archived thread. A thread with a handoff already pending is refused with reason `handoff-pending`. A second request racing a handoff waits for the first, then is refused. Also refused while the thread applies a change or has one in the *landing lane*.
 
-The route's body takes `coding_agent`, `coding_agent_model` and `reasoning_effort` beside the narrative, plus `build_chain`, `checkpoint` and `progress`. Its reply carries `{successor_thread_id, link, implementer, build_chain}`.
+The route's body takes `coding_agent`, `coding_agent_model` and `reasoning_effort` beside the narrative, plus `checkpoint` and `progress`. Its reply carries `{implementer, starts}`. `starts` is `after-this-turn` when the thread's own agent called, and `now` for any other caller.
 
 `GET /api/v1/threads/:id/context` returns `{input_tokens, can_hand_off, offer, applied, implementer, card}`. `input_tokens` is the context size, and `can_hand_off` says whether the thread may hand off at all. `offer` is the size decision the plan card reads.
 
-`card` is the *Successor card*'s verdict, `{warm, cold, cold_at, fresh_ratio}`. `warm` and `cold` say whether the handoff estimate says a handoff pays while the prompt cache is warm and once it is cold. `cold_at` is when the cache goes cold. `fresh_ratio` is how many times a fresh thread's context the thread holds. It is absent when the engine cannot make a reading.
+`card` is the *Successor card*'s verdict, `{warm, cold, cold_at, fresh_ratio}`. `warm` and `cold` say whether the handoff estimate says a handoff pays while the prompt cache is warm and once it is cold. `cold_at` is when the cache goes cold. `fresh_ratio` is how many times a fresh session's context the thread holds. It is absent when the engine cannot make a reading.
 
-`applied` says whether the thread has an applied change. `implementer` is `{coding_agent, model, reasoning_effort}` for a coding-agent thread, a `null` model or effort meaning the backend's default, and `null` for any other thread. A thread that cannot hand off (an *integrated sub-thread*, or one already handed off) reads `can_hand_off` and `offer` false, and shows no card.
+`applied` says whether the thread has an applied change. `implementer` is `{coding_agent, model, reasoning_effort}` for a coding-agent thread, a `null` model or effort meaning the backend's default, and `null` for any other thread. A thread that cannot hand off (an *integrated sub-thread*, or one whose handoff is pending) reads `can_hand_off` and `offer` false, and shows no card.
 
-The *Successor card* uses two other routes, both for a user's device and refused for an agent. `POST /api/v1/threads/:id/successor-offer/continue` takes `{message?, coding_agent?, coding_agent_model?, reasoning_effort?}`. The engine picks the path by the prompt cache's warmth and answers `{path}`. On `narrative` (a warm cache) it records `SuccessorRequested` and asks the old agent for its *handoff narrative*. The agent's `lucidos successor spawn` then picks up that request and implementer. On `brief` (a cold cache) it starts the successor at once from a *handoff brief* and also answers the successor's fields.
+The *Successor card* uses two other routes, both for a user's device and refused for an agent. `POST /api/v1/threads/:id/successor-offer/continue` takes `{message?, coding_agent?, coding_agent_model?, reasoning_effort?}`. The engine picks the path by the prompt cache's warmth and answers `{path}`. On `narrative` (a warm cache) it records `SuccessorRequested` and asks the agent for its *handoff narrative*. The agent's `lucidos successor start` then picks up that request and implementer. On `brief` (a cold cache) it starts the successor session at once from a *handoff brief*, and also answers `{implementer, starts}`.
 
-A thread that is not idle is refused, and so is a cold one holding uncommitted work.
+A thread that is not idle is refused.
 
 `POST /api/v1/threads/:id/successor-offer/decline` records *Stay here* as `SuccessorOfferDeclined`.
 
-`POST /api/v1/threads/:id/handoff-checkpoints` takes `{name, progress?, offered?}` and returns the same reading plus `handoff`: `{name, progress, pays, estimate, without_card, approval_target}`. `pays` is `null` when the engine could not make a reading, such as a model with no price row. It is `false` while the thread holds a pending, applying or landing change, since a handoff would withdraw it. `estimate` holds `warmth`, `units_left`, `calls_per_unit`, `calls_left`, `fresh_tokens`, `saving_usd` and `cost_usd`.
-
-`without_card` says whether this caller could spawn the successor with no owner approval card. When it is `false`, `approval_target` names the parent an owner approval card asks about. A malformed name or progress is a 400, and a thread records only its own runs.
+`POST /api/v1/threads/:id/handoff-checkpoints` takes `{name, progress?, offered?}` and returns the same reading plus `handoff`: `{name, progress, pays, estimate}`. `pays` is `null` when the engine could not make a reading, such as a model with no price row. It is `false` while the thread holds a pending, applying or landing change. `estimate` holds `warmth`, `units_left`, `calls_per_unit`, `calls_left`, `fresh_tokens`, `saving_usd` and `cost_usd`. A malformed name or progress is a 400, and a thread records only its own runs.
 
 ### `lucidos frontend-preview start [--thread-id <uuid>]` / `lucidos frontend-preview stop` / `lucidos frontend-preview status`
 
@@ -2017,32 +2066,39 @@ The response comes back with an allowlisted set of upstream headers, the same fo
   "sonos":   { "base_url": "http://localhost:5005" },
   "comfort": {
     "base_url": "https://accsmart.panasonic.com",
-    "auth": { "type": "bearer", "credential": "comfort-cloud" }
+    "auth": { "pipeline": [
+      { "type": "static_credential", "kind": "bearer", "credential": "comfort-cloud" }
+    ] }
   },
   "weather": {
     "base_url": "https://api.weather.example",
-    "auth": { "type": "api_key", "credential": "weather-api", "header": "X-API-Key" }
+    "auth": { "pipeline": [
+      { "type": "static_credential", "kind": "api_key",
+        "credential": "weather-api", "header": "X-API-Key" }
+    ] }
   }
 }
 ```
 
-`auth.type` selects how the engine attaches the credential to the outgoing request. Six modes:
+`auth.pipeline` is an ordered list of authentication layers. Each layer has a
+`type`:
 
-- **`bearer`**: `Authorization: Bearer <auth_value>`. `{"type": "bearer", "credential": "<service_name>"}`
-- **`api_key`**: `<header>: <auth_value>` (default header `Authorization`). `{"type": "api_key", "credential": "<service_name>", "header": "X-API-Key"}`
-- **`basic`**: `Authorization: Basic <base64(auth_value)>`. The credential's `auth_value` should already be `user:password`. `{"type": "basic", "credential": "<service_name>"}`
-- **`query_param`**: appends `?<param_name>=<auth_value>` to the request URL, for APIs (e.g. Helius) that take the key as a query parameter. `{"type": "query_param", "credential": "<service_name>", "param_name": "api-key"}`
-- **`hmac_signed`**: signs each request with HMAC over the query string, for APIs (e.g. Binance) that require per-request signing. `{"type": "hmac_signed", "key_credential": "binance-key", "secret_credential": "binance-secret", "key_header": "X-MBX-APIKEY", "algorithm": "sha256", "signed_payload": "query_string", "signature_param": "signature", "timestamp_param": "timestamp"}`
-  - Optional `timestamp_param` injects the current millis-since-epoch as a query parameter before signing.
-  - Optional `key_header` (default `X-API-KEY`) carries the API key.
-  - `signature_param` (default `signature`) names the resulting signature parameter.
-  - `algorithm` is `sha256` or `sha512`. `signed_payload` is `query_string`.
-- **`script_handshake`**: for APIs that need a multi-step login (POST creds, get a session token or multi-header response, refresh on a schedule). `{"type": "script_handshake", "credential": "<service_name>", "script": "scripts/auth/<api>.py"}`. See `system-knowhow/building-an-auth-handshake.md` for the full guide and worked Comfort Cloud + Firebase examples.
-  - The engine runs a per-API Python script you write under `data/scripts/auth/<api>.py`. It caches the resulting headers in memory, and refreshes on `expires_in` or an upstream 401.
-  - The credential can be any type. The script reads it as `CRED_<NAME>_USERNAME` + `CRED_<NAME>_PASSWORD` for `password`, or `CRED_<NAME>` for the others, as `run_python` / `run_bash` do.
-  - Optional `"oauth_providers": ["google", ...]` injects each listed provider's connected access token (auto-refreshed) as `OAUTH_<UPPER>_ACCESS_TOKEN` in the script's env. A missing provider is a 502 naming it, so the user knows which `connect_oauth_account` to run.
+- `static_credential`: chooses `kind` (`bearer`, `api_key`, `basic` or
+  `query_param`) and a `credential` name. `api_key` accepts `header`;
+  `query_param` accepts `param_name`.
+- `hmac_signed`: takes `key_credential`, `secret_credential`, `algorithm`
+  (`sha256` or `sha512`) and `signed_payload: "query_string"`.
+  Optional fields are `key_header`, `signature_param` and `timestamp_param`.
+- `script_handshake`: takes `script`, an optional `credential` and optional
+  `oauth_providers`. The script returns cached headers and an expiry.
+- `wasm_signer`: takes `module` and optional `credential_handles`, each mapping
+  a logical `name` to a stored `credential`.
 
-`auth.credential` (single-credential modes) and `auth.credentials` / `auth.key_credential` / `auth.secret_credential` (multi-credential modes) name `service_name`s already in the engine credential store, the one `request_credential` writes to. An entry with no `auth` block forwards unauthenticated, for local services like Sonos.
+Credential references name `service_name`s in the engine credential store.
+Omit `auth` for an unauthenticated backend. The legacy `auth.type` shape is
+retired; startup migration handles old files, but new entries need a pipeline.
+See [Building an auth handshake](building-an-auth-handshake.md) for layer
+examples, defaults, secret injection and WASM capability declarations and grants.
 
 **A credential goes only where it is scoped.** The engine checks the entry's `base_url` against the *credential scope*, the set of base URLs the credential declares, before attaching it. Rewriting an entry's `base_url` therefore cannot redirect a secret (ADR 0144). One key covering several hostnames of one provider declares each of them, and `lucidos credentials` below is how you read and set that. A `script_handshake` credential is the exception, because the script presents it rather than the proxy: what binds there is the `injects` column of the approvals record, which pins the exact secret set that entry may hand the script.
 
@@ -2349,7 +2405,7 @@ lucidos update-address show --port 5300   # a gateway on an unusual port.
 ```
 
 - **One setting, three editors.** The gateway stores it in
-  `~/.lucidos/updates.toml`. **Settings → System → Maintenance** and
+  `~/.lucidos/updates.toml`. **Settings → System → Overview → Maintenance** and
   `PUT /~/api/v1/control/release-check` edit the same value.
 - **The rule:** `https`, or `http` only to `localhost`, `127.0.0.1` or `[::1]`.
   `set` refuses anything else before it sends a request.

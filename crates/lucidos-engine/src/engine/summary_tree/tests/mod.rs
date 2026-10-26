@@ -193,6 +193,9 @@ pub(super) fn line_response(line: String) -> LlmResponse {
         input_tokens: Some(100),
         cache_creation_tokens: None,
         cache_creation_1h_tokens: None,
+        cache_creation_30m_tokens: None,
+        cache_creation_12h_tokens: None,
+        cache_creation_requested_ttl: None,
         stable_prefix_fingerprint: None,
         cache_read_tokens: None,
         served_model: None,
@@ -202,6 +205,7 @@ pub(super) fn line_response(line: String) -> LlmResponse {
         unknown_sse_dropped: 0,
         model_only_text: None,
         progress_notes: Vec::new(),
+        prefill: None,
         service_tier: None,
     }
 }

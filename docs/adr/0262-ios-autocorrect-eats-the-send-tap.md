@@ -161,3 +161,29 @@ The Consequences change with it:
 - The quiet period that retires the composer probes still counts from this ADR,
   whichever way the reporter's switch is set. With the switch on, a dead Send
   with no fresh correction above it still falsifies the diagnosis.
+
+## Addendum, 2026-10-24: the held correction is visible, and it lags a move
+
+On iOS 27 the reporter saw a word in the composer turn blue, then later get a
+dotted spell-check underline. The blue letters are iOS holding an autocorrect
+correction for that word. The underline follows once iOS drops the correction
+and only flags the spelling.
+
+An earlier report found that the blue letters lag behind when the keyboard
+opens or closes. They stay at the old spot outside the textarea, then snap into
+place. So iOS draws the held correction in its own view, above the page, and
+does not move it with the textarea.
+
+What this adds to the diagnosis:
+
+- **The state that eats the tap now has a visible marker.** Blue letters mean
+  autocorrect holds a correction, and a tap elsewhere goes to the keyboard. A
+  dead-Send report with a blue word above Send supports the diagnosis. One
+  without it, and with no autocorrect underline either, weighs against it.
+- **The state does not follow the textarea.** When the composer moves under a
+  held correction, iOS keeps the correction where it was. Our CSS paints no
+  blue on composer text, and no theme asks for a drawn caret, so the page has
+  no part in the lag.
+- **A programmatic caret move is untested.** Moving the caret by hand clears
+  the correction. Whether a `setSelectionRange` from code on a keyboard resize
+  does the same is unknown, and only a device can show it.

@@ -1630,6 +1630,7 @@ fn user_question_asked() -> crate::engine::thread_events::ThreadEvent {
 fn user_question_answered() -> crate::engine::thread_events::ThreadEvent {
     crate::engine::thread_events::ThreadEvent::UserQuestionAnswered {
         tool_use_id: "tu-1".to_string(),
+        quiet: false,
         answer: crate::engine::thread_events::AnswerKind::FreeText {
             text: "go".to_string(),
             image_hashes: vec![],

@@ -443,7 +443,7 @@ impl ChangesProjection {
     }
 
     /// [`Self::branch_has_decided_change`] for the residue after `thread_id`
-    /// handed off to a *successor thread*. A closed row counts only when it
+    /// handed off to a *legacy successor thread*. A closed row counts only when it
     /// was recorded after the handoff: a decision before it says nothing about
     /// the residue. An open row counts at any age, since a branch holds one.
     pub async fn branch_has_decided_change_since_handoff(

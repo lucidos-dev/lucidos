@@ -300,7 +300,7 @@ pub enum UnproposedReason {
     /// An integrated sub-thread's hardened work. It is never proposed: the
     /// parent's agent merges the branch.
     IntegratedIntoParent,
-    /// The thread handed off to a successor thread, whose branch carries this
+    /// The thread handed off to a legacy successor thread, whose branch carries this
     /// work. The successor's change proposes it.
     CarriedBySuccessor,
 }

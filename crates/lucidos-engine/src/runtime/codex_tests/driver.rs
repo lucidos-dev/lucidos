@@ -67,6 +67,7 @@ fn stub_driver_prompted(
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(driver_task(
         config,
@@ -74,6 +75,7 @@ fn stub_driver_prompted(
         events_tx,
         input_rx,
         control_rx,
+        withdraw_rx,
         cancel.clone(),
     ));
     StubSession {
@@ -86,7 +88,7 @@ fn stub_driver_prompted(
             input_tx,
             control_tx,
             permission_rx: None,
-            withdraw_tx: None,
+            withdraw_tx,
         },
         cancel,
     }
@@ -455,6 +457,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (_withdraw_tx, withdraw_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(driver_task(
         config,
@@ -462,6 +465,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         events_tx,
         input_rx,
         control_rx,
+        withdraw_rx,
         cancel.clone(),
     ));
 
@@ -600,6 +604,74 @@ async fn a_line_split_around_a_queued_input_still_arrives_whole() {
     s.cancel.cancel();
 }
 
+fn input(text: &str) -> AgentInput {
+    AgentInput {
+        text: text.into(),
+        images: vec![],
+        uuid: uuid::Uuid::new_v4(),
+    }
+}
+
+/// Ask the driver to take back `input_uuid` and return its answer.
+async fn withdraw(agent: &RunningAgent, input_uuid: uuid::Uuid) -> InputWithdrawal {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    agent
+        .withdraw_tx
+        .send(WithdrawRequest { input_uuid, reply })
+        .expect("driver alive");
+    tokio::time::timeout(EVENT_TIMEOUT, answer)
+        .await
+        .expect("withdraw answered")
+        .expect("driver answered")
+}
+
+#[tokio::test]
+async fn withdraw_drops_a_queued_input_and_refuses_the_one_in_flight() {
+    let signals = tempfile::TempDir::new().expect("tempdir");
+    let go_on = signals.path().join("go-on");
+    let tail = format!(
+        "printf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}}'\n\
+         while [ ! -e '{go}' ]; do sleep 0.05; done\n\
+         cat <<'JSONL_EOF'\n{rest}\nJSONL_EOF\n",
+        go = go_on.display(),
+        rest = HAPPY_TURN.split_once('\n').expect("a multi-line turn").1,
+    );
+    let mut s = stub_driver_running(&tail, None);
+    let running = input("running");
+    s.agent.input_tx.send(running.clone()).unwrap();
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::InputRead { input } if input == running.uuid
+    ));
+
+    let queued = input("queued report");
+    s.agent.input_tx.send(queued.clone()).unwrap();
+    assert_eq!(
+        withdraw(&s.agent, queued.uuid).await,
+        InputWithdrawal::Withdrawn
+    );
+    assert_eq!(
+        withdraw(&s.agent, running.uuid).await,
+        InputWithdrawal::AlreadyRead
+    );
+    std::fs::write(&go_on, "").expect("release the stub");
+    while !matches!(next_event(&mut s.agent).await, AgentEvent::Result { .. }) {}
+
+    // The next turn runs the next input, never the withdrawn one.
+    let next = input("next");
+    s.agent.input_tx.send(next.clone()).unwrap();
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::InputRead { input } if input == next.uuid
+    ));
+    let prompts = std::fs::read_to_string(&s.stdin_log).unwrap_or_default();
+    assert!(
+        !prompts.contains("queued report"),
+        "a withdrawn input must never start a turn: {prompts}"
+    );
+    s.cancel.cancel();
+}
+
 /// A child that exits before it prints anything never took its prompt, so the
 /// driver reports no read for it. The read is the turn gap's proof of
 /// delivery: reporting it early would let a lost prompt hide its note. It names
@@ -638,6 +710,7 @@ async fn a_turn_that_cannot_spawn_rejects_its_input() {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(driver_task(
         config,
@@ -645,6 +718,7 @@ async fn a_turn_that_cannot_spawn_rejects_its_input() {
         events_tx,
         input_rx,
         control_rx,
+        withdraw_rx,
         cancel.clone(),
     ));
     let mut agent = RunningAgent {
@@ -653,7 +727,7 @@ async fn a_turn_that_cannot_spawn_rejects_its_input() {
         input_tx,
         control_tx,
         permission_rx: None,
-        withdraw_tx: None,
+        withdraw_tx,
     };
     let ping = uuid::Uuid::new_v4();
     agent

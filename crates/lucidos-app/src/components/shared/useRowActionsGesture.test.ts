@@ -1,10 +1,11 @@
+// @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   makeLongPressHandlers, LONG_PRESS_DELAY_MS, type LongPressCallback,
 } from '../../hooks/useLongPress';
 import { rowGestureHandlers } from './useRowActionsGesture';
 
-const row = { closest: () => null };
+const row = document.createElement('div');
 /** A fake target whose `closest` matches any of `tags` in a selector list. */
 const inside = (...tags: string[]) => ({
   closest: (sel: string) => (sel.split(',').some((s) => tags.includes(s.trim())) ? {} : null),

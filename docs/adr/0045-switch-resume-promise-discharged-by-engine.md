@@ -83,6 +83,15 @@ uses it to say exactly that.
   switch abort in the start-event sense. It is, because its own withdrawal becomes
   the thread's newest `ResponseAborted` and the query requires the switch abort to
   be the newest one.
+- A coding-agent thread has two candidate sources for the switch resume. The
+  worktree scan covers a thread with a session. A thread interrupted before its
+  agent read anything may have no `SessionStarted`. The scan never sees it.
+  `unengaged_switch_resume_candidates` selects it by the same fingerprint.
+- "Read nothing" means no `CodingAgentInputRead` and no agent output, because the
+  spawn writes `SessionStarted` before the agent reads its first prompt. Without
+  the second source the floor withdrew the promise, and the user's Continue sent a
+  bare prompt to an agent with no context. `resume_input` now replays the
+  thread's unread prompts, engine-mode included, for such a thread.
 - A third consumer now reads the switch fingerprint, in TypeScript
   (`abortPromisesAutoResume`). It cannot import the Rust constant, so
   `switch_teardown_fingerprint_is_stable_for_the_frontend_mirror` is the canary

@@ -8,14 +8,26 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 
-type FrameProps = { place: string; size?: string; visible?: boolean; onMenu?: (at?: { x: number; y: number }) => void };
+type FrameProps = {
+  place: string;
+  size?: string;
+  visible?: boolean;
+  onMenu?: (at?: { x: number; y: number }) => void;
+  onFrameState?: (state: FrameState) => void;
+};
 const frameProps = new Map<string, FrameProps>();
-vi.mock('../../widgets/WidgetFrame', () => ({
-  WidgetFrame: (props: FrameProps & { appId: string }) => {
-    frameProps.set(props.appId, props);
-    return <iframe data-frame={props.appId} />;
-  },
-}));
+/** What each mocked frame reports on mount. A frame not listed has revealed. */
+const mountStates = new Map<string, FrameState>();
+vi.mock('../../widgets/WidgetFrame', async () => {
+  const { useLayoutEffect } = await import('preact/hooks');
+  return {
+    WidgetFrame: (props: FrameProps & { appId: string }) => {
+      frameProps.set(props.appId, props);
+      useLayoutEffect(() => props.onFrameState?.(mountStates.get(props.appId) ?? 'revealed'), []);
+      return <iframe data-frame={props.appId} />;
+    },
+  };
+});
 
 const api = vi.hoisted(() => ({
   arranged: [] as Array<{ dashboard: string; tiles: unknown[] }>,
@@ -35,7 +47,11 @@ vi.mock('../../../api/client/widgets', async (importOriginal) => ({
 
 import type { AppDashboardTile, DashboardTile, DashboardView, WidgetDashboardTile } from '../../../api/client/widgets';
 import { dashboards } from '../../../store/dashboards';
+import { threadMap } from '../../../store/store';
+import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { Dashboard, stableTileOrder } from '../Dashboard';
+import { TILE_DRAG_THRESHOLD_PX } from '../useDashboardDrag';
+import { DashboardRailToggle } from '../DashboardRail';
 import {
   DASHBOARD_CELL_REM,
   DASHBOARD_GAP_REM,
@@ -46,6 +62,10 @@ import {
   dashboardContentWidth,
 } from '../../../utils/dashboardGeometry';
 import { SIZE_SPANS } from '../DashboardTile';
+import { SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
+import { DASHBOARD_SETTLE_FUSE_MS } from '../useDashboardSettled';
+import { PANE_TRANSITION_MS } from '../../layout/splitHelpers';
+import type { FrameState } from '../../widgets/widgetFrameState';
 
 const openApp = vi.hoisted(() => vi.fn());
 vi.mock('../../../store/actions/apps', async (importOriginal) => ({
@@ -136,6 +156,7 @@ describe('<Dashboard>', () => {
 
   beforeEach(() => {
     frameProps.clear();
+    mountStates.clear();
     host = document.createElement('div');
     document.body.appendChild(host);
   });
@@ -213,14 +234,13 @@ describe('<Dashboard>', () => {
     expect(tiles().map((t) => t.classList.contains('is-transparent'))).toEqual([true, false]);
   });
 
-  /** Invariant: the desktop rail's head carries no title; the phone's does (ADR 0468). */
-  it('titles the head on the phone only', () => {
+  it('titles the head on both layouts', () => {
     setDashboard([tile('clock', 'small')]);
     act(() => render(<Dashboard dashboard="desktop" />, host));
-    expect(host.querySelector('.dashboard-title')).toBeNull();
+    expect(host.querySelector('.dashboard-head .dashboard-title')?.textContent).toBe('Dashboard');
     expect(host.querySelector('.dashboard-head .dashboard-edit')).not.toBeNull();
     act(() => render(<Dashboard dashboard="phone" />, host));
-    expect(host.querySelector('.dashboard-title')?.textContent).toBe('Dashboard');
+    expect(host.querySelector('.dashboard-head .dashboard-title')?.textContent).toBe('Dashboard');
   });
 
   it('an empty dashboard says so and offers Add', () => {
@@ -229,6 +249,132 @@ describe('<Dashboard>', () => {
     expect(host.querySelector('.dashboard-empty')?.textContent).toContain('Nothing is on this dashboard yet');
     expect(host.querySelector('.dashboard-empty .dashboard-add')).not.toBeNull();
     expect(host.querySelector('.dashboard-empty')?.textContent).toContain('an app');
+  });
+});
+
+describe('<Dashboard> settling', () => {
+  let host: HTMLDivElement;
+
+  beforeEach(() => {
+    frameProps.clear();
+    mountStates.clear();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    render(null, host);
+    host.remove();
+    dashboards.value = new Map();
+  });
+
+  const grid = () => host.querySelector<HTMLElement>('.dashboard-grid:not(.loading-fade-skeleton *)')!;
+  const hiding = () => grid().classList.contains('is-settling');
+  const report = (appId: string, state: FrameState) => act(() => frameProps.get(appId)!.onFrameState!(state));
+
+  /** Invariant: the grid stays hidden while a mounted frame is still covered. */
+  it('hides the grid until every frame on screen has revealed', () => {
+    mountStates.set('clock', 'loading');
+    mountStates.set('inbox', 'loading');
+    setDashboard([tile('clock', 'small'), tile('inbox', 'medium')]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    expect(hiding()).toBe(true);
+    report('clock', 'revealed');
+    expect(hiding()).toBe(true);
+    report('inbox', 'revealed');
+    expect(hiding()).toBe(false);
+  });
+
+  /** Invariant: an off-screen tile and an app shortcut never hold the dashboard. */
+  it('is not held by an off-screen tile or an app shortcut', () => {
+    mountStates.set('far', 'off-screen');
+    setDashboard([tile('clock', 'small'), tile('far', 'small'), shortcut('notes')]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    expect(hiding()).toBe(false);
+  });
+
+  /** Invariant: a tile whose place is unknown holds the dashboard. */
+  it('is held by a tile the viewport observer has not reported on', () => {
+    mountStates.set('clock', 'unknown');
+    setDashboard([tile('clock', 'small')]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    expect(hiding()).toBe(true);
+  });
+
+  /** Invariant: once settled, the grid never hides again. */
+  it('stays shown when a tile added later is still loading', () => {
+    setDashboard([tile('clock', 'small')]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    expect(hiding()).toBe(false);
+    mountStates.set('inbox', 'loading');
+    act(() => setDashboard([tile('clock', 'small'), tile('inbox', 'medium')]));
+    expect(hiding()).toBe(false);
+    report('clock', 'loading');
+    expect(hiding()).toBe(false);
+  });
+
+  /** Invariant: the fuse bounds the wait, and is cleared on unmount. */
+  it('shows after the fuse while a frame is still loading', () => {
+    vi.useFakeTimers();
+    mountStates.set('clock', 'loading');
+    setDashboard([tile('clock', 'small')]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    act(() => void vi.advanceTimersByTime(DASHBOARD_SETTLE_FUSE_MS - 1));
+    expect(hiding()).toBe(true);
+    act(() => void vi.advanceTimersByTime(1));
+    expect(hiding()).toBe(false);
+  });
+
+  it('starts no fuse while hidden, and no timer outlives the dashboard', () => {
+    vi.useFakeTimers();
+    mountStates.set('clock', 'loading');
+    setDashboard([tile('clock', 'small')]);
+    act(() => render(<Dashboard dashboard="desktop" hidden />, host));
+    const pending = vi.getTimerCount();
+    act(() => void vi.advanceTimersByTime(DASHBOARD_SETTLE_FUSE_MS * 2));
+    expect(hiding()).toBe(true);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    expect(vi.getTimerCount()).toBeGreaterThan(pending);
+    act(() => render(null, host));
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(pending);
+  });
+
+  /** Invariant: a hidden dashboard ignores its tiles until it is shown. */
+  it('does not settle while hidden, and settles once shown', () => {
+    setDashboard([tile('clock', 'small')]);
+    act(() => render(<Dashboard dashboard="desktop" hidden />, host));
+    expect(hiding()).toBe(true);
+    report('clock', 'revealed');
+    expect(hiding()).toBe(true);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    expect(hiding()).toBe(true);
+    report('clock', 'revealed');
+    expect(hiding()).toBe(false);
+  });
+
+  /** Invariant: a rail sliding in reads off-screen wrongly, so it is not trusted until the slide ends. */
+  it('holds an off-screen answer while a shown dashboard slides in', () => {
+    vi.useFakeTimers();
+    setDashboard([tile('clock', 'small')]);
+    act(() => render(<Dashboard dashboard="desktop" hidden />, host));
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    report('clock', 'off-screen');
+    expect(hiding()).toBe(true);
+    act(() => { vi.advanceTimersByTime(PANE_TRANSITION_MS + 100); });
+    expect(hiding()).toBe(false);
+  });
+
+  /** Invariant: the loader obeys the delay gate and is opaque when shown. */
+  it('draws the skeleton in the real tiles\' sizes, only past the delay gate', () => {
+    vi.useFakeTimers();
+    mountStates.set('clock', 'loading');
+    setDashboard([tile('clock', 'small'), tile('inbox', 'medium'), shortcut('notes')]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    const skeleton = () => [...host.querySelectorAll<HTMLElement>('.loading-fade-skeleton .dashboard-tile')].map((t) => t.dataset.size);
+    expect(skeleton()).toEqual([]);
+    act(() => void vi.advanceTimersByTime(SPINNER_DELAY_MS));
+    expect(skeleton()).toEqual(['small', 'medium', 'quarter']);
   });
 });
 
@@ -380,6 +526,51 @@ describe('<Dashboard> in edit mode', () => {
     expect(api.arranged).toHaveLength(1);
   });
 
+  /** Invariant: a shield on screen is a shield that can start a drag. A press
+   *  right after the shield draws, before any passive effect has run, still
+   *  grabs the tile. */
+  it('a press right after edit mode draws starts a drag', async () => {
+    setDashboard([tile('clock', 'small'), tile('inbox', 'medium')]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    host.querySelector<HTMLButtonElement>('.dashboard-edit')!.click();
+    await Promise.resolve();
+    const shield = tileOf('clock').querySelector<HTMLElement>('.dashboard-tile-shield')!;
+    expect(shield).not.toBeNull();
+
+    const pointer = (type: string, x: number) => shield.dispatchEvent(Object.assign(new Event(type, { bubbles: true }), {
+      pointerId: 1, isPrimary: true, button: 0, clientX: x, clientY: 0,
+    }));
+    pointer('pointerdown', 0);
+    pointer('pointermove', 2 * TILE_DRAG_THRESHOLD_PX);
+    await Promise.resolve();
+    expect(tileOf('clock').classList.contains('is-dragging')).toBe(true);
+  });
+
+  /** Invariant: a swap's reflow never swaps again under a stationary pointer.
+   *  The tile the reflow slides under the pointer counts as passed, so a drop
+   *  right after a swap commits the swap, never its reversal. */
+  it('a reflow that slides another tile under the pointer does not swap straight back', () => {
+    setDashboard([tile('clock', 'small'), tile('inbox', 'medium'), tile('prs', 'large')]);
+    edit();
+    const orderNow = () => ['clock', 'inbox', 'prs'].sort((a, b) => Number(tileOf(a).style.order) - Number(tileOf(b).style.order));
+    // Over `prs` before the swap; the reflow then puts `inbox` where the pointer is.
+    document.elementsFromPoint = () => [tileOf(orderNow().join() === 'clock,inbox,prs' ? 'prs' : 'inbox')];
+    const shield = tileOf('clock').querySelector<HTMLElement>('.dashboard-tile-shield')!;
+    const pointer = (type: string, x: number) => act(() => {
+      shield.dispatchEvent(Object.assign(new Event(type, { bubbles: true }), {
+        pointerId: 1, isPrimary: true, button: 0, clientX: x, clientY: 0,
+      }));
+    });
+    pointer('pointerdown', 0);
+    pointer('pointermove', 2 * TILE_DRAG_THRESHOLD_PX);
+    pointer('pointermove', 250);
+    expect(orderNow()).toEqual(['inbox', 'prs', 'clock']);
+    pointer('pointermove', 251);
+    pointer('pointerup', 251);
+    delete (document as Partial<Document>).elementsFromPoint;
+    expect((api.arranged[0].tiles as Array<{ app_id: string }>).map((t) => t.app_id)).toEqual(['inbox', 'prs', 'clock']);
+  });
+
   it('the minus badge removes the tile from this dashboard', () => {
     setDashboard([tile('clock', 'small')]);
     edit();
@@ -439,5 +630,19 @@ describe('<Dashboard> tile menu', () => {
       .find((b) => b.textContent === 'Edit dashboard')!;
     act(() => edit.click());
     expect(host.querySelector('.dashboard-tile-shield')).not.toBeNull();
+  });
+});
+
+describe('the rail toggle', () => {
+  /** It sits on the rail's head, off the header bar, so it wears no accent tint. */
+  it('wears the quiet tone', () => {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    threadMap.value = new Map([['home', makeThreadState('home', { meta: { title: 'Home', home: true, section: 'inbox' }, eventsLoaded: true })]]);
+    act(() => render(<DashboardRailToggle />, host));
+    expect(host.querySelector('.dashboard-rail-toggle')?.getAttribute('data-tone')).toBe('quiet');
+    act(() => render(null, host));
+    host.remove();
+    threadMap.value = new Map();
   });
 });

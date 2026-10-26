@@ -121,7 +121,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   extraClass?: string;
   /** Extra attributes for the ⋯ trigger. A host whose row is MEASURED marks its
    *  members with one, and the trigger is a member like any other. Ignored
-   *  when no trigger is drawn. */
+   *  when no trigger is drawn. A `face` takes them too. */
   triggerAttrs?: Record<string, string>;
   /** Run as the menu opens, before anything else.
    *
@@ -264,7 +264,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
   return (
     <>
       {face && (
-        <FaceTrigger face={face} open={open} triggerRef={triggerRef} onTap={toggle} onGesture={openFromGesture} />
+        <FaceTrigger face={face} attrs={triggerAttrs} open={open} triggerRef={triggerRef} onTap={toggle} onGesture={openFromGesture} />
       )}
       {drawsDots && (
         <button
@@ -306,8 +306,9 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, triggerAt
  *  lift is swallowed, a tap toggles it, and a right-click opens it at the
  *  pointer (ADR 0285). A phone places it against the button instead, since a
  *  finger covers the point. */
-function FaceTrigger({ face, open, triggerRef, onTap, onGesture }: {
+function FaceTrigger({ face, attrs, open, triggerRef, onTap, onGesture }: {
   face: TriggerFace;
+  attrs?: Record<string, string>;
   open: boolean;
   triggerRef: { current: HTMLButtonElement | null };
   onTap: (e: MouseEvent) => void;
@@ -319,6 +320,7 @@ function FaceTrigger({ face, open, triggerRef, onTap, onGesture }: {
     <button
       ref={triggerRef}
       type="button"
+      {...attrs}
       class={face.class}
       aria-label={face.label}
       data-tooltip={face.label}

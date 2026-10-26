@@ -122,10 +122,32 @@ mod tests {
             output_tokens: output,
             cache_read_tokens: read,
             cache_creation_tokens: written,
-            modality: None,
-            service_tier: None,
             cache_creation_1h_tokens: Some(written_1h),
+            ..Default::default()
         }
+    }
+
+    /// OpenAI's 12-hour write bills at the card's 12-hour rate, and the
+    /// 30-minute part at the plain write rate.
+    #[test]
+    fn a_12h_write_prices_at_its_own_rate() {
+        let today = crate::llm::model_prices::today();
+        let table = crate::llm::model_prices::price_table();
+        let rates = table.card_on("gpt-6.1-sol", today).expect("priced").rates;
+        let write_12h = rates
+            .cache_write_12h
+            .expect("a GPT-5.6+ card prices 12 hours");
+        let call = ApiUsage {
+            input_tokens: 1_300,
+            cache_creation_tokens: 1_200,
+            cache_creation_30m_tokens: Some(1_000),
+            cache_creation_12h_tokens: Some(200),
+            ..Default::default()
+        };
+        let expected =
+            (100.0 * rates.uncached_in + 1_000.0 * rates.cache_write + 200.0 * write_12h) / 1e6;
+        let cost = call.usd_on("gpt-6.1-sol", today).expect("priced");
+        assert!((cost - expected).abs() < 1e-12, "{cost} vs {expected}");
     }
 
     /// A keep-alive ping reads the whole context at the cache read rate.
@@ -231,9 +253,7 @@ mod tests {
             output_tokens: 678,
             cache_read_tokens: 10_000,
             cache_creation_tokens: 200,
-            modality: None,
-            service_tier: None,
-            cache_creation_1h_tokens: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
@@ -281,8 +301,7 @@ mod tests {
                 output_text_tokens: 20,
                 output_audio_tokens: 44,
             }),
-            service_tier: None,
-            cache_creation_1h_tokens: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(json["input_tokens"], 1200);
@@ -572,10 +591,22 @@ pub struct ApiUsage {
     /// Part of `cache_creation_tokens`: the tokens written to the 1-hour
     /// cache, billed at 2x base input rather than 1.25x. A Claude Code
     /// session and a Claude chat call on Anthropic or Vertex split a write by
-    /// lifetime, and every other producer leaves it absent. The cache
-    /// keep-alive reads the session's TTL from it.
+    /// lifetime, and the rest of the write went to the 5-minute cache.
+    /// `CacheTtl::of_write` reads the call's TTL from the split.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_tokens: Option<u32>,
+    /// Part of `cache_creation_tokens`: the tokens OpenAI's Responses API
+    /// wrote to its 30-minute cache. With the 12-hour part it covers the write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_30m_tokens: Option<u32>,
+    /// Part of `cache_creation_tokens`: the tokens OpenAI's Responses API
+    /// wrote to its 12-hour cache, billed above the 30-minute write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_12h_tokens: Option<u32>,
+    /// The cache lifetime the request asked for, where the response split
+    /// nothing. The router sets it only for a route probes showed honours it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_requested_ttl: Option<crate::llm::cache_lifetime::CacheLifetime>,
 }
 
 impl ApiUsage {
@@ -598,11 +629,14 @@ impl ApiUsage {
         let read = f64::from(self.cache_read_tokens);
         let written = f64::from(self.cache_creation_tokens);
         let written_1h = f64::from(self.cache_creation_1h_tokens.unwrap_or(0)).min(written);
+        let written_12h =
+            f64::from(self.cache_creation_12h_tokens.unwrap_or(0)).min(written - written_1h);
         let fresh = (f64::from(self.input_tokens) - read - written).max(0.0);
         let input_usd = fresh * rates.uncached_in
             + read * rates.cache_read
-            + (written - written_1h) * rates.cache_write
-            + written_1h * rates.cache_write_1h.unwrap_or(rates.cache_write);
+            + (written - written_1h - written_12h) * rates.cache_write
+            + written_1h * rates.cache_write_1h.unwrap_or(rates.cache_write)
+            + written_12h * rates.cache_write_12h.unwrap_or(rates.cache_write);
         Some((input_usd + f64::from(self.output_tokens) * rates.out) / 1_000_000.0)
     }
 }
@@ -890,9 +924,10 @@ pub enum SessionPhase {
 /// **Single agent per thread — deliberate.** The owning HashMap is keyed by
 /// `Uuid` (thread_id) alone, so a thread hosts at most one live agent session.
 /// This holds with both backends wired in (Claude Code + Codex): a thread's
-/// backend is locked at its first session (`thread_summaries.coding_agent`;
-/// `validate_thread_continuity` rejects a mismatched follow-up with 409), and
-/// the session records its backend in [`AgentSession::coding_agent`].
+/// backend holds until a handoff (`thread_summaries.coding_agent`, the newest
+/// session's backend; `validate_thread_continuity` rejects a mismatched
+/// follow-up with 409), and the session records its backend in
+/// [`AgentSession::coding_agent`].
 pub struct AgentSession {
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     /// The turn reached its boundary. Only the run loop writes it, because the
@@ -1045,6 +1080,8 @@ pub struct AgentSession {
     pub withdraw_tx: tokio::sync::mpsc::UnboundedSender<
         crate::engine::agent_session::withdraw::WithdrawInputRequest,
     >,
+    /// Child-report takes for the run loop, and how many reports wait unread.
+    pub child_reports: crate::engine::agent_session::child_reports::ChildReportsHandle,
     /// Follow-ups sent on `msg_tx` that the run loop has not forwarded yet,
     /// by origin event id. The chat fast path adds one before its send and the
     /// run loop removes it on receipt, both under the `agent_sessions` lock. A
@@ -1080,6 +1117,10 @@ pub struct AgentSession {
     /// hook; default `false` so a genuine trailing straggler still drops. See
     /// docs/plans/2026-06-27-cc-question-answer-resume-straggler-drop.md.
     pub question_resume_pending: bool,
+    /// The answer that woke this live turn picked only *quiet options*, so the
+    /// agent ends the turn without a reply. The run loop takes it at the turn's
+    /// `Result`, where an empty reply then counts as finished, not failed.
+    pub quiet_answer_pending: bool,
     /// Paired ToolCalled / ToolResult counter, mirrored from the local
     /// counter inside `run_session`. Read by the external watchdog
     /// (`external_watchdog::tick`) — which lives outside `run_session`'s
@@ -1227,6 +1268,7 @@ impl AgentSession {
                 control_tx: tokio::sync::mpsc::unbounded_channel().0,
             },
             withdraw_tx: tokio::sync::mpsc::unbounded_channel().0,
+            child_reports: crate::engine::agent_session::child_reports::child_reports_channel().0,
             unforwarded_inputs: Default::default(),
             builtin_commands: vec![],
             skill_commands: vec![],
@@ -1235,6 +1277,7 @@ impl AgentSession {
             reasoning_effort_in_force: None,
             last_event_at: Arc::new(AtomicI64::new(0)),
             question_resume_pending: false,
+            quiet_answer_pending: false,
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             question_flushes: Default::default(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,

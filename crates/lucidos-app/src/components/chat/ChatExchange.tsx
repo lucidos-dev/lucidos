@@ -8,10 +8,11 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission, TypedAnswer } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, drawsInitiatorPanel, isResumeTurn, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, drawnResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, opensAwaitingAnswer, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { discardUnsentMessage, editQueuedMessage, removeQueuedMessage, retryUnsentMessage } from '../../store/actions/chat';
+import { currentCacheCards } from '../../store/actions/preferences';
 import { unsentMessages } from '../../store/unsentMessages';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
@@ -32,7 +33,7 @@ import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { FormRequestRow } from './FormRequestRow';
 import { NO_SIDE_QUESTIONS, SideQuestionGroup, placeInBody } from './SideQuestionCard';
 import type { SideQuestion } from '../../store/sideQuestions';
-import { ChangeEventRow, CheckpointCard, ContinueButton, RestartRow, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, SubAgentStepGroup, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
+import { ChangeEventRow, CheckpointCard, ContinueButton, RestartRow, FreshSessionRow, HandoffSessionRow, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, SubAgentStepGroup, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
 import type { BoundaryTurn } from './chat-exchange-parts';
 import { EditIcon, TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
@@ -93,9 +94,11 @@ interface Props {
    *  in `renderExchanges` so this component does not subscribe to threadMap
    *  itself — see `chatExchangePropsEqual` below for the memo contract. */
   threadIsCC: boolean;
-  /** Specific coding-agent backend for labels/icons. The channel remains
-   *  `claude_code` for both Claude Code and Codex for backwards compatibility. */
-  threadCodingAgent: CodingAgent;
+  /** The backend of the session this turn ran in (`sessionCodingAgents`), for
+   *  labels and icons. A handoff may switch backend, so only a queued message
+   *  reads the thread's: the live session reads it. The channel stays
+   *  `claude_code` for both Claude Code and Codex. */
+  sessionCodingAgent: CodingAgent;
   /** Lifted from `isRenderedThreadIdle(threadMap.value.get(threadId))` — quiescent
    *  by raw status, but false while an optimistic resume is in flight. */
   threadIdle: boolean;
@@ -170,31 +173,6 @@ export function liveRowDrawsNoPanel(userEvent: StoredEvent): boolean {
   return isLivePartialRow(userEvent) || !(userEvent as { text?: string }).text;
 }
 
-/**
- * Does this turn draw the panel naming who started it?
- *
- * Everything does, except a resume (see `isResumeTurn`) and a continuation
- * fragment. A fragment's boundary is older than the page this client holds, so
- * nothing loaded can name it. Its `userEvent` is only its own first step,
- * standing in for a key. Drawing that as an initiator would put a tool call
- * where the reader expects a person.
- *
- * The rows themselves still draw. The head of the turn arrives with the page
- * behind it, and the fold then merges the fragment into the real turn. See
- * `Exchange.continuationFragment`.
- */
-export function drawsInitiatorPanel(exchange: Exchange): boolean {
-  return exchange.continuationFragment !== true && !isResumeTurn(exchange);
-}
-
-/** A resume opens no header of its own. It is a card at the top of the reply it
- *  resumed (`ResumeCard`), so the response panel draws even when that reply is
- *  still empty. */
-function isResumeTurn(exchange: Exchange): boolean {
-  return exchange.userEvent.type === 'ContinuationStarted';
-}
-
-
 /** The event id to retry when this exchange is an unsent message, else
  *  undefined. A Retry already under way has taken its record, so the card
  *  offers nothing twice. */
@@ -217,7 +195,10 @@ function heldOnThePress(fn: () => void): (e: MouseEvent) => void {
   return (e) => withScrollAnchor(e.currentTarget as HTMLElement | null, fn);
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, behindOpenQuestion, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy, sideQuestions = NO_SIDE_QUESTIONS }: Props) {
+/** The response rows of an exchange that has none. */
+const NO_EVENTS: readonly ResponseEvent[] = [];
+
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMarker, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, sessionCodingAgent, threadIdle, threadAwaitingAnswer, behindOpenQuestion, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, pausedBy, sideQuestions = NO_SIDE_QUESTIONS, cacheCards }: ImplProps) {
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
   const artifactPaths = loadedOr(artifacts.value, NO_ARTIFACTS);
@@ -233,10 +214,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const readAt = readMarker === 'read' ? messageReadTimestamp(exchange) : undefined;
   const responseTextRaw = exchangeResponseText(exchange);
   const steps = exchangeSteps(exchange, isLast, threadIdle);
-  const events = exchangeResponseEvents(exchange, isLast, threadIdle);
+  const allEvents = drawnResponseEvents(exchange, isLast, threadIdle, cacheCards);
+  // A run that began under a question or permission card draws its card right
+  // below that card, outside the response panel. It needs no agent header of
+  // its own, and an answered card draws no panel at all, so the record would
+  // vanish with the answer.
+  const keepAliveRuns = opensAwaitingAnswer(exchange) ? allEvents.filter((e) => e.type === 'cache_keep_alive') : NO_EVENTS;
+  const events = keepAliveRuns.length > 0 ? allEvents.filter((e) => e.type !== 'cache_keep_alive') : allEvents;
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer, behindOpenQuestion);
   const error = exchangeError(exchange);
-  const agentExitCard = error?.agentExit && agentExitCopy(error.agentExit, threadCodingAgent);
+  const agentExitCard = error?.agentExit && agentExitCopy(error.agentExit, sessionCodingAgent);
   const unsentEventId = unsentMessageOf(exchange);
   // A live turn's output can land between the bubble and this card, so the
   // card names the message Retry would send.
@@ -447,14 +434,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const heldNote = status === 'held' ? HELD_CALLBACK_NOTE : undefined;
   const initiator = useMemo(
     () => withoutActorHeader(
-      describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, { description: proposedChangeDesc, fileCount: proposedChangeFileCount, summary: proposedChangeSummary }, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }, heldNote),
+      describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, sessionCodingAgent, { description: proposedChangeDesc, fileCount: proposedChangeFileCount, summary: proposedChangeSummary }, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }, heldNote),
       exchange.userEvent,
       {
         turn: boundaryTurn,
         actions: exchange.userEvent.type === 'ResponseAborted' && isContinuableAbort ? <ContinueButton threadId={threadId} /> : undefined,
       },
     ),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, heldNote, boundaryTurn, isContinuableAbort],
+    // `exchange.userEvent` too: a keep-alive run swaps its status event on the
+    // same exchange object.
+    [exchange, exchange.userEvent, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, sessionCodingAgent, proposedChangeDesc, proposedChangeFileCount, proposedChangeSummary, matchedEventType, matchedEventId, matchedPayloadJson, heldNote, boundaryTurn, isContinuableAbort],
   );
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
   // Card-less treatment. A human chat message renders as a right-aligned
@@ -486,8 +475,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // its own "Queued" says it. A callback does, unless its card drew it already.
   const panelHeld = isQueuedUserMessage && threadAwaitingAnswer ? {}
     : heldNote && !initiator.heldNoteInCard ? { note: heldNote } : undefined;
-  // Claude Code can take back a message it has not read; Codex cannot.
-  const canTakeBack = !threadIsCC || threadCodingAgent === 'claude-code';
+  // A Codex follow-up redirects the running turn at once, so it never waits
+  // long enough to take back. Claude Code queues it until read.
+  const canTakeBack = !threadIsCC || sessionCodingAgent === 'claude-code';
   const queuedMessageId = isQueuedUserMessage && canTakeBack ? exchange.userEvent._eventId : undefined;
   const isLiveRow = liveRowDrawsNoPanel(exchange.userEvent);
   // The buttons live INSIDE the status label, an existing `display: flex` row,
@@ -582,7 +572,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // The panel draws its body only when it has one and is unfolded, which is
   // exactly when `bodyPieces` carries the cards.
   const bodyTakesCards = showResponsePanel && canCollapse && !bodyFolded;
-  const executor = describeExecutor(threadIsCC, threadCodingAgent);
+  const executor = describeExecutor(threadIsCC, sessionCodingAgent);
 
   // Keyed by the row's index in the whole turn (`responseBody`). So no toggle,
   // no head clamp and no new chunk remounts a row that stays drawn.
@@ -657,6 +647,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     // the talker says what an answer means rather than reading it out.
     if (evt.type === 'spoken_reply') return <SpokenReply key={`sr${k}`} event={evt} />;
     if (evt.type === 'restart') return <RestartRow key={`rs${k}`} event={evt} />;
+    if (evt.type === 'fresh_session') return <FreshSessionRow key={`fs${k}`} event={evt} />;
+    if (evt.type === 'handoff_session') return <HandoffSessionRow key={`hs${k}`} event={evt} />;
     // Ungated, like every other marker. The park is the transcript's only
     // record that the thread subscribed to something. The clock indicator
     // holds the LIVE half and drops the wait as it resolves. A toggle
@@ -664,6 +656,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
     if (evt.type === 'event_wait') return <EventWaitRow key={`ew${k}`} event={evt} />;
     // Ungated too: a held message is the user's cue that a reply is owed.
     if (evt.type === 'held_message') return <HeldMessageRow key={`hm${k}`} event={evt} />;
+    // Ungated, like a held message: it is the record of what the wait cost.
+    if (evt.type === 'cache_keep_alive') return <KeepAliveRow key={`ka${k}`} threadId={threadId} status={evt.status} />;
     // Ungated: an open one is how the user reaches a form they closed or
     // never saw, and a resolved one records how the request ended.
     if (evt.type === 'form_request') return <FormRequestRow key={`fr${k}`} row={evt} threadId={threadId} />;
@@ -716,6 +710,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         held={panelHeld}
       />
       )}
+
+      {keepAliveRuns.map((run, i) => run.type === 'cache_keep_alive' && (
+        <div class="keep-alive-under-card" key={`ka${i}`}>
+          <KeepAliveRow threadId={threadId} status={run.status} />
+        </div>
+      ))}
 
       {showResponsePanel && (
         <ResponsePanel
@@ -770,7 +770,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
             <div class="exchange-engine-limit" role="status" onClick={handleLinkClick}>
               <strong>{engineLimitHeading(engineLimitDetail)}</strong>
               {/* Markdown, so the Settings link in the engine's text is a link. */}
-              <div dangerouslySetInnerHTML={{ __html: linkifyPaths(renderMarkdown(engineLimitDetail), artifactPaths, apps) }} />
+              <div class="authored-html" dangerouslySetInnerHTML={{ __html: linkifyPaths(renderMarkdown(engineLimitDetail), artifactPaths, apps) }} />
             </div>
           )}
         </ResponsePanel>
@@ -907,7 +907,7 @@ function unsentEventIdOf(exchange: Exchange): string | undefined {
  *     OUTSIDE, by a later exchange, so nothing else here moves with them.
  *
  *  All other props are primitives or strings, compared with Object.is. */
-export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
+export function chatExchangePropsEqual(prev: ImplProps, next: ImplProps): boolean {
   if (prev.revision !== next.revision) return false;
   if (prev.streamingBuffer !== next.streamingBuffer) return false;
   if (prev.isLast !== next.isLast) return false;
@@ -919,7 +919,7 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.priorEffort !== next.priorEffort) return false;
   if (prev.isContinuableAbort !== next.isContinuableAbort) return false;
   if (prev.threadIsCC !== next.threadIsCC) return false;
-  if (prev.threadCodingAgent !== next.threadCodingAgent) return false;
+  if (prev.sessionCodingAgent !== next.sessionCodingAgent) return false;
   if (prev.threadIdle !== next.threadIdle) return false;
   if (prev.threadAwaitingAnswer !== next.threadAwaitingAnswer) return false;
   if (prev.behindOpenQuestion !== next.behindOpenQuestion) return false;
@@ -936,6 +936,7 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.matchedPayloadJson !== next.matchedPayloadJson) return false;
   if (prev.pausedBy !== next.pausedBy) return false;
   if (!sameSideQuestions(prev.sideQuestions, next.sideQuestions)) return false;
+  if (prev.cacheCards !== next.cacheCards) return false;
   const a = prev.exchange;
   const b = next.exchange;
   if (a.userSeq !== b.userSeq) return false;
@@ -979,9 +980,21 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   return true;
 }
 
+/** The Cache cards switch, read here so the memo sees it as a prop and a
+ *  preference save wakes no memoized exchange. */
+type ImplProps = Props & { cacheCards: boolean };
+
 /** Memo-wrapped public component. Drops the 28 unchanged sibling re-renders
  *  on every per-SSE-event ThreadView re-render of the heavy thread. */
-export const ChatExchange = memo(ChatExchangeImpl, chatExchangePropsEqual);
+const MemoChatExchange = memo(ChatExchangeImpl, chatExchangePropsEqual);
+
+/** A turnless keep-alive card is the whole exchange, so the Cache cards switch
+ *  drops the exchange itself. A card under a question hides in the exchange. */
+export function ChatExchange(props: Props) {
+  const cacheCards = currentCacheCards();
+  if (!cacheCards && props.exchange.userEvent.type === 'CacheKeepAliveStatusChanged') return null;
+  return <MemoChatExchange {...props} cacheCards={cacheCards} />;
+}
 
 /** Whether the response panel gets a status badge at all. Two turns state
  *  their own outcome in the panel ABOVE the response, so a second rendering is
@@ -1295,7 +1308,7 @@ export function describeInitiator(
    *  (specific coding agent vs Lucidos Agent) for question/permission
    *  dividers. */
   threadIsCC: boolean = false,
-  threadCodingAgent: CodingAgent = 'claude-code',
+  sessionCodingAgent: CodingAgent = 'claude-code',
   /** The in-thread seed for <ChangeEventRow> on the change-lifecycle arms, so
    *  the body paints at full height on first open. One object, since three
    *  same-typed positional neighbours mis-order with no type error. */
@@ -1590,7 +1603,7 @@ export function describeInitiator(
       // UserQuestionAnswered, which findQuestionAnswer returns. Exclude those
       // from "Answered" and let each carry its own status instead.
       const unanswered = questionDividerResolution(exchange);
-      const agent = describeExecutor(threadIsCC, threadCodingAgent);
+      const agent = describeExecutor(threadIsCC, sessionCodingAgent);
       return {
         variant: 'lucidos',
         icon: agent.icon,
@@ -1619,7 +1632,7 @@ export function describeInitiator(
     case 'CodingAgentPermissionRequest': {
       const resolvedStep = findPermissionResolution(exchange, ev.request_id);
       const resolved = permissionVerdict(resolvedStep);
-      const agent = describeExecutor(true, threadCodingAgent);
+      const agent = describeExecutor(true, sessionCodingAgent);
       return {
         variant: 'lucidos',
         icon: agent.icon,
@@ -1633,6 +1646,7 @@ export function describeInitiator(
               tool_name: ev.tool_name,
               input: ev.input,
               summary: ev.summary,
+              grant_offer: ev.grant_offer,
             }}
             resolved={resolved}
             terminated={responseTerminated}

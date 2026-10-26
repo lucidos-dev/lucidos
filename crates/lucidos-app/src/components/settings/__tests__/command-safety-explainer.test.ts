@@ -21,7 +21,7 @@ const settingsView: string = readFileSync(resolve(here, '../SettingsView.tsx'), 
  *  claim, never the line break that happens to sit inside it. */
 describe('Settings → Permissions: the Command safety explainer', () => {
   const section = settingsView.indexOf('data-search-anchor="command-safety"');
-  const body = settingsView.slice(section, section + 1800).replace(/\s+/g, ' ');
+  const body = settingsView.slice(section, section + 2600).replace(/\s+/g, ' ');
 
   it('is on the page at all', () => {
     expect(section).toBeGreaterThan(-1);
@@ -54,7 +54,7 @@ describe('Settings → Permissions: the Command safety explainer', () => {
   });
 
   /** Two exceptions send a Codex escape through without a card, and only one
-   *  of them is this section's. The static pass in `attended_escalation_allowed`
+   *  of them is this section's. The static pass in `attended_command_allowed`
    *  runs ahead of both toggles, so a plain read is answered even with Command
    *  safety off. Attributing that to the judge would promise a card the guard
    *  does not raise. */
@@ -69,5 +69,27 @@ describe('Settings → Permissions: the Command safety explainer', () => {
     expect(body).toMatch(/reaches past the Lucidos Agent/);
     expect(body).toMatch(/Codex sandbox escape/);
     expect(body).toMatch(/Turn the guard off and those ask you instead/);
+  });
+
+});
+
+/** The coding-agents row widens what runs without a card, with no undo, so its
+ *  own explainer has to say so beside the switch. */
+describe('Settings → Permissions: the Enabled for coding agents explainer', () => {
+  const row = settingsView.indexOf('data-search-anchor="command-safety:coding-agents"');
+  const body = settingsView.slice(row, row + 1200).replace(/\s+/g, ' ');
+
+  it('explains from the row label', () => {
+    expect(body).toMatch(/Enabled for coding agents <Explainer title="Enabled for coding agents">/);
+  });
+
+  it('says what the switch widens, and what it costs', () => {
+    expect(body).toMatch(/The guard also judges the commands of <strong>Claude Code<\/strong>/);
+    expect(body).toMatch(/so a wrong reversible call has no undo/);
+    expect(body).toMatch(/Irreversible and catastrophic commands still ask/);
+  });
+
+  it('says what the guard still does with the switch off', () => {
+    expect(body).toMatch(/answers only the Codex commands it places as safe/);
   });
 });

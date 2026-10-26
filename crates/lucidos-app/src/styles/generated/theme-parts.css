@@ -161,7 +161,7 @@
 @property --codex-mark {
     syntax: '<color>';
     inherits: true;
-    initial-value: #7ab8ff;
+    initial-value: #e6edf3;
 }
 
 @property --accent-green {

@@ -2,12 +2,15 @@ import { useRef, useEffect, useLayoutEffect } from 'preact/hooks';
 import { mobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, appPseudoFullscreen, type MobileView } from '../../store/store';
 import { swipeToNeighbourPane } from '../../store/actions/pane';
 import { MOBILE_PANE_CONFIGS } from './MobileAppHeader';
+import { DashboardPanel } from '../dashboard/DashboardPanel';
 import { EdgeSwipeZones } from './EdgeSwipeZones';
+import { documentReplayHost, replayEdgeTap } from './edgeTapReplay';
 import {
   isInteractiveTarget,
   opensSoftwareKeyboard,
   getRemPx,
   viewportIsKeyboardShrunk,
+  readableVisualViewport,
   computedTranslateX,
 } from '../../utils/dom';
 import { PaneDrag, attachPaneDragTouches, isFrameInside, type PaneTrack, type TouchPoint } from './paneDrag';
@@ -58,7 +61,8 @@ export const EDGE_NAV_GUARD_RIGHT_REM = 1.25;
  *  only reliable suppression is preventDefault on the touchstart itself. Scoped
  *  to the screen-edge strips (sized to the `.edge-swipe-*` zones) and to
  *  non-interactive, non-text-input targets so taps on edge controls and
- *  vertical scrolling elsewhere survive.
+ *  vertical scrolling elsewhere survive. A tap on any other edge target
+ *  loses its click, which `replayEdgeTap` restores.
  *
  *  `remPx` is handed in rather than read here, so the edge math stays testable
  *  without a DOM. The caller measures it per touch, which is what keeps both
@@ -144,6 +148,30 @@ interface AttrTarget {
 export function reconcileKeyboardActive(root: AttrTarget, active: EventTarget | null): void {
   if (isKeyboardActiveTarget(active)) root.setAttribute('data-keyboard-active', '');
   else root.removeAttribute('data-keyboard-active');
+}
+
+/** How long after a focus the keyboard may still be rising, in ms. */
+export const KEYBOARD_RISE_GRACE_MS = 1000;
+
+/** Pure decision: is this *ghost focus*, a keyboard field focused with the
+ *  keyboard down?
+ *
+ *  The iOS photo picker leaves the composer that way, and so does a focus()
+ *  made outside a gesture. Everything that reads focus as typing then holds:
+ *  the header stays away and pane swipes are refused. iOS keeps the focus
+ *  through a tap on anything unfocusable, so the user has no way out.
+ *
+ *  A hardware keyboard also leaves the viewport unshrunk. A key pressed with
+ *  the viewport unshrunk proves one, so that focus is real typing. */
+export function isGhostFocus(args: {
+  fieldFocused: boolean;
+  keyboardShrunk: boolean;
+  focusHeldMs: number;
+  hardwareKeyPressed: boolean;
+}): boolean {
+  const { fieldFocused, keyboardShrunk, focusHeldMs, hardwareKeyPressed } = args;
+  return fieldFocused && !keyboardShrunk && !hardwareKeyPressed
+    && focusHeldMs >= KEYBOARD_RISE_GRACE_MS;
 }
 
 /** Pure decision: what value should `--app-height` be written to, given the
@@ -333,6 +361,13 @@ export function stripTrack(
   };
 }
 
+/** Whether a touch on `target` drives a horizontal gesture of its own, which a
+ *  pane swipe must not hijack: a horizontally scrollable child (a code block),
+ *  a range slider's knob, or a dashboard tile dragged in edit mode. */
+export function targetOwnsHorizontalDrag(target: Element): boolean {
+  return isHorizontallyScrollable(target) || !!target.closest('input[type="range"], .dashboard-tile-shield');
+}
+
 /** May a pane swipe start for this touch on the strip? Also suppresses
  *  iOS's native back/forward swipe at the screen edges, for every new touch.
  *
@@ -341,13 +376,13 @@ export function stripTrack(
  *  started, never an older one. So a thumb resting on an edge swipe zone
  *  does not cancel every other touch's scroll. Scrollable children,
  *  interactive controls and focused text inputs are exempt, so their own
- *  gestures and taps survive (see shouldSuppressEdgeNavigation). */
+ *  gestures and taps survive (see shouldSuppressEdgeNavigation). A tap on any
+ *  other edge target loses its click to the cancel, so `replayEdgeTap` gives it
+ *  back to the element under the strip. */
 function gateStripTouch(e: TouchEvent, touch: TouchPoint): boolean {
   const target = e.target as Element;
   const textInputFocused = opensSoftwareKeyboard(document.activeElement);
-  // Don't hijack touches on horizontally-scrollable children (e.g., code blocks)
-  // or range sliders (knob drag is horizontal and must not trigger pane swipe).
-  const targetScrollable = isHorizontallyScrollable(target) || !!target.closest('input[type="range"]');
+  const targetScrollable = targetOwnsHorizontalDrag(target);
 
   if (!targetScrollable && shouldSuppressEdgeNavigation({
     clientX: touch.clientX,
@@ -359,6 +394,10 @@ function gateStripTouch(e: TouchEvent, touch: TouchPoint): boolean {
     textInputFocused,
   })) {
     e.preventDefault();
+    // The cancel also kills the click a tap on this strip would have paired.
+    // Only a cancel that took is replayed. A touchstart that is not cancelable
+    // keeps its native click, or has none when it stops a fling.
+    if (e.defaultPrevented) replayEdgeTap(documentReplayHost(), e);
   }
 
   // Must come AFTER the suppression above: a pseudo-fullscreen app cancels
@@ -500,8 +539,33 @@ export function MobileSwipeContainer() {
   // <html> so CSS can disable pointer-events on non-textarea elements.
   useEffect(() => {
     const root = document.documentElement;
+    let fieldFocusedAt = 0;
+    let hardwareKeyPressed = false;
+    const keyboardShrunk = (vv: VisualViewport) =>
+      viewportIsKeyboardShrunk(vv.height, window.innerHeight);
     const onFocusIn = (e: FocusEvent) => {
+      if (opensSoftwareKeyboard(e.target)) {
+        fieldFocusedAt = performance.now();
+        hardwareKeyPressed = false;
+      }
       if (isKeyboardActiveTarget(e.target)) root.setAttribute('data-keyboard-active', '');
+    };
+    const onKeyDown = () => {
+      const vv = window.visualViewport;
+      if (vv && !keyboardShrunk(vv)) hardwareKeyPressed = true;
+    };
+    // A touch anywhere but the field ends ghost focus, so the same touch can
+    // start a pane swipe. A touch on the field is the user opening the keys.
+    const releaseGhostFocus = (e: TouchEvent) => {
+      const active = document.activeElement;
+      const vv = window.visualViewport;
+      if (!vv || !(active instanceof HTMLElement) || active.contains(e.target as Node)) return;
+      if (isGhostFocus({
+        fieldFocused: opensSoftwareKeyboard(active),
+        keyboardShrunk: keyboardShrunk(vv),
+        focusHeldMs: performance.now() - fieldFocusedAt,
+        hardwareKeyPressed,
+      })) active.blur();
     };
     const onFocusOut = (e: FocusEvent) => {
       // relatedTarget is the next focused element — if it's also a triggering
@@ -513,15 +577,21 @@ export function MobileSwipeContainer() {
     // inert target still reports it) and a return to the foreground. See
     // `reconcileKeyboardActive` for the transition that fires no event at all.
     const reconcile = () => reconcileKeyboardActive(root, document.activeElement);
+    const onTouchStart = (e: TouchEvent) => {
+      releaseGhostFocus(e);
+      reconcile();
+    };
     document.addEventListener('focusin', onFocusIn, { passive: true });
     document.addEventListener('focusout', onFocusOut, { passive: true });
-    document.addEventListener('touchstart', reconcile, { passive: true, capture: true });
+    document.addEventListener('keydown', onKeyDown, { passive: true, capture: true });
+    document.addEventListener('touchstart', onTouchStart, { passive: true, capture: true });
     document.addEventListener('visibilitychange', reconcile, { passive: true });
     window.addEventListener('pageshow', reconcile, { passive: true });
     return () => {
       document.removeEventListener('focusin', onFocusIn);
       document.removeEventListener('focusout', onFocusOut);
-      document.removeEventListener('touchstart', reconcile, { capture: true });
+      document.removeEventListener('keydown', onKeyDown, { capture: true });
+      document.removeEventListener('touchstart', onTouchStart, { capture: true });
       document.removeEventListener('visibilitychange', reconcile);
       window.removeEventListener('pageshow', reconcile);
       root.removeAttribute('data-keyboard-active');
@@ -719,12 +789,14 @@ export function MobileSwipeContainer() {
     // to the layout viewport — that's the only scenario where keyboard-related
     // ghost focus matters. Without the scope, a quick tab-switch return while
     // a search modal or settings input is focused would dismiss its focus
-    // for no benefit (no keyboard-related state to clear).
+    // for no benefit (no keyboard-related state to clear). A viewport with no
+    // reading (iOS 27 reports 0) cannot rule a pinned one out, so it blurs too.
     //
     // Reset lastSetHeight so the CSS write happens even when innerHeight
     // matches the cached value.
     const onWake = () => {
-      const vvLooksShrunk = viewportIsKeyboardShrunk(vv.height, window.innerHeight);
+      const vvLooksShrunk =
+        !readableVisualViewport() || viewportIsKeyboardShrunk(vv.height, window.innerHeight);
       const active = document.activeElement;
       if (vvLooksShrunk && active instanceof HTMLElement && opensSoftwareKeyboard(active)) {
         active.blur();
@@ -819,6 +891,7 @@ export function MobileSwipeContainer() {
             return (
               <div key={v} class="mobile-swipe-pane" data-offscreen={isOffscreenPane(v, mobileView.value) ? '' : undefined}>
                 <Pane />
+                {v === 'thread' && <DashboardPanel />}
                 {/* Rendered inside each pane (not the swipe container) so they
                     share a stacking context with the prompt-area, allowing
                     .prompt-area's z-index:2 to keep its buttons clickable. */}

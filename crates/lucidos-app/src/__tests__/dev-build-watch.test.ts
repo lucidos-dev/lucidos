@@ -35,6 +35,11 @@ const {
   buildChildEnv,
   buildStatusRecord,
   firstErrorLine,
+  gitInputPaths,
+  pollAction,
+  PROJECT_DIR,
+  watchDirs,
+  watchFiles,
 } = watcher;
 
 describe('when a build outcome is announced', () => {
@@ -289,5 +294,45 @@ describe('announcing a budget edge', () => {
     const silent = budgetAlerts(over.within, {});
     expect(silent.alerts).toEqual([]);
     expect(silent.within).toEqual(over.within);
+  });
+});
+
+describe('a watch whose file-system events stopped', () => {
+  // The incident: `fs.watch` went quiet while the process stayed alive. Two
+  // landings never built. The committed inputs are the second trigger, and it
+  // needs no events at all.
+  const base = { built: 'tree-a', current: 'tree-b', eventSinceBuild: false };
+
+  it('re-arms and builds when the committed inputs moved and no event said so', () => {
+    expect(pollAction(base)).toBe('rearm-and-build');
+  });
+
+  it('builds nothing while the committed inputs are unchanged', () => {
+    expect(pollAction({ ...base, current: 'tree-a' })).toBe('none');
+  });
+
+  it('builds nothing twice for a change an event already caught', () => {
+    expect(pollAction({ ...base, eventSinceBuild: true })).toBe('none');
+  });
+
+  it('treats a probe that could not run as unknown, never as a change', () => {
+    expect(pollAction({ ...base, current: null })).toBe('none');
+    expect(pollAction({ ...base, built: null })).toBe('none');
+  });
+});
+
+describe('the committed inputs the poll asks git about', () => {
+  it('are exactly the watched inputs, relative to the project root', () => {
+    const absolute = [...watchDirs, ...watchFiles];
+    const paths = gitInputPaths(PROJECT_DIR, absolute);
+    expect(paths).toHaveLength(absolute.length);
+    for (const [i, path] of paths.entries()) {
+      expect(path.startsWith('/')).toBe(false);
+      expect(path.startsWith('..')).toBe(false);
+      expect(absolute[i].endsWith(path)).toBe(true);
+    }
+    expect(paths).toContain('crates/lucidos-app/src');
+    expect(paths).toContain('package-lock.json');
+    expect(paths).toContain('packages/lucidos-sdk/src');
   });
 });

@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: triggers
 description: The triggers audit section: procedure in intent, stale run.knowhow, subscriptions on retired event names, slugs, orphaned trigger knowhow, notification taps, MCP servers a trigger uses but does not list.
+sources: ["docs/taxonomy.md", "system-knowhow/triggers.md", "system-knowhow/thread-events.md", "system-knowhow/coding-agent-events.md", "system-knowhow/plugins.md", "system-knowhow/js-sdk.md", "system-knowhow/best-practices.md", "crates/lucidos-engine/src/engine/chat/process/system_prompt.rs", "crates/lucidos-engine/src/engine/thread_events/*", "crates/lucidos-engine/src/scheduler/notifications.rs"]
 ---
 
 # Workspace audit section: triggers
@@ -21,7 +22,7 @@ scan tap-strings "[\\\"']*tap[\\\"']*[[:space:]]*:[[:space:]]*[\\\"']+(modal|non
 
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
-**Start from the live projection (`list_triggers` / the trigger registry the scheduler uses), not from `TriggerCreated` events.** Anything off the live list was deleted (`TriggerDeleted`) or no longer fires, so walking events alone invents phantom "broken" triggers. Use `TriggerCreated`/`TriggerUpdated` only to rebuild `run` fields the projection hides (intent text, stale `run.knowhow:[...]`, slug) for live triggers.
+**Start from the live projection (`triggers(action="list")` / the trigger registry the scheduler uses), not from `TriggerCreated` events.** Anything off the live list was deleted (`TriggerDeleted`) or no longer fires, so walking events alone invents phantom "broken" triggers. Use `TriggerCreated`/`TriggerUpdated` only to rebuild `run` fields the projection hides (intent text, stale `run.knowhow:[...]`, slug) for live triggers.
 
 Per the engine prompt's taxonomy section and the worked example in `docs/taxonomy.md` (mirrored in best-practices). Trigger threads discover knowhow at fire time via `load_knowhow`, as chat does, with no per-trigger allow-list. For each *live* trigger, reduce its `TriggerCreated` and later `TriggerUpdated` events to the *latest* `run` (most recent payload by sequence), then apply these checks:
 
@@ -52,7 +53,7 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
 - **Missing explicit `slug` field.** The tools, CLI and HTTP API store the slug on `TriggerCreated` (`system-knowhow/triggers.md` § "Setup checklist" item 4). An older event without one re-derives it from the *create-time* name on every read, with no collision check. Recommend an explicit `slug` when the trigger has, or will have, per-trigger knowhow files. Set it with `lucidos triggers update --slug` or the HTTP API, since the LLM tools take none. Severity: **nit** (preventive).
 
-- **Per-trigger knowhow dir orphaned from any live trigger**: for each directory under `data/triggers/<slug>/knowhow/`, confirm `<slug>` matches an active (non-deleted) trigger's slug. The system prompt scopes by exact slug match, so knowhow under an unreferenced slug is invisible. Recommend renaming the directory to a live slug or deleting it. If the trigger runs a **script**, moving its folder also needs `update_trigger(run.path=…)`, since the registered path does not follow the folder. Deleting the old folder before that event lands breaks the next fire (see `triggers.md` § "Renamed trigger → stale `run.path`"). Reference: `system-knowhow/triggers.md`.
+- **Per-trigger knowhow dir orphaned from any live trigger**: for each directory under `data/triggers/<slug>/knowhow/`, confirm `<slug>` matches an active (non-deleted) trigger's slug. The system prompt scopes by exact slug match, so knowhow under an unreferenced slug is invisible. Recommend renaming the directory to a live slug or deleting it. If the trigger runs a **script**, moving its folder also needs `triggers(action="update", run.path=…)`, since the registered path does not follow the folder. Deleting the old folder before that event lands breaks the next fire (see `triggers.md` § "Renamed trigger → stale `run.path`"). Reference: `system-knowhow/triggers.md`.
 
 - **Notification routing: `tap` opt-ins for CTA-shaped triggers.** Take each trigger whose `run.intent` mentions `send_notification`, plus each `NotificationCreated` event traceable to a trigger. Look the body's shape up in the table under `system-knowhow/triggers.md` § "Notification routing". Report each trigger whose `app_id`, `tap` or `event_id` disagrees with its row, quoting the row as the fix. Severity: **drift**, since the default works and the opt-in only tightens UX. Skip a trigger that already sets `tap` to a non-default value.
 
@@ -101,7 +102,7 @@ route.
 
 ### Listing an MCP server a trigger uses
 
-**Route: inline**, one `update_trigger` call. Add the server to the trigger's `mcp_servers`. The field is a full replacement, so send the existing list plus the new id. It is reversible, so it may join "Do all suggested fixes". A server the fire enabled once and never called is not worth listing: report it, and leave the choice to the user.
+**Route: inline**, one `triggers(action="update")` call. Add the server to the trigger's `mcp_servers`. The field is a full replacement, so send the existing list plus the new id. It is reversible, so it may join "Do all suggested fixes". A server the fire enabled once and never called is not worth listing: report it, and leave the choice to the user.
 
 ### Rewriting an old-form `tap`
 
@@ -120,5 +121,5 @@ route.
 Three rules the rewrite has to follow:
 
 - **Build the new sub-fields from the call's own sibling fields, and keep those siblings.** They are notification-level context. The §4 in-app matrix and the inbox modal both read them, even when the tap navigates elsewhere.
-- **Reuse the expression when a sibling is computed.** Hoist a `resolve_app()` call into a local, then pass that local to both `app_id` and `to.app_id`. Calling it twice risks two different answers.
+- **Reuse the expression when a sibling is computed.** Hoist the app-resolution call into a local, then pass that local to both `app_id` and `to.app_id`. Calling it twice risks two different answers.
 - **Flag a missing sibling, never guess one.** The old form let the engine fill the id in at write time; the new one does not. A navigate with no thread id raises the error toast `Navigation target missing thread id` on tap. Leave a `MIGRATION REVIEW` comment naming the two ways out: supply `to.id`, or fall back to `{ kind: 'modal' }`. List every such site in the report's `## Remediation` section.

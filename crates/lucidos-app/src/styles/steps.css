@@ -689,21 +689,40 @@
     font-family: var(--font-ui);
 }
 
+/* A grid, so the code blocks share the height and the body never scrolls
+   around them. A scrolling block's row starts at 0 and grows to its capped
+   height, and the free space goes to the rows equally. A short block shows
+   whole, and long ones split the rest, each scrolling inside itself. Text and
+   labels keep their content height. */
 .step-detail-body {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    align-content: start;
     gap: var(--space-md);
     min-height: 0;
+    /* A fallback only, for when text and labels alone overflow. A flick that
+       reaches its end must not chain out to whatever is behind the scrim. */
     overflow-y: auto;
-    /* The body is the scroller, so a flick that reaches its end must not
-       chain out to whatever is behind the scrim. */
     overscroll-behavior: contain;
     color: var(--text-primary);
 }
 
-/* The body scrolls, so a child never shrinks to fit. A code block is a scroll
-   box with a minimum height of 0, and a tall diff below it squeezed it shut. */
-.step-detail-body > * {
+/* A lazily fetched block sits in a `LoadingFade` grid. Holding a code block,
+   it gives way like a bare one and passes its height through. Holding only
+   text (a description, an error), it keeps its content height. */
+.step-detail-fade {
+    grid-template-rows: minmax(0, 1fr);
+}
+
+.step-detail-fade:has(pre) {
+    min-height: 0;
+}
+
+.step-detail-fade .loading-fade-content {
+    min-height: 0;
+}
+
+.step-detail-fade .loading-fade-content > :not(pre) {
     flex-shrink: 0;
 }
 

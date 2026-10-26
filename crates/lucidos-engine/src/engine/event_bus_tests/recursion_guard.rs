@@ -225,7 +225,7 @@ async fn test_recursion_guard_enforces_max_depth() {
     emit_thread_message(&bus, root, None, "root").await;
     chain.push(root);
 
-    // Build chain up to MAX_THREAD_DEPTH
+    // Extend the chain to MAX_THREAD_DEPTH.
     for i in 1..=crate::engine::chat::MAX_THREAD_DEPTH {
         let child = Uuid::new_v4();
         emit_thread_message(

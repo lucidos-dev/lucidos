@@ -4,6 +4,7 @@ import {
   setCacheKeepAliveMode,
   type CacheKeepAliveMode,
 } from '../../store/actions/preferences';
+import { openCacheKeepAliveSetting } from '../../store/actions/menu';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
@@ -38,8 +39,8 @@ export function isCacheKeepAliveMode(value: string): value is CacheKeepAliveMode
 }
 
 /**
- * Settings → Coding Agents → Cache keep-alive: when the engine stops pinging a
- * waiting Claude Code session to keep its prompt cache warm.
+ * Settings → Models → Cache keep-alive: when the engine stops pinging a waiting
+ * Claude Code session or Lucidos Agent thread to keep its prompt cache warm.
  *
  * Writes through `setCacheKeepAliveMode`, which applies locally before the
  * request and parks a failed delivery for retry.
@@ -49,19 +50,20 @@ export function CacheKeepAliveSection() {
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="coding-agents:cache-keep-alive">
+      <div class="settings-section-title" data-search-anchor="models:cache-keep-alive">
         Cache keep-alive
         <Explainer title="Cache keep-alive">
           <p>
-            Claude Code's prompt cache expires minutes after its last request. A session
-            that waits longer re-writes its whole context when it wakes, which costs many
-            times a cached read. So while a session waits, Lucidos pings it with a tiny
+            A model's prompt cache expires minutes after its last request. A thread that
+            waits longer re-writes its whole context when it wakes, which costs many times
+            a cached read. So while a thread waits, Lucidos pings the model with a tiny
             request just before the cache expires.
           </p>
           <p>
-            It pings a session waiting on an event, on a sub-thread, or on your answer to
-            a question card or permission prompt. For a card it asks a throwaway copy of
-            the session, so the card stays as it is.
+            It pings a thread waiting on an event, on a sub-thread, or on your answer to a
+            question card or permission prompt. For Claude Code it asks a throwaway copy of
+            the session. For the Lucidos Agent it sends the start of the last request again
+            and asks for no reply. Either way the conversation stays as it is.
           </p>
           <p>
             <strong>{CACHE_KEEP_ALIVE_COPY[DEFAULT_CACHE_KEEP_ALIVE].label}</strong> stops
@@ -81,9 +83,9 @@ export function CacheKeepAliveSection() {
       <div class="list-rows">
         <div class="list-row">
           <div class="list-row-info">
-            <div class="title">Claude Code</div>
+            <div class="title">Claude Code and the Lucidos Agent</div>
             <div class="list-row-details list-row-details-prose">
-              Codex threads are unaffected: their cache cannot be kept warm this way.
+              Codex threads, and models whose cache a ping cannot keep warm, are unaffected.
             </div>
           </div>
           <div class="list-row-actions">
@@ -96,6 +98,22 @@ export function CacheKeepAliveSection() {
             />
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/** Coding Agents' one-line pointer to the setting, which lives on Models since
+ *  it covers the Lucidos Agent too (ADR 0556). */
+export function CacheKeepAlivePointer() {
+  return (
+    <div class="settings-section">
+      <div class="settings-section-title">Cache keep-alive</div>
+      <div class="settings-row">
+        <span class="settings-row-label">How long Lucidos keeps a waiting session's prompt cache warm</span>
+        <button class="action-btn" onClick={openCacheKeepAliveSetting}>
+          Open Models
+        </button>
       </div>
     </div>
   );

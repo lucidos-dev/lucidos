@@ -24,10 +24,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use crate::engine::agent_session::child_reports::{begin_take, settle_take};
+use crate::engine::agent_session::continuity::resolve_session_continuity;
 use crate::engine::agent_session::input_ledger::{
     announce_reads, forwards_verbatim, InputLedger, Settled,
 };
-use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
+use crate::engine::agent_session::io_helpers::{
+    drain_lost_followups, lost_followups_to_orphans, requeue_at_head,
+};
 use crate::engine::agent_session::lifecycle::{
     classify_result, idle_action, idle_change_write, is_definitive_session_not_found,
     is_resume_settle_result, is_stale_resume_signal, require_agent_input, reset_per_turn_flags,
@@ -42,11 +46,12 @@ use crate::engine::agent_session::resume::{
     change_description_fallback, default_claude_config_dir, live_claude_config_dir,
     resolve_resume_context,
 };
-use crate::engine::agent_session::spawn::spawn_or_resume;
+use crate::engine::agent_session::spawn::{spawn_or_resume, ResumeAttempt};
 use crate::engine::agent_session::withdraw::{
     begin_withdraw, finish_withdraw, settle_answered_withdraws, PendingWithdraws,
     WithdrawInputRequest,
 };
+use crate::engine::chat::held_deliveries::anchor_is_child_report;
 use crate::engine::question_card_gate::LoopEndsFlushes;
 
 /// Decrement the paired-tool counter, flooring at 0. An unpaired decrement going
@@ -372,6 +377,9 @@ fn coding_agent_capture(
         modality: None,
         service_tier: None,
         cache_creation_1h_tokens: reported.cache_creation_1h_tokens,
+        cache_creation_30m_tokens: None,
+        cache_creation_12h_tokens: None,
+        cache_creation_requested_ttl: None,
     };
     crate::engine::thread_events::ThreadEvent::ContextCaptured {
         producer: crate::engine::ContextProducer::from_coding_agent(coding_agent),
@@ -395,6 +403,7 @@ fn coding_agent_capture(
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        session: None,
     }
 }
 
@@ -448,21 +457,46 @@ impl LucidosEngine {
             .await;
     }
 
-    /// After a hard stop, record the usage Claude Code's driver flushes for a
-    /// call cut off mid-stream. The provider billed its prompt, and the event
-    /// loop no longer reads. Reads up to `OutputEnded`, dropping everything
-    /// else, which the stopped loop would have dropped too.
+    /// Decide the idle exit again after the ledger changed outside an agent
+    /// event. A withdraw or a settled take can leave an idle session owing
+    /// nothing, and only an idle decides the exit. `true` when the session
+    /// should end.
+    async fn idle_exit_ends_session(
+        &self,
+        thread_id: Uuid,
+        msg_rx: &tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>,
+        owed: u32,
+        agent_cancel: &tokio_util::sync::CancellationToken,
+        action: IdleAction,
+        handed_off: &mut bool,
+    ) -> bool {
+        if action == IdleAction::Nothing {
+            return false;
+        }
+        let exited = self
+            .exit_idle_subprocess_unless_owed(thread_id, msg_rx, owed, agent_cancel, handed_off)
+            .await;
+        exited && action == IdleAction::EndSession
+    }
+
     /// At an idle, exit the subprocess unless a follow-up is on its way: one in
     /// `msg_rx`, one of the `owed` inputs the agent has not read, or an armed
     /// redirect. The next turn then resumes with `--resume`. Returns whether
     /// it exited.
+    ///
+    /// Refreshes the run loop's `handed_off` flag. A handoff that ended, for
+    /// example by a Stop, re-opens the input arm for what it left queued.
     async fn exit_idle_subprocess_unless_owed(
         &self,
         thread_id: Uuid,
         msg_rx: &tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>,
         owed: u32,
         agent_cancel: &tokio_util::sync::CancellationToken,
+        handed_off: &mut bool,
     ) -> bool {
+        // Read before the lock: a query must not hold it.
+        *handed_off = crate::engine::successor::handoff_pending(self.pool(), thread_id).await;
+        let handed_off = *handed_off;
         // Hold the `agent_sessions` lock across the whole read-decide-act, so
         // the chat fast path's check-and-send takes the same lock and cannot
         // interleave. Otherwise a follow-up could `msg_tx.send` into a
@@ -477,7 +511,7 @@ impl LucidosEngine {
             .get_mut(&thread_id)
             .map(|s| std::mem::take(&mut s.redirect_followup_pending))
             .unwrap_or(false);
-        match terminate_decision(msg_rx.len(), owed, redirect_pending) {
+        match terminate_decision(msg_rx.len(), owed, redirect_pending, handed_off) {
             TerminateDecision::KeepAliveForFollowup {
                 queued,
                 unread,
@@ -503,6 +537,10 @@ impl LucidosEngine {
         }
     }
 
+    /// After a hard stop, record the usage Claude Code's driver flushes for a
+    /// call cut off mid-stream. The provider billed its prompt, and the event
+    /// loop no longer reads. Reads up to `OutputEnded`, dropping everything
+    /// else, which the stopped loop would have dropped too.
     #[allow(clippy::too_many_arguments)]
     async fn record_usage_flushed_at_stop(
         &self,
@@ -801,19 +839,28 @@ impl LucidosEngine {
             thread_id.to_string(),
         );
 
-        let (resume_session_id, resume_branch) =
-            if recovery_worktree.is_none() && !is_resolution_session {
-                resolve_resume_context(
-                    self.pool(),
-                    self.changes(),
-                    thread_id,
-                    resume_session_id,
-                    recorded_pin.as_ref().map(|pin| pin.dir.as_str()),
-                )
-                .await
-            } else {
-                (resume_session_id, None)
-            };
+        // A conflict-resolution or orphan-recovery session never looks up a
+        // session to resume, so it records no continuity either.
+        let looks_up_resume = recovery_worktree.is_none() && !is_resolution_session;
+        // Its first session is the thread's *successor session*.
+        let pending_handoff = if looks_up_resume {
+            crate::engine::successor::pending_handoff(self.pool(), thread_id).await?
+        } else {
+            None
+        };
+        let (resume_session_id, resume_branch) = if looks_up_resume {
+            resolve_resume_context(
+                self.pool(),
+                self.changes(),
+                thread_id,
+                resume_session_id,
+                recorded_pin.as_ref().map(|pin| pin.dir.as_str()),
+                pending_handoff.is_some(),
+            )
+            .await
+        } else {
+            (resume_session_id, None)
+        };
 
         // Conflict resolution mode: run in the merge worktree (not repo root)
         let conflict_change = if let Some(cid) = conflict_change_id {
@@ -923,8 +970,9 @@ impl LucidosEngine {
             mut branch_name,
             worktree_path,
             interactive_session,
-            adoption_note,
+            branch_note,
             resume_session_id,
+            branch_gone,
             worktree_created,
             branch_created,
         } = self
@@ -976,7 +1024,10 @@ impl LucidosEngine {
 
         // Asked before the process starts, so a failed lookup costs no work.
         // This session's `SessionStarted` closes the window, so it must not be
-        // recorded over a lookup that failed. A keep-alive must not act.
+        // recorded over a lookup that failed. A lookup that fails after its
+        // retries fails the turn: starting anyway would lose the message for
+        // good, while a failed turn is retried by the next send (ADR 0574).
+        // A keep-alive must not act.
         let first_prompt_events: Vec<Uuid> = std::iter::once(origin_id)
             .chain(carried_event_ids.iter().copied())
             .collect();
@@ -997,7 +1048,8 @@ impl LucidosEngine {
         // A new session in an existing thread sees what was discussed and done
         // before this message, and the images no agent has seen yet. A stranded
         // follow-up is redelivered with its own images, so it brings none here.
-        {
+        // A successor session starts clean: its opening carries the context.
+        if pending_handoff.is_none() {
             let thread_messages = self.event_store.get_thread_messages(&thread_id_str).await?;
             let (prior, current_at) = before_current_message(
                 thread_messages.iter().map(HistoryLine::of).collect(),
@@ -1023,11 +1075,16 @@ impl LucidosEngine {
             session_context.push(&thread_history_block(&prior, &attached));
             session_context.attach_images(images);
         }
+        // A successor session reads its opening first, whatever input started it.
+        let opened_message = pending_handoff
+            .as_ref()
+            .map(|handoff| handoff.first_message(user_message));
+        let first_message = opened_message.as_deref().unwrap_or(user_message);
         // A keep-alive carries no notes: the agent must not act on anything.
         let first_prompt = if self.event_bus.in_keep_alive_turn(thread_id) {
-            PromptFor::KeepAlive(user_message)
+            PromptFor::KeepAlive(first_message)
         } else {
-            PromptFor::Turn(user_message)
+            PromptFor::Turn(first_message)
         };
         let session_context = session_context.render();
 
@@ -1170,7 +1227,7 @@ impl LucidosEngine {
             "[AgentSession] [TIMING] Startup semaphore acquired: {:?}",
             cc_start.elapsed()
         );
-        let runtime = match spawn_or_resume(
+        let (runtime, resume_attempt) = match spawn_or_resume(
             self,
             coding_agent,
             crate::runtime::SpawnArgs {
@@ -1266,7 +1323,7 @@ impl LucidosEngine {
             ResumeSpawnContext {
                 worktree_path: worktree_path.as_deref(),
                 last_idle_sha: last_idle_sha.as_deref(),
-                adoption_note: adoption_note.as_deref(),
+                branch_note: branch_note.as_deref(),
                 session_branch: Some(branch_name.as_str()),
             },
             HeldBlocks::for_agent(
@@ -1415,6 +1472,7 @@ impl LucidosEngine {
         let crate::engine::agent_session::spawn_claim::ClaimedEntry {
             msg_rx,
             withdraw_rx,
+            child_reports,
             ..
         } = &mut claim.entry;
 
@@ -1442,6 +1500,19 @@ impl LucidosEngine {
             // same path their SessionStarted event has always carried.
             repo_root.to_string_lossy().to_string()
         };
+        // Read before the emit below, which would count as an earlier session.
+        let continuity = if looks_up_resume || resume_attempt == ResumeAttempt::Resumed {
+            resolve_session_continuity(
+                self.pool(),
+                thread_id,
+                resume_attempt,
+                branch_gone,
+                pending_handoff.as_ref(),
+            )
+            .await
+        } else {
+            None
+        };
         if let Err(e) = self
             .event_bus
             .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -1457,6 +1528,7 @@ impl LucidosEngine {
                     integrated,
                     auto_compact_window: auto_compact.and_then(|s| s.window),
                     auto_compact_arm: auto_compact.map(|s| s.arm),
+                    continuity,
                 },
                 meta: meta.clone(),
             })
@@ -1557,6 +1629,8 @@ impl LucidosEngine {
         let mut last_thought_persisted_len: usize = 0;
         const THOUGHT_FLUSH_THRESHOLD: usize = 240;
         let mut is_waiting = false;
+        // The session handed off: it forwards no more input.
+        let mut handed_off = false;
         let mut proposed_change = false;
         // The branch HEAD each turn-end re-entry last went out for.
         let mut reentry_ledger = crate::engine::turn_end::ReentryLedger::default();
@@ -1644,6 +1718,7 @@ impl LucidosEngine {
                         }
                         Settled::Nothing => (false, Vec::new()),
                     };
+                    child_reports.publish(&inputs);
                     if let AgentEvent::Exited { exit } = ev {
                         exit_facts = exit;
                         // Final flush of any pending reasoning: surface what the
@@ -2379,12 +2454,21 @@ impl LucidosEngine {
                                             shutting_down
                                                 .load(std::sync::atomic::Ordering::Relaxed),
                                         );
+                                        // A quiet pick ends the turn with no
+                                        // reply by design, so its empty Result
+                                        // is not the killed-tool failure.
+                                        let ended_on_quiet_answer = self
+                                            .agent_sessions
+                                            .lock()
+                                            .await
+                                            .get_mut(&thread_id)
+                                            .is_some_and(|s| std::mem::take(&mut s.quiet_answer_pending));
                                         let (terminal_kind, emit_idle) = classify_result(
                                             user_hit_stop,
                                             redirect_cause,
                                             is_shutdown,
                                             cc_error,
-                                            buffered_text_empty && result_text_empty,
+                                            buffered_text_empty && result_text_empty && !ended_on_quiet_answer,
                                         );
                                         // Capture before the terminal emit below moves
                                         // it out. The idle gate and the post-loop
@@ -2682,6 +2766,7 @@ impl LucidosEngine {
                                                 crate::engine::turn_end::SessionFacts {
                                                     head: branch_head_sha(&repo_root, &branch_name).await,
                                                     held: Some(hold),
+                                                    handoff_pending: crate::engine::successor::handoff_pending(self.pool(), thread_id).await,
                                                 },
                                             );
                                             if let Some(hold) = reentry_ledger.take_due(&gate) {
@@ -2695,13 +2780,13 @@ impl LucidosEngine {
                                             IdleAction::EndSession => {
                                                 // The rule an ordinary session exits by: a
                                                 // follow-up on its way gets its turn first.
-                                                if self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel).await {
+                                                if self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel, &mut handed_off).await {
                                                     log!("[AgentSession] Resolution session idle for thread {}: ending loop", thread_id);
                                                     break 'event_loop;
                                                 }
                                             }
                                             IdleAction::ExitSubprocess => {
-                                                self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel).await;
+                                                self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel, &mut handed_off).await;
                                             }
                                             IdleAction::Nothing => {}
                                         }
@@ -2738,7 +2823,7 @@ impl LucidosEngine {
                             // the MCP path resolves, and reading it here keeps
                             // the arm lock-free.
                             let session_worktree = worktree_path.clone();
-                            // The escalation classifier's LLM half runs off the
+                            // The attended command gate's LLM half runs off the
                             // engine, inside the spawned task below. Taken as an
                             // Arc for the same reason the title task does, and
                             // the select arm stays free of the classification.
@@ -2799,7 +2884,15 @@ impl LucidosEngine {
                     }
                 }
 
-                Some(mut user_input) = msg_rx.recv() => {
+                Some(mut user_input) = msg_rx.recv(), if !handed_off => {
+                    // After a handoff, input waits in the channel for the
+                    // successor session. The idle exit drains it there.
+                    if crate::engine::successor::handoff_pending(self.pool(), thread_id).await {
+                        handed_off = true;
+                        let _sessions = self.agent_sessions.lock().await;
+                        requeue_at_head(&msg_tx, msg_rx, user_input);
+                        continue 'event_loop;
+                    }
                     // The input just left the channel and is about to reach the
                     // driver. It therefore moves from the "sent, not yet
                     // forwarded" window into the "forwarded, not yet read" one.
@@ -2843,6 +2936,12 @@ impl LucidosEngine {
                     claude_text_buf.clear();
 
                     let images = user_input.images.clone().unwrap_or_default();
+                    let child_report_card = match (user_input.kind, user_input.origin_event_id) {
+                        (crate::engine::AgentInputKind::ReentryFromEngine, Some(anchor)) => {
+                            anchor_is_child_report(&self.pool, anchor).await.then_some(anchor)
+                        }
+                        _ => None,
+                    };
                     // Only some kinds write this, see `writes_prompt_sent`; a
                     // child wake's own `ChildThreadCompleted` is the start. It
                     // goes out BEFORE the forward because the turn-gap note ends
@@ -2897,11 +2996,20 @@ impl LucidosEngine {
                     if let Some(fingerprint) = follow_up.device_block {
                         blocks_in_flight.insert(agent_input.uuid, fingerprint);
                     }
-                    inputs.forwarded(
-                        owed_input_event_ids(user_input.origin_event_id, prompt_sent),
-                        &agent_input,
-                        user_input.completion.take(),
-                    );
+                    match child_report_card {
+                        Some(card_id) => inputs.forwarded_child_report(
+                            card_id,
+                            &agent_input,
+                            user_input.completion.take(),
+                            user_input.text.clone(),
+                        ),
+                        None => inputs.forwarded(
+                            owed_input_event_ids(user_input.origin_event_id, prompt_sent),
+                            &agent_input,
+                            user_input.completion.take(),
+                        ),
+                    }
+                    child_reports.publish(&inputs);
                     if agent_input_tx.send(agent_input).is_err() {
                         log!("[AgentSession] Failed to forward user input to agent runtime — channel closed");
                         break;
@@ -2912,7 +3020,7 @@ impl LucidosEngine {
                             .partition(|w| w.input_event_id == id);
                         withdraws_awaiting_forward = still_waiting;
                         for withdraw in now_forwarded {
-                            begin_withdraw(&inputs, agent_withdraw_tx.as_ref(), &self.pool, thread_id, withdraw, &mut pending_withdraws);
+                            begin_withdraw(&inputs, &agent_withdraw_tx, &self.pool, thread_id, withdraw, &mut pending_withdraws);
                         }
                     }
                 }
@@ -2929,22 +3037,33 @@ impl LucidosEngine {
                     if on_its_way {
                         withdraws_awaiting_forward.push(withdraw);
                     } else {
-                        begin_withdraw(&inputs, agent_withdraw_tx.as_ref(), &self.pool, thread_id, withdraw, &mut pending_withdraws);
+                        begin_withdraw(&inputs, &agent_withdraw_tx, &self.pool, thread_id, withdraw, &mut pending_withdraws);
+                    }
+                }
+
+                Some(take) = child_reports.take_rx.recv() => {
+                    begin_take(&inputs, &agent_withdraw_tx, child_reports, &self.pool, thread_id, take, &mut pending_withdraws);
+                }
+
+                Some(withdrawn) = child_reports.settled_rx.recv() => {
+                    for (withdrawn, resent) in settle_take(&self.event_bus, thread_id, &mut inputs, &agent_input_tx, withdrawn).await {
+                        if let Some(block) = blocks_in_flight.remove(&withdrawn) {
+                            blocks_in_flight.insert(resent, block);
+                        }
+                    }
+                    child_reports.publish(&inputs);
+                    let action = idle_action(is_resolution_session, self.session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed)));
+                    if is_waiting && self.idle_exit_ends_session(thread_id, msg_rx, inputs.owed(), &agent_cancel, action, &mut handed_off).await {
+                        break;
                     }
                 }
 
                 Some(answered) = pending_withdraws.next() => {
                     finish_withdraw(&self.event_bus, thread_id, &mut inputs, answered).await;
-                    // A withdrawal can leave an idle session owing nothing, and
-                    // only an idle decides the exit, so decide it again here.
-                    let is_shutdown = self
-                        .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
-                    let action = idle_action(is_resolution_session, is_shutdown);
-                    if is_waiting && action != IdleAction::Nothing {
-                        let exited = self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel).await;
-                        if exited && action == IdleAction::EndSession {
-                            break;
-                        }
+                    child_reports.publish(&inputs);
+                    let action = idle_action(is_resolution_session, self.session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed)));
+                    if is_waiting && self.idle_exit_ends_session(thread_id, msg_rx, inputs.owed(), &agent_cancel, action, &mut handed_off).await {
+                        break;
                     }
                 }
 
@@ -3225,9 +3344,9 @@ pub(super) struct ResumeSpawnContext<'a> {
     /// `worktree_head_sha` from the last `CodingAgentIdled`, the baseline the
     /// external-edit detector diffs against. `None` on a first turn.
     pub last_idle_sha: Option<&'a str>,
-    /// Pre-built note from `try_adopt_renegade_branch`, when the worktree was
-    /// switched to a branch holding this agent's work.
-    pub adoption_note: Option<&'a str>,
+    /// Pre-built note when the worktree is on a branch holding this agent's
+    /// work: an adopted one, or an internal thread's side branch.
+    pub branch_note: Option<&'a str>,
     /// The branch this session resumes on, so a discard elsewhere can be told
     /// apart from a discard of the agent's own work.
     pub session_branch: Option<&'a str>,
@@ -3459,7 +3578,7 @@ pub(super) async fn build_resume_prompt_text(
     let ResumeSpawnContext {
         worktree_path,
         last_idle_sha,
-        adoption_note,
+        branch_note,
         session_branch,
     } = spawn;
 
@@ -3491,7 +3610,7 @@ pub(super) async fn build_resume_prompt_text(
     // effects of.
     let combined: Vec<&str> = [
         turn_note(standing_note),
-        adoption_note,
+        branch_note,
         gap_note.as_ref().map(|n| n.note.as_str()),
         edit_note.as_deref(),
     ]

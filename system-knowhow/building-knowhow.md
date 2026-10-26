@@ -5,7 +5,23 @@ description: Use when writing or updating a knowhow file (API quirks, payload sh
 
 # Building Knowhow
 
-How to write a knowhow file the engine LLM will find and use. The intent/knowhow/script taxonomy and frontmatter shape live in `docs/taxonomy.md` and the engine system prompt. The standalone-vs-app-scoped placement rule lives in CLAUDE.md and `system-knowhow/best-practices.md`. Apply those, don't restate them. The doc-vs-reference rule below is this file's own, because it changes how you write the file.
+Write reusable technical knowledge under the workspace data paths below.
+Use `system-knowhow/best-practices.md` for placement and ownership.
+This file explains frontmatter and how a doc exposes its supporting references.
+
+## Frontmatter
+
+Start with a YAML header between `---` lines:
+
+```yaml
+---
+name: Example API
+description: Payload shapes, authentication and error handling for the example API.
+---
+```
+
+`name` is required. `description` is optional; the loader derives it from the
+name and first body paragraph when absent. Write one explicitly for useful routing.
 
 ## When knowhow is the right artifact
 
@@ -19,7 +35,9 @@ Knowhow captures *technical detail you'd otherwise re-derive*: API quirks, paylo
 | "Today I noticed X" | The chat, not knowhow |
 | "Workaround for the Panasonic API rate limit" | Knowhow |
 
-A fact that is the same in every workspace may belong in `docs/` or `system-knowhow/` instead. A fact specific to *this* workspace's setup is knowhow.
+Reusable facts belong in workspace knowhow, including facts shared by several apps.
+Engine-shipped `system-knowhow/` and source-repository `docs/` are managed outside
+the workspace data tree. Workspace agents write to the data paths below.
 
 ## Where the file goes: a doc, or one doc's reference
 

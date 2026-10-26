@@ -42,6 +42,7 @@ async fn answer(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
         thread_id,
         ThreadEvent::UserQuestionAnswered {
             tool_use_id: tool_use_id.into(),
+            quiet: false,
             answer: AnswerKind::FreeText {
                 text: "yes".into(),
                 image_hashes: vec![],
@@ -351,6 +352,7 @@ async fn an_agent_message_is_held_behind_a_pending_permission_card() {
             tool_name: "Edit".into(),
             input: serde_json::json!({"file_path": "/tmp/x"}),
             summary: "Edit /tmp/x".into(),
+            grant_offer: None,
         },
     )
     .await;

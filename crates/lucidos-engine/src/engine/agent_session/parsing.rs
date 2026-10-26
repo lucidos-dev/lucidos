@@ -43,11 +43,11 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
             arr.iter()
                 .enumerate()
                 .map(|(i, opt)| {
-                    let label = opt
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string();
+                    let (label, prefixed_quiet) = strip_quiet_label_prefix(
+                        opt.get("label").and_then(|v| v.as_str()).unwrap_or("?"),
+                    );
+                    let quiet = prefixed_quiet
+                        || opt.get("quiet").and_then(|v| v.as_bool()).unwrap_or(false);
                     let non_empty = |field: &str| {
                         opt.get(field)
                             .and_then(|v| v.as_str())
@@ -60,6 +60,7 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
                         description: non_empty("description"),
                         preview: non_empty("preview"),
                         widget: None,
+                        quiet,
                     })
                 })
                 .collect()
@@ -73,6 +74,20 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
         question,
         options,
         multi_select,
+    }
+}
+
+/// The label prefix that marks a *quiet option* on Claude Code. Its native
+/// `AskUserQuestion` refuses any option field beyond label, description and
+/// preview, so the mark rides in the label. The Lucidos Agent and Codex tools
+/// take a `quiet` field instead.
+pub(crate) const QUIET_LABEL_PREFIX: &str = "[quiet]";
+
+/// The label with any [`QUIET_LABEL_PREFIX`] removed, and whether it had one.
+pub(crate) fn strip_quiet_label_prefix(label: &str) -> (String, bool) {
+    match label.trim_start().strip_prefix(QUIET_LABEL_PREFIX) {
+        Some(rest) => (rest.trim_start().to_string(), true),
+        None => (label.to_string(), false),
     }
 }
 
@@ -129,6 +144,29 @@ mod tests {
             options: Vec::new(),
             multi_select: false,
         }
+    }
+
+    #[test]
+    fn quiet_comes_from_the_field_or_the_label_prefix_which_is_stripped() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Draft a follow-up?",
+                "options": [
+                    { "label": "Draft it" },
+                    { "label": "Leave it", "quiet": true },
+                    { "label": format!("{QUIET_LABEL_PREFIX} Not now") },
+                ],
+            }],
+        });
+        let options = &parse_ask_user_question_inputs(&input)[0].options;
+        let shape: Vec<(&str, bool)> = options
+            .iter()
+            .map(|o| (o.label.as_str(), o.quiet))
+            .collect();
+        assert_eq!(
+            shape,
+            [("Draft it", false), ("Leave it", true), ("Not now", true)]
+        );
     }
 
     #[test]

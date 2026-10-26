@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">
     <meta name="google" content="notranslate">
     <meta name="apple-mobile-web-app-capable" content="yes">
-    <!-- Never black-translucent: iOS 26+ then blurs the top of the page, the
-         header included, and no page paint can stop it (ADR 0548). -->
-    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <!-- The header runs up behind the status bar, and its controls sit below
+         iOS 27's top-edge blur (ADR 0553). -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Lucidos">
     <!-- The header's top colour in dark mode. The boot script below sets the
          device's own, and the gateway splash lifts this tag as it stands. -->

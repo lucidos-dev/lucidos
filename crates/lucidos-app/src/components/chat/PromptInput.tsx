@@ -2,7 +2,6 @@ import { Fragment, type VNode } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { Disclosure } from '../shared/Disclosure';
-import { useLongPress } from '../../hooks/useLongPress';
 import { signal, untracked, useSignalEffect } from '@preact/signals';
 import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive, scaledDurationMs } from '../../store/store';
 import { resolveCodingAgent } from '../../store/composeSelections';
@@ -25,25 +24,26 @@ import { getDraft } from '../../store/composeDrafts';
 import { askSideQuestion, routeSideQuestion, sideQuestionModeOn } from '../../store/sideQuestions';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSideQuestion } from './scrollState';
-import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon, WarningIcon } from '../shared/icons';
+import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, ReturnArrowIcon, SendArrowIcon, StopIcon, WarningIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { closeControlMenus, codingAgentMenuOpenRequest, rungFoldOpenRequest } from './controlMenuRequests';
 import {
-  codingAgentMenuAction, composerRowMembers, isComposeContext, LazyCodingAgentControlMenu, promptRowToggles,
+  codingAgentMenuAction, composerRowMembers, FOLLOW_LIVE_EDGE_KEY, isComposeContext, LazyCodingAgentControlMenu, promptRowToggles, sideQuestionToggleAction,
 } from './PromptRowControls';
 import { CODING_AGENT_MENU_FOLD_KEY, menuCodingAgent } from './ControlMenuTrigger';
 import { LazyRungControl } from './LazyRungControl';
-import { RUNG_FOLD_KEY, RUNG_SHED_LEVELS, RungMenuIcon } from './RungButtons';
+import { RUNG_FOLD_KEY, RungMenuIcon } from './RungButtons';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
-import { FOLD_KEY_ATTR, SHED_ATTR, usePromptActionCollapse, type FoldGroup } from '../../hooks/usePromptActionCollapse';
+import { useComposerCompact } from '../../hooks/useComposerCompact';
+import { FOLD_KEY_ATTR, usePromptActionCollapse, type FoldGroup, type PromptMerge } from '../../hooks/usePromptActionCollapse';
 import { TodoPanelSlot, closeTodoPanel, todoIndicatorAction } from './todoIndicator';
 import { WaitingPanelHost, closeWaitingPanel, waitingIndicatorAction } from './WaitingPanel';
-import { composerBannerState, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
+import { composerBannerState, DIFF_APPLY_MERGE, DiffApplyMenu, getBannerActions, getWaitingState, getStandaloneActions } from './WaitingBanner';
+import { ActionSlot, SlotFace } from './ActionSlot';
 import { composeHasContent, sideQuestionModeActive, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, threadHasConversation, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, queuedUploadSends, queueUploadSend, clearQueuedUploadSend, uploadBlockedSends, markUploadBlockedSend, settleQueuedUploadSends, uploadSendNotice, uploadSendNoticeText, clearSubmittingThread, armCancelSettle, isCancelSettling, promptStopRequested, promptSideQuestionRequested, sideQuestionBlocker, composerEnterSends, type UploadSendIntent } from './prompt-input-helpers';
 import { currentComposerEnterKey } from '../../store/actions/preferences';
 import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
-import { SplitButton } from '../shared/SplitButton';
 import { NotReadyStrip } from './NotReadyStrip';
 import { lazyComponent } from '../../utils/lazyComponent';
 export * from './prompt-input-helpers';
@@ -83,18 +83,25 @@ const cameraOpen = signal(false);
  *  being one. Module-level, so its identity is stable across renders. */
 const MORE_TRIGGER_ATTRS = { 'data-row-item': 'fold', [FOLD_KEY_ATTR]: '' };
 
-/** Retire every popover a foldable member owns.
+/** Retire the popovers a fold step can strand. A fold step moves controls
+ *  between the row and the ⋯ menu, so an open panel's anchor can leave the DOM
+ *  under it.
  *
- *  Two callers, and a hazard each. A fold step moves controls between the row
- *  and the ⋯ menu, so an open panel's anchor can leave the DOM under it.
- *
- *  And the ⋯ trigger is itself the anchor of any panel a menu row opened. An
- *  anchor is exempt from its own panel's outside-click dismiss, so re-pressing
- *  the trigger would stack a menu over a panel that will not go. */
+ *  The two control menus are not here: each closes itself when its own fold
+ *  flips. A step that leaves them where they were keeps them open. So the "/"
+ *  that opens the coding-agent menu survives the fold its character causes. */
 function closeFoldedPanels(): void {
   attachMenuOpen.value = false;
   closeTodoPanel();
   closeWaitingPanel();
+}
+
+/** Retire every popover a foldable member owns, as the ⋯ opens. The ⋯ trigger
+ *  is itself the anchor of any panel a menu row opened. An anchor is exempt
+ *  from its own panel's outside-click dismiss, so re-pressing the trigger would
+ *  stack a menu over a panel that will not go. */
+function closeRowPanels(): void {
+  closeFoldedPanels();
   closeControlMenus();
 }
 /** 1x length of the compose-destination row's fade-out, mirroring
@@ -302,6 +309,7 @@ export function PromptInput() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const promptActionsAreaRef = useRef<HTMLDivElement>(null);
+  const composerCompact = useComposerCompact(promptActionsAreaRef);
   // Measure-driven stacking. The hook sums every `[data-row-item]`'s width and
   // compares against the row's content width. User font scaling, browser zoom
   // and per-thread label changes therefore feed in directly, with no
@@ -320,8 +328,8 @@ export function PromptInput() {
   //
   // The morph and the answer control are mutually exclusive, so they share one
   // gate instance. The multi-select split-button Submit needs no gate: its
-  // caret menu makes the action deliberate. So it takes `ungatedHoldHandlers`,
-  // and each gated button takes `holdHandlers`, which feeds this gate.
+  // caret menu makes the action deliberate. Each gated button takes
+  // `tapGateHandlers`, which feeds this gate.
   const morphGate = useMemo(() => createTapGate(), []);
   /** A discarded tap is the user's press thrown away, so it must never be
    *  silent: the button reads as dead and nothing says why.
@@ -917,19 +925,18 @@ export function PromptInput() {
   const cancelSettling = isCancelSettling();
 
   // While the thread is `waiting_for_user_answer` the prompt row swaps the
-  // morph Send/Stop for a Submit-default control (`computeAnswerActionMode`).
-  // Multi-select is the only state needing the split button: its Submit is
-  // always present, so Cancel lives behind the caret. Every other state is a
-  // lone Submit, while a custom answer is typed, or a lone red Cancel. In the
-  // second the forward action lives in the card above.
-  // In side-question mode a typed box asks rather than answers. So the round
-  // morph button takes over from Submit, as during a running turn.
+  // morph Send/Stop for one lone answer button (`computeAnswerActionMode`). It
+  // is Submit while an answer is ready, else Cancel. In side-question mode a
+  // typed box asks rather than answers, so the round morph button takes over
+  // from Submit, as during a running turn.
   const answersCard = isAnsweringQuestion && !(sideQuestionMode && morphHasContent);
   const answerMode = answersCard
     ? computeAnswerActionMode({
-        pendingMultiQ: hasPendingMultiQ,
-        hasContent: morphHasContent,
         isCanceling,
+        hasContent: morphHasContent,
+        multi: hasPendingMultiQ
+          ? { pickedCount: multiSelectedIds.length, text: composeText, imageCount: images.length }
+          : null,
       })
     : null;
 
@@ -952,88 +959,34 @@ export function PromptInput() {
   // The constructive actions blur on their own (`submit`, `submitMultiAnswer`):
   // the suppressed click never reaches `installActionBtnBlurListener`, which
   // listens on `click`.
-  // A hold on whichever button ends the row turns on side-question mode, and
-  // the draft stays in the box to be asked. The release that ends the hold
-  // must not also send, submit or cancel, so the hold marks itself. That
-  // release or the next press spends the mark, so it never swallows a later
-  // tap.
-  const heldSendRef = useRef(false);
-  // A mouse press moves focus off the composer, so a mouse hold hands it back
-  // for the side question to be typed. A touch hold keeps the keyboard up on
-  // its own, and focusing outside a tap cannot raise it.
-  const holdRefocusesComposerRef = useRef(false);
   const sideQuestionRefusal = sideQuestionBlocker({
     threadStarted: focusedThread !== undefined && focusedThread.meta.state !== 'composing',
     isCodex: promptCodingAgent === 'codex',
   });
-  const holdOffersSideQuestion = sideQuestionRefusal === null;
-  const sendHold = useLongPress(() => {
-    if (sideQuestionRefusal !== null) return;
-    heldSendRef.current = true;
-    // The hold took the press, so the gate must not rule on its lift. Stop
-    // asks the gate before the mark, so drift during the hold would toast.
-    morphGate.spend();
-    setSideQuestionMode(true);
-  }, () => {});
-  useSignalEffect(() => {
-    if (!promptSideQuestionRequested.value) return;
-    promptSideQuestionRequested.value = false;
+  /** The toggle and the shortcut turn the mode on and off alike. Where a side
+   *  question cannot be asked, the shortcut says why. The toggle is not drawn
+   *  there. */
+  function toggleSideQuestionMode(): void {
     if (sideQuestionRefusal !== null) {
       showToast(sideQuestionRefusal, 'info');
       return;
     }
-    // The shortcut toggles, as the pill's × and Escape turn the mode off.
     setSideQuestionMode(!sideQuestionMode);
-    if (!sideQuestionMode) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
-  });
-  /** Whether this release ends a hold, spending the hold's mark if so. */
-  function releaseEndsHold(): boolean {
-    if (!heldSendRef.current) return false;
-    heldSendRef.current = false;
-    // This click still reaches the `.action-btn` blur listener, so the
-    // composer takes focus back a frame later.
-    if (holdRefocusesComposerRef.current) requestAnimationFrame(() => focusIfNeeded(inputRef.current));
-    return true;
   }
-  /** The hold gesture alone. A multi-select card's Submit takes it as is,
-   *  since that button sits outside the tap gate. */
-  const ungatedHoldHandlers = {
-    onPointerDown: (e: PointerEvent) => {
-      heldSendRef.current = false;
-      holdRefocusesComposerRef.current = e.pointerType === 'mouse';
-      sendHold.onPointerDown(e);
-    },
-    onPointerMove: sendHold.onPointerMove,
-    onPointerUp: sendHold.onPointerUp,
-    onPointerLeave: sendHold.onPointerLeave,
-    onPointerCancel: sendHold.onPointerCancel,
-    onContextMenu: holdOffersSideQuestion ? sendHold.onContextMenu : undefined,
-    // A key press is never a hold's release. A right-click leaves the mark
-    // with no click to spend it.
-    onKeyDown: (e: KeyboardEvent) => {
-      if (e.key === 'Enter' || e.key === ' ') heldSendRef.current = false;
-    },
-  };
-  /** The hold gesture, feeding the tap gate, on the gated buttons that end
-   *  the row: Send, Stop, Submit, or a waiting card's lone Cancel. */
-  const holdHandlers = {
-    ...ungatedHoldHandlers,
-    onPointerDown: (e: PointerEvent) => {
-      ungatedHoldHandlers.onPointerDown(e);
-      morphGate.down(e);
-    },
-    onPointerMove: (e: PointerEvent) => {
-      sendHold.onPointerMove(e);
-      morphGate.move(e);
-    },
-    onPointerCancel: (e: PointerEvent) => {
-      sendHold.onPointerCancel(e);
-      morphGate.cancel();
-    },
+  useSignalEffect(() => {
+    if (!promptSideQuestionRequested.value) return;
+    promptSideQuestionRequested.value = false;
+    toggleSideQuestionMode();
+  });
+  /** The pointer half of the tap gate, on the gated buttons that end the row:
+   *  Send, Stop, Submit, or a waiting card's lone Cancel. */
+  const tapGateHandlers = {
+    onPointerDown: (e: PointerEvent) => morphGate.down(e),
+    onPointerMove: (e: PointerEvent) => morphGate.move(e),
+    onPointerCancel: () => morphGate.cancel(),
   };
   const morphActivate = useTouchActivated(
     () => {
-      if (releaseEndsHold()) return;
       if (morphMode === 'send') void submit();
       else if (morphMode === 'cancel') cancelExchangeForTarget();
     },
@@ -1042,16 +995,13 @@ export function PromptInput() {
     morphMode === 'cancel',
   );
   const answerSubmitActivate = useTouchActivated(() => {
-    if (releaseEndsHold()) return;
-    void submit();
+    if (hasPendingMultiQ) void submitMultiAnswer();
+    else void submit();
   }, true, morphActivationGate);
   // The lone answer Cancel is its own node, so it needs its own activation.
   // Always destructive, and stood down for the same settle window.
   const answerCancelActivate = useTouchActivated(
-    () => {
-      if (releaseEndsHold()) return;
-      cancelExchangeForTarget();
-    },
+    () => cancelExchangeForTarget(),
     !cancelSettling,
     morphActivationGate,
     true,
@@ -1201,9 +1151,6 @@ export function PromptInput() {
     restoreComposerFocus();
   }
 
-  const submitMultiCount = computeSubmitMultiCount(multiSelectedIds.length, composeText);
-  const submitMultiDisabled = submitMultiCount === 0 && images.length === 0;
-
   // The Stop shortcut. It cancels exactly what the red button would, and does
   // nothing while there is no running turn to cancel.
   useSignalEffect(() => {
@@ -1253,58 +1200,31 @@ export function PromptInput() {
     void handleCancelExchange(targetId);
   }
 
-  // The three lone-button states share ONE key ("answer-lone"), so crossing the
-  // empty-to-typed boundary morphs Cancel and Submit in place rather than
-  // remounting the node. That is the no-mobile-blink contract the morph button
-  // keeps. Multi-select uses the SplitButton, its own node.
-  const answerControl = answerMode === 'multi' ? (
-    <SplitButton
-      primaryLabel={submitMultiCount > 0 ? `Submit (${submitMultiCount})` : 'Submit'}
-      primaryClassName="action-btn action-btn-confirm"
-      primaryAriaLabel="Submit answer"
-      primaryDisabled={submitMultiDisabled}
-      primaryTouchActivate
-      primaryPressHandlers={ungatedHoldHandlers}
-      onPrimary={() => {
-        if (releaseEndsHold()) return;
-        void submitMultiAnswer();
-      }}
-      caretClassName="action-btn action-btn-confirm"
-      caretAriaLabel="Cancel this question"
-      menuItems={[{
-        key: 'cancel',
-        label: 'Cancel',
-        className: 'action-btn action-btn-danger',
-        // This path exists only while a multi-select question is pending, so the
-        // question-specific wording always applies here.
-        tooltip: ANSWER_CANCEL_TOOLTIP,
-        onClick: cancelExchangeForTarget,
-      }]}
-    />
-  ) : answerMode === 'canceling' ? (
-    <button key="answer-lone" type="button" class="action-btn action-btn-danger" disabled aria-label="Canceling" data-row-item>
-      Canceling…
+  // The three states share ONE key ("answer-lone"), so crossing the empty-to-
+  // answered boundary morphs Cancel and Submit in place rather than remounting
+  // the node. That is the no-mobile-blink contract the morph button keeps.
+  const submitMultiCount = hasPendingMultiQ ? computeSubmitMultiCount(multiSelectedIds.length, composeText) : 0;
+  const submitLabel = submitMultiCount > 0 ? `Submit ${submitMultiCount}` : 'Submit';
+  const answerControl = answerMode === 'canceling' ? (
+    <button key="answer-lone" type="button" class="action-btn action-btn-danger action-slot" disabled aria-label="Canceling" data-row-item>
+      <SlotFace icon={() => <CloseIcon />} label="Cancel" busy />
     </button>
   ) : answerMode === 'submit' ? (
     <button
       key="answer-lone"
       type="button"
-      class="action-btn action-btn-confirm"
-      {...holdHandlers}
+      class="action-btn action-btn-confirm action-slot"
+      {...tapGateHandlers}
       onTouchStart={answerSubmitActivate.onTouchStart}
       onTouchMove={answerSubmitActivate.onTouchMove}
       onTouchCancel={answerSubmitActivate.onTouchCancel}
       onTouchEnd={answerSubmitActivate.onTouchEnd}
       onClick={answerSubmitActivate.onClick}
       aria-label="Submit answer"
-      data-tooltip={
-        uploadsBlocking ? 'Send after image upload'
-        : holdOffersSideQuestion ? tooltipWithShortcut('Send answer. Hold for a side question', 'askSideQuestion')
-        : 'Send answer'
-      }
+      data-tooltip={uploadsBlocking ? 'Send after image upload' : 'Submit answer'}
       data-row-item
     >
-      Submit
+      <SlotFace icon={() => <ReturnArrowIcon />} label={submitLabel} />
     </button>
   ) : answerMode === 'cancel' ? (
     // Lone destructive Cancel — keep the scroll-vs-tap gate so an iOS PWA scroll
@@ -1312,13 +1232,13 @@ export function PromptInput() {
     <button
       key="answer-lone"
       type="button"
-      class="action-btn action-btn-danger"
+      class="action-btn action-btn-danger action-slot"
       // Held disabled for the post-submit settle window. The Submit the user
       // just pressed morphed into this Cancel, so a laggy repeat tap must not
       // abort the resuming turn. `cancelExchangeForTarget` belts the same check.
       disabled={cancelSettling}
-      // The scroll-vs-tap gate rides inside the hold handlers.
-      {...holdHandlers}
+      // The scroll-vs-tap gate's pointer feed.
+      {...tapGateHandlers}
       // The touch path runs the abort inside the gesture, because iOS drops
       // the click when the keyboard dismisses under the finger. Being
       // destructive, it rules on the gate: a press that travelled is refused
@@ -1335,7 +1255,7 @@ export function PromptInput() {
       data-tooltip={answeringQuestionCard ? ANSWER_CANCEL_TOOLTIP : tooltipWithShortcut('Stop', 'stopThread')}
       data-row-item
     >
-      Cancel
+      <SlotFace icon={() => <CloseIcon />} label="Cancel" />
     </button>
   ) : null;
 
@@ -1344,19 +1264,21 @@ export function PromptInput() {
   // A pending question or permission card has its own answer control, so it
   // carries no pill.
   const showsRungControl = !answersCard;
-  // The row's right-hand members. With the banner suppressed the standalone
-  // pair stands in. So a branch with commits always shows a Diff whatever the
-  // coding agent's run-state, and a still-working thread can still arm an apply
-  // (ADR 0168). Both FOLD, like everything between the menu and the send.
-  const bannerActions = bannerState ? getBannerActions(bannerState) : getStandaloneActions();
+  // The banner's members: Diff, and the one control in the action slot. With
+  // the banner suppressed the standalone pair stands in. So a branch with
+  // commits always shows a Diff whatever the coding agent's run-state, and a
+  // still-working thread can still arm an apply (ADR 0168). Both FOLD, like
+  // everything between the menu and the action slot.
+  const bannerActions = bannerState ? getBannerActions(bannerState) : null;
+  const situationalActions = bannerActions ? bannerActions.situational : getStandaloneActions();
   const sendButton = morphMode !== 'hidden' ? (
     <button
       key="send-cancel-morph"
       class={
-        'action-btn send-cancel-morph send-cancel-round'
+        'action-btn send-cancel-morph action-slot'
         + (morphMode === 'cancel' && cancelSettling ? ' morph-settling' : '')
       }
-      {...holdHandlers}
+      {...tapGateHandlers}
       onTouchStart={morphActivate.onTouchStart}
       onTouchMove={morphActivate.onTouchMove}
       onTouchCancel={morphActivate.onTouchCancel}
@@ -1373,25 +1295,27 @@ export function PromptInput() {
         : true
       }
       data-tooltip={
-        morphMode === 'cancel' && holdOffersSideQuestion ? tooltipWithShortcut('Stop. Hold for a side question', 'stopThread')
-        : morphMode === 'cancel' ? tooltipWithShortcut('Stop', 'stopThread')
+        morphMode === 'cancel' ? tooltipWithShortcut('Stop', 'stopThread')
         : morphMode === 'canceling' ? 'Stopping…'
         : morphMode === 'send' && uploadsBlocking ? 'Send after image upload'
         : morphMode === 'send' && sideQuestionMode ? 'Ask side question'
-        : morphMode === 'send' && holdOffersSideQuestion ? tooltipWithShortcut('Send. Hold for a side question', 'askSideQuestion')
         : morphMode === 'send' ? 'Send'
         : undefined
       }
       data-row-item
     >
-      {/* Icon-only: an up-arrow for send, a stop-square while a turn is
-          running/canceling. One stable element swaps only its glyph +
-          aria-label/tooltip between states: no unmount, so no mobile blink. */}
+      {/* An up-arrow for send, a stop-square while a turn runs, a spinner while
+          it stops. One stable element swaps only its face and aria-label/tooltip
+          between states: no unmount, so no mobile blink. */}
       {morphMode === 'cancel' || morphMode === 'canceling'
-        ? <StopIcon />
-        : <SendArrowIcon />}
+        ? <SlotFace icon={() => <StopIcon />} label="Stop" busy={morphMode === 'canceling'} />
+        : <SlotFace icon={() => <SendArrowIcon />} label={sideQuestionMode ? 'Ask' : 'Send'} />}
     </button>
   ) : null;
+  // The action slot: exactly one control at the right edge. Send or Stop wins
+  // whenever it stands; a banner's control takes the slot only while it hides.
+  const actionSlot = answersCard ? answerControl
+    : sendButton ?? (bannerActions && <ActionSlot occupant={bannerActions.slot} compact={composerCompact} />);
   // `.thread-action-buttons` is the e2e hook for a visible banner with action
   // buttons. Keep it bound to `bannerState`, so the selector flips with the
   // banner. The row wrapper itself always renders.
@@ -1401,9 +1325,9 @@ export function PromptInput() {
   // ── The row's FOLDABLE members, left to right ──
   //
   // `composerRowMembers` orders them, and the fold takes a PREFIX of that
-  // order. Only the send button, or the answer control in its place, never
-  // folds. It fits at any width the app supports, so a row too narrow for its
-  // members is not a state this can settle in.
+  // order. Only the action slot never folds: Send, the answer control, or the
+  // banner's one control in its place. It fits at any width the app supports,
+  // so a row too narrow for its members is not a state this can settle in.
   const readouts: HeaderActionSpec[] = [];
   const todoAction = promptCodingAgent === null ? todoIndicatorAction() : null;
   if (todoAction) readouts.push(todoAction);
@@ -1495,7 +1419,10 @@ export function PromptInput() {
     attachImage: attachImageAction,
     readouts,
     clearDraft: clearDraftAction,
-    toggles: promptRowToggles(promptCodingAgent, inComposeContext, focusedThread),
+    toggles: promptRowToggles(
+      promptCodingAgent, inComposeContext, focusedThread,
+      sideQuestionRefusal === null ? sideQuestionToggleAction(sideQuestionMode, toggleSideQuestionMode) : null,
+    ),
     rung: showsRungControl ? {
       key: RUNG_FOLD_KEY,
       dataRole: 'rung-control',
@@ -1503,7 +1430,7 @@ export function PromptInput() {
       icon: () => <RungMenuIcon />,
       onMenuClick: (anchor) => { if (anchor) rungFoldOpenRequest.value = anchor; },
     } : null,
-    banner: bannerActions,
+    situational: situationalActions,
   });
   const foldActions = [...members.row, ...members.cluster];
 
@@ -1516,10 +1443,17 @@ export function PromptInput() {
     () => foldActions.map((a) => (clusterKeys.has(a.key) ? 'cluster' : 'row')),
     [foldSignature],
   );
-  // The rung pill shortens to its badge before any member folds.
-  const { folded: collapsedActions, shed } = usePromptActionCollapse(
-    promptActionsAreaRef, foldKeys, foldGroups,
-    showsRungControl ? { key: RUNG_FOLD_KEY, levels: RUNG_SHED_LEVELS } : null,
+  // Diff and the standing apply merge into one box before the follow toggle
+  // folds. Only when both stand, and adjacent, as the standalone row has them.
+  const pairAt = foldKeys.indexOf(DIFF_APPLY_MERGE.keys[0]);
+  const mergeSpec = useMemo<PromptMerge | null>(
+    () => (pairAt !== -1 && foldKeys[pairAt + 1] === DIFF_APPLY_MERGE.keys[1]
+      ? { ...DIFF_APPLY_MERGE, atKey: FOLLOW_LIVE_EDGE_KEY }
+      : null),
+    [foldSignature],
+  );
+  const { folded: collapsedActions, merged } = usePromptActionCollapse(
+    promptActionsAreaRef, foldKeys, foldGroups, mergeSpec, composerCompact,
   );
   const hidden = foldActions.slice(0, collapsedActions);
   const foldedKeys = new Set(hidden.map((a) => a.key));
@@ -1552,13 +1486,22 @@ export function PromptInput() {
     ),
   };
   const renderMember = (a: HeaderActionSpec) => {
+    // The merged control takes the first member's place and the second draws
+    // nothing. Folded, both are plain rows in the ⋯.
+    if (merged && mergeSpec && standing(a)) {
+      if (a.key === mergeSpec.keys[0]) {
+        const pair = foldActions.filter((m) => mergeSpec.keys.includes(m.key));
+        return <Fragment key={a.key}><DiffApplyMenu members={pair} attrs={foldAttrs(mergeSpec.foldKey)} /></Fragment>;
+      }
+      if (a.key === mergeSpec.keys[1]) return null;
+    }
     const mounted = mountedWhileFolded[a.key];
     if (mounted) return <Fragment key={a.key}>{mounted(foldedKeys.has(a.key))}</Fragment>;
     return standing(a) ? <Fragment key={a.key}>{renderHeaderAction(a, foldAttrs(a.key))}</Fragment> : null;
   };
   // A fold moves controls between the row and the ⋯ menu, so an open popover's
   // anchor can leave the DOM under it. A panel pinned to a detached box is
-  // positioned against nothing. Close them all on a step rather than pick.
+  // positioned against nothing. Close them on a step rather than pick.
   useEffect(closeFoldedPanels, [collapsedActions]);
 
   return (
@@ -1663,7 +1606,7 @@ export function PromptInput() {
           aria-hidden="true"
           onChange={handleFileSelect}
         />
-        <div class={rowClass} ref={promptActionsAreaRef} {...{ [SHED_ATTR]: shed }}>
+        <div class={rowClass} ref={promptActionsAreaRef} data-composer-compact={composerCompact || undefined}>
           {/* The ⋯ holds the folded members, which are always the leftmost
               ones, so it stands at the left edge where they were. */}
           {hidden.length > 0 && (
@@ -1671,15 +1614,17 @@ export function PromptInput() {
               ariaLabel="More actions"
               extraClass="prompt-actions-more"
               triggerAttrs={MORE_TRIGGER_ATTRS}
-              onOpen={closeFoldedPanels}
+              onOpen={closeRowPanels}
               items={(ctx) => hidden.map((a) => renderMenuAction(a, ctx))}
             />
           )}
           {members.row.map(renderMember)}
-          {/* The pill leads the cluster, so the action (Send, Apply, Archive) holds the right edge. */}
+          {/* Diff and the standing apply lead the cluster, then the pill, so the
+              action (Send, Apply, Archive) holds the right edge with the pill
+              beside it. */}
           <div class="prompt-actions-right">
             {members.cluster.map(renderMember)}
-            {answersCard ? answerControl : sendButton}
+            {actionSlot}
           </div>
         </div>
       </div>

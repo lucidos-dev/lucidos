@@ -1143,7 +1143,7 @@ fn a_call_to_execute_intent_is_refused_with_its_replacement() {
             "{refusal}"
         );
         assert!(
-            refusal.starts_with("Error: execute_intent was removed"),
+            refusal.starts_with("Error: execute_intent is retired"),
             "{refusal}"
         );
         assert!(!refusal.contains("Unknown tool"), "{refusal}");

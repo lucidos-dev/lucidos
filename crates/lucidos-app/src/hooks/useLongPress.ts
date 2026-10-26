@@ -1,3 +1,4 @@
+import { hapticTick } from '@lucidos/haptic';
 import { LONG_PRESS_DELAY_MS, PRESS_MOVE_TOLERANCE_PX } from '@lucidos/widget-frame';
 import { useEffect, useRef } from 'preact/hooks';
 import type { ViewportPoint } from './useAnchoredPopover';
@@ -10,8 +11,8 @@ export interface LongPressHandlers {
   onPointerCancel(e: PointerEvent): void;
   onContextMenu(e: MouseEvent): void;
   onClick(e: MouseEvent): void;
-  /** Clear any pending hold-timer / suppress-fuse. Call on unmount so a timer
-   *  can't fire into a torn-down component. */
+  /** Drop any pending press and suppress-fuse. Call on unmount so a late lift
+   *  or timer can't fire into a torn-down component. */
   cancel(): void;
 }
 
@@ -28,15 +29,40 @@ const DEFAULT_MOVE_TOLERANCE_PX = PRESS_MOVE_TOLERANCE_PX;
 // pointerup. Keyed to pointerup (not to fire time) so an arbitrarily long hold
 // can never leave the suppressor armed against a later, unrelated click.
 const SUPPRESS_FUSE_MS = 700;
+const NATIVE_LONG_PRESS_PROPERTIES = ['user-select', '-webkit-user-select', '-webkit-touch-callout'];
+
+/** Turn off iOS's own answer to a resting finger on `target`, until the next
+ *  press anywhere. iOS shows its selection or link menu while the finger rests,
+ *  and a selection also cancels the gesture. Returns the undo. */
+function holdNativeLongPress(target: HTMLElement): () => void {
+  const { style } = target;
+  const before = NATIVE_LONG_PRESS_PROPERTIES.map((property) =>
+    [property, style.getPropertyValue(property), style.getPropertyPriority(property)] as const);
+  for (const property of NATIVE_LONG_PRESS_PROPERTIES) style.setProperty(property, 'none', 'important');
+  const release = () => {
+    document.removeEventListener('pointerdown', release, true);
+    for (const [property, value, priority] of before) {
+      if (value) style.setProperty(property, value, priority);
+      else style.removeProperty(property);
+    }
+  };
+  document.addEventListener('pointerdown', release, true);
+  return release;
+}
 
 /** Where a right-click landed. A hold passes none: the finger covers the
  *  point, so its host places the menu against the target instead. */
 export type LongPressCallback = (target: HTMLElement, at?: ViewportPoint) => void;
 
 /** Pure long-press / right-click gesture machine. Returns DOM handlers that
- *  call `onLongPress(target)` when the pointer is held still past `delayMs`,
- *  or `onLongPress(target, at)` on a right-click `contextmenu`, and
- *  `onClick(e)` for an ordinary tap.
+ *  call `onLongPress(target)`, with a haptic tick, once the pointer has been
+ *  held still for `delayMs`, finger still down. A right-click `contextmenu`
+ *  calls `onLongPress(target, at)`, and an ordinary tap calls `onClick(e)`.
+ *
+ *  A lift, a cancel, travel past the tolerance or a new press before the delay
+ *  ends the press. The lift is read at `document` capture, so a tap's action
+ *  that swaps the button out cannot strand the timer.
+ *  A touch press turns off the platform's own long-press answer at once.
  *  The `click` the browser pairs with a fired long-press is swallowed
  *  (`preventDefault` + `stopPropagation`) so the host button's primary action
  *  doesn't also run.
@@ -56,9 +82,40 @@ export function makeLongPressHandlers(
   let startX = 0;
   let startY = 0;
   let armed = false; // a long-press fired; swallow the paired click
+  let unwatchLift: (() => void) | null = null;
+  let releaseNativeLongPress: (() => void) | null = null;
 
-  function clearTimer() {
+  function endPress() {
     if (timer !== null) { clearTimeout(timer); timer = null; }
+    unwatchLift?.();
+    unwatchLift = null;
+  }
+  function fire(target: HTMLElement) {
+    endPress();
+    armed = true;
+    hapticTick();
+    onLongPress(target);
+  }
+  /** End this press when its pointer lifts or is cancelled anywhere, or when
+   *  the last finger leaves the glass. A tap's action can swap the button out,
+   *  or disable it on `touchend`. WebKit then dispatches no pointerup at all.
+   *  A later press ends a press whose lift was lost. */
+  function watchLift(pointerId: number) {
+    const samePointer = (e: PointerEvent) => { if (e.pointerId === pointerId) endPress(); };
+    const lastFinger = (e: TouchEvent) => { if (e.touches.length === 0) endPress(); };
+    const nextPress = () => endPress();
+    document.addEventListener('pointerdown', nextPress, true);
+    document.addEventListener('pointerup', samePointer, true);
+    document.addEventListener('pointercancel', samePointer, true);
+    document.addEventListener('touchend', lastFinger, true);
+    document.addEventListener('touchcancel', lastFinger, true);
+    unwatchLift = () => {
+      document.removeEventListener('pointerdown', nextPress, true);
+      document.removeEventListener('pointerup', samePointer, true);
+      document.removeEventListener('pointercancel', samePointer, true);
+      document.removeEventListener('touchend', lastFinger, true);
+      document.removeEventListener('touchcancel', lastFinger, true);
+    };
   }
   function disarm() {
     armed = false;
@@ -77,42 +134,40 @@ export function makeLongPressHandlers(
       // paired click (e.g. a right-click).
       if (e.button !== 0) return;
       disarm();
-      clearTimer();
+      endPress();
       startX = e.clientX;
       startY = e.clientY;
       const target = e.currentTarget as HTMLElement;
       // No `setPointerCapture`: it retargets the paired `click`, and it
       // suppresses the boundary events `onPointerLeave` cancels on
       // (`docs/known-gaps.md`).
-      timer = setTimeout(() => {
-        timer = null;
-        armed = true;
-        onLongPress(target);
-      }, delayMs);
+      timer = setTimeout(() => fire(target), delayMs);
+      if (e.pointerType !== 'mouse') releaseNativeLongPress = holdNativeLongPress(target);
+      watchLift(e.pointerId);
     },
     onPointerMove(e) {
       if (timer === null) return;
       if (Math.abs(e.clientX - startX) > moveTolerance ||
           Math.abs(e.clientY - startY) > moveTolerance) {
-        clearTimer();
+        endPress();
       }
     },
     onPointerUp() {
-      clearTimer();
+      endPress();
       // If a long-press fired, the paired click is imminent: keep the arm
       // alive just long enough to swallow it, then auto-disarm.
       if (armed && fuse === null) armFuse();
     },
     onPointerLeave() {
-      clearTimer();
+      endPress();
     },
     onPointerCancel() {
-      clearTimer();
+      endPress();
       disarm();
     },
     onContextMenu(e) {
       e.preventDefault();
-      clearTimer();
+      endPress();
       // A mouse right-click dispatches no `click`, so the arm is harmless there;
       // a touch long-press that surfaces as `contextmenu` may pair one, which
       // the fused arm then swallows.
@@ -130,8 +185,10 @@ export function makeLongPressHandlers(
       onClick(e);
     },
     cancel() {
-      clearTimer();
+      endPress();
       disarm();
+      releaseNativeLongPress?.();
+      releaseNativeLongPress = null;
     },
   };
 }
@@ -157,7 +214,7 @@ export function useLongPress(
       opts,
     );
   }
-  // Clear any pending hold-timer / fuse if the host unmounts mid-gesture (e.g. a
+  // Drop any pending press / fuse if the host unmounts mid-gesture (e.g. a
   // viewport breakpoint swaps the header layout while the button is held).
   useEffect(() => () => handlersRef.current?.cancel(), []);
   return handlersRef.current;

@@ -2,6 +2,7 @@
 //! The struct, shared stream types, and dispatch live in the parent `openai`
 //! module.
 
+use crate::llm::prefill::{pair_of, BeatShape, PrefillPair, StableEnd, TurnRoute};
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
@@ -449,6 +450,14 @@ impl OpenAiProvider {
         if let Some(tool) = selection.forced_tool {
             body["tool_choice"] = Self::forced_tool_choice_responses(tool);
         }
+        let prefill = prefill_pair(
+            &body,
+            TurnRoute {
+                wire_model: model,
+                reasoning_effort: selection.reasoning_effort,
+                betas: &[],
+            },
+        );
 
         // Debug: log tool count and names
         if let Some(tools_arr) = body.get("tools").and_then(|t| t.as_array()) {
@@ -529,7 +538,10 @@ impl OpenAiProvider {
                             .collect();
                         log!("[OpenAI] Tool calls: {:?}", names);
                     }
-                    return Ok(response);
+                    return Ok(LlmResponse {
+                        prefill,
+                        ..response
+                    });
                 }
                 Err(e) => {
                     let err_str = e.to_string();
@@ -551,6 +563,37 @@ pub(crate) const MAX_BREAKPOINTS: usize = 3;
 /// Breakpoints a request in explicit mode may carry: all four writes, since
 /// nothing writes at the end.
 pub(crate) const MAX_EXPLICIT_BREAKPOINTS: usize = 4;
+
+/// The most output a Responses prefill allows: the API's minimum
+/// `max_output_tokens`. Probe P5 settled that a beat capped there reads.
+const RESPONSES_OUTPUT_CAP: u32 = 16;
+
+/// The pair a beat on a Responses request sends. The stable cut ends at the
+/// last part that carries a breakpoint, where the turn wrote an entry.
+///
+/// `None` when no part carries one: a model before GPT-5.6, or a request with
+/// no memory view. A cut there would make the beat write, not read.
+fn prefill_pair(body: &serde_json::Value, route: TurnRoute<'_>) -> Option<PrefillPair> {
+    let input = body.get("input")?.as_array()?;
+    let end = input.iter().enumerate().rev().find_map(|(item, value)| {
+        let part = value
+            .get("content")?
+            .as_array()?
+            .iter()
+            .rposition(|part| part.get("prompt_cache_breakpoint").is_some())?;
+        Some(StableEnd::Part { item, part })
+    })?;
+    let mut value = body.clone();
+    value["max_output_tokens"] = RESPONSES_OUTPUT_CAP.into();
+    value["stream"] = false.into();
+    pair_of(
+        value,
+        "input",
+        end,
+        BeatShape::json_reply(RESPONSES_OUTPUT_CAP),
+        route,
+    )
+}
 
 /// A user message holding memory view blocks, as typed text parts. Each
 /// memory view block takes a breakpoint, so a later request that marks the
@@ -1130,6 +1173,72 @@ mod tests {
         assert_eq!(meta.cache_read_tokens, None);
     }
 
+    /// The `response.completed` data of one live turn, with `usage` details
+    /// and the response's `prompt_cache_options` echo.
+    fn completed_response(details: &str, echo: &str) -> LlmResponse {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut item_id_map = std::collections::HashMap::new();
+        let mut meta = StreamMeta::default();
+        let data = format!(
+            r#"{{"response":{{"status":"completed",{echo}"usage":{{"input_tokens":16500,"output_tokens":9,"input_tokens_details":{details}}}}}}}"#
+        );
+        OpenAiProvider::process_responses_chunk(
+            "response.completed",
+            &data,
+            &mut content,
+            &mut tools,
+            &mut item_id_map,
+            &mut meta,
+        )
+        .unwrap();
+        OpenAiProvider::build_llm_response("ok".to_string(), tools, meta).unwrap()
+    }
+
+    /// Probe A1 and A3: the write splits by lifetime, and the TTL is reported.
+    #[test]
+    fn a_responses_write_split_by_lifetime_is_reported() {
+        let response = completed_response(
+            r#"{"cached_tokens":0,"cache_write_tokens":16439,"cache_write_tokens_details":{"ttl_30m_tokens":16439,"ttl_12h_tokens":0}}"#,
+            r#""prompt_cache_options":{"mode":"implicit","ttl":"30m"},"#,
+        );
+        assert_eq!(response.cache_creation_tokens, Some(16439));
+        assert_eq!(response.cache_creation_30m_tokens, Some(16439));
+        assert_eq!(response.cache_creation_12h_tokens, Some(0));
+    }
+
+    /// With no split, the echoed TTL names the whole write's lifetime.
+    #[test]
+    fn the_echoed_ttl_names_the_lifetime_of_a_write_with_no_split() {
+        let response = completed_response(
+            r#"{"cached_tokens":0,"cache_write_tokens":16007}"#,
+            r#""prompt_cache_options":{"mode":"explicit","ttl":"12h"},"#,
+        );
+        assert_eq!(response.cache_creation_30m_tokens, None);
+        assert_eq!(response.cache_creation_12h_tokens, Some(16007));
+    }
+
+    /// A split whose parts each fit but together claim more than the write is
+    /// dropped, echo or not, so nothing records tokens nobody wrote.
+    #[test]
+    fn an_over_summed_split_is_dropped() {
+        let response = completed_response(
+            r#"{"cached_tokens":0,"cache_write_tokens":1000,"cache_write_tokens_details":{"ttl_30m_tokens":900,"ttl_12h_tokens":900}}"#,
+            r#""prompt_cache_options":{"mode":"implicit","ttl":"30m"},"#,
+        );
+        assert_eq!(response.cache_creation_tokens, Some(1000));
+        assert_eq!(response.cache_creation_30m_tokens, None);
+        assert_eq!(response.cache_creation_12h_tokens, None);
+    }
+
+    /// A write with neither a split nor an echo has no known TTL.
+    #[test]
+    fn a_responses_write_with_no_split_and_no_echo_is_unknown() {
+        let response = completed_response(r#"{"cached_tokens":0,"cache_write_tokens":880}"#, "");
+        assert_eq!(response.cache_creation_30m_tokens, None);
+        assert_eq!(response.cache_creation_12h_tokens, None);
+    }
+
     /// A response that read no cache leaves the count unset.
     #[test]
     fn an_input_total_with_no_cache_reports_no_cache_read() {
@@ -1198,5 +1307,140 @@ mod tests {
 
         assert!(err.contains("server_error"), "got: {err}");
         assert!(err.contains("The server had an error"), "got: {err}");
+    }
+
+    // --- Prefill beats (ADR 0556) ---
+
+    const SOL: &str = "gpt-6.1-sol";
+
+    fn route(model: &str) -> TurnRoute<'_> {
+        TurnRoute {
+            wire_model: model,
+            reasoning_effort: Some("medium"),
+            betas: &[],
+        }
+    }
+
+    fn json(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).expect("a body is JSON")
+    }
+
+    /// A Tree turn: two memory view blocks and the task, an answer, then a
+    /// follow-up with no view.
+    fn tree_turn() -> Vec<Message> {
+        vec![
+            user(vec![
+                view("[THREAD MEMORY VIEW]\n[0+8] old\n"),
+                view("[8+4] newer\n"),
+                text("the task"),
+            ]),
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("an answer".to_string()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("and then?".to_string()),
+            },
+        ]
+    }
+
+    fn turn_body(model: &str, messages: &[Message]) -> serde_json::Value {
+        let provider = OpenAiProvider::new("k".to_string(), model.to_string()).unwrap();
+        let selection = ModelSelection::default().with_effort(Some("medium"));
+        let mut body =
+            provider.build_responses_body(model, messages, &[], Some("system"), &selection);
+        body["tool_choice"] = OpenAiProvider::forced_tool_choice_responses("request_read");
+        body
+    }
+
+    /// The whole cut is the turn capped at the API's minimum output and not
+    /// streamed, with its reasoning and tool choice. The stable cut ends at
+    /// the last breakpoint.
+    #[test]
+    fn a_responses_pair_caps_output_and_cuts_at_the_last_breakpoint() {
+        let body = turn_body(SOL, &tree_turn());
+        let pair = prefill_pair(&body, route(SOL)).expect("a marked request beats");
+
+        let mut whole = body.clone();
+        whole["max_output_tokens"] = RESPONSES_OUTPUT_CAP.into();
+        whole["stream"] = false.into();
+        assert_eq!(json(&pair.whole.body), whole);
+        assert_eq!(whole["reasoning"]["effort"], "medium");
+        assert_eq!(whole["tool_choice"]["name"], "request_read");
+
+        let mut stable = whole;
+        let input = stable["input"].as_array_mut().unwrap();
+        input.truncate(1);
+        input[0]["content"].as_array_mut().unwrap().truncate(2);
+        assert_eq!(json(&pair.stable.body), stable);
+        let last = &stable["input"][0]["content"][1];
+        assert!(last.get("prompt_cache_breakpoint").is_some(), "{last}");
+
+        for body in [&pair.stable, &pair.whole] {
+            assert_eq!(body.output_cap, Some(RESPONSES_OUTPUT_CAP));
+            assert_eq!(body.wire_model, SOL);
+            assert_eq!(body.reasoning_effort.as_deref(), Some("medium"));
+        }
+    }
+
+    /// No breakpoint means no entry a beat could read: a model before
+    /// GPT-5.6 takes none, and a Classic turn has no memory view.
+    #[test]
+    fn a_request_with_no_breakpoint_gets_no_pair() {
+        assert!(prefill_pair(&turn_body("gpt-5.5", &tree_turn()), route("gpt-5.5")).is_none());
+        let classic = [user(vec![text("profile"), text("the task")])];
+        assert!(prefill_pair(&turn_body(SOL, &classic), route(SOL)).is_none());
+    }
+
+    const COMPLETED_TURN: &str = concat!(
+        "event: response.output_text.delta\n",
+        r#"data: {"delta":"done"}"#,
+        "\n\n",
+        "event: response.completed\n",
+        r#"data: {"response":{"status":"completed","usage":{"input_tokens":900,"output_tokens":3,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":880}}}}"#,
+        "\n\n",
+    );
+
+    const PREFILL_REPLY: &str = r#"{"model":"gpt-6.1-sol","status":"incomplete","usage":{"input_tokens":900,"output_tokens":16,"input_tokens_details":{"cached_tokens":880}}}"#;
+
+    /// A turn hands back its pair, and the beat posts the stable cut to the
+    /// Responses endpoint and reads the reply's usage.
+    #[tokio::test]
+    async fn a_turn_returns_a_pair_whose_beat_reads_the_turn() {
+        let (base, bodies) =
+            super::super::serve_recording("/v1/responses", COMPLETED_TURN, PREFILL_REPLY).await;
+        let provider =
+            OpenAiProvider::new_with_base_url("k".into(), SOL.into(), &base, Vec::new(), false)
+                .unwrap();
+        let turn = provider
+            .chat_responses(
+                &tree_turn(),
+                &[],
+                ModelSelection::model(SOL),
+                Some("system"),
+                None,
+            )
+            .await
+            .expect("the turn completes");
+        let pair = turn
+            .prefill
+            .expect("a marked GPT-6.1 turn can be prefilled");
+
+        let beat = crate::llm::LlmProvider::prefill(
+            &provider,
+            &pair.stable,
+            crate::llm::metered::CallToken::for_test(),
+        )
+        .await
+        .expect("the beat answers");
+        assert_eq!(beat.cache_read_tokens, Some(880));
+        assert_eq!(beat.output_tokens, Some(16));
+
+        let sent = bodies.lock().unwrap().clone();
+        let [_, beat_body] = sent.as_slice() else {
+            panic!("expected a turn and a beat, saw {}", sent.len());
+        };
+        assert_eq!(beat_body, &json(&pair.stable.body));
     }
 }

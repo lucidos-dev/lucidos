@@ -557,9 +557,8 @@ pub struct RunningAgent {
     /// for backends whose permissions flow out-of-band (Claude Code's MCP
     /// HTTP path, the Codex exec driver's sandbox-only model).
     pub permission_rx: Option<mpsc::UnboundedReceiver<AgentPermissionRequest>>,
-    /// Withdraws (see [`WithdrawRequest`]). `None` for backends that cannot
-    /// take back an input: both Codex drivers.
-    pub withdraw_tx: Option<mpsc::UnboundedSender<WithdrawRequest>>,
+    /// Withdraws (see [`WithdrawRequest`]).
+    pub withdraw_tx: mpsc::UnboundedSender<WithdrawRequest>,
 }
 
 #[async_trait]

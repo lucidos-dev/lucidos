@@ -73,6 +73,7 @@ async fn answer_ends_the_park() {
     assert!(
         !parked_after(Some(ThreadEvent::UserQuestionAnswered {
             tool_use_id: "toolu_park".into(),
+            quiet: false,
             answer: AnswerKind::Selected {
                 option_id: "opt-0".into(),
             },
@@ -433,6 +434,7 @@ async fn an_answered_question_reads_back_as_nothing() {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: "toolu_park".into(),
+            quiet: false,
             answer: AnswerKind::Canceled,
         },
         meta: EventMeta {

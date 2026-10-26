@@ -8,6 +8,9 @@
 - **Amends**: [0489](0489-keep-alive-budget-follows-model-prices.md). Break-even
   stays the default for event waits. A parked wait gives up at half of it, and
   a preference can pick another rule or turn the keep-alive off.
+- **Amended by**: [0554](0554-keep-alive-per-thread-switch.md). A thread can turn the keep-alive off for one wait.
+- **Amended by**: [0556](0556-lucidos-agent-keep-alive-prefill-beats.md). A Lucidos Agent thread parked on its own card is kept warm by a prefill beat.
+- **Amended by**: [0563](0563-cache-keep-alive-speaks-one-grammar.md). A parked wait shows its status and card, not only the cache-warm line.
 
 ## Context
 
@@ -75,6 +78,10 @@ from cache.
 - **A dead session gets nothing.** A park preserved across a restart has no
   live process and no remembered prompt.
 - **Codex gets nothing**, as in ADR 0470.
+- **The cache-warm line and the switch estimate read the copy beats.** They
+  share one definition of the last cache refresh with the keep-alive. The line
+  says `kept until HH:MM`, the spend so far, and why nothing keeps a thread
+  warm when that is so.
 
 ## Alternatives considered
 

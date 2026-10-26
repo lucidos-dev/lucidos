@@ -3,6 +3,8 @@
 
 use super::{AnthropicAuth, AnthropicProvider, Endpoint};
 use crate::llm::anthropic_wire::{build_claude_request, parse_claude_stream, WireTarget};
+use crate::llm::claude_prefill;
+use crate::llm::prefill::{PrefillBody, TurnRoute};
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
 use crate::llm::ModelSelection;
 
@@ -153,10 +155,8 @@ impl AnthropicProvider {
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let (mut auth, model) = self
-            .endpoint
-            .begin_call(selection.model.unwrap_or(&self.model))
-            .await?;
+        let requested = selection.model.unwrap_or(&self.model);
+        let (mut auth, model) = self.endpoint.begin_call(requested).await?;
         let model = model.as_str();
         let reasoning_effort = selection.reasoning_effort;
         let messages_url = self.endpoint.messages_url();
@@ -175,6 +175,14 @@ impl AnthropicProvider {
             request.force_tool(tool, model)?;
         }
         let stable_prefix_fingerprint = crate::llm::stable_prefix::fingerprint(&request, model);
+        let prefill = claude_prefill::pair(
+            &request,
+            TurnRoute {
+                wire_model: requested,
+                reasoning_effort,
+                betas: &request_betas,
+            },
+        );
 
         let mut headers = auth.headers(&request_betas);
         let mut renewed = false;
@@ -249,6 +257,7 @@ impl AnthropicProvider {
                 Ok(response) => {
                     return Ok(LlmResponse {
                         stable_prefix_fingerprint,
+                        prefill,
                         ..response
                     })
                 }
@@ -261,6 +270,22 @@ impl AnthropicProvider {
                 }
             }
         }
+    }
+
+    /// Send one prefill beat, with a fresh credential for a gateway.
+    pub(super) async fn prefill_anthropic(
+        &self,
+        body: &PrefillBody,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let (auth, _) = self.endpoint.begin_call(&body.wire_model).await?;
+        let mut builder = self
+            .streaming_client
+            .post(self.endpoint.messages_url())
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        for (name, value) in auth.headers(&body.betas) {
+            builder = builder.header(name, value);
+        }
+        crate::llm::prefill::send(builder, body, self.endpoint.label()).await
     }
 }
 
@@ -759,6 +784,88 @@ mod tests {
                 trace.failure(false),
                 crate::llm::call_trace::CallFailure::Http
             );
+        }
+
+        /// A gateway that streams a turn and a beat alike, and keeps each
+        /// Messages body it was sent. [`COMPLETED_TURN`] stands for the
+        /// stream a beat hangs up on.
+        async fn serve_recording_bodies() -> (GatewayOrigin, Arc<Mutex<Vec<serde_json::Value>>>) {
+            let bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+            let record = bodies.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/v1/models",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({
+                            "data": [{"type": "model", "id": LISTED}],
+                            "has_more": false,
+                        }))
+                    }),
+                )
+                .route(
+                    "/v1/messages",
+                    axum::routing::post(move |body: axum::body::Bytes| {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        record.lock().unwrap().push(body);
+                        async move { ([("content-type", "text/event-stream")], COMPLETED_TURN) }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (
+                GatewayOrigin::parse(&format!("http://{addr}")).unwrap(),
+                bodies,
+            )
+        }
+
+        /// A turn hands back its prefill pair. Its whole body goes out as the
+        /// turn's bytes and parameters plus the beat prompt, and the usage of
+        /// the stream's `message_start` comes back.
+        #[tokio::test]
+        async fn a_turn_returns_a_pair_whose_beat_reads_the_turn() {
+            let (origin, bodies) = serve_recording_bodies().await;
+            let provider = AnthropicProvider::claude_gateway(
+                origin,
+                Arc::new(FixedTokens::fixed(Ok("gw-token".into()))),
+                "m".to_string(),
+            )
+            .unwrap();
+            let turn = provider
+                .chat_anthropic(
+                    vec![Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text("hi".to_string()),
+                    }],
+                    vec![],
+                    ModelSelection::model(LISTED),
+                    Some("system prompt"),
+                    None,
+                )
+                .await
+                .expect("the turn completes");
+            let pair = turn.prefill.expect("a gateway turn can be prefilled");
+            assert_eq!(pair.whole.wire_model, LISTED);
+
+            let beat = provider
+                .prefill_anthropic(&pair.whole)
+                .await
+                .expect("the beat answers");
+            assert_eq!(beat.input_tokens, Some(9));
+
+            let sent = bodies.lock().unwrap().clone();
+            let [turn_body, beat_body] = sent.as_slice() else {
+                panic!("expected a turn and a beat, saw {}", sent.len());
+            };
+            let mut expected = turn_body.clone();
+            expected["messages"][0]["content"]
+                .as_array_mut()
+                .expect("the turn's message is blocks")
+                .push(serde_json::json!({
+                    "type": "text",
+                    "text": crate::llm::claude_prefill::BEAT_PROMPT
+                }));
+            assert_eq!(beat_body, &expected);
         }
     }
 }

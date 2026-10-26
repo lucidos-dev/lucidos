@@ -110,7 +110,7 @@ pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
          APPROVAL WITH THE `AskUserQuestion` TOOL. Put the plan summary on the card's question \
          itself, in short markdown with the ask on its last line: the user never sees a message \
          that also calls a tool. Run the approval checkpoint in the `implementation-plan` skill \
-         (§ Asking for approval) and offer the options it prints. With no new thread to offer, \
+         (§ Asking for approval) and offer the options it prints. With no fresh session to offer, \
          that is `Approve` / `Request changes`, a floor: if the plan offers a real fork, that \
          fork takes the second slot and `Request changes` is dropped rather than carried as a \
          third. Approval is a DECISION question, not a post-work confirmation: \
@@ -339,7 +339,7 @@ mod tests {
     fn awaiting_approval_points_at_the_skills_checkpoint() {
         let out = build_awaiting_approval_json("/tmp/x.rs");
         assert!(out.contains("approval checkpoint in the `implementation-plan` skill"));
-        assert!(!out.contains("lucidos successor spawn"), "{out}");
+        assert!(!out.contains("lucidos successor"), "{out}");
     }
 
     #[test]

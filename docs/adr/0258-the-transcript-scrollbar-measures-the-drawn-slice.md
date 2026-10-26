@@ -65,16 +65,18 @@ needs no code of ours to drag, press or wheel.
 - The scrollbar hold exists because Chromium puts its own drag position back,
   with no input event, which undoes an anchor write. A page may still be
   fetched during the scrollbar hold, but it lands only a frame after the
-  release, at the store's landing gate (`scrollbarReleased`). A grow the
-  scrollbar hold put off runs then too (`onScrollbarReleased`). A drag pinned at
+  release, at the store's landing gate (`scrollHoldReleased`). A grow the
+  scrollbar hold put off runs then too (`onScrollHoldReleased`). A drag pinned at
   the top fires no scroll event, so without the release it locked.
 - A scrollbar hold starts on a primary press on the scroller's own box
-  (`isScrollbarHeld`). That covers a classic gutter, and an overlay thumb, which
+  (`isScrollHeld`). That covers a classic gutter, and an overlay thumb, which
   sits inside the client box. WebKit's overlay scrollbar (Safari, the macOS app)
   is unverified. If it sends the page no press, nothing is held there, and a
   grow can land under a drag as it did before.
 - Detecting a press in the classic gutter still covers the standing follow, as
   it did before ADR 0253.
+- A touch scroll holds the same way, until its momentum stops (the *touch
+  hold*, `docs/glossary.md`). iOS kills a fling on any `scrollTop` write.
 
 ## Alternatives considered
 

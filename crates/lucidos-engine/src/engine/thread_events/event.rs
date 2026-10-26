@@ -288,6 +288,11 @@ pub enum ThreadEvent {
         /// every row written before the field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
+        /// The thread's *agent session* the call ran in, counted from 1. The
+        /// event bus stamps it at append, so a producer leaves it `None`.
+        /// Absent on every row written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<u32>,
     },
     /// A metered chat call that failed. It is **never a `ContextCaptured`**: a
     /// capture binds to a transcript step and every usage rollup sums it, while
@@ -544,10 +549,10 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
         /// Which backend drives this thread (`claude-code` | `codex`).
-        /// Locked in at first SessionStarted via the thread_summaries
-        /// projection (COALESCE keeps the existing value) so follow-ups and
-        /// recovery resume on the same backend. The default covers legacy rows,
-        /// which are all Claude Code.
+        /// The thread_summaries projection follows the newest SessionStarted,
+        /// so follow-ups and recovery resume on its backend. Only a successor
+        /// session can change backends. The default covers legacy rows, which
+        /// are all Claude Code.
         #[serde(default = "default_coding_agent_claude_code")]
         coding_agent: CodingAgent,
         /// The thread is an *integrated sub-thread*: it folds into its
@@ -565,6 +570,10 @@ pub enum ThreadEvent {
         /// trial is off and on Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auto_compact_arm: Option<crate::engine::auto_compact_trial::AutoCompactArm>,
+        /// Whether this session carried the thread's earlier context. Absent
+        /// on rows written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuity: Option<super::SessionContinuity>,
     },
     SessionEnded {
         /// Why the session ended. Always serialized, because the frontend reads
@@ -577,20 +586,46 @@ pub enum ThreadEvent {
         #[serde(default = "default_session_ended_reason")]
         reason: SessionEndReason,
     },
-    /// This thread handed off to a *successor thread*, which carries on with
-    /// a fresh context. Lands on the OLD thread. The successor's branch starts
-    /// at `base_sha`, this thread's last commit at the handoff.
+    /// Legacy: this thread handed off to a *legacy successor thread*, which carried
+    /// on with a fresh context. Lands on the OLD thread. The successor's
+    /// branch starts at `base_sha`, this thread's last commit at the handoff.
+    /// Nothing emits it now: a handoff starts a successor session instead.
     SuccessorThreadSpawned {
         successor_thread_id: uuid::Uuid,
         base_sha: String,
-        /// The successor is the builder of a *build chain*: a `no-wake`
-        /// child of this thread, which stays open (ADR 0503).
+        /// The successor was the builder of a retired *build chain*: a
+        /// `no-wake` child of this thread (ADR 0503).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         starts_build_chain: bool,
-        /// The authority that let a successor placed under a parent start,
-        /// which it inherits for its own automatic handoffs (ADR 0507).
+        /// The retired *handoff consent* that let a successor placed under a
+        /// parent start (ADR 0507).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         handoff_consent: Option<HandoffConsent>,
+    },
+    /// The thread handed off to a *successor session* in the same thread. The
+    /// current session ends at its turn end, and the next one starts fresh on
+    /// the same branch, with `message` as its first input. Pending until that
+    /// session's `SessionStarted`.
+    SessionHandedOff {
+        opening: super::HandoffOpening,
+        /// The opening itself: the *handoff narrative* or *handoff brief*,
+        /// framed for the new session.
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<String>,
+        /// The *implementer* the successor session runs on.
+        coding_agent: CodingAgent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coding_agent_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// What the user typed at the *Successor card*, and who typed it. The
+        /// successor session starts on it as their message, and `message`
+        /// leaves it out. Older rows quote it inside `message` instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<crate::engine::successor::HandoffRequest>,
     },
     /// The agent ran a *handoff checkpoint* a flow names (ADR 0505). It
     /// records what the *handoff estimate* read, so a later run of the same
@@ -610,6 +645,15 @@ pub enum ThreadEvent {
         /// The verdict. `None` when the engine could not make a reading.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pays: Option<bool>,
+        /// The run declared the *default floor*.
+        #[serde(default, skip_serializing_if = "is_false")]
+        default_floor: bool,
+        /// The default rung the run offered, for a thread below it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        floor_rung: Option<crate::runtime::intelligence_ladder::IntelligenceRung>,
+        /// The *risk rung* the run offered, just above the default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk_rung: Option<crate::runtime::intelligence_ladder::IntelligenceRung>,
     },
     /// The user chose *Stay here* on the Successor card. `input_tokens` is the
     /// context size at that moment: the card stays hidden until the thread
@@ -761,6 +805,14 @@ pub enum ThreadEvent {
         /// not count it.
         #[serde(default, skip_serializing_if = "is_false")]
         verbatim: bool,
+    },
+    /// The coding agent took a child's report mid-turn, through its own
+    /// `lucidos` call, before its driver delivered the queued copy. The engine
+    /// withdrew that copy, so the report reaches the agent once. Follows the
+    /// card, so the boot refire treats the card as handled.
+    ChildReportTaken {
+        /// The `ChildThreadCompleted` card whose report the agent took.
+        input_event_id: uuid::Uuid,
     },
     /// An effort restart interrupted the turn before the coding agent read
     /// the input that opened it, so the agent never will. The input stays
@@ -1413,6 +1465,11 @@ pub enum ThreadEvent {
     UserQuestionAnswered {
         tool_use_id: String,
         answer: AnswerKind,
+        /// The pick was a *quiet option*, so the turn ends without waking the
+        /// agent. The engine derives it from the asked options
+        /// (`agent_question::answer_is_quiet`); a client never sets it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        quiet: bool,
     },
     /// A thread asked for an *owner approval* (ADR 0387), through `POST
     /// /api/v1/owner-approvals`. `question` is the card the engine wrote. It
@@ -1446,6 +1503,11 @@ pub enum ThreadEvent {
         /// The tool call's arguments, always a JSON object.
         input: Value,
         summary: String,
+        /// The grant each "Always allow"-style button stores (ADR 0571). `None`
+        /// on a card persisted before the engine stamped it, and on an
+        /// unattended auto-deny, which renders already answered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_offer: Option<crate::engine::claude_code::GrantOffer>,
     },
     /// User answered (or system timed out) a `CodingAgentPermissionRequest`.
     /// Emitted by the permission-prompt handler immediately after the oneshot
@@ -1853,6 +1915,15 @@ pub enum ThreadEvent {
         /// Absent once the thread has nothing to keep warm.
         status: Option<CacheKeepAliveStatus>,
     },
+
+    /// The user turned the cache keep-alive off for this thread (ADR 0554).
+    /// It projects into `thread_summaries.cache_keep_alive_off_at`, and holds
+    /// until the thread's next real request. Metadata: it moves nothing.
+    CacheKeepAliveTurnedOff,
+
+    /// The user turned the cache keep-alive back on for this thread. It clears
+    /// `thread_summaries.cache_keep_alive_off_at`.
+    CacheKeepAliveTurnedOn,
 
     /// A voice session opened on this thread (ADR 0148).
     ///

@@ -1,14 +1,11 @@
 import { useRef } from 'preact/hooks';
 import { hardenThread } from '../../api/client';
-import type { SuccessorLink } from '../../api/threads';
 import type { UnproposedReason } from '../../generated/thread-event-wire';
 import type { ThreadMeta } from '../../store/thread-events';
 import { focusedThreadId, notReadyReason, showToast, threadMap } from '../../store/store';
-import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { errorDetail } from '../../utils/errorDetail';
 import { Disclosure } from '../shared/Disclosure';
 import { continueStoppedThread } from './continueStoppedThread';
-import { successorLinkTitle } from './SuccessorNotice';
 
 /** What the strip says for each reason a turn end withheld the work (ADR 0400).
  *  `hint` sits on the strip, and a tap toasts `detail`. */
@@ -57,9 +54,13 @@ export const NOT_READY_COPY: Record<StripReason, { label: string; hint: string; 
   },
 };
 
-/** Every reason but a hand-off: that one is no warning, so it draws as a
- *  quiet link to the successor thread instead of the amber strip. */
+/** Every reason but a hand-off. A handed-off thread draws nothing here: the
+ *  transcript's closing notice already links its legacy successor thread. */
 type StripReason = Exclude<UnproposedReason, 'carried_by_successor'>;
+
+function isStripReason(reason: UnproposedReason | null): reason is StripReason {
+  return reason !== null && reason !== 'carried_by_successor';
+}
 
 /** The strip's label for `reason`. An integrated sub-thread names the parent
  *  it folds into, once the title is known. */
@@ -68,31 +69,22 @@ export function notReadyLabel(reason: StripReason, meta: Pick<ThreadMeta, 'paren
   return NOT_READY_COPY[reason].label;
 }
 
-type Shown =
-  | { threadId: string; reason: StripReason; label: string }
-  | { threadId: string; reason: 'carried_by_successor'; successor: SuccessorLink | null };
-
-function shownFor(threadId: string, reason: UnproposedReason, meta: ThreadMeta | undefined): Shown {
-  if (reason === 'carried_by_successor') return { threadId, reason, successor: meta?.successor ?? null };
-  return { threadId, reason, label: notReadyLabel(reason, meta) };
-}
+type Shown = { threadId: string; reason: StripReason; label: string };
 
 /** What sits above the prompt box when the focused thread's work is not
- *  ready, where Apply would otherwise be offered: the amber strip saying why,
- *  or a link to the successor thread that carries the work on. */
+ *  ready, where Apply would otherwise be offered: the amber strip saying why. */
 export function NotReadyStrip() {
   const threadId = focusedThreadId.value;
   const thread = threadId ? threadMap.value.get(threadId) : undefined;
   const reason = notReadyReason(thread);
+  const open = isStripReason(reason);
   // The last reason shown, so the strip keeps its words while it rolls shut.
   const shown = useRef<Shown | null>(null);
-  if (threadId && reason) shown.current = shownFor(threadId, reason, thread?.meta);
+  if (threadId && open) shown.current = { threadId, reason, label: notReadyLabel(reason, thread?.meta) };
   const last = shown.current;
   return (
-    <Disclosure open={reason !== null}>
-      {last?.reason === 'carried_by_successor' ? (
-        <ContinuedHereLink successor={last.successor} />
-      ) : last && (
+    <Disclosure open={open}>
+      {last && (
         <div class="not-ready-strip" data-reason={last.reason}>
           <button
             class="not-ready-strip-reason"
@@ -120,33 +112,6 @@ export function NotReadyStrip() {
   );
 }
 
-/** "Continued here", where "here" opens the successor thread. Before its link
- *  loads there is nowhere to go, so it says so without one. */
-function ContinuedHereLink({ successor }: { successor: SuccessorLink | null }) {
-  return (
-    <p class="continued-here" data-role="continued-here">
-      <ArrowIcon />
-      <span>
-        {successor ? (
-          <>
-            {'Continued '}
-            <button
-              type="button"
-              class="continued-here-link"
-              data-tooltip={successorLinkTitle(successor) ?? undefined}
-              onClick={() => focusThreadOrBootstrap(successor.thread_id)}
-            >
-              here
-            </button>
-          </>
-        ) : (
-          'Continued in a new thread'
-        )}
-      </span>
-    </p>
-  );
-}
-
 /** Start the hardening run the strip offers. A failure toasts, since the
  *  strip stays up and the press can be retried. */
 async function startHardening(threadId: string): Promise<void> {
@@ -155,15 +120,6 @@ async function startHardening(threadId: string): Promise<void> {
   } catch (err) {
     showToast(`Failed to start hardening: ${errorDetail(err)}`, 'error');
   }
-}
-
-function ArrowIcon() {
-  return (
-    <svg class="continued-here-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <line x1="5" y1="12" x2="19" y2="12" />
-      <polyline points="12 5 19 12 12 19" />
-    </svg>
-  );
 }
 
 function WarningIcon() {

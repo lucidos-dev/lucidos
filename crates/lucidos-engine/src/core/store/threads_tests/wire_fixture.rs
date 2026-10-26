@@ -63,6 +63,7 @@ fn fixture_row() -> ThreadRow {
         coding_agent_kind: Some("lucidos".into()),
         coding_agent_folder: Some("/home/user/example-repo".into()),
         coding_agent: Some("claude-code".into()),
+        coding_agents: vec!["claude-code".into(), "codex".into()],
         state: "composing".into(),
         compose_text: "draft".into(),
         compose_images: serde_json::json!([]),
@@ -97,7 +98,8 @@ fn thread_summary_serializes_to_the_pinned_bytes() {
             r#""successor_of":{{"thread_id":"00000000-0000-0000-0000-000000000005","title":null}},"#,
             r#""cc_repo_id":"00000000-0000-0000-0000-000000000003","cc_repo_name":"example-repo","#,
             r#""coding_agent_kind":"lucidos","coding_agent_folder":"/home/user/example-repo","#,
-            r#""coding_agent":"claude-code","state":"composing","compose_text":"draft","#,
+            r#""coding_agent":"claude-code","coding_agents":["claude-code","codex"],"#,
+            r#""state":"composing","compose_text":"draft","#,
             r#""compose_images":[],"compose_mode":"claude_code","compose_epoch":9}}"#,
         ),
         waits = WAIT_JSON,
@@ -127,7 +129,8 @@ fn thread_aggregate_serializes_to_the_pinned_bytes() {
             r#""successorOf":{{"thread_id":"00000000-0000-0000-0000-000000000005","title":null}},"#,
             r#""ccRepoId":"00000000-0000-0000-0000-000000000003","ccRepoName":"example-repo","#,
             r#""codingAgentKind":"lucidos","codingAgentFolder":"/home/user/example-repo","#,
-            r#""codingAgent":"claude-code","state":"composing"}}"#,
+            r#""codingAgent":"claude-code","codingAgents":["claude-code","codex"],"#,
+            r#""state":"composing"}}"#,
         ),
         waits = WAIT_JSON,
     );
@@ -239,6 +242,10 @@ fn a_keep_alive_status_serializes_to_its_tagged_object() {
             beats: 25,
             cost_usd: 0.5,
             context_tokens: 262_000,
+            ping_usd: None,
+            reread_usd: None,
+            beat_every_secs: None,
+            odds: None,
         })),
         ..fixture_row()
     };

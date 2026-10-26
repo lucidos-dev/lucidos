@@ -1,7 +1,7 @@
 import {
-  chatModels, configuredProviders, showToast, showConfirm,
+  chatLadder, chatModels, configuredProviders, showToast, showConfirm,
 } from '../store';
-import { toFailed, setLoadingIfFresh } from '../types';
+import { failedIfFresh, toFailed, setLoadingIfFresh } from '../types';
 import { MODELS, REASONING_LEVELS, providerLabel } from '../models';
 import {
   clampToOffered, lucidosTiers, tierOptions,
@@ -9,7 +9,7 @@ import {
 } from '../modelSelection';
 import { displayModelName } from '../thread-events';
 import {
-  listModels, createModel, updateModel, deleteModelApi, type RouteInput,
+  getChatLadder, listModels, createModel, updateModel, deleteModelApi, type RouteInput,
 } from '../../api/client';
 import type { ModelInfo, RouteInfo } from '../../api/types';
 import { errorDetail } from '../../utils/errorDetail';
@@ -33,6 +33,22 @@ export async function loadChatModels(): Promise<void> {
     chatModels.value = { status: 'loaded', data: data.models || [] };
   } catch (error) {
     chatModels.value = toFailed(error);
+  }
+}
+
+let chatLadderReadSeq = 0;
+
+/** Load the served chat ladder into the `chatLadder` signal. A re-read keeps
+ *  the ladder shown through the round trip, and through a failed one. Only the
+ *  latest read writes, so a slow older answer never overwrites a newer one. */
+export async function loadChatLadder(): Promise<void> {
+  const seq = ++chatLadderReadSeq;
+  setLoadingIfFresh(chatLadder);
+  try {
+    const data = await getChatLadder();
+    if (seq === chatLadderReadSeq) chatLadder.value = { status: 'loaded', data };
+  } catch (error) {
+    if (seq === chatLadderReadSeq) chatLadder.value = failedIfFresh(chatLadder.peek(), error);
   }
 }
 

@@ -2,11 +2,10 @@
 # Tests for scripts/lib/codegen.sh: the codegen fingerprint, the cache, the
 # copy that writes only changed bytes, and the dep-info check.
 #
-# Hermetic: every case runs in a scratch git repo under $TMP. A stub stands in
-# for the lucidos-codegen bin, and codegen_build_sdk is replaced, so no cargo,
-# node or npm runs.
+# Hermetic: render/cache fixtures use scratch repos; build inputs read this
+# checkout. Stubs replace the writers and SDK build, so no Cargo or npm runs.
 #
-# Run: ./scripts/lib/codegen_test.sh
+# Run: bash scripts/lib/codegen_test.sh
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +26,21 @@ expect_ne() { # <name> <unexpected> <actual>
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+echo "engine build inputs"
+ENGINE_ROOT="$SCRIPT_DIR/../../crates/lucidos-engine"
+WATCH_PATHS=$(sed -n 's/.*println!("cargo:rerun-if-changed=\([^"{}]*\)").*/\1/p' "$ENGINE_ROOT/build.rs")
+expect_ne "the build script declares its source inputs" "" "$WATCH_PATHS"
+while IFS= read -r watched; do
+    if [ -e "$ENGINE_ROOT/$watched" ] && [ -n "$(git -C "$ENGINE_ROOT" ls-files -- "$watched")" ]; then
+        pass "declared build input is present and tracked: $watched"
+    else
+        fail "declared build input is missing or untracked: $watched"
+    fi
+done <<< "$WATCH_PATHS"
+
 # The SDK step needs node. Record that it ran instead.
+# CLI composition is tested separately; cache fixtures never invoke cargo.
+codegen_cli_surface() { :; }
 codegen_build_sdk() { echo sdk >> "$TMP/sdk-log"; }
 
 WIRE=crates/lucidos-app/src/generated/thread-event-wire.ts
@@ -38,6 +51,9 @@ new_repo() { # <dir>
     echo 'pub const A: u32 = 1;' > "$1/crates/lucidos-engine/src/lib.rs"
     echo '# lock' > "$1/Cargo.lock"
     echo 'export {};' > "$1/crates/lucidos-app/src/main.ts"
+    mkdir -p "$1/system-knowhow" "$1/scripts/lib"
+    cp "$SCRIPT_DIR/codegen_blocks.py" "$1/scripts/lib/codegen_blocks.py"
+    printf 'Handwritten\n<!-- generated:begin Sample -->\nstale\n<!-- generated:end -->\n' > "$1/system-knowhow/sample.md"
     git -C "$1" add -A
     git -C "$1" -c user.email=t@example.com -c user.name=t commit -q -m base
 }
@@ -54,6 +70,8 @@ while [ $# -gt 0 ]; do
 done
 mkdir -p "$out/crates/lucidos-app/src/generated"
 cp "$root/crates/lucidos-engine/src/lib.rs" "$out/crates/lucidos-app/src/generated/thread-event-wire.ts"
+mkdir -p "$out/.codegen"
+echo '{"schema_version":1,"documents":{"system-knowhow/sample.md":{"Sample":"\n`fresh`\n"}}}' > "$out/.codegen/knowhow-blocks.json"
 STUB
     chmod +x "$bin"
     {
@@ -88,6 +106,17 @@ expect_ne "a deleted input changes it" "$clean" "$(codegen_fingerprint "$R")"
 git -C "$R" checkout -q -- Cargo.lock
 expect_eq "the tree is back to its commit" "$clean" "$(codegen_fingerprint "$R")"
 
+echo "CLI dependency fingerprints"
+for crate in lucidos-cli lucidos-installs lucidos-update-address; do
+    mkdir -p "$R/crates/$crate/src"
+    echo 'pub fn flag() {}' > "$R/crates/$crate/src/lib.rs"
+    expect_ne "$crate changes the fingerprint" "$clean" "$(codegen_fingerprint "$R")"
+    rm "$R/crates/$crate/src/lib.rs"
+done
+mkdir -p "$R/packages/lucidos-sdk/src"
+echo 'export const lucidos = { added };' > "$R/packages/lucidos-sdk/src/index.ts"
+expect_ne "SDK exports change the fingerprint" "$clean" "$(codegen_fingerprint "$R")"
+rm "$R/packages/lucidos-sdk/src/index.ts"
 echo "render, cache and copy"
 BIN=$(new_stub_bin "$R" "$R/crates/lucidos-engine/src/lib.rs" "$R/Cargo.lock")
 : > "$TMP/sdk-log"
@@ -104,6 +133,16 @@ expect_eq "a hit leaves an unchanged file's mtime alone" "$before" "$after"
 echo 'stale' > "$R/$WIRE"
 codegen_main "$R" --cached-only 2>/dev/null
 expect_eq "a hit rewrites a changed file" "pub const A: u32 = 1;" "$(cat "$R/$WIRE")"
+sed -i.bak 's/Handwritten/Edited prose/' "$R/system-knowhow/sample.md"
+rm "$R/system-knowhow/sample.md.bak"
+prose=$(cat "$R/system-knowhow/sample.md")
+codegen_main "$R" --cached-only 2>/dev/null
+expect_eq "a cache hit preserves handwritten prose" "$prose" "$(cat "$R/system-knowhow/sample.md")"
+expect_eq "fragments never sync as ordinary outputs" "no" "$([ -e "$R/$CODEGEN_BLOCKS" ] && echo yes || echo no)"
+echo 'Missing markers' > "$R/system-knowhow/sample.md"
+expect_eq "a cache hit fails on missing markers" "1" "$(codegen_main "$R" --cached-only 2>/dev/null; echo $?)"
+expect_eq "a failed splice preserves the document" "Missing markers" "$(cat "$R/system-knowhow/sample.md")"
+printf '%s\n' "$prose" > "$R/system-knowhow/sample.md"
 
 echo "cached-only on a miss"
 echo 'pub const A: u32 = 3;' > "$R/crates/lucidos-engine/src/lib.rs"
@@ -138,11 +177,36 @@ expect_eq "git-dir paths are skipped and a relative path is read from the root" 
 touch "$TMP/test-bin"
 expect_eq "freshness-only ignores coverage" "0" \
     "$(codegen_check_inputs "$R" "$TMP/rustc.d" "$TMP/test-bin" --freshness-only 2>/dev/null; echo $?)"
-expect_eq "the test binary is read from cargo's output, anchored at the root" \
-    "/repo/target/debug/deps/lucidos_engine-abc123" \
-    "$(printf '%s\n' '   Compiling x' '     Running unittests src/lib.rs (target/debug/deps/lucidos_engine-abc123)' | codegen_test_binary /repo)"
-expect_eq "an absolute test binary stays as cargo printed it" "/t/debug/deps/lucidos_engine-abc123" \
-    "$(printf '%s\n' '     Running unittests src/lib.rs (/t/debug/deps/lucidos_engine-abc123)' | codegen_test_binary /repo)"
+mkdir -p "$R/crates/lucidos-engine/assets"
+printf '%s: %s\n' "$TMP/test-bin" "$R/crates/lucidos-engine/assets" > "$TMP/directory.d"
+touch "$TMP/test-bin"
+expect_eq "a declared source directory is a valid dependency" "0" \
+    "$(codegen_check_inputs "$R" "$TMP/directory.d" "$TMP/test-bin" 2>/dev/null; echo $?)"
+touch -t 200001010000 "$TMP/test-bin"
+expect_eq "a newer source directory fails freshness" "1" \
+    "$(codegen_check_inputs "$R" "$TMP/directory.d" "$TMP/test-bin" 2>/dev/null; echo $?)"
+rmdir "$R/crates/lucidos-engine/assets"
+touch "$TMP/test-bin"
+expect_eq "a missing source directory fails closed" "1" \
+    "$(codegen_check_inputs "$R" "$TMP/directory.d" "$TMP/test-bin" 2>/dev/null; echo $?)"
+echo "dependency artifacts"
+mkdir -p "$R/target/debug/deps"
+echo 'binary' > "$R/target/debug/deps/liblucidos_cli-abc.rlib"
+printf '%s: %s\n' "$R/target/debug/deps/liblucidos_cli-abc.rlib" "$R/crates/lucidos-engine/src/lib.rs" > "$R/target/debug/deps/lucidos_cli-abc.d"
+python3 - "$R" > "$TMP/artifacts.json" <<'PY'
+import json, sys
+root = sys.argv[1]
+print(json.dumps({'reason': 'compiler-artifact', 'package_id': 'path+file://' + root + '/crates/lucidos-cli#0.1',
+                  'filenames': [root + '/target/debug/deps/liblucidos_cli-abc.rlib']}))
+PY
+expect_eq "a dependency's dep-info is checked" "$R/target/debug/deps/lucidos_cli-abc.d" \
+    "$(codegen_artifacts "$R" "$TMP/artifacts.json" | cut -f1)"
+rm "$R/target/debug/deps/lucidos_cli-abc.d"
+expect_eq "missing dependency dep-info fails" "1" "$(codegen_artifacts "$R" "$TMP/artifacts.json" 2>/dev/null; echo $?)"
+: > "$TMP/empty.d"
+expect_eq "empty dep-info fails" "1" "$(codegen_check_inputs "$R" "$TMP/empty.d" "$BIN" 2>/dev/null; echo $?)"
+printf '# env-dep:EXAMPLE=value\n%s: %s\n' "$R/target/debug/x" "$R/Cargo.lock" > "$TMP/comments.d"
+expect_eq "rustc metadata comments are not paths" "Cargo.lock" "$(codegen_repo_inputs "$R" "$TMP/comments.d")"
 
 echo "a rendering already cached"
 BIN=$(new_stub_bin "$R" "$R/crates/lucidos-engine/src/lib.rs")
@@ -165,6 +229,25 @@ expect_eq "a bin older than an input it compiled is refused" "1" \
 expect_eq "a reused bin is not refused for its age" "0" \
     "$(codegen_main "$R" --reused-bin "$BIN" 2>/dev/null; echo $?)"
 git -C "$R" reset -q --hard
+
+echo "surface composition"
+mkdir -p "$TMP/surface/docs/generated"
+echo '{"tools":{"offered":["current"],"retired":["old"]}}' > "$TMP/surface/docs/generated/agent-surface.json"
+echo '{"name":"lucidos","commands":[{"name":"sample"}]}' > "$TMP/cli-fixture.json"
+(
+    source "$SCRIPT_DIR/codegen.sh"
+    codegen_writer() { cp "$TMP/cli-fixture.json" "$2/cli-surface.json"; }
+    codegen_cli_surface "$R" "$TMP/surface"
+)
+expect_eq "the CLI tree is combined" "lucidos" \
+    "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cli"]["name"])' "$TMP/surface/docs/generated/agent-surface.json")"
+expect_eq "retired names carry their classification on the same line" '    "retired": ["old"]' \
+    "$(sed -n '/"retired"/p' "$TMP/surface/docs/generated/agent-surface.json")"
+if [ -f "$TMP/surface/cli-surface.json" ]; then
+    fail "the intermediate CLI file was synced"
+else
+    pass "the intermediate CLI file is not synced"
+fi
 
 echo "prune"
 CACHE=$(codegen_cache_root "$R")

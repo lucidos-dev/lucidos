@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { apiRequest, assertHealthy, navigateToApp } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, hideDashboardRail } from './helpers';
 import {
   psql, git, WORKSPACE, cleanupCCThread, cleanupFileFromMain,
 } from './db-helpers';
@@ -122,6 +122,8 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_change_state', (
       await page.addInitScript((tid: string) => {
         localStorage.setItem('lucidos-focused-thread', tid);
       }, threadId);
+      // Diff folds before the picker, so keep the rail from squeezing the row.
+      await hideDashboardRail(page);
       await navigateToApp(page);
 
       // The banner renders (Archive is offered) but with no diff there is no
@@ -143,6 +145,8 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_change_state', (
       await page.addInitScript((tid: string) => {
         localStorage.setItem('lucidos-focused-thread', tid);
       }, threadId);
+      // Diff folds before the picker, so keep the rail from squeezing the row.
+      await hideDashboardRail(page);
       await navigateToApp(page);
 
       // No diff yet → no Diff affordance.
@@ -175,6 +179,8 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_change_state', (
       await page.addInitScript((tid: string) => {
         localStorage.setItem('lucidos-focused-thread', tid);
       }, threadId);
+      // Diff folds before the picker, so keep the rail from squeezing the row.
+      await hideDashboardRail(page);
       await navigateToApp(page);
 
       await expect(archiveButton(page)).toBeVisible({ timeout: 15_000 });

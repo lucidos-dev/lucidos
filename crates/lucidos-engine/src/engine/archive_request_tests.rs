@@ -314,6 +314,7 @@ async fn a_question_holds_the_request_until_the_turn_after_it_ends() {
         thread,
         ThreadEvent::UserQuestionAnswered {
             tool_use_id: "tu-1".into(),
+            quiet: false,
             answer: AnswerKind::FreeText {
                 text: "the first".into(),
                 image_hashes: vec![],

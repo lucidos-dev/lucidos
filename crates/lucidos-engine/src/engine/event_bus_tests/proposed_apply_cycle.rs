@@ -276,6 +276,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
             EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

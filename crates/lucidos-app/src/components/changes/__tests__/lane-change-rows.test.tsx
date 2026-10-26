@@ -21,7 +21,7 @@ vi.mock('../../../store/actions/laneControls', () => ({ removeFromLandingLane: r
 
 import { ChangesView } from '../ChangesView';
 import { getBannerActions, getWaitingState } from '../../chat/WaitingBanner';
-import { focusThread } from '../../../store/actions/threads';
+import { focusThreadOrBootstrap } from '../../../store/actions/threads';
 import {
   appliedChanges,
   changes,
@@ -114,7 +114,7 @@ describe('the Changes panel row', () => {
     expect(button.textContent).toBe('Lane thread');
     expect(button.disabled).toBe(false);
     button.click();
-    expect(focusThread).toHaveBeenCalledWith('lane-t');
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('lane-t');
   });
 
   it('reads "Waiting to land" while it waits, and Remove takes it out', () => {
@@ -140,20 +140,21 @@ describe("the thread's prompt row", () => {
     focusedThreadId.value = 't-batch';
     const state = getWaitingState();
     expect(state).toEqual({ type: 'landing', place: 'in-batch', laneThreadId: 'lane-t' });
-    const [member] = getBannerActions(state as Exclude<typeof state, null | { type: 'canceling' }>);
-    expect(member.label).toBe('Landing in a batch');
-    expect(member.disabledTooltip).toBeUndefined();
-    member.onClick?.(new MouseEvent('click'));
-    expect(focusThread).toHaveBeenCalledWith('lane-t');
+    const { face } = getBannerActions(state as Exclude<typeof state, null | { type: 'canceling' }>).slot;
+    expect(face.label).toBe('Landing');
+    expect(face.ariaLabel).toBe('Landing in a batch');
+    face.invoke?.();
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('lane-t');
   });
 
   it('waiting, shows the one disabled progress face', () => {
     focusedThreadId.value = 't-wait';
     const state = getWaitingState();
     expect(state).toMatchObject({ type: 'landing', place: 'waiting' });
-    const [member] = getBannerActions(state as Exclude<typeof state, null | { type: 'canceling' }>);
-    expect(member.label).toBe('Waiting to land');
-    expect(member.disabledTooltip).toBe('Waiting to land');
+    const { face } = getBannerActions(state as Exclude<typeof state, null | { type: 'canceling' }>).slot;
+    expect(face.label).toBe('Waiting');
+    expect(face.ariaLabel).toBe('Waiting to land');
+    expect(face.invoke).toBeNull();
   });
 
   it('outside the lane, offers Apply as before', () => {

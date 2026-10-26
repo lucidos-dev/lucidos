@@ -5,7 +5,7 @@
  * A pick on a started thread asks the engine whether it rebuilds a warm cache,
  * and asks the user before it does. A chat thread has no successor, so the
  * choice is Keep or Switch anyway. The engine records the pick, and refuses it
- * while a turn runs, when the pill is locked.
+ * while a turn runs, when the pill refuses every pick and step.
  */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -27,7 +27,7 @@ const served = (model: string, label: string, effort: string, on = true): Served
 
 /** The chat ladder: Haiku low and Opus medium and high on, Sonnet off. Read
  *  at call time, once the fallback model list has loaded. */
-const chatLadder = (): IntelligenceLadder => ({
+const servedChatLadder = (): IntelligenceLadder => ({
   surface: 'chat',
   source: 'test',
   estimated: '2026-10-16',
@@ -45,7 +45,7 @@ const chatLadder = (): IntelligenceLadder => ({
   ],
 });
 
-const getChatLadder = vi.fn(async () => chatLadder());
+const getChatLadder = vi.fn(async () => servedChatLadder());
 
 vi.mock('../../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client')>()),
@@ -68,7 +68,7 @@ const { RungControl } = await import('../RungControl');
 const { ConfirmDialog } = await import('../../shared/ConfirmDialog');
 const { controlMenuParts } = await import('../controlMenuParts');
 const {
-  confirmState, settleConfirm, threadMap, toasts, currentModel, chatModels,
+  confirmState, settleConfirm, threadMap, toasts, currentModel, chatModels, chatLadder,
 } = await import('../../../store/store');
 const { ApiError } = await import('../../../api/client');
 const { rungLockedReason } = await import('../rungControlParts');
@@ -85,8 +85,8 @@ const SONNET = idOf('Sonnet 5.5');
 
 beforeAll(() => controlMenuParts.preload());
 
-const REBUILD: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: true, extra_cost_usd: 0.42 };
-const KEEPS_CACHE: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: false, extra_cost_usd: null };
+const REBUILD: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: 'yes', extra_cost_usd: 0.42 };
+const KEEPS_CACHE: SwitchEstimate = { context_tokens: 300_000, rebuilds_cache: 'no', extra_cost_usd: null };
 
 let host: HTMLDivElement;
 
@@ -147,6 +147,8 @@ function renderControl(props: { threadId?: string; composeContext: boolean }): v
 beforeEach(() => {
   vi.clearAllMocks();
   currentModel.value = OPUS;
+  // A failed registry read is still an answer: the pill draws from the fallback list.
+  chatModels.value = { status: 'failed', error: 'test' };
   threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { channel: 'chat', status: 'idle', state: 'active' } })]]);
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -157,6 +159,8 @@ afterEach(() => {
   host.remove();
   settleConfirm(false);
   threadMap.value = new Map();
+  chatLadder.value = { status: 'not-loaded' };
+  chatModels.value = { status: 'not-loaded' };
   clearComposeSelection('d1');
   toasts.value = [];
 });
@@ -174,6 +178,61 @@ describe('the Lucidos Agent rung control', () => {
     await settle();
     expect(host.querySelector('.rung-pill .rung-name')!.textContent).toContain('Opus 5.5');
     expect(host.querySelectorAll('.rung-pill .rung-step')).toHaveLength(2);
+  });
+});
+
+describe('the shared chat ladder', () => {
+  it('is read from the store, so a control mounted after the load starts no fetch', async () => {
+    chatLadder.value = { status: 'loaded', data: servedChatLadder() };
+    renderControl({ threadId: 'd1', composeContext: true });
+    await settle();
+    expect(getChatLadder).not.toHaveBeenCalled();
+    expect(host.querySelector('.rung-pill .rung-name')!.textContent).toContain('Opus 5.5');
+  });
+
+  const pill = () => host.querySelector<HTMLElement>('.rung-pill')!;
+
+  it('keeps the pill unseen until the ladder and the registry have both answered', async () => {
+    chatLadder.value = { status: 'loading' };
+    chatModels.value = { status: 'loaded', data: [] };
+    renderControl({ threadId: 'd1', composeContext: true });
+    await settle();
+    expect(pill().hasAttribute('data-pending')).toBe(true);
+    expect(host.querySelector('.rung-name')).toBeNull();
+
+    chatLadder.value = { status: 'loaded', data: servedChatLadder() };
+    chatModels.value = { status: 'loading' };
+    await settle();
+    expect(pill().hasAttribute('data-pending')).toBe(true);
+  });
+
+  it('draws its face on the first render it is seen', async () => {
+    chatLadder.value = { status: 'loading' };
+    renderControl({ threadId: 'd1', composeContext: true });
+    await settle();
+    expect(pill().hasAttribute('data-pending')).toBe(true);
+
+    chatLadder.value = { status: 'loaded', data: servedChatLadder() };
+    await settle();
+    expect(pill().hasAttribute('data-pending')).toBe(false);
+    expect(host.querySelector('.rung-name')!.textContent).toContain('Opus 5.5');
+  });
+
+  it('still draws the pill when the ladder read failed, and retries once on mount', async () => {
+    chatLadder.value = { status: 'failed', error: 'nope' };
+    getChatLadder.mockRejectedValue(new Error('still down'));
+    renderControl({ threadId: 'd1', composeContext: true });
+    await settle();
+    expect(getChatLadder).toHaveBeenCalledTimes(1);
+    expect(host.querySelector('.rung-pill .rung-name')!.textContent).toContain('Opus 5.5');
+  });
+
+  it('recovers the ladder on a mount after a failed read', async () => {
+    chatLadder.value = { status: 'failed', error: 'nope' };
+    getChatLadder.mockResolvedValue(servedChatLadder());
+    renderControl({ threadId: 'd1', composeContext: true });
+    await settle();
+    expect(chatLadder.value.status).toBe('loaded');
   });
 });
 
@@ -211,7 +270,7 @@ describe('a pick on a started thread', () => {
     const dialog = document.querySelector('.confirm-dialog')!.textContent!;
     expect(dialog).toContain('about $0.42');
     expect(dialog).not.toMatch(/slow/i);
-    expect(dialog).not.toMatch(/hand off|new thread/i);
+    expect(dialog).not.toMatch(/hand off|fresh session/i);
     expect(recordedModel(), 'nothing is picked before an answer').toBeUndefined();
   });
 
@@ -286,29 +345,28 @@ describe('a pick on a started thread', () => {
 
 describe('a started thread while a turn runs', () => {
   for (const status of ['running', 'waiting_for_user_answer', 'paused'] as const) {
-    it(`locks the pill while ${status}: every part says why and records nothing`, async () => {
+    it(`opens the list while ${status}, but a pick or a step says why and records nothing`, async () => {
       setStatus(status);
       renderControl({ threadId: 't1', composeContext: false });
       await settle();
-      const pill = host.querySelector('.rung-pill')!;
-      expect(pill.hasAttribute('data-locked')).toBe(true);
-      for (const part of Array.from(pill.querySelectorAll<HTMLElement>('button'))) {
+      const trigger = host.querySelector<HTMLElement>('.rung-trigger')!;
+      expect(trigger.hasAttribute('aria-disabled')).toBe(false);
+
+      await pickHaiku();
+      expect(toasts.value.map(t => t.message)).toContain(LOCKED);
+
+      const steps = host.querySelectorAll<HTMLElement>('.rung-step:not([aria-disabled="true"])');
+      expect(steps.length).toBeGreaterThan(0);
+      for (const step of Array.from(steps)) {
         toasts.value = [];
-        part.click();
+        step.click();
         await settle();
-        expect(toasts.value.map(t => t.message), part.className).toContain(LOCKED);
+        expect(toasts.value.map(t => t.message)).toContain(LOCKED);
       }
-      expect(document.querySelector('.control-option'), 'the list stays shut').toBeNull();
       expect(fetchSwitchEstimate).not.toHaveBeenCalled();
       expect(recordChatSettings).not.toHaveBeenCalled();
     });
   }
-
-  it('leaves a draft\'s pill unlocked', async () => {
-    renderControl({ threadId: 'd1', composeContext: true });
-    await settle();
-    expect(host.querySelector('.rung-pill')!.hasAttribute('data-locked')).toBe(false);
-  });
 });
 
 const ALL_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];

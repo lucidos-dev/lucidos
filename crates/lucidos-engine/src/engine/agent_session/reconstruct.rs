@@ -414,6 +414,7 @@ mod tests {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
         )
         .await;
@@ -475,6 +476,7 @@ mod tests {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
         )
         .await;

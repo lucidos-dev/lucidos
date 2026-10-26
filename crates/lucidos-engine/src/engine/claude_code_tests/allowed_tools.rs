@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn cc_allowed_tools_seeds_empty_default_file_on_first_use() {
+fn cc_allowed_tools_seeds_the_file_and_allows_only_engine_tools_on_first_use() {
     let dir = tempfile::tempdir().unwrap();
     let file = GrantFile::CodingAgentTools;
     let path = dir.path().join(file.file_name());
@@ -9,31 +9,94 @@ fn cc_allowed_tools_seeds_empty_default_file_on_first_use() {
 
     let result = cc_allowed_tools(dir.path());
 
-    assert_eq!(result, "", "default allowlist must be empty");
+    assert_eq!(
+        result,
+        ENGINE_ALLOWED_TOOLS.join(","),
+        "a workspace with no grants allows only the engine's own tools"
+    );
     assert!(path.exists(), "seed file should have been written");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), file.header());
 }
 
-/// Codex backend tools (raised by the app-server approval bridge) must never
-/// derive a PERSISTED pattern: `cc-allowed-tools` only reaches Claude Code's
-/// `--allowedTools`; no Codex driver reads it, so persisting
-/// `command_execution` would claim a suppression nothing enforces.
+/// A Codex command persists Claude Code's own lines, `Bash` and
+/// `Bash(<head>:*)`, read from the unwrapped command (ADR 0571). A
+/// `file_change` derives no persisted line at all.
 #[test]
-fn derive_allow_pattern_codex_tools_have_no_persisted_scopes() {
-    let cmd_input = serde_json::json!({ "command": "git push", "cwd": "/wt" });
+fn derive_allow_pattern_codex_persists_claude_codes_bash_lines() {
+    let cmd_input = serde_json::json!({ "command": "/bin/zsh -lc 'git push'", "cwd": "/wt" });
     let fc_input = serde_json::json!({ "reason": "writes outside worktree" });
+    assert_eq!(
+        derive_allow_pattern(
+            "command_execution",
+            &cmd_input,
+            AllowScope::Broad,
+            &TrustedHeads::NONE
+        )
+        .as_deref(),
+        Some("Bash")
+    );
+    assert_eq!(
+        derive_allow_pattern(
+            "command_execution",
+            &cmd_input,
+            AllowScope::Narrow,
+            &TrustedHeads::NONE
+        )
+        .as_deref(),
+        Some("Bash(git:*)")
+    );
+    // Claude Code's protected-path rule follows the line it persists.
+    let hook = serde_json::json!({ "command": "/bin/zsh -lc 'echo x > .git/hooks/pre-commit'" });
     for scope in [AllowScope::Broad, AllowScope::Narrow] {
         assert_eq!(
-            derive_allow_pattern("command_execution", &cmd_input, scope),
-            None,
-            "{scope:?} must not persist a codex command pattern"
+            derive_allow_pattern("command_execution", &hook, scope, &TrustedHeads::NONE),
+            None
         );
+    }
+    for scope in [AllowScope::Broad, AllowScope::Narrow] {
         assert_eq!(
-            derive_allow_pattern("file_change", &fc_input, scope),
+            derive_allow_pattern("file_change", &fc_input, scope, &TrustedHeads::NONE),
             None,
             "{scope:?} must not persist a codex file-change pattern"
         );
     }
+}
+
+/// The card names the head that carded, not a read before it. The click
+/// stores that head, and the stored line covers the same command next time.
+#[test]
+fn a_compound_read_derives_the_head_the_fast_path_does_not_settle() {
+    let command = "/bin/zsh -lc 'cat data/pid; ps -p 1; rg --files docs; \
+                   gh run rerun 4 --repo example-org/example-repo'";
+    let input = serde_json::json!({ "command": command, "cwd": "/wt" });
+    assert_eq!(
+        command_grant_head(&input, &TrustedHeads::NONE).as_deref(),
+        Some("gh")
+    );
+    let narrow = derive_allow_pattern(
+        "command_execution",
+        &input,
+        AllowScope::Narrow,
+        &TrustedHeads::NONE,
+    );
+    assert_eq!(narrow.as_deref(), Some("Bash(gh:*)"));
+    let stored = narrow.unwrap();
+    assert!(crate::engine::command_guard::grant_covers_command(
+        "Bash",
+        command,
+        crate::engine::command_guard::CommandSite::TextOnly { root: None },
+        &crate::engine::command_guard::TrustedHeads::NONE,
+        |p| p == stored
+    ));
+    // Every segment Safe: the first head, as before.
+    let reads = serde_json::json!({ "command": "cat a; ls" });
+    assert_eq!(
+        command_grant_head(&reads, &TrustedHeads::NONE).as_deref(),
+        Some("cat")
+    );
+    // The head that carded runs its arguments, so no click can grant it.
+    let wrapped = serde_json::json!({ "command": "cat a; timeout 5 curl https://example.com" });
+    assert_eq!(command_grant_head(&wrapped, &TrustedHeads::NONE), None);
 }
 
 /// Session scope for codex commands is head-scoped, exactly like Bash. The
@@ -43,14 +106,26 @@ fn derive_allow_pattern_codex_tools_have_no_persisted_scopes() {
 fn derive_allow_pattern_codex_command_session_is_head_scoped() {
     let input = serde_json::json!({ "command": "git push origin main", "cwd": "/wt" });
     assert_eq!(
-        derive_allow_pattern("command_execution", &input, AllowScope::Session).as_deref(),
+        derive_allow_pattern(
+            "command_execution",
+            &input,
+            AllowScope::Session,
+            &TrustedHeads::NONE
+        )
+        .as_deref(),
         Some("command_execution(git:*)"),
     );
     // A DIFFERENT head must produce a different pattern. That is the whole
     // point of the scoping.
     let rm = serde_json::json!({ "command": "rm -rf /tmp/x" });
     assert_eq!(
-        derive_allow_pattern("command_execution", &rm, AllowScope::Session).as_deref(),
+        derive_allow_pattern(
+            "command_execution",
+            &rm,
+            AllowScope::Session,
+            &TrustedHeads::NONE
+        )
+        .as_deref(),
         Some("command_execution(rm:*)"),
     );
 }
@@ -66,7 +141,8 @@ fn derive_allow_pattern_codex_command_session_reads_inside_the_wrapper() {
         derive_allow_pattern(
             "command_execution",
             &wrapped("git status --short"),
-            AllowScope::Session
+            AllowScope::Session,
+            &TrustedHeads::NONE
         )
         .as_deref(),
         Some("command_execution(git:*)"),
@@ -75,16 +151,77 @@ fn derive_allow_pattern_codex_command_session_reads_inside_the_wrapper() {
         derive_allow_pattern(
             "command_execution",
             &wrapped("rm -rf /tmp/x"),
-            AllowScope::Session
+            AllowScope::Session,
+            &TrustedHeads::NONE
         )
         .as_deref(),
         Some("command_execution(rm:*)"),
     );
     // The same holds for a Claude Code `Bash` command carrying a wrapper.
     assert_eq!(
-        derive_allow_pattern("Bash", &wrapped("cargo test"), AllowScope::Narrow).as_deref(),
+        derive_allow_pattern(
+            "Bash",
+            &wrapped("cargo test"),
+            AllowScope::Narrow,
+            &TrustedHeads::NONE
+        )
+        .as_deref(),
         Some("Bash(cargo:*)"),
     );
+}
+
+/// A second shell inside Codex's wrapper names the real command, never `bash`.
+/// A line that runs its arguments through a shell derives nothing at all.
+#[test]
+fn derive_allow_pattern_reads_through_a_nested_shell_and_never_stores_one() {
+    let nested = serde_json::json!({ "command": "/bin/zsh -lc \"bash -c 'git push'\"" });
+    let opaque = serde_json::json!({ "command": "/bin/zsh -lc 'bash x.sh'" });
+    for tool in ["Bash", "command_execution"] {
+        assert_eq!(
+            derive_allow_pattern(tool, &nested, AllowScope::Narrow, &TrustedHeads::NONE).as_deref(),
+            Some("Bash(git:*)"),
+            "{tool}"
+        );
+        for scope in [AllowScope::Narrow, AllowScope::Session] {
+            assert_eq!(
+                derive_allow_pattern(tool, &opaque, scope, &TrustedHeads::NONE),
+                None,
+                "{tool} {scope:?}"
+            );
+        }
+    }
+}
+
+/// Claude Code prefix-matches `--allowedTools` itself, so a line naming a
+/// shell or an exec wrapper would skip its card for any wrapped command.
+#[test]
+fn cc_allowed_tools_drops_a_line_that_names_a_shell_or_an_exec_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = GrantFile::CodingAgentTools;
+    let lines = "Bash\nBash(git:*)\nBash(bash:*)\nBash(zsh:*)\nBash(timeout:*)\nRead\n\
+                 Bash(/bin/bash:*)\nBash(\\bash:*)\nBash(sudo rm:*)\nBash(eval:*)\nBash(env)\n";
+    std::fs::write(dir.path().join(file.file_name()), lines).unwrap();
+
+    let result = cc_allowed_tools(dir.path());
+
+    let mut want = ENGINE_ALLOWED_TOOLS.to_vec();
+    want.extend(["Bash", "Bash(git:*)", "Read"]);
+    assert_eq!(result, want.join(","));
+}
+
+/// A path line is the engine's to check: Claude Code would prefix-match it
+/// with no trust check (ADR 0571).
+#[test]
+fn cc_allowed_tools_drops_a_path_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = GrantFile::CodingAgentTools;
+    let lines = "Bash(./scripts/check.sh:*)\nBash(scripts/check.sh:*)\nBash(/tmp/x.sh:*)\n\
+                 Bash(check.sh:*)\nBash(git:*)\n";
+    std::fs::write(dir.path().join(file.file_name()), lines).unwrap();
+
+    let mut want = ENGINE_ALLOWED_TOOLS.to_vec();
+    want.extend(["Bash(check.sh:*)", "Bash(git:*)"]);
+    assert_eq!(cc_allowed_tools(dir.path()), want.join(","));
 }
 
 /// A command running nothing derivable gets NO session pattern. The bare-name
@@ -95,7 +232,7 @@ fn derive_allow_pattern_command_with_no_head_has_no_session_pattern() {
         let input = serde_json::json!({ "command": command });
         for tool in ["Bash", "command_execution"] {
             assert_eq!(
-                derive_allow_pattern(tool, &input, AllowScope::Session),
+                derive_allow_pattern(tool, &input, AllowScope::Session, &TrustedHeads::NONE),
                 None,
                 "{tool} {command:?}"
             );
@@ -110,7 +247,12 @@ fn derive_allow_pattern_command_with_no_head_has_no_session_pattern() {
 fn derive_allow_pattern_codex_file_change_has_no_session_pattern() {
     let input = serde_json::json!({ "reason": "writes outside worktree", "grant_root": "/etc" });
     assert_eq!(
-        derive_allow_pattern("file_change", &input, AllowScope::Session),
+        derive_allow_pattern(
+            "file_change",
+            &input,
+            AllowScope::Session,
+            &TrustedHeads::NONE
+        ),
         None,
     );
 }
@@ -119,7 +261,7 @@ fn derive_allow_pattern_codex_file_change_has_no_session_pattern() {
 fn derive_allow_pattern_skill_narrow_uses_plugin_glob() {
     let input = serde_json::json!({ "skill": "code-review:code-review" });
     assert_eq!(
-        derive_allow_pattern("Skill", &input, AllowScope::Narrow).as_deref(),
+        derive_allow_pattern("Skill", &input, AllowScope::Narrow, &TrustedHeads::NONE).as_deref(),
         Some("Skill(code-review:*)"),
     );
 }
@@ -128,7 +270,7 @@ fn derive_allow_pattern_skill_narrow_uses_plugin_glob() {
 fn derive_allow_pattern_skill_narrow_with_no_colon_uses_full_name() {
     let input = serde_json::json!({ "skill": "loop" });
     assert_eq!(
-        derive_allow_pattern("Skill", &input, AllowScope::Narrow).as_deref(),
+        derive_allow_pattern("Skill", &input, AllowScope::Narrow, &TrustedHeads::NONE).as_deref(),
         Some("Skill(loop:*)"),
     );
 }
@@ -137,7 +279,7 @@ fn derive_allow_pattern_skill_narrow_with_no_colon_uses_full_name() {
 fn derive_allow_pattern_skill_broad_returns_bare_tool_name() {
     let input = serde_json::json!({ "skill": "code-review:code-review" });
     assert_eq!(
-        derive_allow_pattern("Skill", &input, AllowScope::Broad).as_deref(),
+        derive_allow_pattern("Skill", &input, AllowScope::Broad, &TrustedHeads::NONE).as_deref(),
         Some("Skill"),
     );
 }
@@ -146,7 +288,7 @@ fn derive_allow_pattern_skill_broad_returns_bare_tool_name() {
 fn derive_allow_pattern_bash_narrow_uses_the_command_head() {
     let input = serde_json::json!({ "command": "git status --short" });
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Narrow).as_deref(),
+        derive_allow_pattern("Bash", &input, AllowScope::Narrow, &TrustedHeads::NONE).as_deref(),
         Some("Bash(git:*)"),
     );
 }
@@ -155,7 +297,7 @@ fn derive_allow_pattern_bash_narrow_uses_the_command_head() {
 fn derive_allow_pattern_bash_broad_returns_bare_tool_name() {
     let input = serde_json::json!({ "command": "ls" });
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Broad).as_deref(),
+        derive_allow_pattern("Bash", &input, AllowScope::Broad, &TrustedHeads::NONE).as_deref(),
         Some("Bash"),
     );
 }
@@ -164,7 +306,7 @@ fn derive_allow_pattern_bash_broad_returns_bare_tool_name() {
 fn derive_allow_pattern_other_tool_narrow_returns_none() {
     let input = serde_json::json!({ "file_path": "/tmp/x" });
     assert_eq!(
-        derive_allow_pattern("Read", &input, AllowScope::Narrow),
+        derive_allow_pattern("Read", &input, AllowScope::Narrow, &TrustedHeads::NONE),
         None
     );
 }
@@ -173,7 +315,7 @@ fn derive_allow_pattern_other_tool_narrow_returns_none() {
 fn derive_allow_pattern_other_tool_broad_returns_bare_name() {
     let input = serde_json::json!({});
     assert_eq!(
-        derive_allow_pattern("Read", &input, AllowScope::Broad).as_deref(),
+        derive_allow_pattern("Read", &input, AllowScope::Broad, &TrustedHeads::NONE).as_deref(),
         Some("Read"),
     );
 }
@@ -182,7 +324,7 @@ fn derive_allow_pattern_other_tool_broad_returns_bare_name() {
 fn derive_allow_pattern_skill_missing_input_returns_none() {
     let input = serde_json::json!({});
     assert_eq!(
-        derive_allow_pattern("Skill", &input, AllowScope::Narrow),
+        derive_allow_pattern("Skill", &input, AllowScope::Narrow, &TrustedHeads::NONE),
         None
     );
 }
@@ -198,17 +340,22 @@ fn derive_allow_pattern_skill_missing_input_returns_none() {
 fn derive_allow_pattern_broad_returns_none_for_acceptedits_routed_tools() {
     let input = serde_json::json!({"file_path": "/x", "old_string": "a", "new_string": "b"});
     assert_eq!(
-        derive_allow_pattern("Edit", &input, AllowScope::Broad),
+        derive_allow_pattern("Edit", &input, AllowScope::Broad, &TrustedHeads::NONE),
         None,
         "broad Edit must be suppressed — bare entry doesn't bypass acceptEdits routing"
     );
     assert_eq!(
-        derive_allow_pattern("Write", &input, AllowScope::Broad),
+        derive_allow_pattern("Write", &input, AllowScope::Broad, &TrustedHeads::NONE),
         None,
         "broad Write must be suppressed for the same reason"
     );
     assert_eq!(
-        derive_allow_pattern("NotebookEdit", &input, AllowScope::Broad),
+        derive_allow_pattern(
+            "NotebookEdit",
+            &input,
+            AllowScope::Broad,
+            &TrustedHeads::NONE
+        ),
         None,
         "broad NotebookEdit must be suppressed for the same reason"
     );
@@ -223,7 +370,12 @@ fn derive_allow_pattern_broad_returns_none_for_acceptedits_routed_tools() {
 fn derive_allow_pattern_broad_returns_none_for_exit_plan_mode() {
     let input = serde_json::json!({ "plan": "Step 1: do thing" });
     assert_eq!(
-        derive_allow_pattern("ExitPlanMode", &input, AllowScope::Broad),
+        derive_allow_pattern(
+            "ExitPlanMode",
+            &input,
+            AllowScope::Broad,
+            &TrustedHeads::NONE
+        ),
         None,
         "broad ExitPlanMode must be suppressed — CC always prompts for plan approval"
     );
@@ -236,15 +388,20 @@ fn derive_allow_pattern_broad_returns_none_for_exit_plan_mode() {
 fn derive_allow_pattern_narrow_remains_none_for_path_tools() {
     let input = serde_json::json!({"file_path": "/x"});
     assert_eq!(
-        derive_allow_pattern("Edit", &input, AllowScope::Narrow),
+        derive_allow_pattern("Edit", &input, AllowScope::Narrow, &TrustedHeads::NONE),
         None
     );
     assert_eq!(
-        derive_allow_pattern("Write", &input, AllowScope::Narrow),
+        derive_allow_pattern("Write", &input, AllowScope::Narrow, &TrustedHeads::NONE),
         None
     );
     assert_eq!(
-        derive_allow_pattern("NotebookEdit", &input, AllowScope::Narrow),
+        derive_allow_pattern(
+            "NotebookEdit",
+            &input,
+            AllowScope::Narrow,
+            &TrustedHeads::NONE
+        ),
         None
     );
 }
@@ -322,7 +479,7 @@ fn derive_allow_pattern_broad_returns_none_when_bash_command_touches_dot_claude(
         "command": "rm -rf /Users/me/.claude/skills/grill"
     });
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Broad),
+        derive_allow_pattern("Bash", &input, AllowScope::Broad, &TrustedHeads::NONE),
         None,
         "broad Bash must be suppressed for `.claude/` commands — CC routes them through the prompt regardless of --allowedTools"
     );
@@ -334,7 +491,7 @@ fn derive_allow_pattern_narrow_returns_none_when_bash_command_touches_dot_claude
         "command": "rm -rf /Users/me/.claude/skills/grill"
     });
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Narrow),
+        derive_allow_pattern("Bash", &input, AllowScope::Narrow, &TrustedHeads::NONE),
         None,
         "narrow Bash(rm:*) must be suppressed for `.claude/` commands — same reason as broad"
     );
@@ -344,7 +501,7 @@ fn derive_allow_pattern_narrow_returns_none_when_bash_command_touches_dot_claude
 fn derive_allow_pattern_narrow_returns_none_when_bash_command_touches_dot_git() {
     let input = serde_json::json!({"command": "git push --force HEAD:.git/refs/heads/x"});
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Narrow),
+        derive_allow_pattern("Bash", &input, AllowScope::Narrow, &TrustedHeads::NONE),
         None,
     );
 }
@@ -358,7 +515,7 @@ fn derive_allow_pattern_session_unaffected_by_protected_path() {
         "command": "rm -rf /Users/me/.claude/skills/grill"
     });
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Session).as_deref(),
+        derive_allow_pattern("Bash", &input, AllowScope::Session, &TrustedHeads::NONE).as_deref(),
         Some("Bash(rm:*)"),
         "session scope must remain Some — engine-side intercept bypasses CC's protected-path routing"
     );
@@ -370,11 +527,11 @@ fn derive_allow_pattern_broad_unaffected_for_unrelated_bash_command() {
     // legitimate Broad/Narrow grants for ordinary commands.
     let input = serde_json::json!({"command": "git status"});
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Broad).as_deref(),
+        derive_allow_pattern("Bash", &input, AllowScope::Broad, &TrustedHeads::NONE).as_deref(),
         Some("Bash"),
     );
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Narrow).as_deref(),
+        derive_allow_pattern("Bash", &input, AllowScope::Narrow, &TrustedHeads::NONE).as_deref(),
         Some("Bash(git:*)"),
     );
 }
@@ -387,7 +544,7 @@ fn derive_allow_pattern_session_edit_uses_per_file_scope() {
         "new_string": "y",
     });
     assert_eq!(
-        derive_allow_pattern("Edit", &input, AllowScope::Session).as_deref(),
+        derive_allow_pattern("Edit", &input, AllowScope::Session, &TrustedHeads::NONE).as_deref(),
         Some("Edit(/Users/me/repo/.claude/commands/harden.md)"),
     );
 }
@@ -399,7 +556,7 @@ fn derive_allow_pattern_session_write_uses_per_file_scope() {
         "content": "hello",
     });
     assert_eq!(
-        derive_allow_pattern("Write", &input, AllowScope::Session).as_deref(),
+        derive_allow_pattern("Write", &input, AllowScope::Session, &TrustedHeads::NONE).as_deref(),
         Some("Write(/tmp/new.txt)"),
     );
 }
@@ -411,7 +568,13 @@ fn derive_allow_pattern_session_notebookedit_uses_notebook_path() {
         "new_source": "print(1)",
     });
     assert_eq!(
-        derive_allow_pattern("NotebookEdit", &input, AllowScope::Session).as_deref(),
+        derive_allow_pattern(
+            "NotebookEdit",
+            &input,
+            AllowScope::Session,
+            &TrustedHeads::NONE
+        )
+        .as_deref(),
         Some("NotebookEdit(/tmp/nb.ipynb)"),
     );
 }
@@ -423,8 +586,8 @@ fn derive_allow_pattern_session_two_edits_to_same_file_match() {
     let a = serde_json::json!({"file_path": "/x", "old_string": "a", "new_string": "b"});
     let b = serde_json::json!({"file_path": "/x", "old_string": "c", "new_string": "d"});
     assert_eq!(
-        derive_allow_pattern("Edit", &a, AllowScope::Session),
-        derive_allow_pattern("Edit", &b, AllowScope::Session),
+        derive_allow_pattern("Edit", &a, AllowScope::Session, &TrustedHeads::NONE),
+        derive_allow_pattern("Edit", &b, AllowScope::Session, &TrustedHeads::NONE),
     );
 }
 
@@ -432,7 +595,7 @@ fn derive_allow_pattern_session_two_edits_to_same_file_match() {
 fn derive_allow_pattern_session_edit_missing_path_returns_none() {
     let input = serde_json::json!({"old_string": "x"});
     assert_eq!(
-        derive_allow_pattern("Edit", &input, AllowScope::Session),
+        derive_allow_pattern("Edit", &input, AllowScope::Session, &TrustedHeads::NONE),
         None
     );
 }
@@ -441,7 +604,7 @@ fn derive_allow_pattern_session_edit_missing_path_returns_none() {
 fn derive_allow_pattern_session_bash_reuses_narrow_pattern() {
     let input = serde_json::json!({"command": "git push origin main"});
     assert_eq!(
-        derive_allow_pattern("Bash", &input, AllowScope::Session).as_deref(),
+        derive_allow_pattern("Bash", &input, AllowScope::Session, &TrustedHeads::NONE).as_deref(),
         Some("Bash(git:*)"),
     );
 }
@@ -450,7 +613,7 @@ fn derive_allow_pattern_session_bash_reuses_narrow_pattern() {
 fn derive_allow_pattern_session_skill_reuses_narrow_pattern() {
     let input = serde_json::json!({"skill": "superpowers:test-driven-development"});
     assert_eq!(
-        derive_allow_pattern("Skill", &input, AllowScope::Session).as_deref(),
+        derive_allow_pattern("Skill", &input, AllowScope::Session, &TrustedHeads::NONE).as_deref(),
         Some("Skill(superpowers:*)"),
     );
 }
@@ -462,7 +625,7 @@ fn derive_allow_pattern_session_skill_reuses_narrow_pattern() {
 fn derive_allow_pattern_session_other_tool_falls_back_to_bare_name() {
     let input = serde_json::json!({"pattern": "foo"});
     assert_eq!(
-        derive_allow_pattern("Read", &input, AllowScope::Session).as_deref(),
+        derive_allow_pattern("Read", &input, AllowScope::Session, &TrustedHeads::NONE).as_deref(),
         Some("Read"),
     );
 }
@@ -481,6 +644,9 @@ fn cc_allowed_tools_parses_user_file_strips_comments_and_blanks() {
 
     assert_eq!(
         cc_allowed_tools(dir.path()),
-        "Bash,Read,Edit,Skill(superpowers:*)",
+        format!(
+            "{},Bash,Read,Edit,Skill(superpowers:*)",
+            ENGINE_ALLOWED_TOOLS.join(",")
+        ),
     );
 }

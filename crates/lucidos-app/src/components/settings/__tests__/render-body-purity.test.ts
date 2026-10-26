@@ -36,5 +36,7 @@ describe('SettingsView render-body purity', () => {
     expect(loadDevices).not.toHaveBeenCalled();
     expect(loadCredentials).not.toHaveBeenCalled();
     expect(loadOAuthAccounts).not.toHaveBeenCalled();
-  });
+    // The cold import of the whole settings graph is the slow part, and on a
+    // loaded host it alone outlasts the 5 s default.
+  }, 30_000);
 });

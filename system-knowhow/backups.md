@@ -52,10 +52,10 @@ The schedule, provider, and retention are ordinary agent-settable preferences:
 |---|---|---|
 | `backup_schedule` | a 6-field cron, or `off` | When automatic backups run (user's timezone). `off` disables them. |
 | `backup_provider` | `google_drive` \| `dropbox` | Where to upload. Independent of `backup_schedule`: a destination stays configured with the schedule `off`, and the Backup page opens on it. The account itself is connected in **Settings → Accounts**, not here. |
-| `backup_retention` | `1`–`50` | How many recent backups to keep; older ones are pruned after each success. |
+| `backup_retention` | `1`–`1000` | How many recent backups to keep; older ones are pruned after each success. The UI dropdown offers 1, 3, 5, 10, 20 and 50. |
 
-Set them with `set_preference`, for example `set_preference(key="backup_schedule",
-value="0 0 3 * * *")` then `set_preference(key="backup_provider",
+Set them with `preferences(action="set")`, for example `preferences(action="set", key="backup_schedule",
+value="0 0 3 * * *")` then `preferences(action="set", key="backup_provider",
 value="google_drive")`. The schedule re-registers immediately, with no restart.
 With no connected account, scheduled backups still run but the upload fails.
 
@@ -74,7 +74,7 @@ this flow goes wrong:
 
 | What | Where | What lives there |
 |---|---|---|
-| **The backup itself** | Settings → System → Backup | Provider dropdown, *Back up now*, the schedule, retention, the backup key (set up, verify, rotate), and a health card (last run, last cloud backup, staleness). The dropdown opens on the configured `backup_provider` and **writes** it: picking one there is the same act as `set_preference(key="backup_provider", …)`. |
+| **The backup itself** | Settings → System → Backup | Provider dropdown, *Back up now*, the schedule, retention, the backup key (set up, verify, rotate), and a health card (last run, last cloud backup, staleness). The dropdown opens on the configured `backup_provider` and **writes** it: picking one there is the same act as `preferences(action="set", key="backup_provider", …)`. |
 | **The provider account** | **Settings → Accounts** | The *Connected accounts* list. This is the ONLY place a Google / Dropbox account is connected, and the only place its OAuth app registration is stored. |
 
 The Backup page has no account UI. When the selected provider has no connected
@@ -163,7 +163,7 @@ stores the backup key, so nothing on this machine can open a backup.
   (`age1…`), with no paste-back. That step never takes the backup key itself.
 - **Finding the public key.** Once set up, Settings → System → Backup shows the
   workspace's public key under Backup key, with Copy. So the user can seal a
-  second workspace to the same backup key. For a key made with the `age` tool,
+  second workspace to the same backup key. For a key made with the `age` utility,
   `age-keygen -y key.txt` prints it.
 - **Not set up.** With no backup key, a scheduled backup skips and the user gets
   a "Backups are not set up" notice. A manual backup is refused with the same

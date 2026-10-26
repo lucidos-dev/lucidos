@@ -15,14 +15,14 @@ own steps, such as how it records an approval, stay outside the block.
 **Plan approval.** Before you ask for approval, run
 `lucidos successor offer --at plan-approval --ask --progress 0/<phases>`, where
 `<phases>` counts the plan's phases. Ask with your question tool, in the card
-shape it prints. The option to stay is `Approve here`. With no new-thread
+shape it prints. The option to stay is `Approve here`. With no fresh-session
 option, the floor is `Approve` / `Request changes`, and a real fork takes the
 second slot. A re-plan runs this checkpoint again before it asks again.
 
-**A new-thread pick.** It approves the plan: record the approval as this
-repository does. Then run `lucidos successor spawn --build-chain --narrative
-<file>` with the flags the checkpoint printed. The narrative names the plan's
-path, says the user approved it, and quotes the phase checkpoint below.
+**A fresh-session pick.** It approves the plan: record the approval as this
+repository does. Then run `lucidos successor start --narrative <file>` with
+the flags the checkpoint printed, and end your turn. The narrative names the
+plan's path, says the user approved it, and quotes the phase checkpoint below.
 
 **Phase commit.** After you commit a phase that another phase follows, run
 `lucidos successor offer --at phase-commit --progress <done>/<phases>`, where

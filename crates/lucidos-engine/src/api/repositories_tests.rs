@@ -525,6 +525,7 @@ async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uui
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta(),
     })

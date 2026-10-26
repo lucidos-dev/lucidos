@@ -65,6 +65,15 @@ impl AuxCapture {
         .await
     }
 
+    /// Send one *prefill beat* and record what it cost.
+    pub(crate) async fn prefill<P: LlmProvider + ?Sized>(
+        &self,
+        provider: &P,
+        body: &crate::llm::prefill::PrefillBody,
+    ) -> Result<LlmResponse, BoxError> {
+        metered::prefill(self, provider, body).await
+    }
+
     /// Ask one typed judgment and record what it cost.
     pub(crate) async fn judge<J: JudgmentProvider + ?Sized>(
         &self,
@@ -288,6 +297,7 @@ impl Drop for TurnCapture {
             stable_prefix_fingerprint: None,
             ttft_ms: report.detail.ttft_ms,
             request_id: report.detail.request_id,
+            session: None,
         };
         runtime.spawn(async move {
             bus.emit_or_log(

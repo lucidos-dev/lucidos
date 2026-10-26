@@ -102,6 +102,10 @@ function isSized(className: string): boolean {
   return sized;
 }
 
+/** Classes a markdown surface wears that are not a wrapper of its own.
+ *  `authored-html` contains layout and sets no type (host-components.css). */
+const NOT_A_WRAPPER = new Set(['markdown-content', 'authored-html']);
+
 describe('a markdown surface names its own font size', () => {
   it('finds the surfaces to check', () => {
     // A rename that breaks the scan must fail here rather than pass vacuously.
@@ -121,10 +125,11 @@ describe('a markdown surface names its own font size', () => {
 
   it('sizes every surface that wraps markdown in a class of its own', () => {
     const unsized = markdownSurfaces()
+      .map(s => ({ ...s, wrappers: s.classes.filter(c => !NOT_A_WRAPPER.has(c)) }))
       // A bare `markdown-content` has no wrapper to size and inherits from its
       // container, which no source scan can resolve. Exempt on purpose.
-      .filter(s => s.classes.length > 1)
-      .filter(s => !s.classes.some(c => c !== 'markdown-content' && isSized(c)))
+      .filter(s => s.wrappers.length > 0)
+      .filter(s => !s.wrappers.some(isSized))
       .map(s => `${s.file}: ${s.classes.join(' ')}`);
     expect(unsized, 'these render at the root font size, off the type scale').toEqual([]);
   });

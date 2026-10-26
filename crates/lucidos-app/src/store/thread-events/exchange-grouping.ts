@@ -744,6 +744,10 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // A rung pick between turns names the NEXT turn's pair. `threadModelSelections`
   // reads it from the thread's events, never from a turn's steps.
   'ChatSettingsChanged',
+  // The per-thread keep-alive switch (ADR 0554). The cache-warm line and the
+  // waiting panel say it, never a turn.
+  'CacheKeepAliveTurnedOff',
+  'CacheKeepAliveTurnedOn',
 ]);
 
 /** True for a `ContextCaptured` recording an *auxiliary model call* rather
@@ -784,21 +788,47 @@ export function isCacheKeepAliveIdle(event: StoredEvent): boolean {
 }
 
 /** Whether `status` reports the wait that `card` last reported. A wait has one
- *  `since` while it warms, and stops for good once past break-even. */
+ *  `since` while it warms, and stops for good once past break-even. A turned-off
+ *  run carries no `since`, and warms again when the user turns it back on. An
+ *  ended run reopens only when its own wait warms again. */
 function continuesWait(card: StoredEvent, status: CacheKeepAliveStatus | null | undefined): boolean {
   const last = (card as { status?: CacheKeepAliveStatus }).status;
-  if (!last || !status || status.state !== 'warming') return true;
+  if (last?.state === 'ended') return status?.state === 'warming' && status.since === last.since;
+  if (!last || !status || status.state !== 'warming' || last.state === 'turned_off') return true;
   return last.state === 'warming' && last.since === status.since;
 }
 
+/** The question or permission card the turn is parked on, when nothing has
+ *  landed under it yet. Walking back, it skips turnless cards and step-less
+ *  cards that await no answer: a held callback, an MCP consent card. Any answer
+ *  or progress lands under the card, so a card with steps of its own is no
+ *  longer parked. A held message may wait there. */
+function parkedCard(exchanges: Exchange[]): Exchange | null {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const ex = exchanges[i];
+    if (isTurnlessBoundary(ex.userEvent)) continue;
+    const awaits = opensAwaitingAnswer(ex);
+    if (!awaits && ex.steps.length === 0) continue;
+    const idle = ex.steps.every(({ event }) => event.type === 'CacheKeepAliveStatusChanged' || event.type === 'MessageHeld');
+    return awaits && idle && dividerStillAwaitsUser(ex) ? ex : null;
+  }
+  return null;
+}
+
 /** Fold one status of the engine's keep-alive report. A *keep-alive run* is one
- *  wait the engine kept warm, and leaves one turnless card, opened by its first
- *  ping. A later status updates that card in place, and a `not_kept` one
- *  leaves it alone: the engine counts pings from the wait's start, so the
- *  same wait may warm again. A cleared status, or a ping count that fell back
- *  to a lower number, or a status of another wait, ends the run: the wait is over and the next one starts
- *  afresh. A wait that ended before its first ping spent nothing, so it leaves
- *  no card (ADR 0540). */
+ *  wait the engine kept warm, and leaves one card, opened by its first status
+ *  and before any ping (ADR 0572). A
+ *  run that began while the turn waited on a question or permission card puts
+ *  its card under that card, inside the turn (ADR 0563). Any other run leaves a
+ *  turnless card of its own. A later status updates the card in place, and a
+ *  `not_kept` one leaves it alone: the engine counts pings from the wait's
+ *  start, so the same wait may warm again.
+ *
+ *  An `ended` status fills the card in, and the same wait warming again
+ *  reopens that card (ADR 0563). A cleared status closes the run, as do a ping
+ *  count that fell back and a status of another wait. The next run starts
+ *  afresh. A wait that ended before its first ping closes its card as an
+ *  `ended` run that spent nothing. */
 function foldKeepAliveStatus(
   state: GroupFoldState,
   seq: number,
@@ -807,22 +837,41 @@ function foldKeepAliveStatus(
 ): void {
   const status: CacheKeepAliveStatus | null | undefined = event.status;
   if (status?.state === 'not_kept') return;
-  const beats = status ? status.beats : 0;
+  if (!status) {
+    state.keepAliveRun = null;
+    return;
+  }
+  const { beats } = status;
   const { keepAliveRun: run } = state;
-  if (run && beats >= run.beats && continuesWait(run.card.userEvent, status)) {
+  if (run && beats >= run.beats && continuesWait(runRecord(run), status)) {
     // The card keeps its first event id: `exchangeKey` keys the node on it,
     // and a new id would remount the card on every ping.
-    run.card.userEvent = { ...event, _eventId: run.card.userEvent._eventId };
+    const next = { ...event, _eventId: runRecord(run)._eventId };
+    if (run.step) run.step.event = next;
+    else run.card.userEvent = next;
     run.beats = beats;
     touched?.add(run.card);
     return;
   }
   state.keepAliveRun = null;
-  if (beats === 0) return;
+  const parked = parkedCard(state.exchanges);
+  if (parked) {
+    const step = { seq, event };
+    parked.steps.push(step);
+    touched?.add(parked);
+    state.keepAliveRun = { card: parked, beats, step };
+    return;
+  }
   const card: Exchange = { userEvent: event, userSeq: seq, steps: [] };
   state.exchanges.push(card);
   touched?.add(card);
-  state.keepAliveRun = { card, beats };
+  state.keepAliveRun = { card, beats, step: null };
+}
+
+/** The status event a run's card shows now: the turnless card's own event, or
+ *  the step a parked run keeps under its question. */
+function runRecord(run: NonNullable<GroupFoldState['keepAliveRun']>): StoredEvent {
+  return run.step ? run.step.event : run.card.userEvent;
 }
 
 /** Whether `event` belongs to one of the thread's keep-alive turns. */
@@ -1478,7 +1527,7 @@ interface GroupFoldState {
   keepAliveAnchors: Set<string>;
   /** The open *keep-alive run*: its card, and the pings it reports. Null
    *  between runs. See `foldKeepAliveStatus`. */
-  keepAliveRun: { card: Exchange; beats: number } | null;
+  keepAliveRun: { card: Exchange; beats: number; step: SequencedEvent | null } | null;
   /** request_event_id of the most recent request-id-routed chat event, i.e. the
    *  active chat turn's req_id. The divider redirect bootstrap reads it to
    *  target the divider directly. It cannot trust `previousCurrent`, which can

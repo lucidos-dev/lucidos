@@ -40,20 +40,24 @@ fn share_of(share: f64) -> LongPromptShare {
     }
 }
 
-/// The served ladder with `reference` as Claude Code's default rung.
-fn served(
+/// The served ladder with `reference` as the backend's default effort: Opus
+/// on Claude Code, GPT-6.1 Sol on Codex.
+pub(crate) fn served(
     surface: LadderSurface,
     override_value: Option<&str>,
     reference: &str,
     share: f64,
 ) -> IntelligenceLadder {
-    let default = (surface == LadderSurface::ClaudeCode).then(|| opus_at(reference));
+    let default = match surface {
+        LadderSurface::Codex => IntelligenceRung::new("gpt-6.1-sol", reference),
+        _ => opus_at(reference),
+    };
     assemble(
         surface,
         &OfferAll,
         override_value,
-        default,
-        Some(opus_at(reference)),
+        Some(default.clone()),
+        Some(default),
         Some(share_of(share)),
     )
 }
@@ -712,6 +716,19 @@ fn an_off_intelligence_rung_is_served_but_refused_naming_every_one_that_is_on() 
 }
 
 #[test]
+fn an_on_position_counts_only_the_intelligence_rungs_that_are_on() {
+    let ladder = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
+    let pairs = ladder.pairs();
+    for (at, pair) in pairs.iter().enumerate() {
+        assert_eq!(ladder.on_position_of(pair), Some(at), "{pair}");
+    }
+    assert_eq!(
+        ladder.on_position_of(&IntelligenceRung::new("claude-sonnet-5-5", "max")),
+        None
+    );
+}
+
+#[test]
 fn a_time_band_reads_as_a_rounded_multiple() {
     let labels: Vec<String> = [-17, -4, -3, -2, -1, 0, 1, 4, 6, 7]
         .into_iter()
@@ -719,7 +736,7 @@ fn a_time_band_reads_as_a_rounded_multiple() {
         .collect();
     assert_eq!(
         labels,
-        ["0.02×", "0.4×", "0.5×", "0.6×", "0.8×", "1×", "1.3×", "2.5×", "4×", "5×"]
+        ["0.02×", "0.4×", "0.5×", "0.6×", "0.8×", "1.0×", "1.3×", "2.5×", "4.0×", "5.0×"]
     );
     assert_eq!(Band::from_time_steps(3).multiple, 2.0);
 }
@@ -732,7 +749,7 @@ fn a_cost_band_reads_on_the_finer_grid() {
         .collect();
     assert_eq!(
         labels,
-        ["0.5×", "0.8×", "0.9×", "1×", "1.1×", "1.3×", "1.4×", "2×"]
+        ["0.5×", "0.8×", "0.9×", "1.0×", "1.1×", "1.3×", "1.4×", "2.0×"]
     );
     assert_eq!(Band::from_cost_steps(6).multiple, 2.0);
 }
@@ -751,7 +768,7 @@ fn an_intelligence_band_reads_in_hundredths() {
         .into_iter()
         .map(|(band, reference)| Band::from_intelligence(band, reference).unwrap().label)
         .collect();
-    assert_eq!(labels, ["0.6×", "0.96×", "1×", "1.04×", "1.16×", "0.03×"]);
+    assert_eq!(labels, ["0.6×", "0.96×", "1.0×", "1.04×", "1.16×", "0.03×"]);
     assert_eq!(Band::from_intelligence(5, 0), None);
     assert_eq!(Band::from_intelligence(0, 10), None);
 }
@@ -759,12 +776,12 @@ fn an_intelligence_band_reads_in_hundredths() {
 #[test]
 fn the_bands_follow_the_reference_intelligence_rung() {
     let at_medium = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
-    assert_eq!(cost_label(&at_medium, "claude-opus-5-5", "medium"), "1×");
+    assert_eq!(cost_label(&at_medium, "claude-opus-5-5", "medium"), "1.0×");
     assert_eq!(cost_label(&at_medium, "claude-opus-5-5", "max"), "4.5×");
     assert_eq!(cost_label(&at_medium, "claude-haiku-5-5", "low"), "0.02×");
     assert_eq!(
         intelligence_label(&at_medium, "claude-opus-5-5", "medium"),
-        "1×"
+        "1.0×"
     );
     assert_eq!(
         intelligence_label(&at_medium, "claude-opus-5-5", "max"),
@@ -775,11 +792,11 @@ fn the_bands_follow_the_reference_intelligence_rung() {
         "0.64×"
     );
     let at_high = served(LadderSurface::ClaudeCode, None, "high", 0.0);
-    assert_eq!(cost_label(&at_high, "claude-opus-5-5", "high"), "1×");
+    assert_eq!(cost_label(&at_high, "claude-opus-5-5", "high"), "1.0×");
     assert_eq!(cost_label(&at_high, "claude-opus-5-5", "medium"), "0.8×");
     assert_eq!(
         intelligence_label(&at_high, "claude-opus-5-5", "high"),
-        "1×"
+        "1.0×"
     );
     assert_eq!(
         intelligence_label(&at_high, "claude-opus-5-5", "medium"),
@@ -858,11 +875,14 @@ fn assert_efforts_rise(ladder: &IntelligenceLadder, model: &str, efforts: &[&str
 }
 
 #[test]
-fn codex_compares_against_the_claude_code_default() {
+fn codex_compares_against_its_own_default() {
     let ladder = served(LadderSurface::Codex, None, "medium", 0.0);
-    assert_eq!(ladder.reference, Some(opus_at("medium")));
-    assert_eq!(cost_label(&ladder, "gpt-6-astra", "max"), "2.2×");
-    assert!(ladder.intelligence_rungs.iter().all(|r| !r.is_default));
+    assert_eq!(
+        ladder.reference,
+        Some(IntelligenceRung::new("gpt-6.1-sol", "medium"))
+    );
+    assert_eq!(cost_label(&ladder, "gpt-6.1-sol", "medium"), "1.0×");
+    assert!(served_intelligence_rung(&ladder, "gpt-6.1-sol", "medium").is_default);
 }
 
 #[test]
@@ -979,22 +999,107 @@ fn a_registry_tier_claude_code_does_not_take_is_not_pinned() {
     );
 }
 
+fn sol_medium() -> DefaultImplementer {
+    DefaultImplementer {
+        model: "gpt-6.1-sol".into(),
+        effort: Some("medium".into()),
+    }
+}
+
 #[test]
-fn codex_with_no_default_picks_nothing_and_keeps_its_own_effort() {
+fn a_codex_spawn_with_no_pick_takes_the_codex_default_implementer() {
     assert_eq!(
-        fill_pick(CodingAgent::Codex, None, None, None, |_| Some("medium")),
-        (None, None)
+        fill_pick(CodingAgent::Codex, None, None, Some(&sol_medium()), |_| {
+            None
+        }),
+        (Some("gpt-6.1-sol".into()), Some("medium".into()))
     );
-    assert_eq!(
+}
+
+#[test]
+fn a_codex_model_only_pick_runs_at_the_models_codex_default_effort() {
+    let registry = model_registry::empty();
+    let filled = |model: &str| {
         fill_pick(
             CodingAgent::Codex,
-            Some("gpt-6.1-sol".into()),
+            Some(model.into()),
             None,
-            None,
-            |_| Some("medium")
-        ),
-        (Some("gpt-6.1-sol".into()), None)
+            Some(&sol_medium()),
+            |m| model_default_effort(CodingAgent::Codex, &registry, m),
+        )
+    };
+    assert_eq!(
+        filled("gpt-6.1-sol"),
+        (Some("gpt-6.1-sol".into()), Some("low".into()))
     );
+    assert_eq!(
+        filled("gpt-6-luna"),
+        (Some("gpt-6-luna".into()), Some("medium".into()))
+    );
+    assert_eq!(
+        filled("default"),
+        (Some("default".into()), None),
+        "the sentinel leaves the effort to Codex's config"
+    );
+}
+
+#[test]
+fn every_codex_model_names_an_effort_it_accepts() {
+    for row in super::super::codex::codex_model_options()
+        .iter()
+        .filter(|row| row.value != "default")
+    {
+        let effort = row
+            .default_effort
+            .as_deref()
+            .unwrap_or_else(|| panic!("{} has no default_effort", row.value));
+        assert!(
+            super::super::validate_coding_agent_effort(
+                CodingAgent::Codex,
+                Some(&row.value),
+                Some(effort)
+            )
+            .is_ok(),
+            "{}: {effort} is not an effort it accepts",
+            row.value
+        );
+    }
+}
+
+#[test]
+fn codex_with_no_offered_default_picks_nothing() {
+    assert_eq!(
+        fill_pick(CodingAgent::Codex, None, None, None, |_| None),
+        (None, None)
+    );
+}
+
+#[tokio::test]
+async fn the_shipped_codex_default_is_an_intelligence_rung_on_the_shipped_codex_ladder() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let routes = seeded_routes(&pool).await;
+    assert_eq!(
+        default_implementer(&pool, CodingAgent::Codex).await,
+        Some(sol_medium())
+    );
+    let ladder = load(&pool, &routes, LadderSurface::Codex).await;
+    let default = ladder
+        .default_intelligence_rung
+        .clone()
+        .expect("the shipped Codex default is a rung");
+    assert!(
+        ladder.intelligence_rungs.iter().any(|r| r.on
+            && r.is_default
+            && r.model == default.model
+            && r.effort == default.effort),
+        "the default reads as an on rung of the ladder"
+    );
+    assert_eq!(
+        ladder.reference.as_ref(),
+        Some(&default),
+        "Codex bands compare against Codex's own default"
+    );
+    crate::test_support::teardown_test_db(&db_name).await;
 }
 
 #[test]

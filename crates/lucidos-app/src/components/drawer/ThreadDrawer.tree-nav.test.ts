@@ -1,9 +1,10 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import {
-  leftAction, rightAction, nodeKey, sectionNavKey, ongoingTileNavKey, handleDrawerKeyDown, landingGroupFor,
+  leftAction, rightAction, nodeKey, sectionNavKey, ongoingTileNavKey, handleDrawerKeyDown,
   type DrawerNavNode, type NavCollapseState,
 } from './ThreadDrawer';
 import type { OngoingGroup } from '../../store/store';
+import { landingGroupFor } from '../../store/actions/event-navigation';
 import { openThreadFilterPanel, closeThreadFilterPanel } from '../../store/threadFilterPanel';
 
 // Pure ←/→ tree-navigation logic for the drawer — no signals, no DOM.

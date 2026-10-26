@@ -8,7 +8,7 @@ use crate::engine::agent_session::prompts::{
     wake_decision_section, worktree_system_prompt, SessionContext, SpawnPromptInputs,
 };
 use crate::engine::agent_session::spawn::{
-    resolve_branch_for_resume, BranchResolution, FreshBranch,
+    recover_renamed_branch, resolve_branch_for_resume, BranchResolution, FreshBranch,
 };
 use crate::engine::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use crate::engine::git_ops::{
@@ -163,8 +163,13 @@ pub(super) struct SpawnWorktreeContext {
     pub(super) branch_name: String,
     pub(super) worktree_path: Option<PathBuf>,
     pub(super) interactive_session: bool,
-    pub(super) adoption_note: Option<String>,
+    /// Tells the agent which branch its worktree is on, when that is not the
+    /// tracked one it expects.
+    pub(super) branch_note: Option<String>,
     pub(super) resume_session_id: Option<String>,
+    /// True when the recorded branch was gone and no rename of it was proven,
+    /// which is why this session starts fresh.
+    pub(super) branch_gone: bool,
     /// True when THIS call created the worktree directory (vs. reusing a
     /// recovery / conflict / resume worktree). The spawn-failure cleanup
     /// (`git_ops::cleanup_failed_spawn`) only removes what this attempt
@@ -211,7 +216,8 @@ impl LucidosEngine {
         // the Codex teaching section without re-querying thread_summaries.
         coding_agent: crate::runtime::CodingAgent,
     ) -> Result<SpawnWorktreeContext, Box<dyn std::error::Error + Send + Sync>> {
-        let mut adoption_note: Option<String> = None;
+        let mut branch_note: Option<String> = None;
+        let mut branch_gone = false;
         // An external repo's base ref, for the session context. Known only
         // when this spawn resolved where a new worktree branches from.
         let mut base_ref: Option<String> = None;
@@ -319,9 +325,11 @@ impl LucidosEngine {
                 branch_name,
                 reusing_branch,
                 resume_session_id: validated_sid,
+                gone,
             } = resolve_branch_for_resume(&fresh, resume_session_id, resume_branch.as_deref())
                 .await;
             resume_session_id = validated_sid;
+            branch_gone = gone.is_some();
 
             // Caller-supplied worktree path wins over branch-based lookup —
             // see the `resume_worktree_path` parameter doc. The validity check
@@ -407,17 +415,15 @@ impl LucidosEngine {
             // When reusing an existing worktree, the actual checked-out branch may
             // differ from `branch_name`. Two reasons for the divergence:
             //
-            // 1. CC itself ran `git checkout -b foo` mid-turn — legitimate; the
-            //    new branch is the source of truth and we override.
+            // 1. CC itself ran `git checkout -b foo`. Legitimate, and git's
+            //    reflogs prove it (`branch_continuing_tracked`).
             // 2. The user externally ran `git checkout other-branch` between
             //    turns. Phase 8.3: refuse the spawn when we have a recorded
-            //    resume branch (`reusing_branch`) and the worktree no longer
-            //    sits on it. Continuing would silently commit CC's work to the
-            //    wrong ref. Discriminating (1) from (2) reliably is hard, so
-            //    the trip-wire is "we had an expected branch coming in and
-            //    the worktree disagrees." First spawns (no resume context)
-            //    fall through to the override path because there's no
-            //    expectation to violate.
+            //    resume branch (`reusing_branch`), the worktree no longer sits
+            //    on it, and no proof of (1) holds. Continuing would silently
+            //    commit CC's work to the wrong ref. First spawns (no resume
+            //    context) fall through to the override path because there's
+            //    no expectation to violate.
             let mut branch_name = if let Some(ref existing) = existing_worktree {
                 if reusing_branch {
                     match crate::engine::agent_session::external_edits::verify_branch(
@@ -428,15 +434,14 @@ impl LucidosEngine {
                     {
                         Ok(()) => branch_name,
                         Err(mismatch) => {
-                            // External repos: a skill may legitimately have
-                            // created a feature branch off our tracked one
-                            // (e.g. `git checkout -b feature-1234`). Adopt it
-                            // when its history contains our last commit, or
-                            // when it provably continues the tracked branch.
-                            // Internal threads keep the strict refusal so
-                            // Apply has a stable engine-named branch.
+                            // A branch that provably continues the tracked one
+                            // (e.g. the agent's own `git checkout -b feature-1234`)
+                            // keeps the session. An external repo adopts it, as a
+                            // skill's ticket branch. An internal thread resumes on
+                            // it but keeps tracking the engine-named branch, so
+                            // Apply has a stable one. Anything else is refused.
                             //
-                            // Adoption needs git to have NAMED a different
+                            // The proof needs git to have NAMED a different
                             // branch. `Unanswered` means the probe timed out or
                             // could not run, so nothing is known. Sending it
                             // here only re-runs the same `rev-parse` to guess.
@@ -448,8 +453,8 @@ impl LucidosEngine {
                                 crate::engine::agent_session::external_edits::BranchMismatch::OnOtherBranch { .. }
                                     | crate::engine::agent_session::external_edits::BranchMismatch::Detached { .. }
                             );
-                            let adopted = if is_external_repo && probe_named_a_branch {
-                                crate::engine::agent_session::external_edits::try_adopt_renegade_branch(
+                            let continuing = if probe_named_a_branch {
+                                crate::engine::agent_session::external_edits::branch_continuing_tracked(
                                     repo_root,
                                     existing,
                                     &branch_name,
@@ -459,16 +464,33 @@ impl LucidosEngine {
                             } else {
                                 None
                             };
-                            match adopted {
-                                Some((new_branch, note)) => {
+                            match continuing {
+                                Some(new_branch) if is_external_repo => {
                                     log!(
                                         "[AgentSession] Adopting renegade branch '{}' (was expecting '{}') for thread {}",
                                         new_branch,
                                         branch_name,
                                         thread_id
                                     );
-                                    adoption_note = Some(note);
+                                    branch_note = Some(
+                                        crate::engine::agent_session::external_edits::build_adoption_note(&new_branch),
+                                    );
                                     new_branch
+                                }
+                                Some(side_branch) => {
+                                    log!(
+                                        "[AgentSession] Resuming thread {} on its side branch '{}', still tracking '{}'",
+                                        thread_id,
+                                        side_branch,
+                                        branch_name
+                                    );
+                                    branch_note = Some(
+                                        crate::engine::agent_session::external_edits::side_branch_note(
+                                            &side_branch,
+                                            &branch_name,
+                                        ),
+                                    );
+                                    branch_name
                                 }
                                 None => {
                                     log!(
@@ -486,17 +508,34 @@ impl LucidosEngine {
                         }
                     }
                 } else {
-                    match worktree_current_branch(existing).await {
-                        Some(a) if a != branch_name => {
-                            log!(
+                    // The recorded branch is gone. An external repo's own
+                    // workflow may have renamed it with `git branch -m`: a
+                    // proven rename keeps the session, as in the mismatch
+                    // arm above. A refusal starts fresh, never refuses.
+                    let recovered = match gone {
+                        Some(gone) if is_external_repo => {
+                            recover_renamed_branch(repo_root, existing, gone, idle_anchor).await
+                        }
+                        _ => None,
+                    };
+                    if let Some(recovered) = recovered {
+                        branch_gone = false;
+                        branch_note = Some(recovered.adoption_note);
+                        resume_session_id = recovered.session_id;
+                        recovered.branch_name
+                    } else {
+                        match worktree_current_branch(existing).await {
+                            Some(a) if a != branch_name => {
+                                log!(
                                 "[AgentSession] Worktree {} is on branch {} (expected {}) — overriding",
                                 wt_path.display(),
                                 a,
                                 branch_name
                             );
-                            a
+                                a
+                            }
+                            _ => branch_name,
                         }
-                        _ => branch_name,
                     }
                 }
             } else {
@@ -509,7 +548,7 @@ impl LucidosEngine {
             // that branch's commits into this thread as phantom "pending
             // changes". External repos keep the origin-or-HEAD contract.
             //
-            // A successor thread starts at its old thread's last commit
+            // A legacy successor thread starts at its old thread's last commit
             // instead, so its branch carries all of that thread's work. An
             // unreadable base fails the spawn: branching from `main` would
             // split the work across two branches.
@@ -519,7 +558,7 @@ impl LucidosEngine {
                 Ok(base) => base,
                 Err(e) => {
                     return Err(format!(
-                        "Could not read where this successor thread's branch starts: {e}. Resend the message to retry."
+                        "Could not read where this legacy successor thread's branch starts: {e}. Resend the message to retry."
                     )
                     .into())
                 }
@@ -826,13 +865,13 @@ impl LucidosEngine {
         // The same widgets section the chat agent reads, so a coding agent
         // embeds widgets in its options and replies the same way (ADR 0415).
         let widgets = self.coding_agent_widgets();
-        // A resume drops the session context, and Codex states 5 minutes
-        // whatever was observed, so neither pays for the read.
+        // A resume drops the session context, and Codex reports no lifetime,
+        // so neither pays for the read.
         let cache_ttl = match (coding_agent, &resume_session_id) {
             (crate::runtime::CodingAgent::ClaudeCode, None) => {
                 crate::engine::cache_ttl::repo_cache_ttl(&self.pool, repo_id.as_deref()).await
             }
-            _ => None,
+            _ => crate::engine::cache_ttl::CacheTtl::Unknown,
         };
         let (system_prompt, session_context) = spawn_prompts(SpawnPromptInputs {
             flavor: system_prompt,
@@ -853,8 +892,9 @@ impl LucidosEngine {
             branch_name,
             worktree_path,
             interactive_session,
-            adoption_note,
+            branch_note,
             resume_session_id,
+            branch_gone,
             worktree_created,
             branch_created,
         })

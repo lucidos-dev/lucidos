@@ -10,6 +10,7 @@
  *
  *  Registered in `docs/temporary-measures.md` § 1, "Safe-area floor". */
 import { isIOSPwa } from './platform';
+import { reportSafeAreaReading, scheduleSafeAreaSnapshot } from './safeAreaProbe';
 
 export type SafeAreaSide = 'top' | 'right' | 'bottom' | 'left';
 export type SafeAreaInsets = Record<SafeAreaSide, number>;
@@ -109,10 +110,12 @@ export function createSafeAreaMemory(storage: Pick<Storage, 'getItem' | 'setItem
 }
 
 /** The viewport shape a set of insets belongs to. A rotation moves the notch to
- *  another side, and an iPad window resize can change the insets too. */
+ *  another side, and an iPad window resize can change the insets too. The
+ *  height tells a page below an opaque status bar, whose top inset really is
+ *  0, from a page behind a translucent one. */
 export function viewportShapeKey(opts: { orientation: string | undefined; width: number; height: number }): string {
   const orientation = opts.orientation ?? (opts.width > opts.height ? 'landscape' : 'portrait');
-  return `${orientation}:${opts.width}`;
+  return `${orientation}:${opts.width}x${opts.height}`;
 }
 
 /** Frames to keep re-reading after a return to the foreground. WebKit settles
@@ -152,12 +155,14 @@ export function installSafeAreaFloor(): void {
       width: window.innerWidth,
       height: window.innerHeight,
     });
-    const { remembered, floor } = foldSafeAreaReading(memory.get(key), read());
+    const reading = read();
+    const { remembered, floor } = foldSafeAreaReading(memory.get(key), reading);
     if (remembered) memory.set(key, remembered);
     for (const side of SAFE_AREA_SIDES) {
       if (floor) root.setProperty(`--safe-area-floor-${side}`, `${floor[side]}px`);
       else root.removeProperty(`--safe-area-floor-${side}`);
     }
+    reportSafeAreaReading(reading, floor);
   }
 
   let recheckFrames = 0;
@@ -180,4 +185,5 @@ export function installSafeAreaFloor(): void {
   document.addEventListener('visibilitychange', onWake);
   window.addEventListener('pageshow', onWake);
   sync();
+  scheduleSafeAreaSnapshot();
 }

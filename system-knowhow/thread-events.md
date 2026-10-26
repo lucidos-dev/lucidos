@@ -3,6 +3,12 @@ name: ThreadEvent Reference
 description: Every `ThreadEvent`, by family (chat, coding-agent, lifecycle, changes, background bash, plugin, repo, merge conflict, transient SSE-only). With payload, persistence, and whether a trigger can subscribe. Load for "what events fire on a thread" or "can I trigger on ResponseGenerated / ChangeApplied / BackgroundBashCompleted". Also for "is X persisted" and "is X a real event name".
 ---
 
+<!-- domain-event: BuildBroken: Example domain event emitted by a build-monitoring script. -->
+
+<!-- domain-event: HabitCompleted: Example domain event emitted by a habit-tracker app. -->
+<!-- domain-event: OuraDataImported: Example domain event emitted by a wearable-data integration. -->
+<!-- domain-event: LucidosReleased: Release automation emits this domain event to announce a published version. -->
+
 # ThreadEvent Reference
 
 Every `ThreadEvent`: the per-thread event family that flows through the EventBus into PostgreSQL, the SSE stream and the trigger matcher. Source of truth: `crates/lucidos-engine/src/engine/thread_events/` (the enum is in `event.rs`). Names below are the **current** names. Legacy aliases (e.g. `ClaudeCodeIdled`, `SessionRecovered`, `parent_thread`, `task_id` / `task_name`) exist as `#[serde(alias = ...)]` so old DB rows decode. Write new code, triggers and docs against the current name only.
@@ -13,14 +19,14 @@ Event-store column shape, the chat-mode terminator set and the `events` table sc
 
 ## One table, two enums
 
-**This is the canonical statement of the `ThreadEvent` / `SystemEvent` split. Everything else points here.**
+**This is the canonical statement of the `ThreadEvent` / `engine::event_bus::SystemEvent` split. Everything else points here.**
 
 There are two Rust enums and **one** table.
 
 - **`ThreadEvent`** (`crates/lucidos-engine/src/engine/thread_events/`) is the per-thread family in this file: `MessageReceived`, `ResponseGenerated`, `CodingAgentIdled`, `ChildThreadCompleted`, every `Change*`, every `Thread*` lifecycle event.
-- **`SystemEvent`** (`crates/lucidos-engine/src/engine/event_bus_system_event.rs`) is the workspace-scoped family: `NotificationCreated`, `TriggerCompleted`, `PluginInstalled`, `PreferencesChanged`, and so on. Its **`SystemEvent::DomainEvent`** variant carries names the workspace invents (`HabitCompleted`, `OuraDataImported`, `LucidosReleased`). Writers: `lucidos events emit`, the `events` LLM tool's `emit` action, `lucidos.events.emit` in an app, or `POST /api/v1/events/emit`.
+- **`engine::event_bus::SystemEvent`** (`crates/lucidos-engine/src/engine/event_bus_system_event.rs`) is the workspace-scoped family: `NotificationCreated`, `TriggerCompleted`, `PluginInstalled`, `PreferencesChanged`, and so on. Its **`SystemEvent::DomainEvent`** variant carries names the workspace invents (`HabitCompleted`, `OuraDataImported`, `LucidosReleased`). Writers: `lucidos events emit`, the `events` LLM tool's `emit` action, `lucidos.events.emit` in an app, or `POST /api/v1/events/emit`.
 
-Both go through the one `EventBus::emit`. Every variant whose `is_persisted()` is true goes through the one `EventBus::persist` INSERT into the one **`events`** table, with `event_type` set to the variant name. A `DomainEvent` is stored under its *inner* type (`HabitCompleted`), never the literal string `"DomainEvent"`.
+Both go through the one `EventBus::emit`. Every variant whose `is_persisted` method returns true goes through the one `EventBus::persist` INSERT into the one **`events`** table, with `event_type` set to the variant name. A `DomainEvent` is stored under its *inner* type (`HabitCompleted`), never the literal string `"DomainEvent"`.
 
 Only two columns differ:
 
@@ -28,9 +34,9 @@ Only two columns differ:
 |---|---|---|---|
 | `ThreadEvent` | `'thread'` | the thread id | set (mirrored from `aggregate_id`) |
 | `SystemEvent::DomainEvent` | `'domain'` | the event type | NULL |
-| other `SystemEvent` | its own (`'notification'`, `'trigger'`, `'plugin'`, `'app'`, …) | the entity id | NULL |
+| other `engine::event_bus::SystemEvent` | its own (`'notification'`, `'trigger'`, `'plugin'`, `'app'`, …) | the entity id | NULL |
 
-The rest of both enums is **transient**: a `ThreadEvent` whose `is_persisted()` is false (see "Persisted vs transient"), or a `DomainEvent` emitted with `{ transient: true }`. These go out on SSE and are never written, so nobody can query them. A transient `ThreadEvent` cannot fire a trigger. A transient `DomainEvent` can, live only: under heavy load a fire can be missed, because there is no row to read back (`system-knowhow/triggers.md`).
+The rest of both enums is **transient**: a `ThreadEvent` whose `ThreadEvent::is_persisted()` is false (see "Persisted vs transient"), or a `DomainEvent` emitted with `{ transient: true }`. These go out on SSE and are never written, so nobody can query them. A transient `ThreadEvent` cannot fire a trigger. A transient `DomainEvent` can, live only: under heavy load a fire can be missed, because there is no row to read back (`system-knowhow/triggers.md`).
 
 **Consequence for reading.** `GET /api/v1/events/query`, `GET /api/v1/events/count`, `GET /api/v1/events/types`, `lucidos events query`, `lucidos.events.query` in an app, and the `events` LLM tool all run one statement over that table with **no aggregate predicate**. They return persisted rows of BOTH enums, filtered by `event_type` and time. All of them leave out the four side-question events (ADR 0320). There is no separate domain-event stream to "switch to".
 
@@ -40,20 +46,26 @@ So the split is a Rust type distinction and a column value, never a storage boun
 
 ## Today the scheduler uses a blocklist
 
-The scheduler subscribes to the EventBus and forwards events to the trigger matcher. It has one branch per enum, gated differently. The `BusEvent::Thread` branch uses a small **blocklist**, `core::event_subscription::is_subscribable`, called from `crates/lucidos-engine/src/scheduler/mod.rs`. It drops two groups, both defined in `crates/lucidos-engine/src/engine/thread_events/event_impl.rs`:
+The scheduler forwards EventBus events to the trigger matcher. Each enum has
+its own gate. The `BusEvent::Thread` branch calls
+`core::event_subscription::is_subscribable` from
+`crates/lucidos-engine/src/scheduler/mod.rs`. It drops three groups:
 
 - **Per-token streaming** (`ThreadEvent::is_per_token_streaming`): `TextStreamed`, `ThoughtStreamed`, `CodingAgentTextStreamed`, `CodingAgentThoughtStreamed`. Each fires once per text chunk, so a trigger never belongs on one.
 - **Side questions** (`ThreadEvent::is_side_question_event`): `SideQuestionAsked`, `SideQuestionAnswered`, `SideQuestionFailed`, `SideQuestionDismissed`. They record a card no agent may see, so a subscription on one is refused (ADR 0320).
 
+- **Cache keep-alive idles** (`ThreadEvent::is_cache_keep_alive_idle`):
+  `CodingAgentIdled` carrying a keep-alive reason. These record no finished work.
+
 Every other persisted `ThreadEvent` reaches the matcher and is a valid `on:` entry.
 
-The `BusEvent::System` branch is an **allowlist**: **a persisted `SystemEvent` is subscribable, a transient one is not** (ADR 0113). It admits every variant whose `is_persisted()` is true, plus a `DomainEvent` on either setting of `transient`. So `BackupCompleted`, `BackupFailed`, `NotificationCreated`, `TriggerCompleted`, `PluginInstalled` and the rest of the persisted set are valid `on:` entries. `BackupProgress`, `Toast`, `MemoryRebuildProgress`, `RecoveryProgress`, `EmbeddingModelStatusChanged` and `TreeBackfillProgressed` are transient frames that write no row, so they reach neither matcher. The full persisted list is `SystemEvent::PERSISTED_TYPE_NAMES`, and `.claude/rules/db.md` § Key event types enumerates the variants.
+The `BusEvent::System` branch is an **allowlist**: **a persisted `engine::event_bus::SystemEvent` is subscribable, a transient one is not** (ADR 0113). It admits every variant whose `SystemEvent::is_persisted()` is true, plus a `DomainEvent` on either setting of `transient`. So `BackupCompleted`, `BackupFailed`, `NotificationCreated`, `TriggerCompleted`, `PluginInstalled` and the rest of the persisted set are valid `on:` entries. `BackupProgress`, `Toast`, `MemoryRebuildProgress`, `RecoveryProgress`, `EmbeddingModelStatusChanged` and `TreeBackfillProgressed` are transient frames that write no row, so they reach neither matcher. The full persisted list is `SystemEvent::PERSISTED_TYPE_NAMES`, and `.claude/rules/db.md` § Key event types enumerates the variants.
 
 Both fan-outs run one predicate, `core::event_subscription::is_subscribable_system_event`, so a trigger and an `await_event` are offered the same set.
 
 High-cardinality per-action variants (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemoryRecalled`, `ImageDescribed`, `PromptInjected`, `CodingAgentPromptSent`) are **triggerable**. Scope them with per-entry `condition:` filters (e.g. `name: "Bash"`, `estimated_total_tokens: { $gt: 150000 }`). A condition key is a **field path**, so `{ "args.command": { "$regex": "cargo test" } }` reads one level down. Operators are `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in` / `$nin` / `$regex`, and a bare value means `$eq`. `$or` in key position takes a list of conditions.
 
-**`thread_id` is available on every event in this file, and on none of their payloads.** The engine supplies it at matching time from the event's own thread. So `condition: { thread_id: "<uuid>" }` scopes any event type to one thread: one session's `CodingAgentIdled`, one thread's next `ResponseGenerated`, one thread's next tool call. It never appears in a payload read back with `query_events`, where the row's thread column carries it. A **`SystemEvent`** belongs to no thread, so a domain event or `BackupCompleted` has no `thread_id` to filter on.
+**`thread_id` is available on every event in this file, and on none of their payloads.** The engine supplies it at matching time from the event's own thread. So `condition: { thread_id: "<uuid>" }` scopes any event type to one thread: one session's `CodingAgentIdled`, one thread's next `ResponseGenerated`, one thread's next tool call. It never appears in a payload read back with `events(action="query")`, where the row's thread column carries it. A **`engine::event_bus::SystemEvent`** belongs to no thread, so a domain event or `BackupCompleted` has no `thread_id` to filter on.
 
 What works today (each line is one entry in a trigger's `on` list; full shape in `system-knowhow/triggers.md`):
 
@@ -63,8 +75,8 @@ What works today (each line is one entry in a trigger's `on` list; full shape in
 - `event_type: ResponseGenerated` / `ResponseFailed` / `CodingAgentIdled` / `ChangeApplied` / `ChangeHardened` / `TriggerCompleted` / `BackgroundBashCompleted` / every `Change*` / every `Thread*` lifecycle event: **work**.
 - `event_type: ToolCalled` / `CodingAgentToolCalled` / `ContextCaptured` / `ImageDescribed` etc.: **work**, scoped with a `condition:`.
 - `event_type: TextStreamed` and the other per-token variants: **refused**, at both surfaces.
-- `event_type: <a workspace-emitted DomainEvent>`: works. `SystemEvent::DomainEvent` (from `lucidos events emit` / the `emit_event` LLM tool) always reaches the matcher. This is the supported path for "trigger on something my workspace observes."
-- `event_type: BackupCompleted` or any other persisted `SystemEvent`: **work**, scoped with the payload's own fields.
+- `event_type: <a workspace-emitted DomainEvent>`: works. `SystemEvent::DomainEvent` (from `lucidos events emit` / the `events(action="emit")` LLM tool) always reaches the matcher. This is the supported path for "trigger on something my workspace observes."
+- `event_type: BackupCompleted` or any other persisted `engine::event_bus::SystemEvent`: **work**, scoped with the payload's own fields.
 - `event_type: BackupProgress` or another transient frame: **refused**, at both surfaces. The refusal names the persisted event that ends the run, e.g. `BackupCompleted` or `BackupFailed`.
 
 **Two more gates apply to every carrier.** First, self-exclusion. Every event a trigger's fire emits carries that trigger's id, and the matcher drops that trigger from the matches. So a trigger never wakes on its own fire, at any depth. Every other subscriber still sees the event.
@@ -75,7 +87,7 @@ Second, the recursion cap bounds a chain ACROSS triggers. An event a fire emits 
 
 **When the cap stops a fire, you get a notification.** It names the trigger, the event and the ceiling, once per trigger per ten minutes. Raise `max_event_trigger_depth` in the Thread Queue panel if a chain is legitimately longer. `system-knowhow/triggers.md` covers what the two gates mean for authors.
 
-A new per-token streaming variant goes into `ThreadEvent::is_per_token_streaming` in the same change. Other `ThreadEvent` variants need no scheduler change. Neither does a new `SystemEvent`: being persisted is what makes it subscribable.
+A new per-token streaming variant goes into `ThreadEvent::is_per_token_streaming` in the same change. Other `ThreadEvent` variants need no scheduler change. Neither does a new `engine::event_bus::SystemEvent`: being persisted is what makes it subscribable.
 
 The `Triggerable` column in every table below answers "would a trigger fire on this today?" **Triggerable does not mean "good idea to subscribe without a condition"**: scope any per-action variant with `condition:`.
 
@@ -155,7 +167,39 @@ When the engine writes a message or prompt, the event carries `origin: { "kind":
 
 The engine wrote the words, so the engine is the origin, never the user's device. The confirming device rides beside it as `confirmed_on_device_id`, the id only. `from_version` is absent when the prior install record names no version.
 
-The other reasons are `continuation_started`, `orphan_recovery`, `scheduler` (with `trigger_id`, optional `trigger_name`), `harden_retrigger`, `stale_session`, `archived_branch_work`, `unmerged_integrated_work`, `successor_residue`, `merge_conflict`, `main_check_red`, `main_check_flaky`, `missing_hardening`, `missing_plan`, `event_wait` and `cache_keep_alive`. `archived_branch_work` marks a change the engine set aside from an archived thread's work, and `unmerged_integrated_work` one from an *integrated sub-thread* its parent landed without. `successor_residue` marks the work a thread committed after handing off to a *successor thread*. `missing_plan` marks the engine's message to a coding agent whose turn-end work it withheld (`ProposalWithheld`), because the branch had no approved implementation plan.
+The complete reason kinds, including historical values, are:
+
+<!-- generated:begin EngineReason -->
+EngineReason wire values:
+
+- `continuation_started`
+- `orphan_recovery`
+- `scheduler`
+- `harden_retrigger`
+- `stale_session`
+- `archived_branch_work`
+- `unmerged_integrated_work`
+- `successor_residue`
+- `successor_session`
+- `merge_conflict`
+- `main_check_red`
+- `main_check_flaky`
+- `missing_hardening`
+- `missing_plan`
+- `plugin_auto_update`
+- `plugin_setup`
+- `plugin_upstream_proposal`
+- `event_wait`
+- `cache_keep_alive`
+<!-- generated:end -->
+
+`scheduler` carries `trigger_id` and optional `trigger_name`.
+
+`archived_branch_work` identifies unproposed work recovered from an archived thread.
+`unmerged_integrated_work` identifies an integrated child's work omitted from its parent's landing.
+`successor_residue` identifies work left behind by a legacy successor thread.
+`successor_session` identifies a handoff opening in the same thread.
+`missing_plan` identifies a prompt asking a coding agent to satisfy the plan gate.
 
 `missing_hardening` marks the boundary before an *Apply* hardens a change. It also marks the engine's message to a coding agent whose turn-end work it withheld because the work never ran `/harden`. `plugin_auto_update` is historical and no longer written.
 
@@ -183,21 +227,21 @@ These fire on chat threads (`channel = chat`) and trigger runs (`channel = trigg
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `MessageReceived` | A user, upstream workspace, parent thread or the engine submitted text into the thread. Stamped at the HTTP boundary in `api/chat.rs::chat_submit`. Its projection leaves the thread's compose draft alone. A person's send consumed the draft when `chat_submit` accepted it, advancing the *compose epoch* and broadcasting a `ThreadComposeChanged` with what the consumption left. So a draft typed after the send survives this event, and an agent's or engine's message never touches the user's draft. Carries the turn's resolved `model`, `reasoning_effort` and `provider`. `provider` is the backend chosen for a multi-backend model, so the thread keeps it even if the model's *preferred provider* changes. Absent means the model's own row decides. | one-per-turn | yes | yes |
+| `MessageReceived` | A user, upstream workspace, parent thread or the engine submitted text into the thread. Stamped at the HTTP boundary in `crates/lucidos-engine/src/api/chat.rs::chat_submit`. Its projection leaves the thread's compose draft alone. A person's send consumed the draft when `chat_submit` accepted it, advancing the *compose epoch* and broadcasting a `ThreadComposeChanged` with what the consumption left. So a draft typed after the send survives this event, and an agent's or engine's message never touches the user's draft. Carries the turn's resolved `model`, `reasoning_effort` and `provider`. `provider` is the backend chosen for a multi-backend model, so the thread keeps it even if the model's *preferred provider* changes. Absent means the model's own row decides. | one-per-turn | yes | yes |
 | `QueuedMessageRemoved` | A user removed a queued follow-up before its agent read it: a chat follow-up the loop had not ingested, or a Claude Code follow-up the agent confirmed it dropped, or one only a dead agent process held (ADR 0506). An append-only marker over the original `MessageReceived`. Renderers hide the matching message only while it has no steps, and the loop skips the matching injected prompt. Carries `removed_message_id: Uuid` (the queued `MessageReceived`'s event id), plus `actor` / `channel` from `EventMeta`. | per-action | yes | yes |
 | `ChatSettingsChanged` | The user picked a Lucidos Agent thread's model and effort between turns, through `POST /api/v1/chat/settings`. Carries `model`, optional `reasoning_effort` and optional `provider`, plus the user's `actor`. The thread's next turn runs on it, however it starts: a send, a child's report or a wake. While a turn runs the pair is locked: the endpoint refuses with 409 and `reason: "turn-running"`, and records nothing. A message that reaches a running turn carries that turn's pair, so its `MessageReceived` never names a model that did not answer it. Chat threads only. | per-action | yes | yes |
 | `TextStreamed` | A complete chunk of assistant text was committed to the thread (post-stream finalize for chat; one event per appended chunk). A chat question card's `message` lands as one, just before the card. | high-volume-streaming | yes | **no (blocked)** |
 | `ThoughtStreamed` | The model emitted a `thinking` / reasoning block (extended-thinking models). One event per chunk. Legacy alias: `Thinking`. | high-volume-streaming | yes | **no (blocked)** |
 | `ContextCaptured` | One snapshot of the context the engine assembled for one LLM call: prompt sections, tools, estimated tokens, and real `usage` when the provider reports it. The modal reads these to show context drift. **`purpose` says which call it was** (§ Which call each purpose names). **A trigger on `ContextCaptured` sees auxiliary calls too**, so add `condition: { purpose: "turn" }` for agent turns only. Payload, `reconstructed` rows and `usage.modality`: § `ContextCaptured`. | per-action | yes | yes (use condition) |
 | `ModelCallFailed` | A metered chat call failed. It is **never a `ContextCaptured`**: a failed call spent nothing a rollup bills, so no usage total moves. Carries facts only: `model`, `provider`, `reasoning_effort`, `duration_ms`, `attempts`, `failure` (`http` / `connection` / `timeout` / `stream` / `other`), `status_code` and `request_id`. Never the error message. Payload: § `ModelCallFailed`. | per-action | yes | yes (use condition) |
-| `MemoryRecalled` | The engine's **automatic pre-turn recall**, on the Classic *memory module* only: a Tree workspace's turn reads its memory views instead and emits none. Before the model saw anything, a classifier derived sub-queries, the chat-side memory consumer vector-searched long-term memory, and the hits went into the turn's context. Carries `results: usize` (how many were injected), `queries: Vec<String>` (the sub-queries) and `memories`. Each memory has `id`, `topic`, `summary`, `src_created_at` and `source`, in the order the model saw them, so the length equals `results` (absent on older rows). The step detail lists `memories` as links to their sources. **Not the agent's own lookup**: the agent's mid-turn `memory` tool `search` arrives as a `ToolCalled`. Subscribe here for "the engine recalled something", to `ToolCalled` for "the agent went looking". Legacy alias: `MemorySearched` (renamed because the two names read as the same event). Old rows still decode and render, but **subscriptions do not follow a rename**: a trigger or `await_event` on `MemorySearched` stops firing. Re-point it at `MemoryRecalled`. | per-action | yes | yes (use condition) |
+| `MemoryRecalled` | The engine's **automatic pre-turn recall**, on the Classic *memory module* only: a Tree workspace's turn reads its memory views instead and emits none. Before the model saw anything, a classifier derived sub-queries, the chat-side memory consumer vector-searched long-term memory, and the hits went into the turn's context. Carries `results: usize` (how many were injected), `queries: Vec<String>` (the sub-queries) and `memories`. Each memory has `id`, `topic`, `summary`, `src_created_at` and `source`, in the order the model saw them, so the length equals `results` (absent on older rows). The step detail lists `memories` as links to their sources. **Not the agent's own lookup**: the agent's mid-turn `memory(action="search")` tool arrives as a `ToolCalled`. Subscribe here for "the engine recalled something", to `ToolCalled` for "the agent went looking". Legacy alias: `MemorySearched` (renamed because the two names read as the same event). Old rows still decode and render, but **subscriptions do not follow a rename**: a trigger or `await_event` on `MemorySearched` stops firing. Re-point it at `MemoryRecalled`. | per-action | yes | yes (use condition) |
 | `ToolCalled` | The chat agentic loop invoked a tool (`name`, `args`, optional `description`). Coding-agent tool calls are `CodingAgentToolCalled` instead. | per-action | yes | yes (use condition) |
 | `ToolResult` | The result returned to the chat loop for a prior `ToolCalled`. Carries `result: String`, `images`, `success: bool` (default true), and `tool_called_event_id: Uuid`. **Pair a result with its call by that id, never by position** (§ `ToolResult`). **Inline image bytes are stubbed out of `result`**, e.g. `[image image/png, 641.2 KB omitted, not embedded in event]` or `[screenshot image/png, 1.5 MB omitted, not embedded in event]`, then the page DOM. The calling model saw the real image. A stub means the image was shown and not persisted, never that it failed. | per-action | yes | yes (use condition) |
 | `BackgroundBashStarted` | A long-running task was spawned via `run_bash_background` (shell command), a coding agent's `lucidos background-task run` (the same, in its worktree), OR `run_python_background`. For Python the engine wraps the venv script as `bash -o pipefail -c "<venv-python> <script>"` and uses the same registry. The `command` field captures the exact shell invocation. A `BackgroundBashCompleted` follows. | per-action | yes | yes |
 | `BackgroundBashCompleted` | The task ended: natural exit, signal death, watchdog timeout, `bash_kill`, or the engine going away under it. Carries `exit_code: Option<i32>` (set **only** for a normal exit), `signal: Option<i32>` (set only for a signal death; omitted otherwise), `stdout`, `stderr`, `timed_out: bool`, `killed: bool`, `abandoned: bool`. Read the status per § `BackgroundBashStarted` / `BackgroundBashCompleted`: both codes null is never success, and `abandoned` is not `killed`. Every started task on a live thread reaches exactly one of these, so a subscription never waits on an event nobody sends. **A thread's own stop does not wake it** (ADR 0369): `bash_kill`, `lucidos background-task stop` and `lucidos hardened mark` stand down the stopping thread's waits on the task before signalling it, so the killed completion matches nothing there. The task's owner still hears about a stop another thread issued, and the watchdog's timeout, Discard and Archive deliver as before. Emitting it does NOT evict the in-memory registry entry. A completed task stays drainable for a few minutes, so a `bash_output` at the completion instant still gets the final tail. `bash_output` falls back to this row once that window closes. Same shape for `run_bash_background` and `run_python_background`. | per-action | yes | yes |
 | `ResponseGenerated` | The chat agentic loop ended with an assistant response: the chat-mode terminator. Carries `text` (`#[serde(skip_serializing_if = "is_empty_str")]`), `images`, `model`, `reasoning_effort`. **`text` may be empty** on a *benign empty completion*, e.g. Gemini `finishReason: STOP` after successful tool calls. The thread then completes Idle, not red (§ `ResponseGenerated`). | one-per-turn | yes | yes |
-| `ResponseCanceled` | User clicked Cancel, clicked Apply / Discard / Archive on a still-running session, or posted a follow-up that interrupted a mid-turn Codex turn. Carries `cause: CancelCause` (`UserStop` / `UserAction` / `SupersededByFollowup` / `EffortRestart` / `Unknown`). Always emit via `thread_events::emit_response_canceled`, which is idempotent against pre-emitted terminators (the `/api/v1/restart` race). | one-per-turn | yes | yes |
-| `ResponseAborted` | System-driven termination: engine shutdown, safety net (non-watchdog), recovery sweep, OS signal, stale-projection settle. Carries `cause: AbortCause` (`EngineShutdown` / `SafetyNet` / `RecoveryAfterRestart` / `ProcessKilled` / `StaleSettle` / `SessionDropped` / `Unknown`). Always emit via `thread_events::emit_response_aborted`. A coding agent that exits on its own with a non-zero code or any stderr is a `ResponseFailed`, never this abort. When a hung-subprocess watchdog interrupts a coding agent (not a crash or driver death), the engine emits `ContinuationRequested{auto_recovery_after_hang}` instead of `ResponseAborted{SafetyNet}`. The thread then auto-resumes. Two watchdogs can fire that path (see `ContinuationRequested`). | one-per-turn | yes | yes |
+| `ResponseCanceled` | User clicked Cancel, clicked Apply / Discard / Archive on a still-running session, or posted a follow-up that interrupted a mid-turn Codex turn. Carries `cause: CancelCause`; see the generated wire values under `ResponseCanceled` / `ResponseAborted` / `ResponseFailed`. Always emit via `thread_events::emit_response_canceled`, which is idempotent against pre-emitted terminators (the `/api/v1/restart` race). | one-per-turn | yes | yes |
+| `ResponseAborted` | System-driven termination: engine shutdown, safety net (non-watchdog), recovery sweep, OS signal, stale-projection settle. Carries `cause: AbortCause`; see the generated wire values under `ResponseCanceled` / `ResponseAborted` / `ResponseFailed`. Always emit via `thread_events::emit_response_aborted`. A coding agent that exits on its own with a non-zero code or any stderr is a `ResponseFailed`, never this abort. When a hung-subprocess watchdog interrupts a coding agent (not a crash or driver death), the engine emits `ContinuationRequested{auto_recovery_after_hang}` instead of `ResponseAborted{SafetyNet}`. The thread then auto-resumes. Two watchdogs can fire that path (see `ContinuationRequested`). | one-per-turn | yes | yes |
 | `ResponseFailed` | Hard failure mid-turn: upstream API error, panic, OOM-killed bash, empty assistant text on a non-cancel turn (`agent_session::lifecycle::classify_result` does this for coding-agent threads too). Carries `error: String`, and an optional `agent_exit: { stage, code }` (stage `startup` or `mid_turn`, `code` omitted when a signal ended the process) on a coding-agent turn whose process exited on its own. Then `error` is the CLI's own stderr tail, masked and at most 4 KB, or a fallback naming the agent and exit code when it wrote nothing. `startup` means the exit came before Claude Code's first `system/init` line or before the Codex app-server handshake. The engine never retries a start failure by itself, and an event with no `agent_exit` is any other failure. An empty chat completion lands here only for a *genuine* failure: output **truncated**, **blocked** by a safety classifier, **dropped** (billed but nothing parsed; Anthropic-only), or an **unrecognised** stop reason. A clean empty stop emits an empty `ResponseGenerated` instead. A reply a safety classifier stops **partway** also lands here, and its streamed `TextStreamed` text stays on screen with no `ResponseGenerated`. `classify_empty_completion` and `normalize_finish_reason` (`agentic_loop/helpers.rs`) treat every provider and thread type alike. | one-per-turn | yes | yes |
 | `PromptInjected` | An injected prompt reached the live agentic loop: a human interjection (a message sent mid-turn), an agent's follow-up into its child thread, or an engine note (a resume note, an event-wait re-entry anchor). `mode` names the sender. Only a `Human` one counts as a user action for the drawer's recency. Retired name: `UserPromptInjected` (ADR 0389). Carries `text`, `mode: ActorMode`, optional `origin`, optional `injected_message_id`, optional `delivered_event_id`. The loop frames the text before the model sees it (`framed_injected_prompt`, `agentic_loop/helpers.rs`), keyed on `mode` **and** on whether it lands mid-turn or starts a turn. Mid-turn, a `Human` message is an interjection to answer *and then resume the work in progress*. A redirect still overrides, but answering alone does not end the turn. `Agent`/`Engine` messages are a system update to fold into the response in progress. An injection the previous turn left undrained runs as its own turn (`api::chat::process_orphan_chain`) with no resume directive, since that turn's work is over. **Every** orphan in such a batch is announced, the first included (`announce_orphan_batch`). A restart also ends a turn undrained. Then the queued messages come back from the event store, not the dead channel (`chat::queued_recovery`, ADR 0236). They ride the resume's own turn after the engine note, announced the same way, so the client absorbs each into its own message panel. The re-processed turn reuses the persisted `MessageReceived` as its starter event. So this is the only event in that turn whose lifecycle rule sets the thread back to `running`. The client uses `injected_message_id` to absorb it into that message's panel instead of rendering a second one. The event always stores the user's raw `text`, never the framing. | per-action | yes | yes (use condition) |
 | `ImageDescribed` | A background Flash call described one image attached to a `MessageReceived`, one event per `user_image_hashes` entry. Emitted from the agentic loop after iteration 1 of a chat turn. A mid-turn message is injected instead, so that path emits from the chat injection fast-path as a detached task. Carries `source_event_id: Uuid`, `hash: String`, `description: String` (after the `is_bad_image_description` filter) and `model: String`. The `description` is indexed into memory (§ `ImageDescribed`). | per-action | yes | yes (use condition) |
@@ -211,7 +255,7 @@ Terminator set for chat-mode (`TERMINATOR_EVENT_TYPES` constant): `ResponseGener
 
 The rule covers all three out-of-loop emitters: the `/api/v1/restart` teardown, the 60 s stuck-turn eviction, and the shutdown sweep.
 
-**A coding-agent session needs another way, because its request id cannot do that job.** A live session keeps ONE `request_event_id` across every follow-up turn. So "a terminator exists for this request id" would read turn one's `ResponseGenerated` as covering turn two, and swallow a real terminator. Its suppression is scoped to the *turn* instead: a `ResponseAborted` that out-sequences the thread's newest start event already covers the turn, so the session emits nothing. Start events are `MessageReceived`, `CodingAgentUserMessageSent`, `TriggerStarted`, `ContinuationStarted` and `OrphanRecoveryStarted`.
+**A coding-agent session needs another way, because its request id cannot do that job.** A live session keeps ONE `request_event_id` across every follow-up turn. So "a terminator exists for this request id" would read turn one's `ResponseGenerated` as covering turn two, and swallow a real terminator. Its suppression is scoped to the *turn* instead: a `ResponseAborted` that out-sequences the thread's newest start event already covers the turn, so the session emits nothing. Start events are `MessageReceived`, `CodingAgentUserMessageSent`, `TriggerStarted` and `ContinuationStarted`. The query also recognizes the retired event `OrphanRecoveryStarted` on stored rows.
 
 Two checks apply. The in-memory `AgentSession::external_terminal_emitted` flag is the fast path when the session was already registered. The events-table check covers a boundary emitted **before the session existed at all**. Both restart emitters iterate a snapshot of `agent_sessions`, so they miss a session still spawning. Without that check, a *Switch to new version* during a spawn stacked a `ResponseCanceled{user_stop}` beside "Paused by restart". The resume gate reads a cancel as "turn ended", so the next boot declined the promised auto-resume.
 
@@ -220,8 +264,49 @@ Two checks apply. The in-memory `AgentSession::external_terminal_emitted` flag i
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
 | `ContinuationStarted` | Resume-after-abort boundary. Opens a new exchange whose body is the rerun (chat: a fresh LLM call; coding agent: resume into the same `cc_session_id` when the backend has one). **Channel-agnostic**: emitted on chat, trigger and coding-agent paths alike, so it says nothing about a thread's type (see below). Carries optional `branch`, engine-stamped `origin`, `reason`, which mirrors `ContinuationRequested.reason` so a hang or stray-signal recovery is not labelled an engine restart, and `resumed_abort_id`, the abort a chat or trigger Continue resumes. Aliases for old DB rows: `SessionRecovered`, `SessionResumed`. | lifecycle | yes | yes |
-| `SessionStarted` | A coding-agent process spawned. Carries `session_id` (backend session id), optional `branch`, optional `repo_id`, plus *coding-agent-thread* discriminators. `coding_agent_kind`: `"lucidos" \| "app" \| "external"`, default `"lucidos"`. `coding_agent_folder`: the folder the spawn targets, `<ws>/data/apps/<id>/` for App, else the repo root. `app_id`: set only for App. `coding_agent`: `"claude-code" \| "codex"`, default `"claude-code"`, the backend driving the thread, locked in by the first SessionStarted via the `thread_summaries.coding_agent` projection. `integrated: true` (omitted when false) marks an *integrated sub-thread*, kept for the thread's life in `thread_summaries.coding_agent_integrated`. `auto_compact_arm` (`"control" \| "window" \| "override"`) and `auto_compact_window` (tokens) record the auto-compact trial on a Claude Code spawn. Both are omitted when the trial is off and on Codex. The window is omitted under `control`, and under `override` when the workspace value is not a number. Legacy rows without these decode as Lucidos / Claude Code / independent via serde defaults. It leaves the thread's compose draft and *compose epoch* alone: the send that started the session consumed them when the engine accepted it. | lifecycle | yes | yes |
-| `SessionEnded` | A coding-agent thread is truly done (terminal-only). Carries `reason: SessionEndReason` (`Shutdown` / `Panic` / `Closed` / `StaleResume` / `LegacyNonTerminal`). `StaleResume` is the one transient case and does NOT settle the thread. The projection stays `running` while the caller re-spawns once with a fresh session (chat and the continuation/spawn consumer both do), and the frontend skips the AbortPanel. A caller that does not retry leaves the thread `running` with no subprocess, so the retry is part of the contract. | lifecycle | yes | yes |
+| `SessionStarted` | A coding-agent process spawned. Carries `session_id` (backend session id), optional `branch`, optional `repo_id`, plus *coding-agent-thread* discriminators. `coding_agent_kind`: `"lucidos" \| "app" \| "external"`, default `"lucidos"`. `coding_agent_folder`: the folder the spawn targets, `<ws>/data/apps/<id>/` for App, else the repo root. `app_id`: set only for App. `coding_agent`: `"claude-code" \| "codex"`, default `"claude-code"`, the backend driving this session. `thread_summaries.coding_agent` follows the newest SessionStarted, so a *successor session* may switch it. `integrated: true` (omitted when false) marks an *integrated sub-thread*, kept for the thread's life in `thread_summaries.coding_agent_integrated`. `auto_compact_arm` (`"control" \| "window" \| "override"`) and `auto_compact_window` (tokens) record the auto-compact trial on a Claude Code spawn. Both are omitted when the trial is off and on Codex. The window is omitted under `control`, and under `override` when the workspace value is not a number. `continuity` says whether the session carried the thread's earlier context; see the generated values below. Its `handoff` kind marks a *successor session*, with the opening it started from, and the `checkpoint` and `progress` it handed off at when there was one. The transcript draws its card from this field. Omitted on rows written before it existed. Legacy rows without these decode as Lucidos / Claude Code / independent via serde defaults. It leaves the thread's compose draft and *compose epoch* alone: the send that started the session consumed them when the engine accepted it. | lifecycle | yes | yes |
+| `SessionEnded` | A coding-agent thread is truly done (terminal-only). Carries `reason: SessionEndReason`; see the generated values below. `stale_resume` is the one transient case and does NOT settle the thread. The projection stays `running` while the caller re-spawns once with a fresh session (chat and the continuation/spawn consumer both do), and the frontend skips the AbortPanel. A caller that does not retry leaves the thread `running` with no subprocess, so the retry is part of the contract. | lifecycle | yes | yes |
+
+The session payload enums use these wire values. `SessionContinuity` is tagged by `kind`.
+Its `fresh` variant carries a `FreshSessionReason` in `reason`.
+Its `handoff` variant carries a `HandoffOpening` in `opening` and the opening text in `message`.
+
+<!-- generated:begin SessionEndReason -->
+SessionEndReason wire values:
+
+- `shutdown`
+- `panic`
+- `closed`
+- `stale_resume`
+- `legacy_non_terminal`
+<!-- generated:end -->
+
+<!-- generated:begin SessionContinuity -->
+SessionContinuity wire values:
+
+- `first`
+- `resumed`
+- `fresh`
+- `handoff`
+<!-- generated:end -->
+
+<!-- generated:begin FreshSessionReason -->
+FreshSessionReason wire values:
+
+- `change-applied`
+- `change-discarded`
+- `session-ended`
+- `branch-gone`
+- `resume-failed`
+- `no-resumable-session`
+<!-- generated:end -->
+
+<!-- generated:begin HandoffOpening -->
+HandoffOpening wire values:
+
+- `narrative`
+- `brief`
+<!-- generated:end -->
 
 ## Coding agent (Claude Code / Codex)
 
@@ -231,26 +316,30 @@ The `CodingAgent*` family covers Claude Code and Codex. Variants carry `coding_a
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
+| `MessageHeld` | On a coding-agent thread, an agent-sent message waits for a human reply before delivery. Carries `text`, optional `user_image_hashes`, `mode` and `origin`. It leaves the question and thread status unchanged. | per-action | yes | yes |
+| `HeldMessageReleased` | On a coding-agent thread, a held message is released just before its `MessageReceived`. Carries `held_message_id`, referencing `MessageHeld`, so release happens at most once. | per-action | yes | yes |
 | `CodingAgentUserMessageSent` | A user message was relayed into the agent's input stream. | one-per-turn | yes | yes |
 | `CodingAgentPromptSent` | A prompt was forwarded into a live coding-agent session: an engine-synthesized one (orphan recovery, hardening retrigger, merge-conflict explainer, post-question continuation), or a user follow-up with the user's text and no origin. `input_event_id` names the event that carried the input, absent for an engine prompt with no starter event. A redelivered follow-up (ADR 0506) writes a second one for the same message. Carries `origin: Option<MessageOrigin>`; an automated prompt (hardening retrigger, merge conflict) always carries an engine origin with its reason. Audit-only, not rendered in chat. | per-action | yes | yes (use condition) |
 | `CodingAgentInputRead` | The coding agent read an input the engine forwarded. `verbatim: true` marks the read of a slash command forwarded exactly as typed. Carries `input_event_id` (the `MessageReceived` it read, the `ChildThreadCompleted` of a child wake, or the `CodingAgentPromptSent` of an engine prompt with no starter event). Only the agent's own report is a read. Rows written before 2026-10-12 can carry `assumed: true`, a read a since-removed timer settled with no report. Carries `started_turn: true` (omitted when false) when the read opened a new turn, such as a queued message after a Stop; that read sets the thread running again. See [coding-agent-events](coding-agent-events.md). | per-action | yes | yes |
 | `CodingAgentInputDiscarded` | Older threads only: an effort restart interrupted a Claude Code turn before the agent read the input that opened it, so the agent never will. Nothing emits it now (ADR 0542). Carries `input_event_id`, as on `CodingAgentInputRead`. A message, a child's report or an engine prompt stays owed until a `CodingAgentInputRead` names it, and the next session to start delivers it. A continuation or a cache keep-alive is never owed. Not rendered. See [coding-agent-events](coding-agent-events.md). | per-action | yes | yes |
+| `ChildReportTaken` | A coding agent took a child's report mid-turn through its own `lucidos` call (`lucidos threads child-reports`, or a `lucidos background-task wait` that returned early). The engine withdrew the report's queued copy first, so the agent reads it once. Carries `input_event_id`, the `ChildThreadCompleted` card. It follows the card, so a restart does not wake the parent for that card again. Not rendered. See [coding-agent-events](coding-agent-events.md). | per-action | yes | yes |
 | `CodingAgentTextStreamed` | One chunk of the coding agent's assistant text. Join a turn's chunks with no separator: each new text block already starts a new paragraph. A chunk never holds whitespace alone: a paragraph break leads the next chunk instead. Older rows can still hold a bare `"\n\n"`, or two blocks with no break between them. A chunk a Claude Code sub-agent wrote carries `parent_tool_use_id` and is the sub-agent's narration, not the reply. A chunk flagged `progress_note: true` is a progress note: the provider's short summary of longer text the agent wrote before a tool call. The user saw only the summary. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentThoughtStreamed` | One chunk of the coding agent's streamed reasoning (CC's `thinking_delta`; Codex's `item/reasoning/*Delta` or `reasoning` item). Coalesced before persistence. Rendered as the live "Thinking" step's content. | high-volume-streaming | yes | **no (blocked)** |
 | `CodingAgentToolCalled` | One coding-agent tool invocation. Carries `name`, `args`, optional `description`, `tool_use_id`. A call a Claude Code sub-agent made also carries `parent_tool_use_id`, the id of the `Agent` call that spawned it. A Claude Code call carries `api_call_id`, shared by every tool call of one API call and by its `ContextCaptured`. | per-action | yes | yes (use condition) |
 | `CodingAgentToolResult` | The result returned to the coding agent for a prior `CodingAgentToolCalled`. Same `tool_use_id`, `name` and `parent_tool_use_id`. `result` holds the whole output (rows before full storage kept 200 chars). | per-action | yes | yes (use condition) |
 | `CodingAgentIdled` | **The coding-agent turn-boundary marker.** Emitted at the end of every coding-agent turn whose Result was not an engine-shutdown abort. Carries `has_changes`, `is_external_repo`, `requires_restart`, `cc_session_id`, `coding_agent`, optional `reason`, optional `worktree_path`, optional `worktree_head_sha`, and `bg_bash_pending`. That last is a history flag: true when the turn idled with a chat-agent `run_bash_background` task running. It **no longer gates proposal or drives any UI**; harden-at-apply covers correctness. | one-per-turn | yes | yes |
-| `SuccessorThreadSpawned` | This thread handed off to a *successor thread*. Lands on the OLD thread. Carries `successor_thread_id` and `base_sha`, this thread's last commit, where the successor's branch starts. `starts_build_chain: true` marks a plan card's handoff, whose successor is a `no-wake` child of this thread, which stays open (a *build chain*). `handoff_consent` (`owner`, `owner-approval` or `carried`) names the authority that let a successor placed under a parent start: its *handoff consent*, which that successor inherits for its own automatic handoffs. Absent for a top-level successor, a build chain member, a machine caller, and any spawn the owner did not authorize. Projects `thread_summaries.successor_thread_id` here and `successor_of` on the successor, and clears this thread's pending parent report: the successor reports in its place. The thread's work then waits as `carried_by_successor`. A thread hands off once: a second one is refused and never recorded. | lifecycle (rare) | yes | yes |
-| `HandoffCheckpointReached` | The agent ran a *handoff checkpoint* a flow names, through `lucidos successor offer --at <name>`. Carries `name`, optional `progress` (`{done, total}`), and what the *handoff estimate* read: `context_tokens`, `model`, `reasoning_effort`. `offered: true` marks a `--ask` run, and `pays` is the verdict (absent when the engine could not make a reading). A later run of the same checkpoint reads it as history: the main-session calls from here to the first turn end with nothing pending (no open question, event wait or unread message), per unit left. Changes no status. | lifecycle (rare) | yes | yes |
+| `SessionHandedOff` | The current session handed off: the thread's next session is its *successor session*, which starts fresh once this session's turn ends. Carries `opening` (`narrative` or `brief`), `message` (the opening the successor session reads first), optional `checkpoint` and `progress`, and the implementer it runs on: `coding_agent`, optional `coding_agent_model` and `reasoning_effort`. Optional `request` holds what the user typed at the *Successor card* (`message`) and who typed it (`by`). The successor session then starts on it as that user's own `MessageReceived`, and the opening goes ahead of it in the agent's first prompt. Pending until the successor session's `SessionStarted`, whose `continuity` is `handoff`. A user's Stop withdraws it, as does an Apply, Discard or Archive that stops a turn. So does a failed turn that began after it, since the successor session never started. A recovery or conflict-resolution session leaves it pending. Meanwhile the thread offers no second handoff, owes its parent no report or wake decision, and gets no cache keep-alive. Creates no thread, changes no status, and leaves the branch and change alone. | rare | yes | yes |
+| `SuccessorThreadSpawned` | Legacy: this thread handed off to a *legacy successor thread*, before handoffs started a *successor session* in the same thread. No new row records it. Lands on the OLD thread. Carries `successor_thread_id` and `base_sha`, this thread's last commit, where the successor's branch starts. `starts_build_chain: true` marks a plan card's handoff, whose successor is a `no-wake` child of this thread, which stays open (a *build chain*). `handoff_consent` (`owner`, `owner-approval` or `carried`) names the authority that let a successor placed under a parent start: its *handoff consent*, which that successor inherits for its own automatic handoffs. Absent for a top-level successor, a build chain member, a machine caller, and any spawn the owner did not authorize. Projects `thread_summaries.successor_thread_id` here and `successor_of` on the successor, and clears this thread's pending parent report: the successor reports in its place. The thread's work then waits as `carried_by_successor`. A thread hands off once: a second one is refused and never recorded. | lifecycle (rare) | yes | yes |
+| `HandoffCheckpointReached` | The agent ran a *handoff checkpoint* a flow names, through `lucidos successor offer --at <name>`. Carries `name`, optional `progress` (`{done, total}`), and what the *handoff estimate* read: `context_tokens`, `model`, `reasoning_effort`. `offered: true` marks a `--ask` run, and `pays` is the verdict (absent when the engine could not make a reading). `default_floor: true` marks a `--default-floor` run. Its `floor_rung` and `risk_rung` (`{model, effort}`) are the rungs it named, each absent when none. A later run of the same checkpoint reads it as history: the main-session calls from here to the first turn end with nothing pending (no open question, event wait or unread message), per unit left. Changes no status. | lifecycle (rare) | yes | yes |
 | `SuccessorOfferDeclined` | The user chose *Stay here* on the *Successor card*. Carries `input_tokens`, the context size at that moment. The card stays hidden until the thread holds 100k tokens more, and a compaction below that size lifts the hold. Changes no status. | rare | yes | yes |
-| `SuccessorRequested` | The user chose *Continue with context* on the *Successor card* while the prompt cache was warm. Carries the first request they typed for the successor and the implementer they picked. The agent writes the *handoff narrative*, and its spawn reads this row. Pending until the thread idles. Changes no status. | rare | yes | yes |
+| `SuccessorRequested` | The user chose *Continue with context* on the *Successor card* while the prompt cache was warm. Carries the first request they typed for the successor and the implementer they picked. The agent writes the *handoff narrative*, and its handoff reads this row. Pending until the thread idles. Changes no status. | rare | yes | yes |
 | `CodingAgentCompacted` | The coding agent compacted its own context mid-session: Claude Code's `compact_boundary`. Carries `trigger` (`"auto"` or `"manual"`), optional `pre_tokens` and `post_tokens`, and `coding_agent`. Renders as a finished step, so the context counter's drop has a cause on screen. | lifecycle (rare) | yes | yes |
 | `CodingAgentSettingsChanged` | User changed model or reasoning effort mid-session. Also emitted once at backend init with `cc_session_id`, `claude_config_dir` (where the session's transcripts live) and `claude_config_dir_explicit` (whether `CLAUDE_CONFIG_DIR` was set). That makes them durable before the first `CodingAgentIdled`. The session id lets a mid-turn engine restart still resume. The config-dir fields let the resume replay the same Claude Code profile, even if the user toggled the env var meanwhile. | lifecycle (rare) | yes | yes |
 | `CodingAgentPermissionRequest` | A coding agent asked to confirm a tool call, on one of two raise paths. Claude Code's MCP permission-prompt subprocess fires for a path outside the session's working directories, or `.git/` inside the worktree. Those directories are the worktree, the workspace's `data/` tree, `/tmp` and `$TMPDIR`; an in-worktree write, including under `.claude/`, is auto-allowed before any card. Under the `auto` permission mode CC's classifier decides instead. The Codex app-server approval bridge fires for a sandbox-escaping `command_execution` or an out-of-worktree `file_change` under `approvalPolicy: on-request`. The exec escape-hatch protocol emits none. | per-action | yes | yes |
 | `CodingAgentPermissionResolved` | The above request was answered, or the engine auto-resolved it. Auto cases: recovery (orphaned after restart); supersession (`allowed: false`, `reason: "Superseded by a new message"` when the user types instead of clicking); a **session-ended clear**. The clear fires when the turn idled with the card still open, e.g. a parallel subagent's card outliving the main turn. Its `reason` starts `"Coding agent session ended before answering"`. Carries `allowed`, optional `reason`, optional `persist_scope` (`narrow` / `broad` / `session`). Flips the thread back to `running` **only from `waiting_for_user_answer`**. A resolution on an idle or terminal thread (a stale click, or the session-ended clear) leaves the status unchanged, so a finished thread never becomes a dead `running`. | per-action | yes | yes |
 | `MissingHardeningDetected` | A coding-agent session ended without running `/harden`, so the engine auto-spawned a recovery hardening session. Not a session terminator: the thread stays active until hardening finishes. | lifecycle (rare) | yes | yes |
 | `ContinuationRequested` | An interrupted coding-agent turn needs to resume without a new user message. The spawn dispatcher picks it up; the event id is the spawn idempotency key. Delivery is guaranteed two ways. The bus sends each committed request to the dispatcher on a directed channel, not the broadcast, so a lag cannot drop it. And every engine start re-dispatches any unactuated request: no later lifecycle or terminal event, on a thread still `running`. So a request never strands a thread as a running zombie. `reason: String` is one of: `"user_clicked_continue"` (Continue after an engine restart); `"answered_after_idle"` (an `AskUserQuestion` answered after the subprocess was torn down at idle); `"auto_recovery_after_hang"` (a hung-subprocess watchdog found the agent silent past its inactivity limit); `"auto_resume_after_switch"` (recovery resumes an in-flight thread after a user's *Switch to new version*); `"harden_requested"` (the user pressed **Harden** on the *Not ready* strip, and the thread resumes to run `/harden`); `"auto_resume_after_api_error"`. That last one fires when the agent ended a turn on a transient upstream failure it reported itself (`API Error: …`, e.g. a connection closed mid-response). The engine then resumes instead of leaving the thread dead behind the `ResponseFailed`. It is the only BOUNDED reason: at most 3 in a row since the thread's last `MessageReceived` or `ResponseGenerated`, so a broken upstream shows a red dot instead of looping. It is skipped during engine shutdown (post-restart recovery owns those threads) and on a conflict-resolution session (an API drop mid-merge aborts the merge and leaves the change pending). Two watchdogs produce `auto_recovery_after_hang`. The in-loop one sits in `run_session`'s `select!` (10 min, the fast first line). An external scanner task (12 min, ticks every 30 s) catches a `select!` wedged in an event-handler await. They share a gate, and the 2-min grace lets the in-loop one fire first. The gate skips while a tool is in flight (a long `Bash`, an unanswered `AskUserQuestion`), up to a 45-min hung-tool ceiling. Past it, a tool that never returns (a hung sub-agent) fires anyway, after re-confirming the thread is still `running`, so a pending user answer is never killed. A thread may have an in-flight *conflict resolution*: a pending change whose latest merge-lifecycle event is an unpaired `MergeConflictDetected`. Then a **recovery-shaped** continuation (`user_clicked_continue` / `auto_recovery_after_hang` / `auto_resume_after_switch`) re-attaches the merge duty. Never `answered_after_idle`, a different interaction that must not silently land a change. The resumed session runs in the merge worktree with the change bound, so its completion finishes the apply (`ChangeApplied`) or aborts for real. A stray-killed merge session's cleanup skips the failure events, so the pairing stays open for the hand-off. A duty the continuation cannot carry (merge worktree gone, resume failed first) closes loudly with the deferred `MergeResolutionCleared` + `ChangeApplyFailed` pair. Past name `ContinueSignal` is a serde alias for old DB rows. | lifecycle | yes | yes |
-| `SideQuestionAsked` | The user asked a *side question* in a Claude Code or Lucidos Agent thread. Carries `side_question_id: Uuid` (named by the client), `question`, any attached `image_hashes`, and `actor` from `EventMeta`. Records a card beside the thread, never a turn: it moves no status, recency, count or section. **No agent sees it**: `query_events`, triggers, event waits and every context builder leave it out (ADR 0320). | per-action | yes | **no (hidden)** |
+| `SideQuestionAsked` | The user asked a *side question* in a Claude Code or Lucidos Agent thread. Carries `side_question_id: Uuid` (named by the client), `question`, any attached `image_hashes`, and `actor` from `EventMeta`. Records a card beside the thread, never a turn: it moves no status, recency, count or section. **No agent sees it**: `events(action="query")`, triggers, event waits and every context builder leave it out (ADR 0320). | per-action | yes | **no (hidden)** |
 | `SideQuestionAnswered` | The thread's agent answered the side question with this `side_question_id`. Carries `answer`. Same hiding as `SideQuestionAsked`. | per-action | yes | **no (hidden)** |
 | `SideQuestionFailed` | The side question with this `side_question_id` got no answer. Carries `error`. Startup writes one, `"Interrupted by a restart. Ask again."`, for every ask a restart left unsettled. Same hiding. | per-action | yes | **no (hidden)** |
 | `SideQuestionDismissed` | The user dismissed the card for this `side_question_id`. The ask stays recorded, so the card collapses to a row that reopens. Same hiding. | per-action | yes | **no (hidden)** |
@@ -262,7 +351,7 @@ Not prefixed `CodingAgent*`, because any agent can use this machinery to ask the
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
 | `UserQuestionAsked` | An interactive question was raised by Claude Code's `AskUserQuestion` tool, Codex's `ask_user_question` MCP tool (one question per call), or the chat agent's `ask_user_question` tool. `meta.channel` records the lane: `claude_code` (the coding-agent channel, both backends) or `chat`. Resume goes through `POST /api/v1/threads/{thread_id}/answer-question`. The engine branches on the channel: coding agent gets a resume marker plus a `ContinuationRequested` respawn if needed; chat wakes the in-process tool. Carries `tool_use_id`, `cc_session_id` (empty for chat-channel and Codex rows), `question`, `options: Vec<QuestionOption>`, optional `worktree_path`, `multi_select: bool`, and on an *owner approval card* `owner_approval: { verb, target_thread_id? }`. | one-per-turn (of the `Asked` kind) | yes | yes |
-| `UserQuestionAnswered` | The user (or the engine, on the orphan-recovery path) supplied an answer. Pairs 1:1 with its `UserQuestionAsked` via `tool_use_id`. Carries `answer: AnswerKind` (`Selected` / `FreeText` / `MultiSelected` / `Canceled` / `Superseded`) and copies `meta.channel` from the `Asked`. A typed `FreeText` or `MultiSelected` may carry the user's `image_hashes`. The last two kinds resolve the question without an answer. `Canceled` is a dismissal or teardown stamp. `Superseded` is a follow-up that could not be the answer and replaced the question (coding-agent lane only). | one-per-turn | yes | yes |
+| `UserQuestionAnswered` | The user (or the engine, on the orphan-recovery path) supplied an answer. Pairs 1:1 with its `UserQuestionAsked` via `tool_use_id`. Carries `answer: AnswerKind` (`Selected` / `FreeText` / `MultiSelected` / `Canceled` / `Superseded`) and copies `meta.channel` from the `Asked`. `quiet: true` marks a pick of only *quiet options*: the turn ends, nothing wakes the agent, and the thread settles to `idle`. A typed `FreeText` or `MultiSelected` may carry the user's `image_hashes`. The last two kinds resolve the question without an answer. `Canceled` is a dismissal or teardown stamp. `Superseded` is a follow-up that could not be the answer and replaced the question (coding-agent lane only). | one-per-turn | yes | yes |
 | `OwnerApprovalRequested` | A coding agent asked for an *owner approval* with `lucidos ask-owner-approval` (ADR 0387). Carries `request_id`, `approval: { verb, target_thread_id? }` and `question`, the card text Lucidos wrote. Grants nothing by itself: the card appears when the agent asks `AskUserQuestion` with `request_id` as its question, and that card's `UserQuestionAsked` carries the same `owner_approval`. | per-action | yes | yes |
 | `OwnerApprovalSpent` | A thread used the owner's **Allow once** on the act it names, just before the act ran. Carries `tool_use_id` (the approval card), `verb` and optional `target_thread_id`. At most one per card. | per-action | yes | yes |
 | `CommandPermissionRequested` | The **command guard** (ADR 0002) paused a chat bash/python tool call in the `IrreversibleDanger` lane to ask the user. That lane means a likely real-world side-effect (mutating HTTP, sending mail, a cloud-CLI mutation) or destruction outside the workspace. A static fast-path settles the obvious safe or catastrophic cases; the LLM **judge** (Phase 3) decides the ambiguous middle. The chat mirror of `CodingAgentPermissionRequest`: same `PermissionCard`, but the agent loop blocks in-process (no MCP subprocess). Carries `request_id`, `tool_use_id`, `tool_name` (a bash/python tool), `command` (the inspected text), `summary` (the card's one-line risk, written by the judge), and for bash an optional `grant_head` (the head a grant stores, after a leading `cd` into the workspace root drops). Chat-channel only; flips the thread to `waiting_for_user_answer`. | per-action (only when the guard is on AND a command hits the danger lane) | yes | yes |
@@ -331,10 +420,10 @@ The FreeText fast-path also requires a **human-authored** follow-up (`ActorMode:
 | `TriggerStarted` | A scheduled or event-driven trigger run started. Carries `trigger_id`, optional `trigger_name`, optional `prompt`, optional `invocation: TriggerInvocation` (`Schedule` or `Event { event_type, event_id?, thread_id? }`). That `thread_id` is set only for thread-scoped source events, and script triggers see it as `TRIGGER_EVENT_THREAD_ID`. Also optional `origin`, `go_to_review: bool`, optional `model`, `reasoning_effort` and `provider`. Wire aliases: `task_id`, `task_name` (from when triggers were "scheduled tasks"). `model` / `reasoning_effort` / `provider` record what the fire ran on: the trigger's own pin, else the account trigger model; for the provider, the model's preferred route. This is a trigger thread's *starter* event, with no `MessageReceived`, so per-thread model memory reads these fields. A follow-up on a trigger thread reuses the fire's model instead of the account chat model. Absent on older runs. | lifecycle | yes | yes |
 | `TriggerCompleted` | A trigger run finished. Carries `trigger_id`, optional `trigger_name`, optional `result_summary`. Same aliases. `result_summary` is always a non-empty, single trimmed line. A script that exits 0 with no stdout falls back to its last non-empty line, else `"<name> completed (exit <code>, no output)"`. An intent run with no final text falls back to `"<name> completed (no output)"`. So idle-detector triggers never read as a flood of no-op fires to the learning and audit sweeps. | lifecycle | yes | yes |
 
-### Deleting a thread is a `SystemEvent`, not one of these
+### Deleting a thread is a `engine::event_bus::SystemEvent`, not one of these
 
 A thread's own events cannot record its deletion, because the delete removes
-them. So `ThreadsDeleted` is a **`SystemEvent`** on aggregate `ops` with
+them. So `ThreadsDeleted` is a **`engine::event_bus::SystemEvent`** on aggregate `ops` with
 `aggregate_id` `global`. It is persisted and subscribable like any other, and
 `condition: { thread_id: ... }` does NOT reach it: the row belongs to no thread.
 Subscribe on the type and read `thread_ids` from the payload instead.
@@ -348,10 +437,10 @@ changes nothing about retrievability. Delete removes the rows, and what Lucidos
 learned from them, with no undo. It is offered to the workspace owner in the UI
 and to nobody else, so no tool, CLI verb or SDK method can reach it.
 
-### Correcting a memory is a `SystemEvent` too
+### Correcting a memory is a `engine::event_bus::SystemEvent` too
 
 A memory correction belongs to no thread, so `MemoryCorrected` is a
-**`SystemEvent`** on aggregate `memory` with `aggregate_id` `global`.
+**`engine::event_bus::SystemEvent`** on aggregate `memory` with `aggregate_id` `global`.
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
@@ -376,10 +465,10 @@ A provider refusing a background task's model reports on aggregate `ops`.
 |---|---|---|---|---|
 | `ModelNotServedObserved` | A provider answered that it does not serve the model a background task ran on: retired, never enabled, or misspelled. Carries `model`, `provider`, `purpose`, `message` (the provider's failure, with advice where Lucidos has one) and `moved_to`, the model the call retried on. No `moved_to` means the call failed. For six hours an unset default passes over the model; a stored pick keeps failing and gets one notification. | at most once per provider, model and task per six hours | yes | yes |
 
-### A dashboard reports as `SystemEvent`s
+### A dashboard reports as `engine::event_bus::SystemEvent`s
 
 The two *dashboards* belong to the workspace, not to a thread, so their events
-are **`SystemEvent`s** on aggregate `dashboard`. The `aggregate_id` and the
+are **`engine::event_bus::SystemEvent`s** on aggregate `dashboard`. The `aggregate_id` and the
 payload's `dashboard` field are both `phone` or `desktop`. Each carries an
 optional `actor`. The engine folds them on read, on top of the seed from
 Home's old pins and `HomeBoardArranged` rows (ADR 0496).
@@ -390,11 +479,11 @@ Home's old pins and `HomeBoardArranged` rows (ADR 0496).
 | `DashboardTileRemoved` | A tile left one dashboard: Remove from dashboard, `widgets(action="remove_from_dashboard")`, or `lucidos widgets dashboard-remove`. Carries `dashboard`, `app_id` and the optional `params`. The other dashboard keeps its own tiles, and no file changes. | per-action | yes | yes |
 | `DashboardArranged` | One dashboard was arranged: by a drop or a size change in edit mode, by `widgets(action="arrange")` when the user asked, or by `lucidos widgets arrange`. Carries `dashboard` and `tiles`, in order: each `app_id`, optional `params` and `size`, one of `quarter`, `small`, `medium` or `large`. A widget takes the last three and an app shortcut only `quarter`. The manifest says which a tile is, so no event stores a kind. An entry naming no tile on that dashboard is ignored, and a tile it leaves out keeps its place after the named ones. | per-action | yes | yes |
 
-### Freeing disk space reports as `SystemEvent`s
+### Freeing disk space reports as `engine::event_bus::SystemEvent`s
 
 The *recommended cleanup* behind Disk Usage's "Free up space" button walks
 every worktree, so its report belongs to no thread. Its four events are
-**`SystemEvent`s** on aggregate `ops` with `aggregate_id` `global`. Each tree
+**`engine::event_bus::SystemEvent`s** on aggregate `ops` with `aggregate_id` `global`. Each tree
 it touches still gets its own `WorktreeCleaned` thread event.
 
 | Event | When it fires | Volume | Persisted | Triggerable |
@@ -416,7 +505,7 @@ The change family is per-thread, keyed by `change_id`. `ChangeProposed` is emitt
 | `unproposed` | Work on the branch that no pending change carries. | `reason`, or `null` |
 | `proposed` | A pending change exists, and Apply takes it. | `requires_restart` |
 
-The `reason` is the verdict of the last turn end that withheld the work: `plan_missing`, `plan_awaiting_approval`, `outside_bound`, `hardening_missing`, `turn_incomplete`, `awaiting_landing`, `integrated_into_parent` or `carried_by_successor`. A new turn clears it. A `null` reason means no turn end withheld it. The thread is still running, holds a live event wait, works in an external repo, or its work was set aside. Other summary fields already say which (ADR 0400).
+The `reason` is the verdict of the last turn end that withheld the work: `plan_missing`, `plan_awaiting_approval`, `outside_bound`, `hardening_missing`, `turn_incomplete`, `awaiting_landing`, `integrated_into_parent` or `carried_by_successor` (legacy successor threads only). A new turn clears it. A `null` reason means no turn end withheld it. The thread is still running, holds a live event wait, works in an external repo, or its work was set aside. Other summary fields already say which (ADR 0400). A turn that hands off to a *successor session* announces no proposal-hold verdict either: the successor session owes what the hold asks for, and its own turn end decides.
 
 **An unfinished turn never proposes.** A user Stop, a failure, an abort or a cut-off at shutdown leaves its work on the branch as `unproposed` with reason `turn_incomplete`. The engine announces it with `ProposalWithheld`. Continue resumes the session, and the next finished turn proposes. This supersedes ADR 0328's "a Stop proposes".
 
@@ -438,7 +527,7 @@ The Diff button follows git separately. It can appear earlier, when the worktree
 
 A merge-conflict re-run, or any re-spawn, can propose on a *new* branch. `propose_change` then first discards the thread's open changes on the *old* branches. It emits `ChangeDiscarded` for each **before** the new `ChangeProposed`, so the discard's reset cannot wipe the fresh change state. A `proposed` state follows the pending `changes` rows, so order does not matter for it.
 
-As a backstop, `apply_change` runs the same reconcile after a *successful* apply. It is gated on `ApplyStatus::Applied`, never `Noop`, `Hardening` or `Conflict`, which would discard a newer sibling. That covers the panel Apply, the no-live `apply_now` paths and the Apply-All driver. The live in-place merge path reconciles in `apply_now_success`.
+As a backstop, `LucidosEngine::apply_change` runs the same reconcile after a *successful* apply. It is gated on `ApplyStatus::Applied`, never `Noop`, `Hardening` or `Conflict`, which would discard a newer sibling. That covers the panel Apply, the no-live `apply_now` paths and the Apply-All driver. The live in-place merge path reconciles in `apply_now_success`.
 
 Without this, an orphaned `pending` row lingers on the abandoned branch. The frontend reads *any* pending row as "has pending changes", so it offers Apply and Discard and never Archive. The reconcile keys on branch and `change_id`, so same-branch multi-change survives. `discard_change` notifies the Apply-All driver, so discarding a batch member advances the batch. See `docs/plans/2026-07-01-orphaned-pending-change-blocks-archive.md`.
 
@@ -456,7 +545,7 @@ The current post-commit hook emits no `ChangeProposed`. It only moves the change
 | `ChangeReverted` | An applied change was reverted. Carries `change_id`, optional `actor`, legacy `path`. | lifecycle | yes | yes |
 | `ChangeSetAside` | A pending change was kept for later, out of Review, attention and Apply All (ADR 0328). Carries `change_id`; the actor is on `EventMeta`. Its thread can be archived. | lifecycle | yes | yes |
 | `ChangeBroughtBack` | A set-aside change returned to pending: the user brought it back, or its thread proposed new work on the same branch. Carries `change_id`; the actor is on `EventMeta`. An incomplete set-aside row never returns to pending: Bring back emits `ChangeWithdrawn` for it instead. | lifecycle | yes | yes |
-| `ProposalWithheld` | A turn end left work on the branch and proposed none of it. The plan floor held it, the work never ran `/harden`, or the turn did not finish (a Stop, a failure, an abort). Carries `branch_name`, `files` (what a proposal would have carried) and `reason`: `plan_missing`, `plan_awaiting_approval`, `outside_bound`, `hardening_missing`, `turn_incomplete`, `awaiting_landing` (the thread's change waits in the landing lane), `integrated_into_parent` (an *integrated sub-thread*'s hardened work, which its parent's agent merges and which is never proposed) or `carried_by_successor` (the thread handed off to a *successor thread*, whose change carries the work). Sets the thread's change state to `unproposed` with that reason, and leaves a `proposed` state alone. Two boot sweeps emit it too. The held-back sweep emits only when the reason differs from the projected one, so restarts add no duplicates. The sweep that withdraws an old pending incomplete change emits it after the `ChangeWithdrawn`. Moves no section. | per-action | yes | yes |
+| `ProposalWithheld` | A turn end left work on the branch and proposed none of it. The plan floor held it, the work never ran `/harden`, or the turn did not finish (a Stop, a failure, an abort). Carries `branch_name`, `files` (what a proposal would have carried) and `reason: UnproposedReason` (generated under `ProposalWithheld` below). Sets the thread's change state to `unproposed` with that reason, and leaves a `proposed` state alone. Two boot sweeps emit it too. The held-back sweep emits only when the reason differs from the projected one, so restarts add no duplicates. The sweep that withdraws an old pending incomplete change emits it after the `ChangeWithdrawn`. Moves no section. | per-action | yes | yes |
 | `ChangeQueued` | Apply put a Lucidos-source change in the *landing lane*. Carries `change_id` and `snapshot_sha`, the exact branch commit the lane lands. The actor is on `EventMeta`. The change stays pending, and a later commit on the branch is not part of it. `ChangeApplied` reports the landing. | per-action | yes | yes |
 | `ChangeUnqueued` | A queued change left the landing lane without landing. Carries `change_id` and `reason`: `discarded`, `set_aside`, `removed` (the user took it out of the lane while it waited), `batch_failed` (its lane batch failed) or `landing_failed` (the lane could not build or publish its landing merge). After `removed`, `batch_failed` or `landing_failed` it stays pending and apply-ready, and nothing queues it again until Apply is pressed. | lifecycle (rare) | yes | yes |
 | `ChangeWithdrawn` | A pending or set-aside change went back to unproposed work. The row's status becomes `withdrawn`, and the branch keeps every commit. Four causes: an unfinished turn moved the branch past a pending or set-aside change; a session running at shutdown had a pending change; Bring back met an incomplete set-aside row; or the first boot after ADR 0400 met an old pending incomplete row. Carries `change_id`. Moves the thread to the inbox. After a Bring back, the engine decides again: it proposes under a fresh id if the last turn finished, and otherwise emits `ProposalWithheld`. | lifecycle (rare) | yes | yes |
@@ -623,7 +712,7 @@ turn:
   ended does not count**, so waiting on other threads one at a time never
   reaches it. Everything else counts:
   - a wait ended by this thread's own event;
-  - a wait ended by an event with no known source (`emit_event` writes those);
+  - a wait ended by an event with no known source (`events(action="emit")` writes those);
   - a wait that timed out, and one not yet ended.
 
   That bounds a thread that re-opens itself and a model stuck re-arming. An
@@ -638,7 +727,9 @@ says what the keep-alive does as a whole (ADR 0529).
 
 | Event | When it fires | Volume | Persisted | Triggerable | Awaitable |
 |---|---|---|---|---|---|
-| `CacheKeepAliveStatusChanged` | The keep-alive status of a waiting thread changed. The keep-alive tick is its one writer, and it emits only on a change: a new ping, a cost update, a stop, or a cleared status. Carries `status`, absent once the thread has nothing to keep warm. Otherwise `status.state` is one of three. `warming`: `since`, `beats`, `budget_beats`, `beat_every_secs`, `cost_usd`, `context_tokens`, optional `next_beat_at`, `give_up_at`. `stopped` (past break-even): `at`, `beats`, `cost_usd`, `context_tokens`. `not_kept`: `reason`, `no_wake_children` or `children_awaiting_user`. Metadata: it opens no turn and moves no status, section or recency. Projects into `thread_summaries.cache_keep_alive_status`. The transcript folds a run's statuses into one card (ADR 0540). | per-action (rare) | yes | yes | yes |
+| `CacheKeepAliveStatusChanged` | The keep-alive status of a waiting thread changed. The keep-alive tick is its one writer, and it emits only on a change: a new ping, a cost update, a stop, an end or a cleared status. A wait parked on a question or permission card writes one too. Carries `status`, absent once the thread has nothing to keep warm. Otherwise `status.state` is one of five. `warming`: `since`, `beats`, `budget_beats`, `beat_every_secs`, `cost_usd`, `context_tokens`, optional `next_beat_at`, `give_up_at`, optional `odds` (`samples`, `slots`, `after_cap`: how past waits of the same agent and type ended against the cap). `stopped` (a run that pinged, then passed break-even): `at`, `beats`, `cost_usd`, `context_tokens`. `ended` (the wait ended while kept warm): `since`, `at`, `beats`, `cost_usd`, optional `saved_usd`, optional `context_tokens`. `turned_off`: `at`, `beats`, `cost_usd`, `context_tokens`. These four also carry optional `ping_usd` and `reread_usd`, today's list price of one ping and of rereading the context. The three closed states also carry the optional `beat_every_secs` and `odds` of the run's cap, so the math reads the same in every state. `not_kept`: `reason`, one of `no_wake_children`, `children_awaiting_user`, `uncacheable_provider` (the provider cannot prefill the Lucidos Agent's last request) `restarted` (Lucidos restarted since that request), `past_give_up_time` (the wait passed its give-up time before the first ping was due) or `unknown_ttl` (no reply said how long the cache lives, so no ping can be timed). A trigger thread no person has written in gets no ping and records no status. Metadata: it opens no turn and moves no status, section or recency. Projects into `thread_summaries.cache_keep_alive_status`. The transcript folds a run's statuses into one card, opened by the first warming status, before any ping (ADRs 0540, 0563 and 0572). A run that ends before its first ping closes as `ended` with zero `beats` and no `saved_usd`. | per-action (rare) | yes | yes | yes |
+| `CacheKeepAliveTurnedOff` | The user turned the cache keep-alive off for this one thread ("Turn off for this thread", or the `threads` tool's `cache_keep_alive` action), ADR 0554. No payload; `actor` names who. Projects into `thread_summaries.cache_keep_alive_off_at`. It holds until the thread's next real request, so a keep-alive ping never ends it. Metadata, and the transcript draws nothing. | per-action (rare) | yes | yes | yes |
+| `CacheKeepAliveTurnedOn` | The user turned the cache keep-alive back on for this thread. No payload; `actor` names who. Clears `thread_summaries.cache_keep_alive_off_at`. Metadata, and the transcript draws nothing. | per-action (rare) | yes | yes | yes |
 
 ## Voice session (a thread being spoken to)
 
@@ -660,7 +751,7 @@ which is what lets the boot sweep find one whose engine died mid-call.
 | `VoiceSessionEnded` | The session closed. Carries the same `session_id`, `duration_secs: u64`, and `reason`. Reasons: `hangup` (the caller rang off); `agent_hangup` (the caller said they were done and Lucidos rang off, ending the call but never the work); `disconnected` (the socket died with no goodbye); `provider_failed` (the talker could not go on); `engine_shutdown` (the engine went away, or the boot sweep settled a start its process never ended). A sweep-settled row carries `duration_secs: 0`, since the engine holding the clock is gone. | lifecycle (rare per thread) | yes | yes |
 | `SpokenReplyGenerated` | What the talker said in one finished turn of speech. Carries `session_id: Uuid`, `text: String`, `interrupted: bool` (the caller spoke over it, so only that much was heard) and an optional `spoken_secs_before: f64`. Written when the provider ends that turn, so `created` IS when the words stopped (ADR 0201). `spoken_secs_before` is how long the talker had been speaking by then. The transcript places the row at `created` minus it, where the talker BEGAN, before every step the words were said over (ADR 0206). It is absent on a reply that streamed no deltas, which reads at `created`. One per provider TURN, whether the talker composed the words or read the agent's answer aloud. A transcriber cuts sentences where the speaker breathes, so the transcript and the agent's history join neighbouring rows back together. A reply the caller CUT OFF carries only what they heard; the later full-turn report writes nothing (ADR 0200). A reply cut off before any word writes nothing. The `actor` names the talker as a guest agent, so the agent sees it under the talker's label, not as its own prior turn (ADR 0150). It is `Metadata`, because the agent's turn owns the thread's status. Like the spoken message, it MAKES THE THREAD REAL (ADR 0167), which matters because the talker usually greets first. | a few per call | yes | yes |
 | `SpokenMessageReceived` | The caller said something on a call: EVERY caller utterance, whatever the talker does with it (ADR 0201). Carries `session_id: Uuid` and `text: String`; the `actor` is the caller's device. Written when the provider ends the caller's turn, so `created` is when they stopped speaking. It starts no agent turn, which is why it is not a `MessageReceived`: that Start event would claim a turn that never runs. The talker's `WorkDelegated` starts a delegated turn. `Metadata`, and it moves no section. It MAKES THE THREAD REAL (ADR 0167): a draft the call was placed from becomes an ordinary thread, its stored draft is cleared, and every device is told. The caller's FIRST spoken words become the thread's `first_message`. They never retitle Home, which only the user names (ADR 0362). | a few per call | yes | yes |
-| `WorkDelegated` | The talker asked for the agent with its `delegate` tool. Carries `session_id: Uuid` and `reason: String`, the talker's few words on what the caller wants. It is empty when the talker composed none, as on any protocol whose delegation frame carries no words. The transcript then draws no row, rather than putting the caller's sentence in the talker's mouth (ADR 0200). The `actor` names the talker as a guest agent. **`Start`: this row begins a delegated call's turn** (ADR 0201), and the turn anchors on it. No `MessageReceived` is written beside it, since the caller's words have their own row. | a few per call | yes | yes |
+| `WorkDelegated` | The talker asked for the agent with its `delegate` voice tool. Carries `session_id: Uuid` and `reason: String`, the talker's few words on what the caller wants. It is empty when the talker composed none, as on any protocol whose delegation frame carries no words. The transcript then draws no row, rather than putting the caller's sentence in the talker's mouth (ADR 0200). The `actor` names the talker as a guest agent. **`Start`: this row begins a delegated call's turn** (ADR 0201), and the turn anchors on it. No `MessageReceived` is written beside it, since the caller's words have their own row. | a few per call | yes | yes |
 
 No payload here carries audio, and audio is never persisted.
 
@@ -743,7 +834,7 @@ cannot says why: a fixed backend, or the agent's own chat model.
 | `command_judge` | The *command guard*'s judge over one ambiguous command, on either backend. | `model_command_judge` |
 | `judge_tool` | One call of the agent's own `judge` tool. | fixed: TypeSafe |
 | `intent_loop` | Retired: one round of the removed intent sub-loop. Old rows still carry it, and nothing records it now. | the agent's own |
-| `memory_correction` | The verdict behind `correct_memory`, over which entries to delete. | the agent's own |
+| `memory_correction` | The verdict behind `memory(action="correct")`, over which entries to delete. | the agent's own |
 | `artifact_summary` | The summary written for a file the `import_file` tool imported. | the agent's own |
 | `side_question` | One *side question*: a Lucidos Agent round, or a Claude Code session copy's whole run. | the agent's own |
 | `web_search` | One `web_search` call, on whichever backend answered. | fixed per backend |
@@ -831,7 +922,7 @@ The `Api` variant carries an optional `source_thread_id`:
 
 Set when the engine recognises a Lucidos-spawned subprocess (coding-agent session, `run_bash`, `run_python`, scheduled script, `lucidos` CLI). Detection uses the **thread-bound origin token**. Every spawned subprocess gets its own `LUCIDOS_AGENT_ORIGIN_TOKEN` in its env, shaped `<thread-id>@<depth>@<trigger>.<mac>` under a per-engine-startup HMAC secret. A `-` stands in for any field the spawn does not carry. The `lucidos` CLI forwards the token as the `x-lucidos-agent-origin-token` header on every engine call. The Python shim does the same for urllib and requests.
 
-The MAC covers the whole prefix, so all three fields are authenticated, not claimed. A subprocess can present only the token it was handed. The depth is the event-trigger chain depth (ADR 0138), and the trigger is the fire this subprocess belongs to (ADR 0137). Mutating HTTP handlers (`apply_change`, `revert_change`, `discard_change`, `chat_submit`, settings writes, …) then stamp `Api { mode: "agent", source_thread_id: <spawning thread> }`, whatever the body claims. So agent actions never appear as "You" cards.
+The MAC covers the whole prefix, so all three fields are authenticated, not claimed. A subprocess can present only the token it was handed. The depth is the event-trigger chain depth (ADR 0138), and the trigger is the fire this subprocess belongs to (ADR 0137). Mutating HTTP handlers (`api::changes::apply_change`, `revert_change`, `discard_change`, `chat_submit`, settings writes, …) then stamp `Api { mode: "agent", source_thread_id: <spawning thread> }`, whatever the body claims. So agent actions never appear as "You" cards.
 
 A token that does not verify, including a valid one re-pointed at another thread, counts as no subprocess at all. It falls through to the unattributed-API-client path that external clients take. A script calling bare `curl` sends no header, so it takes that path too. The old `x-lucidos-source-thread-id` header was unverifiable; it is gone, and nothing reads one.
 
@@ -1026,8 +1117,38 @@ in `crates/lucidos-engine/src/engine/agentic_loop/helpers.rs`.
 
 `cause` values:
 
-- `CancelCause`: `user_stop` (Cancel button), `user_action` (Apply / Discard / Archive on a running thread), `superseded_by_followup`, `effort_restart`, `unknown` (legacy DB rows). `superseded_by_followup` means a follow-up interrupted a mid-turn **Codex** turn. The engine ran the follow-up as the next turn, keeping partial work. `effort_restart` appears on older threads only: a reasoning-effort pick interrupted a Claude Code turn, and a `ContinuationStarted` with reason `effort_restart` resumed it. Nothing emits it now, because the rung locks while a turn runs (ADR 0542).
-- `AbortCause`: `engine_shutdown`, `safety_net`, `recovery_after_restart`, `process_killed`, `stale_settle`, `session_dropped`, `unknown` (legacy). `session_dropped` means the run future was dropped because its caller was cancelled; the session entry's drop-guard emits it.
+<!-- generated:begin CancelCause -->
+CancelCause wire values:
+
+- `user_stop`
+- `user_action`
+- `superseded_by_followup`
+- `effort_restart`
+- `unknown`
+<!-- generated:end -->
+
+`user_stop` means the Cancel button; `user_action` means Apply / Discard / Archive on a running thread.
+`unknown` covers legacy DB rows. `superseded_by_followup` means a follow-up interrupted a mid-turn **Codex** turn.
+The engine ran the follow-up as the next turn, keeping partial work.
+
+`effort_restart` appears on older threads only: a reasoning-effort pick interrupted a Claude Code turn.
+A `ContinuationStarted` with reason `effort_restart` resumed it.
+Nothing emits it now, because the rung locks while a turn runs (ADR 0542).
+
+<!-- generated:begin AbortCause -->
+AbortCause wire values:
+
+- `engine_shutdown`
+- `safety_net`
+- `recovery_after_restart`
+- `process_killed`
+- `stale_settle`
+- `session_dropped`
+- `unknown`
+<!-- generated:end -->
+
+`unknown` covers legacy rows. `session_dropped` means the run future was dropped because its caller was cancelled.
+The session entry's drop-guard emits it.
 
 On a *coding-agent thread*, `user_stop` is a **resumable turn boundary**, not a terminator. The `Cancel` button uses the backend's native interrupt, so the session stays alive. `CodingAgentIdled` follows (with the `cc_session_id` when available), the branch is kept, and the next message resumes the conversation. `user_action` (Apply / Discard / Archive) DOES terminate, via its own lifecycle event. See `system-knowhow/coding-agent-events.md` § `CodingAgentIdled` "Cancel = Esc".
 
@@ -1128,15 +1249,21 @@ Both events also fire for `run_python_background`. The `command` then carries th
 }
 ```
 
-`producer` is `ContextProducer`, serialized snake_case: `main_llm`, `claude_code`, `codex`. Match those exact values in a `condition:` filter; the PascalCase Rust names never match. `usage` is `None` pre-call and on a call whose provider reported no prompt tokens. When present it carries the real provider-reported counts. **`usage.modality` splits the four counts across text, audio and image**; only a realtime voice call reports one. Each part is named after the total it sums into, and a producer that cannot fill every field sends none.
+`producer` is `ContextProducer`, serialized snake_case: `main_llm`, `claude_code`, `codex`, `auxiliary`. Match those exact values in a `condition:` filter; the PascalCase Rust names never match. `usage` is `None` pre-call and on a call whose provider reported no prompt tokens. When present it carries the real provider-reported counts. **`usage.modality` splits the four counts across text, audio and image**; only a realtime voice call reports one. Each part is named after the total it sums into, and a producer that cannot fill every field sends none.
 
 **`usage.service_tier` names the tier that served the call** when it was not the provider's standard one. Today that is only `flex`, OpenAI's Flex processing, which bills every rate at half. Price such a row at its tier's rates.
 
-**`usage.cache_creation_1h_tokens` is the part of `cache_creation_tokens` written to the 1-hour cache.** A 1-hour write bills at 2x base input, a 5-minute one at 1.25x. Claude Code captures carry it when Claude Code split the write by lifetime. Chat calls to Claude on Anthropic or Vertex carry it whenever the reply split the write, where `0` means only 5-minute writes. Absent elsewhere and on older rows. The *cache keep-alive* reads a session's cache lifetime from it.
+**`usage.cache_creation_1h_tokens` is the part of `cache_creation_tokens` written to the 1-hour cache.** A 1-hour write bills at 2x base input, a 5-minute one at 1.25x. Claude Code captures carry it when Claude Code split the write by lifetime. Chat calls to Claude on Anthropic or Vertex carry it whenever the reply split the write, where `0` means only 5-minute writes. Absent elsewhere and on older rows.
+
+**`usage.cache_creation_30m_tokens` and `usage.cache_creation_12h_tokens` split an OpenAI Responses write** into its 30-minute and 12-hour parts, which together cover it. A 12-hour write bills at 2.5x input. **`usage.cache_creation_requested_ttl`** (`5m`, `30m`, `1h` or `12h`) names the lifetime the request asked for, where the reply split nothing. Lucidos records it only on a route shown to honour it: today OpenRouter's `anthropic/` models.
+
+The *cache keep-alive*, the cache-warm line and the switch estimate read a thread's cache lifetime from its latest write: the split first, then the requested lifetime. With neither, the lifetime is unknown, never a guess.
 
 A Claude Code sub-agent's call carries `parent_tool_use_id`, the id of the `Agent` call that spawned it. Every other capture omits it.
 
 A Claude Code capture also carries `api_call_id`, the agent's id for that API call. Every `CodingAgentToolCalled` the call produced carries the same value, so group on it to find the tool calls one model call made. Codex captures and older rows omit it.
+
+`session` names the thread's coding-agent session the call ran in, counted from 1. A thread starts in session 1. Each `SessionStarted` whose `continuity.kind` is `fresh` or `handoff` opens the next one, and a resume stays in its session. The event bus stamps it on every capture, so group on it for a thread's cost per session. Context size, cache warmth and the handoff estimate read only the current session. Absent on every row written before the field existed.
 
 A `reconstructed: true` row was rebuilt by the startup backfill from events never captured live. Its `estimated_total_tokens` is a reconstruction and it carries no `usage`, so a rollup filtering on `usage` still reports measured spend only.
 
@@ -1154,9 +1281,25 @@ On a Claude Code row both fields come from the reply: `model` is the id it named
 
 `stable_prefix_fingerprint` is a 16-hex hash of the stable prefix a chat turn's first round sent: the tools, the system block and any memory view blocks, with the model and thinking config, and without cache markers. Only round 1 of a turn on Claude through Anthropic or Vertex carries it. Two turns with the same value sent the same stable prefix, so the second could read what the first cached.
 
-`context_window` is the model's window in tokens as the engine resolved it. That is the value on the model's *model registry* row, or else a guess from the model id (`[1m]`→1M, `claude-`→200k, `gpt-5`→400k, else 200k). A capture showing `200000` for a bigger model means its row declares no *context window*. The turn was then budgeted against the smaller number.
+`context_window` is the model registry's window, or a fallback from its id:
 
-`estimated_total_tokens` covers the system prompt, the tool definitions and the messages: the whole request, as the trim budget counts it. It uses a fixed 2.5 chars/token, measured across 12,069 captures against real counts. Compare it to `usage.input_tokens` (the real total prompt) rather than treating it as exact. The trim budget deliberately uses a conservative 1.5 chars/token, so it never packs a prompt past the *context window*. This readout used 1.5 until 2026-08-07, which ran about 1.7x high. **A trigger condition on `estimated_total_tokens` written before that date wants re-scaling by 5/3**: a `{ $gt: 150000 }` threshold now silently stops firing where it used to.
+- Any id containing `[1m]`: 1M.
+- `claude-`: 200k.
+- GPT major version 5 or later: 400k.
+- Other ids: 200k.
+
+A capture showing 200,000 for a bigger model can mean its registry row lacks a
+window. The turn was then budgeted against the smaller number.
+
+`estimated_total_tokens` covers the whole request: system prompt, tools and
+messages. It estimates tokens at 2.5 characters each. Compare it with
+`usage.input_tokens`, the provider's real total, rather than treating it as exact.
+The trim budget uses a conservative 1.5 characters per token.
+
+Before 2026-08-07 this readout also used 1.5, making estimates about 1.7 times
+higher. Multiply thresholds written for that readout by **3/5**:
+`{ $gt: 150000 }` becomes `{ $gt: 90000 }`. Leaving the old threshold can
+silently stop a trigger firing.
 
 Each section carries `name`, two sizes, and `role` (`system` / `prior_message` / `user`). It also carries an optional `group` label and an optional `content` body. The body is omitted when the `capture_context` preference is off, and truncated head and tail at 8,000 chars when it is on. The engine reads the preference before each model call, so a turn resumed after a question card follows a switch flipped while it waited.
 
@@ -1227,7 +1370,7 @@ On the live SSE stream a `ToolResult` carries its full text, and a `CodingAgentT
 
 **A tool call's `args` are stripped everywhere a client reads.** The snapshot and the live SSE stream both remove `args` from every `ToolCalled` and `CodingAgentToolCalled` and stamp `args_stripped: true`. Otherwise a `Write` would send a whole file to every client. `description` is filled first, so the step label never needs the args. A `generate_image` call keeps its args, because the image takes its alt text from the prompt.
 
-To fetch the dropped args, call `GET /api/v1/events/:event_id/tool-args`. It returns `{ args }` for that one call. The stored row keeps them, so a trigger condition on `args.command` still matches, and `query_events` still returns them.
+To fetch the dropped args, call `GET /api/v1/events/:event_id/tool-args`. It returns `{ args }` for that one call. The stored row keeps them, so a trigger condition on `args.command` still matches, and `events(action="query")` still returns them.
 
 ### `ChangeProposed`
 
@@ -1252,11 +1395,29 @@ Several events with the same `change_id` can arrive for a branch, one per propos
 
 - Work on an archived thread's branch, with origin reason `archived_branch_work`. It runs on the archive, after a full worktree removal, or on a boot pass. A removal may have committed the tree's dirt there.
 - An idle *integrated sub-thread*'s work, when its parent's change lands without its branch. The origin reason is `unmerged_integrated_work`. The proposal clears the sub-thread's `integrated_into_parent` reason.
-- Work a thread committed after it handed off to a *successor thread*, when the successor's change is applied or discarded without it. The origin reason is `successor_residue`. Work the successor's branch carries is never set aside, and only a change row recorded since the handoff, or an open one, stops it.
+- Work a thread committed after it handed off to a *legacy successor thread*, when the successor's change is applied or discarded without it. The origin reason is `successor_residue`. Work the successor's branch carries is never set aside, and only a change row recorded since the handoff, or an open one, stops it.
 
 `incomplete: true` marks a set-aside proposal whose turn nobody saw finish. The archive net always sets it, since it cannot tell. Older rows can carry it on a pending proposal from a Stop. `description` is optional, and old rows also carry legacy `path` and `diff`. The legacy per-commit shape (empty `change_id`, `commit_sha` set) is inert in the projection.
 
 ### `ProposalWithheld`
+
+<!-- generated:begin UnproposedReason -->
+UnproposedReason wire values:
+
+- `plan_missing`
+- `plan_awaiting_approval`
+- `outside_bound`
+- `hardening_missing`
+- `turn_incomplete`
+- `awaiting_landing`
+- `integrated_into_parent`
+- `carried_by_successor`
+<!-- generated:end -->
+
+`integrated_into_parent` marks an *integrated sub-thread*'s hardened work, which its parent's agent merges.
+The child's work is never proposed on its own.
+`carried_by_successor` marks the thread that handed off to a *legacy successor thread*, whose change carries the work.
+`awaiting_landing` means the thread's change waits in the landing lane.
 
 ```json
 {
@@ -1556,8 +1717,8 @@ Four knobs:
 
 1. **Pick the right event.** Lifecycle and one-per-turn variants are usually what you want. Always pair a per-action variant with a `condition:` filter (§ "Volume classes").
 2. **Per-token streaming is off-limits**, and the create is refused. For token-level reactivity, consume the SSE stream directly.
-3. **For workspace-defined signals**, `lucidos events emit` (or the `emit_event` LLM tool) writes a `SystemEvent::DomainEvent` that always reaches the matcher. Use it for a name outside the engine's ThreadEvent enum (e.g. `OuraDataImported`, `BuildBroken`); see `system-knowhow/lucidos-cli.md`.
-4. **For workspace-scoped engine facts**, subscribe to the persisted `SystemEvent` directly. `BackupFailed`, `NotificationCreated` and `TriggerCompleted` are `on:` entries like any other. Never emit a domain event beside one to make it reachable: the engine already wrote the row.
+3. **For workspace-defined signals**, `lucidos events emit` (or the `events(action="emit")` LLM tool) writes a `SystemEvent::DomainEvent` that always reaches the matcher. Use it for a name outside the engine's ThreadEvent enum (e.g. `OuraDataImported`, `BuildBroken`); see `system-knowhow/lucidos-cli.md`.
+4. **For workspace-scoped engine facts**, subscribe to the persisted `engine::event_bus::SystemEvent` directly. `BackupFailed`, `NotificationCreated` and `TriggerCompleted` are `on:` entries like any other. Never emit a domain event beside one to make it reachable: the engine already wrote the row.
 
 Trigger-run failures auto-create an error notification, so "tell me when one of my triggers blew up" needs no wiring.
 

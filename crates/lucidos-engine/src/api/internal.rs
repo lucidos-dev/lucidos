@@ -100,9 +100,7 @@ pub(super) async fn permission_prompt(
         &state.engine.trigger_configs,
         &state.workspace_path,
         worktree_path.as_deref(),
-        // Claude Code's lane. The escalation classifier is Codex-only, so this
-        // path never reaches its LLM half and needs no judge handle.
-        None,
+        Some(&state.engine),
         CodingAgentPermissionInput {
             thread_id,
             tool_use_id: body.tool_use_id,
@@ -457,6 +455,60 @@ fn marker_write_refusal(headers: &HeaderMap) -> Option<axum::response::Response>
     })
 }
 
+/// The thread a Lucidos-spawned process signed its request for, if any.
+fn caller_thread(headers: &HeaderMap) -> Option<String> {
+    match crate::api::actor::subprocess_origin(headers) {
+        crate::api::actor::SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } => source_thread_id.map(|id| id.to_string()),
+        crate::api::actor::SubprocessOrigin::NotSubprocess => None,
+    }
+}
+
+/// The 409 for a plan marker on a branch the caller's Apply never lands, or
+/// `None` to proceed. See [`crate::engine::git_ops::tracked_branch_elsewhere`].
+async fn off_tracked_branch_refusal(
+    state: &AppState,
+    repo_root: &std::path::Path,
+    caller_thread: Option<&str>,
+    branch_name: &str,
+) -> Option<axum::response::Response> {
+    let thread = caller_thread?;
+    let tracked = match crate::engine::git_ops::tracked_branch_elsewhere(
+        state.engine.pool(),
+        repo_root,
+        thread,
+        branch_name,
+    )
+    .await
+    {
+        Ok(tracked) => tracked?,
+        Err(e) => {
+            return Some(
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("could not read this thread's tracked branch: {e}"),
+                )
+                .into_response(),
+            )
+        }
+    };
+    Some(
+        ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "This thread's Apply lands only branch '{tracked}', and you are on \
+                 '{branch_name}'. A plan marker here would never reach Apply. Run \
+                 `git switch {tracked}`, bring any work you want applied, and re-run this \
+                 command. Never cut a new branch for new work in this thread: \
+                 '{tracked}' is the only one Lucidos applies."
+            ),
+        )
+        .with_reason("marker-off-tracked-branch")
+        .into_response(),
+    )
+}
+
 /// POST /api/v1/internal/mark-hardened, invoked by `lucidos hardened mark`,
 /// which `/harden` Phase 5 runs once every phase completes. Replaces
 /// the prior worktree-keyed file marker, which was lost when stale-session
@@ -631,7 +683,8 @@ pub(super) struct MarkPlannedRequest {
 ///
 /// A rejected file list answers 400 with the rejection's own text, not 500. The
 /// caller is an agent that can fix the call, so the body has to say how. A 500
-/// reads as an engine fault and gets retried unchanged.
+/// reads as an engine fault and gets retried unchanged. A branch the calling
+/// thread's Apply never lands answers 409 `marker-off-tracked-branch`.
 pub(super) async fn mark_planned(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -669,6 +722,16 @@ pub(super) async fn mark_planned(
             return (StatusCode::BAD_REQUEST, rejection.to_string()).into_response();
         }
     };
+    if let Some(refusal) = off_tracked_branch_refusal(
+        &state,
+        &repo_root,
+        caller_thread(&headers).as_deref(),
+        &body.branch_name,
+    )
+    .await
+    {
+        return refusal;
+    }
     match state
         .engine
         .record_planned(
@@ -755,7 +818,9 @@ struct ApprovePlanResponse {
 /// no-op that reports `approved: false`.
 ///
 /// The engine checks the user's own answer first. Without it the reply is a 409
-/// with reason `no-plan-approval`, and an unreadable answer is a 500.
+/// with reason `no-plan-approval`, and an unreadable answer is a 500. A branch
+/// the calling thread's Apply never lands is a 409 `marker-off-tracked-branch`,
+/// as on `mark-planned`.
 pub(super) async fn approve_plan(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -765,12 +830,17 @@ pub(super) async fn approve_plan(
         return refusal;
     }
     let repo_root = std::path::PathBuf::from(&body.repo_root);
-    let caller_thread = match crate::api::actor::subprocess_origin(&headers) {
-        crate::api::actor::SubprocessOrigin::Subprocess {
-            source_thread_id, ..
-        } => source_thread_id.map(|id| id.to_string()),
-        crate::api::actor::SubprocessOrigin::NotSubprocess => None,
-    };
+    let caller_thread = caller_thread(&headers);
+    if let Some(refusal) = off_tracked_branch_refusal(
+        &state,
+        &repo_root,
+        caller_thread.as_deref(),
+        &body.branch_name,
+    )
+    .await
+    {
+        return refusal;
+    }
     match state
         .engine
         .approve_plan(&repo_root, &body.branch_name, caller_thread.as_deref())
@@ -1053,6 +1123,9 @@ struct AskUserQuestionResponse {
     /// to the agent as a denied tool call. See `engine::question_card_gate`.
     #[serde(skip_serializing_if = "Option::is_none")]
     refusal: Option<String>,
+    /// Every pick was a *quiet option*: the CLI ends the agent's turn.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    quiet: bool,
 }
 
 /// Does a token-bearing caller name a thread other than its own?
@@ -1110,6 +1183,7 @@ pub(super) async fn ask_user_question(
                  another thread. Ask from inside your own thread."
                     .to_string(),
             ),
+            quiet: false,
         })
         .into_response();
     }
@@ -1135,6 +1209,7 @@ pub(super) async fn ask_user_question(
                     questions: body.questions,
                     answers: serde_json::Value::Object(serde_json::Map::new()),
                     refusal: Some(refusal),
+                    quiet: false,
                 })
                 .into_response();
             }
@@ -1163,6 +1238,7 @@ pub(super) async fn ask_user_question(
             questions,
             answers: serde_json::Value::Object(serde_json::Map::new()),
             refusal: Some(refusal.text()),
+            quiet: false,
         })
         .into_response();
     }
@@ -1182,8 +1258,8 @@ pub(super) async fn ask_user_question(
         )
         .await;
 
-    let answer_kinds = match outcome {
-        Ok(o) => o.answer_kinds,
+    let (answer_kinds, quiet) = match outcome {
+        Ok(o) => (o.answer_kinds, o.quiet),
         Err(e) => {
             // Both callers turn a 500 into a failed tool call carrying this
             // text. It tells the agent to ask again with the tool
@@ -1208,6 +1284,7 @@ pub(super) async fn ask_user_question(
             questions,
             answers: serde_json::Value::Object(serde_json::Map::new()),
             refusal: None,
+            quiet: false,
         })
         .into_response();
     }
@@ -1221,6 +1298,7 @@ pub(super) async fn ask_user_question(
         questions,
         answers,
         refusal: None,
+        quiet,
     })
     .into_response()
 }

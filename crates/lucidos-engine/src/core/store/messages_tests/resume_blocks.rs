@@ -115,12 +115,12 @@ fn a_retired_execute_intent_pair_still_replays_on_resume() {
         row("MessageReceived", json!({"text": "Check my calendar."}), 1),
         row(
             "ToolCalled",
-            json!({"name": "execute_intent", "args": {"intent_id": "calendar/check"}}),
+            json!({"name": "execute_intent", "args": {"intent_id": "calendar/check"}}), // Retired compatibility.
             2,
         ),
         row(
             "ToolResult",
-            json!({"name": "execute_intent", "result": "Calendar is clear.", "success": true}),
+            json!({"name": "execute_intent", "result": "Calendar is clear.", "success": true}), // Retired compatibility.
             3,
         ),
         row(
@@ -144,7 +144,7 @@ fn a_retired_execute_intent_pair_still_replays_on_resume() {
     };
     assert!(
         matches!(&call[0], ContentBlock::ToolUse { name, input, .. }
-            if name == "execute_intent" && input["intent_id"] == "calendar/check"),
+            if name == "execute_intent" && input["intent_id"] == "calendar/check"), // Retired compatibility.
         "{call:?}"
     );
     let MessageContent::Blocks(result) = &blocks[1].content else {

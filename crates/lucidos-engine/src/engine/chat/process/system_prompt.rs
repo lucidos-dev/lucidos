@@ -444,14 +444,14 @@ WORKSPACE LAYOUT:
   .lucidos/tmp/            Gitignored scratch from http_request / git_clone
   data/artifacts/          User files (notes, imported data, projects, screenshots),
                            including user_profile.md and imported/<service>/
-  data/apps/<id>/          App: manifest.json + ui/, plus knowhow/ intents/ scripts/ triggers/
+  data/apps/<id>/          App: manifest.json + index.html, plus knowhow/ intents/ scripts/ triggers/
   data/knowhow/            Standalone knowhow docs (API specs, data formats)
-  data/triggers/<slug>/    Standalone triggers: <slug>.md + scripts/
+  data/triggers/<slug>/    Standalone triggers: optional <slug>.md intent, knowhow/ and scripts/; trigger.toml is a read-only projection
 
 PATHS:
 - A tool path under data/ is relative to data/: "artifacts/notes.md", NOT "data/artifacts/notes.md". A .lucidos/ path is relative to the workspace root: ".lucidos/tmp/file.json", NEVER "data/.lucidos/tmp/file.json". Pass a .lucidos/tmp/ path reported by http_request or git_clone straight to read_file; don't `cat` it and don't re-fetch.
 - Only .lucidos/tmp/ is reachable by the file tools; the rest of .lucidos/ is engine runtime state and is refused. Those tools git-commit what they write, so they REFUSE to write .lucidos/tmp/: create or edit scratch with run_python, delete it with run_bash. run_python's cwd is the workspace root, so open('.lucidos/tmp/x.json') for scratch and open('data/artifacts/x.md') for an artifact.
-- Everything under data/ (except postgres/) is git-tracked. Never nest artifacts inside artifacts.
+- Git tracks data/ except postgres/, blobs/, .env, plugin-media/ and derived trigger.toml files. Never nest artifacts inside artifacts.
 
 CONTENT TAXONOMY (intent, knowhow, script, trigger; each scoped to an app, a knowhow domain, or a trigger):
 - Intent: what the user wants, in their terms. Goals, conditions, outcomes. Stable. Frontmatter: `name`, optional `knowhow` (ids, each the path under data/knowhow/ without .md and including subdirectories, e.g. 'weather/api'; engine-shipped docs take the 'system-knowhow/' prefix).
@@ -519,8 +519,8 @@ EMAIL SETUP:
 - NEVER put an email password in chat; configure_email collects it in a popup.
 
 OAUTH SETUP:
-- load_knowhow('system-knowhow/oauth-providers') BEFORE collecting any OAuth credential: it owns the provider registry, the redirect-URI forms, the confidential-vs-public client rule and the scope-alias rule. If a provider is not listed, web_search its endpoints and app-registration steps and ADD it there.
-- connect_oauth_account is ONE call for the whole flow, and never ask for a client_id or secret in chat. Walk the user through registering the app before you call it (the redirect URI, the scopes, where to find the client id), assuming they have never done OAuth setup before.
+- First load_knowhow('system-knowhow/oauth-providers') for registration, redirect URIs, client types and scopes. Walk the user through registration; collect credentials only in the modal.
+- connect_oauth_account opens that modal when needed. After the form reports completed, call again to authorize. For unknown providers, web_search registration steps and endpoints; pass endpoints explicitly. The shipped registry is read-only.
 
 LOOKING UP SPECIFIC DATA (numbers, ids, dates, amounts, addresses):
 - Find the file with list_files, or glob_files / grep_files on a larger workspace, then read_file it. A memory summary says WHAT a file contains, never the exact values inside it.
@@ -1703,7 +1703,7 @@ mod tests {
     /// Raised by 4 to a measured 132,723 for `request_read`: a turn that
     /// asks the user a question skips the read decision.
     ///
-    /// Lowered by 413 to a measured 132,310: the `execute_intent` schema left
+    /// Lowered by 413 to a measured 132,310: the retired `execute_intent` schema left
     /// the tools array with its sub-loop.
     ///
     /// Raised by 201 to a measured 132,511 for the `coding_agent` and `folder`
@@ -1713,7 +1713,15 @@ mod tests {
     /// Raised by 279 to a measured 132,790 for the routing line of
     /// `system-knowhow/stored-secrets`. The agent role cannot see secret
     /// columns, so without it the agent concluded secrets were not stored.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 132_790;
+    ///
+    /// Raised by 135 to a measured 132,925 for the `quiet` option field of
+    /// `ask_user_question`, the one way to offer a pick that ends the turn.
+    ///
+    /// Raised by 197 to a measured 133,122 for `threads` 'cache_keep_alive'
+    /// (ADR 0554), so a user can turn a thread's keep-alive off in words
+    /// (prompt-first). Its summary is one clause, and `state` has no
+    /// description beyond its enum.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 133_122;
 
     /// The gate set the ratchet bills.
     ///
@@ -1953,13 +1961,14 @@ mod tests {
         ),
         (
             "ask_user_question",
-            2_082,
+            2_217,
             "the \"Other\"-option ban is deliberately mirrored between \
              ASK_USER_QUESTION_RULE and this schema, and pinned by a test in \
              each place; the nested question / options / label object is 434 \
              chars of frozen shape. Raised from 1,950 by `message`: a tool input \
              is never summarized, so it is the one place an always-thinking \
-             model can hand the user an answer before a card",
+             model can hand the user an answer before a card. Raised by 135 \
+             for `quiet`, the one way to offer a pick that ends the turn",
         ),
         (
             "edit_file",
@@ -1992,7 +2001,7 @@ mod tests {
         ),
         (
             "threads",
-            3_172,
+            3_369,
             "five more actions on a domain whose two existing schemas \
              are almost entirely a spelled-out `status` enum pinned to \
              `ThreadStatus::ALL` by a test, repeated across both because \
@@ -2005,7 +2014,8 @@ mod tests {
              2,737 for `triage` and `apply_triage` (ADR 0349), two short \
              summaries and one `entries` array. Raised from 3,159 for \
              `change_state`, the three-value enum that replaced `has_diff` \
-             (ADR 0400)",
+             (ADR 0400). Raised from 3,172 for `cache_keep_alive`, one clause \
+             and a two-value `state` enum (ADR 0554)",
         ),
         (
             "events",

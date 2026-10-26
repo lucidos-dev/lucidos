@@ -88,6 +88,7 @@ impl Thread {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
             anchor,
         )
@@ -254,6 +255,76 @@ async fn a_follow_up_the_previous_session_never_read_is_stranded() {
         assert!(stranded[0].images.is_none());
     })
     .await;
+}
+
+/// The reported failure: Postgres ended the check's connection, and the turn
+/// failed on "expected to read 5 bytes, got 0 bytes at EOF". The pool skips its
+/// health check, so the query, not the acquire, meets the dead connection.
+#[tokio::test]
+async fn a_connection_the_server_ended_is_retried_and_the_check_succeeds() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Thread {
+        bus,
+        id: Uuid::new_v4(),
+    };
+    thread.session_started().await;
+    let queued = thread.user_says("also add a test").await;
+    thread.forwarded(queued).await;
+
+    let fragile = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .test_before_acquire(false)
+        .connect(&crate::test_support::test_db_url(&db_name))
+        .await
+        .unwrap();
+    let doomed: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&fragile)
+        .await
+        .unwrap();
+    let ended: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(doomed)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(ended, "the test must end the pooled connection's backend");
+    // The backend exits after the signal, so wait for it to go.
+    let mut gone = false;
+    for _ in 0..200 {
+        gone =
+            sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                .bind(doomed)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        if gone {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(gone, "the ended backend must exit before the check runs");
+
+    let stranded = stranded_follow_ups(
+        &fragile,
+        Path::new("/nonexistent"),
+        thread.id,
+        &[Uuid::new_v4()],
+    )
+    .await
+    .expect("the retry reaches the database on a fresh connection");
+    assert_eq!(
+        stranded.iter().map(|f| f.event_id).collect::<Vec<_>>(),
+        vec![queued]
+    );
+    let replacement: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&fragile)
+        .await
+        .unwrap();
+    assert_ne!(replacement, doomed, "the check ran on a new connection");
+
+    fragile.close().await;
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 #[tokio::test]

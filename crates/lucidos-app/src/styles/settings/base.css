@@ -184,6 +184,10 @@
     padding: 0.5rem 0;
 }
 
+.settings-row input[type="range"]:not(:disabled) {
+    cursor: pointer;
+}
+
 /* Uniform gap on all four sides for the navigation focus marker on a settings row
    (a Search-Everywhere jump). The marker (.nav-focus-stuck wash + glow,
    host-components.css) fills the row's padding box, and a .settings-row is padded

@@ -378,26 +378,34 @@ impl LucidosEngine {
         reason: EngineReason,
         on_failure: impl FnOnce(&str) + Send + 'static,
     ) {
-        self.spawn_engine_coding_turn_with(thread_id, prompt, title, reason, None, on_failure);
+        self.spawn_engine_coding_turn_with(
+            thread_id,
+            prompt,
+            title,
+            MessageOrigin::engine(reason),
+            None,
+            on_failure,
+        );
     }
 
     /// [`Self::spawn_engine_coding_turn_or_else`] on a named `implementer`,
-    /// not the workspace's default.
+    /// not the workspace's default, sent as `origin`'s message.
     pub(crate) fn spawn_engine_coding_turn_as(
         self: &std::sync::Arc<Self>,
         thread_id: Uuid,
         prompt: String,
         title: Option<String>,
-        reason: EngineReason,
+        origin: MessageOrigin,
         implementer: crate::engine::successor::Implementer,
+        on_failure: impl FnOnce(&str) + Send + 'static,
     ) {
         self.spawn_engine_coding_turn_with(
             thread_id,
             prompt,
             title,
-            reason,
+            origin,
             Some(implementer),
-            |_| {},
+            on_failure,
         );
     }
 
@@ -406,7 +414,7 @@ impl LucidosEngine {
         thread_id: Uuid,
         prompt: String,
         title: Option<String>,
-        reason: EngineReason,
+        origin: MessageOrigin,
         implementer: Option<crate::engine::successor::Implementer>,
         on_failure: impl FnOnce(&str) + Send + 'static,
     ) {
@@ -439,12 +447,12 @@ impl LucidosEngine {
                     None,
                     None,
                     None,
-                    crate::engine::thread_events::ActorMode::Engine,
+                    origin.mode(),
                     cc_model,
                     coding_agent,
                     None,
                     title.as_deref(),
-                    Some(MessageOrigin::engine(reason)),
+                    Some(origin),
                     None,
                     crate::engine::FollowUpUrgency::Normal,
                     None,

@@ -147,6 +147,7 @@ async fn teardown_skips_abort_for_question_parked_chat_thread() {
                 description: None,
                 preview: None,
                 widget: None,
+                quiet: false,
             }],
             worktree_path: None,
             multi_select: false,
@@ -340,6 +341,7 @@ async fn teardown_emits_abort_when_question_already_answered() {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: "toolu_teardown_2".into(),
+            quiet: false,
             answer: AnswerKind::Selected {
                 option_id: "opt-0".into(),
             },

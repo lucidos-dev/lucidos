@@ -7,7 +7,8 @@
 import { focusedThreadId, threadMap } from '../store';
 import { forgetComposeState } from './compose';
 import { forgetUnsentMessagesOfThread } from '../unsentMessages';
-import { focusThread, unfocusThread, visibleCandidatesAround } from './threads';
+import { unfocusThread, visibleCandidatesAround } from './threads';
+import { openListedThread } from './event-navigation';
 import { forgetThreadEventsFailures, noteThreadDeleted } from './thread-loading';
 import { removeThreadNavEntries } from './thread-navigation';
 import { pruneRecents } from './entityReferences';
@@ -48,7 +49,7 @@ export function dropDeletedThreads(ids: readonly string[]): void {
 
   if (focused && gone.has(focused)) {
     const nextId = candidates.find((id) => !gone.has(id)) ?? null;
-    if (nextId) focusThread(nextId, { revealPane: false });
+    if (nextId) openListedThread(nextId, { revealPane: false });
     else unfocusThread({ revealPane: false });
   }
 }

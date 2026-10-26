@@ -40,7 +40,15 @@ struct AskUserQuestionResponseBody {
     /// Set when the engine refused the card, which the user never saw.
     #[serde(default)]
     refusal: Option<String>,
+    /// Every pick was a *quiet option*, so the agent's turn ends here.
+    #[serde(default)]
+    quiet: bool,
 }
+
+/// Why the turn ended after a *quiet option*. Shared with the Codex
+/// `ask_user_question` MCP tool, which can only ask the agent to stop.
+pub(crate) const QUIET_ANSWER_NOTE: &str = "The user picked a quiet option: \
+    end your turn now. Write no reply and do no further work.";
 
 /// Always exits 0 with a decision on stdout. Claude Code treats any other exit
 /// as a non-blocking error and runs its native tool. In a headless session that
@@ -56,7 +64,7 @@ fn output_for(asked: Result<AskUserQuestionResponseBody, BoxError>) -> String {
             refusal: Some(reason),
             ..
         }) => build_refusal_output(&reason),
-        Ok(resp) => build_hook_output(&resp.questions, &resp.answers),
+        Ok(resp) => build_hook_output(&resp.questions, &resp.answers, resp.quiet),
         Err(e) => build_refusal_output(&card_not_shown_reason("AskUserQuestion", &e.to_string())),
     }
 }
@@ -137,8 +145,15 @@ fn build_refusal_output(reason: &str) -> String {
 /// `updatedInput` carrying the synthesized answers (CC then constructs a
 /// matching `tool_result` for its session). Echoes the questions array
 /// verbatim alongside the answers — both fields are required.
-fn build_hook_output(questions: &serde_json::Value, answers: &serde_json::Value) -> String {
-    serde_json::json!({
+///
+/// A quiet answer adds the hook-common `continue: false`, so Claude Code ends
+/// the turn after the tool call instead of generating a reply.
+fn build_hook_output(
+    questions: &serde_json::Value,
+    answers: &serde_json::Value,
+    quiet: bool,
+) -> String {
+    let mut output = serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
@@ -147,8 +162,12 @@ fn build_hook_output(questions: &serde_json::Value, answers: &serde_json::Value)
                 "answers": answers,
             }
         }
-    })
-    .to_string()
+    });
+    if quiet {
+        output["continue"] = serde_json::Value::Bool(false);
+        output["stopReason"] = serde_json::Value::from(QUIET_ANSWER_NOTE);
+    }
+    output.to_string()
 }
 
 #[cfg(test)]
@@ -222,8 +241,9 @@ mod tests {
             "options": [{"label":"A","description":""}]
         }]);
         let answers = serde_json::json!({"Q1?": "A"});
-        let output = build_hook_output(&questions, &answers);
+        let output = build_hook_output(&questions, &answers, false);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(parsed.get("continue").is_none(), "{parsed}");
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
         assert_eq!(
@@ -285,6 +305,7 @@ mod tests {
             questions: serde_json::json!([]),
             answers: serde_json::json!({"Q?": "A"}),
             refusal: None,
+            quiet: false,
         }));
         let parsed: serde_json::Value = serde_json::from_str(&answered).unwrap();
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
@@ -293,12 +314,32 @@ mod tests {
             questions: serde_json::json!([]),
             answers: serde_json::json!({}),
             refusal: Some("Question card not shown.".into()),
+            quiet: false,
         }));
         let parsed: serde_json::Value = serde_json::from_str(&refused).unwrap();
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
         assert_eq!(
             parsed["hookSpecificOutput"]["permissionDecisionReason"],
             "Question card not shown."
+        );
+    }
+
+    #[test]
+    fn a_quiet_answer_allows_the_call_and_stops_the_turn() {
+        let answers = serde_json::json!({"Q?": "Leave it"});
+        let quiet = output_for(Ok(AskUserQuestionResponseBody {
+            questions: serde_json::json!([]),
+            answers: answers.clone(),
+            refusal: None,
+            quiet: true,
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&quiet).unwrap();
+        assert_eq!(parsed["continue"], false);
+        assert_eq!(parsed["stopReason"], QUIET_ANSWER_NOTE);
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["updatedInput"]["answers"],
+            answers
         );
     }
 

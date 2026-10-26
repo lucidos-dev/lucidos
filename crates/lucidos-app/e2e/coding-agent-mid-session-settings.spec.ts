@@ -5,7 +5,7 @@ import {
   apiRequest, navigateToApp, assertHealthy, newThread, pickComposeDestination,
   sendMessage, sendMessageCapturingThreadId, waitForCCToStart, waitForActionPanel, dismissCCSession,
   waitForActiveSession, openRungList, readRungRows, pickRung, currentRungValue,
-  COMPOSER_FOLD_TRIGGER, answerRungSwitchIfAsked,
+  answerRungSwitchIfAsked,
 } from './helpers';
 import type { Page } from '@playwright/test';
 
@@ -13,24 +13,11 @@ import type { Page } from '@playwright/test';
  * A started coding-agent thread's model and effort change between turns only
  * (ADR 0542). A pick at idle is recorded on the engine, and the next turn's
  * spawn runs on it, though the follow-up itself carries no rung. While a turn
- * runs the engine refuses a pick, and the rung pill is locked.
+ * runs the engine refuses a pick, and so does the rung pill.
  */
 
 const FAKE_CLAUDE = fileURLToPath(new URL('./fake-claude-code/claude.mjs', import.meta.url));
 const CLAUDE_PATH_PREF = 'coding_agent_claude_path';
-
-/** Press the rung control: its pill when drawn, else its row in the ⋯ menu. */
-async function pressRungControl(page: Page) {
-  const trigger = page.locator('.rung-trigger[aria-label^="Model"]:visible').first();
-  if (await trigger.isVisible()) {
-    // Locked, the trigger is aria-disabled, which Playwright waits out. A
-    // finger still presses it, and the press says why.
-    await trigger.click({ force: true });
-    return;
-  }
-  await page.locator(COMPOSER_FOLD_TRIGGER).first().click();
-  await page.locator('.thread-overflow-item[data-role="rung-control"]:visible').click();
-}
 
 /** Wait until the engine reports the picked rung. A pick waits out the
  *  finished turn's idle exit, and a follow-up sent before it lands would
@@ -161,8 +148,8 @@ test.describe('CC mid-session model/effort persistence', () => {
 
   // A running turn keeps its rung: the engine refuses a pick with a reason
   // the client tells apart, and the pill says why. The turn runs to its end
-  // on the effort it started with, and the pill frees at idle.
-  test('a pick mid-turn is refused, and the rung pill is locked until idle', async ({ page }) => {
+  // on the effort it started with.
+  test('a pick mid-turn is refused, and the rung records again at idle', async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await pickComposeDestination(page);
@@ -173,14 +160,12 @@ test.describe('CC mid-session model/effort persistence', () => {
     const before = await waitForActiveSession(page, threadId);
     const picked = before.current_reasoning_effort === 'low' ? 'high' : 'low';
 
-    // The default split folds the pill into the ⋯ menu, so press the control
-    // wherever it is drawn. Locked, it opens no list and says why.
+    // The list still opens mid-turn, but a pick says why and records nothing.
     const lockReason = page.locator('.toast:visible', { hasText: 'stay fixed while a turn runs' });
-    await expect(async () => {
-      await pressRungControl(page);
-      await expect(lockReason.first()).toBeVisible({ timeout: 2_000 });
-    }).toPass({ timeout: 30_000 });
-    await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
+    await openRungList(page);
+    const other = (await readRungRows(page)).find((r) => !r.current)!;
+    await page.locator(`.control-dropdown .control-option[data-value="${other.value}"]`).click();
+    await expect(lockReason.first()).toBeVisible({ timeout: 5_000 });
 
     const res = await apiRequest(page).post('/api/v1/claude-code/control', {
       data: { thread_id: threadId, request: { subtype: 'set_reasoning_effort', effort: picked } },
@@ -198,7 +183,7 @@ test.describe('CC mid-session model/effort persistence', () => {
     expect(replies[0]).not.toBe(`effort: ${picked}`);
     expect(eventsOf('ResponseCanceled', 'cause')).toEqual([]);
 
-    // Idle frees it: the list opens again.
+    // Idle: the list opens as before.
     await openRungList(page);
     await page.keyboard.press('Escape');
     await dismissCCSession(page);

@@ -881,6 +881,73 @@ async fn adopt_takes_a_branch_created_with_git_switch() {
     assert_eq!(adopted, "feature-1234");
 }
 
+// -------------------- worktree_serves_branch --------------------
+
+#[tokio::test]
+async fn a_worktree_on_its_tracked_branch_serves_it() {
+    let (_tmp, repo, wt) = make_repo_with_worktree().await;
+    let base = current_head(&repo).await;
+    let tracked = spawn_worktree_at_base(&repo, &wt, &base).await;
+
+    assert!(worktree_serves_branch(&repo, &wt, &tracked, &IdleAnchor::Absent).await);
+}
+
+#[tokio::test]
+async fn a_worktree_on_the_agents_own_side_branch_still_serves_the_tracked_one() {
+    // The reported bug. The agent ran `git switch -c` for a throwaway commit
+    // mid-turn, then a user switch restarted Lucidos. Boot recovery read only
+    // the checked-out name, skipped the thread, and the switch never resumed it.
+    let (_tmp, repo, wt) = make_repo_with_worktree().await;
+    let base = current_head(&repo).await;
+    let tracked = spawn_worktree_at_base(&repo, &wt, &base).await;
+    let _ = git_cmd(&["switch", "-c", "p0-measure"], &wt).await;
+    tokio::fs::write(wt.join("measure.txt"), "run A")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &wt).await;
+    let _ = git_cmd(&["commit", "-m", "measuring run"], &wt).await;
+
+    assert!(
+        worktree_serves_branch(&repo, &wt, &tracked, &IdleAnchor::Absent).await,
+        "the agent cut this branch from its tracked one, so the worktree is still the thread's"
+    );
+}
+
+#[tokio::test]
+async fn a_worktree_moved_onto_someone_elses_branch_does_not_serve_the_tracked_one() {
+    let (_tmp, repo, wt) = make_repo_with_worktree().await;
+    let base = current_head(&repo).await;
+    let sibling = unrelated_sibling(&repo, &base, "2020-01-02T03:04:05+0000").await;
+    let tracked = spawn_worktree_at_base(&repo, &wt, &base).await;
+    let _ = git_cmd(&["checkout", &sibling], &wt).await;
+
+    assert!(
+        !worktree_serves_branch(&repo, &wt, &tracked, &IdleAnchor::Absent).await,
+        "resuming here would run the thread against another branch's checkout"
+    );
+}
+
+#[tokio::test]
+async fn a_side_branch_does_not_serve_when_the_anchor_lookup_failed() {
+    let (_tmp, repo, wt) = make_repo_with_worktree().await;
+    let base = current_head(&repo).await;
+    let tracked = spawn_worktree_at_base(&repo, &wt, &base).await;
+    let _ = git_cmd(&["switch", "-c", "p0-measure"], &wt).await;
+
+    assert!(
+        !worktree_serves_branch(&repo, &wt, &tracked, &IdleAnchor::Unknown).await,
+        "an unanswered anchor must never stand in for the proof"
+    );
+}
+
+#[test]
+fn the_side_branch_note_names_both_branches() {
+    let note = side_branch_note("p0-measure", "thread-branch");
+    assert!(note.contains("'p0-measure'"), "note: {}", note);
+    assert!(note.contains("'thread-branch'"), "note: {}", note);
+    assert!(note.starts_with("[Note from engine"));
+}
+
 #[tokio::test]
 async fn the_provenance_probe_refuses_when_git_cannot_answer() {
     // A directory that is not a work tree makes `git reflog` exit non-zero,

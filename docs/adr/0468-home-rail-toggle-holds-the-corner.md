@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-13
+- **Amended by**: [ADR 0561](0561-dashboard-head-titled-on-desktop.md), decision 2
 
 Amends [ADR 0467](0467-home-rail-toggle-sits-beside-the-bell.md), decision 1.
 

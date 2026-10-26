@@ -8,7 +8,8 @@ import type { JSX } from 'preact';
  *  - `framed`: accent glyph in a chip. The default, and what Filter wears.
  *  - `glyph`: accent glyph, no chip. A standing mode (Pin, Follow, Fold).
  *  - `armed`: green glyph, no chip. A standing Apply, armed for the thread.
- *  - `quiet`: neutral chip, no accent. Controls that repeat on every turn.
+ *  - `quiet`: neutral chip, no accent. Controls that repeat on every turn, and
+ *    a toggle on a head off the header bar, such as the dashboard rail's.
  *  - `live`: green glyph in a green chip. A call that is up. */
 export type ToggleTone = 'framed' | 'glyph' | 'armed' | 'quiet' | 'live';
 

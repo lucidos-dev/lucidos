@@ -31,10 +31,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
     AgentEvent, AgentExitFacts, AgentInput, AgentPermissionRequest, ControlRequest,
-    SessionContextDue,
+    SessionContextDue, WithdrawRequest,
 };
 use super::claude_code::{format_exit_status, EXIT_AFTER_STDOUT_EOF_GRACE};
-use super::codex::{lucidos_mcp_server_config_json, write_image_files, CodexConfig};
+use super::codex::{
+    answer_withdraw, lucidos_mcp_server_config_json, write_image_files, CodexConfig,
+};
 use super::codex_app_server_parse::{
     parse_app_server_line, parse_approval_request, AppServerLine, AppServerTracker,
 };
@@ -221,12 +223,14 @@ fn spawn_app_server_child(
 }
 
 /// Drive one persistent app-server session. See module docs for the contract.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn app_server_driver_task(
     config: CodexConfig,
     resume_session_id: Option<String>,
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
     mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
+    mut withdraw_rx: mpsc::UnboundedReceiver<WithdrawRequest>,
     permission_tx: mpsc::UnboundedSender<AgentPermissionRequest>,
     cancel: CancellationToken,
 ) {
@@ -623,6 +627,9 @@ pub(super) async fn app_server_driver_task(
                         break 'session;
                     }
                 }
+            }
+            Some(withdraw) = withdraw_rx.recv() => {
+                answer_withdraw(&mut queue, &mut input_rx, withdraw);
             }
             req = control_rx.recv() => {
                 match req {

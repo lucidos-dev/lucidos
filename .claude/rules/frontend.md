@@ -38,7 +38,7 @@ type Loadable<T> =
 - Handle **all four states**. `loaded ? data : []` is a bug (masks loading as empty).
 - Failed draws `<LoadableError>`, never empty. Never fake errors as `loaded` with empty data.
 - Tab data loads on page reload via `store/startup.ts`. Use `ApiError` + `toFailed()`.
-- **Never render a loader immediately.** Gate it on `useDelayedLoading(loadable)` or `useDelayedFlag(active, delayMs?)`. Loaders are delay-only, with no minimum-visible floor.
+- **Never render a loader immediately.** Gate it on `useDelayedLoading(loadable)` or `useDelayedFlag(active, delayMs?)`. A shown loader stays up `LOADER_MIN_VISIBLE_MS`, owned by `<LoadingFade>` (ADR 0555).
 - **Data loading draws a skeleton, always.** No page spinner, no "Loading…" text. `.mini-spinner` is only for an indeterminate working state, or a multi-read list's trailing row. Wrap the skeleton in `<LoadingFade>`. Full-screen surfaces gate it too.
 - **The delay gate has NO exception.** Never "hold" a skeleton ahead of it (ADR 0081). Cut the render cost instead.
 - **An animated element must SURVIVE the conditional renders around it, so key it.** A remount cannot transition.
@@ -121,7 +121,11 @@ Frontend live: `wasInterrupted: !wasIdle`. Reload: uses `completed === false` fr
 
 ## Circuit Breakers
 
-Generic breaker: same tool+target **failed** 3+ times in a row → warn the model; 5+ → force-break with error. It gates on consecutive *failure*, not consecutive call, so productive repetition (e.g. distinct `psql` queries) never trips. `read_file`/`list_files` keep their own content-deterministic breakers (identical re-reads block regardless of success). All bounded by `MAX_ITERATIONS`.
+The generic breaker counts identical attempts after errors. After two failed
+executions, attempts three and four warn without running; attempt five breaks.
+A successful call or different target resets the streak.
+`read_file` and `list_files` have separate content-based breakers that also
+block identical successful reads. `MAX_ITERATIONS` bounds every path.
 
 ## Navigation That Lands Content Must Call `revealContentPane()`
 

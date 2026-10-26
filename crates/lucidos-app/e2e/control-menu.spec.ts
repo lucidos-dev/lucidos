@@ -1,6 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import {
-  apiRequest, assertHealthy, blurActiveElement, closeComposerFold, codingAgentCommandsReady, composerControl, ensureOnThreadPane,
+  apiRequest, assertHealthy, blurActiveElement, closeComposerFold, COMPOSER_FOLD_TRIGGER, codingAgentCommandsReady, composerControl, ensureOnThreadPane,
   getHeaderTop, navigateToApp, newThread, pickComposeDestination, pickDropdownOption,
   ensureSlashCommandsReported, openRungList, sendMessage, uniqueMessage, waitForActionPanel, waitForVisibleInput,
 } from './helpers';
@@ -92,7 +92,7 @@ test.describe('Coding-agent control menu', () => {
     expect(value).toBe('');
   });
 
-  test('Codex Lucidos-source draft shows Codex controls and posts coding_agent=codex', async ({ page }) => {
+  test('Codex Lucidos-source draft has no `/` button and posts coding_agent=codex', async ({ page }) => {
     const commandUrls: string[] = [];
     let sentBody: Record<string, unknown> | null = null;
     let chatRequestFulfilled = false;
@@ -132,17 +132,8 @@ test.describe('Coding-agent control menu', () => {
       page.locator('.compose-coding-agent-chip .dropdown-sizer > :first-child:visible').first(),
     ).toHaveText('Codex');
 
-    // Codex has no slash commands, so its `/` button is drawn but inert, and
-    // its model pick is the rung control's.
-    // The control may stand in the row or sit behind its ⋯, so it is read by
-    // its accessible name, which both renderings share.
-    await expect(async () => {
-      await closeComposerFold(page);
-      const codexControls = await composerControl(page, '.commands-btn');
-      await expect(codexControls).toHaveAccessibleName('Codex controls', { timeout: 1_000 });
-      await expect(codexControls).not.toHaveClass(/commands-btn-active/);
-    }).toPass({ timeout: 15_000 });
-    await closeComposerFold(page);
+    // Codex has no slash commands, so it gets no `/` button, standing or
+    // behind the ⋯. Its model pick is the rung control's.
     await openRungList(page);
     await page.keyboard.press('Escape');
     await expect.poll(() => commandUrls.some((u) => {
@@ -150,10 +141,14 @@ test.describe('Coding-agent control menu', () => {
       return url.searchParams.get('repo_id') === ''
         && url.searchParams.get('coding_agent') === 'codex';
     })).toBe(true);
-
-    await (await composerControl(page, '.commands-btn')).click();
-    await page.waitForTimeout(250);
-    await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
+    await expect(page.locator('.prompt-actions-row .commands-btn:visible')).toHaveCount(0);
+    const more = page.locator(COMPOSER_FOLD_TRIGGER).first();
+    if (await more.count() > 0) {
+      await more.click();
+      await expect(page.locator('.thread-overflow-menu')).toBeVisible();
+      await expect(page.locator('.thread-overflow-menu .commands-btn')).toHaveCount(0);
+      await closeComposerFold(page);
+    }
 
     await typeSlash(page);
     await page.waitForTimeout(250);

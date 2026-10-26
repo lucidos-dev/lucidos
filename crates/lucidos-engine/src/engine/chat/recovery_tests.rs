@@ -38,6 +38,7 @@ async fn emit_unanswered_question(bus: &EventBus, thread_id: Uuid, tool_use_id: 
                 description: None,
                 preview: None,
                 widget: None,
+                quiet: false,
             }],
             worktree_path: None,
             multi_select: false,
@@ -353,6 +354,7 @@ async fn orphan_threads_query_recovers_answered_then_interrupted_thread() {
         thread_id: answered_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: "toolu_answered".into(),
+            quiet: false,
             answer: crate::engine::thread_events::AnswerKind::Selected {
                 option_id: "opt-0".into(),
             },

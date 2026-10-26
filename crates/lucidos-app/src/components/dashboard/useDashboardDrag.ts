@@ -18,7 +18,8 @@ interface Drag {
   y: number;
   moved: boolean;
   /** The tile the last swap moved past. The pointer must leave it before it
-   *  can swap again, or a slide still under the pointer swaps straight back. */
+   *  can swap again, or a slide still under the pointer swaps straight back.
+   *  After a reflow it is the tile now under the pointer. */
   passed: string | null;
 }
 
@@ -86,10 +87,13 @@ export function useDashboardDrag({ order, enabled, onDrop }: {
   useLayoutEffect(() => {
     const previous = before.current;
     before.current = null;
+    // Hit-test before the slides start: their first frame draws each tile at its old place.
+    const d = drag.current;
+    if (d?.moved) d.passed = tileUnder(d.x, d.y, d.key, elements.current) ?? d.passed;
     if (previous) {
       for (const [key, el] of elements.current) {
         const from = previous.get(key);
-        if (from && key !== drag.current?.key) slideFrom(el, from, el.getBoundingClientRect());
+        if (from && key !== d?.key) slideFrom(el, from, el.getBoundingClientRect());
       }
     }
     follow();

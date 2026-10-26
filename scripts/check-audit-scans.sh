@@ -12,8 +12,8 @@
 # in its `## Scan` block. The audit runs them through the root's `scan()`, which
 # hands the pattern to `grep -rnE`. This script evaluates the same lines with a
 # stub `scan()` that keeps the pattern, so it tests the exact string the audit
-# greps with, bash escapes and all. Then it runs each FIXTURES row through
-# `grep -E`.
+# greps with, bash escapes and all. It batches FIXTURES rows by scan through
+# `grep -nE`, retaining each row’s expected result.
 #
 # The scar: the db-defaults psql arm needed whitespace after the command name.
 # An argv list puts a quote there (`["psql","-A",...]`), so a real audit missed
@@ -175,45 +175,47 @@ while IFS= read -r line; do
 done <<< "$SCAN_LINES"
 set +f
 
-SCANS=$(cd "$WORK/patterns" && ls)
-if [ -z "$SCANS" ]; then
-    echo "ERROR: no scan lines found in the audit sections, so the audit-scan check cannot run." >&2
-    exit 1
-fi
+printf '%s\n' "$FIXTURES" > "$WORK/fixtures"
+python3 - "$WORK" "$BROKEN" <<'PY'
+import collections
+import pathlib
+import subprocess
+import sys
 
-FAILED=$BROKEN
-ROWS=0
-while read -r id want text; do
-    ROWS=$((ROWS + 1))
-    if [ ! -f "$WORK/patterns/$id" ]; then
-        echo "FAIL: a fixture names scan '$id', which no audit section defines."
-        FAILED=1
+work = pathlib.Path(sys.argv[1])
+failed = int(sys.argv[2])
+patterns = {path.name: path.read_text() for path in (work / 'patterns').iterdir()}
+if not patterns:
+    raise SystemExit('ERROR: no scan lines found, so the audit-scan check cannot run.')
+fixtures = collections.defaultdict(list)
+rows = 0
+for line in (work / 'fixtures').read_text().splitlines():
+    fields = line.split(None, 2)
+    if len(fields) != 3 or fields[1] not in ('hit', 'miss'):
+        raise SystemExit('ERROR: malformed audit fixture: ' + line)
+    name, want, text = fields
+    if name not in patterns:
+        raise SystemExit('ERROR: fixture names an unknown scan: ' + name)
+    fixtures[name].append((want, text))
+    rows += 1
+for name, pattern in sorted(patterns.items()):
+    cases = fixtures[name]
+    if not any(want == 'hit' for want, _ in cases):
+        print("FAIL: scan '%s' has no hit fixture." % name)
+        failed = 1
         continue
-    fi
-    grep -qE -e "$(cat "$WORK/patterns/$id")" <<< "$text"
-    rc=$?
-    if [ "$rc" -gt 1 ]; then
-        echo "ERROR: grep rejected the '$id' pattern, so the audit-scan check cannot run." >&2
-        exit 1
-    fi
-    got=miss
-    [ "$rc" -eq 0 ] && got=hit
-    if [ "$got" != "$want" ]; then
-        echo "FAIL: $id should $want, got $got: $text"
-        FAILED=1
-    fi
-done <<< "$FIXTURES"
-
-for id in $SCANS; do
-    # A here-string, not a pipe: `grep -q` quits early, and under pipefail the
-    # writer's SIGPIPE would fail the check.
-    if ! grep -q "^$id hit " <<< "$FIXTURES"; then
-        echo "FAIL: scan '$id' has no hit fixture. Add one to FIXTURES in $0."
-        FAILED=1
-    fi
-done
-
-if [ "$FAILED" -ne 0 ]; then
-    exit 1
-fi
-echo "OK: $ROWS fixtures across $(printf '%s\n' "$SCANS" | grep -c .) audit scans behave."
+    result = subprocess.run(['grep', '-nE', '-e', pattern],
+                            input=''.join(text + '\n' for _, text in cases),
+                            text=True, capture_output=True)
+    if result.returncode not in (0, 1):
+        raise SystemExit("ERROR: grep rejected scan '%s': %s" % (name, result.stderr))
+    hits = {int(line.split(':', 1)[0]) for line in result.stdout.splitlines()}
+    for index, (want, text) in enumerate(cases, 1):
+        got = 'hit' if index in hits else 'miss'
+        if got != want:
+            print('FAIL: %s should %s, got %s: %s' % (name, want, got, text))
+            failed = 1
+if failed:
+    sys.exit(1)
+print('OK: %d fixtures across %d audit scans behave.' % (rows, len(patterns)))
+PY

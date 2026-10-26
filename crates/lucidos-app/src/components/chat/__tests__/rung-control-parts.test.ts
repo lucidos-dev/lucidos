@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { rungFaces, shownRung, stepTargets } from '../rungControlParts';
+import { shownRung, stepTargets } from '../rungControlParts';
 import { LADDER_LINK_VALUE } from '../rungRows';
 
 const rungs = [
@@ -48,22 +48,6 @@ describe('shownRung', () => {
   it('treats the default sentinel as nothing picked', () => {
     expect(shownRung({ ...base, loaded: true, model: 'default' }))
       .toEqual({ name: 'Opus 5.6', effort: 'medium', position: { at: 1, of: 2 }, intelligence: null });
-  });
-});
-
-describe('rungFaces', () => {
-  it('gives every rung a face, numbered from the top of the ladder', () => {
-    expect(rungFaces(rungs, (r) => [r.label])).toEqual([
-      { name: 'Opus 5.6', effort: 'medium', position: { at: 1, of: 2 }, intelligence: null },
-      { name: 'Opus 5.6', effort: 'high', position: { at: 2, of: 2 }, intelligence: '1.08×' },
-    ]);
-  });
-
-  it('gives a rung one face per name it can carry, so a 1M window keeps its room', () => {
-    expect(rungFaces(rungs.slice(0, 1), (r) => [r.label, `${r.label} (1M)`])).toEqual([
-      { name: 'Opus 5.6', effort: 'medium', position: { at: 1, of: 1 }, intelligence: null },
-      { name: 'Opus 5.6 (1M)', effort: 'medium', position: { at: 1, of: 1 }, intelligence: null },
-    ]);
   });
 });
 

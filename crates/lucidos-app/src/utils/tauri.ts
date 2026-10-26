@@ -142,6 +142,18 @@ export function toggleWindowMaximize(): Promise<void> {
 }
 
 /**
+ * Put the calling window into or out of native fullscreen (app_window.rs
+ * `set_window_fullscreen`). Resolves to whether it was ALREADY fullscreen, so the
+ * caller can leave only a fullscreen it entered. Only call when isTauri() is true. */
+export function setWindowFullscreen(fullscreen: boolean): Promise<boolean> {
+  return invoke('set_window_fullscreen', { fullscreen });
+}
+
+/** The Tauri event (a bare boolean) the shell sends when the calling window
+ *  enters or leaves native fullscreen. */
+export const WINDOW_FULLSCREEN_CHANGED_EVENT = 'window-fullscreen-changed';
+
+/**
  * Name the CALLING window (app_window.rs `set_window_title`), so the macOS Window menu
  * tells two windows apart by the workspace each is showing.
  *

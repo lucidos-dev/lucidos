@@ -530,6 +530,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, reported, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     handlers.onTouchEnd(touch);
     expect(action).toHaveBeenCalledTimes(1);
     expect(reported).not.toHaveBeenCalled();
@@ -539,6 +540,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, reported, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.move(at(100, 240));
     handlers.onTouchEnd(touch);
     expect(action).not.toHaveBeenCalled();
@@ -552,6 +554,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, reported, activation } = gated();
     const { action, handlers, touch, advance } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.move(at(100, 240));
     handlers.onTouchEnd(touch);
     expect(touch.preventDefault).toHaveBeenCalledTimes(1);
@@ -566,6 +569,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, activation } = gated();
     const { handlers, touch } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     handlers.onTouchEnd(touch);
     expect(takePressOutcome(5_000)).toBe('served');
   });
@@ -575,6 +579,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, activation } = gated();
     const { handlers, touch } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.move(at(100, 240));
     handlers.onTouchEnd(touch);
     expect(takePressOutcome(5_000)).toBeNull();
@@ -591,6 +596,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
       enabled: () => false,
     });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     handlers.onTouchEnd(touch);
     expect(action).not.toHaveBeenCalled();
     expect(touch.preventDefault).not.toHaveBeenCalled();
@@ -602,6 +608,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, reported, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => false });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.move(at(100, 240));
     handlers.onTouchEnd(touch);
     expect(action).toHaveBeenCalledTimes(1);
@@ -616,6 +623,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, reported, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.move(at(100, 240));
     gate.cancel();
     handlers.onTouchEnd(touch);
@@ -629,6 +637,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.cancel();
     handlers.onTouchEnd(touch);
     expect(action).not.toHaveBeenCalled();
@@ -638,9 +647,11 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => true });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.cancel();
     handlers.onTouchEnd(touch);
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     handlers.onTouchEnd(touch);
     expect(action).toHaveBeenCalledTimes(1);
   });
@@ -651,6 +662,7 @@ describe('a destructive face asks the gate rather than spending it', () => {
     const { gate, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => false });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     handlers.onTouchEnd(touch);
     expect(gate.wasAborted()).toBe(false);
     handlers.onTouchEnd(touch);
@@ -666,18 +678,107 @@ describe('a destructive face asks the gate rather than spending it', () => {
 
   it('reads the flag per press, since one node serves Send and Cancel', () => {
     // The morph is a single button that turns destructive. The flag is a thunk
-    // for that reason, read at the lift rather than captured at bind time.
+    // for that reason, read per press rather than captured at bind time.
     let destructive = false;
     const { gate, activation } = gated();
     const { action, handlers, touch } = harness({ gate: activation, destructive: () => destructive });
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.move(at(100, 240));
     handlers.onTouchEnd(touch);
     expect(action).toHaveBeenCalledTimes(1);
     destructive = true;
     gate.down(at(100, 200));
+    handlers.onTouchStart(contact(100, 200, 1));
     gate.move(at(100, 240));
     handlers.onTouchEnd(touch);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** The iOS PWA report: "I did not press Cancel". Twice, a Send held for well
+ *  over a second sent at once. Its lift arrived after the button had morphed into
+ *  Stop and the settle window had run out. The lift then stopped the turn it had
+ *  just started. One press is one activation, of the face it began on. */
+describe('a press serves only the face it started on, once', () => {
+  function morph() {
+    const face = { destructive: false };
+    const { action, handlers, touch, advance } = harness({ destructive: () => face.destructive });
+    const lift = { ...contact(100, 200, 0), ...touch };
+    return { face, action, handlers, lift, advance };
+  }
+
+  it('a lift that finds Send turned into Stop stops nothing', () => {
+    const { face, action, handlers, lift, advance } = morph();
+    handlers.onTouchStart(contact(100, 200, 1));
+    face.destructive = true;
+    advance(1_900);
+    handlers.onTouchEnd(lift);
+    expect(action).not.toHaveBeenCalled();
+    expect(lift.preventDefault).toHaveBeenCalledTimes(1);
+  });
+
+  it('a press its click already served is not served again at its lift', () => {
+    const { action, handlers, lift, advance } = morph();
+    handlers.onTouchStart(contact(100, 200, 1));
+    handlers.onClick();
+    advance(1_400);
+    handlers.onTouchEnd(lift);
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it('a lift that finds Stop turned back into Send sends nothing', () => {
+    const { face, action, handlers, lift } = morph();
+    face.destructive = true;
+    handlers.onTouchStart(contact(100, 200, 1));
+    face.destructive = false;
+    handlers.onTouchEnd(lift);
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('a Stop lift with no press behind it stops nothing', () => {
+    const { face, action, handlers, lift } = morph();
+    face.destructive = true;
+    handlers.onTouchEnd(lift);
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it('a cancelled press that began on Send stops nothing when the face is now Stop', () => {
+    vi.useFakeTimers();
+    try {
+      const { face, action, handlers } = morph();
+      handlers.onTouchStart(contact(100, 200, 1));
+      face.destructive = true;
+      handlers.onTouchCancel(contact(100, 200, 0));
+      vi.advanceTimersByTime(CANCELLED_TAP_SETTLE_MS);
+      expect(action).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a refused lift spends the gate and is claimed, so the probe never calls it dead', () => {
+    takePressOutcome(0);
+    const face = { destructive: false };
+    const spend = vi.fn();
+    const { action, handlers, touch } = harness({
+      gate: { pass: () => true, spend },
+      destructive: () => face.destructive,
+    });
+    handlers.onTouchStart(contact(100, 200, 1));
+    face.destructive = true;
+    handlers.onTouchEnd({ ...contact(100, 200, 0), ...touch });
+    expect(action).not.toHaveBeenCalled();
+    expect(spend).toHaveBeenCalledTimes(1);
+    expect(takePressOutcome(5_000)).toBe('refused');
+  });
+
+  it('a held Stop still stops', () => {
+    const { face, action, handlers, lift, advance } = morph();
+    face.destructive = true;
+    handlers.onTouchStart(contact(100, 200, 1));
+    advance(1_900);
+    handlers.onTouchEnd(lift);
     expect(action).toHaveBeenCalledTimes(1);
   });
 });

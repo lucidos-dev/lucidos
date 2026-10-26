@@ -1,6 +1,6 @@
 import { showToast, showConfirm, threadMap, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, setFocusedThread, focusedThreadId, awaitedThreadId, drawerGrouping, selectedOngoingGroup, threadSearchQuery, threadSearchResults } from '../store';
 import { appliedThreadFilter } from '../appliedThreadFilter';
-import { closeDashboardSheet } from '../dashboards';
+import { closeDashboardPanel } from '../dashboards';
 import { revealThreadPane } from './pane';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import { deepLinkAnchorInThread, describeWaitSubscription, NO_CHANGE } from '../thread-events';
@@ -23,6 +23,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { pruneRecents } from './entityReferences';
 import { BLOCKER_REASON, blockedRefusal, type BlockedRefusal } from './blockerCopy';
 import { collectThreadFamily } from './threadFamily';
+import { openListedThread } from './event-navigation';
 
 // ---------------------------------------------------------------------------
 // Thread CRUD
@@ -79,9 +80,9 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // retires at its own optimistic focus instead.
   if (!wasFocused) stopFollowingBottom();
   setFocusedThread(threadId);
-  // The sheet belongs to the thread it was opened over. Any focus closes it,
+  // The panel belongs to the thread it was opened over. Any focus closes it,
   // so a drafted prompt in the open thread is not hidden behind it.
-  closeDashboardSheet();
+  closeDashboardPanel();
   rememberOpenedViewRows(threadId);
   // Focusing a thread does NOT position its transcript. `useScrollMemory` owns
   // that: a saved position is restored, and a thread with none opens at the top
@@ -814,11 +815,12 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   // is not navigation. The hand-off exists so the thread pane isn't left
   // pointing at a thread that just left the list, not because the user asked to
   // go there. On mobile the thread drawer is its own pane, so revealing swiped a
-  // user archiving row after row out of the list on every tap.
+  // user archiving row after row out of the list on every tap. The next row
+  // still opens as a tap opens it, so a Blocked row lands on its card.
   const nextId = candidates.find(id => !cascade.has(id)) ?? null;
   if (nextId) {
     revealOnFocus.value = true;
-    focusThread(nextId, { revealPane: false });
+    openListedThread(nextId, { revealPane: false });
   } else {
     // Last review dismissed → the thread pane falls back to the compose view.
     unfocusThread({ revealPane: false });

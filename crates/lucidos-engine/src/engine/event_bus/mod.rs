@@ -1285,7 +1285,7 @@ impl EventBus {
         Self::lock_thread_append(&mut tx, thread_id).await?;
 
         let mut staged = Vec::with_capacity(events.len());
-        for (te, meta) in events {
+        for (mut te, meta) in events {
             let event_id = meta.event_id.unwrap_or_else(Uuid::new_v4);
 
             // === Phase: Validate ===
@@ -1382,6 +1382,13 @@ impl EventBus {
                     child_thread_id
                 );
                 return Ok(None);
+            }
+
+            // A capture names its *agent session*. The append lock keeps a
+            // session from opening between this read and the insert.
+            if let ThreadEvent::ContextCaptured { session, .. } = &mut te {
+                *session =
+                    Some(super::session_scope::current_session_ordinal(&mut tx, thread_id).await?);
             }
 
             // === Phase: Persist ===

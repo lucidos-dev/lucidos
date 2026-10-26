@@ -40,11 +40,11 @@ export function shouldKeepHeaderVisible(opts: { dynamicBars: boolean; findOpen: 
  *  the bars pinned rendered the input under the header). */
 export function spacerHeightPx(opts: {
   cachedHeight: number;
-  safeAreaTop: number;
+  controlsTop: number;
   keyboardOpen: boolean;
   disabled: boolean;
 }): number {
-  return opts.keyboardOpen && !opts.disabled ? opts.safeAreaTop : opts.cachedHeight;
+  return opts.keyboardOpen && !opts.disabled ? opts.controlsTop : opts.cachedHeight;
 }
 
 /** Whether a scroll event's delta counts toward the bars' intent. Only the
@@ -232,8 +232,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let viewScrollTop = 0;
     let distanceToBottomPx = Infinity;
     let cachedHeight = 0;
-    // Header's padding-top (var(--safe-area-top)) in px. See updateHeaderVar.
-    let cachedSafeAreaTop = 0;
+    // Header's padding-top (var(--header-controls-top)) in px. See updateHeaderVar.
+    let cachedControlsTop = 0;
     let titleBarHeight = 0; // px, thread title bar height (0 while no thread is open)
     let titleBarEl: HTMLElement | null = null;
     // The thread's transcript, which the title bar and the prompt read while
@@ -308,16 +308,16 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
 
     /** Set --mobile-header-height based on keyboard + pinned state.
-     *  Keyboard open (header sliding off) → safe-area-inset-top: keeps a spacer
-     *    at the notch / dynamic-island clearance so focused inputs near the top
-     *    of the page don't end up behind iOS chrome. Resolves to 0 on platforms
-     *    without a safe-area inset (Android, pre-notch iPhones, desktop).
+     *  Keyboard open (header sliding off) → the header's controls top. The
+     *    spacer clears the island, and iOS 27's blur in the installed app. So
+     *    focused inputs near the top of the page stay clear of iOS chrome. It
+     *    is 0 on platforms without a safe-area inset (Android, desktop).
      *  Header pinned visible (pinned bars / find bar) or keyboard closed → actual
      *    header height, so content stays clear of the still-visible header. */
     function updateHeaderVar() {
       const heightPx = spacerHeightPx({
         cachedHeight,
-        safeAreaTop: cachedSafeAreaTop,
+        controlsTop: cachedControlsTop,
         keyboardOpen,
         disabled,
       });
@@ -552,9 +552,9 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       cachedRemSize = getRemPx();
       const el = headerRef.current;
       if (!el) {
-        if (cachedHeight !== 0 || cachedSafeAreaTop !== 0) {
+        if (cachedHeight !== 0 || cachedControlsTop !== 0) {
           cachedHeight = 0;
-          cachedSafeAreaTop = 0;
+          cachedControlsTop = 0;
           updateHeaderVar();
         }
         return;
@@ -565,11 +565,11 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       const h = el.getBoundingClientRect().height;
       if (Math.abs(h - cachedHeight) <= 0.1) return;
       cachedHeight = h;
-      // padding-top is var(--safe-area-top) (mobile.css). Any change
+      // padding-top is var(--header-controls-top) (mobile.css). Any change
       // to it also changes the bounding height, so we only re-read when the
       // height delta above already proved something moved — skipping a forced
       // style flush on every no-op refreshHeight tick.
-      cachedSafeAreaTop = parseFloat(getComputedStyle(el).paddingTop) || 0;
+      cachedControlsTop = parseFloat(getComputedStyle(el).paddingTop) || 0;
       updateHeaderVar();
       // An away header moves by its own height, so a header that grows while
       // away would otherwise peek in by the growth.
@@ -810,10 +810,10 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       if (keyboardOpen) return; // Already hidden — skip duplicate scroll compensation
       keyboardOpen = true;
       updateHeaderVar();
-      // Compensate scroll: spacer shrinks from cachedHeight to cachedSafeAreaTop,
+      // Compensate scroll: spacer shrinks from cachedHeight to cachedControlsTop,
       // so move content up by the same delta to stay visually anchored.
       if (currentContainer) {
-        const delta = cachedHeight - cachedSafeAreaTop;
+        const delta = cachedHeight - cachedControlsTop;
         holdAcrossRelayout(currentContainer as HTMLElement, Math.max(0, currentContainer.scrollTop - delta));
       }
       applyTransform();
@@ -844,7 +844,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         // This runs after a send's two landing calls, so an unmarked write
         // would read as the reader and cancel the landing.
         if (currentContainer) {
-          holdAcrossRelayout(currentContainer as HTMLElement, currentContainer.scrollTop + cachedHeight - cachedSafeAreaTop);
+          holdAcrossRelayout(currentContainer as HTMLElement, currentContainer.scrollTop + cachedHeight - cachedControlsTop);
         }
         syncToScroll(currentContainer);
       });
@@ -954,7 +954,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         updateHeaderVar();
         // The spacer grew back, so the content keeps its place as on focusout.
         if (currentContainer) {
-          holdAcrossRelayout(currentContainer as HTMLElement, currentContainer.scrollTop + cachedHeight - cachedSafeAreaTop);
+          holdAcrossRelayout(currentContainer as HTMLElement, currentContainer.scrollTop + cachedHeight - cachedControlsTop);
         }
       }
       // While pinned, no scroll reached the intent. Unpinned, the bars stay

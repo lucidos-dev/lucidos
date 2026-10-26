@@ -5,8 +5,8 @@
  * `--icon-size-lg` glyph. Giving the leading agent control that class was not
  * enough, because the same BOX is not the same SIZE. Todo, the subscription
  * clock and attach are drawn to one grid and each paints exactly 0.75 of its
- * own viewBox; the three agent marks are foreign artwork and paint 0.997
- * (Claude) and 0.88 (Codex). At one box, Claude reads a third larger than the
+ * own viewBox; the Claude mark is foreign artwork and paints 0.997. At one
+ * box, it reads a third larger than the
  * checkbox beside it. The user reported exactly that.
  *
  * So each mark is sized by its own fill fraction to land the run's ink. This
@@ -44,7 +44,6 @@ function rule(selector: string): CssRule {
  *  hundredth of a px on every glyph here. */
 const MEASURED = {
   'claude-icon': 0.997,
-  'codex-icon': 0.88,
 };
 
 describe('the composer agent mark is sized by ink, not by box', () => {

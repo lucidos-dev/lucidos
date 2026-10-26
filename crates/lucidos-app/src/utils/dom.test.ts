@@ -122,6 +122,12 @@ describe('viewportIsKeyboardShrunk', () => {
     // whenever the keys are really up.
     expect(viewportIsKeyboardShrunk(784, 844)).toBe(false);
   });
+
+  it('reads a zero-height visual viewport as no reading, not as a keyboard', () => {
+    // iOS 27 reports this transiently in a standalone PWA. Read as a keyboard,
+    // it sized the app shell to 0px and blanked the screen.
+    expect(viewportIsKeyboardShrunk(0, 852)).toBe(false);
+  });
 });
 
 describe('matrixTranslateX', () => {

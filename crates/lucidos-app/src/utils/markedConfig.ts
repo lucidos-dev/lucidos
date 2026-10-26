@@ -1,7 +1,6 @@
 import { marked } from 'marked';
 import type { Tokens } from 'marked';
 import { widgetEmbedAtStart, type EmbedMatch } from './widgetEmbed';
-import { COPY_ICON } from './copyIcons';
 
 export function escapeHtmlAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -52,23 +51,24 @@ renderer.code = ({ text, lang: info = '', escaped, raw }: Tokens.Code) => {
   const body = [escapeHtmlAttr(firstLine), escaped ? text : escapeHtmlAttr(text)].filter(Boolean).join('\n');
   // Lang label + copy button share one .code-block-header overlay. See
   // `.code-block-header` in styles/chat/response.css for why this structure
-  // (not two absolute siblings of <pre>).
-  return `<div class="code-block-wrapper" ${CODE_COPY_ATTR}="${COPY_ID_NONCE}"><div class="code-block-header">${langLabel}<button type="button" class="copy-btn code-block-copy-btn" aria-label="Copy code">${COPY_ICON}</button></div><pre><code>${body}</code></pre></div>`;
+  // (not two absolute siblings of <pre>). The sanitizer escapes every
+  // `<button>`, so `resolveCodeBlockCopy` adds the copy button after it.
+  return `<div class="code-block-wrapper" ${CODE_COPY_ATTR}="${COPY_ID_NONCE}"><div class="code-block-header">${langLabel}</div><pre><code>${body}</code></pre></div>`;
 };
 
 /** Marks a GFM task-list checkbox this renderer wrote, carrying the same
- *  nonce as the copy markers above. Raw HTML in markdown passes through
- *  unchanged, and DOMPurify keeps `data-*` by default. So an authored
- *  `<input type="checkbox">` is otherwise indistinguishable in the DOM from
- *  one `marked` generated for a real `- [ ]` line.
- *  `MarkdownDocument`'s checkbox-toggle wiring only counts the latter when
- *  mapping a click back to a source line (`taskListToggle.ts`). Querying
- *  every checkbox would pick up the authored one too, shifting every later
- *  index and toggling the wrong line. */
+ *  nonce as the copy markers above. It is the only `<input>` the sanitizer
+ *  keeps: an authored one shows as text (`renderMarkdown.ts`).
+ *  `MarkdownDocument`'s checkbox-toggle wiring also keys on it when mapping a
+ *  click back to a source line (`taskListToggle.ts`). */
 export const TASK_CHECKBOX_ATTR = 'data-task-checkbox';
 
-renderer.checkbox = ({ checked }: Tokens.Checkbox): string =>
-  `<input ${TASK_CHECKBOX_ATTR}="${COPY_ID_NONCE}"${checked ? ' checked' : ''} disabled type="checkbox"> `;
+/** The task checkbox's whole markup. The sanitizer rebuilds every kept
+ *  checkbox from it, so no authored attribute rides on one. */
+export const taskCheckboxTag = (checked: boolean): string =>
+  `<input ${TASK_CHECKBOX_ATTR}="${COPY_ID_NONCE}"${checked ? ' checked' : ''} disabled type="checkbox">`;
+
+renderer.checkbox = ({ checked }: Tokens.Checkbox): string => `${taskCheckboxTag(checked)} `;
 
 /** Marks an email the GFM autolinker found in bare text, so `renderMarkdown`
  *  can unwrap one sitting inside a path. Its token's `raw` is the bare address;

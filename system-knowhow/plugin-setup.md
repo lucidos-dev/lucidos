@@ -3,6 +3,8 @@ name: Plugin Setup
 description: Use when a thread asks to set up a newly installed plugin, or to set up one again after an update. Covers reusing an earlier run, finding the author's instructions, planning the steps, doing the wiring, and asking the user for what only they can provide.
 ---
 
+<!-- domain-event: PluginSetupCompleted: Plugin setup emits this domain event after completing its procedure. -->
+
 # Plugin Setup
 
 This thread finishes setting up a plugin that was **just installed or updated** in this workspace. The opening request names the plugin and says which. "Set up the newly installed Super Slides plugin" is a first install. "Set up Super Slides again" is an update whose setup instructions changed, or whose author asked to run setup again. Your job is to carry out the author's setup instructions with the user, who is reading this thread now.
@@ -19,9 +21,9 @@ The opening request names the cause. Match the seed on its cause wording. The `s
 
 | The seed says | Cause | What it means for the diff |
 |---|---|---|
-| `changed its setup instructions` and nothing about the author | Instructions changed | The two `setup` texts differ. The diff is the work. |
+| `setup instructions changed` or `changed its setup instructions`, without an author request | Instructions changed | The two `setup` texts differ. The diff is the work. |
 | `asks to run its setup again` | Revision raised | The author raised `setup_revision`. The two texts are the same, so **the diff is empty by design**. |
-| `changed its setup instructions`, then `and the author asks to run it again` | Both | The texts differ and the revision rose. Do both jobs. |
+| Either instructions-changed wording, then `and the author asks to run it again` | Both | The texts differ and the revision rose. Do both jobs. |
 
 An `Author's note:` at the end of the seed is the author's `setup_reason`. Read it first. It names what changed outside the setup text, such as a shipped file the setup copies elsewhere.
 
@@ -31,7 +33,7 @@ Then use these sources:
 
 - **Diff the author's two setup texts.** Query `PluginInstalled` for this plugin and take the newest two. Each `setup` value sits at `payload.data.manifest.manifest.setup` (see § 2). When they differ, what the author changed is the work. The rest is done. The revision sits beside it, at `payload.data.manifest.manifest.setup_revision`.
 - **Read the record of the last run.** Query `PluginSetupCompleted` and take the newest whose `plugin` matches. It holds the user's choices and what they skipped, which the author's text cannot recover.
-- **Fall back to the earlier thread only when there is no record.** The previous `PluginInstalled` event holds its setup thread's id at `payload.data.manifest.setup_thread_id`, one level above the raw manifest. `query_events` reads that thread by `thread_id`. It is a whole transcript, so read it last, and only for questions the diff leaves open.
+- **Fall back to the earlier thread only when there is no record.** The previous `PluginInstalled` event holds its setup thread's id at `payload.data.manifest.setup_thread_id`, one level above the raw manifest. `events(action="query")` reads that thread by `thread_id`. It is a whole transcript, so read it last, and only for questions the diff leaves open.
 
 ### Verify before you skip
 
@@ -101,7 +103,7 @@ When every step is complete, confirm briefly what is ready to use. If the plugin
 The next update spawns another setup thread, and § 1 needs this record to avoid re-asking everything. Emit it before you finish:
 
 ```
-emit_event("PluginSetupCompleted", {
+events(action="emit", event_type="PluginSetupCompleted", payload={
   "summary": "Set up Super Slides 0.5.2: 1 trigger, 1 credential",
   "plugin": "super-slides",
   "version": "0.5.2",

@@ -151,8 +151,9 @@ impl LucidosEngine {
                     opening.thread_id,
                     opening.prompt,
                     Some(opening.title),
-                    opening.reason,
+                    crate::engine::thread_events::MessageOrigin::engine(opening.reason),
                     opening.implementer,
+                    |_| {},
                 );
             }),
             publish: Box::new(move |snapshot| {

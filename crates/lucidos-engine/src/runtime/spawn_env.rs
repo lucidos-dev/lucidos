@@ -36,8 +36,8 @@ use super::lucidos_cli::path_with_prefixes;
 /// - The agent run marker (`LUCIDOS_AGENT_RUN`) from `args.agent_run`, whose
 ///   `finish` reaps what outlives the agent (`agent_run_marker`).
 /// - The compile env from `agent_compile_env`: `RUSTC_WRAPPER` (sccache when
-///   on PATH, explicitly empty otherwise), the agents' own sccache daemon, and
-///   a Lucidos source tree's compile mode.
+///   on PATH and the agent is unsandboxed, explicitly empty otherwise), the
+///   agents' own sccache daemon, and a Lucidos source tree's compile mode.
 /// - `PATH` prefixed with the `lucidos` CLI dir when one was found, AND the
 ///   bundled Postgres bin dir (`LUCIDOS_PG_BIN_DIR`) when set. A packaged
 ///   build's `psql` lives there, not on the service manager's minimal PATH.
@@ -46,6 +46,7 @@ pub(super) fn apply_lucidos_env(
     cmd: &mut tokio::process::Command,
     args: &SpawnArgs<'_>,
     cli_dir: Option<&Path>,
+    sandbox: AgentSandbox,
     log_label: &str,
 ) {
     // User-managed env vars FIRST so every engine-owned var below overrides on
@@ -95,7 +96,7 @@ pub(super) fn apply_lucidos_env(
     // `build.rustc-wrapper = "sccache"`, which cargo falls back to when
     // RUSTC_WRAPPER is unset — only an explicit empty value overrides it to
     // a plain (uncached) build. See `sccache_on_path` and `agent_compile_env`.
-    for (key, value) in agent_compile_env(args.worktree_path) {
+    for (key, value) in agent_compile_env(sandbox, args.worktree_path) {
         cmd.env(key, value);
     }
     let prefixes = agent_path_prefixes(
@@ -602,8 +603,20 @@ const AGENT_SCCACHE_CACHE_SIZE: &str = "50G";
 /// Two daemons never share one disk cache: sccache does not lock it.
 const AGENT_SCCACHE_DIR_NAME: &str = "sccache-agents";
 
+/// Whether the OS confines an agent's processes, decided by its backend at spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentSandbox {
+    Unsandboxed,
+    /// The agent runs under an OS sandbox (Codex's `workspace-write` seatbelt).
+    OsSandboxed,
+}
+
 /// The compile env a coding agent's builds get. The agent spawn and an agent's
 /// background task both take it, so a build behaves the same in both.
+///
+/// A sandboxed agent compiles without sccache. The daemon auto-starts from the
+/// first client and inherits that client's sandbox, so a sandboxed daemon
+/// refuses every other worktree's writes (ADR 0567).
 ///
 /// With `sccache` on PATH, builds go to the agents' own daemon. That daemon
 /// inherits the priority of the agent that starts it, so agent `rustc` runs
@@ -611,10 +624,11 @@ const AGENT_SCCACHE_DIR_NAME: &str = "sccache-agents";
 /// never unset: see the note in `apply_lucidos_env`. Without a cache root, the
 /// wrapper goes alone, to the default daemon.
 pub(crate) fn agent_compile_env_from(
+    sandbox: AgentSandbox,
     path_var: Option<&std::ffi::OsStr>,
     cache_root: Option<&Path>,
 ) -> Vec<(&'static str, String)> {
-    if !sccache_on_path(path_var) {
+    if sandbox == AgentSandbox::OsSandboxed || !sccache_on_path(path_var) {
         return vec![("RUSTC_WRAPPER", String::new())];
     }
     let mut env = vec![("RUSTC_WRAPPER", "sccache".to_string())];
@@ -629,10 +643,16 @@ pub(crate) fn agent_compile_env_from(
 
 /// [`agent_compile_env_from`] over the engine's own PATH and cache root, plus
 /// the *compile mode* of a Lucidos source tree at `worktree` (ADR 0392).
-pub(crate) fn agent_compile_env(worktree: &Path) -> Vec<(&'static str, String)> {
+pub(crate) fn agent_compile_env(
+    sandbox: AgentSandbox,
+    worktree: &Path,
+) -> Vec<(&'static str, String)> {
     let cache_root = crate::paths::user_cache_root();
-    let mut env =
-        agent_compile_env_from(std::env::var_os("PATH").as_deref(), cache_root.as_deref());
+    let mut env = agent_compile_env_from(
+        sandbox,
+        std::env::var_os("PATH").as_deref(),
+        cache_root.as_deref(),
+    );
     env.extend(super::compile_mode::env_for_worktree(
         worktree,
         cache_root.as_deref(),
@@ -825,7 +845,13 @@ mod tests {
         let mut args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
         args.auto_compact = decide(TrialMode::On, None, uuid::Uuid::new_v4());
         let mut cmd = tokio::process::Command::new("true");
-        apply_lucidos_env(&mut cmd, &args, None, "SpawnEnvTest");
+        apply_lucidos_env(
+            &mut cmd,
+            &args,
+            None,
+            AgentSandbox::Unsandboxed,
+            "SpawnEnvTest",
+        );
         assert!(
             !cmd.as_std()
                 .get_envs()
@@ -843,7 +869,13 @@ mod tests {
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
         let mut cmd = tokio::process::Command::new("true");
-        apply_lucidos_env(&mut cmd, &args, None, "SpawnEnvTest");
+        apply_lucidos_env(
+            &mut cmd,
+            &args,
+            None,
+            AgentSandbox::Unsandboxed,
+            "SpawnEnvTest",
+        );
         let envs: std::collections::HashMap<String, Option<String>> = cmd
             .as_std()
             .get_envs()
@@ -883,7 +915,13 @@ mod tests {
         let args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
 
         let mut cmd = tokio::process::Command::new("true");
-        apply_lucidos_env(&mut cmd, &args, None, "SpawnEnvTest");
+        apply_lucidos_env(
+            &mut cmd,
+            &args,
+            None,
+            AgentSandbox::Unsandboxed,
+            "SpawnEnvTest",
+        );
         let stamped = cmd
             .as_std()
             .get_envs()
@@ -909,7 +947,13 @@ mod tests {
         let mut cmd = tokio::process::Command::new("true");
         crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
             .scope("the-fire-that-started-the-session".to_string(), async {
-                apply_lucidos_env(&mut cmd, &args, None, "SpawnEnvTest");
+                apply_lucidos_env(
+                    &mut cmd,
+                    &args,
+                    None,
+                    AgentSandbox::Unsandboxed,
+                    "SpawnEnvTest",
+                );
             })
             .await;
 
@@ -991,7 +1035,28 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path_var = std::env::join_paths([tmp.path()]).expect("join_paths");
         assert_eq!(
-            agent_compile_env_from(Some(&path_var), Some(Path::new("/tmp/cache"))),
+            agent_compile_env_from(
+                AgentSandbox::Unsandboxed,
+                Some(&path_var),
+                Some(Path::new("/tmp/cache"))
+            ),
+            vec![("RUSTC_WRAPPER", String::new())],
+        );
+    }
+
+    /// The incident: a daemon a sandboxed session started inherited its
+    /// seatbelt, and every other worktree's `rustc` then got EPERM writing its
+    /// own `target/`. Sandboxed `rustc` runs as the session's own child.
+    #[test]
+    fn a_sandboxed_agent_never_reaches_the_shared_daemon() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path_var = path_with_fake_sccache(tmp.path());
+        assert_eq!(
+            agent_compile_env_from(
+                AgentSandbox::OsSandboxed,
+                Some(&path_var),
+                Some(Path::new("/tmp/cache/lucidos"))
+            ),
             vec![("RUSTC_WRAPPER", String::new())],
         );
     }
@@ -1003,7 +1068,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path_var = path_with_fake_sccache(tmp.path());
         assert_eq!(
-            agent_compile_env_from(Some(&path_var), Some(Path::new("/tmp/cache/lucidos"))),
+            agent_compile_env_from(
+                AgentSandbox::Unsandboxed,
+                Some(&path_var),
+                Some(Path::new("/tmp/cache/lucidos"))
+            ),
             vec![
                 ("RUSTC_WRAPPER", "sccache".to_string()),
                 ("SCCACHE_SERVER_PORT", "4227".to_string()),
@@ -1021,7 +1090,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path_var = path_with_fake_sccache(tmp.path());
         assert_eq!(
-            agent_compile_env_from(Some(&path_var), None),
+            agent_compile_env_from(AgentSandbox::Unsandboxed, Some(&path_var), None),
             vec![("RUSTC_WRAPPER", "sccache".to_string())],
         );
     }

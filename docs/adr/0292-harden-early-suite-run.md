@@ -7,6 +7,8 @@
   reaps the early run by agent run marker.
 - **Amended by**: [0478](0478-switch-hands-agent-processes-to-the-resumed-session.md).
   The early run survives a Switch, and the resumed `/harden` joins it.
+- **Amended by**: [0558](0558-harden-other-model-review.md). The driver tests
+  wait for the other-model review, Codex or Claude, not for Codex alone.
 
 ## Context
 

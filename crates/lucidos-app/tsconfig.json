@@ -28,6 +28,7 @@
       "@lucidos/find": ["../../packages/lucidos-sdk/src/find.ts"],
       "@lucidos/font-faces": ["../../packages/lucidos-sdk/src/fontFaces.ts"],
       "@lucidos/geometry": ["../../packages/lucidos-sdk/src/geometry.ts"],
+      "@lucidos/haptic": ["../../packages/lucidos-sdk/src/haptic.ts"],
       "@lucidos/one-sound": ["../../packages/lucidos-sdk/src/oneSound.ts"],
       "@lucidos/pane-swipe": ["../../packages/lucidos-sdk/src/paneSwipe.ts"],
       "@lucidos/preference-catalog": ["../../packages/lucidos-sdk/src/generated/preference-catalog.ts"],

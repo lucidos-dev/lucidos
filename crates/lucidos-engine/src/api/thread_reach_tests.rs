@@ -29,13 +29,14 @@ const EVERY_VERB: &[ThreadReachVerb] = &[
     ThreadReachVerb::AnswerQuestion,
     ThreadReachVerb::ResolvePermission,
     ThreadReachVerb::Continue,
-    ThreadReachVerb::SpawnSuccessor,
 ];
 
-/// The verbs that left clause 4 (ADR 0475). Kept for stored approval cards.
+/// The verbs that left clause 4: thread creation (ADR 0475) and the handoff to
+/// a legacy successor thread. Kept for stored approval cards.
 const RETIRED_VERBS: &[ThreadReachVerb] = &[
     ThreadReachVerb::CreateTopThread,
     ThreadReachVerb::DetachChild,
+    ThreadReachVerb::SpawnSuccessor,
 ];
 
 /// Every surface carrying a clause-4 verb, and the file its handler lives in.
@@ -60,7 +61,6 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("changes.rs", CHANGES_RS, "discard_all_changes"),
     ("changes.rs", CHANGES_RS, "remove_from_landing_lane"),
     ("changes.rs", CHANGES_RS, "cancel_lane_batch"),
-    ("threads/successor.rs", SUCCESSOR_RS, "start_successor"),
     ("chat.rs", CHAT_RS, "cancel_chat"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_stop"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_apply_now"),
@@ -106,7 +106,6 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
 
 const CHANGES_RS: &str = include_str!("changes.rs");
 const CHAT_RS: &str = include_str!("chat.rs");
-const SUCCESSOR_RS: &str = include_str!("threads/successor.rs");
 const CLAUDE_CODE_RS: &str = include_str!("claude_code.rs");
 const DISK_USAGE_RS: &str = include_str!("disk_usage.rs");
 const ACTIONS_RS: &str = include_str!("threads/actions.rs");
@@ -117,13 +116,12 @@ const MCP_PERMISSION_RS: &str = include_str!("mcp_permission.rs");
 const MCP_RS: &str = include_str!("mcp.rs");
 const THREAD_REACH_RS: &str = include_str!("thread_reach.rs");
 
-/// The gate under any of its names: the header form a route asks, and its
-/// form naming the authority it passed on. Then the thread form an in-process
-/// tool asks, and the three local wrappers. Each wrapper is asserted to reach
-/// the real one by the test below, so naming them here is not a hole.
+/// The gate under any of its names: the header form a route asks, the thread
+/// form an in-process tool asks, and the local wrappers. Each wrapper is
+/// asserted to reach the real one by the test below, so naming them here is
+/// not a hole.
 const GATE_CALLS: &[&str] = &[
     "refuse_without_authority",
-    "pass_authority",
     "refuse_thread_without_authority",
     "refuse_change_verb",
     "refuse_batch_change_verb",
@@ -621,7 +619,7 @@ async fn every_verb_reaches_the_caller_s_own_subtree_with_no_owner_turn() {
     teardown_test_db(&db_name).await;
 }
 
-/// ADR 0475: a retired verb needs no authority. A thread in a turn nobody's
+/// A retired verb needs no authority. A thread in a turn nobody's
 /// device opened, and a subprocess with no thread, both pass at any target.
 #[tokio::test]
 async fn a_retired_verb_passes_with_no_authority() {
@@ -654,55 +652,6 @@ async fn a_retired_verb_passes_with_no_authority() {
         }
     }
     assert!(EVERY_VERB.iter().all(|verb| verb.needs_authority()));
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// I13: a child hands off by starting its successor under its parent. That
-/// is an act in the parent's subtree, which the child does not reach on its
-/// own. The owner's turn carries it; the parent itself always may.
-#[tokio::test]
-async fn a_child_needs_the_owner_to_start_its_successor_under_its_parent() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let f = family(&pool).await;
-    let verb = ThreadReachVerb::SpawnSuccessor;
-
-    assert!(matches!(
-        refuse_without_authority(
-            &bus_for(&pool),
-            &agent_headers(Some(f.child)),
-            Some(f.root),
-            verb
-        )
-        .await,
-        Err(ThreadReachError::OutOfReach { .. })
-    ));
-    assert!(
-        refuse_without_authority(
-            &bus_for(&pool),
-            &agent_headers(Some(f.root)),
-            Some(f.root),
-            verb
-        )
-        .await
-        .is_ok(),
-        "the parent itself reaches its own subtree"
-    );
-    let opened = Uuid::new_v4();
-    seed_thread_opened_by(&bus, opened, Some(f.root), Some(owner_device())).await;
-    assert!(
-        refuse_without_authority(
-            &bus_for(&pool),
-            &agent_headers(Some(opened)),
-            Some(f.root),
-            verb
-        )
-        .await
-        .is_ok(),
-        "a child in a turn the owner opened carries their instruction"
-    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;

@@ -238,6 +238,9 @@ async fn find_pending_question(
 #[derive(Debug)]
 pub(crate) struct QuestionWalkOutcome {
     pub answer_kinds: Vec<serde_json::Value>,
+    /// Every question was answered with *quiet options*, so the caller ends
+    /// the turn instead of handing the answers back to the agent.
+    pub quiet: bool,
 }
 
 /// Why a `walk_question_batch` call failed. Boxed because no caller today
@@ -397,11 +400,20 @@ impl LucidosEngine {
             owner_approval,
         } = asker;
         let parser_input = serde_json::json!({ "questions": questions });
-        let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+        let mut parsed =
+            crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
         let total = parsed.len();
+        // A quiet pick ends the turn, which only one question can mean: a later
+        // card still needs the agent. So a batch carries no quiet option.
+        if total > 1 {
+            for option in parsed.iter_mut().flat_map(|q| q.options.iter_mut()) {
+                option.quiet = false;
+            }
+        }
         if total == 0 {
             return Ok(QuestionWalkOutcome {
                 answer_kinds: vec![],
+                quiet: false,
             });
         }
 
@@ -441,8 +453,10 @@ impl LucidosEngine {
         // Where the walk stopped early, and with which kind, so the padding
         // below repeats that kind rather than assuming a cancel.
         let mut ended_at: Option<(usize, AnswerKind)> = None;
+        let mut quiet = true;
         for (i, q) in parsed.into_iter().enumerate() {
             let sub_id = synth_question_id(outer_tool_use_id, i);
+            let options = q.options.clone();
 
             // Register FIRST. If the lookup ran first and the user
             // answered between lookup and register, the broadcast send
@@ -456,6 +470,7 @@ impl LucidosEngine {
                 Ok(Some(prior)) => {
                     self.question_wait_registry.forget(&sub_id).await;
                     let ending = batch_ending_answer(&prior);
+                    quiet &= answer_value_is_quiet(&prior, &options);
                     answer_kinds.push(prior);
                     if let Some(kind) = ending {
                         ended_at = Some((i, kind));
@@ -531,6 +546,7 @@ impl LucidosEngine {
             self.question_wait_registry.forget(&sub_id).await;
 
             let ending = batch_ending_answer(&payload.answers);
+            quiet &= answer_value_is_quiet(&payload.answers, &options);
             answer_kinds.push(payload.answers);
             if let Some(kind) = ending {
                 ended_at = Some((i, kind));
@@ -561,6 +577,7 @@ impl LucidosEngine {
                             event: ThreadEvent::UserQuestionAnswered {
                                 tool_use_id: remaining_sub,
                                 answer: ending_kind.clone(),
+                                quiet: false,
                             },
                             meta: EventMeta {
                                 channel: Some(channel),
@@ -573,7 +590,10 @@ impl LucidosEngine {
             }
         }
 
-        Ok(QuestionWalkOutcome { answer_kinds })
+        Ok(QuestionWalkOutcome {
+            answer_kinds,
+            quiet,
+        })
     }
 }
 
@@ -697,6 +717,33 @@ fn answer_resolves_without_resume(answer: &AnswerKind) -> bool {
     matches!(answer, AnswerKind::Canceled | AnswerKind::Superseded)
 }
 
+/// [`answer_is_quiet`] for an answer still in its persisted JSON form.
+fn answer_value_is_quiet(answer: &serde_json::Value, options: &[QuestionOption]) -> bool {
+    serde_json::from_value::<AnswerKind>(answer.clone())
+        .is_ok_and(|answer| answer_is_quiet(&answer, options))
+}
+
+/// True when the answer picks only *quiet options*, so the turn ends without
+/// waking the agent. Typed text or an image is a reply the agent must read, so
+/// it always wakes, even beside quiet picks.
+pub(crate) fn answer_is_quiet(answer: &AnswerKind, options: &[QuestionOption]) -> bool {
+    let is_quiet = |id: &String| options.iter().any(|o| &o.id == id && o.quiet);
+    match answer {
+        AnswerKind::Selected { option_id } => is_quiet(option_id),
+        AnswerKind::MultiSelected {
+            option_ids,
+            text,
+            image_hashes,
+        } => {
+            !option_ids.is_empty()
+                && option_ids.iter().all(is_quiet)
+                && text.as_deref().is_none_or(|t| t.trim().is_empty())
+                && image_hashes.is_empty()
+        }
+        AnswerKind::FreeText { .. } | AnswerKind::Canceled | AnswerKind::Superseded => false,
+    }
+}
+
 /// Most recent `UserQuestionAnswered.answer` for `tool_use_id`, if any. DB
 /// errors propagate so a transient failure isn't read as "no prior answer".
 pub(crate) async fn lookup_existing_answer(
@@ -758,7 +805,7 @@ fn lookup_option_label(
                 .and_then(|opts| opts.get(idx))
                 .and_then(|opt| opt.get("label"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
+                .map(|s| crate::engine::agent_session::strip_quiet_label_prefix(s).0)
         })
         .unwrap_or_else(|| opt_id.to_string())
 }
@@ -1284,13 +1331,14 @@ pub async fn answer_pending_question_with_event_id(
     // Validate the answer shape against the persisted question. The pending
     // lookup above guarantees the question exists, so a `None` here is a
     // race we treat as a conflict for symmetry with the answered-already arm.
-    match lookup_question_options(engine.pool(), thread_id, &tool_use_id).await {
+    let quiet = match lookup_question_options(engine.pool(), thread_id, &tool_use_id).await {
         Ok(Some((options, multi_select))) => {
             if let Err(msg) = validate_answer(&answer, &options, multi_select)
                 .and_then(|()| check_answer_images(engine.workspace_path(), &answer))
             {
                 return AnswerResult::Conflict(msg);
             }
+            answer_is_quiet(&answer, &options)
         }
         Ok(None) => {
             return AnswerResult::Conflict(format!(
@@ -1307,7 +1355,7 @@ pub async fn answer_pending_question_with_event_id(
             );
             return AnswerResult::Conflict("Database lookup failed".into());
         }
-    }
+    };
 
     // Read the originating question's channel so we can propagate it onto
     // the answer (so the persisted pair shares a wire-channel) and decide
@@ -1328,6 +1376,10 @@ pub async fn answer_pending_question_with_event_id(
             }
         };
     let answer_channel = original_channel.unwrap_or(EventChannel::ClaudeCode);
+    // A delivery held behind a chat card needs the agent, so the pick wakes it.
+    let quiet = quiet
+        && (should_emit_cc_resume_side_effects(original_channel)
+            || !has_held_deliveries(engine, thread_id, &tool_use_id).await);
 
     if let Err(e) = engine
         .event_bus
@@ -1336,6 +1388,7 @@ pub async fn answer_pending_question_with_event_id(
             event: ThreadEvent::UserQuestionAnswered {
                 tool_use_id: tool_use_id.clone(),
                 answer: answer.clone(),
+                quiet,
             },
             meta: EventMeta {
                 event_id,
@@ -1380,7 +1433,10 @@ pub async fn answer_pending_question_with_event_id(
         // same turn. `Canceled` is a teardown sentinel (archive/stop), never a
         // resume, and `Superseded` is followed by the message that replaced the
         // question, which drives the next turn itself.
-        if !had_waiter && !answer_resolves_without_resume(&answer) {
+        if !had_waiter && quiet {
+            end_restart_orphaned_turn_quietly(engine, thread_id, &tool_use_id, answer_channel)
+                .await;
+        } else if !had_waiter && !answer_resolves_without_resume(&answer) {
             // Resume on the ORIGINATING channel — this branch runs for both
             // `Chat` and `Trigger` questions (both skip CC side effects), so a
             // restart-preserved trigger question must resume as `Trigger`, not
@@ -1399,15 +1455,17 @@ pub async fn answer_pending_question_with_event_id(
         return AnswerResult::Resumed;
     }
 
-    let coding_agent = engine.thread_coding_agent(thread_id).await;
-    emit_resume_marker_for_cc_answer(
-        &engine.event_bus,
-        thread_id,
-        &answer,
-        actor.clone(),
-        coding_agent,
-    )
-    .await;
+    if !quiet {
+        let coding_agent = engine.thread_coding_agent(thread_id).await;
+        emit_resume_marker_for_cc_answer(
+            &engine.event_bus,
+            thread_id,
+            &answer,
+            actor.clone(),
+            coding_agent,
+        )
+        .await;
+    }
 
     // Arm the run-loop resume signal on a live subprocess BEFORE waking its hook.
     // The answer reaches CC through the PreToolUse hook (notify below), not via
@@ -1416,7 +1474,11 @@ pub async fn answer_pending_question_with_event_id(
     // continued turn's output is dropped as "post-terminal stragglers" (see
     // `AgentSession::question_resume_pending`). Set before notify so the flag is
     // visible before CC's first post-answer event reaches the loop.
-    arm_question_resume_if_live(&engine.agent_sessions, thread_id, &answer).await;
+    //
+    // Only a waiting hook ends the live turn quietly. A card whose process died
+    // must not mark the newer turn that now holds the session.
+    let quiet_wake = quiet && engine.question_wait_registry.has_waiter(&tool_use_id).await;
+    arm_question_resume_if_live(&engine.agent_sessions, thread_id, &answer, quiet_wake).await;
 
     // Wake the blocked hook (if any). No-op if nothing is registered:
     // - The subprocess died with the hook (teardown, restart, kill). Nothing
@@ -1430,14 +1492,16 @@ pub async fn answer_pending_question_with_event_id(
     //   that lookup still serves.
     notify_and_release_waiter(engine, &tool_use_id, &answer).await;
 
-    ensure_resume_after_answer(
-        &engine.event_bus,
-        &engine.agent_sessions,
-        thread_id,
-        &answer,
-        actor.clone(),
-    )
-    .await;
+    if !quiet {
+        ensure_resume_after_answer(
+            &engine.event_bus,
+            &engine.agent_sessions,
+            thread_id,
+            &answer,
+            actor.clone(),
+        )
+        .await;
+    }
 
     // The human replied, so agent messages held behind the question go now.
     // A Cancel keeps them held (ADR 0256).
@@ -1602,20 +1666,99 @@ async fn resume_chat_after_answer(
         result is in the tool result above. Continue the turn — do not ask the \
         same question again.";
 
-    // A multi-question batch shares one outer id (`{outer}#q{i}`).
-    let outer = sub_tool_use_id
-        .rsplit_once("#q")
-        .map(|(o, _)| o)
-        .unwrap_or(sub_tool_use_id);
-    // Read before the ToolResult below, which would mark every held delivery
-    // as read (ADR 0321).
+    // Read before the ToolResult, which would mark every held delivery as
+    // read (ADR 0321).
     let held = crate::engine::chat::held_deliveries::held_deliveries(
         engine.pool(),
         thread_id,
-        &synth_question_id(outer, 0),
+        &synth_question_id(outer_question_id(sub_tool_use_id), 0),
     )
     .await;
+    let anchor =
+        emit_restart_orphaned_ask_result(engine, thread_id, sub_tool_use_id, channel).await;
 
+    // `spawn_chat_resume` returns a boxed `dyn Future`, the boundary that breaks
+    // the async recursion cycle (see its doc). So a plain `.await` is Send-safe.
+    let note =
+        crate::engine::chat::held_deliveries::resume_note_with_held_deliveries(RESUME_NOTE, &held);
+    if let Err(e) = engine
+        .spawn_chat_resume(thread_id, note, channel, actor, anchor)
+        .await
+    {
+        log!(
+            "[CCQuestion] chat resume-after-answer failed for thread {}: {}",
+            thread_id,
+            e
+        );
+    }
+}
+
+/// Whether child reports or wait deliveries wait behind the batch this
+/// question belongs to (ADR 0321).
+async fn has_held_deliveries(engine: &LucidosEngine, thread_id: Uuid, tool_use_id: &str) -> bool {
+    let first = synth_question_id(outer_question_id(tool_use_id), 0);
+    let held =
+        crate::engine::chat::held_deliveries::held_deliveries(engine.pool(), thread_id, &first)
+            .await;
+    !held.wait_texts.is_empty() || held.child_reports > 0
+}
+
+/// Close a chat turn a restart left open, after a quiet answer. Pair the
+/// dangling call with the answer so a later turn reads it. Then end the turn as
+/// the live loop would, with an empty reply.
+async fn end_restart_orphaned_turn_quietly(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    sub_tool_use_id: &str,
+    channel: EventChannel,
+) {
+    let anchor =
+        emit_restart_orphaned_ask_result(engine, thread_id, sub_tool_use_id, channel).await;
+    let request_event_id = match anchor {
+        ChatResumeAnchor::ExistingTurn(id) => Some(id),
+        ChatResumeAnchor::NewBoundary { .. } => None,
+    };
+    engine
+        .event_bus
+        .emit_or_log(
+            BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ResponseGenerated {
+                    text: String::new(),
+                    images: vec![],
+                    model: None,
+                    reasoning_effort: None,
+                },
+                meta: EventMeta {
+                    channel: Some(channel),
+                    request_event_id,
+                    ..EventMeta::NONE
+                }
+                .authored_by(crate::engine::thread_events::AgentParticipant::LucidosAgent),
+            },
+            "[CCQuestion] ResponseGenerated (quiet answer after restart)",
+        )
+        .await;
+}
+
+/// The batch id a per-question id (`{outer}#q{i}`) belongs to.
+fn outer_question_id(sub_tool_use_id: &str) -> &str {
+    sub_tool_use_id
+        .rsplit_once("#q")
+        .map(|(o, _)| o)
+        .unwrap_or(sub_tool_use_id)
+}
+
+/// Emit the `ToolResult{ask_user_question}` that a restart kept the chat loop
+/// from emitting, built from the persisted sub-answers. Returns where a resume
+/// of that turn anchors. A quiet answer emits it and resumes nothing.
+async fn emit_restart_orphaned_ask_result(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    sub_tool_use_id: &str,
+    channel: EventChannel,
+) -> ChatResumeAnchor {
+    let outer = outer_question_id(sub_tool_use_id);
     let ask = lookup_interrupted_ask(engine.pool(), thread_id).await;
     let anchor = resume_anchor_for_ask(ask.as_ref(), thread_id);
 
@@ -1688,26 +1831,11 @@ async fn resume_chat_after_answer(
                         ..EventMeta::NONE
                     },
                 },
-                "[CCQuestion] ToolResult (ask_user_question resume after restart)",
+                "[CCQuestion] ToolResult (ask_user_question answered after restart)",
             )
             .await;
     }
-
-    // `spawn_chat_resume` returns a boxed `dyn Future` (its concrete return type
-    // is the type-erasure boundary that breaks the mutual-async-recursion cycle —
-    // see its doc), so a plain `.await` here is Send-safe.
-    let note =
-        crate::engine::chat::held_deliveries::resume_note_with_held_deliveries(RESUME_NOTE, &held);
-    if let Err(e) = engine
-        .spawn_chat_resume(thread_id, note, channel, actor, anchor)
-        .await
-    {
-        log!(
-            "[CCQuestion] chat resume-after-answer failed for thread {}: {}",
-            thread_id,
-            e
-        );
-    }
+    anchor
 }
 
 /// Emit the empty `CodingAgentPromptSent` "resume marker" that projects to a
@@ -1844,10 +1972,14 @@ async fn ensure_resume_after_answer(
 /// session is not being torn down. It wakes, finishes the turn it was in, and
 /// reads the follow-up only after that. Its post-answer events need the same
 /// re-arming a real answer's do.
+///
+/// `quiet` records a *quiet option* pick as `quiet_answer_pending`: the agent
+/// then ends the turn with no reply, which must not read as a failure.
 async fn arm_question_resume_if_live(
     agent_sessions: &Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
     thread_id: Uuid,
     answer: &AnswerKind,
+    quiet: bool,
 ) -> bool {
     if matches!(answer, AnswerKind::Canceled) {
         return false;
@@ -1856,6 +1988,7 @@ async fn arm_question_resume_if_live(
     match sessions.get_mut(&thread_id) {
         Some(s) if s.is_live() && s.is_running() => {
             s.question_resume_pending = true;
+            s.quiet_answer_pending = quiet;
             true
         }
         _ => false,

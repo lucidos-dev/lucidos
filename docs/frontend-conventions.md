@@ -2,6 +2,14 @@
 
 `.claude/rules/frontend.md` lists the TypeScript and state conventions as short bullets. This page keeps the reasoning behind the long ones. Each section covers one rule area. ADRs hold the decisions, and this page holds what has no ADR.
 
+## Filtering picker lists
+
+`components/shared/useListFilter.ts` owns the query, printable-key capture, visibility, and Escape clearing for searchable lists. It extracts the behavior from `Dropdown.tsx`. The standard dropdown, `ModelSelectionPicker`, and `WidgetPickerItems` use it.
+
+The field appears after typing on desktop and disappears when its query becomes empty. A coarse pointer or narrow layout always gets a field. Render it through the existing `SearchField` or `ControlFilter`, using their theme classes. Keep row navigation and focus placement in the host, since model steps and keyboard handoff have different focus targets.
+
+`utils/listFilter.ts` matches every query term against the name and optional description without case sensitivity. Filter before computing keyboard indices. Register query clearing through the Escape stack; a host with nested steps can compose `clear` into its existing `useEscapeStep` handler.
+
 ## Drafts are threads
 
 A compose draft lives in `threadMap` like any thread, with `meta.state === 'composing'`. `sendCompose` flips the state to `'active'` before it calls `sendMessage`. So `sendMessage` cannot tell a first send from a follow-up by thread state alone. Every plausible signal is wrong for one case: an optimistic insert, a focused draft, or the pre-flip. Lifecycle states are `'composing' | 'active' | 'discarded'`. Archive is orthogonal: an archived thread keeps `state: 'active'` and carries `section: 'archived'`.
@@ -49,7 +57,7 @@ A hold's two steps are the two reported symptoms. Raising the loader early is sh
 
 Components keep no `[loading, setLoading]` flag. A `Loadable` holds the state, and `loadable-guard.test.ts` enforces it. A `failed` branch renders `<LoadableError noun="items" error={loadable.error} />` (`components/shared/LoadableError.tsx`).
 
-A minimum-visible floor was also tried and rejected. Holding a loader withholds loaded content, which feels sluggish.
+A loader the gate let through is a different matter: it stays opaque for `LOADER_MIN_VISIBLE_MS` (500 ms), so a load that ends just past the gate does not flash a skeleton (ADR 0555). The exit owners hold it, `<LoadingFade>` and `ThreadSkeletonOverlay`, through `useMinimumVisibleFlag`. While it holds, `<LoadingFade>` hides its content. The floor is legibility, so the speed slider leaves it alone. Do not add a floor to a caller or to `useDelayedFlag`, which also backs non-loader flags.
 
 Full-screen surfaces gate the skeleton too, including the workspace picker. An earlier carve-out showed the skeleton at once when no competing content existed. It failed in practice. The picker renders its header and footer immediately, and its inline boot splash fades over it for about 0.65 s on every open. The sub-gate window is never a bare blank panel, so an ungated skeleton only blinked under the clearing splash on a fast local backend.
 

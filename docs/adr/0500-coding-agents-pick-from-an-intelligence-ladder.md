@@ -46,13 +46,17 @@ Each coding-agent backend has an *intelligence ladder*: an ordered list of
   refused.
 - **Lucidos owns the default implementer.** `model_claude_code` and
   `reasoning_claude_code` pin Opus 5.5 at `medium` on every Claude Code spawn
-  with no pick. Codex's pair ships unset, so Codex behaves as before.
-- **A model-only pick runs at the model's default effort** from the model
-  registry, never at Claude Code's settings file.
+  with no pick. `model_codex` and `reasoning_codex` pin GPT-6.1 Sol at
+  `medium` on every Codex spawn with no pick, so `~/.codex/config.toml` never
+  decides a Lucidos thread's model.
+- **A model-only pick runs at the model's default effort.** Claude Code reads
+  it from the model registry, never from its settings file. Codex reads
+  `default_effort` from `codex_menu_options.json`, which a `model/list` probe
+  of the Codex app server fills.
 
 A band is a multiple of Opus 5.5 at `medium`, rounded to a step of the cube
 root of 2. Cost and time show as multiples of a reference rung: the backend's
-default rung, or Claude Code's while Codex has none. The engine divides one
+default rung. The engine divides one
 band by the other, so the default rung reads 1×.
 
 Some models bill a whole call higher once its prompt passes 100k tokens,
@@ -70,6 +74,9 @@ Code calls.
 - **0499:** the raise means a higher rung, not a fixed `high`.
 - **0390:** coding agents now get a default pair, and a model-only pick gets
   the model's default effort.
+- **Codex default:** the Codex pair ships set, not unset (see Decision).
+  Lucidos does not read an effort back from Codex, which echoes only an
+  effort the config set.
 - **0537:** the token and cost bands count steps of the sixth root of 2. The
   time band keeps the cube root.
 

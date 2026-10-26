@@ -4,6 +4,7 @@ import { ENGINE_LABEL, RESPONSE_CANCELED_SUMMARY, continuationStartedSummary, re
 import { CC_ACTIVITY_EVENTS } from './thread-meta';
 import { parseMcpToolName } from '../../utils/mcpToolName';
 import type { ActorMode, SequencedEvent, StoredEvent, ThreadEvent, ThreadInitiator } from './thread-event-types';
+import type { CodingAgent } from '../../generated/thread-event-wire';
 
 /** A typed answer to a question card that the engine has not confirmed. It is
  *  either still sending, or its POST got no answer and it waits for a Retry
@@ -211,6 +212,43 @@ export function isUserBubbleEvent(userEvent: { type: string }): boolean {
   return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived';
 }
 
+/**
+ * Does this turn draw the panel naming who started it?
+ *
+ * Everything does, except a resume (see `isResumeTurn`), a successor
+ * session's opening (see `isSuccessorSessionOpening`) and a continuation
+ * fragment. A fragment's boundary is older than the page this client holds, so
+ * nothing loaded can name it. Its `userEvent` is only its own first step,
+ * standing in for a key. Drawing that as an initiator would put a tool call
+ * where the reader expects a person.
+ *
+ * The rows themselves still draw. The head of the turn arrives with the page
+ * behind it, and the fold then merges the fragment into the real turn. See
+ * `Exchange.continuationFragment`. Find in the transcript counts a user's
+ * message only where this draws it.
+ */
+export function drawsInitiatorPanel(exchange: Exchange): boolean {
+  return exchange.continuationFragment !== true && !isResumeTurn(exchange) && !isSuccessorSessionOpening(exchange);
+}
+
+/** The engine's message that opened a successor session. Its session card
+ *  (`HandoffSessionRow`) already folds it, so a panel would be a second copy.
+ *  Without that card, as when the spawn failed, the panel is the only place
+ *  the message shows. */
+function isSuccessorSessionOpening({ userEvent, steps }: Exchange): boolean {
+  return userEvent.type === 'MessageReceived'
+    && userEvent.origin?.kind === 'engine'
+    && userEvent.origin.reason.kind === 'successor_session'
+    && steps.some(({ event }) => event.type === 'SessionStarted' && event.continuity?.kind === 'handoff');
+}
+
+/** A resume opens no header of its own. It is a card at the top of the reply it
+ *  resumed (`ResumeCard`), so the response panel draws even when that reply is
+ *  still empty. */
+export function isResumeTurn(exchange: Exchange): boolean {
+  return exchange.userEvent.type === 'ContinuationStarted';
+}
+
 /** Derive the user message text from an exchange. */
 export function exchangeUserMessage(exchange: Exchange): string {
   const ev = exchange.userEvent;
@@ -336,6 +374,33 @@ export function exchangeReasoningEffort(exchange: Exchange): string | undefined 
     }
     return spawnSettings(event)?.reasoning_effort || undefined;
   });
+}
+
+/** The backend each exchange's session ran on, index for index. A handoff may
+ *  switch backend (ADR 0560). So each `SessionStarted` decides the turns up to
+ *  the next one, and the newest in an exchange decides that exchange.
+ *
+ *  The loaded events are the thread's newest page, so turns above the first
+ *  loaded session ran in the session before it. A resume or a fresh session
+ *  keeps the backend, so they take that session's own. Above a handoff, or
+ *  with no session loaded at all, they take `threadBackend`, the newest
+ *  session's. That holds until the older page loads. */
+export function sessionCodingAgents(exchanges: Exchange[], threadBackend: CodingAgent): CodingAgent[] {
+  const backends: CodingAgent[] = [];
+  let current: CodingAgent | undefined;
+  for (const exchange of exchanges) {
+    for (const { event } of exchange.steps) {
+      if (event.type !== 'SessionStarted') continue;
+      // A row from before the field existed is Claude Code, the wire default.
+      const backend = event.coding_agent ?? 'claude-code';
+      if (current === undefined) {
+        backends.fill(event.continuity?.kind === 'handoff' ? threadBackend : backend);
+      }
+      current = backend;
+    }
+    backends.push(current ?? threadBackend);
+  }
+  return backends;
 }
 
 // Static fallback labels: the `MODELS` fallback list plus legacy model strings
@@ -692,7 +757,7 @@ export function fullCommandForEngineTool(name: string, args: unknown): string | 
     case 'browser_open':
     case 'http_request': return s('url');
     case 'web_search': return s('query');
-    case 'execute_intent': return s('intent_id');
+    case 'execute_intent': return s('intent_id'); // Retired compatibility.
     case 'emit_event':
     case 'query_events': return s('event_type');
     case 'send_notification': return s('title');
@@ -792,7 +857,7 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'import_file': return str('source_path') ? `Import ${basename(str('source_path'))}` : 'Import file';
     case 'run_bash': return str('command') ? describeRun(str('command')) : 'Run bash';
     case 'run_python': return str('code') ? describeRun(str('code')) : (str('description') || 'Run Python');
-    case 'execute_intent': return str('intent_id') ? `Run intent: ${str('intent_id')}` : 'Run intent';
+    case 'execute_intent': return str('intent_id') ? `Run intent: ${str('intent_id')}` : 'Run intent'; // Retired compatibility.
     case 'emit_event': return str('event_type') ? `Emit ${str('event_type')}` : 'Emit event';
     case 'query_events': return str('event_type') ? `Query ${str('event_type')}` : 'Query events';
     case 'web_search': return str('query') ? `Search "${str('query')}"` : 'Web search';

@@ -8,7 +8,7 @@ import { successorLinkTitle } from './SuccessorNotice';
 import { CardOption } from './SuccessorCard';
 
 /** A warning on top of the composer of a thread that handed off to a
- *  *successor thread*, once the user starts writing there. Commits made here
+ *  *legacy successor thread*, once the user starts writing there. Commits made here
  *  are set aside once the successor's change lands (ADR 0474). *Send here
  *  anyway* hides it until the composer is cleared. */
 export function HandedOffCard() {

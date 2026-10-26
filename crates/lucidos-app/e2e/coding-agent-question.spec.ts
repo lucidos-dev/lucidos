@@ -338,12 +338,12 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await expect(panel).toBeVisible({ timeout: 10_000 });
       const pendingBody = panel.locator(`.question-body[data-tool-use-id="${toolUseId}"]`).first();
 
-      // Submit lives in the prompt action row now (PromptInput.tsx) — there's
-      // one prompt rendered per layout (desktop + mobile both mount), so scope
-      // by visibility. Disabled with zero selections + empty textarea.
+      // Submit lives in the prompt action row (PromptInput.tsx). One prompt
+      // renders per layout, so scope by visibility. With no pick and an empty
+      // box the row shows a lone Cancel instead.
       const submit = page.locator('.prompt-actions-row:visible button[aria-label="Submit answer"]').first();
-      await expect(submit).toBeVisible();
-      await expect(submit).toBeDisabled();
+      await expect(page.locator('.prompt-actions-row:visible button[aria-label="Cancel"]')).toBeVisible();
+      await expect(submit).toHaveCount(0);
 
       // Toggle Red and Green (skip Blue).
       await pendingBody.locator('.question-option').nth(0).click();

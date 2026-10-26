@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
  * A started coding-agent thread keeps its rung while a turn runs (ADR 0542).
- * The pill dims and says why, a press opens no list and records nothing, and
- * the pill frees again once the thread is idle.
+ * The list still opens, but a pick or a step says why and records nothing.
+ * Once the thread is idle a pick records again.
  */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render } from 'preact';
@@ -31,7 +31,7 @@ const response: CodingAgentCommandsResponse = {
 } as unknown as CodingAgentCommandsResponse;
 
 const sendCodingAgentControl = vi.fn(() => Promise.resolve(true));
-const fetchSwitchEstimate = vi.fn(() => Promise.resolve({ context_tokens: 1000, rebuilds_cache: false, extra_cost_usd: null }));
+const fetchSwitchEstimate = vi.fn(() => Promise.resolve({ context_tokens: 1000, rebuilds_cache: 'no' as const, extra_cost_usd: null }));
 
 vi.mock('../../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client')>()),
@@ -63,7 +63,6 @@ function seedThread(status: ThreadStatus, pendingUserMessages: PendingUserMessag
   })]]);
 }
 
-const pill = () => document.querySelector<HTMLElement>('.rung-pill')!;
 const trigger = () => document.querySelector<HTMLElement>('.rung-trigger')!;
 
 beforeEach(() => {
@@ -86,41 +85,37 @@ const LOCKED: [string, () => void][] = [
   ['paused', () => seedThread('paused')],
 ];
 
+async function pickHigh(): Promise<void> {
+  trigger().click();
+  await settle();
+  Array.from(document.querySelectorAll<HTMLElement>('.control-option'))
+    .find(e => e.textContent?.includes('Opus 5.6 · high'))!.click();
+  await settle();
+}
+
 describe('the rung pill on a started coding-agent thread', () => {
-  it.each(LOCKED)('is locked while the thread is %s', async (_state, seed) => {
+  it.each(LOCKED)('opens, but changes nothing, while the thread is %s', async (_state, seed) => {
     seed();
     render(<RungControl threadId="t1" codingAgent="claude-code" />, host);
     await settle();
+    expect(trigger().hasAttribute('aria-disabled')).toBe(false);
 
-    expect(pill().hasAttribute('data-locked')).toBe(true);
-    expect(trigger().getAttribute('aria-disabled')).toBe('true');
-    expect(trigger().getAttribute('data-tooltip')).toMatch(/while a turn runs/);
-
-    trigger().click();
+    await pickHigh();
     document.querySelector<HTMLElement>('.rung-step:last-child')!.click();
     await settle();
-    expect(document.querySelector('.control-option'), 'the list opened').toBeNull();
     expect(sendCodingAgentControl).not.toHaveBeenCalled();
     expect(fetchSwitchEstimate).not.toHaveBeenCalled();
     expect(toasts.value.map(t => t.message).join(' ')).toMatch(/while a turn runs/);
   });
 
-  it('frees once the thread is idle, and a pick records on the engine', async () => {
+  it('records a pick on the engine once the thread is idle', async () => {
     seedThread('running');
     render(<RungControl threadId="t1" codingAgent="claude-code" />, host);
     await settle();
-    expect(pill().hasAttribute('data-locked')).toBe(true);
 
     seedThread('idle');
     await settle();
-    expect(pill().hasAttribute('data-locked')).toBe(false);
-    expect(trigger().hasAttribute('aria-disabled')).toBe(false);
-
-    trigger().click();
-    await settle();
-    Array.from(document.querySelectorAll<HTMLElement>('.control-option'))
-      .find(e => e.textContent?.includes('Opus 5.6 · high'))!.click();
-    await settle();
+    await pickHigh();
     expect(sendCodingAgentControl).toHaveBeenCalledTimes(1);
     expect(sendCodingAgentControl).toHaveBeenCalledWith('t1', { subtype: 'set_model', model: 'claude-opus-5-6', effort: 'high' });
   });

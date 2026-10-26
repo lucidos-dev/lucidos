@@ -1,6 +1,6 @@
 use super::*;
 use crate::engine::agent_session::input_ledger::{ReadInput, Settled};
-use crate::runtime::AgentInput;
+use crate::runtime::{AgentInput, CodingAgent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use futures::{FutureExt, StreamExt};
 
@@ -12,11 +12,17 @@ fn sent(text: &str) -> AgentInput {
     }
 }
 
+/// A driver the withdraw never reaches: the store answers first.
+fn unused_driver() -> mpsc::UnboundedSender<WithdrawRequest> {
+    mpsc::unbounded_channel().0
+}
+
 fn request(input_event_id: Uuid) -> (WithdrawInputRequest, oneshot::Receiver<InputWithdrawal>) {
     let (reply, answer) = oneshot::channel();
     let request = WithdrawInputRequest {
         input_event_id,
         actor: None,
+        purpose: WithdrawPurpose::Remove,
         reply,
     };
     (request, answer)
@@ -65,7 +71,7 @@ async fn an_input_this_session_read_is_already_read() {
     let (withdraw, answer) = request(id);
     begin_withdraw(
         &inputs,
-        Some(&driver),
+        &driver,
         &unused_pool(),
         Uuid::new_v4(),
         withdraw,
@@ -90,14 +96,7 @@ async fn an_unread_input_this_session_never_forwarded_is_withdrawn() {
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
     let (withdraw, answer) = request(id);
-    begin_withdraw(
-        &inputs,
-        Some(&driver),
-        &pool,
-        thread_id,
-        withdraw,
-        &mut pending,
-    );
+    begin_withdraw(&inputs, &driver, &pool, thread_id, withdraw, &mut pending);
     let back = pending.next().await.expect("the store answers");
     finish_withdraw(&bus, thread_id, &mut inputs, back).await;
 
@@ -121,7 +120,14 @@ async fn an_input_an_earlier_session_read_is_already_read() {
     let mut inputs = InputLedger::new();
     let mut pending = PendingWithdraws::new();
     let (withdraw, answer) = request(id);
-    begin_withdraw(&inputs, None, &pool, thread_id, withdraw, &mut pending);
+    begin_withdraw(
+        &inputs,
+        &unused_driver(),
+        &pool,
+        thread_id,
+        withdraw,
+        &mut pending,
+    );
     let back = pending.next().await.expect("the store answers");
     finish_withdraw(&bus, thread_id, &mut inputs, back).await;
 
@@ -164,27 +170,6 @@ async fn forwarded_in_the_store(bus: &EventBus, thread_id: Uuid, id: Uuid) {
     .unwrap();
 }
 
-#[tokio::test]
-async fn a_backend_without_withdraws_refuses() {
-    let id = Uuid::new_v4();
-    let mut inputs = InputLedger::new();
-    inputs.forwarded(vec![id], &sent("queued"), None);
-    let mut pending = PendingWithdraws::new();
-    let (withdraw, answer) = request(id);
-    begin_withdraw(
-        &inputs,
-        None,
-        &unused_pool(),
-        Uuid::new_v4(),
-        withdraw,
-        &mut pending,
-    );
-    assert_eq!(
-        answer.await.unwrap(),
-        InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string())
-    );
-}
-
 /// A driver that is gone before it answers leaves the message where it was.
 #[tokio::test]
 async fn a_driver_that_ended_refuses() {
@@ -197,7 +182,7 @@ async fn a_driver_that_ended_refuses() {
     let (withdraw, _answer) = request(id);
     begin_withdraw(
         &inputs,
-        Some(&driver),
+        &driver,
         &unused_pool(),
         Uuid::new_v4(),
         withdraw,
@@ -225,14 +210,7 @@ async fn a_withdrawn_input_leaves_the_ledger_and_records_its_tombstone() {
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
     let (withdraw, answer) = request(id);
-    begin_withdraw(
-        &inputs,
-        Some(&driver),
-        &pool,
-        thread_id,
-        withdraw,
-        &mut pending,
-    );
+    begin_withdraw(&inputs, &driver, &pool, thread_id, withdraw, &mut pending);
     let asked: WithdrawRequest = driver_rx.recv().await.expect("Claude Code is asked");
     assert_eq!(asked.input_uuid, queued.uuid);
     asked.reply.send(InputWithdrawal::Withdrawn).unwrap();
@@ -295,49 +273,37 @@ async fn a_thread_without_a_live_session_has_no_run_loop_to_ask() {
     assert_eq!(outcome, None);
 }
 
-#[tokio::test]
-async fn a_codex_session_refuses_at_once() {
-    let thread_id = Uuid::new_v4();
-    let (mut session, _msg_rx) = AgentSession::for_test();
-    session.coding_agent = CodingAgent::Codex;
-    let outcome = withdraw_from_session(
-        &sessions_with(session, thread_id),
-        thread_id,
-        Uuid::new_v4(),
-        None,
-        QUICK,
-    )
-    .await;
-    assert_eq!(
-        outcome,
-        Some(InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string()))
-    );
-}
-
 /// The request reaches the session's run loop, and the loop's answer is the
-/// caller's answer.
+/// caller's answer, for either coding agent.
 #[tokio::test]
-async fn a_claude_code_session_answers_through_its_run_loop() {
-    let thread_id = Uuid::new_v4();
-    let message = Uuid::new_v4();
-    let (mut session, _msg_rx) = AgentSession::for_test();
-    let (withdraw_tx, mut withdraw_rx) = mpsc::unbounded_channel();
-    session.withdraw_tx = withdraw_tx;
-    let run_loop = tokio::spawn(async move {
-        let request: WithdrawInputRequest = withdraw_rx.recv().await.unwrap();
-        assert_eq!(request.input_event_id, message);
-        request.reply.send(InputWithdrawal::Withdrawn).unwrap();
-    });
-    let outcome = withdraw_from_session(
-        &sessions_with(session, thread_id),
-        thread_id,
-        message,
-        None,
-        QUICK,
-    )
-    .await;
-    assert_eq!(outcome, Some(InputWithdrawal::Withdrawn));
-    run_loop.await.unwrap();
+async fn a_session_answers_through_its_run_loop() {
+    for coding_agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
+        let thread_id = Uuid::new_v4();
+        let message = Uuid::new_v4();
+        let (mut session, _msg_rx) = AgentSession::for_test();
+        session.coding_agent = coding_agent;
+        let (withdraw_tx, mut withdraw_rx) = mpsc::unbounded_channel();
+        session.withdraw_tx = withdraw_tx;
+        let run_loop = tokio::spawn(async move {
+            let request: WithdrawInputRequest = withdraw_rx.recv().await.unwrap();
+            assert_eq!(request.input_event_id, message);
+            request.reply.send(InputWithdrawal::Withdrawn).unwrap();
+        });
+        let outcome = withdraw_from_session(
+            &sessions_with(session, thread_id),
+            thread_id,
+            message,
+            None,
+            QUICK,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            Some(InputWithdrawal::Withdrawn),
+            "{coding_agent:?}"
+        );
+        run_loop.await.unwrap();
+    }
 }
 
 /// A run loop that ends with the request unanswered does not hang. Its process
@@ -472,14 +438,7 @@ async fn a_withdrawal_whose_tombstone_failed_records_it_on_retry() {
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
     let (withdraw, answer) = request(id);
-    begin_withdraw(
-        &inputs,
-        Some(&driver),
-        &pool,
-        thread_id,
-        withdraw,
-        &mut pending,
-    );
+    begin_withdraw(&inputs, &driver, &pool, thread_id, withdraw, &mut pending);
     assert!(
         driver_rx.try_recv().is_err(),
         "Claude Code is not asked again"
@@ -511,14 +470,7 @@ async fn a_read_after_a_drop_settles_the_input_it_names() {
     let (driver, mut driver_rx) = mpsc::unbounded_channel();
     let mut pending = PendingWithdraws::new();
     let (withdraw, _answer) = request(a);
-    begin_withdraw(
-        &inputs,
-        Some(&driver),
-        &pool,
-        thread_id,
-        withdraw,
-        &mut pending,
-    );
+    begin_withdraw(&inputs, &driver, &pool, thread_id, withdraw, &mut pending);
     // Polled once, as the select arm does, so it waits on the answer.
     assert!(pending.next().now_or_never().is_none());
     let asked: WithdrawRequest = driver_rx.recv().await.unwrap();

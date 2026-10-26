@@ -30,7 +30,7 @@
        Redefined at the phone layout line, not the 600px cosmetic one, so the
        anchor flips exactly when the header layout it describes does. */
     :root {
-        --app-header-bottom: var(--mobile-header-height, calc(2.75rem + var(--safe-area-top)));
+        --app-header-bottom: var(--mobile-header-height, calc(2.75rem + var(--header-controls-top)));
         /* The one height every mobile header row takes, whichever pane it
            belongs to (see .mobile-header-row). The value is the tallest control
            any of them carries, the Lucidos mark's tap target. */
@@ -460,7 +460,7 @@
         height: 100%;
         border: none;
         border-radius: 0;
-        padding-top: var(--safe-area-top);
+        padding-top: var(--header-controls-top);
         padding-bottom: var(--safe-area-bottom);
         box-sizing: border-box;
     }
@@ -517,7 +517,7 @@
         will-change: translate;
         transition: translate var(--bars-glide-duration, 0s) ease;
         background: var(--header-gradient);
-        padding-top: var(--safe-area-top);
+        padding-top: var(--header-controls-top);
         /* The inline inset belongs to the ROWS here, not to this column.
            `.pane-header` pads the desktop bar, where the header IS one row of
            controls. This header is a column, and the app-shell banners at its
@@ -991,7 +991,7 @@
         pointer-events: auto;
     }
 
-    :root[data-keyboard-active] .mobile-thread-header .dashboard-sheet-toggle {
+    :root[data-keyboard-active] .mobile-thread-header .dashboard-panel-toggle {
         pointer-events: auto;
     }
 
@@ -1347,7 +1347,7 @@
 
        Algebraically identical to the max() nest it replaces, via
        max(A, B + x) == B + max(A - B, x) with
-         A = safe-area + 0.75rem                       (dynamic-island floor)
+         A = controls top + 0.75rem                  (dynamic-island floor)
          B = headerHeight + titleHeight + 0.75rem      (resting position)
          x = max(offset, -headerHeight)                (offset, clamped)
        so A - B collapses to safe-area - headerHeight - titleHeight (the two
@@ -1355,7 +1355,7 @@
     .mobile-swipe-pane .scroll-to-top {
         top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.75rem);
         translate: 0 max(
-            calc(var(--safe-area-top) - var(--mobile-header-height, 3rem) - var(--mobile-thread-title-height, 2.75rem)),
+            calc(var(--header-controls-top) - var(--mobile-header-height, 3rem) - var(--mobile-thread-title-height, 2.75rem)),
             max(var(--mobile-header-offset, 0rem), calc(-1 * var(--mobile-header-height, 3rem)))
         );
     }
@@ -1675,6 +1675,12 @@
            dissolving above it. Only the bottom padding strip stays opaque, so
            no sharp text shows below the box. The stop is that padding (0.5rem). */
         background: linear-gradient(to top, var(--bg-primary) 0.5rem, transparent 0.5rem);
+    }
+
+    /* Above the scroll chevrons while a composer menu is open, as on every
+       layout (panels/content.css). */
+    :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area:has([data-overlay-panel]):not(:has(.modal-overlay)) {
+        z-index: calc(var(--z-float) + 2);
     }
 
     :root[data-mobile-dynamic-bars] .thread-pane:not(.compose-empty) .prompt-area::before {

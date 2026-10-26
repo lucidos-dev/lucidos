@@ -13,7 +13,7 @@ import {
 import { PENDING_TITLE_PLACEHOLDER } from '../thread-events';
 import { changeToastMessage } from './changeToast';
 import { changeHeadline } from '../changeHeadline';
-import { focusThread } from './threads';
+import { focusThreadOrBootstrap } from './threads';
 
 /** What an apply is doing, as the activity group names it. */
 export const APPLY_PHASE_LABEL: Record<ApplyPhase, string> = {
@@ -213,7 +213,7 @@ export function openApplyPhase(
   changeId: string | undefined,
   reading: ApplyPhaseReading | null | undefined,
 ): void {
-  focusThread(threadId, reading?.eventId
+  focusThreadOrBootstrap(threadId, reading?.eventId
     ? { targetEventId: reading.eventId }
     : { targetChangeId: changeId ?? null });
 }

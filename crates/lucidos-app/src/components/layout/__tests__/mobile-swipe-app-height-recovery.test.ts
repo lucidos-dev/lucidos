@@ -94,6 +94,14 @@ describe('MobileSwipeContainer — --app-height wake recovery', () => {
     expect(onWakeBody!).toMatch(/viewportIsKeyboardShrunk\(vv\.height,\s*window\.innerHeight\)/);
   });
 
+  it('wake-time blur also runs on a viewport with no reading, which cannot rule out a pinned keyboard', () => {
+    // iOS 27 reports a zero height at wake. The keys are down after a resume,
+    // so clearing the ghost focus costs nothing and keeps the next resize honest.
+    const onWakeBody = swipeSource.match(/const onWake = \(\) => \{([\s\S]*?)\};/)?.[1];
+    expect(onWakeBody, 'onWake handler not found in MobileSwipeContainer.tsx').toBeTruthy();
+    expect(onWakeBody!).toMatch(/!readableVisualViewport\(\)\s*\|\|\s*viewportIsKeyboardShrunk/);
+  });
+
   it('onResize, onOrientationChange, and the initial write all route through computeAppHeight', () => {
     // Single decision site. Routing onOrientationChange through the helper
     // covers the case where the user rotates with the keyboard up — writing
@@ -188,6 +196,15 @@ describe('computeAppHeight', () => {
       activeElementOpensKeyboard: true,
     })).toBe(743);
   });
+
+  it('a zero-height visual viewport keeps the layout height, even with focus', () => {
+    // The iOS 27 PWA reading that blanked the screen: the shell went to 0px.
+    expect(computeAppHeight({
+      vvHeight: 0,
+      innerHeight: 852,
+      activeElementOpensKeyboard: true,
+    })).toBe(852);
+  });
 });
 
 // The slack the keyboard's own reveal needs. iOS scrolls the focused field's
@@ -232,6 +249,14 @@ describe('keyboardBandPx', () => {
     expect(keyboardBandPx({
       vvHeight: 900,
       innerHeight: 844,
+      activeElementOpensKeyboard: true,
+    })).toBe(0);
+  });
+
+  it('is zero when the visual viewport reports no height', () => {
+    expect(keyboardBandPx({
+      vvHeight: 0,
+      innerHeight: 852,
       activeElementOpensKeyboard: true,
     })).toBe(0);
   });

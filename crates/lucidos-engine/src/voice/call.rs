@@ -1409,13 +1409,15 @@ impl Call<'_> {
             }
             ThreadEvent::CodingAgentPermissionRequest {
                 request_id,
-                tool_name,
-                input,
                 summary,
+                grant_offer,
                 ..
             } => {
-                let open =
-                    OpenDecision::coding_agent_permission(request_id, tool_name, input, summary);
+                let open = OpenDecision::coding_agent_permission(
+                    request_id,
+                    grant_offer.as_ref(),
+                    summary,
+                );
                 self.ask(session, open).await;
             }
             // Settled, whichever way and by whichever surface. Appended rather

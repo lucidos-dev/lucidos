@@ -3,6 +3,8 @@ name: Plugins
 description: Use when the user wants to author, package, publish, share, install, update, or uninstall a Lucidos plugin: "build a plugin", "publish a plugin", "share this app as a plugin", "package this for other workspaces", "ship a knowhow bundle", "install the X plugin", "update plugins", "make a .lucidos-plugin".
 ---
 
+<!-- domain-event: PluginSetupCompleted: Plugin setup emits this domain event after completing its procedure. -->
+
 # Plugins
 
 How to package a coherent bundle of workspace content (apps, knowhow, triggers, scripts) so another workspace installs it as a unit. It also covers distribution, updates and uninstall. The v1 design is `docs/plans/2026-04-29-plugins-v1-design.md`. For setup right after install, see `plugin-setup.md`.
@@ -58,13 +60,13 @@ my-plugin/
 
 The `manifest.json` sidecar carries only WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never loads provider config from it: `data/config/apis.json` is the single source of truth for proxy entries. A plugin that ships a signer puts the matching `apis.json` snippet in its `setup` field. The install-time LLM then walks the user through pasting it into `data/config/apis.json` and registering the credential.
 
-Install validates the tree (`core/plugins.rs::validate_tree` and `validate_archive_entry_path`). Any failure rejects the archive before any file is written:
+Install validates the tree (`crates/lucidos-engine/src/core/plugins.rs::validate_tree` and `validate_archive_entry_path`). Any failure rejects the archive before any file is written:
 
 - `manifest.toml` exists at the plugin root and parses.
 - All required manifest fields are present (`id`, `version`, `name`, `description`).
 - `id` matches `[a-z0-9-]+`, non-empty, max 64 chars. Uppercase, underscore, dot all reject.
 - `version` parses as semver.
-- `source`, when present, looks like a git remote: starts with `https://`, `http://`, `git@`, or ends in `.git`. Bare strings, `file://` URLs, and `.lucidos-plugin` paths are not valid. `source` is optional: omit it for archive-only plugins shared peer-to-peer (Slack drop, USB stick, attachment). `update_plugin` and `check_plugin_updates` refuse a sourceless plugin with an explanatory error. Install and uninstall work fine.
+- `source`, when present, looks like a git remote: starts with `https://`, `http://`, `git@`, or ends in `.git`. Bare strings, `file://` URLs, and `.lucidos-plugin` paths are not valid. `source` is optional: omit it for archive-only plugins shared peer-to-peer (Slack drop, USB stick, attachment). `plugins(action="update")` and `plugins(action="check_updates")` refuse a sourceless plugin with an explanatory error. Install and uninstall work fine.
 - Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules, themes, fonts, media}`. `media/` is never content: it holds *plugin media* and counts toward nothing below. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (macOS Finder adds it when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed. A `looks/` folder, the name themes had before ADR 0316, is refused with a hint to rename it `themes/`.
 - At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/`, `themes/`, `fonts/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
 - Every file under `themes/` is `<id>.json` and a valid theme, with an id no built-in theme uses (`InvalidTheme` otherwise). The rules are in `themes.md`, theme parts included. A part value past a cap, or a part on a protected surface, fails staging with the field, the rule and the limit (`dark.parts.chat-text.text-shadow: blur 2em is over the 0.6em cap.`).
@@ -83,11 +85,11 @@ Four required fields, nine optional. Unknown extra fields are accepted and round
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
-| `id` | yes | string | `[a-z0-9-]+`, max 64 chars. Used as the install-record key, the event `aggregate_id`, and the canonical argument to `update_plugin` / `uninstall_plugin`. (`uninstall_plugin` also accepts the manifest `name` or any `apps/<dir>` folder name the plugin owns, case-insensitive. It picks one if unambiguous, otherwise lists candidates.) |
+| `id` | yes | string | `[a-z0-9-]+`, max 64 chars. Used as the install-record key, the event `aggregate_id`, and the canonical argument to `plugins(action="update")` / `plugins(action="uninstall")`. (`plugins(action="uninstall")` also accepts the manifest `name` or any `apps/<dir>` folder name the plugin owns, case-insensitive. It picks one if unambiguous, otherwise lists candidates.) |
 | `version` | yes | string | Semver (`MAJOR.MINOR.PATCH`). `0.1.0`, `1.4.2-beta.1` both parse. |
 | `name` | yes | string | Human-friendly title shown in install/uninstall messages. |
 | `description` | yes | string | One-line summary. Free text. If your plugin pairs well with a cron trigger, mention it here (e.g. "Ask Lucidos to set up a daily reflection trigger after install"). The install-time LLM then offers to wire one up: see "What doesn't belong in a plugin" below. |
-| `source` | no | string | Git remote URL where the plugin lives. Used by `check_plugin_updates` and `update_plugin` to re-fetch the manifest. Omit for archive-only sharing: the plugin still installs and uninstalls, but the update tools return an explanatory error. When present, it must look like a git remote (`https://`, `http://`, `git@`, or ending in `.git`). |
+| `source` | no | string | Git remote URL where the plugin lives. Used by `plugins(action="check_updates")` and `plugins(action="update")` to re-fetch the manifest. Omit for archive-only sharing: the plugin still installs and uninstalls, but the update tools return an explanatory error. When present, it must look like a git remote (`https://`, `http://`, `git@`, or ending in `.git`). |
 | `engine` | no | string | Semver requirement on the Lucidos release (e.g. `">=0.46.1"`). **Enforced at install and update**: see "The `engine` requirement" below. Omit it and any release installs the plugin, but Lucidos shows that it declares none. Declare it. |
 | `setup` | no | string | Markdown wiring instructions, written **to the agent about what to do with the user**. It renders in the install confirmation panel before the user confirms, and on confirm it drives a spawned Lucidos Agent setup thread. The engine never interprets it. This is the only way to ship workspace state rather than a file, a webhook above all. See "Install confirmation panel" below and `plugin-setup.md`. |
 | `setup_revision` | no | positive integer | Raise it on a release that needs `setup` to run again although its text is unchanged. An update re-runs setup when this is **greater** than the installed version's. A missing field counts as 0. Needs a non-empty `setup`. See "A release can ask for setup to run again". |
@@ -99,7 +101,7 @@ Four required fields, nine optional. Unknown extra fields are accepted and round
 
 **Plugin categories: the controlled vocabulary.** The allowed values are: `productivity`, `finance`, `health`, `developer-tools`, `data`, `communication`, `automation`, `lifestyle`, `research`, `fun` (kebab-case). The catalog offers a filter pill per category that appears in it, and each card shows its category chips. The set stays small so categories stay browsable: a free-form tag would fragment (`finance` vs `money` vs `budgeting`). Tag a plugin with the one or few that fit, or omit `categories` if none do. (Source of truth: `PLUGIN_CATEGORIES` in `crates/lucidos-engine/src/core/plugins.rs`.)
 
-**The `engine` requirement.** Set `engine` to the **first Lucidos release that has every platform feature your plugin uses**, as a floor: `engine = ">=0.46.1"`. For example, a plugin that styles a field with the shared `.text-input` class needs 0.46.1, the first release that ships it. The engine checks it every time a plugin is staged: the `install_plugin` and `update_plugin` tools, and the Plugins panel's Install and Update buttons.
+**The `engine` requirement.** Set `engine` to the **first Lucidos release that has every platform feature your plugin uses**, as a floor: `engine = ">=0.46.1"`. For example, a plugin that styles a field with the shared `.text-input` class needs 0.46.1, the first release that ships it. The engine checks it every time a plugin is staged: the `plugins(action="install")` and `plugins(action="update")` tools, and the Plugins panel's Install and Update buttons.
 
 - **Met**: staging goes ahead as usual.
 - **Not met**: staging is refused before anything is written and before the confirmation panel opens. The refusal names the plugin, the requirement and the running release: `Theme Studio 0.1.0 needs Lucidos 0.46.1 or later. This is Lucidos 0.46.0. Update Lucidos first.`
@@ -113,7 +115,7 @@ Four required fields, nine optional. Unknown extra fields are accepted and round
 
 **The workspace audit keeps asking until you declare one.** `system-knowhow/workspace-audit/plugins.md` checks every installed plugin and every plugin tree a workspace authors. It flags a plugin with no `engine` on every pass, with a fix the user can act on: update to a version that declares one, ask the author, or add the floor themselves.
 
-**Adding `engine` later still needs a version bump.** `check_plugin_updates` compares semver. Add `engine` without raising `version`, and every existing installer sees `Already at latest` and never receives the floor.
+**Adding `engine` later still needs a version bump.** `plugins(action="check_updates")` compares semver. Add `engine` without raising `version`, and every existing installer sees `Already at latest` and never receives the floor.
 
 **For a third-party plugin you cannot edit, propose the floor upstream.** Never try to add `engine` to the installed copy. `manifest.toml` never lands under `data/`, and the floor is read from the fetched source at install and update time. Use "Proposing your patch upstream" below, or a plain issue or pull request against the plugin's repository.
 
@@ -198,7 +200,7 @@ A plugin may ship *reusable widgets* (ADR 0414). Such a widget's plugin owns it,
 
 ## Install confirmation panel
 
-`install_plugin` (and `update_plugin`) never write directly to `data/`. The engine fetches and validates into a staged temp dir, and checks the manifest's `engine` requirement. A plugin this release cannot take is refused there, and no panel opens. Otherwise the engine opens a confirmation panel in the same content pane as a credential request. The panel shows:
+`plugins(action="install")` (and `plugins(action="update")`) never write directly to `data/`. The engine fetches and validates into a staged temp dir, and checks the manifest's `engine` requirement. A plugin this release cannot take is refused there, and no panel opens. Otherwise the engine opens a confirmation panel in the same content pane as a credential request. The panel shows:
 
 - The plugin name + version + description from the manifest, under **Update plugin** when the plugin is already installed and **Install plugin** otherwise. The staged payload carries `is_update`, read from the plugin's install record rather than from overwritten files
 - The `source` (git URL or archive path) and `source_type` (git / archive)
@@ -221,7 +223,7 @@ Uninstall is symmetric: confirming it deletes the recorded files and commits the
 
 - The thread's first message is one short line, `Set up the newly installed <name> plugin.`, **not** a wall of agent instructions.
 - The agent loads `system-knowhow/plugin-setup` (the chat system prompt nudges it to). It reads your `setup` text from the durable `PluginInstalled` event, at the payload path that knowhow names.
-- It fires for **both** the Plugins panel's Install button and the agent's `install_plugin` tool, since they share the confirm endpoint.
+- It fires for **both** the Plugins panel's Install button and the agent's `plugins(action="install")` tool, since they share the confirm endpoint.
 - The `PluginInstalled` event records the thread's id (`manifest.setup_thread_id`), so the plugin's card can resolve it later.
 - A fresh install spawns it. An **update** spawns it in two cases: the new `setup` text **differs** (after trimming) from the installed version's, or `setup_revision` is **greater** than the installed one. Otherwise it re-runs nothing and navigates nowhere.
 - The background marketplace **update check** never installs, so it never spawns a setup thread.
@@ -247,8 +249,8 @@ What this means for plugin authors:
 
   > Copy `data/knowhow/<name>/skill/` to `~/.claude/skills/<name>/`. If that folder already exists, compare it with the shipped copy. When they match, say so and skip the copy. When the user changed their copy, show the difference and ask before you overwrite it.
 
-- **Updates inherit the same panel.** `update_plugin` re-fetches the source and routes through the same staging path. The user reviews the new version's file list before any bytes are written: new files, files to replace, and files to remove.
-- **Staged installs expire after 1 hour.** The user then has to re-call `install_plugin`. Engine restarts also drop in-flight stagings (the staged temp dir is gone).
+- **Updates inherit the same panel.** `plugins(action="update")` re-fetches the source and routes through the same staging path. The user reviews the new version's file list before any bytes are written: new files, files to replace, and files to remove.
+- **Staged installs expire after 1 hour.** The user then has to re-call `plugins(action="install")`. Engine restarts also drop in-flight stagings (the staged temp dir is gone).
 - **The panel survives a reload, but not the expiry.** An install staged from a chat is a *form request* (`PluginInstallRequested`, see `system-knowhow/thread-events.md` § Form requests). Its row in the thread stays live until Confirm or Cancel, and `FormRequestResolved` records the outcome. On expiry the request closes as `expired` and the row stops offering Confirm. Uninstall behaves the same.
 
 ### A release can ask for setup to run again
@@ -301,7 +303,7 @@ Each card has one button, which progresses **Install → Setup → Open**. The d
   - **pending** (no row yet but a live `thread_queue` entry, the brief window before the agent's first event): not done, so the card keeps showing Setup without flicker.
   - **gone** (no row and no queue entry: a lost spawn, deleted thread, or stale catalog id): treated as done. The card falls through to Open/Installed rather than offering a Setup button that would 404.
 - **Open**: shown once setup is finished (or the plugin had none). It launches the plugin's primary app (`data/apps/<id>/`). Plugins that ship no app show the word **Installed** instead.
-- **Uninstall** (detail page only): stages the uninstall confirmation panel (the same one the `uninstall_plugin` LLM tool produces). The card re-fetches the catalog on every mount, so the Setup→Open transition shows when the user returns from setup.
+- **Uninstall** (detail page only): stages the uninstall confirmation panel (the same one the `plugins(action="uninstall")` LLM tool produces). The card re-fetches the catalog on every mount, so the Setup→Open transition shows when the user returns from setup.
 
 **Plugin uninstall is the single removal authority for a plugin's app.** **Delete** in an app row's ⋯ menu on the Apps panel would `rm -rf` only `apps/<id>/`, leaving the plugin registered and its sibling `triggers/`/`knowhow/`/`scripts/` orphaned. So `DELETE /api/v1/app?id=...` returns **409** with `{ error, plugin_id, plugin_name }` when the app belongs to an installed plugin. That mirrors the `delete_file` guard, which refuses raw deletes of plugin-owned files. The UI catches the 409 and routes the user to the plugin **Uninstall** panel, which removes the whole plugin tree and emits `PluginUninstalled`. Standalone apps (no `PluginInstalled` record) keep deleting directly.
 
@@ -323,7 +325,7 @@ A `.lucidos/plugin-update-notice.json` marker tracks what the user was told. The
 
 The marketplace list itself is read live from the registry on every request. So a rename shows with no scan behind it, and a removed marketplace never contributes cached plugins. A scan announces both ends as **transient** events (SSE only, never stored): `PluginCatalogScanStarted` when it begins and `PluginCatalogScanned` when it lands, the latter carrying `failed`. They raise and lower the panel's scanning state on every connected client, the scheduler's own pass included.
 
-Every marketplace mutation is **announced**, so an open Plugins panel and Settings → Marketplaces update in place with no reload. Registering a marketplace (or re-registering one under a new name) emits `PluginMarketplaceRegistered`. Unregistering emits `PluginMarketplaceRemoved`. The frontend re-reads the catalog on either. `Registered` is an upsert covering rename as well as create: the id hashes the canonical source, so re-registering a listed source rewrites its entry in place. The announcement lives in the one shared registry write path, so it fires for the HTTP endpoints below and the `register_plugin_marketplace` tool alike.
+Every marketplace mutation is **announced**, so an open Plugins panel and Settings → Marketplaces update in place with no reload. Registering a marketplace (or re-registering one under a new name) emits `PluginMarketplaceRegistered`. Unregistering emits `PluginMarketplaceRemoved`. The frontend re-reads the catalog on either. `Registered` is an upsert covering rename as well as create: the id hashes the canonical source, so re-registering a listed source rewrites its entry in place. The announcement lives in the one shared registry write path, so it fires for the HTTP endpoints below and the `plugins(action="register_marketplace")` tool alike.
 
 Marketplace HTTP surface:
 
@@ -334,13 +336,13 @@ Marketplace HTTP surface:
 - `POST /api/v1/plugins/catalog/rescan` -> queue a marketplace scan. Answers `{ "queued": true }` at once; the result arrives as `PluginCatalogScanned`. A scan already running goes round once more after it, so the result comes from a scan that started after the request.
 - `GET /api/v1/plugins/installed` -> `{ plugins }` from the `PluginInstalled` projection (no marketplace scan). Each row carries `id`, `name`, `version`, `source?`, `app_id?`, `content` (the shipped content-dir kinds), `files` (every installed `data/`-relative path), and `modified` + `modified_paths` (see "Local modifications" below). Backs the Plugins panel's installed-plugins view (the default **Installed only** filter) so it works offline and lists plugins whose marketplace was removed.
 - `POST /api/v1/plugins/install-request` with `{ "source": "..." }` -> stage an install request payload for the existing confirmation panel.
-- `POST /api/v1/plugins/uninstall-request` with `{ "id": "..." }` -> stage an uninstall request payload (resolves the plugin id, partitions its files into present/missing) for the uninstall confirmation panel. The button counterpart of the `uninstall_plugin` LLM tool.
+- `POST /api/v1/plugins/uninstall-request` with `{ "id": "..." }` -> stage an uninstall request payload (resolves the plugin id, partitions its files into present/missing) for the uninstall confirmation panel. The button counterpart of the `plugins(action="uninstall")` LLM tool.
 - `POST /api/v1/plugins/install/:install_id/confirm[?keep_local_changes=false]` -> write the staged files. The optional flag is the panel's keep control; absent means keep. The response adds `local_changes` (`merged` / `conflicted` / `replaced` / `saved_paths`) whenever the install met a locally-edited file.
 - `POST /api/v1/plugins/propose-upstream` with `{ "id": "..." }` -> `{ patch_path, thread_id }`. Derives the plugin's local patch, writes it under `data/artifacts/`, and spawns a thread to take it to the author. See "Proposing your patch upstream" below.
 
 Marketplace LLM surface:
 
-- `register_plugin_marketplace(source, name?)` registers or renames a marketplace in the registry the Plugins panel browses. It commits `data/config/plugin-marketplaces.json` and announces the change, so any open panel refreshes. It then starts the scan / update-check pass, which notifies about plugin updates rather than applying them. Use it when a user asks to add a plugin repo, marketplace, or plugin marketplace source. There is no unregister tool: remove a marketplace from Settings → Marketplaces.
+- `plugins(action="register_marketplace", source, name?)` registers or renames a marketplace in the registry the Plugins panel browses. It commits `data/config/plugin-marketplaces.json` and announces the change, so any open panel refreshes. It then starts the scan / update-check pass, which notifies about plugin updates rather than applying them. Use it when a user asks to add a plugin repo, marketplace, or plugin marketplace source. There is no unregister tool: remove a marketplace from Settings → Marketplaces.
 
 For GitHub monorepo marketplaces, register either the repo URL (`https://github.com/lucidos-dev/plugins`) or a tree URL (`https://github.com/lucidos-dev/plugins/tree/main/community`). The scanner turns discovered subdirectory plugins into installable GitHub tree URLs. For non-GitHub monorepos, use one repo per plugin: the install tool installs a subdirectory only from a GitHub tree URL.
 
@@ -399,7 +401,7 @@ Design around three consequences:
 - **Renaming a plugin directory changes its install URL** and orphans the
   `source` recorded in existing installs. Treat the directory name as stable.
 - Still set each plugin's own `manifest.toml` `source` to its tree URL. That is
-  what `check_plugin_updates` / `update_plugin` re-fetch after install,
+  what `plugins(action="check_updates")` / `plugins(action="update")` re-fetch after install,
   independent of the marketplace.
 
 ### Registering and the scan cycle
@@ -561,8 +563,8 @@ Apps, knowhow, and **event-driven (`on_event`) triggers** belong in plugins: the
 
 1. **Cadence is user-specific.** Heavy users want it every 6h, light users weekly. Hardcoding `0 0 4 * * *` in the bundle makes that decision for them.
 2. **The schedule is workspace state, not reference material.** A plugin shipping a cron entry is like a library shipping a crontab line: wrong layer. Knowhow is "how to do this well", cron triggers are "when I want it to happen".
-3. **Orphaned cron entries.** A cron trigger the install instructions create as a side effect (an agent calling `create_trigger`) carries no plugin provenance. Uninstall leaves it in place, and so does an update that drops the knowhow it runs. Lucidos warns about it as an *affected trigger* (see "Affected triggers"), but the trigger still points at deleted knowhow until the user edits it. A shipped `trigger.toml` avoids this, because uninstall deletes exactly the triggers stamped with the plugin id.
-4. **Install-time prompt is the right UX.** When `install_plugin` lands the knowhow, the LLM tells the user *"This plugin works best with a reflection trigger. Want me to set one up? Daily at 4am is a good default."* Conversational, opinionated default, but the user owns the schedule.
+3. **Orphaned cron entries.** A cron trigger the install instructions create as a side effect (an agent calling `triggers(action="create")`) carries no plugin provenance. Uninstall leaves it in place, and so does an update that drops the knowhow it runs. Lucidos warns about it as an *affected trigger* (see "Affected triggers"), but the trigger still points at deleted knowhow until the user edits it. A shipped `trigger.toml` avoids this, because uninstall deletes exactly the triggers stamped with the plugin id.
+4. **Install-time prompt is the right UX.** When `plugins(action="install")` lands the knowhow, the LLM tells the user *"This plugin works best with a reflection trigger. Want me to set one up? Daily at 4am is a good default."* Conversational, opinionated default, but the user owns the schedule.
 
 So if a plugin would benefit from a cron trigger, mention it in the manifest `description`. The install-time LLM then offers to set one up. The canonical example is `browser-learning` v0.2.0, which ships knowhow only and relies on that prompt for its reflection (cron) trigger.
 
@@ -606,7 +608,7 @@ This overrides the `__file__`-relative state path in `triggers.md` § "Scripts r
 
 ## Three distribution shapes
 
-`install_plugin(source)` detects the shape by string format (`engine/tools/plugins.rs::detect_source`).
+`plugins(action="install", source)` detects the shape by string format (`crates/lucidos-engine/src/engine/tools/plugins/source.rs::detect_source`).
 
 ### 1. Single-repo plugin: plain git URL
 
@@ -655,11 +657,11 @@ cd my-plugin
 zip -r ../my-plugin.lucidos-plugin .
 ```
 
-**Do not use `tar`, `tar -czf`, `gzip`, or any non-zip format.** The custom extension does not change the format. The engine opens it with `zip::ZipArchive::new()` (`engine/tools/plugins.rs::extract_zip`), which only understands PKZip. A gzipped tarball or raw gzip stream fails with an opaque "read archive: ..." parse error, and the user has to repackage. If `zip` is not installed, install it (`brew install zip`, `apt install zip`) rather than substituting another archiver.
+**Do not use `tar`, `tar -czf`, `gzip`, or any non-zip format.** The custom extension does not change the format. The engine opens it with `zip::ZipArchive::new()` (`crates/lucidos-engine/src/engine/tools/plugins/source.rs::extract_zip`), which only understands PKZip. A gzipped tarball or raw gzip stream fails with an opaque "read archive: ..." parse error, and the user has to repackage. If `zip` is not installed, install it (`brew install zip`, `apt install zip`) rather than substituting another archiver.
 
 Install URL: an absolute filesystem path ending in `.lucidos-plugin` (`/Users/me/Downloads/my-plugin.lucidos-plugin`). The engine extracts the zip into a temp dir and validates as if it were a git checkout.
 
-Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugins that should not go to a public git host. The custom extension makes the file self-announcing and leaves room for OS file association later. Archive plugins may omit `source`: they install and uninstall normally, but `check_plugin_updates` / `update_plugin` report nowhere to fetch from. For updates while distributing as an archive, set `source` to the git repo the archive is built from.
+Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugins that should not go to a public git host. The custom extension makes the file self-announcing and leaves room for OS file association later. Archive plugins may omit `source`: they install and uninstall normally, but `plugins(action="check_updates")` / `plugins(action="update")` report nowhere to fetch from. For updates while distributing as an archive, set `source` to the git repo the archive is built from.
 
 ## Authoring loop
 
@@ -695,7 +697,7 @@ Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugin
    - (d) abort packaging.
 
    Ask because the engine cannot guess. An image in `data/artifacts/foo.png` might be a source of truth the user wants to share, or scratch they want to drop. Auto-bundling risks shipping private workspace artifacts, and auto-dropping risks publishing a broken feature.
-4. **Bump `version` in `manifest.toml` before publishing.** Without a bump, `check_plugin_updates` reports `"Already at latest"` to existing installers, and they never get the new content. Adding `engine` for the first time needs its own bump too (see "The `engine` requirement" above).
+4. **Bump `version` in `manifest.toml` before publishing.** Without a bump, `plugins(action="check_updates")` reports `"Already at latest"` to existing installers, and they never get the new content. Adding `engine` for the first time needs its own bump too (see "The `engine` requirement" above).
 5. **Decide whether this release asks setup to run again.** Do this on every release of a plugin that has a `setup` field. See "A release can ask for setup to run again".
    - List the files this release changed.
    - Raise `setup_revision` by one when `setup` installs, copies, registers or builds any of them outside `data/`. A Claude Code skill that setup copies to `~/.claude/skills/<name>/` is the usual case.
@@ -703,11 +705,14 @@ Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugin
    - Otherwise leave both fields alone. Never reword `setup` to force a re-run.
    - Tell the user which way you decided, and why.
 6. **For archive distribution, package as zip and verify.** From inside the plugin tree, run `zip -r ../my-plugin.lucidos-plugin .`. Then check that `unzip -l ../my-plugin.lucidos-plugin` lists every expected file. `file ../my-plugin.lucidos-plugin` must report `Zip archive data`, not `gzip compressed data`.
-7. **Commit and push.** For monorepo plugins, the install URL changes only if the subpath changes. `update_plugin` re-fetches new content under the same path.
+7. **Commit and push.** For monorepo plugins, the install URL changes only if the subpath changes. `plugins(action="update")` re-fetches new content under the same path.
 
 Authors need no manual smoke test: the engine's e2e tests cover install, update and uninstall.
 
-A second `install_plugin` over the same tree returns `Error: would overwrite N files: [list]. Re-run with overwrite=true to proceed.` The LLM relays that message verbatim. Running again with `overwrite=true` replaces each file atomically (write to `<dest>.tmp`, rename), so a crash mid-extract leaves no half-written file. The conflict scan runs before any write to `data/`, so a validation failure leaves the workspace untouched.
+`plugins(action="install")` takes only `source`. Installing over an existing tree stages
+a confirmation panel listing the files it would overwrite. The user confirms
+that panel before extraction writes to `data/`. Confirmation replaces each file
+atomically through a temporary file and rename. A validation failure changes nothing.
 
 A disk failure during extract (out-of-space, permission denied) returns an error mid-write but does NOT roll back files already written. No install record is emitted, so a failed install can leave a partial set of files on disk.
 
@@ -717,12 +722,12 @@ Semver is enforced at parse time: `0.1.0`, `1.4.2-beta.1` parse, `latest` and `1
 
 **A version bump alone does not re-run setup.** An update re-runs it when the new `setup` text differs, or when `setup_revision` is greater than the installed one. Raise the revision on a release that changes a file setup installs outside `data/`. See "A release can ask for setup to run again".
 
-`check_plugin_updates(id?)` (`engine/tools/plugins.rs::execute_check_plugin_updates`):
+`plugins(action="check_updates", id?)` (`crates/lucidos-engine/src/engine/tools/plugins/registry.rs::check_plugin_updates_impl`):
 
 - With `id` omitted, surveys every currently-installed plugin (newest `PluginInstalled` event for each `aggregate_id`, skipped if a later `PluginUninstalled` exists).
 - For each plugin, fetches the manifest from the recorded `manifest.source` (shallow clone to temp, read `manifest.toml`, discard).
 - Compares semver. `changed: true` only when the remote version is strictly greater.
-- Checks the remote manifest's `engine` requirement. It reports `engine_requirement` (as authored, or `null` when undeclared), `engine_compatible`, and, when it is false, `engine_incompatible_reason` with the same sentence `update_plugin` would refuse with. `changed: true` with `engine_compatible: false` means a newer version exists that this release cannot install yet.
+- Checks the remote manifest's `engine` requirement. It reports `engine_requirement` (as authored, or `null` when undeclared), `engine_compatible`, and, when it is false, `engine_incompatible_reason` with the same sentence `plugins(action="update")` would refuse with. `changed: true` with `engine_compatible: false` means a newer version exists that this release cannot install yet.
 - A network failure for one plugin becomes an `error` entry in the JSON output. It does not abort the whole check.
 
 ```json
@@ -734,12 +739,15 @@ Semver is enforced at parse time: `0.1.0`, `1.4.2-beta.1` parse, `latest` and `1
 ]
 ```
 
-`update_plugin(id)` (`execute_update_plugin`):
+`plugins(action="update", id)` (`crates/lucidos-engine/src/engine/tools/plugins/mod.rs::stage_install_request`):
 
 - Looks up the newest `PluginInstalled` for `id` (must not be followed by `PluginUninstalled`).
 - Re-fetches the remote manifest from the recorded `source`.
-- If `remote_version <= installed_version`, returns `Already at latest (v<x>)`: a no-op that emits no event. `compare_versions` treats remote-older-than-installed as `AlreadyLatest`, so `update_plugin` cannot downgrade.
-- Otherwise re-runs `install_plugin` with the recorded source and `overwrite=true`. It goes through the same staging, so an unmet `engine` requirement refuses the update just as it refuses an install. Same conflict mechanics, same `PluginInstalled` event variant: updates are installs over existing files.
+- If `remote_version <= installed_version`, returns `Already at latest (v<x>)`: a no-op that emits no event. `compare_versions` treats remote-older-than-installed as `AlreadyLatest`, so `plugins(action="update")` cannot downgrade.
+- Otherwise stages an install confirmation using the recorded source.
+  The panel lists overwrites and removals for the user to approve.
+  An unmet `engine` requirement refuses staging. Confirmed updates emit
+  `PluginInstalled`, just as confirmed installs do.
 
 If the recorded manifest has no `source`, the update returns an error rather than guessing.
 
@@ -755,7 +763,7 @@ Only recorded paths are candidates, so a file the user added beside a dropped on
 
 ### Affected triggers
 
-An *affected trigger* is one the plugin does not own that relies on a path its update or uninstall removes. A trigger made with `create_trigger` during setup is the usual case: it carries no plugin id, so the update leaves it as it is. Lucidos matches a trigger to a removed path in three ways:
+An *affected trigger* is one the plugin does not own that relies on a path its update or uninstall removes. A trigger made with `triggers(action="create")` during setup is the usual case: it carries no plugin id, so the update leaves it as it is. Lucidos matches a trigger to a removed path in three ways:
 
 | Reason (`reason`) | When it matches |
 |---|---|
@@ -778,7 +786,7 @@ A version that fails to parse (`compare_versions` with garbage on either side) c
 
 ## Uninstall semantics
 
-Uninstall stages a confirmation panel, just like install, and deletes nothing until the user confirms. The `uninstall_plugin(id)` tool (`prepare_uninstall_plugin`) and the Plugins panel's **Uninstall** button (`stage_uninstall_request`) open the same panel. Staging:
+Uninstall stages a confirmation panel, just like install, and deletes nothing until the user confirms. The `plugins(action="uninstall", id)` tool (`prepare_uninstall_plugin`) and the Plugins panel's **Uninstall** button (`stage_uninstall_request`) open the same panel. Staging:
 
 - Resolves `id` (or the manifest `name`, or an owned `apps/<dir>` folder) and reads the newest `PluginInstalled` record.
 - Splits the recorded files into `files_present` and `files_missing`, and lists both in the panel. A recorded path outside the seven content dirs counts as missing, so the panel never offers it for deletion.
@@ -799,7 +807,7 @@ What this means for plugin authors:
 
 - **Uninstall deletes edited files too.** Confirming removes every recorded file still on disk, local edits included. The panel lists them first, and the workspace git history keeps each committed version. If your plugin invites edits, say so in its `description`.
 - **Sharing a path between plugins is allowed but messy.** If two plugins both ship `knowhow/sites/linkedin.com/selectors.md`, whichever installs second wins (overwrite). Uninstalling either one deletes the file, even though the other plugin still relies on it. Namespace your files, e.g. `knowhow/<plugin-id>-<topic>.md` or a dedicated subdirectory.
-- **Reinstall after uninstall is supported.** `install_plugin` on the same source after `uninstall_plugin` works: the engine treats the uninstall as a tombstone, and the next install is fresh.
+- **Reinstall after uninstall is supported.** `plugins(action="install")` on the same source after `plugins(action="uninstall")` works: the engine treats the uninstall as a tombstone, and the next install is fresh.
 
 ## Local modifications (the "Modified" badge)
 
@@ -873,7 +881,7 @@ Never push to the upstream repo directly, and never open a PR without the user's
 
 ## Events emitted
 
-Three `SystemEvent` variants for the install lifecycle, plus the two cancel-audit ones. All carry `actor: Option<MessageOrigin>`, all have `aggregate()` returning `"plugin"`, and the `aggregate_id` is the plugin's `id` field.
+Three `engine::event_bus::SystemEvent` variants for the install lifecycle, plus the two cancel-audit ones. All carry `actor: Option<MessageOrigin>`, all have `aggregate()` returning `"plugin"`, and the `aggregate_id` is the plugin's `id` field.
 
 ### `PluginInstalled`
 
@@ -909,7 +917,7 @@ Emitted on every successful install, overwrites and updates included (there is n
 
 `affected_triggers` (at `payload.data.affected_triggers`) lists the affected triggers of those removed paths (see "Affected triggers"). It is omitted when empty. Rows from before the field carry none, so a fire never warns about their removals.
 
-The two outer wrappers come from how Lucidos persists `SystemEvent`: serde's `tag = "type", content = "data"` adds `{type, data}`, and `install_from_unpacked_with_bus` packs the raw manifest into a payload map under `manifest` before assigning that map to `SystemEvent::PluginInstalled.manifest`. Net effect: the raw manifest fields (`version`, `source`, `setup`, ...) sit at `payload.data.manifest.manifest.*`. `InstalledRecord` reads them at that path; do the same in any new consumer. `setup_thread_id` sits one level up, at `payload.data.manifest.setup_thread_id`, because the engine records it rather than the author.
+The two outer wrappers come from how Lucidos persists `engine::event_bus::SystemEvent`: serde's `tag = "type", content = "data"` adds `{type, data}`, and `install_from_unpacked_with_bus` packs the raw manifest into a payload map under `manifest` before assigning that map to `SystemEvent::PluginInstalled.manifest`. Net effect: the raw manifest fields (`version`, `source`, `setup`, ...) sit at `payload.data.manifest.manifest.*`. `InstalledRecord` reads them at that path; do the same in any new consumer. `setup_thread_id` sits one level up, at `payload.data.manifest.setup_thread_id`, because the engine records it rather than the author.
 
 `id` is the exception, and deliberately so: it is at `payload.data.id`, where every sibling `Plugin*` frame carries it. It is still inside the manifest too. Rows written before the top-level field existed carry it only there, so a reader that must cover history falls back to `payload.data.manifest.manifest.id`.
 
@@ -928,7 +936,7 @@ Same rule for anything deeper: `payload.data.manifest.manifest.version` when rea
 
 `commit` (at `payload.data.manifest.commit`) is the workspace-repo sha of the "Install plugin: ..." commit. It is the baseline the Modified badge diffs against (see "Local modifications" above). Legacy rows installed before this field existed never show as modified.
 
-Some old rows carry `aggregate_id = "unknown"`, from a since-fixed bug, and `latest_install(pool, &id)` cannot find them. Reinstall the plugin to refresh.
+Some old rows carry `aggregate_id = "unknown"`, from a since-fixed bug, and `plugins::registry::latest_install(pool, &id)` cannot find them. Reinstall the plugin to refresh.
 
 ### `PluginLocalChangesMerged`
 

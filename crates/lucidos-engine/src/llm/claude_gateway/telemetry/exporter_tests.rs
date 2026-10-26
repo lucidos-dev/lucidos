@@ -112,6 +112,9 @@ impl Fixture {
             modality: None,
             service_tier: None,
             cache_creation_1h_tokens: None,
+            cache_creation_30m_tokens: None,
+            cache_creation_12h_tokens: None,
+            cache_creation_requested_ttl: None,
         });
         let mut event =
             auxiliary_capture(ContextPurpose::Title, "claude-opus-5-5", 40, usage, false);
@@ -461,6 +464,9 @@ async fn a_capture_that_commits_late_is_still_sent() {
             modality: None,
             service_tier: None,
             cache_creation_1h_tokens: None,
+            cache_creation_30m_tokens: None,
+            cache_creation_12h_tokens: None,
+            cache_creation_requested_ttl: None,
         }),
         false,
     );

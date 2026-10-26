@@ -28,9 +28,12 @@ const source = (rel: string): string => readFileSync(new URL(rel, import.meta.ur
 const APP_SURFACES = [
   '../../apps/AppCard.tsx',
   '../../apps/ReusableWidgetsSection.tsx',
+  '../../dashboard/DashboardTile.tsx',
+  '../../plugins/pluginCard.tsx',
   '../../layout/Drawer.tsx',
   '../../widgets/WidgetShelf.tsx',
   '../../widgets/InlineWidget.tsx',
+  '../../widgets/WidgetPickerItems.tsx',
   '../../search/SearchEverywhere.tsx',
   '../../layout/ContentNav.tsx',
   '../../chat/MessageRoutePanel.tsx',

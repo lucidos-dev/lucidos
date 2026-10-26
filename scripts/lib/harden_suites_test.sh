@@ -69,7 +69,21 @@ CHECKOUT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 expect_eq "no file in this checkout turns the allowlist off" "" \
     "$(hs_read_check "$CHECKOUT" | tr '\n' ' ' | sed 's/ $//')"
 
+echo "generated knowhow freshness"
+expect_eq "typecheck codegen shares the Cargo lane" "0" "$(hs_is_cargo_suite ts; echo $?)"
+expect_eq "Vitest codegen shares the Cargo lane" "0" "$(hs_is_cargo_suite vitest; echo $?)"
+expect_eq "freshness shares the serialized cargo lane" "0" "$(hs_is_cargo_suite knowhow-generated; echo $?)"
+expect_has "fast docs still run freshness" "knowhow-generated" "$(printf '%s\n' docs/a.md | hs_select_suites '' '' '' '' fast)"
+expect_has "freshness runs even for docs" "knowhow-generated" "$(printf '%s\n' docs/a.md | hs_select_suites)"
+expect_eq "freshness invokes the committed comparison" "./scripts/check-knowhow-generated.sh" "$(hs_suite_command knowhow-generated normal "$TMP")"
+expect_has "codegen changes run their fixtures" "codegen" "$(printf '%s\n' scripts/lib/codegen.sh | hs_select_suites)"
+expect_eq "the codegen suite runs its hermetic fixtures" "bash scripts/lib/codegen_test.sh && bash scripts/lib/codegen_blocks_test.sh" "$(hs_suite_command codegen normal "$TMP")"
+expect_has "block parser edits run codegen fixtures" "codegen" "$(printf '%s\n' scripts/lib/codegen_blocks.py | hs_select_suites)"
+expect_has "engine build input edits run codegen fixtures" "codegen" "$(printf '%s\n' crates/lucidos-engine/build.rs | hs_select_suites)"
+expect_has "fast engine build edits keep codegen fixtures" "codegen" "$(printf '%s\n' crates/lucidos-engine/build.rs | hs_select_suites '' '' '' '' fast)"
+
 echo "suite selection"
+# Path-selection assertions omit the unconditional freshness suite tested above.
 # The compile inputs are a fixed list, so selection never depends on a build.
 printf '%s\n' CHANGELOG.md crates/lucidos-engine/src/runtime/cc_menu_options.json \
     crates/lucidos-engine/src/api/sdk_iframe.css \
@@ -80,7 +94,7 @@ printf '%s\n' crates/lucidos-engine/src/runtime/cc_menu_options.json > "$TMP/cli
 # The files a Vitest test reads, as `start` records them from hs_vitest_inputs.
 printf '%s\n' crates/lucidos-engine/src/api \
     crates/lucidos-engine/src/engine/event_bus_system_event.rs .claude/rules/frontend.md > "$TMP/vitest-inputs"
-select_for() { printf '%s\n' "$@" | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" | tr '\n' ' ' | sed 's/ $//'; }
+select_for() { printf '%s\n' "$@" | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//'; }
 expect_eq "rust" "rust" "$(select_for crates/lucidos-engine/src/a.rs)"
 expect_eq "Cargo.lock" "rust" "$(select_for Cargo.lock)"
 expect_eq "Cargo.toml" "rust" "$(select_for crates/lucidos-engine/Cargo.toml)"
@@ -92,17 +106,17 @@ expect_eq "cli crate" "rust cli" "$(select_for crates/lucidos-cli/src/main.rs)"
 expect_eq "a CLI include runs the CLI tests" "rust cli" \
     "$(select_for crates/lucidos-engine/src/runtime/cc_menu_options.json)"
 expect_eq "no cli-inputs file" "rust" \
-    "$(printf '%s\n' crates/lucidos-engine/src/runtime/cc_menu_options.json | hs_select_suites "$TMP/inputs" | tr '\n' ' ' | sed 's/ $//')"
+    "$(printf '%s\n' crates/lucidos-engine/src/runtime/cc_menu_options.json | hs_select_suites "$TMP/inputs" | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//')"
 expect_eq "a compiled-in markdown file" "rust" "$(select_for CHANGELOG.md)"
-expect_eq "no compile-inputs file" "" "$(printf '%s\n' CHANGELOG.md | hs_select_suites | tr '\n' ' ')"
+expect_eq "no compile-inputs file" "" "$(printf '%s\n' CHANGELOG.md | hs_select_suites | sed '/^knowhow-generated$/d' | tr '\n' ' ')"
 expect_eq "a capability manifest change runs the CLI tests" "rust cli" \
     "$(select_for crates/lucidos-capabilities/src/lib.rs)"
 printf 'drift\n' > "$TMP/drift"
 expect_eq "generated drift runs the TS suite" "rust ts" \
-    "$(printf '%s\n' crates/lucidos-engine/src/x.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "$TMP/drift" | tr '\n' ' ' | sed 's/ $//')"
+    "$(printf '%s\n' crates/lucidos-engine/src/x.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "$TMP/drift" | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//')"
 : > "$TMP/no-drift"
 expect_eq "no generated drift leaves the TS suite out" "rust" \
-    "$(printf '%s\n' crates/lucidos-engine/src/x.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "$TMP/no-drift" | tr '\n' ' ' | sed 's/ $//')"
+    "$(printf '%s\n' crates/lucidos-engine/src/x.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "$TMP/no-drift" | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//')"
 
 echo "generated drift"
 # A stub stands in for scripts/codegen.sh: it answers each fingerprint and
@@ -157,9 +171,12 @@ expect_eq "release" "shell-lint release" "$(select_for scripts/lib/release_draft
 expect_eq "self" "shell-lint harden-suites" "$(select_for scripts/lib/harden_suites.sh)"
 expect_eq "harden scope" "shell-lint harden-scope" "$(select_for scripts/harden-scope.sh)"
 expect_eq "harden scope test" "shell-lint harden-scope" "$(select_for scripts/lib/harden_scope_test.sh)"
-expect_eq "harden codex review" "shell-lint harden-codex-review" "$(select_for scripts/harden-codex-review.sh)"
-expect_eq "harden codex review test" "shell-lint harden-codex-review" \
-    "$(select_for scripts/lib/harden_codex_review_test.sh)"
+expect_eq "harden other-model review" "shell-lint harden-other-model-review" \
+    "$(select_for scripts/harden-other-model-review.sh)"
+expect_eq "harden other-model review lib" "shell-lint harden-other-model-review" \
+    "$(select_for scripts/lib/other_model_review.sh)"
+expect_eq "harden other-model review test" "shell-lint harden-other-model-review" \
+    "$(select_for scripts/lib/harden_other_model_review_test.sh)"
 expect_eq "ts" "ts first-paint" "$(select_for crates/lucidos-app/src/a.ts)"
 expect_eq "css" "vite first-paint" "$(select_for crates/lucidos-app/src/a.css)"
 expect_eq "sdk iframe css" "rust vitest" "$(select_for crates/lucidos-engine/src/api/sdk_iframe.css)"
@@ -173,7 +190,7 @@ expect_eq "ts already runs Vitest" "rust ts first-paint" \
     "$(select_for crates/lucidos-engine/src/engine/event_bus_system_event.rs crates/lucidos-app/src/a.ts)"
 
 echo "fast tier selection (an integrated sub-thread)"
-select_fast() { printf '%s\n' "$@" | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "" fast | tr '\n' ' ' | sed 's/ $//'; }
+select_fast() { printf '%s\n' "$@" | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "" fast | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//'; }
 expect_eq "fast: rust runs the lint, not the engine suite" "lint" "$(select_fast crates/lucidos-engine/src/a.rs)"
 expect_eq "fast: the app crate drops its tests" "lint" "$(select_fast crates/lucidos-app/src/lib.rs)"
 expect_eq "fast: the cli crate drops its tests" "lint" "$(select_fast crates/lucidos-cli/src/main.rs)"
@@ -189,9 +206,9 @@ expect_eq "fast: the script tests stay" "shell-lint harden-scope" "$(select_fast
 expect_eq "fast: mixed rust and ts" "lint ts" \
     "$(select_fast crates/lucidos-engine/src/a.rs crates/lucidos-app/src/a.ts)"
 expect_eq "full is the default tier" "rust" \
-    "$(printf '%s\n' crates/lucidos-engine/src/a.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "" | tr '\n' ' ' | sed 's/ $//')"
+    "$(printf '%s\n' crates/lucidos-engine/src/a.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "" | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//')"
 expect_eq "fast: generated drift keeps the TS suite" "lint ts" \
-    "$(printf '%s\n' crates/lucidos-engine/src/a.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "$TMP/drift" fast | tr '\n' ' ' | sed 's/ $//')"
+    "$(printf '%s\n' crates/lucidos-engine/src/a.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "$TMP/drift" fast | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//')"
 expect_eq "an unknown tier is the full tier" "full" "$(hs_normalize_tier banana)"
 expect_eq "fast normalizes to fast" "fast" "$(hs_normalize_tier fast)"
 
@@ -297,7 +314,7 @@ printf '%s\n' chat.spec.ts rail.spec.ts > "$TMP/touched"
 select_touched() { # <touched-file> <tier> <paths...>
     local touched=$1 tier=$2
     shift 2
-    printf '%s\n' "$@" | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" /dev/null "$tier" "$touched" | tr '\n' ' ' | sed 's/ $//'
+    printf '%s\n' "$@" | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" /dev/null "$tier" "$touched" | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//'
 }
 expect_eq "a touched spec selects e2e-touched" "ts first-paint e2e-touched" \
     "$(select_touched "$TMP/touched" full crates/lucidos-app/src/a.ts)"
@@ -428,7 +445,10 @@ git -C "$REPO" init -q -b main
 git -C "$REPO" config user.email "t@t"
 git -C "$REPO" config user.name "t"
 printf '.lucidos/\ntarget/\n' > "$REPO/.gitignore"
-mkdir -p "$REPO/crates/lucidos-engine/src" "$REPO/crates/lucidos-app/src" "$REPO/docs/plans"
+mkdir -p "$REPO/crates/lucidos-engine/src" "$REPO/crates/lucidos-app/src" "$REPO/docs/plans" "$REPO/scripts"
+# A stable fingerprint keeps suite fixtures independent of real Cargo writers.
+printf '#!/bin/sh\necho fixture-fingerprint\n' > "$REPO/scripts/codegen.sh"
+chmod +x "$REPO/scripts/codegen.sh"
 echo "fn a() {}" > "$REPO/crates/lucidos-engine/src/a.rs"
 echo "export {}" > "$REPO/crates/lucidos-app/src/a.ts"
 git -C "$REPO" add -A && git -C "$REPO" commit -qm base
@@ -503,6 +523,8 @@ expect_eq "run shares the caller's process group" "$(ps -o pgid= -p $$ | tr -d '
 
 expect_eq "the gate was asked before each cargo suite only" \
     "the /harden rust suite
+the /harden ts suite
+the /harden knowhow-generated suite
 the /harden driver suite" "$(cat "$STUB_DIR/gate.calls")"
 
 echo "a refused memory gate starts no cargo suite"
@@ -514,7 +536,7 @@ rc=$?
 expect_eq "a refused suite asks for a rerun" 2 "$rc"
 expect_has "names the gate" "rust VOID refused by the build memory gate" "$out"
 if [ -f "$STUB_DIR/rust.ran" ]; then fail "the rust suite ran on a refused gate"; else pass "the rust suite never ran"; fi
-if [ -f "$STUB_DIR/ts.ran" ]; then pass "a non-cargo suite still ran"; else fail "the ts suite did not run"; fi
+if [ -f "$STUB_DIR/first-paint.ran" ]; then pass "a non-cargo suite still ran"; else fail "the first-paint suite did not run"; fi
 rm -f "$STUB_DIR/gate.rc"
 hs start --early > /dev/null 2>&1
 hs wait --budget 20 > /dev/null
@@ -645,21 +667,21 @@ out="$(hs wait --budget 20)"
 expect_eq "the early retry passes to a rerun" 2 "$?"
 if [ -f "$STUB_DIR/driver.ran" ]; then fail "a retry round ran the driver"; else pass "a retry round runs no driver"; fi
 
-echo "a retried driver run waits for the Codex review, then runs once"
+echo "a retried driver run waits for the other-model review, then runs once"
 reset_stub
 printf '%s\n' "rust engine::a::tests::x" "driver runtime::codex::driver_tests::y" > "$REPO/.lucidos/harden-retry"
 echo "running 1 test" > "$STUB_DIR/rust.say"
-mkdir -p "$REPO/.lucidos" && echo "{}" > "$REPO/.lucidos/codex-review.out"
+mkdir -p "$REPO/.lucidos" && echo "{}" > "$REPO/.lucidos/other-model-review.out"
 hs start > "$TMP/out" 2>&1
 expect_has "the retry names the driver" "a retry of what failed): rust driver" "$(cat "$TMP/out")"
 if [ -f "$STUB_DIR/driver.ran" ]; then fail "start held the driver back"; else pass "start held the driver back"; fi
 hs wait --budget 20 > /dev/null
-expect_eq "Codex still running: wait says running" 3 "$?"
+expect_eq "review still running: wait says running" 3 "$?"
 if [ -f "$STUB_DIR/driver.ran" ]; then fail "wait held the driver back"; else pass "wait held the driver back"; fi
-out="$(hs wait --budget 20 --codex-abandoned)"
+out="$(hs wait --budget 20 --review-abandoned)"
 expect_eq "the retry passes to a rerun" 2 "$?"
 expect_eq "the retried driver ran once" "ran" "$(cat "$STUB_DIR/driver.ran")"
-rm -f "$REPO/.lucidos/codex-review.out" "$STUB_DIR/rust.say"
+rm -f "$REPO/.lucidos/other-model-review.out" "$STUB_DIR/rust.say"
 
 echo "a retried driver run alone still starts"
 reset_stub
@@ -685,19 +707,19 @@ out="$(hs wait --budget 20)"
 expect_eq "no driver tests: FAIL" 1 "$?"
 expect_has "says so" "driver FAIL ran no tests" "$out"
 
-echo "the Codex join"
+echo "the other-model review join"
 reset_stub
-mkdir -p "$REPO/.lucidos" && echo "{}" > "$REPO/.lucidos/codex-review.out"
+mkdir -p "$REPO/.lucidos" && echo "{}" > "$REPO/.lucidos/other-model-review.out"
 hs start --early > /dev/null 2>&1
 out="$(hs wait --budget 20)"
-expect_eq "Codex still running: wait says running" 3 "$?"
+expect_eq "review still running: wait says running" 3 "$?"
 if [ -f "$STUB_DIR/driver.ran" ]; then fail "driver held back"; else pass "driver held back"; fi
 out="$(hs verdict)"
 expect_eq "no driver run yet: RERUN, never PASS" 2 "$?"
 expect_has "says so" "driver MISSING" "$out"
-hs wait --budget 20 --codex-abandoned > /dev/null
-expect_eq "abandoned Codex review: driver runs" 0 "$?"
-touch "$REPO/.lucidos/codex-review.done"
+hs wait --budget 20 --review-abandoned > /dev/null
+expect_eq "abandoned review: driver runs" 0 "$?"
+touch "$REPO/.lucidos/other-model-review.done"
 
 echo "the driver runs in the background and wait joins it"
 reset_stub
@@ -845,13 +867,13 @@ expect_eq "a pinned file at its count passes" "" "$(read_hits)"
 commit_file "$PINNED" "$(printf 'include_str!("x");\n"see docs/plans/y.md"\n"and docs/adr/z.md"')"
 expect_eq "a pinned file over its count trips" "$PINNED 2" "$(read_hits)"
 
-echo "a docs-only diff selects nothing"
+echo "a docs-only diff selects freshness"
 git -C "$REPO" checkout -q -b docs-only main
 commit_file docs/readme-extra.md words
 out="$(hs start --early 2>&1)"
-expect_has "nothing selected" "No suites selected" "$out"
+expect_has "docs still select freshness" "knowhow-generated" "$out"
 hs verdict > /dev/null
-expect_eq "empty selection: PASS" 0 "$?"
+expect_eq "docs freshness: PASS" 0 "$?"
 commit_file crates/lucidos-engine/src/fix.rs "fn fix() {}"
 out="$(hs verdict)"
 expect_eq "a fix that widens the selection: RERUN" 2 "$?"

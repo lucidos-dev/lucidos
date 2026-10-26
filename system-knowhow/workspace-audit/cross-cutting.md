@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: cross-cutting
 description: The cross-cutting audit section: credentials in workspace code, broken references, duplicates, removed CLI flags, removed thread-summary fields and retired LLM tools.
+sources: ["system-knowhow/js-sdk.md", "system-knowhow/lucidos-cli.md", "system-knowhow/intent-registry.md", "system-knowhow/triggers.md", "crates/lucidos-cli/src/*", "crates/lucidos-engine/src/llm/tools/*", "crates/lucidos-engine/src/engine/tools/*", "crates/lucidos-engine/src/api/threads*", "crates/lucidos-engine/src/core/store/threads/*"]
 ---
 
 # Workspace audit section: cross-cutting
@@ -43,14 +44,14 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
   `data/scripts/**`, each trigger's `scripts/`, and `data/apps/**`, and recommend
   the replacement. Severity: **broken** (the call errors on next use). Currently
   removed:
-  - `lucidos spawn-thread --parent` → `--relation child` (a same-workspace
+  - Removed `lucidos spawn-thread --parent` → `--relation child` (a same-workspace
     parent-with-callback spawn). Do NOT flag `threads list --parent <uuid>` or
     `threads count --parent <uuid>`, which are current, unrelated filters.
-  - `lucidos spawn-thread --cc-model` → `--coding-agent-model` (same value).
+  - Removed `lucidos spawn-thread --cc-model` → `--coding-agent-model` (same value).
   - `repo` passed to the `run_coding_agent` tool → `folder` (which also accepts a
     registered repo name). Do NOT flag the current `lucidos spawn-thread --repo`
     flag, which is a different, live argument.
-  - `lucidos threads list --has-diff` and `threads count --has-diff`, and the
+  - Removed `lucidos threads list --has-diff` and `threads count --has-diff`, and the
     `threads` tool's `has_diff` arg → `--change-state` / `change_state`. The
     tool and the HTTP route refuse a stale `has_diff` by name.
     `--has-diff false` becomes `--change-state none`. `--has-diff` covered both
@@ -59,7 +60,7 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
     hand. Do NOT flag `has_diff` on `CodingAgentDiffChanged`, which is current.
 - **Removed thread-summary fields still read by workspace code.** A thread
   summary comes from `lucidos.threads.list`, `lucidos threads list` or the
-  `list_threads` tool. A removed field reads as `undefined` in JS, so the code
+  `threads(action="list")` tool. A removed field reads as `undefined` in JS, so the code
   quietly takes its falsy branch. Grep the same four surfaces as the flags above. Severity: **stale**, or **broken** for a Python `row["field"]`,
   which raises on the missing key. Currently removed:
   - `coding_agent_applying`. There is no replacement: it never tracked a live
@@ -75,13 +76,13 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
   scan finds every mention across `data/apps/**`, `data/triggers/**`,
   `data/knowhow/**` and `data/scripts/**`. Fix every hit, so none survives the
   run. Currently retired:
-  - `execute_intent`. An intent now runs in the thread that asks for it: load
+  - The retired `execute_intent` tool. An intent now runs in the thread that asks for it: load
     it with `load_knowhow(<intent id>)` and do its steps in the same turn.
     Owns the rule: `system-knowhow/intent-registry.md`.
-    - **broken**: an instruction to call it, such as "use `execute_intent` to
+    - **broken**: an instruction to call the retired tool, such as "use `execute_intent` to
       run the digest". The call now fails with a hint.
-    - **stale**: a passing mention that tells nobody to call it, such as a note
-      that an intent "runs through `execute_intent`".
+    - **stale**: a passing mention of the retired tool that tells nobody to call it,
+      such as "runs through `execute_intent`" (the retired tool).
 
 ## Remediation
 
@@ -96,13 +97,13 @@ flow.
 
 | Old | New |
 |---|---|
-| An instruction to call `execute_intent(intent_id: "<id>")` | `load_knowhow(id: "<id>")`, then do its steps in this turn |
-| An instruction to run the work in a separate thread through `execute_intent` | `run_thread`, only where the work truly needs its own thread |
-| A passing mention of `execute_intent` | the same sentence about `load_knowhow`, or delete it when it only described the old tool |
+| An instruction to call the retired `execute_intent(intent_id: "<id>")` | `load_knowhow(id: "<id>")`, then do its steps in this turn |
+| An instruction to run the work in a separate thread through the retired `execute_intent` | `run_thread`, only where the work truly needs its own thread |
+| A passing mention of the retired `execute_intent` | the same sentence about `load_knowhow`, or delete it when it only described the old tool |
 
 **A hit in `data/triggers/<slug>/trigger.toml` is not a file edit.** That file
 is a copy of the trigger's `run`, written from its events. Rewrite the
-`run.intent` with one `update_trigger` call per trigger, per
+`run.intent` with one `triggers(action="update")` call per trigger, per
 `system-knowhow/triggers.md`. The engine then rewrites the file.
 
 Verify by re-running the `retired-tools` scan. It should fall to zero.

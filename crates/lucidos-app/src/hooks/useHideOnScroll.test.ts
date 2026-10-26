@@ -71,7 +71,7 @@ describe('headerOffsetPx (dynamic bars)', () => {
 
 describe('chromeOffsetPx (dynamic bars)', () => {
   const headerHeight = 110;
-  const safeAreaTop = 47;
+  const controlsTop = 47;
   const titleBarHeight = 40;
   const base = { disabled: false, keyboardOpen: false, away: false, scrollTop: 500, headerHeight, titleBarHeight };
 
@@ -87,7 +87,7 @@ describe('chromeOffsetPx (dynamic bars)', () => {
     const offset = chromeOffsetPx({ ...base, keyboardOpen: true });
     expect(headerHeight + offset + titleBarHeight).toBeLessThanOrEqual(0);
     // While the keys are up the spacer is only the safe area.
-    expect(safeAreaTop + offset + titleBarHeight).toBeLessThanOrEqual(0);
+    expect(controlsTop + offset + titleBarHeight).toBeLessThanOrEqual(0);
   });
 
   it('follows the scroll with the keyboard down, and pins wins over both', () => {
@@ -1293,12 +1293,12 @@ describe('useHideOnScroll app UI disabled mode', () => {
  */
 function simulateFocusCompensation(opts: {
   cachedHeight: number;
-  safeAreaTop: number;
+  controlsTop: number;
   scrollTop: number;
   firstInputContentY: number;
 }) {
-  const { cachedHeight, safeAreaTop, scrollTop, firstInputContentY } = opts;
-  const delta = cachedHeight - safeAreaTop;
+  const { cachedHeight, controlsTop, scrollTop, firstInputContentY } = opts;
+  const delta = cachedHeight - controlsTop;
   const newScrollTop = Math.max(0, scrollTop - delta);
   // Content shifts up by `delta` in content-space when the spacer shrinks.
   const newContentY = firstInputContentY - delta;
@@ -1310,21 +1310,21 @@ function simulateFocusCompensation(opts: {
 describe('useHideOnScroll keyboard open compensation respects safe-area', () => {
   // iPhone-with-dynamic-island numbers: ~3rem header content + ~50px safe area.
   const cachedHeight = 94;
-  const safeAreaTop = 50;
+  const controlsTop = 50;
 
   it('first input (at top of scroll) lands at safe-area-top, not behind dynamic island', () => {
     // First device row is at content-y = cachedHeight (just past the spacer).
     // User is at scrollTop = 0 (top of the devices list).
     const { newScrollTop, layoutY } = simulateFocusCompensation({
       cachedHeight,
-      safeAreaTop,
+      controlsTop,
       scrollTop: 0,
       firstInputContentY: cachedHeight,
     });
 
     expect(newScrollTop).toBe(0); // can't scroll above the top
-    // Without the fix (safeAreaTop = 0), layoutY would be 0 — behind dynamic island.
-    expect(layoutY).toBe(safeAreaTop);
+    // Without the fix (controlsTop = 0), layoutY would be 0 — behind dynamic island.
+    expect(layoutY).toBe(controlsTop);
   });
 
   it('scrolled-down input stays anchored to its pre-focus layout position', () => {
@@ -1335,22 +1335,22 @@ describe('useHideOnScroll keyboard open compensation respects safe-area', () => 
 
     const { newScrollTop, layoutY } = simulateFocusCompensation({
       cachedHeight,
-      safeAreaTop,
+      controlsTop,
       scrollTop,
       firstInputContentY: inputContentY,
     });
 
-    // scrollTop drops by (cachedHeight - safeAreaTop) so the input visually stays put.
-    expect(newScrollTop).toBe(scrollTop - (cachedHeight - safeAreaTop));
+    // scrollTop drops by (cachedHeight - controlsTop) so the input visually stays put.
+    expect(newScrollTop).toBe(scrollTop - (cachedHeight - controlsTop));
     expect(layoutY).toBe(inputContentY - scrollTop); // unchanged
   });
 
-  it('no-op on platforms without a safe area (safeAreaTop = 0)', () => {
+  it('no-op on platforms without a safe area (controlsTop = 0)', () => {
     // Android, pre-notch iPhones, desktop emulation — compensation matches
     // the old behaviour (subtract full cachedHeight, content shifts up by it).
     const { newScrollTop, layoutY } = simulateFocusCompensation({
       cachedHeight,
-      safeAreaTop: 0,
+      controlsTop: 0,
       scrollTop: 0,
       firstInputContentY: cachedHeight,
     });
@@ -1430,24 +1430,24 @@ describe('shouldKeepHeaderVisible', () => {
  */
 describe('spacerHeightPx', () => {
   const cachedHeight = 94;
-  const safeAreaTop = 50;
+  const controlsTop = 50;
 
   it('collapses to safe-area-top when keyboard opens and header is NOT pinned', () => {
-    expect(spacerHeightPx({ cachedHeight, safeAreaTop, keyboardOpen: true, disabled: false }))
-      .toBe(safeAreaTop);
+    expect(spacerHeightPx({ cachedHeight, controlsTop, keyboardOpen: true, disabled: false }))
+      .toBe(controlsTop);
   });
 
   it('stays full height when header is pinned, even with keyboard open', () => {
     // The fix: pinned header → spacer must not collapse, or content slides
     // under the header (the device-name-under-header bug).
-    expect(spacerHeightPx({ cachedHeight, safeAreaTop, keyboardOpen: true, disabled: true }))
+    expect(spacerHeightPx({ cachedHeight, controlsTop, keyboardOpen: true, disabled: true }))
       .toBe(cachedHeight);
   });
 
   it('stays full height when keyboard is closed', () => {
-    expect(spacerHeightPx({ cachedHeight, safeAreaTop, keyboardOpen: false, disabled: false }))
+    expect(spacerHeightPx({ cachedHeight, controlsTop, keyboardOpen: false, disabled: false }))
       .toBe(cachedHeight);
-    expect(spacerHeightPx({ cachedHeight, safeAreaTop, keyboardOpen: false, disabled: true }))
+    expect(spacerHeightPx({ cachedHeight, controlsTop, keyboardOpen: false, disabled: true }))
       .toBe(cachedHeight);
   });
 });

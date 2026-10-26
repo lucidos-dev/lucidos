@@ -375,6 +375,7 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

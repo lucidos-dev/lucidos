@@ -100,6 +100,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'system-overview', label: 'Overview', subview: 'system-overview', path: 'Settings → System', keywords: 'connection status workspace path api versions build uptime restart refresh update' },
   { id: 'release-notices', label: 'Release Notices', subview: 'release-notices', path: 'Settings → System', anchor: 'release-notices:list', keywords: 'release notice notices after upgrade to do action needed workspace audit drift got it answered' },
   { id: 'whats-new', label: "What's New", subview: 'whats-new', path: 'Settings → System', keywords: 'changelog release notes version history whats new updates changes released' },
+  { id: 'thread-queue', label: 'Thread Queue', subview: 'thread-queue', path: 'Settings → System', keywords: 'thread queue concurrency capacity running queued' },
   { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings → System' },
   { id: 'memory', label: 'Memory', subview: 'memory', path: 'Settings → System' },
   { id: 'memory:module', label: 'Memory module', subview: 'memory', path: 'Settings → System → Memory', anchor: 'memory:module', keywords: 'memory module classic tree summary trees compactor compaction backfill recall zoom' },
@@ -111,7 +112,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
 
   // System → Debugging rows
   { id: 'debugging:capture-context', label: 'Capture context per step', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:capture-context', keywords: 'capture context step debug llm prompt' },
-  { id: 'debugging:cache-warm-line', label: 'Cache-warm line', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:cache-warm-line', keywords: 'cache warm line prompt cache countdown time left hide show' },
+  { id: 'debugging:cache-cards', label: 'Cache cards', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:cache-cards', keywords: 'cache cards warm line kept warm keep-alive prompt cache countdown time left hide show' },
   { id: 'debugging:perf', label: 'Perf instrumentation', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:perf', keywords: 'perf performance instrumentation telemetry lag latency profiling thread open render linkify' },
   { id: 'debugging:animation-speed', label: 'Animation speed', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:animation-speed', keywords: 'animation speed transition duration slow motion multiplier' },
   { id: 'debugging:autocorrect', label: 'Autocorrect', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:autocorrect', keywords: 'autocorrect auto-correct autocorrection keyboard typing spelling send button submit button tap dead nothing happens iphone ipad', iosOnly: true },
@@ -140,7 +141,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Coding Agents subview
   { id: 'coding-agents:binaries', label: 'Binaries', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:binaries', keywords: 'coding agent claude codex binary path cli override auto-detect' },
   { id: 'coding-agents:permissions', label: 'Permissions', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:permissions', keywords: 'permission mode claude code auto accept edits classifier approve prompt card ask' },
-  { id: 'coding-agents:cache-keep-alive', label: 'Cache keep-alive', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:cache-keep-alive', keywords: 'cache keep-alive keep warm prompt cache rewrite ping beat give up break-even tuned workspace data off cost' },
+  { id: 'models:cache-keep-alive', label: 'Cache keep-alive', subview: 'models', path: 'Settings → Models', anchor: 'models:cache-keep-alive', keywords: 'cache keep-alive keep warm prompt cache rewrite ping beat prefill give up break-even tuned workspace data off cost claude code lucidos agent' },
   { id: 'coding-agents:intelligence', label: 'Intelligence ladders', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:intelligence', keywords: 'intelligence ladder claude code codex link' },
   { id: 'intelligence:prices', label: 'Prices', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:prices', keywords: 'price prices price table checked keep prices current trigger daily weekly cost' },
   { id: 'intelligence:ladder-chat', label: 'Intelligence ladder · Lucidos Agent', subview: 'intelligence', path: 'Settings → Intelligence', anchor: 'intelligence:ladder-chat', keywords: 'intelligence ladder rung model effort default picker chat lucidos agent trigger cost time band opus sonnet haiku gpt gemini grok enable disable list customised reset sort order' },
@@ -261,9 +262,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'command-safety', label: 'Command safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
   { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
   { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
+  { id: 'command-safety:coding-agents', label: 'Enabled for coding agents', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:coding-agents', keywords: 'command guard coding agents codex claude code bash permission card auto allow' },
   { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku typesafe jev clef system one judgment backend' },
   { id: 'permissions:lucidos', label: 'Lucidos Agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:lucidos', keywords: 'lucidos agent command allowlist bash python always allow auto allow' },
-  { id: 'permissions:claude-code', label: 'Claude Code permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:claude-code', keywords: 'claude code coding agent tool permissions allowed tools allowlist' },
+  { id: 'permissions:coding-agent', label: 'Coding agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:coding-agent', keywords: 'claude code permissions codex permissions tool permissions allowed tools allowlist always allow' },
   { id: 'permissions:mcp', label: 'MCP tool permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:mcp', keywords: 'mcp model context protocol server tool permissions allowlist always allow' },
 
   // MCP Servers subview

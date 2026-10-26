@@ -407,6 +407,7 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
             tool_name: "Edit".into(),
             input: serde_json::json!({"file_path": "/tmp/x"}),
             summary: "Edit /tmp/x".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -573,6 +574,7 @@ async fn test_cc_child_stale_resume_does_not_decrement_parent() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })

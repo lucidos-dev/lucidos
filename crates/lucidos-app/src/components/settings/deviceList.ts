@@ -68,6 +68,14 @@ export function buildDeviceRows(
 }
 
 /**
+ * A device nothing depends on: not this client, no push, and not paired. It
+ * reaches no workspace and receives nothing, so the list folds it away.
+ */
+export function isUnusedDevice(row: DeviceRowModel): boolean {
+  return !row.isCurrent && !row.paired && !row.device?.push_enabled;
+}
+
+/**
  * What a row with no engine half says about itself.
  *
  * It states the PRESENT, and that is the whole point. The earlier wording

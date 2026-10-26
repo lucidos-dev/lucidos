@@ -107,3 +107,22 @@ edge and fades in and out where it stands.
 - **The button's on-state** is the header bar's `framed` toggle look, the one
   Filter wears (`docs/plans/2026-10-21-one-toggle-icon-button.md`).
 - Points 1 to 3 and 6 are unchanged.
+
+## Amendment, 2026-10-22: the sheet becomes a panel in the thread pane
+
+The maintainer asked for the phone dashboard to behave as a regular panel, not
+an overlay. It is now the *dashboard panel*, a layer of the thread pane. Plan:
+`docs/plans/2026-10-22-phone-dashboard-panel.md`.
+
+- **It is not an overlay.** No dismiss on an outside tap, no `pushOverlay`, no
+  body portal. The header, the Lucidos menu, the menu drawer and a pane swipe
+  all work while it is open.
+- **A pane swipe carries it along.** It is still open when you swipe back.
+- **Back closes it.** Opening adds a row to the thread history. The thread
+  header's back chevron closes the panel, and forward reopens it. Closing it
+  with its button is the same Back step, so toggling never grows the history.
+  The iOS back gesture stays disabled.
+- **A reload reopens it** when the saved history sits on a dashboard row.
+- **Picking another thread still closes it.**
+- Points 1 to 3 and 6 are unchanged. The "no swipe" and "Back does not close it"
+  consequences above no longer hold. The sheet's name is replaced everywhere.

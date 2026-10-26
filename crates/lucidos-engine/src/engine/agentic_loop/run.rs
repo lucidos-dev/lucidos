@@ -225,8 +225,8 @@ impl LucidosEngine {
         // Split by provenance because only one side needs a bound:
         //
         // `user_image_idxs` — the turn's user message plus any mid-turn injection
-        // that carried images. The user's own content; bounded by how many
-        // messages they send in one turn, so it needs no cap.
+        // or question answer that carried images. The user's own content;
+        // bounded by how many messages they send in one turn, so it needs no cap.
         //
         // `explicit_image_idxs` — tool results holding an image the model asked
         // to see (`view_image` / `read_file`). Capped, because the model can
@@ -902,6 +902,11 @@ impl LucidosEngine {
                     ));
                 }
             };
+            self.remembered_requests.remember(
+                thread_id,
+                response.prefill.clone(),
+                std::time::Instant::now(),
+            );
 
             // `usage` only when the provider reported it (Anthropic);
             // OpenAI/Gemini stay None and the chars*2/5 estimate stands (see
@@ -1036,14 +1041,13 @@ impl LucidosEngine {
             // turn with raw XML as the response). Only when the model made NO
             // real tool call (a genuine leak), reconstruct the call and push it
             // so the existing tool-execution branch resumes the turn instead of
-            // persisting the XML. The detector requires a registered tool name +
-            // a non-code-fenced block, so prose/examples don't mis-fire. The
+            // persisting the XML. The detector requires an offered tool + a
+            // non-code-fenced block, so prose/examples don't mis-fire. The
             // synthesised call flows through the same command guard + circuit
             // breakers as a real call. See `inline_tool_call_repair`.
             let tool_call_repair = if response.tool_calls.is_empty() {
-                let known: Vec<&str> = tools.names().iter().map(String::as_str).collect();
                 response.content.as_deref().and_then(|c| {
-                    crate::engine::inline_tool_call_repair::detect_inline_tool_call(c, &known)
+                    crate::engine::inline_tool_call_repair::detect_inline_tool_call(c, tools.defs())
                 })
             } else {
                 None
@@ -1101,6 +1105,7 @@ impl LucidosEngine {
                         stable_prefix_fingerprint: report.stable_prefix_fingerprint,
                         ttft_ms: report.detail.ttft_ms,
                         request_id: report.detail.request_id,
+                        session: None,
                     },
                 )
                 .await;
@@ -1782,6 +1787,9 @@ impl LucidosEngine {
             // emits a terminal `ResponseFailed` and returns `Err` so the
             // scheduler fails the trigger. Reset per outer-loop iteration.
             let mut trigger_fail_reason: Option<String> = None;
+            // The user picked a *quiet option*: the turn ends after this batch
+            // with no further model call.
+            let mut quiet_answer = false;
 
             // Helper: push a circuit-breaker response into the messages array.
             // Must add the assistant's tool_use message AND matching tool_result blocks
@@ -1964,21 +1972,9 @@ impl LucidosEngine {
                     continue;
                 }
 
-                // Generic circuit breaker: any tool whose SAME (tool, call_key)
-                // FAILED 3+ times in a row. It keys on consecutive *failure*,
-                // not consecutive call — successful repetition is by definition
-                // not a stuck loop, so productive runs (three distinct `psql`
-                // queries bucketed under `psql`, sequential downloads whose
-                // scripts share a first line) never trip. There is no per-tool
-                // exclusion list: failing repetition of ANY tool (a `run_bash`
-                // that errors, an `edit_file` whose `old_string` never matches,
-                // a `web_search`/`browser_*` that keeps erroring) is a real
-                // stuck loop. read_file / list_files are handled by their own
-                // content-deterministic branches above (they block identical
-                // *successful* re-reads, which this failure gate intentionally
-                // does not). All still bounded by the tool-call cap, and the
-                // `bash_output(wait_secs)` server-side block remains the
-                // structural fix for the sleep-poll case.
+                // Count repeated attempts after errors, skipping warned calls.
+                // Successful calls reset the streak. read_file / list_files
+                // have separate content-based breakers above.
                 let breaker_action = generic_breaker_action(consecutive_failing_call);
                 if breaker_action != BreakerAction::None {
                     // Human-readable target for the log / STOP / force-break
@@ -1989,10 +1985,9 @@ impl LucidosEngine {
                         call_key.clone()
                     };
                     if breaker_action == BreakerAction::Break {
-                        // Hard break after 5 consecutive failures — the LLM
-                        // ignored the warnings.
+                        // Attempt 5: the model kept retrying after warnings.
                         log!(
-                            "[AgentLoop] Force-breaking loop: {} failed {} times in a row on '{}'",
+                            "[AgentLoop] Force-breaking loop: {} repeated after errors (attempt {}) on '{}'",
                             current_tool,
                             consecutive_failing_call,
                             target
@@ -2031,19 +2026,17 @@ impl LucidosEngine {
                             *proposed_change,
                         ));
                     }
-                    // Soft break at 3-4 consecutive failures — warn the LLM and
-                    // let it continue. The proposed (repeat) call is NOT executed,
-                    // so `last_call_was_error` stays as-is and the failure streak
-                    // survives a continued retry.
+                    // Warn on attempts 3-4 without executing the call.
+                    // Keep the previous error so another retry advances the streak.
                     log!(
-                        "[AgentLoop] Warning LLM: {} failed {} times in a row on '{}'",
+                        "[AgentLoop] Skipping repeated failed call: {} (attempt {}) on '{}'",
                         current_tool,
                         consecutive_failing_call,
                         target
                     );
                     let stop_msg = format!(
-                        "STOP: Your call to {} on '{}' has failed {} times in a row. Do NOT call it again the same way. Use the results you already have and give your final answer now, or resolve the underlying error first.",
-                        current_tool, target, consecutive_failing_call
+                        "STOP: Your call to {} on '{}' failed earlier. This identical retry will not run. Use the results you already have, or resolve the underlying error before retrying.",
+                        current_tool, target
                     );
                     push_circuit_breaker(messages, &response, &stop_msg);
                     continue;
@@ -2402,7 +2395,18 @@ impl LucidosEngine {
                         {
                             pending_checkpoint = Some(pending);
                         }
-                        if let Some(r) = self
+                        if tool_call.name == tn::ASK_USER_QUESTION {
+                            let asked = self
+                                .handle_chat_ask_user_question(
+                                    thread_id,
+                                    &tool_call.id,
+                                    &tool_call.arguments,
+                                    &meta,
+                                )
+                                .await;
+                            quiet_answer |= asked.quiet;
+                            crate::engine::tools::lift_legacy_string(asked.result)
+                        } else if let Some(r) = self
                             .handle_special_tool(
                                 &tool_call.name,
                                 &tool_call.arguments,
@@ -2618,6 +2622,12 @@ impl LucidosEngine {
                 if trigger_fail_reason.is_some() {
                     break;
                 }
+                // A quiet pick means no more work, so later calls in the batch
+                // never run. With an injection queued the turn goes on, and every
+                // call then needs its result.
+                if quiet_answer && injection_rx.is_empty() {
+                    break;
+                }
             }
 
             // Carry this iteration's failed-ask signal into the next iteration
@@ -2648,6 +2658,47 @@ impl LucidosEngine {
                     .await;
                 *terminator_settled = true;
                 return Err(reason.into());
+            }
+
+            // A queued injection still needs the agent, so the turn goes on.
+            if quiet_answer && injection_rx.is_empty() {
+                self.gate_chat_turn_end(
+                    thread_id,
+                    origin_id,
+                    read_decided,
+                    "",
+                    crate::engine::turn_end::TurnFinish::Finished(
+                        crate::engine::thread_events::ChildCompletionStatus::Success,
+                    ),
+                )
+                .await;
+                self.refresh_apps_modified_this_turn(thread_id, &modified_app_uis)
+                    .await;
+                self.event_bus
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::Thread {
+                            thread_id,
+                            event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+                                text: String::new(),
+                                images: images.clone(),
+                                model: effective_model.clone(),
+                                reasoning_effort: effective_effort.clone(),
+                            },
+                            meta: meta.authored_by(
+                                crate::engine::thread_events::AgentParticipant::LucidosAgent,
+                            ),
+                        },
+                        "[AgenticLoop] ResponseGenerated (quiet answer)",
+                    )
+                    .await;
+                *terminator_settled = true;
+                return Ok(terminal_result(
+                    String::new(),
+                    images,
+                    request_id,
+                    thread_id,
+                    *proposed_change,
+                ));
             }
 
             // A reply whose only calls were its turn-end decisions has already
@@ -2786,16 +2837,20 @@ impl LucidosEngine {
             );
             let result_blocks = build_tool_result_blocks(&tool_outputs, &instruction);
 
-            // Pin before the move: an image the model explicitly asked to see
+            // Pin before the move. An image the model explicitly asked to see
             // must stay in vision for the rest of the turn, not just until its
-            // next tool call.
+            // next tool call. So must one the user attached to an answer.
             let pin_images = holds_explicitly_requested_image(&result_blocks);
+            let pin_answer_images = holds_answer_images(&tool_outputs);
             messages.push(Message {
                 role: "user".to_string(),
                 content: MessageContent::Blocks(result_blocks),
             });
             if pin_images {
                 push_explicit_image_pin(&mut explicit_image_idxs, messages.len() - 1);
+            }
+            if pin_answer_images {
+                user_image_idxs.push(messages.len() - 1);
             }
 
             // Check for injected prompts (mid-flight user corrections or system events).

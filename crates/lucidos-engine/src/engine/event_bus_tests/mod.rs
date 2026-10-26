@@ -53,6 +53,18 @@ async fn spawn_parent_child_with_mode(
     .await
     .unwrap();
 
+    spawn_child_of(bus, parent_id, child_id, child_channel, wake_mode).await;
+    (parent_id, child_id)
+}
+
+/// Start `child_id` as a child of the existing thread `parent_id`.
+async fn spawn_child_of(
+    bus: &EventBus,
+    parent_id: Uuid,
+    child_id: Uuid,
+    child_channel: EventChannel,
+    wake_mode: Option<WakeMode>,
+) {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
@@ -77,8 +89,6 @@ async fn spawn_parent_child_with_mode(
     })
     .await
     .unwrap();
-
-    (parent_id, child_id)
 }
 
 async fn emit_cc_session_started(bus: &EventBus, child_id: Uuid) {
@@ -95,6 +105,7 @@ async fn emit_cc_session_started(bus: &EventBus, child_id: Uuid) {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })
@@ -512,6 +523,7 @@ mod atomic_emit;
 mod blocking_attention_counts;
 mod branch_work_and_actor;
 mod change_apply_archive;
+mod child_report_taken;
 mod command_permission;
 mod committed_horizon;
 mod crash_cut_child;

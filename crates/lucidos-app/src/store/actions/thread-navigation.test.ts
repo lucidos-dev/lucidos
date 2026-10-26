@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { pushThreadEntry, removeEntriesById, MAX_THREAD_NAV_STACK, type ThreadNavEntry } from './thread-navigation';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { collapseDashboardEntries, pushThreadEntry, removeEntriesById, MAX_THREAD_NAV_STACK, type ThreadNavEntry } from './thread-navigation';
 
 const T = (id: string): ThreadNavEntry => ({ type: 'thread', id });
 
@@ -114,5 +114,162 @@ describe('thread back/forward simulation', () => {
     r = pushThreadEntry(stack, cursor, T('thread-3'));
     stack = r!.stack; cursor = r!.cursor;
     expect(stack).toEqual([T('seed'), T('thread-1'), T('thread-3')]);
+  });
+});
+
+describe('the dashboard panel in the thread history', () => {
+  const D = (id: string): ThreadNavEntry => ({ type: 'dashboard', id });
+  const KEY = 'lucidos-thread-nav-history';
+  let nav: typeof import('./thread-navigation');
+  let dashboards: typeof import('../dashboards');
+  let store: typeof import('../store');
+  let viewport: typeof import('../../utils/viewport');
+
+  beforeEach(async () => {
+    vi.resetModules();
+    localStorage.clear();
+    // The real focusThread loads events over the network. This stand-in keeps
+    // the three effects the history depends on: focus moves, the panel closes,
+    // a thread row is pushed.
+    vi.doMock('./threads', async () => {
+      const s = await import('../store');
+      const d = await import('../dashboards');
+      return {
+        focusThread: (id: string) => {
+          s.focusedThreadId.value = id;
+          d.closeDashboardPanel();
+          nav.pushThreadNavState({ type: 'thread', id });
+        },
+      };
+    });
+    nav = await import('./thread-navigation');
+    dashboards = await import('../dashboards');
+    store = await import('../store');
+    viewport = await import('../../utils/viewport');
+    viewport.viewportIsMobile.value = true;
+    store.focusedThreadId.value = 'a';
+    nav._resetThreadNavForTesting();
+    dashboards.closeDashboardPanel();
+  });
+
+  afterEach(() => {
+    vi.doUnmock('./threads');
+    store.focusedThreadId.value = null;
+  });
+
+  it('opening pushes a dashboard row for the thread under it', () => {
+    nav.setDashboardPanelOpen(true);
+    expect(dashboards.dashboardPanelOpen.value).toBe(true);
+    expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('a'), D('a')], cursor: 1 });
+  });
+
+  it('Back closes the panel on the thread row, and Forward reopens it', () => {
+    nav.setDashboardPanelOpen(true);
+    nav.threadNavBack();
+    expect(dashboards.dashboardPanelOpen.value).toBe(false);
+    expect(nav._threadNavStateForTesting().cursor).toBe(0);
+    nav.threadNavForward();
+    expect(dashboards.dashboardPanelOpen.value).toBe(true);
+    expect(store.focusedThreadId.value).toBe('a');
+    expect(nav._threadNavStateForTesting().cursor).toBe(1);
+  });
+
+  it('closing with the button steps back onto the thread row, so Forward reopens the panel', () => {
+    nav.setDashboardPanelOpen(true);
+    nav.setDashboardPanelOpen(false);
+    expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('a'), D('a')], cursor: 0 });
+    nav.threadNavForward();
+    expect(dashboards.dashboardPanelOpen.value).toBe(true);
+  });
+
+  /** Invariant: toggling the panel never grows the history past one thread row and one dashboard row. */
+  it('toggling the panel repeatedly leaves one thread row and one dashboard row', () => {
+    for (let i = 0; i < 5; i++) {
+      nav.setDashboardPanelOpen(true);
+      nav.setDashboardPanelOpen(false);
+    }
+    expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('a'), D('a')], cursor: 0 });
+    nav.setDashboardPanelOpen(true);
+    expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('a'), D('a')], cursor: 1 });
+  });
+
+  it('closing a dashboard row with no thread row before it pushes a thread row', () => {
+    localStorage.setItem(KEY, JSON.stringify({ stack: [T('b'), D('a')], cursor: 1 }));
+    dashboards.openDashboardPanel();
+    nav.setDashboardPanelOpen(false);
+    expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('b'), D('a'), T('a')], cursor: 2 });
+  });
+
+  it('a toggle that changes nothing pushes nothing', () => {
+    nav.setDashboardPanelOpen(true);
+    nav.setDashboardPanelOpen(true);
+    expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('a'), D('a')], cursor: 1 });
+    nav.setDashboardPanelOpen(false);
+    nav.setDashboardPanelOpen(false);
+    expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('a'), D('a')], cursor: 0 });
+  });
+
+  it('opens with no thread open without pushing a row', () => {
+    store.focusedThreadId.value = null;
+    nav._resetThreadNavForTesting();
+    nav.setDashboardPanelOpen(true);
+    expect(dashboards.dashboardPanelOpen.value).toBe(true);
+    expect(nav._threadNavStateForTesting().stack).toEqual([]);
+  });
+
+  /** Invariant: off the phone layout no dashboard row survives, so every Back step changes the screen. */
+  it('folding the live history rewrites it and saves it', () => {
+    nav.setDashboardPanelOpen(true);
+    nav.setDashboardPanelOpen(false);
+    nav.collapseDashboardNavEntries();
+    expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('a')], cursor: 0 });
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual({ stack: [T('a')], cursor: 0 });
+  });
+
+  /** Invariant: an iOS cold launch can read the layout wrong at first, so loading never folds. */
+  it('a reload off the phone layout keeps the saved dashboard rows', () => {
+    viewport.viewportIsMobile.value = false;
+    localStorage.setItem(KEY, JSON.stringify({ stack: [T('a'), D('a')], cursor: 1 }));
+    expect(nav.threadNavHistory.value).toEqual({ stack: [T('a'), D('a')], cursor: 1 });
+  });
+
+  it('a reload with the cursor on a dashboard row reopens the panel', () => {
+    localStorage.setItem(KEY, JSON.stringify({ stack: [T('a'), D('a')], cursor: 1 }));
+    nav.reopenDashboardPanelFromHistory();
+    expect(dashboards.dashboardPanelOpen.value).toBe(true);
+  });
+
+  it('a reload with the cursor on a thread row leaves the panel closed', () => {
+    localStorage.setItem(KEY, JSON.stringify({ stack: [T('a'), D('a'), T('a')], cursor: 2 }));
+    nav.reopenDashboardPanelFromHistory();
+    expect(dashboards.dashboardPanelOpen.value).toBe(false);
+  });
+
+  it('a dashboard row for a thread that is not open does not reopen the panel', () => {
+    localStorage.setItem(KEY, JSON.stringify({ stack: [T('b'), D('b')], cursor: 1 }));
+    nav.reopenDashboardPanelFromHistory();
+    expect(dashboards.dashboardPanelOpen.value).toBe(false);
+  });
+
+  it('a saved history of thread rows only still loads', () => {
+    localStorage.setItem(KEY, JSON.stringify({ stack: [T('x'), T('y')], cursor: 1 }));
+    expect(nav.canGoBackThread.value).toBe(true);
+    expect(nav._threadNavStateForTesting().stack).toEqual([T('x'), T('y')]);
+  });
+
+  it('folds each dashboard row into its thread and keeps the cursor on that thread', () => {
+    expect(collapseDashboardEntries([T('a'), D('a'), T('a'), T('b'), D('b')], 2))
+      .toEqual({ stack: [T('a'), T('b')], cursor: 0 });
+    expect(collapseDashboardEntries([T('a'), D('a'), T('b'), D('b')], 3))
+      .toEqual({ stack: [T('a'), T('b')], cursor: 1 });
+  });
+
+  it('folds nothing when no dashboard row is there', () => {
+    expect(collapseDashboardEntries([T('a'), T('b')], 1)).toBeNull();
+  });
+
+  it('discarding a thread drops its dashboard rows too', () => {
+    const r = removeEntriesById([T('a'), D('a'), T('b')], 2, 'a');
+    expect(r!.stack).toEqual([T('b')]);
   });
 });

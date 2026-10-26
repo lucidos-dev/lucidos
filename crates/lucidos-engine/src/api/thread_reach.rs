@@ -13,8 +13,9 @@
 //! module refuses when none of the three covers the act.
 //!
 //! **Creating a thread is not on the list.** Any caller may create a
-//! top-thread, or move its own child to top level (ADR 0475). Those two verbs
-//! stay in the enum only because stored approval cards name them.
+//! top-thread, or move its own child to top level (ADR 0475). A handoff
+//! starts a session in its own thread. Those three verbs stay in the enum only
+//! because stored approval cards name them.
 //!
 //! The gate is per VERB, never per route. Three verbs arrive by more than one
 //! path, and gating the first path of each is how the ungated set grew.
@@ -85,8 +86,9 @@ pub enum ThreadReachVerb {
     /// Retired with [`Self::CreateTopThread`]: an agent moves its own child to
     /// top level with no authority beyond the detach ladder (ADR 0475).
     DetachChild,
-    /// Starting a *successor thread* under a thread's parent, in the place of
-    /// one of its children. It takes that parent as its target.
+    /// Retired: a handoff starts a *successor session* in its own thread, an act
+    /// that needs no authority. Kept so approval cards asked before then still
+    /// deserialize.
     SpawnSuccessor,
 }
 
@@ -113,7 +115,7 @@ impl ThreadReachVerb {
             Self::Continue => "restart the turn on",
             Self::CreateTopThread => "create a top-thread beside",
             Self::DetachChild => "detach",
-            Self::SpawnSuccessor => "start a successor thread under",
+            Self::SpawnSuccessor => "start a legacy successor thread under",
         }
     }
 
@@ -138,7 +140,7 @@ impl ThreadReachVerb {
             Self::Continue => "restarting a turn",
             Self::CreateTopThread => "creating a top-thread",
             Self::DetachChild => "moving a child thread to top level",
-            Self::SpawnSuccessor => "starting a successor thread",
+            Self::SpawnSuccessor => "starting a legacy successor thread",
         }
     }
 
@@ -151,10 +153,13 @@ impl ThreadReachVerb {
         !matches!(self, Self::AnswerQuestion | Self::ResolvePermission)
     }
 
-    /// Is this still a clause-4 verb? The two retired ones are not, so the
-    /// gate allows them and no card proposes them (ADR 0475).
+    /// Is this still a clause-4 verb? The retired ones are not, so the gate
+    /// allows them and no card proposes them.
     pub(crate) fn needs_authority(self) -> bool {
-        !matches!(self, Self::CreateTopThread | Self::DetachChild)
+        !matches!(
+            self,
+            Self::CreateTopThread | Self::DetachChild | Self::SpawnSuccessor
+        )
     }
 }
 
@@ -486,24 +491,13 @@ pub(in crate::api) async fn refuse_without_authority(
     target: Option<Uuid>,
     verb: ThreadReachVerb,
 ) -> Result<(), ThreadReachError> {
-    pass_authority(bus, headers, target, verb).await.map(drop)
-}
-
-/// [`refuse_without_authority`], naming the authority that let the act
-/// through. A successor records it as its *handoff consent* (ADR 0507).
-pub(in crate::api) async fn pass_authority(
-    bus: &EventBus,
-    headers: &HeaderMap,
-    target: Option<Uuid>,
-    verb: ThreadReachVerb,
-) -> Result<PassedAuthority, ThreadReachError> {
     let SubprocessOrigin::Subprocess {
         source_thread_id,
         emitting_trigger_id,
         ..
     } = crate::api::actor::subprocess_origin(headers)
     else {
-        return Ok(PassedAuthority::Untokened);
+        return Ok(());
     };
     weigh_authority(
         bus,
@@ -531,32 +525,19 @@ pub(crate) async fn refuse_thread_without_authority(
     target: Option<Uuid>,
     verb: ThreadReachVerb,
 ) -> Result<(), ThreadReachError> {
-    weigh_authority(bus, Some(caller_thread_id), None, target, verb)
-        .await
-        .map(drop)
+    weigh_authority(bus, Some(caller_thread_id), None, target, verb).await
 }
 
 /// Which authority of its own a caller holds for an act, before any *owner
 /// approval* is weighed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeldAuthority {
-    /// The verb is retired and needs no authority (ADR 0475).
+    /// The verb is retired and needs no authority.
     NoneNeeded,
     /// The target is the caller or one of its descendants (clause 3).
     OwnSubtree,
     /// The caller carries the owner's standing instruction (clause 5).
     StandingInstruction,
-}
-
-/// Which authority let an act through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PassedAuthority {
-    /// The caller presented no thread-bound token: a device, or the machine.
-    Untokened,
-    /// Authority of the caller's own.
-    Held(HeldAuthority),
-    /// The caller spent an owner approval for this one act (ADR 0387).
-    OwnerApproval,
 }
 
 /// Clauses 3 and 5, over the two authenticated facts about the caller.
@@ -594,7 +575,7 @@ async fn weigh_authority(
     emitting_trigger_id: Option<&str>,
     target: Option<Uuid>,
     verb: ThreadReachVerb,
-) -> Result<PassedAuthority, ThreadReachError> {
+) -> Result<(), ThreadReachError> {
     let held = authority_held(
         bus.pool(),
         source_thread_id,
@@ -612,7 +593,7 @@ async fn weigh_authority(
                 target
             );
         }
-        return Ok(PassedAuthority::Held(held));
+        return Ok(());
     }
 
     // An approval names one thread's act, so a threadless caller holds none.
@@ -626,7 +607,7 @@ async fn weigh_authority(
                 verb.word(),
                 target
             );
-            return Ok(PassedAuthority::OwnerApproval);
+            return Ok(());
         }
     }
 

@@ -289,3 +289,22 @@ async fn thread_save_and_unsave() {
         "Unsaving an already-unsaved thread must be an idempotent 200, not 409"
     );
 }
+
+/// Only a thread's own agent takes its child reports. A device caller, which
+/// holds no thread-bound origin token, is refused before anything is taken.
+#[tokio::test]
+async fn a_device_cannot_take_a_threads_child_reports() {
+    let client = user_client().await;
+    let url = format!(
+        "{}/api/v1/threads/{}/child-reports/take",
+        base_url(),
+        uuid::Uuid::new_v4()
+    );
+    let resp = client.post(&url).send().await.expect("take request failed");
+    assert_eq!(resp.status(), 403);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("lucidos"),
+        "the refusal says what to use: {body}"
+    );
+}

@@ -103,8 +103,8 @@ impl LucidosEngine {
     /// boot, after `SpawnDispatcher::spawn(..)` returns the receiver end.
     ///
     /// A continue request re-enters `run_direct_agent` with `--resume` against
-    /// the existing session id and the continuation text from
-    /// `continue_input_for_reason` as its input.
+    /// the existing session id. Its input comes from `resume_input`, else the
+    /// reason's continuation text (`continue_input_for_reason`).
     pub fn start_spawn_request_consumer(
         self: &Arc<Self>,
         mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::engine::spawn_dispatcher::SpawnRequest>,
@@ -319,7 +319,8 @@ impl LucidosEngine {
                             // empty-stdin zombie write-up). An
                             // `answered_after_idle` continuation carries the
                             // answer it was spawned for; every other reason
-                            // gets the bare continue message.
+                            // gets the bare continue message, unless
+                            // `resume_input` below replaces it.
                             //
                             // Direct run_direct_agent (bypasses
                             // process_message_with_steps): engine-driven
@@ -331,22 +332,20 @@ impl LucidosEngine {
                             // Code session resurrection, not a new user
                             // message.
                             //
+                            // A thread whose agent never engaged gets the prompts
+                            // it was never given, for every reason.
+                            //
                             // Try again after a start failure delivers the
                             // message the agent never read, with its images.
+                            //
                             // The first prompt carries the inputs' ids, so its
                             // read settles them.
-                            let undelivered = match continue_reason.as_deref() {
-                                Some(
-                                    crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON,
-                                ) => {
-                                    crate::engine::agent_recovery::undelivered_input(
-                                        engine.pool(),
-                                        thread_id,
-                                    )
-                                    .await
-                                }
-                                _ => None,
-                            };
+                            let undelivered = crate::engine::agent_recovery::resume_input(
+                                engine.pool(),
+                                thread_id,
+                                continue_reason.as_deref(),
+                            )
+                            .await;
                             let carried_event_ids = undelivered
                                 .as_ref()
                                 .map_or(&[][..], |u| u.event_ids.as_slice());
@@ -414,7 +413,7 @@ impl LucidosEngine {
                                 retried = true;
                                 let retry_text = match &undelivered {
                                     Some(u) => {
-                                        crate::engine::agent_session::prepend_reconstruction(
+                                        crate::engine::successor::resume_failed_input(
                                             engine.pool(),
                                             thread_id,
                                             &u.text,
@@ -459,8 +458,6 @@ impl LucidosEngine {
                                 };
                             }
 
-                            // Let go before the settle, which claims the thread itself.
-                            drop(claim);
                             let final_err = err_text(&result);
                             let settle = match crate::engine::agent_recovery::continue_recovery(
                                 final_err.as_deref(),
@@ -469,6 +466,27 @@ impl LucidosEngine {
                                 ContinueRecovery::Settle => true,
                                 ContinueRecovery::Nothing | ContinueRecovery::RetryFresh => false,
                             };
+                            // A turn this continuation owned says why it failed:
+                            // a spawn refusal, or the CLI's own exit. Land that as
+                            // the turn's failure while the claim still holds, so no
+                            // new turn can start under it. A failed claim owned no
+                            // turn, and another session may hold the thread.
+                            if let (true, Err(error), Ok(_)) = (settle, &result, &claim) {
+                                crate::engine::agentic_loop::ensure_agent_failure_terminator_emitted(
+                                    &engine.event_bus,
+                                    engine.pool(),
+                                    thread_id,
+                                    event_id,
+                                    Some(crate::engine::thread_events::EventChannel::ClaudeCode),
+                                    &error.to_string(),
+                                    crate::engine::agent_session::start_failure::agent_exit_of(
+                                        error.as_ref(),
+                                    ),
+                                )
+                                .await;
+                            }
+                            // Let go before the settle, which claims the thread itself.
+                            drop(claim);
                             if settle {
                                 let e = final_err.as_deref().unwrap_or_default();
                                 crate::log!(
@@ -477,28 +495,6 @@ impl LucidosEngine {
                                     event_id,
                                     e
                                 );
-                                // A coding agent that exited before its session
-                                // began says why. Land that as the turn's failure,
-                                // so the settle below finds a terminal and the
-                                // card shows the CLI's words.
-                                if let Err(error) = &result {
-                                    if let Some(agent_exit) =
-                                        crate::engine::agent_session::start_failure::agent_exit_of(
-                                            error.as_ref(),
-                                        )
-                                    {
-                                        crate::engine::agentic_loop::ensure_agent_failure_terminator_emitted(
-                                            &engine.event_bus,
-                                            engine.pool(),
-                                            thread_id,
-                                            event_id,
-                                            Some(crate::engine::thread_events::EventChannel::ClaudeCode),
-                                            &error.to_string(),
-                                            Some(agent_exit),
-                                        )
-                                        .await;
-                                    }
-                                }
                                 // Fail-loud backstop for a re-attached duty:
                                 // the resumed session died before its
                                 // completion could settle the merge (spawn
@@ -1584,6 +1580,8 @@ impl LucidosEngine {
             live_waits: Arc::new(crate::engine::event_wait::LiveWaits::new()),
             keep_alive_beats: Default::default(),
             keep_alive_durations: Default::default(),
+            remembered_requests: Default::default(),
+            keep_alive_status_writes: Default::default(),
             wait_reentry_tx: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 crate::engine::WAIT_REENTRY_RX.with(|cell| cell.borrow_mut().replace(rx));

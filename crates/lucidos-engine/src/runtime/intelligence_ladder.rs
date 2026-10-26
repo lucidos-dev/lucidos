@@ -518,7 +518,7 @@ pub(crate) fn is_estimated(surface: LadderSurface, pair: &IntelligenceRung) -> b
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Band {
     pub multiple: f64,
-    /// How a person reads it: `2.5×`, `0.6×`, `0.02×`, or `included`.
+    /// How a person reads it: `2.5×`, `1.0×`, `0.02×`, or `included`.
     pub label: String,
 }
 
@@ -531,7 +531,8 @@ pub(crate) const TIME_STEPS_PER_DOUBLING: i32 = 3;
 impl Band {
     /// The one label rule. From half the reference up a band reads to
     /// `decimals`. Below that it takes two decimals, or more where two would
-    /// round it to zero.
+    /// round it to zero. Trailing zeros go, but one decimal always stays, so
+    /// the reference reads `1.0×` and never a bare `1×`.
     fn from_multiple(multiple: f64, decimals: usize) -> Self {
         let decimals = if multiple >= 0.5 {
             decimals
@@ -543,7 +544,12 @@ impl Band {
             first_digit.max(2)
         };
         let fixed = format!("{multiple:.decimals$}");
-        let label = fixed.trim_end_matches('0').trim_end_matches('.');
+        let trimmed = fixed.trim_end_matches('0');
+        let label = if trimmed.ends_with('.') {
+            format!("{trimmed}0")
+        } else {
+            trimmed.to_string()
+        };
         Self {
             multiple,
             label: format!("{label}×"),
@@ -582,7 +588,7 @@ impl Band {
 }
 
 /// What a backend runs a spawn on when nobody picked: the `model_*` and
-/// `reasoning_*` preference pair. Codex's ships unset.
+/// `reasoning_*` preference pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultImplementer {
     pub model: String,
@@ -609,8 +615,8 @@ pub async fn default_implementer(pool: &PgPool, agent: CodingAgent) -> Option<De
             effort: Some(prefs::REASONING_CLAUDE_CODE.read(pool).await),
         },
         CodingAgent::Codex => DefaultImplementer {
-            model: prefs::MODEL_CODEX.read(pool).await?,
-            effort: prefs::REASONING_CODEX.read(pool).await,
+            model: prefs::MODEL_CODEX.read(pool).await,
+            effort: Some(prefs::REASONING_CODEX.read(pool).await),
         },
     };
     offered_default(agent, stored)
@@ -633,18 +639,36 @@ fn offered_default(agent: CodingAgent, stored: DefaultImplementer) -> Option<Def
     })
 }
 
+/// The effort a pick naming only `model` runs at: the model registry's answer
+/// for Claude Code, the menu file's for Codex.
+pub(crate) fn model_default_effort(
+    agent: CodingAgent,
+    registry: &ModelRegistry,
+    model: &str,
+) -> Option<&'static str> {
+    match agent {
+        CodingAgent::ClaudeCode => model_registry::default_effort(
+            registry,
+            &super::strip_version_pin(&model_run_by(agent, model)),
+        ),
+        CodingAgent::Codex => super::codex::codex_model_options()
+            .iter()
+            .find(|row| row.value == model)
+            .and_then(|row| row.default_effort.as_deref()),
+    }
+}
+
 /// Fill what a pick left out, after the thread's own memory had its say.
 ///
 /// No model takes the default implementer whole, or its model beside a
-/// picked effort. A model with no effort runs at the *default effort* of the
-/// model it resolves to, Claude Code only: Codex keeps its own config's answer
-/// (ADR 0500).
+/// picked effort. A model with no effort runs at its *default effort*
+/// (`model_default_effort`), unless the backend refuses that tier.
 pub fn fill_pick(
     agent: CodingAgent,
     model: Option<String>,
     effort: Option<String>,
     default: Option<&DefaultImplementer>,
-    registry_effort: impl Fn(&str) -> Option<&'static str>,
+    default_effort: impl Fn(&str) -> Option<&'static str>,
 ) -> (Option<String>, Option<String>) {
     match (model, effort) {
         (None, None) => (
@@ -652,8 +676,8 @@ pub fn fill_pick(
             default.and_then(|d| d.effort.clone()),
         ),
         (None, Some(effort)) => (default.map(|d| d.model.clone()), Some(effort)),
-        (Some(model), None) if agent == CodingAgent::ClaudeCode => {
-            let effort = registry_effort(&super::strip_version_pin(&model_run_by(agent, &model)))
+        (Some(model), None) => {
+            let effort = default_effort(&model)
                 .filter(|e| {
                     super::validate_coding_agent_effort(agent, Some(&model), Some(e)).is_ok()
                 })
@@ -800,6 +824,20 @@ impl IntelligenceLadder {
                 pick,
             )
         })
+    }
+
+    /// Where `pick` sits among the rungs that are on, as [`Self::pairs`]
+    /// lists them. `None` when `pick` is not on.
+    pub fn on_position_of(&self, pick: &IntelligenceRung) -> Option<usize> {
+        let at = self
+            .position_of(pick)
+            .filter(|&at| self.intelligence_rungs[at].on)?;
+        Some(
+            self.intelligence_rungs[..at]
+                .iter()
+                .filter(|r| r.on)
+                .count(),
+        )
     }
 
     /// Whether a rung that is on runs `model`, seeing through a `[1m]` twin
@@ -1148,7 +1186,7 @@ pub async fn check_agent_pick(
                 model.map(str::to_string),
                 effort.map(str::to_string),
                 default.as_ref(),
-                |m| model_registry::default_effort(&routes.registry, m),
+                |m| model_default_effort(agent, &routes.registry, m),
             )
         }
         None => fill_chat_pick(pool, &routes.registry, model, effort).await,
@@ -1166,4 +1204,4 @@ pub async fn check_agent_pick(
 
 #[cfg(test)]
 #[path = "intelligence_ladder_tests.rs"]
-mod tests;
+pub(crate) mod tests;

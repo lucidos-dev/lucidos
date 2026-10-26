@@ -3,6 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-20
 - **Amends**: [0505](0505-named-handoff-checkpoints.md)
+- **Amended by**: [0560: A handoff starts a successor session in the same thread](0560-successor-session-in-the-same-thread.md)
 
 ## Context
 

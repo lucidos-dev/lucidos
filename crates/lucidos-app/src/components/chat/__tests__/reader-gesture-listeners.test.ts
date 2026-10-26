@@ -6,15 +6,17 @@ if (typeof (globalThis as any).HTMLElement === 'undefined') {
 
 import {
   followingLiveEdge,
-  isScrollbarHeld,
+  isScrollHeld,
   makeScrollObservers,
-  onScrollbarReleased,
+  onScrollHoldReleased,
   readerGestureForTest,
-  scrollbarReleased,
+  scrollHoldReleased,
   setActiveScrollElement,
   setFollowLiveEdge,
   setTranscriptLive,
   stopFollowingBottom,
+  TOUCH_COAST_IDLE_MS,
+  TOUCH_COAST_MAX_MS,
 } from '../scrollState';
 
 /**
@@ -140,7 +142,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     const { detachGestures } = makeScrollObservers(el);
 
     expect(Object.keys(el.listeners).sort()).toEqual(
-      ['focusin', 'keydown', 'pointerdown', 'pointermove', 'touchmove', 'wheel'],
+      ['focusin', 'keydown', 'pointerdown', 'pointermove', 'scroll', 'touchmove', 'wheel'],
     );
     // The release goes on `window`: a drag that ends with the pointer outside
     // the transcript would otherwise leave the press recorded forever.
@@ -383,7 +385,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     let realDocument: any;
     beforeEach(() => {
       released = [];
-      unsubscribe = onScrollbarReleased((el) => released.push(el));
+      unsubscribe = onScrollHoldReleased((el) => released.push(el));
       realDocument = (globalThis as any).document;
     });
     afterEach(() => {
@@ -394,10 +396,10 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     it('is held from a gutter press until the release, which is announced once', () => {
       const { el } = riding();
       gutterPress(el);
-      expect(isScrollbarHeld(el)).toBe(true);
+      expect(isScrollHeld(el)).toBe(true);
 
       fireWindow('pointerup');
-      expect(isScrollbarHeld(el)).toBe(false);
+      expect(isScrollHeld(el)).toBe(false);
       expect(released).toEqual([el]);
 
       fireWindow('pointerup');
@@ -407,7 +409,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     it('is held by a press on the container inside its client box, where an overlay thumb sits', () => {
       const { el } = ridingAndAnchored();
       el.fire('pointerdown', { offsetX: el.clientWidth - 4, offsetY: 200 });
-      expect(isScrollbarHeld(el)).toBe(true);
+      expect(isScrollHeld(el)).toBe(true);
     });
 
     it('leaves the reader where an overlay thumb drag put them', () => {
@@ -445,7 +447,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     it('is never held by a press on content, so no release is announced', () => {
       const { el } = riding();
       el.fire('pointerdown', { target: { nodeName: 'BUTTON' }, offsetX: 40, offsetY: 12 });
-      expect(isScrollbarHeld(el)).toBe(false);
+      expect(isScrollHeld(el)).toBe(false);
       fireWindow('pointerup');
       expect(released).toEqual([]);
     });
@@ -453,13 +455,13 @@ describe('what the reader-gesture listeners count as a scroll', () => {
     it('is never held by a right-click, whose menu can swallow the release', () => {
       const { el } = riding();
       el.fire('pointerdown', { button: 2, offsetX: el.clientWidth + 6, offsetY: 200 });
-      expect(isScrollbarHeld(el)).toBe(false);
+      expect(isScrollHeld(el)).toBe(false);
     });
 
     it('still counts a middle-click in the gutter as a scroll, which pages the track', () => {
       const { el, onScroll } = riding();
       el.fire('pointerdown', { button: 1, offsetX: el.clientWidth + 6, offsetY: 200 });
-      expect(isScrollbarHeld(el)).toBe(false);
+      expect(isScrollHeld(el)).toBe(false);
       platformScrollsTo(el, 900, onScroll);
       expect(followingLiveEdge.value).toBe(false);
     });
@@ -468,7 +470,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
       const { el } = riding();
       gutterPress(el);
       el.fire('pointermove', { buttons: 0 });
-      expect(isScrollbarHeld(el)).toBe(false);
+      expect(isScrollHeld(el)).toBe(false);
       expect(released).toEqual([el]);
     });
 
@@ -478,7 +480,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
       (globalThis as any).document = { hasFocus: () => false };
       fireWindow('blur');
       vi.advanceTimersByTime(0);
-      expect(isScrollbarHeld(el)).toBe(false);
+      expect(isScrollHeld(el)).toBe(false);
       expect(released).toEqual([el]);
     });
 
@@ -488,14 +490,14 @@ describe('what the reader-gesture listeners count as a scroll', () => {
       (globalThis as any).document = { hasFocus: () => true };
       fireWindow('blur');
       vi.advanceTimersByTime(0);
-      expect(isScrollbarHeld(el)).toBe(true);
+      expect(isScrollHeld(el)).toBe(true);
     });
 
     it('lets go on teardown, so nothing waiting on the release waits for good', () => {
       const { el, detachGestures } = riding();
       gutterPress(el);
       detachGestures();
-      expect(isScrollbarHeld(el)).toBe(false);
+      expect(isScrollHeld(el)).toBe(false);
       expect(released).toEqual([el]);
     });
 
@@ -507,7 +509,7 @@ describe('what the reader-gesture listeners count as a scroll', () => {
       expect(released).toEqual([]);
     });
 
-    describe('scrollbarReleased', () => {
+    describe('scrollHoldReleased', () => {
       let frames: Array<() => void>;
       let realRaf: any;
       beforeEach(() => {
@@ -526,13 +528,13 @@ describe('what the reader-gesture listeners count as a scroll', () => {
 
       it('resolves at once when nothing is held', async () => {
         const { el } = riding();
-        expect(await settled(scrollbarReleased(el))).toBe(true);
+        expect(await settled(scrollHoldReleased(el))).toBe(true);
       });
 
       it('resolves a frame after the release, so the drag has ended first', async () => {
         const { el } = riding();
         gutterPress(el);
-        const landing = scrollbarReleased(el);
+        const landing = scrollHoldReleased(el);
         expect(await settled(landing)).toBe(false);
 
         fireWindow('pointerup');
@@ -541,6 +543,138 @@ describe('what the reader-gesture listeners count as a scroll', () => {
         for (const frame of frames.splice(0)) frame();
         expect(await settled(landing)).toBe(true);
       });
+    });
+  });
+
+  describe('a touch scroll, held until its momentum stops', () => {
+    // iOS kills a fling on any scrollTop write, and a grow's anchor write is
+    // built from a reading the fling has already left. Both read as the
+    // transcript flickering and landing somewhere else. So the touch holds the
+    // window exactly as a held scrollbar does, until the coast is over.
+    let released: unknown[];
+    let unsubscribe: () => void;
+    beforeEach(() => {
+      released = [];
+      unsubscribe = onScrollHoldReleased((el) => released.push(el));
+    });
+    afterEach(() => unsubscribe());
+
+    const lift = (remaining = 0) => fireWindow('touchend', { touches: new Array(remaining) });
+
+    it('is never held by a tap, which moves nothing', () => {
+      const { el } = riding();
+      el.fire('touchstart');
+      lift();
+      expect(isScrollHeld(el)).toBe(false);
+      expect(released).toEqual([]);
+    });
+
+    it('holds from the first move while the finger stays down', () => {
+      const { el } = riding();
+      el.fire('touchmove');
+      expect(isScrollHeld(el)).toBe(true);
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS * 10);
+      expect(isScrollHeld(el)).toBe(true);
+    });
+
+    it('keeps holding while the momentum scrolls, and lets go once it is still', () => {
+      const { el } = riding();
+      el.fire('touchmove');
+      lift();
+      for (let i = 0; i < 20; i++) {
+        vi.advanceTimersByTime(16);
+        el.fire('scroll');
+      }
+      expect(isScrollHeld(el)).toBe(true);
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS);
+      expect(isScrollHeld(el)).toBe(false);
+      expect(released).toEqual([el]);
+    });
+
+    it('waits for the last finger to lift', () => {
+      const { el } = riding();
+      el.fire('touchmove');
+      lift(1);
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS * 2);
+      expect(isScrollHeld(el)).toBe(true);
+      lift();
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS);
+      expect(isScrollHeld(el)).toBe(false);
+    });
+
+    it('lets go at the cap, whatever keeps scrolling after the lift', () => {
+      const { el } = riding();
+      el.fire('touchmove');
+      lift();
+      for (let t = 0; t < TOUCH_COAST_MAX_MS; t += 50) {
+        el.fire('scroll');
+        vi.advanceTimersByTime(50);
+      }
+      expect(isScrollHeld(el)).toBe(false);
+      expect(released).toEqual([el]);
+    });
+
+    it('lets go at the cap when the lift never reaches the window', () => {
+      const { el } = riding();
+      el.fire('touchmove');
+      vi.advanceTimersByTime(TOUCH_COAST_MAX_MS);
+      expect(isScrollHeld(el)).toBe(false);
+      expect(released).toEqual([el]);
+    });
+
+    it('keeps holding a long drag, since every move re-arms the cap', () => {
+      const { el } = riding();
+      for (let t = 0; t < TOUCH_COAST_MAX_MS * 2; t += 50) {
+        el.fire('touchmove');
+        vi.advanceTimersByTime(50);
+      }
+      expect(isScrollHeld(el)).toBe(true);
+    });
+
+    it('drops the first cap when a tap lands mid-coast, so it cannot end a later drag', () => {
+      const { el } = riding();
+      el.fire('touchmove');
+      lift();
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS / 2);
+      lift();
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS);
+      expect(released).toEqual([el]);
+      vi.advanceTimersByTime(TOUCH_COAST_MAX_MS - TOUCH_COAST_IDLE_MS * 3);
+      el.fire('touchmove');
+      vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS * 4);
+      expect(isScrollHeld(el)).toBe(true);
+      expect(released).toEqual([el]);
+    });
+
+    it('holds the landing gate until the coast is over', async () => {
+      const frames: Array<() => void> = [];
+      const realRaf = (globalThis as any).requestAnimationFrame;
+      (globalThis as any).requestAnimationFrame = (fn: () => void) => { frames.push(fn); return frames.length; };
+      try {
+        const { el } = riding();
+        el.fire('touchmove');
+        let landed = false;
+        void scrollHoldReleased(el).then(() => { landed = true; });
+        lift();
+        el.fire('scroll');
+        await Promise.resolve();
+        expect(landed).toBe(false);
+        vi.advanceTimersByTime(TOUCH_COAST_IDLE_MS);
+        for (const frame of frames.splice(0)) frame();
+        await Promise.resolve();
+        expect(landed).toBe(true);
+      } finally {
+        (globalThis as any).requestAnimationFrame = realRaf;
+      }
+    });
+
+    it('announces once when a scrollbar and a touch hold end together on teardown', () => {
+      const { el, detachGestures } = riding();
+      el.fire('pointerdown', { offsetX: el.clientWidth + 6, offsetY: 200 });
+      el.fire('touchmove');
+      detachGestures();
+      expect(isScrollHeld(el)).toBe(false);
+      expect(released).toEqual([el]);
     });
   });
 });

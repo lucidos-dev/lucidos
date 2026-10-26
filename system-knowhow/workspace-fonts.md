@@ -6,8 +6,7 @@ description: Install, fix or remove the user's own fonts, or ship one in a plugi
 # Workspace fonts
 
 A *workspace font* is a font installed into the workspace, beside the fonts
-Lucidos bundles. The user installs one in Settings → Appearance → Workspace
-fonts, you write its files, or a plugin ships one. It then works like a catalog
+Lucidos bundles. The user installs one in Settings → Appearance & Behavior → Typography → Workspace fonts, you write its files, or a plugin ships one. It then works like a catalog
 font: the user picks it under Font, and a theme can name it.
 
 The engine serves it from the workspace, never from the internet: `font.json`
@@ -89,8 +88,8 @@ with the reason, such as a missing face file. Fix the file, or remove the font.
 
 ## Use it
 
-- **As the UI font:** `set_preference("font-family", "ws-brand-sans")` for the
-  calling device, or the user picks it under Settings → Font.
+- **As the UI font:** `preferences(action="set", key="font-family", value="ws-brand-sans")` for the
+  calling device, or the user picks it under Settings → Appearance & Behavior → Typography → Font.
 - **From a theme:** name it in `fonts.ui`, or in `fonts.mono` for a `mono` font.
   The theme write is refused unless the font is installed and fits the slot. See
   `system-knowhow/themes.md` § Fonts. Approval cards still show a command in a
@@ -101,7 +100,7 @@ named nothing.
 
 ## Remove one
 
-The user removes one in Settings → Appearance → Workspace fonts, or you delete
+The user removes one in Settings → Appearance & Behavior → Typography → Workspace fonts, or you delete
 the directory. Open clients see the change the next time they read the font
 list.
 

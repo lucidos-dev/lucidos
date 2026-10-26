@@ -22,13 +22,10 @@ describe('describeExecutor', () => {
     expect((icon as VNode).type).toBe(CodexIcon);
   });
 
-  it('uses the Codex app mark instead of a red code glyph', () => {
+  it('paints the OpenAI mark in the Codex brand token', () => {
     const icon = CodexIcon() as VNode;
     const props = icon.props as Record<string, unknown>;
-    expect(props.stroke).toBe('var(--codex-mark, var(--accent-light))');
-    expect(props['stroke-width']).toBe('2.25');
-    const group = icon.props.children as VNode;
-    expect((group.props as Record<string, unknown>).transform).toBe('translate(-1.2 -1.2) scale(1.1)');
+    expect(props.fill).toBe('var(--codex-mark, var(--text-primary))');
   });
 
   it('shows Lucidos Agent label + mark glyph for non-CC threads (same entity as the parent_thread initiator label)', () => {

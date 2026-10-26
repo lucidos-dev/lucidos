@@ -86,7 +86,7 @@ describe('the card carries no hint of its own', () => {
   // above) intact while the escape goes unnamed on screen. Source-scan for the
   // same reason as prompt-answer-no-images.test.ts: mounting PromptInput drags
   // in every chat signal and store.
-  it('wires that tooltip onto both Cancel controls in PromptInput', () => {
+  it('wires that tooltip onto the lone Cancel in PromptInput', () => {
     const promptSource = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../PromptInput.tsx'),
       'utf8',
@@ -95,8 +95,6 @@ describe('the card carries no hint of its own', () => {
     expect(promptSource).toMatch(
       /data-tooltip=\{answeringQuestionCard\s*\?\s*ANSWER_CANCEL_TOOLTIP\s*:\s*tooltipWithShortcut\('Stop', 'stopThread'\)\}/,
     );
-    // Multi-select split button: that path only exists with a question pending.
-    expect(promptSource).toMatch(/tooltip:\s*ANSWER_CANCEL_TOOLTIP/);
   });
 });
 

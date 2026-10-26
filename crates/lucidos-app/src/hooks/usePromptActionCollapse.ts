@@ -9,10 +9,6 @@ import { computeFitsInOneRow, contentWidthOf } from './useFitsInOneRow';
  *  members rather than being one. */
 export const FOLD_KEY_ATTR = 'data-fold-key';
 
-/** The row attribute naming how far the shedding member has shortened: `0`
- *  full, up to its last level. CSS keys the member's faces off it. */
-export const SHED_ATTR = 'data-shed';
-
 /** The row's only gapped cluster. The row itself declares none, so its icon
  *  boxes touch (`styles/__tests__/prompt-actions-row-gap-guard.test.ts`). */
 const GAPPED_CLUSTER = '.prompt-actions-right';
@@ -44,27 +40,31 @@ export interface PromptCollapseInput {
   gapPx: number;
   /** The ⋯ trigger's box, spent whenever anything is folded. */
   moreWidth: number;
-  /** The one member that shortens before anything folds: its index in fold
-   *  order, and its width at each shed level, full first. */
-  shedding?: { index: number; widths: readonly number[] } | null;
+  /** A run of adjacent members the row may draw as ONE control, once the
+   *  member at `atFold` is the next to fold. `first` and `count` name the run
+   *  in fold order, `width` is the merged control's box. */
+  merge?: { first: number; count: number; width: number; atFold: number } | null;
 }
 
-/** Where the row settles: how many members fold, and how far the shedding
- *  member has shortened. */
+/** Where the row settles: how many members fold, and whether the merge group
+ *  stands as one control. */
 export interface PromptCollapse {
   folded: number;
-  shed: number;
+  merged: boolean;
 }
 
-const STANDING: PromptCollapse = { folded: 0, shed: 0 };
+const STANDING: PromptCollapse = { folded: 0, merged: false };
 
 /**
- * How many of the composer row's foldable members move into the ⋯ menu, and
- * how far the shedding member shortens first.
+ * How many of the composer row's foldable members move into the ⋯ menu.
  *
- * Candidates run in order and the first that fits wins. The shedding member
- * walks its levels with nothing folded, then every fold count from 1 to N
- * follows at its last level. So no member folds while one can still shorten.
+ * Candidates run in order and the first that fits wins: every fold count from
+ * 0 to N. No member ever shortens, so a fold is the only answer to lack of room.
+ *
+ * A merge group joins the ladder at `atFold`. Unmerged folds run up to `atFold`,
+ * so the member there outlasts the group standing as separate boxes. Merged
+ * folds follow. A merged group folds whole: a count inside it is no candidate,
+ * and it costs one box and one cluster gap.
  *
  * `computeHeaderCollapse` skips a fold of exactly one, because its members are
  * uniform icon boxes and folding one trades a box for the ⋯ box. Here the
@@ -87,13 +87,19 @@ const STANDING: PromptCollapse = { folded: 0, shed: 0 };
 export function computePromptCollapse(input: PromptCollapseInput): PromptCollapse {
   const {
     containerWidth, pinnedWidth, memberWidths, memberGroups,
-    pinnedClusterCount, gapPx, moreWidth, shedding = null,
+    pinnedClusterCount, gapPx, moreWidth, merge = null,
   } = input;
   const total = memberWidths.length;
-  const lastShed = shedding ? shedding.widths.length - 1 : 0;
+  const groupEnd = merge ? merge.first + merge.count : 0;
   const candidates: PromptCollapse[] = [];
-  for (let shed = 0; shed < lastShed; shed++) candidates.push({ folded: 0, shed });
-  for (let folded = 0; folded <= total; folded++) candidates.push({ folded, shed: lastShed });
+  const unmergedTo = merge ? Math.min(merge.atFold, total) : total;
+  for (let folded = 0; folded <= unmergedTo; folded++) candidates.push({ folded, merged: false });
+  if (merge) {
+    for (let folded = unmergedTo; folded <= total; folded++) {
+      const insideGroup = folded > merge.first && folded < groupEnd;
+      if (!insideGroup) candidates.push({ folded, merged: true });
+    }
+  }
 
   let best = candidates[0];
   let bestWidth = Infinity;
@@ -101,7 +107,13 @@ export function computePromptCollapse(input: PromptCollapseInput): PromptCollaps
     let standing = 0;
     let inCluster = pinnedClusterCount;
     for (let i = candidate.folded; i < total; i++) {
-      standing += shedding?.index === i ? shedding.widths[candidate.shed] : memberWidths[i];
+      if (merge && candidate.merged && i === merge.first) {
+        standing += merge.width;
+        if (memberGroups[i] === 'cluster') inCluster++;
+        i = groupEnd - 1;
+        continue;
+      }
+      standing += memberWidths[i];
       if (memberGroups[i] === 'cluster') inCluster++;
     }
     const width = (candidate.folded > 0 ? moreWidth : 0) + standing + Math.max(0, inCluster - 1) * gapPx;
@@ -115,6 +127,15 @@ export function computePromptCollapse(input: PromptCollapseInput): PromptCollaps
     if (width < bestWidth) { bestWidth = width; best = candidate; }
   }
   return best;
+}
+
+/** The members the row may draw as one control. `keys` are adjacent in fold
+ *  order. `foldKey` names the merged control's own box. The merge starts once
+ *  the member `atKey` is the next to fold. */
+export interface PromptMerge {
+  keys: readonly string[];
+  foldKey: string;
+  atKey: string;
 }
 
 /**
@@ -140,45 +161,36 @@ export function computePromptCollapse(input: PromptCollapseInput): PromptCollaps
  * unmeasured member is assumed to be one ⋯ box, the smallest a member can be.
  * That can only under-fold, and the next pass corrects it.
  *
- * **The shedding member is measured at every level in one pass.** The pass
- * stamps each level on the row, reads the member, and puts back the level the
- * row rendered with. No paint falls between, and the answer never depends on
- * the level drawn now, so it cannot oscillate.
+ * **A face flip changes every width.** `compact` marks the row's face set, so
+ * a flip forgets the remembered widths just as a new member set does.
+ *
+ * **The merged control is a member under its own key.** It is measured once
+ * drawn. Until then it takes the narrowest of the members it replaces.
  */
 export function usePromptActionCollapse(
   containerRef: RefObject<HTMLElement>,
   memberKeys: readonly string[],
   memberGroups: readonly FoldGroup[],
-  shedding: { key: string; levels: number } | null = null,
+  merge: PromptMerge | null = null,
+  compact = false,
   gapRem = 0.5,
 ): PromptCollapse {
   const [collapse, setCollapse] = useState<PromptCollapse>(STANDING);
   const widths = useRef<Map<string, number>>(new Map());
   const keys = memberKeys.join(' ');
-  const shedKey = shedding?.key ?? null;
-  const shedLevels = shedding?.levels ?? 0;
+  const mergeKeys = merge?.keys.join(' ') ?? null;
+  const mergeFoldKey = merge?.foldKey ?? null;
+  const mergeAtKey = merge?.atKey ?? null;
   useLayoutEffect(() => {
     // The set changed, so a member may never have been measured. Start from a
     // fully standing row: `useLayoutEffect` runs before paint, so the pass that
     // measures it and the pass that folds it land in the same frame.
     widths.current = new Map();
     setCollapse(STANDING);
-  }, [keys]);
+  }, [keys, compact]);
   useLayoutEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const levelKey = (level: number) => `${shedKey}@${level}`;
-    const measureShedLevels = (seen: Map<string, number>) => {
-      const member = container.querySelector<HTMLElement>(`[${FOLD_KEY_ATTR}="${shedKey}"]`);
-      if (!member) return;
-      const rendered = container.getAttribute(SHED_ATTR);
-      for (let level = 0; level < shedLevels; level++) {
-        container.setAttribute(SHED_ATTR, String(level));
-        seen.set(levelKey(level), member.getBoundingClientRect().width);
-      }
-      if (rendered === null) container.removeAttribute(SHED_ATTR);
-      else container.setAttribute(SHED_ATTR, rendered);
-    };
     const measure = () => {
       const seen = widths.current;
       let pinnedWidth = 0;
@@ -193,9 +205,16 @@ export function usePromptActionCollapse(
         pinnedWidth += width;
         if (item.closest(GAPPED_CLUSTER)) pinnedClusterCount++;
       });
-      if (shedKey !== null) measureShedLevels(seen);
       const fallback = moreWidth || seen.values().next().value || 0;
-      const shedIndex = shedKey === null ? -1 : memberKeys.indexOf(shedKey);
+      const mergeFirst = merge ? memberKeys.indexOf(merge.keys[0]) : -1;
+      const mergeAt = merge ? memberKeys.indexOf(merge.atKey) : -1;
+      const mergeSpec = merge && mergeFirst !== -1 && mergeAt !== -1 ? {
+        first: mergeFirst,
+        count: merge.keys.length,
+        width: seen.get(merge.foldKey)
+          ?? Math.min(...merge.keys.map((k) => seen.get(k) ?? fallback)),
+        atFold: mergeAt,
+      } : null;
       const next = computePromptCollapse({
         containerWidth: contentWidthOf(container),
         pinnedWidth,
@@ -204,12 +223,11 @@ export function usePromptActionCollapse(
         pinnedClusterCount,
         gapPx: gapRem * getRemPx(),
         moreWidth: moreWidth || fallback,
-        shedding: shedIndex === -1 ? null : {
-          index: shedIndex,
-          widths: Array.from({ length: shedLevels }, (_, level) => seen.get(levelKey(level)) ?? fallback),
-        },
+        merge: mergeSpec,
       });
-      setCollapse((prev) => (prev.folded === next.folded && prev.shed === next.shed ? prev : next));
+      setCollapse((prev) => (
+        prev.folded === next.folded && prev.merged === next.merged ? prev : next
+      ));
     };
     measure();
     const ro = new ResizeObserver(measure);
@@ -220,6 +238,6 @@ export function usePromptActionCollapse(
       ro.disconnect();
       mo.disconnect();
     };
-  }, [containerRef, keys, gapRem, memberKeys, memberGroups, shedKey, shedLevels]);
+  }, [containerRef, keys, compact, gapRem, memberKeys, memberGroups, mergeKeys, mergeFoldKey, mergeAtKey]);
   return collapse;
 }

@@ -29,7 +29,7 @@ test.describe('The home thread from the phone header', () => {
   test('the mark sits on the row middle between Home and the dashboard, and Home opens it', async ({ page }) => {
     const home = page.locator('.mobile-thread-header .header-mark-group .home-thread-btn');
     await expect(home).toBeVisible();
-    await expect(page.locator('.mobile-thread-header .header-mark-group .dashboard-sheet-toggle')).toBeVisible();
+    await expect(page.locator('.mobile-thread-header .header-mark-group .dashboard-panel-toggle')).toBeVisible();
 
     const offset = await page.evaluate(() => {
       const row = document.querySelector('.mobile-thread-header .mobile-header-row')!.getBoundingClientRect();
@@ -63,7 +63,7 @@ test.describe('The home thread from the phone header', () => {
         const group = box('.header-mark-group');
         const home = box('.home-thread-btn');
         const mark = box('.brand-mark-slot');
-        const dash = box('.dashboard-sheet-toggle');
+        const dash = box('.dashboard-panel-toggle');
         return {
           max,
           homeGap: mark.left - home.right,

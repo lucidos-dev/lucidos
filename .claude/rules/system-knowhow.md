@@ -3,8 +3,7 @@ paths:
   - "system-knowhow/**"
   - "docs/taxonomy.md"
   - "docs/glossary.md"
-  # A module that becomes a directory needs its entry widened in the same
-  # change, or this rule silently stops loading for it.
+  # Widen a file's path when its module becomes a directory.
   - "crates/lucidos-engine/src/engine/thread_events/**"
   - "crates/lucidos-engine/src/engine/event_bus/**"
   - "crates/lucidos-engine/src/engine/agentic_loop/**"
@@ -12,7 +11,7 @@ paths:
   - "crates/lucidos-engine/src/scheduler/notifications.rs"
   - "crates/lucidos-engine/src/llm/tools/**"
   - "crates/lucidos-engine/src/engine/tools/**"
-  - "crates/lucidos-engine/src/engine/agent_session/prompts.rs"
+  - "crates/lucidos-engine/src/engine/chat/process/system_prompt.rs"
   - "crates/lucidos-engine/src/api/history.rs"
   - "crates/lucidos-engine/src/api/app_ui.rs"
   - "crates/lucidos-engine/src/api/sdk.rs"
@@ -62,17 +61,23 @@ paths:
   - "crates/lucidos-engine/src/runtime/python.rs"
   - "crates/lucidos-engine/src/engine/thread_queue/**"
   - "crates/lucidos-engine/src/api/thread_queue.rs"
-  # The deterministic half of this rule. Editing a gate should load what the
-  # gate is for.
+  # Load this rule when editing its gates.
   - "scripts/check-knowhow-refs.sh"
+  - "scripts/check-knowhow-generated.sh"
+  - "scripts/check-knowhow-coupling.sh"
+  - "docs/knowhow-surfaces.tsv"
+  - "scripts/lib/check_knowhow*_test.sh"
   - "scripts/check-audit-scans.sh"
+  - "scripts/lib/check_audit_scans_test.sh"
+  - "scripts/check-retired-terms.sh"
+  - "scripts/lib/check_retired_terms_test.sh"
 ---
 
 # System-Knowhow Maintenance
 
 > **`system-knowhow/` ships publicly.** Its files go verbatim to the public mirror, so every example uses generic placeholders. Definition and approved placeholders: `.claude/rules/no-private-data.md`.
 
-Each `system-knowhow/*.md` is the engine LLM's canonical reference for its surface. A stale file misleads every workspace. Two halves:
+`system-knowhow/*.md` is canonical for the engine LLM. Two halves:
 
 1. **Drift prevention (this file).** A code change to a documented surface MUST update the matching `system-knowhow/*.md` in the same change.
 2. **Recipe maintenance (below).** Changing one file may require the recipes that cite it (workspace-audit, workspace-learning) to follow.
@@ -81,37 +86,16 @@ Each `system-knowhow/*.md` is the engine LLM's canonical reference for its surfa
 
 ## Drift prevention — required updates by surface
 
-Touch a surface on the left and update the right **in the same commit**. Skipping it is a `/harden` failure.
+[The surface registry](../../docs/knowhow-surfaces.tsv) owns the path mappings and conditional review guidance.
+Touch a declared surface and update its documentation in the same change.
+The coupling gate checks this mechanical floor; review checks the registry's semantic requirements.
+Term changes follow [the glossary rule](glossary.md).
 
-| You changed… | You MUST also update… |
-|---|---|
-| `engine/thread_events/` (`ThreadEvent` variant added, removed or renamed, payload or persistence changed) | `system-knowhow/thread-events.md`, and `coding-agent-events.md` for a `CodingAgent*` / `UserQuestion*` variant. A **rename** adds the old name to `ThreadEvent::LEGACY_TYPE_NAME_ALIASES`, beside its `serde(alias)`. The `events` tool serves it as `retired`, and the retired-name check in `workspace-audit/triggers.md` reads only it. A rename with no `serde(alias)` belongs in neither. |
-| `engine/event_bus/` (`SystemEvent` variant, aggregate name, persistence or projection routing) | the variant's doc comment, `docs/system-events.md`, and every `system-knowhow/*.md` naming that event (grep first). |
-| `ThreadEvent::is_per_token_streaming`, or the trigger gate in `scheduler/mod.rs` that consumes it | `thread-events.md` "Triggerable" column and blocklist section, `coding-agent-events.md` § "Triggerability: blocklist semantics", and `triggers.md` if a new `on_event:` path opens. |
-| `packages/lucidos-sdk/**` (`window.lucidos.*`: method, signature or namespace) | `js-sdk.md` § matching `lucidos.<namespace>` (see `.claude/rules/sdk.md`). A `lucidos.ui` helper replacing an app-drawn control also reaches `workspace-audit/apps.md` (`hand-rolled-ui` scan, hand-rolled-control check, § Remediation). |
-| The app-facing shared CSS layer (`shared-components.css`, `surface.css`, `text-input.css`, each `include_str!`'d via `api/sdk.rs`) or an iframe-only file (`sdk_iframe.css`, `sdk_iframe_control_theme_parts.css`, `sdk_iframe_shapes.css`) | `js-sdk.md` § "Component classes" and § "Theme variables", with token VALUES matching the CSS. Keep the file split honest per `frontend-css.md`. A new class replacing an app-drawn control also reaches the hand-rolled-control check in `workspace-audit/apps.md`. |
-| `appFrameSandbox.ts`, `api/app_reach.rs` (*route reach*) or `app-bridge.ts` (the *app bridge*) | `js-sdk.md` § Setup, and `workspace-audit/apps.md` "What an isolated app frame can no longer do" plus § Remediation. The audit OWNS those detection patterns ([ADR 0227](../../docs/adr/0227-app-frames-get-their-own-renderer-process.md)). |
-| `core/apps.rs` (`AppReveal`) or `appFrameReveal.ts` (when the cover lifts, fuse lengths, load bar) | `js-sdk.md` § Showing the app once its content is ready, `workspace-audit/apps.md` "The ready signal" with its `ready-signal` scan and § Remediation, and the *ready signal* glossary entry. |
-| `crates/lucidos-cli/**` (subcommand, flag or output shape) | `system-knowhow/lucidos-cli.md`. |
-| `crates/lucidos-capabilities/**`, `capability_manifest/**` (the *capability parity manifest*) | [ADR 0018](../../docs/adr/0018-capability-parity-manifest.md). A new `cli` enum needs a `Command` variant and `run()` arm (`lucidos-cli`), a new `sdk` facade registers in `capabilities.test.ts`, and the grouped LLM handler under `engine/tools/` matches. Also `lucidos-cli.md` and `js-sdk.md`. |
-| `api/plugins.rs`, `core/plugins.rs`, `engine/tools/plugins/` (manifest schema, install flow, plugin LLM tools) | `system-knowhow/plugins.md`, and `docs/taxonomy.md` § plugins if layout or install semantics changed. |
-| `llm/tools/**`, `engine/tools/**` (LLM tool added, removed, renamed, or args changed) | `engine/agent_session/prompts.rs` (system prompts advertise tools), and `best-practices.md` or `intent-registry.md` if the tool's intent maps there. |
-| `core/preference_catalog.rs` (the *preference catalog*) | `system-knowhow/preferences.md` (a `cargo test` sync test fails on an undocumented key), and the *preference* glossary entries if user-facing semantics shifted. |
-| `bash_background.rs`, `bash.rs` (`wait_secs`), `runtime/python.rs` (`truncate_python_error`), or `agentic_loop/` (`derive_call_key`, the 3-strike `excluded` list) | `system-knowhow/running-python.md`: it documents the drain pattern, `wait_secs`, truncation and the repeated-call guard. |
-| `scheduler/notifications.rs` (the `Tap` type: kind, sub-field, `Deserialize` strictness) | `js-sdk.md` § `lucidos.notifications`, and `workspace-audit/triggers.md` check "Old-form `tap` strings" with its § Remediation. The audit OWNS those patterns ([ADR 0214](../../docs/adr/0214-one-shot-migrations-are-a-notice-plus-an-audit-check.md)). |
-| `api/history.rs`, `api/app_ui.rs` (HTTP shapes for events and the app UI bridge) | `js-sdk.md`, and `building-an-app.md` if the app-side contract shifts. |
-| `api/proxy_pipeline_config.rs` and `proxy*.rs` siblings (the `data/config/apis.json` schema) | `building-an-auth-handshake.md`, and `best-practices.md` § `config/`. |
-| `engine/agent_session/prompts.rs` (taxonomy and trigger sections, intent advertise-list, knowhow listing) | `intent-registry.md` if intents changed, and `workspace-audit.md` (its reference table names sections of this file by heading). |
-| `engine/thread_queue/**` (*Thread Queue*: admission rules, `CapacityPolicy`, `ThreadQueueRequest`, boot requeue, thresholds) or `api/thread_queue.rs` | `thread-queue.md`, `.claude/rules/db.md` § Key tables and `docs/system-events.md` if the projection or `ThreadQueue*` events changed, and the *Thread Queue* / *capacity policy* glossary entries. |
-| Notification and presence code (`scheduler/push.rs`, `core/device_presence.rs`, `api/presence*.rs`, `sw.js`, the presence, push and toast actions in `store/actions/`), or the native desktop half (`notifications.rs`, `native-push.ts`, `nativeWindow.ts`, `app_window.rs`) | `notifications.md` § matching `§N` (§2 fan-out matrix, §3 PresenceCheck, §4 in-app surface and its Tauri subsection), and `glossary.md` if "active device", "in-app surface" or "OS surface" shifted. |
-| `net_config.rs` (engine and gateway), `crates/lucidos-tailscale/**`, `mobile.rs`, or `MobileAccessPage.tsx` | `remote-access.md` § Settings → Access, § Network bind, § Route B, and `README.md` § Remote access if the install-time `--bind` / `--tls-cert` contract changed. |
-| `AddDeviceSection.tsx`, `PairingGate.tsx` (Add a device, code expiry, pairing screen) | `remote-access.md` § Settings → Access, § A phone installs before it pairs. |
-| `deviceList.ts`, `pairedDevices.ts`, or the Devices section of `SettingsView.tsx` | `remote-access.md` § The list of devices lives in Settings → Devices, § What a device is called, and the *device* / *paired device* entries in `glossary.md`. |
-| Any change renaming, retiring or shifting a term in `system-knowhow/glossary.md` or `docs/glossary.md` | The matching glossary entry, in the same commit. A new term gets a new entry in the right layer. Drift is a `/harden` failure. |
+## A change that REMOVES a capability needs a corpus search
 
-## A change that REMOVES a capability has no row above
-
-The table pairs a surface with the doc that NAMES it. Removing a capability slips through, because the docs it falsifies INSTRUCT using it and name a different surface. [ADR 0227](../../docs/adr/0227-app-frames-get-their-own-renderer-process.md) is the worked case.
+The registry pairs a surface with the doc that names it.
+Removing a capability can also falsify instructions that name a different surface.
+[ADR 0227](../../docs/adr/0227-app-frames-get-their-own-renderer-process.md) is the worked case.
 
 When a change narrows what a caller may do, **grep the corpus for the thing you took away**, not for the file you edited. Every doc that tells someone to use it is now wrong. Where there is no replacement to name, say so plainly and open a row in `docs/temporary-measures.md`.
 
@@ -132,9 +116,22 @@ A new surface here cannot land without a matching `system-knowhow/*.md`, either 
 
 ## `/harden` enforcement
 
-`/harden` reviews the diff against this rule. A surface change without its `system-knowhow/*.md` update is a hardening failure, like a failing test.
+`scripts/check-knowhow-coupling.sh` checks committed `main...HEAD` changes against the surface registry and audit declarations.
+It includes deleted and renamed source paths and rejects missing or malformed inputs.
+It reads both endpoint declarations, so deleting a mapping cannot erase its obligation.
 
-Under that judgment sits one deterministic floor, `./scripts/check-knowhow-refs.sh`, run by `/harden` Phase 4.5 for every diff. It fails on a repo path or knowhow id resolving to nothing, an event name no engine enum has, and an undefined severity. A reader cannot spot those, because they look like live references.
+A listed documentation path in the diff satisfies the surface's mechanical check.
+Documentation can be an embedded system prompt; a target cannot overlap its source globs.
+Each endpoint must declare sources that exist in its own tree.
+Review still checks conditional requirements and whether the documentation matches the behavior.
+
+When documentation stays correct, add `Knowhow-unchanged: <surface>: <reason>` as a commit trailer.
+Use the registry's surface id, or `audit/<filename stem>` for an audit section.
+Each commit changing the source needs the trailer unless the branch updates the documentation.
+A trailer from an earlier commit cannot cover later source changes.
+A clean two-parent merge reuses prior trailers; its resolution edits need their own.
+
+`make lint-knowhow` checks forward references, retired terms and audit scans without Cargo. `/harden` runs it for every diff, plus fixtures and a fresh comparison against the committed agent surface. Domain examples declare `<!-- domain-event: Name: reason -->` in the file that uses them.
 
 ## After-the-fact detection
 
@@ -144,7 +141,10 @@ Under that judgment sits one deterministic floor, `./scripts/check-knowhow-refs.
 
 `system-knowhow/workspace-audit.md` audits a workspace against current conventions. Each check lives in one *audit section* file under `workspace-audit/`, which the root names by id. It **references** other knowhow files and never restates their rules.
 
-Its sources are the files in its § "Sources of truth" table, plus `triggers.md`, `docs/taxonomy.md`, and the engine system prompt's taxonomy and trigger section. Touch one and open the audit section that cites it, to check that:
+Each section declares `sources:` in its frontmatter as a nonempty JSON array of repository paths or globs.
+Use tracked paths and the registry's glob syntax; include knowhow and code that the section checks.
+The coupling gate requires the section to change when a declared source changes, or an `audit/<filename stem>` trailer explaining why it remains current.
+Touch a source and open the audit section that cites it, to check that:
 
 - The reference table still names the right files and what they own.
 - Any check naming a heading or filename in those sources still resolves.

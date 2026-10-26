@@ -6,9 +6,7 @@ use super::*;
 use crate::api::actor::{
     init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN, HEADER_DEVICE_ID,
 };
-use crate::api::thread_reach::{
-    pass_authority, refuse_without_authority, PassedAuthority, ThreadReachError,
-};
+use crate::api::thread_reach::{refuse_without_authority, ThreadReachError};
 use crate::engine::thread_events::{ActorMode, AnswerKind, EventChannel};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
@@ -168,6 +166,7 @@ async fn answer(
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: tool_use_id.into(),
+            quiet: false,
             answer,
         },
         meta: EventMeta {
@@ -455,17 +454,8 @@ async fn two_concurrent_presses_spend_one_approval_once() {
     teardown_test_db(&db_name).await;
 }
 
-const NEW_THREAD_OPTION: &str = "Implement in a new thread: Sonnet 5.5, high (Recommended)";
-
-/// A plan card as an agent words it: a new-thread option beside `Approve here`.
-/// Returns the card's id and its options as the question walk stores them.
-async fn raise_plan_card(
-    bus: &EventBus,
-    thread_id: Uuid,
-) -> (String, Vec<crate::engine::thread_events::QuestionOption>) {
-    raise_card_offering(bus, thread_id, &[NEW_THREAD_OPTION, "Approve here"]).await
-}
-
+/// A card as an agent words it. Returns the card's id and its options as the
+/// question walk stores them.
 async fn raise_card_offering(
     bus: &EventBus,
     thread_id: Uuid,
@@ -510,105 +500,21 @@ fn pick(options: &[crate::engine::thread_events::QuestionOption], label: &str) -
     }
 }
 
-async fn spawn_successor_under(bus: &EventBus, p: &Pair) -> Result<(), ThreadReachError> {
-    press(
-        bus,
-        p.asker,
-        Some(p.sibling),
-        ThreadReachVerb::SpawnSuccessor,
-    )
-    .await
-}
-
-/// The owner's pick of the new-thread option on a plan card is their consent
-/// to the successor: one spend, for any target, then refused again.
+/// A plan card's pick grants no authority. A handoff needs none, so its verb
+/// is retired, and any other act still needs Allow once on an engine card.
 #[tokio::test]
-async fn a_new_thread_pick_lets_the_successor_start_exactly_once() {
+async fn a_plan_card_pick_grants_nothing() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let p = pair(&bus).await;
-    let other = Uuid::new_v4();
-    open_turn_from(&bus, other, None, p.sibling).await;
-
-    assert!(spawn_successor_under(&bus, &p).await.is_err());
-    let (card, options) = raise_plan_card(&bus, p.asker).await;
+    let fresh_session = "Implement in a fresh session: Sonnet 5.5, high (Recommended)";
+    let (card, options) =
+        raise_card_offering(&bus, p.asker, &[fresh_session, "Approve here"]).await;
     answer(
         &bus,
         p.asker,
         &card,
-        pick(&options, NEW_THREAD_OPTION),
-        Some(owner_device()),
-    )
-    .await;
-
-    press(&bus, p.asker, Some(other), ThreadReachVerb::SpawnSuccessor)
-        .await
-        .expect("the pick names the act, and the route names the target");
-    assert!(
-        spawn_successor_under(&bus, &p).await.is_err(),
-        "the pick is spent"
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// ADR 0507, I3: the gate names the authority it passed on, which a successor
-/// records as its handoff consent. A spent pick is an owner approval, and a
-/// device presents no thread token.
-#[tokio::test]
-async fn the_gate_names_the_authority_it_passed_on() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let p = pair(&bus).await;
-    let (card, options) = raise_plan_card(&bus, p.asker).await;
-    answer(
-        &bus,
-        p.asker,
-        &card,
-        pick(&options, NEW_THREAD_OPTION),
-        Some(owner_device()),
-    )
-    .await;
-    let spawn = |headers: HeaderMap| {
-        let bus = &bus;
-        async move {
-            pass_authority(
-                bus,
-                &headers,
-                Some(p.sibling),
-                ThreadReachVerb::SpawnSuccessor,
-            )
-            .await
-        }
-    };
-
-    assert_eq!(
-        spawn(agent_headers(Some(p.asker))).await,
-        Ok(PassedAuthority::OwnerApproval)
-    );
-    assert_eq!(
-        spawn(device_headers("owner-phone")).await,
-        Ok(PassedAuthority::Untokened)
-    );
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// The pick names one act. It never lets another verb through.
-#[tokio::test]
-async fn a_new_thread_pick_covers_the_successor_only() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let p = pair(&bus).await;
-
-    let (card, options) = raise_plan_card(&bus, p.asker).await;
-    answer(
-        &bus,
-        p.asker,
-        &card,
-        pick(&options, NEW_THREAD_OPTION),
+        pick(&options, fresh_session),
         Some(owner_device()),
     )
     .await;
@@ -621,140 +527,20 @@ async fn a_new_thread_pick_covers_the_successor_only() {
     ] {
         assert!(
             press(&bus, p.asker, Some(p.sibling), verb).await.is_err(),
-            "{verb:?} must not spend a new-thread pick"
+            "{verb:?} must not spend a plan card pick"
         );
     }
-    spawn_successor_under(&bus, &p)
-        .await
-        .expect("the successor is what the pick allowed");
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// Only a registered device's `Selected` pick of that option grants. A typed
-/// reply, an agent, a parent thread, a cancel and an unattributed answer do not.
-#[tokio::test]
-async fn nothing_but_a_devices_new_thread_pick_grants() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let p = pair(&bus).await;
-
-    let agent = MessageOrigin::Api {
-        user_agent: None,
-        mode: ActorMode::Agent,
-        source_thread_id: Some(p.asker),
-    };
-    let parent_thread = MessageOrigin::ThreadLink {
-        thread_id: p.sibling,
-        title: None,
-        spawning_event_id: None,
-        mode: ActorMode::Agent,
-        direction: crate::engine::thread_events::ThreadDirection::Parent,
-    };
-    let free_text = AnswerKind::FreeText {
-        text: "Implement in a new thread".into(),
-        image_hashes: vec![],
-    };
-    // `Some(kind)` is a fixed answer. `None` picks the named option.
-    let cases: Vec<(Option<AnswerKind>, &str, Option<MessageOrigin>)> = vec![
-        (None, "Approve here", Some(owner_device())),
-        (Some(free_text), NEW_THREAD_OPTION, Some(owner_device())),
-        (
-            Some(AnswerKind::Canceled),
-            NEW_THREAD_OPTION,
-            Some(owner_device()),
-        ),
-        (
-            Some(AnswerKind::Superseded),
-            NEW_THREAD_OPTION,
-            Some(owner_device()),
-        ),
-        (None, NEW_THREAD_OPTION, Some(agent)),
-        (None, NEW_THREAD_OPTION, Some(parent_thread)),
-        (None, NEW_THREAD_OPTION, None),
-    ];
-    for (fixed, label, actor) in cases {
-        let (card, options) = raise_plan_card(&bus, p.asker).await;
-        let kind = fixed.unwrap_or_else(|| pick(&options, label));
-        answer(&bus, p.asker, &card, kind.clone(), actor.clone()).await;
-        assert!(
-            spawn_successor_under(&bus, &p).await.is_err(),
-            "{kind:?} on {label:?} by {actor:?} must grant nothing"
-        );
-    }
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// The pick belongs to the turn that offered it, like an Allow once.
-#[tokio::test]
-async fn a_new_thread_pick_ends_with_its_turn() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let p = pair(&bus).await;
-
-    let (card, options) = raise_plan_card(&bus, p.asker).await;
-    answer(
+    press(
         &bus,
         p.asker,
-        &card,
-        pick(&options, NEW_THREAD_OPTION),
-        Some(owner_device()),
+        Some(p.sibling),
+        ThreadReachVerb::SpawnSuccessor,
     )
-    .await;
-    open_turn_from(&bus, p.asker, None, p.sibling).await;
-    assert!(spawn_successor_under(&bus, &p).await.is_err());
-
-    let (stale, options) = raise_plan_card(&bus, p.asker).await;
-    open_turn_from(&bus, p.asker, None, p.sibling).await;
-    answer(
-        &bus,
-        p.asker,
-        &stale,
-        pick(&options, NEW_THREAD_OPTION),
-        Some(owner_device()),
-    )
-    .await;
-    assert!(spawn_successor_under(&bus, &p).await.is_err());
+    .await
+    .expect("a retired verb needs no authority");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
-}
-
-/// The prefix names the act, so it must open the label.
-#[tokio::test]
-async fn a_label_only_mentioning_the_new_thread_grants_nothing() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    let p = pair(&bus).await;
-
-    let label = "Do not implement in a new thread";
-    let (card, options) = raise_card_offering(&bus, p.asker, &[label]).await;
-    answer(
-        &bus,
-        p.asker,
-        &card,
-        pick(&options, label),
-        Some(owner_device()),
-    )
-    .await;
-    assert!(spawn_successor_under(&bus, &p).await.is_err());
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
-/// The CLI cannot import the engine, so this pins its option text to the
-/// prefix the engine matches.
-#[test]
-fn the_cli_offers_the_label_prefix_the_engine_matches() {
-    let planned = include_str!("../../../lucidos-cli/src/planned.rs");
-    assert!(
-        planned.contains(&format!("`{NEW_THREAD_LABEL_PREFIX}: <implementer>")),
-        "crates/lucidos-cli/src/planned.rs no longer offers `{NEW_THREAD_LABEL_PREFIX}: …`"
-    );
 }
 
 /// The engine words everything the owner taps. The agent's reason sits inside
@@ -930,56 +716,6 @@ fn a_thread_raises_cards_on_itself_only() {
     assert!(!asks(&HeaderMap::new(), theirs));
 }
 
-/// The pick of a new-thread option grants a successor, so only the owner's
-/// registered device may make it. Every other answer to the plan card stays
-/// open to whoever could answer it before.
-#[tokio::test]
-async fn only_the_owners_device_picks_the_new_thread_option() {
-    let (pool, db_name) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-    crate::core::DeviceStore::register(&pool, &bus, "owner-phone", Some("Mozilla/5.0"), None, None)
-        .await
-        .unwrap();
-    let p = pair(&bus).await;
-    let (card, options) = raise_plan_card(&bus, p.asker).await;
-    let new_thread = pick(&options, NEW_THREAD_OPTION);
-    let agent = agent_headers(Some(p.asker));
-
-    for headers in [&agent, &device_headers("typed-id")] {
-        let refused = answering_actor(&pool, headers, p.asker, &card, &new_thread)
-            .await
-            .unwrap_err();
-        assert_eq!(refused.status, StatusCode::FORBIDDEN);
-    }
-    let owner = answering_actor(
-        &pool,
-        &device_headers("owner-phone"),
-        p.asker,
-        &card,
-        &new_thread,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(owner, Some(MessageOrigin::Device { .. })));
-
-    let not_a_pick = [
-        pick(&options, "Approve here"),
-        AnswerKind::Canceled,
-        AnswerKind::FreeText {
-            text: "Implement in a new thread".into(),
-            image_hashes: vec![],
-        },
-    ];
-    for answer in &not_a_pick {
-        answering_actor(&pool, &agent, p.asker, &card, answer)
-            .await
-            .unwrap_or_else(|e| panic!("{answer:?} grants nothing, so it stays open: {e:?}"));
-    }
-
-    pool.close().await;
-    teardown_test_db(&db_name).await;
-}
-
 /// No agent answers an owner approval card, not even the one that raised it.
 /// The owner's registered device does, and an ordinary card is untouched.
 #[tokio::test]
@@ -992,41 +728,22 @@ async fn only_the_owners_device_answers_an_approval_card() {
     let p = pair(&bus).await;
     let card = raise(&bus, p.asker, ThreadReachVerb::Apply, p.sibling).await;
 
-    let refused = answering_actor(
-        &pool,
-        &agent_headers(Some(p.asker)),
-        p.asker,
-        &card,
-        &allow(),
-    )
-    .await
-    .unwrap_err();
+    let refused = answering_actor(&pool, &agent_headers(Some(p.asker)), p.asker, &card)
+        .await
+        .unwrap_err();
     assert_eq!(refused.status, StatusCode::FORBIDDEN);
-    let unregistered =
-        answering_actor(&pool, &device_headers("typed-id"), p.asker, &card, &allow())
-            .await
-            .unwrap_err();
+    let unregistered = answering_actor(&pool, &device_headers("typed-id"), p.asker, &card)
+        .await
+        .unwrap_err();
     assert_eq!(unregistered.status, StatusCode::FORBIDDEN);
-    let owner = answering_actor(
-        &pool,
-        &device_headers("owner-phone"),
-        p.asker,
-        &card,
-        &allow(),
-    )
-    .await
-    .unwrap();
+    let owner = answering_actor(&pool, &device_headers("owner-phone"), p.asker, &card)
+        .await
+        .unwrap();
     assert!(matches!(owner, Some(MessageOrigin::Device { .. })));
 
-    let ordinary = answering_actor(
-        &pool,
-        &agent_headers(Some(p.asker)),
-        p.asker,
-        "plain-card",
-        &allow(),
-    )
-    .await
-    .unwrap();
+    let ordinary = answering_actor(&pool, &agent_headers(Some(p.asker)), p.asker, "plain-card")
+        .await
+        .unwrap();
     assert!(matches!(
         ordinary,
         Some(MessageOrigin::Api {

@@ -85,6 +85,7 @@ pub(super) async fn start_cc_thread(bus: &EventBus, thread_id: Uuid) {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

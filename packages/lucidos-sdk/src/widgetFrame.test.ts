@@ -165,13 +165,28 @@ describe('installWidgetFrame', () => {
       document.body.innerHTML = '';
     });
 
-    it('posts a menu request with no point once the press outlasts a long press', () => {
+    it('posts a held menu request with no point once a press outlasts a long press, finger still down', () => {
       installWidgetFrame();
       mark({ place: 'dashboard', size: 'small', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
-      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
-      window.dispatchEvent(finger('pointerup'));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS - 1);
+      expect(menus()).toHaveLength(0);
+      vi.advanceTimersByTime(1);
+      // The lift's click is still to come, and the host's menu must spend it.
       expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
+      window.dispatchEvent(finger('pointerup'));
+      expect(menus()).toHaveLength(1);
+    });
+
+    it('a new press ends one whose lift was lost before its delay', () => {
+      installWidgetFrame();
+      mark({ place: 'dashboard', size: 'small', menu: true });
+      document.body.dispatchEvent(finger('pointerdown'));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS - 100);
+      document.body.dispatchEvent(finger('pointerdown'));
+      window.dispatchEvent(finger('pointerup'));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+      expect(menus()).toHaveLength(0);
     });
 
     it("swallows the platform's long-press menu that follows the hold, so one press opens one menu", () => {
@@ -183,23 +198,29 @@ describe('installWidgetFrame', () => {
       expect(menus()).toHaveLength(1);
     });
 
-    it('a hold that opens the menu selects no text, until the next press', () => {
+    it("a press turns off iOS's own long-press answer at once, until the next press", () => {
       const root = document.documentElement;
       document.body.innerHTML = '<p>Twelve minutes left</p>';
       installWidgetFrame();
       mark({ place: 'dashboard', size: 'small', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
-      expect(root.style.getPropertyValue('user-select')).toBe('');
+      // iOS shows its own selection or link menu while the finger rests, so the
+      // press itself must turn them off. jsdom drops the callout property.
+      for (const property of ['user-select', '-webkit-user-select']) {
+        expect(root.style.getPropertyValue(property)).toBe('none');
+      }
       window.getSelection()?.selectAllChildren(document.body);
       vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
       expect(window.getSelection()?.rangeCount).toBe(0);
-      expect(root.style.getPropertyValue('user-select')).toBe('none');
-      expect(root.style.getPropertyValue('-webkit-user-select')).toBe('none');
       window.dispatchEvent(finger('pointerup'));
       expect(root.style.getPropertyValue('user-select')).toBe('none');
       document.body.dispatchEvent(finger('pointerdown'));
-      expect(root.style.getPropertyValue('user-select')).toBe('');
-      expect(root.style.getPropertyValue('-webkit-user-select')).toBe('');
+      window.dispatchEvent(finger('pointerup'));
+      mark({ place: 'inline', menu: true });
+      document.body.dispatchEvent(finger('pointerdown'));
+      for (const property of ['user-select', '-webkit-user-select']) {
+        expect(root.style.getPropertyValue(property)).toBe('');
+      }
     });
 
     it("the next press gives back the widget's own selection style", () => {
@@ -208,12 +229,29 @@ describe('installWidgetFrame', () => {
       installWidgetFrame();
       mark({ place: 'dashboard', size: 'small', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
-      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
       expect(root.style.getPropertyValue('user-select')).toBe('none');
+      mark({ place: 'inline', menu: true });
       document.body.dispatchEvent(finger('pointerdown'));
       expect(root.style.getPropertyValue('user-select')).toBe('text');
       expect(root.style.getPropertyPriority('user-select')).toBe('');
       root.style.removeProperty('user-select');
+    });
+
+    it('a hold that opens the menu ticks, and a quick tap does not', () => {
+      const vibrate = vi.fn();
+      Object.defineProperty(navigator, 'vibrate', { value: vibrate, configurable: true });
+      try {
+        installWidgetFrame();
+        mark({ place: 'dashboard', size: 'small', menu: true });
+        document.body.dispatchEvent(finger('pointerdown'));
+        window.dispatchEvent(finger('pointerup'));
+        expect(vibrate).not.toHaveBeenCalled();
+        document.body.dispatchEvent(finger('pointerdown'));
+        vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+        expect(vibrate).toHaveBeenCalledTimes(1);
+      } finally {
+        delete (navigator as { vibrate?: unknown }).vibrate;
+      }
     });
 
     it("a long-press menu that comes first cancels the hold", () => {
@@ -232,6 +270,26 @@ describe('installWidgetFrame', () => {
       document.body.dispatchEvent(finger('pointerdown'));
       document.body.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 9, clientY: 9, buttons: 1 }));
       expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
+    });
+
+    it('a starved frame reads a long hold from the event times, and the lift opens the menu', () => {
+      installWidgetFrame();
+      mark({ place: 'dashboard', size: 'small', menu: true });
+      const at = (type: string, timeStamp: number) => Object.defineProperty(finger(type), 'timeStamp', { value: timeStamp });
+      // Both events reach a frame that was busy for the whole press, so no timer ran.
+      document.body.dispatchEvent(at('pointerdown', 1000));
+      window.dispatchEvent(at('pointerup', 1000 + LONG_PRESS_DELAY_MS));
+      expect(menus()).toEqual([{ type: WIDGET_MENU_MESSAGE_TYPE, held: true }]);
+    });
+
+    it('a quick lift in a starved frame opens no menu', () => {
+      installWidgetFrame();
+      mark({ place: 'dashboard', size: 'small', menu: true });
+      const at = (type: string, timeStamp: number) => Object.defineProperty(finger(type), 'timeStamp', { value: timeStamp });
+      document.body.dispatchEvent(at('pointerdown', 1000));
+      window.dispatchEvent(at('pointerup', 1000 + LONG_PRESS_DELAY_MS - 1));
+      vi.advanceTimersByTime(LONG_PRESS_DELAY_MS);
+      expect(menus()).toHaveLength(0);
     });
 
     it('posts none when the finger moves first, lifts first, or the frame is no tile', () => {

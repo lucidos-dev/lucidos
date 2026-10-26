@@ -790,8 +790,13 @@ impl LucidosEngine {
     }
 
     /// Enqueue a thread for auto-resume after a user-initiated switch (recovery).
+    /// Idempotent: two recovery sources can name one thread, and a second
+    /// request would double-spawn it.
     pub(crate) fn enqueue_switch_resume(&self, thread_id: uuid::Uuid) {
-        self.pending_switch_resumes.lock().unwrap().push(thread_id);
+        let mut queue = self.pending_switch_resumes.lock().unwrap();
+        if !queue.contains(&thread_id) {
+            queue.push(thread_id);
+        }
     }
 
     /// Whether recovery queued this thread for auto-resume. Only answers before

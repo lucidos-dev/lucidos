@@ -1,11 +1,11 @@
 //! Withdrawing a queued follow-up the coding agent has not read yet. Plan:
 //! `docs/plans/2026-09-29-withdraw-a-queued-claude-code-message.md`.
 //!
-//! A withdraw travels API, then run loop, then driver, then Claude Code. The
+//! A withdraw travels API, then run loop, then driver, then agent. The
 //! run loop owns the input ledger, so it decides whether the message is still
-//! owed. It never blocks on Claude Code: it keeps each pending answer, and
+//! owed. It never blocks on the agent: it keeps each pending answer, and
 //! settles the ledger and records the `QueuedMessageRemoved` tombstone once
-//! the answer lands. The tombstone therefore always matches what Claude Code
+//! the answer lands. The tombstone therefore always matches what the agent
 //! did, even when the HTTP caller gave up first.
 //!
 //! For an input this session never forwarded, the store answers
@@ -30,9 +30,8 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::types::AgentSession;
 use crate::engine::LucidosEngine;
-use crate::runtime::{CodingAgent, InputWithdrawal, WithdrawRequest};
+use crate::runtime::{InputWithdrawal, WithdrawRequest};
 
-pub(crate) const CODEX_UNSUPPORTED: &str = "Codex cannot take back a message it was sent.";
 /// A message no session has forwarded yet may be on its way to a spawn, which
 /// would deliver it over a tombstone.
 pub(crate) const NOT_YET_FORWARDED: &str =
@@ -47,11 +46,22 @@ const WITHDRAW_TIMEOUT: Duration = Duration::from_secs(15);
 /// A withdraw on its way to a session's run loop.
 #[derive(Debug)]
 pub struct WithdrawInputRequest {
-    /// The `MessageReceived` event that carried the follow-up.
+    /// The event that carried the input: a follow-up's `MessageReceived`, or
+    /// a child report's `ChildThreadCompleted`.
     pub input_event_id: Uuid,
     /// Who asked, for the tombstone.
     pub actor: Option<MessageOrigin>,
+    pub purpose: WithdrawPurpose,
     pub reply: oneshot::Sender<InputWithdrawal>,
+}
+
+/// Why the input is taken back, which decides what a success records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawPurpose {
+    /// The user removed a queued message: a `QueuedMessageRemoved` tombstone.
+    Remove,
+    /// The agent took a child report mid-turn: a `ChildReportTaken`.
+    TakeChildReport,
 }
 
 /// A withdraw Claude Code has answered, back in the run loop.
@@ -69,7 +79,7 @@ pub(crate) type PendingWithdraws =
 /// The answer joins `pending`, unless it is known at once.
 pub(crate) fn begin_withdraw(
     inputs: &InputLedger,
-    driver: Option<&mpsc::UnboundedSender<WithdrawRequest>>,
+    driver: &mpsc::UnboundedSender<WithdrawRequest>,
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     request: WithdrawInputRequest,
@@ -95,12 +105,6 @@ pub(crate) fn begin_withdraw(
     let Some(input_uuid) = inputs.withdrawable(request.input_event_id) else {
         // The requester may have gone away; nobody is left to tell.
         let _ = request.reply.send(InputWithdrawal::AlreadyRead);
-        return;
-    };
-    let Some(driver) = driver else {
-        let _ = request
-            .reply
-            .send(InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string()));
         return;
     };
     let (reply, answer) = oneshot::channel();
@@ -146,24 +150,26 @@ pub(crate) async fn settle_answered_withdraws(
     }
 }
 
-/// Settle a withdraw Claude Code answered: on success the input leaves the
-/// ledger and the tombstone hides its bubble on every device.
+/// Settle a withdraw the agent answered. A removal leaves the ledger on
+/// success, and its tombstone hides its bubble on every device.
 pub(crate) async fn finish_withdraw(
     bus: &EventBus,
     thread_id: Uuid,
     inputs: &mut InputLedger,
     WithdrawAnswered { request, outcome }: WithdrawAnswered,
 ) {
-    let outcome = if outcome == InputWithdrawal::Withdrawn {
-        inputs.withdrawn(request.input_event_id);
-        let recorded =
-            record_tombstone(bus, thread_id, request.input_event_id, request.actor).await;
-        if recorded == InputWithdrawal::Withdrawn {
-            inputs.tombstone_recorded(request.input_event_id);
+    let outcome = match (outcome, request.purpose) {
+        (InputWithdrawal::Withdrawn, WithdrawPurpose::Remove) => {
+            inputs.withdrawn(request.input_event_id);
+            let recorded =
+                record_tombstone(bus, thread_id, request.input_event_id, request.actor).await;
+            if recorded == InputWithdrawal::Withdrawn {
+                inputs.tombstone_recorded(request.input_event_id);
+            }
+            recorded
         }
-        recorded
-    } else {
-        outcome
+        // A take settles once all its withdraws answer (`settle_take`).
+        (other, _) => other,
     };
     let _ = request.reply.send(outcome);
 }
@@ -207,18 +213,14 @@ async fn withdraw_from_session(
     timeout: Duration,
 ) -> Option<InputWithdrawal> {
     let sender = match sessions.lock().await.get(&thread_id) {
-        Some(session) if session.is_live() => match session.coding_agent {
-            CodingAgent::Codex => {
-                return Some(InputWithdrawal::Refused(CODEX_UNSUPPORTED.to_string()))
-            }
-            CodingAgent::ClaudeCode => session.withdraw_tx.clone(),
-        },
+        Some(session) if session.is_live() => session.withdraw_tx.clone(),
         _ => return None,
     };
     let (reply, answer) = oneshot::channel();
     let request = WithdrawInputRequest {
         input_event_id,
         actor,
+        purpose: WithdrawPurpose::Remove,
         reply,
     };
     sender.send(request).ok()?;

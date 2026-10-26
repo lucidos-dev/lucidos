@@ -3,7 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-16
 - **Amends**: [0387](0387-an-owner-approval-authorizes-one-act.md), [0474](0474-successor-threads.md)
-- **Amended by**: [0507: A successor inherits the consent that started it](0507-successor-inherits-handoff-consent.md)
+- **Amended by**: [0507: A successor inherits the consent that started it](0507-successor-inherits-handoff-consent.md), [0560: A handoff starts a successor session in the same thread](0560-successor-session-in-the-same-thread.md)
 
 ## Context
 

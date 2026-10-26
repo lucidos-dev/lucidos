@@ -17,12 +17,19 @@ import {
   engineBuilding,
   engineRebuildWedged,
   engineVersionPending,
+  IDLE_MAIN_CHECK,
+  mainCheck,
   toasts,
 } from '../../../store/store';
 import type { PendingCommits } from '../../../api/client';
 
 const cancelApplyAllBatch = vi.fn(async () => {});
 vi.mock('../../../store/actions/chat-changes', () => ({ cancelApplyAllBatch: () => cancelApplyAllBatch() }));
+const focusThreadOrBootstrap = vi.fn();
+vi.mock('../../../store/actions/threads', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../store/actions/threads')>(),
+  focusThreadOrBootstrap: (...args: unknown[]) => focusThreadOrBootstrap(...args),
+}));
 
 const COMMITS: PendingCommits = {
   total: 14,
@@ -384,6 +391,7 @@ describe('ActivityMenuGroup', () => {
     engineBuilding.value = false;
     applyAllInProgress.value = false;
     applyAllCanceling.value = false;
+    mainCheck.value = IDLE_MAIN_CHECK;
     toasts.value = [];
     vi.clearAllMocks();
   });
@@ -416,5 +424,14 @@ describe('ActivityMenuGroup', () => {
     pendingRow?.click();
     expect(onClose).toHaveBeenCalledOnce();
     expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Rebuild');
+  });
+
+  it('opens a fix thread the page never loaded, such as an archived one', async () => {
+    mainCheck.value = { state: 'red', check_id: 'k-1', summary: 'Failed: engine.', fix_thread_id: 'fix-archived' };
+    const { host: el, onClose } = mount();
+    await act(async () => { el.querySelector<HTMLButtonElement>('.brand-menu-activity-row')!.click(); });
+    el.querySelector<HTMLButtonElement>('[data-role="main-check"] [data-role="activity-thread-link"]')!.click();
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('fix-archived');
   });
 });

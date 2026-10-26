@@ -6,7 +6,7 @@
 #   ./scripts/harden-suites.sh start --early   # at the Phase 1 kickoff
 #   ./scripts/harden-suites.sh stop            # before a fix the result cannot survive
 #   ./scripts/harden-suites.sh wait            # at Phase 4.5: join, then the verdict
-#                   [--codex-abandoned]        #   Phase 3 gave up on the Codex review
+#                   [--review-abandoned]       #   Phase 3 gave up on the other-model review
 #                   [--budget <seconds>]       #   how long to wait (default 230)
 #   ./scripts/harden-suites.sh verdict         # the verdict alone
 #   ./scripts/harden-suites.sh start           # a normal run, when the verdict says RERUN
@@ -14,8 +14,8 @@
 #
 # `start` selects suites from `git diff main...HEAD`, runs them, and records
 # the start commit. An early run skips the two Codex driver modules. Once the
-# Codex review is joined, `wait` starts them alone in the background and joins
-# them like any suite, so no `wait` blocks past its budget.
+# other-model review is joined, `wait` starts them alone in the background
+# and joins them like any suite, so no `wait` blocks past its budget.
 #
 # The touched-spec selection is slow on a loaded host, and only the
 # `e2e-touched` suite reads it. So `start` launches every other suite first,
@@ -77,8 +77,8 @@ fi
 STATE="$ROOT/.lucidos/harden-suites"
 # Outside STATE, which every start clears: the record outlives the run.
 RETRY_FILE="$ROOT/.lucidos/harden-retry"
-CODEX_OUT="$ROOT/.lucidos/codex-review.out"
-CODEX_DONE="$ROOT/.lucidos/codex-review.done"
+REVIEW_OUT="$ROOT/.lucidos/other-model-review.out"
+REVIEW_DONE="$ROOT/.lucidos/other-model-review.done"
 
 usage() {
     awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"
@@ -236,7 +236,7 @@ cmd_start() {
             cp "$RETRY_FILE" "$STATE/retry"
             printf '%s\n' "$suites" > "$STATE/suites"
             echo "Suites ($label, a retry of what failed): $(tr '\n' ' ' < "$STATE/suites")"
-            # A failed driver run reruns alone, once `wait` has joined the Codex review.
+            # A failed driver run reruns alone, once `wait` has joined the other-model review.
             launch_suites "$(printf '%s\n' "$suites" | grep -v -x driver)"
             wait
             return 0
@@ -358,10 +358,10 @@ driver_due() {
 }
 
 cmd_wait() {
-    local budget=$HS_WAIT_BUDGET codex_abandoned="" deadline
+    local budget=$HS_WAIT_BUDGET review_abandoned="" deadline
     while [ $# -gt 0 ]; do
         case "$1" in
-            --codex-abandoned) codex_abandoned=1 ;;
+            --review-abandoned) review_abandoned=1 ;;
             --budget) shift; budget=$1 ;;
             *) usage >&2; return 1 ;;
         esac
@@ -377,9 +377,9 @@ cmd_wait() {
         return 3
     fi
     if driver_due; then
-        if [ -f "$CODEX_OUT" ] && [ ! -f "$CODEX_DONE" ] && [ -z "$codex_abandoned" ]; then
-            echo "The Codex review is still running. Join it (harden.md Phase 3), then re-issue wait."
-            echo "If Phase 3 abandoned it, re-issue: ./scripts/harden-suites.sh wait --codex-abandoned"
+        if [ -f "$REVIEW_OUT" ] && [ ! -f "$REVIEW_DONE" ] && [ -z "$review_abandoned" ]; then
+            echo "The other-model review is still running. Join it (harden.md Phase 3), then re-issue wait."
+            echo "If Phase 3 abandoned it, re-issue: ./scripts/harden-suites.sh wait --review-abandoned"
             return 3
         fi
         echo "Starting the Codex driver tests alone."

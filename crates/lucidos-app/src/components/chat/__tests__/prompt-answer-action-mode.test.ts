@@ -1,34 +1,41 @@
 import { describe, it, expect } from 'vitest';
 import { computeAnswerActionMode } from '../prompt-input-helpers';
 
-const base = {
-  pendingMultiQ: false,
-  hasContent: false,
-  isCanceling: false,
-};
+const single = { isCanceling: false, hasContent: false, multi: null };
+const emptyMulti = { pickedCount: 0, text: '', imageCount: 0 };
 
 describe('computeAnswerActionMode', () => {
-  it('cancel when nothing is submittable (single-select / permission / empty freetext)', () => {
-    expect(computeAnswerActionMode(base)).toBe('cancel');
+  it('cancel on an empty multi-select card: no pick, nothing typed', () => {
+    expect(computeAnswerActionMode({ ...single, multi: emptyMulti })).toBe('cancel');
   });
 
-  it('submit when a freetext/custom answer has been typed', () => {
-    expect(computeAnswerActionMode({ ...base, hasContent: true })).toBe('submit');
+  it('cancel while the box holds only whitespace', () => {
+    expect(computeAnswerActionMode({ ...single, multi: { ...emptyMulti, text: '  ' } })).toBe('cancel');
   });
 
-  it('multi for a pending multi-select question (the only state that needs the caret)', () => {
-    expect(computeAnswerActionMode({ ...base, pendingMultiQ: true })).toBe('multi');
+  it('submit once one option is picked', () => {
+    expect(computeAnswerActionMode({ ...single, multi: { ...emptyMulti, pickedCount: 1 } })).toBe('submit');
   });
 
-  // Multi-select always shows Submit (disabled at zero), so typed content does
-  // not change the mode — it still routes through the split button.
-  it('multi wins over typed content', () => {
-    expect(computeAnswerActionMode({ ...base, pendingMultiQ: true, hasContent: true })).toBe('multi');
+  it('submit once text is typed on a multi-select card', () => {
+    expect(computeAnswerActionMode({ ...single, multi: { ...emptyMulti, text: 'mine' } })).toBe('submit');
+  });
+
+  it('submit with images alone on a multi-select card', () => {
+    expect(computeAnswerActionMode({ ...single, multi: { ...emptyMulti, imageCount: 1 } })).toBe('submit');
+  });
+
+  it('cancel on a single-pick or permission card with an empty box', () => {
+    expect(computeAnswerActionMode(single)).toBe('cancel');
+  });
+
+  it('submit on a single-pick card once an answer is typed', () => {
+    expect(computeAnswerActionMode({ ...single, hasContent: true })).toBe('submit');
   });
 
   it('canceling overrides every other state once a Cancel is in flight', () => {
-    expect(computeAnswerActionMode({ ...base, isCanceling: true })).toBe('canceling');
-    expect(computeAnswerActionMode({ ...base, isCanceling: true, hasContent: true })).toBe('canceling');
-    expect(computeAnswerActionMode({ ...base, isCanceling: true, pendingMultiQ: true })).toBe('canceling');
+    expect(computeAnswerActionMode({ ...single, isCanceling: true })).toBe('canceling');
+    expect(computeAnswerActionMode({ ...single, isCanceling: true, hasContent: true })).toBe('canceling');
+    expect(computeAnswerActionMode({ ...single, isCanceling: true, multi: { ...emptyMulti, pickedCount: 2 } })).toBe('canceling');
   });
 });

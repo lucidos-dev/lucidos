@@ -228,11 +228,11 @@ self.addEventListener('fetch', (event) => {
   }
 });
 
-async function fetchWithRetry(request) {
+async function fetchWithRetry(request, init) {
   try {
-    return await fetch(request);
+    return await fetch(request, init);
   } catch {
-    return await fetch(request);
+    return await fetch(request, init);
   }
 }
 
@@ -377,7 +377,9 @@ async function networkFirstShell(request) {
   const shellKey = new Request(self.location.origin + SCOPE_PATH);
   let response;
   try {
-    response = await fetchWithRetry(request);
+    // Always revalidate. Chrome hands the worker a back/forward navigation as
+    // `force-cache`, which would boot the HTTP cache's shell of an old build.
+    response = await fetchWithRetry(request, { cache: 'no-cache' });
   } catch (err) {
     // Offline / engine down — serve the last good shell if install precached one.
     const cached = await cache.match(shellKey);

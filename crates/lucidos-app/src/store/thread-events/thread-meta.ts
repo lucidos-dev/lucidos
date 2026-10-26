@@ -2,7 +2,7 @@ import { changeWork, EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS } from '../../ge
 import type { ChangeWork, EventChannel, ThreadStatus } from '../../generated/thread-lifecycle';
 import type { EventWaitSummary, StoredEvent, ThreadInitiator, ThreadSection, TodoItem } from './thread-event-types';
 import type { CodingAgentChangeState, SuccessorLink } from '../../api/threads';
-import type { CacheKeepAliveStatus } from '../../generated/thread-event-wire';
+import type { CacheKeepAliveStatus, CodingAgent } from '../../generated/thread-event-wire';
 
 /** Post-event projection snapshot carried on persisted SSE thread events
  *  (`data.aggregate`) and on `fetchThreadEvents` HTTP responses
@@ -105,6 +105,9 @@ export type ThreadAggregate = {
   /** Which backend drives this thread — 'claude-code' | 'codex'. Absent for
    *  non-CC threads and legacy rows (consumers default to 'claude-code'). */
   codingAgent?: 'claude-code' | 'codex';
+  /** Every backend the thread's sessions started on, first use first. See
+   *  `ThreadMeta.codingAgents`. */
+  codingAgents?: CodingAgent[];
   state: ThreadComposeState;
 };
 
@@ -119,6 +122,13 @@ export type ThreadAggregate = {
  *  `threadMap` flush. */
 function sameWaits(a: EventWaitSummary[], b: EventWaitSummary[]): boolean {
   return a.length === b.length && a.every((w, i) => w.wait_id === b[i].wait_id);
+}
+
+/** Order matters: the list is first use first, and the drawer stacks it that way. */
+export function sameCodingAgents(a: CodingAgent[] | undefined, b: CodingAgent[] | undefined): boolean {
+  const prev = a ?? [];
+  const next = b ?? [];
+  return prev.length === next.length && next.every((agent, i) => prev[i] === agent);
 }
 
 /** The version of a row the client drew before any server summary existed.
@@ -220,6 +230,10 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
     meta.codingAgent = agg.codingAgent;
     changed = true;
   }
+  if (agg.codingAgents && !sameCodingAgents(meta.codingAgents, agg.codingAgents)) {
+    meta.codingAgents = agg.codingAgents;
+    changed = true;
+  }
   return changed;
 }
 
@@ -319,9 +333,9 @@ export type ThreadMeta = {
   /** Set when mode != 'human' on the initial MessageReceived. */
   parentThreadId?: string;
   parentThreadTitle?: string;
-  /** The *successor thread* this one continued in, once it handed off. */
+  /** The *legacy successor thread* this one continued in, once it handed off. */
   successor?: SuccessorLink;
-  /** The thread this *successor thread* continues. */
+  /** The thread this *legacy successor thread* continues. */
   successorOf?: SuccessorLink;
   /** Trigger that fired this thread (only for `channel === 'trigger'`). */
   triggerId?: string;
@@ -343,6 +357,11 @@ export type ThreadMeta = {
    *  compose promotion (sendCompose) for new threads; loaded from the
    *  thread summary afterwards. Absent = legacy / 'claude-code'. */
   codingAgent?: 'claude-code' | 'codex';
+  /** Every backend the thread's sessions started on, first use first, each
+   *  once. A thread that moved to another backend at a handoff lists both.
+   *  Empty for a thread that never started a session. Absent until a server
+   *  summary arrives, so a client-made row reads `codingAgent` instead. */
+  codingAgents?: CodingAgent[];
   /** Compose state machine. Server is the source of truth; events flow via
    *  ThreadStarted, MessageReceived, ThreadDiscarded, ThreadArchived.
    *

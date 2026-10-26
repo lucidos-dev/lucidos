@@ -191,12 +191,15 @@ pub(crate) enum WakeDuty {
 
 impl WakeDuty {
     pub(crate) async fn of_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Self {
-        let row = sqlx::query_as::<_, (Option<Uuid>, Option<String>)>(
-            // A thread that handed off reports through its successor, so it
-            // owes no decision of its own.
-            "SELECT CASE WHEN successor_thread_id IS NULL THEN parent_thread_id END, wake_mode \
+        // A thread whose handoff is pending reports at its successor
+        // session's end. One that handed off to a legacy successor thread reports
+        // through it. Neither owes a decision of its own now.
+        let row = sqlx::query_as::<_, (Option<Uuid>, Option<String>)>(&format!(
+            "SELECT CASE WHEN successor_thread_id IS NULL AND NOT {} THEN parent_thread_id END, \
+                    wake_mode \
              FROM thread_summaries WHERE thread_id = $1",
-        )
+            crate::engine::successor::pending_handoff_sql("$1")
+        ))
         .bind(thread_id)
         .fetch_optional(pool)
         .await

@@ -8,12 +8,27 @@
 //! The spawn runs through the mock provider's `MOCK_TOOL_CALL:` sentinel, so no
 //! LLM round-trip is needed.
 
-use crate::support::{base_url, db_url, poll_thread_summary_by_marker, unique_marker, user_client};
+use crate::support::{
+    base_url, capacity_policy, capacity_policy_lock, db_url, poll_thread_summary_by_marker,
+    unique_marker, user_client, with_pool_room, with_pool_room_held,
+};
 use serde_json::json;
 
 /// Have a fresh human thread call `run_thread` with `args`, and return the
 /// stored wake mode of the child it spawned.
+///
+/// Both threads need a free slot in the shared capacity pool. The rest of the
+/// suite pins it at its ceiling, so the whole spawn runs under `with_pool_room`.
 async fn spawned_wake_mode(pool: &sqlx::PgPool, args: serde_json::Value) -> Option<String> {
+    let client = user_client().await;
+    let pool = pool.clone();
+    with_pool_room(&client, async move {
+        spawn_and_read_wake_mode(&pool, args).await
+    })
+    .await
+}
+
+async fn spawn_and_read_wake_mode(pool: &sqlx::PgPool, args: serde_json::Value) -> Option<String> {
     let marker = unique_marker("api-wake-mode");
     let resp = user_client()
         .await
@@ -104,4 +119,44 @@ async fn chat_stream_refuses_a_wake_mode_it_cannot_honour() {
     }))
     .await;
     assert_eq!(unknown, 400, "`file` is not a wake mode");
+}
+
+/// The queue endpoint's `max_concurrent_total`, as the engine reports it now.
+async fn pool_ceiling(client: &reqwest::Client) -> u64 {
+    capacity_policy(client).await["max_concurrent_total"]
+        .as_u64()
+        .expect("the policy carries a pool ceiling")
+}
+
+#[tokio::test]
+async fn the_pool_room_helper_widens_the_pool_and_restores_it_after_a_panic() {
+    // Held throughout, so no other test widens the pool between these reads.
+    let _cap = capacity_policy_lock().lock().await;
+    let client = user_client().await;
+    let before = pool_ceiling(&client).await;
+
+    let widened = {
+        let client = client.clone();
+        with_pool_room_held(&client.clone(), async move { pool_ceiling(&client).await }).await
+    };
+    assert!(widened > before, "the pool was not widened: {widened}");
+    assert_eq!(
+        pool_ceiling(&client).await,
+        before,
+        "the pool was not restored"
+    );
+
+    let panicked = {
+        let client = client.clone();
+        tokio::spawn(
+            async move { with_pool_room_held(&client, async { panic!("work failed") }).await },
+        )
+        .await
+    };
+    assert!(panicked.is_err(), "the panic must reach the caller");
+    assert_eq!(
+        pool_ceiling(&client).await,
+        before,
+        "a panicking job left the pool widened"
+    );
 }

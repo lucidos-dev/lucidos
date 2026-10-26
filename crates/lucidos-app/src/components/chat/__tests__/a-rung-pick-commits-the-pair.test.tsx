@@ -37,7 +37,7 @@ const response: CodingAgentCommandsResponse = {
   has_active_session: false,
   default_implementer: { model: 'claude-opus-5-6', effort: 'medium' },
   ladder_rungs: [
-    { model: 'claude-opus-5-6', effort: 'medium', label: 'Opus 5.6', estimated: true, intelligence: { multiple: 1, label: '1×' } },
+    { model: 'claude-opus-5-6', effort: 'medium', label: 'Opus 5.6', estimated: true, intelligence: { multiple: 1, label: '1.0×' } },
     { model: 'claude-opus-5-6', effort: 'high', label: 'Opus 5.6', estimated: true, intelligence: { multiple: 1.08, label: '1.08×' } },
   ],
 } as unknown as CodingAgentCommandsResponse;
@@ -162,9 +162,8 @@ describe('the rung list', () => {
     render(<RungControl composeThreadId="d1" codingAgent="claude-code" />, host);
     await settle();
     // Nothing picked runs the ladder's default, which is the first rung.
-    // The face in force, not the hidden faces reserved behind it.
-    const face = () => host.querySelector('.rung-label > .rung-face:not(.rung-face-reserve)')!.textContent;
-    expect(face()).toBe('1×Opus 5.6 · medium');
+    const face = () => host.querySelector('.rung-label')!.textContent;
+    expect(face()).toBe('1.0×Opus 5.6 · medium');
     stepButtons()[1].click();
     await settle();
     expect(face()).toBe('1.08×Opus 5.6 · high');

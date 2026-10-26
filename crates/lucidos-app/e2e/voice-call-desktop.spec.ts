@@ -21,7 +21,7 @@
  * the two mobile projects, one of which is WebKit.
  */
 import { test, expect } from '@playwright/test';
-import { apiRequest, gotoWithRetry, newThread, setVoiceEnabled, waitForVisibleInput } from './helpers';
+import { apiRequest, gotoWithRetry, hideDashboardRail, newThread, setVoiceEnabled, waitForVisibleInput } from './helpers';
 import { ensureHomeThread } from './db-helpers';
 
 // A fake capture device, so `getUserMedia` resolves with no hardware and no
@@ -49,6 +49,18 @@ async function setOpenAiProvider(
 }
 
 test.describe('a call the engine cannot take', () => {
+  // The composer row folds the call toggle into the ⋯ menu when the
+  // Conversation pane is too narrow for the picker's full face. These specs
+  // look for the toggle standing in the row, so they give the pane the whole
+  // window: no rail, no drawer, no Canvas.
+  test.beforeEach(async ({ page }) => {
+    await hideDashboardRail(page);
+    await page.addInitScript(() => {
+      localStorage.setItem('lucidos-thread-drawer-open', 'false');
+      localStorage.setItem('lucidos-split-ratio', '1');
+    });
+  });
+
   // Two GLOBAL switches, armed here and put back afterwards. The e2e database
   // resets only between projects. A spec that left either one moved would hand
   // every later spec a workspace it was not written against.

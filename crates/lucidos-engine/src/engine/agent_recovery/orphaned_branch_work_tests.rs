@@ -120,6 +120,7 @@ async fn an_archived_integrated_childs_unmerged_work_is_set_aside() {
             integrated: true,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta(),
     })
@@ -199,6 +200,7 @@ async fn child_with_work(
             integrated,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         generated(),
     ] {
@@ -1026,6 +1028,39 @@ async fn work_a_successor_carries_is_never_set_aside() {
     assert!(!scope.set_aside_archived_branch_work(old).await.unwrap());
     assert!(!scope.set_aside_successor_residue(successor).await);
     assert_eq!(change_proposed_count(&pool, old).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// Legacy chains: the boot pass leaves an archived old thread's carried work
+/// alone, so nothing re-proposes a legacy successor thread's predecessor.
+#[tokio::test]
+async fn the_boot_pass_never_proposes_a_legacy_predecessor() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let branch = "claude-code/legacy-old";
+    let (old, successor, _tmp, repo, _wt) = handed_off_thread(&bus, branch).await;
+    let successor_branch = "claude-code/legacy-successor";
+    git_cmd(&["branch", successor_branch, branch], &repo)
+        .await
+        .unwrap();
+    start_cc_session(&bus, successor, successor_branch, None).await;
+    sqlx::query("UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1")
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let scope = BranchWorkScope {
+        pool: &pool,
+        event_bus: &bus,
+        lucidos_repo_root: &repo,
+        workspace_root: &repo,
+    };
+
+    assert_eq!(scope.set_aside_archived_branch_work_on_startup().await, 0);
+    assert_eq!(change_proposed_count(&pool, old).await, 0);
+    assert!(crate::engine::successor::handed_off(&pool, old).await);
 
     pool.close().await;
     teardown_test_db(&db).await;

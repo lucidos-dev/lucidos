@@ -88,13 +88,13 @@ impl LucidosEngine {
         // CC on a clean conversation rather than the sid we just proved
         // unusable.
         //
-        // Phase 9: prepend a reconstruction of the prior conversation so
-        // CC has rough context instead of starting from amnesia.
+        // The fresh session gets a recap of the prior conversation, then a
+        // *handoff brief* telling it how to rebuild the rest, then the message.
         let mut result = result;
         if let Err(ref e) = result {
             if e.to_string() == crate::engine::claude_code::STALE_RESUME_ERROR {
                 log!("[Chat] Stale CC resume — retrying with fresh session");
-                let retry_text = crate::engine::agent_session::prepend_reconstruction(
+                let retry_text = crate::engine::successor::resume_failed_input(
                     &self.pool,
                     thread_id,
                     user_message,

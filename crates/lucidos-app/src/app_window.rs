@@ -15,6 +15,9 @@
 //! places: menu items, tray items, window events and notification taps. The
 //! concept underneath is single, so the module is cohesive rather than deep.
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::{
@@ -314,6 +317,60 @@ pub(crate) fn toggle_window_maximize(window: tauri::Window) -> Result<(), String
     } else {
         window.maximize().map_err(|e| format!("{e}"))
     }
+}
+
+/// Put the CALLING window into or out of native fullscreen, and answer whether
+/// it was ALREADY fullscreen. The page leaves a fullscreen it entered and keeps
+/// one the user chose (the green button), so it needs the prior state.
+///
+/// The app view's Fullscreen uses this in the desktop client, in place of
+/// WebKit element fullscreen (ADR 0559). An app command, like
+/// `toggle_window_maximize`, so the window-plugin ACL does not apply.
+#[tauri::command]
+pub(crate) fn set_window_fullscreen(
+    window: tauri::Window,
+    fullscreen: bool,
+) -> Result<bool, String> {
+    let was_fullscreen = window.is_fullscreen().map_err(|e| format!("{e}"))?;
+    window
+        .set_fullscreen(fullscreen)
+        .map_err(|e| format!("{e}"))?;
+    Ok(was_fullscreen)
+}
+
+/// The Tauri event a window's page listens for. Its payload is a `bool`.
+const WINDOW_FULLSCREEN_CHANGED_EVENT: &str = "window-fullscreen-changed";
+
+/// The last fullscreen value reported to each window's page.
+static FULLSCREEN_REPORTED: Mutex<BTreeMap<String, bool>> = Mutex::new(BTreeMap::new());
+
+/// Record `now` as what `label`'s page was last told, and say whether that is
+/// news. A window nobody has reported on counts as windowed.
+fn fullscreen_changed(reported: &mut BTreeMap<String, bool>, label: &str, now: bool) -> bool {
+    reported.insert(label.to_string(), now).unwrap_or(false) != now
+}
+
+/// Tell `window`'s page that the window entered or left native fullscreen. Runs
+/// from the `Resized` arm, so it sends on a CHANGE only: a live drag resizes at
+/// frame rate, and an IPC emit per step would load that path (ADR 0074).
+pub(crate) fn report_window_fullscreen(window: &tauri::Window) {
+    let Ok(now) = window.is_fullscreen() else {
+        return;
+    };
+    let changed = fullscreen_changed(
+        &mut FULLSCREEN_REPORTED.lock().unwrap(),
+        window.label(),
+        now,
+    );
+    if changed {
+        let _ = window.emit_to(window.label(), WINDOW_FULLSCREEN_CHANGED_EVENT, now);
+    }
+}
+
+/// A window is gone for good, so drop what it was last told. Called from
+/// `Destroyed`, which keeps the map from growing one entry per closed window.
+pub(crate) fn forget_window_fullscreen(label: &str) {
+    FULLSCREEN_REPORTED.lock().unwrap().remove(label);
 }
 
 /// Title the CALLING window, so the macOS Window menu names the workspace that
@@ -1390,5 +1447,28 @@ mod tests {
         assert!(!is_app_window("url-preview-3"));
         assert!(!is_app_window("lucidos-tray"));
         assert!(!is_app_window(""));
+    }
+
+    // ── Reporting fullscreen to the page ─────────────────────────────────────
+
+    // A resize drag fires this per frame. Only the first report of a value is
+    // news, so the IPC emit happens once per transition.
+    #[test]
+    fn fullscreen_is_reported_on_a_change_only() {
+        let mut reported = BTreeMap::new();
+        assert!(!fullscreen_changed(&mut reported, "main", false));
+        assert!(fullscreen_changed(&mut reported, "main", true));
+        assert!(!fullscreen_changed(&mut reported, "main", true));
+        assert!(fullscreen_changed(&mut reported, "main", false));
+    }
+
+    // Two windows can be fullscreen independently, so one window's report must
+    // not swallow the other's.
+    #[test]
+    fn each_window_has_its_own_last_report() {
+        let mut reported = BTreeMap::new();
+        assert!(fullscreen_changed(&mut reported, "main", true));
+        assert!(fullscreen_changed(&mut reported, "window-1", true));
+        assert!(!fullscreen_changed(&mut reported, "main", true));
     }
 }

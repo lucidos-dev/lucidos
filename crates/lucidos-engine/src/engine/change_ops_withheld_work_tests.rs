@@ -228,6 +228,93 @@ async fn unhardened_work_is_held_but_a_plan_alone_is_not() {
     teardown_test_db(&db).await;
 }
 
+/// The turn that hands off still holds its unhardened work, but announces no
+/// verdict: its successor session owes the harden, and that session's turn end
+/// decides. Once the successor session starts, the hold announces again.
+#[tokio::test]
+async fn a_pending_handoff_holds_the_work_but_announces_no_verdict() {
+    use crate::engine::git_ops::{record_planned, PlanMarkerKind};
+    use crate::engine::thread_events::{HandoffOpening, SessionContinuity};
+
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (_tmp, repo, thread_id) = thread_with_work(&bus).await;
+    let repo_str = repo.to_string_lossy().to_string();
+    record_planned(
+        &pool,
+        &repo,
+        BRANCH,
+        PlanMarkerKind::Planned,
+        None,
+        None,
+        &[],
+        "abc",
+    )
+    .await
+    .expect("mark planned");
+    let code = files(&["a.txt"]);
+    let message = "A fresh session starts here.";
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::SessionHandedOff {
+            opening: HandoffOpening::Narrative,
+            message: message.into(),
+            checkpoint: Some("pre-harden".into()),
+            progress: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            coding_agent_model: None,
+            reasoning_effort: None,
+            request: None,
+        },
+    )
+    .await;
+
+    let hold = hold_of(&pool, &bus, &input(thread_id, &repo_str, "work", &code)).await;
+    assert_eq!(hold, Some(ProposalHold::HardeningMissing));
+    assert!(payloads(&pool, thread_id, "ProposalWithheld")
+        .await
+        .is_empty());
+    assert_ne!(
+        read_change_state(&pool, thread_id).await,
+        CodingAgentChangeState::Unproposed {
+            reason: Some(UnproposedReason::HardeningMissing)
+        },
+        "no Not ready strip before the successor session starts"
+    );
+
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: "successor-session".into(),
+            branch: BRANCH.into(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
+            continuity: Some(SessionContinuity::Handoff {
+                checkpoint: Some("pre-harden".into()),
+                progress: None,
+                opening: HandoffOpening::Narrative,
+                message: message.into(),
+            }),
+        },
+    )
+    .await;
+    hold_of(&pool, &bus, &input(thread_id, &repo_str, "work", &code)).await;
+    let withheld = payloads(&pool, thread_id, "ProposalWithheld").await;
+    assert_eq!(withheld.len(), 1, "{withheld:?}");
+    assert_eq!(withheld[0]["reason"], "hardening_missing");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
 /// The branch head, as a marker records it.
 async fn branch_head(repo: &std::path::Path) -> String {
     String::from_utf8(git_cmd(&["rev-parse", BRANCH], repo).await.unwrap().stdout)
@@ -265,6 +352,7 @@ async fn an_integrated_child_hands_up_hardened_work_and_never_proposes() {
             integrated: true,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
     )
     .await;

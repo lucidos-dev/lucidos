@@ -64,5 +64,5 @@ export function ReplyHtml({ html, final, threadId, eventId, class: className, te
 }) {
   const [host, setHost] = useState<HTMLDivElement | null>(null);
   useWidgetEmbedSlots(host, html, final, threadId, eventId);
-  return <div ref={setHost} class={className} data-text-seq={textSeq} dangerouslySetInnerHTML={{ __html: html }} />;
+  return <div ref={setHost} class={['authored-html', className].filter(Boolean).join(' ')} data-text-seq={textSeq} dangerouslySetInnerHTML={{ __html: html }} />;
 }

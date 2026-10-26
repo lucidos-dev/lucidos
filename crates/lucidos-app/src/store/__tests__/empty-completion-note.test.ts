@@ -41,6 +41,23 @@ describe('benign empty completion → neutral note', () => {
     expect(events.some(e => e.type === 'empty')).toBe(false);
   });
 
+  it('no note when a quiet pick ended the turn, but a loud pick still gets one', () => {
+    const answeredWith = (quiet: boolean) => makeExchange(msg(), [
+      step(1, { type: 'ToolCalled', name: 'ask_user_question', args: {} }),
+      step(2, {
+        type: 'UserQuestionAnswered',
+        tool_use_id: 'q#q0',
+        answer: { kind: 'Selected', option_id: 'opt-1' },
+        quiet,
+      } as StoredEvent),
+      step(3, { type: 'ResponseGenerated', text: '' }),
+    ]);
+    const hasNote = (quiet: boolean) =>
+      exchangeResponseEvents(answeredWith(quiet), true, false).some(e => e.type === 'empty');
+    expect(hasNote(true)).toBe(false);
+    expect(hasNote(false)).toBe(true);
+  });
+
   it('no note for the [ENGINE-LIMIT] cap (text-less stream but non-empty RG text)', () => {
     const exchange = makeExchange(msg(), [
       step(1, { type: 'ToolCalled', name: 'x', args: {} }),

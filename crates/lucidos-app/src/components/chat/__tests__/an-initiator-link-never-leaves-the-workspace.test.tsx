@@ -60,7 +60,7 @@ function drawTurn(text: string): void {
       isLast={false}
       threadId={THREAD}
       threadIsCC={false}
-      threadCodingAgent="claude-code"
+      sessionCodingAgent="claude-code"
       threadIdle={true}
       threadAwaitingAnswer={false}
       threadCanceling={false}

@@ -769,6 +769,7 @@ mod tests {
                     description: Some("Chunks 25-33, on the current main".to_string()),
                     preview: None,
                     widget: None,
+                    quiet: false,
                 },
                 QuestionOption {
                     id: "opt-1".to_string(),
@@ -776,6 +777,7 @@ mod tests {
                     description: None,
                     preview: None,
                     widget: None,
+                    quiet: false,
                 },
             ],
             multi_select,

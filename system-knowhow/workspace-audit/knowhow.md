@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: knowhow
 description: The knowhow audit section: frontmatter, naming, placement, references no doc names, and orphaned docs.
+sources: ["docs/taxonomy.md", "system-knowhow/best-practices.md", "system-knowhow/building-knowhow.md", "system-knowhow/triggers.md", "crates/lucidos-engine/src/core/knowhow.rs"]
 ---
 
 # Workspace audit section: knowhow

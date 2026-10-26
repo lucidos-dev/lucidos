@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { afterPressSettles, primaryPointerIsDown } from './pointerPress';
+import { afterPressSettles, notePressOwesClick, primaryPointerIsDown } from './pointerPress';
 
 /** Drives the document stub from `test-setup.ts`, which dispatches to every
  *  listener of a type regardless of phase. That is enough here: the module
@@ -76,6 +76,17 @@ describe('afterPressSettles', () => {
     expect(fn).not.toHaveBeenCalled();
     dispatch('pointerup');
     expect(fn).not.toHaveBeenCalled();
+    vi.runAllTimers();
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it('runs after the click an already-lifted press still owes', () => {
+    // A widget frame's finger lifted there, so this document saw no pointerup.
+    vi.useFakeTimers();
+    const fn = vi.fn();
+    notePressOwesClick();
+    afterPressSettles(fn);
+    dispatch('click');
     vi.runAllTimers();
     expect(fn).toHaveBeenCalledOnce();
   });

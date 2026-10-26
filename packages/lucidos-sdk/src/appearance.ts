@@ -69,8 +69,8 @@ export const THEME_MODE_BG: Record<ResolvedThemeMode, string> = {
 };
 
 /** The shell header's top colour per resolved mode, as its stylesheet sets
- *  `--header-bar-top`. It tints the bar above the page: the iOS status bar of
- *  the installed app (ADR 0548), and Android's and the browsers' toolbars. */
+ *  `--header-bar-top`. It tints the browsers' and Android's toolbars, and
+ *  colours index.html's iOS status bar strip before the stylesheet loads. */
 export const THEME_MODE_HEADER_TOP: Record<ResolvedThemeMode, string> = {
   light: '#1a6fd0',
   dark: '#15549e',

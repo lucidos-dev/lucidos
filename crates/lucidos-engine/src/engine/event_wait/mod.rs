@@ -24,6 +24,7 @@ mod background_task;
 mod dispatcher;
 pub(crate) mod keep_alive;
 mod register;
+mod remembered_requests;
 mod wait_durations;
 
 pub(crate) use agent_surface::CancelEventWaitOutcome;
@@ -39,6 +40,7 @@ pub(crate) use register::{describe_subscriptions, AwaitEventOutcome};
 /// Re-exported so the `await_event` tool description interpolates the real cap.
 /// A restated number would silently drift from the refusal the model hits.
 pub(crate) use register::{MAX_RECENT_SUBSCRIPTIONS, RECENT_SUBSCRIPTION_WINDOW_SECS};
+pub(crate) use remembered_requests::RememberedRequests;
 pub(crate) use wait_durations::WaitDurationsCache;
 
 use crate::engine::thread_events::not_a_keep_alive_idle_sql;

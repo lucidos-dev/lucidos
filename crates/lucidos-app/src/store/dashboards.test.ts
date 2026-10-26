@@ -1,35 +1,35 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  closeDashboardSheet,
-  dashboardSheetOpen,
-  openDashboardSheet,
-  toggleDashboardSheet,
+  closeDashboardPanel,
+  dashboardPanelOpen,
+  openDashboardPanel,
 } from './dashboards';
+import { toggleDashboardPanel } from './actions/thread-navigation';
 import { focusedThreadId } from './store';
 
-describe('the dashboard sheet', () => {
+describe('the dashboard panel', () => {
   beforeEach(() => {
-    closeDashboardSheet();
+    closeDashboardPanel();
     focusedThreadId.value = 'thread-a';
   });
 
   it('opens, closes and toggles', () => {
-    expect(dashboardSheetOpen.value).toBe(false);
-    openDashboardSheet();
-    expect(dashboardSheetOpen.value).toBe(true);
-    toggleDashboardSheet();
-    expect(dashboardSheetOpen.value).toBe(false);
-    toggleDashboardSheet();
-    expect(dashboardSheetOpen.value).toBe(true);
-    closeDashboardSheet();
-    expect(dashboardSheetOpen.value).toBe(false);
+    expect(dashboardPanelOpen.value).toBe(false);
+    openDashboardPanel();
+    expect(dashboardPanelOpen.value).toBe(true);
+    toggleDashboardPanel();
+    expect(dashboardPanelOpen.value).toBe(false);
+    toggleDashboardPanel();
+    expect(dashboardPanelOpen.value).toBe(true);
+    closeDashboardPanel();
+    expect(dashboardPanelOpen.value).toBe(false);
   });
 
   it('never moves the focused thread', () => {
-    openDashboardSheet();
-    toggleDashboardSheet();
-    toggleDashboardSheet();
-    closeDashboardSheet();
+    openDashboardPanel();
+    toggleDashboardPanel();
+    toggleDashboardPanel();
+    closeDashboardPanel();
     expect(focusedThreadId.value).toBe('thread-a');
   });
 });

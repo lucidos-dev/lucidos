@@ -79,6 +79,16 @@ impl QuestionWaitRegistry {
         }
     }
 
+    /// Whether a live waiter is blocked on `tool_use_id`, so a `notify` now
+    /// would wake it.
+    pub async fn has_waiter(&self, tool_use_id: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .get(tool_use_id)
+            .is_some_and(|tx| tx.receiver_count() > 0)
+    }
+
     /// Drop the channel for `tool_use_id` after the hook completes its turn.
     pub async fn forget(&self, tool_use_id: &str) {
         self.inner.write().await.remove(tool_use_id);
@@ -113,6 +123,21 @@ mod tests {
             .expect("received");
 
         assert_eq!(got.answers, serde_json::json!({"q?": "Red"}));
+    }
+
+    #[tokio::test]
+    async fn has_waiter_is_true_only_while_a_receiver_is_live() {
+        let registry = QuestionWaitRegistry::new();
+        assert!(!registry.has_waiter("toolu_test_2").await);
+
+        let waiter = registry.register("toolu_test_2").await;
+        assert!(registry.has_waiter("toolu_test_2").await);
+
+        drop(waiter);
+        assert!(
+            !registry.has_waiter("toolu_test_2").await,
+            "a channel whose hook died wakes nobody"
+        );
     }
 
     #[tokio::test]

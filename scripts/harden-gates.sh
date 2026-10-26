@@ -30,9 +30,13 @@ build-script-paths ./scripts/check-build-script-paths.sh
 e2e-workflow ./scripts/check-e2e-workflow.sh
 mirror-push-gate ./scripts/mirror-push-gate.sh
 mirror-pushers ./scripts/check-mirror-pushers.sh
-knowhow-refs ./scripts/check-knowhow-refs.sh
+knowhow make lint-knowhow
+knowhow-coupling ./scripts/check-knowhow-coupling.sh
+knowhow-coupling-fixtures ./scripts/lib/check_knowhow_coupling_test.sh
+audit-fixtures ./scripts/lib/check_audit_scans_test.sh
+knowhow-fixtures ./scripts/lib/check_knowhow_refs_test.sh && ./scripts/lib/check_knowhow_generated_test.sh
 default-flows ./scripts/check-default-flows.sh
-audit-scans ./scripts/check-audit-scans.sh
+retired-terms-fixtures ./scripts/lib/check_retired_terms_test.sh
 hooks-registered ./scripts/lib/hooks_registered_test.sh'
 
 case "${1:-}" in

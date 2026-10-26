@@ -4,6 +4,9 @@
 - **Date**: 2026-10-04
 - **Amended by**: [0391](0391-agent-teardown-reaps-by-agent-run-marker.md). The
   group teardown named below missed every Bash call until then.
+- **Amended by**: [0558](0558-harden-other-model-review.md). The other-model
+  review no longer runs behind a shell `&`. It runs as an engine background
+  task, and only the early suites keep the shell `&`.
 
 ## Context
 

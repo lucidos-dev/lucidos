@@ -160,13 +160,20 @@ async fn continuation_retry_input_recaps_the_thread_before_the_continue_message(
     let recap_pos = input
         .find("fix the flaky drafts spec")
         .expect("prior user turn must be recapped into the retry input");
-    let continue_pos = input
-        .find(CONTINUE_RESUME_USER_MESSAGE)
-        .expect("retry input must still carry the continue message");
+    let brief = crate::engine::successor::handoff_brief(
+        thread_id,
+        crate::engine::successor::BriefCause::ResumeFailed,
+        true,
+        None,
+    );
+    let brief_pos = input
+        .find(&brief)
+        .expect("a failed resume opens on a handoff brief");
     assert!(
-        recap_pos < continue_pos,
+        recap_pos < brief_pos,
         "the recap must come FIRST so the agent reads what happened before being told to continue"
     );
+    assert!(input.ends_with(CONTINUE_RESUME_USER_MESSAGE));
     assert!(
         input.contains("Traced it to the debounced compose PUT."),
         "prior assistant turn missing from the retry input"
@@ -177,8 +184,8 @@ async fn continuation_retry_input_recaps_the_thread_before_the_continue_message(
 }
 
 /// A thread with no reconstructable history still yields a usable retry input:
-/// the bare continue message, never an empty string. An empty stdin parks
-/// `claude --print --resume` forever waiting for input — the exact hang
+/// the brief and the continue message, never an empty string. An empty stdin
+/// parks `claude --print --resume` forever waiting for input, the exact hang
 /// `CONTINUE_RESUME_USER_MESSAGE` exists to prevent.
 #[tokio::test]
 async fn continuation_retry_input_is_never_empty() {
@@ -196,8 +203,18 @@ async fn continuation_retry_input_is_never_empty() {
     .await;
 
     assert_eq!(
-        input, CONTINUE_RESUME_USER_MESSAGE,
-        "with nothing to recap the retry input must fall back to the bare continue message"
+        input,
+        crate::engine::successor::successor_first_message(
+            &crate::engine::successor::handoff_brief(
+                thread_id,
+                crate::engine::successor::BriefCause::ResumeFailed,
+                true,
+                None,
+            ),
+            Some(CONTINUE_RESUME_USER_MESSAGE),
+            CONTINUE_RESUME_USER_MESSAGE,
+        ),
+        "with nothing to recap the retry input is the brief alone"
     );
 
     pool.close().await;
@@ -233,6 +250,7 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -257,6 +275,7 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
                     description: None,
                     preview: None,
                     widget: None,
+                    quiet: false,
                 },
                 QuestionOption {
                     id: "opt-1".into(),
@@ -264,6 +283,7 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
                     description: None,
                     preview: None,
                     widget: None,
+                    quiet: false,
                 },
             ],
             worktree_path: None,
@@ -283,6 +303,7 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: tool_use_id.into(),
+            quiet: false,
             answer: AnswerKind::FreeText {
                 text: typed.into(),
                 image_hashes: vec![],
@@ -544,6 +565,222 @@ async fn a_start_failure_leaves_its_message_owed_to_the_next_continue() {
         .await
         .expect("the message the agent never read is owed");
     assert_eq!(owed.text, "Make the OpenRouter calls use prompt caching.");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+fn aborted(cause: crate::engine::thread_events::AbortCause) -> ThreadEvent {
+    ThreadEvent::ResponseAborted {
+        text: String::new(),
+        images: Vec::new(),
+        model: None,
+        reasoning_effort: None,
+        cause,
+    }
+}
+
+/// The events a switch leaves on a thread whose prompt the engine wrote and
+/// whose agent read nothing: the engine prompt, the switch teardown abort,
+/// and the boot floor's withdrawal. Returns the prompt's event id.
+async fn seed_unread_engine_prompt_after_switch(
+    bus: &EventBus,
+    thread_id: Uuid,
+    prompt: &str,
+) -> Uuid {
+    use crate::engine::thread_events::{AbortCause, ActorMode, MessageOrigin};
+
+    let mut engine_prompt = crate::test_support::message_received(prompt);
+    if let ThreadEvent::MessageReceived { mode, .. } = &mut engine_prompt {
+        *mode = ActorMode::Engine;
+    }
+    let prompt_id = emit_cc(bus, thread_id, engine_prompt).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: aborted(AbortCause::EngineShutdown),
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            actor: Some(MessageOrigin::Device {
+                device_id: "d1".into(),
+            }),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("emit succeeds");
+    emit_cc(bus, thread_id, aborted(AbortCause::RecoveryAfterRestart)).await;
+    prompt_id
+}
+
+/// A switch that lands before the agent spawned leaves its engine prompt
+/// unread, behind two aborts. A resume of any reason must hand it over: a bare
+/// "continue" asks an agent with no context to resume work it was never told.
+#[tokio::test]
+async fn a_thread_whose_agent_read_nothing_gets_its_engine_prompt_on_every_resume() {
+    use crate::engine::agent_recovery::{
+        resume_input, AUTO_RESUME_AFTER_SWITCH_REASON, USER_CLICKED_CONTINUE_REASON,
+    };
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let prompt_id =
+        seed_unread_engine_prompt_after_switch(&bus, thread_id, "Fix main: browser failed").await;
+
+    for reason in [
+        AUTO_RESUME_AFTER_SWITCH_REASON,
+        USER_CLICKED_CONTINUE_REASON,
+    ] {
+        let owed = resume_input(&pool, thread_id, Some(reason))
+            .await
+            .unwrap_or_else(|| panic!("the unread prompt is owed to a `{reason}` resume"));
+        assert_eq!(owed.text, "Fix main: browser failed");
+        assert_eq!(owed.event_ids, vec![prompt_id]);
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The spawn writes `SessionStarted` before the agent reads its first prompt,
+/// so a switch can land between the two. The agent read nothing: it still owes
+/// the prompt, and a resume must hand it over.
+#[tokio::test]
+async fn a_thread_that_started_but_read_nothing_gets_its_prompt_on_every_resume() {
+    use crate::engine::agent_recovery::{
+        resume_input, AUTO_RESUME_AFTER_SWITCH_REASON, USER_CLICKED_CONTINUE_REASON,
+    };
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    crate::test_support::start_cc_session(&bus, thread_id, "claude-code/started", None).await;
+    let prompt_id =
+        seed_unread_engine_prompt_after_switch(&bus, thread_id, "Fix main: browser failed").await;
+
+    for reason in [
+        AUTO_RESUME_AFTER_SWITCH_REASON,
+        USER_CLICKED_CONTINUE_REASON,
+    ] {
+        let owed = resume_input(&pool, thread_id, Some(reason))
+            .await
+            .unwrap_or_else(|| panic!("the unread prompt is owed to a `{reason}` resume"));
+        assert_eq!(owed.event_ids, vec![prompt_id]);
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The same events once the agent read its prompt: it resumes its own session,
+/// so only Continue's existing start-failure rule applies, and it finds nothing.
+#[tokio::test]
+async fn a_thread_whose_agent_read_its_prompt_keeps_the_bare_continue() {
+    use crate::engine::agent_recovery::{
+        resume_input, AUTO_RESUME_AFTER_SWITCH_REASON, USER_CLICKED_CONTINUE_REASON,
+    };
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    crate::test_support::start_cc_session(&bus, thread_id, "claude-code/read", None).await;
+    let prompt_id =
+        seed_unread_engine_prompt_after_switch(&bus, thread_id, "Fix main: browser failed").await;
+    emit_cc(
+        &bus,
+        thread_id,
+        ThreadEvent::CodingAgentInputRead {
+            input_event_id: prompt_id,
+            started_turn: true,
+            verbatim: false,
+        },
+    )
+    .await;
+
+    for reason in [
+        AUTO_RESUME_AFTER_SWITCH_REASON,
+        USER_CLICKED_CONTINUE_REASON,
+    ] {
+        assert!(
+            resume_input(&pool, thread_id, Some(reason)).await.is_none(),
+            "an agent that read its prompt resumes its session, so `{reason}` replays nothing"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An agent that answered has the conversation, even where no read was
+/// recorded (a thread from before the input ledger). Each output kind counts.
+#[tokio::test]
+async fn a_thread_whose_agent_produced_output_keeps_the_bare_continue() {
+    use crate::engine::agent_recovery::{resume_input, AUTO_RESUME_AFTER_SWITCH_REASON};
+
+    let outputs = [
+        ThreadEvent::CodingAgentTextStreamed {
+            text: "on it".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            parent_tool_use_id: None,
+            progress_note: false,
+        },
+        ThreadEvent::CodingAgentThoughtStreamed {
+            text: "thinking".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+    ];
+    for output in outputs {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_unread_engine_prompt_after_switch(&bus, thread_id, "Fix main").await;
+        emit_cc(&bus, thread_id, output).await;
+
+        assert!(
+            resume_input(&pool, thread_id, Some(AUTO_RESUME_AFTER_SWITCH_REASON))
+                .await
+                .is_none(),
+            "an agent that produced output was told its task"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+}
+
+/// A message the user took back is not owed to the agent.
+#[tokio::test]
+async fn a_message_the_user_took_back_is_not_replayed() {
+    use crate::engine::agent_recovery::{resume_input, AUTO_RESUME_AFTER_SWITCH_REASON};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let kept = emit_cc(
+        &bus,
+        thread_id,
+        crate::test_support::message_received("keep"),
+    )
+    .await;
+    let removed = emit_cc(
+        &bus,
+        thread_id,
+        crate::test_support::message_received("drop"),
+    )
+    .await;
+    emit_cc(
+        &bus,
+        thread_id,
+        ThreadEvent::QueuedMessageRemoved {
+            removed_message_id: removed,
+        },
+    )
+    .await;
+
+    let owed = resume_input(&pool, thread_id, Some(AUTO_RESUME_AFTER_SWITCH_REASON))
+        .await
+        .expect("the kept prompt is owed");
+    assert_eq!(owed.event_ids, vec![kept]);
 
     pool.close().await;
     teardown_test_db(&db_name).await;

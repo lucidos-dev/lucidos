@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * The Successor card on top of the composer, offering a *successor thread* to a
+ * The Successor card on top of the composer, offering a *successor session* to a
  * large coding-agent thread. It shows only at a clean idle, and only where the
  * engine's verdict for the current cache state says a handoff pays. It also
  * waits for the user to start writing in the composer.
@@ -116,11 +116,11 @@ describe('successorOffer', () => {
 });
 
 describe('successorFinding', () => {
-  it('names the size and the ratio to a fresh thread', () => {
+  it('names the size and the ratio to a fresh session', () => {
     expect(successorFinding(reading({ fresh_ratio: 6.2 }))).toBe(
-      'This thread holds 412k tokens, and every reply rereads all of it (about 6x a fresh thread).',
+      'This thread holds 412k tokens, and every reply rereads all of it (about 6x a fresh session).',
     );
-    expect(successorFinding(reading({ fresh_ratio: 1.44 }))).toContain('about 1.4x a fresh thread');
+    expect(successorFinding(reading({ fresh_ratio: 1.44 }))).toContain('about 1.4x a fresh session');
     expect(successorFinding({ ...WARM, input_tokens: null })).toContain('This thread is large,');
   });
 });
@@ -166,7 +166,7 @@ describe('SuccessorCard', () => {
   it('asks the question with three options, each with its explanation', async () => {
     const host = await mount();
     expect(host.querySelector('.question-text')?.textContent).toContain('This thread holds 412k tokens');
-    expect(host.querySelector('.question-text p:last-child')?.textContent).toBe('Carry on in a new thread?');
+    expect(host.querySelector('.question-text p:last-child')?.textContent).toBe('Carry on in a fresh session?');
     const labels = Array.from(host.querySelectorAll('.successor-card .question-option-label')).map((e) => e.textContent);
     expect(labels).toEqual(['Continue with context', 'Start fresh', 'Stay here']);
     expect(option(host, 'Start fresh').textContent).toContain('no carry-over');
@@ -213,12 +213,12 @@ describe('SuccessorCard', () => {
     expect(option(host, 'Start fresh').disabled).toBe(false);
   });
 
-  it('says Starting the new thread on a cold cache', async () => {
+  it('says Starting the fresh session on a cold cache', async () => {
     vi.mocked(fetchThreadContext).mockResolvedValue(COLD);
     vi.mocked(continueInSuccessor).mockReturnValueOnce(new Promise<void>(() => {}));
     const host = await mount();
     await act(async () => { option(host, 'Continue with context').click(); });
-    expect(option(host, 'Continue with context').textContent).toContain('Starting the new thread…');
+    expect(option(host, 'Continue with context').textContent).toContain('Starting the fresh session…');
   });
 
   it('starts fresh through the draft action and calls no engine route', async () => {
@@ -239,7 +239,7 @@ describe('SuccessorCard', () => {
     vi.mocked(continueInSuccessor).mockRejectedValueOnce(new Error('uncommitted work'));
     const host = await mount();
     await act(async () => { option(host, 'Continue with context').click(); });
-    expect(toasts.value.map((t) => t.message).join(' ')).toContain('Could not continue in a new thread');
+    expect(toasts.value.map((t) => t.message).join(' ')).toContain('Could not continue in a fresh session');
     expect(option(host, 'Continue with context').disabled).toBe(false);
   });
 

@@ -44,7 +44,9 @@ struct ChildRow {
     batch_still_working: bool,
     /// The child is in a *cache keep-alive* turn, which finishes nothing.
     keep_alive_turn: bool,
-    /// The child handed off to a successor, which reports in its place.
+    /// The child's handoff is pending, so its successor session reports at
+    /// the real end. Or it handed off to a legacy successor thread, which reports in
+    /// its place.
     handed_off: bool,
 }
 
@@ -76,12 +78,14 @@ fn child_row_sql() -> String {
             c.first_message, c.parent_callback_pending, c.is_stopped_child, \
             c.live_event_wait_count > 0 AS holds_live_wait, c.status, \
             c.coding_agent_change_state, c.parent_wake_requested, c.wake_mode, \
-            c.keep_alive_turn, c.successor_thread_id IS NOT NULL AS handed_off, \
+            c.keep_alive_turn, \
+            (c.successor_thread_id IS NOT NULL OR {}) AS handed_off, \
             p.is_coding_agent AS parent_is_coding_agent, \
             {} AS batch_still_working \
      FROM thread_summaries c \
      LEFT JOIN thread_summaries p ON p.thread_id = c.parent_thread_id \
      WHERE c.thread_id = $1",
+        crate::engine::successor::pending_handoff_sql("c.thread_id"),
         batch_still_working_sql("c", "$2", "$3")
     )
 }
@@ -90,9 +94,11 @@ fn child_row_sql() -> String {
 /// is still working": the batch [`Delivery::for_report`] waits on. Bind
 /// `active_thread_statuses` to `statuses_param` and the batch mode's name to
 /// `mode_param`. The fan-in and the turn-end gate both read it, so the read
-/// decision's forecast matches the delivery. A sibling that handed off works
-/// on until its successor's row exists, since the Thread Queue may hold the
-/// spawn. From then on the successor counts as the sibling.
+/// decision's forecast matches the delivery. A sibling whose handoff is
+/// pending works on: its successor session is about to start. A sibling that
+/// handed off to a legacy successor thread works on until that thread's row exists,
+/// since the Thread Queue may hold the spawn. From then on the successor counts
+/// as the sibling.
 pub(crate) fn batch_still_working_sql(
     child: &str,
     statuses_param: &str,
@@ -102,10 +108,11 @@ pub(crate) fn batch_still_working_sql(
         "EXISTS (SELECT 1 FROM thread_summaries s \
                   WHERE s.parent_thread_id = {child}.parent_thread_id \
                     AND s.thread_id <> {child}.thread_id AND s.wake_mode = {mode_param} \
-                    AND CASE WHEN s.successor_thread_id IS NULL THEN {} \
+                    AND CASE WHEN s.successor_thread_id IS NULL THEN ({} OR {}) \
                         ELSE NOT EXISTS (SELECT 1 FROM thread_summaries n \
                                          WHERE n.thread_id = s.successor_thread_id) END)",
-        crate::core::store::still_working_sql("s", statuses_param)
+        crate::core::store::still_working_sql("s", statuses_param),
+        crate::engine::successor::pending_handoff_sql("s.thread_id")
     )
 }
 
@@ -432,7 +439,8 @@ impl EventBus {
             return;
         };
         // A keep-alive turn's terminal reports nothing: the child still waits.
-        // A child that handed off reports nothing either: its successor does.
+        // A child that handed off reports nothing either: its successor
+        // session, or a legacy successor thread, does.
         if row.keep_alive_turn || row.handed_off {
             return;
         }

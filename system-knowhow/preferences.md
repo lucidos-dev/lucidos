@@ -9,22 +9,22 @@ Lucidos **Settings** spans several stores. This file covers the
 **preferences** store: the key→value settings the *Lucidos Agent* reads and
 writes with the grouped **`preferences`** tool (`action: get | set`). The CLI
 mirrors it as `lucidos preferences get | set` (see `lucidos-cli.md`). Here,
-`get_preferences` / `set_preference(key, value)` are shorthand for
+`preferences(action="get")` / `preferences(action="set", key, value)` are shorthand for
 `preferences(action="get")` / `preferences(action="set", key, value)`. The old
 flat tool names still work as aliases.
 
-- **`get` (`get_preferences`)**: lists every settable preference with its current
+- **`get` (`preferences(action="get")`)**: lists every settable preference with its current
   value, allowed values, default, and scope (global or per-device). Call it when
   you are unsure of a key or a valid value, or suspect a per-device override.
-- **`set` (`set_preference(key, value)`)**: changes one preference. `value` is
+- **`set` (`preferences(action="set", key, value)`)**: changes one preference. `value` is
   always a string (`"true"`/`"false"` for booleans, `"125"` for numbers, the
   exact enum string otherwise).
 
-The other Settings stores have their own tools, never `set_preference`:
+The other Settings stores have their own tools, never `preferences(action="set")`:
 
 | Want to change… | Use |
 |---|---|
-| A preference below | `set_preference` |
+| A preference below | `preferences(action="set")` |
 | Which models appear in the picker, or a model's routes, preferred provider or context window | `manage_models` |
 | An API key / secret | `request_credential` (never put secrets in a preference) |
 | A non-secret env var | `env_vars` (`action: set`) |
@@ -34,7 +34,7 @@ The other Settings stores have their own tools, never `set_preference`:
 
 ## How a write propagates
 
-`set_preference` validates against the **preference catalog**
+`preferences(action="set")` validates against the **preference catalog**
 (`crates/lucidos-engine/src/core/preference_catalog.rs`, the single source of
 truth). It writes through the engine's one preference chokepoint, which emits the
 persisted **`PreferencesChanged`** event (or `LanguageSet` / `TimezoneSet` for
@@ -94,10 +94,10 @@ picked. Never infer one from how they write: a guess colours every answer.
 
 **Device scope.** Device-scoped keys (theme-mode, theme, theme-effects,
 font-family, ui-scale, motion, autocorrect, push_notifications) are stored
-per-device and override the global value on that device. `set_preference`
+per-device and override the global value on that device. `preferences(action="set")`
 targets the calling device; you never pass a device id. The trap: a global
 `theme-mode=dark` does nothing on a device with its own `theme-mode=light`
-override. `get_preferences` shows the per-device effective value and the global one.
+override. `preferences(action="get")` shows the per-device effective value and the global one.
 
 ## Background models
 
@@ -158,7 +158,7 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
   modal shows what Tree costs a month and writes the answer. Closing it writes
   `classic`. A headless workspace with no client open stays on Classic.
 - **Do not choose for the user.** Tree costs money, and writing `tree` with
-  `set_preference` skips the cost the memory choice and Settings show. Even
+  `preferences(action="set")` skips the cost the memory choice and Settings show. Even
   when the user asks for Tree, point them at Settings → System → Memory, which
   shows the cost before it starts.
 - `tree` gives each turn two *memory views*. The workspace
@@ -270,14 +270,14 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `model_voice_talker` | global | a model id | `gpt-realtime-2.1` | Speech-to-speech model a *voice session* speaks through; the id also picks the call's protocol. It holds the conversation only, so every action goes through the ordinary agent. Settings offers the realtime family newest first: `gpt-realtime-2.1`, `gpt-realtime-2.1-mini`, `gpt-realtime-2` and `gpt-realtime-1.5`. These bill by the token, and the caller can settle a card or ring off out loud. `gpt-live-1` follows: it takes an interruption better, holds no tools, and bills by the minute. A Live caller answers a question out loud, and taps for a permission or to ring off. OpenAI retired `gpt-realtime`, `gpt-realtime-mini` and the `gpt-4o` realtime models: a write of one is refused, and the engine moves a stored one to `gpt-realtime-2.1` (a mini to `gpt-realtime-2.1-mini`) at startup. |
 | `model_voice_transcriber` | global | a model id | `gpt-transcribe` | Model turning the caller's speech into text in a realtime *voice session*. A `gpt-live-1` talker transcribes the caller itself and ignores this key. The second and last model in the voice loop: nothing translates or summarises, and `language` sets its pin. Settings offers three ids. The two built for a live microphone lead and stream as the caller speaks: `gpt-live-transcribe` and `gpt-realtime-whisper`. Then `gpt-transcribe`, the default, which transcribes a turn once committed. The engine sends the language pin of `gpt-transcribe` and `gpt-live-transcribe` as `languages`, an array; every other model reads the singular `language`. OpenAI retired `whisper-1` and the `gpt-4o` transcribers: a write of one is refused, and the engine moves a stored one to `gpt-transcribe` at startup. |
 | `voice_talker_voice` | global | a provider voice name | `marin` | The voice a call is spoken in. Not a model and not the language: `language` decides what is spoken, this decides who speaks it. A name the provider does not know refuses the call, so pick one the talker model offers. |
-| `voice_resident_sections` | global | comma-separated section ids | `who-and-where,this-thread,workspace-shape` | What a *voice session* loads at the start of a call. The talker cannot look anything up, so this block is all voice answers with no wait; everything else waits for the agent. `who-and-where`: the workspace name, timezone and local time. `this-thread`: the title, the recent turns, and any question the thread is parked on. `workspace-shape`: the names of apps, triggers and unread notifications, plus two thread lines (what Lucidos was working on as the call opened, and what is stopped waiting on an answer). An unknown id is ignored with a log line. A stored row means exactly what it lists; only an absent row means the three above. Turning every section off writes an empty value, which `set_preference` rejects. That state is Settings-only, through the toggles in Settings > Models > Voice. |
+| `voice_resident_sections` | global | comma-separated section ids | `who-and-where,this-thread,workspace-shape` | What a *voice session* loads at the start of a call. The talker cannot look anything up, so this block is all voice answers with no wait; everything else waits for the agent. `who-and-where`: the workspace name, timezone and local time. `this-thread`: the title, the recent turns, and any question the thread is parked on. `workspace-shape`: the names of apps, triggers and unread notifications, plus two thread lines (what Lucidos was working on as the call opened, and what is stopped waiting on an answer). An unknown id is ignored with a log line. A stored row means exactly what it lists; only an absent row means the three above. Turning every section off writes an empty value, which `preferences(action="set")` rejects. That state is Settings-only, through the toggles in Settings > Models > Voice. |
 | `vertex_region` | global | text | `europe-west1` | Google Vertex AI region. |
 | `opencode_free_enabled` | global | `true` \| `false` | `false` | `true` makes the keyless OpenCode Free models available in the picker. No account and no API key: requests go anonymously to a third-party relay, and several of those models may train on what they receive. Turn it on only if the user asked for free models and accepts that. |
 | `proxy_timeout_secs` | global | number 1–600 | `30` | Seconds the engine proxy waits on one upstream request before it answers 504. Covers every proxied call: `lucidos proxy`, `lucidos.proxy` in an app, the `proxy_request` tool, and the builtin model routes such as `vertex` and `openai`. A streamed reply counts in full, because the proxy reads the whole body first. Raise it when a long model call through the proxy times out. An `apis.json` entry's own `timeout_secs` wins for that entry. Every write path refuses a value outside the range. |
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
 | `notification_toasts` | global | `true` \| `false` | `true` | Whether a notification pops an in-app toast on a device the user is looking at. `false` silences the pop-up only: the notification still counts on the bell badge and waits in the Notifications panel. No OS push replaces it, because a present device never gets one. Unlike `push_notifications`, one write covers every device. |
 | `composer_enter_key` | global | `send` \| `newline` | `send` | What Enter does in the chat composer on a desktop layout. `send`: Enter sends and Shift+Enter adds a new line. `newline`: Enter adds a new line and Shift+Enter sends. Cmd+Enter or Ctrl+Enter sends in both. On a phone, Enter always adds a new line and the Send button sends. Offer `newline` to a user who keeps sending half-written prompts. Found under **Settings → Keyboard Shortcuts → Composer**. |
-| `mobile_dynamic_bars` | global | `true` \| `false` | `false` | *Dynamic bars* on a phone. `true` glides the header, the thread title and the prompt away while scrolling down a thread, and the header while scrolling down an app that loads the SDK. They return on scroll up or a pane swipe. `false` keeps them always visible. |
+| `mobile_dynamic_bars` | global | `true` \| `false` | `false` | *Dynamic bars* on a phone. `true` glides the header, the thread title and the prompt away while scrolling down a thread, and the header while scrolling down an app that loads the SDK. They return on scroll up or a pane swipe. `false` keeps them always visible. The installed iOS app ignores it and always glides them. |
 | `automatic_widgets` | global | `true` \| `false` | `true` | Whether you may choose a *widget* on your own: a small interactive answer shown inline in the thread as an *inline widget* (`create_app` with `kind="widget"`, then an embed). `false` stops only your own choice, and a widget the user asks for is still made. Set it to `false` when the user tells you to stop making widgets. |
 | `external_link_target` | global | `safari` \| `ask` \| `in-app` | `safari` | Where an external http(s) link goes when tapped in an **installed iOS PWA**. Desktop, Android and a normal Safari tab always open a new tab. `safari` hands it to the Safari app. `ask` opens the OS share sheet, so iOS offers every installed browser, including the user's real default. `in-app` keeps it in the PWA's in-app web view (no address bar, no shared Safari session). |
 | `welcome_suggestions_dismissed` | global | `true` \| `false` | `false` | Hide the new-workspace welcome message. Set `false` to SHOW it again. |
@@ -291,7 +291,7 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `coding_agent_claude_path` | global | absolute path | (auto-detected) | Path to the `claude` CLI for Claude Code threads. Unset = auto-detect (`~/.local/bin`, `~/.claude/local`, Homebrew, PATH). A set path that does not resolve fails the spawn and names this key; it never falls back silently. |
 | `coding_agent_codex_path` | global | absolute path | (auto-detected) | Path to the `codex` CLI for Codex threads. Unset = auto-detect (`~/.local/bin`, Homebrew, PATH). A set path that does not resolve fails the spawn and names this key; it never falls back silently. |
 | `coding_agent_auto_compact_trial` | global | `off` \| `ab` \| `on` | `off` | The auto-compact trial for Claude Code threads. `off` leaves Claude Code's own compaction alone. `ab` gives a 400k-token auto-compact window to half of all top-level threads, each with its sub-threads and successors, picked by a stable hash. A thread keeps the arm it first ran in. `on` gives every family that window. A workspace `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var always wins. `SessionStarted` records the arm. Codex ignores it. Applies to new sessions. A temporary measure. |
-| `cache_keep_alive_mode` | global | `default` \| `workspace-data` \| `off` | `default` | When the cache keep-alive gives up on a waiting Claude Code session. `default` beats an event wait or working children until the beats cost one cache rewrite (break-even), and a session parked on a question card or permission prompt until half of that. `workspace-data` gives up at the point that would have cost least over this workspace's last 30 days, per wait type, and keeps the default for a type with under 50 waits. `off` sends no beats, so every wait past the cache lifetime pays its rewrite. Codex ignores it. |
+| `cache_keep_alive_mode` | global | `default` \| `workspace-data` \| `off` | `default` | When the cache keep-alive gives up on a waiting Claude Code session or Lucidos Agent thread. `default` beats an event wait or working children until the beats cost one cache rewrite (break-even), and a thread parked on a question card or permission prompt until half of that. `workspace-data` gives up at the point that would have cost least over this workspace's last 30 days, per wait type, and keeps the default for a type with under 50 waits. `off` sends no beats, so every wait past the cache lifetime pays its rewrite. Codex, and a model whose cache a ping cannot keep warm, ignore it. |
 | `coding_agent_claude_permission_mode` | global | `accept-edits` \| `auto` | `accept-edits` | Which of Claude Code's own permission modes coding-agent threads run in. `accept-edits` cards anything outside the session's working directories. `auto` lets Claude Code's safety classifier approve routine actions, reaching shapes no allowlist can (a `cd` combined with a redirect, a write, or git). Four costs: it ignores a bare `Bash` entry in `cc-allowed-tools`, it denies rather than cards when the classifier is unreachable, a denial streak falls back to prompting, and each gated call pays a classifier round-trip. Claude Code only; Codex ignores it. Applies to new sessions. |
 | `backup_schedule` | global | 6-field cron (in the user's timezone) or `off` | `off` | Automatic backup schedule. E.g. `0 0 3 * * *` = daily 03:00, `0 0 3 * * 0` = weekly Sun 03:00, `0 0 */12 * * *` = every 12h. Fires in the user's `timezone`. Requires `backup_provider` set AND its account connected (see that key). |
 | `backup_provider` | global | `google_drive` \| `dropbox` | (unset) | Cloud destination, independent of `backup_schedule`: it stays set with the schedule `off`. The Backup page's provider dropdown opens on it and writes it. Setting this connects NOTHING. Connect the account with `connect_oauth_account`, or the user does it in **Settings → Accounts** (the Backup page has no account UI). Until then backups run and the upload fails. `get_backup_status` reports whether the account is connected. |
@@ -300,21 +300,22 @@ Background tasks also shows the compactor's model, `model_summary_compaction`.
 | `theme-mode` | device | `light` \| `dark` \| `system` | `system` | Light or dark for the calling device. `system` follows the OS; `light` and `dark` pin it. |
 | `font-family` | device | `theme` \| `system` \| `geist` \| `atkinson-hyperlegible-next` \| `inter` \| `roboto` \| `open-sans` \| `manrope` \| `source-serif-4` \| `lora` \| `literata` \| `fira-code` \| `monospace` \| `geist-mono` \| `atkinson-hyperlegible-mono` \| `jetbrains-mono` \| `ibm-plex-mono` \| `source-code-pro` \| `commit-mono` \| `cascadia-code` \| `vt323` \| `ws-<slug>` | `theme` | UI font for the calling device. The default `theme` ("Follow the theme" in Settings) paints the font the active theme suggests, else `fira-code`. Any other value is the user's own pick and wins over the theme. `GET /api/v1/fonts` lists every font with its kind and group (sans, serif, mono). Every font is bundled, on the device, or a workspace font (`ws-<slug>`, installed under `data/fonts/`, see `system-knowhow/workspace-fonts.md`), so none needs the internet. Fira Code, JetBrains Mono and Cascadia Code enable programming ligatures on code surfaces only (code blocks, inline code, diffs, file previews); prose and the prompt render literally, because contextual alternates re-space a typed `...` into what reads as two dots. |
 | `ui-scale` | device | number 75–200 | `100` | UI scale percent for the calling device (snaps to 12.5 steps). |
-| `motion` | device | `system` \| `reduce` \| `full` | `system` | Whether animations are reduced on the calling device. `system` follows the OS reduce-motion switch. `reduce` calms the app whatever the OS says: no slides, pulses or spinners, and transitions become instant. `full` keeps every animation even when the OS asks to reduce. Found under **Settings → Appearance → Motion**. Offer `reduce` to a user who finds the app busy or reports motion discomfort. Apps read it as `data-motion` on `<html>`. |
-| `theme-effects` | device | `system` \| `reduce` \| `full` | `system` | Whether the shadows, filters and scanlines a theme puts on its parts show on the calling device. `reduce` drops every part `text-shadow`, `box-shadow` and `filter` and the screen's scanlines. It keeps part colours, letter-spacing, the caret shape and borders. `system` drops them when the OS asks for more contrast or less transparency; it ignores battery state. `full` always shows them. Found under **Settings → Appearance → Theme → Effects**. Offer `reduce` to a user who finds a theme's glow hard to read or wants to save battery. Apps read it as `data-theme-effects` on `<html>`. See the `themes` knowhow. |
-| `theme` | device | a theme id | `lucidos` | The theme on the calling device: a named set of colours, header and focus styles. A built-in id (listed in `themes.md`) or a workspace theme at `data/themes/<id>.json`. It works with `theme-mode`: a theme styles light, dark or both. An unknown id shows the default. Found under **Settings → Appearance → Theme**. To make a theme, load the `themes` knowhow. |
+| `motion` | device | `system` \| `reduce` \| `full` | `system` | Whether animations are reduced on the calling device. `system` follows the OS reduce-motion switch. `reduce` calms the app whatever the OS says: no slides, pulses or spinners, and transitions become instant. `full` keeps every animation even when the OS asks to reduce. Found under **Settings → Appearance & Behavior → Motion**. Offer `reduce` to a user who finds the app busy or reports motion discomfort. Apps read it as `data-motion` on `<html>`. |
+| `theme-effects` | device | `system` \| `reduce` \| `full` | `system` | Whether the shadows, filters and scanlines a theme puts on its parts show on the calling device. `reduce` drops every part `text-shadow`, `box-shadow` and `filter` and the screen's scanlines. It keeps part colours, letter-spacing, font-weight, the caret shape and borders. `system` drops them when the OS asks for more contrast or less transparency; it ignores battery state. `full` always shows them. Found under **Settings → Appearance & Behavior → Theme → Effects**. Offer `reduce` to a user who finds a theme's glow hard to read or wants to save battery. Apps read it as `data-theme-effects` on `<html>`. See the `themes` knowhow. |
+| `theme` | device | a theme id | `lucidos` | The theme on the calling device: a named set of colours, header and focus styles. A built-in id (listed in `themes.md`) or a workspace theme at `data/themes/<id>.json`. It works with `theme-mode`: a theme styles light, dark or both. An unknown id shows the default. Found under **Settings → Appearance & Behavior → Theme**. To make a theme, load the `themes` knowhow. |
 | `autocorrect` | device | `true` \| `false` | `true` | Whether text fields autocorrect as the user types on the calling device. While iOS autocorrect holds a correction, it can swallow the tap on Send or Submit until the keyboard closes. If an iPhone or iPad user reports that, closing the keyboard and tapping again gets through. Offer `false` if it keeps happening. Spell-check underlines and sentence capitals stay either way. Found under **Settings → System → Debugging**, on iPhone and iPad only. An app's own text fields follow it too, through `sdk.js`. |
 | `push_notifications` | device | `enabled` \| `declined` | (unset) | Push notifications for the calling device. `enabled` triggers the OS/browser permission prompt. |
 
 ## Read-only / managed elsewhere
 
-`get_preferences` also lists the settings among these so you can explain them,
-and `set_preference` refuses every one with a hint naming the right surface:
+`preferences(action="get")` also lists the settings among these so you can explain them,
+and `preferences(action="set")` refuses every one with a hint naming the right surface:
 
-- `command_guard`, `command_guard_judge`, `model_command_judge`,
-  `reasoning_command_judge`: the command guard (safety gate over the agent's own
-  bash/python) and the model its LLM judge runs on. Settings → Permissions only.
-  You must not disable or weaken your own safety gate.
+- `command_guard`, `command_guard_judge`, `command_guard_coding_agents`,
+  `model_command_judge`, `reasoning_command_judge`: the command guard (safety
+  gate over the agent's own bash/python), the model its LLM judge runs on, and
+  whether it also answers coding-agent command cards. Settings → Permissions
+  only. You must not disable or weaken your own safety gate.
 - `judgment_command_guard`, `judgment_query_classification`: which backend
   answers each judgment: `chat`, or a System One model (`jev`, `openrouter`,
   `clef`, `clef-flash`, `openai`, `custom`). Both ask typed questions and decide the outcome in
@@ -352,9 +353,9 @@ and `set_preference` refuses every one with a hint naming the right surface:
 - `model_claude_code`, `reasoning_claude_code`, `model_codex`,
   `reasoning_codex`: the *default implementer*, the pair a coding-agent thread
   runs on when nobody picked one. Claude Code's ships as `claude-opus-5-5` at
-  `medium`; Codex's ships unset, so Codex's own config decides. Lucidos pins the
-  pair at spawn. A pick that names a model and no effort runs at that model's
-  default effort. Only the owner sets them, with the star in Settings →
+  `medium`; Codex's ships as `gpt-6.1-sol` at `medium`. Lucidos pins the pair
+  at spawn, so neither backend's config file decides. A pick that names a model
+  and no effort runs at that model's default effort. Only the owner sets them, with the star in Settings →
   Intelligence.
 - `intelligence_ladder_chat`: the owner's *intelligence ladder* for the
   Lucidos Agent, the same shape as the two below. It is the only switch for
@@ -397,20 +398,20 @@ and `set_preference` refuses every one with a hint naming the right surface:
   engine stops it with an `[ENGINE-LIMIT]` message. It counts calls, not
   replies: three calls in one reply spend three. Default `500`. The user may set
   any number of at least `1` (a value below `1` is raised to `1`) in Settings →
-  Models → Chat & triggers. Never via `set_preference`: it is the backstop over
+  Models → Chat & triggers. Never via `preferences(action="set")`: it is the backstop over
   your own loop, so never raise it. The `[ENGINE-LIMIT]` prefix is your only signal the cap was hit.
 - `keybindings`: Settings → Keyboard Shortcuts.
 - `capture_context`: a debug-only toggle.
-- `cache_warm_line`: whether a waiting thread draws the cache-warm line (how long
-  its prompt cache stays warm). Default on. The user changes it in Settings →
-  System → Debugging.
+- `cache_cards`: whether a thread draws its prompt-cache cards (Cache kept warm
+  and the cache-warm line). Default on. Display only: pings and costs never
+  change. The user changes it in Settings → System → Debugging.
 - `voice_input_device`: which microphone a call opens, per device. The value is
   a browser's own opaque handle, meaningless in another browser or on another
   machine. The user picks it by holding the call control in the composer. You
   cannot know what the ids stand for, so never write one.
 - `network_bind`: this workspace's engine network bind (`loopback` / `all` / a
   specific tailnet IP). A security setting, changed in Settings → Access →
-  Network access, never via `set_preference`. Takes effect on the next engine
+  Network access, never via `preferences(action="set")`. Takes effect on the next engine
   restart. The machine-global gateway bind and the engine-inherit toggle live in
   `~/.lucidos/network.toml`, not here.
 - `engine_switch_dismissed_build`, `client_refresh_dismissed_build`: internal UI
@@ -419,19 +420,19 @@ and `set_preference` refuses every one with a hint naming the right surface:
   toast). The second holds the served client's id (the *refresh to sync*
   toast). Workspace-global (`device_id IS NULL`): a dismiss on one device defers
   the toast everywhere, until a newer build (a different id) re-surfaces it.
-  The version-update toasts manage them, never `set_preference`.
+  The version-update toasts manage them, never `preferences(action="set")`.
 - `release_notice_cursor`: internal UI state. It holds the id of the last
   *release notice* this workspace answered; everything after it in the authored
   order is still owed. Workspace-global (`device_id IS NULL`), so answering on
   one device settles it everywhere. The engine writes it when the user answers a
   notice. It also stamps a workspace with no threads once at startup, so nothing
-  lands over its first run. Never via `set_preference`: clearing it re-shows
+  lands over its first run. Never via `preferences(action="set")`: clearing it re-shows
   every notice the user already read.
 - `backfill_trigger_id_from_events_done`,
   `backfill_trigger_id_v5_to_config_id_done`,
   `backfill_repo_names_from_changes_done`,
   `backfill_cc_repo_id_to_deterministic_done`: engine bookkeeping, never shown
-  by `get_preferences`. They are one-shot migration markers. `vapid_keys` is
+  by `preferences(action="get")`. They are one-shot migration markers. `vapid_keys` is
   retired: the Web Push signing keypair is a sealed secret in its own table now.
 - `provider_enabled_vertex`, `provider_enabled_anthropic`,
   `provider_enabled_openai`, `provider_enabled_openrouter`,
@@ -440,12 +441,12 @@ and `set_preference` refuses every one with a hint naming the right surface:
   Settings → Models → Providers. Absent means **on**; only an explicit `false`
   switches a provider off. Off drops it from the model picker and from web
   search, with no restart, and leaves the stored key untouched for later. Never
-  via `set_preference`: the provider you switch off may be answering this turn.
+  via `preferences(action="set")`: the provider you switch off may be answering this turn.
   `opencode_free_enabled` above IS settable, because turning a keyless free tier
   on cannot leave the workspace unable to answer.
 - `local_base_url`: the base URL of the `local` OpenAI-compatible provider,
   `http://localhost:11434/v1` by default. The user sets it in Settings → Models
-  → Providers. Neither you (`set_preference`) nor an app may set it: that host
+  → Providers. Neither you (`preferences(action="set")`) nor an app may set it: that host
   reads every prompt and writes the replies you run as tool calls. The host must
   be loopback, a private or tailnet address, or a `.local` or `.home.arpa` name.
   Any other host is refused on save, and one stored earlier is ignored, so the
@@ -466,7 +467,7 @@ and `set_preference` refuses every one with a hint naming the right surface:
   that picked one of its models: off, those run on their chat model whatever the
   key says. A System One model holds no conversation, so it is in no chat model
   picker and no `configured_providers` list. It is offered only in the judgment
-  rows (ADR 0224). Never via `set_preference`, for a different reason:
+  rows (ADR 0224). Never via `preferences(action="set")`, for a different reason:
   switching one off returns the command guard's backend to chat, which is not
   your decision.
 - `system_one_custom_url`, `system_one_custom_model`: where the custom System

@@ -252,6 +252,7 @@ fn indexable_text_returns_none_for_non_chat_events() {
         integrated: false,
         auto_compact_window: None,
         auto_compact_arm: None,
+        continuity: None,
     }
     .indexable_text()
     .is_none());

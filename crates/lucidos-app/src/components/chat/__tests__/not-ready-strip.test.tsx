@@ -10,12 +10,10 @@ import { render } from 'preact';
 
 vi.mock('../continueStoppedThread', () => ({ continueStoppedThread: vi.fn() }));
 vi.mock('../../../api/client', () => ({ hardenThread: vi.fn(() => Promise.resolve()) }));
-vi.mock('../../../store/actions/threads', () => ({ focusThreadOrBootstrap: vi.fn() }));
 
 import { NOT_READY_COPY, NotReadyStrip, notReadyLabel } from '../NotReadyStrip';
 import { continueStoppedThread } from '../continueStoppedThread';
 import { hardenThread } from '../../../api/client';
-import { focusThreadOrBootstrap } from '../../../store/actions/threads';
 import { focusedThreadId, notReadyReason, threadMap } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import type { CodingAgentChangeState } from '../../../api/threads';
@@ -191,29 +189,9 @@ describe('NotReadyStrip', () => {
     expect(notReadyLabel('hardening_missing', { parentThreadTitle: 'Fix the drawer' })).toBe(NOT_READY_COPY.hardening_missing.label);
   });
 
-  describe('for a handed-off thread', () => {
-    const successor = { thread_id: 's1', title: 'Fix the drawer (2)' };
-    const handedOff = { kind: 'unproposed', reason: 'carried_by_successor' } as const;
-
-    it('draws a framed note with an arrow, not the amber strip', () => {
-      const host = mount(handedOff, { successor });
-      expect(host.querySelector('.not-ready-strip')).toBeNull();
-      const note = host.querySelector('[data-role="continued-here"]');
-      expect(note?.textContent).toBe('Continued here');
-      expect(note?.querySelector('.continued-here-icon')).not.toBeNull();
-    });
-
-    it('opens the successor thread from "here"', () => {
-      const host = mount(handedOff, { successor });
-      host.querySelector<HTMLButtonElement>('.continued-here-link')?.click();
-      expect(focusThreadOrBootstrap).toHaveBeenCalledWith('s1');
-    });
-
-    it('says where the work went without a link before the successor is known', () => {
-      const host = mount(handedOff);
-      expect(host.querySelector('[data-role="continued-here"]')?.textContent).toBe('Continued in a new thread');
-      expect(host.querySelector('button')).toBeNull();
-    });
+  it('draws nothing for a handed-off thread, whose transcript links the successor', () => {
+    const host = mount({ kind: 'unproposed', reason: 'carried_by_successor' }, { successor: { thread_id: 's1', title: 'Fix the drawer (2)' } });
+    expect(host.textContent).toBe('');
   });
 
   it('draws nothing for a proposal', () => {

@@ -83,7 +83,7 @@ fn result() -> AgentEvent {
 /// The idle decision with no message waiting in the channel and no redirect
 /// armed, so only what the agent still owes decides it.
 fn at_idle(ledger: &InputLedger) -> TerminateDecision {
-    terminate_decision(0, ledger.owed(), false)
+    terminate_decision(0, ledger.owed(), false, false)
 }
 
 /// The held-message repro. A parent's follow-up was held behind the child's
@@ -480,4 +480,57 @@ fn a_session_that_ends_first_closes_the_waiter() {
         answered.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Closed)
     );
+}
+
+/// Only a child report is takeable. A user follow-up and an engine prompt owed
+/// beside it stay owed.
+#[test]
+fn only_a_child_report_is_takeable() {
+    let mut inputs = InputLedger::new();
+    let (message, card, prompt) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    inputs.forwarded(vec![message], &sent("also check the totals"), None);
+    inputs.forwarded_child_report(card, &sent("[child report]"), None, "report".into());
+    inputs.forwarded(vec![prompt], &sent("run /harden"), None);
+
+    assert_eq!(
+        inputs.child_reports(),
+        vec![ChildReport {
+            card_id: card,
+            text: "report".into(),
+            sent: "[child report]".into(),
+        }]
+    );
+    assert_eq!(inputs.owed_child_reports(), 1);
+    inputs.child_report_taken(card);
+    inputs.child_report_taken(message);
+    assert!(inputs.child_reports().is_empty());
+    assert_eq!(inputs.owed(), 2, "the follow-up and the prompt stay owed");
+}
+
+/// A taken report is never read again: the driver's late read names nothing
+/// owed.
+#[test]
+fn a_taken_report_settles_nothing_later() {
+    let mut inputs = InputLedger::new();
+    let card = Uuid::new_v4();
+    let report = sent("[child report]");
+    inputs.forwarded_child_report(card, &report, None, "report".into());
+    inputs.child_report_taken(card);
+    assert_eq!(
+        inputs.observe(&AgentEvent::InputRead { input: report.uuid }),
+        Settled::Nothing
+    );
+    assert_eq!(inputs.owed(), 0);
+}
+
+/// A report the agent already read is never handed back.
+#[test]
+fn a_read_report_is_not_takeable() {
+    let mut inputs = InputLedger::new();
+    let card = Uuid::new_v4();
+    let report = sent("[child report]");
+    inputs.forwarded_child_report(card, &report, None, "report".into());
+    inputs.observe(&AgentEvent::InputRead { input: report.uuid });
+    assert!(inputs.child_reports().is_empty());
+    assert_eq!(inputs.owed_child_reports(), 0);
 }

@@ -32,8 +32,9 @@ export const CHOICE_CARD_ROLE = 'card-choices';
 
 const CHOICE_CARD_SELECTOR = `[data-role="${CHOICE_CARD_ROLE}"]`;
 /** Enabled choices within a marked container, in DOM order. Disabled buttons are
- *  excluded so a card mid-resolution (every button disabled) navigates nowhere. */
-const CHOICE_SELECTOR = 'button:not([disabled])';
+ *  excluded so a card mid-resolution (every button disabled) navigates nowhere.
+ *  A button marked `data-not-choice` (a link out of the card) is no choice. */
+const CHOICE_SELECTOR = 'button:not([disabled]):not([data-not-choice])';
 
 /** Prev/next direction for an arrow key. BOTH axes map to the same walk. The
  *  question card is a vertical list and the permission card is a wrapping row,

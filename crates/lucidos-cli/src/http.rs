@@ -240,6 +240,28 @@ fn root_cause(err: &reqwest::Error) -> String {
     last
 }
 
+/// How many child reports wait unread for the calling agent's thread. Mirrors
+/// the engine's `api::threads::child_reports::HEADER_CHILD_REPORTS_WAITING`.
+const HEADER_CHILD_REPORTS_WAITING: &str = "lucidos-child-reports-waiting";
+
+/// The stderr line for a response announcing waiting child reports, if any.
+fn child_reports_note(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let waiting: u64 = headers
+        .get(HEADER_CHILD_REPORTS_WAITING)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+    let reports = match waiting {
+        0 => return None,
+        1 => "A child thread's report is".to_string(),
+        n => format!("{n} child thread reports are"),
+    };
+    Some(format!(
+        "lucidos: {reports} waiting for you. Read it now with `lucidos threads child-reports`."
+    ))
+}
+
 /// Send `req`, fail on non-2xx, and return the response body.
 /// Shared error wording via `format_request_error` (timeouts and connect
 /// failures get actionable hints instead of reqwest's generic "error sending
@@ -256,6 +278,10 @@ pub(crate) fn send_expect_success(
         .send()
         .map_err(|e| format_request_error(method, url, &e, start.elapsed()))?;
     let status = resp.status();
+    if let Some(note) = child_reports_note(resp.headers()) {
+        // A side channel for the agent reading this, beside the body it parses.
+        eprintln!("{note}");
+    }
     let text = resp
         .text()
         .map_err(|e| format!("Failed to read response body: {}", e))?;
@@ -296,6 +322,26 @@ pub(crate) fn send_and_print(
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    fn waiting(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(HEADER_CHILD_REPORTS_WAITING, value.parse().unwrap());
+        h
+    }
+
+    /// The note names the command that reads the reports, and only shows when
+    /// one waits.
+    #[test]
+    fn a_waiting_child_report_is_noted() {
+        let one = child_reports_note(&waiting("1")).expect("one waits");
+        assert!(one.contains("A child thread's report is waiting"), "{one}");
+        assert!(one.contains("lucidos threads child-reports"), "{one}");
+        let two = child_reports_note(&waiting("2")).expect("two wait");
+        assert!(two.contains("2 child thread reports are waiting"), "{two}");
+        assert_eq!(child_reports_note(&waiting("0")), None);
+        assert_eq!(child_reports_note(&waiting("x")), None);
+        assert_eq!(child_reports_note(&reqwest::header::HeaderMap::new()), None);
+    }
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;

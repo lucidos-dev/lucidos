@@ -14,6 +14,7 @@
 //! the handshake state machine, and the approval round-trips.
 
 use super::agent_runtime::AgentEvent;
+use super::codex_parse::CodexInput;
 use std::collections::HashMap;
 
 /// One decoded line of `codex app-server` stdout.
@@ -471,22 +472,21 @@ impl AppServerTracker {
                     .unwrap_or_default();
                 let u64_field = |key: &str| last.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
                 let clamp = |v: u64| crate::llm::clamp_provider_token_count(v, "Codex");
-                // Same convention as the exec tracker: codex reports TOTAL
-                // input with the cached share inside it; `Usage.input_tokens`
-                // carries the uncached portion (Anthropic convention the
-                // consumer re-totals).
-                let total_input = clamp(u64_field("inputTokens"));
-                let cached = clamp(u64_field("cachedInputTokens")).min(total_input);
+                let input = CodexInput::of_total(
+                    clamp(u64_field("inputTokens")),
+                    clamp(u64_field("cachedInputTokens")),
+                    clamp(u64_field("cacheWriteInputTokens")),
+                );
                 let output = clamp(u64_field("outputTokens"));
-                if total_input == 0 && output == 0 {
+                if input.total() == 0 && output == 0 {
                     return Vec::new();
                 }
                 vec![AgentEvent::Usage {
                     model: None,
-                    input_tokens: total_input - cached,
+                    input_tokens: input.uncached,
                     output_tokens: output,
-                    cache_read_tokens: cached,
-                    cache_creation_tokens: 0,
+                    cache_read_tokens: input.read,
+                    cache_creation_tokens: input.written,
                     cache_creation_1h_tokens: None,
                     parent_tool_use_id: None,
                     api_call_id: None,

@@ -57,6 +57,7 @@ async fn seed_question_canceled_after_agent_died(bus: &EventBus, thread_id: Uuid
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta(),
     })
@@ -74,6 +75,7 @@ async fn seed_question_canceled_after_agent_died(bus: &EventBus, thread_id: Uuid
                 description: None,
                 preview: None,
                 widget: None,
+                quiet: false,
             }],
             worktree_path: None,
             multi_select: false,
@@ -87,6 +89,7 @@ async fn seed_question_canceled_after_agent_died(bus: &EventBus, thread_id: Uuid
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: tool_use_id.into(),
+            quiet: false,
             answer: AnswerKind::Canceled,
         },
         meta: EventMeta {

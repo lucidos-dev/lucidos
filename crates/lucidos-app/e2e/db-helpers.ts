@@ -235,6 +235,34 @@ export function seedChatThread({ turns, needles, title }: {
   return threadId;
 }
 
+/** Seed an archived chat thread whose `word` sits only in a step row and on
+ *  a question card's option, and return its id. Thread find must reach both. */
+export function seedThreadOfCards({ word, title }: { word: string; title: string }): string {
+  const threadId = randomUUID();
+  const base = Date.now() - 60_000;
+  let n = 0;
+  const at = () => new Date(base + n++ * 1000).toISOString();
+  const row = (type: string, payload: string, id = randomUUID()) =>
+    `('${id}', '${type}', '${payload}'::jsonb, '${at()}', 'thread', '${threadId}', '${threadId}')`;
+  const messageId = randomUUID();
+  const ref = `"request_event_id":"${messageId}"`;
+  const rows = [
+    row('MessageReceived', '{"text":"Plan the zoo","mode":"human","channel":"chat"}', messageId),
+    row('ToolCalled', `{"name":"read_file","args":{"path":"notes/${word}.md"},${ref}}`),
+    row('ToolResult', `{"name":"read_file","result":"ok",${ref}}`),
+    row('TextStreamed', `{"text":"Read the notes.",${ref}}`),
+    row('UserQuestionAsked', `{"tool_use_id":"q1","question":"Which plan?","multi_select":false,`
+      + `"options":[{"id":"a","label":"Approve","description":"Approves the ${word} plan."}],${ref}}`),
+    row('UserQuestionAnswered', '{"tool_use_id":"q1","answer":{"kind":"Selected","option_id":"a"}}'),
+  ];
+  psql([
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_change_state, coding_agent_is_external_repo) `
+      + `VALUES ('${threadId}', '${title}', 'chat', '${new Date().toISOString()}', 1, false, true, 'idle', 'archived', 'active', false, 0, 0, 'none', false)`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES\n${rows.join(',\n')}`,
+  ].join(';\n'));
+  return threadId;
+}
+
 /** Seed an archived chat thread whose every step row carries a context
  *  counter, and return its id. A legacy `ThoughtStreamed` with
  *  `context_tokens` is the smallest payload that gives a step a snapshot,

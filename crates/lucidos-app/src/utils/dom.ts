@@ -65,13 +65,26 @@ export function opensSoftwareKeyboard(el: EventTarget | Element | null): boolean
  *  layout viewport for it, and browser chrome moves by far less than this. */
 const KEYBOARD_SHRINK_MIN_PX = 100;
 
+/** Whether a visual-viewport height is a reading at all. The iOS 27
+ *  standalone PWA transiently reports 0, and no screen is zero tall. */
+function isViewportReading(vvHeight: number): boolean {
+  return vvHeight > 0;
+}
+
+/** `window.visualViewport`, or null when it has no reading to give. A caller
+ *  measures against the layout viewport instead. */
+export function readableVisualViewport(): VisualViewport | null {
+  const vv = window.visualViewport;
+  return vv && isViewportReading(vv.height) ? vv : null;
+}
+
 /** Is the software keyboard taking room off the foot of the screen?
  *
  *  Says nothing about focus, so a caller that needs both asks
  *  `opensSoftwareKeyboard` separately. Takes both heights as arguments rather
  *  than reading `window`, so the decision is testable without a viewport. */
 export function viewportIsKeyboardShrunk(vvHeight: number, innerHeight: number): boolean {
-  return vvHeight < innerHeight - KEYBOARD_SHRINK_MIN_PX;
+  return isViewportReading(vvHeight) && vvHeight < innerHeight - KEYBOARD_SHRINK_MIN_PX;
 }
 
 /** Pixels per CSS rem at the document root. Mobile uses 112.5% (18px) base;

@@ -3,7 +3,7 @@ import type { LandingLane } from '../../api/client';
 import { EMPTY_LANDING_LANE, landingLane, landingLaneCanceling, lanePlace } from '../store';
 import { laneWithBatchEnded, laneWithBatchStarted, setLandingLaneFromServer } from './landingLane';
 
-vi.mock('./threads', () => ({ focusThread: vi.fn() }));
+vi.mock('./threads', () => ({ focusThreadOrBootstrap: vi.fn() }));
 
 const LANE: LandingLane = {
   open_batch: { batch_id: 'b-1', lane_thread_id: 'lane-t', members: ['c-1'], step: 'resolving' },

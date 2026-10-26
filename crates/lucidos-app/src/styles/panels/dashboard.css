@@ -135,7 +135,14 @@
     margin-bottom: var(--space-md);
 }
 
-/* The phone's head only. One line: it ellipsizes rather than wrap the head. */
+/* The phone dashboard's title centres on the same line as the thread title
+   under the same header. That one centres 0.5rem plus half its 1.25rem icon
+   box down (`.mobile-thread-title-row`), and this one half the 2rem head. */
+.dashboard[data-dashboard="phone"] {
+    padding-top: 0.125rem;
+}
+
+/* One line: it ellipsizes rather than wrap the head. */
 .dashboard-title {
     min-width: 0;
     margin-right: auto;
@@ -182,6 +189,15 @@
     grid-auto-rows: var(--dashboard-step);
     justify-content: center;
     gap: var(--dashboard-gap);
+    transition: opacity var(--duration-slow) ease;
+}
+
+/* Until the dashboard settles the grid is laid out and its frames load, but
+   nothing shows or takes a pointer. Its skeleton stands in, and the grid fades
+   in as one. */
+.dashboard-grid.is-settling {
+    opacity: 0;
+    pointer-events: none;
 }
 
 /* The tile sets the box and the frame fills it. A report never sizes it, and
@@ -382,46 +398,48 @@
     color: var(--text-on-accent);
 }
 
-/* --- The dashboard sheet: the phone dashboard over the open thread ---
+/* --- The dashboard panel: the phone dashboard over the open thread ---
 
-   It meets the app header's bottom edge with no gap, line or corner, so the
-   two read as one surface. The header carries its toggle
-   (components/dashboard/DashboardSheet.tsx). */
+   A layer of the thread pane (`.mobile-swipe-pane`), so a pane swipe carries it
+   along. It meets the app header's bottom edge with no gap, line or corner, so
+   the two read as one surface. The header carries its toggle
+   (components/dashboard/DashboardPanel.tsx). */
 
 @media (--phone-layout) {
-    /* Starts below the header, never at the top edge. iOS colours the status
-       bar from the topmost fixed box there, and this one stays mounted and
-       transparent once closed, so on the edge iOS would sample it, not the
-       header. */
-    .dashboard-sheet {
-        position: fixed;
+    /* Starts below the header, which overlays the pane. The z-index clears
+       every thread layer in the pane, up to the floating scroll chevrons
+       (chat/input-messages.css). Fades in and out in place. Closed, it is
+       hidden with its tiles still mounted. */
+    .dashboard-panel {
+        position: absolute;
         top: var(--app-header-bottom);
         left: 0;
         right: 0;
         bottom: 0;
-        z-index: var(--z-control-panel);
-        pointer-events: none;
-    }
-
-    /* Fades in and out in place. Closed, it is hidden with its tiles still
-       mounted. */
-    .dashboard-sheet-panel {
-        position: absolute;
-        inset: 0;
-        overflow-y: auto;
-        overscroll-behavior: contain;
-        padding-bottom: var(--safe-area-bottom);
-        background: var(--bg-primary);
-        pointer-events: auto;
+        z-index: calc(var(--z-float) + 2);
+        /* Its own compositor layer. The transcript (`.thread-content`) holds
+           one (mobile.css), and on iOS a panel painted into the pane's layer
+           lets that transcript blink through it while the strip slides. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
         visibility: hidden;
         opacity: 0;
         transition: opacity var(--duration-normal) ease,
             visibility 0s linear var(--duration-normal);
     }
 
-    .dashboard-sheet.is-open .dashboard-sheet-panel {
+    .dashboard-panel.is-open {
         visibility: visible;
         opacity: 1;
         transition: opacity var(--duration-normal) ease;
+    }
+
+    .dashboard-panel-body {
+        position: absolute;
+        inset: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        padding-bottom: var(--safe-area-bottom);
+        background: var(--bg-primary);
     }
 }

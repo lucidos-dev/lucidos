@@ -110,7 +110,7 @@ function OptionContent({
       <span class="question-option-label">{option.label}</span>
       {option.description && (
         <span
-          class="question-option-desc"
+          class="question-option-desc authored-html"
           dangerouslySetInnerHTML={{ __html: renderMarkdownInline(option.description) }}
         />
       )}
@@ -118,7 +118,7 @@ function OptionContent({
           appear inside it. */}
       {option.preview && (
         <span
-          class="question-option-preview"
+          class="question-option-preview authored-html"
           dangerouslySetInnerHTML={{ __html: renderMarkdownInline(option.preview) }}
         />
       )}
@@ -155,7 +155,7 @@ function OptionSlot({ option, state, children }: {
 function QuestionText({ question }: { question: string }) {
   return (
     <div
-      class="question-text markdown-content"
+      class="question-text markdown-content authored-html"
       dangerouslySetInnerHTML={{ __html: renderMarkdown(question) }}
     />
   );
@@ -485,6 +485,14 @@ function OptionButton({
   );
 }
 
+/** What an answer typed, drawn under the options in a user bubble. */
+export function typedAnswerText(answer: AnswerKind): string | undefined {
+  return answer.kind === 'FreeText' || answer.kind === 'MultiSelected' ? answer.text : undefined;
+}
+
+/** What a question the user's next message closed says, in place of a pick. */
+export const QUESTION_SUPERSEDED_NOTE = 'Replaced by your next message';
+
 /** Resolved-state rendering: options dim, the picked one is highlighted; the
  *  typed-answer block surfaces freetext (FreeText answers, or the freetext
  *  typed alongside a MultiSelected); Canceled renders a disabled Cancel button
@@ -517,10 +525,7 @@ export function AnsweredBody({
   const isSelected = (id: string) =>
     (resolved.kind === 'Selected' && resolved.option_id === id) ||
     (resolved.kind === 'MultiSelected' && resolved.option_ids.includes(id));
-  const customText =
-    resolved.kind === 'FreeText' ? resolved.text
-    : resolved.kind === 'MultiSelected' ? resolved.text
-    : undefined;
+  const customText = typedAnswerText(resolved);
   const imageHashes =
     resolved.kind === 'FreeText' || resolved.kind === 'MultiSelected' ? resolved.image_hashes ?? [] : [];
   return (
@@ -558,9 +563,7 @@ export function AnsweredBody({
           something else and the engine closed the question for them, so the
           card says what happened rather than offering an affordance. */}
       {resolved.kind === 'Superseded' && (
-        <span class="question-superseded-note">
-          Replaced by your next message
-        </span>
+        <span class="question-superseded-note">{QUESTION_SUPERSEDED_NOTE}</span>
       )}
     </div>
   );

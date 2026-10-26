@@ -185,6 +185,7 @@ async fn superseded_resolves_pending_command_permission_and_unblocks_waiter() {
         state.by_dedup_key.insert(
             key.clone(),
             PermissionEntry {
+                grant_offer: Default::default(),
                 thread_id,
                 request_id: "req-super".into(),
                 tool_name: "run_bash".into(),

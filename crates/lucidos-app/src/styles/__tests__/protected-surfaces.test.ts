@@ -153,12 +153,12 @@ describe('every protected surface carries the class', () => {
     file => expect(read(file)).toContain(`overlayClass="${PROTECTED_CLASS}"`),
   );
 
-  it('builds every change-action button on the banner, and each folded row, as one', () => {
-    const banner = read('components/chat/WaitingBanner.tsx');
-    expect(banner).toMatch(/function protectedButtonClass[\s\S]*PROTECTED_SURFACE/);
-    expect(banner.match(/extraClass: PROTECTED_SURFACE/g)?.length).toBe(4);
-    expect(banner).toContain('class={`thread-overflow-item ${PROTECTED_SURFACE}`}');
-    expect(banner).not.toMatch(/class=\{?['"`]action-btn action-btn-(confirm|danger)['"`]/);
+  it('builds the action slot, alone or split, as one', () => {
+    const slot = read('components/chat/ActionSlot.tsx');
+    expect(slot).toContain('class={`${classOf(action)} action-slot ${PROTECTED_SURFACE}`}');
+    // A split face, caret, whole face and menu each take the class there.
+    expect(read('components/shared/SplitButton.tsx').match(/protected-surface/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(read('components/chat/WaitingBanner.tsx')).not.toMatch(/class=\{?['"`]action-btn action-btn-(confirm|danger)['"`]/);
   });
 
   it('carries the class onto a popover portalled out of a protected surface', () => {

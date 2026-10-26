@@ -1,7 +1,7 @@
 import { test, expect, type Page } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
-import { WORKSPACE, seedChatThread } from './db-helpers';
+import { WORKSPACE, seedChatThread, seedThreadOfCards } from './db-helpers';
 import {
   apiRequest, assertHealthy, clickHeaderAction, disarmFollowSeed, navigateToApp, waitForEventStream,
   waitForScrollSettled,
@@ -15,7 +15,8 @@ import {
 // turn the window had not drawn.
 //
 // `-desktop`, because Mod+F and the pane focus it follows are desktop input.
-// Plan: `docs/plans/2026-10-07-find-in-previews-and-transcript.md`.
+// Plans: `docs/plans/2026-10-07-find-in-previews-and-transcript.md` and
+// `docs/plans/2026-10-25-find-all-thread-text.md`.
 
 const NOTES_PATH = 'artifacts/e2e-find-notes.md';
 const REPORT_PATH = 'artifacts/e2e-find-report.html';
@@ -131,5 +132,41 @@ test.describe('the find bar', () => {
       const r = range?.getBoundingClientRect();
       return !!r && r.top >= box.top && r.bottom <= box.bottom && range!.toString() === 'zebra';
     })).toBe(true);
+  });
+
+  test('finds a step row the Steps setting hides, and a question card\'s option', async ({ page }) => {
+    const threadId = seedThreadOfCards({ word: 'giraffe', title: 'Find bar cards' });
+    await page.addInitScript((tid: string) => {
+      localStorage.setItem('lucidos-focused-thread', tid);
+      localStorage.setItem('lucidos-steps-expanded-v2', 'false');
+    }, threadId);
+    await disarmFollowSeed(page);
+    await assertHealthy(page);
+    await navigateToApp(page);
+    const transcript = page.locator('.thread-view .thread-content:visible');
+    await expect(transcript).toContainText('Approves the giraffe plan.', { timeout: 15_000 });
+    await expect(transcript.locator('.step-description', { hasText: 'giraffe' })).toHaveCount(0);
+
+    await transcript.click();
+    await page.keyboard.press('ControlOrMeta+f');
+    await expect(findInput(page)).toBeFocused();
+    await page.keyboard.type('giraffe');
+    await expect(status(page)).toHaveText('2 matches');
+
+    // The step row comes first. Stepping to it turns steps on.
+    await page.keyboard.press('Enter');
+    await expect(status(page)).toHaveText('1 of 2');
+    await expect(transcript.locator('.step-description', { hasText: 'giraffe' })).toBeVisible();
+    await page.keyboard.press('Enter');
+    await expect(status(page)).toHaveText('2 of 2');
+    await expect.poll(() => page.evaluate(() => {
+      const current = CSS.highlights.get('lucidos-find-current') as Highlight | undefined;
+      const range = current ? [...current][0] as Range : undefined;
+      return range?.startContainer.parentElement?.closest('.question-option-desc') ? range.toString() : null;
+    })).toBe('giraffe');
+
+    // Closing hands the reader's Steps setting back.
+    await page.keyboard.press('Escape');
+    await expect(transcript.locator('.step-description', { hasText: 'giraffe' })).toHaveCount(0);
   });
 });

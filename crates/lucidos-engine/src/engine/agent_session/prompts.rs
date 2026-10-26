@@ -1,4 +1,4 @@
-use crate::engine::cache_ttl::CacheTtl;
+use crate::engine::cache_ttl::{CacheLifetime, CacheTtl};
 
 /// Workspace context preamble shared by all Lucidos-repo CC system prompts.
 pub(super) fn workspace_preamble(workspace_name: &str) -> String {
@@ -149,7 +149,7 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     offering `Approve` and `Request changes` in the shape that section gives. A message that also \
     calls a tool never reaches the user, so the card's question carries a short markdown summary \
     of the plan, ask last. Offer the options the skill's approval checkpoint prints, which may \
-    swap this pair for `Implement in a new thread`. \
+    swap this pair for `Implement in a fresh session`. \
     Once the user approves, run `lucidos planned approve` to flip the marker to gate-satisfying, which unblocks \
     edits and Apply. Lucidos refuses it unless the user tapped an approving \
     option, or typed a plain approval such as `approve`, after you proposed the plan. A tapped \
@@ -291,7 +291,7 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// second ONLY when the plan offers no real fork, never a third slot beside one.
 /// Stated unconditionally, the pair yields a three-option card whose last button
 /// means only "I will type what I want changed". The NEVER AUTHOR AN "OTHER"
-/// OPTION paragraph below bans exactly that shape. `Implement in a new thread`
+/// OPTION paragraph below bans exactly that shape. `Implement in a fresh session`
 /// replaces the pair when the thread's context is large, but only the CLI names
 /// it: this rule also serves external-repo sessions, which have no plan marker.
 ///
@@ -376,6 +376,9 @@ const ASK_USER_QUESTION_RULE: &str =
      a decision you can act on is still welcome (\"None of these\", \"Neither, ask me later\", \
      \"Cancel the deploy\"); what is banned is an option whose only meaning is \"I will type it \
      instead\".\n\n\
+     QUIET OPTIONS: start a label with `[quiet]` when that pick needs nothing more from you \
+     (`[quiet] Not now`). The tag is hidden, and the pick ends your turn: no reply, no more \
+     work.\n\n\
      WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
      waiting. It parks the thread in the waiting-for-answer state, which is what lights the \
      Blocked badge, keeps the thread in the live working set, and can push a \
@@ -605,6 +608,8 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     choices only. An option carrying a decision you can act on is different and still welcome \
     (\"None of these\", \"Neither, ask me later\"); what is banned is one whose only meaning is \
     \"I will type it instead\". \
+    QUIET OPTIONS: pass `{label, quiet: true}` when that pick needs nothing more from you \
+    (\"Not now\"). Picking it ends your turn: no reply, no more work. \
     WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
     waiting. It parks the thread in the waiting-for-answer state, which lights the \
     Blocked badge, keeps the thread in the live working set, and can notify the user. A \
@@ -635,9 +640,10 @@ const NOTES_REACH_USER_SENTENCE: &str = notes_reach_user_sentence!();
 
 /// What a session whose notes never reach the user reads instead. The agent's
 /// own context holds the text it wrote, so it cannot tell by looking.
-const NOTES_HIDDEN_SENTENCE: &str = "The user NEVER sees text you write in a message that also \
-    calls a tool, not even a summary of it, though your own context holds it. A message that \
-    calls no tool is shown in full. Put what they must read there, or on the question card.";
+const NOTES_HIDDEN_SENTENCE: &str = "Text you write in a message that also calls a tool may \
+    NEVER reach the user, not even a summary of it, though your own context holds it. A message \
+    that calls no tool is shown in full. Put what they must read there, or on the question card, \
+    once: never write it before a tool call and again after.";
 
 /// Backend-independent teaching appended to every coding-agent prompt by
 /// [`append_backend_rules`], the chokepoint every flavor and both backends ride.
@@ -834,9 +840,9 @@ const PERMISSION_ASK_RULE: &str = "\n\n\
 /// turn-end gate forces a decision the session skipped. The chat agent learns
 /// the same from the `request_read` tool's own description.
 const READ_DECISION_RULE: &str = "\n\n\
-    READ DECISION: End every turn that asks no question with `lucidos request-read yes|no` \
-    before your final message. Yes for an answer and no change (an investigation, a review), or \
-    one read later. Else no.";
+    READ DECISION: End every turn that asks no question with `lucidos request-read yes|no`, \
+    in its own message, then answer once. Yes for an answer and no change (an investigation, a \
+    review), or one read later. Else no.";
 
 /// Backend-independent, riding [`append_backend_rules`] like the rules above.
 ///
@@ -851,12 +857,12 @@ const READ_NARROWLY_RULE: &str = "\n\n\
     Read a whole file only when you need all of it. Do not re-read lines \
     already in your context unless the file changed or you are about to edit them.";
 
-/// How a session continues in a *successor thread*. The procedure lives in
+/// How a session continues in a *successor session*. The procedure lives in
 /// `lucidos successor --help`. Advice from any other source to `/clear` or to
 /// write a handoff file is read the same way, without naming that source.
-const SUCCESSOR_THREAD_RULE: &str = "\n\n\
-    SUCCESSOR THREADS: When the user says \"handoff this session\", commit your work, write a \
-    handoff narrative and run `lucidos successor spawn --narrative <file>` (see its --help). In a \
+const SUCCESSOR_SESSION_RULE: &str = "\n\n\
+    SUCCESSOR SESSIONS: When the user says \"handoff this session\", commit your work, write a \
+    handoff narrative and run `lucidos successor start --narrative <file>` (see --help). In a \
     Lucidos thread, advice to run `/clear` or write a handoff file means the same. A HANDOFF \
     CHECKPOINT is a `lucidos successor offer --at <name>` step in a repo flow: run it and follow \
     it. Setup: `lucidos knowhow read system-knowhow/coding-agent-flows`.";
@@ -997,22 +1003,31 @@ impl SessionContext {
 }
 
 /// The prompt cache lifetime the [`BACKGROUND_PROCESS_RULE`] cap points at
-/// (ADR 0511). An unknown TTL states 5 minutes, as the keep-alive beats it
-/// (ADR 0479). Codex states 5 minutes too: its cache is OpenAI's.
+/// (ADR 0511). Codex reports no lifetime, so a repo's Claude Code TTL says
+/// nothing of its cache. An unknown lifetime caps at what fits the shortest
+/// lifetime a provider documents (ADR 0575).
 pub(super) fn prompt_cache_section(
-    observed: Option<CacheTtl>,
+    repo_ttl: CacheTtl,
     coding_agent: crate::runtime::CodingAgent,
 ) -> String {
-    let ttl = match coding_agent {
-        crate::runtime::CodingAgent::ClaudeCode => observed.unwrap_or(CacheTtl::FiveMinutes),
-        crate::runtime::CodingAgent::Codex => CacheTtl::FiveMinutes,
+    let lifetime = match coding_agent {
+        crate::runtime::CodingAgent::ClaudeCode => repo_ttl.lifetime(),
+        crate::runtime::CodingAgent::Codex => None,
     };
-    format!(
-        "PROMPT CACHE: Your prompt cache lives {}. Keep every blocking call, subagents \
-         included, under {}.",
-        ttl.lifetime_words(),
-        ttl.blocking_cap_words()
-    )
+    match lifetime {
+        Some(lifetime) => format!(
+            "PROMPT CACHE: Your prompt cache lives {}. Keep every blocking call, subagents \
+             included, under {}.",
+            lifetime.lifetime_words(),
+            lifetime.blocking_cap_words()
+        ),
+        None => format!(
+            "PROMPT CACHE: Lucidos does not know how long your prompt cache lives. Keep every \
+             blocking call, subagents included, under {}: that fits the shortest lifetime a \
+             provider documents.",
+            CacheLifetime::FiveMinutes.blocking_cap_words()
+        ),
+    }
 }
 
 /// Opens the branch section. The e2e fake Claude Code reads the branch here.
@@ -1039,8 +1054,8 @@ pub(super) struct SpawnPromptInputs<'a> {
     pub(super) repo_id: Option<&'a str>,
     pub(super) app_id: Option<&'a str>,
     pub(super) wake_section: &'a str,
-    /// The repo's observed prompt cache TTL.
-    pub(super) cache_ttl: Option<CacheTtl>,
+    /// The TTL of the repo's latest Claude Code cache write.
+    pub(super) cache_ttl: CacheTtl,
 }
 
 /// A spawn's appended system prompt, and the start of its session context.
@@ -1067,7 +1082,8 @@ pub(super) fn spawn_prompts(inputs: SpawnPromptInputs<'_>) -> (String, SessionCo
 /// point where the two coding-agent backends diverge. Claude Code prompts gain
 /// [`PERMISSION_CONFIG_RULE`] (the `--allowedTools` / `cc-allowed-tools`
 /// mechanics are CC-only); Codex prompts replace [`ASK_USER_QUESTION_RULE`]
-/// with [`CODEX_ASK_USER_QUESTION_RULE`] and append [`CODEX_CLI_RULE`]. Each
+/// with [`CODEX_ASK_USER_QUESTION_RULE`] and append [`codex_exec_question_rule`]
+/// and [`CODEX_CLI_RULE`]. Each
 /// backend gets ONLY its own section: the CC permission-config rule would be
 /// misleading noise on a Codex session, which surfaces permissions through its
 /// sandbox + approval-policy model (approval cards raised by the app-server),
@@ -1085,15 +1101,29 @@ pub(super) fn append_backend_rules(
     let prompt = format!(
         "{prompt}{REASONING_NOT_VISIBLE_RULE}{SHOWING_AN_IMAGE_RULE}\
          {HTML_ARTIFACT_TYPE_SCALE_RULE}{NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}\
-         {PERMISSION_ASK_RULE}{READ_DECISION_RULE}{READ_NARROWLY_RULE}{SUCCESSOR_THREAD_RULE}"
+         {PERMISSION_ASK_RULE}{READ_DECISION_RULE}{READ_NARROWLY_RULE}{SUCCESSOR_SESSION_RULE}"
     );
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
         crate::runtime::CodingAgent::Codex => {
             let prompt = prompt.replace(ASK_USER_QUESTION_RULE, CODEX_ASK_USER_QUESTION_RULE);
-            format!("{prompt}{CODEX_CLI_RULE}{CODEX_SLASH_COMMANDS_RULE}")
+            let exec_question_rule = codex_exec_question_rule();
+            format!("{prompt}{exec_question_rule}{CODEX_CLI_RULE}{CODEX_SLASH_COMMANDS_RULE}")
         }
     }
+}
+
+/// Codex's code-mode `exec` cell yields after 30 s by default. A yielded
+/// `ask_user_question` cell sends the model into a `wait` loop: a fresh,
+/// fully billed model turn every 10 s, streaming "Thinking" under an open
+/// card. The pragma holds the cell open as long as the tool itself may block.
+fn codex_exec_question_rule() -> String {
+    let wait_ms = crate::engine::cc_settings::USER_ANSWER_WAIT_SECS * 1000;
+    format!(
+        "\n\nASKING FROM EXEC: when an `exec` cell calls `ask_user_question`, make its first line \
+         `// @exec: {{\"yield_time_ms\": {wait_ms}}}`, so it blocks until the user answers. \
+         Never poll a question cell with short `wait` calls: each one is a billed model turn."
+    )
 }
 
 /// Build the system prompt for Lucidos-source coding-agent threads.
@@ -1301,7 +1331,7 @@ pub(super) fn app_worktree_system_prompt(
          APP WORKTREE CONTEXT: You are running in an isolated git worktree of the user's \
          Lucidos *workspace* git (not the Lucidos source), narrowed by sparse-checkout to \
          one app folder, on the branch your SESSION CONTEXT names. \
-         Your cwd is the app folder at `data/apps/{app_id}/`. The worktree root sits two \
+         Your cwd is the app folder at `data/apps/{app_id}/`. The worktree root is three \
          levels up, but only this app folder (plus top-level files like the workspace \
          `.gitignore`) is materialised. Other app folders, knowhow, triggers, artifacts — \
          all gitignored from your view via sparse-checkout.\n\n\
@@ -1591,6 +1621,36 @@ fn shell_single_quote(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Claude Code marks a quiet option with the label prefix the parser
+    /// strips, so the rule must name that exact prefix.
+    #[test]
+    fn the_claude_code_rule_names_the_quiet_label_prefix() {
+        let prefix = crate::engine::agent_session::parsing::QUIET_LABEL_PREFIX;
+        assert!(ASK_USER_QUESTION_RULE.contains(&format!("`{prefix}`")));
+        assert!(CODEX_ASK_USER_QUESTION_RULE.contains("quiet: true"));
+    }
+
+    /// A yielded exec cell turns an open card into a billed `wait` loop. The
+    /// pragma must hold the cell open as long as the tool timeout allows.
+    #[test]
+    fn only_codex_learns_to_hold_a_question_cell_open() {
+        let wait_ms = crate::engine::cc_settings::USER_ANSWER_WAIT_SECS * 1000;
+        let pragma = format!("// @exec: {{\"yield_time_ms\": {wait_ms}}}");
+        let codex = append_backend_rules(String::new(), crate::runtime::CodingAgent::Codex);
+        let claude = append_backend_rules(String::new(), crate::runtime::CodingAgent::ClaudeCode);
+        assert!(codex.contains(&pragma), "{codex}");
+        assert!(!claude.contains("@exec"), "{claude}");
+    }
+
+    /// The read decision runs on every turn, before the answer. Claude Code
+    /// allows that command up front, so no permission card stalls the turn.
+    #[test]
+    fn the_read_decision_command_is_allowed_without_a_card() {
+        assert!(READ_DECISION_RULE.contains("`lucidos request-read yes|no`"));
+        assert!(crate::engine::claude_code::ENGINE_ALLOWED_TOOLS
+            .contains(&"Bash(lucidos request-read:*)"));
+    }
+
     /// The rule exempts exactly what Apply exempts, by naming the predicate
     /// Apply reads. The binding below fails to compile once it is renamed.
     #[test]
@@ -1660,12 +1720,12 @@ mod tests {
                         cache_ttl,
                     })
                 };
-                let (one, one_context) = session("lucidos-one", None, "", None);
+                let (one, one_context) = session("lucidos-one", None, "", CacheTtl::Unknown);
                 let (two, two_context) = session(
                     "lucidos-two",
                     Some("origin/release"),
                     WAKE_DECISION_RULE,
-                    Some(CacheTtl::OneHour),
+                    CacheTtl::Reported(CacheLifetime::OneHour),
                 );
                 assert_eq!(one, two, "{flavor}/{label}");
                 assert!(!one.contains("lucidos-one"), "{flavor}/{label}");
@@ -1690,37 +1750,50 @@ mod tests {
     /// stays byte-identical whatever cache a session gets (ADR 0511).
     #[test]
     fn the_background_rule_names_no_cache_lifetime() {
-        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
-            for words in [ttl.lifetime_words(), ttl.blocking_cap_words()] {
+        for lifetime in CacheLifetime::ALL {
+            for words in [lifetime.lifetime_words(), lifetime.blocking_cap_words()] {
                 assert!(!BACKGROUND_PROCESS_RULE.contains(words), "{words}");
             }
         }
     }
 
-    /// Claude Code states the observed lifetime, and 5 minutes when unknown.
-    /// Codex states 5 minutes whatever was observed.
+    /// Claude Code states the lifetime the repo's latest write reported.
     #[test]
-    fn the_cache_section_states_the_observed_lifetime() {
+    fn the_cache_section_states_a_known_lifetime() {
+        use crate::runtime::CodingAgent::ClaudeCode;
+        for lifetime in CacheLifetime::ALL {
+            for ttl in [CacheTtl::Reported(lifetime), CacheTtl::Requested(lifetime)] {
+                let section = prompt_cache_section(ttl, ClaudeCode);
+                assert!(
+                    section.contains(&format!("lives {}.", lifetime.lifetime_words())),
+                    "{ttl:?}: {section}"
+                );
+                assert!(
+                    section.contains(&format!("under {}.", lifetime.blocking_cap_words())),
+                    "{ttl:?}: {section}"
+                );
+            }
+        }
+    }
+
+    /// An unknown lifetime is said to be unknown, never guessed. Codex reports
+    /// none, so it always reads that way.
+    #[test]
+    fn the_cache_section_states_an_unknown_lifetime() {
         use crate::runtime::CodingAgent::{ClaudeCode, Codex};
-        let cases = [
-            (Some(CacheTtl::OneHour), ClaudeCode, CacheTtl::OneHour),
-            (
-                Some(CacheTtl::FiveMinutes),
-                ClaudeCode,
-                CacheTtl::FiveMinutes,
-            ),
-            (None, ClaudeCode, CacheTtl::FiveMinutes),
-            (Some(CacheTtl::OneHour), Codex, CacheTtl::FiveMinutes),
-        ];
-        for (observed, agent, stated) in cases {
-            let section = prompt_cache_section(observed, agent);
-            assert!(
-                section.contains(&format!("lives {}.", stated.lifetime_words())),
-                "{observed:?}/{agent:?}: {section}"
-            );
-            assert!(
-                section.contains(&format!("under {}.", stated.blocking_cap_words())),
-                "{observed:?}/{agent:?}: {section}"
+        let one_hour = CacheTtl::Reported(CacheLifetime::OneHour);
+        for (ttl, agent) in [
+            (CacheTtl::Unknown, ClaudeCode),
+            (CacheTtl::Unknown, Codex),
+            (one_hour, Codex),
+        ] {
+            let section = prompt_cache_section(ttl, agent);
+            assert_eq!(
+                section,
+                "PROMPT CACHE: Lucidos does not know how long your prompt cache lives. Keep \
+                 every blocking call, subagents included, under 4 minutes: that fits the \
+                 shortest lifetime a provider documents.",
+                "{ttl:?}/{agent:?}"
             );
         }
     }
@@ -2291,7 +2364,7 @@ mod tests {
     ///
     /// Per BACKEND as well as per flavor, because the two tails differ enough
     /// to hide each other. Codex swaps `ASK_USER_QUESTION_RULE` for a shorter
-    /// one and then appends `CODEX_CLI_RULE` +
+    /// one and then appends `codex_exec_question_rule`, `CODEX_CLI_RULE` and
     /// `CODEX_SLASH_COMMANDS_RULE`, while Claude Code appends
     /// `PERMISSION_CONFIG_RULE`. One shared number per flavor would let either
     /// backend grow into the other's slack unnoticed.
@@ -2342,17 +2415,17 @@ mod tests {
         // child's clean report may be filed rather than re-open the thread. A
         // Codex parent otherwise waits for a wake that never comes.
         //
-        // EVERY row rose by 208 to 239 bytes for `SUCCESSOR_THREAD_RULE`. It
+        // EVERY row rose by 208 to 239 bytes for `SUCCESSOR_SESSION_RULE`. It
         // is what turns "handoff this session", and advice to `/clear`, into
-        // a successor thread instead of a lost context.
+        // a successor session instead of a lost context.
         //
         // The Codex rows rose by 42 more, and two Lucidos-source rows by 3.
         // Main grew `CODEX_CLI_RULE` and the plan rule beside the successor
         // rule, and neither side left slack for the other.
         //
         // Most rows rose by up to 123 bytes for the large-thread plan card.
-        // The plan and ask rules now say it leads with `Implement in a new
-        // thread`, as the approval checkpoint prints it.
+        // The plan and ask rules now lead with `Implement in a fresh session`,
+        // as the approval checkpoint prints it.
         //
         // EVERY row rose by 34 bytes for named checkpoints (ADR 0505). The
         // successor rule names `--at <name>` and the knowhow that wires one,
@@ -2370,31 +2443,43 @@ mod tests {
         // Every row fell in the baseline trim: the plan, ask, apply and
         // permission-config rules each say a fact once, and the Lucidos
         // worktree flavor lost 2.6 KB.
-        ("worktree", "claude-code", 25410),
-        ("worktree", "codex", 25391),
+        //
+        // The claude-code rows rose by 12 bytes when `READ_DECISION_RULE` put
+        // the call in its own message. An answer written beside the call was
+        // written again after it, and the user read it twice.
+        //
+        // The twelve non-conflict rows rose for quiet options in the ask rule:
+        // Claude Code by 181 bytes, Codex by 150. Without it an agent cannot
+        // offer a "Not now" that leaves the thread asleep.
+        //
+        // EVERY Codex row rose by 240 to 243 bytes for `codex_exec_question_rule`.
+        // A question asked from a code-mode `exec` cell otherwise yields after
+        // 30 s, and the model re-bills its whole context on each `wait` poll.
+        ("worktree", "claude-code", 25603),
+        ("worktree", "codex", 25784),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 18226),
-        ("external_repo", "codex", 18207),
-        ("recovery", "claude-code", 24127),
-        ("recovery", "codex", 24108),
-        ("external_repo_recovery", "claude-code", 18128),
-        ("external_repo_recovery", "codex", 18109),
-        ("app_worktree", "claude-code", 20718),
-        ("app_worktree", "codex", 20699),
-        ("app_worktree_recovery", "claude-code", 19278),
-        ("app_worktree_recovery", "codex", 19259),
+        ("external_repo", "claude-code", 18419),
+        ("external_repo", "codex", 18597),
+        ("recovery", "claude-code", 24320),
+        ("recovery", "codex", 24501),
+        ("external_repo_recovery", "claude-code", 18321),
+        ("external_repo_recovery", "codex", 18499),
+        ("app_worktree", "claude-code", 20911),
+        ("app_worktree", "codex", 21089),
+        ("app_worktree_recovery", "claude-code", 19471),
+        ("app_worktree_recovery", "codex", 19649),
         // Both conflict_resolution rows rose by about 115 bytes when
         // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
         // either. The other rows had the slack to absorb it. Both rose again,
         // by 384, for its visual-choice clause: a real picture per option.
         // The external-repo, app-worktree and conflict-resolution rows rose by
         // 22 bytes when `READ_DECISION_RULE` excused a turn that asks a question.
-        ("conflict_resolution", "claude-code", 7166),
-        ("conflict_resolution", "codex", 9245),
+        ("conflict_resolution", "claude-code", 7178),
+        ("conflict_resolution", "codex", 9485),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
@@ -2512,26 +2597,26 @@ mod tests {
     /// Every session, on both backends, learns the one handoff path, and the
     /// rule names the CLI rather than any source of `/clear` advice.
     #[test]
-    fn every_session_is_taught_the_successor_thread() {
+    fn every_session_is_taught_the_successor_session() {
         for (flavor, prompt) in all_prompt_flavors() {
             for (agent, label) in all_backends() {
                 let prompt = append_backend_rules(prompt.clone(), agent);
                 assert!(
-                    prompt.contains(SUCCESSOR_THREAD_RULE),
+                    prompt.contains(SUCCESSOR_SESSION_RULE),
                     "{flavor}/{label} lacks the successor rule"
                 );
             }
         }
-        assert!(SUCCESSOR_THREAD_RULE.contains("lucidos successor spawn"));
-        assert!(SUCCESSOR_THREAD_RULE.contains("`/clear`"));
+        assert!(SUCCESSOR_SESSION_RULE.contains("lucidos successor start"));
+        assert!(SUCCESSOR_SESSION_RULE.contains("`/clear`"));
         // A repository names its own checkpoints, so the rule sends the agent
         // to the command its flow names, and to the knowhow for wiring one.
-        assert!(SUCCESSOR_THREAD_RULE.contains("HANDOFF CHECKPOINT"));
-        assert!(SUCCESSOR_THREAD_RULE.contains("`lucidos successor offer --at <name>`"));
-        assert!(SUCCESSOR_THREAD_RULE.contains("system-knowhow/coding-agent-flows"));
+        assert!(SUCCESSOR_SESSION_RULE.contains("HANDOFF CHECKPOINT"));
+        assert!(SUCCESSOR_SESSION_RULE.contains("`lucidos successor offer --at <name>`"));
+        assert!(SUCCESSOR_SESSION_RULE.contains("system-knowhow/coding-agent-flows"));
         // A warm Continue on the Successor card queues exactly this phrase.
         let request = crate::engine::successor::HANDOFF_REQUEST;
-        assert!(SUCCESSOR_THREAD_RULE.contains(&format!("\"{request}\"")));
+        assert!(SUCCESSOR_SESSION_RULE.contains(&format!("\"{request}\"")));
     }
 
     #[test]
@@ -2742,6 +2827,21 @@ mod tests {
         );
     }
 
+    /// An agent that wrote its answer beside the read decision's call then
+    /// wrote it again after the call, and the user read it twice.
+    #[test]
+    fn the_read_decision_comes_before_the_answer_in_every_flavor() {
+        for (label, base) in all_prompt_flavors() {
+            for (backend, backend_label) in all_backends() {
+                let built = append_backend_rules(base.clone(), backend);
+                assert!(
+                    built.contains("in its own message, then answer once"),
+                    "{label}/{backend_label}"
+                );
+            }
+        }
+    }
+
     /// Notes that never reach the user: the agent's own context holds the text
     /// it wrote, so only the prompt can tell it the user saw none.
     #[test]
@@ -2751,7 +2851,10 @@ mod tests {
             let built = append_backend_rules(base, crate::runtime::CodingAgent::ClaudeCode);
             let hidden = with_notes_visibility(built.clone(), Hidden);
             assert!(hidden.contains(NOTES_HIDDEN_SENTENCE), "{label}");
-            assert!(hidden.contains("NEVER sees text you write"), "{label}");
+            assert!(hidden.contains("NEVER reach the user"), "{label}");
+            // Text before a tool call can still show, so a rule saying it never
+            // does made agents repeat their whole answer after the call.
+            assert!(hidden.contains("never write it before a tool call and again after"));
             assert!(
                 !hidden.contains(NOTES_REACH_USER_SENTENCE),
                 "{label}: both rules in one prompt"

@@ -12,9 +12,11 @@ Copy the block below to the start of the review flow, markers included.
 #### Handoff checkpoint
 
 At this flow's first entry, before any review, run
-`lucidos successor offer --at pre-harden` and follow what it prints. Only the
-first entry runs it: a later pass returns to the review, never here. A
-successor this checkpoint started skips it too, and starts at the review.
+`lucidos successor offer --at pre-harden --default-floor` and follow what it
+prints. Only the first entry runs it: a later pass returns to the review,
+never here. A successor session this checkpoint started skips it too, and
+starts at the review. `--default-floor` makes the surface's default rung the
+floor for this run, so a thread below it hands off onto it.
 <!-- /default-flow: hardening -->
 
 ## The rest of the flow

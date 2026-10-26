@@ -66,7 +66,7 @@ export function SideQuestionCard({ item }: { item: SideQuestion }) {
         </div>
         {item.status === 'pending' && <Thinking />}
         {item.status === 'answered' && (
-          <MarkdownBlock html={renderMarkdown(item.answer)} onClick={routeLinks} />
+          <MarkdownBlock html={renderMarkdown(item.answer)} onClick={routeLinks} className="side-question-answer" />
         )}
         {item.status === 'failed' && (
           <div class="side-question-failure">

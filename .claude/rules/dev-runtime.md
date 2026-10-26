@@ -19,15 +19,14 @@ paths:
   - "scripts/lib/deps_state*.sh"
   - "scripts/test-engine.sh"
   - "scripts/codegen.sh"
-  - "scripts/lib/codegen*.sh"
+  - "scripts/lib/codegen*"
   - "scripts/harden-gates.sh"
   - "scripts/harden-suites.sh"
   - "scripts/lib/harden_suites*.sh"
   - "scripts/harden-scope.sh"
   - "scripts/lib/harden_scope_test.sh"
-  - "scripts/harden-codex-review.sh"
   - "scripts/lane-report.sh"
-  - "scripts/lib/harden_codex_review_test.sh"
+  - "scripts/**/*other*model*review*.sh"
   - "scripts/lib/proc_tree.sh"
   - "scripts/test-scripts.sh"
   - "scripts/with-build-slot.sh"
@@ -46,8 +45,12 @@ paths:
   - "scripts/lib/prose_scan*.sh"
   - "scripts/check-adrs.sh"
   - "scripts/check-context-budget.sh"
-  - "scripts/check-knowhow-refs.sh"
+  - "scripts/check-knowhow-*.sh"
+  - "scripts/lib/check_knowhow*_test.sh"
   - "scripts/check-audit-scans.sh"
+  - "scripts/lib/check_audit_scans_test.sh"
+  - "scripts/check-retired-terms.sh"
+  - "scripts/lib/check_retired_terms_test.sh"
   - "scripts/check-default-flows.sh"
   - "scripts/lib/check_default_flows_test.sh"
   - "scripts/check-prompt-mirror.sh"
@@ -100,9 +103,9 @@ paths:
 
 # Dev Runtime & Workspace Scripts
 
-Launching a workspace, dev topology, frontend serving and the engine test harness. Build and packaging: `.claude/rules/build-release.md`. Facts in no ADR or header: [`docs/dev-runtime.md`](../../docs/dev-runtime.md).
+Dev runtime and test harness. Build rules: `.claude/rules/build-release.md`; other facts: [runtime notes](../../docs/dev-runtime.md).
 
-**`paths:` above is an explicit list, not a `scripts/**` catch-all.** A new script under `scripts/` gets NO rule until its path is added here or to `build-release.md`.
+Add new scripts to `paths:` here or in `build-release.md`, so their rule loads.
 
 ## Dev / runtime scripts
 
@@ -199,6 +202,7 @@ Every cargo variant uplifts to that path, and the last writer wins. A completed 
 - **Shared build-watch: one per checkout**, under three locks in `crates/lucidos-app/.build-watch/` (ADR 0438). A running watch is reused, so stop it to pick up an edit to `dev-build-watch.mjs`. Teardown is one non-blocking try on `consumers.lock`.
 - **`ensure_npm_deps` never installs under a live build-watch.** Under `ENGINE_ONLY` and `ENGINE_BUILD_ONLY` it warns and returns 0, never a hard fail. It is `npm ci`, never `npm install`: `.claude/rules/build-release.md` § "Lockfile determinism".
 - **`.build-watch/status.json` records the last build, and `watch.lock` says whether anything still builds.**
+- A deaf `fs.watch` heals via a 10 s git poll.
 - **The service worker caches `/assets/*` first and the shell network-first** (`networkFirstShell`), because a cache-first shell once blacked out the PWA.
 - A missed update toast: `docs/dev-runtime.md` § Debugging a missed toast.
 

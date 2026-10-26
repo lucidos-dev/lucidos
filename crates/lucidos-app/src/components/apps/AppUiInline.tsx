@@ -49,12 +49,13 @@ function refreshOpenApp(reveal: AppReveal): Promise<void> {
 
 /** The Canvas pane's frame. Counts its mount, so a refresh waits for a frame
  *  newer than the one on screen, and drops the pull arrow when it goes. */
-function ContentAppFrame({ src, reveal }: { src: string; reveal: AppReveal }) {
+function ContentAppFrame({ src, reveal, appId }: { src: string; reveal: AppReveal; appId: string }) {
   const [frame] = useState(() => ++framesMounted);
   return (
     <AppFrame
       src={src}
       reveal={reveal}
+      label={{ app: appId, place: 'canvas' }}
       onRevealed={() => settleFrameLoad(frame)}
       onLoad={() => void rerunFindOn('content')}
       onUnmount={() => showPullTravel(0)}
@@ -145,7 +146,7 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
       )}
       <FindBar surface="content" scope={`app:${app.id}`} placeholder="Find in app" />
       {frameSrc && (
-        <ContentAppFrame key={`${refreshKey}:${splitFrameSrc(frameSrc).doc}`} src={frameSrc} reveal={reveal} />
+        <ContentAppFrame key={`${refreshKey}:${splitFrameSrc(frameSrc).doc}`} src={frameSrc} reveal={reveal} appId={app.id} />
       )}
       {/* Where the host's overlay layer sits while this panel is natively
           fullscreen (OverlayLayer moves its node in, found by this marker).

@@ -144,7 +144,7 @@ pub(crate) enum ProposalHold {
     /// An integrated sub-thread's hardened work. It hands its branch up to
     /// its parent, whose agent merges it, so it never becomes a change.
     IntegratedIntoParent,
-    /// The thread handed off to a successor thread. Its branch work rides on
+    /// The thread handed off to a legacy successor thread. Its branch work rides on
     /// the successor's branch, so this thread never proposes it.
     CarriedBySuccessor,
 }
@@ -186,7 +186,7 @@ const INTEGRATED_HAS_NO_APPLY: &str =
 
 /// Why a thread that handed off has no Apply.
 const CARRIED_HAS_NO_APPLY: &str =
-    "This thread continued in a successor thread, whose branch carries its work. Lucidos \
+    "This thread continued in a legacy successor thread, whose branch carries its work. Lucidos \
      never proposes it here: the successor's change carries it to Apply.";
 
 /// The plan floor for a branch whose thread kind is already loaded. Skips the
@@ -465,6 +465,7 @@ mod tests {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

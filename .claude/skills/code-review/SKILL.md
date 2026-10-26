@@ -43,8 +43,9 @@ The arg picks the recipe. Default to **medium** when no arg is passed.
 | high | **recall-biased** | 3 correctness + 4 cleanup-class + altitude (7) | 6 | 1-vote (recall-biased) | no | 10 |
 | xhigh / max | **recall** — a missed bug ships; err toward surfacing | 5 correctness + 3 cleanup + 1 altitude (9) | 8 | 1-vote | yes | 15 |
 
-`/harden` calls this at **high**. It is the one Claude review of each iteration,
-beside Codex, so a missed bug costs more than a false positive (ADR 0476).
+`/harden` calls this at **high**. It is each iteration's one review by the
+hardening model's family, beside the other-model review. So a missed bug costs
+more than a false positive (ADR 0476).
 
 ## Phase 0 — Gather the diff
 
@@ -263,6 +264,12 @@ buried findings as `compliance`. The caller decides what to fix by it.
 
 Route the findings by what your runtime offers:
 
+- **You run as the other-model reviewer for `/harden`:** your prompt says so,
+  and names a diff file to review in place of Phase 0's git commands. Run the
+  correctness angles and Phase 2 inline, since you have no subagents. Read any
+  file you need, and change nothing. Return the surviving findings as the
+  structured output your caller's schema asks for, with an empty list when none
+  survive. The hardening agent validates them in its own Phase 3.
 - **You run as a subagent for `/harden` Phase 1:** do NOT call
   `ReportFindings`, since its result would stay in your own context. End with
   a final report listing each surviving finding with all five fields, ranked

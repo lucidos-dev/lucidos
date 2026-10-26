@@ -629,7 +629,9 @@ pub const TABLES: &[TableRule] = &[
                  derivation rather than introducing new state. keep_alive_turn \
                  spans a cache keep-alive run, from after its PromptInjected \
                  anchor to its keep-alive CodingAgentIdled. \
-                 cache_keep_alive_status projects CacheKeepAliveStatusChanged.",
+                 cache_keep_alive_status projects CacheKeepAliveStatusChanged, \
+                 and cache_keep_alive_off_at the CacheKeepAliveTurnedOff and \
+                 CacheKeepAliveTurnedOn pair.",
         },
     },
     TableRule {

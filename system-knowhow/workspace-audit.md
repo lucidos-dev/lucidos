@@ -3,6 +3,8 @@ name: Workspace Consistency Audit
 description: Audits workspace apps, triggers, knowhow, intents, scripts, plugins, artifacts and prompt footprint against current conventions. Use to audit the workspace and check for drift. Finds stale or unused items, and moves apps off a retired pattern or onto SDK UI helpers.
 ---
 
+<!-- domain-event: WorkspaceAuditCompleted: This audit emits its own domain event when its report is complete. -->
+
 # Workspace Consistency Audit
 
 A read-only sweep that reports drift between what's on disk and current conventions. Output: one Markdown report under `data/artifacts/audits/` plus a `WorkspaceAuditCompleted` event.
@@ -78,10 +80,10 @@ its rule; load it for the canonical wording.
 
 | Reference | Owns |
 |---|---|
-| `system-knowhow/best-practices.md` | Workspace file conventions: artifacts/, apps/, knowhow/, intents/, scripts/, config/ layout, per-workspace environment variables (Settings → System → Environment variables / the grouped `env_vars` tool), naming, "never nest artifacts", import-the-minimum |
+| `system-knowhow/best-practices.md` | Workspace file conventions: artifacts/, apps/, knowhow/, intents/, scripts/, config/ layout, per-workspace environment variables (Settings → System → Environment Variables / the grouped `env_vars` tool), naming, "never nest artifacts", import-the-minimum |
 | `system-knowhow/js-sdk.md` | Current app HTML boilerplate and the full `lucidos.*` API surface (anything not listed is either deprecated or invented) |
 | `system-knowhow/lucidos-cli.md` | What scripts and coding-agent subprocesses use for `data.*` writes, `events.*` emits, `proxy` calls to external APIs (preferred over raw `curl -H "Authorization: ..."` with `$CRED_*`), and `spawn-thread` thread spawning (sub-threads + cross-workspace, including Codex via `--codex`) |
-| `system-knowhow/plugins.md` | The plugin manifest schema, the `engine` requirement, and `check_plugin_updates` / `update_plugin` semantics |
+| `system-knowhow/plugins.md` | The plugin manifest schema, the `engine` requirement, and `plugins(action="check_updates")` / `plugins(action="update")` semantics |
 | `system-knowhow/building-knowhow.md` | Knowhow doc vs reference: which files a root lists, and where a doc's own supporting files go |
 | `system-knowhow/intent-registry.md` | Which on-disk files become intents in the system prompt (trigger files double as intents, which is easy to miss) |
 | `system-knowhow/thread-events.md` | Every `ThreadEvent` name and which of them a trigger can subscribe to. For the **retired** set, ask the `events` tool rather than reading this file: see the `triggers` section |
@@ -295,7 +297,10 @@ The first label says *suggested* because each finding's own line says so. A labe
 
 When you do spawn coding-agent work:
 
-- **Spawn child threads: omit `relation` (it defaults to `"child"`). Never pass `relation: "top"`.** When a child's session ends, this audit thread resumes with the result. You can then confirm each fix, note what didn't land, and update the report.
+- **Spawn child threads with `relation: "child"` and `wake_mode: "wake-when-all-done"`.**
+  This explicitly resumes the audit after all remediation children report.
+  Home-thread spawns otherwise default to filing reports without waking.
+  Confirm each proposed fix and update the report when the children finish.
   - The coding-agent threads nest under the audit in the thread drawer. Each one on a pending change is an *attention descendant*, which bubbles the audit thread to the Current section. The user follows one row, not N.
   - `relation: "top"` records no parent *and* no spawning event. Nothing links the fix to the audit, and the report stays frozen at "suggested fix". The `"top"` wording ("for the user to follow themselves") does **not** cover audit remediation.
   - Only exception: a fix in a *different* workspace must use `relation: "top"`. Child callbacks don't cross a workspace boundary, and the tool refuses the combination. Say so in the report and link the thread, since it won't report back.

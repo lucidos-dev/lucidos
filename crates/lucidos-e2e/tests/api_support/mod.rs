@@ -101,6 +101,83 @@ pub fn capacity_policy_lock() -> &'static tokio::sync::Mutex<()> {
     &LOCK
 }
 
+/// The capacity policy the engine runs with, read off the queue endpoint.
+/// A restore then puts back exactly what was there, not a guess at defaults.
+pub async fn capacity_policy(client: &reqwest::Client) -> serde_json::Value {
+    let body: serde_json::Value = client
+        .get(format!("{}/api/v1/thread-queue", base_url()))
+        .send()
+        .await
+        .expect("GET /thread-queue failed")
+        .json()
+        .await
+        .expect("Invalid JSON");
+    body["policy"].clone()
+}
+
+/// Replace the capacity policy. Sent whole: `PUT /thread-queue/policy` fills
+/// absent fields with defaults, so a partial body would silently reset every
+/// limit the caller did not name.
+async fn set_capacity_policy(client: &reqwest::Client, policy: &serde_json::Value) {
+    let resp = client
+        .put(format!("{}/api/v1/thread-queue/policy", base_url()))
+        .json(policy)
+        .send()
+        .await
+        .expect("PUT /thread-queue/policy failed");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 200, "policy PUT rejected: {body}");
+}
+
+/// Run `work` with the shared capacity pool widened, so it never queues behind
+/// other tests' in-flight chats.
+///
+/// A free pool slot is the PREMISE of a test that starts a thread or fires a
+/// trigger, not part of what it proves. This suite runs its whole API surface
+/// in parallel, and sampling `GET /thread-queue` through a full run shows the
+/// pool pinned at its 32-slot ceiling. A human chat waits for a slot before
+/// its first message is recorded. Its thread can then stay absent from
+/// `thread_summaries` for longer than any poll. A cron submit is reported as
+/// `queued`. Raising the ceiling drains the waiters at once.
+///
+/// - **The restore runs on every path out.** `work` runs on its own task, so a
+///   panic inside it is caught, the original policy goes back, and the panic
+///   then resumes. Otherwise the shared engine keeps the widened limits for
+///   the rest of the suite, and every admission-refusal assertion stops
+///   testing anything.
+/// - **The widen is a read-modify-write over one shared setting.**
+///   `capacity_policy_lock` makes two of them exclusive. That stops the second
+///   saving the first's widened policy as "the original".
+/// - One helper, because a copy per test drifts out of step with the others.
+pub async fn with_pool_room<T: Send + 'static>(
+    client: &reqwest::Client,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let _cap = capacity_policy_lock().lock().await;
+    with_pool_room_held(client, work).await
+}
+
+/// [`with_pool_room`] for a caller that already holds `capacity_policy_lock`.
+/// The lock is not reentrant, so a test that reads the policy around the
+/// widen takes it once and calls this.
+pub async fn with_pool_room_held<T: Send + 'static>(
+    client: &reqwest::Client,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    let original_policy = capacity_policy(client).await;
+    let mut roomy_policy = original_policy.clone();
+    roomy_policy["max_concurrent_total"] = serde_json::json!(512);
+    roomy_policy["max_concurrent_cron"] = serde_json::json!(512);
+    set_capacity_policy(client, &roomy_policy).await;
+    let outcome = tokio::spawn(work).await;
+    set_capacity_policy(client, &original_policy).await;
+    match outcome {
+        Ok(value) => value,
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    }
+}
+
 /// Holds the e2e workspace's working tree still for the one test that asserts
 /// on a snapshot of the whole tree.
 ///

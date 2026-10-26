@@ -289,6 +289,30 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** none.
 
+### App frame load probe
+
+- **Added:** 2026-10-23
+- **Lives in:** `crates/lucidos-app/src/components/apps/appFrameLoadProbe.ts`
+  and its two tests, wired into `AppFrame.tsx`. It reads
+  `utils/resumeClock.ts` (installed by `shellStartup.ts`),
+  `api/client/requestsInFlight.ts` (fed by `api/client/_core.ts`) and
+  `FetchLanes.snapshot` in `store/actions/bridgedFetchLanes.ts`.
+- **Impermanent because:** pure telemetry chasing a bug. On the iPhone, both
+  dashboard widget tiles sat on their load cover for 10 s or more after a
+  resume. A phone-sized browser run could not reproduce it, and the gateway log
+  points at the connection, not at widget code. So a frame still covered or
+  unloaded 3 s after mount writes one `[Client/app-frame]` `slow load` line,
+  then `slow load ended` or `slow load abandoned`. A fast frame writes nothing.
+  `docs/client-logs.md` covers reading them.
+- **Removal / resolution condition:** a logged phone episode names the cause and
+  that cause is fixed, or two months pass with no `slow load` line from a
+  phone. Verify by confirming no open work reads the line. Then delete the
+  probe, the resume clock, the requests-in-flight tracker, the lanes snapshot,
+  their tests, and the wiring in `AppFrame.tsx`, `_core.ts`,
+  `app-bridge.ts` and `shellStartup.ts`.
+- **Status:** active
+- **Investigation:** none.
+
 ### Shell snap-back log
 
 - **Added:** 2026-10-20
@@ -311,6 +335,42 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   test, the `reportShellSnapBack` call in `shellStartup.ts`, and the
   `shell-scroll` entry in `docs/client-logs.md`.
 - **Status:** active
+- **Investigation:** none.
+
+### Safe-area geometry log
+
+- **Added:** 2026-10-22
+- **Lives in:** `crates/lucidos-app/src/utils/safeAreaProbe.ts`
+  (`postClientLog('safe-area', …)` on each change of the inset state, plus one
+  `settled` line three seconds after launch), its test, and its two calls in
+  `utils/safeAreaFloor.ts`.
+- **Impermanent because:** pure telemetry chasing a bug. Its lines showed the
+  status bar strip moving the page below an opaque bar, and the floor counting
+  the inset twice (ADR 0551). It now confirms the header under the translucent
+  bar: the raw `env()` insets, the floor, the viewport and where the header and
+  its first button land.
+- **Removal / resolution condition:** the user confirms the always-on dynamic
+  bars header on device (ADR 0553). Or two months pass with no `[Client/safe-area]` line read
+  by open work.
+  Verify by confirming no open work reads the line. Then delete the module, its
+  test, both calls in `safeAreaFloor.ts`, and the `safe-area` entry in
+  `docs/client-logs.md`.
+- **Status:** active
+- **Investigation:** none.
+
+### Header blur clearance slider
+
+- **Added:** 2026-10-22
+- **Lives in:** removed. It was the "Header icon drop" row in
+  `components/settings/DebuggingSection.tsx`, its `searchIndex.ts` entry and
+  the stored per-device value in `utils/statusBarBlurClearance.ts`.
+- **Impermanent because:** the clearance that keeps the installed iOS app's
+  header controls clear of iOS 27's blur had no measured value yet (ADR 0551).
+  The user tuned it on the device.
+- **Removal / resolution condition:** the user says a value looks right. Make it
+  the constant `CLEARANCE_PX` and delete the slider.
+- **Status:** resolved 2026-10-23. The user settled on 24pt (ADR 0552), now the
+  constant, and the slider is gone.
 - **Investigation:** none.
 
 ### Toast press probe
@@ -2054,7 +2114,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   "in my message just before this card".
 
   A session on such a route reads a hard rule in place of the "short note"
-  sentence: text in a message that also calls a tool is never seen.
+  sentence: text in a message that also calls a tool may never be seen. It
+  says to write what the user must read once, in a message that calls no tool.
+  A real text block before a tool call still shows. So "never seen" alone made
+  agents repeat their whole answer after the call.
 - **Removal / resolution condition:** Claude Code requests `updates` on every
   provider. Check: on the `gateway` route with Opus 5.5, a note before a `Bash`
   call carries text. Then delete the module, the prompt swap, the `notes`
@@ -2683,11 +2746,17 @@ condition; fix the condition rather than acting on it.
   `input_json_delta` → tool_calls, history reconstruction uses structured
   `ContentBlock::ToolUse`, and neither the prompt nor loaded context primes the
   format (see `docs/plans/2026-06-30-inline-tool-call-leak-repair.md`).
+- **Headless shape:** widened on 2026-10-23. The model closed a `<copy>` block
+  with `</parameter>`, then typed an `ask_user_question` call's
+  `<parameter name="questions">` and `</invoke>` with no opener. The user read
+  raw JSON and got no card. A block with no opener now resolves to the one
+  offered tool whose schema fits its parameter names, and a dangling `<copy>`
+  is closed.
 - **Removal / resolution condition:** When the model reliably stops leaking tool
-  calls as text — disable the repair and confirm a sampled batch of chat turns
-  shows no `<invoke name=` substrings in any persisted `TextStreamed` /
-  `ResponseGenerated`. On removal, drop the module + its `run.rs` wiring + the
-  suppression branch.
+  calls as text. Disable the repair and confirm a sampled batch of chat turns
+  shows no `<invoke name=`, `<parameter name=` or `</invoke>` substrings in any
+  persisted `TextStreamed` / `ResponseGenerated`. On removal, drop the module +
+  its `run.rs` wiring + the suppression branch.
 - **Status:** active
 - **Investigation:** `model-tool-call-as-text`
 
@@ -3571,6 +3640,21 @@ event that retires it.
   so each function and its call went. `populate_memory` now runs the migrations
   itself. The migration header still names the bodies, and stays unedited.
 
+### `lucidos successor spawn` as an alias of `start`
+
+- **Added:** 2026-10-23
+- **Lives in:** `crates/lucidos-cli/src/main.rs`, the `#[command(alias = "spawn")]`
+  on `SuccessorCmd::Start`.
+- **Impermanent because:** a handoff now starts a *successor session* in the
+  same thread, so the subcommand is `start`. Repository flows, skills and
+  running sessions written before the rename still call `spawn`, and a removed
+  subcommand fails them with an unknown-command error.
+- **Removal / resolution condition:** two releases have shipped since the
+  rename, and `rg -n 'successor spawn'` over this tree finds no instruction
+  outside `docs/plans/`, `docs/adr/` and `CHANGELOG.md`. Then delete the alias,
+  and the sentence naming it in `system-knowhow/lucidos-cli.md`.
+- **Status:** active
+
 ---
 
 ## 4. Open investigations (parents)
@@ -3856,6 +3940,27 @@ measure now eligible for removal** — search this file for the id to find them 
   prompt are built once per turn in `engine::chat::process::run` and handed to
   `run_agentic_loop` frozen. So the cached prefix cannot move mid-turn, and is
   rebuilt from scratch between turns, which is exactly where the miss lives.
+- **The Vertex relay is RULED OUT** (probes on 2026-10-23, in
+  `data/artifacts/token-cost/vertex-relay-cache-miss-probes.md` in the `dev`
+  workspace). Byte-identical bodies hit every time, through the relay and
+  direct, on `eu` and `global`. The keep-alive side finding that suggested the
+  relay compared bodies that were not identical: each changed `max_tokens`.
+- **Vertex keys its cache pools on `max_tokens`.** Change only `max_tokens` and
+  a call misses a prefix written seconds earlier: 9 of 33 on `global`, 2 of 11
+  on `eu`, for Opus 5.5 and Sonnet 5.5, thinking on or off. Whitespace, metadata,
+  message text, beta set, effort and the session header moved nothing. This is
+  upstream behaviour. It does not explain Claude Code or the Lucidos Agent:
+  both send one fixed `max_tokens` on every call.
+- **The `eu` endpoint drops identical prefixes in bursts; `global` did not.**
+  Identical bodies missed 15 of 174 calls on `eu` and 0 of 148 on `global`. One
+  run missed 11 of 11, and its rerun was clean. A Vertex session reaches the
+  region its own environment names, which need not match the engine's
+  `vertex_region`.
+- **The Claude gateway did not fix it.** Claude Code in `dev` now runs on the
+  gateway, whose call ids still start `msg_vrtx_`, so Vertex serves it. Opus
+  first-of-turn calls read zero in 22.6% of 292 turns before the gateway
+  landed, and in 17.4% of 850 after (10 days to 2026-10-23). Mid-turn stays
+  near 1.3%.
 - **Removal / resolution condition:** The cause is identified, and either fixed
   or attributed to Anthropic with evidence. The discriminator is two consecutive
   calls on one thread whose `[CacheProbe]` prefix hashes are identical while the

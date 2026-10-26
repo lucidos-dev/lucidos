@@ -21,7 +21,8 @@
 #   commit <sha>     a branch commit since the hardening, oldest first
 #   merge <sha>      a merge since the hardening, oldest first
 #   overlap <path>   a file both sides of a merge changed
-#   codex-base <sha> INCREMENTAL with no merge: the base for the Codex review
+#   other-model-base <sha>
+#                    INCREMENTAL with no merge: the other-model review base
 #   fork-point <sha> the branch has no marker of its own: its reviewed heads
 #                    stand in, and its own work counts from where it forked
 #
@@ -90,6 +91,6 @@ for m in $merges; do
 done
 printf '%s' "$overlap" | sort -u | sed -n 's/^\(..*\)$/overlap \1/p'
 # With a merge in range, <sha>...HEAD holds all of main's new code as well.
-[ -n "$own" ] && [ -z "$merges" ] && echo "codex-base $sha"
+[ -n "$own" ] && [ -z "$merges" ] && echo "other-model-base $sha"
 [ -n "$fork" ] && echo "fork-point $fork"
 exit 0

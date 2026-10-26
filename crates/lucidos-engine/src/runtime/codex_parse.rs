@@ -25,6 +25,7 @@ pub(super) enum CodexLine {
     TurnCompleted {
         input_tokens: u64,
         cached_input_tokens: u64,
+        cache_write_input_tokens: u64,
         output_tokens: u64,
     },
     TurnFailed {
@@ -95,6 +96,37 @@ pub(super) enum ItemKind {
     },
 }
 
+/// One Codex turn's input, as `AgentEvent::Usage` carries it.
+///
+/// Codex reports the TOTAL prompt size, with the cache read and the cache
+/// write counted inside it. `Usage.input_tokens` carries the UNCACHED rest
+/// instead (the Claude Code convention the capture re-totals). Codex names no
+/// cache lifetime, so its TTL stays Unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CodexInput {
+    pub(super) uncached: u32,
+    pub(super) read: u32,
+    pub(super) written: u32,
+}
+
+impl CodexInput {
+    /// Split a reported total. A read and a write that claim more than the
+    /// total are cut to fit, so the uncached rest never goes negative.
+    pub(super) fn of_total(total: u32, read: u32, written: u32) -> Self {
+        let read = read.min(total);
+        let written = written.min(total - read);
+        Self {
+            uncached: total - read - written,
+            read,
+            written,
+        }
+    }
+
+    pub(super) fn total(self) -> u32 {
+        self.uncached + self.read + self.written
+    }
+}
+
 fn str_field(v: &serde_json::Value, key: &str) -> String {
     v.get(key)
         .and_then(|x| x.as_str())
@@ -125,6 +157,7 @@ pub(super) fn parse_codex_line(line: &str) -> CodexLine {
             CodexLine::TurnCompleted {
                 input_tokens: u64_field("input_tokens"),
                 cached_input_tokens: u64_field("cached_input_tokens"),
+                cache_write_input_tokens: u64_field("cache_write_input_tokens"),
                 output_tokens: u64_field("output_tokens"),
             }
         }
@@ -314,26 +347,24 @@ impl TurnTracker {
             CodexLine::TurnCompleted {
                 input_tokens,
                 cached_input_tokens,
+                cache_write_input_tokens,
                 output_tokens,
             } => {
                 self.turn_terminal_seen = true;
                 let clamp = |v: u64| crate::llm::clamp_provider_token_count(v, "Codex");
-                // Codex's `input_tokens` is the TOTAL prompt size with
-                // `cached_input_tokens` counting the cached portion within it
-                // — unlike Anthropic, where input_tokens excludes the cache.
-                // `AgentEvent::Usage.input_tokens` carries the UNCACHED
-                // portion (the CC convention the consumer re-totals), so
-                // subtract the cached share here.
-                let total_input = clamp(input_tokens);
-                let cached = clamp(cached_input_tokens).min(total_input);
+                let input = CodexInput::of_total(
+                    clamp(input_tokens),
+                    clamp(cached_input_tokens),
+                    clamp(cache_write_input_tokens),
+                );
                 let mut events = self.close_open_tools();
-                if total_input > 0 || output_tokens > 0 {
+                if input.total() > 0 || output_tokens > 0 {
                     events.push(AgentEvent::Usage {
                         model: None,
-                        input_tokens: total_input - cached,
+                        input_tokens: input.uncached,
                         output_tokens: clamp(output_tokens),
-                        cache_read_tokens: cached,
-                        cache_creation_tokens: 0,
+                        cache_read_tokens: input.read,
+                        cache_creation_tokens: input.written,
                         cache_creation_1h_tokens: None,
                         parent_tool_use_id: None,
                         api_call_id: None,

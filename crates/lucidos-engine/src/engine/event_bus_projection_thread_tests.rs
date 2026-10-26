@@ -194,3 +194,162 @@ async fn an_early_title_does_not_cost_a_sub_thread_its_parent() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+async fn emit_thread_event(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event,
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+}
+
+async fn start_session_on(
+    bus: &EventBus,
+    thread_id: Uuid,
+    coding_agent: crate::runtime::CodingAgent,
+) {
+    emit_thread_event(
+        bus,
+        thread_id,
+        ThreadEvent::SessionStarted {
+            coding_agent,
+            session_id: String::new(),
+            branch: String::new(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
+            continuity: None,
+        },
+    )
+    .await;
+}
+
+async fn backends_of(pool: &sqlx::PgPool, thread_id: Uuid) -> (Option<String>, Vec<String>) {
+    sqlx::query_as("SELECT coding_agent, coding_agents FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// `coding_agents` lists each backend a thread's sessions started on once, in
+/// first-use order. `coding_agent` stays the newest session's backend.
+#[tokio::test]
+async fn the_backends_a_thread_used_are_listed_once_in_first_use_order() {
+    use crate::runtime::CodingAgent::{ClaudeCode, Codex};
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    start_session_on(&bus, thread_id, ClaudeCode).await;
+    assert_eq!(
+        backends_of(&pool, thread_id).await,
+        (Some("claude-code".into()), vec!["claude-code".into()]),
+        "one session"
+    );
+
+    start_session_on(&bus, thread_id, ClaudeCode).await;
+    assert_eq!(
+        backends_of(&pool, thread_id).await.1,
+        vec!["claude-code"],
+        "a second session on the same backend adds nothing"
+    );
+
+    emit_thread_event(
+        &bus,
+        thread_id,
+        ThreadEvent::ContinuationStarted {
+            branch: String::new(),
+            origin: None,
+            reason: None,
+            resumed_abort_id: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        backends_of(&pool, thread_id).await.1,
+        vec!["claude-code"],
+        "a continuation names no backend"
+    );
+
+    start_session_on(&bus, thread_id, Codex).await;
+    assert_eq!(
+        backends_of(&pool, thread_id).await,
+        (
+            Some("codex".into()),
+            vec!["claude-code".into(), "codex".into()]
+        ),
+        "a successor on another backend joins the list and becomes current"
+    );
+
+    start_session_on(&bus, thread_id, ClaudeCode).await;
+    assert_eq!(
+        backends_of(&pool, thread_id).await.1,
+        vec!["claude-code", "codex"],
+        "going back keeps the first-use order"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+const ADD_CODING_AGENTS: &str =
+    include_str!("../../migrations/20261024054546_add_coding_agents_to_thread_summaries.sql");
+
+/// The backfill lists every backend from a thread's SessionStarted events.
+/// A legacy session, whose payload names no backend, counts as Claude Code,
+/// so a later handoff appends to `{claude-code}` rather than to `{}`.
+#[tokio::test]
+async fn the_backfill_lists_legacy_sessions_as_claude_code() {
+    use crate::runtime::CodingAgent::{ClaudeCode, Codex};
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (legacy, handed_off, fresh) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+    start_session_on(&bus, legacy, ClaudeCode).await;
+    start_session_on(&bus, handed_off, ClaudeCode).await;
+    start_session_on(&bus, handed_off, Codex).await;
+    first_message(&bus, fresh, None).await;
+
+    // The state before this migration: a legacy session's payload and row name
+    // no backend, and the column does not exist yet.
+    sqlx::raw_sql(&format!(
+        "UPDATE events SET payload = payload - 'coding_agent' \
+           WHERE event_type = 'SessionStarted' AND aggregate_id = '{legacy}'; \
+         UPDATE thread_summaries SET coding_agent = NULL WHERE thread_id = '{legacy}'; \
+         ALTER TABLE thread_summaries DROP COLUMN coding_agents;"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(ADD_CODING_AGENTS)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backends_of(&pool, legacy).await,
+        (None, vec!["claude-code".into()])
+    );
+    assert_eq!(
+        backends_of(&pool, handed_off).await.1,
+        vec!["claude-code", "codex"],
+        "first use first"
+    );
+    assert!(
+        backends_of(&pool, fresh).await.1.is_empty(),
+        "no session, no backend"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
-import { clampWithin, safeAreaTopPx } from '../utils/dom';
+import { clampWithin, readableVisualViewport, safeAreaTopPx } from '../utils/dom';
 import { ANCHOR_GAP } from './anchorGap';
 import { notePressOutcome } from '../utils/tapGesture';
 import { primaryPointerIsDown } from '../utils/pointerPress';
@@ -111,7 +111,7 @@ export function computeAnchorPosition(
   // The VISUAL viewport, in the layout-viewport coordinates `fixed` uses. iOS
   // shrinks only it for the keyboard, so `innerHeight` counts screen the keys
   // cover, and a panel measured against it opens behind them.
-  const vv = window.visualViewport;
+  const vv = readableVisualViewport();
   const viewTop = (vv?.offsetTop ?? 0) + topInset;
   const viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
   const roomBelow = viewBottom - CLAMP_MARGIN - (rect.bottom + ANCHOR_GAP);

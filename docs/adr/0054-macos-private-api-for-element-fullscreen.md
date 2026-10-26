@@ -1,6 +1,6 @@
 # 0054: The packaged client enables macOS private API so the app view's Fullscreen is real fullscreen
 
-- **Status**: Accepted
+- **Status**: Accepted. The app view's Fullscreen no longer uses it in the desktop client: ADR 0559 supersedes the frontend half. The private API stays for an app's own `requestFullscreen`.
 - **Date**: 2026-08-07
 
 ## Context

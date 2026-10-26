@@ -30,6 +30,9 @@ pub struct Rates {
     /// The 1-hour cache write. Absent means `cache_write`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_1h: Option<f64>,
+    /// OpenAI's 12-hour cache write. Absent means `cache_write`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_12h: Option<f64>,
     pub cache_read: f64,
     pub out: f64,
 }
@@ -88,6 +91,8 @@ pub struct CacheShares {
     pub write_5m: f64,
     /// Equal to `write_5m` for a provider whose cache has one write rate.
     pub write_1h: f64,
+    /// Equal to `write_5m` for a provider with no 12-hour cache.
+    pub write_12h: f64,
 }
 
 /// The state of the workspace override, as the merged table reports it.
@@ -232,6 +237,7 @@ fn validate_override(file: OverrideFile, currency: &str) -> Result<OverrideFile,
         [r.uncached_in, r.cache_write, r.cache_read, r.out]
             .into_iter()
             .chain(r.cache_write_1h)
+            .chain(r.cache_write_12h)
             .any(|v| v < 0.0)
     };
     for (id, cards) in &file.models {
@@ -293,6 +299,8 @@ impl ModelPrice {
                 read,
                 write_5m,
                 write_1h: share(rates.cache_write_1h.unwrap_or(rates.cache_write))
+                    .unwrap_or(write_5m),
+                write_12h: share(rates.cache_write_12h.unwrap_or(rates.cache_write))
                     .unwrap_or(write_5m),
             },
             _ => unpriced,

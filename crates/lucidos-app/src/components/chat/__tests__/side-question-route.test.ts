@@ -35,7 +35,7 @@ describe('PromptInput submit routes a side question before any send', () => {
   // a typed box shows the round Ask in place of the card's Submit.
   it('lets side-question mode win over a waiting card', () => {
     expect(promptSource).toMatch(/const hasPendingMultiQ = pendingMultiQ !== null && !sideQuestionMode;/);
-    expect(promptSource).toContain('{answersCard ? answerControl : sendButton}');
+    expect(promptSource).toContain('const actionSlot = answersCard ? answerControl');
   });
 
   it('asks whenever side-question mode is on', () => {

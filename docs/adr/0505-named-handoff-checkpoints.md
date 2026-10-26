@@ -3,7 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-17
 - **Amends**: [0499](0499-successor-offer-follows-effort-and-checkpoints.md), [0503](0503-build-chain.md)
-- **Amended by**: [0507: A successor inherits the consent that started it](0507-successor-inherits-handoff-consent.md)
+- **Amended by**: [0507: A successor inherits the consent that started it](0507-successor-inherits-handoff-consent.md), [0557: Harden hands off onto the default rung](0557-harden-runs-on-the-default-floor.md), [0560: A handoff starts a successor session in the same thread](0560-successor-session-in-the-same-thread.md)
 
 ## Context
 

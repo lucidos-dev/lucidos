@@ -419,8 +419,8 @@ describe('MUST TEST 4: Scheduled triggers', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       { type: 'TriggerStarted', trigger_id: 'task-1', trigger_name: 'Morning Brief', prompt: 'Check my calendar' },
-      { type: 'ToolCalled', name: 'execute_intent', args: {} },
-      { type: 'ToolResult', name: 'execute_intent', result: 'Calendar is clear.' },
+      { type: 'ToolCalled', name: 'load_knowhow', args: { id: 'calendar/check' } },
+      { type: 'ToolResult', name: 'load_knowhow', result: 'Calendar is clear.' },
       { type: 'TextStreamed', text: 'Your calendar is clear today.' },
       { type: 'ResponseGenerated', text: 'Your calendar is clear today.' },
     ]);

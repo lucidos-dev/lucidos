@@ -64,6 +64,7 @@ impl NoDecisions {
                     description: None,
                     preview: None,
                     widget: None,
+                    quiet: false,
                 }],
                 false,
                 false,
@@ -522,6 +523,9 @@ fn usage() -> ApiUsage {
         }),
         service_tier: None,
         cache_creation_1h_tokens: None,
+        cache_creation_30m_tokens: None,
+        cache_creation_12h_tokens: None,
+        cache_creation_requested_ttl: None,
     }
 }
 
@@ -578,6 +582,7 @@ async fn a_coding_agent_thread(bus: &EventBus) -> uuid::Uuid {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: crate::engine::thread_events::EventMeta {
             channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
@@ -3590,6 +3595,7 @@ fn asks_the_caller() -> ThreadEvent {
                 description: Some("Chunks 25-33, on the current main".to_string()),
                 preview: None,
                 widget: None,
+                quiet: false,
             },
             QuestionOption {
                 id: "opt-1".to_string(),
@@ -3597,6 +3603,7 @@ fn asks_the_caller() -> ThreadEvent {
                 description: None,
                 preview: None,
                 widget: None,
+                quiet: false,
             },
         ],
         worktree_path: None,
@@ -3729,6 +3736,7 @@ async fn an_answered_question_is_appended_and_never_asked_again() {
                 thread_id,
                 ThreadEvent::UserQuestionAnswered {
                     tool_use_id: "toolu_q0".to_string(),
+                    quiet: false,
                     answer: AnswerKind::Canceled,
                 },
             )
@@ -3806,6 +3814,7 @@ async fn a_permission_card_is_put_to_the_caller_out_loud_in_every_lane() {
                 tool_name: "Bash".to_string(),
                 input: serde_json::json!({ "command": "git push" }),
                 summary: "Bash git push".to_string(),
+                grant_offer: None,
             },
             "Bash git push",
             "agent:req-agent#allow-once",
@@ -3970,6 +3979,7 @@ fn the_choices_are_read_out_with_the_ids_that_settle_them() {
         description: None,
         preview: None,
         widget: None,
+        quiet: false,
     }];
     let single = decision_to_ask(
         &OpenDecision::question("toolu_q0", "Ready?", &one, false, false),

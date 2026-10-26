@@ -17,49 +17,6 @@ fn the_decisions_flip_strictly_above_each_threshold() {
     assert!(at(Some(HANDOFF_OFFER_TOKENS + 1)).offer);
 }
 
-/// I12, I14: a successor takes its old thread's place, never a detached
-/// child. A child successor keeps the parent and wake mode, so the parent
-/// waits on it and wakes as it would have for the old thread.
-#[test]
-fn a_successor_takes_its_old_threads_place() {
-    use crate::engine::thread_events::WakeMode;
-    let top = Placement::of_old_thread(None, Some("wake"), Some(Uuid::new_v4()));
-    assert_eq!(
-        top,
-        Placement {
-            parent_thread_id: None,
-            wake_mode: None,
-            spawning_event_id: None
-        }
-    );
-
-    let parent = Uuid::new_v4();
-    let spawned_by = Uuid::new_v4();
-    let child =
-        Placement::of_old_thread(Some(parent), Some("wake-when-all-done"), Some(spawned_by));
-    assert_eq!(child.parent_thread_id, Some(parent));
-    assert_eq!(child.wake_mode, Some(WakeMode::WakeWhenAllDone));
-    assert_eq!(child.spawning_event_id, Some(spawned_by));
-}
-
-/// I6: a build chain's builder is a `no-wake` child of the planner, so every
-/// report it sends is filed and opens no planner turn. That includes a
-/// failure and a restart cut (ADR 0545).
-#[test]
-fn a_build_chain_member_files_every_report() {
-    use crate::engine::event_bus::Delivery;
-    use crate::engine::thread_events::{ChildCompletionStatus, WakeMode};
-    let planner = Uuid::new_v4();
-    let placement = Placement::build_chain_under(planner);
-    assert_eq!(placement.parent_thread_id, Some(planner));
-    assert_eq!(placement.wake_mode, Some(WakeMode::NoWake));
-    let report = |status| Delivery::for_report(status, placement.wake_mode, None, false);
-    use ChildCompletionStatus::*;
-    for status in [Success, Failure, NoChanges, Canceled, Interrupted] {
-        assert_eq!(report(status), Delivery::File, "{status:?}");
-    }
-}
-
 fn implementer(agent: CodingAgent, model: Option<&str>, effort: Option<&str>) -> Implementer {
     Implementer {
         coding_agent: agent,
@@ -313,8 +270,8 @@ mod db {
     use crate::engine::event_bus::{BusEvent, EventBus};
     use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
     use crate::test_support::{
-        message_received, seed_chat_thread, seed_coding_thread, seed_consented_handoff,
-        seed_handoff, setup_test_db, start_cc_session, teardown_test_db,
+        message_received, seed_chat_thread, seed_coding_thread, seed_handoff, setup_test_db,
+        start_cc_session, teardown_test_db,
     };
 
     fn cc_meta() -> EventMeta {
@@ -339,7 +296,7 @@ mod db {
     }
 
     async fn hand_off(bus: &EventBus, old: Uuid, parent: Option<Uuid>) -> Uuid {
-        seed_handoff(bus, old, parent, false).await
+        seed_handoff(bus, old, parent).await
     }
 
     /// I16, I17: one event links both threads, durably, and a successor
@@ -535,159 +492,241 @@ mod db {
         teardown_test_db(&db).await;
     }
 
-    /// I21: the old thread asks to be archived once, on its successor's
-    /// first session. The archive request then waits until nothing blocks
-    /// it, so a running or pinned old thread stays open.
-    #[tokio::test]
-    async fn the_old_thread_asks_to_archive_on_the_first_session_only() {
-        let (pool, db) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let old = coding_thread(&bus, None).await;
-        let successor = hand_off(&bus, old, None).await;
-        let requests = || {
-            let pool = pool.clone();
-            async move {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT count(*) FROM events \
-                     WHERE thread_id = $1 AND event_type = 'ThreadArchiveRequested'",
-                )
-                .bind(old)
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-            }
-        };
-        request_predecessor_archive(&bus, &pool, successor).await;
-        assert_eq!(requests().await, 0, "no session yet, no request");
-        start_cc_session(&bus, successor, "claude-code/s", None).await;
-        request_predecessor_archive(&bus, &pool, successor).await;
-        assert_eq!(requests().await, 1);
-        start_cc_session(&bus, successor, "claude-code/s", None).await;
-        request_predecessor_archive(&bus, &pool, successor).await;
-        assert_eq!(requests().await, 1, "a resume asks nothing twice");
-        request_predecessor_archive(&bus, &pool, old).await;
-        assert_eq!(
-            requests().await,
-            1,
-            "a thread that is no successor asks nothing"
-        );
-
-        teardown_test_db(&db).await;
+    fn session_handed_off(checkpoint: Option<&str>) -> ThreadEvent {
+        ThreadEvent::SessionHandedOff {
+            opening: crate::engine::thread_events::HandoffOpening::Narrative,
+            message: "A fresh session starts here.".into(),
+            checkpoint: checkpoint.map(str::to_string),
+            progress: checkpoint.map(|_| "2/5".to_string()),
+            coding_agent: CodingAgent::Codex,
+            coding_agent_model: Some("gpt-5.6-sol".into()),
+            reasoning_effort: None,
+            request: None,
+        }
     }
 
-    /// A build chain is the builder under its planner plus each successor
-    /// beside it. A successor in an ordinary child's place is in no chain.
-    #[tokio::test]
-    async fn a_build_chain_follows_successors_under_one_planner() {
-        let (pool, db) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let planner = coding_thread(&bus, None).await;
-        let builder = seed_handoff(&bus, planner, Some(planner), true).await;
-        let next = hand_off(&bus, builder, Some(planner)).await;
-        assert!(starts_build_chain(&pool, builder).await.unwrap());
-        assert!(!starts_build_chain(&pool, next).await.unwrap());
-        let chain = build_chain(&pool, next)
+    /// A `SessionStarted` on `coding_agent` with `continuity`.
+    fn session_started(
+        thread: Uuid,
+        coding_agent: CodingAgent,
+        continuity: Option<crate::engine::thread_events::SessionContinuity>,
+    ) -> ThreadEvent {
+        ThreadEvent::SessionStarted {
+            coding_agent,
+            session_id: "test-session".into(),
+            branch: format!("claude-code/{thread}"),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
+            continuity,
+        }
+    }
+
+    /// The successor session of `thread`'s pending handoff starts.
+    async fn start_successor(bus: &EventBus, pool: &sqlx::PgPool, thread: Uuid) {
+        let handoff = pending_handoff(pool, thread)
             .await
             .unwrap()
-            .expect("a chain member");
-        assert_eq!(chain.planner, planner);
-        assert_eq!(chain.members, vec![builder, next]);
-        assert_eq!(build_chain(&pool, planner).await.unwrap(), None);
-
-        let parent = seed_chat_thread(&bus, "parent").await;
-        let child = coding_thread(&bus, Some(parent)).await;
-        let in_place = hand_off(&bus, child, Some(parent)).await;
-        assert_eq!(build_chain(&pool, in_place).await.unwrap(), None);
-        assert!(!starts_build_chain(&pool, in_place).await.unwrap());
-
-        teardown_test_db(&db).await;
+            .expect("a pending handoff");
+        let event = session_started(thread, handoff.coding_agent, Some(handoff.continuity()));
+        emit(bus, thread, event).await;
     }
 
-    /// ADR 0507, I2 and I4: a successor carries the consent its predecessor
-    /// recorded, read back from the events table, toward that shared parent
-    /// only. A non-successor child and a no-consent handoff carry none.
+    /// A handoff is pending from its `SessionHandedOff` until its
+    /// successor session's `SessionStarted`. It records no
+    /// thread, and the reading offers no second handoff meanwhile.
     #[tokio::test]
-    async fn a_successor_carries_its_predecessors_recorded_consent() {
-        use crate::engine::thread_events::HandoffConsent;
+    async fn a_handoff_is_pending_until_the_next_session_starts() {
         let (pool, db) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
-        let parent = seed_chat_thread(&bus, "parent").await;
-        let first = coding_thread(&bus, Some(parent)).await;
-        let second = seed_consented_handoff(
-            &bus,
-            first,
-            Some(parent),
-            false,
-            Some(HandoffConsent::OwnerApproval),
-        )
-        .await;
-        let third = seed_consented_handoff(
-            &bus,
-            second,
-            Some(parent),
-            false,
-            Some(HandoffConsent::Carried),
-        )
-        .await;
-
-        assert_eq!(
-            carried_consent(&pool, second, parent).await.unwrap(),
-            Some(HandoffConsent::OwnerApproval)
-        );
-        assert_eq!(
-            carried_consent(&pool, third, parent).await.unwrap(),
-            Some(HandoffConsent::Carried),
-            "the consent lasts down the lineage"
-        );
-        let elsewhere = seed_chat_thread(&bus, "elsewhere").await;
-        assert_eq!(
-            carried_consent(&pool, second, elsewhere).await.unwrap(),
-            None
-        );
-        assert_eq!(
-            carried_consent(&pool, first, parent).await.unwrap(),
-            None,
-            "a child that is no successor carries nothing"
-        );
-
-        let other = coding_thread(&bus, Some(parent)).await;
-        let unconsented = hand_off(&bus, other, Some(parent)).await;
-        assert_eq!(
-            carried_consent(&pool, unconsented, parent).await.unwrap(),
-            None
-        );
-
-        teardown_test_db(&db).await;
-    }
-
-    /// I5: the planner stays open when its builder starts. A later member's
-    /// predecessor archives as any old thread does.
-    #[tokio::test]
-    async fn the_planner_stays_open_and_chain_members_archive() {
-        let (pool, db) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
-        let planner = coding_thread(&bus, None).await;
-        let builder = seed_handoff(&bus, planner, Some(planner), true).await;
-        let next = hand_off(&bus, builder, Some(planner)).await;
-        let requests = |id: Uuid| {
+        let thread = coding_thread(&bus, None).await;
+        let rows = || {
             let pool = pool.clone();
             async move {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT count(*) FROM events \
-                     WHERE thread_id = $1 AND event_type = 'ThreadArchiveRequested'",
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM thread_summaries")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let before = rows().await;
+        assert_eq!(pending_handoff(&pool, thread).await.unwrap(), None);
+
+        emit(&bus, thread, session_handed_off(Some("phase-commit"))).await;
+        let pending = pending_handoff(&pool, thread)
+            .await
+            .unwrap()
+            .expect("a pending handoff");
+        assert_eq!(
+            pending.continuity(),
+            crate::engine::thread_events::SessionContinuity::Handoff {
+                checkpoint: Some("phase-commit".into()),
+                progress: Some("2/5".into()),
+                opening: crate::engine::thread_events::HandoffOpening::Narrative,
+                message: "A fresh session starts here.".into(),
+            }
+        );
+        assert_eq!(pending.implementer().coding_agent, CodingAgent::Codex);
+        assert_eq!(rows().await, before, "a handoff creates no thread");
+        assert_eq!(successor_thread_of(&pool, thread).await.unwrap(), None);
+        let context = thread_context(&pool, thread).await.unwrap();
+        assert!(!context.can_hand_off && !context.offer);
+
+        start_cc_session(&bus, thread, &format!("claude-code/{thread}"), None).await;
+        assert!(
+            pending_handoff(&pool, thread).await.unwrap().is_some(),
+            "a recovery or resolution session records no continuity, and starts no successor"
+        );
+
+        start_successor(&bus, &pool, thread).await;
+        assert_eq!(pending_handoff(&pool, thread).await.unwrap(), None);
+        assert!(thread_context(&pool, thread).await.unwrap().can_hand_off);
+
+        teardown_test_db(&db).await;
+    }
+
+    /// The pending check names its own aliases, so it reads the right thread
+    /// under an outer `s` alias. Another thread's session never ends it.
+    #[tokio::test]
+    async fn another_threads_session_never_ends_a_pending_handoff() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        let other = coding_thread(&bus, None).await;
+        emit(&bus, other, session_handed_off(None)).await;
+        emit(&bus, thread, session_handed_off(None)).await;
+        start_successor(&bus, &pool, other).await;
+
+        let pending: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT s.thread_id FROM thread_summaries s WHERE {}",
+            pending_handoff_sql("s.thread_id")
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, vec![thread]);
+
+        teardown_test_db(&db).await;
+    }
+
+    /// A user's Stop withdraws a pending handoff, and so does a successor
+    /// turn that failed before its session started. A follow-up that only
+    /// redirected the turn, or a failure of the turn that handed off, does not.
+    #[tokio::test]
+    async fn a_stop_or_a_failed_successor_turn_ends_a_pending_handoff() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let event = |value: serde_json::Value| -> ThreadEvent {
+            serde_json::from_value(value).expect("a thread event")
+        };
+        let cancel =
+            |cause: &str| event(serde_json::json!({"type": "ResponseCanceled", "cause": cause}));
+        let failure =
+            || event(serde_json::json!({"type": "ResponseFailed", "error": "spawn failed"}));
+        let message =
+            || event(serde_json::json!({"type": "MessageReceived", "text": "the opening"}));
+
+        let stopped = coding_thread(&bus, None).await;
+        emit(&bus, stopped, session_handed_off(None)).await;
+        emit(&bus, stopped, cancel("superseded_by_followup")).await;
+        emit(&bus, stopped, failure()).await;
+        assert!(
+            pending_handoff(&pool, stopped).await.unwrap().is_some(),
+            "a redirect, or the handing-off turn's own failure, keeps it"
+        );
+        emit(&bus, stopped, cancel("user_stop")).await;
+        assert_eq!(pending_handoff(&pool, stopped).await.unwrap(), None);
+
+        let failed = coding_thread(&bus, None).await;
+        emit(&bus, failed, session_handed_off(None)).await;
+        emit(&bus, failed, message()).await;
+        emit(&bus, failed, failure()).await;
+        assert_eq!(pending_handoff(&pool, failed).await.unwrap(), None);
+        assert!(thread_context(&pool, failed).await.unwrap().can_hand_off);
+
+        teardown_test_db(&db).await;
+    }
+
+    /// I3 (parent unchanged): a child whose handoff is pending owes no
+    /// decision and keeps its report armed. Its successor session owes both,
+    /// and reports once at the real end.
+    #[tokio::test]
+    async fn a_child_keeps_its_parents_wait_across_a_handoff() {
+        use crate::engine::turn_end::wake_decision::WakeDuty;
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let parent = seed_chat_thread(&bus, "parent").await;
+        let child = coding_thread(&bus, Some(parent)).await;
+        let report_armed = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT parent_callback_pending FROM thread_summaries WHERE thread_id = $1",
                 )
-                .bind(id)
+                .bind(child)
                 .fetch_one(&pool)
                 .await
                 .unwrap()
             }
         };
-        start_cc_session(&bus, builder, "claude-code/b", None).await;
-        request_predecessor_archive(&bus, &pool, builder).await;
-        assert_eq!(requests(planner).await, 0, "the planner stays open");
-        start_cc_session(&bus, next, "claude-code/n", None).await;
-        request_predecessor_archive(&bus, &pool, next).await;
-        assert_eq!(requests(builder).await, 1);
+        assert_eq!(WakeDuty::of_thread(&pool, child).await, WakeDuty::Decide);
+
+        emit(&bus, child, session_handed_off(None)).await;
+        assert_eq!(WakeDuty::of_thread(&pool, child).await, WakeDuty::NoParent);
+        emit(
+            &bus,
+            child,
+            serde_json::from_value(serde_json::json!({"type": "CodingAgentIdled"}))
+                .expect("an idle with every field defaulted"),
+        )
+        .await;
+        assert!(
+            report_armed().await,
+            "the old session's turn end reports nothing, so the report stays armed"
+        );
+
+        start_successor(&bus, &pool, child).await;
+        assert_eq!(WakeDuty::of_thread(&pool, child).await, WakeDuty::Decide);
+        assert!(report_armed().await);
+
+        teardown_test_db(&db).await;
+    }
+
+    /// Backend at boundary: a mid-thread request for another backend is
+    /// ignored, a handoff naming Codex starts a Codex session, and that
+    /// session then holds the thread's backend.
+    #[tokio::test]
+    async fn a_handoff_is_the_only_place_the_backend_changes() {
+        use crate::engine::agent_session::spawn_claim::resolve_thread_coding_agent as backend;
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        assert_eq!(
+            backend(&pool, thread, Some(CodingAgent::Codex))
+                .await
+                .unwrap(),
+            CodingAgent::ClaudeCode,
+            "no switch without a fresh session"
+        );
+
+        emit(&bus, thread, session_handed_off(Some("phase-commit"))).await;
+        assert_eq!(
+            backend(&pool, thread, None).await.unwrap(),
+            CodingAgent::Codex
+        );
+
+        start_successor(&bus, &pool, thread).await;
+        assert_eq!(
+            backend(&pool, thread, Some(CodingAgent::ClaudeCode))
+                .await
+                .unwrap(),
+            CodingAgent::Codex,
+            "the successor session's backend is the thread's now"
+        );
 
         teardown_test_db(&db).await;
     }
@@ -826,7 +865,7 @@ mod db {
     }
 
     /// I3, I4: the request recorded at the tap is pending until the thread's
-    /// turn ends, and carries the implementer the user picked.
+    /// turn ends, and carries who typed it and the implementer they picked.
     #[tokio::test]
     async fn a_request_is_pending_until_the_turn_ends() {
         let (pool, db) = setup_test_db().await;
@@ -854,13 +893,19 @@ mod db {
             serde_json::json!({
                 "message": "Add a toggle",
                 "coding_agent_model": "claude-sonnet-5-5",
+                "actor": { "kind": "device", "device_id": "test-device" },
             }),
         )
         .await;
         assert_eq!(
             pending_successor_request(&pool, old).await.unwrap(),
             Some(PendingRequest {
-                message: Some("Add a toggle".into()),
+                request: Some(HandoffRequest {
+                    message: "Add a toggle".into(),
+                    by: crate::engine::thread_events::MessageOrigin::Device {
+                        device_id: "test-device".into(),
+                    },
+                }),
                 implementer: ImplementerRequest {
                     coding_agent: None,
                     coding_agent_model: Some("claude-sonnet-5-5".into()),
@@ -880,101 +925,94 @@ mod db {
     }
 }
 
-#[test]
-fn the_first_handoff_numbers_the_successor_two() {
-    assert_eq!(
-        successor_title("Fix the drawer", None),
-        "Fix the drawer (2)"
+/// One process: the successor session waits until the old session's run lets
+/// go of the thread, so two subprocesses never run in one thread.
+#[tokio::test]
+async fn the_successor_session_waits_for_the_old_run_to_let_go() {
+    use crate::engine::types::AgentSession;
+    let thread = Uuid::new_v4();
+    let (session, old_run) = AgentSession::for_test();
+    let sessions = tokio::sync::Mutex::new(std::collections::HashMap::from([(thread, session)]));
+    let wait = wait_until_thread_released(&sessions, thread);
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut wait)
+            .await
+            .is_err(),
+        "the old run still holds the thread"
     );
+    drop(old_run);
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .expect("the successor session starts once the old run let go");
+    wait_until_thread_released(&sessions, Uuid::new_v4()).await;
 }
 
 #[test]
-fn a_repeat_handoff_counts_up_and_never_stacks() {
-    let second = successor_title("Fix the drawer", None);
-    let third = successor_title(&second, None);
-    assert_eq!(third, "Fix the drawer (3)");
-    assert_eq!(successor_title(&third, None), "Fix the drawer (4)");
-}
-
-#[test]
-fn legacy_continued_titles_migrate_to_their_chain_position() {
-    assert_eq!(
-        successor_title("Fix the drawer (continued)", None),
-        "Fix the drawer (3)"
-    );
-    assert_eq!(
-        successor_title("Fix the drawer (continued) (continued)", None),
-        "Fix the drawer (4)"
-    );
-}
-
-#[test]
-fn a_checkpoint_names_the_work_the_successor_starts() {
-    assert_eq!(
-        successor_title("Fix the drawer", Some("Harden")),
-        "Fix the drawer (2) · Harden"
-    );
-}
-
-#[test]
-fn a_checkpoint_suffix_does_not_survive_the_next_handoff() {
-    assert_eq!(
-        successor_title("Fix the drawer (2) · Harden", None),
-        "Fix the drawer (3)"
-    );
-    assert_eq!(
-        successor_title("Fix the drawer (3) · Phase 2", Some("Harden")),
-        "Fix the drawer (4) · Harden"
-    );
-    assert_eq!(
-        successor_title("Fix the drawer (continued) · Harden", Some("Build")),
-        "Fix the drawer (3) · Build"
-    );
-}
-
-#[test]
-fn a_dot_in_a_plain_title_is_part_of_the_title() {
-    assert_eq!(
-        successor_title("Fix · the drawer", None),
-        "Fix · the drawer (2)"
-    );
-}
-
-#[test]
-fn only_a_small_parenthesised_number_counts_as_a_position() {
-    assert_eq!(successor_title("Report (1)", None), "Report (1) (2)");
-    assert_eq!(successor_title("Report (2024)", None), "Report (2024) (2)");
-}
-
-#[test]
-fn a_title_that_is_only_a_marker_keeps_its_text() {
-    assert_eq!(successor_title("(continued)", None), "(continued) (2)");
-}
-
-#[test]
-fn the_brief_names_the_old_thread_and_how_to_rebuild() {
+fn the_brief_says_why_and_how_to_rebuild() {
     let id = Uuid::new_v4();
-    let brief = handoff_brief("[Old](thread:ws/x)", id, None, Some("Fixed the drawer"));
-    assert!(brief.contains("continues [Old](thread:ws/x)"));
-    assert!(brief.contains(&format!("lucidos events query --thread-id {id}")));
-    assert!(brief.contains("git log"));
-    assert!(brief.contains("docs/plans/"));
-    assert!(brief.contains("The change it applied last: Fixed the drawer"));
+    let cold = handoff_brief(id, BriefCause::CacheCold, false, Some("Fixed the drawer"));
+    assert!(
+        cold.contains("handed off with no handoff narrative"),
+        "{cold}"
+    );
+    assert!(cold.contains(&format!("lucidos events query --thread-id {id}")));
+    assert!(cold.contains("git status"));
+    assert!(cold.contains("git log"));
+    assert!(cold.contains("docs/plans/"));
+    assert!(cold.contains("The change this thread applied last: Fixed the drawer"));
+    let failed = handoff_brief(id, BriefCause::ResumeFailed, false, None);
+    assert!(failed.contains("could not resume"), "{failed}");
 }
 
-/// I3: a typed request is quoted in the brief, and with none the successor
-/// is told to ask where to pick up.
+/// I3: a brief leaves the request to the first message, and with none the
+/// session is told to ask where to pick up.
 #[test]
-fn the_brief_carries_a_typed_request_or_asks_for_one() {
+fn the_brief_asks_for_a_request_only_when_none_follows() {
     let id = Uuid::new_v4();
-    let with = handoff_brief(
-        "[Old](thread:ws/x)",
-        id,
-        Some("Add a dark-mode toggle"),
-        None,
-    );
-    assert!(with.contains("Add a dark-mode toggle"));
-    assert!(!with.contains("AskUserQuestion"));
-    let without = handoff_brief("[Old](thread:ws/x)", id, None, None);
+    let with = handoff_brief(id, BriefCause::CacheCold, true, None);
+    assert!(with.ends_with("that the branch touched."), "{with}");
+    let without = handoff_brief(id, BriefCause::CacheCold, false, None);
     assert!(without.contains("end your first turn on an AskUserQuestion card"));
+}
+
+/// A session started at a checkpoint is told to skip it. A flow saying "run
+/// it at first entry" then does not send it back there.
+#[test]
+fn a_checkpoint_handoff_is_told_to_skip_that_checkpoint() {
+    let opening = narrative_opening(Some("pre-harden"), "Next: review.");
+    assert!(
+        opening.contains("`pre-harden` checkpoint, so skip that checkpoint"),
+        "{opening}"
+    );
+    assert!(opening.ends_with("Next: review."), "{opening}");
+    let plain = narrative_opening(None, "Next: review.");
+    assert!(!plain.contains("skip"), "{plain}");
+}
+
+/// The successor agent reads its opening, then the user's request, then any
+/// other input that started the session: each once.
+#[test]
+fn the_first_message_reads_the_opening_then_the_request_once() {
+    let opening = "A fresh session starts here.\n\n# Next step\nReview.";
+    let request = "Add a dark-mode toggle";
+    let framed = "The user's request for you:\n\nAdd a dark-mode toggle";
+
+    assert_eq!(successor_first_message(opening, None, opening), opening);
+
+    let from_request = successor_first_message(opening, Some(request), request);
+    assert!(from_request.starts_with(opening), "{from_request}");
+    assert!(from_request.ends_with(framed), "{from_request}");
+    assert_eq!(from_request.matches(request).count(), 1, "{from_request}");
+
+    let started_by_user = successor_first_message(opening, None, "Also fix the drawer");
+    assert!(started_by_user.starts_with(opening), "{started_by_user}");
+    assert!(
+        started_by_user.ends_with("The message that started this session:\n\nAlso fix the drawer"),
+        "{started_by_user}"
+    );
+
+    let both = successor_first_message(opening, Some(request), "Also fix the drawer");
+    assert!(both.contains(framed), "{both}");
+    assert!(both.ends_with("Also fix the drawer"), "{both}");
 }

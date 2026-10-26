@@ -376,6 +376,7 @@ async fn startup_resolves_orphan_permission_request() {
             tool_name: "Edit".into(),
             input: serde_json::json!({"file_path": "/tmp/x"}),
             summary: "Edit /tmp/x".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -460,6 +461,7 @@ async fn startup_skips_already_resolved_permission_requests() {
             tool_name: "Edit".into(),
             input: serde_json::json!({}),
             summary: "Edit".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -531,6 +533,7 @@ async fn typed_message_supersedes_pending_permission() {
             tool_name: "Bash".into(),
             input: serde_json::json!({"command": "ls"}),
             summary: "Bash ls".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -562,6 +565,7 @@ async fn typed_message_supersedes_pending_permission() {
         state.by_dedup_key.insert(
             key.clone(),
             PermissionEntry {
+                grant_offer: Default::default(),
                 thread_id,
                 request_id: "req-super".into(),
                 tool_name: "Bash".into(),
@@ -642,6 +646,7 @@ async fn supersede_is_noop_when_no_pending_permission() {
             tool_name: "Edit".into(),
             input: serde_json::json!({}),
             summary: "Edit".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -706,6 +711,7 @@ async fn permission_resolution_resumes_waiting_thread() {
             tool_name: "Bash".into(),
             input: serde_json::json!({"command": "ls"}),
             summary: "Bash ls".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -779,6 +785,7 @@ async fn permission_resolution_does_not_resurrect_idle_thread() {
             tool_name: "Bash".into(),
             input: serde_json::json!({"command": "sed -n '1,10p' x"}),
             summary: "Bash sed".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -860,6 +867,7 @@ async fn idle_sweep_clears_pending_permission_without_resurrecting() {
             tool_name: "Bash".into(),
             input: serde_json::json!({"command": "sed x"}),
             summary: "Bash sed".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -885,6 +893,7 @@ async fn idle_sweep_clears_pending_permission_without_resurrecting() {
         state.by_dedup_key.insert(
             key.clone(),
             PermissionEntry {
+                grant_offer: Default::default(),
                 thread_id,
                 request_id: "req-idle".into(),
                 tool_name: "Bash".into(),

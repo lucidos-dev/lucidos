@@ -3,12 +3,13 @@
  *
  * The transcript draws only a tail of the thread, and a folded turn draws
  * nothing (`threadWindow.ts`, `Disclosure`). So the count comes from the
- * thread's data: every user message and reply chunk, rendered to text the way
- * the transcript renders it. Typing only counts. A step makes its match drawn:
- * it unfolds the turn, asks the transcript to render down to it, then
- * highlights the occurrence and scrolls to it.
+ * thread's data: every text the transcript draws (`transcript-passages.ts`).
+ * Typing only counts. A step makes its match drawn: it unfolds what hides it,
+ * asks the transcript to render down to it, then highlights the occurrence and
+ * scrolls to it.
  *
- * Plan: `docs/plans/2026-10-07-find-in-previews-and-transcript.md`.
+ * Plans: `docs/plans/2026-10-07-find-in-previews-and-transcript.md` and
+ * `docs/plans/2026-10-25-find-all-thread-text.md`.
  */
 
 import {
@@ -17,65 +18,16 @@ import {
 } from '@lucidos/find';
 import type { FindTarget } from './find-bar';
 import {
-  collapsedInitiators, detailsExpanded, expandExchange, threadMap, toggleInitiatorCollapsed,
+  collapsedInitiators, detailsExpanded, expandExchange, openSubAgentGroups, stepsExpanded, threadMap,
+  toggleInitiatorCollapsed, toggleSubAgentGroup,
 } from '../store';
-import { computeExchanges } from '../thread-events/exchange-grouping';
-import { exchangeKey, exchangeUserMessage, isUserBubbleEvent } from '../thread-events/exchange';
-import { exchangeResponseEvents } from '../thread-events/exchange-render';
-import type { ThreadState } from '../thread-events/thread-meta';
-import { getCollapsedVisibleEvents, headClampApplies, isMeaningfulText } from '../event-rendering';
-import { renderMarkdown } from '../../utils/renderMarkdown';
+import { reopenSideQuestion, sideQuestionsFor } from '../sideQuestions';
+import { cachedText, transcriptPassages, type TranscriptPassage } from './transcript-passages';
 import { ensureWholeThreadLoaded } from './thread-loading';
 import { markRevealScroll, stopFollowingBottom } from '../../components/chat/scrollState';
 import { isElementVisible } from '../../utils/elementVisibility';
 
 import { transcriptRenderRequest } from './transcriptRenderRequest';
-
-/** One searchable stretch of the transcript: a user's message, or one reply
- *  chunk, as the plain text the transcript draws for it. A reply chunk carries
- *  the seq of every streamed piece in it: a side question can split the chunk
- *  in two, and the second half is drawn under a later piece's seq. */
-export interface TranscriptPassage {
-  key: string;
-  userSeq: number;
-  /** `needsDetails`: the turn draws this chunk only with the full response
-   *  on, since without it a turn shows its last chunk alone. */
-  part: { kind: 'user' } | { kind: 'reply'; seqs: number[]; needsDetails: boolean };
-  text: string;
-}
-
-/** Every passage of the thread, in reading order. Pure over the thread's
- *  data, so it counts history the transcript has not drawn. */
-export function transcriptPassages(thread: ThreadState, plainText: (md: string) => string): TranscriptPassage[] {
-  const passages: TranscriptPassage[] = [];
-  for (const exchange of computeExchanges(thread)) {
-    const key = exchangeKey(exchange);
-    const { userSeq } = exchange;
-    if (isUserBubbleEvent(exchange.userEvent)) {
-      const md = exchangeUserMessage(exchange);
-      if (md.trim()) passages.push({ key, userSeq, part: { kind: 'user' }, text: plainText(md) });
-    }
-    const events = exchangeResponseEvents(exchange, false, true);
-    const shownWithoutDetails = headClampApplies(events, false) ? null : new Set(getCollapsedVisibleEvents(events));
-    for (const event of events) {
-      if (event.type !== 'text' || !isMeaningfulText(event) || event.seq === undefined) continue;
-      const seqs = (event.pieces ?? [{ seq: event.seq }]).flatMap((p) => (p.seq === undefined ? [] : [p.seq]));
-      const needsDetails = shownWithoutDetails !== null && !shownWithoutDetails.has(event);
-      passages.push({ key, userSeq, part: { kind: 'reply', seqs, needsDetails }, text: plainText(event.md) });
-    }
-  }
-  return passages;
-}
-
-let parseDoc: Document | null = null;
-
-/** A passage's text, read from its rendered Markdown in a document never
- *  shown. Blocks are told apart as the drawn transcript tells them. */
-export function markdownText(md: string): string {
-  parseDoc ??= document.implementation.createHTMLDocument('');
-  parseDoc.body.innerHTML = renderMarkdown(md);
-  return collectPageText(parseDoc.body, 'markup').text;
-}
 
 /** The thread's drawn turns, in DOM order. */
 function drawnTurns(threadId: string): HTMLElement[] {
@@ -83,25 +35,26 @@ function drawnTurns(threadId: string): HTMLElement[] {
   return [...document.querySelectorAll<HTMLElement>(selector)].filter(isElementVisible);
 }
 
-/** A user's message, drawn as a bubble or as a plain panel (an API caller's
- *  or an agent's message). Never a side question or a card's typed answer. */
-const USER_MESSAGE = '.initiator-panel .initiator-body .markdown-content';
-
 /** Drawn, not on its way out: a closing `Disclosure` keeps its body, inert. */
 function live(roots: Iterable<Element>): Element[] {
   return [...roots].filter((root) => !root.closest('[inert]'));
 }
 
-function rootsIn(turn: Element, passage: TranscriptPassage): Element[] {
-  const selector = passage.part.kind === 'user'
-    ? USER_MESSAGE
-    : passage.part.seqs.map((seq) => `.response-chunk[data-text-seq="${seq}"]`).join(', ');
-  return live(turn.querySelectorAll(selector));
+/** Where a passage can draw: its turn, or for a side question the feed. */
+function containerOf(passage: TranscriptPassage, turns: HTMLElement[]): Element | null {
+  if (passage.where.inFeed) return turns[0]?.closest('.thread-feed') ?? null;
+  return turns.find((el) => el.dataset.userSeq === String(passage.userSeq)) ?? null;
+}
+
+function rootsIn(container: Element | null, passage: TranscriptPassage): Element[] {
+  if (!container) return [];
+  const { selector, nth } = passage.where;
+  const roots = live(container.querySelectorAll(selector));
+  return nth === undefined ? roots : roots.slice(nth, nth + 1);
 }
 
 function passageRoots(threadId: string, passage: TranscriptPassage): Element[] {
-  const turn = drawnTurns(threadId).find((el) => el.dataset.userSeq === String(passage.userSeq));
-  return turn ? rootsIn(turn, passage) : [];
+  return rootsIn(containerOf(passage, drawnTurns(threadId)), passage);
 }
 
 function rangesIn(roots: Element[], pattern: RegExp): Range[] {
@@ -174,9 +127,29 @@ async function rollsSettled(el: Element | null): Promise<void> {
   await Promise.race([Promise.all(rolls), sleep(1000)]);
 }
 
-/** Whether the find bar turned the full response on, which `clear` undoes:
- *  the setting is the reader's, and saved. */
-let detailsForcedOn = false;
+/** The reader's saved turn settings the find bar turned on, which `clear`
+ *  turns off again. */
+const forcedOn = new Set<typeof detailsExpanded>();
+
+function forceOn(setting: typeof detailsExpanded): void {
+  if (setting.value) return;
+  setting.value = true;
+  forcedOn.add(setting);
+}
+
+/** Open what hides a passage. Folds the reader owns stay as the step leaves
+ *  them; only the saved settings go back on close. */
+function unfold(threadId: string, passage: TranscriptPassage): void {
+  const { initiator, details, steps, subAgent, sideQuestion } = passage.unfold;
+  expandExchange(threadId, passage.userSeq);
+  if (initiator && collapsedInitiators.value.has(`${threadId}:${passage.userSeq}`)) {
+    toggleInitiatorCollapsed(threadId, passage.userSeq);
+  }
+  if (details) forceOn(detailsExpanded);
+  if (steps) forceOn(stepsExpanded);
+  if (subAgent && !openSubAgentGroups.value.has(subAgent)) toggleSubAgentGroup(subAgent);
+  if (sideQuestion) reopenSideQuestion(sideQuestion);
+}
 
 /** Make a match drawn and bring it into view. Resolves to its range, or null
  *  when the transcript could not draw it or the step was overtaken. */
@@ -187,22 +160,14 @@ async function reveal(
   pattern: RegExp,
   stillWanted: () => boolean,
 ): Promise<Range | null> {
-  expandExchange(threadId, passage.userSeq);
-  const initiatorKey = `${threadId}:${passage.userSeq}`;
-  if (passage.part.kind === 'user' && collapsedInitiators.value.has(initiatorKey)) {
-    toggleInitiatorCollapsed(threadId, passage.userSeq);
-  }
-  if (passage.part.kind === 'reply' && passage.part.needsDetails && !detailsExpanded.value) {
-    detailsExpanded.value = true;
-    detailsForcedOn = true;
-  }
+  unfold(threadId, passage);
   transcriptRenderRequest.value = { threadId, key: passage.key };
   // The reader asked for this match, so a streaming turn must not pull them
   // back to the live edge while it is on screen.
   stopFollowingBottom();
   const roots = await waitForRoots(threadId, passage);
   if (roots.length === 0) return null;
-  await rollsSettled(roots[0].closest('.chat-exchange'));
+  await rollsSettled(roots[0].closest('.chat-exchange, .side-question-card'));
   if (!stillWanted()) return null;
   const ranges = rangesIn(roots, pattern);
   const range = ranges[Math.min(k, ranges.length - 1)] ?? null;
@@ -233,9 +198,8 @@ function drawnRange(threadId: string, passage: TranscriptPassage, k: number, pat
 }
 
 /** One find session over one thread. Module-scoped, because the find store
- *  asks for the target afresh on every run. `texts` caches each passage's
- *  plain text by its Markdown: the thread is searched on every keystroke, and
- *  its settled passages do not change. */
+ *  asks for the target afresh on every run. `texts` is the passages' text
+ *  cache (`cachedText`). */
 let session: {
   threadId: string;
   query: string;
@@ -251,17 +215,15 @@ export function transcriptTarget(threadId: string, painter: FindPainter): FindTa
   const clear = () => {
     session = null;
     painter.clear();
-    if (detailsForcedOn) {
-      detailsForcedOn = false;
-      detailsExpanded.value = false;
-    }
+    for (const setting of forcedOn) setting.value = false;
+    forcedOn.clear();
   };
 
   /** Highlight every counted match the transcript draws, and the current one. */
-  function paint(passages: TranscriptPassage[], pattern: RegExp, current: Range | null): void {
-    const roots = drawnTurns(threadId).flatMap((turn) => passages
-      .filter((p) => String(p.userSeq) === turn.dataset.userSeq)
-      .flatMap((p) => rootsIn(turn, p)));
+  function paint(passages: TranscriptPassage[], hits: Hit[], pattern: RegExp, current: Range | null): void {
+    const turns = drawnTurns(threadId);
+    const matched = [...new Set(hits.map((h) => h.passage))];
+    const roots = matched.flatMap((i) => rootsIn(containerOf(passages[i], turns), passages[i]));
     const ranges = rangesIn(roots, pattern);
     let index = current ? ranges.findIndex((r) => sameRange(r, current)) : -1;
     if (current && index < 0) {
@@ -296,12 +258,7 @@ export function transcriptTarget(threadId: string, painter: FindPainter): FindTa
     const thread = threadMap.value.get(threadId);
     if (!thread) return null;
 
-    const plainText = (md: string) => {
-      let text = own.texts.get(md);
-      if (text === undefined) own.texts.set(md, (text = markdownText(md)));
-      return text;
-    };
-    const passages = transcriptPassages(thread, plainText);
+    const passages = transcriptPassages(thread, cachedText(own.texts), sideQuestionsFor(threadId));
     const hits: Hit[] = [];
     let capped = false;
     for (const [passage, p] of passages.entries()) {
@@ -322,7 +279,7 @@ export function transcriptTarget(threadId: string, painter: FindPainter): FindTa
     }
     if (total === 0) {
       own.current = -1;
-      paint(passages, pattern, null);
+      paint(passages, hits, pattern, null);
       return NONE;
     }
     if (step) {
@@ -339,7 +296,7 @@ export function transcriptTarget(threadId: string, painter: FindPainter): FindTa
         : drawnRange(threadId, passages[hit.passage], hit.k, pattern);
       if (!stillWanted()) return null;
     }
-    paint(passages, pattern, current);
+    paint(passages, hits, pattern, current);
     return { total, current: own.current + 1, capped };
   }
 

@@ -26,7 +26,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/e2e_flaky.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/e2e_lock.sh"
 
 # The two Codex driver modules. An early run skips them and `wait` starts them
-# alone once the Codex review is joined: their timeouts fail under load.
+# alone once the other-model review ends: their timeouts fail under load.
 HS_DRIVER_MODULES="runtime::codex::driver_tests runtime::codex_app_server::driver_tests"
 
 # How long one `wait` blocks by default, in seconds. The Claude Code prompt
@@ -35,12 +35,12 @@ HS_DRIVER_MODULES="runtime::codex::driver_tests runtime::codex_app_server::drive
 # shellcheck disable=SC2034 # read by scripts/harden-suites.sh and its test
 HS_WAIT_BUDGET=230
 
-# True for a suite that runs cargo. Those share one lane and run one at a
-# time, since two cargo test runs in one worktree can OOM the host. Every other
+# Suites that run Cargo, including npm hooks that invoke codegen, share a lane.
+# They run one at a time, since overlapping Cargo tests can OOM the host. Every other
 # suite gets a lane of its own.
 hs_is_cargo_suite() {
     case "$1" in
-        rust | lint | shell-lint | app-lib | cli | gateway | engine-filtered | driver) return 0 ;;
+        rust | lint | shell-lint | app-lib | cli | gateway | engine-filtered | driver | knowhow-generated | ts | vitest) return 0 ;;
     esac
     return 1
 }
@@ -70,7 +70,7 @@ hs_resolve_tier() { # <engine-answer> <HARDEN_TIER>
 hs_fast_tier_suite() { # <suite>
     case "$1" in
         rust) echo lint ;;
-        shell-lint | ts | vite | vitest | harden-suites | harden-scope | harden-codex-review) echo "$1" ;;
+        codegen | knowhow-generated | shell-lint | ts | vite | vitest | harden-suites | harden-scope | harden-other-model-review) echo "$1" ;;
     esac
     return 0
 }
@@ -337,14 +337,16 @@ hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-fi
         hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${6:-}" | while IFS= read -r suite; do
             hs_fast_tier_suite "$suite"
         done
+        echo knowhow-generated
         return 0
     fi
     hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${6:-}"
+    echo knowhow-generated
 }
 
 # The full tier's selection, which hs_select_suites narrows for the fast tier.
 hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [touched-specs-file]
-    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} touched=${5:-/dev/null} p rust="" shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" codex="" paths=""
+    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} touched=${5:-/dev/null} p rust="" shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" other_model="" codegen="" paths=""
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         paths="$paths$p
@@ -369,13 +371,14 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
         esac
         if hs_is_listed "$p" "$HS_GATEWAY_PINNED"; then gateway=1; fi
         case "$p" in
+            scripts/codegen.sh | scripts/lib/codegen*.sh | scripts/lib/codegen_blocks.py | crates/lucidos-engine/build.rs) codegen=1 ;;
             install.sh | uninstall.sh | scripts/lib/service.sh | scripts/lib/stage_runtime.sh | \
                 scripts/lib/headless_tarball.sh | scripts/lib/install_common.sh) install=1 ;;
             scripts/release.sh | scripts/lib/release_draft.sh) release=1 ;;
             scripts/harden-suites.sh | scripts/lib/harden_suites*.sh | scripts/lib/proc_tree.sh | scripts/lib/touched_specs*.sh | \
                 scripts/lib/e2e_projects.sh | scripts/lib/e2e_flaky.sh) self=1 ;;
             scripts/harden-scope.sh | scripts/lib/harden_scope_test.sh) scope=1 ;;
-            scripts/harden-codex-review.sh | scripts/lib/harden_codex_review_test.sh) codex=1 ;;
+            scripts/harden-other-model-review.sh | scripts/lib/other_model_review.sh | scripts/lib/harden_other_model_review_test.sh) other_model=1 ;;
         esac
         case "$p" in
             *.ts | *.tsx) ts=1 ;;
@@ -418,7 +421,8 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
     [ -n "$release" ] && echo release
     [ -n "$self" ] && echo harden-suites
     [ -n "$scope" ] && echo harden-scope
-    [ -n "$codex" ] && echo harden-codex-review
+    [ -n "$other_model" ] && echo harden-other-model-review
+    [ -n "$codegen" ] && echo codegen
     return 0
 }
 
@@ -491,6 +495,7 @@ hs_suite_command() { # <suite> <early|normal> <state-dir>
                 echo "make lint && make test"
             fi
             ;;
+        knowhow-generated) echo "./scripts/check-knowhow-generated.sh" ;;
         shell-lint | lint) echo "make lint" ;;
         app-lib) echo "cargo test --locked -p lucidos-app --lib" ;;
         cli) echo "cargo test --locked -p lucidos-cli" ;;
@@ -513,7 +518,8 @@ hs_suite_command() { # <suite> <early|normal> <state-dir>
         release) echo "bash scripts/lib/release_draft_test.sh && bash scripts/lib/release_rc_gate_test.sh" ;;
         harden-suites) echo "bash scripts/lib/harden_suites_test.sh && bash scripts/lib/touched_specs_test.sh" ;;
         harden-scope) echo "bash scripts/lib/harden_scope_test.sh" ;;
-        harden-codex-review) echo "bash scripts/lib/harden_codex_review_test.sh" ;;
+        harden-other-model-review) echo "bash scripts/lib/harden_other_model_review_test.sh" ;;
+        codegen) echo "bash scripts/lib/codegen_test.sh && bash scripts/lib/codegen_blocks_test.sh" ;;
         *)
             echo "unknown suite: $suite" >&2
             return 1

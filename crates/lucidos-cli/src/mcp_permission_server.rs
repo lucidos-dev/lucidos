@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, Write};
 
-use crate::ask_user_question_hook::{card_not_shown_reason, post_question};
+use crate::ask_user_question_hook::{card_not_shown_reason, post_question, QUIET_ANSWER_NOTE};
 use crate::http::permission_prompt_client;
 use crate::workspace::{resolve_from_env, BoxError};
 
@@ -228,7 +228,14 @@ fn tool_definitions(tools: ToolSet) -> Vec<Value> {
                                                 picture or a widget embed draws here: \
                                                 ![label](app:<id>?params={...})"
                                         },
-                                        "preview": { "type": "string" }
+                                        "preview": { "type": "string" },
+                                        "quiet": {
+                                            "type": "boolean",
+                                            "description": "True for an option that \
+                                                needs nothing more from you, such as \
+                                                \"Leave it as is\" or \"Not now\". \
+                                                Picking it ends your turn."
+                                        }
                                     },
                                     "required": ["label"]
                                 }
@@ -325,6 +332,9 @@ struct AskUserQuestionResponseBody {
     /// Set when the engine refused the card, which the user never saw.
     #[serde(default)]
     refusal: Option<String>,
+    /// Every pick was a *quiet option*, so the result asks the agent to stop.
+    #[serde(default)]
+    quiet: bool,
 }
 
 /// Translate one MCP `ask_user_question` call into the engine's question-walk
@@ -418,6 +428,9 @@ fn engine_option(option: &Value) -> Option<Value> {
             out[field] = Value::from(text);
         }
     }
+    if option.get("quiet").and_then(Value::as_bool) == Some(true) {
+        out["quiet"] = Value::Bool(true);
+    }
     Some(out)
 }
 
@@ -429,9 +442,15 @@ fn ask_tool_result(resp: &AskUserQuestionResponseBody, question: &str) -> Value 
             "content": [{ "type": "text", "text": refusal }],
             "isError": true
         }),
-        None => serde_json::json!({
-            "content": [{ "type": "text", "text": extract_single_answer(&resp.answers, question) }]
-        }),
+        None => {
+            let answer = extract_single_answer(&resp.answers, question);
+            let text = if resp.quiet {
+                format!("{answer}\n\n{QUIET_ANSWER_NOTE}")
+            } else {
+                answer
+            };
+            serde_json::json!({ "content": [{ "type": "text", "text": text }] })
+        }
     }
 }
 
@@ -643,9 +662,11 @@ mod tests {
     /// Object options used to be dropped without a word, so a card could
     /// arrive with no buttons at all.
     #[test]
-    fn an_object_option_keeps_its_label_description_and_preview() {
+    fn an_object_option_keeps_its_label_description_preview_and_quiet() {
         let options: Vec<Value> = [
             serde_json::json!("Ship it"),
+            serde_json::json!({ "label": "Not now", "quiet": true }),
+            serde_json::json!({ "label": "Later", "quiet": false }),
             serde_json::json!({
                 "label": "D",
                 "description": "Split by a dot",
@@ -662,6 +683,8 @@ mod tests {
             options,
             vec![
                 serde_json::json!({ "label": "Ship it" }),
+                serde_json::json!({ "label": "Not now", "quiet": true }),
+                serde_json::json!({ "label": "Later" }),
                 serde_json::json!({
                     "label": "D",
                     "description": "Split by a dot",
@@ -724,6 +747,21 @@ mod tests {
         let result = ask_tool_result(&answered, "Deploy now?");
         assert!(result.get("isError").is_none());
         assert_eq!(result["content"][0]["text"], "Yes");
+    }
+
+    /// MCP cannot end a Codex turn, so a quiet answer asks the agent to stop.
+    #[test]
+    fn a_quiet_answer_tells_the_agent_to_end_its_turn() {
+        let resp: AskUserQuestionResponseBody = serde_json::from_value(serde_json::json!({
+            "answers": { "Draft it?": "Leave it" },
+            "quiet": true
+        }))
+        .unwrap();
+        let result = ask_tool_result(&resp, "Draft it?");
+        assert_eq!(
+            result["content"][0]["text"],
+            format!("Leave it\n\n{QUIET_ANSWER_NOTE}")
+        );
     }
 
     #[test]

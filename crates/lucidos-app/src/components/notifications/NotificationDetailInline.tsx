@@ -132,7 +132,7 @@ export function NotificationDetailInline() {
       </div>
       <h2 class="notification-detail-title">{detail.title || 'Notification'}</h2>
       <div
-        class="notification-detail-body markdown-content"
+        class="notification-detail-body markdown-content authored-html"
         onClick={handleBodyClick}
         dangerouslySetInnerHTML={{ __html: content }}
       />

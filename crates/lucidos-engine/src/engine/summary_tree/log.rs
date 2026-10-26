@@ -338,6 +338,7 @@ impl Projector {
             ThreadEvent::UserQuestionAnswered {
                 tool_use_id,
                 answer,
+                ..
             } if self.kind == ThreadKind::CodingAgent => {
                 if let Some(text) = self.answer_text(tool_use_id, answer) {
                     self.push(

@@ -10,6 +10,7 @@ const clearThreadRerenderStart = vi.fn();
 // Focused thread is 't1' (the id the tests answer on) so the perf re-render mark
 // is stamped on the focused path.
 const focusedThreadId = { value: 't1' };
+const threadMap = { value: new Map() };
 
 class ApiError extends Error {
   constructor(public readonly httpCode: number, public readonly reason: string) {
@@ -17,7 +18,7 @@ class ApiError extends Error {
   }
 }
 
-vi.mock('../store', () => ({ showToast, markThreadAnswering, clearThreadAnswering, focusedThreadId }));
+vi.mock('../store', () => ({ showToast, markThreadAnswering, clearThreadAnswering, focusedThreadId, threadMap }));
 vi.mock('../../api/client', () => ({
   answerThreadQuestion: apiAnswerThreadQuestion,
   ApiError,
@@ -75,6 +76,24 @@ describe('answerThreadQuestion', () => {
     // Perf: the re-render mark is stamped (focused thread) and NOT cleared on success.
     expect(markThreadRerenderStart).toHaveBeenCalledWith('t1', expect.objectContaining({ cause: 'answer' }));
     expect(clearThreadRerenderStart).not.toHaveBeenCalled();
+  });
+
+  it('leaves a quiet pick unmarked, since no resume follows it', async () => {
+    // The flag reads as a resuming agent: it hides the keep-alive pill and
+    // draws a working row until the status settles, so the transcript jumped.
+    threadMap.value = new Map([['t1', { events: new Map([[1, {
+      type: 'UserQuestionAsked',
+      tool_use_id: 'tool-use-1',
+      options: [{ id: 'opt-a', label: 'Apply now' }, { id: 'opt-b', label: 'Not now', quiet: true }],
+    }]]) }]]);
+    try {
+      expect(await answerThreadQuestion('t1', 'tool-use-1', { kind: 'Selected', option_id: 'opt-b' })).toBe('sent');
+      expect(markThreadAnswering).not.toHaveBeenCalled();
+      await answerThreadQuestion('t1', 'tool-use-1', { kind: 'Selected', option_id: 'opt-a' });
+      expect(markThreadAnswering).toHaveBeenCalledWith('t1');
+    } finally {
+      threadMap.value = new Map();
+    }
   });
 
   it('clears the optimistic answering flag on a 409 (stale/duplicate, no resume coming)', async () => {

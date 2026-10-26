@@ -517,6 +517,7 @@ mod startup_sweep_branch_work {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),

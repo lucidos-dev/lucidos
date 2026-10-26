@@ -175,74 +175,22 @@ async fn read_turn_terminators(trigger_id: &str) -> Result<TurnTerminators, Stri
     result
 }
 
-/// The capacity policy the engine is running with, read off the queue endpoint
-/// so the restore below puts back exactly what was there rather than a guess at
-/// the defaults.
-async fn capacity_policy(client: &reqwest::Client) -> serde_json::Value {
-    let body: serde_json::Value = client
-        .get(format!("{}/api/v1/thread-queue", base_url()))
-        .send()
-        .await
-        .expect("GET /thread-queue failed")
-        .json()
-        .await
-        .expect("Invalid JSON");
-    body["policy"].clone()
-}
-
-/// Replace the capacity policy. Sent whole: `PUT /thread-queue/policy` fills
-/// absent fields with defaults rather than leaving them alone, so a partial
-/// body would silently reset every limit this test did not name.
-async fn set_capacity_policy(client: &reqwest::Client, policy: &serde_json::Value) {
-    let resp = client
-        .put(format!("{}/api/v1/thread-queue/policy", base_url()))
-        .json(policy)
-        .send()
-        .await
-        .expect("PUT /thread-queue/policy failed");
-    let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
-    assert_eq!(status, 200, "policy PUT rejected: {body}");
-}
-
 /// Fire a trigger off-schedule with an admission slot guaranteed.
 ///
 /// A free pool slot is the PREMISE of every test that fires, not part of what
-/// any of them proves. Admission is decided against the SHARED capacity pool and
-/// this suite runs its whole API surface in parallel: sampling
-/// `GET /thread-queue` through a full run shows the pool pinned at its 32-slot
-/// ceiling with other tests' in-flight chats, and a cron submitted right then is
-/// honestly reported as `queued`, so the outcome under test never gets its
-/// chance. So widen the two limits a cron submit can bind on (the global ceiling
-/// and the per-kind cron cap) for the submit, then put the original policy back.
-/// The window is one request wide: `submit` decides admission inline, so nothing
-/// is gained by holding the wider policy across the fire itself.
-///
-/// Three things make this one helper rather than a block in each test:
-///
-/// - **The restore must happen on every path out.** Nothing between the two PUTs
-///   may panic, or the shared engine keeps the widened limits for the rest of the
-///   suite and every admission-refusal assertion silently stops testing anything.
-///   Hence the `Result`: the run's failure is carried out as a value, and the
-///   caller unwraps it after its own cleanup.
-/// - **The widen is a read-modify-write over one shared setting**, so two of them
-///   overlapping is not a slower test but a leak (the second reader saves the
-///   first's widened policy as "the original"). `capacity_policy_lock` is what
-///   makes them exclusive.
-/// - Duplicating it per test is how one copy drifts out of step with the other.
+/// any of them proves: `crate::support::with_pool_room` explains why, and holds
+/// the widened policy for the one request. The run's failure is carried out as
+/// a value, and the caller unwraps it after its own cleanup.
 pub(crate) async fn run_trigger_with_a_free_slot(
     client: &reqwest::Client,
     id: &str,
 ) -> Result<serde_json::Value, String> {
-    let _cap = crate::support::capacity_policy_lock().lock().await;
-    let original_policy = capacity_policy(client).await;
-    let mut roomy_policy = original_policy.clone();
-    roomy_policy["max_concurrent_total"] = json!(512);
-    roomy_policy["max_concurrent_cron"] = json!(512);
-    set_capacity_policy(client, &roomy_policy).await;
-    let run = try_run_trigger(client, id).await;
-    set_capacity_policy(client, &original_policy).await;
-    run
+    let (run_client, id) = (client.clone(), id.to_string());
+    crate::support::with_pool_room(
+        client,
+        async move { try_run_trigger(&run_client, &id).await },
+    )
+    .await
 }
 
 async fn wait_for_last_run(

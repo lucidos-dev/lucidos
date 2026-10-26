@@ -100,7 +100,7 @@ export function ChildCompletionRow(props: Props) {
       ? {
           label: 'Details',
           body: (
-            <div class="markdown-content" dangerouslySetInnerHTML={{ __html: summaryHtml }} />
+            <div class="markdown-content authored-html" dangerouslySetInnerHTML={{ __html: summaryHtml }} />
           ),
         }
       : undefined,

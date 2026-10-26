@@ -383,7 +383,8 @@
 .thread-row.thread-row-lifted-parent .thread-row-title,
 .thread-row.thread-row-lifted-parent .thread-row-created,
 .thread-row.thread-row-lifted-parent .thread-row-context,
-.thread-row.thread-row-lifted-parent .message-channel-tag {
+.thread-row.thread-row-lifted-parent .message-channel-tag,
+.thread-row.thread-row-lifted-parent .thread-row-agent {
     opacity: 0.6;
 }
 
@@ -404,7 +405,8 @@
 .thread-row-wrap.is-archived .thread-row-title,
 .thread-row-wrap.is-archived .thread-row-created,
 .thread-row-wrap.is-archived .thread-row-context,
-.thread-row-wrap.is-archived .message-channel-tag {
+.thread-row-wrap.is-archived .message-channel-tag,
+.thread-row-wrap.is-archived .thread-row-agent {
     opacity: var(--drawer-dim-opacity);
 }
 
@@ -515,11 +517,9 @@ html[data-theme-mode="light"] .family-disclosure {
  * dark fill (text stays readable) and delineate the chip with a 1px --border-color
  * outline (#2c456a, lighter than EVERY row fill incl. selected) — it reads as a
  * distinct pill on every row state regardless of how close its fill is to the row.
- * The channel/type tag stacked above it (.message-channel-tag) gets the SAME
- * outline so the two chips in a row read consistently — an outline on only one of
- * the pair looks like a mistake. (.message-channel-tag is only rendered in the
- * drawer row today, but scope it to .thread-row so a future chat-header reuse of
- * the class stays borderless.) box-sizing is border-box and ContextChip's width
+ * The ERROR tag an unknown channel draws beside it (.message-channel-tag) gets
+ * the SAME outline, so the two chips in a row read consistently. Scoped to
+ * .thread-row so a reuse of the class elsewhere stays borderless. box-sizing is border-box and ContextChip's width
  * pin already includes border widths (ThreadDrawer.tsx), so the outline doesn't
  * shift layout. Light mode's fills are already well clear of --bg-tertiary
  * (#eff2f5 vs #e1e4e8), so both chips keep the plain fill there. */
@@ -603,7 +603,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     height: var(--font-size-md);
 }
 
-/* The date at the left, then the channel tag and the name chip at the right
+/* The date at the left, then the name chip and the agent mark at the right
  * end of the same line. On a narrow drawer the chips wrap to a second line,
  * still right-aligned; nothing shrinks, so the date never truncates. The gap
  * is the only spacing. `.message-channel-tag` brings a margin from its
@@ -621,6 +621,72 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 .thread-row-meta > * {
     flex-shrink: 0;
     margin: 0;
+}
+
+/* The agent mark (`ThreadAgentMark`), last on the meta line so every row puts
+ * it at the same right edge. Centred on the line, since an icon has no
+ * baseline. Every glyph paints in the date's muted colour.
+ *
+ * Its box is as wide as the title line's last action button, and the glyph
+ * centres in it, so the mark stands under that button's glyph.
+ *
+ * The glyphs leave different margins inside their viewBox, so each scales to
+ * fill the same optical box. The Codex mark already does. */
+.thread-row-agent {
+    display: inline-flex;
+    justify-content: center;
+    width: var(--thread-row-action-width);
+    align-self: center;
+    color: var(--text-muted);
+}
+
+/* A thread that ran on several backends stacks one mark per backend, first
+ * used on top. When the title's last line leaves the column free,
+ * `placeStackedMark` marks the meta line `data-agent-lift` and sets the rise in
+ * `--thread-row-agent-lift`. The top mark then leaves the stack and centres on
+ * that line, so the row is no taller than a one-backend row. */
+.thread-row-agents {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    align-self: flex-end;
+}
+
+.thread-row-meta[data-agent-lift] {
+    position: relative;
+}
+
+.thread-row-meta[data-agent-lift] .thread-row-agents {
+    display: contents;
+}
+
+.thread-row-meta[data-agent-lift] .thread-row-agents > .thread-row-agent:first-child {
+    position: absolute;
+    right: 0;
+    top: calc(var(--thread-row-agent-lift) * -1);
+    transform: translateY(-50%);
+}
+
+.thread-row-agent svg {
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
+}
+
+/* Repaints the fill `CodexIcon` sets as a presentation attribute. */
+.thread-row-agent .codex-icon {
+    fill: currentColor;
+}
+
+.thread-row-agent[data-glyph="lucidos"] svg {
+    transform: scale(1.55);
+}
+
+.thread-row-agent[data-glyph="trigger"] svg {
+    transform: scale(1.2);
+}
+
+.thread-row-agent[data-glyph="claude"] svg {
+    transform: scale(0.92);
 }
 
 /* The sub-thread link, then the archived-reveal toggle, under the date and
@@ -839,19 +905,20 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     }
 
     .thread-row-actions .icon-btn.header-icon {
-        width: 1.25rem;
+        width: var(--thread-row-action-width);
         height: 1.25rem;
     }
 
     /* Keeps the last line off the row's bottom divider. */
     .thread-row {
         padding-bottom: 0.5rem;
+        --thread-row-action-width: 1.25rem;
     }
 }
 
 @media (--phone-layout) {
     .thread-row-actions .icon-btn.header-icon {
-        width: 1.75rem;
+        width: var(--thread-row-action-width);
         height: 1.5rem;
     }
 
@@ -859,6 +926,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
      * room), matching the 1rem above the title. */
     .thread-row {
         padding-bottom: var(--space-md);
+        --thread-row-action-width: 1.75rem;
     }
 
     /* The pin is the row's ONLY control here: the ⋯ is gone and a long press on
@@ -1131,6 +1199,82 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     opacity: var(--drawer-dim-opacity);
 }
 
+/* While Blocked holds threads, its count and icon wear the waiting colour, so
+   it reads from the corner of the eye. While a blocked thread is unseen
+   (`hasUnseenBlocked`) the tile also rings and beats: a halo swells around the
+   ring, its fill washes toward the colour, and its count brightens. All of it
+   stops once the user has looked, because a ring at rest reads as focus. The
+   halo and the wash animate only opacity and transform. */
+.ongoing-tile-blocked {
+    position: relative;
+    isolation: isolate;
+    --blocked-tile-beat: 2.1s cubic-bezier(0.2, 0, 0.2, 1) infinite;
+}
+
+.ongoing-tile-unseen:not(.ongoing-tile-selected, .ongoing-tile-highlighted) {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-notable) 80%, transparent);
+}
+
+.ongoing-tile-blocked:not(.ongoing-tile-selected) .ongoing-tile-count,
+.ongoing-tile-blocked:not(.ongoing-tile-selected) .ongoing-tile-icon {
+    color: var(--accent-notable);
+}
+
+@keyframes blocked-tile-halo {
+    0%, 100% { opacity: 0; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.005); }
+}
+
+@keyframes blocked-tile-wash {
+    0%, 100% { opacity: 0; }
+    50% { opacity: 1; }
+}
+
+@keyframes blocked-tile-count {
+    50% { color: color-mix(in srgb, var(--text-primary) 50%, var(--accent-notable)); }
+}
+
+/* The halo stands 1px off the ring, so the two read as separate bands. */
+.ongoing-tile-unseen:not(.ongoing-tile-highlighted)::after {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    border-radius: calc(var(--radius-surface) + 1px);
+    box-shadow: 0 0 1px 4px color-mix(in srgb, var(--accent-notable) 65%, transparent);
+    pointer-events: none;
+    animation: blocked-tile-halo var(--blocked-tile-beat);
+}
+
+/* The wash sits over the tile's fill and under its text. */
+.ongoing-tile-unseen:not(.ongoing-tile-highlighted)::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    background: color-mix(in srgb, var(--accent-notable) 14%, transparent);
+    pointer-events: none;
+    opacity: 0;
+    animation: blocked-tile-wash var(--blocked-tile-beat);
+}
+
+.ongoing-tile-unseen:not(.ongoing-tile-highlighted, .ongoing-tile-selected) .ongoing-tile-count,
+.ongoing-tile-unseen:not(.ongoing-tile-highlighted, .ongoing-tile-selected) .ongoing-tile-icon {
+    animation: blocked-tile-count var(--blocked-tile-beat);
+}
+
+/* Reduced motion keeps the halo on, still, and drops the wash and the count. */
+:root[data-motion="reduce"] .ongoing-tile-unseen:not(.ongoing-tile-highlighted)::after {
+    animation: none;
+    opacity: 1;
+}
+
+:root[data-motion="reduce"] .ongoing-tile-unseen:not(.ongoing-tile-highlighted)::before,
+:root[data-motion="reduce"] .ongoing-tile-unseen:not(.ongoing-tile-highlighted, .ongoing-tile-selected) .ongoing-tile-count,
+:root[data-motion="reduce"] .ongoing-tile-unseen:not(.ongoing-tile-highlighted, .ongoing-tile-selected) .ongoing-tile-icon {
+    animation: none;
+}
+
 /* The ↑/↓ highlight, which a tile's own fill already uses for state. */
 .ongoing-tile-highlighted {
     box-shadow: var(--focus-ring);
@@ -1369,7 +1513,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 @media (--phone-layout) {
     .thread-drawer {
         position: fixed;
-        top: var(--mobile-header-height, calc(2.75rem + var(--safe-area-top)));
+        top: var(--mobile-header-height, calc(2.75rem + var(--header-controls-top)));
         left: 0;
         bottom: 0;
         width: 100% !important;

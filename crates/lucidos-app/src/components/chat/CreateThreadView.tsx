@@ -24,7 +24,7 @@ import type { SideQuestion } from '../../store/sideQuestions';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange, StoredEvent } from '../../store/thread-events';
-import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, continuableAbortIndex, queuedFollowupRun, readMarkers, isChangeLifecycleEvent, restartPauseFoldsInto, opensAwaitingAnswer, agentWorkedSince } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, sessionCodingAgents, exchangeKey, continuableAbortIndex, queuedFollowupRun, readMarkers, isChangeLifecycleEvent, restartPauseFoldsInto, opensAwaitingAnswer, agentWorkedSince, threadFlagsChangeDrawing } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
 import { forceWebKitRepaint, settledScrollTop } from '../../utils/webkitRepaint';
 import { opensSoftwareKeyboard } from '../../utils/dom';
@@ -165,7 +165,8 @@ export function renderExchanges(
   const thread = threadMap.value.get(threadId);
   const threadMeta = thread?.meta;
   const threadIsCC = threadMeta?.channel === 'claude_code';
-  const threadCodingAgent = threadMeta?.codingAgent ?? 'claude-code';
+  const threadBackend = threadMeta?.codingAgent ?? 'claude-code';
+  const sessionBackends = threadIsCC ? sessionCodingAgents(exchanges, threadBackend) : [];
   // Quiescent by raw status, but false while an optimistic resume is in flight
   // (just-answered question / un-ingested follow-up) — see isRenderedThreadIdle.
   const threadIdle = isRenderedThreadIdle(thread);
@@ -239,6 +240,17 @@ export function renderExchanges(
     const isLast = i === activeIdx;
     const isQueued = queuedIndices.has(i);
     const priorActive = priorActiveAt(i);
+    const behindOpenQuestion = openCardIdx >= 0 && i > openCardIdx && !isQueued;
+    // A turn that draws the same under either flag value gets a fixed one, so
+    // answering a card re-renders only the turns it can change.
+    const flagsMatter = threadFlagsChangeDrawing(ex, {
+      streamingBuffer: isLast ? streamingBuffer : '',
+      isLast,
+      isQueued,
+      hasPriorActive: priorActive,
+      threadIsCC,
+      behindOpenQuestion,
+    });
     // Seed the change-lifecycle card's body from the in-thread ChangeProposed
     // so it paints at final height on first open (see buildProposedChangeInfo).
     const seedChangeId = isChangeLifecycleEvent(ex.userEvent)
@@ -271,10 +283,11 @@ export function renderExchanges(
         priorEffort={lastEffort}
         isContinuableAbort={i === continuableIdx}
         threadIsCC={threadIsCC}
-        threadCodingAgent={threadCodingAgent}
-        threadIdle={threadIdle}
-        threadAwaitingAnswer={threadAwaitingAnswer}
-        behindOpenQuestion={openCardIdx >= 0 && i > openCardIdx && !isQueued}
+        // A queued message has run in no session yet: the live one reads it.
+        sessionCodingAgent={isQueued ? threadBackend : sessionBackends[i] ?? threadBackend}
+        threadIdle={flagsMatter && threadIdle}
+        threadAwaitingAnswer={flagsMatter && threadAwaitingAnswer}
+        behindOpenQuestion={behindOpenQuestion}
         threadCanceling={threadCanceling}
         rowsHidden={i === renderFromIndex && !pinnedIndices.has(i) ? floorRowsHidden : 0}
         proposedChangeDesc={proposedSeed?.description}

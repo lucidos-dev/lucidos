@@ -3,22 +3,18 @@ import { navigateToApp, uniqueMessage, assertHealthy } from './helpers';
 import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 
 /**
- * Mobile-scoped (`-mobile` suffix → mobile + mobile-webkit, not chromium): the
- * WaitingBanner collapses the close-set actions (Apply + Discard) into a split
- * button on every viewport — a one-tap "Apply*" primary face (the asterisk
- * marks a restart-requiring change) plus a caret that opens an upward menu
- * holding Discard. Diff lives permanently
- * OUTSIDE the split button as its own standalone icon. This verifies
- * the split renders + works at a real mobile viewport; the desktop rendering of
- * the same control is covered by
- * change-actions-split-desktop / diff-button-branch-has-diff-desktop.
+ * Mobile-scoped (`-mobile` suffix: mobile + mobile-webkit, not chromium). The
+ * action slot merges the close set (Apply + Discard) into one control. On a
+ * phone it is the round button, and every tap opens its menu, Apply included,
+ * so no tap applies at once (ADR 0573). Diff stays outside it, a standalone
+ * icon. The desktop pill is covered by change-actions-split-desktop.
  */
-test.describe('Change actions — mobile split button', () => {
+test.describe('Change actions: the phone round button', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
-  test('Apply is the face; Discard lives in the caret menu; Diff is standalone; Discard works', async ({ page }) => {
+  test('a tap opens the menu with Apply and Discard; Diff is standalone; Discard works', async ({ page }) => {
     const suffix = uniqueMessage('split').replace(/[^a-z0-9-]/g, '');
     const { threadId, changeId, branch, file } = createCCThreadWithChange(
       'E2E Split Button', suffix, { requiresRestart: true },
@@ -30,24 +26,29 @@ test.describe('Change actions — mobile split button', () => {
       }, threadId);
       await navigateToApp(page);
 
-      // The primary face is the one-tap Apply* (the asterisk marks the
-      // restart-requiring change) — a real button, not hidden behind the menu.
-      const face = page.locator('.thread-action-buttons:visible .split-button-primary');
+      // One round button, named for its face (the asterisk marks the
+      // restart-requiring change). No caret: the whole button opens the menu.
+      const face = page.locator('.thread-action-buttons:visible .split-button-whole');
       await expect(face).toBeVisible({ timeout: 15_000 });
-      await expect(face).toHaveText(/^Apply\*$/);
+      await expect(face).toHaveAttribute('aria-label', /^Apply\*\./);
+      await expect(page.locator('.thread-action-buttons:visible .split-button-caret')).toHaveCount(0);
+      const box = (await face.boundingBox())!;
+      expect(Math.abs(box.width - box.height)).toBeLessThan(1);
 
       // Diff is a standalone top-level icon, never folded into the menu.
       await expect(page.locator('.thread-action-buttons:visible button[data-role="thread-diff"]')).toBeVisible();
-      // Discard is NOT a top-level button — it folds into the (closed) caret
-      // menu, so it isn't rendered yet.
-      await expect(page.locator('.thread-action-buttons:visible button.action-btn-danger')).toHaveCount(0);
 
-      // Open the caret menu and assert it lists Discard (and not Diff).
-      await page.locator('.thread-action-buttons:visible .split-button-caret').first().click();
+      // A tap opens the menu and applies nothing.
+      await face.click();
       const menu = page.locator('.split-button-menu:visible');
       await expect(menu).toBeVisible();
+      await expect(menu.locator('button[role="menuitem"]')).toHaveText([/^Discard$/, /^Set aside$/, /^Apply\*$/]);
       await expect(menu.locator('button[data-role="thread-diff"]')).toHaveCount(0);
-      await expect(menu.locator('button:has-text("Discard")')).toBeVisible();
+      const pending = await page.evaluate(async (cid) => {
+        const body = await (await fetch('/api/v1/changes')).json();
+        return (body.pending as Array<{ id: string }>).some(c => c.id === cid);
+      }, changeId);
+      expect(pending).toBe(true);
 
       // Discarding via the menu drops the change from the pending list.
       await menu.locator('button:has-text("Discard")').first().click();

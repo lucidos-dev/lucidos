@@ -38,18 +38,20 @@ flow (`system-knowhow/coding-agent-flows/hardening`), and
 #### Handoff checkpoint
 
 At this flow's first entry, before any review, run
-`lucidos successor offer --at pre-harden` and follow what it prints. Only the
-first entry runs it: a later pass returns to the review, never here. A
-successor this checkpoint started skips it too, and starts at the review.
+`lucidos successor offer --at pre-harden --default-floor` and follow what it
+prints. Only the first entry runs it: a later pass returns to the review,
+never here. A successor session this checkpoint started skips it too, and
+starts at the review. `--default-floor` makes the surface's default rung the
+floor for this run, so a thread below it hands off onto it.
 <!-- /default-flow: hardening -->
 
-It is automatic. It asks the owner at most once, and only when a handoff pays
-but needs their approval. On "carry on", or when the command fails, continue
-below. On a handoff, end your turn: the successor runs `/harden` from the start, but
-skips this checkpoint.
-On an ask, follow what it prints: Allow once hands off, Don't allow carries on.
-A later iteration returns to Phase 1, so a handoff never lands in the middle of
-the loop.
+It is automatic and asks nothing. A handoff is due when it pays, or when this
+thread runs below the default rung. It names one rung above the default for
+security work or a costly one-way door: judge that by its two tests, and say
+why in one line. On "carry on", or when the command fails, continue below. On a
+handoff, end your turn: the successor session runs `/harden` from the start,
+but skips this checkpoint. A later iteration returns to Phase 1, so a handoff
+never lands in the middle of the loop.
 
 Then read the tier this branch runs (ADR 0465):
 
@@ -131,7 +133,7 @@ The first line is the answer:
 - `FULL <reason>`: go on to Phase 0.5 as usual.
 
 The lines after it name what to review: `commit <sha>` (own commits, oldest
-first), `merge <sha>`, `overlap <path>`, `codex-base <sha>`, and
+first), `merge <sha>`, `overlap <path>`, `other-model-base <sha>`, and
 `fork-point <sha>`. The review covers these inputs, and nothing else:
 
 - **The new lines:** one file holding each commit's patch and each merge's
@@ -151,9 +153,10 @@ first), `merge <sha>`, `overlap <path>`, `codex-base <sha>`, and
 The phases then run as follows:
 
 - Phases 0.5 and 0.6 are skipped.
-- Phase 1 kickoff starts the early suite run unchanged. With a `codex-base`
-  line, the Codex review runs against that base. `INCREMENTAL` without one
-  runs it against `main`, which after Phase 0.3 is the branch's own change. A
+- Phase 1 kickoff starts the early suite run unchanged. Pass the answer and
+  any `other-model-base` sha to the review's `decide`. With that line, the
+  other-model review runs against that base. `INCREMENTAL` without one runs
+  it against `main`, which after Phase 0.3 is the branch's own change. A
   hardened SHA as the base would pull in all of main's new code. `MERGE_ONLY`
   skips it.
 - Phase 1 runs `code-review` **inline**, with `.lucidos/review-target.diff`
@@ -177,7 +180,8 @@ iterations review only the fix).
 
 Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `.txt`, the diff is **docs-only**. In docs-only mode:
 
-- Phase 1 skips both kickoff steps and runs `code-review` **inline**, with
+- Phase 1 skips the early suite run, and the review's `decide` skips the
+  other-model review. It runs `code-review` **inline**, with
   only the compliance, prose, private-data and buried-finding angles. The
   correctness angles look for code-shaped bugs that prose does not have.
 - Phase 3, Phase 4 and Phase 5 still run.
@@ -208,7 +212,7 @@ fi
 
 In small-diff mode:
 
-- Phase 1 runs `code-review` **inline**, Codex review included. It is the
+- Phase 1 runs `code-review` **inline**, other-model review included. It is the
   phase that finds real bugs in small CSS diffs, such as a forced-colors
   regression.
 - Phase 2.5, Phase 3, Phase 4, Phase 4.5 and Phase 5 run unchanged.
@@ -228,7 +232,7 @@ before Phase 5.
 
 ```bash
 lucidos events emit HardenRunCompleted --summary "harden iteration <n>: <pass|fail>" \
-  --payload "{\"thread_id\": \"$LUCIDOS_THREAD_ID\", \"branch\": \"$(git branch --show-current)\", \"head_sha\": \"$(git rev-parse HEAD)\", \"iteration\": <n>, \"verdict\": \"<pass|fail>\", \"failed_phase\": \"<phase, or empty on pass>\", \"tier\": \"<full|fast>\", \"findings\": {\"code_review\": <n>, \"codex\": <n>, \"fixed\": <n>}, \"suites\": $(./scripts/harden-suites.sh timings)}"
+  --payload "{\"thread_id\": \"$LUCIDOS_THREAD_ID\", \"branch\": \"$(git branch --show-current)\", \"head_sha\": \"$(git rev-parse HEAD)\", \"iteration\": <n>, \"verdict\": \"<pass|fail>\", \"failed_phase\": \"<phase, or empty on pass>\", \"tier\": \"<full|fast>\", \"findings\": {\"code_review\": <n>, \"other_model\": <n>, \"fixed\": <n>}, \"other_model_reviewer\": \"<codex|claude|none>\", \"other_model_status\": \"<verdict|no-verdict|unavailable|abandoned|skipped>\", \"suites\": $(./scripts/harden-suites.sh timings)}"
 ```
 
 - `failed_phase` names the gate that failed, such as `4.5 prose` or
@@ -237,9 +241,13 @@ lucidos events emit HardenRunCompleted --summary "harden iteration <n>: <pass|fa
   says whether the round was a full run or a retry of what failed. The next
   round of tuning reads per-suite time from it.
 - `findings` counts this iteration's findings by source. `code_review` is what
-  the review returned, and `codex` what Codex returned (0 when it did not
-  run). `fixed` is how many of them led to a fix. A re-measure compares yield
-  per source against ADR 0476.
+  the review returned, and `other_model` what the other-model review returned
+  (0 when it did not run). `fixed` is how many of them led to a fix. A
+  re-measure compares yield per source against ADR 0476.
+- `other_model_reviewer` is the family the status line named. It is `none`
+  only when no line named one, such as an unknown backend.
+  `other_model_status` is that line's shape, or `abandoned` past the Phase 3
+  cap.
 - A domain event carries no thread of its own, so `thread_id` is what ties the
   run to its thread. The auto-compact trial counts these
   (`docs/plans/2026-10-13-auto-compact-trial-and-successor-threads.md`).
@@ -269,16 +277,19 @@ came after it (ADR 0476). Phases 0 to 0.6 do not run again.
    grep -E '^[+-]' .lucidos/review-target.diff | grep -cvE '^(\+\+\+|---)( |$)'
    ```
 
-3. **60 lines or fewer:** run Phase 1 with no kickoff Codex review, and the
-   review **inline** on the target. **Over 60:** run Phase 1 as the first iteration
-   does, on the target. The Codex review takes `CODEX_BASE` from a
-   `codex-base` line, else `main`.
+3. Pass the size to the review's `decide` as `--fix-lines`. **60 lines or
+   fewer:** `decide` skips the other-model review, and the review runs
+   **inline** on the target. **Over 60:** run Phase 1 as the first iteration
+   does, on the target. Pass an `other-model-base` line's sha to `decide`,
+   else the review runs against `main`.
 4. Phases 2.5 to 5 then run as usual.
 
 ## Phase 1: Run /code-review
 
-**Docs-only:** if Phase 0.5 flagged this diff as docs-only, skip both kickoff
-steps below and run the review inline, with the angles Phase 0.5 names.
+**Docs-only:** if Phase 0.5 flagged this diff as docs-only, skip the early
+suite run. The other-model kickoff runs only its `decide`, with `--docs-only`,
+and notes the skipped line it prints. Run the review inline, with the angles
+Phase 0.5 names.
 
 ### Phase 1 kickoff: start the early suite run (Claude Code only)
 
@@ -333,43 +344,75 @@ mkdir -p .lucidos && ./scripts/harden-suites.sh start --early > .lucidos/harden-
   briefly rewrites the two `VERSION` files and restores them. An `-a` commit
   during the run can capture that temporary content.
 
-### Phase 1 kickoff: launch Codex review in parallel (advisory, Claude Code only)
+### Phase 1 kickoff: launch the other-model review (advisory, both backends)
 
-Before running the `code-review` skill, kick off a Codex review of the branch
-diff **in the background**. It overlaps Phases 1 to 3 and adds almost no wall
+Before running the `code-review` skill, launch a review by the other model
+family **in the background**. It overlaps Phases 1 to 3 and adds almost no wall
 clock.
 
 It is the second reviewer beside `code-review`, and the only one from another
-model family. A later iteration launches it only for a fix over 60 lines (§ Later
-iterations review only the fix).
+model family (ADR 0476). The reviewer is always the family other than yours:
+Codex reviews a Claude Code run, and Claude reviews a Codex run.
 
-This step is **advisory**: its findings feed the same validate→fix pipeline as every other reviewer (joined in Phase 3), but Codex being unavailable, slow, erroring, or timing out NEVER blocks the hardened marker.
+This step is **advisory**: its findings feed the same validate→fix pipeline as
+every other reviewer (joined in Phase 3). A reviewer that is unavailable, slow,
+erroring or timing out NEVER blocks the hardened marker.
 
-- **Claude Code only.** A Codex-backed `/harden` run is already Codex reviewing this diff — skip this step and note "Codex review: skipped (Codex-backend run)".
-- **Docs-only:** skipped, since Codex is a code reviewer, not a prose reviewer.
-- **Merge-only or incremental (Phase 0.4):** with a `codex-base <sha>` line, prefix the script in the launch call below with `CODEX_BASE=<sha>`. `INCREMENTAL` without one keeps the default base `main`. `MERGE_ONLY` skips this step: note "Codex review: skipped (merge-only)", since the earlier run already covered the branch.
-
-`./scripts/harden-codex-review.sh` runs the review. It resolves the companion installed with the `codex` plugin, so never hardcode a path. Run the launch below as **one** Bash call. The subshell runs behind a shell `&`, because Claude Code's own background mode is off under Lucidos (ADR 0358). It writes the review to `.lucidos/codex-review.out` and drops `.lucidos/codex-review.done` when it ends, which is what Phase 3 joins on: Claude Code has no blocking wait tool. `CODEX_BASE` defaults to `main`, matching `/harden`'s diff base of `main...HEAD`:
+First ask the script whether the review runs, in the foreground. It holds the
+selection rules, so pass it the facts and never decide yourself:
 
 ```bash
-mkdir -p .lucidos && rm -f .lucidos/codex-review.done
-( ./scripts/harden-codex-review.sh > .lucidos/codex-review.out 2>&1; touch .lucidos/codex-review.done ) > /dev/null 2>&1 &
+mkdir -p .lucidos && rm -f .lucidos/other-model-review.done .lucidos/other-model-review.out
+./scripts/harden-other-model-review.sh decide --hardened-by <claude-code|codex> \
+  [--docs-only] [--scope <Phase 0.4 answer>] [--other-model-base <sha>] [--fix-lines <n>]
 ```
 
-The script header documents what it guarantees:
+The `rm` clears the last review's record first. A stopped review leaves
+`.out` without `.done`, and the suite `wait` would read that as still running.
 
-- **The last line of the output is always one status line**: a verdict, `NO VERDICT` with the upstream cause, or `unavailable`.
-- **It probes the CLI up to three times first.** An `npm install -g` of the Codex CLI breaks both of the companion's readiness checks for a few seconds.
-- **It retries a reviewer that returns no verdict once.**
-- **It never passes the companion's `--background` flag**, which `review` parses and then ignores. The parallelism comes from the shell `&`.
+- **`--hardened-by`** is your own backend: `claude-code` under Claude Code,
+  `codex` under Codex.
+- **`--docs-only`** when Phase 0.5 flagged the diff.
+- **`--scope`** is Phase 0.4's first word. `--other-model-base` is the sha on
+  its `other-model-base` line, when it printed one.
+- **`--fix-lines`** is a later iteration's target size (§ Later iterations
+  review only the fix).
 
-**The `.done` marker is the handle for the Phase 3 join.** There is no companion job id to capture. Do NOT wait for the review here, continue immediately into the `code-review` skill below.
+It prints one line. A `<R> review: skipped (<why>)` line is the outcome: note
+it verbatim and go on to the Phase 1 review. On `run <reviewer> <base>`, launch
+the review as **one** Bash call, with `<base>` from that line:
+
+```bash
+lucidos background-task run --poll --description "the other-model review" \
+  --timeout-secs "$(./scripts/harden-other-model-review.sh task-timeout)" -- \
+  './scripts/harden-other-model-review.sh --hardened-by <backend> --base <base> > .lucidos/other-model-review.out 2>&1; rc=$?; touch .lucidos/other-model-review.done; exit $rc'
+```
+
+**Keep the task id that `run` prints.** It is the handle for the Phase 3 join.
+Do NOT wait for the review here: continue immediately into the `code-review`
+skill below.
+
+The engine runs the task in this worktree, so one launch serves both backends.
+A Codex run has no background shell of its own (ADR 0292). `.done` tells
+`harden-suites.sh` that the review has ended, so the Codex driver tests can
+start alone. The script header documents what it guarantees:
+
+- **The last line of the output is always one status line**: a verdict,
+  `NO VERDICT` with the upstream cause, or `unavailable`.
+- **It probes the reviewer's CLI up to three times first.** An `npm install -g`
+  of a CLI breaks its readiness checks for a few seconds.
+- **It retries a reviewer that returns no verdict once**, and times out each
+  attempt. The task timeout covers both attempts, so the status line always
+  lands.
+- **The Claude reviewer cannot write.** It reads a diff file the script
+  writes, with read-only tools, no MCP and no Lucidos credential.
+- **Each reviewer resolves its own CLI**, so never hardcode a path.
 
 ### Phase 1 review
 
 Run the **repo-owned** `code-review` skill (`.claude/skills/code-review/SKILL.md`)
-at **high** effort. It is the one Claude review of the iteration, beside Codex
-(ADR 0476). Its target is `git diff main...HEAD`, or
+at **high** effort. It is the iteration's one review by your own model family,
+beside the other-model review (ADR 0476). Its target is `git diff main...HEAD`, or
 `.lucidos/review-target.diff` when Phase 0.4 or a later iteration built one.
 
 - **Claude Code, first iteration of a full diff:** run it in ONE `Agent` subagent,
@@ -436,23 +479,55 @@ If the diff edits the resource set or a staging/service/spawn-env path, run `./s
 
 ## Phase 3: Validate Findings
 
-### Join the Codex review (if launched in Phase 1)
+### Join the other-model review (if launched in Phase 1)
 
-If you launched a background Codex review in Phase 1, join it now: `.lucidos/codex-review.done` exists once it has ended. The last line of `.lucidos/codex-review.out` is the status line, and everything above it is the review. Read the status line first: it decides which case below applies.
+If Phase 1 launched the review, join it now, in the foreground with
+`timeout: 240000`:
 
-- **`verdict returned`:** fold Codex's findings into the validation set below. Treat each like any other reviewer's finding: confirm it against source, fix a real 🔴 in Phase 4, discard a false positive. Log recurring dismissals to `docs/code-review-priors.md`. Codex frequently returns "no actionable bugs": record that outcome and move on.
-- **Still running:** give it one bounded foreground wait on the marker, with `timeout: 240000`: `for i in $(seq 1 230); do [ -f .lucidos/codex-review.done ] && break; sleep 1; done`. The default timeout would kill the loop at 2 minutes, and a longer loop outlives the prompt cache. Cap the wait at ~5 minutes *since it was launched in Phase 1*. Usually it is already done, since Phase 1 ran in parallel with it. Remember the probe loop can hold the task for up to a minute before the review even starts, and a retry runs a second review.
-- **`NO VERDICT`:** the reviewer started and failed twice. That is a lost review angle, never a pass and never "unavailable". Say so now, and quote the status line verbatim in the Phase 4 report, upstream cause included. It is still advisory, so proceed.
-- **`unavailable`, or abandoned after the wait:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
+```bash
+lucidos background-task wait <id>
+```
 
-**A reviewer that returns nothing is configuration, not weather.** The status line quotes the cause (`docs/harden-notes.md` § A silent Codex review is configuration).
+- **`finished`:** usual, since Phase 1 ran in parallel with it. Read the status
+  line below.
+- **Still running:** re-issue `wait`. Each call returns within 230 s, inside the
+  prompt cache. Cap the join at about 5 minutes *since the launch*. The probes
+  can hold the task for up to a minute before the review starts, and a retry
+  runs a second review.
+- **Past the cap:** abandon it with `lucidos background-task stop <id>`, so
+  nothing spends after `/harden` moves on. Note "<R> review: abandoned after the
+  wait (advisory), proceeding", and pass `--review-abandoned` to Phase 4.5's
+  `wait`.
+
+Once it has finished, the last line of `.lucidos/other-model-review.out` is the
+status line, and everything above it is the review. `<R>` names the reviewer,
+`Codex` or `Claude`. Read the status line first: it decides which case applies.
+
+- **`verdict returned`:** fold the reviewer's findings into the validation set
+  below. Treat each like any other reviewer's finding: confirm it against
+  source, fix a real 🔴 in Phase 4, discard a false positive. Log recurring
+  dismissals to `docs/code-review-priors.md`. Codex often returns "no
+  actionable bugs", and Claude `No findings.`: record that outcome and move on.
+- **`NO VERDICT`:** the reviewer started and failed. That is a lost review
+  angle, never a pass and never "unavailable". Say so now, and quote the status
+  line verbatim in the Phase 4 report, upstream cause included. It is still
+  advisory, so proceed.
+- **`unavailable`:** it is advisory. Note "<R> review: unavailable
+  (advisory), proceeding" and continue. NEVER block the marker or stall the
+  turn on the review.
+- **A prior iteration's task still running:** stop it with `lucidos
+  background-task stop <id>` before the new launch.
+
+**A reviewer that returns nothing is configuration, not weather.** The status
+line quotes the cause (`docs/harden-notes.md` § A silent other-model review is
+configuration).
 
 Then validate the findings that no verifier has checked, per the rest of this
 phase.
 
-### Validate Codex and Phase 2.5 findings
+### Validate other-model and Phase 2.5 findings
 
-Validate each Codex finding and each Phase 2.5 finding **inline**, in your own
+Validate each other-model finding and each Phase 2.5 finding **inline**, in your own
 session. `code-review` findings skip this step, since the skill's verifier
 already checked them (ADR 0476). For each one:
 
@@ -478,7 +553,8 @@ don't need an entry; recurring-shaped ones do.
   directly. List 🟡 nits and Phase 1 `cleanup` findings without fixing them,
   and do not ask the user about them. A fix can void the early suite run and
   start another iteration (ADR 0476).
-- **Either way, name what the Codex angle returned.** A `NO VERDICT` status
+- **Either way, name the other-model reviewer and what it returned.** Quote
+  its status line, Codex or Claude. A `NO VERDICT` status
   line goes in verbatim, so the report never reads as two reviewers when it
   had one.
 
@@ -534,10 +610,10 @@ step, active voice, 3-word noun clusters) are a `code-review` angle in Phase 1.
 
 ### Also always: the whole-tree gates
 
-Each one runs for **every** diff, docs-only included. Each is a few milliseconds,
-and a merge can break one with no edit on the branch (`docs/harden-notes.md`
-§ Why a gate is unconditional). Fix a failure at its source, never by loosening
-the check. Each script header holds the mechanism.
+Each one runs for **every** diff, docs-only included, and reads tracked files.
+A merge can break a gate (`docs/harden-notes.md` § Why a gate is unconditional).
+Fix a failure at its source, never by loosening the check.
+Each script header holds the mechanism.
 
 | Command | Fails on | Fix |
 |---|---|---|
@@ -547,10 +623,20 @@ the check. Each script header holds the mechanism.
 | `./scripts/check-build-script-paths.sh` | A `build.rs` that reads `env!("CARGO_MANIFEST_DIR")` and bakes a checkout path (ADR 0079). | Read the variable at run time, never exempt the file. |
 | `./scripts/check-e2e-workflow.sh` | `e2e.yml` losing a security limit (ADR 0382): no secret, `contents: read`, triggers only on `e2e/**` and `main`, cache saved on `main` only, one-day artifacts. | Restore the limit. |
 | `./scripts/mirror-push-gate.sh` then `./scripts/check-mirror-pushers.sh` | A tracked script, workflow or Rust source that pushes outside the allowlist or names the mirror's git URL (ADR 0462). The first command installs the refusing push URL. | Route the push through `release_tree_push`, never widen the allowlist. |
-| `./scripts/check-knowhow-refs.sh` | A `system-knowhow/` path, sibling id, event name or severity word that does not resolve (`.claude/rules/system-knowhow.md`). | Correct the pointer. Never widen arm 3's non-event list to silence an event name. |
+| `make lint-knowhow` | Unresolved knowhow paths, CLI flags, tool or event names, symbols, Settings chains or links; retired terms; broken audit scans. | Fix the stale claim. Domain examples declare their reason in the file that uses them. |
+| `./scripts/check-knowhow-coupling.sh` | A committed surface change lacks its documentation or a reasoned `Knowhow-unchanged` trailer; malformed surface or audit-source declarations. | Update the mapped documentation and affected audit sections, or explain unchanged behavior in each source-changing commit's trailer. |
+| `./scripts/lib/check_knowhow_coupling_test.sh` | A coupling regression fixture fails. | Preserve failures for missing inputs, source-only edits, stale trailers and deleted or renamed sources. |
+| `./scripts/lib/check_audit_scans_test.sh` | An audit-scan regression fixture fails. | Fix the checker, preserving hit, miss and missing-input fixtures. |
+| `./scripts/lib/check_knowhow_refs_test.sh` and `./scripts/lib/check_knowhow_generated_test.sh` | A forward-reference or freshness regression fixture fails. | Fix the checker. Keep hit, miss and missing-input fixtures. |
 | `./scripts/check-default-flows.sh` | A copy of a default coding-agent flow that differs from its knowhow block (ADR 0505). | Copy the block back, or change the default and every copy together. Lucidos's own steps stay outside the markers. |
-| `./scripts/check-audit-scans.sh` | A workspace-audit `scan` line that misses a hit row in its `FIXTURES` block. | Fix the pattern. A new scan needs a hit row. |
+| `./scripts/lib/check_retired_terms_test.sh` | A retired-term regression fixture fails. | Fix the checker without loosening its tracked-tree contract. |
 | `./scripts/lib/hooks_registered_test.sh` | A `.claude/settings.json` hook that is not valid, missing or not executable. | Fix the mode or path. |
+
+The `knowhow-generated` suite runs `./scripts/check-knowhow-generated.sh` for every
+diff, including docs-only and fast-tier changes. It compares the committed surface
+with a fresh rendering. Missing inputs or a mismatch fail closed. Regenerate with
+`./scripts/codegen.sh` and commit the surface. Both writers run in the suite's
+serialized Cargo lane, after any prior Cargo suite has ended.
 
 ### Then the test suites: join, and read the verdict
 
@@ -572,10 +658,10 @@ is routine: re-issue it. Act on its exit status:
 | 0 | PASS | Proceed to Phase 5. |
 | 1 | FAIL | Read the named log, fix, commit, return to Phase 1. |
 | 2 | RERUN | Format, start a normal run, and `wait` again (below). After a retry round that passed, this run is the full set. |
-| 3 | still running | Re-issue `wait`. It says if the Codex review or the driver tests are what it waits on. |
+| 3 | still running | Re-issue `wait`. It says if the other-model review or the driver tests are what it waits on. |
 
 **Join inline, never in a subagent.** Run `wait` yourself and follow the table.
-Add `--codex-abandoned` when Phase 3 abandoned the Codex review. Each `wait`
+Add `--review-abandoned` when Phase 3 abandoned the other-model review. Each `wait`
 ends inside the prompt cache, so polling costs one cache read per call. A
 subagent join blocks you for the whole run, usually past the cache. You then
 write your whole context again when it returns (ADR 0517).
@@ -618,10 +704,10 @@ they format, run `start` (Codex in the foreground), then `wait`.
 engine suite. A `style: rustfmt` commit does not send you back to Phase 1,
 because rustfmt changes no behaviour.
 
-**The Codex driver tests run alone, after the Codex review is joined.** The early
-run skips both driver modules, and `wait` starts them by themselves. If Phase 3
-abandoned the Codex review, re-issue
-`./scripts/harden-suites.sh wait --codex-abandoned`. Never treat a driver-test
+**The Codex driver tests run alone, after the other-model review is joined.**
+The early run skips both driver modules, and `wait` starts them by themselves.
+If Phase 3 abandoned the review, re-issue
+`./scripts/harden-suites.sh wait --review-abandoned`. Never treat a driver-test
 failure as a finding until that module has run alone on a quiet host
 (`docs/harden-notes.md` § Timeouts under load).
 

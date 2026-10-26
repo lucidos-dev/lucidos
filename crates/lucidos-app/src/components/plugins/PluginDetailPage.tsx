@@ -155,7 +155,7 @@ function Readme({ readme, showLoading }: { readme: Loadable<string>; showLoading
   return (
     <LoadingFade showSkeleton={showLoading} skeleton={<ProseSkeleton class="markdown-content plugin-detail-readme" />}>
       {readme.status === 'loaded' ? (
-        <div class="markdown-content plugin-detail-readme" dangerouslySetInnerHTML={{ __html: html }} />
+        <div class="markdown-content plugin-detail-readme authored-html" dangerouslySetInnerHTML={{ __html: html }} />
       ) : null}
     </LoadingFade>
   );

@@ -236,3 +236,32 @@ gate cannot see it.
 
 Full reconnaissance and invariants:
 `docs/plans/2026-09-21-codex-sandbox-escapes-are-classified-before-carding.md`.
+
+## Addendum (2026-10-22): the command guard may answer coding-agent commands
+
+A user with Command guard and its judge on still got cards for routine writes:
+`rm -f .lucidos/harden-review-head && lucidos successor offer ...` and
+`./scripts/merge-drivers.sh && git merge main --no-edit`. Both write, so the
+judge places them `ReversibleDanger`, which the 2026-09-21 gate cards.
+
+**Decision.** A new preference, `command_guard_coding_agents` (off by default, a
+child of `command_guard`), widens the gate in two ways. It allows
+`ReversibleDanger` as well as `Safe`, and it takes a Claude Code `Bash` card
+into the gate, which the Codex-only scope kept out. Off, behaviour is exactly the
+2026-09-21 gate. `Catastrophic`, `IrreversibleDanger` (a secret read among it)
+and an unclassified result card whatever the flag says. The three refusals
+stand: a `fast_path_refused` shape, a command run as another user, and a
+destruction from a `cwd` outside the workspace.
+
+**Accepted cost.** This path takes no command checkpoint, so a wrong
+`ReversibleDanger` verdict runs with no undo. The user chose that, and chose the
+flag so the choice is explicit.
+
+**Rejected: run Codex without its sandbox.** With no sandbox and no approvals
+Codex raises no request, so the guard would see nothing.
+
+The permission card for a pending command links to the setting.
+
+Implementation: `engine/cc_permission.rs` (`attended_command_allowed`,
+`lane_allows_escalation`), `api/internal.rs`, `core/preference_catalog.rs`. Plan:
+`docs/plans/2026-10-22-command-guard-answers-coding-agent-commands.md`.

@@ -175,7 +175,7 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
-            adoption_note: None,
+            branch_note: None,
             session_branch: Some(branch),
         },
     )
@@ -309,7 +309,7 @@ async fn resume_prompt_is_prefixed_with_discarded_change_note() {
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
-            adoption_note: None,
+            branch_note: None,
             session_branch: Some(branch),
         },
     )
@@ -356,7 +356,7 @@ async fn the_note_block_disclaims_the_topic_of_the_message_below_it() {
     let spawn = |note: Option<&'static str>| ResumeSpawnContext {
         worktree_path: None,
         last_idle_sha: None,
-        adoption_note: note,
+        branch_note: note,
         session_branch: None,
     };
 
@@ -502,7 +502,7 @@ async fn a_switch_resume_is_told_the_restart_stopped_the_call() {
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
-            adoption_note: None,
+            branch_note: None,
             session_branch: Some(branch),
         },
     )
@@ -662,7 +662,7 @@ async fn a_report_filed_mid_turn_reaches_the_kept_alive_follow_up_once() {
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
-            adoption_note: None,
+            branch_note: None,
             session_branch: Some(branch),
         },
     )
@@ -904,7 +904,7 @@ async fn a_spawn_sends_a_slash_command_verbatim() {
     let spawn = || ResumeSpawnContext {
         worktree_path: None,
         last_idle_sha: None,
-        adoption_note: None,
+        branch_note: None,
         session_branch: Some(branch),
     };
     let sent = SentDeviceContexts::default();
@@ -1070,7 +1070,7 @@ async fn prompts_for_turns_opened_by(
         ResumeSpawnContext {
             worktree_path: None,
             last_idle_sha: None,
-            adoption_note: None,
+            branch_note: None,
             session_branch: Some(branch),
         },
         held(&sent),
@@ -1279,7 +1279,7 @@ async fn a_resume_skips_the_device_block_its_conversation_already_holds() {
                 ResumeSpawnContext {
                     worktree_path: None,
                     last_idle_sha: None,
-                    adoption_note: None,
+                    branch_note: None,
                     session_branch: Some(branch),
                 },
                 HeldBlocks {

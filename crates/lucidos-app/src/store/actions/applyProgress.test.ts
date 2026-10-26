@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ApplyEstimates, Change } from '../../api/client';
 import { NO_APPLY_ESTIMATES, applyAllBatch, applyNowRequests, applyPhases, threadMap, toasts, type ApplyPhaseReading } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
-import { focusThread } from './threads';
+import { focusThreadOrBootstrap } from './threads';
 import {
   applyPhaseOf,
   batchMemberInFlight,
@@ -15,7 +15,7 @@ import {
   reconcileApplyProgress,
 } from './applyProgress';
 
-vi.mock('./threads', () => ({ focusThread: vi.fn() }));
+vi.mock('./threads', () => ({ focusThreadOrBootstrap: vi.fn() }));
 
 function change(id: string, threadId: string | null, overrides: Partial<Change> = {}): Change {
   return {
@@ -247,7 +247,7 @@ describe('reconcileApplyProgress', () => {
     const toast = toasts.value.find((t) => t.key === 'applying-t-2');
     expect(toast?.type).toBe('success');
     toast!.onClick!();
-    expect(focusThread).toHaveBeenCalledWith('t-2', { targetEventId: 'e-7' });
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-2', { targetEventId: 'e-7' });
   });
 
   it('keeps the phase of an apply the engine says still runs', () => {

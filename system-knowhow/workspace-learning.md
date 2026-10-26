@@ -3,6 +3,8 @@ name: Workspace Learning
 description: Recipe for learning from a workspace's recent events, proposing improvements to apps, triggers, knowhow and scripts based on observed friction. Use when the user asks what to learn from the runtime, where things aren't working, or what patterns the events show.
 ---
 
+<!-- domain-event: WorkspaceLearningCompleted: This learning procedure emits its own domain event after reporting. -->
+
 # Workspace Learning
 
 A read-only sweep of a workspace's recent **events**. It finds recurring friction and proposes targeted edits to apps, triggers, knowhow and scripts. Output: one Markdown report under `data/artifacts/learning/` plus a `WorkspaceLearningCompleted` event.
@@ -30,19 +32,19 @@ Point at the file. Don't quote it.
 
 ## What to walk
 
-Window: a recurring run (a trigger fire) covers everything since its previous run. Read that time from this trigger's `Last run:` line in `list_triggers`, which is UTC. The engine stamps it when a fire finishes, pass or fail, so the current fire never shows there. A failed fire writes no report. A successful fire emits `WorkspaceLearningCompleted` minutes before `Last run:`. If the newest one is more than an hour older, that fire failed, so start from the event.
+Window: a recurring run (a trigger fire) covers everything since its previous run. Read that time from this trigger's `Last run:` line in `triggers(action="list")`, which is UTC. The engine stamps it when a fire finishes, pass or fail, so the current fire never shows there. A failed fire writes no report. A successful fire emits `WorkspaceLearningCompleted` minutes before `Last run:`. If the newest one is more than an hour older, that fire failed, so start from the event.
 
 Cap the window at 30 days. After a longer gap, such as a paused trigger, start 30 days back and say so in the report Summary. Friction older than that is almost always fixed or stale.
 
-Fall back to the last **N days** (default 7) when `Last run:` reads `never`, or for a one-off chat run. A window the user names ("last 30 days", "since last release") wins. From chat use `query_events` / `count_events`; from a script use `lucidos events query` / `lucidos events count`.
+Fall back to the last **N days** (default 7) when `Last run:` reads `never`, or for a one-off chat run. A window the user names ("last 30 days", "since last release") wins. From chat use `events(action="query")` / `events(action="count")`; from a script use `lucidos events query` / `lucidos events count`.
 
-**Count first, then drill. This is mandatory.** A busy week can produce 2 MB+ of `ToolResult` payloads. Chaining many `query_events` calls in one turn blows the next turn's prompt budget. This recipe once sent 1.54 M tokens to a 1 M-cap API that way and failed with `prompt is too long`.
+**Count first, then drill. This is mandatory.** A busy week can produce 2 MB+ of `ToolResult` payloads. Chaining many `events(action="query")` calls in one turn blows the next turn's prompt budget. This recipe once sent 1.54 M tokens to a 1 M-cap API that way and failed with `prompt is too long`.
 
-1. **Size the window.** Call `count_events` once with `since` at the window start and **no** `event_type` filter. Pass `thread_id` only to size one thread. It returns `{by_type: [{event_type, count, byte_total}, ...]}`, sorted by count desc. `byte_total` is the raw payload byte sum, the right proxy for context cost.
+1. **Size the window.** Call `events(action="count")` once with `since` at the window start and **no** `event_type` filter. Pass `thread_id` only to size one thread. It returns `{by_type: [{event_type, count, byte_total}, ...]}`, sorted by count desc. `byte_total` is the raw payload byte sum, the right proxy for context cost.
 2. **Decide what to drill into.** Skip any friction-signal type with `count < 3` (see "Noise filter"). Sort the rest by `byte_total`. High-byte types (`ToolResult`, `CodingAgentToolCalled`, `TextStreamed`) need especially tight `limit` values.
-3. **Drill narrow.** For each type you keep, call `query_events` with the `event_type` filter and `limit: 50` (the engine default: sample, don't enumerate). The engine hard-caps `limit` at 200 and `byte_limit` at 512 KB. Never call `query_events` without an `event_type` filter on a window above ~24 hours.
-4. **Watch for `truncated:true`.** `query_events` returns `{events, total_matching, returned, byte_size, truncated, hint?}` with a 128 KB default `byte_limit`. On `truncated:true`, follow the hint: narrow by `aggregate_id` or shorten the window. Raise `byte_limit` only after you narrowed.
-5. **Soft cap of 3 `query_events` calls per assistant turn.** The engine bounds each call but does NOT track per-turn totals. Five or more calls in one assistant message can still blow the next turn's budget. With more than 3 types above threshold, split the drill across turns. The trigger thread persists and can resume.
+3. **Drill narrow.** For each type you keep, call `events(action="query")` with the `event_type` filter and `limit: 50` (the engine default: sample, don't enumerate). The engine hard-caps `limit` at 200 and `byte_limit` at 512 KB. Never call `events(action="query")` without an `event_type` filter on a window above ~24 hours.
+4. **Watch for `truncated:true`.** `events(action="query")` returns `{events, total_matching, returned, byte_size, truncated, hint?}` with a 128 KB default `byte_limit`. On `truncated:true`, follow the hint: narrow by `aggregate_id` or shorten the window. Raise `byte_limit` only after you narrowed.
+5. **Soft cap of 3 `events(action="query")` calls per assistant turn.** The engine bounds each call but does NOT track per-turn totals. Five or more calls in one assistant message can still blow the next turn's budget. With more than 3 types above threshold, split the drill across turns. The trigger thread persists and can resume.
 
 **Step 1 sizes the drill and never produces a finding on its own.** A high count means a type is expensive to pull, nothing more. Event volume is not friction, and neither is a trigger on a tight cadence. The event log is the workspace's memory, so a quieter log is not a better one.
 
@@ -57,7 +59,7 @@ Friction signals to pull:
 | Signal | Event types |
 |---|---|
 | Tool failures | `ToolResult` payloads with errors; repeated `ToolCalled` to the same target without success. HTTP-tool failures land here too: there is no dedicated HTTP event. |
-| Circuit-breaker trips | LLM warned (3 consecutive failures) or force-broken (5) on the same failing target in one thread. The breaker gates on repeated *failure*, not repeated call (see `.claude/rules/frontend.md` § Circuit Breakers) |
+| Circuit-breaker trips | Find forced-break text in `ResponseGenerated`, alongside preceding `ToolResult` errors. Warnings exist only in the model's in-memory messages and leave no persisted event. See `system-knowhow/running-python.md` § Anti-patterns that burn context. |
 | Failed responses | `ResponseFailed` payloads: model errors, timeouts, parse failures. Group by error reason. |
 | Aborts / cancels | `ResponseAborted` (system) and `ResponseCanceled` (user). Group both. |
 | Trigger failures | `TriggerCompleted` payloads whose `result_summary` carries an error. The engine never leaves `result_summary` empty. A run with no output falls back to `"<name> completed (no output)"` or `"<name> completed (exit <code>, no output)"`. Those lines are an **expected** idle-detector outcome (broad subscription + cheap internal gate), **not** friction. Never flag them as "produced no useful output". |

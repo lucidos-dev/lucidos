@@ -524,7 +524,7 @@ export const PREF_MODEL_CODEX = {
   key: "model_codex",
   scope: "global",
   type: "coding-agent-model",
-  fallback: null,
+  fallback: "gpt-6.1-sol",
 } as const;
 
 export const PREF_REASONING_CODEX = {
@@ -532,7 +532,7 @@ export const PREF_REASONING_CODEX = {
   scope: "global",
   type: "enum",
   values: ["low", "medium", "high", "xhigh", "max"],
-  fallback: null,
+  fallback: "medium",
 } as const;
 
 export const PREF_INTELLIGENCE_LADDER_CHAT = {
@@ -672,6 +672,13 @@ export const PREF_COMMAND_GUARD_JUDGE = {
   fallback: "true",
 } as const;
 
+export const PREF_COMMAND_GUARD_CODING_AGENTS = {
+  key: "command_guard_coding_agents",
+  scope: "global",
+  type: "flag",
+  fallback: "false",
+} as const;
+
 export const PREF_MODEL_COMMAND_JUDGE = {
   key: "model_command_judge",
   scope: "global",
@@ -738,8 +745,8 @@ export const PREF_CAPTURE_CONTEXT = {
   fallback: "false",
 } as const;
 
-export const PREF_CACHE_WARM_LINE = {
-  key: "cache_warm_line",
+export const PREF_CACHE_CARDS = {
+  key: "cache_cards",
   scope: "global",
   type: "flag",
   fallback: "true",
@@ -971,6 +978,7 @@ export const PREFERENCE_CATALOG = {
   "backup_reminder_dismissed": PREF_BACKUP_REMINDER_DISMISSED,
   "command_guard": PREF_COMMAND_GUARD,
   "command_guard_judge": PREF_COMMAND_GUARD_JUDGE,
+  "command_guard_coding_agents": PREF_COMMAND_GUARD_CODING_AGENTS,
   "model_command_judge": PREF_MODEL_COMMAND_JUDGE,
   "reasoning_command_judge": PREF_REASONING_COMMAND_JUDGE,
   "judgment_command_guard": PREF_JUDGMENT_COMMAND_GUARD,
@@ -980,7 +988,7 @@ export const PREFERENCE_CATALOG = {
   "judgment_wake_decision": PREF_JUDGMENT_WAKE_DECISION,
   "max_tool_calls": PREF_MAX_TOOL_CALLS,
   "capture_context": PREF_CAPTURE_CONTEXT,
-  "cache_warm_line": PREF_CACHE_WARM_LINE,
+  "cache_cards": PREF_CACHE_CARDS,
   "keybindings": PREF_KEYBINDINGS,
   "voice_input_device": PREF_VOICE_INPUT_DEVICE,
   "network_bind": PREF_NETWORK_BIND,

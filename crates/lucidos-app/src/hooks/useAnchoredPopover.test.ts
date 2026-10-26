@@ -124,6 +124,16 @@ describe('computeAnchorPosition', () => {
       // Unclamped this is 300 - 324 - 4 = -28; the visible band starts at 100.
       expect(pos.top).toBe(108);
     });
+
+    // iOS 27 reports this transiently in a standalone PWA. Trusted, it left no
+    // room below any anchor and pinned the panel under the status bar.
+    it('measures against the layout viewport when the visual one reports no height', () => {
+      setViewport(393, 852);
+      setVisualViewport({ height: 0, offsetTop: 0 });
+      const pos = computeAnchorPosition(fakeAnchor({ top: 400, bottom: 436, left: 20, right: 56 }), 300, 240);
+      expect(pos.placement).toBe('bottom-start');
+      expect(pos.top).toBe(436 + 4);
+    });
   });
 
   /** The status bar and the Dynamic Island draw over the top safe area, so a

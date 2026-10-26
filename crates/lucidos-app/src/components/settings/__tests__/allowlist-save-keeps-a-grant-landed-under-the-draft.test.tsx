@@ -73,8 +73,8 @@ describe('AllowlistEditor save over a file that moved', () => {
   async function mount(save: (contents: string) => Promise<void>, load = () => Promise.resolve(onDisk)) {
     await act(() => render(
       <AllowlistEditor
-        title="Claude Code permissions"
-        anchor="permissions:claude-code"
+        title="Coding agent permissions"
+        anchor="permissions:coding-agent"
         description="what it is for"
         placeholder="Bash(npm:*)"
         noun="tool permissions"

@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.51.0 — 2026-10-26
+
+### Added
+- Turn the prompt cache keep-alive off for one thread from its keep-alive card. It stays off until that thread runs again.
+- Lucidos Agent threads keep their prompt cache warm while you think, on Anthropic, Vertex, OpenAI and OpenRouter.
+- A Cache cards switch in Settings hides the keep-alive card and the cache-warm line. Every cache explainer links to it.
+- The keep-alive card shows what each ping and the whole wait will cost, and ends with a final score.
+- Type to filter any dropdown or model picker list.
+- The command guard can answer coding-agent commands. Turn it on under Settings > Coding Agents, or from the gear on a command card.
+- Codex command cards offer Always allow. A grant you give covers both Claude Code and Codex.
+- Codex ships a default implementer: GPT-6.1 Sol at medium.
+- Settings > Devices folds unused devices into a collapsed group.
+
+### Changed
+- A coding-agent handoff starts a fresh session in the same thread. A New session card marks where it begins, and the thread keeps its title.
+- Start a side question from the circled question-mark toggle in the composer row, or with ⌥↵. No composer button has a hold.
+- A coding agent busy in a long turn reads a finished child's report on its next `lucidos` call.
+- The composer row keeps fixed-width controls: one action slot where Send stands, one model picker face per layout, and Diff and the standing apply left of the picker.
+- The composer row picks compact faces by its own width, and leads with the toggles on coding-agent threads too.
+- The model and effort pill appears at its final width and keeps its badge as the row narrows. It opens during a turn and says why a pick must wait.
+- Find in thread searches every text the thread draws: cards, step rows, side questions, markers, the turn-limit card and failures.
+- Prompt cache lifetimes come only from what the provider reports. A lifetime nobody measured reads Unknown.
+- Coding agent permissions is one list with one meaning per line for every agent.
+- Authored HTML in a message stays inside its own box. Form controls show as text.
+- A drawer row shows a flat mark for each agent the thread used.
+- The Blocked tile in the drawer beats until you have seen its blocked threads, and remembers that across a reload.
+- Loaders stay on screen long enough to read instead of flashing.
+- The dashboard settles before it shows, then fades in. On a phone it is a panel in the thread pane, and Back closes it.
+- The installed iPhone app always runs dynamic bars.
+- Trigger threads with no human message get no cache keep-alive pings.
+
+### Fixed
+- Fullscreen in the desktop app fills the window, also from the keyboard shortcut inside an app.
+- A tap near the screen edge on a phone opens the row under it.
+- A plain tap on Send on an iPhone no longer starts a side question. Long presses fire while the finger is down.
+- A held Send whose lift arrives late no longer stops the turn it started.
+- A question card shows Cancel or Submit, never both.
+- An open Apply menu draws above the scroll chevron.
+- Composer icons stay put when the clear-draft button appears.
+- The System theme follows an OS appearance change that lands while the page starts.
+- A coding-agent thread interrupted by a restart before its agent started resumes with its unread messages.
+- A coding-agent thread resumes after its git branch is renamed.
+- A coding-agent session survives a dropped database connection.
+- Coding agents no longer write their final answer twice.
+- A refresh on one device keeps the update notice on your other devices.
+- Dark mode skeleton bars are faint and neutral.
+- A tool call leaked as text is recovered and run.
 ## v0.50.5 — 2026-10-22
 
 ### Changed

@@ -3,12 +3,15 @@
 //! The wire format (request building, cache-control, SSE parsing) is shared
 //! with the direct Anthropic provider and lives in [`crate::llm::anthropic_wire`].
 //! This file is the Vertex-specific transport: gcloud bearer auth, the
-//! `streamRawPredict` URL, and the retry/auth-refresh loop.
+//! `streamRawPredict` URL, the retry/auth-refresh loop, and the prefill beat
+//! on the same endpoint.
 
 use super::VertexProvider;
 use crate::llm::anthropic_wire::{
     build_claude_request, parse_claude_stream, parse_context_suffix, WireTarget,
 };
+use crate::llm::claude_prefill;
+use crate::llm::prefill::{PrefillBody, TurnRoute};
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
 use crate::llm::{ModelNotServed, ModelSelection};
 
@@ -41,6 +44,14 @@ impl VertexProvider {
             request.force_tool(tool, model)?;
         }
         let stable_prefix_fingerprint = crate::llm::stable_prefix::fingerprint(&request, model);
+        let prefill = claude_prefill::pair(
+            &request,
+            TurnRoute {
+                wire_model: model,
+                reasoning_effort,
+                betas: &header_betas,
+            },
+        );
         let beta_header = (!header_betas.is_empty()).then(|| header_betas.join(","));
         let display = request.thinking_display();
 
@@ -120,6 +131,7 @@ impl VertexProvider {
                 Ok(response) => {
                     return Ok(LlmResponse {
                         stable_prefix_fingerprint,
+                        prefill,
                         ..response
                     })
                 }
@@ -132,5 +144,25 @@ impl VertexProvider {
                 }
             }
         }
+    }
+
+    /// Send one prefill beat to the endpoint the turn used.
+    pub(super) async fn prefill_claude(
+        &self,
+        body: &PrefillBody,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        if !Self::is_claude_model(&body.wire_model) {
+            return Err(crate::llm::prefill::cannot_prefill(body.provider));
+        }
+        let (base_model, _) = parse_context_suffix(&body.wire_model);
+        let url = self.claude_endpoint(base_model);
+        let mut builder = self.streaming_client.post(&url).header(
+            "Authorization",
+            format!("Bearer {}", self.get_access_token().await?),
+        );
+        if !body.betas.is_empty() {
+            builder = builder.header("anthropic-beta", body.betas.join(","));
+        }
+        crate::llm::prefill::send(builder, body, "Vertex").await
     }
 }

@@ -17,7 +17,7 @@ use super::lucidos_cli::{
     ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
     LUCIDOS_CLI_SKILL,
 };
-use super::spawn_env::{apply_lucidos_env, command_secret_values, StderrTail};
+use super::spawn_env::{apply_lucidos_env, command_secret_values, AgentSandbox, StderrTail};
 use super::startup_instructions::{self, claude_version, StartupDecision, StartupFollowUp};
 
 /// One `/model` or `/effort` picker entry. Claude Code's model rows come from
@@ -54,6 +54,11 @@ pub struct CcMenuOption {
     /// `None` derives them from the effort rows (`efforts_for_model`).
     #[serde(default)]
     pub reasoning_efforts: Option<Vec<String>>,
+    /// The effort a pick naming only this model runs at, when the backend
+    /// said so per model. Only the Codex menu file carries it: Claude Code's
+    /// answer comes from the model registry.
+    #[serde(default)]
+    pub default_effort: Option<String>,
     /// Whether a new spawn may pick this row. A row with `offered: false` is
     /// overlay only: it keeps its `context_window` for threads already on it,
     /// and is neither listed nor accepted.
@@ -376,6 +381,9 @@ fn result_usage(value: &serde_json::Value) -> Option<crate::engine::ApiUsage> {
         modality: None,
         service_tier: None,
         cache_creation_1h_tokens: None,
+        cache_creation_30m_tokens: None,
+        cache_creation_12h_tokens: None,
+        cache_creation_requested_ttl: None,
     })
 }
 
@@ -959,7 +967,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
             // CC permissions flow out-of-band: its MCP permission-prompt
             // subprocess POSTs /api/v1/internal/permission-prompt directly.
             permission_rx: None,
-            withdraw_tx: Some(withdraw_tx),
+            withdraw_tx,
         })
     }
 }
@@ -1348,7 +1356,13 @@ fn build_command_with_settings(
     // Agent-independent Lucidos env contract (workspace, host protection,
     // database handle, subprocess origin, spawn metadata, compile env, PATH), shared
     // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.
-    apply_lucidos_env(&mut cmd, args, cli_dir, "ClaudeCode");
+    apply_lucidos_env(
+        &mut cmd,
+        args,
+        cli_dir,
+        AgentSandbox::Unsandboxed,
+        "ClaudeCode",
+    );
     // Push CC's own byte-idle streaming deadline out past the engine's
     // inactivity watchdog, so a provider stall auto-resumes instead of killing
     // the turn. See `CC_BYTE_STREAM_IDLE_TIMEOUT_MS` for the full reasoning.

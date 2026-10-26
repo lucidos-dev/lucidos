@@ -43,6 +43,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("PluginSetupOccasion", "engine/thread_events/actor.rs"),
     ("PluginSetupCause", "engine/thread_events/actor.rs"),
     ("EventWaitOutcome", "engine/thread_events/actor.rs"),
+    ("HandoffRequest", "engine/successor.rs"),
     (
         "CacheKeepAliveStatus",
         "engine/thread_events/keep_alive_status.rs",
@@ -51,6 +52,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
         "CacheKeepAliveNotKeptReason",
         "engine/thread_events/keep_alive_status.rs",
     ),
+    ("CapOdds", "engine/thread_events/keep_alive_status.rs"),
     ("ThreadDirection", "engine/thread_events/actor.rs"),
     ("CaptureFormat", "engine/thread_events/capture.rs"),
     ("AbortCause", "engine/thread_events/cause.rs"),
@@ -82,11 +84,16 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("SubThreadPendingChange", "engine/thread_events/session.rs"),
     ("IntegratedBranch", "engine/thread_events/session.rs"),
     ("SessionEndReason", "engine/thread_events/session.rs"),
+    ("SessionContinuity", "engine/thread_events/session.rs"),
+    ("FreshSessionReason", "engine/thread_events/session.rs"),
+    ("HandoffOpening", "engine/thread_events/session.rs"),
     ("VoiceSessionEndReason", "engine/thread_events/session.rs"),
     ("WakeMode", "engine/thread_events/session.rs"),
     ("AutoCompactArm", "engine/auto_compact_trial.rs"),
     ("CheckpointProgress", "engine/handoff_estimate.rs"),
+    ("IntelligenceRung", "runtime/intelligence_ladder.rs"),
     ("ApiUsage", "engine/types.rs"),
+    ("CacheLifetime", "llm/cache_lifetime.rs"),
     ("ContextProducer", "engine/types.rs"),
     ("ContextPurpose", "engine/types.rs"),
     ("ContextRole", "engine/types.rs"),
@@ -99,6 +106,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
         "engine/agent_session/coding_agent_kind.rs",
     ),
     ("AllowScope", "engine/claude_code/mod.rs"),
+    ("GrantOffer", "engine/claude_code/mod.rs"),
     ("EventSubscription", "core/event_subscription/mod.rs"),
     ("CodingAgent", "runtime/agent_runtime.rs"),
 ];
@@ -633,6 +641,27 @@ fn parse_enum(item: &syn::ItemEnum) -> Result<TypeDef, String> {
         });
     }
     Ok(TypeDef::TaggedUnion { tag, variants, doc })
+}
+
+pub(crate) fn enum_variant_names(repo_root: &Path, name: &str) -> BTreeSet<String> {
+    let (_, rel) = TYPE_SOURCES
+        .iter()
+        .find(|(registered, _)| *registered == name)
+        .unwrap_or_else(|| panic!("unregistered enum {name}"));
+    let src = repo_root.join("crates/lucidos-engine/src");
+    parse_source(&src, rel)
+        .items
+        .into_iter()
+        .find_map(|item| match item {
+            syn::Item::Enum(item) if item.ident == name => Some(
+                item.variants
+                    .iter()
+                    .map(|variant| variant.ident.to_string())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing enum {name} in {rel}"))
 }
 
 fn parse_named_type(src: &Path, name: &str, rel: &str) -> Result<TypeDef, String> {

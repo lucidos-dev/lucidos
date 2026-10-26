@@ -13,7 +13,38 @@ invalidates an entry, delete it in the same commit. Deliberate design *no*s
 with deeper rationale live in `docs/adr/`; this file is for the smaller
 "looks wrong, isn't" patterns that don't warrant an ADR.
 
+## Repository gates
+
+- **Codegen checks coverage on the test executables that contain its writers.**
+  A reviewer asks for freshness-only checks on every test-profile artifact.
+  The CLI writer and clap tree share a binary test target; exempting it would
+  also exempt source inputs used by the writer.
+  `CODEGEN_COMPILE_ONLY` instead lists inspected test fixtures no renderer reads.
+  A new fixture fails closed until its role is classified. Re-flag an entry
+  that feeds generated output, rather than the deliberate classification gate.
+
+- **The retired-term gate scans tracked working files and fails on missing ones.**
+  A reviewer asks it to ignore unstaged deletions and include untracked files.
+  Its approved contract is the tracked tree: missing tracked inputs fail closed.
+  Stage a deliberate deletion before running the gate.
+  Untracked files enter its scope when staged (`scripts/check-retired-terms.sh`).
+
+- **Preserved retired code spellings carry same-line qualifiers.** A reviewer
+  asks to replace repeated compatibility markers with path exceptions or enclosing context.
+  ADR 0565 requires a qualifier on the mention's line; stored identifiers keep their spelling.
+  The markers express that requirement without exempting whole compatibility files.
+  Re-flag only if a marker conceals current terminology or a changed identifier.
+
 ## Rust engine
+
+- **A withdrawn input is never read afterwards.** A reviewer reports that a
+  child report a take withdrew can still be read, since it stays in the input
+  ledger until the take settles. A driver answers `Withdrawn` only for an input
+  it dropped: Claude Code confirmed `cancelled: true`, and a Codex driver took
+  it out of its own queue. No `InputRead` can name that uuid after the answer,
+  so the owed entry waits for `settle_take` alone. Re-flag only if a driver
+  answers `Withdrawn` for an input it still holds. (`agent_session/child_reports.rs`,
+  `runtime/codex.rs` `answer_withdraw`.)
 
 - **A working-children wait is tuned from `ChildThreadCompleted` event
   waits.** A reviewer reports that `workspace-data` never samples a parent
@@ -1280,6 +1311,20 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if the spawn path starts writing one for its first prompt.
   (`agent_recovery/undelivered_input.rs`.)
 
+- **A failed keep-alive beat keeps its `keep_alive_beats` stamp.** A reviewer
+  reads a transient prefill failure as a missed retry, since the stamp then
+  skips the thread as `BeatInFlight` until its window passes. All three beat
+  routes stamp before they send, and a refused beat is never retried by design
+  (ADR 0556 safety rules). Re-flag only if that ADR starts promising a retry.
+  (`engine/event_wait/keep_alive.rs`.)
+
+- **Codex's `exec` pragma `yield_time_ms` is not capped at 30 s.** A reviewer
+  applies the shell tool's 30 s cap to the code-mode `exec` pragma, and calls
+  the 24 h question pragma a no-op. A `// @exec: {"yield_time_ms": 120000}`
+  cell held open 50 s on codex-cli 0.164.0. Re-flag only with a Codex release
+  that clamps the pragma. (`codex_exec_question_rule` in
+  `engine/agent_session/prompts.rs`.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -1358,6 +1403,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **A spec's `browser.newContext({...})` keeps the project's context options.**
+  A reviewer sees a fresh context that passes only `serviceWorkers` and reports
+  that it loses `ignoreHTTPSErrors`, the viewport or the proxy. Playwright's
+  test runner fills every key the call omits from the project config
+  (`runBeforeCreateBrowserContext`). Re-flag only a key passed explicitly as
+  `undefined`, which overrides the inherited value.
 
 - **A feed notice that takes `meta` still appears when SSE sets its field in
   place.** A reviewer applies the cache-warm-line fix to `StoppedChildNotice`,
@@ -4561,14 +4613,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the passed count equals the name count, so an unmatched name cannot pass.
   Re-flag only a runner that is not libtest. (`scripts/lib/e2e_flaky.sh`.)
 
-- **A successor title ending in a small number reads as a chain position.**
-  A reviewer sees `successor_title` strip a trailing ` (N)` from a title the
-  user wrote, such as "Investigate retry (2)", and wants chain metadata
-  instead. The owner chose this rule: the title carries the position, and a
-  user title that ends in a small parenthesised number is deliberately
-  ignored. Only 2 to 99 counts, so a year is safe. Re-flag only a successor
-  title that loses text other than a chain suffix. (`engine/successor.rs`.)
-
 - **The agent role password rotates at every boot, by design.** A reviewer
   sees `agent_role::provision` set a new password per boot and argues two
   engines on one database invalidate each other's `LUCIDOS_DATABASE_URL`. One
@@ -4605,3 +4649,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   flight, and `refreshApps` joins that load. Reading the list through
   `listApps` instead breaks the Loadable guard.
   (`store/actions/newChatPrefill.ts`.)
+
+- **An `ENGINE_ALLOWED_TOOLS` prefix rule such as `Bash(lucidos request-read:*)`
+  is not a shell bypass.** A reviewer reads `:*` as letting
+  `lucidos request-read yes && <anything>` through `--allowedTools` with no
+  card. Claude Code parses shell operators before it matches a prefix rule, so
+  a compound command needs every segment allowed. Splitting the entry into
+  exact `yes` and `no` commands buys nothing. Re-flag only with a Claude Code
+  release that matches a prefix across an operator.
+  (`crates/lucidos-engine/src/engine/claude_code/mod.rs`.)

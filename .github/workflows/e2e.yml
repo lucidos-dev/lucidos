@@ -10,9 +10,10 @@
 # Limits `scripts/check-e2e-workflow.sh` enforces:
 #   - No secrets, and the token is contents: read.
 #   - Triggers: push to e2e/** runs a selection; push to main only seeds the
-#     caches every e2e/* branch can read: dependencies, and the macOS jobs'
-#     Postgres and WebKit. GitHub scopes caches by branch, so a cache saved on
-#     an e2e/* branch would only evict others. Test jobs only restore.
+#     caches every e2e/* branch can read: dependencies, the Linux jobs' apt
+#     packages, and the macOS jobs' Postgres and WebKit. GitHub scopes caches
+#     by branch, so a cache saved on an e2e/* branch would only evict others.
+#     Test jobs only restore.
 #   - Every job but seed-cache waits on the plan, so only a request runs it.
 #   - Every action is pinned by commit.
 #   - mobile-webkit runs on macOS, the WebKit port iOS ships (ADR 0175).
@@ -198,6 +199,14 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '20'
+      # What seed-cache saved on main: the system packages, so a stalled
+      # mirror cannot fail the shard. A miss downloads as before.
+      - id: keys
+        run: ./scripts/e2e-github-shard.sh cache-keys
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ env.LUCIDOS_APT_STASH }}
+          key: e2e-${{ steps.keys.outputs.apt }}
       # The Postgres image, system packages, npm deps and the browser, in the
       # background. Later steps wait only for what they need.
       - name: Start the slow setup
@@ -405,8 +414,23 @@ jobs:
           retention-days: 2
           if-no-files-found: ignore
       - id: keys
-        if: matrix.key == 'macos'
         run: ./scripts/e2e-github-shard.sh cache-keys
+      # A saved cache never changes, so a hit skips the download and the save.
+      - id: apt-cache
+        if: matrix.key == 'linux'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ env.LUCIDOS_APT_STASH }}
+          key: e2e-${{ steps.keys.outputs.apt }}
+          lookup-only: true
+      - name: Fill the Linux test jobs' caches
+        if: matrix.key == 'linux' && steps.apt-cache.outputs.cache-hit != 'true'
+        run: ./scripts/e2e-github-shard.sh seed-linux-cache
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        if: matrix.key == 'linux' && steps.apt-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.LUCIDOS_APT_STASH }}
+          key: e2e-${{ steps.keys.outputs.apt }}
       - name: Fill the macOS test jobs' caches
         if: matrix.key == 'macos'
         run: ./scripts/e2e-github-shard.sh seed-macos-cache "$RUNNER_TEMP/pg"

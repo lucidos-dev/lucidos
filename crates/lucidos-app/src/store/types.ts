@@ -1,4 +1,4 @@
-import type { TileSize, WidgetSize } from '../generated/thread-event-wire';
+import type { CacheKeepAliveStatus, FreshSessionReason, TileSize, WidgetSize } from '../generated/thread-event-wire';
 import { errorDetail } from '../utils/errorDetail';
 import type { PluginLocalChangesResult } from '../api/client/apps';
 import type { WebhookIngress, WebhookRefusals } from '../api/client/webhooks';
@@ -310,6 +310,20 @@ type ResponseEventKind =
       actor?: MessageOrigin;
     }
   | {
+      /** A session that started without the thread's earlier context, from a
+       *  `SessionStarted` whose `continuity` is `fresh`. */
+      type: 'fresh_session';
+      reason: FreshSessionReason;
+    }
+  | {
+      /** A *successor session*, from a `SessionStarted` whose `continuity` is
+       *  `handoff`. */
+      type: 'handoff_session';
+      checkpoint?: string;
+      progress?: string;
+      message: string;
+    }
+  | {
       /** An agent-sent message a coding agent holds until a human replies
        *  (ADR 0256). `released` flips once its `HeldMessageReleased` lands. */
       type: 'held_message';
@@ -317,6 +331,13 @@ type ResponseEventKind =
       text: string;
       sender: string;
       released: boolean;
+    }
+  | {
+      /** The card of a *keep-alive run* that began while the turn waited on a
+       *  question or permission card. It sits below that card, inside the turn,
+       *  and later statuses of the run update it in place. */
+      type: 'cache_keep_alive';
+      status: CacheKeepAliveStatus;
     }
   | {
       /** A *form request* the agent sent (engine `engine/form_requests.rs`).

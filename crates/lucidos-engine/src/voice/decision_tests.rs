@@ -25,6 +25,7 @@ fn option(id: &str, label: &str, description: Option<&str>) -> QuestionOption {
         description: description.map(str::to_string),
         preview: None,
         widget: None,
+        quiet: false,
     }
 }
 
@@ -194,12 +195,7 @@ fn a_permission_offers_three_scopes_and_never_an_always_allow() {
     let lanes = [
         OpenDecision::command_permission("r1", "run_bash", "rm -rf build", "Deletes files."),
         OpenDecision::mcp_permission("r2", "example-server", "Example", "post_message", "{}"),
-        OpenDecision::coding_agent_permission(
-            "r3",
-            "Bash",
-            &serde_json::json!({ "command": "git push" }),
-            "Bash git push",
-        ),
+        OpenDecision::coding_agent_permission("r3", Some(&git_offer()), "Bash git push"),
     ];
     for decision in lanes {
         assert_eq!(
@@ -254,8 +250,7 @@ fn the_permission_scopes_are_allow_once_session_and_deny() {
 fn a_card_that_cannot_be_granted_for_the_thread_does_not_offer_it() {
     let decision = OpenDecision::coding_agent_permission(
         "r3",
-        "file_change",
-        &serde_json::json!({ "changes": [{ "path": "/tmp/x" }] }),
+        Some(&GrantOffer::default()),
         "file_change /tmp/x",
     );
     assert_eq!(labels(&decision), vec!["Allow once", "Deny"]);
@@ -309,6 +304,7 @@ async fn a_coding_agent_thread(bus: &EventBus) -> Uuid {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: crate::engine::thread_events::EventMeta {
             channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
@@ -362,6 +358,16 @@ fn asks_the_coding_agent(request_id: &str) -> ThreadEvent {
         tool_name: "Bash".to_string(),
         input: serde_json::json!({ "command": "git push" }),
         summary: "Bash git push".to_string(),
+        grant_offer: Some(git_offer()),
+    }
+}
+
+/// What the engine stamps on a Claude Code `git push` card.
+fn git_offer() -> GrantOffer {
+    GrantOffer {
+        broad: Some("Bash".to_string()),
+        narrow: Some("Bash(git:*)".to_string()),
+        session: Some("Bash(git:*)".to_string()),
     }
 }
 

@@ -579,6 +579,29 @@ test_a_refused_build_is_no_verdict_and_a_failure_outranks_it() {
     if [ "$rc" = 1 ]; then pass "a later red phase outranks an earlier no verdict"; else fail "rc=$rc"; fi
 }
 
+test_a_failed_setup_is_no_verdict_and_a_failure_outranks_it() {
+    echo "test: a shard whose warm-up failed is no verdict, names the task, and a real failure still wins"
+    local d="$SANDBOX/report-setup" out rc
+    mkdir -p "$d/e2e-plan"
+    printf '%s\n' "chromium-1-2 browser chromium 1 2" "chromium-2-2 browser chromium 2 2" >"$d/e2e-plan/entries"
+    fake_shard "$d" chromium-1-2 "$E2E_WARM_FAILED_EXIT" "ERROR: warm-up task apt failed (exit 1). Its log ends:"
+    fake_shard "$d" chromium-2-2 0 "$PW_PASS_LOG"
+    out="$(e2e_github_report "$d" 2>&1)"; rc=$?
+    if [ "$rc" = "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [[ "$out" == *"ERROR: the chromium-1-2 shard's apt setup failed"* ]]; then
+        pass "a setup failure is no verdict, and names the shard and the task"
+    else
+        fail "rc=$rc: $out"
+    fi
+
+    fake_shard "$d" chromium-2-2 1 "$PW_FAIL_LOG"
+    e2e_github_report "$d" >/dev/null 2>&1; rc=$?
+    if [ "$rc" = 1 ]; then pass "a failing test in another shard keeps the run red"; else fail "rc=$rc"; fi
+
+    fake_shard "$d" chromium-1-2 "$E2E_WARM_FAILED_EXIT" "no task named"
+    rc="$(e2e_github_shard_rc "$d" chromium-1-2 2>&1 >/dev/null)"
+    if [[ "$rc" == *"shard's warm-up setup failed"* ]]; then pass "a log with no task line still gives a message"; else fail "message: $rc"; fi
+}
+
 # fake_api_answer <remaining> <json-body>: one `gh api --include` answer.
 fake_api_answer() {
     printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: %s\r\nContent-Type: application/json\r\n\r\n%s\n' "$1" "$2"
@@ -1190,7 +1213,7 @@ test_the_apt_warm_up_drops_the_microsoft_source() {
     : >"$dir/other.list"
     rm -f "$log"
     APT_CONF_DIR="$SANDBOX/apt-conf-unused" APT_SOURCES_DIR="$dir" APT_ORDER_LOG="$log" bash -c '
-        source "$1"; sudo() { if [ "$1" = apt-get ]; then ls "$APT_SOURCES_DIR" | tr "\n" " " >>"$APT_ORDER_LOG"; else "$@"; fi; }
+        source "$1"; sudo() { if [ "$1" = pkill ]; then :; elif [ "$1" = apt-get ]; then ls "$APT_SOURCES_DIR" | tr "\n" " " >>"$APT_ORDER_LOG"; else "$@"; fi; }
         warm_apt api' _ "$shard" >/dev/null 2>&1
     if [ "$(cat "$log" 2>/dev/null)" = "other.list other.list " ] && [ ! -e "$dir/microsoft-prod.list" ]; then
         pass "apt-get ran with only other.list left"
@@ -1205,7 +1228,7 @@ test_the_apt_warm_up_bounds_every_network_wait() {
     mkdir -p "$dir" "$SANDBOX/apt-conf-sources"
     rm -f "$log" "$dir"/*
     APT_CONF_DIR="$dir" APT_SOURCES_DIR="$SANDBOX/apt-conf-sources" APT_ORDER_LOG="$log" bash -c '
-        source "$1"; sudo() { if [ "$1" = apt-get ]; then ls "$APT_CONF_DIR" | tr "\n" " " >>"$APT_ORDER_LOG"; else "$@"; fi; }
+        source "$1"; sudo() { if [ "$1" = pkill ]; then :; elif [ "$1" = apt-get ]; then ls "$APT_CONF_DIR" | tr "\n" " " >>"$APT_ORDER_LOG"; else "$@"; fi; }
         warm_apt api' _ "$shard" >/dev/null 2>&1
     if [ "$(cat "$log" 2>/dev/null)" = "99-e2e-bounded-network 99-e2e-bounded-network " ] \
         && grep -q 'Timeout "20"' "$dir/99-e2e-bounded-network" && grep -q 'Retries "2"' "$dir/99-e2e-bounded-network"; then
@@ -1222,13 +1245,107 @@ test_a_stalled_apt_attempt_is_cut_off_and_retried() {
     : >"$count"
     out="$(APT_ATTEMPT_SECONDS=1 APT_CONF_DIR="$SANDBOX/apt-retry-conf" APT_SOURCES_DIR="$SANDBOX/apt-retry-sources" \
         APT_COUNT="$count" bash -c '
-        source "$1"; sudo() { "$@"; }
+        source "$1"; sudo() { [ "$1" = pkill ] || "$@"; }
         apt_chain() { echo x >>"$APT_COUNT"; [ "$(wc -l <"$APT_COUNT")" -gt 1 ] || sleep 30; }
         SECONDS=0; warm_apt api && echo "ok after ${SECONDS}s"' _ "$shard" 2>/dev/null)"
     if [ "$(wc -l <"$count")" -eq 2 ] && [[ "$out" == "ok after "[0-9]s ]]; then
         pass "the hung attempt was killed at its deadline, and the retry won ($out)"
     else
         fail "attempts $(wc -l <"$count"), output '$out'"
+    fi
+}
+
+test_a_stalled_apt_attempt_leaves_no_apt_get_holding_the_lock() {
+    echo "test: a failed apt attempt reaps the apt-get it left behind before the next attempt"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" log="$SANDBOX/apt-reap-log" got
+    mkdir -p "$SANDBOX/apt-reap-conf" "$SANDBOX/apt-reap-sources"
+    : >"$log"
+    APT_ATTEMPT_SECONDS=1 APT_CONF_DIR="$SANDBOX/apt-reap-conf" APT_SOURCES_DIR="$SANDBOX/apt-reap-sources" \
+        APT_LOG="$log" bash -c '
+        source "$1"
+        sudo() { if [ "$1" = pkill ]; then echo "$*" >>"$APT_LOG"; else "$@"; fi; }
+        apt_chain() { echo chain >>"$APT_LOG"; [ "$(grep -c chain "$APT_LOG")" -gt 1 ] || sleep 30; }
+        warm_apt api' _ "$shard" >/dev/null 2>&1
+    got="$(tr '\n' ',' <"$log")"
+    if [ "$got" = "chain,pkill -TERM -x apt-get,chain," ]; then
+        pass "the survivor was reaped between the attempts"
+    else
+        fail "order was '$got'"
+    fi
+    if grep -q 'DPkg::Lock::Timeout' "$SANDBOX/apt-reap-conf/99-e2e-bounded-network"; then
+        pass "apt waits for a held dpkg lock instead of failing at once"
+    else
+        fail "the apt config has no lock timeout"
+    fi
+}
+
+test_a_shard_that_fails_its_warm_up_records_the_setup_code() {
+    echo "test: a shard whose warm-up wait fails writes the setup-failure code as its rc, and a test's own code never takes it"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" out="$SANDBOX/warm-fail-out" rc=0
+    E2E_GITHUB_OUT="$out" bash -c '
+        source "$1"
+        e2e_warm_wait() { echo "ERROR: warm-up task apt failed (exit 1)." >&2; return "$E2E_WARM_FAILED_EXIT"; }
+        cmd_run api-1-1 api' _ "$shard" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" = "$E2E_WARM_FAILED_EXIT" ] && [ "$(cat "$out/api-1-1/api-1-1.rc")" = "$E2E_WARM_FAILED_EXIT" ]; then
+        pass "the shard exits and records the setup-failure code"
+    else
+        fail "rc=$rc, file=$(cat "$out/api-1-1/api-1-1.rc" 2>&1)"
+    fi
+    if [ -f "$out/api-1-1/api-1-1.log" ] && grep -q "warm-up task apt failed" "$out/api-1-1/api-1-1.log"; then
+        pass "the failed wait's message reaches the shard log, so the report can name the task"
+    else
+        fail "the shard log lacks the warm-up message"
+    fi
+}
+
+test_a_retried_apt_attempt_leaves_the_azure_mirror() {
+    echo "test: the first apt attempt keeps the image's mirror, and every retry runs against the default Ubuntu one"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" src="$SANDBOX/apt-mirror-sources" log="$SANDBOX/apt-mirror-log" got
+    mkdir -p "$src" "$SANDBOX/apt-mirror-conf"
+    printf 'URIs: http://azure.archive.ubuntu.com/ubuntu/\n' >"$src/ubuntu.sources"
+    : >"$log"
+    APT_ATTEMPT_SECONDS=5 APT_CONF_DIR="$SANDBOX/apt-mirror-conf" APT_SOURCES_DIR="$src" APT_SOURCES_LIST="$src/none" APT_LOG="$log" bash -c '
+        source "$1"
+        sudo() { [ "$1" = pkill ] || "$@"; }
+        apt_chain() { grep -o "//[a-z.]*ubuntu.com" "$APT_SOURCES_DIR/ubuntu.sources" >>"$APT_LOG"; false; }
+        warm_apt api' _ "$shard" >/dev/null 2>&1
+    got="$(tr '\n' ' ' <"$log")"
+    if [ "$got" = "//azure.archive.ubuntu.com //archive.ubuntu.com //archive.ubuntu.com " ]; then
+        pass "attempt 1 used azure, attempts 2 and 3 the default mirror"
+    else
+        fail "mirrors were '$got'"
+    fi
+    if [ ! -e "$src/ubuntu.sources.bak" ]; then pass "the rewrite left no backup file"; else fail "a .bak file is left in the sources directory"; fi
+}
+
+test_the_apt_cache_restores_and_stashes_debs() {
+    echo "test: cached .deb files are copied into apt's archive, a missing cache never fails, and the stash needs debs"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" stash="$SANDBOX/apt-stash" arch="$SANDBOX/apt-arch" rc=0
+    mkdir -p "$stash" "$arch"
+    : >"$stash/fonts_1.deb"
+    APT_ARCHIVE_DIR="$arch" LUCIDOS_APT_STASH="$stash" bash -c 'source "$1"; sudo() { "$@"; }; restore_apt_archives' _ "$shard"
+    if [ -f "$arch/fonts_1.deb" ]; then pass "a cached deb reaches the archive directory"; else fail "the deb was not restored"; fi
+    APT_ARCHIVE_DIR="$arch" LUCIDOS_APT_STASH="$SANDBOX/no-such-stash" bash -c 'source "$1"; sudo() { "$@"; }; restore_apt_archives' _ "$shard" || rc=$?
+    APT_ARCHIVE_DIR="$arch" bash -c 'source "$1"; sudo() { "$@"; }; restore_apt_archives' _ "$shard" || rc=$((rc + $?))
+    if [ "$rc" = 0 ]; then pass "a missing or unset stash restores nothing and fails nothing"; else fail "restore returned $rc"; fi
+    rm -rf "$stash"
+    APT_ARCHIVE_DIR="$arch" LUCIDOS_APT_STASH="$stash" bash -c 'source "$1"; stash_apt_archives' _ "$shard"
+    if [ -f "$stash/fonts_1.deb" ]; then pass "the stash receives the archive's debs"; else fail "nothing was stashed"; fi
+    rc=0
+    APT_ARCHIVE_DIR="$SANDBOX/apt-empty" LUCIDOS_APT_STASH="$SANDBOX/apt-stash-2" bash -c 'source "$1"; stash_apt_archives' _ "$shard" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" != 0 ]; then pass "an archive with no debs fails the seed, not silently"; else fail "an empty stash passed"; fi
+}
+
+test_the_apt_cache_key_names_the_runner_image_and_playwright() {
+    echo "test: the apt cache key carries the runner image and the locked Playwright, and the stash path reaches the job env"
+    local shard="$SCRIPT_DIR/../e2e-github-shard.sh" out env_file="$SANDBOX/apt-keys-env" pw
+    : >"$env_file"
+    out="$(ImageOS=ubuntu24 ImageVersion=20261001.1 RUNNER_TEMP=/r GITHUB_OUTPUT=/dev/stdout GITHUB_ENV="$env_file" bash -c 'source "$1"; cmd_cache_keys' _ "$shard")"
+    pw="$(bash -c 'source "$1"; locked_playwright_version' _ "$shard")"
+    if [[ "$out" == *"apt=apt-archives-ubuntu24-20261001.1-playwright-$pw"* ]] && grep -qx 'LUCIDOS_APT_STASH=/r/apt-archives' "$env_file"; then
+        pass "key, stash path and job env agree"
+    else
+        fail "keys: $out; env: $(cat "$env_file")"
     fi
 }
 
@@ -1286,6 +1403,7 @@ test_attach_takes_a_run_and_its_branch_for_the_main_check_only
 test_the_report_matches_the_local_tally_and_exit_codes
 test_the_report_counts_the_engine_suite
 test_a_refused_build_is_no_verdict_and_a_failure_outranks_it
+test_a_failed_setup_is_no_verdict_and_a_failure_outranks_it
 test_the_run_state_reads_both_answers_and_the_rate_limit
 test_the_poll_speeds_up_once_a_test_job_starts
 test_the_wait_gives_up_with_no_verdict
@@ -1312,6 +1430,11 @@ test_each_job_warms_only_what_it_needs
 test_the_apt_warm_up_drops_the_microsoft_source
 test_the_apt_warm_up_bounds_every_network_wait
 test_a_stalled_apt_attempt_is_cut_off_and_retried
+test_a_stalled_apt_attempt_leaves_no_apt_get_holding_the_lock
+test_a_shard_that_fails_its_warm_up_records_the_setup_code
+test_a_retried_apt_attempt_leaves_the_azure_mirror
+test_the_apt_cache_restores_and_stashes_debs
+test_the_apt_cache_key_names_the_runner_image_and_playwright
 test_a_shard_installs_only_its_own_browser
 test_the_macos_cache_keys_name_the_pinned_builds
 

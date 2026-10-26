@@ -615,6 +615,7 @@ impl LucidosEngine {
                 thread_id,
                 namespaced_tool.to_string(),
                 args.clone(),
+                crate::engine::claude_code::GrantOffer::default(),
             )
         };
 

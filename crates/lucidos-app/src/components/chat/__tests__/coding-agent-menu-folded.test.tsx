@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /** A folded coding-agent menu draws no button, yet every way in still opens it.
  *
- *  The composer row folds the menu into the ⋯ first of all. Three paths must
+ *  The composer row folds the menu into the ⋯ right after the toggles. Three paths must
  *  still open the panel: the ⋯ row, a `/` typed in the prompt, and the global
  *  `/` shortcut. Each anchors it to the ⋯ trigger, which stands in for the
  *  button. */
@@ -126,10 +126,10 @@ describe('a folded coding-agent menu', () => {
   });
 
   it('dims its ⋯ row until the commands arrive, as the button does', async () => {
-    expect(codingAgentMenuAction('claude-code').extraClass).toBe('commands-btn');
+    expect(codingAgentMenuAction('claude-code')?.extraClass).toBe('commands-btn');
     await mountFolded();
     expect(codingAgentCommandsReady.value).toBe(true);
-    expect(codingAgentMenuAction('claude-code').extraClass).toBe('commands-btn commands-btn-active');
+    expect(codingAgentMenuAction('claude-code')?.extraClass).toBe('commands-btn commands-btn-active');
   });
 
   it('says why its ⋯ row opened nothing before the commands arrive', async () => {

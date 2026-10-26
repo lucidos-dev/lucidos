@@ -60,7 +60,7 @@ async fn spawn_driver_checking(
             input_tx,
             control_tx,
             permission_rx: None,
-            withdraw_tx: Some(withdraw_tx),
+            withdraw_tx,
         },
         cancel,
     )
@@ -797,8 +797,6 @@ async fn a_withdraw_never_overtakes_its_input() {
         .unwrap();
     agent
         .withdraw_tx
-        .as_ref()
-        .expect("Claude Code takes withdraws")
         .send(WithdrawRequest { input_uuid, reply })
         .unwrap();
     let answer = tokio::time::timeout(std::time::Duration::from_secs(10), answer)

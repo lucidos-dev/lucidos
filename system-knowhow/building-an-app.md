@@ -3,6 +3,8 @@ name: Building an App
 description: Use when the user wants to build, scaffold, edit, or extend an app: "make me an app", "build a tracker", "dashboard for X", "habit app". Also covers widgets (small inline answers), motion, live data. Covers when an app is the wrong fit, what to clarify before scaffolding, and how to iterate.
 ---
 
+<!-- domain-event: FaresRefreshed: Example domain event emitted by a fare-data refresh trigger. -->
+
 # Building an App
 
 How to guide a user from "I want X" to a working Lucidos app. File layout, SDK, and frontmatter rules live in `system-knowhow/best-practices.md`, `system-knowhow/js-sdk.md`, and `docs/taxonomy.md`. Load those when you need them.
@@ -247,7 +249,7 @@ Every app and every widget gets an icon. Lucidos draws it on the apps panel, the
 
 - **Pass `icon_svg` to `create_app`.** It saves the SVG as `assets/icon.svg` and sets the manifest's `"icon": "assets/icon.svg"`.
 - **The name is words only.** Never put an emoji or other pictograph in an app or widget name. Lucidos draws the icon beside the name, so a leading emoji shows two icons side by side. Draw the motif in the SVG icon instead.
-- **Draw for 18px.** A square `viewBox`, one bold motif in full colour, no text and no fine detail. Lucidos draws it unframed, clipped to a rounded square, so give it its own background or leave a little margin.
+- **Draw for 18px.** A square `viewBox`, one bold motif in full colour, no text and no fine detail. Lucidos clips it to a rounded square and adds a faint theme hairline inside its edge. Give it its own background or leave a little margin; Lucidos supplies the tile's border.
 - **The field has one meaning:** a relative path inside the app folder to an SVG, PNG or WebP file of at most 512 KiB. An emoji, a glyph name, a `..` path or a missing file counts as no icon.
 - **Without a valid icon, a monogram tile stands in:** the first letter of the name on a tile coloured from the theme. It is a fallback, not a design choice.
 - **To add or change an icon later,** write the file under `assets/` and set `icon` in `manifest.json`.
@@ -344,7 +346,7 @@ A "no" on any line means the app is not finished:
 - **Use the SDK for everything stateful.** `lucidos.data.read` / `lucidos.data.write` are the right primitives, and `lucidos.storage` holds per-device state. Inside the host shell, a direct `fetch` to `/api/v1/*` has no network at all. An app frame's origin is opaque, so the engine is cross-origin to it and CORS refuses the answer. `localStorage` and `new EventSource` fail the same way, and the SDK carries all three over a bridge to the host. Where no SDK method covers the endpoint, see `system-knowhow/js-sdk.md` § `lucidos.apiUrl` for what a frame can and cannot reach.
 - **External APIs: call `lucidos.proxy(name).fetch(path, init)`. Always.** Configure the backend in `data/config/apis.json`; the engine forwards server-side and injects the configured auth header. Never paste credentials into iframe code.
 
-  **Model providers are built in**: `lucidos.proxy('openai' | 'vertex' | 'openrouter' | 'xai' | 'anthropic' | 'local').fetch(...)` needs no `apis.json` entry. The engine reuses its own provider credential from Settings → Models, and an `apis.json` entry of the same name overrides it. See `system-knowhow/js-sdk.md` § `lucidos.proxy` → "Built-in model-provider proxies". Two wrong shapes look right:
+  **Model providers are built in**: `lucidos.proxy('openai' | 'vertex' | 'openrouter' | 'xai' | 'anthropic' | 'local' | 'typesafe').fetch(...)` needs no `apis.json` entry. The engine reuses its own provider credential from Settings → Models, and an `apis.json` entry of the same name overrides it. See `system-knowhow/js-sdk.md` § `lucidos.proxy` → "Built-in model-provider proxies". Two wrong shapes look right:
   - `fetch('https://<external-host>/...')` from the iframe: mixed-content / CORS blocks it, and any credential sits in the iframe.
   - `fetch('/api/v1/proxy/<name>/...')` from the iframe: the helper's own URL, written by hand. Inside the host shell the frame's own `fetch` cannot reach the engine at all. Elsewhere it makes the proxy name a magic string and skips future SDK-side concerns (timeouts, retries, response parsing, error shape).
 - **Manifest description matters.** The user finds the app in the launcher by it, and the engine LLM learns what the app is for. Write it like a one-line README, not a tagline.

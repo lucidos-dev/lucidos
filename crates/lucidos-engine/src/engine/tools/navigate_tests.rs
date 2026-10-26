@@ -90,6 +90,7 @@ async fn answer_from(bus: &EventBus, thread_id: Uuid, from: &str) {
                 description: None,
                 preview: None,
                 widget: None,
+                quiet: false,
             }],
             worktree_path: None,
             multi_select: false,
@@ -104,6 +105,7 @@ async fn answer_from(bus: &EventBus, thread_id: Uuid, from: &str) {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id,
+            quiet: false,
             answer: AnswerKind::Selected {
                 option_id: "opt-0".into(),
             },

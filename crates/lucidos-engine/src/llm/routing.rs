@@ -414,6 +414,13 @@ impl LlmProvider for RoutingProvider {
         let mut response = outcome?;
         let route = resolved.route;
         response.provider = Some(route.provider);
+        // Probes showed only OpenRouter keeps a marker's TTL (ADR 0575).
+        if route.provider != ProviderKind::OpenRouter {
+            response.cache_creation_requested_ttl = None;
+        }
+        if let Some(pair) = response.prefill.as_mut() {
+            pair.routed(route.provider, &resolved.model);
+        }
         if let Some(served) = response.served_model.as_deref() {
             if !served_as_sent(&route.wire_id, served) {
                 crate::log!(
@@ -423,6 +430,24 @@ impl LlmProvider for RoutingProvider {
                 );
             }
         }
+        Ok(response)
+    }
+
+    /// Send the beat to the backend that served its turn, never another.
+    async fn prefill(
+        &self,
+        body: &crate::llm::prefill::PrefillBody,
+        call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, BoxError> {
+        let kind = body
+            .provider
+            .ok_or_else(|| crate::llm::prefill::cannot_prefill(None))?;
+        let backend = self
+            .backend(kind)
+            .ok_or_else(|| unconfigured_message(kind))?;
+        crate::llm::call_trace::routed_to(kind);
+        let mut response = backend.prefill(body, call).await?;
+        response.provider = Some(kind);
         Ok(response)
     }
 
@@ -854,6 +879,114 @@ mod tests {
             .await
             .expect("the backend answers");
         assert_eq!(response.provider, Some(ProviderKind::Local));
+        assert!(
+            response.prefill.is_none(),
+            "a local model cannot be prefilled"
+        );
+    }
+
+    /// A marked request asks for a 5-minute cache, and only OpenRouter has
+    /// shown it honours that. The same request on any other route records no
+    /// requested TTL, so its TTL stays Unknown.
+    #[tokio::test]
+    async fn a_requested_ttl_survives_only_on_a_route_that_honours_it() {
+        const MODEL: &str = "anthropic/claude-opus-5-5";
+        for (kind, kept) in [
+            (ProviderKind::OpenRouter, true),
+            (ProviderKind::Local, false),
+            (ProviderKind::OpenAi, false),
+        ] {
+            let (backend, _hits) = answering_backend(
+                "200 OK",
+                concat!(
+                    r#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],"#,
+                    r#""usage":{"prompt_tokens":900,"completion_tokens":1,"#,
+                    r#""prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":880}}}"#,
+                    "\n\ndata: [DONE]\n\n"
+                ),
+            )
+            .await;
+            let mut backends = RoutingBackends::default();
+            match kind {
+                ProviderKind::OpenRouter => backends.openrouter = Some(backend),
+                ProviderKind::Local => backends.local = Some(backend),
+                _ => backends.openai = Some(backend),
+            }
+            let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::from([(
+                MODEL.to_string(),
+                ModelRouting::single(kind, MODEL),
+            )])));
+            let router = RoutingProvider::new(backends, registry, MODEL.to_string());
+            let response = router
+                .chat(
+                    vec![crate::llm::Message {
+                        role: "user".to_string(),
+                        content: crate::llm::MessageContent::Text("hello".to_string()),
+                    }],
+                    vec![],
+                    ModelSelection::model(MODEL),
+                    Some("system"),
+                    None,
+                    crate::llm::metered::CallToken::for_test(),
+                )
+                .await
+                .expect("the backend answers");
+            let expected = kept.then_some(crate::llm::cache_lifetime::CacheLifetime::FiveMinutes);
+            assert_eq!(response.cache_creation_requested_ttl, expected, "{kind:?}");
+        }
+    }
+
+    fn prefill_body(provider: Option<ProviderKind>) -> crate::llm::prefill::PrefillBody {
+        crate::llm::prefill::PrefillBody {
+            provider,
+            model: "local-model".to_string(),
+            reasoning_effort: None,
+            output_cap: Some(0),
+            reply: crate::llm::prefill::ReplyShape::Json,
+            wire_model: "local-model".to_string(),
+            betas: Vec::new(),
+            body: bytes::Bytes::from_static(b"{}"),
+        }
+    }
+
+    /// A beat goes to the backend its body names, and nowhere else. A body
+    /// naming none, or an unconfigured backend, sends nothing. The local
+    /// backend's reply here carries no usage block, so its beat fails.
+    #[tokio::test]
+    async fn a_beat_goes_only_to_the_backend_that_served_its_turn() {
+        let (local, hits) = answering_backend("200 OK", "{}").await;
+        let registry: ModelRegistry = Arc::new(RwLock::new(HashMap::new()));
+        let router = RoutingProvider::new(
+            RoutingBackends {
+                local: Some(local),
+                ..RoutingBackends::default()
+            },
+            registry,
+            "local-model".to_string(),
+        );
+        let beat = |provider| {
+            let router = &router;
+            async move {
+                router
+                    .prefill(
+                        &prefill_body(provider),
+                        crate::llm::metered::CallToken::for_test(),
+                    )
+                    .await
+                    .expect_err("no beat lands here")
+                    .to_string()
+            }
+        };
+        assert!(beat(None).await.contains("cannot prefill"));
+        assert_eq!(
+            beat(Some(ProviderKind::Vertex)).await,
+            unconfigured_message(ProviderKind::Vertex)
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(beat(Some(ProviderKind::Local))
+            .await
+            .contains("no usage block"));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// An OpenAI backend at a local port that records each request it is sent

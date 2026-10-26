@@ -17,6 +17,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
 use crate::api::ChatImage;
+use crate::core::db_retry::retry_transient_read;
 use crate::core::store::{
     format_child_report_filed_block, format_child_thread_completed_block, EventStore,
 };
@@ -173,18 +174,22 @@ pub(crate) struct StrandedFollowUp {
 }
 
 /// Run [`STRANDED_FOLLOW_UPS_SQL`] and rebuild each input with its images.
+/// A dropped connection is retried, so a Postgres restart does not fail the
+/// session that asks.
 pub(crate) async fn stranded_follow_ups(
     pool: &sqlx::PgPool,
     workspace: &Path,
     thread_id: Uuid,
     first_prompt: &[Uuid],
 ) -> Result<Vec<StrandedFollowUp>, sqlx::Error> {
-    let rows: Vec<EventRow> = sqlx::query_as(STRANDED_FOLLOW_UPS_SQL.as_str())
-        .bind(thread_id)
-        .bind(first_prompt)
-        .bind(CACHE_KEEP_ALIVE_REASON_KIND)
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<EventRow> = retry_transient_read("The stranded follow-ups check", || {
+        sqlx::query_as(STRANDED_FOLLOW_UPS_SQL.as_str())
+            .bind(thread_id)
+            .bind(first_prompt)
+            .bind(CACHE_KEEP_ALIVE_REASON_KIND)
+            .fetch_all(pool)
+    })
+    .await?;
     Ok(rebuilt_inputs(pool, rows)
         .await
         .into_iter()

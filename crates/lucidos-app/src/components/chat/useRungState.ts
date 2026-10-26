@@ -20,7 +20,7 @@ import { decodePair, type ModelChoice, type TierChoice } from '../../store/model
 import { openIntelligenceLadder } from '../../store/actions/menu';
 import { displayModelName } from '../../store/thread-events/exchange';
 import { LADDER_LINK_VALUE, rungListRows } from './rungRows';
-import { rungFaces, rungLockedReason, shownRung, stepTargets, type ShownRung } from './rungControlParts';
+import { rungLockedReason, shownRung, stepTargets, type ShownRung } from './rungControlParts';
 import { menuCodingAgent } from './ControlMenuTrigger';
 import { CODING_AGENT_NAME } from './agentExitCopy';
 import { askRungSwitch, registerSendGate } from './rungSwitch';
@@ -44,6 +44,15 @@ interface RungData {
   currentEffort: CodingAgentReasoningEffort | null;
   defaultImplementer: CodingAgentCommandsResponse['default_implementer'];
   ladderRungs: CodingAgentLadderRung[];
+}
+
+/** The last read per request key. A control that remounts starts from what it
+ *  showed and refreshes in place, instead of drawing again from nothing. */
+const lastRead = new Map<string, RungData>();
+
+function cachedRead(requestKey: string): Loadable<RungData> {
+  const data = lastRead.get(requestKey);
+  return data ? { status: 'loaded', data } : { status: 'not-loaded' };
 }
 
 const NO_DATA: RungData = {
@@ -73,13 +82,17 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
   const loadSeqRef = useRef(0);
   const retryTimerRef = useRef<number | null>(null);
   const retryCountRef = useRef(0);
-  const read = useSignal<Loadable<RungData>>({ status: 'not-loaded' });
+  const inCompose = !threadId;
+  const agent = menuCodingAgent(codingAgent, threadId, composeThreadId);
+  // Keyed on what the request sends, read in render, so a prop change counts
+  // too. Never a signal effect: it re-runs on signals only, and the control
+  // stays mounted across a draft switch.
+  const requestKey = threadId ?? `compose:${scopeToRepoId(resolveScope(composeThreadId)) ?? ''}:${agent}`;
+  const read = useSignal<Loadable<RungData>>(cachedRead(requestKey));
   const sending = useSignal(false);
   const { commands, currentModel, currentEffort, defaultImplementer, ladderRungs } =
     loadedOr(read.value, NO_DATA);
 
-  const inCompose = !threadId;
-  const agent = menuCodingAgent(codingAgent, threadId, composeThreadId);
   const draftOverride = inCompose ? getComposeSelectionOverride(composeThreadId) : null;
   /** The pick held under this thread's Successor card, read live so the send
    *  gate sees the card close without waiting for a render. */
@@ -133,6 +146,12 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     }
   }
 
+  /** Show a read and keep it for the next control mounted on this key. */
+  function setLoaded(key: string, data: RungData) {
+    lastRead.set(key, data);
+    read.value = { status: 'loaded', data };
+  }
+
   /** An action, never a dependency: its response writes signals this hook
    *  reads, so none of them may subscribe the effect that called it. */
   function load() {
@@ -153,16 +172,13 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     fetchCodingAgentCommands(threadId, repoId, requestAgent)
       .then((res) => {
         if (seq !== loadSeqRef.current) return;
-        read.value = {
-          status: 'loaded',
-          data: {
-            commands: res.control_commands,
-            currentModel: (res.current_model as CodingAgentModelValue) ?? null,
-            currentEffort: (res.current_reasoning_effort as CodingAgentReasoningEffort) ?? null,
-            defaultImplementer: res.default_implementer ?? null,
-            ladderRungs: res.ladder_rungs ?? [],
-          },
-        };
+        setLoaded(requestKey, {
+          commands: res.control_commands,
+          currentModel: (res.current_model as CodingAgentModelValue) ?? null,
+          currentEffort: (res.current_reasoning_effort as CodingAgentReasoningEffort) ?? null,
+          defaultImplementer: res.default_implementer ?? null,
+          ladderRungs: res.ladder_rungs ?? [],
+        });
         retryCountRef.current = 0;
       })
       .catch((err: unknown) => {
@@ -178,13 +194,9 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
       });
   }
 
-  // Keyed on what the request sends, read in render, so a prop change counts
-  // too. Never a signal effect: it re-runs on signals only, and the control
-  // stays mounted across a draft switch.
-  const requestKey = threadId ?? `compose:${scopeToRepoId(resolveScope(composeThreadId)) ?? ''}:${agent}`;
   useEffect(() => {
     retryCountRef.current = 0;
-    read.value = { status: 'not-loaded' };
+    read.value = cachedRead(requestKey);
     load();
     return clearRetryTimer;
   }, [requestKey]);
@@ -233,12 +245,11 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     agentName: CODING_AGENT_NAME[agent],
     modelLabel: displayModelName,
   });
-  const faces = rungFaces(ladderRungs, (rung) => [rung.label]);
 
   /** Record what a control request just recorded on the engine. */
   function patchData(patch: Partial<RungData>) {
     const loadedData = read.value;
-    if (loadedData.status === 'loaded') read.value = { status: 'loaded', data: { ...loadedData.data, ...patch } };
+    if (loadedData.status === 'loaded') setLoaded(requestKey, { ...loadedData.data, ...patch });
   }
 
   /** The model a pick runs, as the engine's price table names it. */
@@ -249,7 +260,7 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
   /** Whether a pick on a started thread goes ahead, whether or not its session
    *  is live. A switch that keeps the cache is silent. One that rebuilds it
    *  asks first, and only `switch` lets the caller store the pick. A handoff
-   *  starts the new thread here. `alwaysAsk` asks even when the cache is kept. */
+   *  starts a fresh session here. `alwaysAsk` asks even when the cache is kept. */
   async function switchProceeds(
     startedThreadId: string,
     pair: { model: string; effort: string | null },
@@ -263,20 +274,21 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
       showToast(`Could not check what switching to ${label} costs: ${errorDetail(err)}`, 'error');
       return false;
     }
-    if (!estimate.rebuilds_cache && !alwaysAsk) return true;
+    if (estimate.rebuilds_cache === 'no' && !alwaysAsk) return true;
     const implementer: SuccessorImplementer = { coding_agent_model: pair.model, reasoning_effort: pair.effort };
     const startedThread = threadMap.value.get(startedThreadId);
     const choice = await askRungSwitch({
       from: rungList.rows.find(r => r.value === rungList.current)?.label ?? 'this rung',
       to: label,
       extraCostUsd: estimate.extra_cost_usd,
+      rebuild: estimate.rebuilds_cache,
       canHandOff: startedThread !== undefined && effectiveThreadStatus(startedThread) === 'idle',
     });
     if (choice === 'handoff') {
       try {
         await continueInSuccessor(startedThreadId, implementer);
       } catch (err) {
-        showToast(`Could not continue in a new thread on ${label}: ${errorDetail(err)}`, 'error');
+        showToast(`Could not continue in a fresh session on ${label}: ${errorDetail(err)}`, 'error');
       }
     }
     return choice === 'switch';
@@ -379,5 +391,5 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     void pickModelSelection(target, label, true);
   }
 
-  return { sending, lockedReason, shown, faces, rungList, pickRung, steps, step };
+  return { sending, shown, rungList, pickRung, steps, step };
 }

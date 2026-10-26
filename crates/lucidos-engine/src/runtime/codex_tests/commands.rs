@@ -632,3 +632,44 @@ fn write_image_files_decodes_and_names_by_mime() {
     drop(guards);
     assert!(!paths[0].exists(), "temp files are cleaned up on drop");
 }
+
+/// A daemon a sandboxed session starts inherits its seatbelt and then refuses
+/// every other worktree's writes. Codex compiles through no shared daemon.
+#[test]
+fn the_baked_env_compiles_without_the_shared_sccache_daemon() {
+    use crate::runtime::agent_run_marker::AgentRun;
+    let workspace = tempfile::TempDir::new().expect("tempdir");
+    let args = SpawnArgs {
+        worktree_path: workspace.path(),
+        coding_agent_kind: Default::default(),
+        workspace_path: workspace.path(),
+        allowed_tools: None,
+        system_prompt: None,
+        session_context: None,
+        resume_session_id: None,
+        model: None,
+        reasoning_effort: None,
+        thread_id: uuid::Uuid::new_v4(),
+        spawning_event_id: None,
+        repo_name: None,
+        interactive: false,
+        user_env_vars: &[],
+        account_pin: None,
+        binary_override: None,
+        permission_mode: None,
+        additional_directories: &[],
+        auto_compact: None,
+        notes: crate::runtime::claude_code_provider::NotesVisibility::Hidden,
+        agent_run: AgentRun::unrecorded(),
+    };
+    let (env, _) = baked_lucidos_env(&args, None);
+    let value_of = |name: &str| {
+        env.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    };
+    assert_eq!(value_of("RUSTC_WRAPPER").as_deref(), Some(""));
+    for name in ["SCCACHE_SERVER_PORT", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE"] {
+        assert_eq!(value_of(name), None, "{name} reached a sandboxed agent");
+    }
+}

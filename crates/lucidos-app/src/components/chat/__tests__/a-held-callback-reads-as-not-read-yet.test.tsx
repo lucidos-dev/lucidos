@@ -75,7 +75,7 @@ function draw(exchange: Exchange, awaitingAnswer: boolean, extra: { isQueued?: b
         isLast={true}
         threadId="tid"
         threadIsCC={false}
-        threadCodingAgent="claude-code"
+        sessionCodingAgent="claude-code"
         threadIdle={awaitingAnswer}
         threadAwaitingAnswer={awaitingAnswer}
         threadCanceling={false}

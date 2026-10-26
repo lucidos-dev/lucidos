@@ -1,6 +1,7 @@
 use super::*;
 use crate::runtime::agent_runtime::{
-    AgentEvent, AgentInput, AgentPermissionRequest, ControlRequest,
+    AgentEvent, AgentInput, AgentPermissionRequest, ControlRequest, InputWithdrawal,
+    WithdrawRequest,
 };
 use crate::runtime::codex::CodexConfig;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ struct StubSession {
     events_rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     input_tx: tokio::sync::mpsc::UnboundedSender<AgentInput>,
     control_tx: tokio::sync::mpsc::UnboundedSender<ControlRequest>,
+    withdraw_tx: tokio::sync::mpsc::UnboundedSender<WithdrawRequest>,
     permission_rx: tokio::sync::mpsc::UnboundedReceiver<AgentPermissionRequest>,
     cancel: CancellationToken,
 }
@@ -92,6 +94,7 @@ fn stub_driver_scripted(stub: &str, resume: Option<&str>) -> StubSession {
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (withdraw_tx, withdraw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (permission_tx, permission_rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     tokio::spawn(app_server_driver_task(
@@ -100,6 +103,7 @@ fn stub_driver_scripted(stub: &str, resume: Option<&str>) -> StubSession {
         events_tx,
         input_rx,
         control_rx,
+        withdraw_rx,
         permission_tx,
         cancel.clone(),
     ));
@@ -109,6 +113,7 @@ fn stub_driver_scripted(stub: &str, resume: Option<&str>) -> StubSession {
         events_rx,
         input_tx,
         control_tx,
+        withdraw_tx,
         permission_rx,
         cancel,
     }
@@ -393,6 +398,79 @@ async fn approval_deny_sends_decline() {
     s.cancel.cancel();
 }
 
+/// Ask the driver to take back `input_uuid` and return its answer.
+async fn withdraw(s: &StubSession, input_uuid: uuid::Uuid) -> InputWithdrawal {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    s.withdraw_tx
+        .send(WithdrawRequest { input_uuid, reply })
+        .expect("driver alive");
+    tokio::time::timeout(std::time::Duration::from_secs(10), answer)
+        .await
+        .expect("withdraw answered within 10s")
+        .expect("driver answered")
+}
+
+fn input(text: &str) -> AgentInput {
+    AgentInput {
+        text: text.into(),
+        images: vec![],
+        uuid: uuid::Uuid::new_v4(),
+    }
+}
+
+#[tokio::test]
+async fn withdraw_drops_a_queued_input_and_refuses_the_one_in_flight() {
+    // A turn that ends only on interrupt, so the second input stays queued.
+    let turn_body = r#"printf '{"method":"item/started","params":{"threadId":"t-1","turnId":"turn-1","startedAtMs":1,"item":{"id":"i9","type":"commandExecution","command":"sleep 99","commandActions":[],"cwd":"/wt","status":"inProgress"}}}\n'"#;
+    let mut s = stub_driver(turn_body, None);
+    let running = input("running");
+    s.input_tx.send(running.clone()).unwrap();
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::InputRead { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::ToolUse { .. }
+    ));
+
+    let queued = input("queued report");
+    s.input_tx.send(queued.clone()).unwrap();
+    assert_eq!(withdraw(&s, queued.uuid).await, InputWithdrawal::Withdrawn);
+    assert_eq!(
+        withdraw(&s, running.uuid).await,
+        InputWithdrawal::AlreadyRead
+    );
+
+    s.control_tx.send(ControlRequest::Interrupt).unwrap();
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::ToolResult { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::Result { .. }
+    ));
+
+    // The next turn runs the next input, never the withdrawn one.
+    let next = input("next");
+    s.input_tx.send(next.clone()).unwrap();
+    assert!(matches!(
+        next_event(&mut s.events_rx).await,
+        AgentEvent::InputRead { input } if input == next.uuid
+    ));
+    let requests = logged_requests(&s.requests_log);
+    assert!(
+        !requests.iter().any(|r| r.contains("queued report")),
+        "a withdrawn input must never reach turn/start: {requests:?}"
+    );
+    s.cancel.cancel();
+}
+
 #[tokio::test]
 async fn interrupt_sends_turn_interrupt_and_turn_ends_canceled() {
     // A turn that never completes on its own — only the interrupt path (the
@@ -562,6 +640,7 @@ done
         events_tx,
         input_rx,
         control_rx,
+        tokio::sync::mpsc::unbounded_channel().1,
         permission_tx,
         cancel.clone(),
     ));
@@ -761,6 +840,7 @@ async fn the_stderr_tail_masks_the_spawns_injected_secrets() {
         events_tx,
         input_rx,
         control_rx,
+        tokio::sync::mpsc::unbounded_channel().1,
         permission_tx,
         CancellationToken::new(),
     ));

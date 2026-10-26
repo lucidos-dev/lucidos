@@ -435,7 +435,9 @@ export function waitingPanelBody({
             </ul>
           </section>
         ) : null}
-        {keepAlive ? <KeepAliveSection status={keepAlive} subThreadCount={subThreadCount(subThreads)} /> : null}
+        {keepAlive ? (
+          <KeepAliveSection threadId={threadId} status={keepAlive} />
+        ) : null}
       </div>
     </>
   );

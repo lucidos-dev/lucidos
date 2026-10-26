@@ -9,6 +9,7 @@ pub mod changes;
 pub mod changes_projection;
 pub mod credentials;
 pub mod data_prefixes;
+pub mod db_retry;
 pub mod device_presence;
 pub mod devices;
 pub mod email;
@@ -1394,7 +1395,7 @@ pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Opt
         "grep_files" => describe_search_result(result, "matches"),
         "search_artifacts" => Some(format!("{} results", result.lines().count())),
         "run_python" | "run_bash" => result.lines().next().map(|l| truncate(l, 100)),
-        "write_file" | "edit_file" | "create_app" | "execute_intent" => Some("Done".to_string()),
+        "write_file" | "edit_file" | "create_app" | "execute_intent" => Some("Done".to_string()), // Includes the retired intent tool.
         "git_commit" => result.lines().next().map(|l| truncate(l, 80)),
         "git_diff" | "git_log" => Some(format!("{} lines", result.lines().count())),
         "http_request" | "proxy_request" => result.lines().next().map(|l| truncate(l, 80)),
@@ -1448,6 +1449,14 @@ fn drafts_label(args: &serde_json::Value) -> String {
     match args["thread_id"].as_str().map(str::trim) {
         Some(id) if !id.is_empty() => "Reading a thread's draft...".to_string(),
         _ => "Listing unsent drafts...".to_string(),
+    }
+}
+
+/// The step label for the per-thread cache keep-alive switch.
+fn keep_alive_switch_label(args: &serde_json::Value) -> String {
+    match args["state"].as_str() {
+        Some("on") => "Turning the cache keep-alive back on...".to_string(),
+        _ => "Turning the cache keep-alive off for a thread...".to_string(),
     }
 }
 
@@ -1839,6 +1848,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "list_held_messages" => "Listing held messages...".to_string(),
         "detach_child_thread" => "Moving a child thread to top level...".to_string(),
         "archive_thread" => "Archiving a thread...".to_string(),
+        "switch_cache_keep_alive" => keep_alive_switch_label(args),
         "request_read" => match args[crate::llm::tools::READ_ARG].as_bool() {
             Some(false) => "No read needed".to_string(),
             _ => "Asking you to read this reply...".to_string(),
@@ -2040,6 +2050,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("held_messages") => "Listing held messages...".to_string(),
             Some("detach_child") => "Moving a child thread to top level...".to_string(),
             Some("archive") => "Archiving a thread...".to_string(),
+            Some("cache_keep_alive") => keep_alive_switch_label(args),
             Some("triage") => "Triaging threads...".to_string(),
             Some("apply_triage") => "Applying the approved triage...".to_string(),
             _ => "Listing threads...".to_string(),

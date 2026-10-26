@@ -51,7 +51,7 @@ vi.mock('../../api/client', () => ({
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
-const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting, openCacheWarmLineSetting, openIntelligenceLadder } = await import('./menu');
+const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings, openWebhookSettings, openCaptureContextSetting, openCacheCardsSetting, openCacheKeepAliveSetting, openIntelligenceLadder } = await import('./menu');
 
 const fakeApp: App = {
   id: 'trip-planner',
@@ -373,13 +373,35 @@ describe('Debugging row deep links', () => {
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });
 
-  it('lands on the Cache-warm line row in Settings > Debugging', () => {
-    // The cache-warm line's explainer link. Without the scroll target the
+  it('lands on the Cache cards row in Settings > Debugging', () => {
+    // Every cache explainer's link. Without the scroll target the
     // page opens at its top and the row the link names is not marked.
-    openCacheWarmLineSetting();
+    openCacheCardsSetting();
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('debugging');
-    expect(settingsScrollTarget.value).toBe('debugging:cache-warm-line');
+    expect(settingsScrollTarget.value).toBe('debugging:cache-cards');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Coding Agents row deep links', () => {
+  beforeEach(() => {
+    activeMenuItem.value = 'files';
+    settingsSubview.value = 'main';
+    settingsScrollTarget.value = null;
+    panelOverlay.value = null;
+    pushNavState.mockClear();
+    revealContentPane.mockClear();
+  });
+
+  it('lands on the Cache keep-alive section in Settings > Models', () => {
+    // The cache-warm line's explainer link. The scroll target marks the
+    // section the explainer names.
+    openCacheKeepAliveSetting();
+    expect(activeMenuItem.value).toBe('settings');
+    expect(settingsSubview.value).toBe('models');
+    expect(settingsScrollTarget.value).toBe('models:cache-keep-alive');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });

@@ -40,13 +40,11 @@ Read **both** columns that matter:
 | `*:5251` | all interfaces. Reachable on the LAN IP and the tailnet `100.x` IP. |
 | `100.x.y.z:5251` | bound to the tailnet address specifically. |
 
-Expect one `lucidos-gateway` row per install, plus one `lucidos-engine` row per
-running workspace. **Every engine should read `127.0.0.1`**, packaged and dev
-alike. The gateway is the only network-facing surface, because it alone
-authenticates callers. An engine row on `*:` or a `100.x` address means
-something set `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0`: that workspace is reachable
-with no credential. Hand a remote device the **gateway** port, which routes to
-every workspace by slug.
+Expect a gateway listener for each running install. Gateway-managed engines
+bind loopback in both packaged and dev setups. A directly launched engine can
+use a wider bind, but then requires a local credential. See § An engine that
+faces a network asks for a credential. Inspect its launch command and bind settings.
+Hand remote devices the gateway port, which routes workspaces by slug.
 
 ### Step 2: which port speaks TLS
 
@@ -198,7 +196,7 @@ mutating `tailscale` command, so it never re-arms a funnel you turned off.
 
 It catches one address family going dark while the other still works, which
 one probe alone would miss. The outage shows as a bar across the app and a line
-on the row in **Settings > Webhooks**. It emits `WebhookIngressDegraded` and
+on the row in **Settings → Webhooks**. It emits `WebhookIngressDegraded` and
 `WebhookIngressRecovered` once each per outage, for a *trigger* to act on.
 
 **A sleeping computer is not a dead funnel.** A round the machine slept
@@ -421,9 +419,9 @@ installed *and* trusted:
 
 1. `mkcert -CAROOT` prints the directory holding `rootCA.pem`.
 2. Transfer `rootCA.pem` to the device (AirDrop is easiest for iOS).
-3. Open it on iOS, then **Settings → General → VPN & Device Management** and
+3. Open it on iOS, then **iOS Settings → General → VPN & Device Management** and
    install the downloaded profile.
-4. **Separately** go to **Settings → General → About → Certificate Trust
+4. **Separately** go to **iOS Settings → General → About → Certificate Trust
    Settings** and toggle the mkcert root on.
 
 **Step 4 is the one everybody misses.** The profile alone leaves the CA present
@@ -638,6 +636,10 @@ Access adds a device. **Settings → Devices** lists every device and holds
 Both halves key on the id the gateway minted at pairing, so each device has one
 row. (There used to be separate **Paired devices** and **Devices** lists.)
 
+An unused device folds into a collapsed **Unused devices** group at the end.
+Unused means not this device, no push and not paired. Expand the group to
+**Remove** one.
+
 A row can lack either half, and neither is an error. A device paired from
 another workspace holds nothing here yet, and its row says **Not set up in this
 workspace**. It keeps a push toggle, off and disabled, because push hangs off
@@ -721,6 +723,9 @@ debugging:
 
 - A machine with **MagicDNS disabled** has a tailnet address and no name. It is
   still on the tailnet, with no HTTPS name to serve.
+- A machine with **Use Tailscale DNS settings** turned off still gets its name.
+  When the system lookup finds nothing, the reverse lookup goes straight to
+  Tailscale's resolver at `100.100.100.100`, which answers either way.
 - A CLI is needed for **`tailscale serve` only** (and the Sign in button).
   `serve` has no GUI, config-file or admin-console equivalent. So a Mac without
   a CLI can be described but not exposed. The page says so and names two ways
@@ -770,9 +775,9 @@ actions. Every step is indeterminate, so both spin rather than show a bar.
 | Waiting for HTTPS to come up | The mapping is written; polling 443 for up to 30s, because a first-run certificate takes a moment |
 
 The run ends as the `https://...ts.net` address, an error shown verbatim, or
-nothing if cancelled. **Cancel** is offered throughout and leaves no serve
-config behind (killing the child before it commits writes nothing). Only one
-run exists at a time: pressing Expose during one is refused. The button reads
+nothing if cancelled. **Cancel** stops the pending attempt. A mapping already
+configured can remain; inspect `tailscale serve status`. Only one run exists
+at a time: pressing Expose during one is refused. The button reads
 "Setting up…" and stays disabled even if you navigate away and back, because
 the run lives in the app, not the page.
 
@@ -835,7 +840,7 @@ bound beyond loopback. `tailscale serve` does not, since it proxies locally.
 - **`[engine] inherit` reaches a directly-launched engine, not one the gateway
   spawned.** A gateway-spawned engine is pinned to loopback whatever the file
   says, since the gateway is the only door that authenticates.
-- Edit it from the **workspace picker → Settings → Network access** (the
+- Edit it from the **workspace picker's header gear → Network access** (the
   gateway bind), or per workspace in **Settings → Access → Network access** (the
   engine bind, when `inherit` is off).
 - `./install.sh --bind all` writes the same file.

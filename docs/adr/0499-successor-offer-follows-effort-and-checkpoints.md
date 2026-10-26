@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Amends**: 0486
+- **Amended by**: [0557: Harden hands off onto the default rung](0557-harden-runs-on-the-default-floor.md)
 - **Date**: 2026-10-16
 
 ## Context

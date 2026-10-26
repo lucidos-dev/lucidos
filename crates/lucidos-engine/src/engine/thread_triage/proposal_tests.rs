@@ -128,6 +128,7 @@ async fn answering_a_question_card_counts_as_the_users_reply() {
         thread_id: caller,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: "approve-triage".into(),
+            quiet: false,
             answer: AnswerKind::Selected {
                 option_id: "apply".into(),
             },

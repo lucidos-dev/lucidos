@@ -32,6 +32,8 @@ mod cli;
 pub use cli::{resolve_tailscale_binary, tailscale_binary, TAILSCALE_CANDIDATES};
 
 #[cfg(unix)]
+mod quad100;
+#[cfg(unix)]
 mod unix;
 
 /// Is this address inside Tailscale's `100.64.0.0/10` CGNAT range?
@@ -83,6 +85,10 @@ pub fn tailnet_ipv4() -> Option<Ipv4Addr> {
 
 /// The MagicDNS name for a tailnet address (`<machine>.<tailnet>.ts.net`, no
 /// trailing dot, no scheme), via a reverse lookup bounded by `timeout`.
+///
+/// The system resolver goes first. When it finds nothing, the same question
+/// goes straight to Tailscale's resolver, which still answers while the machine
+/// ignores Tailscale's DNS settings.
 ///
 /// **A `None` here does not mean "not on a tailnet."** MagicDNS is a per-tailnet
 /// toggle, so a node with it disabled has an address and no name. Callers must

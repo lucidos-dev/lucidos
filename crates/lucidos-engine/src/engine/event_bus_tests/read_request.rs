@@ -1,7 +1,7 @@
 //! A thread's agent asks the user to read its latest reply (ADR 0409).
 //!
-//! `ThreadReadRequested` sets `read_requested`. A sighting, a human message or
-//! an archive clears it, and so does a change that lists the thread
+//! `ThreadReadRequested` sets `read_requested`. A sighting, a human message, a
+//! human answer or an archive clears it, and so does a change that lists the thread
 //! elsewhere: a `ThreadReadNotRequested`
 //! projects nothing. Each test pins one invariant of
 //! `docs/plans/2026-10-10-agent-read-request.md`,
@@ -109,6 +109,63 @@ async fn a_human_message_clears_it_and_an_agent_message_does_not() {
 
     emit_thread_message(&bus, thread_id, None, "thanks, now do the next one").await;
     assert!(!read_requested(&pool, thread_id).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+async fn emit_answer(bus: &EventBus, thread_id: Uuid, actor: Option<MessageOrigin>, quiet: bool) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAnswered {
+            tool_use_id: Uuid::new_v4().to_string(),
+            answer: AnswerKind::Selected {
+                option_id: "opt-0".into(),
+            },
+            quiet,
+        },
+        meta: EventMeta {
+            actor,
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+}
+
+/// The question card ends the reply, so a user's answer reads it, as a typed
+/// message does. A turn that asked to be read and then asked a question must
+/// not stay in Review after the user answered.
+#[tokio::test]
+async fn a_human_answer_clears_it_and_an_agent_or_engine_answer_does_not() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = requested_chat_thread(&bus).await;
+    emit_answer(&bus, thread_id, None, false).await;
+    let parent = MessageOrigin::Api {
+        user_agent: None,
+        mode: ActorMode::Agent,
+        source_thread_id: Some(Uuid::new_v4()),
+    };
+    emit_answer(&bus, thread_id, Some(parent), false).await;
+    assert!(
+        read_requested(&pool, thread_id).await,
+        "an engine padding or a parent's answer is not the user reading the reply"
+    );
+
+    let device = MessageOrigin::Device {
+        device_id: "test-device".into(),
+    };
+    emit_answer(&bus, thread_id, Some(device.clone()), false).await;
+    assert!(!read_requested(&pool, thread_id).await);
+
+    emit(&bus, thread_id, ThreadEvent::ThreadReadRequested).await;
+    emit_answer(&bus, thread_id, Some(device), true).await;
+    assert!(
+        !read_requested(&pool, thread_id).await,
+        "a quiet pick reads the reply too"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;

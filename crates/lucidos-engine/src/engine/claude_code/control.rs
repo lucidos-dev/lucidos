@@ -445,13 +445,35 @@ impl LucidosEngine {
         &self,
         thread_id: Uuid,
     ) -> (Option<String>, Option<String>) {
+        self.cc_thread_settings_where(thread_id, None).await
+    }
+
+    /// [`Self::cc_thread_settings`] recorded on `coding_agent` only. A model
+    /// one backend ran says nothing about a session on the other.
+    async fn cc_thread_settings_on(
+        &self,
+        thread_id: Uuid,
+        coding_agent: crate::runtime::CodingAgent,
+    ) -> (Option<String>, Option<String>) {
+        self.cc_thread_settings_where(thread_id, Some(coding_agent))
+            .await
+    }
+
+    async fn cc_thread_settings_where(
+        &self,
+        thread_id: Uuid,
+        coding_agent: Option<crate::runtime::CodingAgent>,
+    ) -> (Option<String>, Option<String>) {
         let tid = thread_id.to_string();
         let rows: Vec<(serde_json::Value,)> = match sqlx::query_as(
             "SELECT payload FROM events \
              WHERE aggregate_id = $1 AND event_type = 'CodingAgentSettingsChanged' \
+               AND ($2::text IS NULL \
+                    OR COALESCE(payload->>'coding_agent', payload->>'agent', 'claude-code') = $2) \
              ORDER BY created DESC LIMIT 10",
         )
         .bind(&tid)
+        .bind(coding_agent.map(crate::runtime::CodingAgent::as_str))
         .fetch_all(self.pool())
         .await
         {
@@ -487,9 +509,10 @@ impl LucidosEngine {
     }
 
     /// The model and effort a coding-agent turn runs on: the request's pick,
-    /// else the thread's settings, else the backend's default implementer
-    /// (`intelligence_ladder::fill_pick`). The spawn and the turn's
-    /// `MessageReceived` both resolve through here, so the two agree.
+    /// else a pending handoff's implementer, else the thread's settings, else
+    /// the backend's default implementer (`intelligence_ladder::fill_pick`).
+    /// The spawn and the turn's `MessageReceived` both resolve through here,
+    /// so the two agree.
     pub(crate) async fn coding_agent_rung(
         &self,
         thread_id: Uuid,
@@ -497,9 +520,15 @@ impl LucidosEngine {
         requested_model: Option<String>,
         requested_effort: Option<String>,
     ) -> (Option<String>, Option<String>) {
+        let (requested_model, requested_effort) =
+            if requested_model.is_none() && requested_effort.is_none() {
+                self.pending_handoff_rung(thread_id, coding_agent).await
+            } else {
+                (requested_model, requested_effort)
+            };
         let (event_model, event_effort) = if requested_model.is_none() || requested_effort.is_none()
         {
-            self.cc_thread_settings(thread_id).await
+            self.cc_thread_settings_on(thread_id, coding_agent).await
         } else {
             (None, None)
         };
@@ -511,8 +540,35 @@ impl LucidosEngine {
             requested_model.or(event_model),
             requested_effort.or(event_effort),
             default_implementer.as_ref(),
-            |model| crate::llm::model_registry::default_effort(self.model_registry(), model),
+            |model| {
+                crate::runtime::intelligence_ladder::model_default_effort(
+                    coding_agent,
+                    self.model_registry(),
+                    model,
+                )
+            },
         )
+    }
+
+    /// The model and effort a pending handoff names for `thread_id`'s
+    /// successor session, when it runs on `coding_agent`. A user's message may
+    /// start that session before the engine does.
+    async fn pending_handoff_rung(
+        &self,
+        thread_id: Uuid,
+        coding_agent: crate::runtime::CodingAgent,
+    ) -> (Option<String>, Option<String>) {
+        match crate::engine::successor::pending_handoff(self.pool(), thread_id).await {
+            Ok(Some(handoff)) if handoff.coding_agent == coding_agent => {
+                (handoff.coding_agent_model, handoff.reasoning_effort)
+            }
+            Ok(_) => (None, None),
+            Err(e) => {
+                // The thread's own settings still name a rung the backend runs.
+                log!("[ClaudeCode] pending handoff of {}: {}", thread_id, e);
+                (None, None)
+            }
+        }
     }
 
     /// The model and effort a coding-agent thread runs on. The model is its

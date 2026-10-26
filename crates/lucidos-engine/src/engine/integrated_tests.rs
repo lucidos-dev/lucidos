@@ -24,6 +24,7 @@ async fn start_session(bus: &EventBus, thread_id: Uuid, branch: &str, integrated
             integrated,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

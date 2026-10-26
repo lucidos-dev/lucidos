@@ -208,10 +208,10 @@ pub struct ThreadSummary {
     /// Cached title of the parent thread — saves an extra round-trip when the
     /// route panel renders "Parent thread · <title>" links.
     pub parent_thread_title: Option<String>,
-    /// The *successor thread* this one continued in, once it handed off.
+    /// The *legacy successor thread* this one continued in, once it handed off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor: Option<SuccessorLink>,
-    /// The thread this *successor thread* continues.
+    /// The thread this *legacy successor thread* continues.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub successor_of: Option<SuccessorLink>,
     /// Trigger that fired this thread (only for `channel == "trigger"` threads).
@@ -248,6 +248,10 @@ pub struct ThreadSummary {
     /// rows (consumers default NULL → `'claude-code'` via `CodingAgent::parse`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent: Option<String>,
+    /// Every backend the thread's sessions started on, first use first, each
+    /// once. Stored on `thread_summaries.coding_agents`. Empty for threads that
+    /// never started a session and for legacy rows (see `coding_agent`).
+    pub coding_agents: Vec<String>,
     /// Compose state machine (`composing` | `active` | `discarded`). Orthogonal
     /// to the archive flag (`archive_state` / wire field `section`): an archived
     /// thread carries `state='active'` plus `archive_state='archived'`.
@@ -439,6 +443,7 @@ struct ThreadRow {
     coding_agent_kind: Option<String>,
     coding_agent_folder: Option<String>,
     coding_agent: Option<String>,
+    coding_agents: Vec<String>,
     state: String,
     compose_text: String,
     compose_images: serde_json::Value,
@@ -558,6 +563,8 @@ pub struct ThreadAggregate {
     /// Backend — see `ThreadSummary::coding_agent`. Wire field: `codingAgent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coding_agent: Option<String>,
+    /// Every backend used — see `ThreadSummary::coding_agents`. Wire field: `codingAgents`.
+    pub coding_agents: Vec<String>,
     pub state: ThreadState,
 }
 
@@ -632,11 +639,12 @@ fn row_to_thread_aggregate(
         coding_agent_kind: r.coding_agent_kind,
         coding_agent_folder: r.coding_agent_folder,
         coding_agent: r.coding_agent,
+        coding_agents: r.coding_agents,
         state: ThreadState::from_db_str(&r.state)?,
     })
 }
 
-/// One end of a *successor thread* link: the other thread and its title.
+/// One end of a *legacy successor thread* link: the other thread and its title.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SuccessorLink {
     pub thread_id: String,
@@ -684,7 +692,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.trigger_id, {a}.trigger_name, \
         {a}.cc_repo_id, \
         {repo_name} AS cc_repo_name, \
-        {a}.coding_agent_kind, {a}.coding_agent_folder, {a}.coding_agent, \
+        {a}.coding_agent_kind, {a}.coding_agent_folder, {a}.coding_agent, {a}.coding_agents, \
         {a}.state, {a}.compose_text, {a}.compose_images, {a}.compose_mode, {a}.compose_selection, \
         {a}.compose_epoch",
         a = alias,
@@ -789,6 +797,7 @@ fn row_to_thread_summary(
         coding_agent_kind: r.coding_agent_kind,
         coding_agent_folder: r.coding_agent_folder,
         coding_agent: r.coding_agent,
+        coding_agents: r.coding_agents,
         state: ThreadState::from_db_str(&r.state)?,
         compose_text: r.compose_text,
         compose_images: r.compose_images,

@@ -12,8 +12,10 @@
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
+use crate::engine::agent_session::child_reports::ChildReport;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope};
 use crate::engine::event_wait::StoppedTask;
+use crate::engine::thread_events::MessageOrigin;
 use crate::engine::tools::bash_background::{BackgroundBashRegistry, CompletionDelivery, TaskSpec};
 use crate::engine::LucidosEngine;
 use crate::llm::tools::BG_MAX_TIMEOUT_SECS;
@@ -22,6 +24,15 @@ use crate::llm::tools::BG_MAX_TIMEOUT_SECS;
 /// Claude Code prompt cache lives 5 minutes or 1 hour from the last request's
 /// start, so the next request lands inside either (ADR 0470).
 pub(crate) const AGENT_WAIT_MAX_SECS: u64 = 230;
+
+/// What `lucidos background-task wait` answers.
+#[derive(Debug)]
+pub(crate) struct AgentWaitAnswer {
+    /// What `output` returns, as JSON text.
+    pub output: String,
+    /// The child reports the wait took, oldest first.
+    pub child_reports: Vec<ChildReport>,
+}
 
 /// What starting a background task did.
 #[derive(Debug)]
@@ -242,15 +253,49 @@ impl LucidosEngine {
     /// the final record once finished. The cap is clamped to
     /// [`AGENT_WAIT_MAX_SECS`] whatever the caller asks. A timed-out wait
     /// leaves the task running.
+    ///
+    /// A child report waiting unread ends the wait early, and the answer
+    /// carries it (`agent_session::child_reports`).
     pub(crate) async fn background_task_wait_for_agent(
         &self,
         thread_id: Uuid,
         task_id: &str,
         max_secs: Option<u64>,
-    ) -> Result<String, String> {
+        actor: Option<MessageOrigin>,
+    ) -> Result<AgentWaitAnswer, String> {
         self.refuse_another_threads_task(thread_id, task_id).await?;
         let wait = std::time::Duration::from_secs(agent_wait_secs(max_secs));
-        self.drain_background_output(task_id, wait, thread_id).await
+        let waiting = self.child_reports_waiting(thread_id).await;
+        let output = match waiting.clone() {
+            Some(mut waiting) => {
+                let report_arrived = async {
+                    if waiting.wait_for(|n| *n > 0).await.is_err() {
+                        // The session ended: no report can arrive now.
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    output = self.drain_background_output(task_id, wait, thread_id) => output,
+                    () = report_arrived => {
+                        self.drain_background_output(task_id, std::time::Duration::ZERO, thread_id)
+                            .await
+                    }
+                }
+            }
+            None => self.drain_background_output(task_id, wait, thread_id).await,
+        }?;
+        // Take only when a report waits, so a plain wait never calls the run loop.
+        let child_reports = match waiting {
+            Some(waiting) if *waiting.borrow() > 0 => {
+                self.take_child_reports(thread_id, actor).await
+            }
+            _ => Vec::new(),
+        };
+        Ok(AgentWaitAnswer {
+            output,
+            child_reports,
+        })
     }
 
     /// Stop one of this thread's running background tasks. Its completion is

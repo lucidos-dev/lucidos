@@ -25,10 +25,6 @@ export interface RungControlProps {
 /** The pill's name in the row's fold, which remembers its width. */
 export const RUNG_FOLD_KEY = 'rung';
 
-/** How far the pill shortens before the row folds anything: full, then badge
- *  and name, then the badge alone (`styles/chat/rung-control.css`). */
-export const RUNG_SHED_LEVELS = 3;
-
 /** A ladder glyph for the folded pill's ⋯ menu row. */
 export function RungMenuIcon() {
   return (
@@ -40,30 +36,22 @@ export function RungMenuIcon() {
   );
 }
 
-/** `1.12× Opus 5.5 · medium`. A narrow bar sheds the effort and then the
- *  name, and only a narrow bar shows the intelligence badge. */
-function RungFace({ shown }: { shown: ShownRung }) {
+/** `1.12× Opus 5.5 · medium`. The desktop face shows the name and effort,
+ *  the compact face the intelligence badge alone (`styles/chat/rung-control.css`). */
+function RungLabel({ shown }: { shown: ShownRung }) {
   return (
-    <>
+    <span class="rung-label">
       {shown.intelligence && <span class="rung-intelligence">{shown.intelligence}</span>}
       <span class="rung-name">{shown.name}</span>
       {shown.effort && <span class="rung-effort">{` · ${shown.effort}`}</span>}
-    </>
+    </span>
   );
 }
 
-/** The face in force, stacked over every other face the pill can show. Only
- *  the one in force is visible, and the widest sets the width, so a step
- *  never resizes the pill. */
-function RungLabel({ shown, faces }: { shown: ShownRung; faces: readonly ShownRung[] }) {
-  return (
-    <span class="rung-label">
-      <span class="rung-face"><RungFace shown={shown} /></span>
-      {faces.map((face, i) => (
-        <span key={i} class="rung-face rung-face-reserve" aria-hidden="true"><RungFace shown={face} /></span>
-      ))}
-    </span>
-  );
+/** The pair in full, which the label may cut short with an ellipsis. */
+function pairName(shown: ShownRung | null): string {
+  if (!shown) return 'Model and effort';
+  return shown.effort ? `${shown.name} · ${shown.effort}` : shown.name;
 }
 
 /** The accessible name for the part that opens the list. */
@@ -89,10 +77,9 @@ function stepOnArrow(step: RungSteps | undefined, e: KeyboardEvent): void {
 }
 
 /** One end of the pill: ‹ steps to the previous rung, › to the next. */
-function RungStep({ dir, step, lockedReason }: {
+function RungStep({ dir, step }: {
   dir: 'prev' | 'next';
   step: RungSteps | undefined;
-  lockedReason: string | null;
 }) {
   const label = dir === 'prev' ? 'Previous model and effort' : 'Next model and effort';
   return (
@@ -100,8 +87,8 @@ function RungStep({ dir, step, lockedReason }: {
       type="button"
       class="rung-step"
       aria-label={label}
-      data-tooltip={lockedReason ?? label}
-      aria-disabled={lockedReason !== null || !step?.[dir]}
+      data-tooltip={label}
+      aria-disabled={!step?.[dir]}
       onMouseDown={keepFocusOnPress}
       onKeyDown={(e) => stepOnArrow(step, e)}
       onClick={() => step?.[dir]?.()}
@@ -115,13 +102,12 @@ function RungStep({ dir, step, lockedReason }: {
  *  placeholder shown until its code arrives both draw them, so the box never
  *  changes as it loads. */
 export function RungButtons({
-  shown, faces = [], rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step, lockedReason = null,
+  shown, rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step,
 }: {
   rowAttrs?: Record<string, string>;
-  /** What the control names, or null until the commands have loaded. */
+  /** What the control names, or null until its face is whole. A null face
+   *  draws the boxes unseen, so the pill appears once, with its face. */
   shown: ShownRung | null;
-  /** Every other face the pill can show, which it reserves room for. */
-  faces?: readonly ShownRung[];
   expanded: boolean;
   triggerRef?: (el: HTMLButtonElement | null) => void;
   onOpen: (e: MouseEvent) => void;
@@ -129,18 +115,18 @@ export function RungButtons({
    *  the list has no row for, which leaves its button disabled. Absent until
    *  the commands have loaded. */
   step?: RungSteps;
-  /** Why the rung cannot change now, which dims the pill and makes it inert.
-   *  A press still reaches `onOpen` and the steps, which say why. */
-  lockedReason?: string | null;
 }) {
   return (
-    <div class="rung-control rung-pill" data-locked={lockedReason !== null || undefined} {...rowAttrs}>
-      <RungStep dir="prev" step={step} lockedReason={lockedReason} />
+    <div
+      class="rung-control rung-pill"
+      data-pending={shown === null || undefined}
+      {...rowAttrs}
+    >
+      <RungStep dir="prev" step={step} />
       <button
         type="button"
         class="rung-trigger"
-        data-tooltip={lockedReason ?? tooltipWithShortcut('Model and effort', 'openAgentMenu')}
-        aria-disabled={lockedReason !== null || undefined}
+        data-tooltip={tooltipWithShortcut(pairName(shown), 'openAgentMenu')}
         ref={triggerRef}
         aria-label={openLabel(shown)}
         aria-haspopup="listbox"
@@ -149,10 +135,10 @@ export function RungButtons({
         onKeyDown={(e) => stepOnArrow(step, e)}
         onClick={onOpen}
       >
-        {shown && <RungLabel shown={shown} faces={faces} />}
+        {shown ? <RungLabel shown={shown} /> : <span class="rung-label" />}
         <ChevronDownIcon size="0.75rem" />
       </button>
-      <RungStep dir="next" step={step} lockedReason={lockedReason} />
+      <RungStep dir="next" step={step} />
     </div>
   );
 }

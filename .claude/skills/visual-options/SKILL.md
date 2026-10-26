@@ -21,10 +21,18 @@ rendered options they approve. It never starts with an edit.
   `--accent`"). Skip them too when the fix has one correct answer, like a
   clipped label. Say you skipped them and why. The approval gate under
   "Approval before verification" still applies.
+- **Never offer a settled convention as an option.** An explanation of a
+  control is an `<Explainer>` ⓘ (`.claude/rules/frontend-css.md`). Asking
+  "ⓘ or a hint line?" once drew a rebuke. Read the rules before you render.
 - **It starts at the first question, not the first edit.** A card asking
   which way to fix a UI problem is already a visual choice. Text-only options
   there make the user ask for pictures. That happened when a held-row fix
   first offered three directions in words alone.
+- **Options stay inside the design system.** Build each variant from the
+  component that already draws the nearest neighbour, and vary its wording,
+  facts or fold. Never offer a bespoke divider, band or chip. A first round of
+  three hand-made dividers for the successor session was rejected for exactly
+  that (`.claude/rules/frontend-css.md` § One concept, one component).
 - **Every expand and collapse animates**, through `<Disclosure>`: options may
   differ in how it looks, never in whether it moves (`.claude/rules/frontend.md`
   § Every Expand and Collapse Rolls).

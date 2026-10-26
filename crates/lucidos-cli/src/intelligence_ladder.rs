@@ -262,8 +262,8 @@ mod tests {
                  "cost": {"multiple": 0.315, "label": "0.31×"},
                  "time": {"multiple": 0.5, "label": "0.5×"}, "is_default": false},
                 {"model": "claude-opus-5-5", "effort": "medium", "label": "Opus 5.5", "on": true,
-                 "intelligence": {"multiple": 1.0, "label": "1×"},
-                 "cost": {"multiple": 1.0, "label": "1×"}, "time": null, "is_default": true},
+                 "intelligence": {"multiple": 1.0, "label": "1.0×"},
+                 "cost": {"multiple": 1.0, "label": "1.0×"}, "time": null, "is_default": true},
             ],
             "current": {"model": "claude-opus-5-5", "effort": "medium", "position": 2},
             "reference": {"model": "claude-opus-5-5", "effort": "medium"},
@@ -281,7 +281,9 @@ mod tests {
         );
         assert!(text.contains("2. Opus 5.5, medium"), "{text}");
         assert!(
-            text.contains("intelligence 1×, cost 1×, time not estimated [default, this thread]"),
+            text.contains(
+                "intelligence 1.0×, cost 1.0×, time not estimated [default, this thread]"
+            ),
             "{text}"
         );
         assert!(

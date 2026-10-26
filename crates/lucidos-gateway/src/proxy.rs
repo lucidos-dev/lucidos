@@ -823,7 +823,7 @@ fn app_status_text() -> &'static str {
 /// tags, verbatim. They decide how tall the viewport is in an installed PWA,
 /// and the splash centres its mark in that viewport. A page with a different
 /// set lays out in a different viewport, so its mark sits higher and drops at
-/// the hand-over. `theme-color` colours the status bar above both pages.
+/// the hand-over. `theme-color` tints the browser toolbar above both pages.
 /// Lifted rather than copied, like the stylesheet, so the two cannot differ.
 fn app_device_meta() -> String {
     APP_INDEX_HTML
@@ -988,7 +988,7 @@ mod tests {
         );
         let status_bar = app_tag(r#"<meta name="apple-mobile-web-app-status-bar-style""#);
         assert!(html.contains(status_bar), "{html}");
-        // The bar keeps its colour when the app document takes over.
+        // The toolbar keeps its colour when the app document takes over.
         let theme_color = app_tag(r#"<meta name="theme-color""#);
         assert!(html.contains(theme_color), "{html}");
         assert_eq!(
@@ -996,6 +996,17 @@ mod tests {
             1,
             "{html}"
         );
+    }
+
+    /// A cold launch can open on this page, and iOS samples the top edge at
+    /// load. Neither document carries a status bar strip (ADR 0553), so the
+    /// installed iOS app meets the same translucent bar from the first frame.
+    #[test]
+    fn splash_page_carries_no_ios_status_bar_strip() {
+        assert!(!APP_INDEX_HTML.contains("status-bar-fill"));
+        let html = splash_page_html("Starting engine…", Some(2), false);
+        assert!(!html.contains("status-bar-fill"), "{html}");
+        assert!(!html.contains("data-ios-status-bar"), "{html}");
     }
 
     /// The shared sheet keys reduced motion on `data-motion`, which the app sets

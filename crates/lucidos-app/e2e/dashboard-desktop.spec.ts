@@ -1,6 +1,6 @@
 import { test, expect, Page, Locator } from './fixtures';
 import { randomUUID } from 'crypto';
-import { apiRequest, assertHealthy, navigateToApp, rightClickInsideFrame } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, rightClickInsideFrame, waitForDashboardReady } from './helpers';
 import { ensureHomeThread, psql } from './db-helpers';
 import { computeMinDashboardRailWidth } from '../src/store/paneMinimums';
 import { DASHBOARD_CELL_REM, DASHBOARD_GAP_REM } from '../src/utils/dashboardGeometry';
@@ -62,10 +62,13 @@ async function tileAppIds(page: Page, dashboard: 'phone' | 'desktop'): Promise<s
 }
 
 const rail = (page: Page): Locator => page.locator('.dashboard-rail');
+/** The live grid. While the loading fade runs, a skeleton copy of the grid sits beside it. */
+const grid = (page: Page): Locator => rail(page).locator('.dashboard-grid:not(.loading-fade-skeleton .dashboard-grid)');
 
 async function openDashboard(page: Page): Promise<void> {
   await navigateToApp(page);
   await expect(rail(page).locator('.dashboard')).toBeVisible({ timeout: 15_000 });
+  await waitForDashboardReady(rail(page));
 }
 
 const tile = (page: Page, appId: string): Locator => page.locator(`.dashboard-tile[data-dashboard-tile^="${appId}?"]`);
@@ -97,7 +100,7 @@ async function dragRailTo(page: Page, width: number): Promise<void> {
   await expect.poll(async () => Math.round((await box(rail(page))).width)).toBe(Math.round(width));
 }
 
-const columns = (page: Page) => rail(page).locator('.dashboard-grid')
+const columns = (page: Page) => grid(page)
   .evaluate((el) => getComputedStyle(el).getPropertyValue('--dashboard-columns').trim());
 
 test.describe('dashboard on desktop', () => {
@@ -134,7 +137,7 @@ test.describe('dashboard on desktop', () => {
     await expect(tile(page, ids.small)).toHaveAttribute('data-size', 'small');
     await expect(tile(page, ids.medium)).toHaveAttribute('data-size', 'medium');
     await expect(tile(page, ids.large)).toHaveAttribute('data-size', 'large');
-    const gap = await page.locator('.dashboard-grid').evaluate((el) => parseFloat(getComputedStyle(el).columnGap));
+    const gap = await grid(page).evaluate((el) => parseFloat(getComputedStyle(el).columnGap));
     const s = await box(tile(page, ids.small));
     const m = await box(tile(page, ids.medium));
     const l = await box(tile(page, ids.large));
@@ -287,7 +290,7 @@ test.describe('dashboard on desktop', () => {
     await page.mouse.move(page.viewportSize()!.width - 5, handle.y + 200, { steps: 8 });
     await page.mouse.up();
     await expect.poll(async () => Math.round((await box(rail(page))).width)).toBe(floor);
-    await expect(page.locator('.dashboard-rail .dashboard-grid')).toHaveCSS('--dashboard-columns', '2');
+    await expect(grid(page)).toHaveCSS('--dashboard-columns', '2');
     // The floor holds two whole cells, so they draw at their own edge.
     const cell = DASHBOARD_CELL_REM * await rootFontPx(page);
     expect(Math.abs((await box(tile(page, ids.small))).width - cell)).toBeLessThan(1);
@@ -396,10 +399,10 @@ test.describe('dashboard on desktop', () => {
     await dragRailTo(page, floor + spare);
     expect(await columns(page)).toBe('2');
     const two = await box(tile(page, ids.medium));
-    const grid = await box(rail(page).locator('.dashboard-grid'));
+    const area = await box(grid(page));
     // The medium tile spans both columns, so its insets are the grid's.
-    const left = two.x - grid.x;
-    const right = grid.x + grid.width - (two.x + two.width);
+    const left = two.x - area.x;
+    const right = area.x + area.width - (two.x + two.width);
     expect(Math.abs(left - right)).toBeLessThanOrEqual(1);
     expect(Math.abs(left - spare / 2)).toBeLessThanOrEqual(1);
 
@@ -452,6 +455,28 @@ test.describe('dashboard on desktop', () => {
       await expect(tile(second, ids.small)).toBeVisible({ timeout: 15_000 });
       expect(await order(second, ids.small)).toBe(before[1]);
       await other.close();
+    });
+
+    /** Invariant: `openDashboard` returns only once a press reaches the tiles.
+     *  Frames that load just after the skeleton shows settle the grid inside
+     *  the skeleton's minimum hold, and the held skeleton covers the grid. */
+    test('a drag right after a slow dashboard opens reaches its tiles', async ({ page }) => {
+      await addToDashboard(page, ids.small, { sizes: ['small'] });
+      await addToDashboard(page, ids.large, { sizes: ['large'] });
+      let release = () => {};
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      await page.route(/\/app\/e2e-dash-/, async (route) => {
+        await released;
+        await route.continue();
+      });
+      const opened = openDashboard(page);
+      await expect(rail(page).locator('.loading-fade-skeleton')).toBeVisible({ timeout: 15_000 });
+      release();
+      await opened;
+
+      await page.locator('.dashboard-edit').click();
+      await dragOnto(page, ids.small, ids.large);
+      await expect.poll(() => order(page, ids.small)).toBe('1');
     });
 
     /** Invariant: a widget that declares no sizes takes all three, and a size

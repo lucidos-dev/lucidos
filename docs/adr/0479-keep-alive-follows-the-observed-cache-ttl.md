@@ -8,6 +8,10 @@
   150-minute cut-off below gave way to a budget from the model's prices.
 - **Amended by**: [0492](0492-keep-alive-beat-lands-near-4-5-minutes.md). The
   5-minute window now starts at 230 s, not 200 s.
+- **Amended by**: [0556](0556-lucidos-agent-keep-alive-prefill-beats.md). The
+  engine's own requests state their TTL, and OpenAI adds a 30-minute one.
+- **Amended by**: [0575](0575-cache-ttls-from-evidence-only.md). An unknown
+  TTL no longer beats as 5 minutes: it gets no beats.
 
 ## Context
 

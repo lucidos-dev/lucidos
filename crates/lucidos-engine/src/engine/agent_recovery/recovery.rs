@@ -12,6 +12,7 @@ use super::super::git_ops::{
 use super::super::thread_events::{EngineReason, EventChannel, MessageOrigin, QuestionOption};
 use super::super::thread_lifecycle::ThreadStatus;
 use super::super::LucidosEngine;
+use super::undelivered_input::agent_never_engaged_sql;
 use super::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -786,8 +787,9 @@ impl LucidosEngine {
                     // the cleanup worker alone (ADR 0035). A deterministic
                     // `thread-<short>` dir on disk is one of four things:
                     //
-                    // * a live worktree ON THIS BRANCH: reuse it as-is. A
-                    //   partial-setup leftover is repaired below, not deleted.
+                    // * a live worktree ON THIS BRANCH, or on a side branch the
+                    //   agent cut from it: reuse it as-is. A partial-setup
+                    //   leftover is repaired below, not deleted.
                     // * a live worktree on a DIFFERENT branch: skip it. Reusing
                     //   it resumes against the wrong checkout, and deleting it
                     //   destroys the other branch's work.
@@ -798,10 +800,22 @@ impl LucidosEngine {
                         matches!(tokio::fs::try_exists(&wt_path).await, Ok(true))
                             && crate::engine::git_ops::is_live_worktree_at(&wt_path).await;
                     let on_our_branch = is_live_worktree
-                        && crate::engine::git_ops::worktree_current_branch(&wt_path)
+                        && {
+                            let anchor = match branch_to_thread.get(branch) {
+                            Some(&tid) => {
+                                crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(
+                                    self.pool(),
+                                    tid,
+                                )
+                                .await
+                            }
+                            None => crate::engine::agent_session::resume::IdleAnchor::Unknown,
+                        };
+                            crate::engine::agent_session::worktree_serves_branch(
+                                &repo_root, &wt_path, branch, &anchor,
+                            )
                             .await
-                            .as_deref()
-                            == Some(branch.as_str());
+                        };
 
                     if is_live_worktree && !on_our_branch {
                         // The shared path is occupied by another branch's live
@@ -1152,6 +1166,14 @@ impl LucidosEngine {
                     )
                     .await;
             }
+        }
+
+        for thread_id in unengaged_switch_resume_candidates(self.pool()).await {
+            self.enqueue_switch_resume(thread_id);
+            log!(
+                "[Recovery] Queued auto-resume after user switch for thread {} (agent read nothing)",
+                thread_id
+            );
         }
 
         log!(
@@ -1623,8 +1645,8 @@ pub(crate) async fn boundary_abort_covers_turn(
 /// new version*: an `EngineShutdown` `ResponseAborted` stamped with the device that
 /// clicked switch. Assumes the row is already scoped to one thread's events.
 ///
-/// Shared by [`switch_was_user_initiated`] and the chat candidate scan so "what a
-/// switch abort looks like" is defined exactly once.
+/// Shared by [`switch_was_user_initiated`], the unengaged scan and the chat
+/// candidate scan so "what a switch abort looks like" is defined exactly once.
 pub(crate) const SWITCH_TEARDOWN_ABORT_SQL: &str = "event_type = 'ResponseAborted' \
      AND payload->'actor'->>'kind' = 'device' \
      AND payload->>'cause' = 'engine_shutdown'";
@@ -1673,9 +1695,10 @@ fn after_latest_thread_start_sql(id_expr: &str, seq_expr: &str) -> String {
 /// The **resume loop-breaker**: the switch abort at `seq_expr` is still the newest
 /// thing that happened on the thread at `id_expr`, so no resume has consumed it.
 ///
-/// One definition for all three consumers, so a switch abort cannot be "consumed"
+/// One definition for all four consumers, so a switch abort cannot be "consumed"
 /// by one of them and still live for another: the coding-agent resume gate
-/// ([`switch_was_user_initiated`]), the chat one
+/// ([`switch_was_user_initiated`]), the unengaged coding-agent scan
+/// ([`unengaged_switch_resume_candidates_sql`]), the chat one
 /// (`chat::recovery::switch_resume_candidates`), and the boot floor
 /// ([`unresumed_switch_threads_sql`]). `ContinuationStarted` is in the start set,
 /// so once a resume has actually begun the abort stops counting anywhere. This is
@@ -1806,6 +1829,54 @@ pub(crate) async fn branch_turn_in_flight(
     .fetch_all(pool)
     .await?;
     Ok((!statuses.is_empty()).then(|| statuses.iter().any(|s| s == "running")))
+}
+
+/// The coding-agent threads a user-initiated *Switch to new version* interrupted
+/// before their agent read anything, and that nothing has resumed since.
+///
+/// The worktree scan in `recover_orphaned_worktrees` cannot see a thread with no
+/// `SessionStarted`: it maps a branch to a thread through that event. Every
+/// other clause is the chat drain's, from the same shared fragments, so the
+/// definitions of "a live switch abort" cannot drift.
+///
+/// A thread whose agent started but read nothing is also selected, though the
+/// scan queues it too: `enqueue_switch_resume` keeps it queued once.
+fn unengaged_switch_resume_candidates_sql() -> String {
+    format!(
+        "SELECT e.aggregate_id::uuid AS thread_id \
+         FROM events e \
+         JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
+         WHERE e.aggregate = 'thread' \
+           AND t.source = 'claude_code' \
+           AND t.state = 'active' \
+           AND t.archive_state != 'archived' \
+           AND {abort} \
+           AND {unsuperseded} \
+           AND {unengaged} \
+         ORDER BY e.sequence ASC",
+        abort = SWITCH_TEARDOWN_ABORT_SQL,
+        unengaged = agent_never_engaged_sql("e.aggregate_id"),
+        unsuperseded = switch_abort_unsuperseded_sql("e.aggregate_id", "e.sequence"),
+    )
+}
+
+/// Run [`unengaged_switch_resume_candidates_sql`]. An error yields an empty
+/// list (logged): the affected threads keep their manual Continue.
+pub(crate) async fn unengaged_switch_resume_candidates(pool: &sqlx::PgPool) -> Vec<Uuid> {
+    match sqlx::query_scalar::<_, Uuid>(&unengaged_switch_resume_candidates_sql())
+        .fetch_all(pool)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            log!(
+                "[Recovery] unengaged switch-resume scan failed: {}. \
+                 Affected threads keep their manual Continue",
+                e
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Threads still holding an UNKEPT resume promise: a switch-teardown abort that

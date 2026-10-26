@@ -1,5 +1,5 @@
 import type { ComponentChildren } from 'preact';
-import { useEffect, useLayoutEffect, useState } from 'preact/hooks';
+import { useLayoutEffect, useState } from 'preact/hooks';
 import { WIDGET_SIZES } from '@lucidos/engine-constants';
 import type { AppDashboardTile, DashboardTile as Tile, WidgetDashboardTile } from '../../api/client/widgets';
 import type { Dashboard } from '../../generated/thread-event-wire';
@@ -13,6 +13,7 @@ import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
 import { SkBlock } from '../shared/Skeleton';
 import { useObjectMenu } from '../shared/useObjectMenu';
 import { WidgetFrame } from '../widgets/WidgetFrame';
+import type { FrameState } from '../widgets/widgetFrameState';
 import { dashboardTileMenuItems, type DashboardTileTarget } from '../widgets/WidgetMenu';
 
 /** How many grid steps each tile size spans, a step being a quarter cell: a
@@ -107,6 +108,8 @@ interface TileProps<T extends Tile> {
   dashboardHidden: boolean;
   actions: TileDashboardActions;
   editing: TileEditing | null;
+  /** A widget tile reports where its frame stands, under the tile's key. */
+  onFrameState: (key: string, state: FrameState) => void;
 }
 
 /** One tile: a widget filling a box its size class sets, or an app shortcut. */
@@ -154,6 +157,17 @@ function isMenuKey(e: KeyboardEvent): boolean {
   return e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10');
 }
 
+/** Hands the drag its tile box in the commit that draws the shield, so a press
+ *  on a shield on screen always finds its tile. A passive effect would run a
+ *  frame later, and a press in that gap would start no drag. */
+function useRegisteredTile(register: TileEditing['register'] | undefined, key: string, box: HTMLElement | null): void {
+  useLayoutEffect(() => {
+    if (!register || !box) return undefined;
+    register(key, box);
+    return () => register(key, null);
+  }, [register, box, key]);
+}
+
 /** An *app shortcut*: the app's icon over its name, drawn on the dashboard
  *  with no frame. A tap opens the app in the Canvas. A right-click, a finger
  *  held on it or the menu key opens its menu. No frame mounts, so a
@@ -165,11 +179,7 @@ function AppShortcutTile({ tile, order, actions, editing }: TileProps<AppDashboa
   const register = editing?.register;
   const menu = useObjectMenu({ onTap: () => void openAppById(tile.app_id) });
 
-  useEffect(() => {
-    if (!register || !box) return undefined;
-    register(key, box);
-    return () => register(key, null);
-  }, [register, box, key]);
+  useRegisteredTile(register, key, box);
 
   const classes = ['dashboard-tile', 'is-app-shortcut', editing && 'is-editing', editing?.dragging && 'is-dragging']
     .filter(Boolean).join(' ');
@@ -219,7 +229,7 @@ function AppShortcutTile({ tile, order, actions, editing }: TileProps<AppDashboa
  *  or a finger held on it opens the tile menu, which ends in Edit dashboard.
  *  In edit mode a shield covers the frame, so a drag moves the tile instead of
  *  reaching the widget, and a press opens no menu. */
-function WidgetTile({ tile, order, dashboardHidden, actions, editing }: TileProps<WidgetDashboardTile>) {
+function WidgetTile({ tile, order, dashboardHidden, actions, editing, onFrameState }: TileProps<WidgetDashboardTile>) {
   const [box, setBox] = useState<HTMLDivElement | null>(null);
   const [contentHeight, setContentHeight] = useState(0);
   const [clipped, setClipped] = useState(false);
@@ -228,11 +238,7 @@ function WidgetTile({ tile, order, dashboardHidden, actions, editing }: TileProp
   const register = editing?.register;
   const menu = useObjectMenu();
 
-  useEffect(() => {
-    if (!register || !box) return undefined;
-    register(key, box);
-    return () => register(key, null);
-  }, [register, box, key]);
+  useRegisteredTile(register, key, box);
 
   useLayoutEffect(() => {
     if (!box) return undefined;
@@ -278,6 +284,7 @@ function WidgetTile({ tile, order, dashboardHidden, actions, editing }: TileProp
         size={tile.size}
         visible={!dashboardHidden}
         onSize={(size) => setContentHeight(size.height)}
+        onFrameState={(state) => onFrameState(key, state)}
         onMenu={(at) => { if (box && !editing) menu.open(box, at); }}
       />
       {clipped && !editing && <div class="dashboard-tile-fade" />}

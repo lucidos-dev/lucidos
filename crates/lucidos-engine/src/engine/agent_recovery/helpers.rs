@@ -260,7 +260,7 @@ pub(crate) async fn continue_input_for_reason(
 
 /// Input for the spawn consumer's **one-shot stale-resume retry** of a
 /// `SpawnRequest::Continue`: the thread's conversation reconstructed from events,
-/// followed by [`CONTINUE_RESUME_USER_MESSAGE`].
+/// then a *handoff brief* ending on [`CONTINUE_RESUME_USER_MESSAGE`].
 ///
 /// The retry runs with `resume_session_id: None` — the sid we just proved dead
 /// cannot be reused — so the fresh subprocess starts with zero context. Without
@@ -284,7 +284,7 @@ pub(crate) async fn continue_retry_input(
     reason: Option<&str>,
 ) -> String {
     let tail = continue_input_for_reason(pool, workspace, thread_id, reason).await;
-    crate::engine::agent_session::prepend_reconstruction(pool, thread_id, &tail).await
+    crate::engine::successor::resume_failed_input(pool, thread_id, &tail).await
 }
 
 /// Remove a stale (duplicate-recovery) worktree, deleting its branch ONLY when

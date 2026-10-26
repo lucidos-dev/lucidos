@@ -10,12 +10,14 @@ import { loadApps } from './actions/apps';
 import { loadInstalledPlugins } from './actions/plugins';
 import { loadPluginCatalog } from './actions/plugin-marketplaces';
 import { loadCredentials } from './actions/credentials';
+import { loadChatLadder, loadChatModels } from './actions/models';
 import { loadDevices, registerCurrentDevice } from './actions/devices';
 import { loadPairedDevices } from './actions/pairedDevices';
 import { loadTriggers, loadHistoricalTriggers } from './actions/triggers';
 import { loadTriggerGroups } from './actions/triggerGroups';
 import { loadThreadQueue } from './actions/threadQueue';
 import { loadRepositories } from './actions/chat';
+import { reopenDashboardPanelFromHistory } from './actions/thread-navigation';
 import { loadPreferences, flushPendingPreferenceWrites } from './actions/preferences';
 import { loadPinnedApps } from './actions/pinnedApps';
 import { loadReleaseNotices } from './actions/releaseNotices';
@@ -53,9 +55,9 @@ import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
 import { installMarkdownImageFallback } from '../utils/markdownImageFallback';
 import { CHECK_ICON, COPY_ICON } from '../utils/copyIcons';
 import { clipboardOrReport } from '../utils/clipboard';
-import { effect } from '@preact/signals';
+import { effect, untracked } from '@preact/signals';
 import { markBoot } from '../utils/bootTiming';
-import { activeMenuItem, connectionStatus, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, focusedThreadId, setFocusedThread } from './store';
+import { activeMenuItem, connectionStatus, intelligenceLadderVersion, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, focusedThreadId, setFocusedThread } from './store';
 import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from '../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './actions/client-update';
@@ -151,6 +153,7 @@ export function startClient(): () => void {
   if (savedThreadId) {
     setFocusedThread(savedThreadId);
   }
+  reopenDashboardPanelFromHistory();
   // A device with no stored focus starts in Home (ADR 0411). A returning user
   // keeps their last thread, so this reads the key before anything writes it.
   const stopColdStartHome = openHomeOnColdStart(savedThreadId !== null);
@@ -207,6 +210,13 @@ export function startClient(): () => void {
     void checkEngineVersion();
   }).catch(() => { /* loadPreferences sets Loadable failed internally, and the UI shows the error */ });
   void loadPinnedApps();
+  // Every Lucidos Agent rung control draws from these reads, and stays unseen
+  // until both land. The ladder re-reads whenever a ladder preference changes.
+  void loadChatModels();
+  const stopChatLadderReads = effect(() => {
+    void intelligenceLadderVersion.value;
+    untracked(() => { void loadChatLadder(); });
+  });
   // What this release needs the user to know or do. Loaded here rather than
   // on a panel open, because the modal has to be able to raise itself. Almost
   // always an empty list: most releases carry no notice at all.
@@ -706,6 +716,7 @@ export function startClient(): () => void {
     swLiveness.stop();
     stopLiveness();
     stopBootMarks();
+    stopChatLadderReads();
     stopColdStartHome();
     stopRestoreOffer();
     stopRestoreGuard();

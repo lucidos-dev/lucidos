@@ -44,7 +44,7 @@ function mount(opts: { agentExit?: CodingAgentExit; agent?: CodingAgent; isLast?
         isLast={opts.isLast ?? true}
         threadId="tid"
         threadIsCC={true}
-        threadCodingAgent={opts.agent ?? 'claude-code'}
+        sessionCodingAgent={opts.agent ?? 'claude-code'}
         threadIdle={false}
         threadAwaitingAnswer={false}
         threadCanceling={false}

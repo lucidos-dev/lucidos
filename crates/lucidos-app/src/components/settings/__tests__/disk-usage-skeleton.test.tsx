@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { render, type FunctionComponent } from 'preact';
 import { act } from 'preact/test-utils';
-import { SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
+import { LOADER_MIN_VISIBLE_MS, SPINNER_DELAY_MS } from '../../../hooks/useDelayedLoading';
 
 const answers = new Map<string, (body: unknown) => void>();
 let host: HTMLDivElement;
@@ -66,6 +66,8 @@ it('clears the worktree slots when the inventory lands, while the summary still 
   act(() => { vi.advanceTimersByTime(SPINNER_DELAY_MS); });
   await answer('worktrees', { worktrees: [] });
   const [worktrees, data] = [...host.querySelectorAll('.settings-overview-key-value')];
+  expect(shimmering(worktrees)).toBe(true); // held through the minimum-visible floor
+  act(() => { vi.advanceTimersByTime(LOADER_MIN_VISIBLE_MS); });
   expect(shimmering(worktrees)).toBe(false);
   expect(shimmering(data)).toBe(true);
   expect(shimmering(host.querySelector('.settings-overview-headline-value')!)).toBe(true);

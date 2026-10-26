@@ -5,6 +5,11 @@
 - **Amends**: [0529](0529-keep-alive-shows-one-status.md). Its dashed divider
   and "The status is live only" no longer hold on the client. Each ping still
   leaves no trace, and the engine still emits one status per change.
+- **Amended by**: [0563](0563-cache-keep-alive-speaks-one-grammar.md). A parked
+  thread shows its run under the card it waits on, and an ended run reopens
+  when the same wait warms again.
+- **Amended by**: [0572](0572-a-keep-alive-run-draws-its-card-from-its-first-status.md).
+  The card opens at the run's first warming status, before any ping.
 
 ## Context
 

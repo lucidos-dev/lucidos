@@ -16,13 +16,13 @@ hide a card, write a selector, or load anything from a third-party origin.
 
 ## Switch themes
 
-Set the device-scoped `theme` preference to a theme's id with `set_preference`.
-The user finds it under **Settings → Appearance → Theme**, a carousel grouped by
+Set the device-scoped `theme` preference to a theme's id with `preferences(action="set")`.
+The user finds it under **Settings → Appearance & Behavior → Theme**, a carousel grouped by
 family.
 
 A theme with a map for one mode only is *light only* or *dark only*. Picked in
 the carousel from the other mode, it asks first, then switches the device's
-`theme-mode`. `set_preference` does not ask: set `theme-mode` too when the user
+`theme-mode`. `preferences(action="set")` does not ask: set `theme-mode` too when the user
 wants to see the theme now.
 
 A workspace theme's card carries a "Custom" badge.
@@ -184,10 +184,10 @@ The header bar is fully tunable:
   `repeating-linear-gradient`. Setting it sets `--titlebar-strip-continues` to
   1, so on macOS the pattern runs on up through the title-bar band, lined up.
   `--titlebar-strip-bg` stays the solid colour under it and the window colour.
-- **`--header-bar-top` also colours the bar above the page.** It becomes the
-  page's `theme-color`, which tints the status bar of the installed iPhone or
-  iPad app and the browser toolbar on Android. Keep it the header's top
-  colour.
+- **`--header-bar-top` also colours the bar above the page.** The installed
+  iPhone or iPad app takes its status bar colour from it. It also becomes the
+  page's `theme-color`, which tints the browser toolbar on Android. Keep it the
+  header's top colour.
 
 Focus shows in four places, each with its own tokens in § Focus: the focused
 header's wash and underline, the phone's pane dot, and the navigation spotlight.
@@ -199,7 +199,7 @@ and `--focus-header-underline` to your accent.
 A theme can recolour the three brand icons that mark actors in the chat, with
 the § Brand marks tokens. For a flat Lucidos tile, set `--lucidos-mark-bg-top`
 and `--lucidos-mark-bg-bottom` to one colour. Until set, `--claude-mark`
-follows `--initiator-coding-agent` and `--codex-mark` follows `--accent-light`.
+follows `--initiator-coding-agent` and `--codex-mark` follows `--text-primary`.
 
 These never derive from the seeds. A green-on-black theme that wants green
 marks sets them, for example `"--claude-mark": "var(--accent)"`.
@@ -317,7 +317,7 @@ letter-spacing, font-weight, the caret shape and borders. `system`, the default,
 when the OS asks for more contrast or less transparency. `full` always shows
 them.
 
-The user finds it under **Settings → Appearance → Theme → Effects**. Offer
+The user finds it under **Settings → Appearance & Behavior → Theme → Effects**. Offer
 `reduce` to a user who finds a glow hard to read, or wants to save battery.
 
 ### Retro effects
@@ -491,7 +491,7 @@ The Lucidos tile, the Claude logo and the Codex logo, on the chat's actor chips 
 | `--lucidos-mark-bg-bottom` | The Lucidos tile's gradient at the far corner. Set both stops to one colour for a flat tile. |  |
 | `--lucidos-mark-fg` | The three squares and the spark on the Lucidos tile. |  |
 | `--claude-mark` | The Claude logo on the chat's actor chips and in navigation history. Follows --initiator-coding-agent by default. |  |
-| `--codex-mark` | The Codex logo's stroke. Follows the light accent by default. |  |
+| `--codex-mark` | The Codex logo's fill. Follows the primary text colour by default. |  |
 
 ### Status
 

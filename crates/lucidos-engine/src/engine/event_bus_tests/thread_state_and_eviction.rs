@@ -962,6 +962,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
             meta: cc_meta(),
         })
@@ -1187,6 +1188,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
             meta: cc_meta(),
         })
@@ -1408,6 +1410,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         integrated: false,
         auto_compact_window: None,
         auto_compact_arm: None,
+        continuity: None,
     };
     // Recovery's proposal: engine-origin, and incomplete because the turn
     // never ended cleanly. A branch holds one pending change, so each gets
@@ -1510,6 +1513,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         thread_id,
         ThreadEvent::UserQuestionAnswered {
             tool_use_id: "tu-open".into(),
+            quiet: false,
             answer: AnswerKind::FreeText {
                 text: "somewhere older".into(),
                 image_hashes: vec![],
@@ -1555,6 +1559,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
             tool_name: "Bash".into(),
             input: serde_json::json!({"command": "ls"}),
             summary: "Bash ls".into(),
+            grant_offer: None,
         },
     )
     .await;
@@ -1947,6 +1952,7 @@ async fn a_draft_written_after_the_accept_survives_the_sends_later_events() {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: "tu-1".into(),
+            quiet: false,
             answer: AnswerKind::FreeText {
                 text: "the next message".into(),
                 image_hashes: vec![],
@@ -1970,6 +1976,7 @@ async fn a_draft_written_after_the_accept_survives_the_sends_later_events() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

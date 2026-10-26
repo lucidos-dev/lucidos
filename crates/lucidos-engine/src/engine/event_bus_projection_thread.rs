@@ -429,8 +429,9 @@ impl EventBus {
                     _ => (None, None, None, None, false),
                 };
                 sqlx::query(&format!(
-                    r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, coding_agent, coding_agent_integrated, state)
-                       VALUES ($1, $2, $7, NOW(), NOW(), 0, {RUNNING}, NOW(), $3, $4, $5, $6, $8, 'active')
+                    r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, coding_agent, coding_agents, coding_agent_integrated, state)
+                       VALUES ($1, $2, $7, NOW(), NOW(), 0, {RUNNING}, NOW(), $3, $4, $5, $6,
+                               CASE WHEN $6::text IS NULL THEN '{{}}'::text[] ELSE ARRAY[$6::text] END, $8, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
                        -- Monotone: a coding-agent event sets the flag and
                        -- nothing here clears it, so no ordering of events can
@@ -450,9 +451,17 @@ impl EventBus {
                            cc_repo_id = COALESCE(thread_summaries.cc_repo_id, $3),
                            coding_agent_kind = COALESCE(thread_summaries.coding_agent_kind, $4),
                            coding_agent_folder = COALESCE(thread_summaries.coding_agent_folder, $5),
-                           -- Same lock for the backend: a thread can never flip
-                           -- between Claude Code and Codex mid-conversation.
-                           coding_agent = COALESCE(thread_summaries.coding_agent, $6),
+                           -- The backend is a fact of each session, so the
+                           -- newest SessionStarted names it. Only a successor
+                           -- session may start on another one.
+                           coding_agent = COALESCE($6, thread_summaries.coding_agent),
+                           -- Every backend the thread has run on, first use
+                           -- first. A replayed session leaves it unchanged.
+                           coding_agents = CASE
+                               WHEN $6::text IS NULL OR $6::text = ANY(thread_summaries.coding_agents)
+                               THEN thread_summaries.coding_agents
+                               ELSE array_append(thread_summaries.coding_agents, $6::text)
+                           END,
                            -- Monotone like `is_coding_agent`: an integrated
                            -- thread stays integrated for its whole life.
                            coding_agent_integrated = thread_summaries.coding_agent_integrated OR $8,
@@ -1471,6 +1480,32 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
+            // The user's per-thread switch (ADR 0554). A setting, so it moves
+            // no recency and no status either. The column is the event's own
+            // stamp, so a read of the events gives the same time.
+            ThreadEvent::CacheKeepAliveTurnedOff => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET cache_keep_alive_off_at = \
+                            (SELECT created FROM events \
+                              WHERE thread_id = $1 AND event_type = 'CacheKeepAliveTurnedOff' \
+                              ORDER BY sequence DESC LIMIT 1) \
+                      WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::CacheKeepAliveTurnedOn => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET cache_keep_alive_off_at = NULL \
+                      WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
             ThreadEvent::EventWaitCanceled { wait_id, .. } => {
                 sqlx::query(EVENT_WAIT_CANCEL_SQL.as_str())
                     .bind(thread_id)
@@ -1484,13 +1519,26 @@ impl EventBus {
             // A question answer can RESUME a session that already idled: answering
             // an AskUserQuestion after the thread parked spawns a `--resume`
             // (see `agent_question.rs`, `ANSWERED_AFTER_IDLE_REASON`). So it must
-            // flip `idle -> running` UNCONDITIONALLY.
-            ThreadEvent::UserQuestionAnswered { .. } => {
+            // flip `idle -> running` UNCONDITIONALLY. A quiet answer wakes
+            // nothing, so it settles the thread instead.
+            //
+            // The card ends the reply, so a human answer reads it and clears a
+            // read request, as a human message does (ADR 0409).
+            ThreadEvent::UserQuestionAnswered { quiet, .. } => {
+                let status = if *quiet {
+                    IDLE.to_string()
+                } else {
+                    format!("{RUNNING}, last_revived_at = NOW()")
+                };
+                let human = MessageOrigin::mode_or(meta.actor.as_ref(), ActorMode::Engine)
+                    == ActorMode::Human;
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_user_action = NOW(), \
-                     status = {RUNNING}, last_revived_at = NOW() WHERE thread_id = $1",
+                     status = {status}, \
+                     read_requested = read_requested AND NOT $2 WHERE thread_id = $1",
                 ))
                 .bind(thread_id)
+                .bind(human)
                 .execute(&mut **tx)
                 .await?;
                 // The compose fields are not touched: an answer typed into
@@ -1795,6 +1843,9 @@ impl EventBus {
             | ThreadEvent::SuccessorOfferDeclined { .. }
             // A request is read back by the narrative spawn, never projected.
             | ThreadEvent::SuccessorRequested { .. }
+            // A pending handoff is read back from the events by the spawn of
+            // the successor session.
+            | ThreadEvent::SessionHandedOff { .. }
             // User removed a queued prompt before ingestion. Pure marker:
             // the original MessageReceived remains in history, and the
             // renderer/agentic loop consult this row without changing the
@@ -1815,6 +1866,8 @@ impl EventBus {
             | ThreadEvent::CodingAgentInputRead { started_turn: false, .. }
             // A discard marks an input already recorded as owed again.
             | ThreadEvent::CodingAgentInputDiscarded { .. }
+            // A take marks a child report already recorded as read.
+            | ThreadEvent::ChildReportTaken { .. }
             // Agent-driven curation of a prior tool result / child completion
             // in future resume context: the retired dismissal, and the record
             // of a keep. Pure bookkeeping; no projection state change.

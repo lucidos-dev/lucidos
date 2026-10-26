@@ -147,6 +147,7 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -249,6 +250,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -279,6 +281,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -339,6 +342,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -380,6 +384,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -421,6 +426,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -461,6 +467,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -523,6 +530,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -646,6 +654,7 @@ async fn last_turn_end_mirrors_the_idle_gate() {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
             meta: cc_meta.clone(),
         })
@@ -727,6 +736,7 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
                     integrated: false,
                     auto_compact_window: None,
                     auto_compact_arm: None,
+                    continuity: None,
                 },
                 meta,
             })
@@ -1026,6 +1036,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
                     integrated: false,
                     auto_compact_window: None,
                     auto_compact_arm: None,
+                    continuity: None,
                 },
                 meta: cc_meta.clone(),
             })
@@ -1347,6 +1358,7 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
                 integrated: false,
                 auto_compact_window: None,
                 auto_compact_arm: None,
+                continuity: None,
             },
             meta: cc_meta.clone(),
         })
@@ -1517,6 +1529,7 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1594,6 +1607,7 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1726,6 +1740,7 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1849,6 +1864,7 @@ async fn the_app_id_lookup_answers_none_for_a_non_app_thread() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1906,6 +1922,7 @@ async fn a_crash_still_offers_continue_on_an_app_coding_agent_thread() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1965,6 +1982,7 @@ async fn a_parked_question_survives_a_restart_on_an_app_coding_agent_thread() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta.clone(),
     })
@@ -1996,4 +2014,205 @@ async fn a_parked_question_survives_a_restart_on_an_app_coding_agent_thread() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+/// The boot drain for a coding-agent thread whose agent read nothing. The
+/// worktree scan cannot see one with no `SessionStarted`, the event that maps a
+/// branch to a thread. So `unengaged_switch_resume_candidates` is its only
+/// road to the auto-resume. Each case pins one side of the selection against
+/// the production SQL.
+mod unengaged_switch_resume {
+    use uuid::Uuid;
+
+    use crate::engine::agent_recovery::unengaged_switch_resume_candidates;
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{
+        AbortCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+    };
+    use crate::test_support::{
+        message_received, setup_test_db, start_cc_session, teardown_test_db,
+    };
+
+    fn cc_meta(actor: Option<MessageOrigin>) -> EventMeta {
+        EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            actor,
+            ..EventMeta::NONE
+        }
+    }
+
+    async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent, meta: EventMeta) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta,
+        })
+        .await
+        .expect("emit succeeds");
+    }
+
+    async fn emit_switch_abort(bus: &EventBus, thread_id: Uuid) {
+        emit_teardown_abort(bus, thread_id, device()).await;
+    }
+
+    async fn emit_teardown_abort(bus: &EventBus, thread_id: Uuid, actor: Option<MessageOrigin>) {
+        crate::engine::thread_events::emit_response_aborted(
+            bus,
+            thread_id,
+            AbortCause::EngineShutdown,
+            String::new(),
+            vec![],
+            None,
+            None,
+            cc_meta(actor),
+            "[test] teardown abort",
+        )
+        .await;
+    }
+
+    /// The prompt, then the teardown abort. `actor` is the clicking device for
+    /// a switch and `None` for a crash.
+    async fn seed_prompt_and_abort(bus: &EventBus, thread_id: Uuid, actor: Option<MessageOrigin>) {
+        emit(bus, thread_id, message_received("fix it"), cc_meta(None)).await;
+        emit_teardown_abort(bus, thread_id, actor).await;
+    }
+
+    fn device() -> Option<MessageOrigin> {
+        Some(MessageOrigin::Device {
+            device_id: "d1".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_switch_interrupted_thread_with_no_session_is_a_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_prompt_and_abort(&bus, thread_id, device()).await;
+
+        assert_eq!(
+            unengaged_switch_resume_candidates(&pool).await,
+            vec![thread_id]
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_crash_interrupted_thread_with_no_session_is_not_a_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        seed_prompt_and_abort(&bus, Uuid::new_v4(), None).await;
+
+        assert!(unengaged_switch_resume_candidates(&pool).await.is_empty());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// `SessionStarted` precedes the agent's first read, so a thread with a
+    /// session can still owe its prompt.
+    #[tokio::test]
+    async fn a_started_thread_whose_agent_read_nothing_is_a_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        emit(&bus, thread_id, message_received("fix it"), cc_meta(None)).await;
+        start_cc_session(&bus, thread_id, "claude-code/started", None).await;
+        emit_switch_abort(&bus, thread_id).await;
+
+        assert_eq!(
+            unengaged_switch_resume_candidates(&pool).await,
+            vec![thread_id]
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_thread_whose_agent_read_its_prompt_is_not_a_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        emit(&bus, thread_id, message_received("fix it"), cc_meta(None)).await;
+        start_cc_session(&bus, thread_id, "claude-code/read", None).await;
+        emit(
+            &bus,
+            thread_id,
+            ThreadEvent::CodingAgentInputRead {
+                input_event_id: Uuid::new_v4(),
+                started_turn: true,
+                verbatim: false,
+            },
+            cc_meta(None),
+        )
+        .await;
+        emit_switch_abort(&bus, thread_id).await;
+
+        assert!(unengaged_switch_resume_candidates(&pool).await.is_empty());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The loop-breaker: once a resume has begun, the abort stops counting.
+    #[tokio::test]
+    async fn a_thread_whose_resume_already_began_is_not_a_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_prompt_and_abort(&bus, thread_id, device()).await;
+        emit(
+            &bus,
+            thread_id,
+            ThreadEvent::ContinuationStarted {
+                branch: String::new(),
+                origin: None,
+                reason: Some(crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into()),
+                resumed_abort_id: None,
+            },
+            cc_meta(None),
+        )
+        .await;
+
+        assert!(unengaged_switch_resume_candidates(&pool).await.is_empty());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A chat thread has its own drain (`switch_resume_candidates`).
+    #[tokio::test]
+    async fn a_chat_thread_is_not_a_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let chat_meta = EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        };
+        emit(&bus, thread_id, message_received("hi"), chat_meta.clone()).await;
+        crate::engine::thread_events::emit_response_aborted(
+            &bus,
+            thread_id,
+            AbortCause::EngineShutdown,
+            String::new(),
+            vec![],
+            None,
+            None,
+            EventMeta {
+                actor: device(),
+                ..chat_meta
+            },
+            "[test] teardown abort",
+        )
+        .await;
+
+        assert!(unengaged_switch_resume_candidates(&pool).await.is_empty());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
 }

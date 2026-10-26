@@ -15,6 +15,7 @@ use std::collections::{HashSet, VecDeque};
 
 use uuid::Uuid;
 
+use crate::engine::agent_session::child_reports::ChildReport;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::InputAnswered;
@@ -65,6 +66,8 @@ struct OwedInput {
     /// the flag on its read cannot disagree with it.
     verbatim: bool,
     completion: Option<InputCompletion>,
+    /// The report, when this write is a child's report alone.
+    child_report: Option<ChildReport>,
 }
 
 /// What one agent event settled.
@@ -91,13 +94,65 @@ impl InputLedger {
         input: &AgentInput,
         completion: Option<InputCompletion>,
     ) {
-        self.forwarded_here.extend(input_event_ids.iter().copied());
+        self.push(input_event_ids, input, completion, None);
+    }
+
+    /// The run loop handed the agent a child's report, carried by `card_id`.
+    /// `text` is the report as the agent would read it.
+    pub(crate) fn forwarded_child_report(
+        &mut self,
+        card_id: Uuid,
+        input: &AgentInput,
+        completion: Option<InputCompletion>,
+        text: String,
+    ) {
+        let report = ChildReport {
+            card_id,
+            text,
+            sent: input.text.clone(),
+        };
+        self.push(vec![card_id], input, completion, Some(report));
+    }
+
+    fn push(
+        &mut self,
+        event_ids: Vec<Uuid>,
+        input: &AgentInput,
+        completion: Option<InputCompletion>,
+        child_report: Option<ChildReport>,
+    ) {
+        self.forwarded_here.extend(event_ids.iter().copied());
         self.unread.push_back(OwedInput {
-            event_ids: input_event_ids,
+            event_ids,
             uuid: input.uuid,
             verbatim: forwards_verbatim(&input.text),
             completion,
+            child_report,
         });
+    }
+
+    /// The child reports the agent has not read, oldest first. Each one may
+    /// still be taken mid-turn.
+    pub(crate) fn child_reports(&self) -> Vec<ChildReport> {
+        self.unread
+            .iter()
+            .filter_map(|input| input.child_report.clone())
+            .collect()
+    }
+
+    /// How many child reports the agent has not read.
+    pub(crate) fn owed_child_reports(&self) -> usize {
+        self.unread
+            .iter()
+            .filter(|input| input.child_report.is_some())
+            .count()
+    }
+
+    /// The agent took the report `card_id` carried. Nothing owes it now, and
+    /// no tombstone follows: the agent read it.
+    pub(crate) fn child_report_taken(&mut self, card_id: Uuid) {
+        self.unread
+            .retain(|input| input.child_report.is_none() || input.event_ids != [card_id]);
     }
 
     /// The uuid the agent knows `input_event_id`'s message by, while it is owed

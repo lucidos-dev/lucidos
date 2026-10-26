@@ -98,9 +98,9 @@ Layer shapes (all live in `proxy_pipeline_config::LayerConfig`):
 {"type": "script_handshake", "script": "scripts/auth/keychain-login.py"}   // no credential: the script sources its secret
 {"type": "script_handshake", "credential": "firebase-web-api-key", "script": "scripts/auth/firebase-google-exchange.py", "oauth_providers": ["google"]}
 
-// Built-in Binance-shape HMAC. Sign-only the query string; appends
-// `timestamp=<ms>` first, then `signature=<hex>`. Key is sent in `X-MBX-APIKEY`
-// (or whatever `key_header` overrides to).
+// Built-in Binance-shape HMAC signs the query string and appends a signature.
+// Setting `timestamp_param` prepends that timestamp to the signed query.
+// `key_header` defaults to `X-API-KEY`; Binance uses `X-MBX-APIKEY` below.
 {
   "type": "hmac_signed",
   "key_credential": "binance-key",
@@ -317,7 +317,11 @@ If the user hasn't connected Google, the proxy request fails fast with `502 ... 
 
 ## Layer 3: `hmac_signed` (built-in)
 
-For services that match the Binance shape exactly: append `<timestamp_param>=<unix-ms>` and `<signature_param>=<hex(hmac_sha256_or_512(secret, canonical_query))>` to the query string, and send the key in `<key_header>`. No code: two credentials (`key_credential` and `secret_credential`) and the JSON layer block above.
+For services that sign the query string, `hmac_signed` appends
+`<signature_param>=<hex(hmac_sha256_or_512(secret, canonical_query))>`.
+Setting `timestamp_param` also appends `<timestamp_param>=<unix-ms>` before signing.
+The default adds no timestamp. The API key goes in `key_header`, which defaults
+to `X-API-KEY`. Binance requires the explicit `X-MBX-APIKEY` override shown above.
 
 If the service signs anything other than the query string (body, full path, headers, custom canonical form), go to Layer 4.
 
@@ -350,7 +354,14 @@ The sidecar carries WASM-host metadata only: secret expectations, body-mode pref
   - `"raw"`: module gets the full body bytes, but requests over 1MB are rejected with 413.
   - `"hash"`: host always passes a SHA-256 + length, never the raw bytes (signer opted out for privacy).
   - `"either"` (default): host passes raw under 1MB, hash above.
-- `capabilities`: only `"replace_body"` is recognized. It needs both the manifest declaring it AND the provider config's `granted_capabilities` listing it. Either missing → 403.
+- `capabilities`: supports `"replace_body"` and `"read_prior_headers"`.
+  Each requires the manifest declaration and the provider's
+  `auth.granted_capabilities` grant.
+  - `replace_body` permits a signer to replace the request body. An attempted
+    replacement without both entries returns 403.
+  - `read_prior_headers` exposes earlier layers' header values to the signer.
+    Without both entries, every value becomes
+    `"[withheld: grant read_prior_headers]"`; header names remain visible.
 
 ### WASM ABI
 
@@ -522,7 +533,7 @@ cp signers/<name>/manifest.json <workspace>/data/auth-modules/<name>.manifest.js
 #   HTTP: POST /api/v1/proxy-modules/reload
 ```
 
-Or distribute the signer inside a plugin, so other workspaces install it as a unit. Ship `<name>.wasm` + `<name>.manifest.json` under the plugin's `auth-modules/` directory. `install_plugin` lands them at `data/auth-modules/...` AND auto-reloads the WASM signer map, with no `cp` or manual reload. See `system-knowhow/plugins.md`. Pair the signer with a `setup` field in `manifest.toml` that walks the user through wiring `apis.json` and registering credentials. Those are workspace state and don't ship in plugins.
+Or distribute the signer inside a plugin, so other workspaces install it as a unit. Ship `<name>.wasm` + `<name>.manifest.json` under the plugin's `auth-modules/` directory. `plugins(action="install")` lands them at `data/auth-modules/...` AND auto-reloads the WASM signer map, with no `cp` or manual reload. See `system-knowhow/plugins.md`. Pair the signer with a `setup` field in `manifest.toml` that walks the user through wiring `apis.json` and registering credentials. Those are workspace state and don't ship in plugins.
 
 The build script targets `wasm32-unknown-unknown` in release, then copies the artifact (cargo flattens hyphens to underscores in its name) to `signers/<name>/<name>.wasm`.
 
@@ -532,8 +543,8 @@ Already in the tree at `signers/binance-hmac/`. Algorithm:
 
 1. Find the existing query string in `SignInput.url` (after `?`).
 2. Build canonical = `<existing>&timestamp=<ms>` (current time / 1e6).
-3. `hmac_sha256(SECRET_ID_API_SECRET, canonical, ...)`: the secret stays in the host's per-call table.
-4. `hex_encode(...)` → 64 ASCII bytes.
+3. `signers/binance-hmac/src/lib.rs::hmac_sha256` with the secret handle and canonical bytes: the secret stays in the host's per-call table.
+4. `signers/binance-hmac/src/lib.rs::hex_encode` → 64 ASCII bytes.
 5. Emit `SignOutput { add_query: [["timestamp", ms], ["signature", hex]] }`.
 
 `signers/binance-hmac/manifest.json`:
@@ -564,7 +575,26 @@ The static layer attaches the API key header; the WASM layer adds the timestamp 
 
 ## Composing layers
 
-The pipeline runs layers in declared order. Each layer sees `prior_layer_outputs[<earlier-layer-namespace>]`, a JSON map keyed by layer kind (`script_handshake`, `wasm_signer`, etc.). Use it when a per-request signer needs a value the login script just minted:
+The pipeline runs layers in declared order. Each layer sees
+`prior_layer_outputs[<earlier-layer-namespace>]`.
+The first layer's namespace is its kind; subsequent namespaces append
+`_<zero-based-position>`, even when their kinds differ.
+Static credential kinds use `bearer`, `api_key`, `basic` or `query_param`.
+For example, a handshake at position 1 publishes under `script_handshake_1`.
+
+A signer reading a login token needs `read_prior_headers` declared in its
+sidecar and granted in the provider's `auth` configuration.
+For `comfort-cloud-hmac.manifest.json`:
+
+```json
+{
+  "secret_handles": ["api_secret"],
+  "body_mode": "either",
+  "capabilities": ["read_prior_headers"]
+}
+```
+
+The matching provider configuration:
 
 ```json
 {
@@ -574,12 +604,20 @@ The pipeline runs layers in declared order. Each layer sees `prior_layer_outputs
        "script": "scripts/auth/comfort-login.py"},
       {"type": "wasm_signer", "module": "comfort-cloud-hmac",
        "credential_handles": [{"name": "api_secret", "credential": "comfort-secret"}]}
-    ]
+    ],
+    "granted_capabilities": ["read_prior_headers"]
   }
 }
 ```
 
-Inside `comfort-cloud-hmac` the signer reads `prior_layer_outputs["script_handshake"]["headers"]["x-cfc-auth-token"]`. The script_handshake layer publishes its emitted headers as JSON for downstream layers (`proxy_script_layer.rs`).
+Inside `comfort-cloud-hmac`, the signer reads
+`prior_layer_outputs["script_handshake"]["headers"]["x-cfc-auth-token"]`.
+The handshake is at position 0 here, so its namespace has no suffix.
+It publishes emitted headers as JSON for downstream layers (`proxy_script_layer.rs`).
+
+A missing declaration or grant replaces the token with the withholding placeholder.
+Signing that placeholder produces an invalid signature and an upstream 401.
+Check both capability entries when diagnosing this failure.
 
 ## 401 retry
 
@@ -588,7 +626,7 @@ After every forwarded request, the pipeline asks each layer two things: did your
 ## Pitfalls
 
 - **Reaching for a heavier layer than needed.** A Bearer token that doesn't rotate is `static_credential`, not a script. A "Binance-shape" service (sign the query string, append timestamp + signature) is `hmac_signed`, not a signer.
-- **Forgetting the manifest sidecar.** Without it the loader applies defaults: no `secret_handles`, `body_mode = "either"`, no `capabilities`. A signer that calls `hmac_sha256(SECRET_ID_API_SECRET, ...)` then sees an out-of-bounds handle and gets `-1` back. Symptom: 502 with no signature.
+- **Forgetting the manifest sidecar.** Without it the loader applies defaults: no `secret_handles`, `body_mode = "either"`, no `capabilities`. A signer that calls `signers/binance-hmac/src/lib.rs::hmac_sha256` then sees an out-of-bounds handle and gets `-1` back. Symptom: 502 with no signature.
 - **`replace_body` without both the manifest cap and the provider grant.** Layer returns 403 (see § Manifest sidecar).
 - **Pinning a hard-coded `secret_id`.** The order of `credential_handles` in the provider config sets the indices. Read `SignInput.secret_handles[<your-name>]` instead of hardcoding `0`.
 - **Not exporting `memory`.** The host looks up the standard name `memory` and 502s otherwise. `cdylib` builds emit one by default, but declaring it (`(memory (export "memory") 1)`) makes the contract obvious.

@@ -19,6 +19,10 @@ pub struct QuestionOption {
     /// *widget embed* in its description or preview (ADR 0415).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub widget: Option<WidgetEmbed>,
+    /// A *quiet option*: picking it records the answer and ends the turn
+    /// without waking the agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
 }
 
 /// A *widget embed*, `![label](app:<id>?params={...})`, as the engine reads

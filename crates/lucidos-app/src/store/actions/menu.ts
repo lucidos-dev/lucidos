@@ -116,6 +116,13 @@ export function openProviderSettings(): void {
   openSettingsSubview('models');
 }
 
+/** Deep-link to Settings → Permissions → Command safety → Enabled for coding agents, the
+ *  row a coding-agent permission card points at. */
+export function openCommandGuardCodingAgentsSettings(): void {
+  settingsScrollTarget.value = 'command-safety:coding-agents';
+  openSettingsSubview('permissions');
+}
+
 /** Deep-link to the OpenCode Free switch, one row inside the same Providers
  *  section. It is where the onboarding surface sends a user with no key, whose
  *  one actionable option is the keyless tier.
@@ -136,11 +143,19 @@ export function openCaptureContextSetting(): void {
   openSettingsSubview('debugging');
 }
 
-/** Deep-link to the Cache-warm line switch in Settings → System → Debugging.
- *  One caller, the cache-warm line's explainer. It navigates and nothing else. */
-export function openCacheWarmLineSetting(): void {
-  settingsScrollTarget.value = 'debugging:cache-warm-line';
+/** Deep-link to the Cache cards switch in Settings → System → Debugging.
+ *  Callers are the prompt-cache cards' explainers. It navigates and nothing else. */
+export function openCacheCardsSetting(): void {
+  settingsScrollTarget.value = 'debugging:cache-cards';
   openSettingsSubview('debugging');
+}
+
+/** Deep-link to the Cache keep-alive section in Settings → Models. Two
+ *  callers: the cache-warm line's explainer, and the pointer on Coding Agents.
+ *  It navigates and nothing else. */
+export function openCacheKeepAliveSetting(): void {
+  settingsScrollTarget.value = 'models:cache-keep-alive';
+  openSettingsSubview('models');
 }
 
 /** Deep-link to Settings → System → Backup in a single render. Two callers: the

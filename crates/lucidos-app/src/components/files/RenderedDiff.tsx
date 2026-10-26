@@ -246,7 +246,8 @@ export function renderDiffMarked(
 
   // `gfm: true` passes raw HTML in the source straight through, and this string
   // goes into `dangerouslySetInnerHTML` on the host origin. A repo file is not
-  // trusted input, so scrub it exactly as `renderMarkdown` does. Scrub the
+  // trusted input, so scrub it exactly as `renderMarkdown` does, and render it
+  // into an `.authored-html` box. Scrub the
   // joined document rather than each part: an element opened in one part and
   // closed in another is only well formed once the parts are back together.
   return sanitizeHtmlFragments(unwrapPathEmailAutolinks(parts.join('')));
@@ -378,7 +379,7 @@ export function RenderedDiff({ file, changeId, repoId, gitRef }: Props) {
               );
             })}
           </div>
-          <div class="response-content markdown-content" ref={contentRef} dangerouslySetInnerHTML={{ __html: html ?? '' }} />
+          <div class="response-content markdown-content authored-html" ref={contentRef} dangerouslySetInnerHTML={{ __html: html ?? '' }} />
         </div>
       )}
     </LoadingFade>

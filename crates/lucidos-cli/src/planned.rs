@@ -14,33 +14,30 @@ use crate::hardened::{git_context, run_git};
 use crate::http::client as http_client;
 use crate::workspace::{BoxError, Workspace};
 
-/// What picking an `Implement in a new thread` option does at an offered
+/// What picking an `Implement in a fresh session` option does at an offered
 /// checkpoint run named by `flags`. Printed only when the card may offer one.
 /// The flow's own decision comes first, since only the flow knows what it is.
-fn new_thread_handoff(flags: &str) -> String {
+fn fresh_session_handoff(flags: &str) -> String {
     format!(
-        "Picking an `Implement in a new thread` option is the user's decision here. First do \
+        "Picking an `Implement in a fresh session` option is the user's decision here. First do \
          what your flow says that decision does: a plan flow approves the plan. Then hand the \
-         work to a successor thread with `lucidos successor spawn --narrative <file> {flags}`, \
-         adding `--build-chain` when your flow says so. Add only the flags that differ from this \
+         work to a successor session in this thread with `lucidos successor start --narrative \
+         <file> {flags}`. Add only the flags that differ from this \
          thread's implementer: `--coding-agent <backend>`, `--coding-agent-model <model id>`, \
          `--reasoning-effort <level>`. An omitted flag keeps this thread's, so picking this \
          thread's implementer adds none. Pass the model id the ladder prints, never its picker \
          label. A typed reply naming another implementer works the same way. Lucidos refuses a \
          pick off the intelligence ladder, and lists the rungs. `lucidos successor --help` has \
-         the narrative format. The \
-         narrative says what the user decided here, and quotes your flow's remaining checkpoint \
-         instructions so the successor keeps running them. The successor's branch starts at this \
-         branch's last commit. End your turn with the link it prints. The pick is also the \
-         owner's consent to the handoff, so a handoff after the pick needs no approval card. \
-         After a typed reply, a handoff refused for authority needs the `lucidos \
-         ask-owner-approval` it names, then a retry. Your flow's option to stay carries on in \
-         this thread."
+         the narrative format. The narrative says what the user decided here, and quotes your \
+         flow's remaining checkpoint instructions so the successor session keeps running them. \
+         End your turn: the successor session starts in this thread once it ends. A handoff \
+         needs no approval. Your flow's option to stay carries on in \
+         this session."
     )
 }
 
 /// The option that keeps the work in this thread, which the flow names.
-const STAY_OPTION: &str = "your flow's option to stay in this thread (`Approve here` for a plan, \
+const STAY_OPTION: &str = "your flow's option to stay in this session (`Approve here` for a plan, \
     else `Continue here`)";
 
 /// How the agent picks the successor's implementer. The rung is the agent's
@@ -55,23 +52,23 @@ const IMPLEMENTER_CHOICE: &str = "Recommend the successor's implementer by your 
     costs on every turn. Say why in one line of your message. Name a rung by its picker label \
     and effort, as the ladder prints them. Name the backend only when it is not this thread's.";
 
-/// The paying card's options: the estimate alone calls for a new thread.
+/// The paying card's options: the estimate alone calls for a fresh session.
 fn paying_options() -> String {
     format!(
-        "Offer, in order: `Implement in a new thread: <implementer> (Recommended)`; `Implement \
-         in a new thread: <this thread's implementer>`, only when it differs; {STAY_OPTION}; \
+        "Offer, in order: `Implement in a fresh session: <implementer> (Recommended)`; `Implement \
+         in a fresh session: <this thread's implementer>`, only when it differs; {STAY_OPTION}; \
          then a real fork of the decision if it has one. That is never more than 4 options, and \
          never `Request changes`."
     )
 }
 
-/// The card's options when the handoff does not pay. A fresh thread then
+/// The card's options when the handoff does not pay. A fresh session then
 /// saves only through a lower rung, so it never offers this thread's own
 /// (ADR 0497). A thread with a rung above it may also raise (ADR 0499).
 fn lower_options(raise: bool) -> String {
     let lower = format!(
-        "If your pick is a lower rung than this thread's, offer, in order: `Implement in a new \
-         thread: <implementer> (Recommended)`; {STAY_OPTION}; then a real fork of the decision \
+        "If your pick is a lower rung than this thread's, offer, in order: `Implement in a fresh \
+         session: <implementer> (Recommended)`; {STAY_OPTION}; then a real fork of the decision \
          if it has one. That is never `Request changes`."
     );
     if !raise {
@@ -79,19 +76,19 @@ fn lower_options(raise: bool) -> String {
     }
     format!(
         "{lower} Else, if the work is hard or long, a higher rung builds it better: offer \
-         `Implement in a new thread: <a higher rung> (Recommended)`; {STAY_OPTION}; then a real \
+         `Implement in a fresh session: <a higher rung> (Recommended)`; {STAY_OPTION}; then a real \
          fork of the decision if it has one. That is never more than 3 options, and never \
          `Request changes`. Raise one or two rungs, never to the top for a builder. Otherwise:"
     )
 }
 
-/// The card with no new thread to offer.
+/// The card with no fresh session to offer.
 const FLOOR: &str = "Ask the question your flow asks here, with its own options, and offer no \
-    new thread. A plan's is `Approve` / `Request changes`, where a real fork takes the second \
+    fresh session. A plan's is `Approve` / `Request changes`, where a real fork takes the second \
     slot. If your flow asks no question here, carry on and ask nothing.";
 
 /// The offered card's shape at the checkpoint run named by `flags`. Two
-/// reasons offer a new thread: the engine's *handoff estimate* says it pays,
+/// reasons offer a fresh session: the engine's *handoff estimate* says it pays,
 /// or, at any size, a lower rung than this thread's, as the agent picks it
 /// (ADR 0497). A thread with a rung above its own may also raise (ADR 0499).
 /// The engine decides whether it pays and owns the ladder, so this compares
@@ -126,12 +123,12 @@ pub(crate) fn card_shape(reading: crate::successor::ContextReading, flags: &str)
             implementer,
             ladder,
         } => format!(
-            "The handoff estimate says a fresh thread pays here: this thread's context is {}. \
+            "The handoff estimate says a fresh session pays here: this thread's context is {}. \
              {}{IMPLEMENTER_CHOICE} {} {}",
             size(input_tokens),
             runs_on(implementer.as_ref(), ladder.as_ref()),
             paying_options(),
-            new_thread_handoff(flags)
+            fresh_session_handoff(flags)
         ),
         ContextReading::Read {
             can_hand_off: true,
@@ -140,8 +137,8 @@ pub(crate) fn card_shape(reading: crate::successor::ContextReading, flags: &str)
             ladder,
             ..
         } => format!(
-            "This thread's context is {}, where the handoff estimate says a fresh thread does \
-             not pay, so a new thread pays off only through its implementer. {}\
+            "This thread's context is {}, where the handoff estimate says a fresh session does \
+             not pay, so a fresh session pays off only through its implementer. {}\
              {IMPLEMENTER_CHOICE} {} {FLOOR} {}",
             size(input_tokens),
             runs_on(implementer.as_ref(), ladder.as_ref()),
@@ -150,11 +147,11 @@ pub(crate) fn card_shape(reading: crate::successor::ContextReading, flags: &str)
                     .as_ref()
                     .is_some_and(Ladder::has_higher_intelligence_rung)
             ),
-            new_thread_handoff(flags)
+            fresh_session_handoff(flags)
         ),
         ContextReading::Read { .. } => FLOOR.to_string(),
         ContextReading::Unknown => format!(
-            "{FLOOR} Lucidos could not read this thread's context, so it offers no new thread."
+            "{FLOOR} Lucidos could not read this thread's context, so it offers no fresh session."
         ),
     }
 }
@@ -235,7 +232,9 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         let text = resp
             .text()
             .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
-        return Err(format!("POST {} returned {}: {}", url, status, text).into());
+        return Err(marker_refusal(&text)
+            .unwrap_or_else(|| format!("POST {} returned {}: {}", url, status, text))
+            .into());
     }
     match kind {
         // Naming the question tool here matters: this line is what the agent
@@ -288,7 +287,7 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
         let text = resp
             .text()
             .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
-        return Err(approval_refusal(&text)
+        return Err(marker_refusal(&text)
             .unwrap_or_else(|| format!("POST {} returned {}: {}", url, status, text))
             .into());
     }
@@ -322,12 +321,14 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// The engine's own words when it refuses an approval the user has not given.
-/// The agent then reads what to do, not an HTTP status. `None` for any other
-/// error body.
-fn approval_refusal(body: &str) -> Option<String> {
+/// The engine's own words when it refuses a marker write the agent can fix:
+/// an approval the user has not given, or a branch the thread's Apply never
+/// lands. The agent then reads what to do, not an HTTP status. `None` for any
+/// other error body.
+fn marker_refusal(body: &str) -> Option<String> {
     let body: serde_json::Value = serde_json::from_str(body).ok()?;
-    if body.get("reason")?.as_str()? != "no-plan-approval" {
+    let reason = body.get("reason")?.as_str()?;
+    if !matches!(reason, "no-plan-approval" | "marker-off-tracked-branch") {
         return None;
     }
     Some(body.get("error")?.as_str()?.to_string())
@@ -426,8 +427,8 @@ mod tests {
             model: model.into(),
             effort: effort.into(),
             label: model.into(),
-            intelligence: Some("1×".into()),
-            cost: Some("1×".into()),
+            intelligence: Some("1.0×".into()),
+            cost: Some("1.0×".into()),
             time: None,
             is_default: false,
         };
@@ -476,7 +477,7 @@ mod tests {
         ] {
             let shape = card_shape(reading(pays, ladder.clone()), FLAGS);
             assert_eq!(
-                shape.contains("`Implement in a new thread: <a higher rung> (Recommended)`"),
+                shape.contains("`Implement in a fresh session: <a higher rung> (Recommended)`"),
                 raise,
                 "{pays:?} {ladder:?}: {shape}"
             );
@@ -542,25 +543,25 @@ mod tests {
         }
     }
 
-    /// I8: only a paying verdict recommends a new thread on this thread's own
+    /// I8: only a paying verdict recommends a fresh session on this thread's own
     /// implementer, whatever the size.
     #[test]
-    fn a_new_thread_on_this_implementer_needs_a_paying_verdict() {
+    fn a_fresh_session_on_this_implementer_needs_a_paying_verdict() {
         let paying = card_shape(reading(Some(true), Some(ladder(Some(1)))), FLAGS);
         for needle in [
-            "The handoff estimate says a fresh thread pays here",
+            "The handoff estimate says a fresh session pays here",
             "240k tokens",
             "This thread runs on claude-code with model m-b at medium effort.",
             "intelligence ladder, least to most intelligent",
             "[this thread]",
-            "`Implement in a new thread: <implementer> (Recommended)`",
-            "`Implement in a new thread: <this thread's implementer>`, only when it differs",
+            "`Implement in a fresh session: <implementer> (Recommended)`",
+            "`Implement in a fresh session: <this thread's implementer>`, only when it differs",
             "`Approve here` for a plan",
             "never more than 4 options, and never `Request changes`",
             "by your judgement of the work left",
             "a fully specified plan with settled decisions suits a lower rung",
-            "lucidos successor spawn --narrative <file> --at plan-approval --progress 0/4`",
-            "adding `--build-chain` when your flow says so",
+            "lucidos successor start --narrative <file> --at plan-approval --progress 0/4`",
+            "the successor session starts in this thread once it ends",
             "a plan flow approves the plan",
             "remaining checkpoint instructions",
             "picking this thread's implementer adds none",
@@ -587,7 +588,7 @@ mod tests {
         let shape = card_shape(closed, FLAGS);
         assert_eq!(shape, FLOOR);
         assert!(shape.contains("`Approve` / `Request changes`"));
-        assert!(!shape.contains("Implement in a new thread"), "{shape}");
+        assert!(!shape.contains("Implement in a fresh session"), "{shape}");
         let unknown = card_shape(ContextReading::Unknown, FLAGS);
         assert!(unknown.starts_with(FLOOR));
         assert!(unknown.contains("could not read this thread's context"));
@@ -608,18 +609,25 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_approval_shows_the_engines_words_alone() {
-        let refusal = r#"{"error":"Revise the plan.","reason":"no-plan-approval"}"#;
-        assert_eq!(
-            approval_refusal(refusal).as_deref(),
-            Some("Revise the plan.")
-        );
+    fn a_fixable_refusal_shows_the_engines_words_alone() {
+        for (refusal, words) in [
+            (
+                r#"{"error":"Revise the plan.","reason":"no-plan-approval"}"#,
+                "Revise the plan.",
+            ),
+            (
+                r#"{"error":"Switch back.","reason":"marker-off-tracked-branch"}"#,
+                "Switch back.",
+            ),
+        ] {
+            assert_eq!(marker_refusal(refusal).as_deref(), Some(words));
+        }
         for other in [
             r#"{"error":"busy","reason":"apply_in_progress"}"#,
             r#"{"error":"no reason"}"#,
             "approve_plan: pool closed",
         ] {
-            assert_eq!(approval_refusal(other), None, "{other}");
+            assert_eq!(marker_refusal(other), None, "{other}");
         }
     }
 

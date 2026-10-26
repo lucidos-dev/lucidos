@@ -163,8 +163,8 @@ describe('ThreadView reaches for the whole history through the hold', () => {
     expect(from, 'the chevron reaches for the whole history').toBeGreaterThan(-1);
     const call = SOURCE.slice(from, from + 400);
     expect(call).toContain('settleHistoryRead(threadId, added, onHistoryRead)');
-    // And it lands only once the reader lets go of the scrollbar (ADR 0258).
-    expect(call).toContain('scrollbarReleased(el)');
+    // And it lands only once the reader's scroll hold ends (ADR 0258).
+    expect(call).toContain('scrollHoldReleased(el)');
   });
 
   it('bounds that retry at one ask per visit, and clears it on the way out', () => {

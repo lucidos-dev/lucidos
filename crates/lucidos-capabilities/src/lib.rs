@@ -2123,6 +2123,24 @@ const THREADS_OPS: &[Operation] = &[
         sdk: Some(false),
     },
     Operation {
+        action: "cache_keep_alive",
+        summary: "Turn a thread's cache keep-alive 'off' until it next runs, or 'on'. \
+                  Not your own. (requires: thread_id, state)",
+        method: Method::Post,
+        path: "/threads/:thread_id/cache-keep-alive",
+        args: &[],
+        cli_name: "cache-keep-alive",
+        sdk_name: "cacheKeepAlive",
+        mutating: true,
+        llm_alias: Some("switch_cache_keep_alive"),
+        llm_schema: Some(
+            r#"{"state":{"type":"string","enum":["off","on"]}}"#,
+        ),
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
+    Operation {
         action: "triage",
         summary: "Propose an action per inbox thread, each with a reason. Show the user; \
                   apply only after they reply.",
@@ -2808,7 +2826,7 @@ const MCP_OPS: &[Operation] = &[
     },
     Operation {
         action: "start",
-        summary: "Start a stopped server. From a thread, it is enabled there too. (requires: id)",
+        summary: "Start a stopped server. Thread enablement is a separate action. (requires: id)",
         method: Method::Post,
         path: "/mcp/servers/:id/start",
         args: &[MCP_ID_ARG],

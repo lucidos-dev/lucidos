@@ -179,9 +179,8 @@ pub async fn build_pipeline(
     Ok(layers)
 }
 
-/// Stable per-layer namespace. Pipelines almost always have at most one
-/// layer of each kind, so the kind name alone is unique. When two layers
-/// of the same kind are used (rare), a numeric suffix keeps them distinct.
+/// Stable per-layer namespace: the first layer uses its kind alone.
+/// Every later layer appends its zero-based position, even across kinds.
 fn layer_namespace(idx: usize, layer: &LayerConfig) -> String {
     let base = match layer {
         LayerConfig::StaticCredential { kind, .. } => match kind {

@@ -11,6 +11,7 @@ import type { AppReveal } from '../../store/types';
 import { appFrameLoading, appFrameRevealed, revealFuseMs } from './appFrameReveal';
 import { frameLoaded, frameUnmounted, trackFrameLoad } from './appFrameSharedLoads';
 import { announceFrameGone } from '../../store/actions/frame-swipe-bridge';
+import { startFrameLoadProbe, type FrameLabel, type FrameLoadProbe } from './appFrameLoadProbe';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)).
  *  The cover lingers for this, scaled by the Animation speed slider, plus
@@ -29,6 +30,8 @@ export function cacheBust(url: string, key: number): string {
 export interface AppFrameProps {
   src: string;
   reveal: AppReveal;
+  /** Names the frame in the slow-load log line. */
+  label: FrameLabel;
   /** Runs once the cover lifts. */
   onRevealed?: () => void;
   /** Runs on every load, after the host's own pushes. */
@@ -47,8 +50,9 @@ export interface AppFrameProps {
  *  snapshot of a previous app state mid-swipe. An app switch remounts this
  *  component instead, and a first load adds no entry. A reload after a lost
  *  shared fetch takes a fresh element too (appFrameSharedLoads.ts). */
-export function AppFrame({ src, reveal, onRevealed, onLoad, onUnmount }: AppFrameProps) {
+export function AppFrame({ src, reveal, label, onRevealed, onLoad, onUnmount }: AppFrameProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const probeRef = useRef<FrameLoadProbe | null>(null);
   const [frameSrc, setFrameSrc] = useState(src);
   const lastSrcRef = useRef(frameSrc);
   const [generation, setGeneration] = useState(0);
@@ -90,12 +94,26 @@ export function AppFrame({ src, reveal, onRevealed, onLoad, onUnmount }: AppFram
     return () => frameUnmounted(reload);
   }, []);
 
+  // One probe per element, so it starts with the element's mount and ends with
+  // its unmount or reload. It only watches (appFrameLoadProbe.ts).
+  useLayoutEffect(() => {
+    const probe = startFrameLoadProbe(label, () => iframeRef.current);
+    probeRef.current = probe;
+    return () => {
+      probe.abandon();
+      probeRef.current = null;
+    };
+  }, [generation]);
+
   // Layout phase, so the listener is on the element before the browser paints
   // and before any frame script can run.
   useLayoutEffect(() => {
     const iframe = iframeRef.current;
     if (!iframe) return;
-    const onReady = () => setReady(true);
+    const onReady = () => {
+      probeRef.current?.noteReady();
+      setReady(true);
+    };
     iframe.addEventListener(APP_FRAME_READY_EVENT, onReady);
     return () => iframe.removeEventListener(APP_FRAME_READY_EVENT, onReady);
   }, [generation]);
@@ -110,6 +128,7 @@ export function AppFrame({ src, reveal, onRevealed, onLoad, onUnmount }: AppFram
 
   useEffect(() => {
     if (revealed) {
+      probeRef.current?.noteRevealed(fused);
       onRevealed?.();
       return;
     }
@@ -154,6 +173,7 @@ export function AppFrame({ src, reveal, onRevealed, onLoad, onUnmount }: AppFram
         allow={APP_FRAME_ALLOW}
         onLoad={(e) => {
           setLoaded(true);
+          probeRef.current?.noteLoad();
           frameLoaded(reload);
           pushKeybindingsToFrame(e.currentTarget as HTMLIFrameElement);
           pushAppearanceToFrame(e.currentTarget as HTMLIFrameElement);

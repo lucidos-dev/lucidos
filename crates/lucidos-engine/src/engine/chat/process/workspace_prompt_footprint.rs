@@ -965,7 +965,10 @@ mod tests {
         let apps_section = build_apps_section(&apps);
         let intents_section = build_intents_section(&intents);
         for section in [&apps_section, &intents_section] {
-            assert!(!section.contains("execute_intent"), "got: {section}");
+            assert!(
+                !section.contains("execute_intent"), // Retired tool must stay absent.
+                "retired tool leaked: {section}"
+            );
             assert!(section.contains("load_knowhow"), "got: {section}");
             assert!(section.contains("in this turn"), "got: {section}");
         }

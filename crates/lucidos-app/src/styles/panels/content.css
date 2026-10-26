@@ -738,10 +738,13 @@
 
 /* Overlay that paints the change strips. Strips are positioned relative to
    .rendered-diff's padding box, so left:0 lands on the panel edge regardless
-   of the marked element's nesting depth (paragraph, blockquote, nested li). */
+   of the marked element's nesting depth (paragraph, blockquote, nested li).
+   The content's `.authored-html` clip makes it a stacking context, which
+   would paint over this layer, so the z-index keeps the tint on top. */
 .diff-strip-layer {
     position: absolute;
     inset: 0;
+    z-index: 1;
     pointer-events: none;
 }
 
@@ -1192,6 +1195,16 @@
     /* Opaque base the transcript dissolves into; the ::before below is the
        dissolve itself and needs something solid to land on. */
     background: var(--bg-primary);
+}
+
+/* A menu opened from the composer (the Apply split button's, a picker's) rises
+   over the transcript, where the scroll chevrons float. Lift the composer above
+   them while one is open. Only then: lifted always, the fade band below would
+   paint over the chevron. Never under a modal: its z-index would then rank
+   only inside this box. The phone's floating composer repeats the rule in
+   mobile.css, since its own z-index rule outranks this one. */
+.prompt-area:has([data-overlay-panel]):not(:has(.modal-overlay)) {
+    z-index: calc(var(--z-float) + 2);
 }
 
 /* Dissolve transcript content into the prompt: a bg-colored gradient band drawn

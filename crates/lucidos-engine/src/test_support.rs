@@ -11,6 +11,49 @@ use uuid::Uuid;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent, BUS_CAPACITY};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 
+#[derive(Debug)]
+struct ServerError {
+    code: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ServerError {}
+
+impl sqlx::error::DatabaseError for ServerError {
+    fn message(&self) -> &str {
+        &self.message
+    }
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        Some(self.code.into())
+    }
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        sqlx::error::ErrorKind::Other
+    }
+}
+
+/// A server error carrying the SQLSTATE `code`, as Postgres would send it.
+pub fn server_error(code: &'static str, message: &str) -> sqlx::Error {
+    sqlx::Error::Database(Box::new(ServerError {
+        code,
+        message: message.to_string(),
+    }))
+}
+
 /// Overrun every subscriber's buffer, so its next `recv` is a
 /// `RecvError::Lagged`. The way to reproduce a lag without timing: emit the
 /// event under test first, flood, then hand the subscriber's first `recv` to
@@ -94,6 +137,9 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             input_tokens: Some(self.input_tokens),
             cache_creation_tokens: None,
             cache_creation_1h_tokens: None,
+            cache_creation_30m_tokens: None,
+            cache_creation_12h_tokens: None,
+            cache_creation_requested_ttl: None,
             stable_prefix_fingerprint: None,
             cache_read_tokens: None,
             served_model: None,
@@ -103,6 +149,7 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             unknown_sse_dropped: 0,
             model_only_text: None,
             progress_notes: Vec::new(),
+            prefill: None,
             service_tier: None,
         })
     }
@@ -557,6 +604,7 @@ pub async fn start_cc_session(
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -575,25 +623,10 @@ pub async fn seed_coding_thread(bus: &EventBus, parent: Option<Uuid>) -> Uuid {
     thread_id
 }
 
-/// `old` continues in a new *successor thread*, which opens as a child of
-/// `parent` when given. Returns the successor.
-pub async fn seed_handoff(
-    bus: &EventBus,
-    old: Uuid,
-    parent: Option<Uuid>,
-    starts_build_chain: bool,
-) -> Uuid {
-    seed_consented_handoff(bus, old, parent, starts_build_chain, None).await
-}
-
-/// [`seed_handoff`], recording the *handoff consent* that let it through.
-pub async fn seed_consented_handoff(
-    bus: &EventBus,
-    old: Uuid,
-    parent: Option<Uuid>,
-    starts_build_chain: bool,
-    handoff_consent: Option<crate::engine::thread_events::HandoffConsent>,
-) -> Uuid {
+/// A legacy *successor thread* chain: `old` continued in a new thread, which
+/// opens as a child of `parent` when given. Nothing creates one any more, but
+/// their events stay and must keep reading as they did. Returns the successor.
+pub async fn seed_handoff(bus: &EventBus, old: Uuid, parent: Option<Uuid>) -> Uuid {
     let successor = Uuid::new_v4();
     emit_cc(
         bus,
@@ -601,8 +634,8 @@ pub async fn seed_consented_handoff(
         ThreadEvent::SuccessorThreadSpawned {
             successor_thread_id: successor,
             base_sha: "0123abc".into(),
-            starts_build_chain,
-            handoff_consent,
+            starts_build_chain: false,
+            handoff_consent: None,
         },
     )
     .await;

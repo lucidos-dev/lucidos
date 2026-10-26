@@ -1,3 +1,4 @@
+import { filterListItems } from '../utils/listFilter';
 import { REASONING_LEVELS, availableReasoningLevels } from './models';
 
 /** A *model selection* is a model id paired with a reasoning effort, resolved
@@ -200,21 +201,9 @@ export function modelRows(
   });
 }
 
-/** Narrow the model step to a query, matching the model's own name.
- *
- *  Every whitespace-separated term must appear, so `opus 1m` finds
- *  `Opus 5 (1M)`. Tiers are deliberately not matched: they are the next step,
- *  and every model offers much the same handful. */
-export function filterModelRows(
-  rows: readonly ModelRow[],
-  query: string,
-): ModelRow[] {
-  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
-  if (terms.length === 0) return [...rows];
-  return rows.filter((row) => {
-    const hay = row.label.toLowerCase();
-    return terms.every((t) => hay.includes(t));
-  });
+/** Match model names and descriptions, leaving tiers to their own step. */
+export function filterModelRows(rows: readonly ModelRow[], query: string): ModelRow[] {
+  return [...filterListItems(rows, query)];
 }
 
 /** How an encoded pair reads on its own, resolved against the model step.

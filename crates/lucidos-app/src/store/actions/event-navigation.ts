@@ -1,13 +1,17 @@
-import { effect, signal } from '@preact/signals';
+import { effect, signal, untracked } from '@preact/signals';
 import { ApiError } from '../../api/client';
 import { fetchEventLocation } from '../../api/threads';
-import { EVENT_RESOLVE_DEADLINE_MS } from '../../components/chat/scrollState';
+import { EVENT_RESOLVE_DEADLINE_MS } from '../../components/chat/deepLinkBudget';
 import { UNANCHORABLE_ASYNC_EVENTS, landingTarget, computeExchanges, deepLinkAnchorInThread } from '../thread-events';
 import type { LandingGroup, LandingTarget } from '../thread-events';
-import { showToast, threadMap, focusedThreadId, effectiveThreadStatus, changeAwaitsApply } from '../store';
+import { showToast, threadMap, focusedThreadId, effectiveThreadStatus, changeAwaitsApply, drawerGrouping, selectedOngoingGroup, threadSearchQuery, mobileView } from '../store';
+import type { DrawerGrouping, OngoingGroup } from '../store';
+import { drawnSplitRatio } from '../../components/layout/drawnLayout';
+import { viewportIsMobile } from '../../utils/viewport';
+import { threadPaneOnScreen } from './seen-target';
 import { errorDetail } from '../../utils/errorDetail';
 import { ensureThreadByIdInMap, ensureWholeThreadLoaded, loadThreadEvents, threadEventsStillArriving } from './thread-loading';
-import { focusThread, landOnEvent } from './threads';
+import { focusThread, landOnEvent, type FocusThreadOptions } from './threads';
 
 /** A workspace domain event belongs to no conversation, so there is no
  *  transcript to open. A real answer, not a failure. */
@@ -350,8 +354,57 @@ export async function showEventWhereItLives(eventId: string): Promise<void> {
  *  A late landing is skipped if the user has opened another thread meanwhile. */
 export function openOngoingThread(threadId: string, group: LandingGroup): void {
   focusThread(threadId);
+  landOrSay(threadId, group);
+}
+
+function landOrSay(threadId: string, group: LandingGroup): void {
   landOnTarget(threadId, group).catch(err => {
     showToast(`Could not open what needs your attention: ${errorDetail(err)}`, 'error');
+  });
+}
+
+function conversationPaneOnScreen(): boolean {
+  return threadPaneOnScreen({
+    mobile: viewportIsMobile.value,
+    mobileView: mobileView.value,
+    drawnSplitRatio: drawnSplitRatio.value,
+  });
+}
+
+/** Pure: the group a row of the drawer's list lands from, or null. A Blocked
+ *  or Review row opens on what needs the user; every other row opens the
+ *  thread as it was. */
+export function landingGroupFor(grouping: DrawerGrouping, selected: OngoingGroup): LandingGroup | null {
+  if (grouping !== 'ongoing') return null;
+  return selected === 'blocked' || selected === 'review' ? selected : null;
+}
+
+/** Open a row of the drawer's list on screen, the way a tap on it does. A
+ *  search result opens the thread as it was, since the list is not a group.
+ *
+ *  Every way a row gets opened goes through here, the archive and delete
+ *  hand-offs to the next row included.
+ *
+ *  A hand-off reveals no pane. Behind a hidden Conversation pane the card has
+ *  no box, and the landing would time out and toast. So it lands once the pane
+ *  comes on screen, unless the reader has opened another thread by then. */
+export function openListedThread(threadId: string, options?: Pick<FocusThreadOptions, 'revealPane'>): void {
+  const searching = threadSearchQuery.value.trim().length > 0;
+  const landing = searching ? null : landingGroupFor(drawerGrouping.value, selectedOngoingGroup.value);
+  focusThread(threadId, options);
+  if (!landing) return;
+  if (options?.revealPane !== false || conversationPaneOnScreen()) {
+    landOrSay(threadId, landing);
+    return;
+  }
+  const dispose = effect(() => {
+    if (focusedThreadId.value !== threadId) {
+      queueMicrotask(() => dispose());
+      return;
+    }
+    if (!conversationPaneOnScreen()) return;
+    queueMicrotask(() => dispose());
+    untracked(() => landOrSay(threadId, landing));
   });
 }
 

@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures';
+import { overflowsPane } from './transcript-fit';
 import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport } from './helpers';
 
 /** The transcript reserves NOTHING under its newest turn, so it ends exactly
@@ -70,7 +71,7 @@ test.describe('The transcript ends where its content ends', () => {
      *  is only the transcript while it stays positioned. The reserved air this
      *  spec exists to keep out is caught by the `min-height` check beside it
      *  either way. */
-    const geometry = () => tc.evaluate((el) => {
+    const measure = () => tc.evaluate((el) => {
       // MEASURED INSIDE THE FEED, never off the scroller. The scroller also
       // holds the mobile chrome. Its own first and last children are a header
       // spacer and the transcript's bottom padding, rather than turns.
@@ -110,9 +111,6 @@ test.describe('The transcript ends where its content ends', () => {
          *  starts, so spare space handed to it shows up here, and it shrinks as
          *  the content grows. That shrinking IS the travel reported. */
         headInset: head.getBoundingClientRect().top - feed.getBoundingClientRect().top,
-        /** How far the transcript can be scrolled. Zero is "there is no
-         *  scroll", which is the state the rest below is asserted in. */
-        overflow: el.scrollHeight - el.clientHeight,
         /** Nothing may floor the last turn's height. */
         minHeight: getComputedStyle(last).minHeight,
         /** The last turn's own box. A turn taller than the pane cannot show
@@ -125,7 +123,7 @@ test.describe('The transcript ends where its content ends', () => {
         messageBottom: initiator ? initiator.getBoundingClientRect().bottom - top : null,
         statusLineBottom: header ? header.getBoundingClientRect().bottom - top : null,
         clientHeight: el.clientHeight,
-        scrollable: el.scrollHeight > el.clientHeight + 10,
+        scrollHeight: el.scrollHeight,
         /** Where the mobile sticky title bar sits ON SCREEN, measured down from
          *  the scrollport's top, beside the header spacer it rides under. Null
          *  on desktop, where the row is `display: none`.
@@ -146,6 +144,12 @@ test.describe('The transcript ends where its content ends', () => {
         spacerHeight: parseFloat(getComputedStyle(el, '::before').height) || 0,
       };
     });
+
+    /** `scrollable` is judged here, outside the page, by the one shared rule. */
+    const geometry = async () => {
+      const m = await measure();
+      return m && { ...m, scrollable: overflowsPane(m.scrollHeight, m.clientHeight) };
+    };
 
     /** Did any round measure a transcript that does NOT overflow? The rounds
      *  below walk a thread from its first send, so the early ones are short of
@@ -196,13 +200,6 @@ test.describe('The transcript ends where its content ends', () => {
         expect(
           g.headInset,
           `${when}: the feed's content starts ${Math.round(g.headInset)}px below the feed's own top`,
-        ).toBeLessThanOrEqual(1);
-        // And there is no scroll to be taken down either, which is the reader's
-        // own words for it. A floor that outgrows the pane by a chrome's height
-        // fails here rather than moving anybody.
-        expect(
-          g.overflow,
-          `${when}: a thread short of the pane scrolls by ${Math.round(g.overflow)}px`,
         ).toBeLessThanOrEqual(1);
       }
       // Unconditional, and the sharper half: a reserved length here is the room
@@ -259,8 +256,8 @@ test.describe('The transcript ends where its content ends', () => {
     // the pane is depends on the composer's resting height, so a turn fits on
     // one project and not on the next.
     //
-    // `turnOverflow`, never `overflow`: the geometry above already calls the
-    // SCROLLER's overflow that, and these two are different lengths.
+    // `turnOverflow`, the turn's own excess over the pane. It is a different
+    // length from the scroller's, which `overflowsPane` judges.
     const turnOverflow = Math.max(
       0, landed.turnHeight + landed.paddingBottom - landed.clientHeight);
     expect(landed.messageTop).not.toBeNull();

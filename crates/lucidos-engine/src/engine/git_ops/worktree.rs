@@ -225,7 +225,7 @@ pub(crate) async fn create_sparse_app_worktree(
 }
 
 /// [`create_sparse_app_worktree`], with a fresh branch starting at `base`
-/// rather than the default branch. A successor thread passes its old
+/// rather than the default branch. A legacy successor thread passes its old
 /// thread's last commit.
 pub(crate) async fn create_sparse_app_worktree_from(
     workspace_root: &Path,

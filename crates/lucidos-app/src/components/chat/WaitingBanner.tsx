@@ -4,25 +4,35 @@ import { LANE_PLACE_LABEL, LANE_THREAD_TIP } from '../../store/actions/landingLa
 import { archiveRequestInFlight } from '../../store/rowIntents';
 import { bringBackSingleChange, discardSingleChange } from '../../store/actions/chat-changes';
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
-import { focusThread, handleArchiveThread, handleUnarchiveThread, showBlockedToast } from '../../store/actions/threads';
+import { focusThreadOrBootstrap, handleArchiveThread, showBlockedToast } from '../../store/actions/threads';
 import { BLOCKER_REASON, isDescendantBlocker, type BlockedRefusal } from '../../store/actions/blockerCopy';
 import { exitItems, threadBlocker } from '../../store/actions/threadBlockers';
 import type { ThreadState } from '../../store/thread-events';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { ToggleIconButton } from '../shared/ToggleIconButton';
-import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
-import { ArchiveIcon, CheckIcon, CurrentIcon, DiffIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
-import type { HeaderActionSpec } from '../layout/headerActions';
-import type { OverflowMenuContext } from '../shared/OverflowMenu';
+import { ArchiveIcon, CheckIcon, DiffIcon, InFlightIcon, MoreIcon, MoveToTopIcon, SetAsideIcon, StandingApplyIcon, TrashIcon } from '../shared/icons';
+import { renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
+import { OverflowMenu } from '../shared/OverflowMenu';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
 import { blurPromptInputIfFocused } from './promptFocus';
-import { PROTECTED_SURFACE } from '../shared/protectedSurface';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { getDraft } from '../../store/composeDrafts';
 import { hasInFlightUploads } from '../../store/pendingUploads';
 import { composeHasContent } from './prompt-input-helpers';
+import type { SlotAction, SlotOccupant, SlotTone } from './ActionSlot';
 
 const DIFF_TOOLTIP = 'Show what this thread changed';
+
+const DIFF_KEY = 'thread-diff';
+const STANDING_APPLY_KEY = 'standing-apply';
+
+/** Diff and the standing apply, which the composer row may draw as ONE control
+ *  (`DiffApplyMenu`) before its follow toggle folds. `keys` are adjacent in the
+ *  standalone row's fold order, and `foldKey` names the merged control's box. */
+export const DIFF_APPLY_MERGE = {
+  keys: [DIFF_KEY, STANDING_APPLY_KEY],
+  foldKey: 'diff-and-standing-apply',
+} as const;
 
 /** The close-set kinds the banner renders. Two other kinds come from the same
  *  selector and live elsewhere, so both are excluded. Discard-draft is a
@@ -50,8 +60,6 @@ type WaitingState =
       /** The thread's set-aside change, which the banner offers to bring back,
        *  and to discard unless the thread is unsettled. */
       setAside?: { changeId: string; discardable: boolean };
-      /** An archived thread offers Move to Current where Archive was. */
-      unarchive?: boolean;
       /** A sub-thread holds Archive back. The thread's own blockers already
        *  draw the control that resolves them: Cancel, Apply or Discard. */
       blockedArchive?: BlockedRefusal;
@@ -137,16 +145,17 @@ export function getWaitingState(): WaitingState | null {
     ? { changeId: setAsideChangeId, discardable: !threadUnsettled(thread) }
     : undefined;
   // Placement is where the drawer shows the thread, not where it is stored
-  // (ADR 0378). One in the Archive section offers Move to Current.
-  const unarchive = actions.length === 0 && getThreadDisplaySection(thread) === 'archive';
-  const blockedArchive = actions.length === 0 && !unarchive ? subThreadBlocker(focused) : undefined;
+  // (ADR 0378). One in the Archive section offers nothing here: the thread's
+  // ⋯ menu moves it back to Current.
+  const archived = getThreadDisplaySection(thread) === 'archive';
+  const blockedArchive = actions.length === 0 && !archived ? subThreadBlocker(focused) : undefined;
   // The thread menu's own answer, when the selector offers no Archive: a thread
   // stored archived but kept in Current, or one whose blocking sub-thread is
   // not loaded. Pressing it lets the engine decide, and recount if it drifted.
-  if (actions.length === 0 && !unarchive && !blockedArchive && exitItems(focused).archive === 'enabled') {
+  if (actions.length === 0 && !archived && !blockedArchive && exitItems(focused).archive === 'enabled') {
     actions.push(archiveExitAction(focused));
   }
-  if (actions.length === 0 && !setAside && !unarchive && !blockedArchive) return null;
+  if (actions.length === 0 && !setAside && !blockedArchive) return null;
 
   // The Diff button is shown only when the branch holds work (`hasCcDiff`), so
   // it can never drop the user into an empty diff. `getStandaloneActions`
@@ -160,7 +169,6 @@ export function getWaitingState(): WaitingState | null {
     isArchiving: false,
     showDiff,
     setAside,
-    unarchive,
     blockedArchive,
   };
 }
@@ -179,25 +187,7 @@ function subThreadBlocker(threadId: string): BlockedRefusal | undefined {
     : undefined;
 }
 
-/** ONE close-set action, as a ⋯ menu row. The composite split button folds into
- *  several of these, so the caret's actions survive the fold with the face. */
-function actionMenuRow(action: TaggedAction, ctx: OverflowMenuContext) {
-  return (
-    <button
-      key={action.kind}
-      type="button"
-      class={`thread-overflow-item ${PROTECTED_SURFACE}`}
-      role="menuitem"
-      onClick={ctx.run(() => void action.invoke())}
-    >
-      {ACTION_ICON[action.kind]?.() ?? null}
-      {action.label}
-    </button>
-  );
-}
-
-/** A glyph per close-set kind, for the menu row. The row buttons carry words,
- *  so this exists only for the folded rendering. */
+/** A glyph per close-set kind: the icon its face pins at the left. */
 const ACTION_ICON: Record<string, () => ComponentChildren> = {
   apply: () => <CheckIcon />,
   discard: () => <TrashIcon />,
@@ -205,118 +195,137 @@ const ACTION_ICON: Record<string, () => ComponentChildren> = {
   archive: () => <ArchiveIcon />,
 };
 
-/** The banner's members, in FOLD ORDER, as specs the composer row can fold.
- *
- *  Diff folds before the change actions: looking is cheaper to postpone than
- *  doing. A busy state is one member, the spinner, and it folds like any other
- *  rather than being a reason to overflow the box. */
-export function getBannerActions(state: BannerState): HeaderActionSpec[] {
-  if (state.type === 'applying') return [busyAction('applying', 'action-btn-confirm', 'Apply...')];
-  if (state.type === 'landing') return [laneAction(state)];
-  if (state.type === 'discarding') return [busyAction('discarding', 'action-btn-danger', 'Discard...')];
-  // Archive in flight: a dedicated disabled spinner (the selector no longer
-  // returns an Archive action once the optimistic section flips).
-  if (state.isArchiving) return [busyAction('archiving', '', 'Archive...')];
+/** The banner's members. Diff stands left of the model picker and folds like
+ *  any member. Everything else is ONE control in the action slot, where Send
+ *  stands, and it never folds. */
+export interface BannerActions {
+  situational: HeaderActionSpec[];
+  slot: SlotOccupant;
+}
 
-  const members: HeaderActionSpec[] = [];
+export function getBannerActions(state: BannerState): BannerActions {
+  if (state.type === 'applying') return alone(busyAction('applying', 'Apply', 'confirm', 'Applying'));
+  if (state.type === 'landing') return alone(laneAction(state));
+  if (state.type === 'discarding') return alone(busyAction('discarding', 'Discard', 'danger', 'Discarding'));
+  // Archive in flight: a dedicated busy face (the selector no longer returns an
+  // Archive action once the optimistic section flips).
+  if (state.isArchiving) return alone(busyAction('archiving', 'Archive', 'neutral', 'Archiving'));
+
   // Diff shows whenever the branch has a diff on disk, independent of whether
   // the close set has an Apply. It always opens the thread-level branch diff.
   // The historical change-row Diff buttons (ChatExchange, ChangesView) call
   // viewChangeDiff for one Change; this asks what the branch looks like now.
-  if (state.showDiff) members.push(diffAction(state.threadId));
-  if (state.setAside) members.push(bringBackAction(state.setAside));
-
-  // When the close set has a primary Apply, the remaining close-set buttons
-  // collapse into a split button: a one-tap face plus a caret menu holding the
-  // others. One compact control instead of two or three. Folded, it is several
-  // menu rows, because the caret's actions would otherwise go with it.
-  const applyAction = state.actions.find((a) => a.kind === 'apply');
-  if (applyAction) {
-    // Discard goes last: the destructive choice sits furthest from the face.
-    const others = state.actions
-      .filter((a) => a !== applyAction)
-      .sort((a, b) => Number(a.kind === 'discard') - Number(b.kind === 'discard'));
-    const primary = applyFace(applyAction);
-    members.push({
-      key: 'change-actions',
-      label: primary.label,
-      tooltip: primary.tooltip,
-      icon: primary.icon,
-      render: (attrs) => (
-        <ChangeActionSplitButton
-          primary={primary}
-          menuActions={others}
-          attrs={{ ...attrs, 'data-thread-action': '' }}
-        />
-      ),
-      menuRows: (ctx) => [
-        faceMenuRow(primary, ctx),
-        ...others.map((a) => actionMenuRow(a, ctx)),
-      ],
-    });
-    return members;
-  }
-
-  // The no-Apply states (an idle coding-agent thread with a diff but no pending
-  // change, so Archive plus a standalone Diff). Each button is its own member,
-  // so the row can fold one without the other.
-  for (const action of state.actions) members.push(closeSetAction(action));
-  if (state.unarchive) members.push(unarchiveAction(state.threadId));
-  if (state.blockedArchive) members.push(blockedArchiveAction(state.blockedArchive));
-  return members;
+  return {
+    situational: state.showDiff ? [diffAction(state.threadId)] : [],
+    slot: closeSlot(state),
+  };
 }
 
-const UNARCHIVE_TOOLTIP = 'Move this thread and its sub-threads back to Current.';
+function alone(face: SlotAction): BannerActions {
+  return { situational: [], slot: { face, menu: [], menuLabel: '' } };
+}
 
-/** Move an archived thread back to Current, where Archive was. */
-function unarchiveAction(threadId: string): HeaderActionSpec {
+/** Which action wears the face, first to last. Discard goes last, so the
+ *  destructive choice sits furthest from the face. */
+const FACE_ORDER = ['apply', 'archive', 'archive-blocked', 'set_aside', 'bring-back', 'discard', 'discard-set-aside'];
+
+/** The close set, the set-aside pair and a held-back Archive, merged into one
+ *  control. Its face is the first of them in `FACE_ORDER`, and the rest go in
+ *  its menu. */
+function closeSlot(state: Extract<BannerState, { type: 'actions' }>): SlotOccupant {
+  const [face, ...menu] = [
+    ...state.actions.map(closeSetAction),
+    ...(state.setAside ? setAsideActions(state.setAside) : []),
+    ...(state.blockedArchive ? [blockedArchiveAction(state.blockedArchive)] : []),
+  ].sort((a, b) => FACE_ORDER.indexOf(a.key) - FACE_ORDER.indexOf(b.key));
+  const menuLabel = face.key === 'apply' ? 'More change actions'
+    : face.key === 'bring-back' ? 'More set-aside actions'
+    : 'More close actions';
+  return { face, menu, menuLabel };
+}
+
+/** One close-set TaggedAction. Label, tooltip and the (confirm-wrapped)
+ *  handler come from the selector; tone and icon derive from the kind. */
+function closeSetAction(action: TaggedAction): SlotAction {
+  const tone: SlotTone = action.kind === 'discard' ? 'danger' : action.kind === 'apply' ? 'confirm' : 'neutral';
+  const tooltip = action.tooltip ?? action.label;
   return {
-    key: 'unarchive',
-    label: 'Move to Current',
-    tooltip: UNARCHIVE_TOOLTIP,
-    icon: () => <CurrentIcon />,
-    extraClass: PROTECTED_SURFACE,
-    render: (attrs) => (
-      <button
-        {...attrs}
-        data-thread-action=""
-        class={protectedButtonClass('')}
-        data-tooltip={UNARCHIVE_TOOLTIP}
-        onClick={() => void handleUnarchiveThread(threadId)}
-      >
-        Move to Current
-      </button>
-    ),
-    onClick: () => void handleUnarchiveThread(threadId),
+    key: action.kind,
+    label: action.label,
+    ariaLabel: action.kind === 'archive' ? 'Archive thread' : undefined,
+    tooltip: action.kind === 'apply' ? tooltipWithShortcut(tooltip, 'applyChange') : tooltip,
+    tone,
+    icon: () => ACTION_ICON[action.kind]?.() ?? null,
+    invoke: () => void action.invoke(),
   };
+}
+
+/** Bring a set-aside change back to pending, from its own thread, with Discard
+ *  beside it, as the Changes panel's set-aside row offers. Discard is withheld
+ *  while the thread is unsettled, since the engine refuses it then. */
+function setAsideActions({ changeId, discardable }: { changeId: string; discardable: boolean }): SlotAction[] {
+  const bringBack: SlotAction = {
+    key: 'bring-back',
+    label: 'Bring back',
+    tooltip: BRING_BACK_TOOLTIP,
+    tone: 'neutral',
+    icon: () => <MoveToTopIcon />,
+    invoke: () => void bringBackSingleChange(changeId),
+  };
+  const discard: SlotAction = {
+    key: 'discard-set-aside',
+    label: 'Discard',
+    ariaLabel: 'Discard the set-aside change',
+    tooltip: DISCARD_SET_ASIDE_TOOLTIP,
+    tone: 'danger',
+    icon: () => <TrashIcon />,
+    invoke: () => void discardSingleChange(changeId),
+  };
+  return discardable ? [bringBack, discard] : [bringBack];
 }
 
 /** Archive, held back by a sub-thread. It stays tappable: a tap says why, and
  *  the toast opens the sub-thread to resolve. */
-function blockedArchiveAction(refusal: BlockedRefusal): HeaderActionSpec {
+function blockedArchiveAction(refusal: BlockedRefusal): SlotAction {
   const reason = BLOCKER_REASON[refusal.blocker];
-  const explain = () => showBlockedToast("Can't archive yet", refusal);
   return {
     key: 'archive-blocked',
-    label: 'Archive thread',
+    label: 'Archive',
+    ariaLabel: `Archive thread. ${reason}`,
     tooltip: reason,
+    tone: 'neutral',
+    heldBack: true,
     icon: () => <ArchiveIcon />,
-    extraClass: PROTECTED_SURFACE,
-    render: (attrs) => (
-      <button
-        {...attrs}
-        data-thread-action=""
-        class={protectedButtonClass('action-btn-blocked')}
-        aria-disabled="true"
-        aria-label={`Archive thread. ${reason}`}
-        data-tooltip={reason}
-        onClick={explain}
-      >
-        Archive
-      </button>
-    ),
-    onClick: explain,
+    invoke: () => showBlockedToast("Can't archive yet", refusal),
   };
+}
+
+/** The lane's word for the fixed face. The full phrase stays its name. */
+const LANE_FACE_LABEL: Record<LanePlace, string> = { 'in-batch': 'Landing', waiting: 'Waiting' };
+
+/** Where the change stands in the landing lane. In the open batch it links
+ *  the lane thread; waiting, it is a busy face. */
+function laneAction(state: Extract<BannerState, { type: 'landing' }>): SlotAction {
+  const label = LANE_FACE_LABEL[state.place];
+  const laneThreadId = state.laneThreadId;
+  if (state.place === 'waiting' || !laneThreadId) {
+    return busyAction('landing-lane', label, 'neutral', LANE_PLACE_LABEL[state.place]);
+  }
+  return {
+    key: 'landing-lane',
+    label,
+    ariaLabel: LANE_PLACE_LABEL[state.place],
+    tooltip: LANE_THREAD_TIP,
+    tone: 'neutral',
+    icon: () => <InFlightIcon />,
+    invoke: () => focusThreadOrBootstrap(laneThreadId),
+  };
+}
+
+/** A request in flight: the plain verb beside a spinner, disabled. `name` says
+ *  what is happening, for a screen reader and the tooltip. */
+function busyAction(key: string, label: string, tone: SlotTone, name: string): SlotAction {
+  return { key, label, ariaLabel: name, tooltip: name, tone, icon: () => null, invoke: null };
 }
 
 /** The members the row carries when the banner is SUPPRESSED because the thread
@@ -336,7 +345,7 @@ export function getStandaloneActions(): HeaderActionSpec[] {
   const standing = resolveThreadActions(focused).find((a) => a.kind === 'apply_when_settled');
   if (standing) {
     members.push({
-      key: 'standing-apply',
+      key: STANDING_APPLY_KEY,
       dataRole: 'standing-apply',
       label: standing.label,
       tooltip: standing.tooltip,
@@ -366,7 +375,7 @@ function hasCcDiff(thread: ThreadState): boolean {
 
 function diffAction(threadId: string): HeaderActionSpec {
   return {
-    key: 'thread-diff',
+    key: DIFF_KEY,
     dataRole: 'thread-diff',
     label: 'Diff',
     tooltip: tooltipWithShortcut(DIFF_TOOLTIP, 'showThreadDiff'),
@@ -402,7 +411,7 @@ function focusedComposerBannerState(): BannerState | null {
  *  composer row draws a Diff button. */
 export function showFocusedThreadDiff(): void {
   const banner = focusedComposerBannerState();
-  const members = banner ? getBannerActions(banner) : getStandaloneActions();
+  const members = banner ? getBannerActions(banner).situational : getStandaloneActions();
   const id = focusedThreadId.value;
   if (id && members.some((m) => m.key === 'thread-diff')) openThreadDiff(id);
 }
@@ -423,209 +432,6 @@ export function applyFocusedThreadChange(): void {
   const id = focusedThreadId.value;
   if (!id || armingStandingApplyThreadIds.value.has(id)) return;
   void resolveThreadActions(id).find((a) => a.kind === 'apply_when_settled')?.invoke();
-}
-
-/** Bring a set-aside change back to pending, from its own thread, with Discard
- *  behind the caret, as the Changes panel's set-aside row offers. Discard is
- *  withheld while the thread is unsettled, since the engine refuses it then. */
-function bringBackAction({ changeId, discardable }: { changeId: string; discardable: boolean }): HeaderActionSpec {
-  const bringBack: SplitFace = {
-    key: 'bring-back',
-    label: 'Bring back',
-    tooltip: BRING_BACK_TOOLTIP,
-    className: 'action-btn',
-    icon: () => <MoveToTopIcon />,
-    invoke: () => bringBackSingleChange(changeId),
-  };
-  const discard: SplitFace = {
-    key: 'discard',
-    label: 'Discard',
-    tooltip: DISCARD_SET_ASIDE_TOOLTIP,
-    className: 'action-btn action-btn-danger',
-    icon: () => <TrashIcon />,
-    invoke: () => discardSingleChange(changeId),
-  };
-  const menuFaces = discardable ? [discard] : [];
-  return {
-    key: bringBack.key,
-    label: bringBack.label,
-    tooltip: bringBack.tooltip,
-    icon: bringBack.icon,
-    render: (attrs) => (
-      <SplitButton
-        primaryLabel={bringBack.label}
-        primaryClassName={bringBack.className}
-        primaryTooltip={bringBack.tooltip}
-        onPrimary={() => void bringBack.invoke()}
-        caretClassName={bringBack.className}
-        caretAriaLabel="More set-aside actions"
-        menuItems={menuFaces.map((face) => ({
-          key: face.key,
-          label: face.label,
-          className: face.className,
-          tooltip: face.tooltip,
-          onClick: () => void face.invoke(),
-        }))}
-        attrs={{ ...attrs, 'data-thread-action': '' }}
-      />
-    ),
-    menuRows: (ctx) => [bringBack, ...menuFaces].map((face) => faceMenuRow(face, ctx)),
-  };
-}
-
-/** A change action is an approval, so each button, and each row it folds into,
- *  is a protected surface of its own (ADR 0309). `variant` is empty for a
- *  neutral button. */
-function protectedButtonClass(variant: string): string {
-  return ['action-btn', variant, PROTECTED_SURFACE].filter(Boolean).join(' ');
-}
-
-/** Where the change stands in the landing lane. In the open batch it links
- *  the lane thread; waiting, it is the one disabled progress face. */
-function laneAction(state: Extract<BannerState, { type: 'landing' }>): HeaderActionSpec {
-  const label = LANE_PLACE_LABEL[state.place];
-  const laneThreadId = state.laneThreadId;
-  if (state.place === 'waiting' || !laneThreadId) return busyAction('landing-lane', '', label);
-  const open = () => focusThread(laneThreadId);
-  return {
-    key: 'landing-lane',
-    label,
-    tooltip: LANE_THREAD_TIP,
-    icon: () => null,
-    render: (attrs) => (
-      <button {...attrs} class="action-btn" data-tooltip={LANE_THREAD_TIP} onClick={open}>
-        {label}
-      </button>
-    ),
-    onClick: open,
-  };
-}
-
-/** A request in flight. Disabled on both sides: `disabledTooltip` is what makes
- *  the folded row `aria-disabled` rather than a live action. */
-function busyAction(key: string, variant: string, label: string): HeaderActionSpec {
-  return {
-    key,
-    label,
-    disabledTooltip: label,
-    icon: () => null,
-    extraClass: PROTECTED_SURFACE,
-    render: (attrs) => (
-      <button {...attrs} class={protectedButtonClass(variant)} disabled aria-label={label}>
-        {label}
-      </button>
-    ),
-  };
-}
-
-/** Render one close-set TaggedAction as a member. Class and aria derive from
- *  the kind; label, tooltip and the (confirm-wrapped) handler come from the
- *  selector. */
-function closeSetAction(action: TaggedAction): HeaderActionSpec {
-  const variant =
-    action.kind === 'discard'
-      ? 'action-btn-danger'
-      : action.kind === 'apply'
-        ? 'action-btn-confirm'
-        : '';
-  const cls = protectedButtonClass(variant);
-  const label = action.kind === 'archive' ? 'Archive thread' : action.label;
-  return {
-    key: action.kind,
-    label,
-    tooltip: action.tooltip,
-    icon: () => ACTION_ICON[action.kind]?.() ?? null,
-    extraClass: PROTECTED_SURFACE,
-    render: (attrs) => (
-      <button
-        {...attrs}
-        data-thread-action=""
-        class={cls}
-        aria-label={action.kind === 'archive' ? label : undefined}
-        data-tooltip={action.tooltip}
-        onClick={() => void action.invoke()}
-      >
-        {action.label}
-      </button>
-    ),
-    onClick: () => void action.invoke(),
-  };
-}
-
-/** The one-tap face of the change split button. */
-interface SplitFace {
-  key: string;
-  label: string;
-  tooltip: string;
-  /** The face's button classes, which set its colour. */
-  className: string;
-  icon: () => ComponentChildren;
-  invoke: () => void | Promise<unknown>;
-}
-
-function applyFace(apply: TaggedAction): SplitFace {
-  return {
-    key: apply.kind,
-    label: apply.label,
-    tooltip: tooltipWithShortcut(apply.tooltip ?? apply.label, 'applyChange'),
-    className: 'action-btn action-btn-confirm',
-    icon: () => <CheckIcon />,
-    invoke: apply.invoke,
-  };
-}
-
-/** The face as a ⋯ menu row, for the folded rendering. */
-function faceMenuRow(face: SplitFace, ctx: OverflowMenuContext) {
-  return (
-    <button
-      key={face.key}
-      type="button"
-      class={`thread-overflow-item ${PROTECTED_SURFACE}`}
-      role="menuitem"
-      onClick={ctx.run(() => void face.invoke())}
-    >
-      {face.icon()}
-      {face.label}
-    </button>
-  );
-}
-
-/** Change-action split button: a one-tap face (Apply / Apply*) plus a caret
- *  menu holding the remaining close-set
- *  actions. Diff is NOT in here: it lives permanently outside this cluster as
- *  its own member of `getBannerActions`. It is built on the generic
- *  `SplitButton`, the control behind the prompt's multi-select answer Submit.
- *  So the caret / Overlay-dismiss / inert-primary contract lives in one place.
- *  The menu takes its labels, tooltips and handlers from the same TaggedActions
- *  the desktop buttons use, so there's no enablement drift. */
-function ChangeActionSplitButton({
-  primary,
-  menuActions,
-  attrs,
-}: {
-  primary: SplitFace;
-  menuActions: TaggedAction[];
-  attrs?: Record<string, string>;
-}) {
-  const menuItems: SplitButtonMenuItem[] = menuActions.map((action) => ({
-    key: action.kind,
-    label: action.label,
-    className: action.kind === 'discard' ? 'action-btn action-btn-danger' : 'action-btn',
-    tooltip: action.tooltip,
-    onClick: () => void action.invoke(),
-  }));
-  return (
-    <SplitButton
-      primaryLabel={primary.label}
-      primaryClassName={primary.className}
-      primaryTooltip={primary.tooltip}
-      onPrimary={() => void primary.invoke()}
-      caretClassName={primary.className}
-      caretAriaLabel="More change actions"
-      menuItems={menuItems}
-      attrs={attrs}
-    />
-  );
 }
 
 /** The Diff button. Rendered in two places: inside the banner via
@@ -668,6 +474,28 @@ export function DiffButton({ threadId, attrs }: { threadId: string; attrs?: Reco
     >
       <DiffIcon />
     </button>
+  );
+}
+
+/** Diff and the standing apply as ONE icon box, for a row too narrow for both.
+ *
+ *  Its menu rows are the two members' own rows, the ones the ⋯ shows once they
+ *  fold. So labels, handlers and the standing apply's checkbox state have one
+ *  source. The face wears the overflow glyph: the Diff glyph would pass for a
+ *  plain Diff button. While the standing apply is armed it also wears the armed
+ *  tone, so the state stays visible on the merged control.
+ *
+ *  `attrs` are the composer row's measurement attributes. */
+export function DiffApplyMenu({ members, attrs }: { members: readonly HeaderActionSpec[]; attrs: Record<string, string> }) {
+  const armed = members.some((m) => m.key === STANDING_APPLY_KEY && m.active);
+  const label = armed ? 'Diff and standing apply (armed)' : 'Diff and standing apply';
+  return (
+    <OverflowMenu
+      ariaLabel={label}
+      triggerAttrs={{ ...attrs, 'data-role': 'diff-apply-menu', ...(armed ? { 'data-tone': 'armed', 'aria-pressed': 'true' } : {}) }}
+      face={{ class: 'icon-btn header-icon', label, children: <MoreIcon /> }}
+      items={(ctx) => members.map((a) => renderMenuAction(a, ctx))}
+    />
   );
 }
 

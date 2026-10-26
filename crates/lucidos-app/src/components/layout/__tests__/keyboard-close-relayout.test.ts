@@ -110,6 +110,14 @@ describe('foldViewportReading: the edge the wedge starts on', () => {
     expect(run(up, { height: FULL, layoutViewport: 0 }, down).closed).toBe(true);
     expect(run(up, { height: NaN, layoutViewport: FULL }, down).closed).toBe(true);
   });
+
+  it('reads a zero-height viewport as no reading, never a keyboard', () => {
+    // The iOS 27 standalone PWA transiently reports 0 with the keys down.
+    const zero = { height: 0, layoutViewport: FULL };
+    expect(foldViewportReading(null, zero)).toEqual({ watch: null, closed: false, covered: false });
+    expect(run(down, zero, down).closed).toBe(false);
+    expect(run(up, zero, down).closed).toBe(true);
+  });
 });
 
 describe('bounceHeight: the relayout that stands in for a keyboard bounce', () => {

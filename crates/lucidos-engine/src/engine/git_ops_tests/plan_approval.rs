@@ -28,7 +28,7 @@ fn a_tapped_option_approves_unless_it_asks_for_changes() {
     assert!(approves(&picked("Approve here")));
     assert!(approves(&picked("Judge only")));
     assert!(approves(&picked(
-        "Implement in a new thread: Sonnet 5.5, high"
+        "Implement in a fresh session: Sonnet 5.5, high"
     )));
     assert!(!approves(&picked("Request changes")));
     assert!(!approves(&picked(" request CHANGES ")));
@@ -79,6 +79,14 @@ struct Owned {
 }
 
 async fn session_for(pool: &sqlx::PgPool, branch: &str) -> Owned {
+    session_of_kind(pool, branch, Default::default()).await
+}
+
+async fn session_of_kind(
+    pool: &sqlx::PgPool,
+    branch: &str,
+    coding_agent_kind: crate::engine::agent_session::CodingAgentKind,
+) -> Owned {
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
@@ -88,12 +96,13 @@ async fn session_for(pool: &sqlx::PgPool, branch: &str) -> Owned {
             session_id: "sid-test".to_string(),
             branch: branch.to_string(),
             repo_id: None,
-            coding_agent_kind: Default::default(),
+            coding_agent_kind,
             coding_agent_folder: String::new(),
             app_id: None,
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })
@@ -155,6 +164,7 @@ impl Owned {
                 thread_id: self.thread,
                 event: ThreadEvent::UserQuestionAnswered {
                     tool_use_id: tool_use_id.into(),
+                    quiet: false,
                     answer,
                 },
                 meta: EventMeta {
@@ -455,6 +465,113 @@ async fn a_superseded_card_never_hides_a_typed_approval() {
     owned.say("approve", device()).await;
     owned.answer(&stale, AnswerKind::Superseded, device()).await;
     assert!(approved(&pool, &repo).await);
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A repo holding `BRANCH`, as a thread's worktree branch would.
+async fn repo_with_branch() -> (tempfile::TempDir, std::path::PathBuf) {
+    let (tmp, repo) = make_test_repo().await;
+    git_cmd(&["branch", BRANCH], &repo).await.unwrap();
+    (tmp, repo)
+}
+
+#[tokio::test]
+async fn a_lucidos_or_app_thread_off_its_tracked_branch_is_told_which_branch_applies() {
+    let (pool, db) = setup_test_db().await;
+    let (_tmp, repo) = repo_with_branch().await;
+    for kind in [
+        crate::engine::agent_session::CodingAgentKind::Lucidos,
+        crate::engine::agent_session::CodingAgentKind::App,
+    ] {
+        let thread = session_of_kind(&pool, BRANCH, kind)
+            .await
+            .thread
+            .to_string();
+        assert_eq!(
+            tracked_branch_elsewhere(&pool, &repo, &thread, "phase6-side")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(BRANCH),
+            "{kind:?}: Apply lands only the engine-named branch, so a side-branch marker strands"
+        );
+        assert_eq!(
+            tracked_branch_elsewhere(&pool, &repo, &thread, BRANCH)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_tracked_branch_absent_from_the_repo_never_refuses() {
+    let (pool, db) = setup_test_db().await;
+    let (_tmp, repo) = make_test_repo().await;
+    let thread = session_for(&pool, BRANCH).await.thread.to_string();
+    assert_eq!(
+        tracked_branch_elsewhere(&pool, &repo, &thread, "renamed")
+            .await
+            .unwrap(),
+        None,
+        "a renamed tracked branch is taken over at the next spawn, and another repo never held it"
+    );
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn an_external_thread_or_a_threadless_caller_may_mark_any_branch() {
+    let (pool, db) = setup_test_db().await;
+    let (_tmp, repo) = repo_with_branch().await;
+    let external = session_of_kind(
+        &pool,
+        BRANCH,
+        crate::engine::agent_session::CodingAgentKind::External,
+    )
+    .await;
+    assert_eq!(
+        tracked_branch_elsewhere(&pool, &repo, &external.thread.to_string(), "renamed")
+            .await
+            .unwrap(),
+        None,
+        "an external thread adopts a renamed branch at idle"
+    );
+    assert_eq!(
+        tracked_branch_elsewhere(&pool, &repo, &Uuid::new_v4().to_string(), "any")
+            .await
+            .unwrap(),
+        None,
+        "a caller with no session has no tracked branch"
+    );
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_legacy_external_thread_reads_its_durable_flag() {
+    let (pool, db) = setup_test_db().await;
+    let (_tmp, repo) = repo_with_branch().await;
+    let legacy = session_for(&pool, BRANCH).await.thread;
+    sqlx::query(
+        "INSERT INTO thread_summaries (thread_id, coding_agent_is_external_repo) \
+         VALUES ($1, TRUE) \
+         ON CONFLICT (thread_id) DO UPDATE SET coding_agent_is_external_repo = TRUE",
+    )
+    .bind(legacy)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tracked_branch_elsewhere(&pool, &repo, &legacy.to_string(), "renamed")
+            .await
+            .unwrap(),
+        None,
+        "a session older than coding_agent_kind still counts as external"
+    );
     pool.close().await;
     teardown_test_db(&db).await;
 }

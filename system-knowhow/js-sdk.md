@@ -3,6 +3,11 @@ name: Lucidos JavaScript SDK
 description: API reference for the `lucidos` JS SDK. Namespaces: data, events, proxy, apiUrl, oauth, triggers, apps, preferences, storage, notifications, threads, ui, sse. Also the component classes and theme variables apps style with.
 ---
 
+<!-- domain-event: ReportOpened: Example domain event emitted when the app opens a report. -->
+
+<!-- domain-event: HabitCompleted: Example domain event emitted by a habit-tracker app. -->
+<!-- domain-event: EmailReceived: Example domain event emitted by an email-ingestion integration. -->
+
 # Lucidos JavaScript SDK
 
 The SDK is available as the `lucidos` global in app UIs (loaded via `<script src="/api/v1/sdk.js">`). The host frontend imports it from the `@lucidos/sdk` package directly.
@@ -501,7 +506,7 @@ view, sort or filter with `.segmented-control` or `.pill-bar`, never by swapping
 | `.label` (+ `.label-success`, `.label-warning`, `.label-error`, `.label-neutral`) | The host's small uppercase chip for a status or a category. The bare class is the accent tone, and the tones are additive: `class="label label-success"`. They use the toast's words, so a status reads the same in a chip and a toast. **Use this instead of drawing your own badge, chip or pill.** A pill the user taps is a button, not a label: see `.pill-bar`. |
 | `.title` | A list/panel/modal title |
 | `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group: two or three mutually exclusive options with one picked. Not page navigation, and not a long strip: past a handful of segments it wraps and reads as options to weigh, not places to go. Use `.pill-bar` as tabs to switch views, or a list of rows to go somewhere. It wraps when the segments pass their container, so each label stays on one line. |
-| `.pill-bar` + `.pill-bar-btn` | A row of pills with one picked, as in Settings > Theme. The markup tells two uses apart. **Tabs** that switch views: `<div class="pill-bar" role="tablist">` holding `<button class="pill-bar-btn" role="tab" aria-selected="true">`. A **filter** that narrows one list: `role="group"` with `aria-pressed` on each button. Set the attribute to `true` on the picked pill, and the bar marks it. It stays on one line and scrolls sideways when the pills do not fit. On a touch screen each pill takes taps `--pill-bar-hit-slop` (0.5rem) above and below itself without growing. The bar pads out room for that reach and for focus rings (`--focus-ring-width`). A negative margin hands back the room above and below, so the pills sit `--focus-ring-width` in from the bar's sides. If you pad the bar yourself, keep both allowances, or a ring or the reach is cut off. **Use this instead of drawing your own tabs or filter pills.** |
+| `.pill-bar` + `.pill-bar-btn` | A row of pills with one picked, as in Settings → Appearance & Behavior → Theme. The markup tells two uses apart. **Tabs** that switch views: `<div class="pill-bar" role="tablist">` holding `<button class="pill-bar-btn" role="tab" aria-selected="true">`. A **filter** that narrows one list: `role="group"` with `aria-pressed` on each button. Set the attribute to `true` on the picked pill, and the bar marks it. It stays on one line and scrolls sideways when the pills do not fit. On a touch screen each pill takes taps `--pill-bar-hit-slop` (0.5rem) above and below itself without growing. The bar pads out room for that reach and for focus rings (`--focus-ring-width`). A negative margin hands back the room above and below, so the pills sit `--focus-ring-width` in from the bar's sides. If you pad the bar yourself, keep both allowances, or a ring or the reach is cut off. **Use this instead of drawing your own tabs or filter pills.** |
 | `.list-rows`, `.list-row`, `.list-row-info`, `.list-row-name`, `.list-row-actions`, `.list-section-title`, … | List/row layouts |
 | `.list-row-add-card` (+ `.list-row-add-icon`, `.list-row-add-label`) | The "+ Add <thing>" row that closes a list. **Put it on a `<button type="button">`**, not a clickable `<div>`. The class carries the UA button reset and a `:focus-visible` ring. On a button the card is in the tab order and answers Enter and Space, and on a div only a pointer reaches it. Markup is `<button class="list-row-add-card"><span class="list-row-add-icon">+</span><span class="list-row-add-label">Add Thing</span></button>`. |
 | `.list-row-details` (+ `.list-row-details-prose`) | The small muted line under a row title. The base class is a flex row of metadata fields, and its 0.75rem gap IS the separator. So a **sentence** takes the additive prose variant (`class="list-row-details list-row-details-prose"`). Under the bare flex class every inline `<strong>`/`<code>` becomes a flex item, which opens gaps mid-sentence and strands the following punctuation on the next line. |
@@ -532,22 +537,6 @@ are in `system-knowhow/building-an-app.md` § Responsive by default.
 `lucidos._capture()` needs nothing from your app. The SDK draws the page through an SVG `foreignObject`. So the browser renders the snapshot, and any CSS it paints comes out right, CSS Color 4 included. It embeds your fonts and images by reading them over the host bridge. One it cannot read (another host, or a route outside the app reach table) paints empty.
 
 When the screenshot fails for any reason, the capture degrades to **DOM-only** rather than throwing. It returns an empty `screenshot` plus a `dom` layout snapshot (element positions + classes), prefixed with the failure reason. So the agent still sees the layout.
-
-External-host apps point `baseUrl` at the Lucidos instance with `lucidos.configure`:
-
-```ts
-lucidos.configure(opts: { baseUrl?: string; token?: string }): void
-```
-
-```js
-lucidos.configure({ baseUrl: 'https://your-lucidos.example' });
-```
-
-`baseUrl` overrides the auto-derived workspace base path. In-app iframes don't
-need it: the SDK reads the gateway prefix from `<base href>` / the `/app/` URL.
-`token`, when set, goes out as an `Authorization: Bearer <token>` header on every
-SDK request, for embedders calling a remote engine that requires auth. Both are
-optional, and each call merges into the existing config.
 
 ### Widget shapes
 
@@ -611,7 +600,7 @@ A call that never gets an answer rejects with a `DOMException` instead, and the
 | `err.name` | Meaning | What to do |
 |---|---|---|
 | `TimeoutError` | The SDK's own 10s deadline fired. | Treat as retryable. The request may or may not have reached the engine. |
-| `AbortError` | Something cancelled the request: an `AbortSignal` you passed in `init`, or the browser tearing down an in-flight fetch. | If you did not cancel it yourself, treat as retryable. |
+| `AbortError` | Something cancelled the request: an `AbortSignal` browser type you passed in `init`, or the browser tearing down an in-flight fetch. | If you did not cancel it yourself, treat as retryable. |
 
 The `AbortError` case is routine on an installed iOS PWA: WebKit aborts every
 in-flight fetch when it suspends the page. Retry an idempotent call rather than
@@ -623,6 +612,23 @@ WebKit rejects an aborted fetch with a generic `AbortError` rather than the
 signal's reason. So the SDK re-stamps a fired deadline as `TimeoutError`, as
 Chrome and Firefox deliver it. A cancel you requested stays an `AbortError`,
 even when the deadline fired in the same instant.
+
+## lucidos.configure: SDK endpoint
+
+`lucidos.configure(opts: { baseUrl?: string; token?: string }): void`
+
+Apps loaded by Lucidos use the host bridge automatically. Standalone clients can
+configure the SDK before making calls:
+
+```js
+lucidos.configure({ baseUrl: 'https://example.com', token: 'your-access-token' });
+```
+
+`baseUrl` overrides the auto-derived workspace base path for requests and event
+streams. In-app iframes read the gateway prefix from `<base href>` or their
+`/app/` URL, so they need no override. `token` adds a Bearer Authorization header
+to SDK fetch requests, including bridged requests. Omitted options keep their current
+values. The endpoint still enforces its authentication and app-route policy.
 
 ## lucidos.data: File Operations
 
@@ -717,7 +723,7 @@ domain events (`HabitCompleted`) and the engine's own thread / system events
 are rows in one `events` table. One call returns them, filtered by `event_type`,
 time, `thread_id`, or a paging cursor. There is no second stream. See
 `system-knowhow/thread-events.md` § "One table, two enums" for the
-`ThreadEvent` / `SystemEvent` distinction.
+`ThreadEvent` / `engine::event_bus::SystemEvent` distinction.
 
 ```ts
 lucidos.events.emit(type: string, payload: Record<string, unknown>, options?: EmitOptions): Promise<void>
@@ -855,8 +861,13 @@ OpenAI speech (`/audio/speech`) reports usage only on an SSE stream. So for `mp3
 **The upstream cannot act on the Lucidos origin.** The engine serves the response from its own origin, so it passes only the headers a caller reads:
 
 - content, caching and range headers, `Location`, `Link` and `Retry-After`
-- the `RateLimit-*` family, `Request-Id` and any `x-` header
-- the `anthropic-` and `openai-` families of the builtin providers
+- `Accept-Patch`, `Accept-Post`, `Allow`, `Date`, `Deprecation`, `Digest`,
+  `Repr-Digest`, `Server`, `Sunset`, `Traceparent`, `Tracestate`, `Vary` and `Warning`
+- `RateLimit`, `RateLimit-Limit`, `RateLimit-Policy`, `RateLimit-Remaining`,
+  `RateLimit-Reset` and `Request-Id`
+- `x-` extensions except browser-control headers, `x-lucidos-*` and
+  `x-forwarded-*`
+- the `anthropic-` and `openai-` header families, for every proxy entry
 
 The engine drops everything else. That covers `Set-Cookie`, `Clear-Site-Data`, `Strict-Transport-Security`, a CSP, CORS headers, `Alt-Svc` and `WWW-Authenticate`, and any other vendor header. Every response carries `X-Content-Type-Options: nosniff`. An HTML, XML or untyped one also carries `Content-Security-Policy: sandbox`, so a proxy URL opened in a tab never runs upstream script.
 
@@ -873,12 +884,17 @@ The engine drops everything else. That covers `Set-Cookie`, `Clear-Site-Data`, `
   "sonos":   { "base_url": "http://localhost:5005" },
   "comfort": {
     "base_url": "https://accsmart.panasonic.com",
-    "auth": { "type": "bearer", "credential": "comfort-cloud" }
+    "auth": { "pipeline": [
+      { "type": "static_credential", "kind": "bearer", "credential": "comfort-cloud" }
+    ] }
   }
 }
 ```
 
-Auth is configured per API and applied server-side. The URL pattern (`/api/v1/proxy/<name>/<path>`) is the same in every auth mode. See `system-knowhow/lucidos-cli.md` § `lucidos proxy` for the full `apis.json` schema (bearer / api_key / basic / query_param / hmac_signed / script_handshake). Omit `auth` for unauthenticated backends (e.g. local services).
+Auth runs server-side through an ordered `auth.pipeline`. The proxy URL stays
+`/api/v1/proxy/<name>/<path>`. Omit `auth` for an unauthenticated backend.
+See [the CLI proxy reference](lucidos-cli.md#configure-the-backend-one-time)
+and [auth pipeline examples](building-an-auth-handshake.md) for layer schemas.
 
 ### Examples
 
@@ -1073,7 +1089,8 @@ app runs in. The whole reachable set, with the methods each opens:
 | `/proxy/:name/*path` | any method |
 | `/ui/navigate` | POST |
 | `/env-vars` | GET |
-| `/models`, `/knowhow`, `/knowhow/read`, `/health` | GET |
+| `/models`, `/model-prices`, `/knowhow`, `/knowhow/read`, `/health` | GET |
+| `/fonts`, `/fonts/:file` | GET |
 | `/themes`, `/theme`, `/themes/tokens`, `/themes/parts` | GET |
 | `/themes/resolve` | POST |
 
@@ -1199,7 +1216,7 @@ interface EventSubscription {
 
 // Irreversible-side-effect category a trigger can be granted. Only enforced
 // when the workspace's command guard is on (Settings → Permissions → Command
-// Safety). A trigger that hits an irreversible command whose category isn't in
+// safety). A trigger that hits an irreversible command whose category isn't in
 // its grant fails, since it runs unattended and cannot ask for approval.
 type SideEffectCategory =
   | 'email'
@@ -1427,7 +1444,7 @@ On a dashboard the tile sets the box and the frame fills it. Draw for the size y
 
 `visible()` turns false while a hidden dashboard keeps the frame loaded, just before it unloads. Stop timers then, and read again when it turns true.
 
-A right-click anywhere in a widget opens the widget's own menu at the pointer (ADR 0528). A finger held on a dashboard tile opens it too, and a dashboard tile draws no ⋯. Content keeps the native menu, by the host's own rule:
+A right-click anywhere in a widget opens the widget's own menu at the pointer (ADR 0528). A finger held on a dashboard tile opens it too, with a haptic tick, and a dashboard tile draws no ⋯. A finger on a tile turns off text selection and iOS's own long-press menu, links included, until the next press. On a right-click, content keeps the native menu, by the host's own rule:
 
 - a link, an input, a text area, editable content, an image, a video or audio;
 - a selection the press landed in;
@@ -1803,7 +1820,9 @@ lucidos.threads.count(opts?: Omit<ThreadsListOptions, 'limit'>): Promise<number>
 
 `list()` calls `GET /api/v1/threads/list` and returns a newest-first array of `ThreadSummary` rows from the projection. `count()` calls `GET /api/v1/threads/count` and resolves to the count under the same filter, cheaper on big workspaces than `(await list()).length`.
 
-Same surface as the `lucidos threads list` / `lucidos threads count` CLI and the `list_threads` / `count_threads` LLM tools. Use it to render thread state (counts, status indicators) without subscribing to the full SSE stream.
+The CLI equivalents are `lucidos threads list` and `lucidos threads count`.
+The LLM uses the grouped `threads` tool with `list` or `count`.
+Use these for thread metadata without subscribing to the full SSE stream.
 
 **`active` is a union, `status` is precise.** `active: true` selects `running` OR `waiting_for_user_answer`, which are opposites: the workspace working, or waiting on a person. "Is anything busy?" wants `status: 'running'`. "N threads I have something invested in" wants `active: true`. Passing both is a 400.
 
@@ -1831,7 +1850,7 @@ interface ThreadsListOptions {
   limit?: number;
   /** Thread id. Restrict to that thread's DIRECT children, never its
    *  grandchildren. Same filter as the `--parent` CLI flag and the
-   *  `list_threads` tool's `my_children`, except an app names the thread.
+   *  `threads` tool's `my_children` on its `list` action, except an app names the thread.
    *  A malformed uuid is a 400, never a silently unfiltered list. */
   parent?: string;
 }
@@ -1845,7 +1864,7 @@ type UnproposedReason =
   | 'turn_incomplete'
   | 'awaiting_landing'
   | 'integrated_into_parent'
-  | 'carried_by_successor';
+  | 'carried_by_successor'; // Legacy successor threads only.
 
 type CodingAgentChangeState =
   | { kind: 'none' }
@@ -1906,8 +1925,8 @@ interface ThreadSummary {
   last_revived_at: string | null;
   parent_thread_id?: string | null;
   parent_thread_title?: string | null;
-  successor?: { thread_id: string; title: string | null };    // the successor thread it continued in
-  successor_of?: { thread_id: string; title: string | null }; // the thread this successor continues
+  successor?: { thread_id: string; title: string | null };    // legacy successor thread
+  successor_of?: { thread_id: string; title: string | null }; // predecessor of a legacy successor thread
   trigger_id?: string | null;
   trigger_name?: string | null;
   cc_repo_id?: string | null;
@@ -2113,11 +2132,11 @@ show(await lucidos.ui.focusedThread());
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` (or `app_id`), `fragment` (optional) | Open an app UI, optionally at a place inside it. See the fragment param below. |
-| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. |
+| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `intelligence`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. |
 | `new-chat` | `prompt`, `coding_agent`, `folder` (all optional) | Open a fresh chat thread, optionally prefilling the compose textarea and preselecting the coding agent and folder. Prefer `lucidos.ui.startThread()`, the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row. The plugin-update notification uses this, so a tap on one update lands on its plugin. |
 | `app-store` | (none) | Open the Plugins panel's Store (marketplace) tab. |
-| `dashboard` | (none) | Show the *dashboard* of the device's layout: the rail on desktop, shown if it was hidden, and the dashboard sheet over the open thread on a phone. |
+| `dashboard` | (none) | Show the *dashboard* of the device's layout: the rail on desktop, shown if it was hidden, and the dashboard panel over the open thread on a phone. |
 | `file` | `file_path`, `line` (optional), `line_end` (optional) | Open a file in the preview pane, optionally at a line. See the two accepted path forms and the line params below. |
 | _other panels_ | (none) | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
 
@@ -2302,9 +2321,9 @@ document.querySelector('#docs-btn').addEventListener('click', () => {
 Two rules:
 
 - **Call it synchronously from the click handler.** When the user has chosen the
-  "Ask" external-link target, this opens the OS share sheet, which the browser
-  refuses without a live user gesture. An `await` before the call spends that
-  gesture. Do async work first, then open from a later interaction.
+  "Ask" external-link target, a standalone tab can open the OS share sheet.
+  That requires a live user gesture. An isolated iframe cannot share and uses
+  host navigation instead. Do async work first, then open from a later interaction.
 - **Don't fall back to `window.open`.** Inside an installed iOS PWA `window.open`
   cannot leave the app: WebKit renders an in-app web view with no address bar,
   no tabs and no shared Safari session. The user's `external_link_target`
@@ -2565,8 +2584,9 @@ you add later is covered too. Never hand-roll a tooltip in an app.
 
 Placement: above the element by default, flipped below when there is no room
 above. Horizontally centred on the element and clamped inside the viewport, with
-the arrow kept on the anchor. It hides on mouseout, on a mousedown, on a scroll,
-and when the frame loses focus.
+the arrow kept on the anchor. Pointer scrolling repositions the tooltip.
+It hides on mouseout, mousedown and when the frame loses focus.
+A touch swipe dismisses it.
 
 **A pointer waits 300ms before the tooltip appears**, so crossing a toolbar does
 not trail one behind the cursor.

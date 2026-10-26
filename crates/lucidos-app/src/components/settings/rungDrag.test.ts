@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { LONG_PRESS_DELAY_MS } from '../../hooks/useLongPress';
 import { makeRungDrag, type RungDragCallbacks } from './rungDrag';
@@ -18,7 +19,7 @@ function fakeSurface() {
   };
 }
 
-const at = (clientY: number) => ({ button: 0, clientX: 0, clientY, currentTarget: {} }) as unknown as PointerEvent;
+const at = (clientY: number) => ({ button: 0, clientX: 0, clientY, currentTarget: document.createElement('div') }) as unknown as PointerEvent;
 const rowAt = (y: number) => Math.min(3, Math.max(0, Math.floor(y / 50)));
 
 describe('makeRungDrag', () => {

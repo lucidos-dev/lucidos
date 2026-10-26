@@ -1,5 +1,6 @@
 use super::LucidosEngine;
 use crate::core::grants::{self, GrantFile};
+use crate::engine::command_guard::TrustedHeads;
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::types::CcCommandsInfo;
 use std::collections::HashMap;
@@ -37,10 +38,9 @@ pub(crate) fn lookup_repo_commands_in_cache(
 //     prompt regardless of `--allowedTools`, because the plan must be
 //     reviewed by the user before the assistant continues. A bare
 //     `ExitPlanMode` line never suppresses the card.
-// The "Always allow" broad button is hidden for these tools (`PermissionCard.tsx`
-// reads this list from the generated `engine-constants.ts`); users wanting in-thread
-// persistence should use the session-allow button instead, which the engine
-// intercepts before CC's gate. See `input_touches_protected_path` for the
+// A card offers no "Always allow" broad button for these tools. For in-thread
+// persistence, use the session-allow button: the engine intercepts it before
+// CC's gate. See `input_touches_protected_path` for the
 // related per-input filter (Bash commands targeting `.claude/` / `.git/`
 // paths, which empirically still surface a card even with bare `Bash` in
 // `--allowedTools`).
@@ -67,22 +67,27 @@ pub(crate) const CC_PROTECTED_PATH_MARKERS: &[&str] = &[".claude/", ".git/"];
 // while `BROAD_ALLOW_INEFFECTIVE` is "tools whose bare allowlist entry is a
 // lie." Edit/Write/NotebookEdit are in both; ExitPlanMode is only in the
 // latter (no per-path identifier — its session pattern is the bare tool
-// name). `PermissionCard.tsx` reads it from the generated `engine-constants.ts`.
+// name).
 pub(crate) const SESSION_PATH_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 // Codex backend tool names, raised by the app-server approval bridge (see
-// `runtime/codex_app_server_parse.rs::parse_approval_request`). The
-// PERSISTED scopes (Broad / Narrow) are meaningless for them:
-// `cc-allowed-tools` only ever reaches Claude Code via `--allowedTools`; no
-// Codex driver reads the file, so persisting `command_execution` there would
-// claim a suppression nothing enforces while polluting CC's allowlist.
-// Session scope stays available where a meaningful sub-scope exists
-// (`command_execution(<first-token>:*)` — see `narrow_subscope`); `file_change`
-// gets NO session pattern at all (see the Session arm of
-// `derive_allow_pattern`). `PermissionCard.tsx` reads it from the generated
-// `engine-constants.ts`, and mirrors the `file_change` arm as
-// `SESSION_ALLOW_INEFFECTIVE`.
-pub(crate) const CODEX_BACKEND_TOOLS: &[&str] = &["command_execution", "file_change"];
+// `runtime/codex_app_server_parse.rs::parse_approval_request`). No Codex
+// driver reads `cc-allowed-tools`. A `command_execution` card persists Claude
+// Code's own `Bash` / `Bash(<head>:*)` line instead, and the engine's gate
+// honours it (`cc_permission::persisted_allow_covers`, ADR 0571). Session scope
+// uses `command_execution(<head>:*)` (see `narrow_subscope`). `file_change`
+// gets no persisted and no session pattern (see the Session arm of
+// `derive_allow_pattern`).
+pub(crate) const CODEX_BACKEND_TOOLS: &[&str] = &[CODEX_COMMAND_TOOL, "file_change"];
+
+/// The Codex app-server's command-approval tool. A Codex card means the OS
+/// sandbox blocked the command, which the user never chose.
+pub(crate) const CODEX_COMMAND_TOOL: &str = "command_execution";
+
+/// Claude Code's command tool. A `Bash` card means the tool is missing from a
+/// `--allowedTools` list the user curates, so it reaches the attended command
+/// gate only under `command_guard_coding_agents`.
+pub(crate) const CLAUDE_CODE_COMMAND_TOOL: &str = "Bash";
 
 /// Where a granted "Always allow" click is remembered.
 ///
@@ -106,13 +111,39 @@ pub enum AllowScope {
     Session,
 }
 
+/// The grant patterns a permission card offers, one per "Always allow"-style
+/// button. A missing pattern means no such button. The engine stamps it on the
+/// request event, the card renders exactly these buttons, and a click stores
+/// exactly the stamped pattern (ADR 0571).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GrantOffer {
+    /// "Always allow": a persisted line, `Bash` or a bare tool name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broad: Option<String>,
+    /// "Always allow `<head>` commands": a persisted line such as `Bash(git:*)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narrow: Option<String>,
+    /// "Allow for this thread": a pattern for this thread's session set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+impl GrantOffer {
+    pub fn pattern(&self, scope: AllowScope) -> Option<&str> {
+        match scope {
+            AllowScope::Broad => self.broad.as_deref(),
+            AllowScope::Narrow => self.narrow.as_deref(),
+            AllowScope::Session => self.session.as_deref(),
+        }
+    }
+}
+
 /// Derive the pattern to record when the user grants an "Always allow"-style
 /// click. Interpretation depends on `scope`:
 ///
 ///   * `Broad` / `Narrow` → appended verbatim to `cc-allowed-tools` so it
 ///     reaches CC as `--allowedTools` on the next spawn. Returns `None`
-///     (suppressing persistence and hiding the button on the UI) when
-///     either:
+///     (no button) when any of these hold:
 ///       1. The tool is in `BROAD_ALLOW_INEFFECTIVE` (Edit / Write /
 ///          NotebookEdit / ExitPlanMode) — CC always routes those through
 ///          the permission prompt regardless of `--allowedTools`, so the
@@ -124,11 +155,15 @@ pub enum AllowScope {
 ///          `Bash` in `--allowedTools`, so persisting `Bash` or
 ///          `Bash(<token>:*)` would lie about future suppression for that
 ///          exact path. Applies to both `Broad` and `Narrow`.
+///       3. The tool is `file_change`.
 ///
-///     Otherwise, `Broad` returns `Some(tool_name)` and `Narrow` returns
-///     `Some(sub_scope)` where the sub-scope exists:
+///     A Codex `command_execution` persists Claude Code's `Bash` line, so it
+///     meets every rule above as `Bash` (ADR 0571). Otherwise, `Broad`
+///     returns `Some(tool_name)` and `Narrow` returns `Some(sub_scope)` where
+///     the sub-scope exists:
 ///       * `Skill { skill: "plugin:name" }` → `Skill(plugin:*)`
 ///       * `Bash  { command: "git status" }` → `Bash(git:*)`
+///       * `command_execution { command: "git status" }` → `Bash(git:*)`
 ///
 ///     All other tools return `None` for `Narrow` (the UI hides that button).
 ///
@@ -137,41 +172,38 @@ pub enum AllowScope {
 ///     thread, including CC-protected paths the persisted scopes can't reach:
 ///       * `Edit | Write` → `Tool(<file_path>)` (per-file)
 ///       * `NotebookEdit` → `NotebookEdit(<notebook_path>)`
-///       * `Bash | command_execution` → `Bash(<first-token>:*)` (same as narrow)
+///       * `Bash | command_execution` → `<tool>(<grant-head>:*)` ([`command_grant_head`])
 ///       * `Skill` → `Skill(<plugin>:*)` (same as narrow)
 ///       * everything else → bare `tool_name`
 ///
 ///     `None` for `file_change`, and for a path tool or command with no path
-///     or head. The card's `sessionGrantable` hides the button in those cases.
+///     or head.
+///
+/// A card offers a derived pattern only when it covers its own request
+/// (`cc_permission::grant_offer`).
 pub(crate) fn derive_allow_pattern(
     tool_name: &str,
     input: &serde_json::Value,
     scope: AllowScope,
+    trusted: &TrustedHeads,
 ) -> Option<String> {
+    // A Codex command persists Claude Code's own line, under its protected-path
+    // rule, so one line means the same whichever agent asks (ADR 0571).
+    let persisted_tool = if tool_name == CODEX_COMMAND_TOOL {
+        CLAUDE_CODE_COMMAND_TOOL
+    } else {
+        tool_name
+    };
     match scope {
-        AllowScope::Broad => {
-            if BROAD_ALLOW_INEFFECTIVE.contains(&tool_name)
-                || CODEX_BACKEND_TOOLS.contains(&tool_name)
-            {
-                return None;
-            }
-            if input_touches_protected_path(tool_name, input) {
-                return None;
-            }
-            Some(tool_name.to_string())
+        AllowScope::Broad | AllowScope::Narrow
+            if CODEX_BACKEND_TOOLS.contains(&persisted_tool)
+                || input_touches_protected_path(persisted_tool, input) =>
+        {
+            None
         }
-        AllowScope::Narrow => {
-            // Codex backend tools: nothing reads a persisted pattern for
-            // them (see CODEX_BACKEND_TOOLS) — even though command_execution
-            // HAS a derivable sub-scope, persisting it would be a lie.
-            if CODEX_BACKEND_TOOLS.contains(&tool_name) {
-                return None;
-            }
-            if input_touches_protected_path(tool_name, input) {
-                return None;
-            }
-            narrow_subscope(tool_name, input)
-        }
+        AllowScope::Broad if BROAD_ALLOW_INEFFECTIVE.contains(&persisted_tool) => None,
+        AllowScope::Broad => Some(persisted_tool.to_string()),
+        AllowScope::Narrow => narrow_subscope(persisted_tool, input, trusted),
         AllowScope::Session => {
             if SESSION_PATH_TOOLS.contains(&tool_name) {
                 let path_key = if tool_name == "NotebookEdit" {
@@ -204,9 +236,9 @@ pub(crate) fn derive_allow_pattern(
             // unreadable command as a grant for every command in the thread.
             // That is the shape `file_change` above is denied.
             if matches!(tool_name, "Bash" | "command_execution") {
-                return narrow_subscope(tool_name, input);
+                return narrow_subscope(tool_name, input, trusted);
             }
-            if let Some(narrow) = narrow_subscope(tool_name, input) {
+            if let Some(narrow) = narrow_subscope(tool_name, input, trusted) {
                 return Some(narrow);
             }
             // Bare tool name — session scope is engine-side, so the
@@ -249,7 +281,11 @@ pub(crate) fn input_touches_protected_path(tool_name: &str, input: &serde_json::
 /// meaningful identifier. Returns `None` for tools without one — Narrow
 /// callers treat that as "no narrow button"; Session callers fall back to
 /// the bare tool name.
-fn narrow_subscope(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+fn narrow_subscope(
+    tool_name: &str,
+    input: &serde_json::Value,
+    trusted: &TrustedHeads,
+) -> Option<String> {
     match tool_name {
         "Skill" => {
             let skill = input.get("skill").and_then(|v| v.as_str())?;
@@ -261,27 +297,43 @@ fn narrow_subscope(tool_name: &str, input: &serde_json::Value) -> Option<String>
         }
         // Codex's command approvals carry a `command` field too, and get the
         // same head scoping as Bash: a grant on `git push` covers `git …` but
-        // NOT a later `rm -rf …`. Only the Session scope reaches this arm for
-        // Codex (Narrow returns None for its backend tools, since nothing
-        // reads a persisted pattern for them).
+        // NOT a later `rm -rf …`. Codex's Narrow scope reaches this arm as
+        // `Bash`, so it persists Claude Code's line.
         //
         // The head comes from the command guard, not from the first
         // whitespace token. Codex wraps EVERY command as
         // `/bin/zsh -lc '<script>'`, so the raw first token names the same
         // shell every time. One "Allow for this thread" click then blanket
-        // approved every later Codex command. `first_command_token` unwraps
-        // the wrapper, skips privilege prefixes and `VAR=value`, and takes the
-        // basename, which is what the card's own label shows.
+        // approved every later Codex command.
         "Bash" | "command_execution" => {
-            let command = input.get("command").and_then(|v| v.as_str())?;
-            let head = crate::engine::command_guard::first_command_token(command)?;
+            let head = command_grant_head(input, trusted)?;
             Some(format!("{}({}:*)", tool_name, head))
         }
         _ => None,
     }
 }
 
-/// Resolve the comma-separated tool allowlist for `claude --allowedTools`.
+/// The head a command grant stores, through [`command_guard::grant_head`]. A
+/// trusted repo script in `trusted` is named by its worktree-relative path.
+/// Read as text, as the session and persisted coverage checks read it.
+///
+/// [`command_guard::grant_head`]: crate::engine::command_guard::grant_head
+pub(crate) fn command_grant_head(
+    input: &serde_json::Value,
+    trusted: &TrustedHeads,
+) -> Option<String> {
+    use crate::engine::command_guard::{grant_head, CommandSite};
+    let command = input.get("command").and_then(|v| v.as_str())?;
+    grant_head(command, CommandSite::TextOnly { root: None }, trusted)
+}
+
+/// Tools every Claude Code session may run without a permission card. The
+/// engine's own prompt makes each turn run these, so a card would stall
+/// every turn in a workspace that has granted nothing yet.
+pub(crate) const ENGINE_ALLOWED_TOOLS: &[&str] = &["Bash(lucidos request-read:*)"];
+
+/// Resolve the comma-separated tool allowlist for `claude --allowedTools`:
+/// [`ENGINE_ALLOWED_TOOLS`], then the user's grants.
 ///
 /// Reads [`GrantFile::CodingAgentTools`] out of this workspace's grants dir
 /// (ADR 0095). On first use it seeds the file with its header, so the user has
@@ -291,7 +343,40 @@ pub(crate) fn cc_allowed_tools(dir: &Path) -> String {
     if !grants::exists(dir, file) {
         seed_allowed_tools_file(dir);
     }
-    grants::patterns(dir, file).join(",")
+    let grants = grants::patterns(dir, file).into_iter().filter(|pattern| {
+        let engine_only = only_the_engine_may_match(pattern);
+        if engine_only {
+            log!(
+                "[ClaudeCode] Left {} out of --allowedTools: Claude Code would match it unchecked",
+                pattern
+            );
+        }
+        !engine_only
+    });
+    ENGINE_ALLOWED_TOOLS
+        .iter()
+        .map(|tool| tool.to_string())
+        .chain(grants)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// True for a `Bash(...)` line Claude Code must not match itself, since it
+/// prefix-matches with no further check. Two kinds:
+///
+/// - the first word runs its arguments as a command (`Bash(bash:*)`,
+///   `Bash(/bin/bash:*)`, `Bash(sudo rm:*)`), so it would cover anything;
+/// - the first word is a path (`Bash(./scripts/x.sh:*)`). Only the engine's
+///   gate checks that the script is trusted (ADR 0571).
+fn only_the_engine_may_match(pattern: &str) -> bool {
+    pattern
+        .strip_prefix("Bash(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|rule| rule.split_whitespace().next())
+        .map(|word| word.strip_suffix(":*").unwrap_or(word))
+        .is_some_and(|word| {
+            word.contains('/') || crate::engine::command_guard::grants_nothing_by_name(word)
+        })
 }
 
 /// Write the instructional header into a not-yet-existing allowlist file.

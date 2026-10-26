@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { DashboardTile as DashboardTileData } from '../../api/client/widgets';
 import type { Dashboard as DashboardName } from '../../generated/thread-event-wire';
-import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { arrangeDashboard, removeFromDashboard, rereadDashboard } from '../../store/actions/dashboards';
 import { loadReusableWidgets } from '../../store/actions/widgets';
 import { dashboardFor } from '../../store/dashboards';
@@ -18,6 +18,7 @@ import { DASHBOARD_CELL_REM, DASHBOARD_GAP_REM, DASHBOARD_MIN_COLUMNS, DASHBOARD
 import { inOrder, withTile } from './dashboardArrangement';
 import { DashboardTile, TileSkeleton } from './DashboardTile';
 import { useDashboardDrag } from './useDashboardDrag';
+import { useDashboardSettled } from './useDashboardSettled';
 
 /** The tiles' DOM order: the order each first appeared in, appended to and
  *  never rearranged. A tile's place is its CSS `order`, because moving an
@@ -29,6 +30,7 @@ export function stableTileOrder(previous: readonly string[], keys: readonly stri
   return [...kept, ...keys.filter((k) => !known.has(k))];
 }
 
+/** The tile sizes the skeleton draws until the tile list has loaded. */
 const SKELETON_SIZES: TileSize[] = ['small', 'small', 'medium', 'medium'];
 
 /** Add: the installed reusable widgets, the picker the thread menu's Add
@@ -45,12 +47,16 @@ function AddWidget({ dashboard }: { dashboard: DashboardName }) {
 }
 
 /** One dashboard (ADR 0496): its own widget tiles, in a grid of square cells.
- *  The desktop rail hosts the `desktop` one, and the phone's dashboard sheet
+ *  The desktop rail hosts the `desktop` one, and the phone's dashboard panel
  *  the `phone` one.
  *
  *  `hidden` is a dashboard kept mounted out of sight, as in a hidden rail. Its
  *  tiles hear they are hidden and unload after the off-screen hold, so
  *  showing it again soon finds them as they were.
+ *
+ *  The grid stays hidden until the dashboard has settled (`useDashboardSettled`),
+ *  so its frames load out of sight. A skeleton of the tiles stands in, behind
+ *  the delay gate, and the grid then fades in as one.
  *
  *  Edit mode lays a shield over each frame. A drag or Alt plus an arrow moves
  *  a tile. The pill resizes it, and the minus removes it from this dashboard.
@@ -60,13 +66,18 @@ export function Dashboard({ dashboard, hidden = false }: {
   hidden?: boolean;
 }) {
   const view = dashboardFor(dashboard);
-  const showLoading = useDelayedLoading(view);
   const [root, setRoot] = useState<HTMLDivElement | null>(null);
   const [columns, setColumns] = useState(DASHBOARD_MIN_COLUMNS);
   const [editing, setEditing] = useState(false);
   const domOrder = useRef<string[]>([]);
   const all = view.status === 'loaded' ? view.data.tiles : [];
   const keys = all.map(dashboardTileKey);
+  const { settled, report } = useDashboardSettled(
+    view.status === 'loaded',
+    hidden,
+    all.filter((t) => t.kind === 'widget').map(dashboardTileKey),
+  );
+  const showLoading = useDelayedFlag(!hidden && view.status !== 'failed' && !settled);
 
   const commit = (tiles: DashboardTileData[]) => void arrangeDashboard(dashboard, tiles);
   const drag = useDashboardDrag({ order: keys, enabled: editing, onDrop: (order) => commit(inOrder(all, order)) });
@@ -100,6 +111,9 @@ export function Dashboard({ dashboard, hidden = false }: {
   const byKey = new Map(all.map((t) => [dashboardTileKey(t), t]));
   domOrder.current = stableTileOrder(domOrder.current, keys);
   const place = (key: string) => drag.shown.indexOf(key);
+  const skeletonSizes = view.status === 'loaded'
+    ? drag.shown.flatMap((key) => byKey.get(key)?.size ?? [])
+    : SKELETON_SIZES;
   // On the dashboard, since its head lines up with the grid too.
   const geometry = {
     '--dashboard-columns': String(columns),
@@ -114,8 +128,7 @@ export function Dashboard({ dashboard, hidden = false }: {
   return (
     <div ref={setRoot} class={`dashboard${editing ? ' is-editing' : ''}`} data-dashboard={dashboard} style={geometry}>
       <div class="dashboard-head">
-        {/* The desktop rail is titled by its own aria-label and needs no words (ADR 0468). */}
-        {dashboard === 'phone' && <span class="dashboard-title">Dashboard</span>}
+        <span class="dashboard-title">Dashboard</span>
         {!empty && <AddWidget dashboard={dashboard} />}
         {!empty && view.status === 'loaded' && (editing ? (
           <button type="button" class="action-btn dashboard-done" onClick={() => setEditing(false)}>Done</button>
@@ -128,7 +141,7 @@ export function Dashboard({ dashboard, hidden = false }: {
         skeleton={(
           <SkeletonProvider>
             <div class="dashboard-grid">
-              {SKELETON_SIZES.map((size, i) => <TileSkeleton key={i} size={size} />)}
+              {skeletonSizes.map((size, i) => <TileSkeleton key={i} size={size} />)}
             </div>
           </SkeletonProvider>
         )}
@@ -139,7 +152,7 @@ export function Dashboard({ dashboard, hidden = false }: {
             <AddWidget dashboard={dashboard} />
           </div>
         ) : (
-          <div class="dashboard-grid">
+          <div class={`dashboard-grid${settled ? '' : ' is-settling'}`} inert={!settled}>
             {domOrder.current.map((key) => {
               const tile = byKey.get(key);
               if (!tile) return null;
@@ -150,6 +163,7 @@ export function Dashboard({ dashboard, hidden = false }: {
                   tile={tile}
                   order={place(key)}
                   dashboardHidden={hidden}
+                  onFrameState={report}
                   actions={{ dashboard, onEdit: editing ? undefined : () => setEditing(true) }}
                   editing={editing ? {
                     register: drag.register,

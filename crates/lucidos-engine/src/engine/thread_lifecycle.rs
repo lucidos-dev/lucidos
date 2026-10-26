@@ -311,6 +311,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "CodingAgentInputRead" => EventClass::Metadata,
         // A discard marks an input already recorded as owed again.
         "CodingAgentInputDiscarded" => EventClass::Metadata,
+        // A take marks a child report already recorded as read.
+        "ChildReportTaken" => EventClass::Metadata,
         // Compose lifecycle — orthogonal to the section/status machinery.
         "ThreadStarted" | "ThreadDiscarded" | "HomeThreadCreated" => EventClass::Metadata,
         // ImageUploaded — passive bookkeeping for content-addressed blob
@@ -327,6 +329,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         | "ChatSettingsChanged"
         | "CodingAgentCompacted"
         | "SuccessorThreadSpawned"
+        | "SessionHandedOff"
         | "HandoffCheckpointReached"
         | "SuccessorOfferDeclined"
         | "SuccessorRequested" => EventClass::Metadata,
@@ -497,6 +500,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // The keep-alive tick's report on a waiting thread. Nothing happened
         // on the thread, so it moves no section, status or recency.
         "CacheKeepAliveStatusChanged" => EventClass::Metadata,
+        // The user's per-thread keep-alive switch. A setting, not work.
+        "CacheKeepAliveTurnedOff" | "CacheKeepAliveTurnedOn" => EventClass::Metadata,
         _ => return None,
     })
 }
@@ -531,6 +536,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "CodingAgentPromptSent",
         "CodingAgentInputRead",
         "CodingAgentInputDiscarded",
+        "ChildReportTaken",
         "CodingAgentIdled",
         "ContinuationRequested",
         "MissingHardeningDetected",
@@ -583,6 +589,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ChatSettingsChanged",
         "CodingAgentCompacted",
         "SuccessorThreadSpawned",
+        "SessionHandedOff",
         "HandoffCheckpointReached",
         "SuccessorOfferDeclined",
         "SuccessorRequested",
@@ -621,8 +628,11 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "EventWaitDelivered",
         "EventWaitExpired",
         "EventWaitCanceled",
-        // The keep-alive status. Persisted because the column projects from it.
+        // The keep-alive status and the per-thread switch. Persisted because
+        // their columns project from them.
         "CacheKeepAliveStatusChanged",
+        "CacheKeepAliveTurnedOff",
+        "CacheKeepAliveTurnedOn",
         // Voice-session lifecycle. Persisted because the pair IS the record:
         // there is no session table, and the boot sweep finds an unpaired
         // start by reading these back.
@@ -763,10 +773,12 @@ pub fn resolve_transition(
         | "CodingAgentPromptSent"
         | "CodingAgentInputRead"
         | "CodingAgentInputDiscarded"
+        | "ChildReportTaken"
         | "MissingHardeningDetected"
         | "CodingAgentSettingsChanged"
         | "CodingAgentCompacted"
         | "SuccessorThreadSpawned"
+        | "SessionHandedOff"
         | "HandoffCheckpointReached"
         | "SuccessorOfferDeclined"
         | "SuccessorRequested"
@@ -1011,6 +1023,8 @@ pub fn resolve_transition(
         // The keep-alive status reports what the engine does while the thread
         // waits. It moves nothing.
         | "CacheKeepAliveStatusChanged"
+        | "CacheKeepAliveTurnedOff"
+        | "CacheKeepAliveTurnedOn"
         // Voice-session lifecycle. Voice is a MODE of a thread (ADR 0148), so
         // neither half moves it: the section and the status belong to the
         // agent's turn, and a live microphone is not a turn. An end that
@@ -1969,6 +1983,8 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
+        // A quiet answer (`quiet: true`) sets Idle instead: it wakes nothing.
+        // The table keys on event type alone, so the projection owns that case.
         (
             "UserQuestionAnswered",
             StatusTransition {

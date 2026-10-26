@@ -6,12 +6,11 @@ import {
 import type { ModelSelection } from '../../hooks/useModelSelection';
 import { useEscapeStep } from '../../hooks/useEscapeStep';
 import { useFocusWhenPlaced } from '../../hooks/useFocusWhenPlaced';
-import { isTextInput } from '../../utils/dom';
-import { hasCoarsePointer, isTouchDevice } from '../../utils/viewport';
+import { hasCoarsePointer } from '../../utils/viewport';
 import {
   ControlOptionList, selectedOptionIndex, wrapHighlight, type ControlOption,
 } from './ControlOptionList';
-import { isTypeaheadKey } from './typeahead';
+import { listFilterVisible, useListFilter } from './useListFilter';
 import { whenStepSettled } from '../../hooks/panelStepMorph';
 
 /** The MODEL step's rows.
@@ -110,7 +109,7 @@ export function pickerKeyAction(key: string): 'choose' | 'next' | 'prev' | null 
  *  A host opened mid-typing (`keyboard`, the keyboard handoff) has it too, so
  *  the box is there to take the keystrokes. */
 export function pickerShowsFilter(opts: { searching: boolean; touch: boolean; keyboard: boolean }): boolean {
-  return opts.searching || opts.touch || opts.keyboard;
+  return listFilterVisible({ query: opts.searching ? 'x' : '', coarse: opts.touch, narrow: false }) || opts.keyboard;
 }
 
 /** Which element must hold focus, since whatever holds it owns the keystrokes.
@@ -190,18 +189,16 @@ export function ModelSelectionPicker({
    *  host applies the whole selection and closes. */
   onPick: (encoded: string, provider?: string) => void;
 }) {
-  const filterRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   /** The opened model and which of its steps is showing, or `null` on the
    *  model step. */
   const open = useSignal<OpenStep | null>(null);
-  const filter = useSignal('');
-  // Latches on the first printable keystroke, and dies with the panel. It is
-  // what the filter box waits for, exactly as `Dropdown`'s does.
-  const searching = useSignal(false);
   const highlight = useSignal(0);
-
-  const visible = filterModelRows(selection.rows, filter.value);
+  const listFilter = useListFilter({ escape: false, onChange: () => { highlight.value = 0; } });
+  const { query: filter, inputRef: filterRef, searching } = listFilter;
+  const visible = filterModelRows(selection.rows.map((row) => ({
+    ...row, description: describeModel ? describeModel(row) : row.description,
+  })), filter.value);
   const modelOptions = [
     ...modelStepOptions(visible, selection, describeModel),
     ...(link ? [link.option] : []),
@@ -214,9 +211,6 @@ export function ModelSelectionPicker({
       ? tierStepOptions(openRow, selection.defaultEffortLabel)
       : providerStepOptions(openRow);
   const rows = openStep ? stepOptions : modelOptions;
-  const showsFilter = pickerShowsFilter({
-    searching: searching.value, touch: isTouchDevice(), keyboard: keyboardHolder !== null,
-  });
 
   // Land on the model in force, so a long registry opens where the user is.
   useEffect(() => {
@@ -229,13 +223,13 @@ export function ModelSelectionPicker({
     // A coarse pointer, not any touch capability: a touchscreen laptop driven
     // by its trackpad still wants the arrow keys in the list.
     const target = pickerFocusTarget({
-      tierStep: !!openStep, searching: searching.value, touch: hasCoarsePointer(),
+      tierStep: !!openStep, searching, touch: hasCoarsePointer(),
       keyboard: keyboardHolder !== null,
     });
     if (target === 'holder') return keyboardHolder;
     if (target === 'filter') return filterRef.current;
     return target === 'list' ? listRef.current : null;
-  }, [open.value, searching.value]);
+  }, [open.value, searching]);
 
   // The model step can overflow the panel, and it opens scrolled part-way down.
   useEffect(() => {
@@ -280,7 +274,7 @@ export function ModelSelectionPicker({
 
   /** Where Escape goes, or `null` when it should close the panel. */
   const escapeTarget = !openStep || !openRow
-    ? back?.onBack ?? null
+    ? searching ? listFilter.clear : back?.onBack ?? null
     : openStep.step === 'providers'
       ? () => stepBackFromProviders(openRow, openStep.effort)
       : backToModels;
@@ -319,18 +313,7 @@ export function ModelSelectionPicker({
   function handleKeyDown(e: KeyboardEvent) {
     const action = pickerKeyAction(e.key);
     if (action === null) {
-      // A printable key reaching the LIST is one the box does not own, so this
-      // both reveals the box and types into it. The box takes focus a frame
-      // later, and the keys pressed inside that frame land here.
-      //
-      // The target is the whole gate. Keys typed INTO the box bubble through
-      // here too, and the box handles those itself.
-      if (openStep || isTextInput(e.target) || !isTypeaheadKey(e)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      searching.value = true;
-      filter.value += e.key;
-      highlight.value = 0;
+      if (!openStep) listFilter.handleKeyDown(e);
       return;
     }
     e.preventDefault();
@@ -369,16 +352,17 @@ export function ModelSelectionPicker({
     <ControlOptionList
       label={label}
       options={modelOptions}
+      noMatches={visible.length === 0}
       currentValue={selection.model}
       highlightIndex={highlight.value}
       disabled={disabled}
       listRef={listRef}
       back={back}
-      filter={showsFilter ? {
+      filter={listFilter.visible ? {
         value: filter.value,
         placeholder: 'Filter models…',
         inputRef: filterRef,
-        onInput: (value) => { filter.value = value; highlight.value = 0; },
+        onInput: listFilter.setQuery,
       } : undefined}
       onKeyDown={handleKeyDown}
       onPick={choose}

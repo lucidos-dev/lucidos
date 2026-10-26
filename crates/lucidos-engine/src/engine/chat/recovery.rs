@@ -320,7 +320,8 @@ const MAX_CHAT_SWITCH_RESUMES: usize = 16;
 /// The chat / trigger threads a user-initiated *Switch to new version* interrupted
 /// and that nothing has resumed since.
 ///
-/// Coding agents get this via `recover_orphaned_worktrees` → `enqueue_switch_resume`;
+/// Coding agents get this via `recover_orphaned_worktrees` → `enqueue_switch_resume`,
+/// from the worktree scan and from `unengaged_switch_resume_candidates`;
 /// this is the chat half. It cannot reuse `recover_orphaned_threads`: that sweep
 /// requires a turn with activity and **no** terminal event (the crash shape), whereas
 /// the switch teardown (`abort_in_flight_for_restart`) always lands a

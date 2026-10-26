@@ -6,7 +6,7 @@ import { LANE_PLACE_LABEL, LANE_THREAD_TIP } from '../../store/actions/landingLa
 import { removeFromLandingLane } from '../../store/actions/laneControls';
 import { applySingleChange, discardSingleChange, setAsideSingleChange, bringBackSingleChange, applyAllChanges, discardAllChanges, revertChange, loadMoreChanges, armStandingApply, disarmStandingApply, armStandingApplies, disarmStandingApplies, refreshChangesState, APPLY_NEW_VERSION_TOOLTIP } from '../../store/actions/chat-changes';
 import { viewChangeDiff } from '../../store/actions/repositories';
-import { focusThread, focusThreadOrBootstrap } from '../../store/actions/threads';
+import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatFileCount } from '../../utils/formatFileCount';
@@ -583,7 +583,7 @@ export function ChangesView() {
                     ? disarmStandingApply(change.thread_id)
                     : armStandingApply(change.thread_id, change.id));
                 }}
-                onLaneThread={() => { if (laneThreadId) focusThread(laneThreadId); }}
+                onLaneThread={() => { if (laneThreadId) focusThreadOrBootstrap(laneThreadId); }}
                 onRemoveFromLane={() => void removeFromLandingLane(change.id)}
               />
             );

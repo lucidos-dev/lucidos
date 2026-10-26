@@ -660,6 +660,7 @@ async fn seed_coding_agent_idle(
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
     )
     .await;
@@ -2638,6 +2639,7 @@ async fn recent_subscriptions_resets_on_a_human_answer_only() {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: tool_use_id.into(),
+            quiet: false,
             answer: crate::engine::thread_events::AnswerKind::Canceled,
         },
         meta: crate::engine::thread_events::EventMeta::with_actor(Some(actor)),

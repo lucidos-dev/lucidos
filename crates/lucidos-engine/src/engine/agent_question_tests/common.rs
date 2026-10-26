@@ -12,6 +12,7 @@ pub(crate) fn opt(id: &str, label: &str) -> QuestionOption {
         description: None,
         preview: None,
         widget: None,
+        quiet: false,
     }
 }
 
@@ -62,6 +63,7 @@ pub(crate) async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta(),
     })
@@ -208,6 +210,7 @@ pub(crate) async fn emit_answered_question(
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: tool_use_id.into(),
+            quiet: false,
             answer,
         },
         meta: cc_meta(),

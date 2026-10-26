@@ -45,6 +45,14 @@ describe('the pill', () => {
     expect(trigger.querySelector('.rung-effort')!.textContent).toBe(' · medium');
   });
 
+  it('is unseen until it has a face, then drops the mark', () => {
+    draw({ shown: null });
+    const pill = host.querySelector('.rung-pill')!;
+    expect(pill.hasAttribute('data-pending')).toBe(true);
+    draw({ shown });
+    expect(pill.hasAttribute('data-pending')).toBe(false);
+  });
+
   it('is never the send button', () => {
     draw();
     expect(host.querySelector('.send-cancel-morph')).toBeNull();
@@ -63,9 +71,9 @@ describe('the pill', () => {
       .toBe('Model and effort: Opus 5.5, medium. Choose another');
   });
 
-  it('draws only the caret until the commands have loaded', () => {
+  it('holds an empty label box until the commands have loaded, so the pill never widens', () => {
     draw({ shown: null });
-    expect(host.querySelector('.rung-label')).toBeNull();
+    expect(host.querySelector('.rung-label')!.textContent).toBe('');
   });
 
   it('badges the rung with its intelligence band, and says its place to a screen reader', () => {
@@ -80,18 +88,11 @@ describe('the pill', () => {
     expect(host.querySelector('.rung-intelligence')).toBeNull();
   });
 
-  it('reserves every other face behind the one in force, hidden from a screen reader', () => {
-    const faces = [
-      { name: 'Sonnet 5.5', effort: 'high', position: { at: 4, of: 7 }, intelligence: '0.96×' },
-      { name: 'Haiku 5.5', effort: 'low', position: { at: 7, of: 7 }, intelligence: '0.68×' },
-    ];
-    draw({ faces });
-    const all = Array.from(host.querySelectorAll('.rung-label > .rung-face'));
-    expect(all.map((f) => f.querySelector('.rung-name')!.textContent)).toEqual(['Opus 5.5', 'Sonnet 5.5', 'Haiku 5.5']);
-    expect(all[0].classList.contains('rung-face-reserve')).toBe(false);
-    expect(all.slice(1).every((f) => f.classList.contains('rung-face-reserve') && f.getAttribute('aria-hidden') === 'true'))
-      .toBe(true);
+  it('names the pair in full in its tooltip, which the label may cut short', () => {
+    draw();
+    expect(host.querySelector('.rung-trigger')!.getAttribute('data-tooltip')).toMatch(/^Opus 5\.5 · medium/);
   });
+
 
   it('states whether the list is open', () => {
     draw({ expanded: true });

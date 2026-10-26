@@ -1136,18 +1136,26 @@ fn the_idle_keep_alive_cannot_be_fed_by_a_phantom_count() {
          N-1 follow-ups that had already been consumed.",
     );
 
-    // Every site that decides the idle exit passes the ledger's count.
-    let calls: Vec<&str> = RUN_SRC
-        .match_indices("self.exit_idle_subprocess_unless_owed(")
-        .map(|(at, _)| {
-            let call = &RUN_SRC[at..];
-            &call[..call.find(";").expect("the call ends")]
-        })
-        .collect();
+    // Every site that decides the idle exit passes the ledger's count: the
+    // idle arm directly, the withdraw and take-settle arms through
+    // `idle_exit_ends_session`.
+    let call_sites = |needle: &str| -> Vec<&str> {
+        RUN_SRC
+            .match_indices(needle)
+            .map(|(at, _)| {
+                let call = &RUN_SRC[at..];
+                &call[..call.find(";").expect("the call ends")]
+            })
+            .collect()
+    };
+    let direct = call_sites("self.exit_idle_subprocess_unless_owed(");
+    let settled = call_sites("self.idle_exit_ends_session(");
+    assert!(!direct.is_empty(), "the idle arm decides the idle exit");
     assert!(
-        calls.len() >= 2,
-        "the idle arm and the withdraw arm both decide the idle exit"
+        settled.len() >= 2,
+        "the withdraw arm and the take-settle arm both decide the idle exit again"
     );
+    let calls: Vec<&str> = direct.into_iter().chain(settled).collect();
     for call in &calls {
         assert!(
             call.contains("inputs.owed()"),

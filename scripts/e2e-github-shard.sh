@@ -407,7 +407,7 @@ drop_microsoft_apt_source() {
 # A stalled mirror made apt retry without a bound and hold the warm-up for
 # 900s. Every apt-get in the chain, install-deps' included, reads this file.
 bound_apt_network() {
-    printf 'Acquire::http::Timeout "20";\nAcquire::https::Timeout "20";\nAcquire::Retries "2";\n' \
+    printf 'Acquire::http::Timeout "20";\nAcquire::https::Timeout "20";\nAcquire::Retries "2";\nDPkg::Lock::Timeout "60";\n' \
         | sudo tee "${APT_CONF_DIR:-/etc/apt/apt.conf.d}/99-e2e-bounded-network" >/dev/null
 }
 
@@ -442,15 +442,55 @@ apt_chain() {
     sudo apt-get install -y -qq ripgrep postgresql-client
 }
 
+# sudo runs apt-get in its own session, so the deadline's group kill can miss
+# it. The survivor then holds the dpkg lock and fails every later attempt.
+# The runner is single-use, so matching the exact name is safe.
+reap_stalled_apt() {
+    sudo pkill -TERM -x apt-get || true
+}
+
+# The default Ubuntu mirror serves the same packages as the Azure one the
+# runner image points apt at.
+prefer_default_ubuntu_mirror() {
+    local dir="${APT_SOURCES_DIR:-/etc/apt/sources.list.d}" f
+    for f in "$dir"/*.sources "$dir"/*.list "${APT_SOURCES_LIST:-/etc/apt/sources.list}"; do
+        [ -f "$f" ] || continue
+        sudo sed -i.bak 's#//azure\.archive\.ubuntu\.com/#//archive.ubuntu.com/#g' "$f" && sudo rm -f "$f.bak"
+    done
+}
+
+# The .deb files of the browser chain, saved on main (seed-linux-cache) and
+# restored into LUCIDOS_APT_STASH by the workflow. A missing or stale copy only
+# costs a download. Without LUCIDOS_APT_STASH, a local run touches nothing.
+apt_archive_dir() { echo "${APT_ARCHIVE_DIR:-/var/cache/apt/archives}"; }
+
+restore_apt_archives() {
+    [ -d "${LUCIDOS_APT_STASH:-}" ] || return 0
+    sudo cp -n "$LUCIDOS_APT_STASH"/*.deb "$(apt_archive_dir)/" 2>/dev/null || true
+}
+
+stash_apt_archives() {
+    local stash="${LUCIDOS_APT_STASH:?stash_apt_archives needs LUCIDOS_APT_STASH}" deb found=
+    mkdir -p "$stash" || return 1
+    for deb in "$(apt_archive_dir)"/*.deb; do
+        [ -f "$deb" ] || continue
+        cp "$deb" "$stash/" && found=1
+    done
+    [ -n "$found" ] || { echo "ERROR: apt left no .deb files to cache." >&2; return 1; }
+}
+
 # A slow mirror that keeps trickling bytes defeats every apt timeout, so each
-# attempt also gets a deadline, and a stalled one is retried.
+# attempt also gets a deadline, and a stalled one is retried on another mirror.
 warm_apt() {
     drop_microsoft_apt_source
     bound_apt_network
+    restore_apt_archives
     local attempt
     for attempt in 1 2 3; do
+        [ "$attempt" -eq 1 ] || prefer_default_ubuntu_mirror
         run_with_deadline "${APT_ATTEMPT_SECONDS:-240}" apt_chain "$1" && return 0
         echo "apt warm-up attempt $attempt failed" >&2
+        reap_stalled_apt
     done
     return 1
 }
@@ -503,15 +543,24 @@ pinned_postgres_versions() {
 # The macOS Postgres native-postgres starts, under its work directory.
 MACOS_PG_TRIPLE=aarch64-apple-darwin
 
-# The two caches seed-cache saves on main and the macOS job restores: the
-# Postgres native-postgres compiles pgvector into, and the WebKit build.
+# The caches seed-cache saves on main: the Postgres native-postgres compiles
+# pgvector into and the WebKit build for macOS, the apt packages for Linux.
 cmd_cache_keys() {
+    local playwright stash="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/apt-archives"
     pinned_postgres_versions || return 1
+    playwright="$(locked_playwright_version)"
     {
         echo "postgres_dir=postgresql-$PG_VERSION-$MACOS_PG_TRIPLE"
         echo "postgres=postgresql-$PG_VERSION-$MACOS_PG_TRIPLE-pgvector-$PGVECTOR_VERSION"
-        echo "playwright=$(locked_playwright_version)"
+        echo "playwright=$playwright"
+        echo "apt=apt-archives-${ImageOS:-local}-${ImageVersion:-local}-playwright-$playwright"
     } >>"${GITHUB_OUTPUT:-/dev/stdout}"
+    echo "LUCIDOS_APT_STASH=$stash" >>"${GITHUB_ENV:-/dev/null}"
+}
+
+# Fills the Linux test jobs' apt cache, which warm_apt restores.
+cmd_seed_linux_cache() {
+    warm_apt browser && stash_apt_archives
 }
 
 cmd_seed_macos_cache() {
@@ -552,11 +601,14 @@ cmd_run() {
     mkdir -p "$out"
     # e2e-browser.sh waits for the system packages and the browser itself,
     # after the engine has booted. gcloud's first call must end before it.
-    if [ "$suite" = browser ]; then
-        e2e_warm_wait npm gcloud || return 1
-    else
-        e2e_warm_wait || return 1
-    fi
+    local -a waits=()
+    [ "$suite" != browser ] || waits=(npm gcloud)
+    e2e_warm_wait ${waits[@]+"${waits[@]}"} 2>"$out/$id.log" || {
+        rc=$?
+        cat "$out/$id.log" >&2
+        echo "$rc" >"$out/$id.rc"
+        return "$rc"
+    }
     # Every suite must see what the build job saw: dist/ holds sourcemaps exactly
     # when coverage was requested, and a mismatch makes the suite rebuild dist/
     # on a runner that never installed node_modules.
@@ -634,8 +686,9 @@ case "${1:-}" in
     assemble) cmd_assemble "${2:?engine dir}" ;;
     warm) cmd_warm "${2:?suite}" "${3:-}" ;;
     cache-keys) cmd_cache_keys ;;
+    seed-linux-cache) cmd_seed_linux_cache ;;
     seed-macos-cache) cmd_seed_macos_cache "${2:?work dir}" ;;
     native-postgres) cmd_native_postgres "${2:?work dir}" ;;
     run) shift; cmd_run "$@" ;;
-    *) echo "usage: $0 plan|find-engine|build|unpack|assemble|warm|cache-keys|seed-macos-cache|native-postgres|run" >&2; exit 1 ;;
+    *) echo "usage: $0 plan|find-engine|build|unpack|assemble|warm|cache-keys|seed-linux-cache|seed-macos-cache|native-postgres|run" >&2; exit 1 ;;
 esac

@@ -1,61 +1,105 @@
-//! How long a Claude Code prompt cache lives, as its cache writes show.
+//! How long a prompt cache lives, as the engine knows it from evidence.
 //!
-//! Billing and settings decide it (ADR 0479), so only the usage block says what
-//! a session got. The keep-alive times its beats from it, and a new session's
-//! context states it (ADR 0470).
+//! The provider's response is the evidence: its usage block splits a write by
+//! lifetime. Where it splits nothing, a TTL the request asked for counts only
+//! on a route probes showed honours it. Anything else is Unknown, and a
+//! provider's documented default never counts (ADR 0575). The keep-alive times
+//! its beats from it, and a new session's context states it (ADR 0470).
 
-use crate::llm::model_prices::CacheShares;
+use serde::Deserialize;
 
-/// How long a session's prompt cache lives, as its latest cache write shows.
+use crate::engine::types::ApiUsage;
+pub(crate) use crate::llm::cache_lifetime::CacheLifetime;
+
+/// How long a prompt cache entry lives, and what says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheTtl {
-    FiveMinutes,
-    OneHour,
+    /// The response split the write by lifetime.
+    Reported(CacheLifetime),
+    /// The response split nothing, and the request asked for this lifetime
+    /// on a route that honours it.
+    Requested(CacheLifetime),
+    Unknown,
+}
+
+/// The fields of a usage block that say how long its cache write lives.
+/// Every field defaults, so a stored row that lacks one still reads: a reader
+/// decodes this, never the whole `ApiUsage`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub(crate) struct WriteSplit {
+    cache_creation_tokens: u32,
+    cache_creation_1h_tokens: Option<u32>,
+    cache_creation_30m_tokens: Option<u32>,
+    cache_creation_12h_tokens: Option<u32>,
+    cache_creation_requested_ttl: Option<CacheLifetime>,
+}
+
+impl From<&ApiUsage> for WriteSplit {
+    fn from(usage: &ApiUsage) -> Self {
+        Self {
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_creation_1h_tokens: usage.cache_creation_1h_tokens,
+            cache_creation_30m_tokens: usage.cache_creation_30m_tokens,
+            cache_creation_12h_tokens: usage.cache_creation_12h_tokens,
+            cache_creation_requested_ttl: usage.cache_creation_requested_ttl,
+        }
+    }
 }
 
 impl CacheTtl {
-    /// The TTL of a write of `written` tokens, `written_1h` of them to the
-    /// 1-hour cache. `None` for no write, or one the provider did not split.
-    /// Any 5-minute token makes it 5 minutes: that part expires first.
-    pub(crate) fn observed(written: i64, written_1h: Option<i64>) -> Option<Self> {
-        let written_1h = written_1h.filter(|_| written > 0)?;
-        Some(if written_1h >= written {
-            Self::OneHour
-        } else {
-            Self::FiveMinutes
-        })
-    }
-
-    /// The lifetime, in seconds.
-    pub(crate) fn lifetime_secs(self) -> f64 {
-        match self {
-            Self::FiveMinutes => 300.0,
-            Self::OneHour => 3600.0,
+    /// The TTL of one call's cache write. Any token with a shorter lifetime
+    /// makes the whole write that short: that part expires first.
+    ///
+    /// Anthropic splits off the 1-hour part, and the rest is 5 minutes.
+    /// OpenAI's 30-minute and 12-hour parts cover the write, so a rest there
+    /// has no known lifetime.
+    pub(crate) fn of_write(usage: impl Into<WriteSplit>) -> Self {
+        let usage: WriteSplit = usage.into();
+        let written = usage.cache_creation_tokens;
+        if written == 0 {
+            return Self::Unknown;
+        }
+        let parts = [
+            (
+                CacheLifetime::ThirtyMinutes,
+                usage.cache_creation_30m_tokens,
+            ),
+            (CacheLifetime::OneHour, usage.cache_creation_1h_tokens),
+            (CacheLifetime::TwelveHours, usage.cache_creation_12h_tokens),
+        ];
+        if parts.iter().all(|(_, part)| part.is_none()) {
+            return match usage.cache_creation_requested_ttl {
+                Some(lifetime) => Self::Requested(lifetime),
+                None => Self::Unknown,
+            };
+        }
+        let named: u64 = parts
+            .iter()
+            .filter_map(|(_, part)| *part)
+            .map(u64::from)
+            .sum();
+        // Parts that claim more than the write are no evidence of anything.
+        let Some(rest) = u64::from(written).checked_sub(named) else {
+            return Self::Unknown;
+        };
+        let shortest_named = parts
+            .iter()
+            .filter(|(_, part)| part.is_some_and(|n| n > 0))
+            .map(|(lifetime, _)| *lifetime)
+            .min();
+        match (rest, usage.cache_creation_1h_tokens) {
+            (0, _) => shortest_named.map_or(Self::Unknown, Self::Reported),
+            (_, Some(_)) => Self::Reported(CacheLifetime::FiveMinutes),
+            (_, None) => Self::Unknown,
         }
     }
 
-    /// What a write at this TTL costs, as a share of the input price.
-    pub(crate) fn write_share(self, cache: CacheShares) -> f64 {
+    /// The lifetime, when evidence gave one.
+    pub(crate) fn lifetime(self) -> Option<CacheLifetime> {
         match self {
-            Self::FiveMinutes => cache.write_5m,
-            Self::OneHour => cache.write_1h,
-        }
-    }
-
-    /// The lifetime, in the words the session context states it.
-    pub(crate) fn lifetime_words(self) -> &'static str {
-        match self {
-            Self::FiveMinutes => "5 minutes",
-            Self::OneHour => "1 hour",
-        }
-    }
-
-    /// The longest blocking call whose next request still lands inside the
-    /// cache, with room for the call's own output and turn overhead.
-    pub(crate) fn blocking_cap_words(self) -> &'static str {
-        match self {
-            Self::FiveMinutes => "4 minutes",
-            Self::OneHour => "50 minutes",
+            Self::Reported(lifetime) | Self::Requested(lifetime) => Some(lifetime),
+            Self::Unknown => None,
         }
     }
 }
@@ -68,8 +112,7 @@ const REPO_WRITE_LOOKBACK_DAYS: i32 = 7;
 /// on one repo. A sub-agent may run on another TTL, so its writes do not
 /// count.
 const LATEST_REPO_WRITE_SQL: &str = r#"
-SELECT (e.payload->'usage'->>'cache_creation_tokens')::bigint AS written,
-       (e.payload->'usage'->>'cache_creation_1h_tokens')::bigint AS written_1h
+SELECT e.payload->'usage' AS usage
   FROM events e
   JOIN thread_summaries ts ON ts.thread_id = e.thread_id
  WHERE e.event_type = 'ContextCaptured'
@@ -86,9 +129,10 @@ SELECT (e.payload->'usage'->>'cache_creation_tokens')::bigint AS written,
 /// The TTL Claude Code sessions on `repo_id` get, from the repo's latest
 /// cache write. A new session has no write of its own yet. Billing is shared
 /// across a workspace, and a repo's project settings can change the TTL, so
-/// the repo is the closest evidence. `None` when unknown or unreadable.
-pub(crate) async fn repo_cache_ttl(pool: &sqlx::PgPool, repo_id: Option<&str>) -> Option<CacheTtl> {
-    let row: Option<(i64, Option<i64>)> = match sqlx::query_as(LATEST_REPO_WRITE_SQL)
+/// the repo is the closest evidence. Unknown when there is none, or it is
+/// unreadable.
+pub(crate) async fn repo_cache_ttl(pool: &sqlx::PgPool, repo_id: Option<&str>) -> CacheTtl {
+    let row: Option<(sqlx::types::Json<WriteSplit>,)> = match sqlx::query_as(LATEST_REPO_WRITE_SQL)
         .bind(REPO_WRITE_LOOKBACK_DAYS)
         .bind(repo_id)
         .fetch_optional(pool)
@@ -97,11 +141,10 @@ pub(crate) async fn repo_cache_ttl(pool: &sqlx::PgPool, repo_id: Option<&str>) -
         Ok(row) => row,
         Err(e) => {
             crate::log!("[CacheTtl] Could not read the repo's latest cache write: {e}");
-            return None;
+            return CacheTtl::Unknown;
         }
     };
-    let (written, written_1h) = row?;
-    CacheTtl::observed(written, written_1h)
+    row.map_or(CacheTtl::Unknown, |(usage,)| CacheTtl::of_write(usage.0))
 }
 
 #[cfg(test)]

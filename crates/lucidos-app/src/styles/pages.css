@@ -1361,7 +1361,7 @@
 .form-actions .btn-cancel {
     background: none;
     border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.5);
+    border-radius: var(--radius-control);
     min-width: 3.5rem;
     padding: 0.25rem 0.625rem;
     color: var(--text-secondary);
@@ -1384,7 +1384,7 @@
        tracks one token across themes. */
     background: var(--accent-action);
     border: none;
-    border-radius: calc(var(--radius-control) * 0.5);
+    border-radius: var(--radius-control);
     min-width: 3.5rem;
     padding: 0.25rem 0.625rem;
     color: var(--text-on-accent);

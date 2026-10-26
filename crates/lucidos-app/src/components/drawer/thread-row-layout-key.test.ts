@@ -44,14 +44,14 @@ function makeThread(overrides: Partial<ThreadMeta> = {}): ThreadState {
 }
 
 const BASE: ThreadRowLayoutProps = {
-    depth: 0, title: 'A', createdLabel: 'Today 10:00:00', channel: 'chat', codingAgent: undefined,
+    depth: 0, title: 'A', createdLabel: 'Today 10:00:00', channel: 'chat', codingAgent: undefined, codingAgents: undefined,
     contextName: undefined, totalChildren: 0, hasDraft: false, isHome: false, collapsible: false,
     isCollapsed: false, hiddenArchivedCount: 0, isArchivedRevealed: false,
 };
 
 /** A different value of the same type, for each layout prop. */
 const CHANGED: ThreadRowLayoutProps = {
-    depth: 1, title: 'B', createdLabel: 'Oct 10 10:00:00', channel: 'claude_code', codingAgent: 'codex',
+    depth: 1, title: 'B', createdLabel: 'Oct 10 10:00:00', channel: 'claude_code', codingAgent: 'codex', codingAgents: ['claude-code', 'codex'],
     contextName: 'example-repo', totalChildren: 3, hasDraft: true, isHome: true, collapsible: true,
     isCollapsed: true, hiddenArchivedCount: 2, isArchivedRevealed: true,
 };

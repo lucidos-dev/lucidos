@@ -397,3 +397,51 @@ fn turn_usage_carries_the_effort_the_turn_was_sent_with() {
         "{events:?}"
     );
 }
+
+/// A live `codex exec --json` turn that wrote its prompt to the cache. Usage
+/// carries the uncached rest, so the capture's re-total stays the reported
+/// input. Codex reports no lifetime, so nothing names one.
+#[test]
+fn a_cache_write_maps_to_the_write_count_and_leaves_the_rest_uncached() {
+    let line = r#"{"type":"turn.completed","usage":{"input_tokens":11974,"cached_input_tokens":0,"cache_write_input_tokens":11971,"output_tokens":40,"reasoning_output_tokens":0}}"#;
+    let (events, _) = track(&[line]);
+    match &events[0] {
+        AgentEvent::Usage {
+            input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            cache_creation_1h_tokens,
+            ..
+        } => {
+            assert_eq!(*input_tokens, 3);
+            assert_eq!(*cache_read_tokens, 0);
+            assert_eq!(*cache_creation_tokens, 11_971);
+            assert_eq!(*cache_creation_1h_tokens, None);
+            assert_eq!(
+                input_tokens + cache_read_tokens + cache_creation_tokens,
+                11_974
+            );
+        }
+        other => panic!("expected Usage, got {other:?}"),
+    }
+}
+
+/// A write and a read that claim more than the total never drive the
+/// uncached rest below zero.
+#[test]
+fn an_overreported_write_saturates_the_uncached_rest() {
+    let line = r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":60,"cache_write_input_tokens":70,"output_tokens":1}}"#;
+    let (events, _) = track(&[line]);
+    assert!(
+        matches!(
+            &events[0],
+            AgentEvent::Usage {
+                input_tokens: 0,
+                cache_read_tokens: 60,
+                cache_creation_tokens: 40,
+                ..
+            }
+        ),
+        "{events:?}"
+    );
+}

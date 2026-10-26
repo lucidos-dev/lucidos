@@ -15,7 +15,7 @@ export type CodingAgentChangeState =
   | { kind: 'unproposed'; reason: UnproposedReason | null }
   | { kind: 'proposed'; requires_restart: boolean };
 
-/** One end of a *successor thread* link. The summary and the aggregate carry
+/** One end of a *legacy successor thread* link. The summary and the aggregate carry
  *  the same object, so its keys stay snake_case in both. */
 export interface SuccessorLink {
   thread_id: string;
@@ -106,9 +106,9 @@ export interface ThreadSummary {
   parent_thread_id?: string | null;
   /** Cached title of the parent thread — null when no parent or no title yet. */
   parent_thread_title?: string | null;
-  /** The *successor thread* this one continued in. Absent until it hands off. */
+  /** The *legacy successor thread* this one continued in. Only stored legacy handoffs set it. */
   successor?: SuccessorLink;
-  /** The thread this *successor thread* continues. */
+  /** The thread this *legacy successor thread* continues. */
   successor_of?: SuccessorLink;
   /** Trigger that fired this thread (only for `channel === 'trigger'`). */
   trigger_id?: string | null;
@@ -131,6 +131,9 @@ export interface ThreadSummary {
    *  non-coding-agent threads and legacy coding-agent rows (consumers default null →
    *  'claude-code'). */
   coding_agent?: 'claude-code' | 'codex' | null;
+  /** Every backend the thread's sessions started on, first use first. Empty
+   *  for threads that never started a session and legacy rows. */
+  coding_agents?: Array<'claude-code' | 'codex'>;
   /** Compose state machine: 'composing' (draft) | 'active' | 'discarded'. The
    *  archive flag lives on the separate `archive_state` field — an archived
    *  thread carries `state='active'` plus `archive_state='archived'`. */

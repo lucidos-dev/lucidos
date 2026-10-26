@@ -268,7 +268,7 @@ export function releaseNotesBody(release: ChangelogRelease, open: boolean): VNod
 export function ReleaseNotes({ release }: { release: ChangelogRelease }) {
   return (
     <div
-      class="markdown-content whats-new-notes"
+      class="markdown-content whats-new-notes authored-html"
       dangerouslySetInnerHTML={{ __html: renderMarkdown(release.notes) }}
     />
   );

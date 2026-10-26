@@ -33,7 +33,6 @@ fn main() {
     // (but NOT when VERSION changes — that would create a feedback loop).
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=migrations");
-    println!("cargo:rerun-if-changed=static");
     println!("cargo:rerun-if-changed=Cargo.toml");
     // Rebuild when the umbrella Lucidos RELEASE bumps (LUCIDOS_RELEASE is
     // baked in via include_str! in lib.rs).

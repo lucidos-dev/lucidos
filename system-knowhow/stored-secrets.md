@@ -56,7 +56,22 @@ does not even list `credentials.auth_value`. **A missing column does not mean
 the secret is stored elsewhere.** It means this role cannot see it.
 
 So never conclude "the secrets are not in the database" from the agent role's
-view. Check what the agent role CAN see instead:
+view.
+
+## Explaining versus proving
+
+**To explain, answer from this file and run nothing.** "Where are my
+credentials", "are they encrypted", "where is the key" and "does my backup
+carry it" are all answered above. A probe adds no facts, and it can stop the
+answer on a permission prompt.
+
+**Run the checks below only when the user asks you to verify or prove it.**
+Run them one at a time, so a prompt names one command the user can judge.
+
+**Never name `~/.lucidos/secret-keys/` in a command**, not even to list it. The
+command guard asks the user before any command that mentions that directory.
+
+What the agent role CAN see:
 
 ```sh
 # Every secret column carries a CHECK that requires the encrypted form

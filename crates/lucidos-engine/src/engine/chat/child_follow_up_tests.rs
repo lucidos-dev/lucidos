@@ -1179,6 +1179,7 @@ async fn parent_redirects_a_coding_agent_child_and_the_card_count_matches() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1358,6 +1359,7 @@ async fn a_coding_agent_child_ending_with_response_generated_reports_nothing() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })

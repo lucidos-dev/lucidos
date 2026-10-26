@@ -9,6 +9,7 @@ import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isRedirectCanc
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, RecalledMemory, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
+import type { SessionContinuity } from '../../generated/thread-event-wire';
 import type { ThreadState } from './thread-meta';
 import type { OngoingGroup } from '../store';
 import type { ActorMode, CodingAgentExit, EventSubscription, EventWaitCancelCause, MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
@@ -714,6 +715,26 @@ export function agentMessageSender(origin: MessageOrigin | undefined): string | 
   }
 }
 
+/** A successor session's card. */
+function handoffSession(
+  continuity: Extract<SessionContinuity, { kind: 'handoff' }>,
+): Extract<ResponseEvent, { type: 'handoff_session' }> {
+  return {
+    type: 'handoff_session',
+    checkpoint: continuity.checkpoint,
+    progress: continuity.progress,
+    message: continuity.message,
+  };
+}
+
+/** The response rows the transcript draws: with the Cache cards switch off,
+ *  no keep-alive card. The render window counts these rows, so its clamp and
+ *  the exchange agree on which row is which. */
+export function drawnResponseEvents(exchange: Exchange, isLast: boolean, threadIdle: boolean, cacheCards: boolean): ResponseEvent[] {
+  const events = exchangeResponseEvents(exchange, isLast, threadIdle);
+  return cacheCards ? events : events.filter((e) => e.type !== 'cache_keep_alive');
+}
+
 /** Build ResponseEvent[] from exchange events (interleaved text + steps for rendering).
  *  @param isLast the ACTIVE exchange, as in `exchangeSteps`. It does not drive
  *  spinner resolution (see `threadIdle`), only the derived live row.
@@ -730,6 +751,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
   // A text-less ResponseGenerated: the model ended its turn cleanly with no
   // text. Drives the neutral "empty response" note pushed after the loop.
   let emptyCompletion = false;
+  // A quiet pick ended the turn on purpose, so its empty reply needs no note.
+  let endedByQuietAnswer = false;
   // One ContextAssembled per exchange; attach to every step pushed after it.
   let currentContext: ContextAssembledData | undefined;
   let legacyAcc: LegacyContextEvents = {};
@@ -920,6 +943,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       }
       case 'SessionStarted':
         if (hasCCContent) events.push({ type: 'section_break', channel: 'claude_code' });
+        if (event.continuity?.kind === 'fresh') events.push({ type: 'fresh_session', reason: event.continuity.reason });
+        if (event.continuity?.kind === 'handoff') events.push(handoffSession(event.continuity));
         break;
       case 'CodingAgentPromptSent':
         pushStep({ type: 'step', description: 'Thinking', outcome: 'pending', created });
@@ -1113,6 +1138,15 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           }
         }
         break;
+      case 'CacheKeepAliveStatusChanged': {
+        // A parked run's card, below the card the turn waits on. The fold
+        // keeps one step per run, updated in place, so each step is one row.
+        // Only a status that names a run draws.
+        const status = event.status;
+        if (!status || status.state === 'not_kept') break;
+        events.push({ type: 'cache_keep_alive', status });
+        break;
+      }
       case 'EventWaitStarted': {
         // The park, as the transcript's ONE record of it. A step-level row,
         // not a divider: the attached delivery resumes THIS exchange, and its
@@ -1230,6 +1264,9 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       case 'CodingAgentIdled':
         terminal = 'clean';
         break;
+      case 'UserQuestionAnswered':
+        endedByQuietAnswer = event.quiet === true;
+        break;
       case 'ResponseCanceled': case 'ResponseAborted': case 'ResponseFailed':
         terminal = 'unclean';
         break;
@@ -1293,6 +1330,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
     // not summarise. State that plainly instead of leaving a blank body.
     if (
       emptyCompletion
+      && !endedByQuietAnswer
       && !events.some(isMeaningfulText)
       && !events.some(e => e.type === 'image')
     ) {

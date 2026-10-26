@@ -18,8 +18,8 @@ use crate::engine::agent_recovery::{
     HARDEN_REQUESTED_REASON, USER_CLICKED_CONTINUE_REASON,
 };
 use crate::engine::agent_session::side_question::SIDE_QUESTION_TIMEOUT;
-use crate::engine::claude_code::{
-    BROAD_ALLOW_INEFFECTIVE, CC_PROTECTED_PATH_MARKERS, CODEX_BACKEND_TOOLS, SESSION_PATH_TOOLS,
+use crate::engine::command_guard::{
+    BENIGN_PREFIX_WORDS, GRANTS_NOTHING_HEADS, GUARD_SHELLS, MAX_SHELL_LAYERS,
 };
 use crate::engine::summary_tree::log::EntryKind;
 use crate::engine::thread_events::{KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON};
@@ -120,11 +120,11 @@ pub(super) fn render() -> String {
     ts.from("engine/chat/rung.rs");
     ts.export("TURN_RUNNING_REASON", quoted(TURN_RUNNING_REASON));
 
-    ts.from("engine/claude_code/mod.rs");
-    ts.export("BROAD_ALLOW_INEFFECTIVE", list(BROAD_ALLOW_INEFFECTIVE));
-    ts.export("CC_PROTECTED_PATH_MARKERS", list(CC_PROTECTED_PATH_MARKERS));
-    ts.export("SESSION_PATH_TOOLS", list(SESSION_PATH_TOOLS));
-    ts.export("CODEX_BACKEND_TOOLS", list(CODEX_BACKEND_TOOLS));
+    ts.from("engine/command_guard.rs");
+    ts.export("GUARD_SHELLS", list(&GUARD_SHELLS));
+    ts.export("BENIGN_PREFIX_WORDS", list(&BENIGN_PREFIX_WORDS));
+    ts.export("GRANTS_NOTHING_HEADS", list(&GRANTS_NOTHING_HEADS));
+    ts.export("MAX_SHELL_LAYERS", MAX_SHELL_LAYERS);
 
     ts.from("engine/agent_recovery/helpers.rs");
     let reasons = [

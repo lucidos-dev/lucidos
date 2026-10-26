@@ -269,8 +269,8 @@ describe('Flow: Scheduled trigger', () => {
 
     insertEvents(map, id, [
       { type: 'TriggerStarted', trigger_id: 'task-1', created: staleTime },
-      { type: 'ToolCalled', name: 'execute_intent', args: {}, created: staleTime },
-      { type: 'ToolResult', name: 'execute_intent', result: 'ok', created: staleTime },
+      { type: 'ToolCalled', name: 'load_knowhow', args: { id: 'calendar/check' }, created: staleTime },
+      { type: 'ToolResult', name: 'load_knowhow', result: 'ok', created: staleTime },
       // No ResponseGenerated/ResponseAborted — TriggerStarted set 'running'
       // and no completion event has arrived yet. Frontend mirrors backend events.
     ]);

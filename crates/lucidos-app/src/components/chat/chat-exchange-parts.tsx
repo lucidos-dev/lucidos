@@ -17,6 +17,7 @@ import { ToggleIconButton } from '../shared/ToggleIconButton';
 import { DisclosureChevron } from '../shared/DisclosureChevron';
 import type { AbortCause, CancelCause, ChangeLifecycleType, EngineReason, EventSubscription, EventWaitReason, EventWaitCancelCause, Exchange, MessageOrigin, StoredEvent, SubscriptionGroup } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
+import type { FreshSessionReason } from '../../generated/thread-event-wire';
 import type { CodingAgent } from '../../api/types';
 import { HEARING_YOU } from '../../voice/callState';
 import { describeAbortCause, describeCancelCause, describeContinuationReason, describeEngineReason, describeWatchedEvents } from '../../utils/engineEventExplainers';
@@ -54,8 +55,12 @@ export function changeAccent(type: ChangeLifecycleType): string {
   return CHANGE_STATE[type].accent;
 }
 
-export function MarkdownBlock({ html, onClick }: { html: string; onClick?: (e: MouseEvent) => void }) {
-  return <div class="markdown-content" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
+export function MarkdownBlock({ html, onClick, className }: {
+  html: string;
+  onClick?: (e: MouseEvent) => void;
+  className?: string;
+}) {
+  return <div class={`markdown-content authored-html${className ? ` ${className}` : ''}`} onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 export function FileList({ files }: { files: string[] }) {
@@ -91,7 +96,7 @@ function UserImages({ imageHashes }: { imageHashes: readonly string[] }) {
 export function UserMessageBody({ html, imageHashes }: { html: string; imageHashes: readonly string[] }) {
   return (
     <>
-      {html && <div class="markdown-content" dangerouslySetInnerHTML={{ __html: html }} />}
+      {html && <div class="markdown-content authored-html" dangerouslySetInnerHTML={{ __html: html }} />}
       <UserImages imageHashes={imageHashes} />
     </>
   );
@@ -426,6 +431,49 @@ export function RestartRow({ event }: { event: Extract<ResponseEvent, { type: 'r
     fold: {
       label: 'Details',
       body: <p>{describeContinuationReason(event.reason) ?? describeEngineReason({ kind: 'continuation_started' })}</p>,
+    },
+  });
+}
+
+/** Why a fresh session left the thread's context behind, one sentence each. */
+const FRESH_SESSION_WHY: Record<FreshSessionReason, string> = {
+  'change-applied': 'The change was applied, which ends its session.',
+  'change-discarded': 'The change was discarded, which ends its session.',
+  'session-ended': 'The previous session ended.',
+  'branch-gone': 'The branch was renamed or deleted.',
+  'resume-failed': 'The previous session could not be resumed.',
+  'no-resumable-session': 'No earlier session was recorded to resume.',
+};
+
+/** The start of a session that did not carry the thread's context over. */
+export function FreshSessionRow({ event }: { event: Extract<ResponseEvent, { type: 'fresh_session' }> }) {
+  return eventRowBody({
+    kind: 'session',
+    role: 'fresh-session',
+    state: event.reason,
+    subject: eventNameChip({ kind: 'chip', name: 'SessionStarted', label: 'New session', sentenceStart: true }),
+    stateLabel: 'Context not carried over',
+    detail: FRESH_SESSION_WHY[event.reason],
+    fold: {
+      label: 'Details',
+      body: <p>{'The agent started a new session without the earlier conversation. The turns above stay in the thread.'}</p>,
+    },
+  });
+}
+
+/** The start of a *successor session*: the same card as a fresh session's,
+ *  saying where the handoff ran. The opening folds under it. */
+export function HandoffSessionRow({ event }: { event: Extract<ResponseEvent, { type: 'handoff_session' }> }) {
+  const at = [event.checkpoint, event.progress].filter(Boolean).join(' ');
+  return eventRowBody({
+    kind: 'session',
+    role: 'handoff-session',
+    subject: eventNameChip({ kind: 'chip', name: 'SessionStarted', label: 'New session', sentenceStart: true }),
+    stateLabel: 'Handed off',
+    detail: at ? `Carried on from a handoff at ${at}.` : 'Carried on from a handoff.',
+    fold: {
+      label: 'What the new session was told',
+      body: <MarkdownBlock html={renderMarkdown(event.message)} />,
     },
   });
 }
@@ -1067,6 +1115,21 @@ const NAMED_STEP_OUTCOMES: ReadonlySet<StepOutcome> = new Set<StepOutcome>([
  *  interactive element. The main target opens what the step DID, and the
  *  context counter opens what the model was SENT. An `Agent` row adds its fold
  *  toggle on both sides of the main target. */
+/** The text a step row draws: its description, and a detail after it.
+ *
+ *  Reasoning streams into `thinkingText` while the row is still an unnamed
+ *  "Thinking" marker. Its tail (latest non-empty line, truncated) is the
+ *  detail, a live ticker so a long reasoning pass visibly progresses. It stops
+ *  at the rename: once the row names the call it produced, a truncated
+ *  fragment trailing "Running: cd …" is noise, and the full reasoning is one
+ *  click away in the step detail. */
+export function stepRowText(event: Extract<ResponseEvent, { type: 'step' }>): { description: string; detail: string } {
+  const thinkingTail = isThinking(event) && event.thinkingText
+    ? lastLinePreview(event.thinkingText)
+    : '';
+  return { description: event.description, detail: event.detail || thinkingTail };
+}
+
 export function InlineStep(
   { event, rowRef, fold, anchored = true }: {
     event: Extract<ResponseEvent, { type: 'step' }>;
@@ -1082,16 +1145,7 @@ export function InlineStep(
   },
 ) {
   const { label, className } = stepStatus(event.outcome);
-  // Reasoning streams into `thinkingText` while the row is still an unnamed
-  // "Thinking" marker. Show its tail (latest non-empty line, truncated) as a
-  // live ticker so a long reasoning pass visibly progresses. It stops at the
-  // rename: once the row names the call it produced, a truncated mid-sentence
-  // fragment trailing "Running: cd …" is noise, and the full reasoning is one
-  // click away in the step detail.
-  const thinkingTail = isThinking(event) && event.thinkingText
-    ? lastLinePreview(event.thinkingText)
-    : '';
-  const detailText = event.detail || thinkingTail;
+  const { description, detail: detailText } = stepRowText(event);
 
   const isPending = event.outcome === 'pending';
 
@@ -1100,6 +1154,8 @@ export function InlineStep(
       ref={rowRef}
       class={`inline-step ${className}${fold ? ' has-fold' : ''}`}
       data-role="inline-step"
+      /* Thread find reaches the row by it (`transcript-passages.ts`). */
+      data-find-row={event.seq}
       /* The reading position names this row (`ROW_ATTR` in scrollAnchor.ts). */
       {...(anchored ? { [ROW_ATTR]: event.call_event_id ?? event.result_event_id } : {})}
       /* The agent holding control, not a row it drew (`DRAWN_ROW_SELECTOR`). */
@@ -1137,7 +1193,7 @@ export function InlineStep(
             is a fixed-width column in CSS, so the running row's text sits on
             the same column as the finished rows above it. */}
         {!fold && <span class="step-icon"><StepOutcomeIcon outcome={event.outcome} /></span>}
-        <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
+        <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(description)}</span>
         {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
       </button>
       {/* The count toggles too, as a wider target than the chevron. The
@@ -1401,7 +1457,7 @@ export function SpokenReply(
   { event }: { event: Extract<ResponseEvent, { type: 'spoken_reply' }> },
 ) {
   return (
-    <div class="spoken-reply" data-role="spoken-reply">
+    <div class="spoken-reply" data-role="spoken-reply" data-find-row={event.seq}>
       {/* The mark is drawn once per RUN, and the slot is kept either way so
           the bubbles below it stay on the same left edge. */}
       <span class="spoken-reply-who" aria-hidden={event.follows ? 'true' : undefined}>
@@ -1409,7 +1465,7 @@ export function SpokenReply(
         {!event.follows && <span class="visually-hidden">{'Said aloud'}</span>}
       </span>
       <span class="spoken-reply-text">
-        {event.text}
+        <span class="spoken-reply-words">{event.text}</span>
         {/* The caller talked over it, so the text stops where they cut in. */}
         {event.interrupted && <span class="spoken-reply-cut">{'cut off'}</span>}
       </span>
@@ -1517,6 +1573,7 @@ export function eventWaitRowBody({
     kind: 'wait',
     state: event.state,
     role: 'event-wait-row',
+    findRow: event.seq,
     subject: eventNameChip({ kind: 'chip', name: 'EventWaitStarted', label: WAIT_PILL }),
     stateLabel: eventWaitStateLabel(event.state, event.expires_at, event.matched_at),
     tone: EVENT_WAIT_ROW_TONE[event.state],
@@ -1540,7 +1597,7 @@ export const WAIT_PILL = 'Waiting for';
 /** The agent's reason as the sentence under the pill. The pill already says
  *  "Waiting for", so a leading "waiting for" goes (`awaitedSubject`). A legacy
  *  stop row carries no reason and says the one thing it knows. */
-function waitDetail(reason: string): string {
+export function waitDetail(reason: string): string {
   const subject = awaitedSubject(reason).trim();
   return subject ? subject.charAt(0).toUpperCase() + subject.slice(1) : 'An event';
 }
@@ -1673,7 +1730,7 @@ export function CheckpointCard({ event }: { event: Extract<ResponseEvent, { type
   };
   const scope = checkpointUndoScope(event.restores, event.removes);
   return (
-    <div class="step-note-card checkpoint-card" data-role="checkpoint-card">
+    <div class="step-note-card checkpoint-card" data-role="checkpoint-card" data-find-row={event.seq}>
       <span class="step-note-icon" aria-hidden="true">{'⎌'}</span>
       <div class="step-note-body">
         <div class="step-note-summary">{event.summary}</div>

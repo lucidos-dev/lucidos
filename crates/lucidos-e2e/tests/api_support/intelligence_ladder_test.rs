@@ -20,7 +20,7 @@ async fn get_ladder_at(route: &str, query: &str) -> serde_json::Value {
 }
 
 /// The shipped Claude Code ladder serves every shipped pair, the ones that
-/// are on matching the shipped list, and the default rung reads 1×.
+/// are on matching the shipped list, and the default rung reads 1.0×.
 #[tokio::test]
 async fn the_route_serves_the_claude_code_ladder_with_its_default_rung() {
     let ladder = get_ladder("?surface=claude-code").await;
@@ -56,20 +56,16 @@ async fn the_route_serves_the_claude_code_ladder_with_its_default_rung() {
         .iter()
         .find(|r| r["is_default"] == true)
         .expect("one rung is the default");
-    assert_eq!(default["cost"]["label"], "1×", "{default}");
-    assert_eq!(default["time"]["label"], "1×", "{default}");
+    assert_eq!(default["cost"]["label"], "1.0×", "{default}");
+    assert_eq!(default["time"]["label"], "1.0×", "{default}");
 }
 
-/// Codex has no default, so its bands compare against Claude Code's default.
+/// Codex ships its own default, so its bands compare against it.
 #[tokio::test]
-async fn the_codex_ladder_compares_against_the_claude_code_default() {
+async fn the_codex_ladder_compares_against_its_own_default() {
     let ladder = get_ladder("?surface=codex").await;
-    assert_eq!(ladder["default_rung"], serde_json::Value::Null, "{ladder}");
-    assert_eq!(
-        ladder["reference"],
-        json!({"model": "claude-opus-5-5", "effort": "medium"}),
-        "{ladder}"
-    );
+    assert_ne!(ladder["default_rung"], serde_json::Value::Null, "{ladder}");
+    assert_eq!(ladder["reference"], ladder["default_rung"], "{ladder}");
 }
 
 /// The old route and its `coding_agent` parameter still serve the same

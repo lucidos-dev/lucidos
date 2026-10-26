@@ -10,6 +10,7 @@ import { isMobile } from '../../utils/viewport';
 import { isImageRetryPending } from '../../utils/markdownImageRetry';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
 import { isElementVisible, unmeasurableBox } from '../../utils/elementVisibility';
+import { EVENT_RESOLVE_DEADLINE_MS } from './deepLinkBudget';
 
 /** Shared scroll-position signals for the chat area.
  *
@@ -1326,38 +1327,90 @@ let _scrollbarPressEl: HTMLElement | null = null;
  *  A click on the padding moves nothing, so it cannot retire the follow. */
 let _scrollbarHoldEl: HTMLElement | null = null;
 
-/** Told when a scrollbar hold ends, with the container it was on. */
-const _scrollbarReleaseListeners = new Set<(el: HTMLElement) => void>();
+/** The container a finger is scrolling, from its first move until the
+ *  momentum after the lift has stopped. The *touch hold*. */
+let _touchHoldEl: HTMLElement | null = null;
+/** Whether a finger is still on the glass for `_touchHoldEl`. */
+let _touchFingerDown = false;
+let _touchCoastTimer: ReturnType<typeof setTimeout> | undefined;
+let _touchCoastDeadline: ReturnType<typeof setTimeout> | undefined;
+
+/** How long the transcript must fire no scroll event, after the finger lifts,
+ *  before its momentum counts as stopped. iOS fires one per frame while it
+ *  coasts, so this is several frames of stillness. */
+export const TOUCH_COAST_IDLE_MS = 150;
+
+/** Longest a touch hold outlives its last move or lift, whatever keeps
+ *  scrolling. A hold
+ *  that never ends would stall the window and every history landing. */
+export const TOUCH_COAST_MAX_MS = 4000;
+
+/** Told when a scroll hold ends, with the container it was on. */
+const _scrollHoldReleaseListeners = new Set<(el: HTMLElement) => void>();
+
+function announceIfReleased(el: HTMLElement) {
+  if (isScrollHeld(el)) return;
+  for (const listener of _scrollHoldReleaseListeners) listener(el);
+}
 
 function releaseScrollbar(el: HTMLElement) {
   if (_scrollbarPressEl === el) _scrollbarPressEl = null;
   if (_scrollbarHoldEl !== el) return;
   _scrollbarHoldEl = null;
-  for (const listener of _scrollbarReleaseListeners) listener(el);
+  announceIfReleased(el);
 }
 
-/** Is the reader holding `el`'s native scrollbar, or may they be?
+function clearTouchCoast() {
+  clearTimeout(_touchCoastTimer);
+  clearTimeout(_touchCoastDeadline);
+  _touchCoastTimer = undefined;
+  _touchCoastDeadline = undefined;
+}
+
+function releaseTouch(el: HTMLElement) {
+  if (_touchHoldEl !== el) return;
+  clearTouchCoast();
+  _touchHoldEl = null;
+  _touchFingerDown = false;
+  announceIfReleased(el);
+}
+
+/** (Re)start the stillness wait. Every coasting scroll event pushes it out. */
+function armTouchCoast(el: HTMLElement) {
+  clearTimeout(_touchCoastTimer);
+  _touchCoastTimer = setTimeout(() => releaseTouch(el), TOUCH_COAST_IDLE_MS);
+}
+
+/** (Re)start the cap. Each move re-arms it too, so a hold whose `touchend`
+ *  never reaches the window still ends. */
+function armTouchDeadline(el: HTMLElement) {
+  clearTimeout(_touchCoastDeadline);
+  _touchCoastDeadline = setTimeout(() => releaseTouch(el), TOUCH_COAST_MAX_MS);
+}
+
+/** Is the reader scrolling `el` in a way an anchor write would fight?
  *
- *  While they do, Chromium re-applies its own drag position, with no input event
- *  at all. That undoes an anchor write, so content drawn above the reader would
- *  jump them by its height. So a grow, and history landing above the reader,
- *  wait for the release (ADR 0258). */
-export function isScrollbarHeld(el: HTMLElement): boolean {
-  return _scrollbarHoldEl === el;
+ *  Two holds, one answer. A held native scrollbar: Chromium re-applies its own
+ *  drag position, undoing the write (ADR 0258). A touch hold: iOS kills a fling
+ *  on any `scrollTop` write. A write built from a reading a frame old also
+ *  snaps the reader back by however far the fling moved since. So a grow, and
+ *  history landing above the reader, wait until the view is still. */
+export function isScrollHeld(el: HTMLElement): boolean {
+  return _scrollbarHoldEl === el || _touchHoldEl === el;
 }
 
-/** Subscribe to a scrollbar hold ending; returns the unsubscribe. */
-export function onScrollbarReleased(listener: (el: HTMLElement) => void): () => void {
-  _scrollbarReleaseListeners.add(listener);
-  return () => { _scrollbarReleaseListeners.delete(listener); };
+/** Subscribe to a scroll hold ending; returns the unsubscribe. */
+export function onScrollHoldReleased(listener: (el: HTMLElement) => void): () => void {
+  _scrollHoldReleaseListeners.add(listener);
+  return () => { _scrollHoldReleaseListeners.delete(listener); };
 }
 
-/** Resolves once `el`'s scrollbar is not held: at once when it is not, else a
- *  frame after the release, so the drag has ended before anything lands. */
-export function scrollbarReleased(el: HTMLElement): Promise<void> {
-  if (_scrollbarHoldEl !== el) return Promise.resolve();
+/** Resolves once `el` is not held: at once when it is not, else a frame after
+ *  the release, so the drag or the coast has ended before anything lands. */
+export function scrollHoldReleased(el: HTMLElement): Promise<void> {
+  if (!isScrollHeld(el)) return Promise.resolve();
   return new Promise((resolve) => {
-    const unsubscribe = onScrollbarReleased((released) => {
+    const unsubscribe = onScrollHoldReleased((released) => {
       if (released !== el) return;
       unsubscribe();
       requestAnimationFrame(() => resolve());
@@ -1488,7 +1541,25 @@ function attachReaderGestures(el: HTMLElement): () => void {
   // intent whatever they land on. The worst they can be wrong about is a nested
   // scroller, where the reader is still scrolling, just not this box.
   const onMove = () => stampGesture(el);
+  // The touch hold starts on the first MOVE, so a tap never holds anything.
+  const onTouchMove = () => {
+    onMove();
+    clearTouchCoast();
+    armTouchDeadline(el);
+    _touchHoldEl = el;
+    _touchFingerDown = true;
+  };
+  // Every scroll event while the finger is up is the momentum coasting.
+  const onScroll = () => {
+    if (_touchHoldEl === el && !_touchFingerDown) armTouchCoast(el);
+  };
   const onUp = () => releaseScrollbar(el);
+  const onTouchUp = (e: TouchEvent) => {
+    if (_touchHoldEl !== el || (e.touches?.length ?? 0) > 0) return;
+    _touchFingerDown = false;
+    armTouchCoast(el);
+    armTouchDeadline(el);
+  };
   // Only a real loss of focus, such as switching apps, ends a drag the page
   // lost track of. Focus moving into an iframe on the page does not.
   let blurTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1566,35 +1637,42 @@ function attachReaderGestures(el: HTMLElement): () => void {
 
   el.addEventListener('pointerdown', onDown as EventListener, { passive: true });
   el.addEventListener('pointermove', onDrag as EventListener, { passive: true });
-  el.addEventListener('touchmove', onMove, { passive: true });
+  el.addEventListener('touchmove', onTouchMove, { passive: true });
   el.addEventListener('wheel', onMove, { passive: true });
+  el.addEventListener('scroll', onScroll, { passive: true });
   el.addEventListener('keydown', onKey);
   el.addEventListener('focusin', onFocusIn, { passive: true });
   root.addEventListener('pointerup', onUp, { passive: true });
   root.addEventListener('pointercancel', onUp, { passive: true });
   root.addEventListener('touchend', onUp, { passive: true });
   root.addEventListener('touchcancel', onUp, { passive: true });
-  // A scrollbar hold gates the window's growth (`isScrollbarHeld`), so it
+  root.addEventListener('touchend', onTouchUp as EventListener, { passive: true });
+  root.addEventListener('touchcancel', onTouchUp as EventListener, { passive: true });
+  // A scrollbar hold gates the window's growth (`isScrollHeld`), so it
   // must not outlive a drag the page lost track of.
   root.addEventListener('blur', onBlur);
 
   return () => {
     el.removeEventListener('pointerdown', onDown as EventListener);
     el.removeEventListener('pointermove', onDrag as EventListener);
-    el.removeEventListener('touchmove', onMove);
+    el.removeEventListener('touchmove', onTouchMove);
     el.removeEventListener('wheel', onMove);
+    el.removeEventListener('scroll', onScroll);
     el.removeEventListener('keydown', onKey);
     el.removeEventListener('focusin', onFocusIn);
     root.removeEventListener('pointerup', onUp);
     root.removeEventListener('pointercancel', onUp);
     root.removeEventListener('touchend', onUp);
     root.removeEventListener('touchcancel', onUp);
+    root.removeEventListener('touchend', onTouchUp as EventListener);
+    root.removeEventListener('touchcancel', onTouchUp as EventListener);
     root.removeEventListener('blur', onBlur);
     clearTimeout(blurTimer);
     if (_gestureEl === el) { _gestureEl = null; _gestureAt = -Infinity; }
     // Released, not just forgotten: a history read waiting on the release
-    // (`scrollbarReleased`) would otherwise wait for good.
+    // (`scrollHoldReleased`) would otherwise wait for good.
     releaseScrollbar(el);
+    releaseTouch(el);
   };
 }
 
@@ -1614,6 +1692,9 @@ export function readerGestureForTest(el: HTMLElement | null, moved = true): void
     _gestureAt = -Infinity;
     _scrollbarPressEl = null;
     _scrollbarHoldEl = null;
+    clearTouchCoast();
+    _touchHoldEl = null;
+    _touchFingerDown = false;
     return;
   }
   stampGesture(el);
@@ -2793,12 +2874,7 @@ function syncAwayFromBottom() {
   awayFromBottom.value = !isAtLiveEdge(el);
 }
 
-/** How long a deep link waits for its target to appear before giving up. It is
- *  the budget for waiting out ONE lazily loading thread. Exported so a caller
- *  with its own pre-navigation wait on the same thread spends the same budget
- *  rather than a second literal that drifts. `showEventWhereItLives` is that
- *  caller, resolving the anchor before it focuses. */
-export const EVENT_RESOLVE_DEADLINE_MS = 4000;
+export { EVENT_RESOLVE_DEADLINE_MS };
 /** The longest a deep link waits in total, however slow the thread is. The
  *  deadline above re-arms while `stillArriving` reports more events coming.
  *  This is what stops a stalled thread holding the link open for the life of

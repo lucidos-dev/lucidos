@@ -1,5 +1,5 @@
 import type { ComponentChildren, VNode } from 'preact';
-import { useLingeringFlag } from '../../hooks/useDelayedLoading';
+import { useLingeringFlag, useMinimumVisibleFlag } from '../../hooks/useDelayedLoading';
 import { scaledDurationMs } from '../../store/store';
 
 /** The skeleton's CSS opacity fade at 1x speed: `var(--duration-normal)`. */
@@ -7,12 +7,13 @@ const SKELETON_FADE_MS = 200;
 /** Fixed margin past the fade, so the element stays mounted until it ends. */
 const SKELETON_FADE_SLACK_MS = 50;
 
-/** Crossfades a skeleton OUT as content comes in — the smooth exit that a plain
- *  delayed loader lacks (a slow load otherwise hard-snaps from skeleton to
- *  content). No content is withheld: `children` (the loaded content) renders
- *  immediately when ready; the skeleton just lingers briefly and fades out over
- *  it. Always pair with a delay-only gate (`useDelayedFlag`/`useDelayedLoading`)
- *  on `showSkeleton` so fast loads never show the skeleton at all — including
+/** Owns a skeleton's EXIT. The skeleton stays opaque for at least
+ *  `LOADER_MIN_VISIBLE_MS` from when it appeared, so a load ending just past the
+ *  delay gate does not flash it. It then crossfades out as content comes in, so
+ *  a slow load does not hard-snap to content. `children` renders as soon as it is
+ *  ready but stays hidden until the floor lifts, so loaded content never draws
+ *  beside an opaque skeleton. Always pair with a delay gate
+ *  (`useDelayedFlag`/`useDelayedLoading`) on `showSkeleton` so fast loads never show the skeleton at all — including
  *  full-screen surfaces (the workspace picker gates it too: its boot splash +
  *  header/footer chrome cover the brief pre-skeleton window, so an ungated
  *  skeleton just blinked under the clearing splash on a fast load). See
@@ -46,12 +47,15 @@ export function LoadingFade({
   class?: string;
   children: ComponentChildren;
 }) {
-  const skeletonMounted = useLingeringFlag(showSkeleton, scaledDurationMs(SKELETON_FADE_MS) + SKELETON_FADE_SLACK_MS);
+  const held = useMinimumVisibleFlag(showSkeleton);
+  const skeletonMounted = useLingeringFlag(held, scaledDurationMs(SKELETON_FADE_MS) + SKELETON_FADE_SLACK_MS);
+  const waitingOutFloor = held && !showSkeleton;
+  const classes = ['loading-fade', cls, waitingOutFloor && 'loading-fade-held'].filter(Boolean).join(' ');
   return (
-    <div class={cls ? `loading-fade ${cls}` : 'loading-fade'}>
+    <div class={classes}>
       <div class="loading-fade-content">{children}</div>
       {skeletonMounted && (
-        <div class={`loading-fade-skeleton${showSkeleton ? '' : ' loading-fade-out'}`} aria-hidden="true">
+        <div class={`loading-fade-skeleton${held ? '' : ' loading-fade-out'}`} aria-hidden="true">
           {skeleton}
         </div>
       )}

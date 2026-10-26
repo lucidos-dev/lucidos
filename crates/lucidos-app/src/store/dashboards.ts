@@ -22,19 +22,16 @@ export function currentDashboard(): Dashboard {
   return viewportIsMobile.value ? 'phone' : 'desktop';
 }
 
-/** The dashboard sheet (ADR 0496 amendment): the phone dashboard drawn over
+/** The dashboard panel (ADR 0496 amendment): the phone dashboard drawn over
  *  the open thread. It never moves focus, so a thread-aware tile describes
- *  the thread underneath. Not persisted: a reload opens with it closed. */
-export const dashboardSheetOpen = signal(false);
+ *  the thread underneath. The thread history persists it. A user action goes
+ *  through `setDashboardPanelOpen`, which records the row. */
+export const dashboardPanelOpen = signal(false);
 
-export function openDashboardSheet(): void {
-  dashboardSheetOpen.value = true;
+export function openDashboardPanel(): void {
+  dashboardPanelOpen.value = true;
 }
 
-export function closeDashboardSheet(): void {
-  dashboardSheetOpen.value = false;
-}
-
-export function toggleDashboardSheet(): void {
-  dashboardSheetOpen.value = !dashboardSheetOpen.value;
+export function closeDashboardPanel(): void {
+  dashboardPanelOpen.value = false;
 }

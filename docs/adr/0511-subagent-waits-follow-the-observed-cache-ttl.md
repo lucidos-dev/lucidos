@@ -4,6 +4,9 @@
 - **Date**: 2026-10-17
 - **Amends**: [0470](0470-keep-the-prompt-cache-warm.md). Its 4-minute cap
   named one lifetime and left subagents out.
+- **Amended by**: [0575](0575-cache-ttls-from-evidence-only.md). Codex and an
+  unknown TTL no longer state 5 minutes: the session context says the lifetime
+  is unknown, with the same 4-minute cap.
 
 ## Context
 

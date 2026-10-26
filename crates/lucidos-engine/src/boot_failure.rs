@@ -155,11 +155,6 @@ pub fn terminal_migration_message(
     })
 }
 
-/// SQLSTATE classes a retry can clear: connection loss (08), rollback (40),
-/// resource limits (53), a lock or busy object (55), operator shutdown (57)
-/// and system faults (58). Every other class fails the same way each time.
-const TRANSIENT_SQLSTATE_CLASSES: [&str; 6] = ["08", "40", "53", "55", "57", "58"];
-
 /// The longest server message a report carries.
 const MAX_SERVER_MESSAGE_BYTES: usize = 300;
 
@@ -180,10 +175,7 @@ pub fn terminal_database_error_message(
         return None;
     };
     let code = db.code()?;
-    if TRANSIENT_SQLSTATE_CLASSES
-        .iter()
-        .any(|class| code.starts_with(class))
-    {
+    if crate::core::db_retry::is_transient_sqlstate(&code) {
         return None;
     }
     let message = db.message().lines().next().unwrap_or_default();
@@ -266,6 +258,7 @@ async fn post_failure(port: &str, id: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::server_error;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -367,48 +360,6 @@ mod tests {
             .is_none(),
             "a transient source/IO fault must stay retryable",
         );
-    }
-
-    #[derive(Debug)]
-    struct ServerError {
-        code: &'static str,
-        message: String,
-    }
-
-    impl std::fmt::Display for ServerError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(&self.message)
-        }
-    }
-
-    impl std::error::Error for ServerError {}
-
-    impl sqlx::error::DatabaseError for ServerError {
-        fn message(&self) -> &str {
-            &self.message
-        }
-        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-            Some(self.code.into())
-        }
-        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-            self
-        }
-        fn kind(&self) -> sqlx::error::ErrorKind {
-            sqlx::error::ErrorKind::Other
-        }
-    }
-
-    fn server_error(code: &'static str, message: &str) -> sqlx::Error {
-        sqlx::Error::Database(Box::new(ServerError {
-            code,
-            message: message.to_string(),
-        }))
     }
 
     /// Reporting stops the gateway respawning, so each of these must stay

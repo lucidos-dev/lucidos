@@ -935,7 +935,7 @@ fn test_describe_tool_result_failure_truncates() {
 /// History rebuild still labels a stored call of the retired tool.
 #[test]
 fn a_retired_execute_intent_result_still_reads_done() {
-    let result = describe_tool_result("execute_intent", "Calendar is clear.", true);
+    let result = describe_tool_result("execute_intent", "Calendar is clear.", true); // Retired compatibility.
     assert_eq!(result, Some("Done".to_string()));
 }
 

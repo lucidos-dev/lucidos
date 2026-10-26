@@ -19,8 +19,8 @@ import { ensureHomeThread } from './db-helpers';
  *  real row at a real width actually folds, and whether a folded control still
  *  works when the user reaches it through the menu.
  *
- *  It also pins the order. The first fold takes attach image, the leftmost
- *  member here, and leaves the follow toggle on its right standing.
+ *  It also pins the order: the call and follow toggles stand before attach
+ *  image, so they fold before it. Clear draft stands last among the icons.
  *
  *  Voice is ON for this file, which is the reported case: a call toggle is one
  *  more box, and the row was reported crowded with one standing. It goes off
@@ -52,7 +52,7 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     await page.close();
   });
 
-  test('folds from the left, keeps the toggles longest, and still clears the draft', async ({ page }) => {
+  test('folds the leading toggles before attach image, and still clears the draft', async ({ page }) => {
     const restore = page.viewportSize();
     // The call toggle stands only on the home thread (ADR 0362).
     const home = ensureHomeThread();
@@ -76,15 +76,14 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     }
     expect(foldedAt, `the row never folded, down to ${WIDTH_LADDER.at(-1)}px`).toBeGreaterThan(0);
 
-    // The ⋯ took the left end of the row, so attach left it. The toggles stand
-    // right of it, and so does the send button. A Lucidos Agent thread has no
-    // `/` menu, since its model pick is the rung control's.
+    // The fold takes a prefix: once attach leaves, both leading toggles have
+    // left too. The action slot stays on the right.
     await expect(attach).toHaveCount(0);
     await expect(page.locator('.prompt-actions-row .control-menu:visible')).toHaveCount(0);
-    await expect(follow).toHaveCount(1);
-    // The call toggle stands just left of follow. One ladder step can fold it
-    // with attach and clear, so it may stand or sit behind the ⋯.
-    await expect(await composerControl(page, '[data-role="call-toggle"]')).toBeVisible();
+    await expect(follow).toHaveCount(0);
+    await expect(await composerControl(page, '[data-role="follow-live-edge"]')).toHaveAttribute('role', 'menuitemcheckbox');
+    await closeComposerFold(page);
+    await expect(await composerControl(page, '[data-role="call-toggle"]')).toHaveAttribute('role', 'menuitemcheckbox');
     await closeComposerFold(page);
     await expect(page.locator('.send-cancel-morph:visible')).toHaveCount(1);
 

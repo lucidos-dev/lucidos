@@ -11,7 +11,7 @@ export function successorLinkTitle(link: SuccessorLink): string | null {
 }
 
 /** What closes the feed of a thread that handed off: where its work went on.
- *  Renders nothing until the thread has a *successor thread*. */
+ *  Renders nothing until the thread has a *legacy successor thread*. */
 export function ContinuedInNotice({ meta }: { meta: ThreadMeta }) {
   if (!meta.successor) return null;
   return (
@@ -26,7 +26,7 @@ export function ContinuedInNotice({ meta }: { meta: ThreadMeta }) {
   );
 }
 
-/** What opens a *successor thread*'s feed: the thread it continues. */
+/** What opens a *legacy successor thread*'s feed: the thread it continues. */
 export function ContinuedFromNotice({ meta }: { meta: ThreadMeta }) {
   if (!meta.successorOf) return null;
   return (

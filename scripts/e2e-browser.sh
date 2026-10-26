@@ -131,7 +131,7 @@ ensure_npm_deps "$PROJECT_DIR" "workspace dependencies"
 # build is present, and restores it when it is not.
 if e2e_warm_active; then
     # shellcheck disable=SC2119 # no names means every started task
-    e2e_warm_wait
+    e2e_warm_wait || exit $?
 else
     PW_BROWSERS=(chromium)
     [ -n "$SKIP_WEBKIT" ] || PW_BROWSERS+=(webkit)

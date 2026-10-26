@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: prompt footprint
 description: The prompt-footprint audit section. Sections over their ceilings, clipped descriptions, unused apps and widgets, knowhow not loaded by name, and triggers listing an MCP server they never call.
+sources: ["system-knowhow/preferences.md", "crates/lucidos-engine/src/engine/prompt_footprint.rs", "crates/lucidos-engine/src/api/workspace_prompt_footprint.rs", "crates/lucidos-engine/src/core/preference_catalog.rs"]
 ---
 
 # Workspace audit section: prompt-footprint
@@ -101,7 +102,7 @@ characters go.
 ## Remediation
 
 Fixes run only on request, as the root's § Remediation says. Every fix here
-is inline: a file edit, a deletion, a CLI call or an `update_trigger` call.
+is inline: a file edit, a deletion, a CLI call or an `triggers(action="update")` call.
 None needs a coding agent. The fixes split by whether they can be undone.
 
 | Finding | Fix | In "Do all suggested fixes" |
@@ -110,7 +111,7 @@ None needs a coding agent. The fixes split by whether they can be undone.
 | a clipped knowhow description | rewrite the frontmatter `description`, under the clip, keeping the routing words | yes |
 | an unused reusable widget | stop reusing it: `lucidos widgets stop-reusing --app-id <id>` | yes |
 | a knowhow doc not loaded by name | move it under a group doc as a reference, named by id from that doc | yes |
-| a trigger listing an MCP server its fires never call | remove the id from its `mcp_servers` with `update_trigger`, sending the rest of the list | yes |
+| a trigger listing an MCP server its fires never call | remove the id from its `mcp_servers` with `triggers(action="update")`, sending the rest of the list | yes |
 | an unused app | delete it, behind its own card | no |
 | a ceiling the items cannot clear | raise the ceiling, only when the user picks its own card option | no |
 
@@ -124,6 +125,6 @@ None needs a coding agent. The fixes split by whether they can be undone.
 - **Offer a raise as its own card option, after the report.** Offer it only for
   a ceiling the items cannot clear. Name the key, the value in force and the
   suggested value. It never joins "Do all suggested fixes". When the user picks
-  it, call `set_preference` with that key and value.
+  it, call `preferences(action="set")` with that key and value.
 - **When some items have fixes, offer those and no raise.** Shorten, stop
   reusing, move or delete them, as above.

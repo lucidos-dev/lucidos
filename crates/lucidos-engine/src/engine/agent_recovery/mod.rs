@@ -19,6 +19,8 @@ mod undelivered_input;
 pub use has_diff::*;
 pub use helpers::*;
 pub use orphaned_branch_work::spawn_branch_work_net;
+pub(crate) use undelivered_input::resume_input;
+#[cfg(test)]
 pub(crate) use undelivered_input::undelivered_input;
 // `recovery`'s free predicates stay in that file next to the recovery pass
 // that documents them; re-export the ones the teardown emit + its tests share
@@ -70,6 +72,8 @@ pub(crate) use recovery::{
 // retired input sat in the mirror being asserted as correct.
 #[cfg(test)]
 pub(crate) use recovery::branch_awaits_recovery;
+#[cfg(test)]
+pub(crate) use recovery::unengaged_switch_resume_candidates;
 pub(crate) use recovery::{switch_abort_unsuperseded_sql, SWITCH_TEARDOWN_ABORT_SQL};
 // Which events begin a turn, shared with `api::standing_instruction`. The
 // recovery gates ask which turn an abort belongs to, and the standing

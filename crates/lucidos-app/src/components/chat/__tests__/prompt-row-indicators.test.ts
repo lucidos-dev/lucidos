@@ -119,11 +119,12 @@ describe('the composer wires both indicators as foldable members', () => {
   /** Two ways a panel's anchor stops being a box worth pointing at. A fold step
    *  can unmount it. And the ⋯ trigger is exempt from the dismiss of the panel
    *  it anchors, so re-pressing it would stack one over the other. */
-  it('retires every composer popover on a fold step and on a ⋯ open', () => {
+  it('retires the stranded popovers on a fold step and every one on a ⋯ open', () => {
     expect(prompt).toMatch(
-      /function closeFoldedPanels\(\): void \{\s*attachMenuOpen\.value = false;\s*closeTodoPanel\(\);\s*closeWaitingPanel\(\);\s*closeControlMenus\(\);\s*\}/,
+      /function closeFoldedPanels\(\): void \{\s*attachMenuOpen\.value = false;\s*closeTodoPanel\(\);\s*closeWaitingPanel\(\);\s*\}/,
     );
+    expect(prompt).toMatch(/function closeRowPanels\(\): void \{\s*closeFoldedPanels\(\);\s*closeControlMenus\(\);\s*\}/);
     expect(prompt).toMatch(/useEffect\(closeFoldedPanels, \[collapsedActions\]\);/);
-    expect(prompt).toMatch(/onOpen=\{closeFoldedPanels\}/);
+    expect(prompt).toMatch(/onOpen=\{closeRowPanels\}/);
   });
 });

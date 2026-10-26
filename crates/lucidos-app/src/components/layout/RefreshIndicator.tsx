@@ -1,19 +1,19 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { LOADER_MIN_VISIBLE_MS } from '../../hooks/useDelayedLoading';
 import { CheckIcon, ReloadIcon } from '../shared/icons';
 import { panelRefreshAvailable, panelRefreshing, panelRefreshSucceeded, runPanelRefresh } from '../../store/panelRefresh';
 import { panelOverlay, parseRepoPath, type PanelOverlay } from '../../store/store';
 import { renderHeaderAction, type HeaderActionSpec } from './headerActions';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 
-/** How long the spinner shows at least, so a quick refresh reads as one before
- *  it turns into the check. Holds only this status icon, never the content. */
-export const REFRESH_MIN_SPIN_MS = 400;
-
 /** How long the check stays up after a refresh lands. The fade out starts
  *  when this ends. */
 export const REFRESH_DONE_HOLD_MS = 400;
 
-// Both holds are for legibility, not animation, so the speed setting leaves them alone.
+// The spin floor is the shared loader floor (LOADER_MIN_VISIBLE_MS): a quick
+// refresh reads as a spinner before it turns into the check. It holds only this
+// status icon, never the content. Both holds are for legibility, not animation,
+// so the speed setting leaves them alone.
 
 export type RefreshIndicatorState = 'idle' | 'refreshing' | 'done';
 
@@ -28,7 +28,7 @@ export interface RefreshIndicatorStep {
  *  between two renders, and still owes its spin and its check. */
 export function refreshEndSteps(landed: boolean, spunMs: number | null): RefreshIndicatorStep[] {
   if (spunMs === null && !landed) return [];
-  const spinLeft = Math.max(0, REFRESH_MIN_SPIN_MS - (spunMs ?? 0));
+  const spinLeft = Math.max(0, LOADER_MIN_VISIBLE_MS - (spunMs ?? 0));
   if (!landed) return [{ afterMs: spinLeft, state: 'idle' }];
   const spin: RefreshIndicatorStep[] = spunMs === null ? [{ afterMs: 0, state: 'refreshing' }] : [];
   return [

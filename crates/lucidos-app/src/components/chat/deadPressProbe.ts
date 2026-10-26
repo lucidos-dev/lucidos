@@ -179,12 +179,12 @@ export function landingReport(f: LandingFacts): string | null {
  *  ordinary use. Stop, Cancel and every banner action are click-only. The fault
  *  being chased is a stationary tap going dead.
  *
- *  Null too for a press somebody CLAIMED, and both claims are legitimate. A
+ *  Null too for a press somebody CLAIMED, and every claim is legitimate. A
  *  served press ran its button's action. A swallowed one is the overlay
  *  contract: a tap that dismisses a popover must not also press what was under
- *  it, and Send is a thing that can be under it. So neither toasts. Both still
- *  reach the log, which is where a run of swallowed Sends with no popover open
- *  would name its own cause.
+ *  it, and Send is a thing that can be under it. A refused one lifted on a face
+ *  it did not begin on. So none toasts. All still reach the log, which is where
+ *  a run of swallowed Sends with no popover open would name its own cause.
  *
  *  Null too for a press that shared the glass, or one held past a tap. See
  *  `pressWasAlone` and `pressWasATap`. */
@@ -1460,13 +1460,19 @@ export function installDeadPressProbe(): void {
     relayoutShell();
   };
 
+  /** Releases everything an armed press holds, on whichever path settles it. */
+  const disarm = (press: ArmedPress) => {
+    press.observer?.disconnect();
+    press.observer = null;
+    if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
+  };
+
   /** Give up on an armed press whose lift never came, and SAY so.
    *
    *  Skipped while another finger is still down, because a second `touchstart`
    *  during a two-finger gesture is not a lost lift. */
   const ruleArmedWithNoLift = (press: ArmedPress, toast: boolean) => {
-    press.observer?.disconnect();
-    if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
+    disarm(press);
     const report = noLiftReport({
       face: press.face,
       movedPx: press.movedPx,
@@ -1524,10 +1530,11 @@ export function installDeadPressProbe(): void {
     noteInput(lastTouchStartAt);
     const touch = e.changedTouches?.[0];
     if (!touch) return;
-    const row = watchableRow();
-    if (!row) { noteStrayTouch(touch, e.target as Element | null, null); return; }
-    const rowRect = row.getBoundingClientRect();
     const target = e.target as Element | null;
+    if (target) hearTouchOnTarget(target);
+    const row = watchableRow();
+    if (!row) { noteStrayTouch(touch, target, null); return; }
+    const rowRect = row.getBoundingClientRect();
     const onRow = !!target && !!target.closest(ROW_SELECTOR);
     const inRow = inside(rowRect, touch.clientX, touch.clientY);
     // The reading the typing-driven recovery arms on. A touch that reached the
@@ -1686,7 +1693,30 @@ export function installDeadPressProbe(): void {
     armed = press;
   }, { capture: true, passive: true });
 
-  document.addEventListener('touchmove', (e) => {
+  /** Hear the rest of the touch on the node it began on, too.
+   *
+   *  WebKit sends every later event of a touch to its first target. Once the
+   *  page removes that node, the event no longer passes through `document`.
+   *  The node's own listeners still run, and Preact binds the face's handlers
+   *  there. So a re-rendered Submit sends the answer while the probe hears no
+   *  lift. That false `no-lift` toast is the case this closes, for an armed
+   *  press and a missed one alike.
+   *
+   *  On a connected node both listeners run, and the document's runs first.
+   *  It settles the press, so the second finds nothing left to settle. The
+   *  next touch releases these listeners. */
+  let targetListeners: AbortController | null = null;
+  const hearTouchOnTarget = (target: Element) => {
+    targetListeners?.abort();
+    targetListeners = new AbortController();
+    const { signal } = targetListeners;
+    const handle = (handler: (e: TouchEvent) => void) => (e: Event) => handler(e as TouchEvent);
+    target.addEventListener('touchmove', handle(onTouchMove), { passive: true, signal });
+    target.addEventListener('touchend', handle(onTouchEnd), { passive: true, signal });
+    target.addEventListener('touchcancel', handle(onTouchCancel), { passive: true, signal });
+  };
+
+  const onTouchMove = (e: TouchEvent) => {
     // Screen coordinates, for the reason `TapPointer` records: with the keyboard
     // up the visual viewport settles under a stationary finger, so client ones
     // report travel that never happened.
@@ -1703,7 +1733,8 @@ export function installDeadPressProbe(): void {
     };
     if (armed) travel(armed);
     if (missedPress) travel(missedPress);
-  }, { capture: true, passive: true });
+  };
+  document.addEventListener('touchmove', onTouchMove, { capture: true, passive: true });
 
   // CAPTURE phase. It used to bubble, and read `defaultPrevented` as proof a
   // path had worked. Both halves of that were wrong, and each hid an episode.
@@ -1717,7 +1748,7 @@ export function installDeadPressProbe(): void {
   // And the touch path cancels the default BEFORE running its action, so
   // `defaultPrevented` never distinguished a press that ran from one that was
   // eaten. Both now say which they were, through `takePressOutcome`.
-  document.addEventListener('touchend', (e) => {
+  const onTouchEnd = (e: TouchEvent) => {
     const miss = missedPress;
     if (miss && touchOf(e, miss.touchId)) {
       missedPress = null;
@@ -1729,9 +1760,7 @@ export function installDeadPressProbe(): void {
     const press = armed;
     if (!press || !touchOf(e, press.touchId)) return;
     armed = null;
-    press.observer?.disconnect();
-    press.observer = null;
-    if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
+    disarm(press);
     const lifted: SettlingPress = {
       el: press.el,
       face: press.face,
@@ -1766,17 +1795,17 @@ export function installDeadPressProbe(): void {
       lifted.graceTimer = null;
       rule(lifted, false);
     }, CLICK_GRACE_MS);
-  }, { capture: true, passive: true });
+  };
+  document.addEventListener('touchend', onTouchEnd, { capture: true, passive: true });
 
-  document.addEventListener('touchcancel', (e) => {
+  const onTouchCancel = (e: TouchEvent) => {
     // A gesture the system took is the platform working, so the row-missed
     // press goes with it and earns no recovery.
     if (missedPress && touchOf(e, missedPress.touchId)) missedPress = null;
     const press = armed;
     if (!press || !touchOf(e, press.touchId)) return;
     armed = null;
-    press.observer?.disconnect();
-    if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
+    disarm(press);
     const heldMs = Date.now() - press.armedAt;
     const fingersAtLift = e.touches.length;
     // A task later, as at the lift: a composer face serves a cancelled tap
@@ -1804,7 +1833,8 @@ export function installDeadPressProbe(): void {
         at: press.at,
       });
     }, 0);
-  }, { capture: true, passive: true });
+  };
+  document.addEventListener('touchcancel', onTouchCancel, { capture: true, passive: true });
 
   // Only the PRESSED face settles its own press. Settling on any click let one
   // landing elsewhere cancel a real report, and a neighbouring face answering

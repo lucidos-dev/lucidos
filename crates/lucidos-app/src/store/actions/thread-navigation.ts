@@ -1,8 +1,11 @@
 import { signal, computed } from '@preact/signals';
 import { focusedThreadId } from '../store';
+import { closeDashboardPanel, dashboardPanelOpen, openDashboardPanel } from '../dashboards';
+import { viewportIsMobile } from '../../utils/viewport';
 import { focusThread } from './threads';
 
-export type ThreadNavEntry = { type: 'thread'; id: string };
+/** A thread, or the dashboard panel open over that thread. */
+export type ThreadNavEntry = { type: 'thread' | 'dashboard'; id: string };
 
 export const MAX_THREAD_NAV_STACK = 50;
 
@@ -38,7 +41,7 @@ export function removeEntriesById(
   let removedAtOrBeforeCursor = 0;
   const newStack: ThreadNavEntry[] = [];
   for (let i = 0; i < stack.length; i++) {
-    if (stack[i].type === 'thread' && stack[i].id === threadId) {
+    if (stack[i].id === threadId) {
       if (i <= cursor) removedAtOrBeforeCursor++;
     } else {
       newStack.push(stack[i]);
@@ -52,6 +55,24 @@ export function removeEntriesById(
   return { stack: newStack, cursor: newCursor };
 }
 
+/** Fold every dashboard row into a row for its thread, then merge runs of the
+ *  same thread. The cursor stays on the row its old one folded into. Returns
+ *  null when there is no dashboard row. */
+export function collapseDashboardEntries(
+  stack: ThreadNavEntry[],
+  cursor: number,
+): { stack: ThreadNavEntry[]; cursor: number } | null {
+  if (!stack.some((e) => e.type === 'dashboard')) return null;
+  const newStack: ThreadNavEntry[] = [];
+  let newCursor = -1;
+  stack.forEach((entry, i) => {
+    const last = newStack[newStack.length - 1];
+    if (last?.id !== entry.id) newStack.push({ type: 'thread', id: entry.id });
+    if (i === cursor) newCursor = newStack.length - 1;
+  });
+  return { stack: newStack, cursor: newCursor };
+}
+
 const THREAD_NAV_STORAGE_KEY = 'lucidos-thread-nav-history';
 
 const threadNavStack = signal<ThreadNavEntry[]>([]);
@@ -62,7 +83,7 @@ let _initialized = false;
 function isValidEntry(v: unknown): v is ThreadNavEntry {
   if (!v || typeof v !== 'object') return false;
   const o = v as { type?: unknown; id?: unknown };
-  return o.type === 'thread' && typeof o.id === 'string';
+  return (o.type === 'thread' || o.type === 'dashboard') && typeof o.id === 'string';
 }
 
 function saveThreadNavState(): void {
@@ -101,6 +122,17 @@ function ensureInitialized(): void {
     threadNavStack.value = [];
     threadNavCursor.value = -1;
   }
+}
+
+/** Off the phone layout there is no dashboard panel, so its rows would be
+ *  Back steps that change nothing on screen. */
+export function collapseDashboardNavEntries(): void {
+  ensureInitialized();
+  const result = collapseDashboardEntries(threadNavStack.value, threadNavCursor.value);
+  if (!result) return;
+  threadNavStack.value = result.stack;
+  threadNavCursor.value = result.cursor;
+  saveThreadNavState();
 }
 
 export const canGoBackThread = computed(() => {
@@ -165,9 +197,50 @@ export function removeThreadNavEntries(threadId: string): void {
 function restore(entry: ThreadNavEntry): void {
   _restoring = true;
   try {
+    // Focusing closes the panel, so a dashboard row opens it afterwards.
     focusThread(entry.id);
+    if (entry.type === 'dashboard' && viewportIsMobile.value) openDashboardPanel();
   } finally {
     _restoring = false;
+  }
+}
+
+/** Open or close the dashboard panel, and record it in the thread history so
+ *  Back closes it and Forward reopens it. Closing steps back onto the thread
+ *  row under the panel when there is one, so toggling never grows the history.
+ *  With no thread open there is no row to record. */
+export function setDashboardPanelOpen(open: boolean): void {
+  if (dashboardPanelOpen.value === open) return;
+  if (open) openDashboardPanel();
+  else closeDashboardPanel();
+  const id = focusedThreadId.value;
+  if (!id) return;
+  const threadRow: ThreadNavEntry = { type: 'thread', id };
+  if (!open && stepBackOnto(threadRow)) return;
+  pushThreadNavState(open ? { type: 'dashboard', id } : threadRow);
+}
+
+/** Move the cursor back one row when that row is `entry`. */
+function stepBackOnto(entry: ThreadNavEntry): boolean {
+  ensureInitialized();
+  const previous = threadNavStack.value[threadNavCursor.value - 1];
+  if (!previous || !entriesEqual(previous, entry)) return false;
+  threadNavCursor.value--;
+  saveThreadNavState();
+  return true;
+}
+
+export function toggleDashboardPanel(): void {
+  setDashboardPanelOpen(!dashboardPanelOpen.value);
+}
+
+/** Open the panel when the history sits on a dashboard row for the open
+ *  thread: at a reload, and when the layout turns phone. */
+export function reopenDashboardPanelFromHistory(): void {
+  ensureInitialized();
+  const row = threadNavStack.value[threadNavCursor.value];
+  if (row?.type === 'dashboard' && row.id === focusedThreadId.value && viewportIsMobile.value) {
+    openDashboardPanel();
   }
 }
 

@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::engine::agent_session::child_reports::{child_reports_channel, ChildReportsLoopEnd};
 use crate::engine::agent_session::withdraw::WithdrawInputRequest;
 use crate::engine::types::{AgentSession, AgentUserInput, SessionPhase};
 use crate::runtime::CodingAgent;
@@ -60,6 +61,7 @@ pub(crate) struct ClaimedEntry {
     pub(crate) msg_tx: UnboundedSender<AgentUserInput>,
     pub(crate) msg_rx: UnboundedReceiver<AgentUserInput>,
     pub(crate) withdraw_rx: UnboundedReceiver<WithdrawInputRequest>,
+    pub(crate) child_reports: ChildReportsLoopEnd,
     pub(crate) stop: Arc<Notify>,
     pub(crate) interrupt: Arc<Notify>,
     pub(crate) idle_notify: Arc<Notify>,
@@ -115,11 +117,13 @@ pub(crate) fn claim_thread_for(
 
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
     let (withdraw_tx, withdraw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (child_reports, child_reports_loop) = child_reports_channel();
     let entry = ClaimedEntry {
         coding_agent,
         msg_tx,
         msg_rx,
         withdraw_rx,
+        child_reports: child_reports_loop,
         stop: Arc::new(Notify::new()),
         interrupt: Arc::new(Notify::new()),
         idle_notify: Arc::new(Notify::new()),
@@ -162,6 +166,7 @@ pub(crate) fn claim_thread_for(
                 ClaimFor::Apply => SessionPhase::Applying,
             },
             withdraw_tx,
+            child_reports,
             unforwarded_inputs: Default::default(),
             builtin_commands,
             skill_commands,
@@ -169,6 +174,7 @@ pub(crate) fn claim_thread_for(
             current_reasoning_effort,
             reasoning_effort_in_force: None,
             question_resume_pending: false,
+            quiet_answer_pending: false,
             tools_in_flight: entry.tools_in_flight.clone(),
             question_flushes: entry.question_flushes.clone(),
             coding_agent,
@@ -484,13 +490,17 @@ impl Drop for SpawnClaim {
 }
 
 /// The backend a thread runs on. Only a thread's FIRST session honours the
-/// request; afterwards the stored `thread_summaries.coding_agent` wins. A new
-/// backend would have no session to resume and would lose all context.
-async fn resolve_thread_coding_agent(
+/// request. A *successor session* runs on the backend its handoff named.
+/// Otherwise the stored `thread_summaries.coding_agent` wins: a new backend
+/// would have no session to resume and would lose all context.
+pub(crate) async fn resolve_thread_coding_agent(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     requested: Option<CodingAgent>,
 ) -> Result<CodingAgent, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(handoff) = crate::engine::successor::pending_handoff(pool, thread_id).await? {
+        return Ok(handoff.coding_agent);
+    }
     let stored: Option<String> =
         sqlx::query_scalar("SELECT coding_agent FROM thread_summaries WHERE thread_id = $1")
             .bind(thread_id)

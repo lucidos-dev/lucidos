@@ -168,7 +168,7 @@ async fn a_sample_follows_the_handoff() {
     let thread = seed_coding_thread(&bus, None).await;
     let start = checkpoint(&pool, thread, "pre-harden", 300_000, None, None).await;
     calls(&pool, thread, 3).await;
-    let successor = seed_handoff(&bus, thread, None, false).await;
+    let successor = seed_handoff(&bus, thread, None).await;
     calls(&pool, thread, 1).await;
     idle(&pool, thread).await;
     calls(&pool, successor, 6).await;
@@ -179,6 +179,37 @@ async fn a_sample_follows_the_handoff() {
     );
     idle(&pool, successor).await;
     assert_eq!(sample_calls(&pool, thread, start).await.unwrap(), Some(9));
+
+    teardown_test_db(&db).await;
+}
+
+/// Sample continuity: a handoff inside a sample leaves it whole. The old
+/// session's idle is no clean turn end, so the sample runs on into the
+/// successor session up to its own.
+#[tokio::test]
+async fn a_sample_runs_on_across_a_successor_session() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = seed_coding_thread(&bus, None).await;
+    let start = checkpoint(&pool, thread, "pre-harden", 300_000, None, None).await;
+    calls(&pool, thread, 3).await;
+    insert(&pool, thread, "SessionHandedOff", serde_json::json!({})).await;
+    idle(&pool, thread).await;
+    assert_eq!(
+        sample_calls(&pool, thread, start).await.unwrap(),
+        None,
+        "the handed-off session's idle ends no sample"
+    );
+    insert(
+        &pool,
+        thread,
+        "SessionStarted",
+        serde_json::json!({"continuity": {"kind": "handoff", "opening": "brief"}}),
+    )
+    .await;
+    calls(&pool, thread, 4).await;
+    idle(&pool, thread).await;
+    assert_eq!(sample_calls(&pool, thread, start).await.unwrap(), Some(7));
 
     teardown_test_db(&db).await;
 }
@@ -345,16 +376,56 @@ async fn the_fresh_median_reads_the_tenth_call_of_recent_successors() {
     };
     for tokens in [70_000, 80_000, 90_000] {
         let old = seed_coding_thread(&bus, None).await;
-        let successor = seed_handoff(&bus, old, None, false).await;
+        let successor = seed_handoff(&bus, old, None).await;
         for _ in 0..9 {
             at(successor, 1_000).await;
         }
         at(successor, tokens).await;
         at(successor, 500_000).await;
     }
-    let short = seed_handoff(&bus, seed_coding_thread(&bus, None).await, None, false).await;
+    let short = seed_handoff(&bus, seed_coding_thread(&bus, None).await, None).await;
     at(short, 1_000).await;
     assert_eq!(fresh_tokens_median(&pool).await.unwrap(), Some(80_000.0));
+
+    teardown_test_db(&db).await;
+}
+
+/// A successor session's fresh context counts from its own start, never from
+/// the calls of the session that handed off.
+#[tokio::test]
+async fn the_fresh_median_reads_the_tenth_call_of_a_successor_session() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let at = |thread, tokens| {
+        let pool = pool.clone();
+        async move {
+            insert(
+                &pool,
+                thread,
+                "ContextCaptured",
+                serde_json::json!({"model": OPUS, "usage": {"input_tokens": tokens}}),
+            )
+            .await;
+        }
+    };
+    for tokens in [60_000, 70_000, 75_000] {
+        let thread = seed_coding_thread(&bus, None).await;
+        for _ in 0..12 {
+            at(thread, 400_000).await;
+        }
+        insert(
+            &pool,
+            thread,
+            "SessionStarted",
+            serde_json::json!({"continuity": {"kind": "handoff", "opening": "narrative"}}),
+        )
+        .await;
+        for _ in 0..9 {
+            at(thread, 1_000).await;
+        }
+        at(thread, tokens).await;
+    }
+    assert_eq!(fresh_tokens_median(&pool).await.unwrap(), Some(70_000.0));
 
     teardown_test_db(&db).await;
 }

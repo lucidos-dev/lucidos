@@ -1,6 +1,7 @@
 ---
 name: Workspace audit: scripts
 description: The scripts audit section: CLI usage for data writes, events and API calls, hardcoded machine paths, and database access through LUCIDOS_DATABASE_URL.
+sources: ["system-knowhow/lucidos-cli.md", "system-knowhow/best-practices.md", "system-knowhow/plugins.md", "crates/lucidos-cli/src/data.rs", "crates/lucidos-engine/src/core/agent_role.rs"]
 ---
 
 # Workspace audit section: scripts

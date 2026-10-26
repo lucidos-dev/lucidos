@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::{clip, READ_ALOUD_CHARS};
 use crate::engine::agent_recovery::newest_open_question;
-use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+use crate::engine::claude_code::{AllowScope, GrantOffer};
 use crate::engine::thread_events::{AnswerKind, MessageOrigin, QuestionOption};
 use crate::engine::LucidosEngine;
 
@@ -275,11 +275,10 @@ impl OpenDecision {
     /// A coding-agent card. Its summary already names the tool and its target.
     pub fn coding_agent_permission(
         request_id: &str,
-        tool_name: &str,
-        input: &serde_json::Value,
+        grant_offer: Option<&GrantOffer>,
         summary: &str,
     ) -> Self {
-        let grantable = derive_allow_pattern(tool_name, input, AllowScope::Session).is_some();
+        let grantable = grant_offer.is_some_and(|offer| offer.session.is_some());
         Self::permission(
             DecisionKind::CodingAgentPermission,
             request_id,
@@ -488,10 +487,12 @@ pub async fn open_on(pool: &sqlx::PgPool, thread_id: Uuid) -> Vec<OpenDecision> 
         ));
     }
     if let Some((payload, request_id)) = requested(agent) {
+        let offer = payload
+            .get("grant_offer")
+            .and_then(|offer| serde_json::from_value::<GrantOffer>(offer.clone()).ok());
         open.push(OpenDecision::coding_agent_permission(
             &request_id,
-            &text(&payload, "tool_name").unwrap_or_default(),
-            payload.get("input").unwrap_or(&serde_json::Value::Null),
+            offer.as_ref(),
             &text(&payload, "summary").unwrap_or_default(),
         ));
     }

@@ -109,7 +109,7 @@ export function MarkdownDocument({ content, location, onClick, editable = false,
       {frontmatter && <FrontmatterCard frontmatter={frontmatter} />}
       <div
         ref={bodyRef}
-        class="response-content markdown-content"
+        class="response-content markdown-content authored-html"
         onClick={onClick ? (e) => onClick(e as unknown as MouseEvent) : undefined}
         dangerouslySetInnerHTML={{ __html: html }}
       />

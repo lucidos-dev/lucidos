@@ -9,9 +9,8 @@ import { CategoryIcon } from './CategoryIcon';
  * wears the same mark wherever it's shown:
  *   - Codex coding-agent thread      → the Codex mark
  *   - Claude Code coding-agent thread → the Claude mark
- *   - trigger thread                 → the trigger glyph (matches the drawer's
- *                                       "Trigger" chip; triggers run the Lucidos
- *                                       Agent but read as their own type)
+ *   - trigger thread                 → the trigger glyph (triggers run the
+ *                                       Lucidos Agent but read as their own type)
  *   - plain Lucidos Agent (chat) thread → the Lucidos mark
  *
  * Used by the thread-pane back/forward history menu (ThreadNav) to label each

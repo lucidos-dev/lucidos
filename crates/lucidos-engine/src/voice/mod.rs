@@ -488,6 +488,9 @@ mod tests {
             modality: None,
             service_tier: None,
             cache_creation_1h_tokens: None,
+            cache_creation_30m_tokens: None,
+            cache_creation_12h_tokens: None,
+            cache_creation_requested_ttl: None,
         };
         let provider = MockVoiceProvider::ending_after(vec![
             VoiceEvent::UserTurnEnded {
@@ -550,6 +553,7 @@ mod tests {
                 description: Some("Chunks 25-33".to_string()),
                 preview: None,
                 widget: None,
+                quiet: false,
             },
             QuestionOption {
                 id: "opt-1".to_string(),
@@ -557,6 +561,7 @@ mod tests {
                 description: None,
                 preview: None,
                 widget: None,
+                quiet: false,
             },
         ]
     }

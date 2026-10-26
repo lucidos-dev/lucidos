@@ -6,11 +6,11 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
 
-// The compose Send→Cancel morph renders icons, not text labels: a round
-// up-arrow for Send and a stop-square while a turn runs/cancels. This pins
-// the icon swap (no regression back to the "Send"/"Cancel" text labels) while
-// keeping the accessibility contract (aria-label) and the e2e selector hooks
-// (class names) intact.
+// The compose Send→Cancel morph wears the action slot's face: an up-arrow for
+// Send and a stop-square while a turn runs, each with its word. A phone shows
+// the icon alone in the round button. This pins the icon swap while keeping
+// the accessibility contract (aria-label) and the e2e selector hooks (class
+// names) intact.
 const here: string = dirname(fileURLToPath(import.meta.url));
 const promptSource = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
 
@@ -20,7 +20,7 @@ function findMorphButton(): string {
   return match[0];
 }
 
-describe('send-cancel-morph renders icons, not text labels', () => {
+describe('send-cancel-morph renders the slot face', () => {
   it('imports SendArrowIcon and StopIcon from shared icons', () => {
     expect(promptSource).toMatch(/import\s*\{[^}]*\bSendArrowIcon\b[^}]*\bStopIcon\b[^}]*\}\s*from\s*['"]\.\.\/shared\/icons['"]/);
   });
@@ -33,19 +33,15 @@ describe('send-cancel-morph renders icons, not text labels', () => {
     expect(findMorphButton()).toMatch(/<StopIcon\s*\/>/);
   });
 
-  it('no longer renders the visible "Cancel..." text label (icon-only now)', () => {
+  it('shows the plain verb while it stops, never "Cancel..."', () => {
     const btn = findMorphButton();
-    // The old visible-label ternary emitted 'Cancel...' for the canceling
-    // state — a string that never appears in the aria-label/tooltip, so its
-    // absence is a clean signal the text labels are gone.
     expect(btn).not.toMatch(/'Cancel\.\.\.'/);
-    // The button children must be icons, not a text-label ternary.
-    expect(btn).toMatch(/>\s*\{\/\*[\s\S]*?\*\/\}\s*\{morphMode/);
+    expect(btn).toContain('label="Stop" busy={morphMode === \'canceling\'}');
   });
 
-  it('keeps the round-shape class and the e2e selector classes', () => {
+  it('keeps the action slot class and the e2e selector classes', () => {
     const btn = findMorphButton();
-    expect(btn).toMatch(/send-cancel-morph send-cancel-round/);
+    expect(btn).toMatch(/send-cancel-morph action-slot/);
   });
 
   it('stays blue in the stop/cancel state (no red danger variant)', () => {

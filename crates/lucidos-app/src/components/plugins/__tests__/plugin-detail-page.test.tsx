@@ -181,7 +181,10 @@ describe('the plugin README', () => {
     expect(doc.querySelector('script, img, iframe, input')).toBeNull();
     expect(doc.querySelector('[style], [background], [src]')).toBeNull();
     expect(html).not.toContain('onerror');
-    expect(html).not.toContain('tracker.example');
+    // The authored input shows as text, so only a live attribute counts.
+    const attributeValues = Array.from(doc.querySelectorAll('*'))
+      .flatMap((el) => Array.from(el.attributes, (attr) => attr.value));
+    expect(attributeValues.join(' ')).not.toContain('tracker.example');
     expect(doc.querySelector('h1')?.textContent).toBe('Hello');
     const [outbound, relative] = Array.from(doc.querySelectorAll('a'));
     expect(outbound.getAttribute('href')).toBe('https://example.com');

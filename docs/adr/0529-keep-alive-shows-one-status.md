@@ -5,6 +5,8 @@
 - **Amends**: [0470](0470-keep-the-prompt-cache-warm.md). Its "the turn leaves
   no visible trace" still holds for each ping. The keep-alive as a whole is
   now visible.
+- **Amended by**: [0554](0554-keep-alive-per-thread-switch.md). The status gains a `turned_off` reason.
+- **Amended by**: [0556](0556-lucidos-agent-keep-alive-prefill-beats.md). Lucidos Agent threads show the status too.
 
 ## Context
 

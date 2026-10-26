@@ -98,11 +98,25 @@ pub(crate) fn magic_dns_name(addr: Ipv4Addr, timeout: Duration) -> Option<String
     // called while a settings pane is loading, so it gets a hard ceiling: the
     // worker is left to finish into a dropped channel rather than joined, since
     // the only cost of abandoning it is the lookup we already gave up on.
+    //
+    // Tailscale's own resolver is asked at the same time, not after: a slow
+    // system lookup would otherwise spend the whole ceiling before it ran.
+    let deadline = std::time::Instant::now() + timeout;
     let (tx, rx) = std::sync::mpsc::channel();
+    let quad100_tx = tx.clone();
     std::thread::spawn(move || {
         let _ = tx.send(reverse_lookup(addr));
     });
-    rx.recv_timeout(timeout).ok().flatten()
+    std::thread::spawn(move || {
+        let _ = quad100_tx.send(crate::quad100::reverse_lookup(addr, timeout));
+    });
+    for _ in 0..2 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Some(name) = rx.recv_timeout(left).ok()? {
+            return Some(name);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

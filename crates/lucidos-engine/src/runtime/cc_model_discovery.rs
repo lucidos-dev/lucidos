@@ -131,6 +131,7 @@ pub fn menu_options(models: &[DiscoveredModel]) -> Vec<CcMenuOption> {
             supported_models: None,
             context_window: None,
             reasoning_efforts: m.reasoning_efforts(),
+            default_effort: None,
             offered: true,
         })
         .collect()

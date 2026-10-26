@@ -498,6 +498,7 @@ fn the_offered_list_is_the_discovered_rows_then_the_curated_rest() {
         supported_models: None,
         context_window: None,
         reasoning_efforts: Some(vec!["low".to_string()]),
+        default_effort: None,
         offered: true,
     }];
     let merged = offered_cc_model_options(Some(&discovered));
@@ -523,6 +524,7 @@ fn a_discovered_row_offers_its_own_tiers() {
         supported_models: None,
         context_window: None,
         reasoning_efforts: Some(Vec::new()),
+        default_effort: None,
         offered: true,
     };
     let (models, _) = model_and_effort_options(&[row], cc_reasoning_effort_options());
@@ -540,6 +542,7 @@ fn discovered_row(value: &str, runs: &str) -> CcMenuOption {
         supported_models: None,
         context_window: None,
         reasoning_efforts: None,
+        default_effort: None,
         offered: true,
     }
 }

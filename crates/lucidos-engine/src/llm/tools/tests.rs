@@ -583,13 +583,8 @@ fn send_notification_schema_tap_documents_object_shape() {
     );
 }
 
-/// The delivery semantics (notifications.md §2/§4) must be in the tool
-/// description so the agent communicates accurately: an active device gets
-/// an in-app TOAST and the OS push is suppressed everywhere; the push fires
-/// only when no device is active. Without this steer the agent tells a user
-/// who is clearly using the app to "check your device for the push" — the
-/// exact mistake that motivated this (the user was active, so no push was
-/// ever sent, only a toast).
+/// Explain delivery outcomes without promising an OS push to an active user.
+/// Toasts, auto-read and silencing suppress push; fullscreen can leave it allowed.
 #[test]
 fn send_notification_description_explains_active_device_gets_toast_not_push() {
     let desc = get_notification_tool().description;
@@ -599,7 +594,7 @@ fn send_notification_description_explains_active_device_gets_toast_not_push() {
     );
     assert!(
         desc.contains("suppressed"),
-        "description must say the OS push is suppressed when a device is active: {desc:?}"
+        "description must explain OS push suppression: {desc:?}"
     );
     assert!(
         desc.contains("check your device for the push"),
@@ -1174,7 +1169,7 @@ fn one_email_account_opens_the_whole_family() {
 fn no_tool_array_offers_execute_intent() {
     for caps in [ToolCapabilities::default(), ToolCapabilities::all_open()] {
         assert!(
-            !chat_wire_order(&caps).contains(&tn::EXECUTE_INTENT.to_string()),
+            !chat_wire_order(&caps).contains(&tn::EXECUTE_INTENT.to_string()), // Retired compatibility.
             "execute_intent is retired, yet {caps:?} offers it"
         );
     }

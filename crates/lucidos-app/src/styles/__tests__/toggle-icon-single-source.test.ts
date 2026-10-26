@@ -125,7 +125,7 @@ describe('an icon toggle has one definition', () => {
       .filter-active { color: red; }
       .icon-btn[aria-pressed="false"]:hover { color: red; }
       .pill-bar-btn.active { color: red; }
-      .dashboard-sheet-toggle[aria-pressed="true"] { color: red; }
+      .dashboard-panel-toggle[aria-pressed="true"] { color: red; }
       .question-option[aria-pressed="true"] { color: red; }
       .icon-btn[aria-pressed="true"][data-tone="framed"] { color: red; }`;
     expect(stray(css, 'styles/other.css')).toEqual([
@@ -133,7 +133,7 @@ describe('an icon toggle has one definition', () => {
       '.icon-btn[aria-pressed="true"]',
       '.toolbar .icon-btn.active:hover',
       '.filter-active',
-      '.dashboard-sheet-toggle[aria-pressed="true"]',
+      '.dashboard-panel-toggle[aria-pressed="true"]',
       '.icon-btn[aria-pressed="true"][data-tone="framed"]',
     ]);
     expect(stray(css, 'styles/global/host-components.css')).not.toContain(

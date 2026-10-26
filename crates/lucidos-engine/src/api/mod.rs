@@ -1630,6 +1630,12 @@ pub fn create_router(
             state.clone(),
             mutating_gate::enforce_caller_identified,
         ))
+        // Tell a coding agent, on any call it makes, that a child report waits
+        // for it (`api::threads::child_reports`).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            threads::child_reports::note_waiting_child_reports,
+        ))
         // Refuse a request an app stamped itself on, to a route apps may not
         // reach (403). The host bridge already refused it, and this is the
         // second answer: see `api::app_reach` and ADR 0231. It reads the

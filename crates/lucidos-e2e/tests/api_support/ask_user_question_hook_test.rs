@@ -373,6 +373,111 @@ async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
         .ok();
 }
 
+/// A *quiet option* picked on Claude Code: the hook learns to stop the turn,
+/// the `[quiet]` tag never reaches a label, and nothing wakes the agent. No
+/// session is live here, so a loud pick would emit a `ContinuationRequested`.
+#[tokio::test]
+async fn a_quiet_pick_stops_the_turn_and_wakes_nothing() {
+    let client = user_client().await;
+    let pool = PgPool::connect(&db_url()).await.expect("db connect");
+    let thread_id = Uuid::new_v4();
+    let tool_use_id = format!("toolu_quiet_{}", thread_id.simple());
+    let q0_id = format!("{tool_use_id}#q0");
+
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+
+    let client_bg = client.clone();
+    let q0_id_bg = q0_id.clone();
+    let pool_bg = pool.clone();
+    let answerer = tokio::spawn(async move {
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id_bg).await;
+        let resp = client_bg
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
+            .json(&json!({
+                "tool_use_id": q0_id_bg,
+                "answer": { "kind": "Selected", "option_id": "opt-1" }
+            }))
+            .send()
+            .await
+            .expect("answer post");
+        assert_eq!(resp.status().as_u16(), 200, "answer-question should accept");
+    });
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+            .json(&json!({
+                "thread_id": thread_id.to_string(),
+                "tool_use_id": tool_use_id,
+                "session_id": "sid-quiet",
+                "questions": [{
+                    "question": "Draft a follow-up?",
+                    "header": "",
+                    "multiSelect": false,
+                    "options": [
+                        {"label": "Draft it"},
+                        {"label": "[quiet] Leave it as posted"}
+                    ]
+                }]
+            }))
+            .send(),
+    )
+    .await
+    .expect("did not time out")
+    .expect("hook post");
+
+    answerer.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["quiet"], true, "the hook must learn to stop the turn");
+    assert_eq!(
+        body["answers"],
+        json!({"Draft a follow-up?": "Leave it as posted"})
+    );
+
+    let stored: (Option<String>, Option<bool>) = sqlx::query_as(
+        "SELECT \
+           (SELECT payload->'options'->1->>'label' FROM events \
+             WHERE thread_id = $1 AND event_type = 'UserQuestionAsked'), \
+           (SELECT (payload->>'quiet')::bool FROM events \
+             WHERE thread_id = $1 AND event_type = 'UserQuestionAnswered')",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("stored question query");
+    assert_eq!(stored.0.as_deref(), Some("Leave it as posted"));
+    assert_eq!(stored.1, Some(true), "the answer records that it was quiet");
+
+    for event_type in ["CodingAgentPromptSent", "ContinuationRequested"] {
+        let count = count_events_of_type(&pool, thread_id, event_type).await;
+        assert_eq!(count, 0, "{event_type} must not fire for a quiet pick");
+    }
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .expect("status query");
+    assert_eq!(status, "idle", "a quiet pick settles the thread");
+
+    sqlx::query("DELETE FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
 /// `Superseded` asserts something no client can make true: that a follow-up
 /// arrived and replaced this question. Only the message router knows that, so
 /// the endpoint refuses the kind and leaves the question pending.

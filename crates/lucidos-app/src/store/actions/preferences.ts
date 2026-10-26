@@ -563,10 +563,9 @@ function paintThemeMode(mode: ThemeMode, resolved: ResolvedThemeMode, sampledLig
   appearanceVersion.value++;
 }
 
-/** Tint the bar above the page with the header's top colour: the iOS status
- *  bar of the installed app (ADR 0548), and Android's and the browsers'
- *  toolbars. Read from the painted token, so a theme, a style override and the
- *  iOS dark-mode nudge in base.css all reach it. */
+/** Tint the browsers' and Android's toolbars with the header's top colour.
+ *  Read from the painted token, so a theme, a style override and the iOS
+ *  dark-mode nudge in base.css all reach it. */
 export function paintThemeColor(): void {
   document.querySelector('meta[name="theme-color"]')?.setAttribute(
     'content',
@@ -785,6 +784,8 @@ function syncSystemThemeModeListener(mode: ThemeMode): void {
   for (const [target, type] of SYSTEM_THEME_MODE_RESUME_EVENTS) {
     target.addEventListener(type, schedule);
   }
+  // The new query announces only later flips, so read once for an earlier one.
+  schedule();
 }
 
 // Module-init install. loadPreferences skips applyThemeMode when the stored mode
@@ -1543,15 +1544,15 @@ export function setCaptureContext(enabled: boolean): Promise<void> {
   return savePreference('capture_context', enabled ? 'true' : 'false');
 }
 
-// --- Cache-warm line ---
+// --- Cache cards ---
 
-/** Whether a thread waiting on the user draws the cache-warm line. */
-export function currentCacheWarmLine(): boolean {
-  return currentPreference('cache_warm_line') === 'true';
+/** Whether the transcript draws the Cache kept warm card and the cache-warm line. */
+export function currentCacheCards(): boolean {
+  return currentPreference('cache_cards') === 'true';
 }
 
-export function setCacheWarmLine(enabled: boolean): Promise<void> {
-  return savePreference('cache_warm_line', enabled ? 'true' : 'false');
+export function setCacheCards(enabled: boolean): Promise<void> {
+  return savePreference('cache_cards', enabled ? 'true' : 'false');
 }
 
 // --- Experimental: in-app browser (Tauri native webview) ---
@@ -1616,9 +1617,10 @@ export function externalLinkTargetConfigurable(): boolean {
 
 /** When true, the mobile header and prompt slide away on scroll down and come
  *  back on scroll up (`hooks/useHideOnScroll.ts`). When false, both stay
- *  pinned. */
+ *  pinned. The installed iOS app is always true: iOS 27 keeps its status bar
+ *  translucent, so a pinned header would sit inside the blur (ADR 0553). */
 export function currentMobileDynamicBars(): boolean {
-  return currentPreference('mobile_dynamic_bars') === 'true';
+  return isIOSPwa() || currentPreference('mobile_dynamic_bars') === 'true';
 }
 
 export function setMobileDynamicBars(enabled: boolean): Promise<void> {
@@ -1904,6 +1906,17 @@ export function currentCommandGuardJudge(): boolean {
 
 export function setCommandGuardJudge(enabled: boolean): Promise<void> {
   return savePreference('command_guard_judge', enabled ? 'true' : 'false');
+}
+
+/** Sub-toggle: let the command guard answer coding-agent command cards
+ *  (Codex, Claude Code `Bash`). Only meaningful while the master
+ *  `command_guard` toggle is on. */
+export function currentCommandGuardCodingAgents(): boolean {
+  return currentPreference('command_guard_coding_agents') === 'true';
+}
+
+export function setCommandGuardCodingAgents(enabled: boolean): Promise<void> {
+  return savePreference('command_guard_coding_agents', enabled ? 'true' : 'false');
 }
 
 // --- Voice ---

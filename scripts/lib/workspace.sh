@@ -2830,8 +2830,8 @@ ensure_frontend_deps() {
 # Write every generated file (scripts/codegen.sh): the Rust-rendered TS, CSS
 # and JSON, then the SDK bundles in packages/lucidos-sdk/dist/, which the
 # engine serves (/api/v1/sdk.js and the scripts beside it). Runs after
-# build_or_find_engine. When that just compiled, a codegen cache miss renders
-# with the lucidos-codegen it built beside the engine, for free.
+# build_or_find_engine. A cache miss reuses its lucidos-codegen for the engine
+# output, then compiles the CLI writer test to compose the agent surface.
 #
 # REUSED_CODEGEN_BIN names a lucidos-codegen the e2e engine cache matched to
 # this tree, for a caller that reused a build rather than compiling one.

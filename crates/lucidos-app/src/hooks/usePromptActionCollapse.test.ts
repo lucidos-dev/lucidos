@@ -152,53 +152,75 @@ describe('a cluster member takes its gap with it', () => {
   });
 });
 
-describe('the shedding member shortens before anything folds', () => {
-  /** Three icons, then the rung pill last in fold order, 50 wide in full, 30
-   *  with the badge and name, 10 with the badge alone. */
-  const PILL = [50, 30, 10];
-  const settle = (containerWidth: number) =>
+describe('the merge step comes before the member at `atFold` folds', () => {
+  /** A leading icon, then the member that must outlast the pair (the follow
+   *  toggle). The last two merge into one icon box: Diff and the standing apply. */
+  const MEMBERS = [ICON, ICON, ICON, ICON];
+  const AT_FOLD = 1;
+  const settle = (containerWidth: number, mergedWidth = ICON) =>
     computePromptCollapse({
       containerWidth,
       pinnedWidth: PINNED,
-      memberWidths: [ICON, ICON, ICON, PILL[0]],
-      memberGroups: ['row', 'row', 'row', 'cluster'],
+      memberWidths: MEMBERS,
+      memberGroups: MEMBERS.map((): FoldGroup => 'row'),
       pinnedClusterCount: 1,
       gapPx: 0,
       moreWidth: ICON,
-      shedding: { index: 3, widths: PILL },
+      merge: { first: 2, count: 2, width: mergedWidth, atFold: AT_FOLD },
     });
 
-  it('stands in full while everything fits', () => {
-    expect(settle(PINNED + 3 * ICON + PILL[0])).toEqual({ folded: 0, shed: 0 });
+  it('draws the pair as separate boxes while everything fits', () => {
+    expect(settle(PINNED + 4 * ICON)).toEqual({ folded: 0, merged: false });
   });
 
-  it('drops to badge and name before folding an icon', () => {
-    expect(settle(PINNED + 3 * ICON + PILL[1])).toEqual({ folded: 0, shed: 1 });
+  it('merges the pair before the member at `atFold` folds', () => {
+    expect(settle(PINNED + 3 * ICON)).toEqual({ folded: 1, merged: true });
   });
 
-  it('drops to the badge alone before folding an icon', () => {
-    // Folding two icons would fit too: the ⋯, one icon and the full pill.
-    expect(settle(PINNED + 3 * ICON + PILL[2])).toEqual({ folded: 0, shed: 2 });
+  it('folds the member at `atFold` only once the pair is merged', () => {
+    for (let width = 0; width <= PINNED + 5 * ICON; width += 1) {
+      const { folded, merged } = settle(width);
+      if (folded > AT_FOLD) expect(merged).toBe(true);
+    }
   });
 
-  it('folds only once the pill has nothing left to shed', () => {
-    // One box short of the badge-only row: folding two icons for the ⋯ fits.
-    expect(settle(PINNED + 2 * ICON + PILL[2])).toEqual({ folded: 2, shed: 2 });
+  it('folds the merged pair whole, never half', () => {
+    for (let width = 0; width <= PINNED + 5 * ICON; width += 1) {
+      expect(settle(width).folded).not.toBe(3);
+    }
+    expect(settle(PINNED + ICON).folded).toBe(4);
   });
 
-  it('answers the same whatever level is drawn now', () => {
-    // The pill's current box is not an input: only its per-level widths are.
-    const drawnShed = (memberWidth: number) =>
+  it('spends the merged control\'s own width', () => {
+    // A merged box twice an icon needs a box more room than an icon-sized one.
+    expect(settle(PINNED + 3 * ICON, 2 * ICON).folded).toBe(2);
+  });
+
+  it('never merges or folds more as the row grows', () => {
+    let previous = { folded: Infinity, merged: true };
+    for (let width = 0; width <= PINNED + 6 * ICON; width += 1) {
+      const next = settle(width);
+      expect(next.folded).toBeLessThanOrEqual(previous.folded);
+      if (next.folded === previous.folded) expect(next.merged && !previous.merged).toBe(false);
+      previous = next;
+    }
+  });
+
+  it('counts the merged group as one member of the gapped cluster', () => {
+    const GAP = 4;
+    const clusterSettle = (containerWidth: number) =>
       computePromptCollapse({
-        containerWidth: PINNED + 3 * ICON + PILL[1],
+        containerWidth,
         pinnedWidth: PINNED,
-        memberWidths: [ICON, ICON, ICON, memberWidth],
-        memberGroups: ['row', 'row', 'row', 'cluster'],
+        memberWidths: MEMBERS,
+        memberGroups: ['row', 'row', 'cluster', 'cluster'],
         pinnedClusterCount: 1,
-        gapPx: 0,
+        gapPx: GAP,
         moreWidth: ICON,
-        shedding: { index: 3, widths: PILL },
+        merge: { first: 2, count: 2, width: ICON, atFold: AT_FOLD },
       });
-    expect(PILL.map(drawnShed)).toEqual(PILL.map(() => ({ folded: 0, shed: 1 })));
+    // The ⋯, the member at `atFold`, the merged box, and one cluster gap.
+    expect(clusterSettle(PINNED + 3 * ICON + GAP)).toEqual({ folded: 1, merged: true });
+    expect(clusterSettle(PINNED + 3 * ICON + GAP - 1).folded).toBe(2);
   });
 });

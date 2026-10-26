@@ -13,9 +13,18 @@
 export const BRIDGED_FETCH_SLOTS = 3;
 
 interface Queued {
+  queuedAt: number;
   deadline: number;
   start: (remainingMs: number) => void;
   reject: (error: Error) => void;
+}
+
+/** What the lanes are doing now, for a diagnostic. Ages are in milliseconds. */
+export interface LanesSnapshot {
+  running: number;
+  queued: number;
+  oldestRunningMs: number | null;
+  oldestQueuedMs: number | null;
 }
 
 /** The frame a queue belongs to. A disconnected one has gone. */
@@ -30,6 +39,8 @@ export class FetchLanes<L extends Lane> {
   /** Calls running, per lane. A lane with none has no entry. */
   private readonly running = new Map<L, number>();
   private inFlight = 0;
+  /** When each running call began. */
+  private readonly runStarts = new Set<{ startedAt: number }>();
 
   constructor(private readonly slots: number) {}
 
@@ -43,12 +54,14 @@ export class FetchLanes<L extends Lane> {
   enqueue<T>(lane: L, deadline: number, send: (remainingMs: number) => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const queued: Queued = {
+        queuedAt: Date.now(),
         deadline,
         reject,
         start: (remainingMs) => {
-          this.began(lane);
+          const run = { startedAt: Date.now() };
+          this.began(lane, run);
           send(remainingMs).then(resolve, reject).finally(() => {
-            this.ended(lane);
+            this.ended(lane, run);
             this.pump();
           });
         },
@@ -72,12 +85,29 @@ export class FetchLanes<L extends Lane> {
     }
   }
 
-  private began(lane: L): void {
+  /** Read-only: the diagnostic reads it without moving a call. */
+  snapshot(now = Date.now()): LanesSnapshot {
+    const oldest = (times: Iterable<number>): number | null => {
+      const first = Math.min(...times);
+      return Number.isFinite(first) ? now - first : null;
+    };
+    const waiting = [...this.queues.values()].flat();
+    return {
+      running: this.inFlight,
+      queued: waiting.length,
+      oldestRunningMs: oldest([...this.runStarts].map((r) => r.startedAt)),
+      oldestQueuedMs: oldest(waiting.map((q) => q.queuedAt)),
+    };
+  }
+
+  private began(lane: L, run: { startedAt: number }): void {
+    this.runStarts.add(run);
     this.inFlight++;
     this.running.set(lane, (this.running.get(lane) ?? 0) + 1);
   }
 
-  private ended(lane: L): void {
+  private ended(lane: L, run: { startedAt: number }): void {
+    this.runStarts.delete(run);
     this.inFlight--;
     const left = (this.running.get(lane) ?? 1) - 1;
     if (left > 0) this.running.set(lane, left);

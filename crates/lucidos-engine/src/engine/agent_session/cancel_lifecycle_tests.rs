@@ -158,6 +158,7 @@ async fn cancel_does_not_terminate_session() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: cc_meta(),
     })

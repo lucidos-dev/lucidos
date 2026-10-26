@@ -157,6 +157,13 @@ html {
     --safe-area-right: max(env(safe-area-inset-right, 0px), var(--safe-area-floor-right, 0px));
     --safe-area-bottom: max(env(safe-area-inset-bottom, 0px), var(--safe-area-floor-bottom, 0px));
     --safe-area-left: max(env(safe-area-inset-left, 0px), var(--safe-area-floor-left, 0px));
+    /* Where the mobile header's controls start: below the status bar, and in
+       the installed iOS app also below iOS 27's top-edge blur. The header's
+       fill still starts at the top edge (ADR 0553). utils/statusBarBlurClearance.ts
+       sets the clearance in the installed iOS app, and it is 0 everywhere
+       else. */
+    --status-bar-blur-clearance: 0px;
+    --header-controls-top: calc(var(--safe-area-top) + var(--status-bar-blur-clearance));
     /* Height of the desktop app header (.app-header, panels/shell.css): the
        2.5rem .pane-header bar plus its 0.25rem top padding plus the safe-area
        inset the header reserves. */
@@ -528,7 +535,7 @@ html, html[data-theme-mode="dark"] {
     --lucidos-mark-bg-bottom: #0a4ea8;
     --lucidos-mark-fg: #ffffff;
     --claude-mark: var(--initiator-coding-agent);
-    --codex-mark: var(--accent-light);
+    --codex-mark: var(--text-primary);
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);

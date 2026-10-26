@@ -267,6 +267,11 @@ Pass `wake_mode` to `run_thread` or `run_coding_agent`, or `--wake-mode` to
 - **A filed report is not lost.** A chat parent reads it as a
   `[CHILD THREAD REPORT FILED]` block on its next turn. A coding-agent parent
   reads it at the front of its next prompt.
+- **A coding-agent parent mid-turn reads a report through its own calls.** A
+  report that wakes you while your turn runs waits for the turn to end. Most
+  `lucidos` calls note it on stderr, `lucidos background-task wait` returns
+  early with it, and `lucidos threads child-reports` reads it now. Each report
+  reaches you once (ADR 0566).
 - **A batch** is every child of yours spawned `wake-when-all-done` and still
   working. Two finishing at once can both wake you, so expect that.
 - **The mode lasts the child's life.** A follow-up keeps it. To hear back from

@@ -1,9 +1,10 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, visibleWorkspaceName, animationSpeed, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, collapsedExchanges, collapsedInitiators, openSubAgentGroups, OPEN_SUB_AGENT_GROUPS_KEY, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
+import { pageTitle, visibleWorkspaceName, animationSpeed, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, collapsedExchanges, collapsedInitiators, openSubAgentGroups, OPEN_SUB_AGENT_GROUPS_KEY, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, removeToast, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
 import { installAppAppearanceSync } from './actions/app-appearance';
+import { installAppFullscreenWindowSync } from './actions/apps';
 import { installNotificationToastLifetime } from './actions/in-app-notification-toast';
 import { installUnregisteredRepoTargetReset } from './actions/compose';
 import { installLiveUtteranceRow } from './liveUtterance';
@@ -250,20 +251,23 @@ effect(() => {
 // toast: it can't be closed mid-reload, and it survives the showToast
 // engine-restart suppression in the rare refresh-during-restart overlap.
 //
-// A refresh always supersedes the "New version available" prompt — that prompt's
-// whole job is to start a refresh, which is now in flight — so dismiss it here
+// A refresh always supersedes the "New version available" prompt: that prompt's
+// whole job is to start a refresh, which is now in flight. So remove it here
 // rather than leaving it stacked above the spinner. This covers every refresh
 // entry point (the toast's own Refresh button, the control panel, the
-// applied-change / reconnect toasts), so the update prompt is replaced by the
-// spinner regardless of how the refresh was triggered.
+// applied-change / reconnect toasts).
 //
-// `untracked` keeps the effect's only dependency `clientRefreshing` — showToast /
-// dismissToast read AND write the `toasts` signal, so tracking them here would
+// Remove, never dismiss: a refresh acts on the prompt rather than deferring it.
+// `dismissToast` pins the workspace-wide `client_refresh_dismissed_build`
+// preference, which would hide the prompt on every other device.
+//
+// `untracked` keeps the effect's only dependency `clientRefreshing`. showToast /
+// removeToast read AND write the `toasts` signal, so tracking them here would
 // make the effect re-trigger itself (a signals "Cycle detected").
 effect(() => {
   if (!clientRefreshing.value) return;
   untracked(() => {
-    dismissToast('update-available');
+    removeToast('update-available');
     showToast('Refreshing...', 'info', { key: 'refreshing', spinning: true, dismissable: false, showWhileUnavailable: true });
   });
 });
@@ -297,6 +301,7 @@ effect(() => {
 });
 
 installAppAppearanceSync();
+installAppFullscreenWindowSync();
 
 // A toast is the third projection of the unread set, beside the bell badge and
 // the Unread tab. So a row that has been read can hold no toast. The *seen

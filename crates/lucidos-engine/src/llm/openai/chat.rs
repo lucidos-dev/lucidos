@@ -3,6 +3,8 @@
 //! module.
 
 use crate::llm::anthropic_wire::{ephemeral_cache_marker, MAX_CACHE_BREAKPOINTS};
+use crate::llm::cache_lifetime::CacheLifetime;
+use crate::llm::prefill::{pair_of, BeatShape, PrefillPair, StableEnd, TurnRoute};
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
@@ -210,6 +212,61 @@ fn place_cache_markers(messages: &mut [ChatMessage], has_system: bool) -> bool {
     has_system && breakpoints < MAX_CACHE_BREAKPOINTS
 }
 
+/// The last memory view that took a marker, as `(message, part)`. Views sit
+/// in fixed places, so the next turn marks the same one. The rolling marks
+/// on the last two messages move every turn, so they never end a stable cut.
+fn last_marked_view(messages: &[ChatMessage]) -> Option<(usize, usize)> {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            let parts = message.parts.as_ref()?;
+            if message.value["role"] != "user" {
+                return None;
+            }
+            let part = parts
+                .views()
+                .into_iter()
+                .rev()
+                .find(|view| parts.marks.contains(view))?;
+            Some((index, part))
+        })
+}
+
+/// The most output a Chat Completions prefill allows. Probe P4 found that
+/// OpenRouter ignores `max_tokens: 0`, and honours 1.
+const CHAT_OUTPUT_CAP: u32 = 1;
+
+/// The pair a beat on a Chat Completions request sends, cut at `end`.
+fn prefill_pair(
+    body: &serde_json::Value,
+    end: StableEnd,
+    route: TurnRoute<'_>,
+) -> Option<PrefillPair> {
+    let mut value = body.clone();
+    let object = value.as_object_mut()?;
+    object.remove("max_completion_tokens");
+    object.remove("stream_options");
+    object.insert("max_tokens".into(), CHAT_OUTPUT_CAP.into());
+    object.insert("stream".into(), false.into());
+    pair_of(
+        value,
+        "messages",
+        end,
+        BeatShape::json_reply(CHAT_OUTPUT_CAP),
+        route,
+    )
+}
+
+/// A Chat Completions request, and where a beat's stable cut on it ends.
+struct ChatBody {
+    body: serde_json::Value,
+    /// `None` where a beat may not go: a model outside the Anthropic
+    /// namespace, or a request with no marker to read.
+    stable_end: Option<StableEnd>,
+}
+
 impl OpenAiProvider {
     /// Convert internal messages to OpenAI Chat Completions format.
     fn convert_messages_chat(messages: &[Message]) -> Vec<ChatMessage> {
@@ -366,7 +423,7 @@ impl OpenAiProvider {
         tools: &[ToolDefinition],
         system_prompt: Option<&str>,
         reasoning_effort: Option<&str>,
-    ) -> serde_json::Value {
+    ) -> ChatBody {
         // OpenRouter caches an Anthropic model's prompt only where a text part
         // carries `cache_control`. Every other model keeps its body as it was,
         // because a strict or local server can reject a key it does not know.
@@ -375,6 +432,15 @@ impl OpenAiProvider {
         let has_system_text = system_prompt.is_some_and(|s| !s.is_empty());
         let mark_system =
             explicit_cache && place_cache_markers(&mut chat_messages, has_system_text);
+        // Only an Anthropic model carries markers, so only it gets a cut.
+        let system_offset = usize::from(system_prompt.is_some());
+        let stable_end = match last_marked_view(&chat_messages) {
+            Some((message, part)) => Some(StableEnd::Part {
+                item: message + system_offset,
+                part,
+            }),
+            None => mark_system.then_some(StableEnd::Placeholder { keep: 1 }),
+        };
 
         let mut openai_messages = Vec::new();
         if let Some(system) = system_prompt {
@@ -424,7 +490,7 @@ impl OpenAiProvider {
             body["reasoning_effort"] = serde_json::Value::String(effort.to_string());
         }
 
-        body
+        ChatBody { body, stable_end }
     }
 
     /// Parse an SSE stream from the Chat Completions API.
@@ -610,11 +676,26 @@ impl OpenAiProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = selection.model.unwrap_or(&self.model);
         let reasoning_effort = selection.reasoning_effort;
-        let mut body =
-            self.build_chat_body(model, messages, tools, system_prompt, reasoning_effort);
+        let ChatBody {
+            mut body,
+            stable_end,
+        } = self.build_chat_body(model, messages, tools, system_prompt, reasoning_effort);
         if let Some(tool) = selection.forced_tool {
             body["tool_choice"] = Self::forced_tool_choice_chat(tool);
         }
+        // A marker with no `ttl` asks for Anthropic's 5-minute cache.
+        let requested_ttl = stable_end.as_ref().map(|_| CacheLifetime::FiveMinutes);
+        let prefill = stable_end.and_then(|end| {
+            prefill_pair(
+                &body,
+                end,
+                TurnRoute {
+                    wire_model: model,
+                    reasoning_effort,
+                    betas: &[],
+                },
+            )
+        });
 
         let mut attempt = 0u32;
         loop {
@@ -660,7 +741,13 @@ impl OpenAiProvider {
             }
 
             match self.parse_chat_stream(resp, &on_token).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    return Ok(LlmResponse {
+                        prefill,
+                        cache_creation_requested_ttl: requested_ttl,
+                        ..response
+                    })
+                }
                 Err(e) => {
                     let err_str = e.to_string();
                     if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {
@@ -1383,7 +1470,9 @@ mod tests {
     #[test]
     fn chat_body_requests_usage_in_stream() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
-        let body = provider.build_chat_body("gpt-4o", &[], &[], None, None);
+        let body = provider
+            .build_chat_body("gpt-4o", &[], &[], None, None)
+            .body;
         let opts = body
             .get("stream_options")
             .expect("stream_options must be sent");
@@ -1421,6 +1510,7 @@ mod tests {
         OpenAiProvider::new("k".to_string(), model.to_string())
             .unwrap()
             .build_chat_body(model, messages, &[], system, None)
+            .body
     }
 
     fn marker_count(body: &serde_json::Value) -> usize {
@@ -1746,7 +1836,9 @@ mod tests {
             "z-ai/glm-5.2",
         ] {
             for effort in crate::llm::reasoning::EFFORT_LADDER {
-                let body = provider.build_chat_body(model, &[], &[], None, Some(effort));
+                let body = provider
+                    .build_chat_body(model, &[], &[], None, Some(effort))
+                    .body;
                 assert_eq!(
                     body["reasoning_effort"], *effort,
                     "{model} rewrote {effort}"
@@ -1760,7 +1852,160 @@ mod tests {
     #[test]
     fn chat_body_omits_reasoning_effort_when_none_is_given() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
-        let body = provider.build_chat_body("gpt-4o", &[], &[], None, None);
+        let body = provider
+            .build_chat_body("gpt-4o", &[], &[], None, None)
+            .body;
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    // --- Prefill beats (ADR 0556) ---
+
+    fn chat_body(model: &str, messages: &[Message], system: Option<&str>) -> ChatBody {
+        OpenAiProvider::new("k".to_string(), model.to_string())
+            .unwrap()
+            .build_chat_body(model, messages, &[], system, Some("high"))
+    }
+
+    fn chat_route(model: &str) -> TurnRoute<'_> {
+        TurnRoute {
+            wire_model: model,
+            reasoning_effort: Some("high"),
+            betas: &[],
+        }
+    }
+
+    fn json(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).expect("a body is JSON")
+    }
+
+    /// `body` as a prefill: one output token, not streamed, no usage stream.
+    fn as_prefill(body: &serde_json::Value) -> serde_json::Value {
+        let mut value = body.clone();
+        let object = value.as_object_mut().unwrap();
+        object.remove("max_completion_tokens");
+        object.remove("stream_options");
+        object.insert("max_tokens".into(), CHAT_OUTPUT_CAP.into());
+        object.insert("stream".into(), false.into());
+        value
+    }
+
+    /// The whole cut keeps the turn's reasoning and tool choice. The stable
+    /// cut ends at the marked view, never at a rolling mark after it.
+    #[test]
+    fn an_openrouter_pair_cuts_at_the_last_marked_view() {
+        let ChatBody {
+            mut body,
+            stable_end,
+        } = chat_body(CLAUDE, &history(), Some("system"));
+        body["tool_choice"] = OpenAiProvider::forced_tool_choice_chat("request_read");
+        let end = stable_end.expect("a marked view ends the cut");
+        assert_eq!(end, StableEnd::Part { item: 3, part: 0 });
+        let pair = prefill_pair(&body, end, chat_route(CLAUDE)).expect("a pair");
+
+        let whole = as_prefill(&body);
+        assert_eq!(json(&pair.whole.body), whole);
+        assert_eq!(whole["max_tokens"], 1);
+        assert!(whole.get("max_completion_tokens").is_none());
+        assert_eq!(whole["reasoning_effort"], "high");
+        assert_eq!(whole["tool_choice"]["function"]["name"], "request_read");
+
+        let mut stable = whole;
+        let messages = stable["messages"].as_array_mut().unwrap();
+        messages.truncate(4);
+        messages[3]["content"].as_array_mut().unwrap().truncate(1);
+        assert_eq!(json(&pair.stable.body), stable);
+        assert_eq!(stable["messages"][3]["content"][0]["text"], "memory view");
+        assert!(stable["messages"][3]["content"][0]["cache_control"].is_object());
+        assert_eq!(pair.stable.output_cap, Some(CHAT_OUTPUT_CAP));
+    }
+
+    /// With no view, a marked system block ends the cut, and a placeholder
+    /// message follows it.
+    #[test]
+    fn with_no_view_the_cut_keeps_the_marked_system_block() {
+        let plain = vec![
+            msg("user", vec![text("first question")]),
+            msg("assistant", vec![text("first answer")]),
+            msg("user", vec![text("second question")]),
+        ];
+        let ChatBody { body, stable_end } = chat_body(CLAUDE, &plain, Some("system"));
+        let end = stable_end.expect("the marked system block ends the cut");
+        assert_eq!(end, StableEnd::Placeholder { keep: 1 });
+        let pair = prefill_pair(&body, end, chat_route(CLAUDE)).expect("a pair");
+        let stable = json(&pair.stable.body);
+        let messages = stable["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0]["content"][0]["cache_control"].is_object());
+        assert_eq!(
+            messages[1],
+            serde_json::json!({"role": "user", "content": "."})
+        );
+
+        assert!(chat_body(CLAUDE, &plain, None).stable_end.is_none());
+    }
+
+    /// A model outside the Anthropic namespace carries no marker, so a beat
+    /// would read nothing.
+    #[test]
+    fn a_model_outside_the_anthropic_namespace_gets_no_cut() {
+        for model in ["gpt-5.4", "z-ai/glm-5.2", "google/gemini-3.8-flash"] {
+            assert!(
+                chat_body(model, &history(), Some("system"))
+                    .stable_end
+                    .is_none(),
+                "{model}"
+            );
+        }
+    }
+
+    const COMPLETED_TURN: &str = concat!(
+        r#"data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+        "\n\n",
+        r#"data: {"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":880}}}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    const PREFILL_REPLY: &str = r#"{"model":"anthropic/claude-haiku-5.5","choices":[],"usage":{"prompt_tokens":900,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":880}}}"#;
+
+    /// A turn hands back its pair, and the beat posts the stable cut to the
+    /// Chat Completions endpoint and reads the reply's usage.
+    #[tokio::test]
+    async fn a_turn_returns_a_pair_whose_beat_reads_the_turn() {
+        let (base, bodies) =
+            super::super::serve_recording("/v1/chat/completions", COMPLETED_TURN, PREFILL_REPLY)
+                .await;
+        let provider =
+            OpenAiProvider::new_with_base_url("k".into(), CLAUDE.into(), &base, Vec::new(), true)
+                .unwrap();
+        let turn = provider
+            .chat_completions(
+                &history(),
+                &[],
+                ModelSelection::model(CLAUDE),
+                Some("system"),
+                None,
+            )
+            .await
+            .expect("the turn completes");
+        let pair = turn
+            .prefill
+            .expect("an OpenRouter Claude turn can be prefilled");
+
+        let beat = crate::llm::LlmProvider::prefill(
+            &provider,
+            &pair.stable,
+            crate::llm::metered::CallToken::for_test(),
+        )
+        .await
+        .expect("the beat answers");
+        assert_eq!(beat.cache_read_tokens, Some(880));
+        assert_eq!(beat.output_tokens, Some(1));
+
+        let sent = bodies.lock().unwrap().clone();
+        let [_, beat_body] = sent.as_slice() else {
+            panic!("expected a turn and a beat, saw {}", sent.len());
+        };
+        assert_eq!(beat_body, &json(&pair.stable.body));
     }
 }

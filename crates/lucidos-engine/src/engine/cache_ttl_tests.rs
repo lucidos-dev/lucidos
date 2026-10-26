@@ -1,37 +1,165 @@
 use super::*;
 use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::ThreadEvent;
-use crate::engine::types::{ContextProducer, ContextPurpose};
+use crate::engine::types::{ApiUsage, ContextProducer, ContextPurpose};
 use crate::test_support::{seed_thread_event, setup_test_db, start_cc_session, teardown_test_db};
 use uuid::Uuid;
 
-/// The TTL a cache write shows: the shortest lifetime any of its tokens got.
+fn write(written: u32) -> ApiUsage {
+    ApiUsage {
+        input_tokens: written + 10,
+        cache_creation_tokens: written,
+        ..Default::default()
+    }
+}
+
+/// Anthropic splits a write into its 1-hour part and the 5-minute rest. The
+/// TTL is the shortest lifetime any written token got: that part expires first.
 #[test]
-fn the_observed_ttl_is_the_shortest_lifetime_written() {
-    let cases: [(&str, i64, Option<i64>, Option<CacheTtl>); 5] = [
-        ("no write", 0, Some(0), None),
-        ("a write with no split", 5_000, None, None),
-        (
-            "all to the 5-minute cache",
-            5_000,
-            Some(0),
-            Some(CacheTtl::FiveMinutes),
-        ),
-        (
-            "all to the 1-hour cache",
-            5_000,
-            Some(5_000),
-            Some(CacheTtl::OneHour),
-        ),
-        (
-            "some to each",
-            5_000,
-            Some(4_000),
-            Some(CacheTtl::FiveMinutes),
-        ),
+fn an_anthropic_split_reports_the_shortest_lifetime_written() {
+    let cases = [
+        ("all to the 5-minute cache", 0, CacheLifetime::FiveMinutes),
+        ("all to the 1-hour cache", 5_000, CacheLifetime::OneHour),
+        ("some to each", 4_000, CacheLifetime::FiveMinutes),
     ];
-    for (label, written, written_1h, expected) in cases {
-        assert_eq!(CacheTtl::observed(written, written_1h), expected, "{label}");
+    for (label, written_1h, expected) in cases {
+        let usage = ApiUsage {
+            cache_creation_1h_tokens: Some(written_1h),
+            ..write(5_000)
+        };
+        assert_eq!(
+            CacheTtl::of_write(&usage),
+            CacheTtl::Reported(expected),
+            "{label}"
+        );
+    }
+}
+
+/// OpenAI Responses splits a write into its 30-minute and 12-hour parts.
+#[test]
+fn an_openai_split_reports_the_shortest_lifetime_written() {
+    let cases = [
+        ("all 30 minutes", 5_000, 0, CacheLifetime::ThirtyMinutes),
+        ("all 12 hours", 0, 5_000, CacheLifetime::TwelveHours),
+        ("some to each", 1_000, 4_000, CacheLifetime::ThirtyMinutes),
+    ];
+    for (label, written_30m, written_12h, expected) in cases {
+        let usage = ApiUsage {
+            cache_creation_30m_tokens: Some(written_30m),
+            cache_creation_12h_tokens: Some(written_12h),
+            ..write(5_000)
+        };
+        assert_eq!(
+            CacheTtl::of_write(&usage),
+            CacheTtl::Reported(expected),
+            "{label}"
+        );
+    }
+}
+
+/// OpenAI's parts must cover the write. A rest nobody named a lifetime for
+/// could expire first, so the TTL is not known.
+#[test]
+fn an_openai_split_that_leaves_a_rest_is_unknown() {
+    let usage = ApiUsage {
+        cache_creation_30m_tokens: Some(3_000),
+        cache_creation_12h_tokens: Some(0),
+        ..write(5_000)
+    };
+    assert_eq!(CacheTtl::of_write(&usage), CacheTtl::Unknown);
+}
+
+/// Parts that add up to more than the write are no evidence.
+#[test]
+fn a_split_claiming_more_than_the_write_is_unknown() {
+    let usage = ApiUsage {
+        cache_creation_30m_tokens: Some(5_000),
+        cache_creation_12h_tokens: Some(4_000),
+        ..write(5_000)
+    };
+    assert_eq!(CacheTtl::of_write(&usage), CacheTtl::Unknown);
+}
+
+/// A requested TTL counts only where the response reports no split.
+#[test]
+fn a_requested_ttl_stands_in_only_for_a_missing_split() {
+    let requested = ApiUsage {
+        cache_creation_requested_ttl: Some(CacheLifetime::FiveMinutes),
+        ..write(5_000)
+    };
+    assert_eq!(
+        CacheTtl::of_write(&requested),
+        CacheTtl::Requested(CacheLifetime::FiveMinutes)
+    );
+    let reported = ApiUsage {
+        cache_creation_1h_tokens: Some(5_000),
+        ..requested
+    };
+    assert_eq!(
+        CacheTtl::of_write(&reported),
+        CacheTtl::Reported(CacheLifetime::OneHour)
+    );
+}
+
+/// No split and no honoured request is no evidence. A provider's documented
+/// default never stands in.
+#[test]
+fn a_write_with_no_evidence_is_unknown() {
+    assert_eq!(CacheTtl::of_write(&write(5_000)), CacheTtl::Unknown);
+    let no_write = ApiUsage {
+        cache_creation_1h_tokens: Some(0),
+        ..write(0)
+    };
+    assert_eq!(CacheTtl::of_write(&no_write), CacheTtl::Unknown);
+}
+
+/// A row stored before the 30-minute, 12-hour and requested keys existed
+/// still reads its TTL from the 1-hour split.
+#[test]
+fn a_stored_row_with_only_the_1h_split_still_reads_its_ttl() {
+    let stored = serde_json::json!({
+        "input_tokens": 5_010,
+        "output_tokens": 5,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 5_000,
+        "cache_creation_1h_tokens": 5_000
+    });
+    let usage: ApiUsage = serde_json::from_value(stored).unwrap();
+    assert_eq!(
+        CacheTtl::of_write(&usage),
+        CacheTtl::Reported(CacheLifetime::OneHour)
+    );
+}
+
+/// A reader decodes only the write fields, so a stored block that lacks an
+/// unrelated count still gives its TTL rather than failing the read.
+#[test]
+fn a_stored_block_missing_other_counts_still_reads_its_ttl() {
+    let stored = serde_json::json!({
+        "input_tokens": 1000,
+        "cache_creation_tokens": 1000,
+        "cache_creation_30m_tokens": 1000,
+        "cache_creation_12h_tokens": 0
+    });
+    let split: WriteSplit = serde_json::from_value(stored).unwrap();
+    assert_eq!(
+        CacheTtl::of_write(split),
+        CacheTtl::Reported(CacheLifetime::ThirtyMinutes)
+    );
+    let empty: WriteSplit = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(CacheTtl::of_write(empty), CacheTtl::Unknown);
+}
+
+/// The requested TTL travels under its wire name.
+#[test]
+fn a_lifetime_serializes_as_its_short_name() {
+    for (lifetime, wire) in [
+        (CacheLifetime::FiveMinutes, "5m"),
+        (CacheLifetime::ThirtyMinutes, "30m"),
+        (CacheLifetime::OneHour, "1h"),
+        (CacheLifetime::TwelveHours, "12h"),
+    ] {
+        assert_eq!(serde_json::to_value(lifetime).unwrap(), wire);
     }
 }
 
@@ -47,10 +175,15 @@ fn each_cap_sits_inside_its_lifetime() {
             n
         }
     };
-    for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+    for lifetime in CacheLifetime::ALL {
         assert!(
-            minutes(ttl.blocking_cap_words()) < minutes(ttl.lifetime_words()),
-            "{ttl:?}"
+            minutes(lifetime.blocking_cap_words()) < minutes(lifetime.lifetime_words()),
+            "{lifetime:?}"
+        );
+        assert_eq!(
+            f64::from(minutes(lifetime.lifetime_words()) * 60),
+            lifetime.lifetime_secs(),
+            "{lifetime:?}"
         );
     }
 }
@@ -60,7 +193,7 @@ fn each_cap_sits_inside_its_lifetime() {
 fn capture(
     producer: ContextProducer,
     written: u32,
-    written_1h: u32,
+    written_1h: Option<u32>,
     sub_agent: bool,
 ) -> ThreadEvent {
     ThreadEvent::ContextCaptured {
@@ -70,12 +203,10 @@ fn capture(
         sections: Vec::new(),
         tools: Vec::new(),
         estimated_total_tokens: 0,
-        usage: Some(crate::engine::ApiUsage {
-            input_tokens: written + 10,
+        usage: Some(ApiUsage {
             output_tokens: 5,
-            cache_creation_tokens: written,
-            cache_creation_1h_tokens: Some(written_1h),
-            ..Default::default()
+            cache_creation_1h_tokens: written_1h,
+            ..write(written)
         }),
         trimmed: false,
         trim_passes: Vec::new(),
@@ -90,6 +221,7 @@ fn capture(
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        session: None,
     }
 }
 
@@ -104,7 +236,7 @@ async fn bind_repo(pool: &sqlx::PgPool, thread_id: Uuid, repo_id: &str) {
 
 /// A repo's TTL is its latest Claude Code session write, across its threads.
 /// A read-only request, a sub-agent's write, a Codex capture and another
-/// repo's write leave it.
+/// repo's write leave it. A latest write with no split makes it Unknown.
 #[tokio::test]
 async fn the_repo_ttl_comes_from_its_latest_session_write() {
     let (pool, db_name) = setup_test_db().await;
@@ -121,47 +253,36 @@ async fn the_repo_ttl_comes_from_its_latest_session_write() {
         bind_repo(&pool, thread_id, repo).await;
     }
     let ttl = || repo_cache_ttl(&pool, Some(&repo_a));
-    assert_eq!(ttl().await, None, "no capture yet");
+    assert_eq!(ttl().await, CacheTtl::Unknown, "no capture yet");
 
-    seed_thread_event(
-        &bus,
-        one,
-        capture(ContextProducer::ClaudeCode, 40_000, 40_000, false),
-    )
-    .await;
-    assert_eq!(ttl().await, Some(CacheTtl::OneHour));
+    let session =
+        |written, written_1h| capture(ContextProducer::ClaudeCode, written, written_1h, false);
+    seed_thread_event(&bus, one, session(40_000, Some(40_000))).await;
+    let one_hour = CacheTtl::Reported(CacheLifetime::OneHour);
+    assert_eq!(ttl().await, one_hour);
 
-    seed_thread_event(&bus, two, capture(ContextProducer::ClaudeCode, 0, 0, false)).await;
+    seed_thread_event(&bus, two, session(0, Some(0))).await;
     seed_thread_event(
         &bus,
         two,
-        capture(ContextProducer::ClaudeCode, 300, 0, true),
+        capture(ContextProducer::ClaudeCode, 300, Some(0), true),
     )
     .await;
-    seed_thread_event(&bus, two, capture(ContextProducer::Codex, 300, 0, false)).await;
-    seed_thread_event(
-        &bus,
-        elsewhere,
-        capture(ContextProducer::ClaudeCode, 300, 0, false),
-    )
-    .await;
+    seed_thread_event(&bus, two, capture(ContextProducer::Codex, 300, None, false)).await;
+    seed_thread_event(&bus, elsewhere, session(300, Some(0))).await;
     assert_eq!(
         ttl().await,
-        Some(CacheTtl::OneHour),
+        one_hour,
         "a read-only request, a sub-agent's write, a Codex capture, another repo"
     );
-    assert_eq!(
-        repo_cache_ttl(&pool, Some(&repo_b)).await,
-        Some(CacheTtl::FiveMinutes)
-    );
+    let five_minutes = CacheTtl::Reported(CacheLifetime::FiveMinutes);
+    assert_eq!(repo_cache_ttl(&pool, Some(&repo_b)).await, five_minutes);
 
-    seed_thread_event(
-        &bus,
-        two,
-        capture(ContextProducer::ClaudeCode, 300, 0, false),
-    )
-    .await;
-    assert_eq!(ttl().await, Some(CacheTtl::FiveMinutes));
+    seed_thread_event(&bus, two, session(300, Some(0))).await;
+    assert_eq!(ttl().await, five_minutes);
+
+    seed_thread_event(&bus, two, session(300, None)).await;
+    assert_eq!(ttl().await, CacheTtl::Unknown, "a write with no split");
 
     pool.close().await;
     teardown_test_db(&db_name).await;

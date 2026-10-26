@@ -22,6 +22,7 @@ import { installUnsentMessageRestore } from './store/actions/unsentMessageRestor
 import { installScaleWheel } from './components/shared/scaleWheelListener';
 import { installSeenTargetWatch } from './store/actions/seen-target';
 import { startPageHealthLog } from './utils/pageHealthLog.report';
+import { installResumeClock } from './utils/resumeClock';
 import { installShellScrollGuard } from './utils/shellScrollGuard';
 import { reportShellSnapBack } from './utils/shellScrollProbe';
 import { pushTrafficLightOffset } from './store/actions/trafficLights';
@@ -65,6 +66,8 @@ export function startShell(): () => void {
     installScaleWheel(),
     // A diagnostic, not a feature: docs/temporary-measures.md § Page health log.
     startPageHealthLog(),
+    // A diagnostic, not a feature: docs/temporary-measures.md § App frame load probe.
+    installResumeClock(),
     // The desktop shell never scrolls as a whole. A snap-back moves the header
     // band, so the traffic lights re-centre on it. The report is a diagnostic:
     // docs/temporary-measures.md § Shell snap-back log.

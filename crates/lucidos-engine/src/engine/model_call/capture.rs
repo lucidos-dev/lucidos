@@ -121,6 +121,7 @@ pub(crate) fn auxiliary_capture_detailed(
         stable_prefix_fingerprint: None,
         ttft_ms: detail.ttft_ms,
         request_id: detail.request_id,
+        session: None,
     }
 }
 
@@ -152,6 +153,9 @@ pub(crate) fn usage_from_response(response: &LlmResponse) -> Option<ApiUsage> {
         modality: None,
         service_tier: response.service_tier,
         cache_creation_1h_tokens: response.cache_creation_1h_tokens,
+        cache_creation_30m_tokens: response.cache_creation_30m_tokens,
+        cache_creation_12h_tokens: response.cache_creation_12h_tokens,
+        cache_creation_requested_ttl: response.cache_creation_requested_ttl,
     })
 }
 
@@ -171,9 +175,7 @@ pub(crate) fn usage_from_judgment(usage: &JudgmentUsage) -> Option<ApiUsage> {
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
-        modality: None,
-        service_tier: None,
-        cache_creation_1h_tokens: None,
+        ..ApiUsage::default()
     })
 }
 
@@ -185,9 +187,7 @@ pub(crate) fn usage_from_provider(usage: ProviderUsage) -> ApiUsage {
         cache_read_tokens: usage.cache_read_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
         // Every raw shape it reads reports one blended total per direction.
-        modality: None,
-        service_tier: None,
-        cache_creation_1h_tokens: None,
+        ..ApiUsage::default()
     }
 }
 
@@ -206,9 +206,7 @@ pub(crate) fn usage_from_image(
         output_tokens: output_tokens.unwrap_or(0),
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
-        modality: None,
-        service_tier: None,
-        cache_creation_1h_tokens: None,
+        ..ApiUsage::default()
     })
 }
 
@@ -448,6 +446,43 @@ mod tests {
         assert_eq!(*context_window, 0, "an aux call spends against no budget");
     }
 
+    /// The usage block carries every field that says how long the write lives.
+    /// So a capture's TTL is the one the response reported.
+    #[test]
+    fn the_usage_carries_the_write_split_and_requested_ttl() {
+        use crate::engine::cache_ttl::{CacheLifetime, CacheTtl};
+        let base = response_reporting(Some(16_500), Some(9), None, Some(16_000));
+        let usage_of = |response: LlmResponse| usage_from_response(&response).expect("usage");
+        let thirty = usage_of(LlmResponse {
+            cache_creation_30m_tokens: Some(1_000),
+            cache_creation_12h_tokens: Some(15_000),
+            ..base.clone()
+        });
+        assert_eq!(thirty.cache_creation_30m_tokens, Some(1_000));
+        assert_eq!(thirty.cache_creation_12h_tokens, Some(15_000));
+        assert_eq!(
+            CacheTtl::of_write(&thirty),
+            CacheTtl::Reported(CacheLifetime::ThirtyMinutes)
+        );
+        let twelve = usage_of(LlmResponse {
+            cache_creation_12h_tokens: Some(16_000),
+            ..base.clone()
+        });
+        assert_eq!(
+            CacheTtl::of_write(&twelve),
+            CacheTtl::Reported(CacheLifetime::TwelveHours)
+        );
+        let requested = usage_of(LlmResponse {
+            cache_creation_requested_ttl: Some(CacheLifetime::FiveMinutes),
+            ..base.clone()
+        });
+        assert_eq!(
+            CacheTtl::of_write(&requested),
+            CacheTtl::Requested(CacheLifetime::FiveMinutes)
+        );
+        assert_eq!(CacheTtl::of_write(&usage_of(base)), CacheTtl::Unknown);
+    }
+
     /// A response reporting only the token counts the test cares about.
     fn response_reporting(
         input: Option<u32>,
@@ -463,6 +498,9 @@ mod tests {
             input_tokens: input,
             cache_creation_tokens: cache_write,
             cache_creation_1h_tokens: None,
+            cache_creation_30m_tokens: None,
+            cache_creation_12h_tokens: None,
+            cache_creation_requested_ttl: None,
             stable_prefix_fingerprint: None,
             cache_read_tokens: cache_read,
             served_model: None,
@@ -472,6 +510,7 @@ mod tests {
             unknown_sse_dropped: 0,
             model_only_text: None,
             progress_notes: Vec::new(),
+            prefill: None,
             service_tier: None,
         }
     }

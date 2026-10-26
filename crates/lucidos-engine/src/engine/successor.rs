@@ -1,9 +1,11 @@
-//! *Successor threads*: a coding-agent thread hands off to a new thread that
-//! carries on with a fresh context. The successor's branch starts at the old
-//! thread's last commit, so its change carries all the work, and the old
-//! thread proposes nothing.
+//! *Successor sessions*: a coding-agent thread hands off to a fresh session in
+//! the same thread, which carries on with a clean context. The branch, the
+//! change and the parent's wait stay with the thread.
 //!
-//! Plan: `docs/plans/2026-10-13-auto-compact-trial-and-successor-threads.md`.
+//! Threads that handed off to a *legacy successor thread* before this keep their
+//! links, read here and rendered as they were. Nothing creates new ones.
+//!
+//! Plan: `docs/plans/2026-10-23-successor-session-in-the-same-thread.md`.
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -12,13 +14,8 @@ use uuid::Uuid;
 use crate::runtime::intelligence_ladder::drops_context_variant;
 use crate::runtime::{validate_coding_agent_effort, validate_coding_agent_model, CodingAgent};
 
-use super::event_bus::{BusEvent, EventBus};
-use super::thread_events::{
-    EventMeta, HandoffConsent, MessageOrigin, ThreadEvent, UnproposedReason,
-};
-
 /// Context size, in input tokens, from which plan approval offers a successor
-/// thread.
+/// session.
 pub const HANDOFF_OFFER_TOKENS: u64 = 150_000;
 
 /// What the user says to have the agent hand off. The engine prompt teaches
@@ -27,7 +24,7 @@ pub const HANDOFF_REQUEST: &str = "handoff this session";
 
 /// Why the projection refuses a second handoff of one thread, rolling the
 /// racing emit back. The route's advisory lock normally stops one first.
-pub const ALREADY_HANDED_OFF: &str = "the thread already continued in a successor thread";
+pub const ALREADY_HANDED_OFF: &str = "the thread already continued in a legacy successor thread";
 
 /// A thread's context size and what it calls for. The CLI and the composer
 /// read these decisions rather than comparing numbers of their own.
@@ -36,13 +33,13 @@ pub struct ThreadContext {
     /// The input tokens of the thread's latest main-session model call.
     /// `None` when the thread has made none.
     pub input_tokens: Option<u64>,
-    /// The thread may start a successor at all, at any size. A plan card
-    /// reads it to offer a new thread for a cheaper implementer.
+    /// The thread may start a successor session at all, at any size. A plan
+    /// card reads it to offer a fresh session for a cheaper implementer.
     pub can_hand_off: bool,
     /// Over [`HANDOFF_OFFER_TOKENS`], on a thread that can hand off.
     pub offer: bool,
     /// The thread has an applied change, so a new request can go to a
-    /// successor after it.
+    /// successor session after it.
     pub applied: bool,
 }
 
@@ -135,32 +132,110 @@ pub(crate) const MAIN_SESSION_CAPTURE: &str = "event_type = 'ContextCaptured' \
      AND payload->'usage'->>'input_tokens' IS NOT NULL \
      AND COALESCE(payload->>'purpose', 'turn') = 'turn'";
 
+/// A SQL predicate over unaliased `events` columns: a [`MAIN_SESSION_CAPTURE`]
+/// in `thread`'s current *agent session*. Size, warmth and the estimates read
+/// only these, so a fresh session starts from nothing.
+pub(crate) fn current_session_capture_sql(thread: &str) -> String {
+    format!(
+        "{MAIN_SESSION_CAPTURE} AND {}",
+        super::session_scope::in_current_session_sql(thread, "sequence")
+    )
+}
+
+/// A SQL scalar: when the latest capture of `thread`'s current session that
+/// matches `predicate` began, which is its `created` less its `duration_ms`.
+/// `thread` is a SQL expression, such as `$1` or `ts.thread_id`.
+fn latest_capture_started(thread: &str, predicate: &str) -> String {
+    latest_capture_started_in_any_session(
+        thread,
+        &format!(
+            "{predicate} AND {}",
+            super::session_scope::in_current_session_sql(thread, "e.sequence")
+        ),
+    )
+}
+
+/// [`latest_capture_started`] over every session of `thread`.
+fn latest_capture_started_in_any_session(thread: &str, predicate: &str) -> String {
+    format!(
+        "(SELECT e.created \
+                 - make_interval(secs => COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000) \
+            FROM events e \
+           WHERE e.thread_id = {thread} AND {predicate} \
+           ORDER BY e.sequence DESC LIMIT 1)"
+    )
+}
+
+/// A SQL scalar: when the latest main-session turn request of `thread` began.
+pub(crate) fn last_turn_started_sql(thread: &str) -> String {
+    latest_capture_started(thread, MAIN_SESSION_CAPTURE)
+}
+
+/// A SQL scalar: when the latest *real* request of `thread` began. That is a
+/// main-session turn request that no keep-alive anchor started. A resume
+/// beat's hidden turn does not count, and a copy beat is no turn capture. The
+/// per-thread keep-alive switch holds until this moves (ADR 0554). It reads
+/// every session: a new session must not undo a request that re-armed it.
+pub(crate) fn last_real_request_started_sql(thread: &str) -> String {
+    latest_capture_started_in_any_session(
+        thread,
+        &format!(
+            "{MAIN_SESSION_CAPTURE} AND NOT EXISTS ( \
+               SELECT 1 FROM events a \
+                WHERE a.id::text = e.payload->>'request_event_id' \
+                  AND a.event_type = 'PromptInjected' \
+                  AND a.payload->'origin'->'reason'->>'kind' = '{}')",
+            crate::engine::thread_events::CACHE_KEEP_ALIVE_REASON_KIND
+        ),
+    )
+}
+
+/// A SQL scalar: when the *cache* of `thread` last refreshed. That is the later
+/// start of its last main-session turn and its last keep-alive copy beat. The
+/// keep-alive, the cache-warm line and the switch estimate all read it, so a
+/// beaten thread is warm to all three (ADR 0547).
+pub(crate) fn last_cache_refresh_started_sql(thread: &str) -> String {
+    let beat = latest_capture_started(
+        thread,
+        &format!(
+            "event_type = 'ContextCaptured' AND payload->>'purpose' = '{}'",
+            crate::engine::ContextPurpose::CacheKeepAlive.wire()
+        ),
+    );
+    format!("GREATEST({}, {beat})", last_turn_started_sql(thread))
+}
+
 /// The one definition of a thread's context size: the latest `ContextCaptured`
-/// of its own turns, read as `usage.input_tokens`. A sub-agent's call and an
+/// of its own turns in its current *agent session*, read as
+/// `usage.input_tokens`. A fresh session has none yet. A sub-agent's call and an
 /// auxiliary call on the thread do not count. A later `CodingAgentCompacted`
 /// replaces it with `post_tokens`, unknown when Claude Code did not report it.
-/// An integrated sub-thread, or a thread that already handed off, is offered
-/// nothing.
+/// An integrated sub-thread, a thread whose handoff is pending, and a thread
+/// that handed off to a legacy successor thread before successor sessions, are
+/// offered nothing.
 pub async fn thread_context(pool: &PgPool, thread_id: Uuid) -> Result<ThreadContext, sqlx::Error> {
     let sql = format!(
         "SELECT tokens FROM ( \
            SELECT sequence, (payload->'usage'->>'input_tokens')::bigint AS tokens FROM events \
-            WHERE thread_id = $1 AND {MAIN_SESSION_CAPTURE} \
+            WHERE thread_id = $1 AND {} \
            UNION ALL \
            SELECT sequence, (payload->>'post_tokens')::bigint FROM events \
-            WHERE thread_id = $1 AND event_type = 'CodingAgentCompacted' \
-         ) readings ORDER BY sequence DESC LIMIT 1"
+            WHERE thread_id = $1 AND event_type = 'CodingAgentCompacted' AND {} \
+         ) readings ORDER BY sequence DESC LIMIT 1",
+        current_session_capture_sql("$1"),
+        super::session_scope::in_current_session_sql("$1", "sequence"),
     );
     let tokens: Option<i64> = sqlx::query_scalar(&sql)
         .bind(thread_id)
         .fetch_optional(pool)
         .await?
         .flatten();
-    let (can_hand_off, applied): (bool, bool) = sqlx::query_as(
-        "SELECT NOT coding_agent_integrated AND successor_thread_id IS NULL, \
+    let (can_hand_off, applied): (bool, bool) = sqlx::query_as(&format!(
+        "SELECT NOT coding_agent_integrated AND successor_thread_id IS NULL AND NOT {}, \
                 EXISTS (SELECT 1 FROM changes WHERE thread_id = $1 AND status = $2) \
          FROM thread_summaries WHERE thread_id = $1",
-    )
+        pending_handoff_sql("$1")
+    ))
     .bind(thread_id)
     .bind(crate::core::changes::ChangeStatus::Applied)
     .fetch_optional(pool)
@@ -191,12 +266,20 @@ pub(crate) async fn latest_offer_decline(
     Ok(tokens.and_then(|t| u64::try_from(t).ok()))
 }
 
+/// What a user typed at the *Successor card*, and who typed it. The successor
+/// session starts on it as that user's message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandoffRequest {
+    pub message: String,
+    pub by: super::thread_events::MessageOrigin,
+}
+
 /// What the user asked for on the *Successor card* while the cache was warm,
 /// and the agent's narrative spawn has not yet used.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PendingRequest {
     /// The user's first request for the successor, when they typed one.
-    pub message: Option<String>,
+    pub request: Option<HandoffRequest>,
     pub implementer: ImplementerRequest,
 }
 
@@ -220,8 +303,18 @@ pub(crate) async fn pending_successor_request(
     .await?;
     Ok(payload.map(|p| {
         let text = |key: &str| p.get(key).and_then(|v| v.as_str()).map(str::to_string);
+        // The route stamps the requester, so a missing actor is only a
+        // hand-written row. It still reads as a person, never as the engine.
+        let by = p
+            .get("actor")
+            .and_then(|a| serde_json::from_value(a.clone()).ok())
+            .unwrap_or(super::thread_events::MessageOrigin::Api {
+                user_agent: None,
+                mode: super::thread_events::ActorMode::Human,
+                source_thread_id: None,
+            });
         PendingRequest {
-            message: text("message"),
+            request: text("message").map(|message| HandoffRequest { message, by }),
             implementer: ImplementerRequest {
                 coding_agent: text("coding_agent").map(|a| CodingAgent::parse(&a)),
                 coding_agent_model: text("coding_agent_model"),
@@ -231,35 +324,232 @@ pub(crate) async fn pending_successor_request(
     }))
 }
 
-/// The opening message of a successor that starts with no *handoff
-/// narrative*: the old thread was too costly to wake. It names the old
-/// thread, and tells the successor how to rebuild what it needs.
+/// Why a fresh session starts from a *handoff brief* rather than a narrative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BriefCause {
+    /// The prompt cache was cold, so waking the old session would cost too
+    /// much (ADR 0539).
+    CacheCold,
+    /// The coding agent refused to resume the previous session.
+    ResumeFailed,
+}
+
+/// The opening of a session that starts with no *handoff narrative*. It tells
+/// the session how to rebuild what it needs from this thread. With no
+/// request to follow it, it asks the session to offer the open items.
 pub fn handoff_brief(
-    old_link: &str,
-    old_id: Uuid,
-    request: Option<&str>,
+    thread_id: Uuid,
+    cause: BriefCause,
+    request_follows: bool,
     applied: Option<&str>,
 ) -> String {
+    let why = match cause {
+        BriefCause::CacheCold => {
+            "The previous session in this thread handed off with no handoff narrative: \
+             waking it would cost too much."
+        }
+        BriefCause::ResumeFailed => {
+            "The coding agent could not resume this thread's previous session, so its \
+             context did not carry over."
+        }
+    };
     let applied = applied
-        .map(|s| format!(" The change it applied last: {s}"))
+        .map(|s| format!(" The change this thread applied last: {s}"))
         .unwrap_or_default();
-    let ending = match request {
-        Some(request) => format!("The user's first request for you:\n\n{request}"),
-        None => "The user typed no request. Once you know where things stand, end your first \
-                 turn on an AskUserQuestion card. Its question says where this stands. Its \
-                 options are the open items to pick up."
-            .to_string(),
+    let ending = if request_follows {
+        ""
+    } else {
+        "\n\nThe user typed no request. Once you know where things stand, end your first \
+         turn on an AskUserQuestion card. Its question says where this stands. Its \
+         options are the open items to pick up."
     };
     format!(
-        "This thread continues {old_link}. Its worktree starts at that thread's last commit, \
-         so it already holds all of its work.{applied}\n\n\
-         There is no handoff narrative: waking the earlier thread would cost too much. \
+        "A fresh session starts here. {why} This worktree and branch hold all the work so \
+         far.{applied}\n\n\
          Rebuild only what you need:\n\
-         - Its recent turns: `lucidos events query --thread-id {old_id} --limit 30`.\n\
+         - `git status` first: the previous session may have left uncommitted work.\n\
+         - The thread's recent turns: `lucidos events query --thread-id {thread_id} --limit 30`.\n\
          - The branch history: `git log`.\n\
-         - Any plan under `docs/plans/` that the branch touched.\n\n\
-         {ending}"
+         - Any plan under `docs/plans/` that the branch touched.{ending}"
     )
+}
+
+/// The input of a fresh session that starts because a resume failed: the
+/// thread's recap, then a *handoff brief* that ends on `message`.
+pub(crate) async fn resume_failed_input(pool: &PgPool, thread_id: Uuid, message: &str) -> String {
+    let brief = handoff_brief(thread_id, BriefCause::ResumeFailed, true, None);
+    let input = successor_first_message(&brief, Some(message), message);
+    super::agent_session::prepend_reconstruction(pool, thread_id, &input).await
+}
+
+/// The opening of a *successor session* that starts from the previous
+/// session's *handoff narrative*. A handoff at a checkpoint resumes at the
+/// step after it, so the session never runs that one again.
+pub fn narrative_opening(checkpoint: Option<&str>, narrative: &str) -> String {
+    let skip = checkpoint
+        .map(|name| {
+            format!(
+                " The handoff ran at the `{name}` checkpoint, so skip that checkpoint when \
+                 your flow reaches it."
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "A fresh session starts here: the previous session in this thread handed off. This \
+         worktree and branch hold all of its work. Run `git status` first, then read the \
+         handoff narrative below and carry on from its next step.{skip}\n\n{narrative}"
+    )
+}
+
+/// The first message of a *successor session*: its `opening`, then the user's
+/// `request`, then the `input` that started the session when it was neither.
+pub fn successor_first_message(opening: &str, request: Option<&str>, input: &str) -> String {
+    let mut message = opening.to_string();
+    if let Some(request) = request {
+        message.push_str(&format!(
+            "\n\n---\nThe user's request for you:\n\n{request}"
+        ));
+    }
+    let started_by_another = input.trim() != opening.trim()
+        && request.is_none_or(|request| request.trim() != input.trim());
+    if started_by_another {
+        message.push_str(&format!(
+            "\n\n---\nThe message that started this session:\n\n{input}"
+        ));
+    }
+    message
+}
+
+/// A `SessionHandedOff` that no `SessionStarted` has followed yet: the next
+/// session of the thread is its *successor session*.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PendingHandoff {
+    pub opening: super::thread_events::HandoffOpening,
+    pub message: String,
+    #[serde(default)]
+    pub checkpoint: Option<String>,
+    #[serde(default)]
+    pub progress: Option<String>,
+    pub coding_agent: CodingAgent,
+    #[serde(default)]
+    pub coding_agent_model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Absent on a handoff recorded before the field: its `message` carries
+    /// any request itself.
+    #[serde(default)]
+    pub request: Option<HandoffRequest>,
+}
+
+impl PendingHandoff {
+    /// The first message of its session, given the `input` that started it.
+    pub fn first_message(&self, input: &str) -> String {
+        successor_first_message(
+            &self.message,
+            self.request.as_ref().map(|r| r.message.as_str()),
+            input,
+        )
+    }
+
+    /// The continuity its session records on `SessionStarted`.
+    pub fn continuity(&self) -> super::thread_events::SessionContinuity {
+        super::thread_events::SessionContinuity::Handoff {
+            checkpoint: self.checkpoint.clone(),
+            progress: self.progress.clone(),
+            opening: self.opening,
+            message: self.message.clone(),
+        }
+    }
+
+    pub fn implementer(&self) -> Implementer {
+        Implementer {
+            coding_agent: self.coding_agent,
+            model: self.coding_agent_model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+        }
+    }
+}
+
+/// A SQL predicate: `thread` has a `SessionHandedOff` that nothing has ended.
+/// `thread` is a SQL expression, such as `$1` or `c.thread_id`, and may name
+/// any outer alias: the subqueries use their own.
+pub(crate) fn pending_handoff_sql(thread: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM events pending_handoff \
+                  WHERE pending_handoff.thread_id = {thread} \
+                    AND pending_handoff.event_type = 'SessionHandedOff' \
+                    AND NOT EXISTS (SELECT 1 FROM events handoff_end \
+                          WHERE handoff_end.thread_id = {thread} \
+                            AND {}))",
+        ends_handoff_sql("handoff_end", "pending_handoff")
+    )
+}
+
+/// A SQL predicate: the `events` row `alias` ends the handoff recorded by the
+/// `SessionHandedOff` row `handoff`, on the same thread. Three things end one:
+///
+/// - its successor session's `SessionStarted`, whose `continuity` is
+///   `handoff`. A recovery or conflict-resolution session records none;
+/// - a user's Stop, or an Apply, Discard or Archive that stopped a turn;
+/// - a failed turn that began after it: the successor session never started.
+pub(crate) fn ends_handoff_sql(alias: &str, handoff: &str) -> String {
+    format!(
+        "{alias}.sequence > {handoff}.sequence AND ( \
+           ({alias}.event_type = 'SessionStarted' \
+              AND {alias}.payload->'continuity'->>'kind' = 'handoff') \
+           OR ({alias}.event_type = 'ResponseCanceled' \
+              AND {alias}.payload->>'cause' IN ('user_stop', 'user_action')) \
+           OR ({alias}.event_type = 'ResponseFailed' \
+              AND EXISTS (SELECT 1 FROM events {alias}_turn \
+                   WHERE {alias}_turn.thread_id = {alias}.thread_id \
+                     AND {alias}_turn.event_type = 'MessageReceived' \
+                     AND {alias}_turn.sequence > {handoff}.sequence \
+                     AND {alias}_turn.sequence < {alias}.sequence)))"
+    )
+}
+
+/// The handoff `thread_id`'s next session starts from, if one is pending.
+pub(crate) async fn pending_handoff(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<Option<PendingHandoff>, sqlx::Error> {
+    let payload: Option<serde_json::Value> = sqlx::query_scalar(&format!(
+        "SELECT handoff.payload FROM events handoff \
+         WHERE handoff.thread_id = $1 AND handoff.event_type = 'SessionHandedOff' \
+           AND NOT EXISTS (SELECT 1 FROM events handoff_end \
+                 WHERE handoff_end.thread_id = $1 AND {}) \
+         ORDER BY handoff.sequence DESC LIMIT 1",
+        ends_handoff_sql("handoff_end", "handoff")
+    ))
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    match serde_json::from_value(payload) {
+        Ok(handoff) => Ok(Some(handoff)),
+        Err(e) => {
+            crate::log!(
+                "[Successor] unreadable SessionHandedOff on {}: {}",
+                thread_id,
+                e
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Whether `thread_id`'s successor session waits to start. A failed read
+/// counts as no: the turn end then sends the agent back as usual.
+pub(crate) async fn handoff_pending(pool: &PgPool, thread_id: Uuid) -> bool {
+    pending_handoff(pool, thread_id)
+        .await
+        .unwrap_or_else(|e| {
+            crate::log!("[Successor] pending handoff of {}: {}", thread_id, e);
+            None
+        })
+        .is_some()
 }
 
 /// The sections a *handoff narrative* must carry, as markdown headings. A
@@ -287,163 +577,6 @@ pub fn missing_narrative_sections(narrative: &str) -> Vec<&'static str> {
             !headings.iter().any(|h| h.starts_with(&section))
         })
         .collect()
-}
-
-const CHECKPOINT_SEPARATOR: &str = " · ";
-const LEGACY_CONTINUED_MARK: &str = " (continued)";
-
-/// The title of the thread that continues `old_title`: the base title, the
-/// successor's position in its chain, and the checkpoint it starts at.
-/// Position 2 is the first successor. The suffixes of `old_title` are
-/// stripped first, so a repeat handoff never stacks them.
-pub fn successor_title(old_title: &str, checkpoint: Option<&str>) -> String {
-    let (base, position) = chain_position(old_title);
-    let number = position + 1;
-    match checkpoint {
-        Some(checkpoint) => format!("{base} ({number}){CHECKPOINT_SEPARATOR}{checkpoint}"),
-        None => format!("{base} ({number})"),
-    }
-}
-
-/// `title` without its chain suffixes, and its own position in the chain. A
-/// title with no suffix is position 1. A legacy ` (continued)` adds one each.
-fn chain_position(title: &str) -> (&str, u32) {
-    let mut rest = title.trim_end();
-    if let Some((head, _)) = rest.rsplit_once(CHECKPOINT_SEPARATOR) {
-        if strip_legacy_mark(head).is_some() || strip_number_mark(head).is_some() {
-            rest = head;
-        }
-    }
-    let mut position = 1;
-    let mut numbered = false;
-    loop {
-        if let Some(head) = strip_legacy_mark(rest) {
-            position += 1;
-            rest = head;
-        } else if let Some((head, number)) = strip_number_mark(rest).filter(|_| !numbered) {
-            position += number - 1;
-            numbered = true;
-            rest = head;
-        } else {
-            return (rest, position);
-        }
-    }
-}
-
-fn strip_legacy_mark(title: &str) -> Option<&str> {
-    title
-        .strip_suffix(LEGACY_CONTINUED_MARK)
-        .filter(|head| !head.trim().is_empty())
-        .map(str::trim_end)
-}
-
-/// A trailing ` (N)` with N from 2 to 99: a year or a one-off count in a
-/// plain title is no chain position.
-fn strip_number_mark(title: &str) -> Option<(&str, u32)> {
-    let (head, tail) = title.rsplit_once(" (")?;
-    let digits = tail.strip_suffix(')')?;
-    let number: u32 = digits
-        .bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| digits.parse().ok())
-        .flatten()?;
-    ((2..=99).contains(&number) && digits.len() <= 2 && !head.trim().is_empty())
-        .then(|| (head.trim_end(), number))
-}
-
-/// Where a successor sits: in its old thread's place. Top-level when the old
-/// thread was, otherwise under the same parent with the same wake mode, so
-/// the parent waits on the successor. Never a child that is later detached.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Placement {
-    pub parent_thread_id: Option<Uuid>,
-    pub wake_mode: Option<super::thread_events::WakeMode>,
-    pub spawning_event_id: Option<Uuid>,
-}
-
-impl Placement {
-    /// The old thread's place, from its row.
-    pub fn of_old_thread(
-        parent_thread_id: Option<Uuid>,
-        wake_mode: Option<&str>,
-        spawning_event_id: Option<Uuid>,
-    ) -> Self {
-        Self {
-            parent_thread_id,
-            wake_mode: parent_thread_id
-                .and(wake_mode.and_then(super::thread_events::WakeMode::parse)),
-            spawning_event_id: parent_thread_id.and(spawning_event_id),
-        }
-    }
-
-    /// The builder's place in a *build chain*: a `no-wake` child of the
-    /// planning thread, so a clean finish files its report without waking it.
-    pub fn build_chain_under(planner: Uuid) -> Self {
-        Self {
-            parent_thread_id: Some(planner),
-            wake_mode: Some(super::thread_events::WakeMode::NoWake),
-            spawning_event_id: None,
-        }
-    }
-}
-
-/// A *build chain*, as one of its members sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildChain {
-    /// The planning thread every member sits under.
-    pub planner: Uuid,
-    /// The builder first, then each successor, down to the asking member.
-    pub members: Vec<Uuid>,
-}
-
-/// The build chain `thread_id` belongs to, if any. Its `successor_of` links
-/// lead, through threads under one parent, to that parent: only the plan
-/// card's handoff puts a successor under its own old thread.
-pub async fn build_chain(
-    pool: &PgPool,
-    thread_id: Uuid,
-) -> Result<Option<BuildChain>, sqlx::Error> {
-    // The hop bound ends a corrupt cycle, as `lineage_root`'s does.
-    let lineage: Vec<(Uuid, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
-        "WITH RECURSIVE lineage AS ( \
-           SELECT thread_id, successor_of, parent_thread_id, 0 AS depth \
-             FROM thread_summaries WHERE thread_id = $1 \
-           UNION ALL \
-           SELECT t.thread_id, t.successor_of, t.parent_thread_id, l.depth + 1 \
-             FROM thread_summaries t \
-             JOIN lineage l ON t.thread_id = l.successor_of \
-                           AND t.parent_thread_id = l.parent_thread_id \
-            WHERE l.depth < $2 \
-         ) \
-         SELECT thread_id, successor_of, parent_thread_id FROM lineage ORDER BY depth DESC",
-    )
-    .bind(thread_id)
-    .bind(i32::try_from(MAX_HANDOFF_HOPS).unwrap_or(i32::MAX))
-    .fetch_all(pool)
-    .await?;
-    let Some(&(_, Some(started_by), Some(planner))) = lineage.first() else {
-        return Ok(None);
-    };
-    Ok((started_by == planner).then(|| BuildChain {
-        planner,
-        members: lineage.iter().map(|(id, _, _)| *id).collect(),
-    }))
-}
-
-/// Whether `successor_thread_id` is the builder of a build chain: the only
-/// successor that sits under its own old thread.
-pub(crate) async fn starts_build_chain(
-    pool: &PgPool,
-    successor_thread_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    Ok(sqlx::query_scalar::<_, Option<bool>>(
-        "SELECT successor_of = parent_thread_id FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(successor_thread_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten()
-    .unwrap_or(false))
 }
 
 /// Whether `thread_id` has a change waiting in the landing lane. The lane
@@ -583,188 +716,146 @@ pub(crate) async fn carry_plan_marker(
     }
 }
 
-/// What the old thread's `SuccessorThreadSpawned` records.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Handoff {
-    pub successor_thread_id: Uuid,
-    /// The old thread's last commit, which the successor's branch starts at.
-    pub base_sha: String,
-    pub starts_build_chain: bool,
-    pub handoff_consent: Option<HandoffConsent>,
-}
+/// Threads whose successor session this engine is starting, each with whether
+/// another start came in meanwhile. That start runs once this one ends: a
+/// successor session may hand off again in its own first turn.
+static STARTING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, bool>>> =
+    std::sync::LazyLock::new(Default::default);
 
-/// The *handoff consent* `thread_id` carries under `parent` (ADR 0507): the
-/// one its predecessor recorded on the handoff that started it, when both sit
-/// under `parent`. A value this engine cannot read counts as none, so the
-/// thread asks rather than hands off.
-pub(crate) async fn carried_consent(
-    pool: &PgPool,
+/// Holds `thread_id` in [`STARTING`] until dropped, then runs a start that
+/// came in meanwhile.
+struct StartingGuard {
     thread_id: Uuid,
-    parent: Uuid,
-) -> Result<Option<HandoffConsent>, sqlx::Error> {
-    let recorded: Option<Option<serde_json::Value>> = sqlx::query_scalar(
-        "SELECT e.payload->'handoff_consent' \
-           FROM thread_summaries t \
-           JOIN thread_summaries p ON p.thread_id = t.successor_of \
-           JOIN events e ON e.thread_id = p.thread_id \
-                        AND e.event_type = 'SuccessorThreadSpawned' \
-                        AND e.payload->>'successor_thread_id' = t.thread_id::text \
-          WHERE t.thread_id = $1 AND t.parent_thread_id = $2 AND p.parent_thread_id = $2 \
-          ORDER BY e.sequence DESC LIMIT 1",
-    )
-    .bind(thread_id)
-    .bind(parent)
-    .fetch_optional(pool)
-    .await?;
-    let Some(value) = recorded.flatten() else {
-        return Ok(None);
-    };
-    Ok(serde_json::from_value(value.clone())
-        .inspect_err(|e| {
-            crate::log!(
-                "[Successor] unreadable handoff consent {} for {}: {}",
-                value,
-                thread_id,
-                e
-            )
-        })
-        .ok())
-}
-
-/// Record the handoff on the old thread, then take back its pending change
-/// and withhold its work as carried. Every read comes first and the link
-/// lands next, so a turn end racing this call already finds the hold. After
-/// the link nothing may fail the handoff: a withdraw that fails is logged,
-/// and the hold still keeps the old work from being proposed again. A
-/// set-aside change stays as the user left it.
-pub(crate) async fn record_handoff(
-    bus: &EventBus,
-    pool: &PgPool,
-    old_thread_id: Uuid,
-    handoff: Handoff,
-    actor: Option<MessageOrigin>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let had_work: bool = sqlx::query_scalar(
-        "SELECT coding_agent_change_state <> 'none' FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(old_thread_id)
-    .fetch_optional(pool)
-    .await?
-    .unwrap_or(false);
-    let pending: Vec<_> = crate::core::changes_projection::ChangesProjection::new(pool.clone())
-        .open_for_thread(old_thread_id)
-        .await?
-        .into_iter()
-        .filter(|change| change.status() == crate::core::changes::ChangeStatus::Pending)
-        .collect();
-    let session_branch =
-        super::agent_session::resume::lookup_session_branch_for_thread(pool, old_thread_id).await;
-    bus.emit(BusEvent::Thread {
-        thread_id: old_thread_id,
-        event: ThreadEvent::SuccessorThreadSpawned {
-            successor_thread_id: handoff.successor_thread_id,
-            base_sha: handoff.base_sha,
-            starts_build_chain: handoff.starts_build_chain,
-            handoff_consent: handoff.handoff_consent,
-        },
-        meta: EventMeta::with_actor(actor.clone()),
-    })
-    .await?;
-    for change in &pending {
-        if let Err(e) =
-            super::change_ops::emit_change_withdrawn(bus, old_thread_id, change.id, actor.clone())
-                .await
-        {
-            crate::log!(
-                "[Successor] could not withdraw change {} of {}: {}",
-                change.id,
-                old_thread_id,
-                e
-            );
-        }
-    }
-    let (branch_name, files) = match pending.into_iter().last() {
-        Some(change) => (change.branch_name, change.files),
-        None => match session_branch.filter(|_| had_work) {
-            Some(branch) => (branch, Vec::new()),
-            None => return Ok(()),
-        },
-    };
-    super::change_ops::emit_proposal_withheld(
-        bus,
-        old_thread_id,
-        &branch_name,
-        &files,
-        UnproposedReason::CarriedBySuccessor,
-    )
-    .await;
-    Ok(())
-}
-
-/// Archive each old thread once its successor's first session starts. It goes
-/// through the *archive request*, so the old thread archives once it settles
-/// and nothing blocks it. Otherwise it stays open and shows where it continued.
-pub fn spawn_successor_archive_net(
     engine: std::sync::Arc<super::LucidosEngine>,
-) -> tokio::task::JoinHandle<()> {
-    use super::event_bus::{LagReplay, ReplayScope};
-    let (mut rx, mut replay) = LagReplay::subscribe(
-        &engine.event_bus,
-        ReplayScope::Workspace,
-        Some(vec!["SessionStarted"]),
-    );
-    tokio::spawn(async move {
-        while let Some(frames) = replay.read(rx.recv().await, engine.pool()).await {
-            for emitted in frames {
-                if let BusEvent::Thread {
-                    thread_id,
-                    event: ThreadEvent::SessionStarted { .. },
-                    ..
-                } = &emitted.typed
-                {
-                    request_predecessor_archive(&engine.event_bus, engine.pool(), *thread_id).await;
-                }
-            }
-        }
-    })
 }
 
-/// Ask `successor_thread_id`'s old thread to archive, on the successor's
-/// first session only, so a resume or a replayed frame asks nothing twice.
-/// A build chain's planner stays open, and an unknown answer keeps it open.
-async fn request_predecessor_archive(bus: &EventBus, pool: &PgPool, successor_thread_id: Uuid) {
-    let old = match predecessor_of(pool, successor_thread_id).await {
-        Ok(Some(old)) => old,
-        Ok(None) => return,
+impl StartingGuard {
+    fn take(engine: &std::sync::Arc<super::LucidosEngine>, thread_id: Uuid) -> Option<Self> {
+        let mut starting = STARTING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(again) = starting.get_mut(&thread_id) {
+            *again = true;
+            return None;
+        }
+        starting.insert(thread_id, false);
+        Some(Self {
+            thread_id,
+            engine: engine.clone(),
+        })
+    }
+}
+
+impl Drop for StartingGuard {
+    fn drop(&mut self) {
+        let again = STARTING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.thread_id)
+            .unwrap_or(false);
+        if again {
+            self.engine.start_successor_session(self.thread_id);
+        }
+    }
+}
+
+impl super::LucidosEngine {
+    /// Start `thread_id`'s *successor session* once no run holds the thread,
+    /// so its old session's process has exited first. Does nothing when no
+    /// handoff is pending by then: another input already started the session,
+    /// and its first prompt carried the opening.
+    pub(crate) fn start_successor_session(self: &std::sync::Arc<Self>, thread_id: Uuid) {
+        let Some(guard) = StartingGuard::take(self, thread_id) else {
+            return;
+        };
+        let engine = self.clone();
+        tokio::spawn(async move {
+            wait_until_thread_released(&engine.agent_sessions, thread_id).await;
+            if engine.is_shutting_down() {
+                crate::log!(
+                    "[Successor] Engine shutting down; thread {} starts its successor session on the next boot",
+                    thread_id
+                );
+                return;
+            }
+            let handoff = match pending_handoff(engine.pool(), thread_id).await {
+                Ok(Some(handoff)) => handoff,
+                Ok(None) => return,
+                Err(e) => {
+                    crate::log!("[Successor] pending handoff of {}: {}", thread_id, e);
+                    return;
+                }
+            };
+            crate::log!(
+                "[Successor] Thread {} starts its successor session on {:?}",
+                thread_id,
+                handoff.coding_agent
+            );
+            let implementer = handoff.implementer();
+            // The user's request starts the session as their own message. The
+            // first prompt puts the opening ahead of it (`first_message`).
+            let (prompt, origin) = match handoff.request {
+                Some(request) => (request.message, request.by),
+                None => (
+                    handoff.message,
+                    super::thread_events::MessageOrigin::engine(
+                        super::thread_events::EngineReason::SuccessorSession,
+                    ),
+                ),
+            };
+            // The guard lives as long as the turn's task.
+            engine.spawn_engine_coding_turn_as(
+                thread_id,
+                prompt,
+                None,
+                origin,
+                implementer,
+                move |_| drop(guard),
+            );
+        });
+    }
+}
+
+/// Wait until no run holds `thread_id`: its process exited, and its teardown
+/// let go of the worktree.
+async fn wait_until_thread_released(
+    agent_sessions: &tokio::sync::Mutex<
+        std::collections::HashMap<Uuid, super::types::AgentSession>,
+    >,
+    thread_id: Uuid,
+) {
+    loop {
+        let holder = {
+            let sessions = agent_sessions.lock().await;
+            sessions
+                .get(&thread_id)
+                .filter(|s| super::agent_session::spawn_claim::holds_thread(s))
+                .map(|s| s.msg_tx.clone())
+        };
+        match holder {
+            Some(holder) => holder.closed().await,
+            None => return,
+        }
+    }
+}
+
+/// Start every successor session a handoff left pending, as at boot: the
+/// engine that recorded the handoff may have stopped before it started one.
+pub async fn start_pending_successor_sessions(engine: std::sync::Arc<super::LucidosEngine>) {
+    let threads: Vec<Uuid> = match sqlx::query_scalar(&format!(
+        "SELECT ts.thread_id FROM thread_summaries ts \
+         WHERE ts.is_coding_agent AND {}",
+        pending_handoff_sql("ts.thread_id")
+    ))
+    .fetch_all(engine.pool())
+    .await
+    {
+        Ok(threads) => threads,
         Err(e) => {
-            crate::log!("[Successor] predecessor of {}: {}", successor_thread_id, e);
+            crate::log!("[Successor] Could not list pending handoffs: {}", e);
             return;
         }
     };
-    match starts_build_chain(pool, successor_thread_id).await {
-        Ok(false) => {}
-        Ok(true) => return,
-        Err(e) => {
-            crate::log!("[Successor] build chain of {}: {}", successor_thread_id, e);
-            return;
-        }
-    }
-    let sessions: Result<i64, sqlx::Error> = sqlx::query_scalar(
-        "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'SessionStarted'",
-    )
-    .bind(successor_thread_id)
-    .fetch_one(pool)
-    .await;
-    match sessions {
-        Ok(1) => {}
-        Ok(_) => return,
-        Err(e) => {
-            crate::log!("[Successor] sessions of {}: {}", successor_thread_id, e);
-            return;
-        }
-    }
-    if let Err(e) = super::chat::agent_archive::record_archive_request(bus, old).await {
-        crate::log!("[Successor] could not ask {} to archive: {}", old, e);
+    for thread_id in threads {
+        engine.start_successor_session(thread_id);
     }
 }
 

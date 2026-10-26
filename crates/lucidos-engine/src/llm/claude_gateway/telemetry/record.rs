@@ -328,6 +328,9 @@ pub(crate) mod tests {
                     modality: None,
                     service_tier: None,
                     cache_creation_1h_tokens: Some(40),
+                    cache_creation_30m_tokens: None,
+                    cache_creation_12h_tokens: None,
+                    cache_creation_requested_ttl: None,
                 },
                 ttft_ms: None,
             },
@@ -401,6 +404,9 @@ pub(crate) mod tests {
             modality: None,
             service_tier: None,
             cache_creation_1h_tokens: Some(100_000),
+            cache_creation_30m_tokens: None,
+            cache_creation_12h_tokens: None,
+            cache_creation_requested_ttl: None,
         };
         // Fresh 300k, read 500k, writes 100k at 5 minutes and 100k at 1 hour,
         // then 100k out.

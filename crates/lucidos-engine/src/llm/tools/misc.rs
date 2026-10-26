@@ -299,7 +299,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     "auth_type": {
                         "type": "string",
                         "enum": crate::core::AuthType::agent_requestable_values(),
-                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. 'secret' is signed with rather than sent: no base_url, no host, read by scripts as CRED_<NAME>. PREFER connect_oauth_account over 'oauth_client': same modal plus the authorize, in one call. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
+                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. 'secret' is signed with rather than sent: no base_url, no host, read by scripts as CRED_<NAME>. PREFER connect_oauth_account over 'oauth_client'. It opens the client modal; call it again after completion to authorize. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
                     },
                     "env_var_name": {
                         "type": "string",
@@ -319,7 +319,7 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::CONNECT_OAUTH_ACCOUNT.to_string(),
-            description: "Connect an OAuth account so Lucidos can call an API on the user's behalf. ONE call for the whole flow: with no client credentials yet it opens the credential modal itself, then authorizes. The page opens on the USER'S DEVICE in the browser they configured, so tell them to complete it there. Provider and scopes alone suffice for a provider the registry knows, otherwise load_knowhow('system-knowhow/oauth-providers').".to_string(),
+            description: "Connect an OAuth account so Lucidos can call an API on the user's behalf. With no client credentials it opens a credential modal. Wait for completed, then call again to authorize. The page opens on the USER'S DEVICE in the browser they configured, so tell them to complete it there. Provider and scopes alone suffice for a provider the registry knows, otherwise load_knowhow('system-knowhow/oauth-providers').".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": with_oauth_endpoints(json!({
@@ -381,6 +381,10 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                                             "description": {
                                                 "type": "string",
                                                 "description": "Optional inline markdown under the label: a one-line explanation, this option's own picture `![A](artifacts/a.png)`, or a widget embed `![A](app:<id>?params={…})`."
+                                            },
+                                            "quiet": {
+                                                "type": "boolean",
+                                                "description": "True when this pick needs nothing more from you (\"Not now\"): it ends your turn, no reply."
                                             }
                                         },
                                         "required": ["label"]

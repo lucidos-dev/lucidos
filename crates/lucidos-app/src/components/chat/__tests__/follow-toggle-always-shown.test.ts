@@ -44,10 +44,10 @@ describe('the follow toggle is always shown', () => {
     expect(toggleBlock()).toContain("dataRole: 'follow-live-edge'");
   });
 
-  /** It closes the row's toggles, after the call toggle, so it folds after
-   *  everything to its left and before the rung pill. */
-  it('is the last of the row toggles', () => {
-    expect(source).toMatch(/return call \? \[call, follow\] : \[follow\];/);
+  /** It follows the call toggle and leads the side-question toggle, so it
+   *  folds before that one and after everything to its left. */
+  it('stands between the call toggle and the side-question toggle', () => {
+    expect(source).toMatch(/return \[call, followLiveEdgeAction\(composeContext\), sideQuestion\]/);
     expect(prompt).toMatch(/toggles: promptRowToggles\(/);
   });
 

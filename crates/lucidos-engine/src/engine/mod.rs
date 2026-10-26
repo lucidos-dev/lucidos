@@ -71,6 +71,7 @@ pub(crate) mod question_card_gate;
 pub(crate) mod read_request;
 pub mod release_notices;
 pub(crate) mod repo_directory_grants;
+pub(crate) mod session_scope;
 mod session_seed;
 pub mod standing_apply;
 pub mod successor;
@@ -91,6 +92,7 @@ pub(crate) mod tool_arg_entity_repair;
 pub(crate) mod tools;
 pub(crate) mod trigger_group_writes;
 pub(crate) mod trigger_writes;
+pub(crate) mod trusted_repo_scripts;
 pub(crate) mod turn_end;
 pub use turn_end::{
     decide_read_for_eval, decide_wake_for_eval, read_decision_chat_judge, wake_decision_chat_judge,
@@ -915,6 +917,12 @@ pub struct LucidosEngine {
     /// How long this workspace's keep-alive waits ran, for the
     /// `workspace-data` give-up rule. A cache, rebuilt hourly from events.
     pub(crate) keep_alive_durations: Arc<event_wait::WaitDurationsCache>,
+    /// Each Lucidos Agent thread's last request, for its prefill beats. A
+    /// cache: a restart loses it, and the thread pays one rewrite.
+    pub(crate) remembered_requests: Arc<event_wait::RememberedRequests>,
+    /// Held by a keep-alive tick and by the per-thread switch. A tick that read
+    /// a thread before the switch never writes its stale status after it.
+    pub(crate) keep_alive_status_writes: tokio::sync::Mutex<()>,
 }
 
 /// RAII guard that removes a thread from active_threads when dropped.

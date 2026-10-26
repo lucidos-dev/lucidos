@@ -36,7 +36,7 @@ function mountLimit(text: string): HTMLElement | null {
         isLast={false}
         threadId="tid"
         threadIsCC={false}
-        threadCodingAgent="claude-code"
+        sessionCodingAgent="claude-code"
         threadIdle={true}
         threadAwaitingAnswer={false}
         threadCanceling={false}

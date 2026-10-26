@@ -113,27 +113,6 @@ function diffNodes(node: ComponentChildren): VNode<{ threadId: string }>[] {
   return diffNodes(v.props.children);
 }
 
-function buttonNodes(node: ComponentChildren): VNode<{ disabled?: boolean }>[] {
-  if (node === null || node === undefined || typeof node === 'boolean') return [];
-  if (typeof node === 'string' || typeof node === 'number') return [];
-  if (Array.isArray(node)) return node.flatMap(buttonNodes);
-  const v = node as VNode<{ children?: ComponentChildren; disabled?: boolean }>;
-  if (v.type === 'button') return [v];
-  return buttonNodes(v.props.children);
-}
-
-// The split button is a function-component VNode; with no DOM/render harness
-// here we assert the props it is handed (the same data the desktop buttons
-// render from), not the rendered menu. The component's interaction contract is
-// covered by the Overlay contract tests + e2e.
-type SplitProps = {
-  primary: { key: string; label: string; className: string };
-  menuActions: TaggedAction[];
-};
-function splitProps(node: ComponentChildren): SplitProps {
-  return (node as VNode<SplitProps>).props;
-}
-
 /** What the composer row stamps on each member it renders. */
 const ROW_ATTRS = { 'data-row-item': 'fold' };
 
@@ -147,129 +126,72 @@ function rows(members: HeaderActionSpec[]): ComponentChildren[] {
   return members.map(rowOf);
 }
 
+type Banner = Parameters<typeof getBannerActions>[0];
+
+/** The action slot's actions, face first, then its menu. */
+function slotKeys(state: Banner): string[] {
+  const { face, menu } = getBannerActions(state).slot;
+  return [face.key, ...menu.map((a) => a.key)];
+}
+
+const actionsState = (actions: TaggedAction[], extra: Partial<Extract<Banner, { type: 'actions' }>> = {}): Banner => ({
+  type: 'actions', actions, threadId: 'tid', isArchiving: false, showDiff: false, ...extra,
+});
+
 describe('getBannerActions', () => {
-  it('marks every thread action, so the dead-press probe never warns about one', () => {
-    const split = getBannerActions({
-      type: 'actions', actions: DISCARD_APPLY, threadId: 'tid', isArchiving: false, showDiff: false,
-    });
-    const splitAttrs = (rowOf(split[0]) as VNode<{ attrs: Record<string, string> }>).props.attrs;
-    expect(splitAttrs).toHaveProperty('data-thread-action', '');
-    expect(splitAttrs).toHaveProperty('data-row-item', 'fold');
-
-    const plain = getBannerActions({
-      type: 'actions', actions: [ta('discard', 'Discard')], threadId: 'tid', isArchiving: false, showDiff: false,
-    });
-    const [discard] = buttonNodes(rowOf(plain[0])) as VNode<Record<string, unknown>>[];
-    expect(discard.props['data-thread-action']).toBe('');
-  });
-
-  it('keeps Diff its own member, ahead of the change actions', () => {
-    const members = getBannerActions({
-      type: 'actions',
-      actions: DISCARD_APPLY,
-      threadId: 'tid',
-      isArchiving: false,
-      showDiff: true,
-    });
-
-    // Diff folds FIRST: looking is cheaper to postpone than doing. It is never
-    // folded into the Apply caret menu, which is a different thing entirely.
-    expect(members.map((m) => m.key)).toEqual(['thread-diff', 'change-actions']);
-    expect(buttonLabels(rowOf(members[0]))).toEqual(['Diff']);
-    const props = splitProps(rowOf(members[1]));
-    expect(props.primary.key).toBe('apply');
-    expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
+  it('keeps Diff a foldable member, out of the action slot', () => {
+    const { situational, slot } = getBannerActions(actionsState(DISCARD_APPLY, { showDiff: true }));
+    // Diff is never folded into the Apply menu, which is a different thing.
+    expect(situational.map((m) => m.key)).toEqual(['thread-diff']);
+    expect(buttonLabels(rowOf(situational[0]))).toEqual(['Diff']);
+    expect(diffNodes(rows(situational)).map((v) => v.props.threadId)).toEqual(['tid']);
+    expect(slot.face.key).toBe('apply');
   });
 
   it('drops the Diff member when the branch has no diff', () => {
-    const members = getBannerActions({
-      type: 'actions',
-      actions: DISCARD_APPLY,
-      threadId: 'tid',
-      isArchiving: false,
-      showDiff: false,
-    });
-
-    expect(members.map((m) => m.key)).toEqual(['change-actions']);
-    const props = splitProps(rowOf(members[0]));
-    expect(props.primary.key).toBe('apply');
-    expect(props.menuActions.map((a) => a.kind)).toEqual(['discard']);
+    expect(getBannerActions(actionsState(DISCARD_APPLY)).situational).toEqual([]);
   });
 
-  it('hides the Diff member on a thread whose branch has none', () => {
-    const members = getBannerActions({
-      type: 'actions',
-      actions: ARCHIVE_ONLY,
-      threadId: 'tid',
-      isArchiving: false,
-      showDiff: false,
-    });
-
-    expect(members.map((m) => m.key)).toEqual(['archive']);
-    expect(buttonLabels(rows(members))).toEqual(['Archive']);
+  it('puts Apply on the face and the other close actions in its menu, Discard last', () => {
+    const state = actionsState([ta('discard', 'Discard'), ta('archive', 'Archive'), ta('apply', 'Apply*', 'primary')]);
+    expect(slotKeys(state)).toEqual(['apply', 'archive', 'discard']);
+    const { face, menuLabel } = getBannerActions(state).slot;
+    expect(face.label).toBe('Apply*');
+    expect(face.tone).toBe('confirm');
+    expect(menuLabel).toBe('More change actions');
   });
 
-  it('gives each close-set button its own member when there is no Apply', () => {
-    // Archive-only keeps the separate-button path, so the row can fold one
-    // button without the other rather than treating the set as one thing.
-    const members = getBannerActions({
-      type: 'actions',
-      actions: ARCHIVE_ONLY,
-      threadId: 'tid',
-      isArchiving: false,
-      showDiff: true,
-    });
-
-    expect(members.map((m) => m.key)).toEqual(['thread-diff', 'archive']);
-    expect(buttonLabels(rows(members))).toEqual(['Diff', 'Archive']);
-    // Diff has no disabled form: every call site renders it only when the
-    // branch has a diff to show. The face takes a thread id and nothing else.
-    expect(diffNodes(rowOf(members[0])).map((v) => v.props.threadId)).toEqual(['tid']);
+  /** One action slot: several close actions without Apply merge too, with
+   *  Archive on the face. */
+  it('merges several close actions without Apply under an Archive face', () => {
+    const state = actionsState([ta('discard', 'Discard'), ta('set_aside', 'Set aside'), ta('archive', 'Archive')]);
+    expect(slotKeys(state)).toEqual(['archive', 'set_aside', 'discard']);
+    expect(getBannerActions(state).slot.face.ariaLabel).toBe('Archive thread');
   });
 
-  /** A request in flight is ONE member, and it folds like any other. A busy row
-   *  is not a reason to let a button leave the box. */
-  it('gives an archiving thread a disabled Archive... member', () => {
-    const members = getBannerActions({
-      type: 'actions',
-      actions: [],
-      threadId: 'tid',
-      isArchiving: true,
-      showDiff: false,
-    });
-    expect(members.map((m) => m.key)).toEqual(['archiving']);
-    expect(buttonLabels(rows(members))).toEqual(['Archive...']);
-    expect(buttonNodes(rowOf(members[0]))[0].props.disabled).toBe(true);
-    // `disabledTooltip` is what makes the FOLDED row aria-disabled rather than
-    // a live action.
-    expect(members[0].disabledTooltip).toBe('Archive...');
+  it('draws a lone close action with no menu', () => {
+    expect(slotKeys(actionsState(ARCHIVE_ONLY))).toEqual(['archive']);
   });
 
-  it('gives an applying thread a disabled Apply... member', () => {
-    const members = getBannerActions({ type: 'applying' });
-    expect(members.map((m) => m.key)).toEqual(['applying']);
-    expect(buttonLabels(rows(members))).toEqual(['Apply...']);
+  it('runs the selector action on a press', () => {
+    const invoke = vi.fn();
+    const { face } = getBannerActions(actionsState([{ ...ta('archive', 'Archive'), invoke }])).slot;
+    face.invoke!();
+    expect(invoke).toHaveBeenCalledTimes(1);
   });
 
-  it('gives a discarding thread a disabled Discard... member', () => {
-    const members = getBannerActions({ type: 'discarding' });
-    expect(members.map((m) => m.key)).toEqual(['discarding']);
-    expect(buttonLabels(rows(members))).toEqual(['Discard...']);
-  });
-
-  /** The caret's actions would go with the fold, so the composite contributes
-   *  one menu row per action rather than one for the face. */
-  it('folds the split button into a row per action', () => {
-    const members = getBannerActions({
-      type: 'actions',
-      actions: DISCARD_APPLY,
-      threadId: 'tid',
-      isArchiving: false,
-      showDiff: false,
-    });
-    const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
-    const menu = members[0].menuRows!(ctx);
-    expect(buttonLabels(menu)).toEqual(['Apply', 'Discard']);
+  /** A request in flight is the plain verb beside a spinner, disabled. */
+  it.each([
+    [{ type: 'applying' } as Banner, 'Apply', 'Applying'],
+    [{ type: 'discarding' } as Banner, 'Discard', 'Discarding'],
+    [actionsState([], { isArchiving: true }), 'Archive', 'Archiving'],
+  ])('gives a busy thread its plain verb, disabled', (state, label, name) => {
+    const { situational, slot } = getBannerActions(state);
+    expect(situational).toEqual([]);
+    expect(slot.menu).toEqual([]);
+    expect(slot.face.label).toBe(label);
+    expect(slot.face.ariaLabel).toBe(name);
+    expect(slot.face.invoke).toBeNull();
   });
 });
 
@@ -403,13 +325,7 @@ describe('showDiff follows the change state', () => {
     // ChangesView; the WaitingBanner does not call it anymore. Diff is the
     // own member on every actions path (Apply or not), so this asserts the one
     // `diffAction` face both paths share.
-    const members = getBannerActions({
-      type: 'actions',
-      actions: ARCHIVE_ONLY,
-      threadId: 'tid',
-      isArchiving: false,
-      showDiff: true,
-    });
+    const members = getBannerActions(actionsState(ARCHIVE_ONLY, { showDiff: true })).situational;
 
     // One face, carrying the THREAD id. What it calls with that id is asserted
     // against the rendered component in `diff-button-touch.test.tsx`.
@@ -496,41 +412,26 @@ describe('a thread holding a set-aside change', () => {
     };
     const state = getWaitingState();
     expect(state).toMatchObject({ type: 'actions', setAside: { changeId: 'c-aside', discardable: true } });
-    const keys = getBannerActions(state as Parameters<typeof getBannerActions>[0]).map((m) => m.key);
-    expect(keys).toContain('bring-back');
+    expect(slotKeys(state as Banner)).toEqual(['bring-back', 'discard-set-aside']);
   });
 
-  /** The Bring back member for a set-aside change, with its caret's items and
-   *  the rows it folds into. */
-  function bringBackMember(discardable: boolean) {
-    const members = getBannerActions({
-      type: 'actions',
-      actions: [],
-      threadId: 't-aside',
-      isArchiving: false,
-      showDiff: false,
-      setAside: { changeId: 'c-aside', discardable },
-    });
-    const bringBack = members.find((m) => m.key === 'bring-back')!;
-    const split = bringBack.render!({}) as VNode<{ primaryLabel: string; menuItems: { label: string; className: string }[] }>;
-    const ctx = { run: (fn: () => void) => () => fn(), anchor: null };
-    return { split: split.props, folded: buttonLabels(bringBack.menuRows!(ctx)) };
-  }
+  const withSetAside = (actions: TaggedAction[], discardable: boolean) =>
+    actionsState(actions, { threadId: 't-aside', setAside: { changeId: 'c-aside', discardable } });
 
-  // The same control the Changes panel's set-aside row wears.
-  it('draws Bring back as a split button with Discard behind the caret', () => {
-    const { split, folded } = bringBackMember(true);
-    expect(split.primaryLabel).toBe('Bring back');
-    expect(split.menuItems.map((i) => [i.label, i.className])).toEqual([
-      ['Discard', 'action-btn action-btn-danger'],
-    ]);
-    expect(folded).toEqual(['Bring back', 'Discard']);
+  // The same pair the Changes panel's set-aside row offers.
+  it('draws Bring back on the face with Discard in its menu', () => {
+    const { face, menu, menuLabel } = getBannerActions(withSetAside([], true)).slot;
+    expect(face.label).toBe('Bring back');
+    expect(menu.map((a) => [a.label, a.tone])).toEqual([['Discard', 'danger']]);
+    expect(menuLabel).toBe('More set-aside actions');
   });
 
   it('withholds Discard while the thread is unsettled', () => {
-    const { split, folded } = bringBackMember(false);
-    expect(split.menuItems).toEqual([]);
-    expect(folded).toEqual(['Bring back']);
+    expect(slotKeys(withSetAside([], false))).toEqual(['bring-back']);
+  });
+
+  it('keeps Archive on the face and Bring back in its menu', () => {
+    expect(slotKeys(withSetAside(ARCHIVE_ONLY, true))).toEqual(['archive', 'bring-back', 'discard-set-aside']);
   });
 
   // A thread watching an event is idle, so the banner shows, but the engine
@@ -550,22 +451,17 @@ describe('a thread holding a set-aside change', () => {
     const thread = makeCCThread('t-none', { status: 'idle', section: 'archived' });
     threadMap.value = new Map([['t-none', thread]]);
     focusedThreadId.value = 't-none';
-    const state = getWaitingState();
-    const keys = getBannerActions(state as Parameters<typeof getBannerActions>[0]).map((m) => m.key);
-    expect(keys).not.toContain('bring-back');
+    expect(getWaitingState()).toBeNull();
   });
 });
 
 // A blocked or finished Archive never leaves the composer row silent (ADR 0378).
 describe('the composer row when Archive is not on offer', () => {
-  it('offers Move to Current on an archived thread', () => {
+  // The thread's ⋯ menu moves it back to Current, so the composer keeps Send.
+  it('draws no banner on an archived thread', () => {
     threadMap.value = new Map([['t-arch', makeCCThread('t-arch', { status: 'idle', section: 'archived' })]]);
     focusedThreadId.value = 't-arch';
-    const state = getWaitingState();
-    expect(state).toMatchObject({ type: 'actions', unarchive: true });
-    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
-    expect(members.map((m) => m.key)).toEqual(['unarchive']);
-    expect(buttonLabels(rows(members))).toEqual(['Move to Current']);
+    expect(getWaitingState()).toBeNull();
   });
 
   it('shows Archive held back, with its reason, when a sub-thread blocks it', () => {
@@ -579,24 +475,23 @@ describe('the composer row when Archive is not on offer', () => {
       type: 'actions',
       blockedArchive: { blocker: 'descendant_question', subThreadId: 't-child' },
     });
-    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
-    expect(members.map((m) => m.key)).toEqual(['archive-blocked']);
-    const [button] = buttonNodes(rowOf(members[0])) as VNode<Record<string, unknown>>[];
-    expect(button.props['aria-disabled']).toBe('true');
-    expect(button.props['data-tooltip']).toBe('A sub-thread is waiting for your answer.');
+    const { face, menu } = getBannerActions(state as Banner).slot;
+    expect(menu).toEqual([]);
+    expect(face.key).toBe('archive-blocked');
+    expect(face.heldBack).toBe(true);
+    expect(face.tooltip).toBe('A sub-thread is waiting for your answer.');
   });
 
   it('offers Archive on a stored-archived thread a stale count keeps in Current', () => {
-    // Shown in Current, so Move to Current would be a lie. Archive makes the
-    // engine recount the family, which lets it go to Archive.
+    // Shown in Current, so it is not archived as the reader sees it. Archive
+    // makes the engine recount the family, which lets it go to Archive.
     threadMap.value = new Map([
       ['t-coord', makeCCThread('t-coord', { status: 'idle', section: 'archived', activeChildrenCount: 12 })],
     ]);
     focusedThreadId.value = 't-coord';
     const state = getWaitingState();
-    expect(state).toMatchObject({ type: 'actions', unarchive: false });
-    const members = getBannerActions(state as Parameters<typeof getBannerActions>[0]);
-    expect(members.map((m) => m.key)).toEqual(['archive']);
+    expect(state).toMatchObject({ type: 'actions' });
+    expect(slotKeys(state as Banner)).toEqual(['archive']);
   });
 
   it('draws nothing extra when the thread itself holds Archive back', () => {

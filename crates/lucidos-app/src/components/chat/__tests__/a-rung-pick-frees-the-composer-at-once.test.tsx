@@ -27,7 +27,7 @@ const response: CodingAgentCommandsResponse = {
 
 let answerControl: ((recorded: boolean) => void) | null = null;
 const sendCodingAgentControl = vi.fn(() => new Promise<boolean>((resolve) => { answerControl = resolve; }));
-const fetchSwitchEstimate = vi.fn(() => Promise.resolve({ context_tokens: 1000, rebuilds_cache: false, extra_cost_usd: null }));
+const fetchSwitchEstimate = vi.fn(() => Promise.resolve({ context_tokens: 1000, rebuilds_cache: 'no' as const, extra_cost_usd: null }));
 
 vi.mock('../../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../api/client')>()),

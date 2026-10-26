@@ -9,7 +9,7 @@ import { handleMarkdownLinkClick } from './markdownLinkClick';
 export function ReleaseNoticeBody({ body }: { body: string }) {
   return (
     <div
-      class="markdown-content release-notice-body"
+      class="markdown-content release-notice-body authored-html"
       dangerouslySetInnerHTML={{ __html: renderMarkdown(body) }}
       onClick={(e) => handleMarkdownLinkClick(e, loadedOr(appsList.value, []), 'a release notice')}
     />

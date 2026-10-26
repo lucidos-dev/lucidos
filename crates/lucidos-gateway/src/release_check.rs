@@ -23,9 +23,9 @@ use lucidos_update_address::UpdateAddress;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 /// Where the check asks. The route is published from the maintainer's workspace
 /// and its contract is fixed in ADR 0108.
@@ -481,9 +481,10 @@ pub struct ReleaseCheck {
     config_path: Option<PathBuf>,
     current_version: &'static str,
     client: reqwest::Client,
-    state: Mutex<ReleaseState>,
+    /// Shared with the task that runs a poll, which outlives its caller.
+    state: Arc<Mutex<ReleaseState>>,
     /// Held across a poll so concurrent refreshes coalesce into one request.
-    poll_lock: AsyncMutex<()>,
+    poll_lock: Arc<AsyncMutex<()>>,
 }
 
 impl ReleaseCheck {
@@ -516,8 +517,8 @@ impl ReleaseCheck {
             config_path: dep.config_path.clone(),
             current_version,
             client: build_client(current_version),
-            state: Mutex::new(ReleaseState::default()),
-            poll_lock: AsyncMutex::new(()),
+            state: Arc::new(Mutex::new(ReleaseState::default())),
+            poll_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -616,9 +617,9 @@ impl ReleaseCheck {
     /// it, so N windows asking at once produce one outbound request.
     pub async fn refresh(&self, force: bool) -> Value {
         if self.may_poll(force) && self.poll_is_due(force) {
-            let _guard = self.poll_lock.lock().await;
+            let guard = Arc::clone(&self.poll_lock).lock_owned().await;
             if self.poll_is_due(force) {
-                self.poll_once().await;
+                self.poll_once(guard).await;
             }
         }
         self.snapshot()
@@ -636,8 +637,14 @@ impl ReleaseCheck {
     /// an empty one: a poll in flight still reads as due, so the caller queues
     /// on `poll_lock` rather than returning past it.
     ///
+    /// The request runs in its own task, which holds `guard` until the answer
+    /// is stored. A caller can stop listening at any await, such as a window
+    /// that hides mid-fetch, and must never cancel a request already sent.
+    /// That would leave `last_attempt` unmoved, and the next caller would send
+    /// another.
+    ///
     /// A refused update address sends nothing. `snapshot` reports the refusal.
-    async fn poll_once(&self) {
+    async fn poll_once(&self, guard: OwnedMutexGuard<()>) {
         let Some((platform, arch)) = self.target else {
             return;
         };
@@ -647,51 +654,17 @@ impl ReleaseCheck {
             Ok(None) => check_url(&self.origin, platform, arch, self.current_version),
             Err(_) => return,
         };
-        let outcome = self.fetch(&url).await;
-        let mut st = self.state.lock().unwrap();
-        st.last_attempt = Some(Instant::now());
-        if st.polled_address != cfg.update_address {
-            // The stored answer came from the other address. A failure here
-            // must not let it pass as this address's offer.
-            st.latest = None;
-            st.checked_at = None;
-            st.polled_address = cfg.update_address;
-        }
-        match outcome {
-            Ok(published) => {
-                st.checked_at = Some(chrono::Utc::now());
-                st.latest =
-                    published.filter(|p| version_is_newer(&p.version, self.current_version));
-                st.last_error = None;
-            }
-            Err(e) => {
-                crate::log!("[ReleaseCheck] {url} failed: {e}");
-                st.last_error = Some(e);
-            }
-        }
-    }
-
-    /// Fetch and read one answer, with the body size capped.
-    async fn fetch(&self, url: &str) -> Result<Option<PublishedRelease>, String> {
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("origin answered {}", resp.status()));
-        }
-        let mut body = Vec::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| e.to_string())?;
-            if body.len() + chunk.len() > MAX_BODY_BYTES {
-                return Err("answer exceeds the size the contract allows".to_string());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        parse_response(&String::from_utf8_lossy(&body))
+        let client = self.client.clone();
+        let state = Arc::clone(&self.state);
+        let current_version = self.current_version;
+        let poll = tokio::spawn(async move {
+            let outcome = fetch(&client, &url).await;
+            record(&state, &url, cfg.update_address, current_version, outcome);
+            drop(guard);
+        });
+        // A panic in the task already dropped the guard. The next due refresh
+        // asks again, and there is no answer here to wait for.
+        let _ = poll.await;
     }
 
     /// The `release_check` object on `GET /~/api/v1/control/gateway/status`.
@@ -728,6 +701,54 @@ impl ReleaseCheck {
             "update_address": update_address,
             "update_address_error": address_error,
         })
+    }
+}
+
+/// Fetch and read one answer, with the body size capped.
+async fn fetch(client: &reqwest::Client, url: &str) -> Result<Option<PublishedRelease>, String> {
+    let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("origin answered {}", resp.status()));
+    }
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err("answer exceeds the size the contract allows".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    parse_response(&String::from_utf8_lossy(&body))
+}
+
+/// Store what one request to `update_address` came back with.
+fn record(
+    state: &Mutex<ReleaseState>,
+    url: &str,
+    update_address: String,
+    current_version: &str,
+    outcome: Result<Option<PublishedRelease>, String>,
+) {
+    let mut st = state.lock().unwrap();
+    st.last_attempt = Some(Instant::now());
+    if st.polled_address != update_address {
+        // The stored answer came from the other address. A failure here
+        // must not let it pass as this address's offer.
+        st.latest = None;
+        st.checked_at = None;
+        st.polled_address = update_address;
+    }
+    match outcome {
+        Ok(published) => {
+            st.checked_at = Some(chrono::Utc::now());
+            st.latest = published.filter(|p| version_is_newer(&p.version, current_version));
+            st.last_error = None;
+        }
+        Err(e) => {
+            crate::log!("[ReleaseCheck] {url} failed: {e}");
+            st.last_error = Some(e);
+        }
     }
 }
 

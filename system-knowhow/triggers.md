@@ -3,6 +3,13 @@ name: Triggers
 description: Use when the user wants something to happen automatically ("every morning", "notify me when X happens", "watch for Y") or an EXISTING trigger to run right now ("run this trigger now", "fire it manually"). Load it even if a trigger may not be the answer: it settles that, and routes "tell me HERE when X happens" to `await_event` instead.
 ---
 
+<!-- domain-event: OrderPlaced: Example domain event emitted by an order-entry app. -->
+<!-- domain-event: OrderQueuedForShipping: Example domain event emitted by an order-processing trigger. -->
+
+<!-- domain-event: OuraSleepImported: Example domain event emitted by a wearable sleep-data integration. -->
+
+<!-- domain-event: EmailReceived: Example domain event emitted by an email-ingestion integration. -->
+
 # Triggers
 
 The working reference for *triggers*: choosing one, building it, editing it, and running an existing one off-schedule. The engine system prompt and the grouped `triggers` tool description carry the cron format and field reference, so this file does not restate them. `docs/taxonomy.md` § Triggers has the intent-versus-procedure worked example.
@@ -10,11 +17,12 @@ The working reference for *triggers*: choosing one, building it, editing it, and
 > **Tool surface.** The grouped **`triggers`** tool (`action: create | list |
 > update | delete | pause | resume | run`) and the grouped **`trigger_groups`**
 > tool (`action: list | create | rename | reorder | delete`) manage triggers.
-> Here a bare verb such as `update_trigger` or `list_trigger_groups` is short for
-> that tool with the matching `action`: `update_trigger(trigger_id, …)` means
-> `triggers(action="update", trigger_id, …)`. The old flat names still work as
-> aliases, but the model sees the grouped tools. The CLI mirrors them as
+> Examples use grouped calls such as `triggers(action="update", trigger_id, …)`.
+> The old flat names remain legacy aliases; the model sees the grouped tools.
+> The CLI exposes
 > `lucidos triggers …` / `lucidos trigger-groups …` (see `lucidos-cli.md`).
+> Pause or resume through the CLI with `lucidos triggers update --paused true`
+> or `--paused false`; the separate `pause` and `resume` actions are LLM-only.
 
 ## When a trigger is the right answer
 
@@ -340,7 +348,7 @@ Set `condition` on a trigger subscription when the event is high-volume and you 
 
 Conditions are pure payload filters, so never use one for logic that depends on external state ("only if this app's data file says X"). Stateful checks belong inside the run.
 
-**One field is always available on a thread event: `thread_id`.** It is not in any event's payload: the engine supplies it from the thread the event belongs to. It scopes a subscription to a single thread, so `{ "event_type": "CodingAgentIdled", "condition": { "thread_id": "<uuid>" } }` fires only when THAT coding-agent session reaches a turn boundary. A **domain event** (one your workspace emits with `emit_event`) belongs to no thread. It has no such field, so a `thread_id` condition on one matches nothing. Everything else a condition names is a **field path** into that event's own payload.
+**One field is always available on a thread event: `thread_id`.** It is not in any event's payload: the engine supplies it from the thread the event belongs to. It scopes a subscription to a single thread, so `{ "event_type": "CodingAgentIdled", "condition": { "thread_id": "<uuid>" } }` fires only when THAT coding-agent session reaches a turn boundary. A **domain event** (one your workspace emits with `events(action="emit")`) belongs to no thread. It has no such field, so a `thread_id` condition on one matches nothing. Everything else a condition names is a **field path** into that event's own payload.
 
 That payload includes the merged metadata fields `channel`, `actor` and `request_event_id` (`thread-events.md` § Wire format and metadata). So `{ "event_type": "ResponseGenerated", "condition": { "channel": "claude_code" } }` fires only when a coding-agent turn ends.
 
@@ -355,7 +363,7 @@ A persisted **system event** is the same case. `BackupFailed` belongs to no thre
 | Emitted by | `actor.kind` | Also carries |
 |---|---|---|
 | An app, through `lucidos.events.emit` | `device` | `device_id` only, never a name (see `thread-events.md`) |
-| The `emit_event` tool (the Lucidos Agent) | `agent` | `agent.kind` = `lucidos_agent` |
+| The `events(action="emit")` tool (the Lucidos Agent) | `agent` | `agent.kind` = `lucidos_agent` |
 | `lucidos events emit` from a coding agent, a script trigger or a `run_bash` script | `api` | `mode` = `agent`, and `source_thread_id` when a thread ran it |
 | A webhook delivery | `webhook` | `webhook_id`, `name` |
 
@@ -482,7 +490,7 @@ chat model and `reasoning_effort` to pin its thinking budget
 (`none|low|medium|high|xhigh|max`). The two are independent: pinning the model
 leaves the effort on the account setting, and the reverse.
 
-To unpin, send null: `update_trigger(trigger_id, model=null, reasoning_effort=null)`.
+To unpin, send null: `triggers(action="update", trigger_id, model=null, reasoning_effort=null)`.
 The trigger then follows the account trigger model again. The CLI spells it
 `--model null --reasoning-effort null`, and `provider` clears the same way. An
 update that omits a field leaves that pin as it is.
@@ -566,9 +574,9 @@ Source event id: 7a9c2c5f-…
 
 …carries the UUID of the event that fired the trigger. Pass it as `send_notification`'s `event_id`. The push tap then deep-links to that exact event, and the question card pulses on land.
 
-**Only a thread event qualifies.** A workspace domain event (anything `emit_event` wrote, such as `E2ETestsPassed`) gets a `Source event id` line too, but it lives in no thread. No transcript can show it, so `send_notification` refuses it as `event_id`, and `lucidos notify` refuses it as `--event-id`. Omit `event_id` for those, and the tap opens the notification card. The same refusal covers an event from a different thread than the one the tap opens.
+**Only a thread event qualifies.** A workspace domain event (anything `events(action="emit")` wrote, such as `E2ETestsPassed`) gets a `Source event id` line too, but it lives in no thread. No transcript can show it, so `send_notification` refuses it as `event_id`, and `lucidos notify` refuses it as `--event-id`. Omit `event_id` for those, and the tap opens the notification card. The same refusal covers an event from a different thread than the one the tap opens.
 
-For schedule (cron) triggers there is no source event, so no `event_id`. For on-event triggers that notify about *a different* event (e.g. fire on `CodingAgentIdled` but notify about the last `UserQuestionAsked`), look the right event up yourself with `query_events` and use that id.
+For schedule (cron) triggers there is no source event, so no `event_id`. For on-event triggers that notify about *a different* event (e.g. fire on `CodingAgentIdled` but notify about the last `UserQuestionAsked`), look the right event up yourself with `events(action="query")` and use that id.
 
 #### Worked example: push when agent needs me
 
@@ -692,16 +700,16 @@ If a payload lacks the well-known fields, the push shows only the fallback title
 
 A *trigger group* is a user-visible folder, shown as a collapsible section in the triggers panel. Groups are pure labels: no schedule, no code, no coordinated firing. They only collect related triggers under one header so the panel stays readable.
 
-Use a group when several triggers form one workflow and the user benefits from seeing them together. For example, one emits an event via `emit_event` and another listens via `on_event`. A single trigger needs no group; the "Ungrouped" section at the bottom of the panel holds it.
+Use a group when several triggers form one workflow and the user benefits from seeing them together. For example, one emits an event via `events(action="emit")` and another subscribes through its `on` field. A single trigger needs no group; the "Ungrouped" section at the bottom of the panel holds it.
 
 | Tool | When to use |
 |---|---|
-| `list_trigger_groups` | Before assigning a trigger, check whether a fitting group already exists. |
-| `create_trigger_group(name, order?)` | Create a new section header. Names are unique within the workspace (case-insensitive). |
-| `create_trigger` / `update_trigger` with `group_id` | Assign a trigger to (or move it between / out of) a group. `update_trigger(group_id: null)` clears membership. |
-| `rename_trigger_group(group_id, name)` | Rename the section. |
-| `reorder_trigger_groups([{id, order}, ...])` | Batch-reorder panel sections. |
-| `delete_trigger_group(group_id)` | Refused if the group still has members; move or delete them first (the error response lists them). |
+| `trigger_groups(action="list")` | Before assigning a trigger, check whether a fitting group already exists. |
+| `trigger_groups(action="create", name, order?)` | Create a new section header. Names are unique within the workspace (case-insensitive). |
+| `triggers(action="create")` / `triggers(action="update")` with `group_id` | Assign a trigger to (or move it between / out of) a group. `triggers(action="update", group_id: null)` clears membership. |
+| `trigger_groups(action="rename", group_id, name)` | Rename the section. |
+| `trigger_groups(action="reorder", [{id, order}, ...])` | Batch-reorder panel sections. |
+| `trigger_groups(action="delete", group_id)` | Refused if the group still has members; move or delete them first (the error response lists them). |
 
 Groups are orthogonal to `app_id`: an app-owned trigger can live in any group. `app_id` drives notification deep-linking, `group_id` drives panel layout.
 
@@ -716,7 +724,9 @@ A chat turn would *ask* the user to approve such a command, but a trigger fires 
 
 The categories are **email**, **external API** (mutating HTTP), **cloud CLI** (gh/aws/gcloud), **out-of-workspace destruction**, and **other** (anything irreversible that fits none of those). The default grant is empty: a new trigger may perform *no* irreversible side-effect.
 
-**The user sets the grant, not you.** The `create_trigger` / `update_trigger` tools accept no grant field, on purpose: an autonomous agent can't widen its own unattended authority. The user ticks the "Allowed side-effects" checkboxes in the trigger's settings. So when a trigger's intent needs an irreversible side-effect ("email me the digest every morning"), **tell the user** to tick the matching one. Here that is *Send email or messages*. With command safety on, the run otherwise fails the first time it tries to send; with it off, none of this applies.
+A `gh` read such as `gh run view` or `gh pr checks` is not a cloud-CLI side effect, so it needs no grant.
+
+**The user sets the grant, not you.** The `triggers(action="create")` / `triggers(action="update")` tools accept no grant field, on purpose: an autonomous agent can't widen its own unattended authority. The user ticks the "Allowed side-effects" checkboxes in the trigger's settings. So when a trigger's intent needs an irreversible side-effect ("email me the digest every morning"), **tell the user** to tick the matching one. Here that is *Send email or messages*. With command safety on, the run otherwise fails the first time it tries to send; with it off, none of this applies.
 
 **The grant also flows to coding-agent work the trigger spawns.** A *coding-agent thread* (Claude Code / Codex) that a trigger's intent launches runs **unattended**, directly or via a sub-thread an orchestrator spawns. Nobody answers its permission cards. So the engine walks the spawn tree to the root trigger and resolves each request from that trigger's grant:
 
@@ -743,24 +753,24 @@ The audit's `triggers` section flags a trigger whose fires enabled a server it d
 
 ## Edit, don't recreate
 
-**Always look for an existing trigger first** (`list_triggers`) and change it with `update_trigger`. Call `create_trigger` only when no comparable trigger exists. Recreating gives the new trigger a fresh `trigger_id` and orphans the old one's run history. The threads still exist, but no longer match the live trigger in the filter dropdown, trigger-scoped reports, or anything else that joins by id. The user sees no threads for a workflow that has fired for months.
+**Always look for an existing trigger first** (`triggers(action="list")`) and change it with `triggers(action="update")`. Call `triggers(action="create")` only when no comparable trigger exists. Recreating gives the new trigger a fresh `trigger_id` and orphans the old one's run history. The threads still exist, but no longer match the live trigger in the filter dropdown, trigger-scoped reports, or anything else that joins by id. The user sees no threads for a workflow that has fired for months.
 
 This applies to every shape of change:
 
 | User says | What to do |
 |---|---|
-| "Change the cron to 9am" | `update_trigger(trigger_id, cron=...)` |
-| "Rename it to X" | `update_trigger(trigger_id, name="X")` |
-| "Switch it to fire on event Y instead" | `update_trigger(trigger_id, cron=null, on=[{event_type:"Y"}])` |
-| "Also fire when Z happens" | `update_trigger(trigger_id, on=[existing..., {event_type:"Z"}])`: append to the `on` array, don't make a sibling trigger |
-| "Stop firing on event Y" | `update_trigger(trigger_id, on=[existing... minus Y])`: `on` is a full replacement |
-| "Tighten the Y filter" | `update_trigger(trigger_id, on=[..., {event_type:"Y", condition:{...}}, ...])`: replace that entry inside the full list |
-| "Tweak the prompt" | `update_trigger(trigger_id, run={...})` |
-| "Pause it" | `pause_trigger(trigger_id)` (or `update_trigger(..., paused=true)`) |
-| "Make sure I see this one" / "Send to review" | `update_trigger(trigger_id, go_to_review=true)` |
-| "Stop bringing this up, keep it in the archive" | `update_trigger(trigger_id, go_to_review=false)` |
-| "Add another time it should run" | `update_trigger(trigger_id, cron=[existing..., new_expr])`: append to the cron array, don't make a sibling trigger |
-| "Run it once more, like at 7pm tonight" | `update_trigger(trigger_id, cron=[existing..., one_shot_expr])`, then another `update_trigger` after it fires to remove the one-shot entry. Never a duplicate trigger, not even temporarily |
+| "Change the cron to 9am" | `triggers(action="update", trigger_id, cron=...)` |
+| "Rename it to X" | `triggers(action="update", trigger_id, name="X")` |
+| "Switch it to fire on event Y instead" | `triggers(action="update", trigger_id, cron=null, on=[{event_type:"Y"}])` |
+| "Also fire when Z happens" | `triggers(action="update", trigger_id, on=[existing..., {event_type:"Z"}])`: append to the `on` array, don't make a sibling trigger |
+| "Stop firing on event Y" | `triggers(action="update", trigger_id, on=[existing... minus Y])`: `on` is a full replacement |
+| "Tighten the Y filter" | `triggers(action="update", trigger_id, on=[..., {event_type:"Y", condition:{...}}, ...])`: replace that entry inside the full list |
+| "Tweak the prompt" | `triggers(action="update", trigger_id, run={...})` |
+| "Pause it" | `triggers(action="pause", trigger_id)` (or `triggers(action="update", ..., paused=true)`) |
+| "Make sure I see this one" / "Send to review" | `triggers(action="update", trigger_id, go_to_review=true)` |
+| "Stop bringing this up, keep it in the archive" | `triggers(action="update", trigger_id, go_to_review=false)` |
+| "Add another time it should run" | `triggers(action="update", trigger_id, cron=[existing..., new_expr])`: append to the cron array, don't make a sibling trigger |
+| "Run it once more, like at 7pm tonight" | `triggers(action="update", trigger_id, cron=[existing..., one_shot_expr])`, then another `triggers(action="update")` after it fires to remove the one-shot entry. Never a duplicate trigger, not even temporarily |
 
 If you truly need a different trigger (a different *workflow*, not a tweak), give it a clearly different name. Two live triggers with the same name are a UX trap: no picker tells them apart.
 
@@ -768,7 +778,7 @@ If you truly need a different trigger (a different *workflow*, not a tweak), giv
 
 A plugin update or uninstall can delete knowhow a trigger relies on. The trigger
 is then an *affected trigger*. The usual case is one an agent made with
-`create_trigger` during a plugin's setup: it carries no plugin id, so the plugin
+`triggers(action="create")` during a plugin's setup: it carries no plugin id, so the plugin
 cannot update it. The engine never edits, pauses or deletes it. It warns instead:
 in the plugin panel, on its receipt, and in one notification
 (`system-knowhow/plugins.md` § "Affected triggers").
@@ -789,13 +799,13 @@ Suggest the user edit the trigger. The run still goes ahead.
 
 The block stops when either holds:
 
-- **The trigger is edited after the removal**, with `update_trigger`. Pause,
+- **The trigger is edited after the removal**, with `triggers(action="update")`. Pause,
   resume and a plugin re-registering its own trigger do not count, because
   nobody looked at the knowhow.
 - **Every listed path exists again**, for example after a reinstall.
 
 To fix one, find where the recipe went (the new version may have moved it), and
-point the intent at it with `update_trigger`. Never recreate the trigger (see
+point the intent at it with `triggers(action="update")`. Never recreate the trigger (see
 "Edit, don't recreate" above). A removal from before Lucidos recorded affected
 triggers raises no block. The workspace audit checks for those
 (`system-knowhow/workspace-audit/triggers.md`).
@@ -804,25 +814,25 @@ triggers raises no block. The workspace audit checks for those
 
 **`triggers(action="run", trigger_id)`.** That is the whole answer for a cron trigger. The CLI is `lucidos triggers run --id <uuid>`, the SDK is `lucidos.triggers.run(id)`, and the trigger's row in the panel has a **Run once** button. (Not to be confused with the Thread Queue panel's **Run now**, which force-admits an entry that is *already queued* and cannot create a fire.)
 
-**When you send the user to that button, link the TRIGGER, not the panel**: `[Nightly digest](trigger:<id>)`, with the id from `list_triggers`. The link lands on the trigger's own row, with **Run once**, the pause toggle and the last-run status. `[Triggers](triggers)` only opens the list.
+**When you send the user to that button, link the TRIGGER, not the panel**: `[Nightly digest](trigger:<id>)`, with the id from `triggers(action="list")`. The link lands on the trigger's own row, with **Run once**, the pause toggle and the last-run status. `[Triggers](triggers)` only opens the list.
 
 It is a real fire. It records `TriggerExecuted` / `TriggerCompleted` and updates the panel's `last_run` and OK/failed status. It runs under the trigger's own identity and side-effect grant, and (for an `intent` run) its *trigger thread* and `go_to_review` routing. Downstream, nothing tells it apart from a scheduled fire. It returns once the run is admitted, not when the run finishes.
 
 Three answers other than "started". Relay each as-is, never as a run:
 
 - **Already running.** A fire of this trigger was already active or queued, so nothing new started: scheduled fires coalesce to at most one pending run per trigger. Tell the user that; do not claim you started one.
-- **Paused.** Refused. Resuming runs nothing *on purpose*, so if the user wants both, do both. Re-registering the schedule does re-run the missed-slot catch-up, so a cron slot from the past hour that never ran fires on resume. That side effect is not a way to ask for a run, and you cannot predict it. A pause *you* just made counts at once: every trigger write is visible to the next call, so `pause_trigger` then `run` in one turn is refused, not raced.
+- **Paused.** Refused. Resuming runs nothing *on purpose*, so if the user wants both, do both. Re-registering the schedule does re-run the missed-slot catch-up, so a cron slot from the past hour that never ran fires on resume. That side effect is not a way to ask for a run, and you cannot predict it. A pause *you* just made counts at once: every trigger write is visible to the next call, so `triggers(action="pause")` then `run` in one turn is refused, not raced.
 - **No cron schedule.** Refused: an event-only trigger has never fired without a payload. An intent run would find no `## Triggering Event` block, and a script run would get none of the `TRIGGER_EVENT_*` vars. Emit its event instead.
 
 ### Event-only trigger: emit the event
 
 `events(action="emit", …)`, or `lucidos events emit <Type> --summary "…" --payload '{…}'` from a script. The emit goes through the same matcher, admission and run as a real event, so it is the faithful reproduction.
 
-- **Per-entry `condition` filters still apply.** A payload that fails the condition matches nothing and you get silence, not an error. Read the `on` array from `list_triggers` and build a payload that passes.
+- **Per-entry `condition` filters still apply.** A payload that fails the condition matches nothing and you get silence, not an error. Read the `on` array from `triggers(action="list")` and build a payload that passes.
 - **A condition on `actor` is not yours to pass.** The engine records you as the emitter, whatever the payload says (§ "Who emitted a domain event"). A trigger gated on `actor.kind` = `device` waits for the user. Ask them to press the button.
 - Shape the payload like the real emitter's, not just enough to match: the run reads it (`## Triggering Event` for an intent, `TRIGGER_EVENT_PAYLOAD` for a script).
 - The event is real and persisted, so every *other* subscriber fires too.
-- **Event fires do NOT coalesce.** Each carries its own payload, so event fires keep strict FIFO, unlike the run action. Emit twice and the trigger runs twice, the second surfacing as an unexplained extra run minutes later. Check `list_threads` (rows carry `trigger_id` and `status`) before you re-emit.
+- **Event fires do NOT coalesce.** Each carries its own payload, so event fires keep strict FIFO, unlike the run action. Emit twice and the trigger runs twice, the second surfacing as an unexplained extra run minutes later. Check `threads(action="list")` (rows carry `trigger_id` and `status`) before you re-emit.
 
 ### Don't imitate the fire
 
@@ -836,11 +846,11 @@ Both are fine for **debugging** ("does the script still crash?"), if you call it
 
 | Tool | On the firing trigger itself | On any other trigger |
 |---|---|---|
-| `create_trigger` | refused | refused |
-| `update_trigger` | refused | refused |
-| `delete_trigger` | allowed | refused |
-| `pause_trigger` | allowed | refused |
-| `resume_trigger` | allowed | refused |
+| `triggers(action="create")` | refused | refused |
+| `triggers(action="update")` | refused | refused |
+| `triggers(action="delete")` | allowed | refused |
+| `triggers(action="pause")` | allowed | refused |
+| `triggers(action="resume")` | allowed | refused |
 | `run` | refused | refused |
 
 Self-delete and self-pause are allowed because they **terminate**: the fire acts on its own id and stops. Self-run is refused because it **recurses**. With the per-trigger concurrency cap at 1, a self-run cannot start a second copy. Each fire instead adds one entry to a queue that never drains.
@@ -857,7 +867,7 @@ The common case: a recurring trigger is paused so a one-off run can take its pla
 
 ## Questions to settle with the user before creating
 
-Don't call `create_trigger` from the user's first message. Most "create a trigger for X" requests leave at least one of these unsettled, so confirm before you write the trigger. Skip a question only when the user already answered it in the same turn.
+Don't call `triggers(action="create")` from the user's first message. Most "create a trigger for X" requests leave at least one of these unsettled, so confirm before you write the trigger. Skip a question only when the user already answered it in the same turn.
 
 1. **Recurring or one-shot, and if one-shot, now or at a future time?** A recurring need is always a trigger. A one-off for **now** ("check X and tell me") is handled inline, with no trigger. A one-off at a **future time** ("remind me at 5pm today", "ping me in 20 minutes") needs a **one-shot trigger**. For any one-shot (even a test like "fire once in 2 min"), ask whether it should delete itself: it won't on its own. See "One-shot triggers" below for the procedure, `go_to_review` included.
 2. **Cron or `on`?** "Every morning at 8" is cron. "When my package ships" is a trigger subscription. Several events for one workflow ("when X *or* Y happens") belong in one trigger with multiple `on` entries. If the event doesn't exist yet, name the work (emit the event from somewhere, then trigger on it) and confirm.
@@ -874,10 +884,10 @@ A one-off that means "do this **now**" ("check X and tell me") needs no trigger:
 
 **Leave `go_to_review` at its default (false / omitted)**, so the single fire-thread goes straight to Archive. Its job is done the moment it fires, and the user doesn't need to read its thread. That holds **even when it sends a `send_notification` or deletes itself**: the notification is the user-facing output. Set `go_to_review: true` only if the user explicitly wants to read the run afterwards.
 
-A one-shot trigger does **not** self-clean. After it fires, its cron matches nothing, but the row stays in the trigger list until something deletes it. It shows in pickers, the filter dropdown and `list_triggers` output. Pick one of two ways with the user before you create it:
+A one-shot trigger does **not** self-clean. After it fires, its cron matches nothing, but the row stays in the trigger list until something deletes it. It shows in pickers, the filter dropdown and `triggers(action="list")` output. Pick one of two ways with the user before you create it:
 
 1. **Leave it.** Tell the user it will sit in the trigger list after firing, and they can delete it from the UI. Don't promise to clean it up.
-2. **Ask the trigger to delete itself.** Add a sentence in the user's voice to the intent, for example `"Send me a hello notification, then delete this trigger."` Don't name `delete_trigger` or paste in the trigger id. The engine's fire envelope already tells the running LLM its own id and that self-deletion is permitted. Then tell the user the trigger will delete itself after firing.
+2. **Ask the trigger to delete itself.** Add a sentence in the user's voice to the intent, for example `"Send me a hello notification, then delete this trigger."` Don't name `triggers(action="delete")` or paste in the trigger id. The engine's fire envelope already tells the running LLM its own id and that self-deletion is permitted. Then tell the user the trigger will delete itself after firing.
 
 Never claim "I'll delete it after it runs" without one of the above.
 
@@ -899,10 +909,10 @@ this file mirrors that config, never feeds it. Two rules follow:
 
 - **Never hand-edit it.** The edit writes a file that reads correctly and changes
   nothing the scheduler sees; the next trigger event or restart overwrites it.
-  Change triggers via `create_trigger`/`update_trigger` (or the UI), which emit
+  Change triggers via `triggers(action="create")`/`triggers(action="update")` (or the UI), which emit
   the events the projection follows.
 - **Never verify from it.** After a config change, re-read the trigger from
-  `list_triggers`, the live registration. Reading `trigger.toml` back off disk
+  `triggers(action="list")`, the live registration. Reading `trigger.toml` back off disk
   proves only that it was written, so a change the scheduler never saw still
   verifies green.
 
@@ -911,7 +921,7 @@ Each fire is recorded as events (`TriggerExecuted` + `TriggerCompleted`, plus an
 **last run's OK/failed status** next to its timestamp. There is no built-in
 run-history view. For detail on a threadless trigger's runs (what it found, when,
 why a run failed), ask the *Lucidos Agent*, which reads the events via
-`query_events`. Or build an *app* on the trigger's events (`lucidos.events`).
+`events(action="query")`. Or build an *app* on the trigger's events (`lucidos.events`).
 
 The file exists so a trigger is inspectable (the Plugins panel's installed-plugin
 file links point at it for plugin-shipped triggers) and so a *plugin* can SHIP a
@@ -930,33 +940,33 @@ Repair, in order:
 
 1. `git mv` the old slug's `scripts/` and `knowhow/` (whichever exist) into
    `data/triggers/<new-slug>/`.
-2. `update_trigger(trigger_id, run={type:"script", path:"triggers/<new-slug>/scripts/run.py"})`.
+2. `triggers(action="update", trigger_id, run={type:"script", path:"triggers/<new-slug>/scripts/run.py"})`.
    Only the event re-points the scheduler.
-3. Confirm the new path in `list_triggers`, then delete the old folder. Deleting
+3. Confirm the new path in `triggers(action="list")`, then delete the old folder. Deleting
    before step 2 lands removes the script the scheduler is still calling.
 
 A broken run reports `Script not found: data/scripts/<path>`. That is the last
 candidate in the path-resolution fallback, not the configured path, which
-`list_triggers` shows.
+`triggers(action="list")` shows.
 
 ## Setup checklist
 
-1. **Set timezone first** if not already set. Cron is 6 fields (`second minute hour day-of-month month day-of-week`) in the user's local timezone, DST-aware via IANA tz. The `create_trigger` tool refuses without a timezone. For anything beyond a plain daily or weekly time, read § "Writing cron expressions" above: the AND/OR split, the nth-weekday and last-weekday recipes, and the combinations the engine rejects.
-2. **`list_triggers` first** to check whether an existing trigger should be updated instead of creating a new one.
+1. **Set timezone first** if not already set. Cron is 6 fields (`second minute hour day-of-month month day-of-week`) in the user's local timezone, DST-aware via IANA tz. The `triggers(action="create")` tool refuses without a timezone. For anything beyond a plain daily or weekly time, read § "Writing cron expressions" above: the AND/OR split, the nth-weekday and last-weekday recipes, and the combinations the engine rejects.
+2. **`triggers(action="list")` first** to check whether an existing trigger should be updated instead of creating a new one.
 3. **Decide cron vs. `on` (and whether `on` needs multiple entries)** before writing the trigger.
 4. **Write the knowhow file, THEN `run.intent` as the user would say it.** The ordering is the rule (§ "Write the knowhow file FIRST, then the intent"). Reusable recipes go in shared `data/knowhow/` (see `building-knowhow.md`); trigger-scoped ones go at `data/triggers/<slug>/knowhow/<descriptive>.md`. `<slug>` is minted from the name at creation (unless given), stored on `TriggerCreated`, and unchanged by a rename, so the folder keeps the old name. The LLM tools take no `slug`; the CLI (`lucidos triggers create --slug`) and HTTP API do. Changing it strands `knowhow/` and `scripts/` under the old slug (§ "Renamed trigger → stale `run.path`").
 
    There is no `run.knowhow` field: the trigger thread finds knowhow via its own `load_knowhow` calls, as chat does. The deserializer silently drops a legacy `run.knowhow:[...]` in old `TriggerCreated` payloads. Rewrite such an intent to name the knowhow inline ("see `system-knowhow/X`"). Or make it rich enough to nudge discovery from the system-prompt knowhow listing. Give the file precise `name` and `description` frontmatter so semantic discovery finds it.
 
    Shared `data/knowhow/` is what you can write first. Trigger-scoped is the
-   exception to the ordering: write that one *after* `create_trigger` returns,
+   exception to the ordering: write that one *after* `triggers(action="create")` returns,
    because only then is `<slug>` authoritative.
 5. **List the MCP servers the intent calls** in `mcp_servers`, and only those. An unlisted server's calls are refused in the fire (§ "MCP servers the fires use: `mcp_servers`").
 
 ## Common mistakes to avoid
 
 - **Recreating instead of editing.** The biggest source of orphaned thread history. See "Edit, don't recreate" above.
-- **Hand-editing `trigger.toml`.** The scheduler never reads it, so the edit no-ops and the next trigger event or restart overwrites it. Change the config with `update_trigger`, then verify against `list_triggers`. See "On-disk trigger definition" above.
+- **Hand-editing `trigger.toml`.** The scheduler never reads it, so the edit no-ops and the next trigger event or restart overwrites it. Change the config with `triggers(action="update")`, then verify against `triggers(action="list")`. See "On-disk trigger definition" above.
 - **Resuming a paused trigger to "run it now", or hand-rolling the run.** Resume runs nothing by itself. Use `triggers(action="run")`, or emit the subscribed event for an event-only trigger. See "Running an existing trigger once, off-schedule" above.
 - **A trigger that manages another trigger.** Refused at fire time, and nothing catches it earlier. See § "What a trigger fire may not do to other triggers".
 - **Patching around a `[REMOVED KNOW-HOW]` block.** Rewriting the missing recipe from memory hides the removal and drifts each run. Find the current knowhow, tell the user, and suggest they edit the trigger. See § "Know-how a plugin removed".

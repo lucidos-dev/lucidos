@@ -1,6 +1,9 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { showToast } from '../../store/store';
+import { openCommandGuardCodingAgentsSettings } from '../../store/actions/menu';
+import { currentCommandGuardCodingAgents } from '../../store/actions/preferences';
+import { SettingsIcon } from '../shared/icons';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
 import { changeKindName, type AllowScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
@@ -8,11 +11,12 @@ import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDow
 import { pendingDecisions, usePickMark, type PickMark } from '../../store/pendingDecisions';
 import { followConfirmedCard, followResolvedPermission } from './scrollState';
 import {
-  BROAD_ALLOW_INEFFECTIVE,
-  CC_PROTECTED_PATH_MARKERS,
-  CODEX_BACKEND_TOOLS,
-  SESSION_PATH_TOOLS,
+  BENIGN_PREFIX_WORDS,
+  GRANTS_NOTHING_HEADS,
+  GUARD_SHELLS,
+  MAX_SHELL_LAYERS,
 } from '@lucidos/engine-constants';
+import type { GrantOffer } from '../../generated/thread-event-wire';
 import { parseMcpToolName } from '../../utils/mcpToolName';
 
 interface PermissionEvent {
@@ -21,6 +25,10 @@ interface PermissionEvent {
   tool_name: string;
   input: Record<string, unknown>;
   summary: string;
+  /** The grant each "Always allow"-style button stores. The card renders
+   *  exactly these buttons. Absent on a card from before the engine stamped
+   *  it, which then offers none. */
+  grant_offer?: GrantOffer;
 }
 
 interface PermissionBodyProps {
@@ -241,116 +249,28 @@ function toolText(toolName: string): string {
   return mcp ? `The ${mcp.tool} tool from ${mcp.server}` : `The ${toolName} tool`;
 }
 
-/** Mirrors the engine's `derive_allow_pattern` for the narrow scope: returns
- *  the pattern that would be persisted if the user clicks "Always allow" with
- *  narrow scope, or null when the tool has no meaningful sub-scope (so the
- *  card hides the narrow button). Returns null also when the input
- *  references a CC-protected path — see `inputTouchesProtectedPath`. Keep in
- *  sync with `claude_code.rs`. */
-export function narrowPattern(toolName: string, input: Record<string, unknown>): string | null {
-  if (inputTouchesProtectedPath(toolName, input)) return null;
-  if (toolName === 'Skill') {
-    const skill = typeof input.skill === 'string' ? input.skill : null;
-    if (!skill) return null;
-    const plugin = skill.includes(':') ? skill.split(':', 1)[0] : skill;
-    return plugin ? `Skill(${plugin}:*)` : null;
-  }
-  if (toolName === 'Bash') {
-    const command = typeof input.command === 'string' ? input.command : null;
-    if (!command) return null;
-    // `commandHead`, not the raw first token. The engine derives the stored
-    // pattern from the unwrapped inner script. A raw-token label therefore
-    // names a different grant from the one the click persists.
-    const head = commandHead(command);
-    return head ? `Bash(${head}:*)` : null;
-  }
-  return null;
-}
-
 /** Whether an engine tool list names `tool`. Each list is typed as its literal
  *  members, so `includes` needs the wider type. */
 function listed(list: readonly string[], tool: string): boolean {
   return list.includes(tool);
 }
 
-/** True when a `Bash` command references a path CC keeps under special
- *  permission routing (`.claude/` or `.git/`). The card hides Broad
- *  ("Always allow") and Narrow ("Always allow Bash(rm:*)") in that case —
- *  those buttons would persist patterns CC ignores for the same path.
- *  Hiding them is not the only thing holding that line. The engine's gate
- *  derives the same `null` and refuses to honour a stored pattern here. So a
- *  broad `Bash` granted elsewhere still cards on these paths (ADR 0125).
- *  Session ("Allow for this thread") still works because the engine
- *  intercepts before CC's gate — and it now survives an engine restart, since
- *  the engine rehydrates the grant from the persisted resolution events.
- *  Restricted to Bash because that's the only tool we've empirically observed
- *  surfacing the card on these paths under the user's bare-allowlist setup
- *  (Read / Edit / cat all auto-approved silently), and because a command is
- *  deliberately excluded from the engine's in-worktree write fast path: it can
- *  do anything, so a `Bash` touching `.claude/` still asks even in-worktree.
- *  Mirror of `input_touches_protected_path` in `claude_code.rs`. */
-export function inputTouchesProtectedPath(
-  toolName: string,
-  input: Record<string, unknown>,
-): boolean {
-  if (toolName !== 'Bash') return false;
-  const command = input.command;
-  return typeof command === 'string'
-    && CC_PROTECTED_PATH_MARKERS.some(m => command.includes(m));
+/** Claude Code's `Bash` and Codex's `command_execution`: the two command tools
+ *  a permission card is raised for. */
+function isCommandTool(toolName: string): boolean {
+  return toolName === 'Bash' || toolName === 'command_execution';
 }
 
-/** Pull a short display label for the session-allow button. For path-tools
- *  we show the basename; for Bash we show the command's first token; for
- *  Skill the plugin slug. Returns null when the tool has no useful identifier
- *  in the input — the button label then falls back to the bare tool name. */
-export function sessionLabel(toolName: string, input: Record<string, unknown>): string | null {
-  if (listed(SESSION_PATH_TOOLS, toolName)) {
-    const key = toolName === 'NotebookEdit' ? 'notebook_path' : 'file_path';
-    const path = typeof input[key] === 'string' ? (input[key] as string) : null;
-    if (!path) return null;
-    const basename = path.split('/').filter(Boolean).pop();
-    return basename || path;
-  }
-  if (toolName === 'Bash' || toolName === 'command_execution') {
-    const command = typeof input.command === 'string' ? input.command : null;
-    if (!command) return null;
-    // Same reason as `narrowPattern`. Codex wraps every command it runs, so
-    // the raw first token labelled every one of them with the same shell.
-    const head = commandHead(command);
-    return head ? `${head} …` : null;
-  }
-  if (toolName === 'Skill') {
-    const skill = typeof input.skill === 'string' ? input.skill : null;
-    if (!skill) return null;
-    const plugin = skill.includes(':') ? skill.split(':', 1)[0] : skill;
-    return plugin ? `${plugin}:*` : null;
-  }
-  return null;
-}
-
-/** Tools whose "Allow for this thread" click would record nothing, because the
- *  engine derives no session pattern. The button is hidden, so a click can't
- *  silently behave as allow-once. Mirror of the `file_change` arm in
- *  `derive_allow_pattern`'s Session branch. Its other `None` case, a key-less
- *  command or path, is `sessionGrantable`.
- *
- *  `file_change` is a deliberate choice, not a data gap. Its approval input now
- *  carries the changed paths (the driver copies them off the item's
- *  `item/started`), so a per-file `file_change(<path>)` pattern would be as
- *  derivable as `Edit(<path>)`. Two reasons it still gets none: codex raises
- *  this approval only for a patch that escaped its sandbox, which is exactly
- *  the thing worth re-confirming each time, and a `changes` list names several
- *  files at once, so there is no single key a grant could stand for. */
-const SESSION_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set(['file_change']);
-
-/** True when "Allow for this thread" records a grant. A command or a path tool
- *  is keyed on its head or path, so with none the engine derives no pattern. */
-export function sessionGrantable(toolName: string, input: Record<string, unknown>): boolean {
-  if (SESSION_ALLOW_INEFFECTIVE.has(toolName)) return false;
-  const keyed = listed(SESSION_PATH_TOOLS, toolName)
-    || toolName === 'Bash'
-    || toolName === 'command_execution';
-  return !keyed || sessionLabel(toolName, input) !== null;
+/** What an "Allow for this thread" grant covers, in words, read off the
+ *  pattern the engine stamped: `Bash(git:*)` reads "git …", `Skill(x:*)` reads
+ *  "x:*", `Edit(/a/b.md)` reads "b.md", and a bare tool name reads as itself. */
+export function sessionLabel(pattern: string): string {
+  const m = /^(\w+)\((.+)\)$/.exec(pattern);
+  if (!m) return pattern;
+  const [, tool, arg] = m;
+  if (tool === 'Skill') return arg;
+  if (arg.endsWith(':*')) return `${arg.slice(0, -2)} …`;
+  return arg.split('/').filter(Boolean).pop() || arg;
 }
 
 export type PermissionChoice = 'deny' | 'allow' | 'session' | 'narrow' | 'broad';
@@ -490,6 +410,7 @@ function PermissionBodyShell({
   mark,
   terminated,
   note,
+  commandGuardLink = false,
 }: {
   requestId: string;
   question: ComponentChildren;
@@ -499,6 +420,9 @@ function PermissionBodyShell({
   mark: PickMark;
   terminated: boolean;
   note: string | null;
+  /** A pending command card links to the Command guard's coding-agents row
+   *  while that switch is off. */
+  commandGuardLink?: boolean;
 }) {
   const bodyStateClass = answered ? ' permission-body-answered'
     : terminated ? ' permission-body-terminated'
@@ -527,6 +451,17 @@ function PermissionBodyShell({
     >
       <div class="permission-text">{question}</div>
       <div class="permission-actions">
+        {commandGuardLink && live && (
+          <button
+            type="button"
+            class="permission-settings-link"
+            data-not-choice="true"
+            onClick={openCommandGuardCodingAgentsSettings}
+          >
+            <SettingsIcon />
+            Let the guard answer these
+          </button>
+        )}
         {buttons.map(spec => renderPermissionButton(spec, state))}
       </div>
       {note && <div class="permission-resolution-note">{note}</div>}
@@ -599,18 +534,8 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
     () => toolText(event.tool_name),
   );
 
-  const touchesProtected = inputTouchesProtectedPath(event.tool_name, event.input);
-  const isCodexTool = listed(CODEX_BACKEND_TOOLS, event.tool_name);
-  const narrow = touchesProtected || isCodexTool
-    ? null
-    : narrowPattern(event.tool_name, event.input);
-  // Broad hides wherever a bare allowlist line would suppress nothing. The
-  // engine's gate refuses such a line too (ADR 0125).
-  const showBroad = !listed(BROAD_ALLOW_INEFFECTIVE, event.tool_name)
-    && !isCodexTool
-    && !touchesProtected;
-  const showSession = sessionGrantable(event.tool_name, event.input);
-  const session = sessionLabel(event.tool_name, event.input);
+  // The engine decides which grants a card offers (ADR 0571).
+  const { broad, narrow, session } = event.grant_offer ?? {};
 
   const selected = effective ? resolvedChoice(effective) : null;
   const answered = effective !== undefined;
@@ -630,11 +555,11 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       ariaLabel: 'Allow this permission request once',
       onClick: () => void decide(true),
     },
-    ...(showSession ? [{
+    ...(session ? [{
       choice: 'session' as const,
       btnClass: 'action-btn action-btn-secondary',
       label: 'Allow for this thread',
-      ariaLabel: `Allow ${session ?? event.tool_name} for the rest of this thread`,
+      ariaLabel: `Allow ${sessionLabel(session)} for the rest of this thread`,
       onClick: () => void decide(true, 'session'),
     }] : []),
     ...(narrow ? [{
@@ -644,11 +569,11 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       ariaLabel: grantText(narrow),
       onClick: () => void decide(true, 'narrow'),
     }] : []),
-    ...(showBroad ? [{
+    ...(broad ? [{
       choice: 'broad' as const,
       btnClass: 'action-btn action-btn-secondary',
       label: 'Always allow',
-      ariaLabel: `Always allow ${event.tool_name}`,
+      ariaLabel: `Always allow ${broad}`,
       onClick: () => void decide(true, 'broad'),
     }] : []),
   ];
@@ -663,6 +588,7 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       mark={mark}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
+      commandGuardLink={isCommandTool(event.tool_name) && !currentCommandGuardCodingAgents()}
     />
   );
 }
@@ -691,12 +617,13 @@ interface CommandPermissionBodyProps {
 
 const BASH_TOOLS: ReadonlySet<string> = new Set(['run_bash', 'run_bash_background']);
 
-const GUARD_SHELLS: ReadonlySet<string> = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash']);
-
-/** Basename of a head token, with grouping and quote characters stripped.
- *  Mirror of the engine's `normalized_head`. */
+/** Basename of a head token, with grouping, `$'…'` and quote characters
+ *  stripped. Mirror of the engine's `normalized_head`. */
 function normalizedHead(head: string): string {
-  const unquoted = head.replace(/^[({\\]+/, '').replace(/^["']+|["']+$/g, '');
+  const unquoted = head
+    .replace(/^[({\\]+/, '')
+    .replace(/^\$(?=["'])/, '')
+    .replace(/^["']+|["']+$/g, '');
   return unquoted.split('/').pop() || unquoted;
 }
 
@@ -729,7 +656,7 @@ function tailRunsMoreCommands(tail: string): boolean {
 function unwrapShellCommand(command: string): string {
   const trimmed = command.trimStart();
   const first = trimmed.split(/\s+/).filter(Boolean)[0];
-  if (!first || !GUARD_SHELLS.has(normalizedHead(first))) return command;
+  if (!first || !listed(GUARD_SHELLS, normalizedHead(first))) return command;
 
   // Walk EVERY whitespace-delimited token for the `-c` cluster, as the engine
   // does. Testing only the first dash token gave up on `bash -o pipefail -c
@@ -821,16 +748,30 @@ function redirectTokenNeedsTarget(tok: string): boolean | null {
   return rest.length === op[1].length;
 }
 
-/** The command head shown on the Bash narrow / session buttons — mirror of the
- *  engine's `first_command_token`: unwrap a shell wrapper, skip privilege
+/** Every shell `-c` layer unwrapped, up to the engine's `MAX_SHELL_LAYERS`.
+ *  Mirror of the innermost entry of the engine's `shell_layers`. */
+function innermostShellScript(command: string): string {
+  let current = command;
+  for (let layer = 0; layer < MAX_SHELL_LAYERS; layer++) {
+    const inner = unwrapShellCommand(current);
+    if (inner === current) break;
+    current = inner;
+  }
+  return current;
+}
+
+/** The command head a card names when its event carries no `grant_head`. It
+ *  mirrors the engine's `first_command_token`: unwrap every shell layer, skip privilege
  *  prefixes and `VAR=value` assignments, take the basename. `null` for an empty
- *  command. Pinned by `__tests__/permission-card-command-head.test.ts`. */
+ *  command, or a head that runs its arguments (`GRANTS_NOTHING_HEADS`), since
+ *  the engine stores no grant for one. Pinned by
+ *  `__tests__/permission-card-command-head.test.ts`. */
 export function commandHead(command: string): string | null {
-  const benign = new Set(['sudo', 'env', 'command', 'time', 'nice', 'builtin', 'exec']);
-  const toks = unwrapShellCommand(command).trim().split(/\s+/).filter(Boolean);
+  const toks = innermostShellScript(command).trim().split(/\s+/).filter(Boolean);
   let i = 0;
   while (i < toks.length) {
-    if (benign.has(toks[i]) || (!toks[i].startsWith('-') && toks[i].includes('='))) {
+    if (listed(BENIGN_PREFIX_WORDS, toks[i])
+      || (!toks[i].startsWith('-') && toks[i].includes('='))) {
       i++;
       continue;
     }
@@ -839,7 +780,7 @@ export function commandHead(command: string): string | null {
     i += needsTarget ? 2 : 1;
   }
   const head = toks[i];
-  if (!head) return null;
+  if (!head || listed(GRANTS_NOTHING_HEADS, normalizedHead(head))) return null;
   const base = head.split('/').filter(Boolean).pop();
   return base || null;
 }

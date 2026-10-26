@@ -18,6 +18,8 @@ import {
   setFocusedThread,
 } from '../store';
 import { nativeFullscreenElement } from '../appFullscreenHost';
+import { isTauri } from '../../utils/platform';
+import { listen, setWindowFullscreen, WINDOW_FULLSCREEN_CHANGED_EVENT } from '../../utils/tauri';
 import { APP_FRAME_ISOLATED } from '../../components/apps/appFrameSandbox';
 import { warmAppIcons } from '../../components/shared/AppIcon';
 import { askFrame } from './app-bridge';
@@ -587,6 +589,54 @@ export function exitPseudoFullscreen(): void {
   appPseudoFullscreen.value = false;
 }
 
+/** Window commands go out one at a time, in signal order. A quick toggle pair
+ *  then cannot send its exit ahead of its entry. */
+let windowCommands: Promise<void> = Promise.resolve();
+
+/** This page put the window into fullscreen, so it must take it out again. A
+ *  window the user already made fullscreen is never owned. */
+let windowFullscreenOwned = false;
+
+/** This page asked the window to leave fullscreen, and the shell's report of
+ *  that exit has not arrived. It is that report's echo, not a macOS-side exit.
+ *  An entry sent meanwhile sees a window still fullscreen, which is the page's
+ *  own doing, so it counts as owned. */
+let windowExitEchoPending = false;
+
+function syncWindowFullscreen(pseudo: boolean): void {
+  windowCommands = windowCommands.then(async () => {
+    if (pseudo) {
+      const wasFullscreen = await setWindowFullscreen(true);
+      windowFullscreenOwned = !wasFullscreen || windowExitEchoPending;
+    } else if (windowFullscreenOwned) {
+      windowFullscreenOwned = false;
+      windowExitEchoPending = true;
+      await setWindowFullscreen(false).catch((e) => {
+        windowExitEchoPending = false;
+        throw e;
+      });
+    }
+  }).catch(() => { /* the window is already leaving fullscreen */ });
+}
+
+/** Keep the desktop client's window fullscreen in step with pseudo-fullscreen.
+ *  Every way into and out of it is the one signal, so no exit path can forget
+ *  the window. A macOS-side exit (green button, Ctrl+Cmd+F) drops
+ *  pseudo-fullscreen in turn. A no-op in the browser. */
+export function installAppFullscreenWindowSync(): void {
+  if (!isTauri()) return;
+  appPseudoFullscreen.subscribe(syncWindowFullscreen);
+  void listen<boolean>(WINDOW_FULLSCREEN_CHANGED_EVENT, (e) => {
+    if (e.payload) return;
+    if (windowExitEchoPending) {
+      windowExitEchoPending = false;
+      return;
+    }
+    windowFullscreenOwned = false;
+    exitPseudoFullscreen();
+  }).catch(() => { /* no native bridge: pseudo-fullscreen still fills the window */ });
+}
+
 /** Leave whichever fullscreen mode an app panel is in, and report whether there
  *  was one to leave. The single definition of "come back to the normal layout",
  *  shared by the header's Fullscreen toggle and by navigation that has to make
@@ -622,6 +672,14 @@ export function toggleAppFullscreen(): void {
   // layout. Shared with the navigation that has to reveal something other
   // than the app, so there is one definition of how to leave.
   if (exitAppFullscreen()) return;
+
+  // The desktop client fullscreens the WINDOW (`installAppFullscreenWindowSync`
+  // follows the signal). Element fullscreen needs a user gesture a forwarded
+  // shortcut lacks, and it moves the web view into another AppKit window.
+  if (isTauri()) {
+    if (getVisibleAppFrame()) appPseudoFullscreen.value = true;
+    return;
+  }
 
   // Try native fullscreen on the app PANEL (not the iframe), fall back to CSS
   // pseudo-fullscreen. The panel is the target because a natively fullscreen

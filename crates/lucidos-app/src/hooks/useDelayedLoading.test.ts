@@ -12,7 +12,14 @@
  * delay behavior itself.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { delayedFlagEffect, lingeringFlagEffect, SPINNER_DELAY_MS } from './useDelayedLoading';
+import {
+  delayedFlagEffect,
+  lingeringFlagEffect,
+  minimumVisibleFlagEffect,
+  LOADER_MIN_VISIBLE_MS,
+  SPINNER_DELAY_MS,
+  type FloorTimer,
+} from './useDelayedLoading';
 
 describe('delayedFlagEffect', () => {
   beforeEach(() => vi.useFakeTimers());
@@ -94,5 +101,76 @@ describe('lingeringFlagEffect', () => {
     vi.advanceTimersByTime(1000);
     expect(h.lingering).toBe(true);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('minimumVisibleFlagEffect', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  function harness() {
+    let held = false;
+    const floor: FloorTimer = { current: undefined };
+    const setHeld = (v: boolean) => { held = v; };
+    return {
+      floor,
+      run: (active: boolean) => minimumVisibleFlagEffect(active, setHeld, LOADER_MIN_VISIBLE_MS, floor),
+      get held() { return held; },
+    };
+  }
+
+  it('holds from the moment the loader appears', () => {
+    const h = harness();
+    h.run(true);
+    expect(h.held).toBe(true);
+  });
+
+  it('keeps holding after active drops until the floor elapses, measured from the rise', () => {
+    const h = harness();
+    h.run(true);
+    vi.advanceTimersByTime(40); // load ends 40 ms after the skeleton appeared
+    h.run(false);
+    vi.advanceTimersByTime(LOADER_MIN_VISIBLE_MS - 40 - 1);
+    expect(h.held).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(h.held).toBe(false);
+  });
+
+  it('a load that outlasts the floor is not extended: the hold is already over when active drops', () => {
+    const h = harness();
+    h.run(true);
+    vi.advanceTimersByTime(LOADER_MIN_VISIBLE_MS * 4);
+    expect(h.held).toBe(false);
+    h.run(false);
+    expect(h.held).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a loader that never appeared holds nothing', () => {
+    const h = harness();
+    h.run(false);
+    expect(h.held).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('a re-show mid-hold keeps the original clock instead of starting a second one', () => {
+    const h = harness();
+    h.run(true);
+    vi.advanceTimersByTime(100);
+    h.run(false);
+    h.run(true);
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(LOADER_MIN_VISIBLE_MS - 100);
+    expect(h.held).toBe(false);
+  });
+
+  it('a new show after the floor ended starts a fresh hold', () => {
+    const h = harness();
+    h.run(true);
+    vi.advanceTimersByTime(LOADER_MIN_VISIBLE_MS);
+    h.run(false);
+    h.run(true);
+    expect(h.held).toBe(true);
+    expect(vi.getTimerCount()).toBe(1);
   });
 });

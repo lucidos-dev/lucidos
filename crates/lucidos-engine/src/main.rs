@@ -1419,7 +1419,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lucidos_engine::engine::pending_change_watch::spawn(shared_engine.clone());
     lucidos_engine::engine::summary_tree::spawn(shared_engine.clone());
     lucidos_engine::engine::agent_recovery::spawn_branch_work_net(shared_engine.clone());
-    lucidos_engine::engine::successor::spawn_successor_archive_net(shared_engine.clone());
+    // A handoff this engine's predecessor recorded and never acted on.
+    lucidos_engine::engine::successor::start_pending_successor_sessions(shared_engine.clone())
+        .await;
 
     // Serve the last discovered Claude Code model list, and refresh it in the
     // background when it is missing or stale.

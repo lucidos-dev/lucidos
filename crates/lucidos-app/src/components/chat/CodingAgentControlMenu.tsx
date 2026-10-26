@@ -238,7 +238,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent,
     if (!folded || !anchor) return;
     codingAgentFoldOpenRequest.value = null;
     if (!untracked(() => codingAgentCommandsReady.value)) {
-      showToast(isClaudeCode ? 'Claude Code commands are still loading' : 'Codex has no slash commands', 'info');
+      showToast('Claude Code commands are still loading', 'info');
       return;
     }
     foldAnchorRef.current = anchor;

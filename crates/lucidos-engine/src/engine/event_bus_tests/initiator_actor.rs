@@ -350,6 +350,7 @@ async fn initiator_preserved_on_session_started_upsert() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

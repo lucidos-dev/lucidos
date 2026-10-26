@@ -541,28 +541,82 @@
     opacity: 1;
 }
 
-/* Round icon variant of the send/cancel morph. Replaces the old text label
- * ("Send" / "Cancel") with a single compact circle that swaps only its glyph
- * between the send (up-arrow) and stop (square) states — saving horizontal
- * space on mobile while staying the .action-btn blue across both states. The
- * padding/min-width from .action-btn are reset so the circle isn't stretched
- * by the label-era sizing. The diameter is sized to sit at the height of the
- * neighbouring text action buttons (Save / Diff / Apply) so the row reads as
- * one cluster, not an oversized primary button. */
-.send-cancel-round {
-    min-width: 0;
-    width: var(--send-round-size);
-    height: var(--send-round-size);
-    padding: 0;
-    border-radius: var(--radius-round);
+/* The action slot: the one control at the composer row's right edge. Send,
+ * Stop, an answer and every banner face wear it, and it keeps one box per
+ * face set whatever it says (ADR 0573).
+ *
+ * Desktop face: a fixed-width button with the .action-btn corner. The icon
+ * holds one spot at the left, and the word centres on the whole button, so a
+ * face change moves neither. A split keeps its caret inside the same width.
+ * Compact face (`data-composer-compact` on the row): the round icon button,
+ * with the word kept as the accessible name. */
+.action-slot {
+    position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    width: var(--action-slot-width);
+    min-width: 0;
+    height: var(--send-round-size);
+    padding: 0 1.75rem;
+    border-radius: var(--radius-control);
 }
-.send-cancel-round svg {
+
+.action-slot-icon {
+    position: absolute;
+    left: 0.625rem;
+    display: inline-flex;
+}
+
+.action-slot-icon svg {
     width: 0.9375rem;
     height: 0.9375rem;
+}
+
+.action-slot-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.split-button:has(> .action-slot) {
+    width: var(--action-slot-width);
+}
+
+.split-button > .action-slot {
+    flex: 1;
+    width: auto;
+    padding: 0 0.375rem 0 1.625rem;
+}
+
+.split-button > .action-slot ~ .split-button-caret {
+    padding: 0 0.25rem;
+    border-radius: 0 var(--radius-control) var(--radius-control) 0;
+}
+
+[data-composer-compact] .action-slot,
+[data-composer-compact] .split-button:has(> .action-slot) {
+    width: var(--send-round-size);
+}
+
+[data-composer-compact] .action-slot,
+[data-composer-compact] .split-button > .action-slot {
+    padding: 0;
+    border-radius: var(--radius-round);
+}
+
+[data-composer-compact] .action-slot-icon {
+    position: static;
+}
+
+/* Out of sight, still the button's name for a screen reader. */
+[data-composer-compact] .action-slot-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
 }
 
 /* Split button: a one-tap primary face joined to a caret that opens an upward
@@ -575,18 +629,6 @@
     position: relative;
     display: flex;
     align-items: stretch;
-}
-
-/* A face that still takes presses reads disabled through aria-disabled. It
-   looks as `.action-btn:disabled` does and keeps its fill on hover. */
-.split-button-primary[aria-disabled="true"] {
-    opacity: 0.4;
-    cursor: default;
-}
-@media (hover: hover) {
-    .split-button-primary.action-btn-confirm[aria-disabled="true"]:hover {
-        background-color: var(--confirm-bg);
-    }
 }
 
 /* Archive held back by a sub-thread (ADR 0378). It looks disabled but still
@@ -718,9 +760,26 @@ html[data-theme-mode="dark"] .split-button.open::before {
  * layout, so the steady base holds. flex:1 makes [Apply*] fill the row
  * so it + the caret span the same width as the Diff / Discard pills above. */
 .split-button.open .split-button-primary,
-.split-button.open .split-button-caret {
+.split-button.open .split-button-caret,
+.split-button.open .split-button-whole {
     position: relative;
     z-index: 1;
+}
+
+/* A face that opens the menu is a round button too narrow to frame the menu.
+ * So the menu stands alone above it, right-aligned and whole, and no frame
+ * wraps the button. */
+.split-button:has(> .split-button-whole) .split-button-menu {
+    left: auto;
+    right: 0;
+    min-width: 8rem;
+    margin-bottom: 0.375rem;
+    border-bottom: 1px solid color-mix(in srgb, var(--border-color) 80%, transparent);
+    border-radius: var(--radius-surface);
+}
+
+.split-button:has(> .split-button-whole).open::before {
+    content: none;
 }
 
 .split-button.open .split-button-primary {
@@ -1447,6 +1506,12 @@ html[data-theme-mode="dark"] .split-button.open::before {
     max-height: min(24rem, calc(var(--app-height, 100dvh) - 4rem - var(--safe-area-top)));
 }
 
+/* Room for a table to sit unscrolled: the keep-alive math's five columns. */
+.explainer-popover-wide {
+    width: min(34rem, var(--anchored-popover-fit));
+    max-height: min(44rem, calc(var(--app-height, 100dvh) - 4rem - var(--safe-area-top)));
+}
+
 /* Explainer copy is the whole point of the popover, so it reads at full
    strength. The shell's body class makes it the scroller. */
 .surface-body.explainer-body {
@@ -1678,6 +1743,30 @@ html[data-theme-mode="dark"] .split-button.open::before {
 
 .system-attention-badge-slot::before {
     content: '\2060';
+}
+
+/* Authored HTML: every host element that receives sanitizer output
+   (`renderMarkdown.ts`). The clip confines the paint and hit-testing of every
+   descendant, fixed ones included, to the box plus a little room. It also
+   makes a stacking context. So no authored style or host class can cover
+   the app chrome (ADR 0570).
+
+   The room is ring room on every side, and on the left room for an
+   ordered list's numbers, which hang outside the list box. `contain: paint`
+   clipped both, and also stopped child margins collapsing. The left room is
+   the narrowest gutter around any host, a reply's, so a fixed descendant
+   never reaches past the pane edge.
+
+   A span site sets a display, so the clip is one box. HOST ONLY: an app frame
+   is its own boundary. Guarded by `authored-html-guard.test.ts`. */
+.authored-html {
+    --authored-html-marker-room: var(--space-md);
+    clip-path: inset(
+        calc(-1 * var(--focus-ring-width))
+        calc(-1 * var(--focus-ring-width))
+        calc(-1 * var(--focus-ring-width))
+        calc(-1 * var(--authored-html-marker-room))
+    );
 }
 
 /* An inline markdown image opens the image popup, which is where it can be
@@ -1990,10 +2079,11 @@ mark.search-match {
 /* ── App icon (ADR 0414) ─────────────────────────────────────────────────────
    The one tile every app and widget picture sits on (`AppIcon`). A surface
    sizes it through --app-icon-size, and a large one rounds it more through
-   --app-icon-radius. An image fills the tile unframed, since most icons
-   draw their own background. The monogram tile tints the theme hue
+   --app-icon-radius. A theme hairline outlines the image or monogram.
+   The monogram tile tints the theme hue
    `AppIcon` picks from the app id. */
 .app-icon {
+    position: relative;
     flex: none;
     display: inline-flex;
     align-items: center;
@@ -2005,6 +2095,16 @@ mark.search-match {
     overflow: hidden;
     -webkit-user-select: none;
     user-select: none;
+}
+
+/* Paint above opaque images without changing their bounds or hit targets. */
+.app-icon::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    box-shadow: inset 0 0 0 1px var(--border-color);
+    pointer-events: none;
 }
 
 .app-icon-image img {

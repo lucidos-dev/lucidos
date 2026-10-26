@@ -202,6 +202,14 @@ impl LlmProvider for AnthropicProvider {
         self.chat_anthropic(messages, tools, selection, system_prompt, on_token)
             .await
     }
+
+    async fn prefill(
+        &self,
+        body: &crate::llm::prefill::PrefillBody,
+        _call: crate::llm::metered::CallToken,
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.prefill_anthropic(body).await
+    }
 }
 
 #[cfg(test)]

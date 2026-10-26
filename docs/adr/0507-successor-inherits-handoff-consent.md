@@ -1,6 +1,6 @@
 # 0507: A successor inherits the consent that started it: amends 0493, 0503 and 0505
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0560](0560-successor-session-in-the-same-thread.md): a handoff needs no authority, so there is no consent to inherit.
 - **Date**: 2026-10-17
 - **Amends**: [0493](0493-a-plan-cards-new-thread-pick-is-owner-consent.md), [0503](0503-build-chain.md), [0505](0505-named-handoff-checkpoints.md)
 

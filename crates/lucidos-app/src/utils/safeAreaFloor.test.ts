@@ -163,13 +163,16 @@ describe('viewportShapeKey', () => {
   });
 
   it('falls back to the aspect ratio without screen.orientation', () => {
-    expect(viewportShapeKey({ orientation: undefined, width: 393, height: 852 })).toBe('portrait:393');
-    expect(viewportShapeKey({ orientation: undefined, width: 852, height: 393 })).toBe('landscape:852');
+    expect(viewportShapeKey({ orientation: undefined, width: 393, height: 852 })).toBe('portrait:393x852');
+    expect(viewportShapeKey({ orientation: undefined, width: 852, height: 393 })).toBe('landscape:852x393');
   });
 
-  it('ignores a height change, which the keyboard can cause', () => {
-    const open = viewportShapeKey({ orientation: 'portrait-primary', width: 393, height: 500 });
-    const closed = viewportShapeKey({ orientation: 'portrait-primary', width: 393, height: 852 });
-    expect(open).toBe(closed);
+  it('keeps a page below an opaque status bar from borrowing the inset of a page behind it', () => {
+    const memory = createSafeAreaMemory(memoryStorage());
+    memory.set(viewportShapeKey({ orientation: 'portrait-primary', width: 393, height: 852 }), PORTRAIT);
+
+    const belowBar = viewportShapeKey({ orientation: 'portrait-primary', width: 393, height: 793 });
+    const reading = { ...PORTRAIT, top: 0 };
+    expect(foldSafeAreaReading(memory.get(belowBar), reading).floor).toBeNull();
   });
 });

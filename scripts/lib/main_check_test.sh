@@ -367,6 +367,27 @@ test_no_verdict_is_its_own_answer() {
     fi
 }
 
+test_a_shard_whose_setup_failed_is_no_verdict_and_names_the_task() {
+    echo "test: a report whose only bad shard failed its setup is no verdict, naming the shard and the task"
+    run_check "$(fake_driver setup-failed 76 "$E2E_GITHUB_LINKED_MARK$RUN_URL $RUN_BRANCH
+══ browser: chromium (GitHub) ══
+ERROR: warm-up task apt failed (exit 1). Its log ends:
+ERROR: the chromium-5-7 shard's apt setup failed (exit 77), so it tested nothing.
+
+── Per-project exit codes ──
+  chromium: 76")"
+    if [ "$RC" = "$E2E_GITHUB_NO_VERDICT_EXIT" ] && [ "$(verdict_field verdict)" = no-verdict ]; then
+        pass "no verdict, so no red and no fix thread"
+    else
+        fail "rc=$RC out=$OUT"
+    fi
+    if [ "$(verdict_field summary)" = "the chromium-5-7 shard's apt setup failed (exit 77), so it tested nothing." ]; then
+        pass "the summary names the shard and the warm-up task"
+    else
+        fail "summary: $(verdict_field summary)"
+    fi
+}
+
 test_a_crash_with_no_report_still_fails_with_a_tail() {
     echo "test: a red exit with no report still fails, with the last lines as its tail"
     run_check "$(fake_driver crash 2 "$E2E_GITHUB_LINKED_MARK$RUN_URL $RUN_BRANCH
@@ -505,6 +526,7 @@ test_a_green_run_passes_and_names_its_run
 test_attach_hands_the_run_to_the_driver
 test_a_red_run_names_what_failed
 test_no_verdict_is_its_own_answer
+test_a_shard_whose_setup_failed_is_no_verdict_and_names_the_task
 test_a_crash_with_no_report_still_fails_with_a_tail
 test_the_verdict_maps_every_exit
 test_a_cargo_failure_names_its_test_and_panic

@@ -135,6 +135,9 @@ fn context_captured_event_type_and_persistence() {
             modality: None,
             service_tier: None,
             cache_creation_1h_tokens: None,
+            cache_creation_30m_tokens: None,
+            cache_creation_12h_tokens: None,
+            cache_creation_requested_ttl: None,
         }),
         trimmed: false,
         trim_passes: Vec::new(),
@@ -149,6 +152,7 @@ fn context_captured_event_type_and_persistence() {
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        session: None,
     };
     assert_eq!(event.event_type(), "ContextCaptured");
     assert!(event.is_persisted());
@@ -316,6 +320,7 @@ fn a_turn_capture_writes_neither_new_key() {
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        session: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert!(json.get("purpose").is_none());
@@ -718,6 +723,7 @@ fn is_per_token_streaming_allows_per_action_lifecycle_and_blocking_request_varia
         tool_name: String::new(),
         input: serde_json::Value::Null,
         summary: String::new(),
+        grant_offer: None,
     }
     .is_per_token_streaming());
     assert!(!ThreadEvent::CredentialRequested {

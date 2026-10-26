@@ -56,6 +56,16 @@ class FakeEl {
     this.row = row;
   }
 
+  /** The node's own listeners. A detached node still hears its touch, though
+   *  the document does not. See `fireOnDetached`. */
+  private listeners: { type: string; fn: (e: unknown) => void; signal?: AbortSignal }[] = [];
+  addEventListener(type: string, fn: (e: unknown) => void, opts?: { signal?: AbortSignal }) {
+    this.listeners.push({ type, fn, signal: opts?.signal });
+  }
+  dispatch(e: { type: string }) {
+    for (const l of this.listeners) if (l.type === e.type && !l.signal?.aborted) l.fn(e);
+  }
+
   get tagName() { return 'BUTTON'; }
   getAttribute(name: string) { return name === 'aria-label' ? this.label : null; }
   get classList() {
@@ -170,6 +180,14 @@ function fire(type: string, event: Record<string, unknown>) {
     if (Array.isArray(e.touches)) e.touches = (e.touches as unknown[]).slice(1);
   }
   (globalThis.document as unknown as { dispatchEvent(x: unknown): void }).dispatchEvent(e);
+}
+
+/** A touch event aimed at a node the page has removed. It reaches only the
+ *  node's own listeners: a detached node is not on the path to `document`. */
+function fireOnDetached(el: FakeEl, type: string, event: Record<string, unknown>) {
+  const e: Record<string, unknown> = { type, ...event };
+  if (Array.isArray(e.touches)) e.touches = (e.touches as unknown[]).slice(1);
+  el.dispatch(e as { type: string });
 }
 
 interface Line {
@@ -423,6 +441,28 @@ describe('the press ledger keeps every press it watched', () => {
       expect.stringContaining('the lift never arrived'),
       'warning',
     );
+  });
+
+  it('hears the lift on a face the page removed mid-press', () => {
+    // The ledger's Submit answer: the row re-rendered 24 times under the
+    // finger, and the answer landed. The lift went to the detached node, which
+    // the document never hears, so the next tap toasted a false `no-lift`.
+    fire('touchstart', touch(send, 350, 420));
+    send.isConnected = false;
+    fireOnDetached(send, 'touchend', touch(send, 350, 420));
+    notePressOutcome('served');
+    vi.advanceTimersByTime(LIFT_DEADLINE_MS);
+    expect(verdicts()).toEqual(['served']);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('settles a lift both the document and the node heard once', () => {
+    fire('touchstart', touch(send, 350, 420));
+    fire('touchend', touch(send, 350, 420));
+    send.dispatch({ type: 'touchend', ...touch(send, 350, 420) });
+    notePressOutcome('served');
+    vi.advanceTimersByTime(1000);
+    expect(verdicts()).toEqual(['served']);
   });
 
   it('does not call a second finger a lost lift', () => {
@@ -847,6 +887,17 @@ describe('a dead composer tap runs the recovery the user runs by hand', () => {
     vi.advanceTimersByTime(700);
     expect(writes).toEqual(['108px', '476px']);
     expect(props['--app-height']).toBe('476px');
+  });
+
+  it('relayouts for a dead tap whose node the page removed mid-press', () => {
+    // The lift reaches only the detached node, never the document.
+    settleHealthy();
+    wedged();
+    fire('touchstart', touch(row, 10, 420));
+    row.isConnected = false;
+    fireOnDetached(row, 'touchend', touch(row, 10, 420));
+    vi.advanceTimersByTime(700);
+    expect(writes).toEqual(['108px', '476px']);
   });
 
   it('spends it on the FIRST dead tap, not the tenth', () => {

@@ -394,20 +394,16 @@ function LadderBlock({
     if (next) void saveRungs(next);
   });
 
-  /** Make `rung` the default. On Codex, whose default ships unset, the star
-   *  on the default clears it again. */
+  /** Make `rung` the default. The star on the default does nothing. */
   const star = async (rung: ServedIntelligenceRung) => {
-    const clears = rung.is_default && surface === 'codex';
-    if (rung.is_default && !clears) return;
+    if (rung.is_default) return;
     if (surface === 'chat') {
       await setChatModelSelection({ model: rung.model, reasoningEffort: rung.effort });
       return;
     }
     const prefs = LADDER_PREFS[surface];
     const what = `the ${name} default`;
-    if (clears) {
-      if (await write(what, deletePreference(prefs.model))) await write(what, deletePreference(prefs.effort));
-    } else if (await write(what, setPreference(prefs.model, rung.model))) {
+    if (await write(what, setPreference(prefs.model, rung.model))) {
       await write(what, setPreference(prefs.effort, rung.effort));
     }
   };

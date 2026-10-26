@@ -2,7 +2,7 @@ import type { ComponentChildren, RefObject } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { batch, computed, effect, signal, useSignal } from '@preact/signals';
-import { threadMap, focusedThreadId, threadsLoaded, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerGrouping, setDrawerGrouping, selectedOngoingGroup, setSelectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, isSplitOngoingGroup, type OngoingFilter, type OngoingPart, type SplitOngoingGroup, ONGOING_GROUPS, type OngoingGroup, type DrawerGrouping, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
+import { threadMap, focusedThreadId, threadsLoaded, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerGrouping, setDrawerGrouping, selectedOngoingGroup, setSelectedOngoingGroup, ongoingFilterChoice, setOngoingFilterChoice, isSplitOngoingGroup, type OngoingFilter, type OngoingPart, type SplitOngoingGroup, ONGOING_GROUPS, type OngoingGroup, repositories, focusedPane, scaledDurationMs, showToast, ALL_CHANNELS, clearThreadFilter } from '../../store/store';
 import { drawnDrawerShown, drawnDrawerWidth } from '../layout/drawnLayout';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
@@ -14,9 +14,8 @@ import { LeavingViewSnapshot, type LeavingDrawing } from './LeavingViewDrawing';
 import { focusPane, showThreadList } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
 import { handleArchiveAll } from '../../store/actions/archive-all';
-import { openOngoingThread } from '../../store/actions/event-navigation';
+import { landingGroupFor, openListedThread, openOngoingThread } from '../../store/actions/event-navigation';
 import { preferencesSettled } from '../../store/actions/preferences';
-import type { LandingGroup } from '../../store/thread-events';
 import { loadOlderThreads, reloadAfterFilterChange, filterChangedSinceLoad, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon } from '../shared/ThreadStatusIcon';
 import { ThreadIcon } from '../shared/ThreadIcon';
@@ -30,9 +29,11 @@ import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import { applyNavFocus } from '../shared/focusMarker';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
+import { sameCodingAgents } from '../../store/thread-events/thread-meta';
 import { getDraft } from '../../store/composeDrafts';
 import type { DisplaySection } from '../../generated/thread-lifecycle';
-import { formatThreadChannelLabel } from '../../utils/formatChannel';
+import { formatChannel, formatThreadChannelLabel } from '../../utils/formatChannel';
+import type { CodingAgent } from '../../api/types';
 import { threadContextName, type ThreadContextFields } from './threadContextName';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { formatMessageTimestamp } from '../../utils/formatTime';
@@ -44,11 +45,13 @@ import { forgetSavedScroll } from '../../store/savedScroll';
 import { useRowActionsGesture } from '../shared/useRowActionsGesture';
 import { RowWindowContext, WindowedRows, replanDrawerRowWindow, revealDrawerRow, rowWindowIsMounted, useRowWindowController } from './WindowedRows';
 import { getRemPx } from '../../utils/dom';
+import { clearStackedMark, placeStackedMark } from './agentMarkLift';
 import { isMobile } from '../../utils/viewport';
 import { scrollBehavior } from '../../utils/motion';
 import type { ThreadSearchResult } from '../../api/threads';
-import { PinIcon, CurrentIcon, ArchiveIcon, DraftsIcon, BlockedIcon, ReviewIcon, InFlightIcon, SearchIcon, ChevronRightIcon } from '../shared/icons';
-import type { ComponentType } from 'preact';
+import { PinIcon, CurrentIcon, ArchiveIcon, DraftsIcon, BlockedIcon, ReviewIcon, InFlightIcon, SearchIcon, ChevronRightIcon, ClaudeIcon, CodexIcon, LucidosMarkIcon } from '../shared/icons';
+import { CategoryIcon } from '../shared/CategoryIcon';
+import type { ComponentType, VNode } from 'preact';
 
 // `threadPassesChannelFilter` lives in `store/threadFilter.ts` (shared with the
 // infinite-scroll cursor in `thread-loading.ts`); re-exported here so existing
@@ -201,7 +204,7 @@ export function selectHighlighted() {
     const node = navNodes.value.find(n => nodeKey(n) === key);
     if (node?.kind === 'section') toggleSectionCollapse(node.sectionKey);
     else if (node?.kind === 'tile') pressOngoingTile(node.group);
-    else if (!isSectionNavKey(key)) openListedThread(key);
+    else if (!isSectionNavKey(key)) openKeyedThread(key);
 }
 
 /** Press an Ongoing tile: select its group. A press on the selected tile of a
@@ -215,24 +218,13 @@ function pressOngoingTile(group: OngoingGroup): void {
 /** Open a thread row of the drawer's current list the way a click on it does:
  *  a search hit is loaded into the map first, and a Blocked or Review row
  *  opens on what needs the user. */
-function openListedThread(id: string): void {
+function openKeyedThread(id: string): void {
     const searchResult = threadSearchResults.value;
-    const searching = threadSearchQuery.value.trim().length > 0;
-    if (searching && searchResult.status === 'loaded') {
+    if (threadSearchQuery.value.trim().length > 0 && searchResult.status === 'loaded') {
         const match = searchResult.data.find((r: ThreadSearchResult) => r.thread_id === id);
         if (match) void ensureThreadInMap(match);
     }
-    const landing = searching ? null : landingGroupFor(drawerGrouping.value, selectedOngoingGroup.value);
-    if (landing) openOngoingThread(id, landing);
-    else focusThread(id);
-}
-
-/** Pure: the group a row of the list on screen lands from, or null. A Blocked
- *  or Review row opens on what needs the user; every other row opens the
- *  thread as it was. */
-export function landingGroupFor(grouping: DrawerGrouping, selected: OngoingGroup): LandingGroup | null {
-    if (grouping !== 'ongoing') return null;
-    return selected === 'blocked' || selected === 'review' ? selected : null;
+    openListedThread(id);
 }
 
 /** Pure: the thread row `delta` steps from `currentId` in the drawer's list, or
@@ -267,7 +259,7 @@ export function stepFocusedThreadInList(delta: 1 | -1): void {
         const id = stepThreadInList(navNodes.value, focusedThreadId.value, delta);
         if (!id) return;
         setHighlight(id);
-        openListedThread(id);
+        openKeyedThread(id);
     });
 }
 
@@ -877,6 +869,7 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
 
 import { ongoingBreakdown, ongoingFilter, ongoingPartOf, stepOngoingFilter, composingThreads, collapsedAncestorIds, computeDrawerCategorization, depthStyle, filterHiddenArchived, inboxThreadCount, nestByParent, renderedFamilyRows, ongoingGroupLists, selectedOngoingRows, threadHasUnsentDraft, visibleChildrenCount } from './family-graph';
 import type { DrawerCategorization, FamilyGraph, NestedThread } from './family-graph';
+import { hasUnseenBlocked } from '../../store/blockedSeen';
 export * from './family-graph';
 function ThreadList({ frozen }: { frozen: boolean }) {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -1439,6 +1432,63 @@ function RowActions({ children }: { children: ComponentChildren }) {
     return <span class="thread-row-actions-line"><span class="thread-row-actions">{children}</span></span>;
 }
 
+type AgentGlyph = 'claude' | 'codex' | 'trigger' | 'lucidos';
+
+const AGENT_GLYPHS: Record<AgentGlyph, () => VNode> = {
+    claude: () => <ClaudeIcon />,
+    codex: () => <CodexIcon />,
+    trigger: () => <CategoryIcon category="triggers" />,
+    lucidos: () => <LucidosMarkIcon />,
+};
+
+/** A coding-agent thread that ran on several backends draws one mark each. */
+function isStackedAgents(channel: string | undefined, agents: CodingAgent[] | undefined): agents is CodingAgent[] {
+    return channel === 'claude_code' && !!agents && agents.length > 1;
+}
+
+function agentGlyph(channel: string, codingAgent?: CodingAgent): AgentGlyph | null {
+    if (channel === 'claude_code') return codingAgent === 'codex' ? 'codex' : 'claude';
+    if (channel === 'trigger') return 'trigger';
+    if (channel === 'chat' || channel === 'lucidos') return 'lucidos';
+    return null;
+}
+
+/** Which agent drives the thread, as its mark. It renders last on the meta line,
+ *  so every row's mark lands in the same spot. A channel with no mark keeps a
+ *  text tag, red for the engine's unknown-channel error: a guessed mark would
+ *  hide a bug. */
+function ThreadAgentMark(
+    { channel, codingAgent, codingAgents }: { channel: string; codingAgent?: CodingAgent; codingAgents?: CodingAgent[] },
+) {
+    if (isStackedAgents(channel, codingAgents)) {
+        return <ThreadAgentStack channel={channel} agents={codingAgents} />;
+    }
+    const glyph = agentGlyph(channel, codingAgent);
+    if (!glyph) {
+        const error = channel === 'error_unknown_channel' ? ' channel-error' : '';
+        return <span class={`label message-channel-tag${error}`}>{formatChannel(channel)}</span>;
+    }
+    const label = formatThreadChannelLabel(channel, codingAgent);
+    return (
+        <span class="thread-row-agent" data-glyph={glyph} role="img" aria-label={label} data-tooltip={label}>
+            {AGENT_GLYPHS[glyph]()}
+        </span>
+    );
+}
+
+/** A thread that ran on several backends: one mark each, first used on top.
+ *  The group's label names them in that order. */
+function ThreadAgentStack({ channel, agents }: { channel: string; agents: CodingAgent[] }) {
+    const names = agents.map(agent => formatThreadChannelLabel(channel, agent));
+    return (
+        <span class="thread-row-agents" role="group" aria-label={names.join(', then ')}>
+            {agents.map(agent => (
+                <ThreadAgentMark key={agent} channel={channel} codingAgent={agent} />
+            ))}
+        </span>
+    );
+}
+
 /** The repo / app / trigger name chip. A long name WRAPS inside the chip's CSS
  *  `max-width` (`.thread-row-context` in drawer.css). A constrained box sits at
  *  its constraint, not at its widest line, so a wrapped name leaves dead space.
@@ -1499,14 +1549,12 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
     if (isFocused) classes.push('thread-row-focused');
     if (isHighlighted) classes.push('thread-row-highlighted');
     // A coding draft has not bound a backend. It spawns with THIS draft's
-    // resolved backend at send time (see `sendCompose`). So the tag must read
+    // resolved backend at send time (see `sendCompose`). So the mark must read
     // that draft's own pick, never a global another draft changed. A plain chat
-    // draft is a Lucidos thread, so `formatThreadChannelLabel('chat')` gives it
-    // the same tag started chat threads wear.
+    // draft is a Lucidos thread, and wears the mark started chat threads wear.
     const draftMode = getDraft(thread.meta.id).mode;
-    const modeLabel = draftMode === 'claude_code'
-        ? formatThreadChannelLabel('claude_code', resolveCodingAgent(thread.meta.id))
-        : formatThreadChannelLabel('chat');
+    const draftChannel = draftMode === 'claude_code' ? 'claude_code' : 'chat';
+    const draftCodingAgent = draftMode === 'claude_code' ? resolveCodingAgent(thread.meta.id) : undefined;
     // The repo/app chip mirrors started threads. A coding draft hasn't bound its
     // meta yet, so it reads THIS draft's per-draft scope override (the same value
     // `sendCompose` would bind) rather than `meta.repoName`/`codingAgentKind`.
@@ -1561,13 +1609,11 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
                             the hold opens its portal. */}
                         {gesture.hostOpener.trigger ? <RowActions>{draftMenu}</RowActions> : draftMenu}
                     </span>
-                    {(createdLabel || modeLabel || contextName) && (
-                        <span class="thread-row-meta">
-                            {createdLabel && <span class="thread-row-created">{createdLabel}</span>}
-                            {modeLabel && <span class="label message-channel-tag">{modeLabel}</span>}
-                            {contextName && <ContextChip name={contextName} />}
-                        </span>
-                    )}
+                    <span class="thread-row-meta">
+                        {createdLabel && <span class="thread-row-created">{createdLabel}</span>}
+                        {contextName && <ContextChip name={contextName} />}
+                        <ThreadAgentMark channel={draftChannel} codingAgent={draftCodingAgent} />
+                    </span>
                 </div>
             </div>
         </div>
@@ -1591,6 +1637,9 @@ interface ThreadRowContentProps {
     /** Coding-agent backend for `claude_code`-channel threads — drives the
      *  "Codex" vs "Claude Code" channel tag. Absent for non-coding-agent/legacy rows. */
     codingAgent?: 'claude-code' | 'codex';
+    /** Every backend the thread ran on, first used first. Two or more draw a
+     *  stack of marks. Absent or one draws the single `codingAgent` mark. */
+    codingAgents?: CodingAgent[];
     /** Precomputed status dot, derived by the caller via `visualStatusFor`
      *  from the snapshot `status`. Every drawer row's dot is built in one pass
      *  and stays in lockstep with the list, rather than being re-read per
@@ -1661,6 +1710,7 @@ export const THREAD_ROW_PROP_ROLES = {
     createdLabel: 'layout',
     channel: 'layout',
     codingAgent: 'layout',
+    codingAgents: 'layout',
     contextName: 'layout',
     totalChildren: 'layout',
     hasDraft: 'layout',
@@ -1723,6 +1773,7 @@ export function threadRowLayoutProps(
         createdLabel: formatCreatedTimestamp(meta.createdAt),
         channel: meta.channel,
         codingAgent: meta.codingAgent,
+        codingAgents: meta.codingAgents,
         contextName: threadContextName(meta),
         totalChildren: liveChildrenCount,
         hasDraft: threadHasUnsentDraft(thread),
@@ -1743,6 +1794,26 @@ export function familyDisclosureLabel(totalChildren: number, isCollapsed: boolea
 
 function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
     const sk = useSkeleton();
+    const leftRef = useRef<HTMLDivElement>(null);
+    const stacked = !sk && isStackedAgents(props.channel, props.codingAgents);
+    useLayoutEffect(() => {
+        const left = leftRef.current;
+        if (!stacked || !left) return;
+        placeStackedMark(left);
+        // A lift changes the observed row's height, so the observer defers
+        // the re-place a frame rather than resize inside its own callback.
+        let frame = 0;
+        const observer = new ResizeObserver(() => {
+            cancelAnimationFrame(frame);
+            frame = requestAnimationFrame(() => placeStackedMark(left));
+        });
+        observer.observe(left);
+        return () => {
+            observer.disconnect();
+            cancelAnimationFrame(frame);
+            clearStackedMark(left);
+        };
+    }, [stacked, props.title]);
     const depth = props.depth ?? 0;
     const hasLiveFamily = !!props.collapsible && (props.totalChildren ?? 0) > 0;
     const hasArchivedToggle = (props.hiddenArchivedCount ?? 0) > 0;
@@ -1774,20 +1845,15 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
         props.onToggleArchivedRevealed?.();
     };
 
-    // Every thread carries a channel tag. The guard stays so an empty label, or
-    // an unknown channel, never paints an empty bordered chip.
-    const channelLabel = props.channel ? formatThreadChannelLabel(props.channel, props.codingAgent) : null;
-    const hasChips = sk || !!channelLabel || !!props.contextName;
+    const hasChips = sk || !!props.channel || !!props.contextName;
     const chips = hasChips && (
         <>
-            {sk ? (
-                <SkBlock w="4.5rem" h="1.15rem" round />
-            ) : channelLabel ? (
-                <span
-                    class={`label message-channel-tag${props.channel === 'error_unknown_channel' ? ' channel-error' : ''}`}
-                >{channelLabel}</span>
-            ) : null}
             {!sk && props.contextName && <ContextChip name={props.contextName} />}
+            {sk ? (
+                <SkBlock w="var(--icon-size-sm)" h="var(--icon-size-sm)" round />
+            ) : props.channel ? (
+                <ThreadAgentMark channel={props.channel} codingAgent={props.codingAgent} codingAgents={props.codingAgents} />
+            ) : null}
         </>
     );
 
@@ -1823,7 +1889,7 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                  // gesture has to swallow its own paired click, so the row
                  // cannot keep a separate `onClick`.
                  {...gesture.handlers}>
-                <div class="thread-row-left">
+                <div class="thread-row-left" ref={leftRef}>
                     <span class="thread-row-title-row">
                         <span class="thread-row-title-text">
                             <ThreadStatusIcon status={sk ? null : (props.visualStatus ?? null)} />
@@ -1920,6 +1986,7 @@ const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
     && prev.createdLabel === next.createdLabel
     && prev.channel === next.channel
     && prev.codingAgent === next.codingAgent
+    && sameCodingAgents(prev.codingAgents, next.codingAgents)
     && prev.visualStatus === next.visualStatus
     && prev.contextName === next.contextName
     && prev.totalChildren === next.totalChildren
@@ -2081,6 +2148,10 @@ function OngoingTile({ group, rows, hydrated, selected }: {
     const classes = ['ongoing-tile'];
     if (selected) classes.push('ongoing-tile-selected');
     if (hydrated && rows.length === 0) classes.push('ongoing-tile-empty');
+    if (group === 'blocked' && rows.length > 0) {
+        classes.push('ongoing-tile-blocked');
+        if (hasUnseenBlocked.value) classes.push('ongoing-tile-unseen');
+    }
     if (highlighted) classes.push('ongoing-tile-highlighted');
     const label = hydrated ? `${title}, ${rows.length}` : title;
     return (
@@ -2218,6 +2289,7 @@ function SearchResultRow({ result }: { result: ThreadSearchResult }) {
             createdLabel={formatCreatedTimestamp(liveThread?.meta.createdAt ?? result.created_at)}
             channel={result.channel}
             codingAgent={liveThread?.meta.codingAgent ?? result.coding_agent ?? undefined}
+            codingAgents={liveThread?.meta.codingAgents ?? result.coding_agents}
             visualStatus={visualStatus}
             contextName={threadContextName(ctxFields)}
             totalChildren={liveThread?.meta.totalChildrenCount ?? 0}

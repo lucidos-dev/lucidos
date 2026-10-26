@@ -147,7 +147,7 @@ It runs the bundle's headless service role (`Lucidos --service`) under a temp `H
 
 `runtime::codex::driver_tests` and `runtime::codex_app_server::driver_tests` spawn a `/bin/sh` stub and carry 30 s and 60 s event timeouts. Under host load they fail, and the failures look like real breakage in code the branch never touched (ADR 0292).
 
-- **`/harden` runs these two modules alone, after the Codex review is joined** (`scripts/harden-suites.sh`).
+- **`/harden` runs these two modules alone, after the other-model review ends** (`scripts/harden-suites.sh`).
 - **Never accept a driver-test failure as a finding** until you re-run the module alone on a quiet host: `./scripts/test-engine.sh -- -- runtime::codex::driver_tests runtime::codex_app_server::driver_tests`.
 
 ## Test Level Selection

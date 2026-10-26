@@ -154,7 +154,7 @@ describe('a running turn with a side question', () => {
         isLast={true}
         threadId="t1"
         threadIsCC={false}
-        threadCodingAgent="claude-code"
+        sessionCodingAgent="claude-code"
         threadIdle={false}
         threadAwaitingAnswer={false}
         threadCanceling={false}
@@ -236,7 +236,7 @@ describe('a running turn with a side question', () => {
   it('re-renders a turn only when its own cards change', () => {
     const props = {
       exchange: running, revision: 0, streamingBuffer: '', isLast: true, threadId: 't1', threadIsCC: false,
-      threadCodingAgent: 'claude-code' as const, threadIdle: false, threadAwaitingAnswer: false, threadCanceling: false,
+      sessionCodingAgent: 'claude-code' as const, threadIdle: false, threadAwaitingAnswer: false, threadCanceling: false, cacheCards: true,
     };
     const asked = card('q', 4);
     expect(chatExchangePropsEqual({ ...props, sideQuestions: [asked] }, { ...props, sideQuestions: [asked] })).toBe(true);

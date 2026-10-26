@@ -19,7 +19,7 @@ function mount(src: string, reveal: AppReveal = 'on-load'): HTMLElement {
   const host = document.createElement('div');
   document.body.appendChild(host);
   hosts.push(host);
-  act(() => { render(<AppFrame src={src} reveal={reveal} />, host); });
+  act(() => { render(<AppFrame src={src} reveal={reveal} label={{ app: 'sound', place: 'canvas' }} />, host); });
   return host;
 }
 

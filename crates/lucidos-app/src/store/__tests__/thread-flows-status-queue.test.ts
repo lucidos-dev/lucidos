@@ -744,7 +744,7 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
     } as any, new Date().toISOString());
 
     handleEventWithAgg(map, id, nextSeq(), {
-      type: 'ToolCalled', name: 'execute_intent', args: { intent_id: 'heatpump' },
+      type: 'ToolCalled', name: 'load_knowhow', args: { id: 'climate/control' },
     } as any, new Date().toISOString());
 
     const thread = map.get(id)!;

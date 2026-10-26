@@ -150,7 +150,7 @@ commit_file late.txt l "feature: late fix"
 C=$(git rev-parse HEAD)
 expect_eq "own commit alone" "INCREMENTAL
 commit $C
-codex-base $H" "$(scope "$H")"
+other-model-base $H" "$(scope "$H")"
 
 echo "two branch commits"
 new_repo owntwo
@@ -161,7 +161,7 @@ C2=$(git rev-parse HEAD)
 expect_eq "both commits, oldest first" "INCREMENTAL
 commit $C1
 commit $C2
-codex-base $H" "$(scope "$H")"
+other-model-base $H" "$(scope "$H")"
 
 echo "a branch commit, then a merge"
 new_repo ownmerge
@@ -175,7 +175,7 @@ expect_eq "first line" "INCREMENTAL" "$(printf '%s\n' "$OUT" | head -1)"
 expect_has "names the commit" "commit $C" "$OUT"
 expect_has "names the merge" "merge $M" "$OUT"
 expect_lacks "main's commit is not the branch's" "main: moved" "$OUT"
-expect_lacks "no Codex base once main's code is in range" "codex-base" "$OUT"
+expect_lacks "no review base once main's code is in range" "other-model-base" "$OUT"
 
 echo "a merge, then a fix (the merge session that finds a failing suite)"
 new_repo mergeown

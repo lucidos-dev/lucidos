@@ -52,6 +52,61 @@ impl SessionEndReason {
     }
 }
 
+/// Whether a coding-agent session carried the thread's earlier context. Carried
+/// by `SessionStarted`, so the thread can say when a session started over.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SessionContinuity {
+    /// The thread's first session. There was nothing to carry.
+    First,
+    /// The session resumed the previous one, so its context carried over.
+    Resumed,
+    /// The thread had a session before, and this one starts without it.
+    Fresh { reason: FreshSessionReason },
+    /// A *successor session*: the thread handed off, and this session starts
+    /// from the handoff's opening.
+    Handoff {
+        /// The *handoff checkpoint* the handoff ran at, when one did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<String>,
+        /// The checkpoint's progress, as `<done>/<total>`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<String>,
+        opening: HandoffOpening,
+        /// The opening itself, which the transcript folds under the session's
+        /// card. The first input may also carry the message that started it.
+        message: String,
+    },
+}
+
+/// What a *successor session* starts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HandoffOpening {
+    /// The *handoff narrative* the previous session wrote.
+    Narrative,
+    /// A *handoff brief*: the engine's note on how to rebuild the context.
+    Brief,
+}
+
+/// Why a session on a thread that had one before started fresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FreshSessionReason {
+    /// The thread's change was applied, which ends its session.
+    ChangeApplied,
+    /// The thread's change was discarded, which ends its session.
+    ChangeDiscarded,
+    /// The previous session ended rather than went idle.
+    SessionEnded,
+    /// The recorded branch is gone, and no rename of it was proven.
+    BranchGone,
+    /// The coding agent refused to resume the previous session.
+    ResumeFailed,
+    /// No resumable session was recorded for the thread's account.
+    NoResumableSession,
+}
+
 /// Why a voice session ended.
 ///
 /// A cause rather than a free string, so a reader can branch on it and a
@@ -111,8 +166,9 @@ pub enum ChildCompletionStatus {
     Interrupted,
 }
 
-/// The *handoff consent* that let a child's successor start under its parent
-/// (ADR 0507). The successor inherits it for its own automatic handoffs.
+/// The retired *handoff consent* that let a child's legacy successor thread start
+/// under its parent (ADR 0507). Kept so legacy `SuccessorThreadSpawned` events
+/// still deserialize. A handoff needs no authority now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HandoffConsent {

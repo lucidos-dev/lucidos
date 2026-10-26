@@ -556,6 +556,7 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })
@@ -576,6 +577,7 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta::NONE,
     })

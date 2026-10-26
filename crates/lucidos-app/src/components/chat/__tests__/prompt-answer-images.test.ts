@@ -6,7 +6,6 @@
  * PromptInput drags in every chat signal and store.
  */
 import { describe, it, expect } from 'vitest';
-import { createTapGate, touchActivated } from '../../../utils/tapGesture';
 import { composerEnterSends } from '../prompt-input-helpers';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
@@ -44,7 +43,7 @@ describe('PromptInput sends images with an answer', () => {
   });
 
   it('images alone can submit a multi-select answer', () => {
-    expect(promptSource).toMatch(/submitMultiDisabled = submitMultiCount === 0 && images\.length === 0/);
+    expect(promptSource).toMatch(/imageCount: images\.length/);
   });
 
   it('the pending-question walk reuses isAnsweringQuestion instead of repeating the literal', () => {
@@ -70,73 +69,27 @@ describe('PromptInput sends images with an answer', () => {
 const cancelButtonSource = (): string =>
   promptSource.match(/answerMode === 'cancel' \? \([\s\S]*?<\/button>/)?.[0] ?? '';
 
-describe('every hold turns on side-question mode', () => {
-  it('marks the hold so its release does not also act', () => {
-    expect(promptSource).toMatch(
-      /function releaseEndsHold\(\): boolean \{\s*if \(!heldSendRef\.current\) return false;\s*heldSendRef\.current = false;/,
-    );
-    // Every new press clears the mark, so it belongs to one gesture only.
-    expect(promptSource).toMatch(/onPointerDown: \(e: PointerEvent\) => \{\s*heldSendRef\.current = false;/);
+describe('no composer button has a hold', () => {
+  // A lost iOS lift read as a held finger and turned on side-question mode
+  // under a plain tap on Send. Side questions start from the toggle and the
+  // shortcut, which are taps.
+  it('PromptInput imports no long-press machinery', () => {
+    expect(promptSource).not.toMatch(/useLongPress|makeLongPressHandlers|LONG_PRESS_DELAY_MS/);
+    expect(promptSource).not.toMatch(/onContextMenu/);
   });
 
-  it('holds only where a side question can be asked', () => {
-    expect(promptSource).toMatch(/if \(sideQuestionRefusal !== null\) return;\s*heldSendRef\.current = true;/);
+  it('says nothing about a hold in any tooltip', () => {
+    expect(promptSource).not.toMatch(/Hold for a side question/);
   });
 
-  it('only turns the mode on, and never asks or sends from the hold', () => {
-    expect(promptSource).toMatch(/morphGate\.spend\(\);\s*setSideQuestionMode\(true\);\s*\}, \(\) => \{\}\);/);
-    expect(promptSource).not.toContain('submit(true)');
-    expect(promptSource).toMatch(/function setSideQuestionMode\(on: boolean\): void \{[^]*?updateComposeSelection\(threadId, \{ sideQuestionMode: on \}\);/);
+  it('feeds the tap gate on every button that can end the row', () => {
+    expect(sendButtonSource()).toContain('{...tapGateHandlers}');
+    expect(submitButtonSource()).toContain('{...tapGateHandlers}');
+    expect(cancelButtonSource()).toContain('{...tapGateHandlers}');
   });
 
-  it('rides on every button that can end the row', () => {
-    expect(sendButtonSource()).toContain('{...holdHandlers}');
-    expect(submitButtonSource()).toContain('{...holdHandlers}');
-    expect(cancelButtonSource()).toContain('{...holdHandlers}');
-    expect(promptSource).toContain('primaryPressHandlers={ungatedHoldHandlers}');
-  });
-
-  it('keeps the ungated multi-select Submit out of the tap gate', () => {
-    const ungated = promptSource.match(/const ungatedHoldHandlers = \{[\s\S]*?\n {2}\};/)?.[0] ?? '';
-    expect(ungated, 'ungatedHoldHandlers not found').not.toBe('');
-    expect(ungated).not.toContain('morphGate');
-  });
-
-  it('spends the mark on every release before it acts', () => {
-    expect(promptSource).toMatch(/const morphActivate = useTouchActivated\(\s*\(\) => \{\s*if \(releaseEndsHold\(\)\) return;/);
-    expect(promptSource).toMatch(/const answerSubmitActivate = useTouchActivated\(\(\) => \{\s*if \(releaseEndsHold\(\)\) return;\s*void submit\(\);/);
-    expect(promptSource).toMatch(
-      /const answerCancelActivate = useTouchActivated\(\s*\(\) => \{\s*if \(releaseEndsHold\(\)\) return;\s*cancelExchangeForTarget\(\);/,
-    );
-    expect(promptSource).toMatch(/onPrimary=\{\(\) => \{\s*if \(releaseEndsHold\(\)\) return;\s*void submitMultiAnswer\(\);/);
-  });
-
-  it('spends the tap gate, so a finger drifting during the hold is not a refused swipe', () => {
-    expect(promptSource).toMatch(/heldSendRef\.current = true;[^]*?morphGate\.spend\(\);[^]*?setSideQuestionMode\(true\);/);
-    // What the spend buys: Stop's destructive lift reaches the hold mark.
-    const gate = createTapGate();
-    let served = 0;
-    const lift = touchActivated(() => { served += 1; }, {
-      destructive: () => true,
-      gate: { pass: () => gate.tapRejection() === null, spend: gate.spend, aborted: gate.wasAborted },
-    });
-    gate.down({ screenX: 0, screenY: 0 });
-    gate.spend();
-    gate.move({ screenX: 12, screenY: 0 });
-    lift.onTouchEnd({ preventDefault: () => {} } as never);
-    expect(served).toBe(1);
-  });
-
-  it('hands focus back to the composer after a mouse hold, for the side question to be typed', () => {
-    expect(promptSource).toMatch(/holdRefocusesComposerRef\.current = e\.pointerType === 'mouse';/);
-    // After the release's click, which the `.action-btn` blur listener hears.
-    expect(promptSource).toMatch(
-      /if \(holdRefocusesComposerRef\.current\) requestAnimationFrame\(\(\) => focusIfNeeded\(inputRef\.current\)\);\s*return true;/,
-    );
-  });
-
-  it('lets a key press act even after a right-click left the hold mark', () => {
-    expect(promptSource).toMatch(/onKeyDown: \(e: KeyboardEvent\) => \{\s*if \(e\.key === 'Enter' \|\| e\.key === ' '\) heldSendRef\.current = false;/);
+  it('leaves the multi-select Submit with no press handlers', () => {
+    expect(promptSource).not.toContain('primaryPressHandlers');
   });
 
   it('shows a pill whose × leaves the mode and keeps the text', () => {
@@ -144,17 +97,16 @@ describe('every hold turns on side-question mode', () => {
     expect(promptSource).toMatch(/onClick=\{\(\) => setSideQuestionMode\(false\)\}/);
   });
 
-  it('says so in each tooltip', () => {
-    expect(sendButtonSource()).toContain("morphMode === 'cancel' && holdOffersSideQuestion ? tooltipWithShortcut('Stop. Hold for a side question', 'stopThread')");
-    expect(sendButtonSource()).toContain("morphMode === 'send' && holdOffersSideQuestion ? tooltipWithShortcut('Send. Hold for a side question', 'askSideQuestion')");
-    expect(submitButtonSource()).toContain("holdOffersSideQuestion ? tooltipWithShortcut('Send answer. Hold for a side question', 'askSideQuestion')");
+  it('turns the mode on and off without asking or sending', () => {
+    expect(promptSource).not.toContain('submit(true)');
+    expect(promptSource).toMatch(/function setSideQuestionMode\(on: boolean\): void \{[^]*?updateComposeSelection\(threadId, \{ sideQuestionMode: on \}\);/);
   });
 });
 
 describe('in side-question mode the round button asks, in every thread state', () => {
   it('takes over from a waiting card\'s Submit once the box holds text', () => {
     expect(promptSource).toMatch(/const answersCard = isAnsweringQuestion && !\(sideQuestionMode && morphHasContent\);/);
-    expect(promptSource).toContain('{answersCard ? answerControl : sendButton}');
+    expect(promptSource).toContain('const actionSlot = answersCard ? answerControl');
   });
 
   it('leaves Submit no "Ask" face of its own', () => {
@@ -171,10 +123,19 @@ describe('the Side question shortcut', () => {
     expect(promptSource).toMatch(/if \(sideQuestionRefusal !== null\) \{\s*showToast\(sideQuestionRefusal, 'info'\);\s*return;/);
   });
 
-  it('toggles the mode, and turning it on puts focus in the box', () => {
+  it('toggles the mode through the one function the row toggle shares', () => {
+    expect(promptSource).toMatch(/function toggleSideQuestionMode\(\): void \{[^]*?setSideQuestionMode\(!sideQuestionMode\);/);
+    expect(promptSource).toMatch(/promptSideQuestionRequested\.value = false;\s*toggleSideQuestionMode\(\);/);
+  });
+
+  it('draws the row toggle only where a side question can be asked, on the same toggle', () => {
     expect(promptSource).toMatch(
-      /setSideQuestionMode\(!sideQuestionMode\);\s*if \(!sideQuestionMode\) requestAnimationFrame\(\(\) => focusIfNeeded\(inputRef\.current\)\);/,
+      /sideQuestionRefusal === null \? sideQuestionToggleAction\(sideQuestionMode, toggleSideQuestionMode\) : null/,
     );
+  });
+
+  it('puts focus in the box inside the gesture when it turns the mode on', () => {
+    expect(promptSource).toMatch(/updateComposeSelection\(threadId, \{ sideQuestionMode: on \}\);\s*if \(on\) focusIfNeeded\(inputRef\.current\);/);
   });
 
   // The full rule and its cases live in composer-enter-key.test.ts.

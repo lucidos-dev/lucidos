@@ -1,17 +1,17 @@
 {
-  "_note": "Source of truth for the Codex coding-agent /model and /effort pickers. Hand-maintained like cc_menu_options.json — the Codex CLI's `exec --json` stream does not expose available models programmatically (https://github.com/openai/codex/issues/14736). Current lineup and effort matrix verified via app-server model/list on codex-cli 0.163.0 (2026-10-16). That CLI also offers an `ultra` effort, which this menu does not offer yet. The intelligence ladder's estimates live in llm/rung_estimates.json. include_str!() baked at compile time, parsed once via LazyLock — no runtime IO cost. Efforts without supported_models are universal; restricted efforts are filtered in the frontend and pair-validated by both drivers so stale settings cannot fail a turn (see docs/code-review-priors.md).",
+  "_note": "Source of truth for the Codex coding-agent /model and /effort pickers. Hand-maintained like cc_menu_options.json — the Codex CLI's `exec --json` stream does not expose available models programmatically (https://github.com/openai/codex/issues/14736). Current lineup and effort matrix verified via app-server model/list on codex-cli 0.163.0 (2026-10-16). `default_effort` is each model's `defaultReasoningEffort` from that list: the effort a pick naming only that model runs at. gpt-5.4 and gpt-5.4-mini no longer appear in the list, so theirs is `medium`. That CLI also offers an `ultra` effort, which this menu does not offer yet. The intelligence ladder's estimates live in llm/rung_estimates.json. include_str!() baked at compile time, parsed once via LazyLock — no runtime IO cost. Efforts without supported_models are universal; restricted efforts are filtered in the frontend and pair-validated by both drivers so stale settings cannot fail a turn (see docs/code-review-priors.md).",
   "models": [
     { "value": "default",       "label": "Default",       "description": "Use your Codex config's default model" },
-    { "value": "gpt-6.1-sol",   "label": "GPT-6.1 Sol",   "description": "Current flagship, Codex's own default" },
-    { "value": "gpt-6-astra",   "label": "GPT-6 Astra",   "description": "Largest GPT-6: slower and costlier" },
-    { "value": "gpt-6-sol",     "label": "GPT-6 Sol",     "description": "Superseded by GPT-6.1 Sol" },
-    { "value": "gpt-6-luna",    "label": "GPT-6 Luna",    "description": "Fastest, lowest-cost GPT-6" },
-    { "value": "gpt-5.6-sol",   "label": "GPT-5.6 Sol",   "description": "Prior flagship" },
-    { "value": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "description": "Balanced capability and speed" },
-    { "value": "gpt-5.6-luna",  "label": "GPT-5.6 Luna",  "description": "Fastest, lower-cost for lighter tasks" },
-    { "value": "gpt-5.5",       "label": "GPT-5.5",       "description": "Older flagship" },
-    { "value": "gpt-5.4",       "label": "GPT-5.4",       "description": "Older flagship with native computer use" },
-    { "value": "gpt-5.4-mini",  "label": "GPT-5.4 mini",  "description": "Faster, lower-cost for lighter tasks" }
+    { "value": "gpt-6.1-sol",   "label": "GPT-6.1 Sol",   "description": "Current flagship, Codex's own default", "default_effort": "low" },
+    { "value": "gpt-6-astra",   "label": "GPT-6 Astra",   "description": "Largest GPT-6: slower and costlier", "default_effort": "low" },
+    { "value": "gpt-6-sol",     "label": "GPT-6 Sol",     "description": "Superseded by GPT-6.1 Sol", "default_effort": "medium" },
+    { "value": "gpt-6-luna",    "label": "GPT-6 Luna",    "description": "Fastest, lowest-cost GPT-6", "default_effort": "medium" },
+    { "value": "gpt-5.6-sol",   "label": "GPT-5.6 Sol",   "description": "Prior flagship", "default_effort": "low" },
+    { "value": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "description": "Balanced capability and speed", "default_effort": "medium" },
+    { "value": "gpt-5.6-luna",  "label": "GPT-5.6 Luna",  "description": "Fastest, lower-cost for lighter tasks", "default_effort": "medium" },
+    { "value": "gpt-5.5",       "label": "GPT-5.5",       "description": "Older flagship", "default_effort": "medium" },
+    { "value": "gpt-5.4",       "label": "GPT-5.4",       "description": "Older flagship with native computer use", "default_effort": "medium" },
+    { "value": "gpt-5.4-mini",  "label": "GPT-5.4 mini",  "description": "Faster, lower-cost for lighter tasks", "default_effort": "medium" }
   ],
   "reasoning_efforts": [
     { "value": "low",    "label": "Low",        "description": "Minimal thinking · Fastest responses" },

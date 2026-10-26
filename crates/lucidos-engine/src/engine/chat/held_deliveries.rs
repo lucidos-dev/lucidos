@@ -48,7 +48,8 @@ pub(crate) async fn delivery_is_held(
             .is_some()
 }
 
-async fn anchor_is_child_report(pool: &sqlx::PgPool, anchor: Uuid) -> bool {
+/// Whether `anchor` is a `ChildThreadCompleted`. An unreadable anchor is not.
+pub(crate) async fn anchor_is_child_report(pool: &sqlx::PgPool, anchor: Uuid) -> bool {
     match sqlx::query_scalar::<_, String>("SELECT event_type FROM events WHERE id = $1")
         .bind(anchor)
         .fetch_optional(pool)

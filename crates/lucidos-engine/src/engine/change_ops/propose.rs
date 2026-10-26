@@ -27,11 +27,11 @@ pub(crate) enum OpenChangeAfterHold {
     None,
 }
 
-/// Withhold a turn end's work for `reason` (ADR 0400). An open change the
-/// turn committed past goes back to unproposed work first, set aside or not,
-/// or Apply would merge commits it never covered. One that still carries all
-/// the work stays, and nothing is announced. A failed withdrawal is an error,
-/// announced as nothing.
+/// Withhold a turn end's work, announcing `reason` when there is one (ADR
+/// 0400). An open change the turn committed past goes back to unproposed work
+/// first, set aside or not, or Apply would merge commits it never covered. One
+/// that still carries all the work stays, and nothing is announced. A failed
+/// withdrawal is an error, announced as nothing.
 ///
 /// `branch_moved` is [`branch_moved_since_last_idle`]: an amend or an
 /// auto-commit can leave the files and the description unchanged.
@@ -39,7 +39,7 @@ async fn withhold_work(
     bus: &EventBus,
     input: &ProposeChangeInput<'_>,
     branch_moved: bool,
-    reason: UnproposedReason,
+    reason: Option<UnproposedReason>,
 ) -> Result<OpenChangeAfterHold, Box<dyn std::error::Error + Send + Sync>> {
     let open = match bus
         .changes_projection()
@@ -65,7 +65,7 @@ async fn withhold_work(
             OpenChangeAfterHold::None
         }
     };
-    if !matches!(open, OpenChangeAfterHold::StillCarries(_)) {
+    if let Some(reason) = reason.filter(|_| !matches!(open, OpenChangeAfterHold::StillCarries(_))) {
         emit_proposal_withheld(bus, input.thread_id, input.branch_name, input.files, reason).await;
     }
     Ok(open)
@@ -78,7 +78,8 @@ pub(crate) async fn withhold_unfinished_work(
     input: &ProposeChangeInput<'_>,
     branch_moved: bool,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let open = withhold_work(bus, input, branch_moved, UnproposedReason::TurnIncomplete).await?;
+    let reason = Some(UnproposedReason::TurnIncomplete);
+    let open = withhold_work(bus, input, branch_moved, reason).await?;
     Ok(open == OpenChangeAfterHold::Withdrawn)
 }
 
@@ -183,7 +184,11 @@ pub(crate) async fn withhold_unready(
     );
     let moved =
         branch_moved_since_last_idle(pool, input.thread_id, repo_root, input.branch_name).await;
-    let open = withhold_work(bus, input, moved, hold.into()).await?;
+    // A pending handoff's successor session owes what the hold asks for, and
+    // its own turn end announces the verdict. Announcing it now would show a
+    // Not ready strip in the gap before that session starts.
+    let announced = !crate::engine::successor::handoff_pending(pool, input.thread_id).await;
+    let open = withhold_work(bus, input, moved, announced.then(|| hold.into())).await?;
     Ok(HoldOutcome::Held(hold, open))
 }
 

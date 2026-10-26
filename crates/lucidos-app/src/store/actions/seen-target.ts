@@ -82,7 +82,7 @@ export interface VisitLocation {
 
 /** Is the Conversation pane on screen? Mobile navigates between panes, so only
  *  the current one is. Desktop shows both unless the split collapsed one. */
-export function threadPaneOnScreen(loc: VisitLocation): boolean {
+export function threadPaneOnScreen(loc: Pick<VisitLocation, 'mobile' | 'mobileView' | 'drawnSplitRatio'>): boolean {
   return loc.mobile ? loc.mobileView === 'thread' : loc.drawnSplitRatio > 0;
 }
 

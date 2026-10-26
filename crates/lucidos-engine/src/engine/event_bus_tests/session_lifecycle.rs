@@ -61,6 +61,7 @@ async fn test_session_started_updates_source_in_projection() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -328,6 +329,7 @@ async fn test_session_started_does_not_update_last_activity() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -484,6 +486,7 @@ async fn test_session_ended_stale_resume_keeps_status_running() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -585,6 +588,7 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -610,6 +614,7 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
             tool_name: "Edit".into(),
             input: serde_json::json!({"file_path": "/tmp/x"}),
             summary: "Edit /tmp/x".into(),
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -709,6 +714,7 @@ async fn test_session_started_stores_repo_id() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -745,6 +751,7 @@ async fn test_session_started_stores_repo_id() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -858,10 +865,9 @@ async fn test_non_cc_child_callbacks_on_response_generated() {
 }
 
 #[tokio::test]
-async fn session_started_locks_coding_agent_backend_in_projection() {
-    // First SessionStarted stamps `thread_summaries.coding_agent`; any later
-    // SessionStarted (resume, replay, drift) must NOT flip it — the other
-    // backend has no session to resume, so a flip silently loses context.
+async fn the_newest_session_started_names_the_coding_agent_backend() {
+    // The backend is a fact of each session. A successor session may start on
+    // another one, and the thread then reads the newest session's backend.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -877,6 +883,7 @@ async fn session_started_locks_coding_agent_backend_in_projection() {
         integrated: false,
         auto_compact_window: None,
         auto_compact_arm: None,
+        continuity: None,
     };
     let meta = EventMeta {
         channel: Some(EventChannel::ClaudeCode),
@@ -903,7 +910,7 @@ async fn session_started_locks_coding_agent_backend_in_projection() {
         "first SessionStarted must stamp the backend"
     );
 
-    // A later SessionStarted claiming ClaudeCode must not overwrite.
+    // A later session on Claude Code moves the thread to it.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: session_started(crate::runtime::CodingAgent::ClaudeCode),
@@ -920,8 +927,8 @@ async fn session_started_locks_coding_agent_backend_in_projection() {
             .unwrap();
     assert_eq!(
         agent.as_deref(),
-        Some("codex"),
-        "backend is locked at first SessionStarted (COALESCE keeps existing)"
+        Some("claude-code"),
+        "the newest SessionStarted names the backend"
     );
 
     pool.close().await;
@@ -1080,6 +1087,7 @@ async fn coding_agent_continuation_started_keeps_is_coding_agent_true() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -1134,6 +1142,7 @@ async fn chat_channel_continuation_started_never_clears_is_coding_agent() {
             integrated: false,
             auto_compact_window: None,
             auto_compact_arm: None,
+            continuity: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),

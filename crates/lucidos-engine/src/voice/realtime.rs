@@ -592,6 +592,9 @@ fn done_usage(value: &Value) -> ApiUsage {
         modality: usage.and_then(done_modality),
         service_tier: None,
         cache_creation_1h_tokens: None,
+        cache_creation_30m_tokens: None,
+        cache_creation_12h_tokens: None,
+        cache_creation_requested_ttl: None,
     };
     warn_on_modality_drift(&reported);
     reported

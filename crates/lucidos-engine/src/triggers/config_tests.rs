@@ -1235,7 +1235,10 @@ fn next_runs_merges_the_whole_schedule_in_order() {
     // OR semantics across the array, so the 8am and 8pm streams interleave
     // rather than the first expression owning all three slots.
     let config = scheduled(json!(["0 0 8 * * *", "0 0 20 * * *"]), false);
-    let runs = config.next_runs(3);
+    // A fixed clock far from a daylight-saving change: UTC hours then map one
+    // to one onto the two expressions.
+    let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 1, 15, 0, 0, 0).unwrap();
+    let runs = config.next_runs_after(now, 3);
     assert_eq!(runs.len(), 3);
     assert!(runs.windows(2).all(|w| w[0] < w[1]), "got: {runs:?}");
     let hours: std::collections::BTreeSet<u32> = runs.iter().map(chrono::Timelike::hour).collect();

@@ -1,3 +1,5 @@
+use crate::engine::agent_session::external_edits::try_adopt_renegade_branch;
+use crate::engine::agent_session::resume::IdleAnchor;
 use crate::engine::git_ops::{
     allocate_coding_agent_branch, branch_name_is_taken, git_answer, worktree_add, BranchScope,
     GitAnswer,
@@ -7,6 +9,17 @@ use crate::runtime::{CodingAgent, RunningAgent, SpawnArgs};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
+/// Whether [`spawn_or_resume`] passed the agent a session to resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResumeAttempt {
+    /// No session id was given, so the agent started fresh.
+    NotAttempted,
+    /// The agent took the resume.
+    Resumed,
+    /// The agent refused the resume, and a fresh spawn replaced it.
+    FellBack,
+}
+
 /// Try to resume a coding-agent session, falling back to fresh spawn on failure.
 /// Routes through the engine's `agent_runtimes` registry — caller picks the agent kind.
 /// `args.resume_session_id` controls whether resume is attempted at all.
@@ -15,7 +28,7 @@ pub(super) async fn spawn_or_resume(
     agent: CodingAgent,
     args: SpawnArgs<'_>,
     cancel: CancellationToken,
-) -> Result<RunningAgent, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(RunningAgent, ResumeAttempt), Box<dyn std::error::Error + Send + Sync>> {
     let runtime = engine
         .agent_runtimes
         .get(&agent)
@@ -23,7 +36,7 @@ pub(super) async fn spawn_or_resume(
     if args.resume_session_id.is_some() {
         let mut fresh = args.clone();
         match runtime.spawn(args, cancel.clone()).await {
-            Ok(rt) => return Ok(rt),
+            Ok(rt) => return Ok((rt, ResumeAttempt::Resumed)),
             Err(e) => {
                 log!(
                     "[AgentSession] Resume failed ({}), falling back to fresh spawn",
@@ -32,9 +45,11 @@ pub(super) async fn spawn_or_resume(
             }
         }
         fresh.resume_session_id = None;
-        return runtime.spawn(fresh, cancel).await;
+        let rt = runtime.spawn(fresh, cancel).await?;
+        return Ok((rt, ResumeAttempt::FellBack));
     }
-    runtime.spawn(args, cancel).await
+    let rt = runtime.spawn(args, cancel).await?;
+    Ok((rt, ResumeAttempt::NotAttempted))
 }
 
 /// How many times a spawn may re-derive its branch name and try the create
@@ -74,6 +89,7 @@ impl FreshBranch<'_> {
             branch_name: self.allocate().await,
             reusing_branch: false,
             resume_session_id: None,
+            gone: None,
         }
     }
 
@@ -133,6 +149,46 @@ pub(super) struct BranchResolution {
     pub reusing_branch: bool,
     /// May be `None` even if the caller passed `Some` — see `resolve_branch_for_resume`.
     pub resume_session_id: Option<String>,
+    /// Set when a branch was recorded but git says it is gone.
+    pub gone: Option<GoneBranch>,
+}
+
+/// A recorded branch git no longer has, and the session id dropped with it.
+/// A proven rename wins both back ([`recover_renamed_branch`]).
+pub(super) struct GoneBranch {
+    pub branch_name: String,
+    pub session_id: Option<String>,
+}
+
+/// The branch a thread's worktree moved to by renaming its gone branch.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct RecoveredBranch {
+    pub branch_name: String,
+    pub adoption_note: String,
+    pub session_id: Option<String>,
+}
+
+/// Follow a `git branch -m` of the thread's own branch. The worktree's branch
+/// must pass the spawn adoption gate against the gone name. Only git's own
+/// record of the rename, or a containment proof, keeps the session.
+pub(super) async fn recover_renamed_branch(
+    repo_root: &Path,
+    worktree_path: &Path,
+    gone: GoneBranch,
+    anchor: &IdleAnchor,
+) -> Option<RecoveredBranch> {
+    let (branch_name, adoption_note) =
+        try_adopt_renegade_branch(repo_root, worktree_path, &gone.branch_name, anchor).await?;
+    log!(
+        "[AgentSession] Recorded branch {} was renamed to {}, resuming on it",
+        gone.branch_name,
+        branch_name
+    );
+    Some(RecoveredBranch {
+        branch_name,
+        adoption_note,
+        session_id: gone.session_id,
+    })
 }
 
 /// The pure half's verdict, before any name is minted. Separate from
@@ -144,7 +200,9 @@ pub(super) enum BranchDecision {
         branch_name: String,
         resume_session_id: Option<String>,
     },
-    Fresh,
+    Gone {
+        resume_session_id: Option<String>,
+    },
 }
 
 /// Decide the git branch for this CC turn and validate the resume context against it.
@@ -154,7 +212,9 @@ pub(super) enum BranchDecision {
 /// fresh branch AND drop `resume_session_id`: spawning CC with `--resume <stale-uuid>`
 /// against a fresh worktree makes CC exit immediately with
 /// `No conversation found with session ID: ...`, which the safety net then turns into
-/// a user-visible "Aborted" badge.
+/// a user-visible "Aborted" badge. The dropped id travels in
+/// [`BranchResolution::gone`], so a live worktree that renamed the branch can
+/// still resume ([`recover_renamed_branch`]).
 pub(super) async fn resolve_branch_for_resume(
     fresh: &FreshBranch<'_>,
     resume_session_id: Option<String>,
@@ -172,8 +232,15 @@ pub(super) async fn resolve_branch_for_resume(
             branch_name,
             reusing_branch: true,
             resume_session_id,
+            gone: None,
         },
-        BranchDecision::Fresh => fresh.resolution().await,
+        BranchDecision::Gone { resume_session_id } => BranchResolution {
+            gone: Some(GoneBranch {
+                branch_name: rb.to_string(),
+                session_id: resume_session_id,
+            }),
+            ..fresh.resolution().await
+        },
     }
 }
 
@@ -214,10 +281,10 @@ pub(super) fn decide_branch_resolution(
         }
     } else {
         log!(
-            "[AgentSession] Resume branch {} no longer exists, creating fresh branch (dropping stale session id)",
+            "[AgentSession] Resume branch {} no longer exists, creating fresh branch unless the worktree proves a rename",
             resume_branch
         );
-        BranchDecision::Fresh
+        BranchDecision::Gone { resume_session_id }
     }
 }
 
@@ -284,6 +351,102 @@ mod tests {
             resolution.resume_session_id, None,
             "stale session_id must be dropped, otherwise CC dies with 'No conversation found'"
         );
+        let gone = resolution
+            .gone
+            .expect("a recorded branch git lacks is reported gone");
+        assert_eq!(gone.branch_name, "claude-code/already-merged-and-pruned");
+        assert_eq!(
+            gone.session_id.as_deref(),
+            Some("e4a3d60a-ea4d-4592-b252-0558f8798cf3")
+        );
+    }
+
+    /// A linked worktree on a thread branch with one commit of its own.
+    async fn make_thread_worktree(
+        tmp: &tempfile::TempDir,
+        repo: &std::path::Path,
+        branch: &str,
+    ) -> std::path::PathBuf {
+        let wt = tmp.path().join("wt");
+        let wt_arg = wt.to_string_lossy().to_string();
+        let out = git_cmd(&["worktree", "add", "-b", branch, &wt_arg], repo)
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        tokio::fs::write(wt.join("work.txt"), "thread work")
+            .await
+            .unwrap();
+        let _ = git_cmd(&["add", "."], &wt).await;
+        let _ = git_cmd(&["commit", "-m", "thread work"], &wt).await;
+        wt
+    }
+
+    /// The reported loss: the repo's own workflow ran `git branch -m` on the
+    /// thread's branch, and the next message started a fresh session.
+    #[tokio::test]
+    async fn a_renamed_branch_keeps_its_session() {
+        let (tmp, repo) = make_test_repo().await;
+        let recorded = "lucidos-claude-code-repo-example-repo-flag-stale-docs-1a2b3c4d";
+        let wt = make_thread_worktree(&tmp, &repo, recorded).await;
+        let out = git_cmd(
+            &["branch", "-m", recorded, "ticket-1234-flag-stale-docs"],
+            &wt,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let resolution = resolve_branch_for_resume(
+            &fresh_branch(&repo),
+            Some("live-sid".into()),
+            Some(recorded),
+        )
+        .await;
+        let gone = resolution
+            .gone
+            .expect("the recorded name is gone after the rename");
+        let recovered = recover_renamed_branch(&repo, &wt, gone, &IdleAnchor::Absent)
+            .await
+            .expect("git's reflog proves the rename, so the session must survive it");
+        assert_eq!(recovered.branch_name, "ticket-1234-flag-stale-docs");
+        assert_eq!(recovered.session_id.as_deref(), Some("live-sid"));
+    }
+
+    /// A gone branch the worktree does not provably continue starts fresh, as
+    /// before, rather than refusing the spawn or keeping the stale session.
+    #[tokio::test]
+    async fn a_deleted_branch_beside_an_unrelated_one_starts_fresh() {
+        let (tmp, repo) = make_test_repo().await;
+        let _ = git_cmd(&["branch", "someone-elses-branch"], &repo).await;
+        let recorded = "lucidos-claude-code-repo-example-repo-flag-stale-docs-1a2b3c4d";
+        let wt = make_thread_worktree(&tmp, &repo, recorded).await;
+        let _ = git_cmd(&["checkout", "someone-elses-branch"], &wt).await;
+        let out = git_cmd(&["branch", "-D", recorded], &repo).await.unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let fresh = fresh_branch(&repo);
+        let resolution =
+            resolve_branch_for_resume(&fresh, Some("stale-sid".into()), Some(recorded)).await;
+        assert_eq!(resolution.branch_name, expected_name(fresh.thread_id));
+        assert_eq!(resolution.resume_session_id, None);
+        let gone = resolution.gone.expect("the recorded name is gone");
+        assert_eq!(
+            recover_renamed_branch(&repo, &wt, gone, &IdleAnchor::Absent).await,
+            None,
+            "absence is not evidence of a rename"
+        );
     }
 
     /// A legacy `claude-code/*` branch is never renamed: a resumed thread that
@@ -342,8 +505,10 @@ mod tests {
         );
         assert_eq!(
             decide_branch_resolution(GitAnswer::No, "claude-code/pruned", Some("sid".into())),
-            BranchDecision::Fresh,
-            "a pruned branch starts over, and Fresh carries no session id by construction"
+            BranchDecision::Gone {
+                resume_session_id: Some("sid".into())
+            },
+            "a pruned branch starts over, and hands the session id on for a rename to win back"
         );
     }
 

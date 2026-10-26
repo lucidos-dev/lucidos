@@ -142,7 +142,7 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
       await expect(pendingBody.locator('.question-option[aria-pressed="true"]')).toHaveCount(2);
 
       const submit = page.locator('.prompt-actions-row:visible button[aria-label="Submit answer"]').first();
-      await expect(submit).toBeEnabled();
+      await expect(submit).toContainText('Submit 2');
       await submit.click();
 
       // Once the quiet retries give up, the card still holds both picks, with

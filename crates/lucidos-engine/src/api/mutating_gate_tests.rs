@@ -144,6 +144,8 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:thread_id/archive",
     "/threads/:thread_id/background-tasks",
     "/threads/:thread_id/background-tasks/:task_id/stop",
+    "/threads/:thread_id/cache-keep-alive",
+    "/threads/:thread_id/child-reports/take",
     "/threads/:thread_id/continue",
     "/threads/:thread_id/detach",
     "/threads/:thread_id/successor",

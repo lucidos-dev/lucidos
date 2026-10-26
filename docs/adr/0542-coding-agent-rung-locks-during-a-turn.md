@@ -24,7 +24,9 @@ model.
 
 A turn runs while it starts, works, or waits on a question. While it runs, the
 engine refuses a model or effort pick with 409 and `reason: "turn-running"`,
-and the picker is disabled. Between turns, a pick is recorded at once as
+and the picker refuses it too. The picker still opens, so the user can see
+the ladder, but a pick or a step says why and records nothing. Between turns,
+a pick is recorded at once as
 `CodingAgentSettingsChanged` with the user's actor, and the next spawn reads
 it. A coding-agent `MessageReceived` carries the model and effort its turn
 runs on.

@@ -49,9 +49,47 @@ pub(super) fn lost_followups_to_orphans(
         .collect()
 }
 
+/// Put `input`, just received, back at the head of `msg_rx`. The caller holds
+/// the `agent_sessions` lock every sender takes, so nothing slips in between.
+pub(super) fn requeue_at_head(
+    msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
+    msg_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>,
+    input: AgentUserInput,
+) {
+    let behind: Vec<_> = std::iter::from_fn(|| msg_rx.try_recv().ok()).collect();
+    // The caller holds the open receiver, so a send cannot fail.
+    for input in std::iter::once(input).chain(behind) {
+        let _ = msg_tx.send(input);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input(text: &str) -> AgentUserInput {
+        AgentUserInput {
+            text: text.into(),
+            images: None,
+            origin_event_id: None,
+            kind: crate::engine::AgentInputKind::User,
+            completion: None,
+        }
+    }
+
+    #[test]
+    fn requeue_puts_the_input_back_ahead_of_what_queued_behind_it() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
+        tx.send(input("first")).unwrap();
+        tx.send(input("second")).unwrap();
+        let first = rx.try_recv().unwrap();
+        requeue_at_head(&tx, &mut rx, first);
+        let order: Vec<String> = drain_lost_followups(&mut rx)
+            .into_iter()
+            .map(|input| input.text)
+            .collect();
+        assert_eq!(order, ["first", "second"]);
+    }
 
     #[test]
     fn drain_returns_unconsumed_followups() {

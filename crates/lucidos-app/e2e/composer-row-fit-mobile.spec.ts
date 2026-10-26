@@ -47,9 +47,8 @@ interface RowMetrics {
   leadingDesc: string[];
   /** Is anything folded? The ⋯ carries the fold marker with an empty name. */
   folded: boolean;
-  /** Is the change action in the row? Read from the split button's own face
-   *  rather than from a label: it carries no `aria-label`, so the item's name
-   *  falls through to its class. */
+  /** Is the change action in the row? It stands in the action slot, which
+   *  never folds (ADR 0573). */
   changeActionUp: boolean;
   sendCount: number;
 }
@@ -82,7 +81,7 @@ async function measureRow(page: Page): Promise<RowMetrics | null> {
       iconWidth: leading[0]?.getBoundingClientRect().width ?? 0,
       leadingDesc: leading.map(nameOf),
       folded: !!row.querySelector('[data-fold-key=""]'),
-      changeActionUp: !!row.querySelector('.split-button-primary'),
+      changeActionUp: !!row.querySelector('.prompt-actions-right > [data-thread-action]'),
       sendCount: row.querySelectorAll('.send-cancel-morph').length,
     };
   });
@@ -253,10 +252,7 @@ test.describe('Composer action row - one row, nothing outside the box', () => {
           // the floor always fit, so a sweep that loses one has lost the floor.
           expect(empty.leadingDesc[0], `${where}: the control menu is not first`)
             .toBeTruthy();
-          expect(
-            empty.changeActionUp || empty.folded,
-            `${where}: the change action is neither in the row nor in the ⋯`,
-          ).toBe(true);
+          expect(empty.changeActionUp, `${where}: the change action left the action slot`).toBe(true);
 
           // The empty row carries no clear-draft box. A reserved one with
           // nothing to clear is a box the row spends on nothing.

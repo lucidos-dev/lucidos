@@ -26,7 +26,7 @@ describe('the rung control in the prompt row', () => {
     const cluster = promptSource.slice(promptSource.indexOf('<div class="prompt-actions-right">'));
     expect(cluster.indexOf('{members.cluster.map(renderMember)}')).toBeGreaterThan(-1);
     expect(cluster.indexOf('{members.cluster.map(renderMember)}'))
-      .toBeLessThan(cluster.indexOf('{answersCard ? answerControl : sendButton}'));
+      .toBeLessThan(cluster.indexOf('{actionSlot}'));
   });
 
   it('folds the pill in its place in the one row order', () => {

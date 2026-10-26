@@ -59,7 +59,7 @@ pub(crate) fn dispatch_name<'a>(
         | tn::THREAD_QUEUE
         | tn::MEMORY
         | tn::RECALL => grouped::grouped_legacy_name(name, args),
-        tn::EXECUTE_INTENT => Err(execute_intent_refusal(args)),
+        tn::EXECUTE_INTENT => Err(execute_intent_refusal(args)), // Retired compatibility.
         other => Ok(other),
     }
 }
@@ -72,7 +72,7 @@ fn execute_intent_refusal(args: &serde_json::Value) -> String {
         .or_else(|| args["prompt_id"].as_str())
         .unwrap_or("<intent id>");
     format!(
-        "Error: execute_intent was removed. Call load_knowhow(id: \"{intent_id}\") and do its \
+        "Error: execute_intent is retired. Call load_knowhow(id: \"{intent_id}\") and do its \
          steps in this turn."
     )
 }
@@ -321,6 +321,9 @@ impl LucidosEngine {
             tn::LIST_HELD_MESSAGES => self.execute_list_held_messages(args).await,
             tn::DETACH_CHILD_THREAD => self.execute_detach_child_thread(args, thread_id).await,
             tn::ARCHIVE_THREAD => self.execute_archive_thread(args, thread_id).await,
+            tn::SWITCH_CACHE_KEEP_ALIVE => {
+                self.execute_switch_cache_keep_alive(args, thread_id).await
+            }
             tn::REQUEST_READ => self.execute_request_read(args, thread_id).await,
             tn::WAKE_PARENT => self.execute_wake_parent(args, thread_id).await,
             tn::TRIAGE_THREADS => self.execute_triage_threads(thread_id).await,
@@ -745,6 +748,62 @@ impl LucidosEngine {
             }
             Err(e) => Err(format!("Error: {e}")),
         }
+    }
+
+    /// LLM tool: turn the cache keep-alive off for one thread, or back on
+    /// (ADR 0554). The user asks for it in words, as the popover's button does.
+    async fn execute_switch_cache_keep_alive(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::event_wait::keep_alive::KeepAliveSwitch;
+
+        let raw_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Error: cache_keep_alive needs a thread_id: the thread's uuid.")?;
+        let target = crate::api::resolve_thread_id_arg(raw_id, Some(caller_thread_id))
+            .map_err(|e| format!("Error: {e}"))?;
+        if target == caller_thread_id {
+            return Err(
+                "Error: this thread's next model call is a real request, which turns \
+                 its keep-alive straight back on. Switch another thread, or point the user to \
+                 'Turn off for this thread' in the Cache kept warm popover."
+                    .to_string(),
+            );
+        }
+        let switch = match args.get("state").and_then(|v| v.as_str()) {
+            Some("off") => KeepAliveSwitch::Off,
+            Some("on") => KeepAliveSwitch::On,
+            _ => return Err("Error: cache_keep_alive needs state 'off' or 'on'.".to_string()),
+        };
+        let row: Option<Option<String>> =
+            sqlx::query_scalar("SELECT title FROM thread_summaries WHERE thread_id = $1")
+                .bind(target)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("Error: {e}"))?;
+        let Some(title) = row else {
+            return Err(format!("Error: no thread {target} in this workspace."));
+        };
+        let title = title.map_or_else(|| "the untitled thread".to_string(), |t| format!("\"{t}\""));
+        self.switch_cache_keep_alive(
+            target,
+            switch,
+            crate::engine::thread_events::EventMeta::NONE,
+        )
+        .await
+        .map_err(|e| format!("Error: {e}"))?;
+        Ok(match switch {
+            KeepAliveSwitch::Off => format!(
+                "Turned the cache keep-alive off for {title}. Nothing pings it until it \
+                 runs again, so a late reply rereads its context once."
+            ),
+            KeepAliveSwitch::On => {
+                format!("Turned the cache keep-alive back on for {title}.")
+            }
+        })
     }
 
     /// LLM tool: archive the calling thread or one of its direct children

@@ -2,7 +2,6 @@ import { useSignal, useSignalEffect } from '@preact/signals';
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { LUCIDOS_AGENT_LABEL } from '../../store/thread-events';
-import { showToast } from '../../store/store';
 import { Overlay } from '../shared/Overlay';
 import { anchoredPanelStyle, useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { usePendingOpen } from '../../hooks/usePendingOpen';
@@ -17,14 +16,11 @@ import { useRungState } from './useRungState';
 
 /** The control's trigger and the list it opens in an overlay. What the list
  *  holds, and what a pick means, belong to the thread kind that draws it. */
-function RungShell({ folded, rowAttrs, shown, faces, step, lockedReason = null, children }: {
+function RungShell({ folded, rowAttrs, shown, step, children }: {
   folded: RungControlProps['folded'];
   rowAttrs: RungControlProps['rowAttrs'];
   shown: ShownRung | null;
-  faces: readonly ShownRung[];
   step?: { prev: (() => void) | null; next: (() => void) | null };
-  /** Why the rung cannot change now. The list then stays shut and says why. */
-  lockedReason?: string | null;
   /** The list, given how to close it and the element that held the keyboard. */
   children: (list: { close: () => void; keyboardHolder: HTMLElement | null }) => ComponentChildren;
 }) {
@@ -40,10 +36,6 @@ function RungShell({ folded, rowAttrs, shown, faces, step, lockedReason = null, 
   const open = useSignal(false);
 
   function openList() {
-    if (lockedReason) {
-      showToast(lockedReason, 'info');
-      return;
-    }
     const trigger = folded ? foldAnchorRef.current : triggerRef.current;
     if (!trigger?.isConnected) return;
     const holder = keyboardHolder();
@@ -103,7 +95,6 @@ function RungShell({ folded, rowAttrs, shown, faces, step, lockedReason = null, 
       {!folded && (
         <RungButtons
           shown={shown}
-          faces={faces}
           rowAttrs={rowAttrs}
           expanded={open.value}
           triggerRef={(el) => { triggerRef.current = el; }}
@@ -113,7 +104,6 @@ function RungShell({ folded, rowAttrs, shown, faces, step, lockedReason = null, 
             openList();
           }}
           step={step}
-          lockedReason={lockedReason}
         />
       )}
       <Overlay
@@ -146,12 +136,10 @@ function CodingAgentRungControl({ folded, rowAttrs, threadId, composeThreadId, c
       folded={folded}
       rowAttrs={rowAttrs}
       shown={rung.shown}
-      faces={rung.faces}
       step={{
         prev: rung.steps.prev === null ? null : () => rung.step(-1),
         next: rung.steps.next === null ? null : () => rung.step(1),
       }}
-      lockedReason={rung.lockedReason}
     >
       {({ close, keyboardHolder: holder }) => (
         <RungPicker
@@ -180,13 +168,10 @@ function ChatRungControl({ folded, rowAttrs, threadId, composeContext }: RungCon
       folded={folded}
       rowAttrs={rowAttrs}
       shown={chat.shown}
-      faces={chat.faces}
       step={{
-        // A locked step still answers a press, to say why.
-        prev: chat.steps.prev === null && chat.lockedReason === null ? null : () => chat.step(-1),
-        next: chat.steps.next === null && chat.lockedReason === null ? null : () => chat.step(1),
+        prev: chat.steps.prev === null ? null : () => chat.step(-1),
+        next: chat.steps.next === null ? null : () => chat.step(1),
       }}
-      lockedReason={chat.lockedReason}
     >
       {({ close, keyboardHolder: holder }) => (
         <RungPicker

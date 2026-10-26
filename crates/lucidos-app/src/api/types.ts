@@ -2,11 +2,11 @@
 
 import type { ActorMode } from '../store/thread-events';
 import type { CredentialInfo, CredentialRequest } from '../store/types';
-import type { CodingAgent } from '../generated/thread-event-wire';
+import type { CodingAgent, IntelligenceRung } from '../generated/thread-event-wire';
 
-/** Coding-agent backend discriminator, generated from the Rust `CodingAgent`
- *  enum. Re-exported here because this is where API callers reach for it. */
-export type { CodingAgent } from '../generated/thread-event-wire';
+/** The coding-agent backend and the intelligence rung, generated from Rust.
+ *  Re-exported here because this is where API callers reach for them. */
+export type { CodingAgent, IntelligenceRung } from '../generated/thread-event-wire';
 
 export interface ChatRequestBody {
   message: string;
@@ -181,13 +181,6 @@ export interface AgentBinaryStatus {
 export interface AgentBinariesResponse {
   claude_code: AgentBinaryStatus;
   codex: AgentBinaryStatus;
-}
-
-/** One model at one effort: an intelligence rung. Mirrors the engine
- *  `IntelligenceRung`. */
-export interface IntelligenceRung {
-  model: string;
-  effort: string;
 }
 
 /** A rung's cost or time per task against the reference rung. Mirrors the

@@ -14,7 +14,7 @@
 
 import type { LandingLane } from '../../api/client';
 import { EMPTY_LANDING_LANE, landingLane, landingLaneCanceling, lanePlace, showToast, type LanePlace } from '../store';
-import { focusThread } from './threads';
+import { focusThreadOrBootstrap } from './threads';
 
 /** What a change row says about its place in the lane. */
 export const LANE_PLACE_LABEL: Record<LanePlace, string> = {
@@ -92,7 +92,7 @@ export function handleLaneFrame(
   if (type === 'LaneBatchFailed' && !data.actor) {
     showToast(`${String(data.reason ?? 'The lane batch failed.')} Its changes are still pending.`, 'error', {
       title: 'Lane batch failed',
-      onClick: laneThreadId ? () => focusThread(laneThreadId) : undefined,
+      onClick: laneThreadId ? () => focusThreadOrBootstrap(laneThreadId) : undefined,
     });
   }
 }

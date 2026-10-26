@@ -378,6 +378,9 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         // until the cost UI explicitly grows a Gemini-cached lane.
         cache_creation_tokens: None,
         cache_creation_1h_tokens: None,
+        cache_creation_30m_tokens: None,
+        cache_creation_12h_tokens: None,
+        cache_creation_requested_ttl: None,
         stable_prefix_fingerprint: None,
         cache_read_tokens: None,
         // The reply's own field, which `parse_gemini_reply` reads.
@@ -393,6 +396,7 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         // is `None`.
         model_only_text: narration,
         progress_notes: Vec::new(),
+        prefill: None,
         service_tier: None,
     }
 }

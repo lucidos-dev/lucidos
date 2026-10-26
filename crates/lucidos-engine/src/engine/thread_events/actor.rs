@@ -56,10 +56,13 @@ pub enum EngineReason {
     /// An integrated sub-thread's parent landed a change that did not carry
     /// the sub-thread's work, so the engine set that work aside (ADR 0465).
     UnmergedIntegratedWork,
-    /// A thread kept committing after it handed off to a successor thread.
+    /// A thread kept committing after it handed off to a legacy successor thread.
     /// The successor's change was resolved without that work, so the engine
     /// set it aside.
     SuccessorResidue,
+    /// The thread handed off, and the engine sent the handoff's opening to
+    /// start its *successor session*.
+    SuccessorSession,
     /// Engine opened a merge-conflict resolution: a Tier-2 or Tier-3 merge,
     /// or the lane thread of a lane batch.
     MergeConflict,

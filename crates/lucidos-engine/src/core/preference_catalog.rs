@@ -879,7 +879,7 @@ pub const MOBILE_DYNAMIC_BARS: Pref<Flag> = Pref::flag(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Bool,
     default: PrefDefault::Value("false"),
-    description: "On a phone, slide the header and the prompt away while scrolling down and bring them back on scroll up ('true'), instead of keeping both always visible ('false').",
+    description: "On a phone, slide the header and the prompt away while scrolling down and bring them back on scroll up ('true'), instead of keeping both always visible ('false'). The installed iOS app ignores this and always slides them.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1133,7 +1133,7 @@ pub const CACHE_KEEP_ALIVE_MODE: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(crate::engine::event_wait::keep_alive::CACHE_KEEP_ALIVE_MODES),
     default: PrefDefault::Value("default"),
-    description: "When the cache keep-alive gives up on a waiting Claude Code session. 'default' beats an event wait or working children until the beats cost one cache rewrite (break-even), and a session parked on a question card or permission prompt until half of that. 'workspace-data' gives up at the point that would have cost least over this workspace's last 30 days, per wait type, and keeps the default for a type with under 50 waits. 'off' sends no beats, so every wait past the cache lifetime pays its rewrite.",
+    description: "When the cache keep-alive gives up on a waiting Claude Code session or Lucidos Agent thread. 'default' beats an event wait or working children until the beats cost one cache rewrite (break-even), and a thread parked on a question card or permission prompt until half of that. 'workspace-data' gives up at the point that would have cost least over this workspace's last 30 days, per wait type, and keeps the default for a type with under 50 waits. 'off' sends no beats, so every wait past the cache lifetime pays its rewrite.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1163,7 +1163,7 @@ pub const REASONING_CLAUDE_CODE: Pref<Text> = Pref::text(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
-pub const MODEL_CODEX: Pref<Optional> = Pref::optional(PrefSpec {
+pub const MODEL_CODEX: Pref<Text> = Pref::text(PrefSpec {
     key: "model_codex",
     label: "Codex default model",
     access: PrefAccess::Human {
@@ -1171,12 +1171,12 @@ pub const MODEL_CODEX: Pref<Optional> = Pref::optional(PrefSpec {
     },
     scope: PrefScope::Global,
     value: PrefValue::CodingAgentModel(crate::runtime::CodingAgent::Codex),
-    default: PrefDefault::Unset("Codex's own config decides"),
-    description: "The model a Codex thread runs on when nobody picked one, beside reasoning_codex. Unset leaves the choice to Codex's own config.",
+    default: PrefDefault::Value("gpt-6.1-sol"),
+    description: "The model a Codex thread runs on when nobody picked one, beside reasoning_codex. Lucidos pins it at spawn, so Codex's own config file never decides a Lucidos thread's model. A thread's own earlier pick still wins on its later sessions.",
     side_effect: PrefSideEffect::None,
 });
 
-pub const REASONING_CODEX: Pref<Optional> = Pref::optional(PrefSpec {
+pub const REASONING_CODEX: Pref<Text> = Pref::text(PrefSpec {
     key: "reasoning_codex",
     label: "Codex default effort",
     access: PrefAccess::Human {
@@ -1184,8 +1184,8 @@ pub const REASONING_CODEX: Pref<Optional> = Pref::optional(PrefSpec {
     },
     scope: PrefScope::Global,
     value: PrefValue::Enum(CODING_AGENT_EFFORTS),
-    default: PrefDefault::Unset("Codex's own config decides"),
-    description: "The reasoning effort a Codex thread runs at when nobody picked one, beside model_codex. Read only while model_codex is set.",
+    default: PrefDefault::Value("medium"),
+    description: "The reasoning effort a Codex thread runs at when nobody picked a model or an effort, beside model_codex. A pick that names only a model runs at that model's default effort instead.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1336,8 +1336,8 @@ pub const PUSH_NOTIFICATIONS: Pref<Optional> = Pref::optional(PrefSpec {
 // A write re-registers the backup cron through the scheduler's
 // PreferencesChanged subscriber, with no engine restart. A scheduled backup
 // uploads only once the provider's account is connected in Settings, Accounts.
-// The Backup page has no account UI. An enabled schedule generates an
-// encryption key on its first run.
+// The Backup page has no account UI. Without a configured sealing key,
+// scheduled backups skip and notify the user to finish setup.
 pub const BACKUP_SCHEDULE: Pref<Text> = Pref::text(PrefSpec {
     key: "backup_schedule",
     label: "Backup schedule",
@@ -1407,6 +1407,19 @@ pub const COMMAND_GUARD_JUDGE: Pref<Flag> = Pref::flag(PrefSpec {
     value: PrefValue::Bool,
     default: PrefDefault::Value("true"),
     description: "Whether the LLM judge classifies the commands the command guard's static lists do not settle. 'false' falls back to the static dangerous list for the ask lane. Read only while command_guard is on.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const COMMAND_GUARD_CODING_AGENTS: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "command_guard_coding_agents",
+    label: "Enabled for coding agents",
+    access: PrefAccess::Human {
+        hint: "managed in Settings → Permissions (Command safety)",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Bool,
+    default: PrefDefault::Value("false"),
+    description: "Whether the command guard answers the permission cards of coding-agent commands (Codex command_execution, Claude Code Bash). On, a command the guard places as safe or reversible runs without a card. There is no undo for a wrong reversible verdict. Off, a Codex command card is skipped only when the guard places it as safe, and a Claude Code Bash card always asks. Read only while command_guard is on.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1539,16 +1552,16 @@ pub const CAPTURE_CONTEXT: Pref<Flag> = Pref::flag(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
-pub const CACHE_WARM_LINE: Pref<Flag> = Pref::flag(PrefSpec {
-    key: "cache_warm_line",
-    label: "Cache-warm line",
+pub const CACHE_CARDS: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "cache_cards",
+    label: "Cache cards",
     access: PrefAccess::Human {
-        hint: "the cache-warm line is a display switch; the user changes it in Settings → System → Debugging",
+        hint: "the cache cards are a display switch; the user changes it in Settings → System → Debugging",
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
     default: PrefDefault::Value("true"),
-    description: "Whether a thread waiting on the user draws the cache-warm line, which counts down how long its prompt cache stays warm. Off hides the line and skips the read behind it.",
+    description: "Whether a thread draws its prompt-cache cards: the Cache kept warm card and the cache-warm line. Off hides both, and skips the read behind the line. Pings and costs never change.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1980,6 +1993,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &BACKUP_REMINDER_DISMISSED.spec,
     &COMMAND_GUARD.spec,
     &COMMAND_GUARD_JUDGE.spec,
+    &COMMAND_GUARD_CODING_AGENTS.spec,
     &MODEL_COMMAND_JUDGE.spec,
     &REASONING_COMMAND_JUDGE.spec,
     &JUDGMENT_COMMAND_GUARD.spec,
@@ -1989,7 +2003,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &JUDGMENT_WAKE_DECISION.spec,
     &MAX_TOOL_CALLS.spec,
     &CAPTURE_CONTEXT.spec,
-    &CACHE_WARM_LINE.spec,
+    &CACHE_CARDS.spec,
     &KEYBINDINGS.spec,
     &VOICE_INPUT_DEVICE.spec,
     &NETWORK_BIND.spec,

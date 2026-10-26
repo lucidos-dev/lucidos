@@ -40,16 +40,16 @@ function findActivationBody(name: string): string {
   throw new Error(`${name} call is unbalanced in PromptInput.tsx`);
 }
 
-/** The `holdHandlers` object literal, found by balancing braces. */
-function findHoldHandlers(): string {
-  const start = promptSource.indexOf('const holdHandlers = {');
-  if (start < 0) throw new Error('holdHandlers not found in PromptInput.tsx');
+/** The `tapGateHandlers` object literal, found by balancing braces. */
+function findTapGateHandlers(): string {
+  const start = promptSource.indexOf('const tapGateHandlers = {');
+  if (start < 0) throw new Error('tapGateHandlers not found in PromptInput.tsx');
   let depth = 0;
   for (let i = promptSource.indexOf('{', start); i < promptSource.length; i++) {
     if (promptSource[i] === '{') depth++;
     else if (promptSource[i] === '}' && --depth === 0) return promptSource.slice(start, i + 1);
   }
-  throw new Error('holdHandlers is unbalanced in PromptInput.tsx');
+  throw new Error('tapGateHandlers is unbalanced in PromptInput.tsx');
 }
 
 describe('send-cancel-morph button has tap-gate scroll protection', () => {
@@ -61,22 +61,22 @@ describe('send-cancel-morph button has tap-gate scroll protection', () => {
     expect(promptSource).toMatch(/useMemo\(\s*\(\s*\)\s*=>\s*createTapGate\(\)/);
   });
 
-  // The pointer half lives in `holdHandlers`, shared with the lone Submit, so
-  // both faces that end the row feed the gate the same way.
-  it('takes its pointer handlers from the shared hold handlers', () => {
-    expect(findMorphButton()).toMatch(/\{\.\.\.holdHandlers\}/);
+  // The pointer half lives in `tapGateHandlers`, shared with the lone Submit,
+  // so both faces that end the row feed the gate the same way.
+  it('takes its pointer handlers from the shared tap gate handlers', () => {
+    expect(findMorphButton()).toMatch(/\{\.\.\.tapGateHandlers\}/);
   });
 
   it('wires onPointerDown to gate.down(event)', () => {
-    expect(findHoldHandlers()).toMatch(/onPointerDown: \(([a-zA-Z]+): PointerEvent\) => \{[^}]*?morphGate\.down\(\s*\1\s*\)/);
+    expect(findTapGateHandlers()).toMatch(/onPointerDown: \(([a-zA-Z]+): PointerEvent\) => morphGate\.down\(\s*\1\s*\)/);
   });
 
   it('wires onPointerMove to gate.move(event)', () => {
-    expect(findHoldHandlers()).toMatch(/onPointerMove: \(([a-zA-Z]+): PointerEvent\) => \{[^}]*?morphGate\.move\(\s*\1\s*\)/);
+    expect(findTapGateHandlers()).toMatch(/onPointerMove: \(([a-zA-Z]+): PointerEvent\) => morphGate\.move\(\s*\1\s*\)/);
   });
 
   it('wires onPointerCancel to gate.cancel()', () => {
-    expect(findHoldHandlers()).toMatch(/onPointerCancel: \([^)]*\) => \{[^}]*morphGate\.cancel\(\)/);
+    expect(findTapGateHandlers()).toMatch(/onPointerCancel: \(\) => morphGate\.cancel\(\)/);
   });
 
   it('hands the gate to every path that could fire from a scroll', () => {
@@ -130,10 +130,10 @@ describe('answer control Cancel/Submit have tap-gate scroll protection', () => {
     expect(findActivationBody('answerSubmitActivate')).toMatch(/\}, true, morphActivationGate\)$/);
   });
 
-  it('feeds the lone Submit\'s pointer to the gate through the shared hold handlers', () => {
+  it('feeds the lone Submit\'s pointer to the gate through the shared tap gate handlers', () => {
     const submit = promptSource.match(/answerMode === 'submit' \? \([\s\S]*?<\/button>/)?.[0] ?? '';
     expect(submit, 'the lone Submit not found').not.toBe('');
-    expect(submit).toMatch(/\{\.\.\.holdHandlers\}/);
+    expect(submit).toMatch(/\{\.\.\.tapGateHandlers\}/);
   });
 });
 
@@ -272,9 +272,8 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     expect(bannerSource).toMatch(/import\s*\{[^}]*\buseTouchActivated\b[^}]*\}/);
   });
 
-  it('opts the multi-select Submit in through the split button', () => {
-    expect(promptSource).toMatch(/primaryTouchActivate/);
-    expect(splitButtonSource).toMatch(/!!props\.primaryTouchActivate && !props\.primaryDisabled/);
+  it('routes the multi-select Submit through the lone answer Submit touch path', () => {
+    expect(findActivationBody('answerSubmitActivate')).toMatch(/if \(hasPendingMultiQ\) void submitMultiAnswer\(\);/);
   });
 
   it('enumerates every touch path in the row, and marks each destructive one', () => {

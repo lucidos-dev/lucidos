@@ -60,7 +60,7 @@ const radius = (page: Page, selector: string) =>
   page.locator(selector).first().evaluate(el => getComputedStyle(el).borderTopLeftRadius);
 
 /** The corners the phone screenshots showed round under a square theme. */
-const CORNERS = ['.prompt-box', '.send-cancel-round', '.scroll-to-top', '#sq-pill', '#sq-button'];
+const CORNERS = ['.prompt-box', '.send-cancel-morph', '.scroll-to-top', '#sq-pill', '#sq-button'];
 
 test.describe('square corners and single-weight fonts', () => {
   test.beforeEach(async ({ page }) => {

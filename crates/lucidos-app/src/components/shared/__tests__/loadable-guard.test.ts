@@ -38,6 +38,7 @@ function hasLoadingFlagState(code: string): boolean {
 /** Reads that may stay outside a `Loadable`, each with the rule that says so. */
 const READ_EXEMPT: Record<string, Exemption> = {
   'components/chat/SuccessorCard.tsx': { tag: 'best-effort', why: 'an unasked offer that is simply absent when the context is unreadable' },
+  'components/chat/useChatRungState.ts': { tag: 'returns-value', why: 'asks what a switch costs on a pick; failure toasts. The ladder it draws is the shared chatLadder Loadable' },
   'components/credentials/CredentialItem.tsx': { tag: 'returns-value', why: 'copies a secret on a press; failure toasts' },
   'components/settings/BackupKeyPanel.tsx': { tag: 'returns-value', why: 'reveals the legacy backup key on a press, for the switch screen; failure toasts' },
   'components/settings/SettingsView.tsx': { tag: 'returns-value', why: 'hands the read to AllowlistEditor, which holds the Loadable' },

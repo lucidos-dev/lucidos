@@ -344,6 +344,22 @@ impl Relation {
     }
 }
 
+/// What a chat `ask_user_question` hands the loop: the tool result, and
+/// whether every pick was a *quiet option*, which ends the turn.
+pub(super) struct ChatAskOutcome {
+    pub result: String,
+    pub quiet: bool,
+}
+
+impl ChatAskOutcome {
+    fn failed(result: impl Into<String>) -> Self {
+        Self {
+            result: result.into(),
+            quiet: false,
+        }
+    }
+}
+
 impl LucidosEngine {
     /// Handle tool calls that need special processing outside of `execute_tool`.
     /// Returns `Some(result)` if the tool was handled, `None` if it should fall through
@@ -379,12 +395,6 @@ impl LucidosEngine {
         // child inherits it.
         caller_route: &crate::core::ResolvedModelSelection,
     ) -> Option<String> {
-        if tool_name == tn::ASK_USER_QUESTION {
-            return Some(
-                self.handle_chat_ask_user_question(thread_id, tool_use_id, tool_args, meta)
-                    .await,
-            );
-        }
         if tool_name == tn::CAPTURE_APP || tool_name == tn::REFRESH_APP {
             let last_used = self.last_used_device(thread_id, device_id).await;
             Some(
@@ -1003,19 +1013,21 @@ impl LucidosEngine {
     /// channel is what makes `answer_pending_question` skip the CC-only
     /// resume side-effects (no `CodingAgentPromptSent`, no `ContinuationRequested`).
     /// The card's `message` renders in the turn `meta` belongs to.
-    async fn handle_chat_ask_user_question(
+    pub(super) async fn handle_chat_ask_user_question(
         &self,
         thread_id: Uuid,
         tool_use_id: &str,
         tool_args: &serde_json::Value,
         meta: &EventMeta,
-    ) -> String {
+    ) -> ChatAskOutcome {
         let questions = tool_args
             .get("questions")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         if !questions.is_array() {
-            return "Error: `questions` must be an array of question objects".to_string();
+            return ChatAskOutcome::failed(
+                "Error: `questions` must be an array of question objects",
+            );
         }
 
         use crate::engine::agent_question::{card_message, CardMessage};
@@ -1033,27 +1045,36 @@ impl LucidosEngine {
                 },
             )
             .await;
-        let answer_kinds = match outcome {
-            Ok(o) => o.answer_kinds,
+        let outcome = match outcome {
+            Ok(o) => o,
             Err(e) => {
                 crate::log!(
                     "[AskUserQuestion] chat walk failed for {thread_id}/{tool_use_id}: {e}"
                 );
-                return format!("Error: ask_user_question failed: {e}");
+                return ChatAskOutcome::failed(format!("Error: ask_user_question failed: {e}"));
             }
         };
 
-        if answer_kinds.is_empty() {
+        if outcome.answer_kinds.is_empty() {
             // LLM sent zero questions in the batch. Surface a typed-error
             // shape rather than the empty `{}` so the model gets a clear
             // signal to retry with at least one question.
-            return "Error: `questions` array was empty — pass at least one question".to_string();
+            return ChatAskOutcome::failed(
+                "Error: `questions` array was empty — pass at least one question",
+            );
         }
 
         use crate::engine::agent_question::{build_hook_answers, with_answer_images, AnswerImages};
-        let answers = build_hook_answers(&answer_kinds, &questions, AnswerImages::AttachedBlocks);
+        let answers = build_hook_answers(
+            &outcome.answer_kinds,
+            &questions,
+            AnswerImages::AttachedBlocks,
+        );
         let result = serde_json::to_string(&answers).unwrap_or_else(|_| answers.to_string());
-        with_answer_images(result, &answer_kinds)
+        ChatAskOutcome {
+            result: with_answer_images(result, &outcome.answer_kinds),
+            quiet: outcome.quiet,
+        }
     }
 }
 

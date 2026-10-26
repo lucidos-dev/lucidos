@@ -18,7 +18,9 @@ mod actions;
 pub(crate) mod archive;
 pub(crate) mod archive_all;
 mod background_tasks;
+mod cache_keep_alive;
 mod cache_warmth;
+pub(super) mod child_reports;
 mod delete;
 mod detach;
 mod events_snapshot;
@@ -223,6 +225,10 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/background-tasks/:task_id/stop",
             post(background_tasks::stop_background_task),
         )
+        .route(
+            "/threads/:thread_id/child-reports/take",
+            post(child_reports::take_child_reports),
+        )
         // The parent-to-child edge. `:thread_id` is the CHILD; the parent is
         // whoever the thread-bound origin token says the caller is, never a
         // field on the request. Not a bare `/threads/<param>` leaf, so it is
@@ -242,6 +248,10 @@ pub(super) fn router() -> Router<super::AppState> {
         .route(
             "/threads/:thread_id/cache-warmth",
             get(cache_warmth::get_cache_warmth),
+        )
+        .route(
+            "/threads/:thread_id/cache-keep-alive",
+            post(cache_keep_alive::switch_cache_keep_alive),
         )
         .route(
             "/threads/:thread_id/switch-estimate",

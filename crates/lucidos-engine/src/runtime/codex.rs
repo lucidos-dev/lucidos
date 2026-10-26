@@ -32,7 +32,7 @@
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
@@ -40,12 +40,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
     AgentEvent, AgentExitFacts, AgentInput, AgentRuntime, CodingAgent, ControlRequest,
-    RunningAgent, SpawnArgs,
+    InputWithdrawal, RunningAgent, SpawnArgs, WithdrawRequest,
 };
 use super::claude_code::{format_exit_status, CcMenuOption, GROUP_TEARDOWN_GRACE};
 use super::codex_parse::{parse_codex_line, TurnTracker};
 use super::lucidos_cli::{ensure_workspace_bin_symlink, lucidos_cli_dir};
-use super::spawn_env::{apply_lucidos_env, command_secret_values, StderrTail};
+use super::spawn_env::{apply_lucidos_env, command_secret_values, AgentSandbox, StderrTail};
 
 #[derive(Debug, serde::Deserialize)]
 struct CodexMenuOptionsFile {
@@ -236,20 +236,7 @@ impl AgentRuntime for CodexRuntime {
         let sandbox_writable_roots =
             sandbox_writable_roots(args.worktree_path, args.workspace_path).await;
 
-        // Bake the Lucidos env contract once; each per-turn child re-applies it.
-        let (env, env_removed) = {
-            let mut probe = tokio::process::Command::new("true");
-            apply_lucidos_env(&mut probe, &args, cli_dir, "Codex");
-            let mut env = Vec::new();
-            let mut env_removed = Vec::new();
-            for (k, v) in probe.as_std().get_envs() {
-                match v {
-                    Some(v) => env.push((k.to_owned(), v.to_owned())),
-                    None => env_removed.push(k.to_owned()),
-                }
-            }
-            (env, env_removed)
-        };
+        let (env, env_removed) = baked_lucidos_env(&args, cli_dir);
         let agent_run = args.agent_run.clone();
 
         // A user-configured `codex` path must point at a real executable —
@@ -278,6 +265,7 @@ impl AgentRuntime for CodexRuntime {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (control_tx, control_rx) = mpsc::unbounded_channel::<ControlRequest>();
+        let (withdraw_tx, withdraw_rx) = mpsc::unbounded_channel::<WithdrawRequest>();
 
         let resume_session_id = args.resume_session_id.map(str::to_string);
         let protocol =
@@ -292,6 +280,7 @@ impl AgentRuntime for CodexRuntime {
                         events_tx,
                         input_rx,
                         control_rx,
+                        withdraw_rx,
                         permission_tx,
                         cancel,
                     )
@@ -308,6 +297,7 @@ impl AgentRuntime for CodexRuntime {
                         events_tx,
                         input_rx,
                         control_rx,
+                        withdraw_rx,
                         cancel,
                     )
                     .await;
@@ -326,9 +316,7 @@ impl AgentRuntime for CodexRuntime {
             input_tx,
             control_tx,
             permission_rx,
-            // Codex has no side-question call in either protocol.
-            // Nor a way to take back an input.
-            withdraw_tx: None,
+            withdraw_tx,
         })
     }
 }
@@ -554,6 +542,31 @@ pub(super) fn lucidos_mcp_server_config_overrides(
         .collect()
 }
 
+/// Bake the Lucidos env contract once; each per-turn child re-applies it. Codex
+/// runs under an OS sandbox, so its compile env skips the shared sccache daemon.
+fn baked_lucidos_env(
+    args: &SpawnArgs<'_>,
+    cli_dir: Option<&Path>,
+) -> (Vec<(OsString, OsString)>, Vec<OsString>) {
+    let mut probe = tokio::process::Command::new("true");
+    apply_lucidos_env(
+        &mut probe,
+        args,
+        cli_dir,
+        AgentSandbox::OsSandboxed,
+        "Codex",
+    );
+    let mut env = Vec::new();
+    let mut env_removed = Vec::new();
+    for (k, v) in probe.as_std().get_envs() {
+        match v {
+            Some(v) => env.push((k.to_owned(), v.to_owned())),
+            None => env_removed.push(k.to_owned()),
+        }
+    }
+    (env, env_removed)
+}
+
 /// Wire name of the question tool as it appears in `CodingAgentToolCalled`
 /// events — codex prefixes MCP tools with `mcp__<server>__`. The engine's
 /// run loop suppresses the tool-call event for this name (the
@@ -765,6 +778,33 @@ pub(super) fn write_image_files(
     (paths, guards)
 }
 
+/// Answer a withdraw for a Codex driver. An input still in `queue` never
+/// reached Codex, so it is dropped. Any other input went into a turn.
+/// Callers must hold no input outside `queue` and `input_rx`.
+pub(super) fn answer_withdraw(
+    queue: &mut VecDeque<AgentInput>,
+    input_rx: &mut mpsc::UnboundedReceiver<AgentInput>,
+    request: WithdrawRequest,
+) {
+    // The run loop sends an input before any withdraw of it, so it may still
+    // sit unread in `input_rx`.
+    while let Ok(input) = input_rx.try_recv() {
+        queue.push_back(input);
+    }
+    let at = queue
+        .iter()
+        .position(|input| input.uuid == request.input_uuid);
+    let outcome = match at {
+        Some(at) => {
+            queue.remove(at);
+            InputWithdrawal::Withdrawn
+        }
+        None => InputWithdrawal::AlreadyRead,
+    };
+    // The run loop may have ended; nobody is left to tell.
+    let _ = request.reply.send(outcome);
+}
+
 /// Outcome of one turn — tells the driver loop what to do next.
 enum TurnOutcome {
     /// Turn ended (completed, failed, interrupted, or synthesized) — keep
@@ -785,6 +825,7 @@ async fn driver_task(
     events_tx: mpsc::UnboundedSender<AgentEvent>,
     mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
     mut control_rx: mpsc::UnboundedReceiver<ControlRequest>,
+    mut withdraw_rx: mpsc::UnboundedReceiver<WithdrawRequest>,
     cancel: CancellationToken,
 ) {
     let mut tracker = TurnTracker::new(resume_session_id);
@@ -807,6 +848,9 @@ async fn driver_task(
                         None => break 'session,
                     }
                 }
+                Some(withdraw) = withdraw_rx.recv() => {
+                    answer_withdraw(&mut queue, &mut input_rx, withdraw);
+                }
                 _ = cancel.cancelled() => {
                     log!("[Codex] cancellation signalled while idle — ending session");
                     break 'session;
@@ -822,6 +866,7 @@ async fn driver_task(
             &events_tx,
             &mut input_rx,
             &mut control_rx,
+            &mut withdraw_rx,
             &mut queue,
             &cancel,
         )
@@ -876,6 +921,7 @@ async fn run_turn(
     events_tx: &mpsc::UnboundedSender<AgentEvent>,
     input_rx: &mut mpsc::UnboundedReceiver<AgentInput>,
     control_rx: &mut mpsc::UnboundedReceiver<ControlRequest>,
+    withdraw_rx: &mut mpsc::UnboundedReceiver<WithdrawRequest>,
     queue: &mut VecDeque<AgentInput>,
     cancel: &CancellationToken,
 ) -> TurnOutcome {
@@ -973,6 +1019,9 @@ async fn run_turn(
                         break 'turn;
                     }
                 }
+            }
+            Some(withdraw) = withdraw_rx.recv() => {
+                answer_withdraw(queue, input_rx, withdraw);
             }
             req = control_rx.recv() => {
                 match req {

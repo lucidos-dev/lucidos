@@ -16,8 +16,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { chatExchangePropsEqual, drawsInitiatorPanel } from '../ChatExchange';
-import { exchangeKey, type Exchange, type StoredEvent } from '../../../store/thread-events';
+import { chatExchangePropsEqual } from '../ChatExchange';
+import { drawsInitiatorPanel, exchangeKey, type Exchange, type StoredEvent } from '../../../store/thread-events';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const chatExchangeSource: string = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf-8');

@@ -1,15 +1,19 @@
 import { test, expect, Page, Locator } from './fixtures';
+import type { BrowserContext } from '@playwright/test';
 import { randomUUID } from 'crypto';
-import { apiRequest, assertHealthy, ensureOnThreadPane, gotoWithRetry, touchPress, waitForVisibleInput, waitForWorkspaceReady } from './helpers';
+import { apiRequest, assertHealthy, ensureMobileView, ensureOnThreadPane, gotoWithRetry, touchPress, waitForDashboardReady, waitForVisibleInput, waitForWorkspaceReady } from './helpers';
 import { ensureHomeThread, psql, seedChatThread } from './db-helpers';
 
 /**
- * The phone dashboard is a sheet over any thread (ADR 0538). A button beside
+ * The phone dashboard is a panel over any thread (ADR 0538). A button beside
  * the mark in the thread header opens it, over Home or any other thread. Opening
  * it never changes focus, so the hash stays put. Closing it
  * never reloads a tile. The phone dashboard has its own tiles, apart from the
  * desktop one.
  */
+
+/** Fresh contexts the held-chunk spec spends to get the route in front of the chunk. */
+const HOLD_ATTEMPTS = 5;
 
 let written: string[] = [];
 let added: string[] = [];
@@ -48,9 +52,9 @@ async function dashboardTiles(page: Page, dashboard: 'phone' | 'desktop'): Promi
   return (await resp.json()).tiles;
 }
 
-const toggle = (page: Page) => page.locator('.mobile-thread-header .header-mark-group .dashboard-sheet-toggle:visible');
-const sheet = (page: Page) => page.locator('.dashboard-sheet-panel');
-const tile = (page: Page, appId: string): Locator => sheet(page).locator(`.dashboard-tile[data-dashboard-tile^="${appId}?"]`);
+const toggle = (page: Page) => page.locator('.mobile-thread-header .header-mark-group .dashboard-panel-toggle:visible');
+const panel = (page: Page) => page.locator('.dashboard-panel');
+const tile = (page: Page, appId: string): Locator => panel(page).locator(`.dashboard-tile[data-dashboard-tile^="${appId}?"]`);
 const frame = (page: Page, appId: string) => tile(page, appId).frameLocator('iframe');
 const order = (page: Page, appId: string) => tile(page, appId).evaluate((el) => Number((el as HTMLElement).style.order));
 
@@ -64,20 +68,21 @@ async function openHome(page: Page): Promise<void> {
   await expect(toggle(page)).toBeVisible({ timeout: 15_000 });
 }
 
-/** Open the sheet from its button and wait for the fade to finish. */
-async function openSheet(page: Page): Promise<void> {
+/** Open the panel from its button and wait for the fade to finish. */
+async function openPanel(page: Page): Promise<void> {
   await toggle(page).click();
-  await expect(sheet(page)).toBeVisible();
-  await expect(sheet(page)).toHaveCSS('opacity', '1');
+  await expect(panel(page)).toBeVisible();
+  await expect(panel(page)).toHaveCSS('opacity', '1');
+  await waitForDashboardReady(panel(page));
 }
 
 /** The app header's bottom edge, in px. */
 const headerBottom = (page: Page) => page.evaluate(() => document.querySelector('.app-header')!.getBoundingClientRect().bottom);
 
-/** The sheet's top edge, in px. */
-const sheetTop = (page: Page) => page.evaluate(() => document.querySelector('.dashboard-sheet-panel')!.getBoundingClientRect().top);
+/** The panel's top edge, in px. */
+const panelTop = (page: Page) => page.evaluate(() => document.querySelector('.dashboard-panel')!.getBoundingClientRect().top);
 
-test.describe('The dashboard sheet on a phone', () => {
+test.describe('The dashboard panel on a phone', () => {
   let a: string;
   let b: string;
 
@@ -104,12 +109,12 @@ test.describe('The dashboard sheet on a phone', () => {
     await openHome(page);
     await expect(page.locator('.home-pane')).toHaveCount(0);
     await expect(page.locator('[data-home-face]')).toHaveCount(0);
-    await expect(sheet(page)).toHaveCount(0);
+    await expect(panel(page)).toHaveCount(0);
   });
 
   test('the pressed button wears the same paint as Filter on the header bar', async ({ page }) => {
     await openHome(page);
-    await openSheet(page);
+    await openPanel(page);
     await page.mouse.move(0, 0);
     await expect(toggle(page)).toHaveAttribute('aria-pressed', 'true');
 
@@ -127,28 +132,28 @@ test.describe('The dashboard sheet on a phone', () => {
       document.querySelector('.mobile-thread-header')!.append(probe);
       const filter = paint(probe);
       probe.remove();
-      return { filter, dashboard: paint(document.querySelector('.mobile-thread-header .dashboard-sheet-toggle')!) };
+      return { filter, dashboard: paint(document.querySelector('.mobile-thread-header .dashboard-panel-toggle')!) };
     });
     await expect.poll(async () => (await paints()).dashboard).toEqual((await paints()).filter);
     expect((await paints()).dashboard.background, 'a pressed toggle wears a chip').not.toBe('rgba(0, 0, 0, 0)');
   });
 
-  test('the button opens the sheet over Home, flush below the header, and the hash stays put', async ({ page }) => {
+  test('the button opens the panel over Home, flush below the header, and the hash stays put', async ({ page }) => {
     await addToDashboard(page, a);
     await openHome(page);
     const hash = await page.evaluate(() => location.hash);
 
-    await openSheet(page);
+    await openPanel(page);
     await expect(tile(page, a)).toBeVisible();
     expect(await page.evaluate(() => location.hash)).toBe(hash);
-    expect(await sheetTop(page)).toBeCloseTo(await headerBottom(page), 0);
+    expect(await panelTop(page)).toBeCloseTo(await headerBottom(page), 0);
   });
 
   for (const [name, title] of [
     ['a short title', 'E2E short'],
     ['a long title', 'E2E a long thread title that has to wrap onto a second line on a narrow phone screen'],
   ] as const) {
-    test(`over a thread with ${name}, the sheet meets the header, and focus stays`, async ({ page }) => {
+    test(`over a thread with ${name}, the panel meets the header, and focus stays`, async ({ page }) => {
       const threadId = seedChatThread({ turns: 1, needles: [], title });
       try {
         await addToDashboard(page, a);
@@ -157,8 +162,8 @@ test.describe('The dashboard sheet on a phone', () => {
         await expect(toggle(page)).toBeVisible({ timeout: 15_000 });
 
         const hash = await page.evaluate(() => location.hash);
-        await openSheet(page);
-        expect(await sheetTop(page)).toBeCloseTo(await headerBottom(page), 0);
+        await openPanel(page);
+        expect(await panelTop(page)).toBeCloseTo(await headerBottom(page), 0);
         expect(await page.evaluate(() => location.hash)).toBe(hash);
         expect(await page.evaluate(() => localStorage.getItem('lucidos-focused-thread'))).toBe(threadId);
       } finally {
@@ -167,26 +172,58 @@ test.describe('The dashboard sheet on a phone', () => {
     });
   }
 
-  test('the button stays tappable and closes the sheet', async ({ page }) => {
+  test('the button stays tappable and closes the panel', async ({ page }) => {
     await openHome(page);
-    await openSheet(page);
+    await openPanel(page);
     await expect(toggle(page)).toHaveAttribute('aria-pressed', 'true');
 
     await toggle(page).click();
-    await expect(sheet(page)).toBeHidden();
+    await expect(panel(page)).toBeHidden();
     await expect(toggle(page)).toHaveAttribute('aria-pressed', 'false');
   });
 
-  /** Invariant: closing and reopening the sheet never reloads a tile. */
-  test('a tile is not reloaded when the sheet closes and opens again', async ({ page }) => {
+  /** Invariant: a pane swipe that starts on the open panel moves the strip. */
+  test('a pane swipe from the open panel moves the strip, and the panel is open on return', async ({ page, browserName }) => {
+    test.skip(browserName === 'webkit', 'CDP touch input is Chromium only');
+    await openHome(page);
+    await openPanel(page);
+    const { width, height } = page.viewportSize()!;
+    const y = height / 2;
+
+    await touchPress(page, [
+      { type: 'touchStart', x: width * 0.4, y },
+      { type: 'touchMove', x: width * 0.55, y },
+      { type: 'touchMove', x: width * 0.7, y },
+      { type: 'touchMove', x: width * 0.85, y },
+      { type: 'touchEnd' },
+    ]);
+    await expect(page.locator('.app-header')).toHaveAttribute('data-mobile-view', 'threads');
+
+    await ensureMobileView(page, 'thread');
+    await expect(toggle(page)).toHaveAttribute('aria-pressed', 'true');
+    await expect(panel(page)).toBeVisible();
+  });
+
+  /** Invariant: the header stays live over the panel, so the mark opens the Lucidos menu. */
+  test('the Lucidos mark opens its menu over the open panel', async ({ page }) => {
+    await openHome(page);
+    await openPanel(page);
+
+    await page.locator('.mobile-thread-header [data-role="brand-menu-toggle"]:visible').first().click();
+    await expect(page.locator('.brand-menu')).toBeVisible();
+    await expect(toggle(page)).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  /** Invariant: closing and reopening the panel never reloads a tile. */
+  test('a tile is not reloaded when the panel closes and opens again', async ({ page }) => {
     await addToDashboard(page, a);
     await openHome(page);
-    await openSheet(page);
+    await openPanel(page);
     const loaded = await frame(page, a).locator('#load').textContent();
 
     await toggle(page).click();
-    await expect(sheet(page)).toBeHidden();
-    await openSheet(page);
+    await expect(panel(page)).toBeHidden();
+    await openPanel(page);
     await expect(frame(page, a).locator('#load')).toHaveText(loaded ?? '');
   });
 
@@ -197,12 +234,12 @@ test.describe('The dashboard sheet on a phone', () => {
     await addToDashboard(page, b);
     await arrange(page, 'phone', [{ app_id: b, size: 'small' }, { app_id: a, size: 'medium' }]);
     await openHome(page);
-    await openSheet(page);
+    await openPanel(page);
 
     expect(await order(page, b)).toBeLessThan(await order(page, a));
     await expect(tile(page, b)).toHaveAttribute('data-size', 'small');
 
-    await sheet(page).locator('.dashboard-edit').click();
+    await panel(page).locator('.dashboard-edit').click();
     await tile(page, a).locator('.dashboard-size-pill button[aria-label="small"]').click();
     await expect.poll(async () => (await dashboardTiles(page, 'phone')).find((t) => t.app_id === a)?.size).toBe('small');
     expect(await dashboardTiles(page, 'desktop')).toEqual(desktopBefore);
@@ -213,8 +250,8 @@ test.describe('The dashboard sheet on a phone', () => {
   test('a medium tile fills the two columns inside the dashboard, with no overflow', async ({ page }) => {
     await addToDashboard(page, a);
     await openHome(page);
-    await openSheet(page);
-    const dashboard = sheet(page).locator('.dashboard');
+    await openPanel(page);
+    const dashboard = panel(page).locator('.dashboard');
     await expect(dashboard).toHaveCSS('--dashboard-columns', '2');
     const content = await dashboard.evaluate((el) => {
       const r = el.getBoundingClientRect();
@@ -228,12 +265,72 @@ test.describe('The dashboard sheet on a phone', () => {
     expect(await dashboard.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
   });
 
+  /** Invariant: the panel is ready to press only once its tiles are mounted
+   *  and no skeleton covers them. The dashboard is a code-split chunk. Until it
+   *  lands the panel shows no grid and, inside the skeleton's delay gate, no
+   *  skeleton. A readiness check that only looks for their absence then passes
+   *  at once. The skeleton then shows over the tiles for its minimum hold, and a
+   *  press lands on it. */
+  test.describe('with the dashboard chunk held', () => {
+    test('a panel with no dashboard yet is not ready to press', async ({ page: seedPage, browser }) => {
+      await addToDashboard(seedPage, a);
+      let release = () => {};
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let held = false;
+      const contexts: BrowserContext[] = [];
+      let page = seedPage;
+      try {
+        // The chunk is the one script that draws the settling grid. The idle
+        // prefetch can fetch it before WebKit routes anything, and a reload then
+        // serves it from the browser cache, past the route. Each attempt is a
+        // fresh context, with a cache of its own, until the route has caught it.
+        // A service worker would answer the chunk past the route, so it is blocked.
+        // Playwright fills every other option from the project config.
+        for (let attempt = 0; attempt < HOLD_ATTEMPTS && !held; attempt++) {
+          const context = await browser.newContext({ serviceWorkers: 'block' });
+          contexts.push(context);
+          // Each attempt has its own flag: a late fetch in an abandoned context
+          // must not mark the current page as held.
+          let caught = false;
+          await context.route('**/assets/*.js', async (route) => {
+            const response = await route.fetch();
+            if ((await response.text()).includes('is-settling')) {
+              caught = true;
+              await released;
+            }
+            await route.fulfill({ response });
+          });
+          page = await context.newPage();
+          await openHome(page);
+          if ((await toggle(page).getAttribute('aria-pressed')) !== 'true') await toggle(page).click();
+          await expect(panel(page)).toHaveCSS('opacity', '1');
+          await expect.poll(() => caught, { timeout: 3_000 }).toBe(true).catch(() => {});
+          held = caught;
+        }
+        expect(held, 'the dashboard chunk request reached the route').toBe(true);
+        let ready = false;
+        const readiness = waitForDashboardReady(panel(page)).then(() => { ready = true; });
+        await page.waitForTimeout(500);
+        expect(ready).toBe(false);
+
+        release();
+        await readiness;
+        const box = (await tile(page, a).boundingBox())!;
+        const coveredBySkeleton = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest('.loading-fade-skeleton') != null, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
+        expect(coveredBySkeleton).toBe(false);
+      } finally {
+        release();
+        await Promise.all(contexts.map((context) => context.close().catch(() => {})));
+      }
+    });
+  });
+
   test('a finger drag over a live tile moves nothing, and a hold opens the tile menu', async ({ page, browserName }) => {
     test.skip(browserName === 'webkit', 'CDP touch input is Chromium only');
     await addToDashboard(page, a);
     await addToDashboard(page, b);
     await openHome(page);
-    await openSheet(page);
+    await openPanel(page);
     // A frame forwards a hold only once the host's push marked it a dashboard
     // tile with a menu. The place stamp lands in the same handler as that mark,
     // and a slow renderer start on a runner can outlast the 450 ms hold.
@@ -252,7 +349,7 @@ test.describe('The dashboard sheet on a phone', () => {
       { type: 'touchMove', ...to },
       { type: 'touchEnd' },
     ]);
-    await expect(sheet(page).locator('.dashboard-tile-shield')).toHaveCount(0);
+    await expect(panel(page).locator('.dashboard-tile-shield')).toHaveCount(0);
     expect([await order(page, a), await order(page, b)]).toEqual(before);
 
     const cdp = await page.context().newCDPSession(page);
@@ -262,8 +359,8 @@ test.describe('The dashboard sheet on a phone', () => {
     // One press opens one menu, and Edit dashboard in it enters edit mode.
     const menu = page.locator('.thread-overflow-menu');
     await expect(menu).toHaveCount(1);
-    await expect(sheet(page).locator('.dashboard-tile-shield')).toHaveCount(0);
+    await expect(panel(page).locator('.dashboard-tile-shield')).toHaveCount(0);
     await menu.getByRole('menuitem', { name: 'Edit dashboard' }).click();
-    await expect(sheet(page).locator('.dashboard-tile-shield')).toHaveCount(2);
+    await expect(panel(page).locator('.dashboard-tile-shield')).toHaveCount(2);
   });
 });

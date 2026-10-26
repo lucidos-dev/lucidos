@@ -51,10 +51,16 @@ function seed(title: string, steps: number[]): string {
 }
 
 /** The step row resting on the transcript's top line and its offset, the same
- *  rule `readRowAnchor` uses, restated so the spec asserts the reader's view. */
+ *  rule `readRowAnchor` uses, restated so the spec asserts the reader's view.
+ *
+ *  The WebKit repaint nudge moves `scrollTop` 1px for a frame and cancels it
+ *  with a `translateY` on the transcript (`utils/webkitRepaint.ts`). The reader
+ *  sees nothing move, but the rows sit 1px lower against the transcript's box.
+ *  A row resting at a fraction above the line then flips to the row before it.
+ *  The top line is therefore measured from the box without that translate. */
 async function rowAtTop(page: Page): Promise<{ label: string; relTop: number } | null> {
   return page.locator('.thread-content').first().evaluate((el) => {
-    const top = el.getBoundingClientRect().top;
+    const top = el.getBoundingClientRect().top - new DOMMatrix(getComputedStyle(el).transform).m42;
     let best: { label: string; relTop: number } | null = null;
     for (const row of Array.from(el.querySelectorAll<HTMLElement>('[data-row-event]'))) {
       const rect = row.getBoundingClientRect();
@@ -65,6 +71,25 @@ async function rowAtTop(page: Page): Promise<{ label: string; relTop: number } |
     }
     return best;
   });
+}
+
+/** Where the step row named `label` sits against the transcript's top line, or
+ *  null while it is not drawn. A reopen may name the row before it, because the
+ *  saved anchor was read in a nudged frame. Both name the same place, so the spec
+ *  asks where the PARKED row is, never which row is on the line. */
+async function rowOffset(page: Page, label: string): Promise<number | null> {
+  return page.locator('.thread-content').first().evaluate(rowOffsetIn, label);
+}
+
+function rowOffsetIn(el: HTMLElement, label: string): number | null {
+  const top = el.getBoundingClientRect().top - new DOMMatrix(getComputedStyle(el).transform).m42;
+  for (const row of Array.from(el.querySelectorAll<HTMLElement>('[data-row-event]'))) {
+    const text = (row.textContent ?? '').replace(/\s+/g, ' ').trim();
+    if (!text.startsWith(label) || /\d/.test(text.charAt(label.length))) continue;
+    const rect = row.getBoundingClientRect();
+    if (rect.height > 0) return Math.round(rect.top - top);
+  }
+  return null;
 }
 
 /** Scroll up by `px` the way a reader does: a wheel event, then the move. */
@@ -118,21 +143,35 @@ test.describe('A long coding-agent thread reopens on the same row', () => {
     await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, threadB);
     await expect(transcript.getByText('Run t0s0').first()).toBeVisible();
     await page.evaluate((tid) => { location.hash = `#thread=${tid}`; }, threadA);
-    await expect.poll(async () => (await rowAtTop(page))?.label, { timeout: 10_000 }).toBe(parked!.label);
-    const back = await rowAtTop(page);
-    expect(Math.abs(back!.relTop - parked!.relTop)).toBeLessThanOrEqual(2);
+    const near = async () => Math.abs((await rowOffset(page, parked!.label) ?? Infinity) - parked!.relTop) <= 2;
+    await expect.poll(near, { timeout: 10_000 }).toBe(true);
     // And it stays there: nothing shrinks the window under a restore that landed.
     await page.waitForTimeout(1500);
-    expect((await rowAtTop(page))?.label).toBe(parked!.label);
+    expect(await near()).toBe(true);
 
     // A reload loads only the newest page, so the row is found by the chase.
+    // Every frame is sampled from the reload on, so a restore that lands and
+    // then moves shows up as a frame.
+    await page.addInitScript(([fn, label]) => {
+      const rowOffsetIn = new Function(`return ${fn}`)() as (el: HTMLElement, label: string) => number | null;
+      const frames: Array<number | null> = [];
+      (window as unknown as { __rowFrames: typeof frames }).__rowFrames = frames;
+      const sample = () => {
+        const el = document.querySelector<HTMLElement>('.thread-content');
+        if (el && el.getBoundingClientRect().height > 0) frames.push(rowOffsetIn(el, label));
+        requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    }, [rowOffsetIn.toString(), parked!.label] as const);
     await page.reload();
     await expect(transcript.locator('.chat-exchange').first()).toBeVisible();
-    await expect.poll(async () => (await rowAtTop(page))?.label, { timeout: 15_000 }).toBe(parked!.label);
-    const reloaded = await rowAtTop(page);
-    expect(Math.abs(reloaded!.relTop - parked!.relTop)).toBeLessThanOrEqual(2);
+    await expect.poll(near, { timeout: 15_000 }).toBe(true);
     await page.waitForTimeout(1500);
-    expect((await rowAtTop(page))?.label).toBe(parked!.label);
+    const frames = await page.evaluate(() => (window as unknown as { __rowFrames: Array<number | null> }).__rowFrames);
+    const isParked = (f: number | null) => f !== null && Math.abs(f - parked!.relTop) <= 2;
+    const landed = frames.findIndex(isParked);
+    expect(landed, 'a frame shows the parked row where it was left').toBeGreaterThanOrEqual(0);
+    expect(frames.slice(landed).filter((f) => !isParked(f)), 'once the parked row is on its line it stays there').toEqual([]);
     const stillScrollable = await transcript.evaluate((el) => el.scrollTop < el.scrollHeight - el.clientHeight - 1);
     expect(stillScrollable, 'never parked at the bottom').toBe(true);
   });

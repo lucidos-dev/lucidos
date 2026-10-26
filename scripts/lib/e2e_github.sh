@@ -16,6 +16,8 @@
 
 # shellcheck source=scripts/lib/touched_specs.sh
 source "$(dirname "${BASH_SOURCE[0]}")/touched_specs.sh"
+# shellcheck source=scripts/lib/e2e_warm.sh
+source "$(dirname "${BASH_SOURCE[0]}")/e2e_warm.sh"
 
 E2E_GITHUB_REPO="lucidos-dev/lucidos"
 E2E_GITHUB_REMOTE="lucidos"
@@ -656,17 +658,23 @@ PY
 # The plan artifact lists one line per shard: "<id> <suite> <project> <shard>
 # <total>". Each shard uploads e2e-out-<id>/<id>.log and <id>.rc. A shard the
 # plan names but whose output is missing has no verdict. So does a shard whose
-# build the memory gate refused, since it tested nothing.
+# build the memory gate refused, or whose warm-up failed, since it tested
+# nothing.
 
 # e2e_github_shard_rc <dir> <id>: the shard's exit code, or the no-verdict code.
 # Needs HOST_MEMORY_BUILD_REFUSED_EXIT, which scripts/lib/e2e.sh sources.
 e2e_github_shard_rc() {
-    local rc_file="$1/e2e-out-$2/$2.rc" rc
+    local rc_file="$1/e2e-out-$2/$2.rc" rc task
     rc="$(cat "$rc_file" 2>/dev/null)"
     case "$rc" in
         '' | *[!0-9]*) echo "$E2E_GITHUB_NO_VERDICT_EXIT" ;;
         "$HOST_MEMORY_BUILD_REFUSED_EXIT")
             echo "ERROR: the $2 shard's build never started (exit $rc), so it tested nothing." >&2
+            echo "$E2E_GITHUB_NO_VERDICT_EXIT"
+            ;;
+        "$E2E_WARM_FAILED_EXIT")
+            task="$(sed -n 's/^ERROR: warm-up task \([^ ]*\) .*/\1/p' "$1/e2e-out-$2/$2.log" 2>/dev/null | tail -n 1)"
+            echo "ERROR: the $2 shard's ${task:-warm-up} setup failed (exit $rc), so it tested nothing." >&2
             echo "$E2E_GITHUB_NO_VERDICT_EXIT"
             ;;
         *) echo "$rc" ;;

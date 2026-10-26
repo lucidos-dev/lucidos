@@ -11,6 +11,10 @@
 # Tested by scripts/lib/e2e_warm_test.sh.
 
 E2E_WARM_TIMEOUT_SECS="${E2E_WARM_TIMEOUT_SECS:-900}"
+# What a failed wait exits with. A shard that dies on it tested nothing, so
+# e2e_github_shard_rc reads it as no verdict. A test command's own code never
+# takes this value.
+E2E_WARM_FAILED_EXIT=77
 
 e2e_warm_active() {
     [ -n "${LUCIDOS_E2E_WARM_DIR:-}" ]
@@ -33,8 +37,8 @@ e2e_warm_start() {
 }
 
 # e2e_warm_wait [<task>...]: wait for the named tasks, or for every started
-# one. Fails, with the end of the task's log, when a task failed, never
-# started, or is still running after E2E_WARM_TIMEOUT_SECS.
+# one. Fails with E2E_WARM_FAILED_EXIT, and the end of the task's log, when a
+# task failed, never started, or is still running after E2E_WARM_TIMEOUT_SECS.
 e2e_warm_wait() {
     e2e_warm_active || return 0
     local dir="$LUCIDOS_E2E_WARM_DIR" task f began now rc ended started
@@ -48,14 +52,14 @@ e2e_warm_wait() {
     for task in ${tasks[@]+"${tasks[@]}"}; do
         if [ ! -f "$dir/$task.started" ]; then
             echo "ERROR: warm-up task $task was never started." >&2
-            return 1
+            return "$E2E_WARM_FAILED_EXIT"
         fi
         while [ ! -f "$dir/$task.rc" ]; do
             now="$(date +%s)"
             if [ $((now - began)) -ge "$E2E_WARM_TIMEOUT_SECS" ]; then
                 echo "ERROR: warm-up task $task is still running after ${E2E_WARM_TIMEOUT_SECS}s. Its log ends:" >&2
                 tail -n 40 "$dir/$task.log" >&2 2>/dev/null
-                return 1
+                return "$E2E_WARM_FAILED_EXIT"
             fi
             sleep 0.5
         done
@@ -63,7 +67,7 @@ e2e_warm_wait() {
         if [ "$rc" != 0 ]; then
             echo "ERROR: warm-up task $task failed (exit $rc). Its log ends:" >&2
             tail -n 40 "$dir/$task.log" >&2
-            return 1
+            return "$E2E_WARM_FAILED_EXIT"
         fi
         started="$(cat "$dir/$task.started")"
         echo "Warm-up: $task ready (ran $((ended - started))s, waited $(($(date +%s) - began))s)"

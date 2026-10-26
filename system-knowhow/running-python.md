@@ -246,7 +246,12 @@ Don't `os.chdir` into the scripts dir instead. Relative paths inside the importe
 
 Each looks reasonable alone, fails the same way every time, and wastes a turn:
 
-1. **Sleep-poll**: `run_python(code="time.sleep(N)")` to wait for a background task. Use `bash_output(task_id, wait_secs=N)` instead. The engine also has a repeated-call guard. It buckets `run_python` calls by the first non-blank non-comment non-import line of `code` (truncated to 80 chars). It fires only on repeated **failures**: three ERRORs in a row with the SAME first actionable line trip it, three successes do not. A sleep-poll burns a turn either way.
+1. **Sleep-poll**: `run_python(code="time.sleep(N)")` to wait for a background task.
+   Use `bash_output(task_id, wait_secs=N)` instead.
+   The repeated-call guard covers both Python tools and groups calls by their
+   first actionable code line. After two failed executions, identical attempts
+   three and four warn without executing; attempt five forces a break.
+   A success or a different call resets the streak.
 2. **`os.chdir` + `sys.path.insert(0, ".")`** for importing app scripts. Use the absolute path via `$LUCIDOS_WORKSPACE` once. Don't try four variants.
 3. **`subprocess.run(["python", "-c", code])`** from inside `run_python` to get a "fresh interpreter". You already are one. The subprocess won't see the venv's site-packages.
 4. **Re-spawning a background task to read its result** instead of calling `bash_output(task_id)`. The task is still running with a known id; drain it.
@@ -259,7 +264,12 @@ Each looks reasonable alone, fails the same way every time, and wastes a turn:
 
 `run_python` (the sync foreground tool) auto-trims long tracebacks. It keeps the first and last `File "..."` frame and the final `ExceptionClass: message` line, and drops the middle. Then it caps the error at its last 4 KB, behind a `[... N bytes of stderr omitted ...]` marker, so one huge line cannot flood your context. The stderr tail stays on disk at `.lucidos/exhaust/<run_id>/stderr.txt` for seven days.
 
-`run_python_background` does NOT auto-trim. Its stderr flows through `bash_output` raw, and a chained import error can dump many KB of frames into your context. For a backtest or long script that might crash loudly, wrap the body in your own `try / except`. Re-raise a short fingerprint: `print(f"FAIL: {type(e).__name__}: {e}", file=sys.stderr); raise`. The full traceback still lands on disk at `.lucidos/exhaust/<task_id>/stderr.txt`, kept for seven days.
+`run_python_background` does not auto-trim. Its stderr flows through `bash_output`
+raw, so chained import errors can fill the context.
+For a long script, catch exceptions and print a short failure summary.
+The engine stages `script.py` under `.lucidos/exhaust/<run_id>/`; that run id
+differs from the background task id. It does not write `stderr.txt` there.
+Save a full traceback explicitly when the work needs one.
 
 A `run_python` call that hits the 300 s ceiling fails with `Python script
 timed out after 300s`. The code was fine; the budget was not. Never retry it

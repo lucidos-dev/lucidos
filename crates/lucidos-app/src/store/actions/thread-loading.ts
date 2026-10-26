@@ -68,6 +68,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       codingAgentKind: info.coding_agent_kind || undefined,
       codingAgentFolder: info.coding_agent_folder || undefined,
       codingAgent: info.coding_agent || undefined,
+      codingAgents: info.coding_agents,
       state: info.state,
       latestTodoList: null,
       liveEventWaits: info.live_event_waits ?? [],
@@ -184,6 +185,7 @@ export function upsertThread(
       if (info.coding_agent_kind) existing.meta.codingAgentKind = info.coding_agent_kind;
       if (info.coding_agent_folder) existing.meta.codingAgentFolder = info.coding_agent_folder;
       if (info.coding_agent) existing.meta.codingAgent = info.coding_agent;
+      if (info.coding_agents) existing.meta.codingAgents = info.coding_agents;
       // The engine still has the thread composing, but this device sent its
       // first message and the engine has not recorded it yet: a pending row,
       // or an unsent message. The row predates the send however late it was

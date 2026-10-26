@@ -1,6 +1,6 @@
 # 0474: A heavy coding-agent thread continues in a successor thread that carries its branch, sits in its place, and proposes for both
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0560](0560-successor-session-in-the-same-thread.md): a handoff starts a successor session in the same thread. Old successor-thread chains still render.
 - **Date**: 2026-10-14
 
 ## Context

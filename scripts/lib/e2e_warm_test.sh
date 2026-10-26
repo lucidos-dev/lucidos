@@ -52,7 +52,7 @@ test_a_failed_task_fails_the_wait_with_its_log() {
     broken() { echo "the mirror refused us"; return 3; }
     e2e_warm_start broken broken
     out="$(e2e_warm_wait broken 2>&1)" || rc=$?
-    if [ "$rc" -ne 0 ]; then pass "the wait fails"; else fail "the wait passed"; fi
+    if [ "$rc" -eq "$E2E_WARM_FAILED_EXIT" ]; then pass "the wait fails with the setup-failure code, not the task's own"; else fail "the wait returned $rc"; fi
     if printf '%s' "$out" | grep -q "exit 3"; then pass "it gives the exit status"; else fail "output: $out"; fi
     if printf '%s' "$out" | grep -q "the mirror refused us"; then pass "it shows the log"; else fail "output: $out"; fi
 }
@@ -82,7 +82,7 @@ test_a_task_nobody_started_is_an_error() {
     fresh_dir unstarted
     e2e_warm_start npm true
     out="$(e2e_warm_wait nmp 2>&1)" || rc=$?
-    if [ "$rc" -ne 0 ]; then pass "the wait fails"; else fail "the wait passed"; fi
+    if [ "$rc" -eq "$E2E_WARM_FAILED_EXIT" ]; then pass "the wait fails with the setup-failure code"; else fail "the wait returned $rc"; fi
     if printf '%s' "$out" | grep -q "nmp was never started"; then pass "it names the task"; else fail "output: $out"; fi
 }
 
@@ -92,7 +92,7 @@ test_a_task_that_outruns_the_limit_fails_the_wait() {
     fresh_dir slow
     e2e_warm_start slow sleep 5
     out="$(E2E_WARM_TIMEOUT_SECS=1 e2e_warm_wait slow 2>&1)" || rc=$?
-    if [ "$rc" -ne 0 ]; then pass "the wait gives up"; else fail "the wait passed"; fi
+    if [ "$rc" -eq "$E2E_WARM_FAILED_EXIT" ]; then pass "the wait gives up with the setup-failure code"; else fail "the wait returned $rc"; fi
     if printf '%s' "$out" | grep -q "still running after 1s"; then pass "it says why"; else fail "output: $out"; fi
 }
 

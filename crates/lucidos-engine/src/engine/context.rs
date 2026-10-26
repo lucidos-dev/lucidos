@@ -739,15 +739,16 @@ fn cut_the_newest_results(
 /// the image pins covering it, the attached image) from the prompt.
 ///
 /// `keep_image_idxs` lists every message whose image bytes pass 0 must preserve,
-/// in addition to the literal last message. Callers pin two kinds of message:
-/// the turn's user messages (the initial one plus any mid-turn injection that
-/// carried images), and tool results holding an image the model *explicitly
-/// asked to see* (`view_image`, `read_file` on an image file). Both must stay
-/// visible for the WHOLE turn: once the model makes another tool call the
-/// message is no longer last, and stripping its image there blinds the model
-/// for the rest of the turn — the "the bot can't see my attached image" bug,
-/// and the reason a `view_image` call used to be undone by the very next tool
-/// call. Ambient captures (`capture_app`, `browser_screenshot`) are
+/// in addition to the literal last message. Callers pin two kinds of message.
+/// One is the user's: the turn's message, and any mid-turn injection or
+/// question answer that carried images. The other is a tool result holding an
+/// image the model *explicitly asked to see* (`view_image`, `read_file` on an
+/// image file).
+///
+/// Both must stay visible for the WHOLE turn. Once the model makes
+/// another tool call the message is no longer last. Stripping its image there
+/// blinds the model for the rest of the turn ("the bot can't see my attached
+/// image"). Ambient captures (`capture_app`, `browser_screenshot`) are
 /// deliberately NOT pinned: they snapshot state that changes under the model,
 /// so they must age out after one call.
 ///

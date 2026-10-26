@@ -770,6 +770,9 @@ pub(crate) async fn parse_claude_stream(
         input_tokens: turn_meta.input_tokens,
         cache_creation_tokens: turn_meta.cache_creation_tokens,
         cache_creation_1h_tokens: turn_meta.cache_creation_1h_tokens,
+        cache_creation_30m_tokens: None,
+        cache_creation_12h_tokens: None,
+        cache_creation_requested_ttl: None,
         cache_read_tokens: turn_meta.cache_read_tokens,
         served_model: turn_meta.served_model,
         provider: None,
@@ -783,6 +786,7 @@ pub(crate) async fn parse_claude_stream(
         // model-only.
         model_only_text: None,
         progress_notes,
+        prefill: None,
         service_tier: None,
     })
 }

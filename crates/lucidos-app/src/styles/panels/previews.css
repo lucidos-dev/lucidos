@@ -150,7 +150,7 @@
 
 .pseudo-fullscreen-exit {
     position: absolute;
-    top: calc(var(--safe-area-top) + var(--fullscreen-exit-inset));
+    top: calc(var(--header-controls-top) + var(--fullscreen-exit-inset));
     right: calc(var(--safe-area-right) + var(--fullscreen-exit-inset));
     padding: var(--fullscreen-exit-pad);
     /* Above the `.edge-swipe-zone` guards this overlay also carries, which
@@ -687,6 +687,11 @@ img.preview-image {
     background: color-mix(in srgb, var(--accent) 8%, transparent);
     border-radius: calc(var(--radius-surface) / 3);
     font-style: italic;
+}
+
+/* A block box, so its `.authored-html` clip is one box. */
+.slides-pv-insight-text {
+    display: block;
 }
 
 .slides-pv-insight[data-color="green"] { background: color-mix(in srgb, var(--accent-green) 8%, transparent); }

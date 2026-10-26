@@ -1,11 +1,13 @@
 pub mod anthropic;
 pub mod anthropic_wire;
 mod aux_provider;
+pub mod cache_lifetime;
 /// Temporary diagnostic, off unless `LUCIDOS_CACHE_PROBE` is set. Tracked in
 /// `docs/temporary-measures.md`.
 pub(crate) mod cache_probe;
 pub mod call_trace;
 pub mod claude_gateway;
+pub(crate) mod claude_prefill;
 pub mod image;
 pub mod judgment;
 pub mod metered;
@@ -15,6 +17,7 @@ pub mod model_prices;
 pub mod model_registry;
 pub mod not_served;
 pub mod openai;
+pub mod prefill;
 pub mod provider;
 pub mod provider_build;
 pub mod provider_selection;
