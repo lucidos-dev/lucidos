@@ -1081,7 +1081,27 @@ impl LucidosEngine {
                     is_external_repo,
                     safety_net_fired,
                     TurnCancel::of(&last_terminal_kind),
+                    crate::engine::successor::handoff_pending(self.pool(), thread_id).await,
                 ) {
+                    SessionEndAction::CarriedBySuccessor => {
+                        match crate::engine::change_ops::withhold_handed_off_work(
+                            self.pool(),
+                            &self.event_bus,
+                            thread_id,
+                            &repo_root,
+                            effective_branch,
+                        )
+                        .await
+                        {
+                            Ok(true) => self.broadcast_changes_updated().await,
+                            Ok(false) => {}
+                            Err(e) => log!(
+                                "[AgentSession] Could not withdraw the handed-off change of thread {}: {}",
+                                thread_id,
+                                e
+                            ),
+                        }
+                    }
                     SessionEndAction::KeepExternalBranch => {
                         log!(
                             "[AgentSession] External repo branch {} — keeping branch, no change proposed",

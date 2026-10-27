@@ -208,18 +208,19 @@ impl LucidosEngine {
             .map(ImageSize::parse_size)
             .unwrap_or(ImageSize::Auto);
 
-        let save_as_artifact = args.get("save_as_artifact").and_then(|v| v.as_str());
+        let raw_save_path = args.get("save_as_artifact").and_then(|v| v.as_str());
         // Refused before the provider call, which the user pays for. Refused
         // after it, the image is generated, billed and then thrown away.
-        if let Some(artifact_path) = save_as_artifact {
-            if crate::api::is_path_traversal(artifact_path) {
+        if let Some(path) = raw_save_path {
+            if crate::api::is_path_traversal(path) {
                 return Err(format!(
                     "Invalid save_as_artifact path (must not contain '..' or start with '/' or '\\'): {}",
-                    artifact_path
+                    path
                 )
                 .into());
             }
         }
+        let save_as_artifact = raw_save_path.map(crate::core::artifact_relative_path);
 
         // Resolve input images
         let input_refs: Vec<String> = args
@@ -301,7 +302,7 @@ impl LucidosEngine {
         // Return a JSON result with the image info — the agentic loop will
         // store the base64 in the ToolResult event's images field
         let result_text = if let Some(path) = save_as_artifact {
-            format!("Image generated and saved to {}.", path)
+            format!("Image generated and saved to artifacts/{}.", path)
         } else {
             "Image generated successfully.".to_string()
         };
@@ -331,17 +332,15 @@ impl LucidosEngine {
             );
         }
 
-        let artifact_path = args
+        let path = args
             .get("path")
             .and_then(|v| v.as_str())
-            // Relative to `data/artifacts/`, matching the tool schema in
-            // `llm/tools/images.rs` and what `write_and_commit` joins onto. An
-            // `artifacts/` prefix here would land at `data/artifacts/artifacts/`.
-            .ok_or("path is required, relative to data/artifacts/ (e.g. 'reports/photo.jpg')")?;
+            .ok_or("path is required, under artifacts/ (e.g. 'artifacts/reports/photo.jpg')")?;
 
-        if crate::api::is_path_traversal(artifact_path) {
+        if crate::api::is_path_traversal(path) {
             return Err("Invalid path (must not contain '..' or start with '/' or '\\')".into());
         }
+        let artifact_path = crate::core::artifact_relative_path(path);
 
         let raw_bytes = self.resolve_image_reference(reference, thread_id).await?;
 
@@ -361,7 +360,7 @@ impl LucidosEngine {
 
         crate::log!("[Image] Saved thread image to artifact: {}", artifact_path);
 
-        Ok(format!("Image saved to {}.", artifact_path))
+        Ok(format!("Image saved to artifacts/{}.", artifact_path))
     }
 
     /// Re-load an image posted earlier in the thread back into the model's
@@ -847,48 +846,19 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("path")));
     }
 
+    /// The examples teach the data path the agent later links in chat, which
+    /// the tools resolve without nesting it under `artifacts/` twice.
     #[test]
-    fn save_thread_image_path_description_is_relative_to_artifacts() {
-        // The path parameter must describe paths relative to data/artifacts/,
-        // NOT relative to data/. write_and_commit already prepends data/artifacts/.
-        // If the description says "under data/" the LLM passes "artifacts/projects/..."
-        // which becomes data/artifacts/artifacts/projects/... — double nesting.
-        let tool = get_save_thread_image_tool();
-        let path_desc = tool.parameters["properties"]["path"]["description"]
-            .as_str()
-            .unwrap();
-
-        assert!(
-            !path_desc.contains("under data/"),
-            "path description must NOT say 'under data/' — paths are relative to data/artifacts/. Got: {}",
-            path_desc
-        );
-        assert!(
-            !path_desc.contains("'artifacts/"),
-            "path example must NOT start with 'artifacts/' — that causes double nesting. Got: {}",
-            path_desc
-        );
-    }
-
-    #[test]
-    fn generate_image_save_as_artifact_description_is_relative_to_artifacts() {
-        use crate::llm::tools::get_image_generation_tool;
-
-        let tool = get_image_generation_tool();
-        let desc = tool.parameters["properties"]["save_as_artifact"]["description"]
-            .as_str()
-            .unwrap();
-
-        assert!(
-            !desc.contains("under data/"),
-            "save_as_artifact description must NOT say 'under data/' — paths are relative to data/artifacts/. Got: {}",
-            desc
-        );
-        assert!(
-            !desc.contains("'artifacts/"),
-            "save_as_artifact example must NOT start with 'artifacts/' — that causes double nesting. Got: {}",
-            desc
-        );
+    fn save_path_examples_are_data_paths() {
+        let save_thread_image = get_save_thread_image_tool();
+        let generate_image = crate::llm::tools::get_image_generation_tool();
+        for desc in [
+            &save_thread_image.parameters["properties"]["path"]["description"],
+            &generate_image.parameters["properties"]["save_as_artifact"]["description"],
+        ] {
+            let desc = desc.as_str().unwrap();
+            assert!(desc.contains("(e.g. 'artifacts/"), "{desc}");
+        }
     }
 
     #[test]

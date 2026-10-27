@@ -33,8 +33,12 @@ fn due() -> Candidate {
         cache_ttl: CacheTtl::Reported(CacheLifetime::FiveMinutes),
         cache: cache_shares_of("claude-opus-5-5"),
         cache_model: Some("claude-opus-5-5".to_string()),
+        cache_effort: None,
+        beat_model: Some("claude-opus-5-5".into()),
+        beat_effort: None,
         turned_off_at: None,
         unattended_trigger: false,
+        beat_missed: false,
     }
 }
 
@@ -76,19 +80,46 @@ fn skip(reason: SkipReason) -> Beat {
     Beat::Skip(reason)
 }
 
-/// The verdict under the `default` rule, which most cases here pin.
+/// The verdict under the `break-even` rule, which most cases here pin.
 fn decide(c: &Candidate) -> Beat {
-    super::decide(c, GiveUpRule::Default)
+    super::decide(c, GiveUpRule::BreakEven)
 }
 
-/// The status under the `default` rule.
+/// The status under the `break-even` rule.
 fn status(c: &Candidate, at: &Anchors, spent: Spent) -> CacheKeepAliveStatus {
-    super::status(c, GiveUpRule::Default, &WaitDurations::default(), at, spent)
+    super::status(
+        c,
+        GiveUpRule::BreakEven,
+        &WaitDurations::default(),
+        at,
+        spent,
+    )
 }
 
 #[test]
 fn a_due_thread_beats() {
     assert_eq!(decide(&due()), Beat::Send(BeatRoute::Resume));
+}
+
+#[test]
+fn a_changed_model_or_effort_stops_every_route() {
+    for base in [due(), parked(), lucidos(), lucidos_on_its_card()] {
+        for (model, effort) in [
+            ("claude-sonnet-5-5", None),
+            ("claude-opus-5-5[1m]", None),
+            ("claude-opus-5-5", Some("high")),
+        ] {
+            let candidate = Candidate {
+                beat_model: Some(model.into()),
+                beat_effort: effort.map(str::to_string),
+                ..base.clone()
+            };
+            assert_eq!(decide(&candidate), skip(SkipReason::ModelChanged));
+            let state = status(&candidate, &anchors_of(&candidate), Spent::default());
+            assert_eq!(state, not_kept(CacheKeepAliveNotKeptReason::ModelChanged));
+            assert_eq!(state.clone().recorded(), Some(state));
+        }
+    }
 }
 
 /// No route beats a trigger thread nobody has written in: not a resume, a
@@ -120,6 +151,22 @@ fn an_unattended_trigger_gets_no_beat_on_any_route() {
 #[test]
 fn every_condition_can_stop_a_beat() {
     let cases: Vec<(&str, Candidate, Beat)> = vec![
+        (
+            "a beat missed the cache",
+            Candidate {
+                beat_missed: true,
+                ..due()
+            },
+            skip(SkipReason::BeatMissed),
+        ),
+        (
+            "the model changed",
+            Candidate {
+                beat_model: Some("claude-sonnet-5-5".into()),
+                ..due()
+            },
+            skip(SkipReason::ModelChanged),
+        ),
         (
             "a Codex thread",
             Candidate {
@@ -222,7 +269,7 @@ fn the_budget_is_the_rewrite_cost_in_beats() {
             cache: cache_shares_of(model),
             ..due()
         };
-        give_up_after_secs(&c, GiveUpRule::Default).expect("a budget")
+        give_up_after_secs(&c, GiveUpRule::BreakEven).expect("a budget")
     };
     let cases = [
         ("claude-opus-5-5", 25.0, 40.0),
@@ -595,7 +642,7 @@ fn short_bash_waits() -> WaitDurations {
 }
 
 /// `workspace-data` gives up at the cap this workspace's own waits price
-/// cheapest. A type with too few waits keeps the default.
+/// cheapest. A type with too few waits keeps break-even.
 #[test]
 fn workspace_data_gives_up_at_the_tuned_cap() {
     let beat_every = window_start(CacheLifetime::FiveMinutes);
@@ -695,19 +742,16 @@ fn the_mode_reads_back_its_catalog_values() {
     }
     assert_eq!(
         CacheKeepAliveMode::parse("sometimes"),
-        CacheKeepAliveMode::Default
+        CacheKeepAliveMode::Off
     );
 }
 
 #[test]
-fn the_catalog_default_is_the_default_mode() {
+fn the_catalog_default_is_off() {
     let PrefDefault::Value(value) = crate::core::prefs::CACHE_KEEP_ALIVE_MODE.spec.default else {
         panic!("the mode preference has a value default");
     };
-    assert_eq!(
-        CacheKeepAliveMode::parse(value),
-        CacheKeepAliveMode::Default
-    );
+    assert_eq!(CacheKeepAliveMode::parse(value), CacheKeepAliveMode::Off);
 }
 
 #[test]
@@ -718,7 +762,7 @@ fn each_mode_picks_its_rule() {
         ..due()
     };
     let decide_under = |mode| super::decide(&c, GiveUpRule::of(mode, &bash));
-    assert_eq!(decide_under(CacheKeepAliveMode::Default), decide(&c));
+    assert_eq!(decide_under(CacheKeepAliveMode::BreakEven), decide(&c));
     assert_eq!(
         decide_under(CacheKeepAliveMode::WorkspaceData),
         skip(SkipReason::PastCutOff)
@@ -1005,6 +1049,53 @@ async fn the_model_comes_from_the_latest_session_write() {
     teardown_test_db(&db_name).await;
 }
 
+#[tokio::test]
+async fn a_persisted_model_switch_cannot_beat_the_previous_models_cache() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/model-switch", None).await;
+    seed_thread_event(
+        &bus,
+        thread_id,
+        capture_writing_on("claude-sonnet-5-5", 100_000, 0, false),
+    )
+    .await;
+    seed_thread_event(
+        &bus,
+        thread_id,
+        ThreadEvent::CodingAgentSettingsChanged {
+            model: Some("claude-opus-5-5".into()),
+            reasoning_effort: Some("high".into()),
+            coding_agent: CodingAgent::ClaudeCode,
+            cc_session_id: None,
+            claude_config_dir: None,
+            claude_config_dir_explicit: None,
+        },
+    )
+    .await;
+    let row = candidate_row(&pool, thread_id).await.unwrap();
+    let (model, effort): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT payload->>'model', payload->>'reasoning_effort' FROM events
+         WHERE thread_id = $1 AND event_type = 'CodingAgentSettingsChanged'
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let candidate = Candidate {
+        cache_model: row.last_write_model,
+        cache_effort: row.last_write_effort,
+        beat_model: model,
+        beat_effort: effort,
+        ..due()
+    };
+    assert_eq!(decide(&candidate), skip(SkipReason::ModelChanged));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// After a restart the in-memory beat map is empty, so the schedule must come
 /// back from the events alone: the request's start is the capture's `created`
 /// minus its duration, and the real idle is the latest `CodingAgentIdled`.
@@ -1202,7 +1293,7 @@ fn kind_of(status: &CacheKeepAliveStatus) -> StatusKind {
         CacheKeepAliveStatus::Warming { .. } => StatusKind::Warming,
         CacheKeepAliveStatus::Stopped { .. } => StatusKind::Stopped,
         CacheKeepAliveStatus::TurnedOff { .. } => StatusKind::TurnedOff,
-        CacheKeepAliveStatus::NotKept { reason } => StatusKind::NotKept(*reason),
+        CacheKeepAliveStatus::NotKept { reason, .. } => StatusKind::NotKept(*reason),
         CacheKeepAliveStatus::Ended { .. } => panic!("no tick builds an ended status"),
     }
 }
@@ -1239,10 +1330,15 @@ fn status_kind_for(rule: GiveUpRule, c: &Candidate, beat: &Beat) -> StatusKind {
         }
         Beat::Skip(SkipReason::OnlyNoWakeChildren) => StatusKind::NotKept(Reason::NoWakeChildren),
         Beat::Skip(SkipReason::UnknownTtl) => StatusKind::NotKept(Reason::UnknownTtl),
+        Beat::Skip(SkipReason::ModelChanged) => StatusKind::NotKept(Reason::ModelChanged),
+        Beat::Skip(SkipReason::BeatMissed) => StatusKind::NotKept(Reason::BeatMissed),
         Beat::Skip(SkipReason::TurnedOff) => StatusKind::TurnedOff,
         Beat::Skip(SkipReason::UncacheableProvider) => {
             StatusKind::NotKept(Reason::UncacheableProvider)
         }
+        Beat::Skip(SkipReason::ProviderPaused) => StatusKind::NotKept(Reason::ProviderPaused),
+        Beat::Skip(SkipReason::PingsPaused) => StatusKind::NotKept(Reason::PingsPaused),
+        Beat::Skip(SkipReason::CacheExpired) => StatusKind::NotKept(Reason::CacheExpired),
         Beat::Skip(SkipReason::Restarted | SkipReason::NoCopyPrompt) => {
             StatusKind::NotKept(Reason::Restarted)
         }
@@ -1262,6 +1358,14 @@ fn one_candidate_per_verdict() -> Vec<Candidate> {
     };
     vec![
         due(),
+        Candidate {
+            beat_missed: true,
+            ..due()
+        },
+        Candidate {
+            beat_model: Some("claude-sonnet-5-5".into()),
+            ..due()
+        },
         Candidate {
             agent: Agent::Codex,
             ..due()
@@ -1341,6 +1445,19 @@ fn one_candidate_per_verdict() -> Vec<Candidate> {
         lucidos(),
         lucidos_on_its_card(),
         remembering(Remembered::Uncacheable),
+        remembering(Remembered::ProviderPaused),
+        remembering(Remembered::Missed),
+        remembering(Remembered::Expired),
+        remembering(paused()),
+        Candidate {
+            agent: Agent::Lucidos(Remembered::Missed),
+            ..lucidos_on_its_card()
+        },
+        Candidate {
+            agent: Agent::Lucidos(paused()),
+            ..lucidos_on_its_card()
+        },
+        remembering(Remembered::GaveUp),
         remembering(Remembered::Nothing),
         Candidate {
             unattended_trigger: true,
@@ -1356,7 +1473,7 @@ fn the_status_agrees_with_the_beat_on_every_verdict() {
     let mut reached = Vec::new();
     let tuned = short_bash_waits();
     for rule in [
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         GiveUpRule::WorkspaceData(&tuned),
         GiveUpRule::Off,
     ] {
@@ -1376,7 +1493,7 @@ fn the_status_agrees_with_the_beat_on_every_verdict() {
             }
         }
     }
-    assert_eq!(reached.len(), 21, "every verdict is covered: {reached:?}");
+    assert_eq!(reached.len(), 26, "every verdict is covered: {reached:?}");
 }
 
 /// A warming status dates everything from the database's own stamps: the wait
@@ -1428,7 +1545,7 @@ fn a_stopped_status_says_when_the_budget_ran_out() {
         context_tokens: 262_000,
         ..Spent::default()
     };
-    let give_up = give_up_after_secs(&c, GiveUpRule::Default).expect("a budget");
+    let give_up = give_up_after_secs(&c, GiveUpRule::BreakEven).expect("a budget");
     assert_eq!(
         status(&c, &anchors_of(&c), spent),
         CacheKeepAliveStatus::Stopped {
@@ -1634,7 +1751,7 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
         &bus,
         thread_id,
         &candidate,
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors,
         None,
@@ -1649,7 +1766,7 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
         &bus,
         thread_id,
         &candidate,
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors,
         written.clone(),
@@ -1675,7 +1792,7 @@ async fn the_status_is_written_on_change_and_cleared_when_the_wait_ends() {
         &bus,
         thread_id,
         &busy,
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors_of(&busy),
         written,
@@ -1841,16 +1958,21 @@ async fn the_saving_is_claimed_only_for_a_warm_wake() {
         last_ping_age: f64,
         /// The wake's frames as (cache read, age).
         frames: &'static [(u32, f64)],
+        input_tokens: u32,
         saved: Option<f64>,
     }
     let case = |label, last_ping_age, frames, saved| Case {
         label,
         last_ping_age,
         frames,
+        input_tokens: 100_000,
         saved,
     };
     let cases = [
         case("a warm wake", 120.0, &[(100_000, 0.0)], Some(priced)),
+        case("a system-prompt-only read", 120.0, &[(15_000, 0.0)], None),
+        case("one token below half", 120.0, &[(49_999, 0.0)], None),
+        case("exactly half", 120.0, &[(50_000, 0.0)], Some(priced)),
         case("a cold wake", 700.0, &[(100_000, 0.0)], None),
         case(
             "a wake that wrote the cache afresh",
@@ -1872,15 +1994,16 @@ async fn the_saving_is_claimed_only_for_a_warm_wake() {
             Some(priced),
         ),
     ];
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
     for Case {
         label,
         last_ping_age,
         frames,
+        input_tokens,
         saved,
     } in cases
     {
-        let (pool, db_name) = setup_test_db().await;
-        let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
         start_cc_session(&bus, thread_id, "claude-code/saving", None).await;
         seed_thread_event(&bus, thread_id, capture_writing(40_000, 0, false)).await;
@@ -1888,7 +2011,14 @@ async fn the_saving_is_claimed_only_for_a_warm_wake() {
         seed_ping(&bus, thread_id, 100_000, 1).await;
         let mut ages = vec![1_200.0, 960.0, 959.0, last_ping_age + 1.0, last_ping_age];
         for (read, age_secs) in frames {
-            seed_thread_event(&bus, thread_id, ping_capture(*read, "wake-call")).await;
+            let mut capture = ping_capture(*read, "wake-call");
+            if let ThreadEvent::ContextCaptured {
+                usage: Some(usage), ..
+            } = &mut capture
+            {
+                usage.input_tokens = input_tokens;
+            }
+            seed_thread_event(&bus, thread_id, capture).await;
             ages.push(*age_secs);
         }
         let end = run_end_of(&pool, thread_id, 1_100.0, &ages).await;
@@ -1898,9 +2028,9 @@ async fn the_saving_is_claimed_only_for_a_warm_wake() {
             !frames.is_empty(),
             "{label}: when it woke"
         );
-        pool.close().await;
-        teardown_test_db(&db_name).await;
     }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 /// A run that pinged ends when its thread waits on nothing, or starts another
@@ -1935,7 +2065,7 @@ async fn a_run_ends_when_its_thread_moves_on_without_leaving_the_selection() {
         &bus,
         thread_id,
         &idle,
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors_of(&idle),
         stored,
@@ -1956,7 +2086,7 @@ async fn a_run_ends_when_its_thread_moves_on_without_leaving_the_selection() {
         &bus,
         thread_id,
         &idle,
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors_of(&idle),
         after,
@@ -1979,7 +2109,7 @@ async fn a_run_ends_when_its_thread_moves_on_without_leaving_the_selection() {
         &bus,
         thread_id,
         &newer,
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors_of(&newer),
         stored,
@@ -2026,13 +2156,13 @@ async fn a_run_that_pinged_ends_when_its_pings_stop_mid_wait() {
         (
             "a restart",
             restarted,
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             Some(CacheKeepAliveNotKeptReason::Restarted),
         ),
         (
             "only no-wake children",
             no_wake_children,
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             Some(CacheKeepAliveNotKeptReason::NoWakeChildren),
         ),
     ];
@@ -2072,7 +2202,7 @@ async fn a_run_that_pinged_ends_when_its_pings_stop_mid_wait() {
             ),
             "{label}: the run ends first: {history:?}"
         );
-        let expected_last = reason.map(|reason| CacheKeepAliveStatus::NotKept { reason });
+        let expected_last = reason.map(CacheKeepAliveStatus::not_kept);
         match expected_last {
             Some(last) => assert_eq!(
                 after_warming,
@@ -2618,7 +2748,7 @@ async fn a_parked_session_writes_its_status() {
         &bus,
         thread_id,
         &parked,
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors_of(&parked),
         None,
@@ -2641,7 +2771,7 @@ async fn a_parked_session_writes_its_status() {
 // --- The status on the cache-warm line (I1) ---
 
 fn not_kept(reason: CacheKeepAliveNotKeptReason) -> CacheKeepAliveStatus {
-    CacheKeepAliveStatus::NotKept { reason }
+    CacheKeepAliveStatus::not_kept(reason)
 }
 
 fn restarted() -> Candidate {
@@ -2666,7 +2796,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
                 agent: Agent::Codex,
                 ..parked()
             },
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             Reason::Codex,
             Some(SkipReason::Codex),
         ),
@@ -2680,7 +2810,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
         (
             "a session that outlived a restart",
             restarted(),
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             Reason::Restarted,
             Some(SkipReason::NoCopyPrompt),
         ),
@@ -2690,7 +2820,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
                 claim: ThreadClaim::Free,
                 ..parked()
             },
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             Reason::Restarted,
             Some(SkipReason::AwaitingUser),
         ),
@@ -2700,7 +2830,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
                 awaiting_user: true,
                 ..due()
             },
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             Reason::NothingPending,
             Some(SkipReason::AwaitingUser),
         ),
@@ -2710,7 +2840,7 @@ fn the_status_names_why_nothing_keeps_a_thread_warm() {
                 keep_warm_wait_secs: None,
                 ..due()
             },
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             Reason::NothingPending,
             Some(SkipReason::NothingToWaitFor),
         ),
@@ -2753,6 +2883,10 @@ fn a_reason_that_names_no_wait_records_nothing() {
         Reason::NoWakeChildren,
         Reason::ChildrenAwaitingUser,
         Reason::UncacheableProvider,
+        Reason::ProviderPaused,
+        Reason::PrefillPaused,
+        Reason::PingsPaused,
+        Reason::CacheExpired,
         Reason::Restarted,
     ] {
         assert!(not_kept(reason).recorded().is_some(), "{reason:?}");
@@ -2765,7 +2899,7 @@ fn a_reason_that_names_no_wait_records_nothing() {
 /// time.
 #[test]
 fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
-    let give_up_after = give_up_after_secs(&parked(), GiveUpRule::Default).expect("a budget");
+    let give_up_after = give_up_after_secs(&parked(), GiveUpRule::BreakEven).expect("a budget");
     let at = |secs: f64| Candidate {
         parked: parked().parked.map(|p| Parked { secs, ..p }),
         secs_since_request: Some(window_start(CacheLifetime::FiveMinutes) + 1.0),
@@ -2778,7 +2912,7 @@ fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
 
     let before = at(give_up_after - 1.0);
     assert_eq!(
-        super::decide(&before, GiveUpRule::Default),
+        super::decide(&before, GiveUpRule::BreakEven),
         Beat::Send(BeatRoute::SessionCopy)
     );
     let spent = Spent {
@@ -2796,7 +2930,7 @@ fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
         ..
     } = super::status(
         &before,
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors_of(&before),
         spent,
@@ -2817,13 +2951,13 @@ fn a_parked_runs_give_up_time_is_the_time_decide_stops_at() {
 
     let after = at(give_up_after + 1.0);
     assert_eq!(
-        super::decide(&after, GiveUpRule::Default),
+        super::decide(&after, GiveUpRule::BreakEven),
         Beat::Skip(SkipReason::PastCutOff)
     );
     assert_eq!(
         super::status(
             &after,
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             &WaitDurations::default(),
             &anchors_of(&after),
             spent
@@ -3025,7 +3159,7 @@ fn the_switch_shows_on_the_status() {
     let off = |c: &Candidate| {
         super::status(
             c,
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             &WaitDurations::default(),
             &anchors_of(c),
             spent,
@@ -3078,7 +3212,7 @@ fn a_warming_status_carries_the_reread_price() {
     };
     let prices = |model: &str| match super::status(
         &due(),
-        GiveUpRule::Default,
+        GiveUpRule::BreakEven,
         &WaitDurations::default(),
         &anchors_of(&due()),
         spent.priced(Some(model), CacheTtl::Reported(CacheLifetime::FiveMinutes)),
@@ -3111,7 +3245,13 @@ fn a_warming_status_carries_the_odds_of_its_cap() {
     );
     let CacheKeepAliveStatus::Warming {
         budget_beats, odds, ..
-    } = super::status(&c, GiveUpRule::Default, &history, &anchors_of(&c), pinged())
+    } = super::status(
+        &c,
+        GiveUpRule::BreakEven,
+        &history,
+        &anchors_of(&c),
+        pinged(),
+    )
     else {
         panic!("not warming");
     };
@@ -3135,7 +3275,13 @@ fn a_closed_status_carries_the_odds_and_interval_of_its_cap() {
         beat_every_secs,
         odds,
         ..
-    } = super::status(&c, GiveUpRule::Default, &history, &anchors_of(&c), pinged())
+    } = super::status(
+        &c,
+        GiveUpRule::BreakEven,
+        &history,
+        &anchors_of(&c),
+        pinged(),
+    )
     else {
         panic!("not warming");
     };
@@ -3146,7 +3292,7 @@ fn a_closed_status_carries_the_odds_and_interval_of_its_cap() {
     };
     let off = turned_off(due());
     for (label, c) in [("stopped", &long), ("turned off", &off)] {
-        let closed = super::status(c, GiveUpRule::Default, &history, &anchors_of(c), pinged());
+        let closed = super::status(c, GiveUpRule::BreakEven, &history, &anchors_of(c), pinged());
         let (CacheKeepAliveStatus::Stopped {
             beat_every_secs: got,
             odds: got_odds,
@@ -3545,6 +3691,28 @@ fn remembering(remembered: Remembered) -> Candidate {
     }
 }
 
+/// A provider whose beats pause until a fixed time.
+fn paused() -> Remembered {
+    Remembered::Paused {
+        until: chrono::DateTime::from_timestamp(1_900_000_000, 0).unwrap(),
+    }
+}
+
+#[test]
+fn a_remembered_pair_decides_a_stable_prefill_beat() {
+    let candidate = remembering(Remembered::Pair);
+    assert_eq!(decide(&candidate), prefill(PrefillCut::Stable));
+}
+
+#[test]
+fn a_provider_pause_has_its_own_durable_reason() {
+    let candidate = remembering(Remembered::ProviderPaused);
+    assert_eq!(decide(&candidate), skip(SkipReason::ProviderPaused));
+    let state = status_at(&candidate);
+    assert_eq!(state, not_kept(CacheKeepAliveNotKeptReason::ProviderPaused));
+    assert_eq!(state.clone().recorded(), Some(state));
+}
+
 /// A Lucidos Agent turn parked on its own question card. The turn holds the
 /// thread while it waits for the answer.
 fn lucidos_on_its_card() -> Candidate {
@@ -3656,7 +3824,7 @@ fn a_lucidos_agent_pair_with_an_unknown_ttl_never_beats() {
     assert_eq!(
         super::status(
             &unknown(265.0),
-            GiveUpRule::Default,
+            GiveUpRule::BreakEven,
             &WaitDurations::default(),
             &anchors_of(&unknown(265.0)),
             Spent::default()
@@ -3673,9 +3841,9 @@ fn a_lucidos_agent_pair_with_an_unknown_ttl_never_beats() {
 /// The budget counts beats at the direct window, and a card gets half.
 #[test]
 fn a_lucidos_agent_card_gives_up_at_half_the_budget() {
-    let event = give_up_after_secs(&lucidos(), GiveUpRule::Default).expect("a budget");
+    let event = give_up_after_secs(&lucidos(), GiveUpRule::BreakEven).expect("a budget");
     assert!((event - 25.0 * 260.0).abs() < 1e-6, "{event}");
-    let card = give_up_after_secs(&lucidos_on_its_card(), GiveUpRule::Default).expect("a budget");
+    let card = give_up_after_secs(&lucidos_on_its_card(), GiveUpRule::BreakEven).expect("a budget");
     assert!((card - event / 2.0).abs() < 1e-6, "{card}");
     let past = Candidate {
         parked: lucidos_on_its_card().parked.map(|p| Parked {
@@ -3701,10 +3869,10 @@ fn an_openai_pair_spends_its_budget_at_the_thirty_minute_pace() {
     let unpriced =
         CacheLifetime::ThirtyMinutes.rewrite_in_beats(price_table().unpriced_cache_shares);
     assert!(beats > unpriced, "GPT-6.1 is priced: {beats} beats");
-    let event = give_up_after_secs(&gpt(lucidos()), GiveUpRule::Default).expect("a budget");
+    let event = give_up_after_secs(&gpt(lucidos()), GiveUpRule::BreakEven).expect("a budget");
     assert!((event - beats * 1560.0).abs() < 1e-6, "{event}");
     let card =
-        give_up_after_secs(&gpt(lucidos_on_its_card()), GiveUpRule::Default).expect("a budget");
+        give_up_after_secs(&gpt(lucidos_on_its_card()), GiveUpRule::BreakEven).expect("a budget");
     assert!((card - event / 2.0).abs() < 1e-6, "{card}");
     let waiting = |secs: f64| Candidate {
         keep_warm_wait_secs: Some(secs),
@@ -3782,6 +3950,26 @@ fn every_exception_keeps_a_lucidos_agent_thread_cold() {
             SkipReason::UncacheableProvider,
         ),
         (
+            "a beat that missed",
+            remembering(Remembered::Missed),
+            SkipReason::BeatMissed,
+        ),
+        (
+            "a paused provider",
+            remembering(paused()),
+            SkipReason::PingsPaused,
+        ),
+        (
+            "a request that outlived its cache",
+            remembering(Remembered::Expired),
+            SkipReason::CacheExpired,
+        ),
+        (
+            "a wait that gave up",
+            remembering(Remembered::GaveUp),
+            SkipReason::PastCutOff,
+        ),
+        (
             "a restart since the last request",
             remembering(Remembered::Nothing),
             SkipReason::Restarted,
@@ -3808,7 +3996,7 @@ fn every_exception_keeps_a_lucidos_agent_thread_cold() {
 fn a_restart_causes_no_beat_burst() {
     let store = super::super::RememberedRequests::default();
     let thread = Uuid::new_v4();
-    let booted = remembering(store.state(thread));
+    let booted = remembering(store.state(thread, chrono::Utc::now()));
     assert_eq!(decide(&booted), skip(SkipReason::Restarted));
     assert_eq!(
         kind_of(&status(&booted, &anchors_of(&booted), Spent::default())),
@@ -3873,7 +4061,7 @@ fn a_budget_under_one_beat_reads_past_give_up_time() {
         },
         ..remembering(Remembered::Nothing)
     };
-    let budget = budget_beats(&c, GiveUpRule::Default).expect("a budget");
+    let budget = budget_beats(&c, GiveUpRule::BreakEven).expect("a budget");
     assert!(budget < 1.0, "the budget is {budget} beats");
     assert_eq!(
         kind_of(&status(&c, &anchors_of(&c), Spent::default())),
@@ -3922,6 +4110,21 @@ fn the_status_covers_a_lucidos_agent_card() {
         not_kept(Reason::Restarted)
     );
     assert_eq!(
+        status_at(&on_card(Remembered::Missed)),
+        not_kept(Reason::BeatMissed)
+    );
+    assert_eq!(
+        status_at(&on_card(Remembered::Expired)),
+        not_kept(Reason::CacheExpired)
+    );
+    let Remembered::Paused { until } = paused() else {
+        unreachable!()
+    };
+    assert_eq!(
+        status_at(&on_card(paused())),
+        CacheKeepAliveStatus::pings_paused(until)
+    );
+    assert_eq!(
         status_at(&Candidate {
             keep_warm_wait_secs: None,
             ..lucidos()
@@ -3934,7 +4137,7 @@ fn the_status_covers_a_lucidos_agent_card() {
 /// pinged stopped, never that Lucidos restarted.
 #[test]
 fn a_lucidos_agent_card_past_its_budget_reads_stopped() {
-    let card = give_up_after_secs(&lucidos_on_its_card(), GiveUpRule::Default).expect("a budget");
+    let card = give_up_after_secs(&lucidos_on_its_card(), GiveUpRule::BreakEven).expect("a budget");
     let past = Candidate {
         agent: Agent::Lucidos(Remembered::Nothing),
         parked: lucidos_on_its_card().parked.map(|p| Parked {
@@ -3977,6 +4180,27 @@ fn a_beat_is_judged_by_its_usage_block() {
             usage(100_000, 0, 0),
             Some(0),
             BeatOutcome::Read,
+        ),
+        (
+            "only the system prompt held",
+            crate::llm::provider::LlmResponse {
+                cache_read_tokens: Some(15_000),
+                ..usage(100_000, 0, 0)
+            },
+            Some(0),
+            BeatOutcome::Missed,
+        ),
+        (
+            "a cold write keeps the prefill probe guard",
+            usage(100_000, 85_000, 0),
+            Some(0),
+            BeatOutcome::Wrote,
+        ),
+        (
+            "no input reported",
+            usage(0, 0, 0),
+            Some(0),
+            BeatOutcome::Missed,
         ),
         (
             "a small write",
@@ -4109,6 +4333,7 @@ fn beat_body() -> PrefillBody {
         provider: Some(crate::llm::ProviderKind::Anthropic),
         model: "claude-opus-5-5".into(),
         reasoning_effort: Some("high".into()),
+        stable_prefix_fingerprint: Some("0123456789abcdef".into()),
         output_cap: Some(0),
         reply: crate::llm::prefill::ReplyShape::Json,
         wire_model: "claude-opus-5-5".into(),
@@ -4167,7 +4392,8 @@ async fn a_beat_leaves_one_capture_and_moves_the_refresh() {
         &store,
         &beat_usage(90_000, 0, 0),
         thread_id,
-        &beat_body(),
+        &store.pair(thread_id, Utc::now()).unwrap(),
+        PrefillCut::Stable,
     )
     .await;
 
@@ -4181,6 +4407,10 @@ async fn a_beat_leaves_one_capture_and_moves_the_refresh() {
     assert!(capture["duration_ms"].is_u64(), "{capture}");
     assert_eq!(capture["usage"]["cache_read_tokens"], 90_000, "{capture}");
     assert_eq!(capture["model"], "claude-opus-5-5", "{capture}");
+    assert_eq!(
+        capture["stable_prefix_fingerprint"], "0123456789abcdef",
+        "{capture}"
+    );
     assert_eq!(
         summary_row(&pool, thread_id).await,
         summary,
@@ -4197,7 +4427,7 @@ async fn a_beat_leaves_one_capture_and_moves_the_refresh() {
     .unwrap();
     assert!(refresh < 5.0, "the refresh is the beat's start: {refresh}");
     assert_eq!(
-        store.state(thread_id),
+        store.state(thread_id, chrono::Utc::now()),
         Remembered::Pair,
         "a read keeps the request"
     );
@@ -4207,39 +4437,103 @@ async fn a_beat_leaves_one_capture_and_moves_the_refresh() {
     teardown_test_db(&db_name).await;
 }
 
-/// A beat that writes over 2% ends the run. On an unproven provider it is
-/// the first beat, so the provider beats no more.
+/// A beat that writes over 2% ends its own thread's run, even as the
+/// provider's first beat. Another thread on the provider still beats, and the
+/// beat's thread says its beat missed (ADR 0580 I1, I4).
 #[tokio::test]
-async fn a_writing_beat_ends_the_run() {
+async fn a_writing_beat_ends_only_its_own_run() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = crate::test_support::seed_chat_thread(&bus, "hello").await;
     let store = remembered_store(thread_id);
-    let anthropic = crate::llm::ProviderKind::Anthropic;
-    store.mark_proven(anthropic);
+    let other = Uuid::new_v4();
+    let body = beat_body();
+    store.remember(
+        other,
+        Some(crate::llm::prefill::PrefillPair {
+            stable: body.clone(),
+            whole: body,
+        }),
+        std::time::Instant::now(),
+    );
+    assert!(
+        store.unproven(crate::llm::ProviderKind::Anthropic),
+        "the first beat"
+    );
+
     beat_once(
         &bus,
         &store,
         &beat_usage(100_000, 5_000, 0),
         thread_id,
-        &beat_body(),
+        &store.pair(thread_id, Utc::now()).unwrap(),
+        PrefillCut::Stable,
     )
     .await;
-    assert_eq!(store.state(thread_id), Remembered::Nothing, "the run ended");
 
-    let fresh = remembered_store(thread_id);
+    let now = chrono::Utc::now();
+    assert_eq!(store.state(thread_id, now), Remembered::Missed);
+    assert!(store.pair(thread_id, now).is_none(), "the run ended");
+    assert_eq!(store.state(other, now), Remembered::Pair);
+    assert!(store.pair(other, now).is_some(), "the other thread beats");
+    let missed = remembering(store.state(thread_id, now));
+    assert_eq!(decide(&missed), skip(SkipReason::BeatMissed));
+    assert_eq!(
+        status_at(&missed),
+        not_kept(CacheKeepAliveNotKeptReason::BeatMissed)
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The beat whose miss ended the run lands after the last tick stored its
+/// warming status. The run still closes counting that beat and its cost.
+#[tokio::test]
+async fn a_run_a_beat_ended_counts_that_beat() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = crate::test_support::seed_chat_thread(&bus, "hello").await;
+    set_status(&pool, thread_id, ThreadStatus::Idle).await;
+    let since: DateTime<Utc> = sqlx::query_scalar("SELECT now() - interval '5 minutes'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let warming = CacheKeepAliveStatus::Warming {
+        since,
+        beats: 0,
+        budget_beats: 12,
+        beat_every_secs: 260,
+        cost_usd: 0.0,
+        context_tokens: 79_000,
+        next_beat_at: None,
+        give_up_at: since + Duration::minutes(40),
+        ping_usd: None,
+        reread_usd: None,
+        odds: None,
+    };
+    emit_status(&bus, thread_id, Some(warming)).await;
+
+    let store = remembered_store(thread_id);
     beat_once(
         &bus,
-        &fresh,
-        &beat_usage(100_000, 5_000, 0),
+        &store,
+        &beat_usage(100_000, 79_000, 0),
         thread_id,
-        &beat_body(),
+        &store.pair(thread_id, Utc::now()).unwrap(),
+        PrefillCut::Stable,
     )
     .await;
-    assert!(
-        !fresh.unproven(anthropic) && fresh.pair(thread_id).is_none(),
-        "a first beat that writes marks its provider"
-    );
+    close_stale_statuses(&bus, &[]).await;
+
+    let Some(CacheKeepAliveStatus::Ended {
+        beats, cost_usd, ..
+    }) = stored_status(&pool, thread_id).await
+    else {
+        panic!("the run ends");
+    };
+    assert_eq!(beats, 1, "the missed beat counts");
+    assert!(cost_usd > 0.0, "and so does its write: {cost_usd}");
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -4255,13 +4549,35 @@ async fn a_refused_first_beat_marks_its_provider() {
     let refused = PrefillStub(Err("max_tokens: must be at least 1"));
 
     let first = remembered_store(thread_id);
-    beat_once(&bus, &first, &refused, thread_id, &beat_body()).await;
-    assert_eq!(first.state(thread_id), Remembered::Uncacheable);
+    beat_once(
+        &bus,
+        &first,
+        &refused,
+        thread_id,
+        &first.pair(thread_id, Utc::now()).unwrap(),
+        PrefillCut::Stable,
+    )
+    .await;
+    assert_eq!(
+        first.state(thread_id, chrono::Utc::now()),
+        Remembered::ProviderPaused
+    );
 
     let proven = remembered_store(thread_id);
     proven.mark_proven(crate::llm::ProviderKind::Anthropic);
-    beat_once(&bus, &proven, &refused, thread_id, &beat_body()).await;
-    assert_eq!(proven.state(thread_id), Remembered::Pair);
+    beat_once(
+        &bus,
+        &proven,
+        &refused,
+        thread_id,
+        &proven.pair(thread_id, Utc::now()).unwrap(),
+        PrefillCut::Stable,
+    )
+    .await;
+    assert_eq!(
+        proven.state(thread_id, chrono::Utc::now()),
+        Remembered::Pair
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -4281,7 +4597,8 @@ async fn a_talkative_beat_marks_its_provider() {
         &store,
         &beat_usage(90_000, 0, 12),
         thread_id,
-        &beat_body(),
+        &store.pair(thread_id, Utc::now()).unwrap(),
+        PrefillCut::Stable,
     )
     .await;
     let other = Uuid::new_v4();
@@ -4294,8 +4611,241 @@ async fn a_talkative_beat_marks_its_provider() {
         }),
         std::time::Instant::now(),
     );
-    assert_eq!(store.state(other), Remembered::Uncacheable);
+    assert_eq!(
+        store.state(other, chrono::Utc::now()),
+        Remembered::ProviderPaused
+    );
 
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn a_missed_beat_stops_every_route_even_after_forgetting_the_pair() {
+    for base in [
+        due(),
+        parked(),
+        lucidos(),
+        lucidos_on_its_card(),
+        remembering(Remembered::Nothing),
+        remembering(Remembered::Uncacheable),
+    ] {
+        let candidate = Candidate {
+            beat_missed: true,
+            ..base
+        };
+        assert_eq!(decide(&candidate), skip(SkipReason::BeatMissed));
+        let state = status_at(&candidate);
+        assert_eq!(state, not_kept(CacheKeepAliveNotKeptReason::BeatMissed));
+        assert_eq!(state.clone().recorded(), Some(state));
+    }
+}
+
+#[tokio::test]
+async fn the_held_predicate_agrees_with_sql_at_every_boundary() {
+    let (pool, db_name) = setup_test_db().await;
+    for (read, input, want) in [
+        (0, 0, false),
+        (0, 1, false),
+        (1, 1, true),
+        (49_999, 100_000, false),
+        (50_000, 100_000, true),
+        (50_000, 100_001, false),
+        (50_001, 100_001, true),
+        (98_000, 100_000, true),
+    ] {
+        let sql: bool = sqlx::query_scalar(&format!(
+            "SELECT {}",
+            held_context_sql("$1::bigint", "$2::bigint")
+        ))
+        .bind(read as i64)
+        .bind(input as i64)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(held_context(read, input), want, "{read}/{input}");
+        assert_eq!(sql, want, "SQL: {read}/{input}");
+    }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+fn policy_capture(route: BeatRoute, read: u32, input: u32, call: &str) -> ThreadEvent {
+    let mut event = ping_capture(read, call);
+    if let ThreadEvent::ContextCaptured {
+        usage: Some(usage),
+        purpose,
+        ..
+    } = &mut event
+    {
+        usage.input_tokens = input;
+        usage.cache_creation_tokens = input.saturating_sub(read);
+        if route != BeatRoute::Resume {
+            *purpose = ContextPurpose::CacheKeepAlive;
+        }
+    }
+    event
+}
+
+async fn policy_beat(
+    bus: &EventBus,
+    thread_id: Uuid,
+    route: BeatRoute,
+    read: u32,
+    input: u32,
+    call: &str,
+) {
+    let anchor = match route {
+        BeatRoute::Resume => Some(seed_thread_event(bus, thread_id, keep_alive_anchor()).await),
+        _ => None,
+    };
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: policy_capture(route, read, input, call),
+        meta: EventMeta {
+            request_event_id: anchor,
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_missed_beat_latches_from_events_until_a_real_request() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let restarted = sqlx::PgPool::connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    for route in [
+        BeatRoute::Resume,
+        BeatRoute::SessionCopy,
+        BeatRoute::Prefill(PrefillCut::Stable),
+    ] {
+        let thread_id = if matches!(route, BeatRoute::Prefill(_)) {
+            crate::test_support::seed_chat_thread(&bus, "hello").await
+        } else {
+            let thread_id = Uuid::new_v4();
+            start_cc_session(&bus, thread_id, "claude-code/beat-policy", None).await;
+            thread_id
+        };
+        let real = seed_thread_event(&bus, thread_id, turn_capture(1_000)).await;
+        age(&pool, real, 120.0).await;
+        if route == BeatRoute::SessionCopy {
+            let mut capture = policy_capture(route, 98_000, 100_000, "held-copy");
+            if let ThreadEvent::ContextCaptured {
+                usage: Some(usage), ..
+            } = &mut capture
+            {
+                usage.cache_creation_tokens = 1_800;
+            }
+            seed_thread_event(&bus, thread_id, capture).await;
+        } else {
+            policy_beat(&bus, thread_id, route, 98_000, 100_000, "held-copy").await;
+        }
+        assert!(candidate_row(&pool, thread_id)
+            .await
+            .unwrap()
+            .missed_beat
+            .is_none());
+        policy_beat(&bus, thread_id, route, 15_000, 100_000, "missed-beat").await;
+        for connection in [&pool, &restarted, &pool] {
+            let row = candidate_row(connection, thread_id).await.unwrap();
+            let miss = row
+                .missed_beat
+                .expect("the miss survives reopening the connection");
+            assert_eq!((miss.read, miss.input), (15_000, 100_000));
+            let candidate = Candidate {
+                beat_missed: true,
+                ..due()
+            };
+            assert_eq!(decide(&candidate), skip(SkipReason::BeatMissed));
+        }
+        policy_beat(&bus, thread_id, route, 98_000, 100_000, "late-held-beat").await;
+        assert!(
+            candidate_row(&pool, thread_id)
+                .await
+                .unwrap()
+                .missed_beat
+                .is_some(),
+            "a later beat cannot re-arm the run"
+        );
+        seed_thread_event(&bus, thread_id, ping_capture(100_000, "real-wake")).await;
+        assert!(
+            candidate_row(&restarted, thread_id)
+                .await
+                .unwrap()
+                .missed_beat
+                .is_none(),
+            "the next real request re-arms it"
+        );
+    }
+    restarted.close().await;
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn only_the_final_frame_judges_a_beat() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, "claude-code/beat-frames", None).await;
+    let real = seed_thread_event(&bus, thread_id, turn_capture(1_000)).await;
+    age(&pool, real, 120.0).await;
+    let anchor = seed_thread_event(&bus, thread_id, keep_alive_anchor()).await;
+    for read in [0, 98_000] {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: policy_capture(BeatRoute::Resume, read, 100_000, "one-call"),
+            meta: EventMeta {
+                request_event_id: Some(anchor),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+    }
+    assert!(candidate_row(&pool, thread_id)
+        .await
+        .unwrap()
+        .missed_beat
+        .is_none());
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn a_released_request_reports_give_up_instead_of_restart() {
+    assert_eq!(
+        status_at(&remembering(Remembered::GaveUp)),
+        not_kept(CacheKeepAliveNotKeptReason::PastGiveUpTime)
+    );
+}
+
+/// A reply to a beat of an older request never ends or extends the request
+/// the thread made since.
+#[tokio::test]
+async fn an_old_prefill_reply_leaves_the_new_request_eligible() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = crate::test_support::seed_chat_thread(&bus, "hello").await;
+    for wrote in [0, 79_000] {
+        let store = remembered_store(thread_id);
+        let sent = store.pair(thread_id, Utc::now()).unwrap();
+        store.remember(thread_id, Some((*sent).clone()), std::time::Instant::now());
+        beat_once(
+            &bus,
+            &store,
+            &beat_usage(100_000, wrote, 0),
+            thread_id,
+            &sent,
+            PrefillCut::Stable,
+        )
+        .await;
+        assert_eq!(store.state(thread_id, Utc::now()), Remembered::Pair);
+    }
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

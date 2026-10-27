@@ -333,6 +333,30 @@ fn a_live_event_wait_holds_the_clean_idle_to_a_resync() {
     );
 }
 
+/// A session whose handoff is pending proposes nothing, whatever its terminal
+/// and even with a wait live: its successor session carries the branch work.
+/// This is what keeps Apply and Review from flashing between the two sessions.
+#[test]
+fn a_pending_handoff_never_proposes_at_idle() {
+    use crate::engine::thread_events::CancelCause;
+    for holds_live_wait in [false, true] {
+        let handed_off = IdleSession {
+            handoff_pending: true,
+            holds_live_wait,
+            ..IdleSession::default()
+        };
+        for terminal in [
+            Some(TerminalKind::Generated),
+            Some(TerminalKind::Canceled(CancelCause::UserStop)),
+            None,
+        ] {
+            let write = idle_change_write(handed_off, &terminal);
+            assert_eq!(write, Some(IdleChangeWrite::HandedOff), "{terminal:?}");
+            assert!(!write.unwrap().may_create());
+        }
+    }
+}
+
 /// The hold covers finished-looking work only. A user Stop with a wait live is
 /// still unfinished, so its work is withheld and announced (ADR 0400).
 #[test]

@@ -255,5 +255,37 @@ out="$(stage_runtime_build_frontend /tmp/nope /tmp/nope/app 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "build the release binaries first"; then pass "codegen without its bin refused"; else fail "expected the binaries-first refusal (rc=$rc): $out"; fi
 
 echo ""
+echo "test: cached PostgreSQL still bundles Linux dependencies and isolates Darwin"
+PG_TEST_WORK="$(mktemp -d)"
+for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+    prefix="$PG_TEST_WORK/postgresql-18.4.0-$triple"
+    mkdir -p "$prefix/bin" "$prefix/share/extension"
+    cat > "$prefix/bin/pg_config" <<'SH'
+#!/bin/sh
+cd "$(dirname "$0")/../share" && pwd
+SH
+    chmod +x "$prefix/bin/pg_config"
+    touch "$prefix/share/extension/vector.control"
+    : > "$PG_TEST_WORK/calls"
+    if (
+        stage_runtime_linux_postgres() { printf '%s\n' "$1" >> "$PG_TEST_WORK/calls"; }
+        stage_runtime_fetch_postgres 18.4.0 0.8.2 "$triple" "$PG_TEST_WORK" >/dev/null
+    ); then
+        case "$triple" in
+            *-linux-gnu) expected=bundle ;;
+            *) expected="" ;;
+        esac
+        if [ "$(cat "$PG_TEST_WORK/calls")" = "$expected" ]; then
+            pass "$triple cached tree uses the correct dependency path"
+        else fail "$triple invoked the wrong dependency path"; fi
+    else fail "$triple cached tree failed"; fi
+done
+if (
+    stage_runtime_linux_postgres() { return 1; }
+    stage_runtime_fetch_postgres 18.4.0 0.8.2 x86_64-unknown-linux-gnu "$PG_TEST_WORK" >/dev/null
+); then fail "a cached vector extension bypassed a failed dependency audit"
+else pass "a failed dependency audit aborts even with cached pgvector"; fi
+rm -rf "$PG_TEST_WORK"
+
 echo "stage_runtime: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

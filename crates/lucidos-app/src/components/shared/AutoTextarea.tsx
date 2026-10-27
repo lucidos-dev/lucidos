@@ -1,5 +1,4 @@
-import { useRef, useEffect } from 'preact/hooks';
-import { autoResizeTextarea } from '../../utils/dom';
+import { useAutoResizeTextarea } from '../../hooks/useAutoResizeTextarea';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 interface Props {
@@ -18,9 +17,7 @@ interface Props {
  *   PROSE_TEXT_ATTRS. A code/config textarea uses a bare <textarea> instead.
  */
 export function AutoTextarea({ value, onInput, placeholder, required }: Props) {
-  const ref = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => autoResizeTextarea(ref.current), [value]);
+  const ref = useAutoResizeTextarea(value);
 
   function handleInput(e: Event) {
     onInput((e.target as HTMLTextAreaElement).value);

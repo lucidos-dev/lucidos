@@ -32,6 +32,26 @@ A shell command on the `PATH` of every subprocess Lucidos spawns: Python scripts
 
 The CLI is a thin Rust wrapper around the engine's HTTP API and filesystem conventions. For app UIs, see the JS [`lucidos.data.*`](./js-sdk.md) reference. Scripts always prefer the CLI over hand-rolled HTTP calls to the engine.
 
+## Waiting through an engine restart
+
+Engine requests retry refused or unreachable connections with exponential
+backoff, from 100 ms up to 1 second, for 30 seconds by default.
+This lets script triggers and app scripts ride out a normal engine restart.
+Set `LUCIDOS_CLI_CONNECT_WAIT_SECS` to a nonnegative whole number of seconds
+to override the window. `0` disables retries; unset or invalid values use
+the default.
+
+Retries apply to every HTTP method, including mutations, only when a network
+error proves the connection was never established. HTTP error statuses, TLS
+failures, response timeouts and interrupted responses are never retried.
+Engine requests do not follow redirects or use protocol-level automatic retries.
+Streaming request bodies that cannot be cloned are sent only once.
+
+Connection and response deadlines remain specific to each command.
+An in-flight attempt can outlast the retry window; no new attempt starts after it.
+Best-effort build-slot announcements and Git diff refreshes do not retry.
+When the window expires, the existing connection error reports the actual elapsed time.
+
 ## Never post to the engine API as the user, and never route around a tool
 
 Read this before anything below it. Three rules, and the third matters most.
@@ -2365,19 +2385,26 @@ desktop install keeps it at `Lucidos.app/Contents/Resources/lucidos`, and a
 headless one under the install prefix in `runtime/current/`.
 
 **`--qr` needs an address the phone can reach.** This command talks to
-`127.0.0.1`, and a QR aimed there helps nobody. So it resolves a hostname from
-the interface list: the MagicDNS name, else the tailnet address, else whatever
-`--host` says (which implies `--qr`). Tailscale is only picking a name to
+`127.0.0.1`, and a QR aimed there helps nobody. It takes the first of these:
+
+1. `--host`, which implies `--qr`. It is never refused: probing only picks which
+   of its two origins to use.
+2. The gateway's *external address* (`lucidos external-address`, below), used as
+   set, since the user typed it.
+3. The tailnet origin Tailscale itself reports: the `https://` name when
+   Tailscale can certify it, then the MagicDNS name, then the tailnet address.
+   When the machine is not on a tailnet, it prints Tailscale's reason.
+
+That is the Access page's order too, minus the two steps a terminal cannot see:
+the reader's own address and the LAN address. Tailscale only picks a name to
 print, and the auth decision reads none of it.
 
-**Then it knocks on the door.** Holding a tailnet address does not make it
+**It knocks on the tailnet door.** Holding a tailnet address does not make it
 reachable. The packaged gateway binds loopback, where `<name>:<port>` is dead.
 `tailscale serve` fronts 443 on that same name and answers where the gateway's
-own port does not.
-
-So both origins are probed, and the first that answers wins. With neither
-answering there is no QR, and the command says which knob to turn. An explicit
-`--host` is never refused: probing only picks which of its two origins to use.
+own port does not. So each tailnet origin is probed, and the first that answers
+with THIS gateway's health `instance_id` wins. With none answering there is no
+QR, and the command says which knob to turn.
 
 The QR is drawn black on white, because a dark terminal would invert it and
 many scanners refuse that. `NO_COLOR` drops the escapes.
@@ -2391,6 +2418,35 @@ That stops a remote caller from pairing itself in.
 
 Nothing you run from a coding-agent session, a trigger or a script needs this.
 Those already prove they are local, and the CLI attaches that proof itself.
+
+### `lucidos external-address show | set <origin> | clear`
+
+The *external address* is the origin other devices open to reach this gateway,
+through a route you run: a reverse proxy, WireGuard, a company VPN, or a
+company name with its own certificate. Pairing QRs use it ahead of Tailscale.
+
+```bash
+lucidos external-address show                 # the address, who set it, this machine's addresses.
+lucidos external-address set https://lucidos.example.com
+lucidos external-address clear                # QRs go back to the tailnet.
+lucidos external-address set --port 5300 http://10.8.0.2:5300   # one gateway of two.
+```
+
+- **One per gateway.** It lives in `~/.lucidos/network.toml` under the
+  gateway's port, so two gateways on one machine never share one. With two
+  running, the command refuses until `--port` names one, as `lucidos pair` does.
+- **An origin only:** scheme, host and optional port, with no path. A loopback,
+  link-local or unspecified host is refused, since no other device can open it.
+- **`set` is probed.** The gateway fetches `<origin>/~/api/v1/health` and
+  compares its per-boot `instance_id`. A match is verified. No answer from here
+  saves with a warning, since hairpin NAT and client-only VPNs are ordinary. An
+  answer it cannot compare, such as an identity proxy's login page, saves with
+  a warning too. Only a different gateway answering refuses the save.
+- **The environment wins.** `LUCIDOS_EXTERNAL_ADDRESS` in the gateway's
+  environment overrides the file and refuses every write. `show` says so.
+- **Four editors, one value:** this command, **Settings → Access → External
+  address**, `install.sh --external-address`, and
+  `PUT /~/api/v1/control/external-address`.
 
 ### `lucidos update-address show | set <url> | reset`
 

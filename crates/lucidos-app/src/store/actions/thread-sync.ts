@@ -1,4 +1,5 @@
 import { API } from '../../api/client';
+import { isChosenByPreference } from '../windowPeers';
 import { forgetThreadWidgets, onWidgetEvent } from './widgets';
 import type { ApplyEstimates, Change, LandingLane, MainCheck } from '../../api/client';
 import { EVENT_STREAM_RETRY_MS, eventStreamTargets, openEventStream, type EventStreamTargets, type StreamDrop } from '@lucidos/event-stream';
@@ -1430,13 +1431,17 @@ function handleTransientSideEffects(
       if (isForThisDevice(event.actor)) void refreshAppUI(event.app_id);
       break;
 
-    // A capture names the turn's last used device, and only that page answers.
-    // Every page gets the event, so an unscoped answer from a page with no app
-    // frame would race the real one (engine/tools/app_capture.rs).
+    // A capture names the turn's last used device, and only one of its windows
+    // answers: the one showing that app, else any app, else the last-touched
+    // window. A second answer would race the real one (engine/tools/app_capture.rs).
     case 'AppUiCaptureRequested':
       // captureAppUI owns its own console.warn telemetry + best-effort
       // postAppCapture surfaces (see apps.ts), so `void` here.
-      if (isForThisDevice(event.actor)) void captureAppUI(event.app_id, event.request_id, event.save_format);
+      if (isForThisDevice(event.actor) && isChosenByPreference(
+        (window) => window.appId === event.app_id,
+        (window) => window.appId !== null,
+        () => true,
+      )) void captureAppUI(event.app_id, event.request_id, event.save_format);
       break;
 
     case 'NavigationRequested': {

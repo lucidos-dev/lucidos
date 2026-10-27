@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::http::client as http_client;
+use crate::http::{client as http_client, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
 /// Hardening state for a branch, as the engine's `query_hardened` labels it:
@@ -112,7 +112,7 @@ pub(crate) fn cmd_mark(ws: &Workspace, tier: Tier) -> Result<(), BoxError> {
     let resp = http_client()?
         .post(&url)
         .json(&body)
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("POST {} failed: {}", url, e))?;
     let status = resp.status();
     let text = resp
@@ -216,7 +216,7 @@ fn fetch_for_branch(
             ("repo_root", repo_root.to_string_lossy().as_ref()),
             ("branch_name", branch.as_str()),
         ])
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("GET {} failed: {}", url, e))?;
     let status = resp.status();
     if !status.is_success() {

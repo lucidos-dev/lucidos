@@ -11,7 +11,7 @@
 //! both block.
 
 use crate::hardened::{git_context, run_git};
-use crate::http::client as http_client;
+use crate::http::{client as http_client, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
 /// What picking an `Implement in a fresh session` option does at an offered
@@ -225,7 +225,7 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
     let resp = http_client()?
         .post(&url)
         .json(&body)
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("POST {} failed: {}", url, e))?;
     let status = resp.status();
     if !status.is_success() {
@@ -280,7 +280,7 @@ pub(crate) fn cmd_approve(ws: &Workspace) -> Result<(), BoxError> {
     let resp = http_client()?
         .post(&url)
         .json(&body)
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("POST {} failed: {}", url, e))?;
     let status = resp.status();
     if !status.is_success() {
@@ -387,7 +387,7 @@ pub(crate) fn query_state(ws: &Workspace) -> Result<PlannedState, BoxError> {
             ("repo_root", repo_root.to_string_lossy().as_ref()),
             ("branch_name", branch.as_str()),
         ])
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("GET {} failed: {}", url, e))?;
     let status = resp.status();
     if !status.is_success() {

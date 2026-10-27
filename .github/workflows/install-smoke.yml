@@ -1049,7 +1049,7 @@ jobs:
       && (github.event_name != 'schedule'
           || github.event.schedule == '0 4 * * 1')
       && inputs.dmg_tag == ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
       LUCIDOS_PREFIX: ${{ github.workspace }}/.tarball-smoke-prefix
@@ -1069,23 +1069,23 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential perl pkg-config curl
+          sudo apt-get install -y --no-install-recommends \
+            build-essential perl pkg-config curl ca-certificates git python3 binutils zstd \
+            patchelf libxml2 libssl3 libgssapi-krb5-2 liblz4-1 libzstd1 zlib1g \
+            libreadline8 libxslt1.1 libossp-uuid16 libpython3.11
 
       - name: Set up Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: '20'   # install.sh requires Node 18+; 20 is the current LTS
 
-      # Same build as the release matrix's Linux x86_64 leg, and 13m38s of this
-      # job's 15m01s. Its cache is deliberately SEPARATE from that leg's: this
-      # one runs on the bare 24.04 runner while the release one builds inside
-      # ubuntu:22.04, so sharing would hand a release build objects compiled
-      # against a different libc. The `smoke` prefix keeps them apart.
+      # Build on the release baseline, retaining a separate smoke cache namespace.
+      # Key the runner image so objects from the previous baseline cannot return.
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
           prefix-key: v0-rust-smoke
-          key: tarball-${{ env.TRIPLE }}
+          key: tarball-${{ env.TRIPLE }}-ubuntu-22.04
 
       - name: Build the prebuilt headless tarball (the download artifact)
         shell: bash

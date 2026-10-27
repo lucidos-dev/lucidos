@@ -1239,7 +1239,7 @@ fn apply_cache_control_to_penultimate_message(messages: &mut [ClaudeMessage]) ->
 
 // ===== Claude/Anthropic request/response types =====
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct ClaudeRequest {
     /// Body API version — `Some("vertex-2023-10-16")` for Vertex; `None` for the
     /// direct API (which sends `anthropic-version` as an HTTP header instead).
@@ -1277,7 +1277,7 @@ pub(crate) struct ClaudeRequest {
 }
 
 /// A `tool_choice` naming the one tool the model must call.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct ClaudeToolChoice {
     #[serde(rename = "type")]
     pub choice_type: &'static str,
@@ -1322,7 +1322,7 @@ impl ThinkingDisplay {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct ClaudeThinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
@@ -1332,12 +1332,12 @@ pub(crate) struct ClaudeThinking {
     pub display: Option<&'static str>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct ClaudeOutputConfig {
     pub effort: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct ClaudeMessage {
     pub role: String,
     pub content: serde_json::Value,
@@ -1351,7 +1351,7 @@ pub(crate) struct ClaudeMessage {
     pub cache_anchor: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct ClaudeTool {
     pub name: String,
     pub description: String,

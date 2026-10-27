@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { readWindowItem, removeWindowItem, writeWindowItem } from '../../utils/windowStorage';
 import { effect } from '@preact/signals';
 import {
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
@@ -74,7 +75,7 @@ beforeEach(() => {
   panelOverlay.value = null;
   threadMap.value = new Map();
   toasts.value = [];
-  localStorage.removeItem(SELECTED_CHANGE_KEY);
+  removeWindowItem(SELECTED_CHANGE_KEY);
   vi.clearAllMocks();
 });
 
@@ -504,17 +505,17 @@ describe('selected change persistence', () => {
 
     await selectRepoChange(mockChange);
 
-    expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBe('change-1');
+    expect(readWindowItem(SELECTED_CHANGE_KEY)).toBe('change-1');
   });
 
   it('removes localStorage entry when selection is cleared', async () => {
     repoSource.value = 'repo-1';
     repoSelectedChangeId.value = 'change-1';
-    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-1');
+    writeWindowItem(SELECTED_CHANGE_KEY, 'change-1');
 
     await selectRepoChange(null);
 
-    expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBeNull();
+    expect(readWindowItem(SELECTED_CHANGE_KEY)).toBeNull();
   });
 });
 
@@ -524,7 +525,7 @@ describe('restoreRepoSelectionFromStorage', () => {
       status: 'loaded',
       data: [{ id: 'repo-1', name: 'Test', path: '/test/repo' }],
     };
-    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-1');
+    writeWindowItem(SELECTED_CHANGE_KEY, 'change-1');
     (getChangeById as ReturnType<typeof vi.fn>).mockResolvedValue(mockChange);
     (getChangeDiff as ReturnType<typeof vi.fn>).mockResolvedValue({ files: [] });
     (getRepoChanges as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [], applied: [], has_more: false });
@@ -544,30 +545,30 @@ describe('restoreRepoSelectionFromStorage', () => {
   });
 
   it('clears stale ID when change no longer exists (404 from engine)', async () => {
-    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-gone');
+    writeWindowItem(SELECTED_CHANGE_KEY, 'change-gone');
     (getChangeById as ReturnType<typeof vi.fn>).mockRejectedValue(new ApiError(404, 'Not found'));
 
     await restoreRepoSelectionFromStorage();
 
-    expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBeNull();
+    expect(readWindowItem(SELECTED_CHANGE_KEY)).toBeNull();
     expect(repoSelectedChangeId.value).toBeNull();
   });
 
   it('keeps saved ID on transient failures (network down, 5xx)', async () => {
     // Without this guard, a momentary engine outage would silently lose the
     // user's diff-view selection across the next reload.
-    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-still-there');
+    writeWindowItem(SELECTED_CHANGE_KEY, 'change-still-there');
     (getChangeById as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Network down'));
 
     await restoreRepoSelectionFromStorage();
 
-    expect(localStorage.getItem(SELECTED_CHANGE_KEY)).toBe('change-still-there');
+    expect(readWindowItem(SELECTED_CHANGE_KEY)).toBe('change-still-there');
   });
 
   it('skips when a file-preview overlay already encodes the same change', async () => {
     // RepoFilePreview's useEffect handles this case — duplicating the fetch
     // here doubles the round-trip on every reload of a diff file preview.
-    localStorage.setItem(SELECTED_CHANGE_KEY, 'change-1');
+    writeWindowItem(SELECTED_CHANGE_KEY, 'change-1');
     panelOverlay.value = {
       type: 'file-preview',
       path: 'repo:repo-1:diff#change-1:src/main.rs',

@@ -18,8 +18,9 @@ describe('the rung control in the prompt row', () => {
     expect(promptSource).toContain("const sendButton = morphMode !== 'hidden' ? (");
   });
 
-  it('draws no pill over a pending question or permission card', () => {
-    expect(promptSource).toContain('const showsRungControl = !answersCard;');
+  it('keeps the pill disabled over a pending question or permission card', () => {
+    expect(promptSource).not.toContain('const showsRungControl');
+    expect(promptSource).toContain('disabledReason={rungDisabledReason}');
   });
 
   it('renders the cluster members, the pill first, before the send button', () => {
@@ -30,7 +31,7 @@ describe('the rung control in the prompt row', () => {
   });
 
   it('folds the pill in its place in the one row order', () => {
-    expect(promptSource).toContain('rung: showsRungControl ? {');
+    expect(promptSource).toContain('rung: {');
     expect(promptSource).not.toContain('foldActions.unshift(');
     expect(promptSource).toContain('rowAttrs={foldAttrs(RUNG_FOLD_KEY)}');
   });

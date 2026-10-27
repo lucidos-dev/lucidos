@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readWindowItem, removeWindowItem, writeWindowItem } from '../../utils/windowStorage';
 import {
   mobileView, threadDrawerOpen, threadDrawerWidth, splitRatio, focusedPane,
   DEFAULT_DRAWER_WIDTH, THREAD_DRAWER_WIDTH_KEY,
@@ -692,14 +693,14 @@ describe('resetPaneLayout', () => {
 describe('mobileView persistence (survives PWA close)', () => {
   beforeEach(() => {
     sessionStorage.removeItem('lucidos-mobile-view');
-    localStorage.removeItem('lucidos-mobile-view');
+    removeWindowItem('lucidos-mobile-view');
     resetState();
   });
 
   it('cold start restores the last pane from localStorage', () => {
     // Simulate the reopen scenario: the user closed on the content pane, iOS
     // killed the PWA (sessionStorage gone), localStorage survives → land on content.
-    localStorage.setItem('lucidos-mobile-view', 'content');
+    writeWindowItem('lucidos-mobile-view', 'content');
     expect(getInitialMobileView()).toBe('content');
   });
 
@@ -708,20 +709,20 @@ describe('mobileView persistence (survives PWA close)', () => {
   });
 
   it('falls back to thread for an invalid localStorage value', () => {
-    localStorage.setItem('lucidos-mobile-view', 'bogus');
+    writeWindowItem('lucidos-mobile-view', 'bogus');
     expect(getInitialMobileView()).toBe('thread');
   });
 
   it('round-trips through localStorage', () => {
     for (const view of MOBILE_VIEWS) {
-      localStorage.setItem('lucidos-mobile-view', view);
+      writeWindowItem('lucidos-mobile-view', view);
       expect(getInitialMobileView()).toBe(view);
     }
   });
 
   it('setMobileView writes to localStorage so it survives a PWA kill', () => {
     setMobileView('content');
-    expect(localStorage.getItem('lucidos-mobile-view')).toBe('content');
+    expect(readWindowItem('lucidos-mobile-view')).toBe('content');
   });
 });
 

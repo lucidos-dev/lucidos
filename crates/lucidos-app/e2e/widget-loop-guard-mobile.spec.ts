@@ -170,6 +170,8 @@ test.describe('A widget cannot lock a phone out of the app', () => {
     await expect(toast).toHaveAttribute('data-toast-tap', 'action');
     await toast.locator('.toast-title').click();
     await expect(page.locator('.chat-exchange:visible', { hasText: MESSAGE_TEXT }).first()).toBeVisible();
-    await expect.poll(() => page.evaluate(() => localStorage.getItem('lucidos-restore-guard'))).toBe(threadId);
+    // The marker names the thread, then the window that armed it (ADR 0585).
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('lucidos-restore-guard')?.split(' ')[0]))
+      .toBe(threadId);
   });
 });

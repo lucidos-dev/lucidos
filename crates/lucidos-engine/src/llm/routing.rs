@@ -941,6 +941,7 @@ mod tests {
             provider,
             model: "local-model".to_string(),
             reasoning_effort: None,
+            stable_prefix_fingerprint: None,
             output_cap: Some(0),
             reply: crate::llm::prefill::ReplyShape::Json,
             wire_model: "local-model".to_string(),

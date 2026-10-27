@@ -428,15 +428,17 @@ export function cancelAppUpdate(): Promise<void> {
 /** This Mac's Tailscale setup, as two INDEPENDENT facts (mirror of the Rust
  *  `TailscaleInfo`).
  *
- *  Tailnet state is read from the machine itself with no CLI. `cli_available`
- *  gates the action buttons and nothing else, so a Mac whose Tailscale works
- *  but has no CLI is still described accurately. */
+ *  Tailnet state comes from Tailscale's own status, with no CLI needed.
+ *  `cli_available` gates the action buttons and nothing else, so a Mac whose
+ *  Tailscale works but has no CLI is still described accurately. */
 export interface TailscaleInfo {
   /** Tailscale is present at all (app bundle or CLI). Drives "Get Tailscale",
    *  so it deliberately does NOT mean "usable". */
   installed: boolean;
-  /** This Mac holds a tailnet address: signed in and connected. */
+  /** Tailscale reports this Mac as running with a tailnet address. */
   on_tailnet: boolean;
+  /** Why it is not on a tailnet, in one sentence. Null when it is. */
+  reason: string | null;
   /** The tailnet IPv4. Reachable over plain HTTP from the same tailnet. */
   tailnet_ip: string | null;
   /** MagicDNS name, no scheme. Null on a tailnet with MagicDNS disabled, which
@@ -586,7 +588,7 @@ export type TailscaleServeProgress =
   | { phase: 'failed'; message: string }
   | { phase: 'cancelled' };
 
-/** This window's Tauri label (`main`, `window-<n>`), read from the metadata the
+/** This window's Tauri label (`main`, `window-<uuid>`), read from the metadata the
  *  runtime injects into every main frame. `null` off Tauri, and defensively when
  *  the shape is missing. Exported for {@link listen}'s target and for tests. */
 export function currentWindowLabel(): string | null {

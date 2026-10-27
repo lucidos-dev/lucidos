@@ -9,9 +9,9 @@ use crate::runtime::CodingAgent;
 use super::{
     AbortCause, ActorMode, AnswerKind, ApplyNowOutcome, CacheKeepAliveStatus, CancelCause,
     CaptureFormat, ChildCompletionStatus, CodingAgentExit, Dashboard, EventWaitCancelCause,
-    FormRequestOutcome, HandoffConsent, LegacyArrangedTile, McpEnablementSource, MessageOrigin,
-    OwnerApproval, QuestionOption, RecalledMemory, SessionEndReason, TodoItem, TriggerInvocation,
-    UnproposedReason, UnqueueReason, VoiceSessionEndReason, WakeMode,
+    FireRetry, FormRequestOutcome, HandoffConsent, LegacyArrangedTile, McpEnablementSource,
+    MessageOrigin, OwnerApproval, QuestionOption, RecalledMemory, RetryOf, SessionEndReason,
+    TodoItem, TriggerInvocation, UnproposedReason, UnqueueReason, VoiceSessionEndReason, WakeMode,
 };
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -1007,6 +1007,9 @@ pub enum ThreadEvent {
         actor: Option<MessageOrigin>,
     },
     TriggerStarted {
+        /// The interrupted fire this fresh thread retries. Absent on ordinary and legacy fires.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_of: Option<RetryOf>,
         #[serde(alias = "task_id")]
         trigger_id: String,
         #[serde(default, alias = "task_name", skip_serializing_if = "Option::is_none")]
@@ -1047,6 +1050,13 @@ pub enum ThreadEvent {
         /// decided.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+    },
+    /// Boot reported a restart-cut fire and its durable retry decision.
+    TriggerRunInterrupted {
+        trigger_id: String,
+        trigger_name: String,
+        fire_event_id: uuid::Uuid,
+        retry: FireRetry,
     },
     TriggerCompleted {
         #[serde(alias = "task_id")]

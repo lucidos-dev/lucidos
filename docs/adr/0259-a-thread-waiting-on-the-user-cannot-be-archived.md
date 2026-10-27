@@ -1,6 +1,7 @@
 # 0259: A thread waiting on the user cannot be archived, by any path
 
 - **Status**: Accepted
+- **Amended by**: [0579](0579-restart-cut-trigger-fire-fails-visibly-and-retries-once.md)
 - **Date**: 2026-09-23
 
 ## Context

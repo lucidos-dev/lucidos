@@ -239,6 +239,68 @@ if [ "$(service_network_toml_bind "$NTC")" = "192.168.1.7" ]; then pass "rewrite
 if [ "$(service_network_toml_engine_inherit "$NTC")" = "false" ]; then pass "rewrite preserves inherit=false"; else fail "rewrite lost inherit: $NTC"; fi
 rm -rf "$NTH"
 
+# ── external address (ADR 0550): shape pre-check, render, preserve, clear ────
+echo ""
+echo "test: service_is_external_address accepts an origin and nothing more"
+for ok_e in https://lucidos.example.com http://10.8.0.2:5252 "http://[2001:db8::2]:5252" https://mymac.example-tailnet.test; do
+    if service_is_external_address "$ok_e"; then pass "accepts '$ok_e'"; else fail "rejected valid '$ok_e'"; fi
+done
+for bad_e in "" lucidos.example.com ftp://x https://x/ https://x/lucidos "https://x?a=1" https://u@x http://x: http://x:0 http://x:99999 \
+    http://127.0.0.1:5252 http://localhost:5252 https://app.localhost "http://[::1]:5252" 'https://x"y' \
+    http://169.254.169.254 http://0.0.0.0:5252 "http://[fe80::1]:5252" "http://[::]:5252" \
+    http://127.1:5252 http://0:5252 http://2130706433 http://0x7f.1 http://010.0.0.1 http://169.254.43518 \
+    "http://[::ffff:127.0.0.1]:5252" "http://[FE80::1]:5252" http://LOCALHOST:5252; do
+    if service_is_external_address "$bad_e"; then fail "accepted invalid '$bad_e'"; else pass "rejects '$bad_e'"; fi
+done
+
+echo ""
+echo "test: service_write_network_toml sets, keeps and clears one gateway's external address"
+NTE="$(mktemp -d)"
+service_write_network_toml "$NTE" all 5252 https://lucidos.example.com || fail "write with external address failed"
+NTEC="$(cat "$NTE/.lucidos/network.toml")"
+if [ "$(service_network_toml_external_address "$NTEC" 5252)" = "https://lucidos.example.com" ]; then pass "external address written for 5252"; else fail "external write: $NTEC"; fi
+if [ -z "$(service_network_toml_external_address "$NTEC" 5251)" ]; then pass "another port has none"; else fail "leaked to 5251: $NTEC"; fi
+service_write_network_toml "$NTE" 192.168.1.7 || fail "bind-only rewrite failed"
+NTEC="$(cat "$NTE/.lucidos/network.toml")"
+if [ "$(service_network_toml_external_address "$NTEC" 5252)" = "https://lucidos.example.com" ]; then pass "a bind rewrite keeps the external address"; else fail "bind rewrite lost it: $NTEC"; fi
+service_write_network_toml "$NTE" "" 5251 http://10.8.0.2:5251 || fail "second gateway's write failed"
+NTEC="$(cat "$NTE/.lucidos/network.toml")"
+if [ "$(service_network_toml_bind "$NTEC")" = "192.168.1.7" ]; then pass "an empty bind keeps the stored bind"; else fail "empty bind: $NTEC"; fi
+if [ "$(service_network_toml_external_address "$NTEC" 5251)" = "http://10.8.0.2:5251" ] \
+    && [ "$(service_network_toml_external_address "$NTEC" 5252)" = "https://lucidos.example.com" ]; then
+    pass "two gateways keep one entry each"; else fail "two entries: $NTEC"; fi
+service_write_network_toml "$NTE" "" 5252 https://other.example.com || fail "replace failed"
+NTEC="$(cat "$NTE/.lucidos/network.toml")"
+if [ "$(service_network_toml_external_entries "$NTEC" | grep -c '^5252')" = "1" ] \
+    && [ "$(service_network_toml_external_address "$NTEC" 5252)" = "https://other.example.com" ]; then
+    pass "a write replaces, never duplicates"; else fail "replace: $NTEC"; fi
+service_write_network_toml "$NTE" "" 5252 "" || fail "clearing rewrite failed"
+service_write_network_toml "$NTE" "" 5251 "" || fail "clearing rewrite failed"
+NTEC="$(cat "$NTE/.lucidos/network.toml")"
+if [ -z "$(service_network_toml_external_entries "$NTEC")" ] && ! has "$NTEC" '
+[external_address]'; then pass "\"\" clears, and an empty table is not written"; else fail "clear: $NTEC"; fi
+rm -rf "$NTE"
+
+echo ""
+echo "test: concurrent service_write_network_toml calls keep every gateway's entry"
+NTL="$(mktemp -d)"
+for lport in 5301 5302 5303 5304 5305 5306; do
+    service_write_network_toml "$NTL" "" "$lport" "https://gw$lport.example.com" &
+done
+wait
+NTLC="$(cat "$NTL/.lucidos/network.toml")"
+if [ "$(service_network_toml_external_entries "$NTLC" | grep -c '^53')" = "6" ]; then
+    pass "six racing writers leave six entries"; else fail "lost an entry: $NTLC"; fi
+if [ -z "$(find "$NTL/.lucidos" -name 'network.toml.?*' ! -name "$SERVICE_NETWORK_TOML_LOCK")" ]; then
+    pass "no temp file is left behind"; else fail "leftover temp: $(ls -a "$NTL/.lucidos")"; fi
+rm -rf "$NTL"
+if grep -q "NETWORK_TOML_LOCK: &str = \"$SERVICE_NETWORK_TOML_LOCK\"" "$SCRIPT_DIR/../../crates/lucidos-gateway/src/net_config.rs"; then
+    pass "the shell and the gateway take the same lock"; else fail "lock name differs from net_config::NETWORK_TOML_LOCK"; fi
+NTF="$(mktemp -d)"
+service_write_network_toml "$NTF" "" || fail "fresh write with no bind failed"
+if [ "$(service_network_toml_bind "$(cat "$NTF/.lucidos/network.toml")")" = "loopback" ]; then pass "no bind anywhere writes loopback"; else fail "fresh empty bind: $(cat "$NTF/.lucidos/network.toml")"; fi
+rm -rf "$NTF"
+
 # ── PURE: env contract (matches spawn_gateway; shared runtime + per-instance data) ─
 echo ""
 echo "test: service_runtime_env_pairs matches the spawn_gateway env contract"

@@ -1,3 +1,4 @@
+import { readWindowItem, removeWindowItem, writeWindowItem } from '../../utils/windowStorage';
 import {
   artifacts,
   filePreviewRevision,
@@ -91,12 +92,12 @@ async function listArtifactsOnce(): Promise<void> {
     // page reload (see filePreviewRestoreAttempted above).
     if (!filePreviewRestoreAttempted) {
       filePreviewRestoreAttempted = true;
-      const savedPath = localStorage.getItem('file-preview-open');
+      const savedPath = readWindowItem('file-preview-open');
       if (savedPath && panelOverlay.value?.type !== 'file-preview') {
         if (paths.includes(savedPath)) {
           openFilePreview(savedPath, { preserveSource: true });
         } else {
-          localStorage.removeItem('file-preview-open');
+          removeWindowItem('file-preview-open');
         }
       }
     }
@@ -196,7 +197,7 @@ export function openFilePreview(path: string, opts?: { preserveSource?: boolean 
   lineScrollTarget.value = null;
   findRequest.value = null;
   panelOverlay.value = { type: 'file-preview', path };
-  localStorage.setItem('file-preview-open', path);
+  writeWindowItem('file-preview-open', path);
   revealContentPane();
   pushNavState();
 }
@@ -342,7 +343,7 @@ export function openUrl(url: string, source?: string): void {
     return;
   }
   const normalized = normalizeUrl(url);
-  localStorage.removeItem('file-preview-open');
+  removeWindowItem('file-preview-open');
   panelOverlay.value = { type: 'url-preview', url: normalized };
   webviewInitialUrl.value = normalized;
   revealContentPane();

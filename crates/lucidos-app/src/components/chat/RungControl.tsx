@@ -16,7 +16,8 @@ import { useRungState } from './useRungState';
 
 /** The control's trigger and the list it opens in an overlay. What the list
  *  holds, and what a pick means, belong to the thread kind that draws it. */
-function RungShell({ folded, rowAttrs, shown, step, children }: {
+function RungShell({ folded, rowAttrs, shown, step, disabledReason, children }: {
+  disabledReason?: string | null;
   folded: RungControlProps['folded'];
   rowAttrs: RungControlProps['rowAttrs'];
   shown: ShownRung | null;
@@ -36,6 +37,7 @@ function RungShell({ folded, rowAttrs, shown, step, children }: {
   const open = useSignal(false);
 
   function openList() {
+    if (disabledReason) return;
     const trigger = folded ? foldAnchorRef.current : triggerRef.current;
     if (!trigger?.isConnected) return;
     const holder = keyboardHolder();
@@ -56,6 +58,12 @@ function RungShell({ folded, rowAttrs, shown, step, children }: {
   }
 
   useEffect(() => close, []);
+  useEffect(() => {
+    if (disabledReason) {
+      pendingOpen.takeBack();
+      if (open.value) close();
+    }
+  }, [disabledReason]);
 
   // A press on the placeholder before this code arrived opens the list as that
   // press would have.
@@ -95,6 +103,7 @@ function RungShell({ folded, rowAttrs, shown, step, children }: {
       {!folded && (
         <RungButtons
           shown={shown}
+          disabledReason={disabledReason}
           rowAttrs={rowAttrs}
           expanded={open.value}
           triggerRef={(el) => { triggerRef.current = el; }}
@@ -129,13 +138,14 @@ function RungShell({ folded, rowAttrs, shown, step, children }: {
  *
  *  What a pick means (the pair, per draft, never an account preference) is
  *  `useRungState`'s. */
-function CodingAgentRungControl({ folded, rowAttrs, threadId, composeThreadId, codingAgent }: RungControlProps) {
+function CodingAgentRungControl({ folded, rowAttrs, threadId, composeThreadId, codingAgent, disabledReason }: RungControlProps) {
   const rung = useRungState({ threadId, composeThreadId, codingAgent });
   return (
     <RungShell
       folded={folded}
       rowAttrs={rowAttrs}
       shown={rung.shown}
+      disabledReason={disabledReason ?? rung.lockedReason ?? (rung.sending.value ? 'Changing the model and effort' : null)}
       step={{
         prev: rung.steps.prev === null ? null : () => rung.step(-1),
         next: rung.steps.next === null ? null : () => rung.step(1),
@@ -161,13 +171,14 @@ function CodingAgentRungControl({ folded, rowAttrs, threadId, composeThreadId, c
 /** A Lucidos Agent thread's control. Its list is the chat ladder's rungs,
  *  and its steps walk one rung either way, as a coding agent's do. A rung
  *  with a choice of backend opens the preferred-provider step. */
-function ChatRungControl({ folded, rowAttrs, threadId, composeContext }: RungControlProps) {
+function ChatRungControl({ folded, rowAttrs, threadId, composeContext, disabledReason }: RungControlProps) {
   const chat = useChatRungState({ threadId, composeContext: composeContext === true });
   return (
     <RungShell
       folded={folded}
       rowAttrs={rowAttrs}
       shown={chat.shown}
+      disabledReason={disabledReason ?? chat.lockedReason}
       step={{
         prev: chat.steps.prev === null ? null : () => chat.step(-1),
         next: chat.steps.next === null ? null : () => chat.step(1),

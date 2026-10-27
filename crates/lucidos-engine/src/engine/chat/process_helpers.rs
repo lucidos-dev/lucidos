@@ -11,12 +11,13 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::engine::thread_events::{
-    EventChannel, EventMeta, MessageOrigin, ThreadEvent, TriggerInvocation,
+    EventChannel, EventMeta, MessageOrigin, RetryOf, ThreadEvent, TriggerInvocation,
 };
 use crate::engine::types::AgentSession;
 
 /// Trigger context passed into the chat process flow. None for user-driven chat.
 pub(super) struct TriggerContext {
+    pub retry_of: Option<RetryOf>,
     pub trigger_id: String,
     pub trigger_name: String,
     /// Stable kebab-case slug of the firing trigger, used to scope the
@@ -142,10 +143,12 @@ pub(super) fn build_trigger_started_event(
     user_message: &str,
     go_to_review: bool,
     selection: &crate::core::ResolvedModelSelection,
+    retry_of: Option<&RetryOf>,
 ) -> (ThreadEvent, EventMeta) {
     use crate::engine::thread_events::EngineReason;
     (
         ThreadEvent::TriggerStarted {
+            retry_of: retry_of.cloned(),
             trigger_id: trigger_id.to_string(),
             trigger_name: Some(trigger_name.to_string()),
             prompt: Some(user_message.to_string()),

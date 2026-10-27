@@ -1,3 +1,4 @@
+import { removeWindowItem, writeWindowItem } from '../utils/windowStorage';
 import { effect, untracked } from '@preact/signals';
 import { pageTitle, visibleWorkspaceName, animationSpeed, durationScale, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, collapsedExchanges, collapsedInitiators, openSubAgentGroups, OPEN_SUB_AGENT_GROUPS_KEY, filePreviewSource, filePreviewWrap, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, removeToast, engineRestarting, SELECTED_CHANGE_KEY, STEPS_EXPANDED_KEY, DETAILS_EXPANDED_KEY, persistTurnControl } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
@@ -234,9 +235,9 @@ effect(() => {
 effect(() => {
   const id = repoSelectedChangeId.value;
   if (id) {
-    localStorage.setItem(SELECTED_CHANGE_KEY, id);
+    writeWindowItem(SELECTED_CHANGE_KEY, id);
   } else {
-    localStorage.removeItem(SELECTED_CHANGE_KEY);
+    removeWindowItem(SELECTED_CHANGE_KEY);
   }
 });
 

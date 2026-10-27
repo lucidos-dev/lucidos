@@ -1931,7 +1931,8 @@ impl EventBus {
             // A merge conflict and a failed apply change the change, not the
             // thread. The `changes` table carries both.
             | ThreadEvent::MergeConflictDetected { .. }
-            | ThreadEvent::ChangeApplyFailed { .. } => Vec::new(),
+            | ThreadEvent::ChangeApplyFailed { .. }
+            | ThreadEvent::TriggerRunInterrupted { .. } => Vec::new(),
         };
 
         // Step 2: Validate and apply section transition via the lifecycle contract.
@@ -1979,17 +1980,17 @@ impl EventBus {
             false
         } else {
             let human = ActorMode::Human.as_str();
-            let latest_start: Option<String> = sqlx::query_scalar(
+            let latest_start_sql = format!(
                 "SELECT event_type FROM events WHERE aggregate_id = $1::text \
-                 AND (event_type = 'TriggerStarted' \
-                      OR (event_type = 'MessageReceived' \
-                          AND COALESCE(payload->>'mode', $2) = $2)) \
+                 AND (event_type = 'TriggerStarted' OR ({})) \
                  ORDER BY sequence DESC LIMIT 1",
-            )
-            .bind(thread_id)
-            .bind(human)
-            .fetch_optional(&mut **tx)
-            .await?;
+                crate::engine::thread_events::HUMAN_MESSAGE_SQL,
+            );
+            let latest_start: Option<String> = sqlx::query_scalar(&latest_start_sql)
+                .bind(thread_id)
+                .bind(human)
+                .fetch_optional(&mut **tx)
+                .await?;
             latest_start.as_deref() != Some("MessageReceived")
         };
         match resolve_transition(event.event_type(), thread_type, current, is_unattended) {

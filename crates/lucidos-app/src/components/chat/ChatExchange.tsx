@@ -8,7 +8,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission, TypedAnswer } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, drawsInitiatorPanel, isResumeTurn, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, drawnResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, opensAwaitingAnswer, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, drawsInitiatorPanel, isResumeTurn, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, drawnResponseEvents, exchangeStatus, exchangeError, exchangeStarterId, dividerBodyIsSuppressed, opensAwaitingAnswer, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY, triggerRunInterruption } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { discardUnsentMessage, editQueuedMessage, removeQueuedMessage, retryUnsentMessage } from '../../store/actions/chat';
@@ -33,7 +33,7 @@ import { handleMarkdownLinkClick } from '../shared/markdownLinkClick';
 import { FormRequestRow } from './FormRequestRow';
 import { NO_SIDE_QUESTIONS, SideQuestionGroup, placeInBody } from './SideQuestionCard';
 import type { SideQuestion } from '../../store/sideQuestions';
-import { ChangeEventRow, CheckpointCard, ContinueButton, RestartRow, FreshSessionRow, HandoffSessionRow, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, SubAgentStepGroup, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
+import { ChangeEventRow, CheckpointCard, ContinueButton, RestartRow, FreshSessionRow, HandoffSessionRow, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, SubAgentStepGroup, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, TriggerInterruptionNotice, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
 import type { BoundaryTurn } from './chat-exchange-parts';
 import { EditIcon, TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
@@ -223,6 +223,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const events = keepAliveRuns.length > 0 ? allEvents.filter((e) => e.type !== 'cache_keep_alive') : allEvents;
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer, behindOpenQuestion);
   const error = exchangeError(exchange);
+  const interruption = triggerRunInterruption(exchange);
   const agentExitCard = error?.agentExit && agentExitCopy(error.agentExit, sessionCodingAgent);
   const unsentEventId = unsentMessageOf(exchange);
   // A live turn's output can land between the bubble and this card, so the
@@ -710,6 +711,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         held={panelHeld}
       />
       )}
+
+      <Disclosure open={!!interruption} key="trigger-interruption" class="initiator-panel" bodyClass="initiator-body">
+        {interruption && <TriggerInterruptionNotice event={interruption} />}
+      </Disclosure>
 
       {keepAliveRuns.map((run, i) => run.type === 'cache_keep_alive' && (
         <div class="keep-alive-under-card" key={`ka${i}`}>
@@ -1618,6 +1623,7 @@ export function describeInitiator(
         details: (
           <QuestionBody
             threadId={threadId}
+            eventId={exchangeStarterId(exchange)}
             toolUseId={ev.tool_use_id}
             question={ev.question}
             options={ev.options ?? []}

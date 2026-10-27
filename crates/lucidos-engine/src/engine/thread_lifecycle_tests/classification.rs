@@ -252,6 +252,25 @@ fn unattended_trigger_runs_route_to_archived() {
     }
 }
 
+#[test]
+fn interrupted_trigger_fire_surfaces_without_changing_status() {
+    for section in [ArchiveState::Inbox, ArchiveState::Archived] {
+        for unattended in [false, true] {
+            let result = resolve_transition(
+                "TriggerRunInterrupted",
+                ThreadType::Chat,
+                section,
+                unattended,
+            )
+            .expect("interrupted fires have a lifecycle transition");
+            assert_eq!(result.new_section, Some(ArchiveState::Inbox));
+        }
+    }
+    assert!(status_transitions().iter().all(|(event, transition)| {
+        *event != "TriggerRunInterrupted" || transition.status == StatusRule::NoChange
+    }));
+}
+
 // 14a2. undo_restores_an_unattended_trigger_run
 #[test]
 fn undo_restores_an_unattended_trigger_run() {

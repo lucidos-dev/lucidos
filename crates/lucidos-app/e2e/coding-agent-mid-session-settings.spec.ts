@@ -160,12 +160,12 @@ test.describe('CC mid-session model/effort persistence', () => {
     const before = await waitForActiveSession(page, threadId);
     const picked = before.current_reasoning_effort === 'low' ? 'high' : 'low';
 
-    // The list still opens mid-turn, but a pick says why and records nothing.
-    const lockReason = page.locator('.toast:visible', { hasText: 'stay fixed while a turn runs' });
-    await openRungList(page);
-    const other = (await readRungRows(page)).find((r) => !r.current)!;
-    await page.locator(`.control-dropdown .control-option[data-value="${other.value}"]`).click();
-    await expect(lockReason.first()).toBeVisible({ timeout: 5_000 });
+    // The current model stays visible, and the disabled picker explains why.
+    const trigger = page.locator('.rung-control:visible .rung-trigger');
+    await expect(trigger).toHaveAttribute('aria-disabled', 'true');
+    await expect(trigger).toHaveAttribute('data-tooltip', /stay fixed while a turn runs/);
+    await trigger.click({ force: true });
+    await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
 
     const res = await apiRequest(page).post('/api/v1/claude-code/control', {
       data: { thread_id: threadId, request: { subtype: 'set_reasoning_effort', effort: picked } },

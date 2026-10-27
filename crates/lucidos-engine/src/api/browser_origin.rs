@@ -17,19 +17,22 @@
 //! JavaScript cannot. A caller with no fetch metadata is not a browser, and is
 //! left to the bind topology.
 
-//! # A WebSocket handshake carries no fetch metadata
+//! # Some requests carry no fetch metadata
 //!
-//! Chromium and Gecko send none on one, because a handshake's headers are not
-//! built by the fetch pipeline. WebKit is the exception and sends it there too.
-//! So for the two that matter the arm above never runs, and the handshake lands
-//! in the `Origin` fallback below.
+//! Two cases reach the `Origin` fallback below. A WebSocket handshake: Chromium
+//! and Gecko send none on one, because its headers are not built by the fetch
+//! pipeline, and WebKit is the exception. An ordinary request to a plain-HTTP
+//! address that is not loopback: no browser sends fetch metadata to a URL that
+//! is not potentially trustworthy. That is a shipped route, a phone paired over
+//! a tailnet IP or a LAN address.
 //!
-//! Direct to the engine that is right, since `Host` is the authority the
-//! browser dialled. Behind the gateway it is not: `Host` is the internal
+//! Direct to the engine the fallback is right, since `Host` is the authority
+//! the browser dialled. Behind the gateway it is not: `Host` is the internal
 //! upstream, so our own page would be refused. The gateway answers the question
-//! there and consumes the `Origin` with it, so the fallback never runs for a
-//! spliced handshake. WebKit's own signal still crosses that hop, and still
-//! decides (ADR 0163).
+//! there and consumes the `Origin` with it, so the fallback never runs for such
+//! a request. A foreign `Origin` is forwarded, and the fallback refuses it.
+//! Fetch metadata still crosses that hop, and still decides (ADR 0163, ADR
+//! 0587).
 
 //! # What a wide bind costs
 //!
@@ -79,16 +82,14 @@ use axum::response::{IntoResponse, Response};
 /// authority in `:authority`, so no `Host` header exists at all. Every current
 /// browser sends fetch metadata (Chrome 76+, Firefox 90+, Safari 16.4+).
 ///
-/// A browser old enough to omit it still sends `Origin`, which falls back to the
-/// legacy `Origin == Host` comparison. That fallback holds **direct-to-engine**
-/// only, where `Host` is the real client authority. Behind the gateway `Host` is
-/// the internal upstream address, and no `x-forwarded-host` is injected. So a
-/// no-fetch-metadata browser behind the gateway is deliberately unsupported, an
-/// accepted and shrinking-population limitation
-/// (`docs/plans/2026-07-22-credentialed-proxy-sec-fetch-authoritative.md`).
-///
-/// A handshake omits it too, in every browser but WebKit's, and the gateway
-/// answers for one instead (module note above).
+/// A browser sends it only to https and loopback URLs. One reached at a
+/// plain-HTTP tailnet or LAN address sends none, and a handshake omits it in
+/// every browser but WebKit's. Both still send `Origin`, which falls back to the
+/// `Origin == Host` comparison. That fallback holds **direct-to-engine**, where
+/// `Host` is the real client authority. Behind the gateway `Host` is the
+/// internal upstream address, and no `x-forwarded-host` is injected. So the
+/// gateway answers for such a request instead and consumes the `Origin` it has
+/// vouched for (module note above, ADR 0587).
 pub fn browser_request_allowed(headers: &HeaderMap) -> bool {
     let sec_fetch_site = headers
         .get("sec-fetch-site")
@@ -332,7 +333,7 @@ mod tests {
     fn a_handshake_behind_the_gateway_is_not_this_gates_to_judge() {
         // Its `Host` is the internal upstream, so the fallback would compare
         // our own page against the wrong authority and refuse it. That is why
-        // the gateway answers the question, in `proxy::foreign_handshake_origin`.
+        // the gateway answers the question, in `proxy::foreign_origin`.
         let wrong_authority = hm(&[
             ("host", "127.0.0.1:5173"),
             ("origin", "https://localhost:5251"),

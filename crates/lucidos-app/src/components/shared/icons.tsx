@@ -884,17 +884,6 @@ export function SendArrowIcon() {
   );
 }
 
-// Question-card Submit: the return key's bent arrow, so answering reads apart
-// from sending a new message.
-export function ReturnArrowIcon() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M20 4v7a4 4 0 0 1-4 4H4" />
-      <polyline points="9 10 4 15 9 20" />
-    </svg>
-  );
-}
-
 // Compose Cancel/Stop button — a filled stop-square inside the round morph button.
 export function StopIcon() {
   return (

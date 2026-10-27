@@ -1483,7 +1483,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The scheduler is the first submission path to come alive, so loading the
     // persisted backlog first keeps per-trigger FIFO intact across a restart.
     // An admitted row whose thread already materialized hands off to the
-    // recovery above; one that bound no thread ran nothing, so it re-queues.
+    // recovery above; an unbound trigger entry re-queues at most once.
+    shared_engine.thread_queue.begin_boot_recovery();
     shared_engine.thread_queue.recover_persisted_entries().await;
 
     // Admission reads user occupancy itself (ADR 0443). This subscriber only

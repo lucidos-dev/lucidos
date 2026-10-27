@@ -16,6 +16,8 @@
 #     Test jobs only restore.
 #   - Every job but seed-cache waits on the plan, so only a request runs it.
 #   - Every action is pinned by commit.
+#   - A test job runs only when its build succeeded or was skipped, so a
+#     cancelled build never leaves a shard without an engine.
 #   - mobile-webkit runs on macOS, the WebKit port iOS ships (ADR 0175).
 #   - Artifacts live one day, except what a later run reuses: an engine and
 #     its manifest live a week, target/ state two days. Traces upload only for
@@ -186,8 +188,8 @@ jobs:
 
   linux:
     needs: [plan, build-linux]
-    # Runs after its build job, or without one when the plan found an engine.
-    if: github.repository == 'lucidos-dev/lucidos' && !cancelled() && needs.plan.outputs.has_linux == 'true' && needs.build-linux.result != 'failure'
+    # Runs after its build job succeeded, or without one when the plan found an engine.
+    if: github.repository == 'lucidos-dev/lucidos' && !cancelled() && needs.plan.outputs.has_linux == 'true' && (needs.build-linux.result == 'success' || needs.build-linux.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -260,8 +262,8 @@ jobs:
 
   macos:
     needs: [plan, build-macos]
-    # Runs after its build job, or without one when the plan found an engine.
-    if: github.repository == 'lucidos-dev/lucidos' && !cancelled() && needs.plan.outputs.has_macos == 'true' && needs.build-macos.result != 'failure'
+    # Runs after its build job succeeded, or without one when the plan found an engine.
+    if: github.repository == 'lucidos-dev/lucidos' && !cancelled() && needs.plan.outputs.has_macos == 'true' && (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped')
     runs-on: macos-15
     timeout-minutes: 120
     strategy:

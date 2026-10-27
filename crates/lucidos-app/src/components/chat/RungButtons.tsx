@@ -9,6 +9,7 @@ export interface RungControlProps {
    *  the focused Lucidos Agent thread (a draft's id in compose). */
   threadId?: string;
   composeThreadId?: string;
+  disabledReason?: string | null;
   /** Lucidos Agent threads only: true for a composing draft and the fresh
    *  compose view. */
   composeContext?: boolean;
@@ -77,8 +78,9 @@ function stepOnArrow(step: RungSteps | undefined, e: KeyboardEvent): void {
 }
 
 /** One end of the pill: ‹ steps to the previous rung, › to the next. */
-function RungStep({ dir, step }: {
+function RungStep({ dir, step, disabledReason }: {
   dir: 'prev' | 'next';
+  disabledReason?: string | null;
   step: RungSteps | undefined;
 }) {
   const label = dir === 'prev' ? 'Previous model and effort' : 'Next model and effort';
@@ -87,11 +89,11 @@ function RungStep({ dir, step }: {
       type="button"
       class="rung-step"
       aria-label={label}
-      data-tooltip={label}
-      aria-disabled={!step?.[dir]}
+      data-tooltip={disabledReason ?? label}
+      aria-disabled={!!disabledReason || !step?.[dir]}
       onMouseDown={keepFocusOnPress}
-      onKeyDown={(e) => stepOnArrow(step, e)}
-      onClick={() => step?.[dir]?.()}
+      onKeyDown={(e) => stepOnArrow(disabledReason ? undefined : step, e)}
+      onClick={() => { if (!disabledReason) step?.[dir]?.(); }}
     >
       {dir === 'prev' ? <ChevronLeftIcon size="0.75rem" /> : <ChevronRightIcon size="0.75rem" />}
     </button>
@@ -102,11 +104,12 @@ function RungStep({ dir, step }: {
  *  placeholder shown until its code arrives both draw them, so the box never
  *  changes as it loads. */
 export function RungButtons({
-  shown, rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step,
+  shown, rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step, disabledReason,
 }: {
   rowAttrs?: Record<string, string>;
+  disabledReason?: string | null;
   /** What the control names, or null until its face is whole. A null face
-   *  draws the boxes unseen, so the pill appears once, with its face. */
+   *  keeps a visible label until the selection arrives. */
   shown: ShownRung | null;
   expanded: boolean;
   triggerRef?: (el: HTMLButtonElement | null) => void;
@@ -122,23 +125,24 @@ export function RungButtons({
       data-pending={shown === null || undefined}
       {...rowAttrs}
     >
-      <RungStep dir="prev" step={step} />
+      <RungStep dir="prev" step={step} disabledReason={disabledReason} />
       <button
         type="button"
         class="rung-trigger"
-        data-tooltip={tooltipWithShortcut(pairName(shown), 'openAgentMenu')}
+        data-tooltip={disabledReason ?? tooltipWithShortcut(pairName(shown), 'openAgentMenu')}
+        aria-disabled={!!disabledReason}
         ref={triggerRef}
         aria-label={openLabel(shown)}
         aria-haspopup="listbox"
         aria-expanded={expanded}
         onMouseDown={keepFocusOnPress}
-        onKeyDown={(e) => stepOnArrow(step, e)}
-        onClick={onOpen}
+        onKeyDown={(e) => stepOnArrow(disabledReason ? undefined : step, e)}
+        onClick={(e) => { if (!disabledReason) onOpen(e); }}
       >
-        {shown ? <RungLabel shown={shown} /> : <span class="rung-label" />}
+        {shown ? <RungLabel shown={shown} /> : <span class="rung-label">Model and effort</span>}
         <ChevronDownIcon size="0.75rem" />
       </button>
-      <RungStep dir="next" step={step} />
+      <RungStep dir="next" step={step} disabledReason={disabledReason} />
     </div>
   );
 }

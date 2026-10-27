@@ -5,6 +5,7 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
+import { removeWindowItem } from '../../utils/windowStorage';
 import { refreshThreadWidgetsNaming } from './widgets';
 import { onDashboardEvent, refreshDashboardsNaming } from './dashboards';
 import type { Dashboard } from '../../generated/thread-event-wire';
@@ -609,7 +610,7 @@ function closeOverlayIfStale(entity: string, id: string): void {
     case 'app':
       if (overlay.type === 'app-ui' && overlay.app.id === id) {
         panelOverlay.value = null;
-        localStorage.removeItem('app-window-open');
+        removeWindowItem('app-window-open');
       }
       break;
     case 'trigger':

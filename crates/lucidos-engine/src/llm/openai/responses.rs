@@ -587,8 +587,8 @@ fn prefill_pair(body: &serde_json::Value, route: TurnRoute<'_>) -> Option<Prefil
     value["max_output_tokens"] = RESPONSES_OUTPUT_CAP.into();
     value["stream"] = false.into();
     pair_of(
-        value,
-        "input",
+        &value,
+        |v: &mut serde_json::Value| v.get_mut("input")?.as_array_mut(),
         end,
         BeatShape::json_reply(RESPONSES_OUTPUT_CAP),
         route,
@@ -1382,6 +1382,24 @@ mod tests {
             assert_eq!(body.wire_model, SOL);
             assert_eq!(body.reasoning_effort.as_deref(), Some("medium"));
         }
+    }
+
+    /// The beat writes the bytes the turn writes: the same serializer over
+    /// the same body, edited only where a beat differs (ADR 0581).
+    #[test]
+    fn a_responses_beat_keeps_the_turns_bytes() {
+        let body = turn_body(SOL, &tree_turn());
+        let pair = prefill_pair(&body, route(SOL)).expect("a marked request beats");
+
+        let mut whole = body.clone();
+        whole["max_output_tokens"] = RESPONSES_OUTPUT_CAP.into();
+        whole["stream"] = false.into();
+        assert_eq!(&*pair.whole.body, serde_json::to_vec(&whole).unwrap());
+
+        let input = whole["input"].as_array_mut().unwrap();
+        input.truncate(1);
+        input[0]["content"].as_array_mut().unwrap().truncate(2);
+        assert_eq!(&*pair.stable.body, serde_json::to_vec(&whole).unwrap());
     }
 
     /// No breakpoint means no entry a beat could read: a model before

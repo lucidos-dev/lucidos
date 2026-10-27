@@ -73,6 +73,13 @@ impl ThreadEvent {
     /// blocks sequentially on `ask_user_question` today, but the uniform list
     /// defends against future regressions.
     ///
+    /// `CodingAgentToolResult` is NOT in the set either. A result completes a
+    /// call issued earlier, and any call issued after the question is already
+    /// listed through its `CodingAgentToolCalled`. A result overtakes a question
+    /// only when it is the question's OWN result (Claude Code's rejection of an
+    /// Esc'd `AskUserQuestion`), which pairs by `tool_use_id`: see
+    /// [`Self::question_own_result_sql`].
+    ///
     /// `UserQuestionAsked` is NOT in the set: the SQL's
     /// `ORDER BY sequence DESC LIMIT 1` already picks the latest unanswered
     /// question, so a replacement naturally takes over without an explicit
@@ -86,7 +93,6 @@ impl ThreadEvent {
         // CC progression — the parallel-tool-call race
         "CodingAgentTextStreamed",
         "CodingAgentToolCalled",
-        "CodingAgentToolResult",
         "CodingAgentPromptSent",
         // Chat-agent progression (symmetry; harmless on CC threads)
         "TextStreamed",
@@ -94,6 +100,16 @@ impl ThreadEvent {
         "ToolCalled",
         "ToolResult",
     ];
+
+    /// SQL for "`later` is the result of the call that asked `question`": the
+    /// one `CodingAgentToolResult` that ends a question without a new action by
+    /// the agent. Both arguments are table aliases over `events`.
+    pub fn question_own_result_sql(question: &str, later: &str) -> String {
+        format!(
+            "({later}.event_type = 'CodingAgentToolResult' \
+              AND {later}.payload->>'tool_use_id' = {question}.payload->>'tool_use_id')"
+        )
+    }
 
     /// Drop a tool result's text from its serialized payload and mark it, so a
     /// reader fetches it by event id. The snapshot and the live stream both
@@ -194,6 +210,7 @@ impl ThreadEvent {
             Self::HomeThreadCreated => "HomeThreadCreated",
             Self::ImageUploaded { .. } => "ImageUploaded",
             Self::TriggerStarted { .. } => "TriggerStarted",
+            Self::TriggerRunInterrupted { .. } => "TriggerRunInterrupted",
             Self::TriggerCompleted { .. } => "TriggerCompleted",
             Self::ChangeProposed { .. } => "ChangeProposed",
             Self::ChangeApplied { .. } => "ChangeApplied",
@@ -353,6 +370,7 @@ impl ThreadEvent {
         "HomeThreadCreated",
         "ImageUploaded",
         "TriggerStarted",
+        "TriggerRunInterrupted",
         "TriggerCompleted",
         "ChangeProposed",
         "ChangeApplied",

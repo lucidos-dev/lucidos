@@ -225,6 +225,7 @@ const PROSE_FIELDS = [
   '../components/triggers/TriggerDetails.tsx', // trigger name, group name, intent
   '../components/settings/ResponseStylesSection.tsx', // a response style's instruction
   '../components/settings/MarketplacesSection.tsx', // a marketplace's display name
+  '../components/settings/TitleStyleRow.tsx', // the title style instruction
 ];
 
 // Config / code / secret surfaces: an iOS auto-capital here corrupts the value.

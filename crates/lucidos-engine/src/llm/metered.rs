@@ -224,7 +224,7 @@ pub(crate) async fn prefill<P: LlmProvider + ?Sized>(
     let call = provider.prefill(body, CallToken::mint());
     let (outcome, trace) = call_trace::scoped(within(sink, call)).await;
     let effort = body.reasoning_effort.as_deref();
-    let response = match outcome {
+    let mut response = match outcome {
         Ok(response) => response,
         Err(error) => {
             sink.record_failure(CallFailed {
@@ -241,6 +241,7 @@ pub(crate) async fn prefill<P: LlmProvider + ?Sized>(
             return Err(error);
         }
     };
+    response.stable_prefix_fingerprint = body.stable_prefix_fingerprint.clone();
     sink.record(CallCost {
         model: &body.model,
         request_chars: body.request_chars(),

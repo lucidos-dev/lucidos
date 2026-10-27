@@ -51,6 +51,10 @@ pub const LOGIN_FLAG: &str = "--login";
 /// Override with `LUCIDOS_ENGINE_PORT` or `<app-data>/config/engine-port`.
 pub const DEFAULT_ENGINE_PORT: u16 = lucidos_installs::DEFAULT_GATEWAY_PORT;
 
+/// The gateway's public health route. Its body carries `release` and the
+/// per-boot `instance_id`.
+pub(crate) const GATEWAY_HEALTH_PATH: &str = "/~/api/v1/health";
+
 /// How long to wait for the gateway to answer `/~/api/v1/health`
 /// (migrations + embedding-model warmup can be slow on a fresh workspace).
 const ENGINE_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1556,16 +1560,32 @@ fn announce_install_conflict(app: &AppHandle, app_data: &Path, port: u16) {
 
 /// One additional window this launch opens.
 ///
-/// A distinct type from the `(slug, frame)` pairs `window_session::restore_plan`
+/// A distinct type from the [`RestoredWindow`]s `window_session::restore_plan`
 /// answers with, so the two cannot be swapped. The slug-to-URL step in
-/// [`launch_plan`] is the security boundary (ADR 0028). These types are what
+/// [`planned_window`] is the security boundary (ADR 0028). These types are what
 /// keep a slug read off disk from reaching a webview verbatim.
+///
+/// [`RestoredWindow`]: crate::window_session::RestoredWindow
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PlannedWindow {
     /// The URL to load, composed here from a validated slug.
     pub url: String,
-    /// The frame the workspace was last left at, when one is remembered.
+    /// The recorded label to rebuild the window under. Never `main`, which only
+    /// the declared window wears. `None` asks for a fresh one.
+    pub label: Option<String>,
+    /// The frame the window was last left at, when one is remembered.
     pub frame: Option<crate::window_restore::RememberedFrame>,
+}
+
+/// The extra window that rebuilds `window`.
+fn planned_window(origin: &str, window: crate::window_session::RestoredWindow) -> PlannedWindow {
+    PlannedWindow {
+        url: crate::window_target::workspace_url(origin, &window.workspace),
+        label: window
+            .label
+            .filter(|label| label != crate::app_window::MAIN_WINDOW_LABEL),
+        frame: window.frame,
+    }
 }
 
 /// Where `main` goes, and what other windows this launch opens.
@@ -1581,64 +1601,68 @@ pub(crate) struct LaunchPlan {
 /// Three rules, in order.
 ///
 /// A notification `tap` wins `main`, because the user asked for that workspace
-/// a moment ago. Its workspace is then skipped in the restored list, or the tap
-/// would open a second window on the one it just landed.
+/// a moment ago. The first restored window on its workspace is then skipped, or
+/// the tap would open a second window on the one it just landed.
 ///
-/// Otherwise `main` takes the first restored workspace. With none it falls back
-/// to the gateway root, the picker, which is the behaviour before any of this.
+/// Otherwise `main` takes the first restored window, when that is the one
+/// recorded as `main` or an unlabelled one an older build wrote. With none it
+/// falls back to the gateway root, the picker. A record with no `main` entry
+/// means `main` was on the picker, so that is also what it gave back.
 ///
 /// Every URL is composed here from a slug `window_session::restore_plan`
 /// already validated, so nothing read off disk reaches a webview verbatim.
 ///
-/// A tap also DROPS the first restored workspace's frame. `setup` sized `main`
+/// A tap also DROPS the first restored window's frame. `setup` sized `main`
 /// from it before the tap existed, so leaving it would open the extra window
 /// exactly on top of `main`.
 pub(crate) fn launch_plan(
     tap: Option<String>,
-    restore: &[(String, Option<crate::window_restore::RememberedFrame>)],
+    restore: &[crate::window_session::RestoredWindow],
     origin: &str,
 ) -> LaunchPlan {
     let tapped = tap
         .as_deref()
-        .and_then(crate::window_target::window_workspace)
-        .map(str::to_string);
-    let mut wanted: Vec<(&String, Option<crate::window_restore::RememberedFrame>)> = restore
+        .and_then(crate::window_target::window_workspace);
+    let skipped = tapped.and_then(|id| restore.iter().position(|w| w.workspace == id));
+    let mut wanted: Vec<(usize, crate::window_session::RestoredWindow)> = restore
         .iter()
-        .filter(|(id, _)| Some(id) != tapped.as_ref())
-        .map(|(id, frame)| (id, frame.clone()))
+        .cloned()
+        .enumerate()
+        .filter(|(index, _)| Some(*index) != skipped)
         .collect();
 
     let main = match tap {
         Some(url) => {
-            // `setup` sized `main` from `restore[0]` before this tap existed.
-            // When THAT workspace survives as an extra, its window must not
-            // reuse the frame `main` now wears, or the two land exactly on top.
+            // `setup` sized `main` from `restore[0]` before this tap existed,
+            // when `main` may take it. When THAT window survives as an extra,
+            // it must not reuse the frame `main` now wears, or the two land
+            // exactly on top.
             //
             // Keyed on `restore[0]`, not on whatever is first after filtering:
             // a tap ON `restore[0]` displaces nothing, and clearing the next
             // entry's frame would shrink a window for no reason.
-            let sized_for = restore.first().map(|(id, _)| id);
-            if let Some(entry) = wanted.first_mut() {
-                if Some(entry.0) == sized_for {
-                    entry.1 = None;
-                }
+            if let Some((0, window)) = wanted
+                .first_mut()
+                .filter(|(_, window)| window.main_may_take())
+            {
+                window.frame = None;
             }
             url
         }
-        None if wanted.is_empty() => origin.to_string(),
-        None => {
-            let (id, _) = wanted.remove(0);
-            crate::window_target::workspace_url(origin, id)
+        None if wanted
+            .first()
+            .is_some_and(|(_, window)| window.main_may_take()) =>
+        {
+            let (_, window) = wanted.remove(0);
+            crate::window_target::workspace_url(origin, &window.workspace)
         }
+        None => origin.to_string(),
     };
     LaunchPlan {
         main,
         extra: wanted
             .into_iter()
-            .map(|(id, frame)| PlannedWindow {
-                url: crate::window_target::workspace_url(origin, id),
-                frame,
-            })
+            .map(|(_, window)| planned_window(origin, window))
             .collect(),
     }
 }
@@ -1687,16 +1711,21 @@ pub(crate) struct ReopenPlan {
 /// and makes a park cheap to undo. One that is already visible is left exactly
 /// where it is.
 ///
-/// A workspace the record names and no live window is on is BUILT. An adrift
-/// `main` takes the first of those as a navigate instead. Otherwise the reopen
-/// leaves a picker window sitting behind the restored ones. It carries that
-/// workspace's frame like any other owed window, because a reopen owes what a
-/// launch owes. `app_window::main_frame_owed` reads that frame off this plan,
+/// A recorded window no live window stands for is BUILT. An adrift `main`
+/// takes its own recorded entry, else the first owed unlabelled one, as a
+/// navigate instead. A labelled extra window is always built under its label. Otherwise the reopen leaves a picker window sitting behind the
+/// restored ones. It carries that window's frame like any other owed window,
+/// because a reopen owes what a launch owes. `app_window::main_frame_owed` reads that frame off this plan,
 /// and covers the launch that never settled `main` at all.
 ///
-/// Every URL is composed here from a slug validated by `is_workspace_slug`.
-/// Every `window-*` webview holds the full IPC permission set on the gateway
-/// origin (ADR 0028), so nothing read off the record may reach one verbatim.
+/// A recorded window is owed when no live window wears its label. An entry an
+/// older build wrote has no label, so it falls back to the old test: owed when
+/// no live window is on its workspace.
+///
+/// Every entry comes through `window_session::restore_plan`, which validates
+/// each slug and label. Every `window-*` webview holds the full IPC permission
+/// set on the gateway origin (ADR 0028), so nothing read off the record may
+/// reach one verbatim.
 pub(crate) fn reopen_plan(
     live: &[LiveWindow],
     session: &crate::window_session::WindowSession,
@@ -1719,7 +1748,7 @@ pub(crate) fn reopen_plan(
         .find(|w| w.label == crate::app_window::MAIN_WINDOW_LABEL);
     // A `main` still on the bundled splash means `launch` has not reached the
     // gateway yet, and it owns that window's first navigation. It is about to
-    // restore these same workspaces, so consulting the record here would
+    // restore these same windows, so consulting the record here would
     // navigate twice and build a duplicate. A workspace URL asked for before
     // the gateway is healthy does not even load. A reopen mid-boot therefore
     // shows what is parked and leaves the record alone, the same deference
@@ -1729,18 +1758,23 @@ pub(crate) fn reopen_plan(
     // in the menu bar while the service starts, and the user clicks it.
     let booting = main.is_some_and(|w| !crate::window_target::window_is_navigated(&w.url));
 
-    let mut owed: Vec<(&str, Option<crate::window_restore::RememberedFrame>)> = Vec::new();
+    let mut owed: Vec<crate::window_session::RestoredWindow> = Vec::new();
+    // The record's entry for the live `main`, which only an adrift `main` takes.
+    let mut recorded_main = None;
     if !booting {
         // Every workspace this process is already serving, visible or parked.
         let served: Vec<&str> = live
             .iter()
             .filter_map(|w| crate::window_target::window_workspace(&w.url))
             .collect();
-        for id in &session.open {
-            let id = id.as_str();
-            let known = served.contains(&id) || owed.iter().any(|(seen, _)| *seen == id);
-            if crate::window_target::is_workspace_slug(id) && !known {
-                owed.push((id, session.geometry.get(id).cloned()));
+        for window in crate::window_session::restore_plan(session, true) {
+            match window.label.as_deref() {
+                Some(crate::app_window::MAIN_WINDOW_LABEL) if main.is_some() => {
+                    recorded_main = Some(window);
+                }
+                Some(label) if live.iter().any(|w| w.label == label) => {}
+                None if served.contains(&window.workspace.as_str()) => {}
+                _ => owed.push(window),
             }
         }
     }
@@ -1748,13 +1782,19 @@ pub(crate) fn reopen_plan(
     // Adrift: on the picker or the gateway root, i.e. navigated but on no
     // workspace. Such a window is the one to point somewhere, never to leave.
     let adrift = main.is_some_and(|w| crate::window_target::window_workspace(&w.url).is_none());
-    let navigate_main = (adrift && !owed.is_empty()).then(|| {
-        let (id, frame) = owed.remove(0);
-        PlannedWindow {
-            url: crate::window_target::workspace_url(origin, id),
-            frame,
-        }
-    });
+    let navigate_main = adrift
+        .then(|| {
+            recorded_main.or_else(|| {
+                let unlabelled = owed.iter().position(|window| window.main_may_take())?;
+                Some(owed.remove(unlabelled))
+            })
+        })
+        .flatten()
+        .map(|window| PlannedWindow {
+            url: crate::window_target::workspace_url(origin, &window.workspace),
+            label: None,
+            frame: window.frame,
+        });
 
     ReopenPlan {
         front: main
@@ -1764,10 +1804,7 @@ pub(crate) fn reopen_plan(
         navigate_main,
         build: owed
             .into_iter()
-            .map(|(id, frame)| PlannedWindow {
-                url: crate::window_target::workspace_url(origin, id),
-                frame,
-            })
+            .map(|window| planned_window(origin, window))
             .collect(),
     }
 }
@@ -1811,7 +1848,7 @@ fn wait_for_health(port: u16, timeout: Duration, watch: &ServiceWatch) -> bool {
     let deadline = Instant::now() + timeout;
     let mut next_read = Instant::now();
     while Instant::now() < deadline {
-        if http_ok(port, "/~/api/v1/health") {
+        if http_ok(port, GATEWAY_HEALTH_PATH) {
             return true;
         }
         if Instant::now() >= next_read {
@@ -1874,7 +1911,7 @@ fn await_gateway_start(port: u16, timeout: Duration, gateway: &mut Child) -> Gat
         // question we cannot answer.
         let exited = !matches!(gateway.try_wait(), Ok(None));
         if let Some(outcome) = gateway_start_poll(
-            http_ok(port, "/~/api/v1/health"),
+            http_ok(port, GATEWAY_HEALTH_PATH),
             exited,
             Instant::now() >= deadline,
         ) {
@@ -1931,7 +1968,7 @@ pub fn run_service() -> i32 {
     // here, and it is perfectly serviceable. Failing the boot would put the
     // splash in an error state while the app works. The client's own preflight
     // is what tells the user, and it can tell the two cases apart.
-    if http_ok(port, "/~/api/v1/health") {
+    if http_ok(port, GATEWAY_HEALTH_PATH) {
         eprintln!(
             "[service] port {port} is already served by a gateway this service did not spawn; \
              the one below will fail to bind. See Settings, System, Overview for the installs."
@@ -3336,7 +3373,32 @@ mod tests {
     fn planned(url: &str, frame: Option<crate::window_restore::RememberedFrame>) -> PlannedWindow {
         PlannedWindow {
             url: url.to_string(),
+            label: None,
             frame,
+        }
+    }
+
+    /// A window an older record restores: a workspace, with no label.
+    fn restored(
+        workspace: &str,
+        frame: Option<crate::window_restore::RememberedFrame>,
+    ) -> crate::window_session::RestoredWindow {
+        crate::window_session::RestoredWindow {
+            label: None,
+            workspace: workspace.to_string(),
+            frame,
+        }
+    }
+
+    /// The same, recorded under `label`.
+    fn labelled(
+        label: &str,
+        workspace: &str,
+        frame: Option<crate::window_restore::RememberedFrame>,
+    ) -> crate::window_session::RestoredWindow {
+        crate::window_session::RestoredWindow {
+            label: Some(label.to_string()),
+            ..restored(workspace, frame)
         }
     }
 
@@ -3356,8 +3418,8 @@ mod tests {
         let plan = launch_plan(
             None,
             &[
-                ("myws".to_string(), Some(remembered(0, 0, 1200, 800))),
-                ("dev".to_string(), Some(remembered(10, 20, 900, 700))),
+                restored("myws", Some(remembered(0, 0, 1200, 800))),
+                restored("dev", Some(remembered(10, 20, 900, 700))),
             ],
             ORIGIN,
         );
@@ -3377,7 +3439,7 @@ mod tests {
     fn a_workspace_with_no_remembered_frame_still_gets_a_window() {
         let plan = launch_plan(
             None,
-            &[("myws".to_string(), None), ("dev".to_string(), None)],
+            &[restored("myws", None), restored("dev", None)],
             ORIGIN,
         );
         assert_eq!(plan.main, "http://localhost:3210/myws/");
@@ -3393,7 +3455,7 @@ mod tests {
     fn a_notification_tap_wins_the_main_window() {
         let plan = launch_plan(
             Some("http://localhost:3210/tapped/".to_string()),
-            &[("myws".to_string(), None)],
+            &[restored("myws", None)],
             ORIGIN,
         );
         assert_eq!(plan.main, "http://localhost:3210/tapped/");
@@ -3409,7 +3471,7 @@ mod tests {
     fn the_tapped_workspace_is_not_restored_a_second_time() {
         let plan = launch_plan(
             Some("http://localhost:3210/myws/".to_string()),
-            &[("myws".to_string(), None), ("dev".to_string(), None)],
+            &[restored("myws", None), restored("dev", None)],
             ORIGIN,
         );
         assert_eq!(plan.main, "http://localhost:3210/myws/");
@@ -3425,7 +3487,7 @@ mod tests {
     fn a_tap_on_no_workspace_skips_nothing() {
         let plan = launch_plan(
             Some("http://localhost:3210/~/".to_string()),
-            &[("myws".to_string(), None)],
+            &[restored("myws", None)],
             ORIGIN,
         );
         assert_eq!(plan.main, "http://localhost:3210/~/");
@@ -3442,8 +3504,8 @@ mod tests {
     #[test]
     fn a_late_tap_returns_the_workspace_it_displaced_to_the_extras() {
         let restore = [
-            ("myws".to_string(), Some(remembered(0, 0, 1200, 800))),
-            ("dev".to_string(), None),
+            restored("myws", Some(remembered(0, 0, 1200, 800))),
+            restored("dev", None),
         ];
         let first = launch_plan(None, &restore, ORIGIN);
         assert_eq!(first.main, "http://localhost:3210/myws/");
@@ -3469,7 +3531,7 @@ mod tests {
 
     #[test]
     fn a_late_tap_on_a_restored_workspace_does_not_open_it_twice() {
-        let restore = [("myws".to_string(), None), ("dev".to_string(), None)];
+        let restore = [restored("myws", None), restored("dev", None)];
         let after = launch_plan(
             Some("http://localhost:3210/dev/".to_string()),
             &restore,
@@ -3489,8 +3551,8 @@ mod tests {
     #[test]
     fn a_tap_on_the_first_restored_workspace_costs_no_other_window_its_size() {
         let restore = [
-            ("myws".to_string(), Some(remembered(0, 0, 1200, 800))),
-            ("dev".to_string(), Some(remembered(50, 60, 900, 700))),
+            restored("myws", Some(remembered(0, 0, 1200, 800))),
+            restored("dev", Some(remembered(50, 60, 900, 700))),
         ];
         let plan = launch_plan(
             Some("http://localhost:3210/myws/".to_string()),
@@ -3513,7 +3575,7 @@ mod tests {
     fn the_restored_windows_follow_the_origin_they_are_given() {
         let plan = launch_plan(
             None,
-            &[("myws".to_string(), None), ("dev".to_string(), None)],
+            &[restored("myws", None), restored("dev", None)],
             "https://box.tail1234.ts.net",
         );
         assert_eq!(plan.main, "https://box.tail1234.ts.net/myws/");
@@ -3521,6 +3583,63 @@ mod tests {
             plan.extra,
             vec![planned("https://box.tail1234.ts.net/dev/", None)]
         );
+    }
+
+    // Each restored window keeps its label, so it finds its own window-scoped
+    // state again. `main` goes to the declared window and never to an extra.
+    #[test]
+    fn restored_windows_keep_their_labels() {
+        let plan = launch_plan(
+            None,
+            &[
+                labelled("main", "dev", None),
+                labelled(WINDOW_A, "dev", None),
+            ],
+            ORIGIN,
+        );
+        assert_eq!(plan.main, "http://localhost:3210/dev/");
+        assert_eq!(plan.extra.len(), 1);
+        assert_eq!(plan.extra[0].label.as_deref(), Some(WINDOW_A));
+    }
+
+    // A tap displaces `main`'s window into the extras. It cannot take the label
+    // `main`, which the declared window already wears.
+    #[test]
+    fn a_window_displaced_from_main_gets_a_fresh_label() {
+        let plan = launch_plan(
+            Some("http://localhost:3210/tapped/".to_string()),
+            &[labelled("main", "dev", None)],
+            ORIGIN,
+        );
+        assert_eq!(
+            plan.extra,
+            vec![planned("http://localhost:3210/dev/", None)]
+        );
+    }
+
+    // A tap on a workspace with two windows skips one of them, not both.
+    #[test]
+    fn a_tap_skips_one_window_on_its_workspace() {
+        let plan = launch_plan(
+            Some("http://localhost:3210/dev/".to_string()),
+            &[
+                labelled("main", "dev", None),
+                labelled(WINDOW_A, "dev", None),
+            ],
+            ORIGIN,
+        );
+        assert_eq!(plan.extra.len(), 1);
+        assert_eq!(plan.extra[0].label.as_deref(), Some(WINDOW_A));
+    }
+
+    // A record with no `main` entry means `main` sat on the picker. Handing it
+    // a labelled window's entry would lose that window's own navigation.
+    #[test]
+    fn main_never_takes_a_labelled_window_at_launch() {
+        let plan = launch_plan(None, &[labelled(WINDOW_A, "dev", None)], ORIGIN);
+        assert_eq!(plan.main, ORIGIN);
+        assert_eq!(plan.extra.len(), 1);
+        assert_eq!(plan.extra[0].label.as_deref(), Some(WINDOW_A));
     }
 
     // ── What a reopen puts back ──────────────────────────────────────────────
@@ -3539,7 +3658,14 @@ mod tests {
         geometry: &[(&str, crate::window_restore::RememberedFrame)],
     ) -> crate::window_session::WindowSession {
         crate::window_session::WindowSession {
-            open: open.iter().map(|id| id.to_string()).collect(),
+            open: open
+                .iter()
+                .map(|id| crate::window_session::OpenWindow {
+                    label: None,
+                    workspace: id.to_string(),
+                    frame: None,
+                })
+                .collect(),
             geometry: geometry
                 .iter()
                 .map(|(id, frame)| (id.to_string(), frame.clone()))
@@ -3685,15 +3811,95 @@ mod tests {
         assert_eq!(plan.build, vec![planned("http://localhost:3210/ok/", None)]);
     }
 
-    // Two entries naming one workspace would land the second window exactly on
-    // the first, which is the rule `capture` already applies on the way in.
+    /// A record of windows, each under its label.
+    fn labelled_session(windows: &[(&str, &str)]) -> crate::window_session::WindowSession {
+        crate::window_session::WindowSession {
+            open: windows
+                .iter()
+                .map(|(label, id)| crate::window_session::OpenWindow {
+                    label: Some(label.to_string()),
+                    workspace: id.to_string(),
+                    frame: None,
+                })
+                .collect(),
+            ..crate::window_session::WindowSession::default()
+        }
+    }
+
+    const WINDOW_A: &str = "window-0123456789abcdef0123456789abcdef";
+    const WINDOW_B: &str = "window-fedcba9876543210fedcba9876543210";
+
+    // Two windows on one workspace are two windows, each with its own state.
+    // Folding them into one cost the user the second on every reboot.
     #[test]
-    fn a_repeated_workspace_is_built_once() {
-        let plan = reopen_plan(&[], &session(&["dev", "dev"], &[]), ORIGIN);
-        assert_eq!(
-            plan.build,
-            vec![planned("http://localhost:3210/dev/", None)]
+    fn two_windows_on_one_workspace_are_both_rebuilt_under_their_labels() {
+        let plan = reopen_plan(
+            &[live("main", "http://localhost:3210/~/", false)],
+            &labelled_session(&[("main", "dev"), (WINDOW_A, "dev"), (WINDOW_B, "dev")]),
+            ORIGIN,
         );
+        assert_eq!(
+            plan.navigate_main,
+            Some(planned("http://localhost:3210/dev/", None))
+        );
+        let built: Vec<Option<&str>> = plan.build.iter().map(|w| w.label.as_deref()).collect();
+        assert_eq!(built, vec![Some(WINDOW_A), Some(WINDOW_B)]);
+    }
+
+    // A label a live window wears is that window, whatever its page says now.
+    #[test]
+    fn a_recorded_label_a_live_window_wears_is_never_rebuilt() {
+        let plan = reopen_plan(
+            &[
+                live("main", "http://localhost:3210/myws/", false),
+                live(WINDOW_A, "http://localhost:3210/other/", false),
+            ],
+            &labelled_session(&[("main", "myws"), (WINDOW_A, "dev"), (WINDOW_B, "dev")]),
+            ORIGIN,
+        );
+        assert_eq!(plan.navigate_main, None);
+        let built: Vec<Option<&str>> = plan.build.iter().map(|w| w.label.as_deref()).collect();
+        assert_eq!(built, vec![Some(WINDOW_B)]);
+    }
+
+    // An adrift `main` takes the entry recorded as `main`, not whichever is
+    // first, so it comes back on its own thread.
+    #[test]
+    fn an_adrift_main_takes_its_own_recorded_window() {
+        let mut session = labelled_session(&[(WINDOW_A, "dev")]);
+        session.open.push(crate::window_session::OpenWindow {
+            label: Some("main".to_string()),
+            workspace: "myws".to_string(),
+            frame: Some(remembered(1, 2, 1200, 800)),
+        });
+        let plan = reopen_plan(
+            &[live("main", "http://localhost:3210/~/", false)],
+            &session,
+            ORIGIN,
+        );
+        assert_eq!(
+            plan.navigate_main,
+            Some(planned(
+                "http://localhost:3210/myws/",
+                Some(remembered(1, 2, 1200, 800))
+            ))
+        );
+        assert_eq!(plan.build.len(), 1);
+        assert_eq!(plan.build[0].label.as_deref(), Some(WINDOW_A));
+    }
+
+    // An adrift `main` with no recorded entry of its own never stands in for
+    // a labelled window. That window is built under its own label.
+    #[test]
+    fn an_adrift_main_never_takes_a_labelled_window() {
+        let plan = reopen_plan(
+            &[live("main", "http://localhost:3210/~/", true)],
+            &labelled_session(&[(WINDOW_A, "dev")]),
+            ORIGIN,
+        );
+        assert_eq!(plan.navigate_main, None);
+        assert_eq!(plan.build.len(), 1);
+        assert_eq!(plan.build[0].label.as_deref(), Some(WINDOW_A));
     }
 
     // Nothing at all: no window in the process and nothing recorded. The caller

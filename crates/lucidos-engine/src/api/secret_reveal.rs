@@ -17,6 +17,11 @@
 //! So the origin half is defense in depth. The guard buys three narrower
 //! things. No plaintext is one bare GET away. A leaked capability is worth
 //! thirty seconds against one secret. And a reveal leaves an attributed row.
+//!
+//! One path weakens the origin half further. A browser at a plain-HTTP address
+//! sends no `Sec-Fetch-Site`, and the gateway consumes its `Origin` once it has
+//! vouched for it (ADR 0587). The request then reads as a CLI here, so
+//! [`RefererRule::Required`] does not refuse a missing `Referer`.
 
 //! # Every route that hands back a secret, and its verdict
 //!

@@ -330,7 +330,13 @@ describe('the cache-warm card on a thread nothing keeps warm', () => {
     ['off', 'The cache keep-alive is off.'],
     ['codex', 'Codex sessions get no keep-alive: their cache cannot be kept warm this way.'],
     ['restarted', 'Lucidos restarted since the last request, so a ping would not match the cache.'],
-    ['uncacheable_provider', "This model's provider has no prompt cache that a ping keeps warm."],
+    ['uncacheable_provider', 'Lucidos cannot safely prefill this prompt cache.'],
+    ['provider_paused', 'Pings on this provider are paused after a failed ping.'],
+    ['prefill_paused', 'Prefill pings are temporarily paused.'],
+    ['pings_paused', "Pings to this model's provider kept missing the cache, so they pause for a while."],
+    ['cache_expired', 'The cache went cold before a ping reached it, so a ping would pay to rewrite it.'],
+    ['model_changed', 'The model or reasoning effort changed, so this cache cannot be kept warm.'],
+    ['beat_missed', 'A ping missed the cache, so this wait is not kept warm.'],
     ['past_give_up_time', 'The wait passed its give-up time before the first ping was due, so no ping went out.'],
     ['nothing_pending', 'This thread waits only for your next message. Lucidos keeps a cache warm while a thread waits on a sub-thread, an event or a card.'],
   ] as const;
@@ -344,7 +350,16 @@ describe('the cache-warm card on a thread nothing keeps warm', () => {
     expect(text).toContain(sentence);
   });
 
-  it.each(reasons.filter(([reason]) => reason !== 'codex' && reason !== 'uncacheable_provider'))(
+  it('says when paused pings start again', async () => {
+    const until = new Date(Date.now() + 40 * 60_000).toISOString();
+    fetchCacheWarmth.mockResolvedValue(warm(240, { state: 'not_kept', reason: 'pings_paused', until }));
+    const text = await openExplainer(await mount(threadWith('idle')));
+    expect(text).toContain(`Pings to this model's provider kept missing the cache, so they pause until ${formatShortTime(new Date(until))}.`);
+  });
+
+  const settingCannotApply = ['codex', 'uncacheable_provider', 'provider_paused', 'prefill_paused', 'pings_paused'] as const;
+
+  it.each(reasons.filter(([reason]) => !(settingCannotApply as readonly string[]).includes(reason)))(
     'links the keep-alive setting for %s',
     async (reason) => {
       fetchCacheWarmth.mockResolvedValue(warm(240, { state: 'not_kept', reason }));
@@ -354,7 +369,7 @@ describe('the cache-warm card on a thread nothing keeps warm', () => {
     },
   );
 
-  it.each(['codex', 'uncacheable_provider'] as const)('drops the keep-alive sentence and link for %s', async (reason) => {
+  it.each(settingCannotApply)('drops the keep-alive sentence and link for %s', async (reason) => {
     fetchCacheWarmth.mockResolvedValue(warm(240, { state: 'not_kept', reason }));
     const text = await openExplainer(await mount(threadWith('idle')));
     expect(text).not.toContain('Settings → Models');
@@ -382,6 +397,8 @@ describe('the cache-warm card settings links', () => {
     ['off', { state: 'not_kept', reason: 'off' }, 2],
     ['codex', { state: 'not_kept', reason: 'codex' }, 1],
     ['uncacheable_provider', { state: 'not_kept', reason: 'uncacheable_provider' }, 1],
+    ['provider_paused', { state: 'not_kept', reason: 'provider_paused' }, 1],
+    ['prefill_paused', { state: 'not_kept', reason: 'prefill_paused' }, 1],
     ['restarted', { state: 'not_kept', reason: 'restarted' }, 2],
     ['past_give_up_time', { state: 'not_kept', reason: 'past_give_up_time' }, 2],
     ['nothing_pending', NOTHING_PENDING, 2],
@@ -431,8 +448,8 @@ describe('the cache-warm card and a copy beat', () => {
 });
 
 describe('the cache cards switch', () => {
-  it('is on until the user turns it off', () => {
-    expect(currentCacheCards()).toBe(true);
+  it('is off until the user turns it on', () => {
+    expect(currentCacheCards()).toBe(false);
   });
 
   it('draws nothing and reads nothing when the call site passes it off', async () => {

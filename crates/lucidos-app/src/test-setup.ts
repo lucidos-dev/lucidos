@@ -208,5 +208,13 @@ if (typeof (globalThis as any).CSS === 'undefined') {
 // is kept, so a file that leaves fake timers on cannot stall this hook.
 if (typeof (globalThis as any).requestAnimationFrame === 'function') {
   const realSetTimeout = globalThis.setTimeout;
-  afterAll(() => new Promise<void>(resolve => realSetTimeout(resolve, 40)));
+  const pageDocument = document;
+  const VisibilityEvent = Event;
+  afterAll(() => {
+    // Close the page's visible lifetime before jsdom removes its globals.
+    // Visibility listeners cancel pending work, including the theme follower.
+    Object.defineProperty(pageDocument, 'visibilityState', { configurable: true, value: 'hidden' });
+    pageDocument.dispatchEvent(new VisibilityEvent('visibilitychange'));
+    return new Promise<void>(resolve => realSetTimeout(resolve, 40));
+  });
 }

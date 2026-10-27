@@ -172,6 +172,10 @@ other: they coalesce to one entry per trigger (see *Cron coalescing* above).
   reason for an engine-seeded thread such as a plugin *setup thread*. It is
   separate from `parent_thread_id` because a *top-thread* has an origin and no
   callback linkage. Entries queued before the field existed carry none.
+- **Retry context (`retry_of`)** on trigger requests: the interrupted thread and
+  the retry's admission deadline. Reload preserves both. The deadline is the
+  earlier of 24 hours after fire start or the next cron slot. Admission at or
+  after it drops the entry and notifies the user. **Run now** also checks it.
 - **The event-trigger chain depth**, for every spawn kind. A fire's spawned work
   runs at the fire's depth, whether admitted at once, drained after a wait, or
   re-fired after a restart. Rows written before the field carry 0, which is what
@@ -193,11 +197,14 @@ On engine restart:
   rule covers all four kinds** (ADR 0133). An entry whose bound thread still
   exists is **handed off** to thread-level recovery, never re-run by the queue.
   A user-initiated switch resumes coding-agent and chat threads; a crash leaves
-  them paused for Continue. An entry that bound no thread **re-queues and
-  re-fires**. A trigger fire binds its thread as soon as it creates one, so a
-  fire that parked on a question never runs twice. A fire that died before
-  creating one ran nothing, so it is still owed. A **script** fire creates no
-  thread, so it always re-runs.
+  them failed for Continue. Boot separately reports an interrupted trigger run
+  and may queue one fresh fire in a new thread (see `triggers.md`). A parked
+  question is excluded.
+
+  An entry that bound no thread **re-queues and re-fires**. For trigger entries,
+  including scripts, this happens only once, using persisted `ThreadQueued.requeued`.
+  A second cut drops the entry and notifies the user. Recovery retains an entry
+  if its drop or notification cannot persist, so the next boot can finish it.
 - **Cron recovery is idempotent.** Duplicate cron rows for one trigger (left by
   a restart storm) collapse to one entry on reload. The oldest is re-queued; the
   rest emit `ThreadQueueDropped` (reason "coalesced on recovery") to clear their

@@ -20,11 +20,23 @@ pub(crate) const HEALTH_PATH: &str = "/~/api/v1/health";
 /// The loopback client every gateway call uses. A gateway may serve a
 /// self-signed certificate, and a proxy must never see a loopback call.
 pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
-    Ok(reqwest::blocking::Client::builder()
+    Ok(client_builder().build()?)
+}
+
+/// [`client`] for an identity probe, which never follows a redirect. A
+/// redirect to loopback would otherwise prove this gateway at an origin that
+/// is not its own.
+pub(crate) fn probe_client() -> Result<reqwest::blocking::Client, BoxError> {
+    Ok(client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+fn client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder()
         .no_proxy()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(5))
-        .build()?)
 }
 
 /// Ports to probe: the dev override from the environment, then the defaults.
@@ -109,10 +121,122 @@ pub(crate) fn no_gateway_on(port: u16) -> BoxError {
 pub(crate) const NO_GATEWAY: &str =
     "no gateway found. Start one, or pass --port if it is on an unusual port";
 
+/// The one gateway a per-gateway command acts on: the one on `port`, else the
+/// only one running. `why` is the sentence a refusal gives for asking.
+pub(crate) fn the_gateway(
+    client: &reqwest::blocking::Client,
+    port: Option<u16>,
+    why: &str,
+) -> Result<String, BoxError> {
+    match port {
+        Some(p) => find_gateways(client, &[p])
+            .into_iter()
+            .next()
+            .map(|g| g.base)
+            .ok_or_else(|| no_gateway_on(p)),
+        None => choose_gateway(
+            &find_gateways(client, &candidate_ports()),
+            dev_port_override(),
+            why,
+        ),
+    }
+}
+
+/// Pure: which gateway to act on, or why the caller has to say.
+///
+/// Ambiguity is refused rather than guessed. A pairing code, the device it
+/// enrols and the external address all belong to one gateway. Acting on the
+/// wrong one is invisible: both gateways answer, and nothing names a port.
+///
+/// `preferred` is a port the caller chose, through `--port` or the dev
+/// override. It wins whenever it answered.
+fn choose_gateway(
+    found: &[FoundGateway],
+    preferred: Option<u16>,
+    why: &str,
+) -> Result<String, BoxError> {
+    if let Some(hit) = self::preferred(found, preferred) {
+        return Ok(hit.base.clone());
+    }
+    match found {
+        [] => Err(NO_GATEWAY.into()),
+        [only] => Ok(only.base.clone()),
+        many => {
+            let ports: Vec<String> = many.iter().map(|g| g.port.to_string()).collect();
+            Err(format!(
+                "{} gateways are running (ports {}). {why}",
+                many.len(),
+                ports.join(", ")
+            )
+            .into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use lucidos_installs::{DEFAULT_DEV_GATEWAY_PORT as DEV, DEFAULT_GATEWAY_PORT as PACKAGED};
+
+    const WHY: &str = "Pass --port to name one.";
+
+    fn found(ports: &[u16]) -> Vec<FoundGateway> {
+        ports
+            .iter()
+            .map(|&port| FoundGateway {
+                port,
+                base: format!("https://127.0.0.1:{port}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_running_gateway_is_used_without_asking() {
+        let only = found(&[5252]);
+        assert_eq!(
+            choose_gateway(&only, None, WHY).unwrap(),
+            "https://127.0.0.1:5252"
+        );
+    }
+
+    #[test]
+    fn two_running_gateways_are_refused_rather_than_guessed() {
+        // The reported bug. Both answer, the first wins, and the code is minted
+        // on a gateway the new device may never reach. Its own store holds the
+        // device, so the phone is told the code expired.
+        let both = found(&[5252, 5251]);
+        let err = choose_gateway(&both, None, WHY).unwrap_err().to_string();
+        assert!(err.contains("5252") && err.contains("5251"), "{err}");
+        assert!(err.ends_with(WHY), "the refusal must say what to do: {err}");
+    }
+
+    #[test]
+    fn a_preferred_port_wins_over_a_second_gateway() {
+        // `--port` and the dev override are both the caller saying which one.
+        let both = found(&[5252, 5251]);
+        assert_eq!(
+            choose_gateway(&both, Some(5251), WHY).unwrap(),
+            "https://127.0.0.1:5251"
+        );
+    }
+
+    #[test]
+    fn a_preferred_port_that_did_not_answer_falls_back_to_the_rules() {
+        // A stale override must not mint on a gateway nobody chose either.
+        let both = found(&[5252, 5251]);
+        assert!(choose_gateway(&both, Some(5999), WHY).is_err());
+        let one = found(&[5252]);
+        assert_eq!(
+            choose_gateway(&one, Some(5999), WHY).unwrap(),
+            "https://127.0.0.1:5252"
+        );
+    }
+
+    #[test]
+    fn no_gateway_at_all_says_how_to_start_one() {
+        let err = choose_gateway(&[], None, WHY).unwrap_err().to_string();
+        assert!(err.contains("no gateway found"), "{err}");
+    }
 
     #[test]
     fn an_explicit_dev_override_is_probed_before_the_defaults() {

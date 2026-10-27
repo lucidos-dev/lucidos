@@ -71,12 +71,21 @@ pub(crate) fn resolve_capture(
 /// Where a capture is saved, and the format its extension names.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SaveTarget {
-    path: String,
+    /// Under `data/artifacts/`, where the store writes it.
+    artifact_path: String,
     format: CaptureFormat,
 }
 
+impl SaveTarget {
+    /// The path every message names: the data path the agent links in chat.
+    fn data_path(&self) -> String {
+        format!("artifacts/{}", self.artifact_path)
+    }
+}
+
 /// Read `save_as_artifact`, refusing a path that leaves `data/artifacts/` or
-/// whose extension names no format a frame can encode.
+/// whose extension names no format a frame can encode. A leading `artifacts/`
+/// is the data path, so it is not nested a second time.
 pub(crate) fn parse_save_target(args: &serde_json::Value) -> Result<Option<SaveTarget>, String> {
     let Some(path) = args.get("save_as_artifact").and_then(|v| v.as_str()) else {
         return Ok(None);
@@ -98,7 +107,7 @@ pub(crate) fn parse_save_target(args: &serde_json::Value) -> Result<Option<SaveT
         )
     })?;
     Ok(Some(SaveTarget {
-        path: path.to_string(),
+        artifact_path: crate::core::artifact_relative_path(path).to_string(),
         format,
     }))
 }
@@ -114,7 +123,7 @@ async fn save_capture(
     thread_id: Uuid,
 ) -> Result<String, String> {
     use base64::Engine;
-    let path = &target.path;
+    let path = &target.data_path();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(screenshot_b64)
         .map_err(|e| format!("Nothing saved to {path}: the picture is not valid base64: {e}"))?;
@@ -132,7 +141,7 @@ async fn save_capture(
         .write_and_commit(
             &crate::engine::git_ops::lock_workspace_repo().await,
             bus,
-            path,
+            &target.artifact_path,
             &bytes,
             &format!("feat: app capture saved to {path}"),
             WriteAnnouncement::Entity {
@@ -250,7 +259,7 @@ pub(crate) async fn app_ui_tool_impl(
             match &save {
                 Some(target) if !out.starts_with("Error") => format!(
                     "Error: Nothing saved to {}: the capture carried no picture.\n{out}",
-                    target.path
+                    target.data_path()
                 ),
                 _ => out,
             }

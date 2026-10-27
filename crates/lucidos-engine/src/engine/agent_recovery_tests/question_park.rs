@@ -95,12 +95,29 @@ async fn rejected_tool_result_ends_the_park() {
                      rejected."
                 .into(),
             coding_agent: CodingAgent::ClaudeCode,
-            tool_use_id: String::new(),
+            tool_use_id: "toolu_park".into(),
             parent_tool_use_id: None,
         }))
         .await,
         "the agent raced past the question, so the thread is an interrupted turn, \
          not a resumable checkpoint"
+    );
+}
+
+/// A command started before the question can finish while the question is open.
+/// That result completes an older call, so the card is still live.
+#[tokio::test]
+async fn a_late_result_of_an_earlier_call_keeps_the_park() {
+    assert!(
+        parked_after(Some(ThreadEvent::CodingAgentToolResult {
+            name: "Bash".into(),
+            result: "done".into(),
+            coding_agent: CodingAgent::ClaudeCode,
+            tool_use_id: "toolu_issued_before_the_question".into(),
+            parent_tool_use_id: None,
+        }))
+        .await,
+        "the agent is still blocked on the question"
     );
 }
 

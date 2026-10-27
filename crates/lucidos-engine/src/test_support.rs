@@ -85,6 +85,15 @@ pub struct ScriptedProvider {
     model: String,
     input_tokens: u32,
     output_tokens: u32,
+    requests: std::sync::Mutex<Vec<RecordedRequest>>,
+}
+
+/// What one `ScriptedProvider` call was asked: the system prompt and the text
+/// of each message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedRequest {
+    pub system_prompt: Option<String>,
+    pub messages: Vec<String>,
 }
 
 impl ScriptedProvider {
@@ -102,7 +111,13 @@ impl ScriptedProvider {
             model: model.to_string(),
             input_tokens: 210,
             output_tokens: 4,
+            requests: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Every request the provider has received, oldest first.
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().expect("recorded requests").clone()
     }
 
     pub fn reporting(mut self, input_tokens: u32, output_tokens: u32) -> Self {
@@ -116,13 +131,26 @@ impl ScriptedProvider {
 impl crate::llm::provider::LlmProvider for ScriptedProvider {
     async fn chat(
         &self,
-        _messages: Vec<crate::llm::provider::Message>,
+        messages: Vec<crate::llm::provider::Message>,
         _tools: Vec<crate::llm::provider::ToolDefinition>,
         _selection: crate::llm::ModelSelection<'_>,
-        _system_prompt: Option<&str>,
+        system_prompt: Option<&str>,
         _on_token: Option<crate::llm::provider::TokenCallback>,
         _call: crate::llm::metered::CallToken,
     ) -> Result<crate::llm::provider::LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        self.requests
+            .lock()
+            .expect("recorded requests")
+            .push(RecordedRequest {
+                system_prompt: system_prompt.map(str::to_string),
+                messages: messages
+                    .iter()
+                    .map(|m| match &m.content {
+                        crate::llm::provider::MessageContent::Text(text) => text.clone(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect(),
+            });
         let next = self
             .replies
             .lock()

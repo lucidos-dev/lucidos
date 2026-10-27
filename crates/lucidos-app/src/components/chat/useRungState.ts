@@ -1,3 +1,4 @@
+import { rungLockedReason } from './rungLockedReason';
 import { useSignal, useSignalEffect, untracked } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import {
@@ -20,7 +21,7 @@ import { decodePair, type ModelChoice, type TierChoice } from '../../store/model
 import { openIntelligenceLadder } from '../../store/actions/menu';
 import { displayModelName } from '../../store/thread-events/exchange';
 import { LADDER_LINK_VALUE, rungListRows } from './rungRows';
-import { rungLockedReason, shownRung, stepTargets, type ShownRung } from './rungControlParts';
+import { shownRung, stepTargets, type ShownRung } from './rungControlParts';
 import { menuCodingAgent } from './ControlMenuTrigger';
 import { CODING_AGENT_NAME } from './agentExitCopy';
 import { askRungSwitch, registerSendGate } from './rungSwitch';
@@ -391,5 +392,5 @@ export function useRungState({ threadId, composeThreadId, codingAgent }: RungSta
     void pickModelSelection(target, label, true);
   }
 
-  return { sending, shown, rungList, pickRung, steps, step };
+  return { lockedReason, sending, shown, rungList, pickRung, steps, step };
 }

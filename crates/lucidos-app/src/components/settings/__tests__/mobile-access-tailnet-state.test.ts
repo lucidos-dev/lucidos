@@ -42,23 +42,30 @@ const HOST_IP = '100.64.0.2';
 describe('hostTailnetState', () => {
   it('reports the tailnet address the engine detected for itself', () => {
     expect(
-      hostTailnetState({ status: 'loaded', data: { detected_tailscale_ip: HOST_IP } }),
+      hostTailnetState({ status: 'loaded', data: { detected_tailscale_ip: HOST_IP } }, null),
     ).toEqual({ kind: 'on-tailnet', ip: HOST_IP });
   });
 
-  it('reports no tailnet when the engine detected no address', () => {
+  it('reports no tailnet, with Tailscale\'s own reason, when the engine has no address', () => {
+    const reason = 'Tailscale is installed, but not signed in.';
     expect(
-      hostTailnetState({ status: 'loaded', data: { detected_tailscale_ip: null } }),
-    ).toEqual({ kind: 'no-tailnet' });
+      hostTailnetState({ status: 'loaded', data: { detected_tailscale_ip: null } }, reason),
+    ).toEqual({ kind: 'no-tailnet', reason });
+    // The reason arrives on a second read, which may not have landed yet.
+    expect(
+      hostTailnetState({ status: 'loaded', data: { detected_tailscale_ip: null } }, null),
+    ).toEqual({ kind: 'no-tailnet', reason: null });
   });
 
   it('claims nothing until the fetch has actually landed', () => {
     // Three not-loaded states, one answer. Rendering "not on a tailnet" while
     // the request is in flight would be a claim we cannot support yet, and the
     // failed case must stay distinct from the empty one (Loadable contract).
-    expect(hostTailnetState({ status: 'not-loaded' })).toEqual({ kind: 'unknown' });
-    expect(hostTailnetState({ status: 'loading' })).toEqual({ kind: 'unknown' });
-    expect(hostTailnetState({ status: 'failed', error: 'boom' })).toEqual({ kind: 'unknown' });
+    expect(hostTailnetState({ status: 'not-loaded' }, null)).toEqual({ kind: 'unknown' });
+    expect(hostTailnetState({ status: 'loading' }, null)).toEqual({ kind: 'unknown' });
+    expect(hostTailnetState({ status: 'failed', error: 'boom' }, null)).toEqual({
+      kind: 'unknown',
+    });
   });
 });
 
@@ -148,6 +155,7 @@ function reader(over: Partial<Parameters<typeof deviceSetupState>[0]> = {}) {
     standalone: false,
     secureContext: true,
     hostTailnetIp: HOST_IP,
+    hostMagicDnsName: MAGIC_DNS,
     ...over,
   });
 }
@@ -178,6 +186,20 @@ describe('deviceSetupState', () => {
       kind: 'ready',
       hostname: HOST_IP,
     });
+  });
+
+  it('accepts the host\'s reported MagicDNS name whatever its suffix', () => {
+    // A self-hosted control server such as Headscale picks its own base
+    // domain, so a suffix test alone told its users to install Tailscale.
+    const headscale = 'mymac.example-tailnet.test';
+    expect(reader({ hostname: headscale, hostMagicDnsName: headscale })).toEqual({
+      kind: 'install-app',
+      hostname: headscale,
+    });
+    // Another name on that domain proves nothing: it is not this host's.
+    expect(
+      reader({ hostname: 'other.example-tailnet.test', hostMagicDnsName: headscale }),
+    ).toEqual({ kind: 'join-tailnet' });
   });
 
   it('never treats the CGNAT range itself as proof', () => {

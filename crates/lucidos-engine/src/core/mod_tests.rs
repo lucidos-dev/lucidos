@@ -2373,3 +2373,23 @@ async fn the_database_handle_refuses_writes_until_a_transaction_opts_in() {
     conn.close().await.expect("close");
     crate::test_support::teardown_test_db(&db_name).await;
 }
+
+/// A data path and an artifact-relative path name the same file. Only one
+/// leading `artifacts/` is the data root, so a real sub-folder of that name
+/// survives.
+#[test]
+fn an_artifacts_prefix_is_the_data_root_once() {
+    assert_eq!(
+        artifact_relative_path("artifacts/shots/a.png"),
+        "shots/a.png"
+    );
+    assert_eq!(artifact_relative_path("shots/a.png"), "shots/a.png");
+    assert_eq!(
+        artifact_relative_path("artifacts/artifacts/a.png"),
+        "artifacts/a.png"
+    );
+    assert_eq!(
+        artifact_relative_path("artifactsx/a.png"),
+        "artifactsx/a.png"
+    );
+}

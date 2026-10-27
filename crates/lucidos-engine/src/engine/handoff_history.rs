@@ -53,7 +53,8 @@ pub(crate) fn clean_turn_end_sql(idle: &str) -> String {
          AND NOT EXISTS (SELECT 1 FROM events q WHERE {q_before} \
                AND q.event_type = 'UserQuestionAsked' \
                AND NOT EXISTS (SELECT 1 FROM events p WHERE {p_before} \
-                     AND p.sequence > q.sequence AND p.event_type IN ({park_ending}))) \
+                     AND p.sequence > q.sequence \
+                     AND (p.event_type IN ({park_ending}) OR {own_result}))) \
          AND NOT EXISTS (SELECT 1 FROM events w WHERE {w_before} \
                AND w.event_type = 'EventWaitStarted' \
                AND NOT EXISTS (SELECT 1 FROM events r WHERE {r_before} \
@@ -76,6 +77,7 @@ pub(crate) fn clean_turn_end_sql(idle: &str) -> String {
         q_before = before_idle("q"),
         p_before = before_idle("p"),
         park_ending = park_ending_event_types_sql(),
+        own_result = ThreadEvent::question_own_result_sql("q", "p"),
         w_before = before_idle("w"),
         r_before = before_idle("r"),
         m_before = before_idle("m"),

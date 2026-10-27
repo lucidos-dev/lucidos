@@ -26,6 +26,8 @@ For each finding, capture: **location**, **what's wrong**, **which reference own
 
 Per the engine prompt's taxonomy section and the worked example in `docs/taxonomy.md` (mirrored in best-practices). Trigger threads discover knowhow at fire time via `load_knowhow`, as chat does, with no per-trigger allow-list. For each *live* trigger, reduce its `TriggerCreated` and later `TriggerUpdated` events to the *latest* `run` (most recent payload by sequence), then apply these checks:
 
+- **Knowhow promising unlimited restart replays or no interruption report.** Read each trigger's knowhow against `system-knowhow/triggers.md` § "A fire due while the engine restarts". Flag instructions that assume scripts always requeue, or that tell a run to duplicate the engine's interruption notification. Severity: **stale**, since the recovery contract bounds retries and owns that report.
+
 - **Imperative verbs about *how* in `run.intent`** (hit, parse, scan, fall back, retry, GET, POST, scrape) → procedure leaked into intent.
 
 - **Stale `run.knowhow: [...]` field.** Per `system-knowhow/triggers.md` § "Setup checklist" item 4: the deserializer silently drops legacy `run.knowhow:[...]`. The trigger keeps firing with no knowhow pre-loaded, so behavior depends on discovery finding the same files. Surface each trigger's id and the `knowhow` ids it requested, and recommend the rewrite the source file specifies. Severity: **stale** (silently broken).
@@ -43,6 +45,8 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
   Domain-event names are arbitrary by design, so read the `workspace` bucket first, and never call one a misspelling.
 
+  Payload values are not event types. Keep-alive reasons belong to `CacheKeepAliveStatusChanged`, as `system-knowhow/thread-events.md` documents. Audit the subscription's event name separately from its payload filters.
+
   **Ask the tool. Never assemble the retired set by hand.** `retired` comes from `ThreadEvent::LEGACY_TYPE_NAME_ALIASES`, which a test holds to the names serde still accepts. A list built by eye from `thread-events.md` misses about half, and adds frontend-only names that were never event renames.
 
   **`retired` says a name is dead, not what replaced it.** For the successor, search `thread-events.md` for the old name. It sits on its successor's row, as a `Legacy alias:` note or in the row's prose. The whole `ClaudeCode*` family became `CodingAgent*`, as `system-knowhow/coding-agent-events.md` states. If neither resolves it, report the finding without a replacement. A guessed successor arms a second subscription that never fires.
@@ -50,6 +54,8 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
   The engine now refuses a new subscription on a dead name, so this check finds rows armed before that.
 
 - **Retired event names in workspace code.** Same list, different surface, because a stale recipe keeps minting dead subscriptions and the finding above returns after the fix. Grep for retired names in `await_event` calls, `on_event` payloads, and `lucidos triggers` invocations. Search `data/knowhow/**/*.md` (fenced `python` / `bash` / `js` / `ts` blocks), `data/scripts/**`, `data/apps/**`, and `data/triggers/**/scripts/**`. Surface path, line, the retired name and its current name, at severity **stale**.
+
+- **Keep-alive reasons are payload values, not event names.** A `CacheKeepAliveStatusChanged` may carry `provider_paused`, `pings_paused` or `uncacheable_provider` inside `status.reason`. Classify subscriptions by the event name alone. Use `thread-events.md` for each reason's meaning.
 
 - **Missing explicit `slug` field.** The tools, CLI and HTTP API store the slug on `TriggerCreated` (`system-knowhow/triggers.md` § "Setup checklist" item 4). An older event without one re-derives it from the *create-time* name on every read, with no collision check. Recommend an explicit `slug` when the trigger has, or will have, per-trigger knowhow files. Set it with `lucidos triggers update --slug` or the HTTP API, since the LLM tools take none. Severity: **nit** (preventive).
 

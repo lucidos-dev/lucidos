@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import * as QuestionCardModule from '../QuestionCard';
 import { render } from 'preact';
+import { act } from 'preact/test-utils';
 import {
   OptionIndicator,
   AnsweredBody,
@@ -101,6 +102,7 @@ describe('the card carries no hint of its own', () => {
 describe('AnsweredBody — Canceled state', () => {
   it('renders a disabled red Cancel button instead of the orange canceled badge', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: 'q',
       options: [{ id: 'a', label: 'A' }],
@@ -121,6 +123,7 @@ describe('AnsweredBody — Canceled state', () => {
   // dismissing a question they actually replied past.
   it('renders a plain note for a Superseded answer, never the Cancel affordance', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: 'q',
       options: [{ id: 'a', label: 'A' }],
@@ -135,6 +138,7 @@ describe('AnsweredBody — Canceled state', () => {
 
   it('does not render the cancel-as-picked button for a Selected answer', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: 'q',
       options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }],
@@ -147,6 +151,7 @@ describe('AnsweredBody — Canceled state', () => {
 
   it('does not render the cancel-as-picked button for a FreeText answer', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: 'q',
       options: [],
@@ -172,6 +177,7 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
 
   it('renders a FreeText answer in a user bubble under its header', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: 'q',
       options: [],
@@ -184,6 +190,7 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
 
   it('renders the freetext typed alongside a MultiSelected pick the same way', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: 'q',
       options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }],
@@ -200,6 +207,7 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
     const host = document.createElement('div');
     render(
       <AnsweredBody
+        threadId="t"
         toolUseId="tool-1"
         question="q"
         options={[]}
@@ -216,6 +224,7 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
 
   it('renders no freetext block at all when the answer carries no text', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: 'q',
       options: [{ id: 'a', label: 'A' }],
@@ -241,6 +250,7 @@ describe('AnsweredBody: the custom answer wears the user bubble', () => {
 describe('a dead card says so to the scroll landing', () => {
   it('an answered body wears question-body-answered', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: 'q',
       options: [],
@@ -252,6 +262,7 @@ describe('a dead card says so to the scroll landing', () => {
 
   it('a terminated body wears question-body-terminated', () => {
     const text = vnodeToText(TerminatedQuestionBody({
+      threadId: 't',
       question: 'q',
       options: [{ id: 'a', label: 'A' }],
       multiSelect: false,
@@ -263,6 +274,7 @@ describe('a dead card says so to the scroll landing', () => {
 describe('TerminatedQuestionBody', () => {
   it('renders every option as a disabled button (single-select)', () => {
     const text = vnodeToText(TerminatedQuestionBody({
+      threadId: 't',
       question: 'Pick a flavor',
       options: [
         { id: 'a', label: 'Vanilla' },
@@ -282,6 +294,7 @@ describe('TerminatedQuestionBody', () => {
 
   it('renders every option as a disabled button (multi-select)', () => {
     const text = vnodeToText(TerminatedQuestionBody({
+      threadId: 't',
       question: 'Pick any',
       options: [
         { id: 'a', label: 'A' },
@@ -296,6 +309,7 @@ describe('TerminatedQuestionBody', () => {
 
   it('renders only the question text when the question had no options (freetext-only ask)', () => {
     const text = vnodeToText(TerminatedQuestionBody({
+      threadId: 't',
       question: 'What do you think?',
       options: [],
       multiSelect: false,
@@ -311,6 +325,7 @@ describe('question text: URL linkification', () => {
 
   it('renders a bare URL in the question as a link (terminated body)', () => {
     const text = vnodeToText(TerminatedQuestionBody({
+      threadId: 't',
       question: QUESTION,
       options: [{ id: 'a', label: 'Yes' }],
       multiSelect: false,
@@ -320,6 +335,7 @@ describe('question text: URL linkification', () => {
 
   it('renders the URL as a link in the answered body too', () => {
     const text = vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tool-1',
       question: QUESTION,
       options: [{ id: 'a', label: 'Yes' }],
@@ -344,6 +360,7 @@ describe('question text: block markdown', () => {
 
   it('renders paragraphs and lists as blocks, in a markdown surface', () => {
     const text = vnodeToText(TerminatedQuestionBody({
+      threadId: 't',
       question: QUESTION,
       options: [{ id: 'a', label: 'Update the plan' }],
       multiSelect: false,
@@ -438,6 +455,7 @@ describe('an option preview', () => {
 
   it('shows on the answered card', () => {
     expectPictureAndSample(vnodeToText(AnsweredBody({
+      threadId: 't',
       toolUseId: 'tu-preview',
       question: 'q',
       options,
@@ -448,6 +466,7 @@ describe('an option preview', () => {
 
   it('shows on the terminated card', () => {
     expectPictureAndSample(vnodeToText(TerminatedQuestionBody({
+      threadId: 't',
       question: 'q',
       options,
       multiSelect: false,
@@ -505,7 +524,7 @@ describe('an option with a widget', () => {
   it('keeps every widget on an answered card and a terminated one', async () => {
     await withPlayerKnown((host) => {
       render(
-        <AnsweredBody toolUseId="tu-a" question="Which voice?" options={options} multiSelect={false}
+        <AnsweredBody threadId="t" toolUseId="tu-a" question="Which voice?" options={options} multiSelect={false}
           resolved={{ kind: 'Selected', option_id: 'opt-1' }} />,
         host,
       );
@@ -514,8 +533,63 @@ describe('an option with a widget', () => {
       expect(box.classList.contains('question-option-dimmed'), 'the box dims, not the row twice').toBe(true);
       expect(box.querySelector('.question-option-static.question-option-dimmed')).toBeNull();
 
-      render(<TerminatedQuestionBody question="Which voice?" options={options} multiSelect={false} />, host);
+      render(<TerminatedQuestionBody threadId="t" question="Which voice?" options={options} multiSelect={false} />, host);
       expect(host.querySelector('.question-option-boxed .widget-embed')).toBeTruthy();
     });
+  });
+});
+
+// A Claude Code card has no message field, so an agent draws its widget in the
+// question text. That text drew only the embed's empty label slot.
+describe('a widget embed in the question text', () => {
+  const tapper = {
+    id: 'tap-counter', name: 'Tap counter', description: '', reveal: 'on-load' as const,
+    kind: 'widget' as const, reusable: false, origin_thread_id: 't', built_in: false,
+  };
+  const question = 'Here is the widget:\n\n![Tap counter](app:tap-counter)\n\nKeep it?';
+  const options = [{ id: 'opt-0', label: 'Keep' }, { id: 'opt-1', label: 'Drop' }];
+
+  async function withTapperKnown(run: (host: HTMLElement) => Promise<void>): Promise<void> {
+    const { appsById } = await import('../../../store/appsById');
+    appsById.value = new Map([[tapper.id, { status: 'loaded', data: tapper }]]);
+    const host = document.createElement('div');
+    document.body.append(host);
+    try {
+      await run(host);
+    } finally {
+      render(null, host);
+      host.remove();
+      appsById.value = new Map();
+    }
+  }
+
+  it('draws on the live, answered and terminated cards', async () => {
+    await withTapperKnown(async (host) => {
+      await act(() => render(<QuestionBody threadId="t" toolUseId="tu-text" question={question} options={options} />, host));
+      expect(host.querySelector('.question-text .inline-widget:not(.inline-widget-gone)')).toBeTruthy();
+
+      await act(() => render(
+        <AnsweredBody threadId="t" toolUseId="tu-text" question={question} options={options} multiSelect={false}
+          resolved={{ kind: 'Selected', option_id: 'opt-0' }} />,
+        host,
+      ));
+      expect(host.querySelector('.question-text .inline-widget:not(.inline-widget-gone)')).toBeTruthy();
+
+      await act(() => render(<TerminatedQuestionBody threadId="t" question={question} options={options} multiSelect={false} />, host));
+      expect(host.querySelector('.question-text .inline-widget:not(.inline-widget-gone)')).toBeTruthy();
+    });
+  });
+
+  it('keeps another thread\'s widget unavailable', async () => {
+    await withTapperKnown(async (host) => {
+      await act(() => render(<QuestionBody threadId="other" toolUseId="tu-other" question={question} options={options} />, host));
+      expect(host.querySelector('.question-text .inline-widget-gone')).toBeTruthy();
+    });
+  });
+
+  it('stays hook-free for text that only names the slot attribute', () => {
+    for (const named of ['Mentions `data-widget-embed-slot` in code.', '<span data-widget-embed-slot="guess">x</span>']) {
+      expect(vnodeToText(TerminatedQuestionBody({ threadId: 't', question: named, options, multiSelect: false }))).toContain('Keep');
+    }
   });
 });

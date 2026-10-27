@@ -4569,6 +4569,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-user-notifications",
  "objc2-web-kit",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
@@ -4577,6 +4578,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tauri-plugin-window-state",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -4870,6 +4872,7 @@ name = "lucidos-tailscale"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "serde_json",
 ]
 
 [[package]]

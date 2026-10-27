@@ -124,12 +124,20 @@ fn self_workspace_name() -> Option<String> {
 /// environment, which a corporate machine exports globally, routes every
 /// subcommand's call to its own engine through that proxy.
 pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
+    engine_client_builder()
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e).into())
+}
+
+fn engine_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
         .no_proxy()
         .danger_accept_invalid_certs(true)
         .default_headers(default_headers_from_env())
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e).into())
+        // Only our pre-connection policy may replay a request. A redirect
+        // could otherwise fail to connect after the first server handled it.
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 /// Like [`client`] but with an explicit response deadline, replacing reqwest's
@@ -144,10 +152,7 @@ pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
 pub(crate) fn client_with_timeout(
     timeout: std::time::Duration,
 ) -> Result<reqwest::blocking::Client, BoxError> {
-    reqwest::blocking::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
-        .default_headers(default_headers_from_env())
+    engine_client_builder()
         .timeout(timeout)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e).into())
@@ -161,13 +166,78 @@ pub(crate) fn client_with_timeout(
 /// permission server is an engine endpoint and benefits from the same
 /// honest attribution.
 pub(crate) fn permission_prompt_client() -> Result<reqwest::blocking::Client, BoxError> {
-    reqwest::blocking::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
-        .default_headers(default_headers_from_env())
+    engine_client_builder()
         .timeout(None)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e).into())
+}
+
+const DEFAULT_CONNECT_WAIT: Duration = Duration::from_secs(30);
+
+fn connect_wait() -> Duration {
+    std::env::var("LUCIDOS_CLI_CONNECT_WAIT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_CONNECT_WAIT)
+}
+
+/// Retry only failures proving that no connection was established.
+/// `is_connect()` alone also includes TLS failures on an established socket.
+fn retryable_connect_error(err: &reqwest::Error) -> bool {
+    use std::error::Error;
+    use std::io::ErrorKind;
+
+    if !err.is_connect() || err.is_timeout() {
+        return false;
+    }
+    let mut source = err.source();
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::HostUnreachable
+                    | ErrorKind::AddrNotAvailable
+            );
+        }
+        source = error.source();
+    }
+    false
+}
+
+pub(crate) trait ConnectRetry {
+    fn send_with_connect_retry(self) -> Result<reqwest::blocking::Response, reqwest::Error>;
+}
+
+impl ConnectRetry for reqwest::blocking::RequestBuilder {
+    fn send_with_connect_retry(self) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        let wait = connect_wait();
+        let start = Instant::now();
+        let mut delay = Duration::from_millis(100);
+        let mut request = self;
+        loop {
+            // Buffered bodies preserve their bytes and headers. A streaming
+            // body cannot be cloned, so it is sent only once.
+            let next = request.try_clone();
+            match request.send() {
+                Err(error) if retryable_connect_error(&error) => {
+                    let remaining = wait.saturating_sub(start.elapsed());
+                    let Some(next) = next.filter(|_| !remaining.is_zero()) else {
+                        return Err(error);
+                    };
+                    std::thread::sleep(delay.min(remaining));
+                    if start.elapsed() >= wait {
+                        return Err(error);
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(1));
+                    request = next;
+                }
+                result => return result,
+            }
+        }
+    }
 }
 
 /// Turn a `reqwest::Error` from `.send()` into a message the user can act on.
@@ -275,7 +345,7 @@ pub(crate) fn send_expect_success(
 ) -> Result<String, BoxError> {
     let start = Instant::now();
     let resp = req
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format_request_error(method, url, &e, start.elapsed()))?;
     let status = resp.status();
     if let Some(note) = child_reports_note(resp.headers()) {
@@ -345,6 +415,67 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn tls_handshake_keeps_the_commands_response_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            assert!(stream.read(&mut buffer).unwrap() > 0);
+            thread::sleep(Duration::from_millis(1200));
+            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+        });
+        let error = client_with_timeout(Duration::from_secs(5))
+            .unwrap()
+            .post(format!("https://{address}"))
+            .send_with_connect_retry()
+            .unwrap_err();
+        assert!(!error.is_timeout(), "{error:?}");
+        assert!(!retryable_connect_error(&error));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn response_timeout_is_not_retried() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let check = listener.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            assert!(stream.read(&mut buffer).unwrap() > 0);
+            thread::sleep(Duration::from_millis(300));
+        });
+        let error = client_with_timeout(Duration::from_millis(100))
+            .unwrap()
+            .post(format!("http://{address}"))
+            .body("mutation")
+            .send_with_connect_retry()
+            .unwrap_err();
+        assert!(error.is_timeout(), "{error:?}");
+        assert!(!retryable_connect_error(&error));
+        server.join().unwrap();
+        check.set_nonblocking(true).unwrap();
+        assert_eq!(
+            check.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn tls_failure_on_an_established_socket_is_not_retried() {
+        let (port, captured) = spawn_capturing_server();
+        let error = client()
+            .unwrap()
+            .post(format!("https://127.0.0.1:{port}"))
+            .send_with_connect_retry()
+            .unwrap_err();
+        captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(error.is_connect(), "{error:?}");
+        assert!(!retryable_connect_error(&error));
+    }
 
     #[test]
     fn a_tls_handshake_on_a_plain_socket_is_recognised_and_named() {

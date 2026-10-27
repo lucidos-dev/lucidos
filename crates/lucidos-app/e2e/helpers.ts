@@ -1295,7 +1295,7 @@ export async function waitForActionPanel(page: Page, buttonText: string, timeout
  *  matching item. */
 export async function clickChangeAction(
   page: Page,
-  label: 'Discard' | 'Diff' | 'Archive',
+  label: 'Apply' | 'Discard' | 'Diff' | 'Archive',
   timeout = 15_000,
 ): Promise<void> {
   // A phone's round button names its face in a hidden label, and a tap only
@@ -1303,15 +1303,17 @@ export async function clickChangeAction(
   const direct = page.locator(
     `.thread-action-buttons:visible button.action-btn:not(.split-button-whole):has-text("${label}")`,
   ).first();
-  if (await direct.isVisible().catch(() => false)) {
-    await direct.click();
-    return;
-  }
   // The action lives in the menu: behind the caret, or the round button.
   const opener = page.locator(
     '.thread-action-buttons:visible .split-button-caret, .thread-action-buttons:visible .split-button-whole',
   ).first();
-  await expect(opener).toBeVisible({ timeout });
+  // Wait for the slot to render before choosing a branch, so a slow panel
+  // never sends a desktop face into the menu.
+  await expect(direct.or(opener)).toBeVisible({ timeout });
+  if (await direct.isVisible()) {
+    await direct.click();
+    return;
+  }
   await opener.click();
   await page.locator(`.split-button-menu:visible button:has-text("${label}")`).first().click();
 }

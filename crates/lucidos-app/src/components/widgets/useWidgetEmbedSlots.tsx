@@ -5,7 +5,14 @@ import type { WidgetEmbed } from '../../generated/thread-event-wire';
 import { InlineWidget, UnavailableWidget } from './InlineWidget';
 import { embedDraws } from '../../utils/widgetEmbed';
 
-const SLOT_SELECTOR = `[${WIDGET_EMBED_SLOT_ATTR}="${COPY_ID_NONCE}"]`;
+const SLOT_MARK = `${WIDGET_EMBED_SLOT_ATTR}="${COPY_ID_NONCE}"`;
+const SLOT_SELECTOR = `[${SLOT_MARK}]`;
+
+/** Whether rendered markdown holds a slot this hook mounts. Text that only
+ *  names the attribute, or forges it without the nonce, does not count. */
+export function hasWidgetEmbedSlot(html: string): boolean {
+  return html.includes(SLOT_MARK);
+}
 
 function slotEmbed(slot: HTMLElement): WidgetEmbed | null {
   const raw = slot.getAttribute(WIDGET_EMBED_ATTR);

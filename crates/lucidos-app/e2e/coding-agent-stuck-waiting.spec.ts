@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import {
-  navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForVisibleInput, hideDashboardRail,
+  navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, waitForVisibleInput, hideDashboardRail, clickChangeAction, waitForActionPanel,
 } from './helpers';
 import {
   psql, createCCThreadWithChange, cleanupCCThread, cleanupFileFromMain,
@@ -10,13 +10,11 @@ import type { Page } from './fixtures';
 
 /** Click Apply, wait for Archive (ChangeApplied keeps archive_state=inbox), click Archive, poll until archived. */
 async function applyAndDismiss(page: Page, threadId: string): Promise<void> {
-  const applyBtn = page.locator('.thread-action-buttons:visible button.action-btn-confirm:has-text("Apply")').first();
-  await expect(applyBtn).toBeVisible({ timeout: 15_000 });
-  await applyBtn.click();
-
-  const archiveBtn = page.locator('.thread-action-buttons:visible button.action-btn:has-text("Archive")').first();
-  await expect(archiveBtn).toBeVisible({ timeout: 15_000 });
-  await archiveBtn.click();
+  await clickChangeAction(page, 'Apply');
+  // Archive becomes the slot's face once the apply lands. Until then the Apply
+  // face still shows, and its menu holds no Archive.
+  await waitForActionPanel(page, 'Archive', 15_000);
+  await clickChangeAction(page, 'Archive');
 
   await expect.poll(
     () => psql(`SELECT archive_state FROM thread_summaries WHERE thread_id = '${threadId}'`),

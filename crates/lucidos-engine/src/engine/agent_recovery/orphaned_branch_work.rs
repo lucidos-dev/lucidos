@@ -109,13 +109,15 @@ impl BranchWorkScope<'_> {
     /// The work a canceled event wait held back from the idle proposal, and
     /// how its turn ended (ADR 0395). `None` unless the thread is an idle,
     /// unarchived coding-agent thread with no wait left, whose last turn ended
-    /// in a way a sweep settles.
+    /// in a way a sweep settles. A pending handoff also yields `None`: the
+    /// successor session carries the work.
     async fn work_a_canceled_wait_held(&self, thread_id: Uuid) -> Option<(BranchWork, TurnEnd)> {
-        let released: Option<bool> = sqlx::query_scalar(
+        let released: Option<bool> = sqlx::query_scalar(&format!(
             "SELECT COALESCE(is_coding_agent AND archive_state <> 'archived' \
-                    AND status = 'idle' AND live_event_wait_count = 0, FALSE) \
+                    AND status = 'idle' AND live_event_wait_count = 0 AND NOT {}, FALSE) \
              FROM thread_summaries WHERE thread_id = $1",
-        )
+            crate::engine::successor::pending_handoff_sql("$1")
+        ))
         .bind(thread_id)
         .fetch_optional(self.pool)
         .await

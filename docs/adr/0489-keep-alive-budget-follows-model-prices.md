@@ -10,6 +10,9 @@
 - **Amended by**: [0547](0547-keep-alive-beats-a-parked-session-by-copy.md). A
   parked wait gives up at half break-even, and a preference picks the rule.
 
+- **Amended by**: [0581](0581-keep-alive-never-pings-a-cache-it-cannot-read.md).
+  A beat needs the cache's model and effort; break-even stays.
+
 ## Context
 
 The 150 minutes came from one simulation over 5-minute Claude Opus 5.5

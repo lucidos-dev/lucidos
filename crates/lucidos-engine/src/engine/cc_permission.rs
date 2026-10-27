@@ -1238,11 +1238,12 @@ fn file_tool_reads_secret(tool_name: &str, input: &serde_json::Value) -> bool {
 /// a judge that is off, has no provider, errored or timed out. It cards, which
 /// is the behavior that predates this gate.
 ///
-/// `Safe` always allows. `ReversibleDanger` allows only when the user switched
-/// `command_guard_coding_agents` on, and `reversible_allowed` carries that.
-/// The chat lane also runs `ReversibleDanger` unasked, but it snapshots the
-/// workspace on a safety ref first, and this gate has no such undo: the user
-/// accepted that trade (ADR 0005, command guard addendum). `Catastrophic` and
+/// `Safe` always allows. `ReversibleDanger` allows only while
+/// `command_guard_coding_agents` resolves on (its default) under a live
+/// `command_guard`, and `reversible_allowed` carries that. The chat lane also
+/// runs `ReversibleDanger` unasked, but it snapshots the workspace on a safety
+/// ref first, and this gate has no such undo: turning the guard on accepts
+/// that trade (ADR 0005, command guard addenda). `Catastrophic` and
 /// `IrreversibleDanger` card whatever the flag says, and nothing here ever
 /// auto-denies.
 fn lane_allows_escalation(lane: Option<RiskLane>, reversible_allowed: bool) -> bool {
@@ -4816,7 +4817,7 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
-    /// The flag reader is gated on the master switch and resolves off by default.
+    /// The flag reader is gated on the master switch and resolves on by default.
     #[tokio::test]
     async fn the_coding_agent_flag_is_read_only_under_the_master_guard() {
         use crate::core::preferences::PreferenceStore;
@@ -4828,17 +4829,13 @@ mod tests {
         };
         assert!(
             !command_guard_covers_coding_agents(&pool).await,
-            "off by default"
-        );
-        set(COMMAND_GUARD_CODING_AGENTS.key(), "true")
-            .await
-            .unwrap();
-        assert!(
-            !command_guard_covers_coding_agents(&pool).await,
-            "the master guard is off, so the child switch is not read"
+            "the master guard is off by default, so the child switch is not read"
         );
         set(COMMAND_GUARD.key(), "true").await.unwrap();
-        assert!(command_guard_covers_coding_agents(&pool).await);
+        assert!(
+            command_guard_covers_coding_agents(&pool).await,
+            "on by default under the master guard"
+        );
         set(COMMAND_GUARD_CODING_AGENTS.key(), "false")
             .await
             .unwrap();

@@ -148,11 +148,17 @@ export type CacheKeepAliveNotKeptReason =
   | 'no_wake_children'
   | 'children_awaiting_user'
   | 'uncacheable_provider'
+  | 'provider_paused'
+  | 'prefill_paused'
+  | 'pings_paused'
+  | 'cache_expired'
   | 'restarted'
   | 'past_give_up_time'
   | 'nothing_pending'
   | 'unattended_trigger'
-  | 'unknown_ttl';
+  | 'unknown_ttl'
+  | 'model_changed'
+  | 'beat_missed';
 
 /** The keep-alive's state for one thread, in the one grammar every surface
  *  speaks: Warming, Stopped, Ended, Turned off, or Not kept. */
@@ -245,6 +251,8 @@ export type CacheKeepAliveStatus =
   | {
       state: 'not_kept';
       reason: CacheKeepAliveNotKeptReason;
+      /** When paused pings start again. Set for `pings_paused` only. */
+      until?: string;
     };
 
 /** A lifetime a provider's cache offers. Every number a reader times or
@@ -374,7 +382,8 @@ export type ContextPurpose =
   | 'proxy'
   | 'read_decision'
   | 'wake_decision'
-  | 'cache_keep_alive';
+  | 'cache_keep_alive'
+  | 'prefill_probe';
 
 /** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
  *  in the LLM API call: the system prompt, prior messages (verbatim resume
@@ -548,6 +557,18 @@ export type EventWaitCancelCause =
 export type EventWaitOutcome =
   | 'delivered'
   | 'expired';
+
+/** The durable retry decision reported on an interrupted fire. */
+export type FireRetry =
+  | {
+      kind: 'queued';
+      entry_id: string;
+      deadline: string;
+    }
+  | {
+      kind: 'skipped';
+      reason: RetrySkipReason;
+    };
 
 /** How a *form request* was closed. Carried by `FormRequestResolved`.
  *  Full reasoning is on the Rust variant. */
@@ -821,6 +842,24 @@ export interface RecalledMemory {
   src_created_at: string;
   source: MemorySource;
 }
+
+/** Provenance and admission deadline for a fresh fire retrying an interrupted thread. */
+export interface RetryOf {
+  thread_id: string;
+  deadline: string;
+}
+
+/** The first eligibility rule that prevented an interrupted fire's retry. */
+export type RetrySkipReason =
+  | 'already_retried'
+  | 'fire_completed'
+  | 'spawned_work'
+  | 'too_old'
+  | 'later_slot_due'
+  | 'newer_fire'
+  | 'trigger_unavailable'
+  | 'request_unavailable'
+  | 'already_queued';
 
 /** A provider's processing tier other than its standard one. */
 export type ServiceTier =
@@ -2138,6 +2177,8 @@ export type ThreadEvent =
     }
   | {
       type: 'TriggerStarted';
+      /** The interrupted fire this fresh thread retries. Absent on ordinary and legacy fires. */
+      retry_of?: RetryOf;
       trigger_id: string;
       trigger_name?: string;
       prompt?: string;
@@ -2169,6 +2210,20 @@ export type ThreadEvent =
        *  the thread's memory. `None` means nothing was pinned, so the row
        *  decided. */
       provider?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Boot reported a restart-cut fire and its durable retry decision. */
+  | {
+      type: 'TriggerRunInterrupted';
+      trigger_id: string;
+      trigger_name: string;
+      fire_event_id: string;
+      retry: FireRetry;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3631,6 +3686,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   HomeThreadCreated: true,
   ImageUploaded: true,
   TriggerStarted: true,
+  TriggerRunInterrupted: true,
   TriggerCompleted: true,
   ChangeProposed: true,
   ChangeApplied: true,

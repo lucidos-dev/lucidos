@@ -34,6 +34,7 @@ mod data;
 mod data_store;
 mod event_waits;
 mod events;
+mod external_address;
 mod frontend_preview;
 mod gateway;
 mod intelligence_ladder;
@@ -188,14 +189,29 @@ enum Command {
         label: Option<String>,
         /// Also draw the code as a QR, so a phone scans instead of typing.
         ///
-        /// Needs an address the phone can reach. That is this machine's
-        /// MagicDNS name, or its tailnet address, or whatever `--host` says.
+        /// Needs an address the phone can reach. That is whatever `--host`
+        /// says, else the gateway's external address, else this machine's
+        /// MagicDNS name or tailnet address.
         #[arg(long)]
         qr: bool,
         /// The hostname a phone should open, when the tailnet answer is wrong
         /// or absent. Implies `--qr`.
         #[arg(long)]
         host: Option<String>,
+    },
+    /// Read or change this gateway's external address: the origin other
+    /// devices reach it at, through a reverse proxy, a VPN or a company name.
+    ///
+    /// It goes in every pairing QR, ahead of the tailnet. Settings, Access
+    /// edits the same value. A set is probed, and refused only when another
+    /// gateway answers there. LUCIDOS_EXTERNAL_ADDRESS overrides it.
+    #[command(name = "external-address")]
+    ExternalAddress {
+        #[command(subcommand)]
+        action: ExternalAddressAction,
+        /// Gateway port, when it is not on 5252 (packaged) or 5251 (dev).
+        #[arg(long, global = true)]
+        port: Option<u16>,
     },
     /// Read or change the update address: the latest.json URL update checks
     /// read instead of the published release.
@@ -1092,6 +1108,20 @@ pub(crate) struct CredentialsCliArgs {
 }
 
 #[derive(Subcommand)]
+enum ExternalAddressAction {
+    /// Print the address, who set it, and this machine's addresses.
+    Show,
+    /// Put this origin in pairing QRs from now on, once the gateway checks it.
+    Set {
+        /// Scheme, host and optional port, with no path, such as
+        /// https://lucidos.example.com.
+        origin: String,
+    },
+    /// Remove it. Pairing QRs go back to the tailnet or the LAN.
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum UpdateAddressAction {
     /// Print the address in use, or why the stored one is refused.
     Show,
@@ -1900,6 +1930,15 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 qr: qr || host.is_some(),
                 host: host.as_deref(),
             })?;
+            Ok(0)
+        }
+        Command::ExternalAddress { action, port } => {
+            let action = match action {
+                ExternalAddressAction::Show => external_address::Action::Show,
+                ExternalAddressAction::Set { origin } => external_address::Action::Set(origin),
+                ExternalAddressAction::Clear => external_address::Action::Clear,
+            };
+            external_address::cmd_external_address(&action, port)?;
             Ok(0)
         }
         Command::UpdateAddress { action, port } => {

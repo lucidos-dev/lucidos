@@ -392,6 +392,23 @@ mod tests {
     use lucidos_build_slot::SlotHolder;
 
     #[test]
+    fn an_unavailable_engine_does_not_delay_an_announcement() {
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let ws = Workspace {
+            root: std::path::PathBuf::from("/unused"),
+            api_port: address.port(),
+            proto: "http".into(),
+            api_base_override: Some(format!("http://{address}")),
+        };
+        let start = std::time::Instant::now();
+        assert!(post_event(&ws, "BuildSlotReleased", &serde_json::json!({})).is_err());
+        assert!(start.elapsed() < ANNOUNCE_TIMEOUT);
+    }
+
+    #[test]
     fn seconds_render_as_a_human_duration() {
         assert_eq!(fmt_secs(0), "0s");
         assert_eq!(fmt_secs(59), "59s");

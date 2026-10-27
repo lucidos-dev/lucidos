@@ -64,6 +64,7 @@ pub(crate) struct CallDetail {
     pub(crate) ttft_ms: Option<u64>,
     /// The provider's id for the response that answered.
     pub(crate) request_id: Option<String>,
+    pub(crate) stable_prefix_fingerprint: Option<String>,
 }
 
 impl CallDetail {
@@ -79,6 +80,10 @@ impl CallDetail {
                 .map(|kind| kind.as_str().to_string()),
             ttft_ms: cost.ttft_ms,
             request_id: cost.request_id.map(str::to_string),
+            stable_prefix_fingerprint: match cost.reported {
+                Reported::Chat(response) => response.stable_prefix_fingerprint.clone(),
+                _ => None,
+            },
         }
     }
 }
@@ -92,6 +97,9 @@ pub(crate) fn auxiliary_capture_detailed(
     reconstructed: bool,
     detail: CallDetail,
 ) -> ThreadEvent {
+    let stable_prefix_fingerprint = detail
+        .stable_prefix_fingerprint
+        .filter(|_| purpose == ContextPurpose::CacheKeepAlive);
     ThreadEvent::ContextCaptured {
         producer: ContextProducer::Auxiliary,
         model: model.to_string(),
@@ -118,7 +126,7 @@ pub(crate) fn auxiliary_capture_detailed(
         duration_ms: detail.duration_ms,
         served_model: detail.served_model,
         provider: detail.provider,
-        stable_prefix_fingerprint: None,
+        stable_prefix_fingerprint,
         ttft_ms: detail.ttft_ms,
         request_id: detail.request_id,
         session: None,

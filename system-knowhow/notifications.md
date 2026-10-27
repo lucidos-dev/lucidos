@@ -500,10 +500,12 @@ The web-push path solves the same problem with `isWorkspaceShell` in `sw.js`. Th
   A window sitting on a *different* workspace is never focused, never navigated, and never handed the tap. **A stopped owner is fine and needs no retry ladder**, unlike the `#thread=` landing channel, which has one. The gateway lazy-starts the workspace and answers with the boot splash, whose meta-refresh re-requests the same URL. The window is therefore on the right workspace by the time the real shell loads. The tap is still in the stash, waiting for its startup drain.
 
   A tap carrying **no** workspace falls back to the main window, dispatched by whichever page drains it. It is either a legacy direct engine (`LUCIDOS_NO_GATEWAY`, one workspace by construction), or a banner from a build older than the stamp. There is nothing to attribute it to.
-- **A boot tap outranks the restored windows.** A launch reopens the workspaces
-  that had a window last time (the *window session*, ADR 0123). A tap aimed at
-  the boot navigation still wins `main`. The workspace it displaces becomes one
-  of the extra windows instead, so nothing is lost and nothing opens twice.
+- **A boot tap outranks the restored windows.** A launch reopens the windows
+  that were open last time, each under its recorded label (the *window
+  session*, ADRs 0123 and 0585). A tap aimed at the boot navigation still wins
+  `main`. The window it displaces becomes an extra window instead, under a
+  fresh label. The first restored window on the tapped workspace is skipped, so
+  nothing is lost and nothing opens twice.
 - **A tap on a parked client wakes one window, not the desk.** Close to Menu Bar
   hides every window rather than destroying any (ADR 0141). A tap fronts the one
   on the raising workspace and leaves the rest parked, because a banner asks for

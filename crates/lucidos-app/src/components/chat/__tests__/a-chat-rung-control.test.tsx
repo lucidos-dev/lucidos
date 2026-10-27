@@ -71,7 +71,7 @@ const {
   confirmState, settleConfirm, threadMap, toasts, currentModel, chatModels, chatLadder,
 } = await import('../../../store/store');
 const { ApiError } = await import('../../../api/client');
-const { rungLockedReason } = await import('../rungControlParts');
+const { rungLockedReason } = await import('../rungLockedReason');
 const { TURN_RUNNING_REASON } = await import('@lucidos/engine-constants');
 const { getComposeSelectionOverride, clearComposeSelection } = await import('../../../store/composeSelections');
 const { makeThreadState } = await import('../../../store/actions/threads-test-helpers');
@@ -345,24 +345,22 @@ describe('a pick on a started thread', () => {
 
 describe('a started thread while a turn runs', () => {
   for (const status of ['running', 'waiting_for_user_answer', 'paused'] as const) {
-    it(`opens the list while ${status}, but a pick or a step says why and records nothing`, async () => {
+    it(`keeps the current model disabled while ${status}`, async () => {
       setStatus(status);
       renderControl({ threadId: 't1', composeContext: false });
       await settle();
       const trigger = host.querySelector<HTMLElement>('.rung-trigger')!;
-      expect(trigger.hasAttribute('aria-disabled')).toBe(false);
-
-      await pickHaiku();
-      expect(toasts.value.map(t => t.message)).toContain(LOCKED);
-
-      const steps = host.querySelectorAll<HTMLElement>('.rung-step:not([aria-disabled="true"])');
-      expect(steps.length).toBeGreaterThan(0);
-      for (const step of Array.from(steps)) {
-        toasts.value = [];
+      expect(trigger.getAttribute('aria-disabled')).toBe('true');
+      expect(trigger.getAttribute('data-tooltip')).toBe(LOCKED);
+      expect(host.querySelector('.rung-name')!.textContent).toContain('Opus 5.5');
+      trigger.click();
+      trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+      for (const step of host.querySelectorAll<HTMLElement>('.rung-step')) {
+        expect(step.getAttribute('aria-disabled')).toBe('true');
         step.click();
-        await settle();
-        expect(toasts.value.map(t => t.message)).toContain(LOCKED);
       }
+      await settle();
+      expect(document.querySelector('.control-dropdown')).toBeNull();
       expect(fetchSwitchEstimate).not.toHaveBeenCalled();
       expect(recordChatSettings).not.toHaveBeenCalled();
     });

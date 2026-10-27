@@ -428,6 +428,7 @@ suite_state() { # <suite>
         echo "VOID refused by the build memory gate, see $STATE/$suite.log"
     elif hs_is_e2e_suite "$suite" && [ "$(cat "$STATE/$suite.exit")" = "$E2E_LOCK_BUSY_EXIT" ]; then
         # ADR 0541: a busy e2e lock is given up, and the main check runs the specs.
+        # Only a run that could not hand off to GitHub (ADR 0584) reaches here.
         echo "SKIP every e2e slot was busy; the main check runs these specs after landing"
     elif [ "$(cat "$STATE/$suite.exit")" != 0 ]; then
         echo "FAIL see $STATE/$suite.log"

@@ -2,7 +2,8 @@
 /** A pending command card links to the Command guard's Enabled for coding agents setting.
  *
  *  Only a command tool carries it, only while the card waits for an answer,
- *  and only while the switch is off: once on, a card means the guard asked. */
+ *  and only while the guard does not already answer coding agents. That takes
+ *  both switches: the child defaults on, so it alone says nothing. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'preact';
 
@@ -10,8 +11,10 @@ const openSettings = vi.hoisted(() => vi.fn());
 vi.mock('../../../store/actions/menu', () => ({
   openCommandGuardCodingAgentsSettings: openSettings,
 }));
+const guardOn = vi.hoisted(() => vi.fn(() => false));
 const codingAgentsOn = vi.hoisted(() => vi.fn(() => false));
 vi.mock('../../../store/actions/preferences', () => ({
+  currentCommandGuard: guardOn,
   currentCommandGuardCodingAgents: codingAgentsOn,
 }));
 
@@ -23,6 +26,7 @@ beforeEach(() => {
   host = document.createElement('div');
   document.body.appendChild(host);
   openSettings.mockClear();
+  guardOn.mockReturnValue(false);
   codingAgentsOn.mockReturnValue(false);
 });
 
@@ -61,10 +65,23 @@ describe('the command guard link on a coding-agent permission card', () => {
     expect(host.querySelector(LINK)?.textContent).toBe('Let the guard answer these');
   });
 
-  it('is absent once the switch is already on', () => {
+  it('is absent once the guard already answers coding agents', () => {
+    guardOn.mockReturnValue(true);
     codingAgentsOn.mockReturnValue(true);
     render(card('Bash'), host);
     expect(host.querySelector(LINK)).toBeNull();
+  });
+
+  it('shows while the guard is off, though the child is on by default', () => {
+    codingAgentsOn.mockReturnValue(true);
+    render(card('Bash'), host);
+    expect(host.querySelector(LINK)).not.toBeNull();
+  });
+
+  it('shows while the guard is on but the child is switched off', () => {
+    guardOn.mockReturnValue(true);
+    render(card('Bash'), host);
+    expect(host.querySelector(LINK)).not.toBeNull();
   });
 
   it('goes away once the card is answered', () => {

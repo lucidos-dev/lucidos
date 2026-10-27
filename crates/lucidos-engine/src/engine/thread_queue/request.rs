@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::ThreadQueueKind;
-use crate::engine::thread_events::{ActorMode, MessageOrigin, WakeMode};
+use crate::engine::thread_events::{ActorMode, MessageOrigin, RetryOf, WakeMode};
 use crate::runtime::CodingAgent;
 
 fn default_coding_agent() -> CodingAgent {
@@ -38,6 +38,8 @@ pub enum ThreadQueueRequest {
     /// fire_matching_triggers`). The trigger config is re-read at execution
     /// time; only the firing context is captured here.
     EventTrigger {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_of: Option<RetryOf>,
         trigger_id: String,
         event_type: String,
         event_payload: serde_json::Value,
@@ -49,7 +51,11 @@ pub enum ThreadQueueRequest {
     },
     /// A trigger's cron schedule fired (`run_task_loop` / missed-grace
     /// catch-up). Config re-read at execution time.
-    Cron { trigger_id: String },
+    Cron {
+        trigger_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_of: Option<RetryOf>,
+    },
     /// `run_thread` LLM tool — chat sub-thread spawn.
     SubThread {
         prompt: String,
@@ -296,7 +302,9 @@ impl ThreadQueueRequest {
     /// The owning trigger, for per-trigger caps and FIFO.
     pub fn trigger_id(&self) -> Option<&str> {
         match self {
-            Self::EventTrigger { trigger_id, .. } | Self::Cron { trigger_id } => Some(trigger_id),
+            Self::EventTrigger { trigger_id, .. } | Self::Cron { trigger_id, .. } => {
+                Some(trigger_id)
+            }
             _ => None,
         }
     }
@@ -329,7 +337,7 @@ impl ThreadQueueRequest {
                 trigger_name.unwrap_or(trigger_id.as_str()),
                 event_type
             ),
-            Self::Cron { trigger_id } => format!(
+            Self::Cron { trigger_id, .. } => format!(
                 "{} (scheduled)",
                 trigger_name.unwrap_or(trigger_id.as_str())
             ),
@@ -342,6 +350,53 @@ impl ThreadQueueRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_requests_replay_old_and_retry_payloads() {
+        use crate::engine::event_bus::SystemEvent;
+        use serde_json::json;
+
+        let retry = json!({
+            "thread_id": Uuid::new_v4(), "deadline": "2030-01-01T12:00:00Z",
+        });
+        for mut request in [
+            json!({ "type": "cron", "trigger_id": "daily-report" }),
+            json!({
+                "type": "event-trigger", "trigger_id": "daily-report",
+                "event_type": "DataImported", "event_payload": { "rows": 3 }, "depth": 1,
+                "source_event_id": Uuid::new_v4(),
+            }),
+        ] {
+            for retry_of in [None, Some(retry.clone())] {
+                if let Some(retry_of) = retry_of {
+                    request["retry_of"] = retry_of;
+                }
+                let stored = json!({
+                    "type": "ThreadQueued", "data": {
+                    "entry_id": Uuid::new_v4(),
+                    "kind": request["type"], "request": request,
+                    "summary": "Daily report", "position": 1, }
+                });
+                let event: SystemEvent = serde_json::from_value(stored).unwrap();
+                let SystemEvent::ThreadQueued {
+                    request: stored_request,
+                    ..
+                } = event
+                else {
+                    panic!("expected ThreadQueued");
+                };
+                let decoded: ThreadQueueRequest = serde_json::from_value(stored_request).unwrap();
+                match &decoded {
+                    ThreadQueueRequest::Cron { retry_of, .. }
+                    | ThreadQueueRequest::EventTrigger { retry_of, .. } => {
+                        assert_eq!(retry_of.is_some(), request.get("retry_of").is_some());
+                    }
+                    other => panic!("wrong request: {other:?}"),
+                }
+                assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+            }
+        }
+    }
 
     #[test]
     fn agent_chat_kind_follows_use_coding_agent() {
@@ -397,6 +452,7 @@ mod tests {
         // The request column / event payload must survive a serialize →
         // deserialize cycle byte-exactly enough to re-fire after restart.
         let req = ThreadQueueRequest::EventTrigger {
+            retry_of: None,
             trigger_id: "trig-1".into(),
             event_type: "DataImported".into(),
             event_payload: serde_json::json!({"rows": 3}),
@@ -668,6 +724,7 @@ mod tests {
         assert!(!cc(Some("dev-1".into())).is_attributed());
 
         assert!(ThreadQueueRequest::Cron {
+            retry_of: None,
             trigger_id: "t".into()
         }
         .is_attributed());
@@ -713,6 +770,7 @@ mod tests {
     #[test]
     fn summary_prefers_trigger_name_and_truncates_prompts() {
         let req = ThreadQueueRequest::Cron {
+            retry_of: None,
             trigger_id: "abc".into(),
         };
         assert_eq!(

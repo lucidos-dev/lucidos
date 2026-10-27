@@ -47,20 +47,36 @@ function rereadWhat(contextTokens: number): string {
   return contextTokens > 0 ? `${formatTokens(contextTokens)} tokens` : 'the whole conversation';
 }
 
-/** Each reason ends on a full stop. */
+/** Each reason ends on a full stop. `pings_paused` names its end in
+ *  `notKeptReason`. */
 const NOT_KEPT_REASON: Record<CacheKeepAliveNotKeptReason, string> = {
   codex: 'Codex sessions get no keep-alive: their cache cannot be kept warm this way.',
   off: 'The cache keep-alive is off.',
   no_wake_children: 'These sub-threads finish without waking this thread, so nothing would read a warm cache.',
   children_awaiting_user: 'The sub-threads are waiting on you. Pings start again if your answer comes while the cache is still warm.',
-  uncacheable_provider: "This model's provider has no prompt cache that a ping keeps warm.",
+  uncacheable_provider: 'Lucidos cannot safely prefill this prompt cache.',
+  provider_paused: 'Pings on this provider are paused after a failed ping.',
+  // Historical: the engine no longer emits it, but stored events still carry it.
+  prefill_paused: 'Prefill pings are temporarily paused.',
+  pings_paused: "Pings to this model's provider kept missing the cache, so they pause for a while.",
+  cache_expired: 'The cache went cold before a ping reached it, so a ping would pay to rewrite it.',
   restarted: 'Lucidos restarted since the last request, so a ping would not match the cache.',
   past_give_up_time: 'The wait passed its give-up time before the first ping was due, so no ping went out.',
   nothing_pending:
     'This thread waits only for your next message. Lucidos keeps a cache warm while a thread waits on a sub-thread, an event or a card.',
   unattended_trigger: 'Nobody has written in this trigger thread, so nothing would read a warm cache.',
   unknown_ttl: 'Lucidos does not know how long this cache lives, so it cannot time a ping.',
+  model_changed: 'The model or reasoning effort changed, so this cache cannot be kept warm.',
+  beat_missed: 'A ping missed the cache, so this wait is not kept warm.',
 };
+
+/** Why nothing keeps the cache warm, with the time paused pings resume. */
+function notKeptReason(status: Status<'not_kept'>): string {
+  if (status.reason === 'pings_paused' && status.until !== undefined) {
+    return `Pings to this model's provider kept missing the cache, so they pause until ${clock(status.until)}.`;
+  }
+  return NOT_KEPT_REASON[status.reason];
+}
 
 /** The sentences of a run, on the card and in the panel. A run that is not
  *  open drops the budget. `null` for a status that names no run. */
@@ -372,7 +388,7 @@ function sectionDetail(status: CacheKeepAliveStatus): string | null {
     case 'turned_off':
       return TURNS_BACK_ON;
     case 'not_kept':
-      return NOT_KEPT_REASON[status.reason];
+      return notKeptReason(status);
   }
 }
 
@@ -596,7 +612,7 @@ function cacheIntro(status: CacheKeepAliveStatus): string {
 /** The run's sentence and the meter, then the math or the reread price. Or
  *  the reason nothing keeps the cache warm. */
 function KeepAliveRunFacts({ status }: { status: CacheKeepAliveStatus }) {
-  if (status.state === 'not_kept') return <p>{`Nothing keeps it warm while you are away. ${NOT_KEPT_REASON[status.reason]}`}</p>;
+  if (status.state === 'not_kept') return <p>{`Nothing keeps it warm while you are away. ${notKeptReason(status)}`}</p>;
   const math = keepAliveMath(status);
   const reread = math ? null : rereadSentence(status);
   return (
@@ -627,7 +643,13 @@ function SettingLink({ label, close, open }: { label: string; close: () => void;
 const KEEP_ALIVE_SETTING = 'Settings → Models → Cache keep-alive';
 
 /** Reasons no keep-alive setting can change: the thread is never beaten. */
-const SETTING_CANNOT_APPLY: ReadonlySet<CacheKeepAliveNotKeptReason> = new Set(['codex', 'uncacheable_provider']);
+const SETTING_CANNOT_APPLY: ReadonlySet<CacheKeepAliveNotKeptReason> = new Set([
+  'codex',
+  'uncacheable_provider',
+  'provider_paused',
+  'prefill_paused',
+  'pings_paused',
+]);
 
 /** What the keep-alive setting changes, as the lead-in to its link. */
 function settingLead(status: CacheKeepAliveStatus): string {

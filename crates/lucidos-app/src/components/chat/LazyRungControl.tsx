@@ -4,11 +4,12 @@ import { RungButtons, type RungControlProps } from './RungButtons';
 
 /** The control's boxes, drawn until its code arrives. A press on the trigger is
  *  held for the control, which takes it as it mounts (ADR 0436). */
-function RungPlaceholder({ folded, rowAttrs }: RungControlProps) {
+function RungPlaceholder({ folded, rowAttrs, disabledReason }: RungControlProps) {
   if (folded) return null;
   return (
     <RungButtons
       shown={null}
+      disabledReason={disabledReason}
       rowAttrs={rowAttrs}
       expanded={false}
       onOpen={(e) => pressControlMenu('rung', e.currentTarget as Element)}

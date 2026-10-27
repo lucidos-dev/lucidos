@@ -35,18 +35,31 @@ pub(crate) struct Snapshot {
 }
 
 /// What one event does to the thread's question park.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QuestionMove {
-    Asked,
+    /// A question opened, keyed by its `tool_use_id`.
+    Asked(String),
     Ended,
+    /// A coding agent's tool result. It ends the park only for the open
+    /// question's own `tool_use_id`.
+    ResultOf(String),
     Untouched,
+}
+
+/// A thread's question park, as far as the watch has seen it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuestionPark {
+    Open { tool_use_id: String },
+    Closed,
 }
 
 impl QuestionMove {
     /// The same reading as the gate's unanswered-question predicate.
     fn of(event: &ThreadEvent) -> Self {
-        if matches!(event, ThreadEvent::UserQuestionAsked { .. }) {
-            Self::Asked
+        if let ThreadEvent::UserQuestionAsked { tool_use_id, .. } = event {
+            Self::Asked(tool_use_id.clone())
+        } else if let ThreadEvent::CodingAgentToolResult { tool_use_id, .. } = event {
+            Self::ResultOf(tool_use_id.clone())
         } else if super::agent_recovery::ends_question_park(event.event_type()) {
             Self::Ended
         } else {
@@ -73,7 +86,7 @@ pub(crate) struct PendingChangeWatch {
     /// Each thread's question park, where known. An open one is kept for any
     /// thread, since a question can open before the proposal. A closed one is
     /// kept only while the thread holds a pending change.
-    questions: HashMap<Uuid, bool>,
+    questions: HashMap<Uuid, QuestionPark>,
 }
 
 impl PendingChangeWatch {
@@ -87,14 +100,17 @@ impl PendingChangeWatch {
     pub(crate) fn observe(&mut self, thread_id: Uuid, proposed: bool, snapshot: Snapshot) -> bool {
         if !proposed {
             self.last.remove(&thread_id);
-            if self.questions.get(&thread_id) == Some(&false) {
+            if self.questions.get(&thread_id) == Some(&QuestionPark::Closed) {
                 self.questions.remove(&thread_id);
             }
             return false;
         }
         let inputs = GateInputs {
             snapshot,
-            question_open: self.questions.get(&thread_id).copied(),
+            question_open: self
+                .questions
+                .get(&thread_id)
+                .map(|park| matches!(park, QuestionPark::Open { .. })),
         };
         self.last.insert(thread_id, inputs) != Some(inputs)
     }
@@ -102,12 +118,18 @@ impl PendingChangeWatch {
     /// Follow one persisted event's effect on the thread's question park. The
     /// next [`Self::observe`] reads the result.
     pub(crate) fn note_question(&mut self, thread_id: Uuid, question: QuestionMove) {
-        let open = match question {
-            QuestionMove::Asked => true,
-            QuestionMove::Ended => false,
+        let park = match question {
+            QuestionMove::Asked(tool_use_id) => QuestionPark::Open { tool_use_id },
+            QuestionMove::Ended => QuestionPark::Closed,
+            QuestionMove::ResultOf(result_id) => match self.questions.get(&thread_id) {
+                Some(QuestionPark::Open { tool_use_id }) if *tool_use_id == result_id => {
+                    QuestionPark::Closed
+                }
+                _ => return,
+            },
             QuestionMove::Untouched => return,
         };
-        self.questions.insert(thread_id, open);
+        self.questions.insert(thread_id, park);
     }
 
     /// Drop every cached state, so each thread's next event rebuilds the frame
@@ -190,7 +212,7 @@ mod tests {
         // ADR 0293: the status reads idle while the question is still open.
         let mut watch = PendingChangeWatch::default();
         let thread = Uuid::new_v4();
-        watch.note_question(thread, QuestionMove::Asked);
+        watch.note_question(thread, QuestionMove::Asked("toolu_q".into()));
         watch.observe(thread, true, inputs(ThreadStatus::Idle, false));
         watch.note_question(thread, QuestionMove::Untouched);
         assert!(!watch.observe(thread, true, inputs(ThreadStatus::Idle, false)));
@@ -210,6 +232,18 @@ mod tests {
         assert!(watch.observe(thread, true, inputs(ThreadStatus::Idle, false)));
         watch.note_question(thread, QuestionMove::Ended);
         assert!(!watch.observe(thread, true, inputs(ThreadStatus::Idle, false)));
+    }
+
+    #[test]
+    fn only_the_open_questions_own_result_ends_the_park() {
+        let mut watch = PendingChangeWatch::default();
+        let thread = Uuid::new_v4();
+        watch.note_question(thread, QuestionMove::Asked("toolu_q".into()));
+        watch.observe(thread, true, inputs(ThreadStatus::Idle, false));
+        watch.note_question(thread, QuestionMove::ResultOf("toolu_earlier".into()));
+        assert!(!watch.observe(thread, true, inputs(ThreadStatus::Idle, false)));
+        watch.note_question(thread, QuestionMove::ResultOf("toolu_q".into()));
+        assert!(watch.observe(thread, true, inputs(ThreadStatus::Idle, false)));
     }
 
     #[test]

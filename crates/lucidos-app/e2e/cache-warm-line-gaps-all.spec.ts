@@ -11,7 +11,8 @@
  * needs a real model call inside the cache's lifetime.
  */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, navigateToApp, sendMessage, uniqueMessage, waitForResponse } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, sendMessage, uniqueMessage, waitForResponse } from './helpers';
+import { psql } from './db-helpers';
 
 const WARMTH = {
   remaining_secs: 240,
@@ -69,7 +70,14 @@ async function measureGaps(page: Page): Promise<Gaps | null> {
 test.describe('the cache-warm line gaps', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+    // The cache cards are off by default.
+    const res = await apiRequest(page).put('/api/v1/preferences?key=cache_cards', { data: { value: 'true' } });
+    expect(res.ok(), 'cache_cards=true').toBe(true);
     await page.route('**/api/v1/threads/*/cache-warmth', (route) => route.fulfill({ json: WARMTH }));
+  });
+
+  test.afterEach(() => {
+    psql("DELETE FROM preferences WHERE key = 'cache_cards'");
   });
 
   test('the space above the card equals the space below it', async ({ page }) => {

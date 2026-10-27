@@ -13,9 +13,8 @@
 #   • build-headless.sh   (Linux + macOS) stages into a plain tree and tars it
 #                         (step 2 of docs/plans/2026-06-30-installer-step2-linux-tarball.md).
 #
-# Everything here is the platform-agnostic spine of staging; the ONLY divergence
-# between the two vehicles is what wraps the staged tree (Tauri/.app/sign vs. a
-# plain tar) and the host-keyed pgvector PG_SYSROOT override (macOS only).
+# Both vehicles share assembly. PostgreSQL fetch handles Darwin's PGXS sysroot
+# override and Linux's non-glibc library bundle before either wrapper stages it.
 #
 # These functions take everything explicitly (no build-dmg.sh / build-headless.sh
 # globals) so scripts/lib/stage_runtime_test.sh exercises the pure ones — triple
@@ -24,8 +23,8 @@
 # (build_frontend / build_binaries / fetch_postgres) need cargo/npm/network and are
 # covered by a real build (the macOS build-headless smoke + the CI matrix).
 #
-# stage_runtime_fetch_postgres depends on nothing external; the assemble/build
-# helpers shell out to cp/cargo/npm. No dependence on `set -e` in the caller —
+# Linux fetch also needs readelf/patchelf/ldconfig and dpkg-query.
+# Assembly/build helpers shell out to cp/cargo/npm. No dependence on caller `set -e`:
 # every step guards its own failure with `|| return 1`.
 
 # ── target-triple resolution ─────────────────────────────────────────────────
@@ -106,6 +105,11 @@ stage_runtime_needs_macos_sysroot() {
     [ "$1" = "Darwin" ]
 }
 
+# Linux build tools stay outside the installed runtime and the Darwin path.
+stage_runtime_linux_postgres() {
+    python3 "$(dirname "${BASH_SOURCE[0]}")/stage_runtime_linux.py" "$@"
+}
+
 # ── build steps (network / toolchain — not offline-testable) ─────────────────
 
 # stage_runtime_build_frontend <repo-root> <app-dir> — write the generated files
@@ -175,6 +179,11 @@ stage_runtime_fetch_postgres() {
     fi
     [ -x "$pgconfig" ] || { echo "ERROR: pg_config missing after extract ($pgconfig)" >&2; return 1; }
 
+    case "$triple" in
+        *-unknown-linux-gnu)
+            stage_runtime_linux_postgres bundle "$prefix" >&2 || return 1 ;;
+    esac
+
     local sharedir
     sharedir="$("$pgconfig" --sharedir)" || return 1
     if [ ! -f "$sharedir/extension/vector.control" ]; then
@@ -191,6 +200,10 @@ stage_runtime_fetch_postgres() {
         ( cd "$work/pgvector" \
             && make -s "${make_args[@]}" \
             && make -s install "${make_args[@]}" ) >&2 || return 1
+        case "$triple" in
+            *-unknown-linux-gnu)
+                stage_runtime_linux_postgres bundle "$prefix" >&2 || return 1 ;;
+        esac
     fi
     [ -f "$sharedir/extension/vector.control" ] || { echo "ERROR: pgvector did not install into the bundled PG" >&2; return 1; }
 

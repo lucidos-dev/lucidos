@@ -1084,6 +1084,16 @@
     overflow-wrap: anywhere;
 }
 
+.plugin-detail-description > p,
+.app-store-plugin-description > p {
+    margin: 0;
+}
+
+.plugin-detail-description > p + p,
+.app-store-plugin-description > p + p {
+    margin-top: var(--space-sm);
+}
+
 .plugin-detail-modified {
     display: flex;
     flex-wrap: wrap;
@@ -1265,7 +1275,7 @@
 .form-group .dropdown-input-wrap {
     width: 100%;
     background: var(--bg-secondary);
-    border-radius: calc(var(--radius-control) * 0.5);
+    border-radius: calc(var(--radius-control) * 0.75);
 }
 
 .form-group .dropdown-input {

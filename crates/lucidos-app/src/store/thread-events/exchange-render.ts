@@ -9,10 +9,34 @@ import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isRedirectCanc
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, RecalledMemory, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
-import type { SessionContinuity } from '../../generated/thread-event-wire';
+import type { FireRetry, RetrySkipReason, SessionContinuity } from '../../generated/thread-event-wire';
 import type { ThreadState } from './thread-meta';
 import type { OngoingGroup } from '../store';
 import type { ActorMode, CodingAgentExit, EventSubscription, EventWaitCancelCause, MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent } from './thread-event-types';
+
+export function triggerRunInterruption(exchange: Exchange): Extract<StoredEvent, { type: 'TriggerRunInterrupted' }> | undefined {
+  if (exchange.userEvent.type === 'TriggerRunInterrupted') return exchange.userEvent;
+  const step = exchange.steps.find(step => step.event.type === 'TriggerRunInterrupted');
+  return step?.event.type === 'TriggerRunInterrupted' ? step.event : undefined;
+}
+
+const RETRY_SKIP_SENTENCE: Record<RetrySkipReason, string> = {
+  already_retried: 'This run was already a retry.',
+  fire_completed: 'Its main work had finished. Use Continue to resume the rest.',
+  spawned_work: 'Its sub-threads carry on by themselves.',
+  too_old: 'It started more than 24 hours ago.',
+  later_slot_due: 'Its next scheduled run is already due.',
+  newer_fire: 'A newer run of this trigger has started.',
+  trigger_unavailable: 'The trigger is paused, disabled or deleted.',
+  request_unavailable: 'Lucidos could not find what started it.',
+  already_queued: 'Another run of this trigger is already queued.',
+};
+
+export function triggerRetrySummary(retry: FireRetry): string {
+  return retry.kind === 'queued'
+    ? 'Running it again once'
+    : `It was not run again. ${RETRY_SKIP_SENTENCE[retry.reason]}`;
+}
 
 /** The two projections' step shapes, as far as the resolvers care. */
 type StepLike = { outcome: StepOutcome; description?: string; tool_name?: string; call_event_id?: string };
@@ -2627,7 +2651,7 @@ export function exchangeVerdict(exchange: Exchange, streamingBuffer: string, isL
   //
   // `!exchange.questionOvertaken` is what keeps this honest. The switch above
   // clears `isWaitingForAnswer` on only three progression types, while
-  // `QUESTION_OVERTAKEN_STEP_TYPES` covers twelve. A shape in the gap reads
+  // `QUESTION_OVERTAKEN_STEP_TYPES` covers more, plus the question's own tool result. A shape in the gap reads
   // "Needs your answer" over a card whose buttons are already dead. Deferring
   // to the overtaken flag means one list decides both, mirroring the engine's
   // single park-ending set. An overtaken divider falls through to the stale

@@ -1,6 +1,7 @@
 # 0133: A trigger fire that already produced a thread hands off at boot instead of re-firing
 
 - **Status**: Accepted
+- **Amended by**: [0579](0579-restart-cut-trigger-fire-fails-visibly-and-retries-once.md)
 - **Date**: 2026-08-25
 
 ## Context

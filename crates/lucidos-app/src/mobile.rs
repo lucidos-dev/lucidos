@@ -27,14 +27,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::desktop::engine_port;
-
-/// Bound on the MagicDNS reverse lookup. The resolver is local (`100.100.100.100`)
-/// whenever we get this far, so this is a stall guard, not a budget.
-const REVERSE_DNS_TIMEOUT: Duration = Duration::from_millis(1500);
+use crate::desktop::{engine_port, GATEWAY_HEALTH_PATH};
 
 /// Bound on the "is anything serving HTTPS" probe. Loopback-speed in practice.
 const SERVE_PROBE_TIMEOUT: Duration = Duration::from_millis(700);
+
+/// Bound on asking the served URL which gateway answers. It crosses Tailscale
+/// and a TLS handshake, so it gets more room than the bare connect.
+const SERVE_IDENTITY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bound on `tailscale version`, the one CLI call the status path makes. Answers
 /// in milliseconds when healthy; the ceiling exists for when it does not.
@@ -93,25 +93,28 @@ pub struct ConnectInfo {
 
 /// What this Mac's Tailscale setup looks like, as two independent facts.
 ///
-/// **Tailnet state** is read without a CLI. **CLI availability** gates the
-/// buttons and nothing else. Keeping them apart is what lets the page stay
+/// **Tailnet state** comes from Tailscale's own status, which needs no CLI.
+/// **CLI availability** gates the buttons and nothing else. Keeping them apart is what lets the page stay
 /// accurate on a Mac that has Tailscale working but no CLI installed.
 #[derive(Serialize)]
 pub struct TailscaleInfo {
     /// Tailscale is present at all: the app bundle, or a CLI. Drives the
     /// "Get Tailscale" offer, so it deliberately does NOT mean "usable".
     pub installed: bool,
-    /// This Mac holds a tailnet address, so it is signed in and connected.
+    /// Tailscale reports this Mac as running with a tailnet address.
     pub on_tailnet: bool,
+    /// Why it is not on a tailnet, in one sentence. `None` when it is.
+    pub reason: Option<String>,
     /// The tailnet IPv4, when on a tailnet. Reachable over plain HTTP from any
     /// device on the same tailnet, which is Route A in `remote-access.md`.
     pub tailnet_ip: Option<String>,
-    /// MagicDNS name, e.g. `mymac.tailnet-name.ts.net` (no scheme). `None` on a
-    /// tailnet with MagicDNS disabled, which is not the same as being offline.
+    /// The MagicDNS name Tailscale reports, e.g. `mymac.tailnet-name.ts.net` (no
+    /// scheme). `None` with MagicDNS disabled, which is not being offline.
     pub magic_dns_name: Option<String>,
-    /// `https://<magic_dns_name>`, set **only** once something is proven to be
-    /// serving it. Before `tailscale serve` runs nothing listens on 443, so
-    /// publishing the URL earlier would advertise a dead address.
+    /// `https://<magic_dns_name>`, set **only** when Tailscale can certify the
+    /// name and something is proven to be serving it. Before `tailscale serve`
+    /// runs nothing listens on 443, so publishing it earlier advertises a dead
+    /// address.
     pub serve_url: Option<String>,
     /// A working `tailscale` CLI was found. Gates the actions only: never the
     /// reporting above.
@@ -159,23 +162,27 @@ where
 /// internal helper rather than its own command.
 fn tailscale_status() -> TailscaleInfo {
     let cli = tailscale_cli();
-    let tailnet_addr = lucidos_tailscale::tailnet_ipv4();
-    let magic_dns_name =
-        tailnet_addr.and_then(|ip| lucidos_tailscale::magic_dns_name(ip, REVERSE_DNS_TIMEOUT));
+    let state = lucidos_tailscale::tailnet_state();
+    let node = state.node();
 
-    // Only a name we can show is answering becomes a URL. See `serve_is_live`.
-    let serve_url = magic_dns_name
-        .as_ref()
-        .filter(|_| tailnet_addr.is_some_and(serve_is_live))
-        .map(|h| format!("https://{h}"));
+    // Only a certifiable name we can show is answering becomes a URL. See
+    // `serve_is_live`.
+    let serve_url = node
+        .and_then(|n| n.https_name().map(|name| (n.ipv4, name)))
+        .map(|(ipv4, name)| (ipv4, format!("https://{name}")))
+        .filter(|(ipv4, url)| serve_is_live(*ipv4) && serves_this_gateway(url))
+        .map(|(_, url)| url);
 
     TailscaleInfo {
         // The app bundle counts even without a CLI: offering "Get Tailscale" to
         // someone who already has it would be the wrong instruction.
-        installed: cli.is_some() || std::path::Path::new(TAILSCALE_APP_BUNDLE).exists(),
-        on_tailnet: tailnet_addr.is_some(),
-        tailnet_ip: tailnet_addr.map(|ip| ip.to_string()),
-        magic_dns_name,
+        installed: cli.is_some()
+            || state != lucidos_tailscale::TailnetState::NotInstalled
+            || std::path::Path::new(TAILSCALE_APP_BUNDLE).exists(),
+        on_tailnet: node.is_some(),
+        reason: state.reason(),
+        tailnet_ip: node.map(|n| n.ipv4.to_string()),
+        magic_dns_name: node.and_then(|n| n.magic_dns_name.clone()),
         serve_url,
         cli_available: cli.is_some(),
     }
@@ -204,6 +211,39 @@ fn serve_is_live(addr: Ipv4Addr) -> bool {
         SERVE_PROBE_TIMEOUT,
     )
     .is_ok()
+}
+
+/// Does `url` reach the gateway this app belongs to?
+///
+/// A listener on 443 can belong to another gateway on this Mac, and then the
+/// URL opens a different set of workspaces. So the per-boot `instance_id` in
+/// the health body over the tailnet must match the one on loopback.
+fn serves_this_gateway(url: &str) -> bool {
+    let ours = crate::desktop::gateway_body(engine_port(), "GET", GATEWAY_HEALTH_PATH, None)
+        .and_then(|body| health_instance_id(&body));
+    let Some(ours) = ours else {
+        return false;
+    };
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(SERVE_IDENTITY_TIMEOUT)
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{url}{GATEWAY_HEALTH_PATH}"))
+        .send()
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.text())
+        .is_ok_and(|body| health_instance_id(&body).as_deref() == Some(ours.as_str()))
+}
+
+/// The `instance_id` a gateway health body carries. Pure, so a test pins it.
+fn health_instance_id(body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    json.get("instance_id")?.as_str().map(str::to_string)
 }
 
 /// Run a command with a hard deadline, killing it if it overruns.
@@ -365,7 +405,7 @@ fn run_tailscale_up(auth_key: Option<&str>) -> Result<(), String> {
     run_checked(cmd, "tailscale up")?;
     // Post-condition, not ceremony: the reported bug was `up` "succeeding" and
     // changing nothing, which the page could only render as a reload.
-    if lucidos_tailscale::tailnet_ipv4().is_none() {
+    if lucidos_tailscale::tailnet_state().node().is_none() {
         return Err(
             "tailscale up reported success but this Mac still has no tailnet address. \
              Open the Tailscale app and check it is signed in."
@@ -505,18 +545,23 @@ fn serve_run(
     let cli = tailscale_cli().ok_or_else(|| ServeFailure::Failed(NO_CLI.to_string()))?;
 
     on_phase(ServePhase::CheckingTailnet);
-    let addr = lucidos_tailscale::tailnet_ipv4().ok_or_else(|| {
-        ServeFailure::Failed(
-            "This Mac is not on a tailnet yet. Sign in to Tailscale first.".to_string(),
-        )
+    let state = lucidos_tailscale::tailnet_state();
+    let node = state.node().ok_or_else(|| {
+        ServeFailure::Failed(format!(
+            "This Mac is not on a tailnet yet. {}",
+            state.reason().unwrap_or_default()
+        ))
     })?;
-    let name = lucidos_tailscale::magic_dns_name(addr, REVERSE_DNS_TIMEOUT).ok_or_else(|| {
+    let name = node.magic_dns_name.as_deref().ok_or_else(|| {
         ServeFailure::Failed(
             "This Mac is on a tailnet but has no MagicDNS name, so there is no HTTPS \
              address to serve. Enable MagicDNS for your tailnet and try again."
                 .to_string(),
         )
     })?;
+    // Not gated on `CertDomains`: serve itself walks the user through turning
+    // certificates on.
+    let addr = node.ipv4;
     let port = engine_port();
 
     // Proxy the tailnet HTTPS endpoint at the root path to the loopback engine,
@@ -542,20 +587,23 @@ fn serve_run(
 
     // Same post-condition rule as `up`: only report the URL we can show is live.
     // Polled rather than probed once, because a mapping written a moment ago is
-    // allowed a moment to come up.
+    // allowed a moment to come up. The test is `tailscale_status`'s own, so
+    // the page shows as serving what this reported as served.
     on_phase(ServePhase::WaitingForHttps);
-    if !wait_until(|| serve_is_live(addr), cancel, SERVE_HTTPS_TIMEOUT) {
+    let url = format!("https://{name}");
+    let live = || serve_is_live(addr) && serves_this_gateway(&url);
+    if !wait_until(live, cancel, SERVE_HTTPS_TIMEOUT) {
         if cancel.load(Ordering::SeqCst) {
             return Err(ServeFailure::Cancelled);
         }
         return Err(ServeFailure::Failed(format!(
-            "tailscale serve was configured but nothing answered on {name} within {}s. \
-             If this is the first time, the certificate may still be provisioning; \
-             `tailscale serve status` shows what was configured.",
+            "tailscale serve was configured but this gateway did not answer on {name} \
+             within {}s. If this is the first time, the certificate may still be \
+             provisioning; `tailscale serve status` shows what was configured.",
             SERVE_HTTPS_TIMEOUT.as_secs()
         )));
     }
-    Ok(format!("https://{name}"))
+    Ok(url)
 }
 
 /// Poll `probe` until it answers true, the deadline passes, or a cancel lands.
@@ -1050,6 +1098,17 @@ mod tests {
             "1.96.4-t41cb72f27\n  go version: go1.24.0\n"
         ));
         assert!(reports_a_version("1.98.9\n"));
+    }
+
+    #[test]
+    fn only_a_health_body_with_an_instance_id_names_a_gateway() {
+        assert_eq!(
+            health_instance_id(r#"{"role":"gateway","instance_id":"abc"}"#).as_deref(),
+            Some("abc")
+        );
+        // A gateway older than the field, and a login page in front of one.
+        assert_eq!(health_instance_id(r#"{"role":"gateway"}"#), None);
+        assert_eq!(health_instance_id("<html>sign in</html>"), None);
     }
 
     #[test]

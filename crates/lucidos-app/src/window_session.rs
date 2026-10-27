@@ -1,4 +1,4 @@
-//! Which workspaces had a window, and how big each one was.
+//! Which windows were open, on which workspace, and how big each one was.
 //!
 //! `<app-data>/.window-session.json`, written by the client as its windows move
 //! and close, and read on the way back up.
@@ -9,11 +9,12 @@
 //! WINDOWS. Only `main` is declared in `tauri.conf.json`, so only `main` comes
 //! back, and it lands on whatever workspace `localStorage` remembers.
 //!
-//! It is keyed by workspace SLUG rather than by window label, which is the
-//! other half of the same defect. `tauri-plugin-window-state` keys geometry by
-//! label, and an extra window's label is `window-<n>` off a counter that resets
-//! each process. That label means nothing across launches, which is why the
-//! plugin is confined to `main` (`window_persist::plugin_tracks`).
+//! Each entry names its window's LABEL, and a restore rebuilds the window under
+//! it. The page keys its window-scoped storage by that label, so a window comes
+//! back on its own thread, panel and history. An extra window's label is
+//! `window-<uuid>`, which never recurs, so no new window inherits a closed one's
+//! state. `tauri-plugin-window-state` still tracks only `main`
+//! (`window_persist::plugin_tracks`): this record owns every other frame.
 //!
 //! Everything here fails soft. It sits on the client's boot path, so a bad
 //! record must mean "restore nothing", never a client that will not start.
@@ -28,18 +29,17 @@ use std::path::{Path, PathBuf};
 /// state, not user config.
 pub const WINDOW_SESSION_FILE: &str = ".window-session.json";
 
-/// The window a workspace opens into, and which ones had one.
+/// The windows to reopen, and the window each workspace opens into later.
 ///
 /// The two fields answer different questions and neither implies the other.
-/// `open` is what to reopen. `geometry` is how big to make it, and it
-/// deliberately OUTLIVES a window's closing. Reopening a workspace later still
-/// lands at the size the user left it.
+/// `open` is what to reopen, one entry per window. `geometry` is how big to make
+/// a workspace's NEXT window, and it deliberately OUTLIVES a window's closing.
+/// Reopening a workspace later still lands at the size the user left it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSession {
-    /// Workspace slugs that had a window, in the order to restore them. The
-    /// first gets `main`.
+    /// The windows that were open, `main` first and then by label.
     #[serde(default)]
-    pub open: Vec<String>,
+    pub open: Vec<OpenWindow>,
     /// The last known frame of each workspace's window, in LOGICAL points, the
     /// units `window_restore` reasons in. See [`FrameUnits`].
     #[serde(default)]
@@ -59,6 +59,59 @@ impl Default for WindowSession {
             open: Vec::new(),
             geometry: BTreeMap::new(),
             units: FrameUnits::LogicalPoints,
+        }
+    }
+}
+
+/// One window the record holds.
+///
+/// Reads two shapes. An older build wrote a bare workspace slug per entry, with
+/// no label and no frame of its own. Such an entry restores as a fresh window at
+/// its workspace's frame, which is what that build did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RecordedWindow")]
+pub struct OpenWindow {
+    /// The window's label, unvalidated: [`restore_plan`] judges it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The workspace slug, unvalidated: [`restore_plan`] judges it.
+    pub workspace: String,
+    /// This window's own last frame, in the record's [`FrameUnits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<RememberedFrame>,
+}
+
+/// Both shapes an `open` entry has been written in.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RecordedWindow {
+    Slug(String),
+    Window {
+        #[serde(default)]
+        label: Option<String>,
+        workspace: String,
+        #[serde(default)]
+        frame: Option<RememberedFrame>,
+    },
+}
+
+impl From<RecordedWindow> for OpenWindow {
+    fn from(recorded: RecordedWindow) -> Self {
+        match recorded {
+            RecordedWindow::Slug(workspace) => Self {
+                label: None,
+                workspace,
+                frame: None,
+            },
+            RecordedWindow::Window {
+                label,
+                workspace,
+                frame,
+            } => Self {
+                label,
+                workspace,
+                frame,
+            },
         }
     }
 }
@@ -140,13 +193,13 @@ pub fn record_path(app_data: &Path) -> PathBuf {
 /// `window_target::window_workspace` decides from its URL. The boot splash and
 /// the picker are not workspaces and must not be recorded as one.
 ///
-/// `open` is REPLACED, so a window the user closed leaves the record.
+/// `open` is REPLACED, so a window the user closed leaves the record. Each
+/// window keeps its own entry, so two windows on one workspace both come back.
 /// `geometry` is MERGED, so a workspace with no window right now keeps its
 /// remembered size.
 ///
-/// The order is `main` first, then by label. A restore hands `open[0]` to
-/// `main`, and the window map has no order of its own. Without this the same
-/// two windows could swap places between launches.
+/// The order is `main` first, then by label. The window map has no order of
+/// its own, so without this the record would churn between captures.
 pub fn capture(previous: &WindowSession, windows: &[WindowSnapshot]) -> WindowSession {
     let mut ordered: Vec<&WindowSnapshot> = windows.iter().collect();
     ordered.sort_by(|a, b| {
@@ -176,19 +229,27 @@ pub fn capture(previous: &WindowSession, windows: &[WindowSnapshot]) -> WindowSe
             Whereabouts::Orphaned => (true, None),
             Whereabouts::OnScreen(anchor) => (snapshot.rescued, anchor.clone()),
         };
+        let chosen = RememberedFrame::new(snapshot.frame, anchor);
         let keep_previous = not_chosen && session.geometry.contains_key(workspace);
         if !keep_previous {
-            session.geometry.insert(
-                workspace.to_string(),
-                RememberedFrame::new(snapshot.frame, anchor),
-            );
+            session
+                .geometry
+                .insert(workspace.to_string(), chosen.clone());
         }
-        // Two windows on ONE workspace collapse to one entry. The record holds
-        // no per-window identity, so a second restored window would land on top
-        // of the first at the same frame.
-        if !session.open.iter().any(|id| id == workspace) {
-            session.open.push(workspace.to_string());
-        }
+        let held = previous
+            .open
+            .iter()
+            .find(|entry| entry.label.as_deref() == Some(snapshot.label.as_str()))
+            .and_then(|entry| entry.frame.clone());
+        let frame = match held {
+            Some(held) if not_chosen => held,
+            _ => chosen,
+        };
+        session.open.push(OpenWindow {
+            label: Some(snapshot.label.clone()),
+            workspace: workspace.to_string(),
+            frame: Some(frame),
+        });
     }
     session
 }
@@ -221,7 +282,7 @@ pub fn read(app_data: &Path) -> WindowSession {
 ///
 /// A record from before ADR 0173 holds physical pixels. Restoring one on a
 /// mixed-DPI desk puts the window at the wrong size in the wrong place, which is
-/// the whole bug. `open` is untouched, so the launch after the upgrade still
+/// the whole bug. Every window stays, so the launch after the upgrade still
 /// reopens every workspace that had a window. Each lands at the declared default
 /// until it is moved once, and the next capture records it in points.
 fn in_points(session: WindowSession) -> WindowSession {
@@ -229,7 +290,14 @@ fn in_points(session: WindowSession) -> WindowSession {
         return session;
     }
     WindowSession {
-        open: session.open,
+        open: session
+            .open
+            .into_iter()
+            .map(|entry| OpenWindow {
+                frame: None,
+                ..entry
+            })
+            .collect(),
         geometry: BTreeMap::new(),
         units: FrameUnits::LogicalPoints,
     }
@@ -274,28 +342,70 @@ pub fn frame_for_url(session: &WindowSession, url: &str) -> Option<RememberedFra
     session.geometry.get(workspace).cloned()
 }
 
-/// The workspaces to restore, and the frame each one wants.
+/// One window a restore rebuilds, every field judged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredWindow {
+    /// The label to rebuild it under, so its window-scoped storage comes back
+    /// with it. `None` asks for a fresh one.
+    pub label: Option<String>,
+    /// A slug `window_target::is_workspace_slug` accepts.
+    pub workspace: String,
+    /// Its own frame, else its workspace's, else none for the declared default.
+    pub frame: Option<RememberedFrame>,
+}
+
+impl RestoredWindow {
+    /// Whether `main` may stand for this window: it was `main`, or an older
+    /// build recorded no label. A labelled extra window is rebuilt under its
+    /// own label, since `main` would read `main`'s window-scoped storage.
+    pub fn main_may_take(&self) -> bool {
+        self.label
+            .as_deref()
+            .is_none_or(|label| label == crate::app_window::MAIN_WINDOW_LABEL)
+    }
+}
+
+/// The windows to restore, in order, with the label and frame each one wants.
 ///
-/// `main` takes the first, and every other entry becomes a new window. A slug
-/// the record cannot justify is dropped rather than trusted: the record is a
-/// file on disk, and every `window-*` webview holds the full IPC permission set
-/// on the gateway origin (ADR 0028).
+/// The entry labelled `main` comes first, since `main` takes the first. Nothing
+/// on the record is trusted: it is a file on disk, and every `window-*` webview
+/// holds the full IPC permission set on the gateway origin (ADR 0028).
+///
+/// - A slug that is not one drops its entry.
+/// - A label that is not one `app_window::is_restorable_label` accepts, or that
+///   an earlier entry already took, becomes a fresh label.
 ///
 /// `restore` is the launch decision. A login start comes up menu-bar-only with
 /// no window at all, so it restores nothing.
-pub fn restore_plan(
-    session: &WindowSession,
-    restore: bool,
-) -> Vec<(String, Option<RememberedFrame>)> {
+pub fn restore_plan(session: &WindowSession, restore: bool) -> Vec<RestoredWindow> {
     if !restore {
         return Vec::new();
     }
-    session
-        .open
-        .iter()
-        .filter(|id| crate::window_target::is_workspace_slug(id))
-        .map(|id| (id.clone(), session.geometry.get(id).cloned()))
-        .collect()
+    let mut taken: Vec<&str> = Vec::new();
+    let mut plan: Vec<RestoredWindow> = Vec::new();
+    for entry in &session.open {
+        if !crate::window_target::is_workspace_slug(&entry.workspace) {
+            continue;
+        }
+        let label = entry
+            .label
+            .as_deref()
+            .filter(|label| crate::app_window::is_restorable_label(label))
+            .filter(|label| !taken.contains(label));
+        taken.extend(label);
+        plan.push(RestoredWindow {
+            label: label.map(str::to_string),
+            workspace: entry.workspace.clone(),
+            frame: entry
+                .frame
+                .clone()
+                .or_else(|| session.geometry.get(&entry.workspace).cloned()),
+        });
+    }
+    plan.sort_by_key(|window| {
+        window.label.as_deref() != Some(crate::app_window::MAIN_WINDOW_LABEL)
+    });
+    plan
 }
 
 #[cfg(test)]
@@ -307,6 +417,32 @@ mod tests {
     }
 
     use crate::window_restore::Rect;
+
+    /// The workspace of each recorded window, in order.
+    fn workspaces(session: &WindowSession) -> Vec<&str> {
+        session.open.iter().map(|w| w.workspace.as_str()).collect()
+    }
+
+    /// Entries the way an older build recorded them: a slug each.
+    fn unlabelled(workspaces: &[&str]) -> Vec<OpenWindow> {
+        workspaces
+            .iter()
+            .map(|id| OpenWindow {
+                label: None,
+                workspace: id.to_string(),
+                frame: None,
+            })
+            .collect()
+    }
+
+    /// What `restore_plan` answers for an unlabelled entry.
+    fn fresh(workspace: &str, frame: Option<RememberedFrame>) -> RestoredWindow {
+        RestoredWindow {
+            label: None,
+            workspace: workspace.to_string(),
+            frame,
+        }
+    }
 
     fn rect(x: i64, y: i64, width: i64, height: i64) -> Rect {
         Rect {
@@ -370,7 +506,7 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(session.open, vec!["myws", "dev"]);
+        assert_eq!(workspaces(&session), vec!["myws", "dev"]);
         assert_eq!(
             frame_of(&session, "myws"),
             Some(held(rect(0, 0, 1200, 800)))
@@ -410,7 +546,7 @@ mod tests {
             Some(held(rect(643, -191, 1728, 1084)))
         );
         // Still open, and still first. Only the frame is held back.
-        assert_eq!(after.open, vec!["myws"]);
+        assert_eq!(workspaces(&after), vec!["myws"]);
     }
 
     // The other half, and the one that matters more. A held frame outliving
@@ -517,7 +653,7 @@ mod tests {
             frame_of(&after, "myws"),
             Some(held(rect(1763, 1473, 1728, 1084)))
         );
-        assert_eq!(after.open, vec!["myws"]);
+        assert_eq!(workspaces(&after), vec!["myws"]);
     }
 
     // Nothing better to hold, so the frame goes in, the same as a rescue.
@@ -549,7 +685,7 @@ mod tests {
                 "dev":{"x":1763,"y":1473,"width":1728,"height":1084}}}"#,
         );
         let session = read(tmp.path());
-        assert_eq!(session.open, vec!["myws", "dev"]);
+        assert_eq!(workspaces(&session), vec!["myws", "dev"]);
         assert_eq!(
             frame_of(&session, "myws"),
             Some(held(rect(0, 356, 1280, 1084)))
@@ -572,7 +708,7 @@ mod tests {
                 snapshot("window-2", "http://localhost:3210/", rect(0, 0, 1200, 800)),
             ],
         );
-        assert!(session.open.is_empty());
+        assert!(workspaces(&session).is_empty());
         assert!(session.geometry.is_empty());
     }
 
@@ -597,7 +733,7 @@ mod tests {
                 snapshot("main", "http://localhost:3210/a/", rect(0, 0, 1200, 800)),
             ],
         );
-        assert_eq!(session.open, vec!["a", "b", "c"]);
+        assert_eq!(workspaces(&session), vec!["a", "b", "c"]);
     }
 
     // A stale `open` entry would resurrect a window the user deliberately shut.
@@ -622,7 +758,7 @@ mod tests {
                 rect(0, 0, 1200, 800),
             )],
         );
-        assert_eq!(after.open, vec!["myws"]);
+        assert_eq!(workspaces(&after), vec!["myws"]);
     }
 
     // The size is remembered per WORKSPACE, not per open window: reopening one
@@ -648,7 +784,7 @@ mod tests {
                 rect(0, 0, 1200, 800),
             )],
         );
-        assert_eq!(after.open, vec!["myws"]);
+        assert_eq!(workspaces(&after), vec!["myws"]);
         assert_eq!(frame_of(&after, "dev"), Some(held(rect(100, 50, 900, 700))));
     }
 
@@ -677,7 +813,7 @@ mod tests {
                 rect(0, 0, 1200, 800),
             )],
         );
-        assert!(after.open.is_empty());
+        assert!(workspaces(&after).is_empty());
         // The sizes are still remembered for when either is opened again.
         assert_eq!(frame_of(&after, "dev"), Some(held(rect(0, 0, 900, 700))));
     }
@@ -699,7 +835,7 @@ mod tests {
         ];
         let before = capture(&WindowSession::default(), &live);
         assert_eq!(capture(&before, &live), before);
-        assert_eq!(before.open, vec!["myws", "dev"]);
+        assert_eq!(workspaces(&before), vec!["myws", "dev"]);
     }
 
     // ── When a capture is worth writing ──────────────────────────────────────
@@ -770,7 +906,7 @@ mod tests {
                 "geometry":{"myws":{"x":4050,"y":3250,"width":3456,"height":2168}}}"#,
         );
         let session = read(tmp.path());
-        assert_eq!(session.open, vec!["myws", "dev"]);
+        assert_eq!(workspaces(&session), vec!["myws", "dev"]);
         assert!(session.geometry.is_empty());
         // In points now, vacuously, so a capture can merge it without checking.
         assert_eq!(session.units, FrameUnits::LogicalPoints);
@@ -813,7 +949,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_raw(tmp.path(), r#"{"open":["myws"]}"#);
         let session = read(tmp.path());
-        assert_eq!(session.open, vec!["myws"]);
+        assert_eq!(workspaces(&session), vec!["myws"]);
         assert!(session.geometry.is_empty());
     }
 
@@ -857,7 +993,7 @@ mod tests {
     #[test]
     fn a_url_with_no_recorded_frame_asks_for_the_default() {
         let session = WindowSession {
-            open: vec!["myws".into()],
+            open: unlabelled(&["myws"]),
             geometry: BTreeMap::from([("myws".to_string(), held(rect(1, 2, 1200, 800)))]),
             units: FrameUnits::LogicalPoints,
         };
@@ -881,15 +1017,15 @@ mod tests {
     #[test]
     fn the_plan_pairs_each_workspace_with_its_frame() {
         let session = WindowSession {
-            open: vec!["myws".into(), "dev".into()],
+            open: unlabelled(&["myws", "dev"]),
             geometry: BTreeMap::from([("myws".to_string(), held(rect(1, 2, 1200, 800)))]),
             units: FrameUnits::LogicalPoints,
         };
         assert_eq!(
             restore_plan(&session, true),
             vec![
-                ("myws".to_string(), Some(held(rect(1, 2, 1200, 800)))),
-                ("dev".to_string(), None),
+                fresh("myws", Some(held(rect(1, 2, 1200, 800)))),
+                fresh("dev", None),
             ]
         );
     }
@@ -900,19 +1036,11 @@ mod tests {
     #[test]
     fn the_plan_drops_anything_that_is_not_a_workspace_slug() {
         let session = WindowSession {
-            open: vec![
-                "..".into(),
-                "a/b".into(),
-                "MyWs".into(),
-                "~".into(),
-                String::new(),
-                "http://evil.example".into(),
-                "ok".into(),
-            ],
+            open: unlabelled(&["..", "a/b", "MyWs", "~", "", "http://evil.example", "ok"]),
             geometry: BTreeMap::new(),
             units: FrameUnits::LogicalPoints,
         };
-        assert_eq!(restore_plan(&session, true), vec![("ok".to_string(), None)]);
+        assert_eq!(restore_plan(&session, true), vec![fresh("ok", None)]);
     }
 
     // A login start comes up menu-bar-only with no window (ADR 0072), and
@@ -920,10 +1048,159 @@ mod tests {
     #[test]
     fn a_launch_that_wants_no_window_restores_nothing() {
         let session = WindowSession {
-            open: vec!["myws".into()],
+            open: unlabelled(&["myws"]),
             geometry: BTreeMap::new(),
             units: FrameUnits::LogicalPoints,
         };
         assert!(restore_plan(&session, false).is_empty());
+    }
+
+    // ── one entry per window ─────────────────────────────────────────────────
+
+    const WINDOW_A: &str = "window-0123456789abcdef0123456789abcdef";
+    const WINDOW_B: &str = "window-fedcba9876543210fedcba9876543210";
+
+    // The reported defect. Two windows on one workspace came back as one, and
+    // the survivor could not say which window's thread it had been showing.
+    #[test]
+    fn two_windows_on_one_workspace_come_back_as_two_under_their_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = capture(
+            &WindowSession::default(),
+            &[
+                snapshot(
+                    WINDOW_A,
+                    "http://localhost:3210/dev/",
+                    rect(500, 0, 900, 700),
+                ),
+                snapshot("main", "http://localhost:3210/dev/", rect(0, 0, 1200, 800)),
+            ],
+        );
+        write(tmp.path(), &session);
+        let plan = restore_plan(&read(tmp.path()), true);
+        assert_eq!(
+            plan,
+            vec![
+                RestoredWindow {
+                    label: Some("main".to_string()),
+                    workspace: "dev".to_string(),
+                    frame: Some(held(rect(0, 0, 1200, 800))),
+                },
+                RestoredWindow {
+                    label: Some(WINDOW_A.to_string()),
+                    workspace: "dev".to_string(),
+                    frame: Some(held(rect(500, 0, 900, 700))),
+                },
+            ]
+        );
+    }
+
+    // A rescue holds back the window's OWN frame, not its workspace sibling's.
+    #[test]
+    fn a_rescued_window_keeps_its_own_held_frame() {
+        let before = capture(
+            &WindowSession::default(),
+            &[
+                snapshot("main", "http://localhost:3210/dev/", rect(0, 0, 1200, 800)),
+                snapshot(
+                    WINDOW_A,
+                    "http://localhost:3210/dev/",
+                    rect(900, -300, 900, 700),
+                ),
+            ],
+        );
+        let after = capture(
+            &before,
+            &[
+                snapshot("main", "http://localhost:3210/dev/", rect(0, 0, 1200, 800)),
+                rescued_snapshot(
+                    WINDOW_A,
+                    "http://localhost:3210/dev/",
+                    rect(900, 30, 900, 700),
+                ),
+            ],
+        );
+        assert_eq!(after.open[1].frame, Some(held(rect(900, -300, 900, 700))));
+    }
+
+    // Every `window-*` webview holds the full IPC permission set (ADR 0028), so
+    // a label this build could not have made is never rebuilt under.
+    #[test]
+    fn a_forged_label_restores_under_a_fresh_one() {
+        let session = WindowSession {
+            open: ["window-1", "url-preview-3", "window-../x", "Main", "evil"]
+                .iter()
+                .map(|label| OpenWindow {
+                    label: Some(label.to_string()),
+                    workspace: "dev".to_string(),
+                    frame: None,
+                })
+                .collect(),
+            ..WindowSession::default()
+        };
+        let plan = restore_plan(&session, true);
+        assert_eq!(plan.len(), 5);
+        assert!(plan.iter().all(|window| window.label.is_none()));
+    }
+
+    // Two windows cannot share a label, so a repeat restores as a fresh window
+    // rather than colliding with the first.
+    #[test]
+    fn a_repeated_label_restores_once_under_it() {
+        let session = WindowSession {
+            open: [WINDOW_A, WINDOW_A]
+                .iter()
+                .map(|label| OpenWindow {
+                    label: Some(label.to_string()),
+                    workspace: "dev".to_string(),
+                    frame: None,
+                })
+                .collect(),
+            ..WindowSession::default()
+        };
+        let labels: Vec<Option<String>> = restore_plan(&session, true)
+            .into_iter()
+            .map(|window| window.label)
+            .collect();
+        assert_eq!(labels, vec![Some(WINDOW_A.to_string()), None]);
+    }
+
+    // `main` takes the first entry, so the one recorded as `main` leads even
+    // when the file lists it later.
+    #[test]
+    fn the_window_recorded_as_main_restores_first() {
+        let session = WindowSession {
+            open: [(WINDOW_B, "b"), ("main", "a")]
+                .iter()
+                .map(|(label, id)| OpenWindow {
+                    label: Some(label.to_string()),
+                    workspace: id.to_string(),
+                    frame: None,
+                })
+                .collect(),
+            ..WindowSession::default()
+        };
+        let plan = restore_plan(&session, true);
+        assert_eq!(plan[0].label.as_deref(), Some("main"));
+        assert_eq!(plan[1].label.as_deref(), Some(WINDOW_B));
+    }
+
+    // A record an older build wrote, a slug per window, still reopens each
+    // workspace, at its workspace frame and under a fresh label.
+    #[test]
+    fn a_record_of_bare_slugs_restores_each_as_a_fresh_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
+            r#"{"open":["myws","dev"],"units":"logical-points",
+                "geometry":{"dev":{"x":1,"y":2,"width":900,"height":700}}}"#,
+        );
+        assert_eq!(
+            restore_plan(&read(tmp.path()), true),
+            vec![
+                fresh("myws", None),
+                fresh("dev", Some(held(rect(1, 2, 900, 700))))
+            ]
+        );
     }
 }

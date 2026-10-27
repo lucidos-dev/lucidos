@@ -59,6 +59,48 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### Prefill beats stay off while their misses are unexplained
+
+- **Added:** 2026-10-26
+- **Lives in:** `PREFILL_BEATS_ENABLED`, `prefill_memory` and `SkipReason::PrefillPaused`
+  in `crates/lucidos-engine/src/engine/event_wait/keep_alive.rs`;
+  `Remembered::PrefillPaused` in the adjacent `remembered_requests.rs`;
+  `CacheKeepAliveNotKeptReason::PrefillPaused` in
+  `crates/lucidos-engine/src/engine/thread_events/keep_alive_status.rs`;
+  and its text in `crates/lucidos-app/src/components/chat/CacheKeepAlive.tsx`.
+- **Impermanent because:** prefill beats missed caches that real requests read.
+  A live probe proved the cause: the old cut sorted the request's JSON keys,
+  and the gateway keys its cache on the raw bytes (ADR 0581 § Probe result).
+  The fix sends the turn's own bytes, and regression tests pin both cuts.
+- **Removal / resolution condition:** the fix has landed, so enable the
+  constant in its own change and watch a live beat hold the turn's cache.
+  Stop emitting `prefill_paused`, and remove its scheduling-only states.
+  Keep its wire variant and UI text so historical events and projections
+  remain readable. Update `thread-events.md` to mark it historical.
+- **Status:** `removed` 2026-10-26: the beat cut now sends the turn's own bytes
+  (10 of 10 first beats held, against 3 of 10 with sorted keys, Fisher p 0.003).
+  The switch and the scheduling-only states are deleted. The wire reason,
+  its generated union member and its UI text stay, marked historical.
+- **Investigation:** none.
+
+### Prefill byte-order probe
+
+- **Added:** 2026-10-26
+- **Lives in:** `crates/lucidos-engine/src/engine/event_wait/prefill_order_probe.rs`;
+  its route in `crates/lucidos-engine/src/api/claude_gateway.rs`;
+  `lucidos claude-gateway probe-prefill-order` in `crates/lucidos-cli/src/main.rs`
+  and `claude_gateway.rs`; its section in `system-knowhow/lucidos-cli.md`.
+  `ContextPurpose::PrefillProbe` stays after removal, so its rows still read.
+- **Impermanent because:** it answers one question. Does a prefill beat's key
+  order decide whether the Claude gateway serves it the turn's cache? Plan:
+  `docs/plans/2026-10-26-prefill-beat-byte-order-probe.md`.
+- **Removal / resolution condition:** the probe has run on the gateway and its
+  table is recorded in ADR 0581. Delete the module, route, command and doc
+  section, and keep the purpose as a retired variant.
+- **Status:** `removed` 2026-10-26. Key order was the cause: the turn's own
+  bytes held 10 of 10 first beats, sorted keys 3 of 10 (ADR 0581).
+- **Investigation:** none.
+
 ### Opus 5.5 ignores its single coding index row
 
 - **Added:** 2026-10-20

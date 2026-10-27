@@ -1,6 +1,7 @@
 import type { Request } from '@playwright/test';
 import { test, expect } from './fixtures';
 import { gotoWithRetry } from './helpers';
+import { SYSTEM_THEME_GRACE_MS } from './systemThemeGrace';
 
 // A `system` theme preference has to keep following the OS for the whole life
 // of the page. The two guards that make that safe are what this covers
@@ -15,9 +16,6 @@ import { gotoWithRetry } from './helpers';
 //
 // The `mobile-webkit` project is the closest automated stand-in for the
 // installed PWA, since it runs the same engine under an iPhone user agent.
-
-/** Long enough to cover the settle delay in `preferences.ts` and a repaint. */
-const SETTLE_GRACE_MS = 2_000;
 
 async function setHidden(page: import('./fixtures').Page, hidden: boolean): Promise<void> {
   await page.evaluate((h) => {
@@ -98,7 +96,7 @@ test.describe('system theme survives a late preference load', () => {
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
 
     await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'light', {
-      timeout: SETTLE_GRACE_MS,
+      timeout: SYSTEM_THEME_GRACE_MS,
     });
   });
 });
@@ -118,7 +116,7 @@ test.describe('system theme follows the OS', () => {
     await page.emulateMedia({ colorScheme: 'light' });
 
     await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'light', {
-      timeout: SETTLE_GRACE_MS,
+      timeout: SYSTEM_THEME_GRACE_MS,
     });
   });
 
@@ -131,7 +129,7 @@ test.describe('system theme follows the OS', () => {
 
     // The guard: nothing paints while the user is not looking. This is the
     // snapshot-pass flip, and applying it is the light flash.
-    await page.waitForTimeout(SETTLE_GRACE_MS);
+    await page.waitForTimeout(SYSTEM_THEME_GRACE_MS);
     await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'dark');
 
     // The repair: an iOS PWA is resumed rather than reloaded, so this is the
@@ -140,7 +138,7 @@ test.describe('system theme follows the OS', () => {
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
 
     await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'light', {
-      timeout: SETTLE_GRACE_MS,
+      timeout: SYSTEM_THEME_GRACE_MS,
     });
   });
 });

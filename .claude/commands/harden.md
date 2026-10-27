@@ -415,6 +415,8 @@ at **high** effort. It is the iteration's one review by your own model family,
 beside the other-model review (ADR 0476). Its target is `git diff main...HEAD`, or
 `.lucidos/review-target.diff` when Phase 0.4 or a later iteration built one.
 
+Treat [population check](../rules/build-for-users.md) violations as correctness findings of at least medium severity.
+
 - **Claude Code, first iteration of a full diff:** run it in ONE `Agent` subagent,
   so its file reads stay out of your long context. Tell it to read the skill
   file and follow it at high effort against the target. Also tell it that it

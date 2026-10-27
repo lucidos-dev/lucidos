@@ -10,6 +10,7 @@
 //! - Panic-safe task execution
 //! - Fresh task data fetch on each execution
 
+pub(crate) mod cut_fires;
 pub(crate) mod notification_plain_text;
 pub mod notifications;
 pub(crate) mod plugin_updates;
@@ -279,6 +280,8 @@ impl SchedulerManager {
 
         // Replay trigger lifecycle events to rebuild in-memory state
         self.replay_triggers_from_events().await?;
+
+        cut_fires::settle_cut_trigger_fires(&self.engine, &self.pool).await;
 
         // Name any replayed schedule that can never fire. Create and update
         // reject those now, so these are triggers stored before the guard

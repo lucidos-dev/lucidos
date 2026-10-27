@@ -629,7 +629,7 @@ pub(crate) fn forget_rescue(label: &str) {
 /// declared `main` window.
 ///
 /// Only `main` is in `tauri.conf.json`. Every other app window is built at run
-/// time and labelled `window-<n>`, so a plain `find` returns `None` for one and
+/// time and labelled `window-<uuid>`, so a plain `find` returns `None` for one and
 /// the clamp skips it. That made the clamp a no-op for the windows a session
 /// restore places, which are the ones whose rect came off a file on disk.
 ///
@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     // The clamp used to `find` the exact label and skip when it missed. Only
-    // `main` is declared, so it skipped every `window-<n>`: precisely the
+    // `main` is declared, so it skipped every `window-<uuid>`: precisely the
     // windows a session restore places from a rect read off disk.
     #[test]
     fn a_runtime_window_is_judged_against_the_declared_main_config() {

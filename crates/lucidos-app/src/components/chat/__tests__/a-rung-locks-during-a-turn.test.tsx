@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /**
  * A started coding-agent thread keeps its rung while a turn runs (ADR 0542).
- * The list still opens, but a pick or a step says why and records nothing.
+ * The disabled pill explains the lock and records nothing.
  * Once the thread is idle a pick records again.
  */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -16,6 +16,13 @@ const response: CodingAgentCommandsResponse = {
     params: [{ key: 'model', options: [
       { value: 'default', label: 'Default', description: '' },
       { value: 'claude-opus-5-6', label: 'Opus 5.6', description: '', reasoning_efforts: ['medium', 'high'] },
+    ] }],
+  }, {
+    subtype: 'set_reasoning_effort',
+    label: 'Reasoning effort',
+    params: [{ key: 'effort', options: [
+      { value: 'medium', label: 'Medium', description: 'Balanced' },
+      { value: 'high', label: 'High', description: 'Deeper' },
     ] }],
   }],
   builtin_commands: [],
@@ -94,18 +101,54 @@ async function pickHigh(): Promise<void> {
 }
 
 describe('the rung pill on a started coding-agent thread', () => {
-  it.each(LOCKED)('opens, but changes nothing, while the thread is %s', async (_state, seed) => {
+  it.each(LOCKED)('stays visible and disabled while the thread is %s', async (_state, seed) => {
     seed();
     render(<RungControl threadId="t1" codingAgent="claude-code" />, host);
     await settle();
-    expect(trigger().hasAttribute('aria-disabled')).toBe(false);
-
-    await pickHigh();
+    expect(trigger().getAttribute('aria-disabled')).toBe('true');
+    expect(trigger().getAttribute('data-tooltip')).toMatch(/while a turn runs/);
+    expect(host.querySelector('.rung-name')!.textContent).toBe('Opus 5.6');
+    trigger().click();
     document.querySelector<HTMLElement>('.rung-step:last-child')!.click();
     await settle();
     expect(sendCodingAgentControl).not.toHaveBeenCalled();
     expect(fetchSwitchEstimate).not.toHaveBeenCalled();
-    expect(toasts.value.map(t => t.message).join(' ')).toMatch(/while a turn runs/);
+    expect(document.querySelector('.control-dropdown')).toBeNull();
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('closes an open list when the turn locks and keeps the same trigger', async () => {
+    seedThread('idle');
+    render(<RungControl threadId="t1" codingAgent="claude-code" />, host);
+    await settle();
+    const before = trigger();
+    before.click();
+    await settle();
+    expect(document.querySelector('.control-dropdown')).not.toBeNull();
+    seedThread('running');
+    await settle();
+    expect(trigger()).toBe(before);
+    expect(trigger().getAttribute('aria-disabled')).toBe('true');
+    expect(trigger().getAttribute('aria-expanded')).toBe('false');
+    expect(sendCodingAgentControl).not.toHaveBeenCalled();
+  });
+
+  it('keeps keyboard focus through a model change', async () => {
+    seedThread('idle');
+    render(<RungControl threadId="t1" codingAgent="claude-code" />, host);
+    await settle();
+    let complete!: (ok: boolean) => void;
+    sendCodingAgentControl.mockImplementationOnce(() => new Promise<boolean>(resolve => { complete = resolve; }));
+    const button = trigger();
+    button.focus();
+    button.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    await settle();
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    expect(document.activeElement).toBe(button);
+    complete(true);
+    await settle();
+    expect(button.getAttribute('aria-disabled')).toBe('false');
+    expect(document.activeElement).toBe(button);
   });
 
   it('records a pick on the engine once the thread is idle', async () => {

@@ -18,11 +18,14 @@ import {
   type TailscaleInfo,
 } from '../../utils/tauri';
 import { getNetworkConfig, getTailnetStatus } from '../../api/client';
+import { getExternalAddress, type ExternalAddressInfo } from '../../api/client/control';
 import { SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
 import { Explainer } from '../shared/Explainer';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { AddDeviceSection } from './AddDeviceSection';
+import { ExternalAddressSection } from './ExternalAddressSection';
+import { NetworkAccessPage } from './NetworkAccessPage';
 import type { PairTarget } from './AddDeviceSection';
 import type { NetworkConfigResponse, TailnetStatusResponse } from '../../api/types';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -32,6 +35,11 @@ import type { Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
 import { openSettingsSubview } from '../../store/actions/menu';
+
+// Served under `/<slug>/`, so `/~/…` reaches the gateway rather than the
+// engine. Same rule, and the same reasoning, as `WorkspaceSwitcher`'s
+// `canList`.
+const gatewayIsOurOrigin = WORKSPACE_ID !== null;
 
 const TAILSCALE_DOWNLOAD_URL = 'https://tailscale.com/download';
 const TAILSCALE_IOS_URL = 'https://apps.apple.com/app/tailscale/id1470499037';
@@ -275,10 +283,14 @@ function originOf(url: string): string | null {
 
 /** Pure: the origin to send a NEW device to, so it can pair.
  *
- *  Tailscale first, then the LAN, then nothing. Both branches answer with an
- *  address some other device can open, which is the whole difficulty: the
- *  machine minting a pairing code is usually reading this page over loopback,
- *  and a QR pointing at `127.0.0.1` helps nobody.
+ *  ADR 0550's one order, which `lucidos pair --qr` shares:
+ *
+ *  1. `external`, this gateway's external address, when the user set one. An
+ *     address someone typed is explicit intent, so it wins.
+ *  2. The tailnet origin ({@link tailnetOrigin}).
+ *  3. The reader's own origin, when it is not loopback. The page arrived
+ *     through it, so it reaches this gateway.
+ *  4. The LAN address, then nothing.
  *
  *  `lan` is whatever the Local network row resolved to. It reaches here on the
  *  packaged desktop app alone, since detecting a LAN address needs the bridge.
@@ -287,12 +299,23 @@ function originOf(url: string): string | null {
  *
  *  Every branch must reach the gateway THIS page is served by. A gateway keeps
  *  its own paired devices and its own pending codes, and two run on one
- *  machine. A QR aimed at the other one carries a code it never minted. The
- *  two plain-HTTP branches hold that by keeping this gateway's port. The serve
- *  URL holds it because the engine publishes one only after proving it reached
- *  this very workspace (`verified_workspace_serve_url`). */
-export function pairingOrigin(input: TailnetInput & { lan: LanRowState | null }): string | null {
-  return tailnetOrigin(input) ?? (input.lan?.kind === 'url' ? input.lan.url : null);
+ *  machine. The external address is stored per gateway, and its save is
+ *  refused when another gateway answers there. The plain-HTTP branches keep
+ *  this gateway's port. The serve URL holds it because the engine publishes one
+ *  only after proving it reached this very workspace
+ *  (`verified_workspace_serve_url`). */
+export function pairingOrigin(
+  input: TailnetInput & { external: string | null; lan: LanRowState | null },
+): string | null {
+  const reader = isLoopbackHostname(input.here.hostname)
+    ? null
+    : originAtHost(input.here, input.here.hostname);
+  return (
+    input.external ??
+    tailnetOrigin(input) ??
+    reader ??
+    (input.lan?.kind === 'url' ? input.lan.url : null)
+  );
 }
 
 /** The sentence under a tailnet URL, by what that address can actually do.
@@ -353,8 +376,9 @@ export type TailscaleRowState =
   /** Nothing installed: offer the download. */
   | { kind: 'get' }
   /** Installed but not on a tailnet. `canRun` means we can drive the sign-in
-   *  ourselves; without a CLI the user does it in the Tailscale app. */
-  | { kind: 'sign-in'; canRun: boolean }
+   *  ourselves; without a CLI the user does it in the Tailscale app. `reason`
+   *  is Tailscale's own state, in one sentence. */
+  | { kind: 'sign-in'; canRun: boolean; reason: string | null }
   /** On a tailnet, but nothing is serving HTTPS yet. */
   | { kind: 'expose'; canRun: boolean; magicDnsName: string | null }
   /** On a tailnet AND proven to be serving. */
@@ -372,7 +396,9 @@ export type TailscaleRowState =
  *  available, so being on a tailnet always wins over an install offer. */
 export function tailscaleRowState(ts: TailscaleInfo): TailscaleRowState {
   if (!ts.on_tailnet) {
-    return ts.installed ? { kind: 'sign-in', canRun: ts.cli_available } : { kind: 'get' };
+    return ts.installed
+      ? { kind: 'sign-in', canRun: ts.cli_available, reason: ts.reason }
+      : { kind: 'get' };
   }
   if (ts.serve_url) return { kind: 'serving', url: ts.serve_url, canRun: ts.cli_available };
   return { kind: 'expose', canRun: ts.cli_available, magicDnsName: ts.magic_dns_name };
@@ -387,30 +413,32 @@ export function tailscaleRowState(ts: TailscaleInfo): TailscaleRowState {
  *  fetch has not landed yet is a claim we cannot support. */
 export type HostTailnetState =
   | { kind: 'on-tailnet'; ip: string }
-  | { kind: 'no-tailnet' }
+  | { kind: 'no-tailnet'; reason: string | null }
   | { kind: 'unknown' };
 
 /** Pure: derive the host's tailnet state from `GET /api/v1/network-config`.
  *
- *  `detected_tailscale_ip` is the engine's own reading of its interface list
- *  (`lucidos_tailscale::tailnet_ipv4`), which requires BOTH a Tailscale
- *  interface and the `100.64/10` range. So it is an interface-checked fact
- *  arriving over plain HTTP, which is what lets this section render in a
- *  browser with no Tauri bridge at all. */
+ *  `detected_tailscale_ip` is the address Tailscale itself reported to the
+ *  engine, held by that machine (`lucidos_tailscale::bindable_tailnet_ipv4`).
+ *  It arrives over plain HTTP, which is what lets this section render in a
+ *  browser with no Tauri bridge at all. `reason` comes from
+ *  `GET /api/v1/tailnet-status`, and is null until that lands. */
 export function hostTailnetState(
   config: Loadable<{ detected_tailscale_ip: string | null }>,
+  reason: string | null,
 ): HostTailnetState {
   if (config.status !== 'loaded') return { kind: 'unknown' };
   const ip = config.data.detected_tailscale_ip;
-  return ip ? { kind: 'on-tailnet', ip } : { kind: 'no-tailnet' };
+  return ip ? { kind: 'on-tailnet', ip } : { kind: 'no-tailnet', reason };
 }
 
-/** Pure: is this a MagicDNS name?
+/** Pure: is this a stock Tailscale MagicDNS name?
  *
- *  One of the three proofs behind {@link deviceSetupState}. A MagicDNS name
- *  resolves only on a device signed in to the tailnet that owns it, so being
- *  served at `<machine>.<tailnet>.ts.net` is proof that Tailscale is installed
- *  and connected right here.
+ *  Part of one of the three proofs behind {@link deviceSetupState}. A MagicDNS
+ *  name resolves only on a device signed in to the tailnet that owns it. So
+ *  being served at `<machine>.<tailnet>.ts.net` proves that Tailscale is
+ *  installed and connected right here. A self-hosted control server picks its
+ *  own suffix, which the exact match against the host's reported name covers.
  *
  *  Deliberately does NOT match a bare `100.64/10` host. That range is real
  *  CGNAT space an ISP can hand to a physical interface, so the range alone
@@ -464,10 +492,11 @@ export type DeviceSetupState =
  *  1. **Loopback**: the reader is the host (see {@link isLoopbackHostname}),
  *     which short-circuits everything below. Whatever the host's tailnet state
  *     is, it is reported by concern 1 and not by an install offer here.
- *  2. **A MagicDNS name** ({@link isTailnetHostname}).
- *  3. **The host's own tailnet address**, matched exactly. The engine read that
- *     address off a Tailscale interface, and this request arrived at it, so
- *     this device is on that tailnet. This is the proof the page was missing:
+ *  2. **A MagicDNS name**: the host's own, as Tailscale reported it, matched
+ *     exactly, or any stock `.ts.net` name ({@link isTailnetHostname}).
+ *  3. **The host's own tailnet address**, matched exactly. Tailscale reported
+ *     that address to the engine, and this request arrived at it, so this
+ *     device is on that tailnet. This is the proof the page was missing:
  *     a gateway bound to its tailnet address serves every remote device at a
  *     bare `100.x` host, and every one of them was being told to install
  *     Tailscale.
@@ -490,12 +519,14 @@ export function deviceSetupState(device: {
   standalone: boolean;
   secureContext: boolean;
   hostTailnetIp: string | null;
+  hostMagicDnsName: string | null;
 }): DeviceSetupState {
   const hostname = device.hostname.trim();
   if (isLoopbackHostname(hostname)) return { kind: 'same-machine' };
+  const isHost = (name: string | null) =>
+    name !== null && hostname.toLowerCase() === name.trim().toLowerCase();
   const onTailnet =
-    isTailnetHostname(hostname) ||
-    (device.hostTailnetIp !== null && hostname === device.hostTailnetIp.trim());
+    isTailnetHostname(hostname) || isHost(device.hostTailnetIp) || isHost(device.hostMagicDnsName);
   if (!onTailnet) return { kind: 'join-tailnet' };
   if (device.standalone) return { kind: 'ready', hostname };
   return device.secureContext
@@ -632,6 +663,7 @@ function HostTailnetRow({
   if (readerIsHost) return <InstallTailscaleRow onHost={true} />;
   return (
     <InfoRow title="This machine is not on a tailnet">
+      {state.reason ? <>{state.reason}{' '}</> : null}
       The machine running Lucidos has no tailnet address, so no device can reach it over Tailscale.
       Install Tailscale there and sign it in to your tailnet.
     </InfoRow>
@@ -775,6 +807,9 @@ export function MobileAccessPage() {
   // platform. Its own request rather than fields on `network-config`, which the
   // bind editor below also fetches and which must stay a cheap local read.
   const [tailnetStatus, setTailnetStatus] = useState<Loadable<TailnetStatusResponse>>({ status: 'not-loaded' });
+  // This gateway's external address (ADR 0550). A gateway setting, read
+  // through its control plane, so only behind the gateway.
+  const [externalAddress, setExternalAddressState] = useState<Loadable<ExternalAddressInfo>>({ status: 'not-loaded' });
   const [busy, setBusy] = useState<null | 'up'>(null);
   // The Expose run's state lives in the store, not here: a run can spend minutes
   // waiting for a tailnet approval, it narrates itself on the brand badge and the
@@ -796,16 +831,18 @@ export function MobileAccessPage() {
   // host's address as ONE of its three proofs and is otherwise independent of
   // it, so a `network-config` that never landed costs that one proof and leaves
   // the rest of the derivation intact.
+  const tailnet = tailnetStatus.status === 'loaded' ? tailnetStatus.data : null;
   const host: HostTailnetState = showMachineHalf && connectInfo.status === 'loaded'
     ? (connectInfo.data.tailscale.tailnet_ip
         ? { kind: 'on-tailnet', ip: connectInfo.data.tailscale.tailnet_ip }
-        : { kind: 'no-tailnet' })
-    : hostTailnetState(netConfig);
+        : { kind: 'no-tailnet', reason: connectInfo.data.tailscale.reason })
+    : hostTailnetState(netConfig, tailnet?.reason ?? null);
   const device: DeviceSetupState = deviceSetupState({
     hostname: window.location.hostname,
     standalone: isStandalone(),
     secureContext: window.isSecureContext,
     hostTailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
+    hostMagicDnsName: tailnet?.magic_dns_name ?? null,
   });
   // Reachability is NOT implied by tailnet membership: under a loopback bind
   // nothing off this machine can connect, however healthy Tailscale is. This
@@ -834,10 +871,6 @@ export function MobileAccessPage() {
         connectInfo.data.port,
         )
       : null;
-  // Served under `/<slug>/`, so `/~/…` reaches the gateway rather than the
-  // engine. Same rule, and the same reasoning, as `WorkspaceSwitcher`'s
-  // `canList`.
-  const gatewayIsOurOrigin = WORKSPACE_ID !== null;
   // The first read that failed, or null. Connect URLs renders it, and Add a
   // device uses it to say "could not work out an address" instead of "there
   // is none". Those are different claims and only one of them is supportable.
@@ -845,6 +878,19 @@ export function MobileAccessPage() {
     netConfig.status === 'failed' ? netConfig.error
     : tailnetStatus.status === 'failed' ? tailnetStatus.error
     : showMachineHalf && connectInfo.status === 'failed' ? connectInfo.error
+    : null;
+  const external = externalAddress.status === 'loaded' ? externalAddress.data.external_address : null;
+  const tailnetInput = (status: TailnetStatusResponse): TailnetInput => ({
+    here: window.location,
+    tailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
+    magicDnsName: status.magic_dns_name,
+    workspaceServeUrl: status.workspace_serve_url,
+    bind,
+  });
+  // What pairing falls back to with no external address, which the field
+  // shows as its default.
+  const tailnetDefault = tailnetStatus.status === 'loaded'
+    ? tailnetOrigin(tailnetInput(tailnetStatus.data))
     : null;
 
   /** Where a NEW device should point.
@@ -855,16 +901,13 @@ export function MobileAccessPage() {
    *  `location.port` would be the engine's, which builds a dead address. */
   function pairTarget(): PairTarget {
     if (!gatewayIsOurOrigin) return { kind: 'none' };
-    if (connectReadsError !== null) return { kind: 'unknown' };
-    if (!connectUrlsReady || tailnetStatus.status !== 'loaded') return { kind: 'resolving' };
-    const url = pairingOrigin({
-      here: window.location,
-      tailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
-      magicDnsName: tailnetStatus.data.magic_dns_name,
-      workspaceServeUrl: tailnetStatus.data.workspace_serve_url,
-      bind,
-      lan,
-    });
+    // A failed external read is unknown too: the user may have set an
+    // address, and a QR that silently ignored it would point elsewhere.
+    if (connectReadsError !== null || externalAddress.status === 'failed') return { kind: 'unknown' };
+    if (!connectUrlsReady || tailnetStatus.status !== 'loaded' || externalAddress.status !== 'loaded') {
+      return { kind: 'resolving' };
+    }
+    const url = pairingOrigin({ ...tailnetInput(tailnetStatus.data), external, lan });
     return url === null ? { kind: 'none' } : { kind: 'origin', url };
   }
 
@@ -886,6 +929,13 @@ export function MobileAccessPage() {
       (data) => setTailnetStatus({ status: 'loaded', data }),
       (e) => setTailnetStatus(toFailed(e)),
     ));
+    if (gatewayIsOurOrigin) {
+      setExternalAddressState(loadingIfFresh);
+      reads.push(getExternalAddress().then(
+        (data) => setExternalAddressState({ status: 'loaded', data }),
+        (e) => setExternalAddressState(toFailed(e)),
+      ));
+    }
     // Not a swallowed error: off the desktop app there is nothing to fetch
     // here, so there is no failure to report. Setting a failed state would
     // render the error card for a bridge this platform was never going to have.
@@ -1016,18 +1066,11 @@ export function MobileAccessPage() {
     }
     const tailnet = tailnetStatus.data;
     const connect = connectInfo.status === 'loaded' ? connectInfo.data : null;
-    const tailnetRows = tailnetConnectRows({
-      scope: SCOPE_PATH,
-      here: window.location,
-      tailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
-      magicDnsName: tailnet.magic_dns_name,
-      workspaceServeUrl: tailnet.workspace_serve_url,
-      bind,
-    });
+    const tailnetRows = tailnetConnectRows({ ...tailnetInput(tailnet), scope: SCOPE_PATH });
     // Nothing honest to list. Says so rather than rendering a bare heading, and
     // rather than vanishing: the anchor is a search destination, so an absent
     // section drops the reader at the top of the page with no explanation.
-    if (connect === null && tailnetRows.length === 0) {
+    if (connect === null && tailnetRows.length === 0 && external === null) {
       return settled(
         <div class="settings-section-desc">
         No address reaches this workspace from another device yet. The Tailscale section
@@ -1086,6 +1129,15 @@ export function MobileAccessPage() {
         {tailnetRows.map((row) => (
           <UrlRow key={row.url} label={row.label} url={row.url} hint={row.hint} />
         ))}
+        {/* The user's own route, as ADR 0550 lists each source on its own row.
+            Its reach is the user's claim, which the save probed. */}
+        {external !== null && (
+          <UrlRow
+            label="External address"
+            url={workspaceUrlAt(external, SCOPE_PATH)}
+            hint={external.startsWith('https:') ? 'your own route · HTTPS' : 'your own route · plain HTTP, so no app install or push'}
+          />
+        )}
       </div>,
     );
   }
@@ -1136,6 +1188,7 @@ export function MobileAccessPage() {
             <div class="list-row-info" style={{ gap: '0.5rem' }}>
               <div class="title">Sign in to Tailscale</div>
               <div class="list-row-details list-row-details-prose">
+                {row.reason ? <>{row.reason}{' '}</> : null}
                 {row.canRun
                   ? 'Opens a browser to join your tailnet. Optionally paste a pre-authorized auth key.'
                   : 'Open the Tailscale app in your menu bar and sign in there. This Mac has no Tailscale command-line tool, which is what we would need to do it for you.'}
@@ -1266,6 +1319,17 @@ export function MobileAccessPage() {
       </div>
 
       <DeviceStepsSection state={device} />
+
+      <NetworkAccessPage />
+
+      {/* Last, because most setups never need it: with Tailscale, pairing
+          already uses the tailnet address. */}
+      <ExternalAddressSection
+        available={gatewayIsOurOrigin}
+        info={externalAddress}
+        tailnetDefault={tailnetDefault}
+        onSaved={(data) => setExternalAddressState({ status: 'loaded', data })}
+      />
     </>
   );
 }

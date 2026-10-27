@@ -15,6 +15,12 @@
   the one the thread's latest cache write reported, never the provider's. An
   unreported one gets no beats.
 
+- **Amended by**: [0581](0581-keep-alive-never-pings-a-cache-it-cannot-read.md).
+  Prefill beats pause until a reproduced miss has a verified fix. A missed beat ends its run.
+- **Amended by**: [0580](0580-keep-alive-missed-ping-is-thread-scoped.md). A
+  missed beat ends its own thread's run only. Three in a row pause the
+  provider for an hour.
+
 ## Context
 
 ADRs 0470 to 0547 keep a Claude Code session's prompt cache warm while it

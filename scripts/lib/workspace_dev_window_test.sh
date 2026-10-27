@@ -23,12 +23,15 @@ source "$SCRIPT_DIR/workspace.sh"
 SANDBOX="$(cd "$(mktemp -d)" && pwd -P)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
+# Exercise macOS layout on every test host. No platform commands run.
+uname() { echo Darwin; }
+
 FEED=""
 _dev_window_ps_feed() { [ -n "$FEED" ] || return 0; printf '%s\n' "$FEED"; }
 
 # ── select_dev_windows ─────────────────────────────────────────────────
-BIN="$SANDBOX/checkout/.launch/debug/plain/lucidos-app"
-SPACED="$SANDBOX/my checkout/.launch/debug/plain/lucidos-app"
+BIN="$(dev_window_bin "$SANDBOX/checkout/.launch/debug/plain")"
+SPACED="$(dev_window_bin "$SANDBOX/my checkout/.launch/debug/plain")"
 
 FEED="101 $BIN
 102 $BIN --some-flag
@@ -73,19 +76,36 @@ out="$(
 )"
 if [ "$out" = "reached [101]" ]; then pass "caller carried on"; else fail "output '$out'"; fi
 
+echo "test: relaunch stops bundled and legacy windows exactly once"
+LEGACY="$SANDBOX/checkout/.launch/debug/plain/lucidos-app"
+FEED="101 $BIN
+102 $LEGACY
+103 $SANDBOX/other/.launch/debug/plain/lucidos-app"
+out="$(
+    is_protected_host_pid() { return 1; }
+    kill() { printf 'stopped %s\n' "$1"; }
+    stop_dev_windows "$BIN" "$LEGACY" "$BIN"
+)"
+if [ "$(printf '%s\n' "$out" | sed -n 's/^stopped //p' | tr '\n' ' ')" = "101 102 " ]; then
+    pass "both window paths stopped, peer untouched"
+else
+    fail "wrong windows stopped: $out"
+fi
+
 # ── publish_dev_window_binary ──────────────────────────────────────────
 inode() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
 
-PUB="$SANDBOX/publish"
+PUB="$SANDBOX/publish with spaces"
+PUBLISHED="$(dev_window_bin "$PUB/launch")"
 mkdir -p "$PUB/launch"
 printf 'window v1' > "$PUB/built"
-publish_dev_window_binary "$PUB/built" "$PUB/launch/lucidos-app"
-first="$(inode "$PUB/launch/lucidos-app")"
+publish_dev_window_binary "$PUB/built" "$PUB/launch"
+first="$(inode "$PUBLISHED")"
 
 echo "test: a rebuild with identical bytes leaves the published file alone"
 printf 'window v1' > "$PUB/built"
-publish_dev_window_binary "$PUB/built" "$PUB/launch/lucidos-app"
-if [ "$(inode "$PUB/launch/lucidos-app")" = "$first" ]; then
+publish_dev_window_binary "$PUB/built" "$PUB/launch"
+if [ "$(inode "$PUBLISHED")" = "$first" ]; then
     pass "same file, so a running window stays put"
 else
     fail "the file was replaced, so the next switch would relaunch the window for nothing"
@@ -94,17 +114,99 @@ fi
 echo "test: a changed binary is published as a new file, stamped at publish time"
 printf 'window v2' > "$PUB/built"
 touch -t 200001010000 "$PUB/built"
-publish_dev_window_binary "$PUB/built" "$PUB/launch/lucidos-app"
-if [ "$(inode "$PUB/launch/lucidos-app")" != "$first" ] \
-    && [ "$(cat "$PUB/launch/lucidos-app")" = "window v2" ]; then
+publish_dev_window_binary "$PUB/built" "$PUB/launch"
+if [ "$(inode "$PUBLISHED")" != "$first" ] \
+    && [ "$(cat "$PUBLISHED")" = "window v2" ]; then
     pass "new file with the new bytes"
 else
     fail "expected a new file holding 'window v2'"
 fi
-if [ "$PUB/launch/lucidos-app" -nt "$PUB/built" ]; then
+if [ "$PUBLISHED" -nt "$PUB/built" ]; then
     pass "mtime is the publish, not the link"
 else
     fail "the published file kept the build's mtime"
+fi
+
+echo "test: macOS launch path is a bundle, never the bare binary"
+if [ "$PUBLISHED" = "$PUB/launch/Lucidos Dev.app/Contents/MacOS/lucidos-app" ] \
+    && [ -x "$PUBLISHED" ] && [ ! -e "$PUB/launch/lucidos-app" ]; then
+    pass "only bundled executable published"
+else
+    fail "invalid launch layout: $PUBLISHED"
+fi
+
+echo "test: bundle metadata describes an accessible dev application"
+if python3 - "$PUB/launch/Lucidos Dev.app/Contents/Info.plist" <<'PYTEST'
+import plistlib
+import sys
+with open(sys.argv[1], "rb") as f:
+    info = plistlib.load(f)
+assert info["CFBundleIdentifier"] == "com.lucidos.dev-launcher"
+assert info["CFBundleName"] == "Lucidos Dev"
+assert info["CFBundleExecutable"] == "lucidos-app"
+assert info["CFBundlePackageType"] == "APPL"
+assert info["NSHighResolutionCapable"] is True
+PYTEST
+then
+    pass "valid plist with dev identity"
+else
+    fail "missing or invalid bundle metadata"
+fi
+
+echo "test: bundled sibling links resolve to this variant's existing binaries"
+for sibling in lucidos-engine lucidos-gateway lucidos; do
+    printf '%s' "$sibling" > "$PUB/launch/$sibling"
+    linked="$(dirname "$PUBLISHED")/$sibling"
+    if [ -L "$linked" ] && [ "$(cat "$linked")" = "$sibling" ]; then
+        pass "$sibling resolves beside the window"
+    else
+        fail "$sibling link is absent or broken"
+    fi
+done
+
+echo "test: missing build output fails without disturbing the published app"
+if publish_dev_window_binary "$PUB/missing" "$PUB/launch"; then
+    fail "missing build output reported success"
+elif [ "$(cat "$PUBLISHED")" = "window v2" ]; then
+    pass "previous window preserved"
+else
+    fail "previous window was modified"
+fi
+
+echo "test: non-macOS publishing keeps the existing flat layout"
+if (
+    uname() { echo Linux; }
+    publish_dev_window_binary "$PUB/built" "$PUB/linux" &&
+        [ "$(dev_window_bin "$PUB/linux")" = "$PUB/linux/lucidos-app" ] &&
+        [ "$(cat "$PUB/linux/lucidos-app")" = "window v2" ] &&
+        [ ! -d "$PUB/linux/Lucidos Dev.app" ]
+); then
+    pass "Linux layout unchanged"
+else
+    fail "Linux layout changed"
+fi
+
+echo "test: publishing another variant leaves this window unchanged"
+publish_dev_window_binary "$PUB/built" "$PUB/other-variant"
+if [ "$(cat "$(dev_window_bin "$PUB/other-variant")")" = "window v2" ] \
+    && [ "$(inode "$PUBLISHED")" != "$(inode "$(dev_window_bin "$PUB/other-variant")")" ]; then
+    pass "separate variant binaries"
+else
+    fail "variants share an executable"
+fi
+
+test_first_window_build() {
+    local PROJECT_DIR="$SANDBOX/first-window"
+    mkdir -p "$PROJECT_DIR/target/debug"
+    run_dev_window_cargo_build() { printf first > "$PROJECT_DIR/target/debug/lucidos-app"; }
+    build_dev_window "$PROJECT_DIR/.launch/debug/plain" &&
+        [ "$(cat "$(dev_window_bin "$PROJECT_DIR/.launch/debug/plain")")" = first ]
+}
+echo "test: first window build reads Cargo's flat output and publishes a bundle"
+if (test_first_window_build); then
+    pass "first build publishes Cargo output inside the bundle"
+else
+    fail "first build did not publish the bundle"
 fi
 
 # ── build_or_find_engine builds the window only where one was published ─
@@ -143,25 +245,37 @@ fi
 echo "test: a checkout with a published window compiles it with the engine, before publishing"
 WITH_WINDOW="$SANDBOX/with-window"
 mkdir -p "$WITH_WINDOW/target/debug" "$WITH_WINDOW/.launch/debug/plain"
+WITH_WINDOW_BIN="$(dev_window_bin "$WITH_WINDOW/.launch/debug/plain")"
 printf 'window old' > "$WITH_WINDOW/.launch/debug/plain/lucidos-app"
 out="$(run_build "$WITH_WINDOW" 0)"
 order="$(printf '%s\n' "$out" | grep -xE 'engine|window|published' | tr '\n' ' ')"
 if [ "$order" = "engine window published " ] \
-    && [ "$(cat "$WITH_WINDOW/.launch/debug/plain/lucidos-app")" = "window built" ]; then
+    && [ "$(cat "$WITH_WINDOW_BIN")" = "window built" ]; then
     pass "engine, window, then publish, and the new window is published"
 else
-    fail "order '$order', published '$(cat "$WITH_WINDOW/.launch/debug/plain/lucidos-app")'"
+    fail "order '$order', published '$(cat "$WITH_WINDOW_BIN")'"
+fi
+
+echo "test: a bundled window remains opted into subsequent builds"
+rm "$WITH_WINDOW/.launch/debug/plain/lucidos-app"
+printf 'window older' > "$WITH_WINDOW_BIN"
+out="$(run_build "$WITH_WINDOW" 0)"
+if printf '%s\n' "$out" | grep -qx window \
+    && [ "$(cat "$WITH_WINDOW_BIN")" = "window built" ]; then
+    pass "bundled window rebuilt without a bare marker"
+else
+    fail "bundle-only opt-in lost: $out"
 fi
 
 echo "test: a failed window build fails the whole build and publishes nothing"
-printf 'window old' > "$WITH_WINDOW/.launch/debug/plain/lucidos-app"
+printf 'window old' > "$WITH_WINDOW_BIN"
 if out="$(run_build "$WITH_WINDOW" 1)"; then
     fail "the build reported success"
 else
     pass "the build failed"
 fi
 if printf '%s\n' "$out" | grep -qx published \
-    || [ "$(cat "$WITH_WINDOW/.launch/debug/plain/lucidos-app")" != "window old" ]; then
+    || [ "$(cat "$WITH_WINDOW_BIN")" != "window old" ]; then
     fail "it published after a failed window build: $out"
 else
     pass "the previous version stays whole"

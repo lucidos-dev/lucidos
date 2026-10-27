@@ -3,7 +3,7 @@
 //! it. The CLI keeps no copy of the ordering: every rung and band comes from
 //! `GET /api/v1/intelligence-ladder` (ADR 0500, ADR 0525).
 
-use crate::http::client as http_client;
+use crate::http::{client as http_client, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
 /// The reason slug the engine puts on a pick off the ladder.
@@ -174,7 +174,7 @@ fn fetch(
         request = request.header(crate::http::HEADER_TARGET_WORKSPACE, target);
     }
     let resp = request
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("GET {url} failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {

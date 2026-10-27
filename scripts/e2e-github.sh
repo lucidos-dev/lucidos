@@ -230,6 +230,10 @@ for s in "${suites[@]}"; do
     fi
     remote_suites+=("$s")
 done
+if [ -z "$attach_run" ] && [ "${#remote_suites[@]}" -eq 0 ] && [ "${#local_specs[@]}" -eq 0 ]; then
+    echo "ERROR: nothing to run: every selected spec needs this host, and --commit runs no local leg." >&2
+    exit "$E2E_GITHUB_NO_VERDICT_EXIT"
+fi
 
 # The main check records coverage, and builds /harden's map from it. Any other
 # run records it under LUCIDOS_E2E_COVERAGE, into its output only.

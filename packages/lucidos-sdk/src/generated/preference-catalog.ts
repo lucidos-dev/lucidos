@@ -69,6 +69,15 @@ export const PREF_RESPONSE_STYLES = {
   fallback: null,
 } as const;
 
+export const PREF_TITLE_STYLE = {
+  key: "title_style",
+  scope: "global",
+  type: "text",
+  maxChars: 500,
+  standard: "a very short title (3-6 words)",
+  fallback: null,
+} as const;
+
 export const PREF_TECHNICAL_LITERACY = {
   key: "technical_literacy",
   scope: "global",
@@ -501,8 +510,8 @@ export const PREF_CACHE_KEEP_ALIVE_MODE = {
   key: "cache_keep_alive_mode",
   scope: "global",
   type: "enum",
-  values: ["default", "workspace-data", "off"],
-  fallback: "default",
+  values: ["break-even", "workspace-data", "off"],
+  fallback: "off",
 } as const;
 
 export const PREF_MODEL_CLAUDE_CODE = {
@@ -676,7 +685,7 @@ export const PREF_COMMAND_GUARD_CODING_AGENTS = {
   key: "command_guard_coding_agents",
   scope: "global",
   type: "flag",
-  fallback: "false",
+  fallback: "true",
 } as const;
 
 export const PREF_MODEL_COMMAND_JUDGE = {
@@ -749,7 +758,7 @@ export const PREF_CACHE_CARDS = {
   key: "cache_cards",
   scope: "global",
   type: "flag",
-  fallback: "true",
+  fallback: "false",
 } as const;
 
 export const PREF_KEYBINDINGS = {
@@ -900,6 +909,7 @@ export const PREFERENCE_CATALOG = {
   "chat_reasoning_efforts": PREF_CHAT_REASONING_EFFORTS,
   "response_style": PREF_RESPONSE_STYLE,
   "response_styles": PREF_RESPONSE_STYLES,
+  "title_style": PREF_TITLE_STYLE,
   "technical_literacy": PREF_TECHNICAL_LITERACY,
   "image_model": PREF_IMAGE_MODEL,
   "model_title": PREF_MODEL_TITLE,

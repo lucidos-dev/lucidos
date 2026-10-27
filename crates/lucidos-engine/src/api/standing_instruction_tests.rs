@@ -107,6 +107,7 @@ async fn fire_trigger_on(bus: &EventBus, thread_id: Uuid, trigger_id: &str) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: trigger_id.to_string(),
             trigger_name: Some("Nightly release".into()),

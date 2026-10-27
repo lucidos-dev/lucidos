@@ -60,11 +60,9 @@ pub(crate) struct SessionFacts {
     /// The branch HEAD, the key each re-entry is bounded by. An unreadable
     /// HEAD keys as the empty string, so it still sends back once.
     pub(crate) head: Option<String>,
-    /// Why the proposal hold kept this idle's work, if it did.
+    /// Why the proposal hold kept this idle's work, if it did. Never set
+    /// while a handoff is pending: the successor session owes it then.
     pub(crate) held: Option<ProposalHold>,
-    /// Whether the session handed off and its successor session waits to
-    /// start. The successor then owes what the hold asks for.
-    pub(crate) handoff_pending: bool,
 }
 
 /// The state one turn ends in.
@@ -97,12 +95,7 @@ impl TurnEndState {
         if !self.read_decided {
             unmet.push(TurnEndRequirement::ReadDecision);
         }
-        if let Some(hold) = self
-            .session
-            .as_ref()
-            .filter(|s| !s.handoff_pending)
-            .and_then(|s| s.held)
-        {
+        if let Some(hold) = self.session.as_ref().and_then(|s| s.held) {
             unmet.push(TurnEndRequirement::Reentry(hold));
         }
         unmet

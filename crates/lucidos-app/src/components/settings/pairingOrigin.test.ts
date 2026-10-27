@@ -93,11 +93,11 @@ describe('pairingOrigin', () => {
   const lan: LanRowState = { kind: 'url', url: 'http://192.168.1.5:5252' };
 
   it('takes the tailnet address ahead of the LAN one', () => {
-    expect(pairingOrigin({ ...base, lan })).toBe('http://mymac.tailnet-name.ts.net:5252');
+    expect(pairingOrigin({ ...base, external: null, lan })).toBe('http://mymac.tailnet-name.ts.net:5252');
   });
 
   it('falls back to the LAN address when there is no tailnet one', () => {
-    expect(pairingOrigin({ ...base, tailnetIp: null, lan })).toBe('http://192.168.1.5:5252');
+    expect(pairingOrigin({ ...base, external: null, tailnetIp: null, lan })).toBe('http://192.168.1.5:5252');
   });
 
   it("keeps this gateway's port, so the code is redeemed where it was minted", () => {
@@ -109,7 +109,7 @@ describe('pairingOrigin', () => {
       ...base,
       here: { protocol: 'https:', hostname: 'localhost', port: '5251' },
     };
-    expect(pairingOrigin({ ...devGateway, lan: null })).toBe(
+    expect(pairingOrigin({ ...devGateway, external: null, lan: null })).toBe(
       'https://mymac.tailnet-name.ts.net:5251',
     );
   });
@@ -119,15 +119,30 @@ describe('pairingOrigin', () => {
     // to loopback, this machine has no address to hand out. A QR aimed at the
     // reader's own `localhost` would be worse than no QR at all.
     for (const lanState of [null, { kind: 'disabled' } as const, { kind: 'none' } as const]) {
-      expect(pairingOrigin({ ...base, tailnetIp: null, bind: 'loopback', lan: lanState })).toBeNull();
+      expect(pairingOrigin({ ...base, external: null, tailnetIp: null, bind: 'loopback', lan: lanState })).toBeNull();
     }
   });
 
   it('never answers with a loopback address', () => {
     const loopbackReader = { ...base, here: { protocol: 'http:', hostname: '127.0.0.1', port: '5252' } };
     for (const lanState of [null, lan]) {
-      const origin = pairingOrigin({ ...loopbackReader, lan: lanState });
+      const origin = pairingOrigin({ ...loopbackReader, external: null, lan: lanState });
       expect(origin === null || !/localhost|127\./.test(origin)).toBe(true);
     }
+  });
+
+  it('takes the external address ahead of the tailnet, since the user typed it', () => {
+    const external = 'https://lucidos.example.com';
+    expect(pairingOrigin({ ...base, external, lan })).toBe(external);
+    expect(pairingOrigin({ ...base, external, tailnetIp: null, bind: 'loopback', lan: null })).toBe(external);
+  });
+
+  it("takes the reader's own origin after the tailnet, when it is not loopback", () => {
+    // A phone that reached the gateway over a company VPN address: the page
+    // arrived there, so a second device can open it too.
+    const vpnReader = { ...base, here: { protocol: 'http:', hostname: '10.8.0.2', port: '5252' } };
+    expect(pairingOrigin({ ...vpnReader, external: null, tailnetIp: null, lan })).toBe('http://10.8.0.2:5252');
+    // The tailnet still comes first.
+    expect(pairingOrigin({ ...vpnReader, external: null, lan })).toBe('http://mymac.tailnet-name.ts.net:5252');
   });
 });

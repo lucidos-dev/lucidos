@@ -43,7 +43,7 @@ import {
   parseFlag, PREFERENCE_CATALOG, PREF_FONT_FAMILY, PREF_PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI,
   PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER,
   PREF_PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM, PREF_PROVIDER_ENABLED_TYPESAFE, PREF_SYSTEM_ONE_CUSTOM_MODEL,
-  PREF_SYSTEM_ONE_CUSTOM_URL, PREF_SYSTEM_ONE_OPENROUTER_MODEL, PREF_THEME, PREF_UI_SCALE,
+  PREF_SYSTEM_ONE_CUSTOM_URL, PREF_SYSTEM_ONE_OPENROUTER_MODEL, PREF_THEME, PREF_TITLE_STYLE, PREF_UI_SCALE,
   type PreferenceKey, type PreferenceValues,
 } from '@lucidos/preference-catalog';
 import { MEMORY_MODULE_WHILE_UNSET, VOICE_RESIDENT_SECTIONS } from '@lucidos/engine-constants';
@@ -1671,6 +1671,12 @@ export function storedBackgroundSelection(
     model: acceptedValue(modelKey, data[modelKey]),
     effort: acceptedValue(reasoningKey, data[reasoningKey]),
   };
+}
+
+/** The workspace's stored title style, `''` while unset or not loaded. */
+export function storedTitleStyle(): string {
+  const data = preferences.value.status === 'loaded' ? preferences.value.data : {};
+  return data[PREF_TITLE_STYLE.key] ?? '';
 }
 
 /** Persist one background *model selection*, both halves.

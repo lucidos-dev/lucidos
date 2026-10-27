@@ -340,7 +340,13 @@ A scheduled fire never starts on an engine that is shutting down, because its ru
 
 The catch-up fires only the most recent slot of the past hour, and only one with no recorded run at or after it. A recorded run counts whatever its status, `failed` included. So a run that failed on a healthy engine is not repeated on restart. Fix the cause, then run the trigger once if the user wants the result now.
 
-A run already in progress when the shutdown starts may finish. If it fails because the API went away, it stays failed and is not re-run.
+A run already in progress may finish before shutdown cuts it. On boot, an **interrupted run** gets a failed last-run status, one notification, and an inbox thread showing the retry decision. Boot reports cut runs from the past seven days. A working automatic resume after a user-initiated switch is excluded.
+
+A qualifying interrupted run retries once through the Thread Queue in a **new thread**. It must have started less than 24 hours ago, before its next cron slot is due, with no newer fire of that trigger. It must not have completed, spawned sub-threads, or already been a retry. The trigger must still exist, be enabled and unpaused, and its original queued request must be recoverable. An already queued fire can cover the work instead.
+
+The deadline is the earlier of 24 hours after fire start or its next cron slot. Admission at or after it drops the retry and notifies the user. A second interruption never causes a third run. An admitted fire that created no thread, including a script fire, requeues only once; a second cut drops it with a notification.
+
+The retry header links back to the cut thread. Read that thread before repeating side effects: the interrupted run may already have sent a message or written a file. A trigger whose side effects must never repeat should say so in its intent. Ordinary failures on a healthy engine are not retried.
 
 ## `condition`: when to filter
 
@@ -456,11 +462,13 @@ A run you leave undecided is decided by a background call, which reads more runs
 
 A trigger that orchestrates *sub-threads* or waits on events wakes many times in one run. Each wake that only reports progress is `read: false`, so only the ending lands in Review. Say `read: true` on a step only for something the user should read before the run finishes, such as a failure.
 
-The scheduler auto-creates an error notification when a trigger fails, so don't double-notify on errors from inside the run.
+The scheduler auto-creates an error notification when a trigger fails, so don't double-notify on errors from inside the run. Boot also sends one notification per interrupted run, opening its cut thread and explaining whether a retry was queued. Let that report carry the interruption; the retry sends notifications only for its own findings or failures.
 
 ## Where the thread lands: `go_to_review`
 
 By default, trigger runs are unattended: their threads go straight to Archive when they finish. They surface in the Current section only if the user follows up with a message. That suits most cron triggers (silent imports, periodic syncs, idle nudges).
+
+An interrupted run is an exception: boot restores its cut thread to the inbox, preserving its pin and failed status. This applies even when **Send directly to Archive** is on. Its retry runs in a new thread with the normal routing below.
 
 A run that stops to ask the user a question, or to ask permission, always surfaces in Current, whatever `go_to_review` says. It stays there until the user answers or stops it.
 

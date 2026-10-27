@@ -198,12 +198,79 @@ service_network_toml_engine_inherit() {
     fi
 }
 
-# service_render_network_toml <bind> <inherit> — the full network.toml content.
-# Byte-mirror of the gateway's net_config::render_network_toml: the picker's
-# writer regenerates this whole file from the same template, so keeping the two
-# writers identical avoids churn when ownership alternates between them.
+# service_network_toml_external_entries <contents> — the `<port> = "<origin>"`
+# lines of the [external_address] table, one per gateway port (ADR 0550). The
+# file is machine-global and two gateways can share a machine, hence the key.
+service_network_toml_external_entries() {
+    printf '%s\n' "$1" | awk '
+        /^[[:space:]]*\[/ { in_table = ($0 ~ /^[[:space:]]*\[external_address\][[:space:]]*$/); next }
+        in_table && /^[[:space:]]*[0-9]+[[:space:]]*=[[:space:]]*"[^"]*"/ {
+            sub(/^[[:space:]]+/, ""); print
+        }'
+}
+
+# service_network_toml_external_address <contents> <port> — the origin stored
+# for the gateway on <port> ("" when absent).
+service_network_toml_external_address() {
+    service_network_toml_external_entries "$1" \
+        | sed -n "s/^$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+# service_is_external_address <value> — a shape pre-check for --external-address:
+# http(s), a host, an optional port, and nothing after. The gateway's
+# net_config::valid_external_address is the authority, and ignores (with a log
+# line) a stored value it refuses. This only stops an obvious typo at install.
+service_is_external_address() {
+    local LC_ALL=C s="$1" authority host port=""
+    case "$s" in
+        https://*) authority="${s#https://}" ;;
+        http://*) authority="${s#http://}" ;;
+        *) return 1 ;;
+    esac
+    case "$authority" in
+        '' | *[/?#@\"\\[:space:]]*) return 1 ;;
+    esac
+    case "$authority" in
+        \[*\]) host="$authority" ;;
+        \[*\]:*) host="${authority%%]*}]"; port="${authority##*]:}" ;;
+        *:*) host="${authority%%:*}"; port="${authority#*:}" ;;
+        *) host="$authority" ;;
+    esac
+    case "$authority" in
+        *:) return 1 ;;
+    esac
+    case "$port" in *[!0-9]*) return 1 ;; esac
+    [ -z "$port" ] || { [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; } || return 1
+    host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+    # A URL parser reads 127.1, 0x7f.1 or 2130706433 as an IPv4 address, so
+    # a numeric host must be a plain dotted quad for the checks below to hold.
+    local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+    case "${host##*.}" in
+        '' | *[!0-9]*) case "${host##*.}" in 0x*) return 1 ;; esac ;;
+        *) [[ "$host" =~ ^$octet\.$octet\.$octet\.$octet$ ]] || return 1 ;;
+    esac
+    # Loopback reaches this machine alone, so it is no address for a phone.
+    # Neither is a link-local or unspecified one (net_config refuses all three).
+    # No VPN hands out an IPv4-mapped IPv6 address, so none passes.
+    case "$host" in
+        '' | localhost | *.localhost | 127.* | '[::1]') return 1 ;;
+        169.254.* | 0.0.0.0 | '[::]' | '[fe8'?:* | '[fe9'?:* | '[fea'?:* | '[feb'?:*) return 1 ;;
+        '[::ffff:'*) return 1 ;;
+    esac
+    return 0
+}
+
+# service_render_network_toml <bind> <inherit> [<entries>] — the full
+# network.toml content, in the shape the gateway's
+# net_config::render_network_toml writes. <entries> holds the [external_address]
+# lines, as service_network_toml_external_entries prints them. Both writers
+# regenerate the whole file, so keeping the two alike avoids churn when
+# ownership alternates.
 service_render_network_toml() {
-    local bind="$1" inherit="$2"
+    local bind="$1" inherit="$2" entries="${3:-}" table=""
+    [ -z "$entries" ] || table="
+[external_address]
+$entries"
     cat <<EOF
 # Lucidos machine-level network bind configuration.
 # Read at process start by the gateway AND every directly-launched
@@ -215,7 +282,11 @@ service_render_network_toml() {
 #                  Tailscale 100.x address.
 # [engine].inherit  true  = every workspace engine binds the gateway's
 #                          bind; false = each engine reads its own
-#                          per-workspace bind (Settings -> Access).
+#                          per-workspace bind (Settings -> Network access).
+# [external_address]  optional, per gateway port: the origin other
+#                  devices reach that gateway at, such as
+#                  5252 = "https://lucidos.example.com". It goes in
+#                  the pairing QR, and is read live (no restart).
 
 [gateway]
 bind = "$bind"
@@ -223,6 +294,7 @@ bind = "$bind"
 [engine]
 inherit = $inherit
 EOF
+    [ -z "$table" ] || printf '%s\n' "$table"
 }
 
 # ── env contract (single source of truth, shared with the foreground launcher) ─
@@ -744,18 +816,45 @@ service_health_wait() {
     done
 }
 
-# service_write_network_toml <home> <bind> — regenerate the machine-global
-# network.toml with <bind>, preserving the existing [engine] inherit flag.
-# Whole-file regenerate + atomic tmp/rename, exactly like the gateway's own
-# writer (net_config::write_network_toml).
+# service_write_network_toml <home> <bind> [<port> <external_address>] —
+# regenerate the machine-global network.toml. An empty <bind> keeps the stored
+# one (else loopback). With <port>, the gateway on that port gets
+# <external_address>, and "" clears it. Every other gateway's entry and the
+# [engine] inherit flag always stay. Whole-file regenerate + atomic tmp/rename,
+# exactly like the gateway's own writer (net_config::update_network_toml).
+#
+# A running gateway can write the file at the same moment, so the whole
+# read-modify-write holds its lock, SERVICE_NETWORK_TOML_LOCK. Without perl it
+# writes unlocked, since an install must not fail for want of a lock.
+SERVICE_NETWORK_TOML_LOCK=network.toml.lock
 service_write_network_toml() {
-    local home="$1" bind="$2" path existing="" inherit
-    path="$(service_network_toml_path "$home")"
+    local path
+    path="$(service_network_toml_path "$1")"
+    mkdir -p "$(dirname "$path")" || return 1
+    (
+        exec 9>>"$(dirname "$path")/$SERVICE_NETWORK_TOML_LOCK" || exit 1
+        if command -v perl >/dev/null 2>&1; then
+            perl -MFcntl=:flock -e 'open(my $fh, ">&=", 9) or exit 2; flock($fh, LOCK_EX) or exit 2' || exit 1
+        fi
+        _service_write_network_toml_locked "$path" "$2" "${3:-}" "${4:-}"
+    )
+}
+
+_service_write_network_toml_locked() {
+    local path="$1" bind="$2" port="$3" external="$4" existing="" inherit entries tmp
     [ -f "$path" ] && existing="$(cat "$path" 2>/dev/null || true)"
     inherit="$(service_network_toml_engine_inherit "$existing")"
-    mkdir -p "$(dirname "$path")" || return 1
-    service_render_network_toml "$bind" "$inherit" > "$path.tmp" || return 1
-    mv "$path.tmp" "$path"
+    [ -n "$bind" ] || bind="$(service_network_toml_bind "$existing")"
+    [ -n "$bind" ] || bind=loopback
+    entries="$(service_network_toml_external_entries "$existing")"
+    if [ -n "$port" ]; then
+        entries="$(printf '%s\n' "$entries" | grep -v "^${port}[[:space:]]*=" || true)"
+        [ -z "$external" ] || entries="$(printf '%s\n%s = "%s"' "$entries" "$port" "$external")"
+        entries="$(printf '%s\n' "$entries" | sed '/^$/d' | sort -n)"
+    fi
+    tmp="$(mktemp "$path.XXXXXX")" || return 1
+    service_render_network_toml "$bind" "$inherit" "$entries" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$path"
 }
 
 # _service_engine_live_pid <workspace> — the engine's pid to signal: printed only

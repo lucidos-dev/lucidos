@@ -8,6 +8,14 @@ If a needed concept genuinely isn't in either glossary, add it here (if dev-only
 
 ## Terms
 
+### Fire retry
+A fresh trigger fire in a new thread after an engine restart interrupted the
+original fire. `FireRetry` records whether boot queued it or skipped it with a
+`RetrySkipReason`. `RetryOf` carries the original thread and the admission
+deadline on the queue request and `TriggerStarted`. A retry never retries again.
+
+Boot reports cut fires from the past seven days. Retry eligibility ends at the earlier of 24 hours after fire start or the next cron slot. Admission at the deadline is expired. Completed fires, fires with spawned work, and fires superseded by a newer fire cannot retry. The trigger must remain available, its original request recoverable, and the queue must accept it. See ADR 0579.
+
 ### Account pin
 The Claude Code profile a *coding-agent thread* is permanently bound to: the one its **first** session ran as. It is two facts, the config dir and whether `CLAUDE_CONFIG_DIR` was set at all. Claude Code treats an unset variable and one set to its default `~/.claude` as different logins, with different keychain entries and `.claude.json` files. Replaying the unset case as `CLAUDE_CONFIG_DIR=~/.claude` made every respawn report "Not logged in". The Rust type is `AccountPin` (`DefaultConfigDir` / `ExplicitConfigDir`).
 
@@ -327,12 +335,15 @@ ADR 0514.
 
 ### Restore guard
 The device-local marker that keeps a launch off the thread the previous session
-died showing (`store/restoreGuard.ts`). Focusing a thread writes its id to
-`lucidos-restore-guard`. The marker clears once the page stays visible for
+died showing (`store/restoreGuard.ts`). Focusing a thread writes
+`"<threadId> <windowId>"` to `lucidos-restore-guard`, in *window-scoped
+storage*. The marker clears once the page stays visible for
 `RESTORE_GUARD_SURVIVAL_MS`, on `pagehide`, or when the page hides, and arms
 again when it returns. A launch that finds the marker naming the stored focus
 *withholds* it: it lands on Home and offers the thread once in a "Started on
-Home" toast. Never server state. ADR 0523.
+Home" toast. A window can inherit another window's marker through the shared
+seed. When that window turns out to be alive, the launch releases the thread
+(`releaseWithheldToLiveWindow`). Never server state. ADRs 0523, 0585.
 
 ### Shell scroll guard
 The listener (`utils/shellScrollGuard.ts`) that holds the desktop shell still.
@@ -1575,7 +1586,7 @@ The fifth and last gate in `cc_permission::prompt_coding_agent_permission` (`att
 
 Scope depends on `command_guard_coding_agents`, a child of the master `command_guard`. Off: a Codex `command_execution` sandbox escape skips its card on `Settled(Safe)`. A Claude Code `Bash` card never enters the gate, because the tool is missing from a `--allowedTools` list the user curates. On: both tools skip the card on `Safe` or `ReversibleDanger`. `file_change` and the file tools are outside the gate either way.
 
-The `ReversibleDanger` allow has no *command checkpoint*, unlike the chat lane, so a wrong verdict runs with no undo. The user accepts that by switching the flag on.
+The `ReversibleDanger` allow has no *command checkpoint*, unlike the chat lane, so a wrong verdict runs with no undo. The flag defaults on, so the user accepts that by turning on the master guard.
 
 Three narrowings hold whatever the flag says. A `fast_path_refused` shape never reaches the *judge*, which is handed the command text alone and cannot see the refusal. `command_guard::command_escalates_privilege` cards a command run as another user: the head walk treats `sudo` as a benign prefix, settling `sudo cat` on the strength of `cat`. A destruction from a request `cwd` outside the workspace cards. `IrreversibleDanger` (a secret read among it) and `Catastrophic` always card.
 
@@ -2534,8 +2545,10 @@ A *keep-alive run*'s beat for a Lucidos Agent thread (`BeatRoute::Prefill`). The
 
 - **The cut.** At a turn-end wait it ends at the stable prefix (`stable_prefix_end`): tools, system block, stable context block, memory views. At the thread's own question card it is the whole last request, since the parked loop extends it.
 - **Providers.** Only where a read refreshes a documented TTL and a write costs more than a read (ADR 0556's table). A provider that cannot prefill gives `uncacheable_provider`.
-- **Remembered in memory only.** One body per thread, dropped at the next call, at give-up, or when no wait follows. A restart loses it, and the thread shows `restarted` instead of beating.
-- **Self-stop.** A beat that writes over 2% of its input ends the run. At most four beats run at once in a workspace.
+- **Remembered in memory only.** One body per thread, replaced at the next call, dropped when no wait follows. A restart loses it, and the thread shows `restarted` instead of beating. A body past its cache lifetime becomes a tombstone that keeps its provider, and the thread shows `cache_expired`. Give-up leaves one too: a run that never pinged then shows `past_give_up_time`, unless a provider-wide pause, a miss or an expiry came first. A beat acts only on the very body it sent, never on a newer one (ADR 0582).
+- **Self-stop.** A beat that writes over 2% of its input, or does not hold the context, ends its own thread's run (`beat_missed`). At most four beats run at once in a workspace.
+- **First-beat guard.** A provider that refuses its first beat, or a beat that writes output, pauses until a restart (`provider_paused`).
+- **Miss streak.** Three missed beats in a row on one provider, with no read between, pause its beats for an hour (`pings_paused`, with `until`). A read resets the streak (ADR 0580).
 
 ### Copy beat
 A *keep-alive run*'s beat for a Claude Code session parked mid-turn on a question card or a permission prompt (`BeatRoute::SessionCopy`). The session blocks on the engine's reply, so the engine asks a *session copy* the keep-alive prompt instead. The copy reads the parked session's cached prefix, and that read refreshes the cache entry.
@@ -2550,11 +2563,21 @@ What the *keep-alive run* does for one waiting thread, as its tick last saw it (
 
 - **`warming`**: the engine pings within the *keep-alive budget*. It carries the ping count, the budget, the beat interval and the pings' cost (from `ApiUsage::usd_on`, each ping on its own day). It also carries the context a wake-up would reread, the next ping and give-up times, and the *cap odds*. A parked wait dates from its turn request.
 - **`stopped`**: a run that pinged, then passed break-even. It carries when, the ping count, the cost and the context the wake-up rereads instead.
-- **`ended`**: the wait ended while the engine kept it warm. It carries the span, the ping count, the cost, the run's context and `saved_usd`, the reread price of that context. `saved_usd` is set only when the next real request began while the cache was still warm (`read_run_end`). A restart, a stop or a cold wake leaves it absent.
+- **`ended`**: the wait ended while the engine kept it warm. It carries the span, the ping count, the cost, the run's context and `saved_usd`, the reread price of that context. `saved_usd` is set only when the next real request began while the cache was still warm and held the context (`read_run_end`). A restart, a stop or a cold wake leaves it absent.
 - **`turned_off`**: the user turned the *keep-alive switch* off. It carries when, the run's pings and cost, and the context a cold reply rereads.
 
 Every state but `not_kept` also carries `ping_usd` and `reread_usd`: one ping (a cache read of the context) and the reread (a cache write of it) at today's list price. `Spent::priced` sets both from the model of the last cache write and the session's TTL, so the card and the cache-warm line quote one price. Each is absent for an unpriced model, and on a status stored before prices. An `ended` status copies them from its warming run. `stopped`, `ended` and `turned_off` also carry the optional `beat_every_secs` and `odds` of the run's cap; `ended` copies both from its warming run.
-- **`not_kept`**: the thread waits and gets no keep-alive, with a `reason`: `codex`, `off`, `no_wake_children`, `children_awaiting_user`, `uncacheable_provider`, `restarted`, `past_give_up_time`, `nothing_pending`, `unattended_trigger` (an *unattended trigger*: a trigger thread with no human-mode message, which no ping serves) or `unknown_ttl` (the *cache TTL* is Unknown, so no ping can be timed). A run that never pinged never reads `stopped`: past its give-up time it reads `uncacheable_provider`, `restarted` or `past_give_up_time`. `status().recorded()` drops `codex`, `off`, `nothing_pending` and `unattended_trigger`, which name no wait. Only the cache-warmth route says them.
+- **`not_kept`**: the thread waits and gets no keep-alive. Its `reason` is `codex`, `off`, `no_wake_children`, `children_awaiting_user`, `uncacheable_provider`, `provider_paused`, `prefill_paused`, `pings_paused`, `cache_expired`, `restarted`, `past_give_up_time`, `nothing_pending`, `unattended_trigger`, `model_changed`, `beat_missed` or `unknown_ttl`.
+
+`uncacheable_provider` means the request has no prefill pair or backend. `provider_paused` means a refused or talkative ping paused the provider until restart. `prefill_paused` is historical: stored events carry it, and the engine no longer emits it. `pings_paused` means the provider's pings kept missing, so they pause until the status's `until`.
+
+`cache_expired` means the cache went cold before a ping reached it. `restarted` means Lucidos holds no record of the thread's last request.
+
+`model_changed` means the beat would use another model or effort. A `beat_missed` did not hold the context; only a real request re-arms it. An `unattended_trigger` has no human-mode message, so no ping serves it. An `unknown_ttl` means no reply reported the cache lifetime, so no ping can be timed.
+
+A request **held the context** when it read at least half its input from cache. Empty input does not count. The beat judge, candidate SQL and warm-wake test share that predicate.
+
+A run that never pinged never reads `stopped`. Past its give-up time it reads a provider-wide reason: `uncacheable_provider`, `provider_paused` or `pings_paused`. Otherwise it reads `beat_missed`, `cache_expired`, `restarted` or `past_give_up_time`. `status().recorded()` drops `codex`, `off`, `nothing_pending` and `unattended_trigger`, which name no wait. Only the cache-warmth route says them.
 
 A `warming` run ends, pinged or not, whenever the engine stops keeping its wait warm: the wait ends, another wait starts, the mode turns `off`, or a `not_kept` is recorded. Only `stopped` and `turned_off` carry the same run on. A thread that leaves candidacy has its open status closed on the next tick (`close_stale_statuses`): a run ends, and any other status is cleared. A run that never pinged ends at once, since no wake is in flight to wait for. While the thread runs and its wake's capture has not landed, the close waits a tick, so the end carries the wake.
 
@@ -2567,7 +2590,7 @@ The card that closes the feed of a waiting thread while its prompt cache is warm
 
 `keep_alive` is the *cache keep-alive status* the tick would record, or the reason it records none. It carries its own prices, and is null only when cold.
 
-The card shows only when `keep_alive` is `not_kept`, the one state that draws no keep-alive card, so a cache never has two cards. It reads the chip `Prompt cache` with the explainer, the state `Not kept` and the detail `Warm until HH:MM`. It goes at that time. With an unknown lifetime the detail reads `Lifetime unknown`, and the card stays. A `not_kept` reason is `codex`, `restarted`, `uncacheable_provider`, `past_give_up_time`, `nothing_pending`, `unattended_trigger`, `unknown_ttl` or `off`.
+The card shows only when `keep_alive` is `not_kept`, the one state that draws no keep-alive card, so a cache never has two cards. It reads the chip `Prompt cache` with the explainer, the state `Not kept` and the detail `Warm until HH:MM`. It goes at that time. With an unknown lifetime the detail reads `Lifetime unknown`, and the card stays. A `not_kept` reason is `codex`, `restarted`, `uncacheable_provider`, `provider_paused`, `prefill_paused`, `pings_paused`, `cache_expired`, `past_give_up_time`, `nothing_pending`, `unattended_trigger`, `model_changed`, `beat_missed`, `unknown_ttl` or `off`.
 
 The info icon opens the one shared explainer (`KeepAliveExplainerButton`), which the card and the waiting panel open too. It says what the cache is, the run's sentence, the switch and the setting behind it. A run with *cap odds*, an interval and prices adds its math, with the slot table folded behind "Show the math": a warming run its expected cost, a closed run (stopped, ended or turned off) its final score, with the row it landed in marked. A run without them prices its reread.
 
@@ -2577,7 +2600,7 @@ No keep-alive surface joins its facts with ` · `: the card, the panel and the e
 
 The client holds no TTL and prices nothing: it multiplies the engine's prices by the *cap odds*. It shows a time, never a countdown, and reads again when the thread's status or events change. It shows only while the thread is idle or awaits an answer, with none in flight, and never while an open run's panel section shows.
 
-The `cache_cards` preference ("Cache cards", Settings → System → Debugging, on by default) turns it off, and the Cache kept warm card with it. It also skips the read behind the line. A cold cache, a thread that never wrote one and a failed read draw nothing.
+The `cache_cards` preference ("Cache cards", Settings → System → Debugging, off by default) turns it off, and the Cache kept warm card with it. It also skips the read behind the line. A cold cache, a thread that never wrote one and a failed read draw nothing.
 
 ### Keep-alive switch
 The user's per-thread "Turn off for this thread" (ADR 0554). `POST /api/v1/threads/:thread_id/cache-keep-alive` with `{"state": "off"}` or `{"state": "on"}`, the popover button, the waiting panel's link and the `threads` tool's `cache_keep_alive` action all emit `CacheKeepAliveTurnedOff` or `CacheKeepAliveTurnedOn`. They project into `thread_summaries.cache_keep_alive_off_at`.
@@ -2585,9 +2608,9 @@ The user's per-thread "Turn off for this thread" (ADR 0554). `POST /api/v1/threa
 The switch is in force while that time is later than `last_real_request_started_sql`: the thread's last turn request no keep-alive anchor started. So the next real request re-arms it with no event. While in force, `decide()` skips with `TurnedOff` on every route, and the status reads `turned_off`. That keeps the run open: turning it back on warms the same run. It never reaches a parent or a sub-thread.
 
 ### Keep-alive budget
-How long a *keep-alive run* keeps beating, counted from the wait's start. Under `cache_keep_alive_mode` `default` it is the break-even of the session's model: the beats that cost one cache rewrite. That is the TTL's write rate over its read rate, times its beat window start (230 s on 5 minutes, 3300 s on 1 hour). The rates come from the *price table*, read for the model of the capture that decides the TTL. An unknown model prices at the standard multipliers, the shortest budget (ADR 0489).
+How long a *keep-alive run* keeps beating, counted from the wait's start. Under `cache_keep_alive_mode` `break-even` it is the break-even of the session's model: the beats that cost one cache rewrite. That is the TTL's write rate over its read rate, times its beat window start (230 s on 5 minutes, 3300 s on 1 hour). The rates come from the *price table*, read for the model of the capture that decides the TTL. An unknown model prices at the standard multipliers, the shortest budget (ADR 0489).
 
-A parked wait gets half of it, and its clock starts at the turn request that asked. Under `workspace-data` the budget is the cheapest cap over this workspace's last 30 days of waits of the same type: the card, or the kinds an event wait watches (`WaitType`, `wait_durations.rs`). It never exceeds twice break-even, and a type with under 50 waits keeps the default. `budget_beats` is the one function `decide` and `status` both read (ADR 0547).
+A parked wait gets half of it, and its clock starts at the turn request that asked. Under `workspace-data` the budget is the cheapest cap over this workspace's last 30 days of waits of the same type: the card, or the kinds an event wait watches (`WaitType`, `wait_durations.rs`). It never exceeds twice break-even, and a type with under 50 waits keeps break-even. `budget_beats` is the one function `decide` and `status` both read (ADR 0547).
 
 ### Cap odds
 How this workspace's finished waits of one agent and wait type ended against a give-up cap (`CapOdds`, `thread_events/keep_alive_status.rs`). `samples` counts the waits, `slots[k]` those that needed `k` pings with the cache still warm, and `after_cap` those that outlasted the cap. A wait of `d` seconds needs `floor(d / beat_every_secs)` pings. The cheapest-cap search under `workspace-data` costs each candidate cap through `CapOdds::cost_in_beats`, so the odds shown and the cap chosen share one definition. A `warming`, `stopped` or `turned_off` status carries the odds of the cap in force, under either mode, from one past wait up. The tick reads the durations hourly unless the mode is `off`.
@@ -2610,7 +2633,7 @@ An event type whose waits a *keep-alive run* keeps warm (`KEEP_WARM_EVENT_TYPES`
 ### Stable prefix
 The part of a chat turn's Claude request that the next turn sends again unchanged: the tools, the system block and, on a Tree workspace, the memory view blocks up to the last one (`llm/stable_prefix.rs`). The per-turn block after it is rebuilt every turn, so a warm turn boundary can read only this part from the prompt cache.
 
-Its **stable-prefix fingerprint** hashes it with the model and thinking config and without any `cache_control` marker. Round 1 of a chat turn records it on its `ContextCaptured`. Two turns with the same fingerprint sent the same stable prefix. Plan: `docs/plans/2026-10-15-keep-chat-thread-caches-warm.md`.
+Its **stable-prefix fingerprint** hashes it with the model and thinking config and without any `cache_control` marker. Round 1 of a chat turn records it on its `ContextCaptured`. A prefill capture hashes the prefix its cut actually sends. Two turns with the same fingerprint sent the same stable prefix. Plan: `docs/plans/2026-10-15-keep-chat-thread-caches-warm.md`.
 
 ### One-round rule
 Retired, replaced by the *swept window*. A tool result reached the model exactly once, and at the top of the next round it became a *round stub* keeping its `evt-<hex>` address.
@@ -3233,7 +3256,13 @@ The rule that a thread interrupted by an engine restart only **auto-resumes** wh
 
 Two halves consume it. **Coding-agent threads** queue a `ContinuationRequested{reason: auto_resume_after_switch}` (`enqueue_switch_resume`, emitted from `main.rs` once the apply recoveries have read the queue) and re-enter via `--resume`. **Chat / trigger threads** are selected at boot by `chat::recovery::switch_resume_candidates` and driven through `continue_chat`. That is the manual **Continue** button's entry point, so the resumed turn gets the same `ContinuationStarted` boundary and side-effect engine note. That pass must follow `recover_orphan_tool_calls`, or the re-entered turn rebuilds an unpaired `tool_use` block.
 
-A **crash / OOM / panic / agent-killed** engine leaves no such boundary, so the thread keeps the manual **Continue** affordance (for coding agents, the Phase 5.3 `engine_restart_interrupt` idle) and is NOT auto-resumed: work that may have crashed the engine can't loop. The start set counts `ContinuationStarted`/`OrphanRecoveryStarted` so a consumed switch-abort can't re-fire (the loop-breaker), and because `continue_chat` emits `ContinuationStarted`, chat inherits that loop-breaker unchanged. A thread parked on an unanswered `UserQuestionAsked` is preserved by recovery either way (`thread_has_unanswered_question`) and is structurally excluded from both resume gates (no abort was ever emitted for it): answering resumes it instead. "Parked" is strict: the question must still be the newest event on the thread. Anything in `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` landing after it means the agent raced past, the card is already dead client-side, and the thread goes back through the ordinary abort-plus-Continue path.
+A **crash / OOM / panic / agent-killed** engine leaves no such boundary. The thread keeps the manual **Continue** affordance and is NOT auto-resumed (for coding agents, the Phase 5.3 `engine_restart_interrupt` idle). So work that may have crashed the engine can't loop.
+
+The start set counts `ContinuationStarted`/`OrphanRecoveryStarted`, so a consumed switch-abort can't re-fire (the loop-breaker). Because `continue_chat` emits `ContinuationStarted`, chat inherits that loop-breaker unchanged.
+
+Recovery preserves a thread parked on an unanswered `UserQuestionAsked` either way (`thread_has_unanswered_question`). No abort was ever emitted for it, so both resume gates exclude it: answering resumes it instead. "Parked" is strict: the question must still be the newest event on the thread. Anything in `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` landing after it means the agent raced past. So does the question's own `CodingAgentToolResult`. The card is then already dead client-side, and the thread goes back through the ordinary abort-plus-Continue path.
+
+A restart-cut trigger fire has one bounded exception: a *fire retry* may start once in a new thread through the Thread Queue. It never resumes the cut thread. A working switch resume excludes the fire from this path; a withdrawn promise can qualify. See ADR 0579.
 
 A switch teardown therefore reads as a **resume promise**. The status, the UI and the boot all honour it through the one predicate.
 
@@ -5283,17 +5312,32 @@ One named step of a **packaged** app update, and the wire contract between `crat
 `<app-data>/.next-boot.json`, what the packaged service leaves behind for the next gateway boot (`crates/lucidos-gateway/src/next_boot.rs`; written by `lucidos-app`'s `desktop.rs`). Two shapes. `{"restore": [ids]}` names the workspaces the teardown just stopped, and the next `boot_all` brings exactly those back **regardless of `autostart`**, because a restart must return what it took: `launchctl kickstart -k` (the Restart control, and the updater's service restart) and a crash respawn all run the same teardown as a permanent stop, killing every engine, and the gateway that follows re-adopts only survivors. `{"quit": true}` is written by *Quit and Stop Background Service* BEFORE it signals launchd, so the one teardown that means *stay down* records nothing; declaring the intent first makes the ordering structural instead of a race against `launchctl bootout`. Consumed and deleted on read, so it is one-shot, and it fails soft in every direction (missing, malformed, half-written all mean "restore nothing") because it sits on the boot path of the whole stack. Distinct from *autostart*, which is the user's per-workspace boot posture: the record outranks it in one direction only, never starting a workspace the user had stopped, since a stopped workspace is not running at teardown and so never enters it.
 
 ### Window session
-`<app-data>/.window-session.json`, the packaged client's record of which workspaces had a window and how big each was (`crates/lucidos-app/src/window_session.rs`; ADR 0123). Three fields answer different questions. `open` lists the workspace slugs that had a window, in restore order. A launch hands the first to `main` and builds one window for each of the rest. `geometry` holds the last frame each workspace window wore BY THE USER'S CHOOSING, which is not always its last frame: see *rescued frame*.
+`<app-data>/.window-session.json`, the packaged client's record of which workspaces had a window and how big each was (`crates/lucidos-app/src/window_session.rs`; ADR 0123). Three fields answer different questions. `open` lists one entry per window: its label, its workspace slug and its own frame, `main` first. A launch rebuilds each window under its recorded label. So each one finds its own *window-scoped storage* again (ADR 0585). An older record lists bare slugs, and those still restore under fresh labels.
+
+`geometry` holds the last frame each workspace window wore BY THE USER'S CHOOSING, which is not always its last frame: see *rescued frame*.
 
 Those frames are in **logical points**, and the third field `units` says so. macOS lays displays out in points, so that is the one space a mixed-DPI desk cannot break. tao's physical pixels are a per-object projection of it. A frame captured on a 2x panel arrived doubled on a 1x display (ADR 0173). A record carrying no `units` marker predates that fix, so `read` drops its frames and keeps `open`.
 
-It is keyed by workspace **slug** rather than by window label, which is the whole point. `tauri-plugin-window-state` keys by label, and an extra window's label is `window-<n>` off a per-process counter. That label means nothing across launches, so a second workspace could never keep its size. The plugin is therefore filtered to `main` alone (`window_persist::plugin_tracks`). Unfiltered it restored one session's second window onto an unrelated one, maximized and fullscreen included. It is also stood down while `main` wears a *rescued frame*: the same rule, for the one file the client does not write itself.
+An extra window's label is `window-<uuid>`, which never recurs, so no new window inherits a closed one's state. `geometry` stays keyed by workspace **slug**: it is the frame a workspace's next window opens into, whichever label that window gets. `tauri-plugin-window-state` is filtered to `main` alone (`window_persist::plugin_tracks`). Unfiltered it restored one session's second window onto an unrelated one, maximized and fullscreen included. It is also stood down while `main` wears a *rescued frame*: the same rule, for the one file the client does not write itself.
 
 `geometry` also OUTLIVES a window's closing, so reopening a workspace later lands at the size it was left. Every path that puts a workspace on screen with no window on it reads that frame back (`window_session::frame_for_url`). That is a launch restore, a reopen, a picker or switcher row, and a notification tap. File > New Window deliberately does not: it opens a second window on the workspace you are already on.
 
 Written by every geometry-save site through `persist_windows`, and by the `Destroyed` arm, which is what drops a window the user closed. A park reaches neither: Close to Menu Bar hides every window rather than destroying any, so the record still names them all and `desktop::reopen_plan` shows them again (ADR 0141). Two halves gate every write, and both rule out a launch with no arrangement yet rather than testing what is on screen now. `any_window_is_navigated` means some window is off the bundled splash, so this is not boot. `PresentedGate` means a window reached the screen at some point, so this is not a login start. A third guard, `TEARING_DOWN`, stands the `Destroyed` recapture down while a deliberate exit destroys the windows it just recorded.
 
 Fails soft in every direction, since it sits on the client's boot path. Distinct from the *next-boot record*, the service role's one-shot instruction to the gateway about *engines*. This is the client's standing arrangement about *windows*, and a restart needs both to give back what it took.
+
+### Window id
+The stable name of one client window, which its navigation is stored under (`windowId()` in `utils/windowStorage.ts`; ADR 0585). On the desktop it is the window's Tauri label: `main`, or `window-<uuid>` for an extra window. The *window session* rebuilds each window under its recorded label, so the id survives a relaunch. In a browser it is a per-tab id kept in `sessionStorage`, which a reload and a browser session restore keep. Read synchronously, because the focus signal is initialized before the first render.
+
+### Window-scoped storage
+How the client keeps navigation per window (`utils/windowStorage.ts`; ADR 0585). A navigation key such as the focused thread is stored as `<key>@window:<id>`, under the *window id*. Every write also lands on the plain key, the **shared seed**. A window with no state of its own starts from the seed, so a new window opens where the user last was. A removal writes an empty own value, a **tombstone**, so a window that went back to Home does not fall through to another window's seed. `pruneClosedWindows` removes the keys of a window unseen for 30 days.
+
+Preferences and pane layout are NOT window-scoped: they stay device-wide.
+
+### Window peers
+The windows of one workspace on one device, telling each other what they show (`store/windowPeers.ts`; ADR 0585). They share a device id, so a device-scoped engine event reaches all of them: `NavigationRequested`, `AppUiCaptureRequested` and the OAuth completion toast. Each window announces its *window id*, focused thread, open app, whether it started an OAuth authorization, and last activity. It speaks on a `BroadcastChannel` named per workspace. Each one runs the same pure `chooseWindow` over the same list, so exactly one acts, with no leader to elect.
+
+Each page load holds a Web Lock for its life, and its peers wait on it. So a closed or crashed window drops out of the next choice, goodbye or not. A window still counts for what it showed for `PEER_CHANGE_GRACE_MS` after a change, since the winner often changes what it shows at once. Two tabs that share an id, as a duplicated tab does, settle it: the younger takes a new one.
 
 ### Rescued frame
 A frame a window is wearing because the CLIENT corrected it, rather than because the user put it there (`crates/lucidos-app/src/window_restore.rs`; ADR 0215). Every correction site notes the exact rect it placed, by window label: the restore clamp, the desk-change pass, and `sanitized_frame` on a frame read off the *window session*.

@@ -63,6 +63,7 @@ Friction signals to pull:
 | Failed responses | `ResponseFailed` payloads: model errors, timeouts, parse failures. Group by error reason. |
 | Aborts / cancels | `ResponseAborted` (system) and `ResponseCanceled` (user). Group both. |
 | Trigger failures | `TriggerCompleted` payloads whose `result_summary` carries an error. The engine never leaves `result_summary` empty. A run with no output falls back to `"<name> completed (no output)"` or `"<name> completed (exit <code>, no output)"`. Those lines are an **expected** idle-detector outcome (broad subscription + cheap internal gate), **not** friction. Never flag them as "produced no useful output". |
+| Interrupted runs | `TriggerRunInterrupted`: group by trigger and `retry` decision, linking the cut thread and any retry. Count once alongside its `ResponseAborted`. |
 | Dead triggers | `TriggerCreated` with zero matching `TriggerCompleted` since creation |
 | App errors | App emits its own error events, or `ToolResult` errors in app-spawned threads |
 | User corrections in chats | `MessageReceived` immediately following a `ResponseGenerated` / `ResponseAborted` / `ToolResult` whose text reads like a correction ("no", "don't", "stop", "actually", "that's wrong", "instead", "you misunderstood") |
@@ -127,6 +128,7 @@ The same correction shape recurs across threads ("the report is too long", "stop
 #### 6. Failed responses, aborts, and cancels: splits
 
 - `ResponseFailed` / `ResponseAborted` → `[engine]`. Engine-side issues (model errors, timeouts, parse failures). Group by error reason where the payload carries one. The fix lives in engine config or upstream retry logic, not workspace content.
+- `TriggerRunInterrupted` → `[engine]` when restarts repeatedly cut runs. Read `retry` before proposing a manual run; one may already be queued. Inspect the cut thread for side effects before recommending another attempt.
 - `ResponseCanceled` → `[workspace]`. The user stopped the LLM mid-stride. Read the surrounding context, infer why, and propose a knowhow change that gets the LLM there faster.
 
 #### 7. Coding-agent sessions that produce nothing

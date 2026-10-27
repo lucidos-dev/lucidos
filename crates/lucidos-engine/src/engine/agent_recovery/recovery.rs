@@ -313,6 +313,27 @@ impl LucidosEngine {
                     // non-empty net diff, so commits that cancel out read as a
                     // no-op branch.
                     match proposal_files_for_branch(repo_root, &branch_name).await {
+                        // The successor session carries the work and decides it.
+                        Some(_) if crate::engine::successor::handoff_pending(self.pool(), thread_id).await => {
+                            branch_has_work = true;
+                            match crate::engine::change_ops::withhold_handed_off_work(
+                                self.pool(),
+                                &self.event_bus,
+                                thread_id,
+                                repo_root,
+                                &branch_name,
+                            )
+                            .await
+                            {
+                                Ok(true) => self.broadcast_changes_updated().await,
+                                Ok(false) => {}
+                                Err(e) => log!(
+                                    "[Recovery] Could not withdraw the handed-off change on {}: {}",
+                                    branch_name,
+                                    e
+                                ),
+                            }
+                        }
                         Some(changed_files) => {
                             branch_has_work = true;
                             self.propose_stale_branch(
@@ -1408,10 +1429,12 @@ fn unanswered_question_predicate_sql(id_expr: &str) -> String {
            AND NOT EXISTS ( \
                SELECT 1 FROM events later \
                WHERE later.aggregate_id = {id} AND later.sequence > uqa.sequence \
-                 AND later.event_type IN ({park_ending}) \
+                 AND (later.event_type IN ({park_ending}) OR {own_result}) \
            )",
         id = id_expr,
         park_ending = &*PARK_ENDING_EVENT_TYPES_SQL,
+        own_result =
+            crate::engine::thread_events::ThreadEvent::question_own_result_sql("uqa", "later"),
     )
 }
 
@@ -1519,8 +1542,10 @@ fn park_ending_event_types() -> impl Iterator<Item = &'static str> {
         .copied()
 }
 
-/// Whether an event of this type ends the thread's question park, as the
-/// predicate above reads it. For a consumer that follows events one by one.
+/// Whether an event of this type ends the thread's question park whatever
+/// question is open. A `CodingAgentToolResult` is absent: it ends the park only
+/// when it pairs with the question's own `tool_use_id`. For a consumer that
+/// follows events one by one.
 pub(crate) fn ends_question_park(event_type: &str) -> bool {
     park_ending_event_types().any(|t| t == event_type)
 }

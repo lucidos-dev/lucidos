@@ -34,8 +34,9 @@
 //!   keep-alive status* per waiting thread, only on a change (`sync_status`),
 //!   a parked thread included. A run ends with an `ended` status, pinged or not.
 //!   The cache-warm line reads the same status.
-//! - **Every run gives up.** `cache_keep_alive_mode` picks the rule: break-even
-//!   by default, half of it for a parked wait, or this workspace's cheapest cap.
+//! - **Every run gives up.** `cache_keep_alive_mode` picks the rule, off by
+//!   default: break-even (half of it for a parked wait) or this workspace's
+//!   cheapest cap.
 //! - **The user can turn it off for one thread.** The switch holds until the
 //!   thread's next real request, and acts on that thread alone.
 //!
@@ -68,8 +69,22 @@ use crate::engine::thread_events::{
 use crate::engine::thread_lifecycle::{ThreadStatus, WAITING_FOR_USER_ANSWER_EVENTS};
 use crate::engine::{LucidosEngine, PreEmittedOrigin};
 use crate::llm::model_prices::{cache_shares_of, CacheShares};
-use crate::llm::prefill::PrefillBody;
+use crate::llm::prefill::{PrefillBody, PrefillPair};
 use crate::runtime::CodingAgent;
+
+const HELD_CONTEXT_DIVISOR: u64 = 2;
+
+pub(super) fn held_context(read: u64, input: u64) -> bool {
+    input > 0 && read >= input.div_ceil(HELD_CONTEXT_DIVISOR)
+}
+
+fn held_context_sql(read: &str, input: &str) -> String {
+    format!(
+        "(COALESCE(({input})::numeric, 0) > 0 AND \
+         COALESCE(({read})::numeric, 0) >= \
+         CEIL(COALESCE(({input})::numeric, 0) / {HELD_CONTEXT_DIVISOR}))"
+    )
+}
 
 /// The events whose waits are worth keeping warm, chosen from measured wait
 /// lengths: most end within a few beats. Any other kind gets no keep-alive.
@@ -126,7 +141,7 @@ impl CacheLifetime {
 
 /// The values of `cache_keep_alive_mode`, as the catalog lists them.
 pub const CACHE_KEEP_ALIVE_MODES: &[&str] = &[
-    CacheKeepAliveMode::Default.as_str(),
+    CacheKeepAliveMode::BreakEven.as_str(),
     CacheKeepAliveMode::WorkspaceData.as_str(),
     CacheKeepAliveMode::Off.as_str(),
 ];
@@ -135,7 +150,7 @@ pub const CACHE_KEEP_ALIVE_MODES: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKeepAliveMode {
     /// Break-even for an event wait, half of it for a parked one.
-    Default,
+    BreakEven,
     /// The cap that would have cost least over this workspace's last 30 days.
     WorkspaceData,
     /// No beats and no status.
@@ -143,23 +158,23 @@ pub enum CacheKeepAliveMode {
 }
 
 impl CacheKeepAliveMode {
-    const ALL: [Self; 3] = [Self::Default, Self::WorkspaceData, Self::Off];
+    const ALL: [Self; 3] = [Self::BreakEven, Self::WorkspaceData, Self::Off];
 
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Default => "default",
+            Self::BreakEven => "break-even",
             Self::WorkspaceData => "workspace-data",
             Self::Off => "off",
         }
     }
 
-    /// A value outside [`CACHE_KEEP_ALIVE_MODES`] reads as `default`, the
-    /// catalog default.
+    /// A value outside [`CACHE_KEEP_ALIVE_MODES`] reads as `off`, the catalog
+    /// default.
     pub fn parse(value: &str) -> Self {
         Self::ALL
             .into_iter()
             .find(|mode| mode.as_str() == value)
-            .unwrap_or(Self::Default)
+            .unwrap_or(Self::Off)
     }
 }
 
@@ -234,9 +249,9 @@ pub(crate) enum WaitType {
 /// `workspace-data` reads.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum GiveUpRule<'a> {
-    Default,
+    BreakEven,
     /// The cheapest cap over these durations. A type with too few waits keeps
-    /// the default.
+    /// break-even.
     WorkspaceData(&'a WaitDurations),
     Off,
 }
@@ -244,7 +259,7 @@ pub(super) enum GiveUpRule<'a> {
 impl<'a> GiveUpRule<'a> {
     pub(super) fn of(mode: CacheKeepAliveMode, durations: &'a WaitDurations) -> Self {
         match mode {
-            CacheKeepAliveMode::Default => Self::Default,
+            CacheKeepAliveMode::BreakEven => Self::BreakEven,
             CacheKeepAliveMode::WorkspaceData => Self::WorkspaceData(durations),
             CacheKeepAliveMode::Off => Self::Off,
         }
@@ -258,13 +273,13 @@ fn budget_beats(c: &Candidate, rule: GiveUpRule) -> Option<f64> {
     let break_even = lifetime.rewrite_in_beats(c.cache);
     let agent = c.agent.wait_agent()?;
     let wait_type = wait_type(c)?;
-    let default = match wait_type {
+    let break_even_cap = match wait_type {
         WaitType::Parked(_) => break_even / 2.0,
         WaitType::Events(_) => break_even,
     };
     match rule {
         GiveUpRule::Off => None,
-        GiveUpRule::Default => Some(default),
+        GiveUpRule::BreakEven => Some(break_even_cap),
         GiveUpRule::WorkspaceData(durations) => Some(
             durations
                 .cap_beats(
@@ -273,7 +288,7 @@ fn budget_beats(c: &Candidate, rule: GiveUpRule) -> Option<f64> {
                     lifetime.beat_every_secs(c.agent.beat_start()),
                     break_even,
                 )
-                .map_or(default, f64::from),
+                .map_or(break_even_cap, f64::from),
         ),
     }
 }
@@ -336,11 +351,15 @@ pub(super) struct Candidate {
     pub cache: CacheShares,
     /// The model that wrote it, which prices a ping and the reread.
     pub cache_model: Option<String>,
+    pub cache_effort: Option<String>,
+    pub beat_model: Option<String>,
+    pub beat_effort: Option<String>,
     /// When the user turned the keep-alive off for this thread, while that
     /// switch holds: no real request has started since.
     pub turned_off_at: Option<DateTime<Utc>>,
     /// A trigger thread no person has written in, so nobody reads a warm cache.
     pub unattended_trigger: bool,
+    pub beat_missed: bool,
 }
 
 /// The agent that runs a thread, as the keep-alive weighs it.
@@ -450,6 +469,12 @@ pub(super) enum SkipReason {
     TurnedOff,
     /// The provider cannot prefill the thread's last request.
     UncacheableProvider,
+    /// A failed ping paused this provider until the engine restarts.
+    ProviderPaused,
+    /// The provider's recent beats kept missing, so its beats pause.
+    PingsPaused,
+    /// The remembered request outlived its cache, so a beat would write.
+    CacheExpired,
     /// The engine remembers no request for the thread since it restarted.
     Restarted,
     /// A trigger thread no person has written in.
@@ -457,6 +482,8 @@ pub(super) enum SkipReason {
     /// No evidence says how long the thread's cache lives, so no beat can be
     /// timed.
     UnknownTtl,
+    ModelChanged,
+    BeatMissed,
 }
 
 /// Decide one thread's beat. Pure, so every condition and boundary is
@@ -477,12 +504,18 @@ pub(super) fn decide(c: &Candidate, rule: GiveUpRule) -> Beat {
     if c.turned_off_at.is_some() {
         return Beat::Skip(TurnedOff);
     }
+    if c.beat_missed {
+        return Beat::Skip(BeatMissed);
+    }
     let Some(lifetime) = c.cache_ttl.lifetime() else {
         return Beat::Skip(UnknownTtl);
     };
     let Some(give_up_after) = give_up_after_secs(c, rule) else {
         return Beat::Skip(Disabled);
     };
+    if model_changed(c) {
+        return Beat::Skip(ModelChanged);
+    }
     if waiting_secs > give_up_after {
         return Beat::Skip(PastCutOff);
     }
@@ -534,8 +567,40 @@ fn route(c: &Candidate) -> Result<BeatRoute, SkipReason> {
 fn forgotten(c: &Candidate) -> Option<SkipReason> {
     match c.agent {
         Agent::Lucidos(Remembered::Uncacheable) => Some(SkipReason::UncacheableProvider),
+        Agent::Lucidos(Remembered::ProviderPaused) => Some(SkipReason::ProviderPaused),
+        Agent::Lucidos(Remembered::Paused { .. }) => Some(SkipReason::PingsPaused),
+        Agent::Lucidos(Remembered::Missed) => Some(SkipReason::BeatMissed),
+        Agent::Lucidos(Remembered::Expired) => Some(SkipReason::CacheExpired),
+        Agent::Lucidos(Remembered::GaveUp) => Some(SkipReason::PastCutOff),
         Agent::Lucidos(Remembered::Nothing) => Some(SkipReason::Restarted),
         Agent::Lucidos(Remembered::Pair) | Agent::ClaudeCode | Agent::Codex => None,
+    }
+}
+
+/// What [`forgotten`] skips for, as the status says it, and whether the
+/// reason covers the whole provider rather than this thread.
+fn forgotten_status(remembered: Remembered) -> Option<(CacheKeepAliveStatus, bool)> {
+    use CacheKeepAliveNotKeptReason as Reason;
+    let not_kept = CacheKeepAliveStatus::not_kept;
+    Some(match remembered {
+        Remembered::Pair => return None,
+        Remembered::Uncacheable => (not_kept(Reason::UncacheableProvider), true),
+        Remembered::ProviderPaused => (not_kept(Reason::ProviderPaused), true),
+        Remembered::Paused { until } => (CacheKeepAliveStatus::pings_paused(until), true),
+        Remembered::Missed => (not_kept(Reason::BeatMissed), false),
+        Remembered::Expired => (not_kept(Reason::CacheExpired), false),
+        Remembered::GaveUp => (not_kept(Reason::PastGiveUpTime), false),
+        Remembered::Nothing => (not_kept(Reason::Restarted), false),
+    })
+}
+
+fn model_changed(c: &Candidate) -> bool {
+    forgotten(c).is_none() && !c.cache_matches(c.beat_model.as_deref(), c.beat_effort.as_deref())
+}
+
+impl Candidate {
+    fn cache_matches(&self, model: Option<&str>, effort: Option<&str>) -> bool {
+        self.cache_model.as_deref() == model && self.cache_effort.as_deref() == effort
     }
 }
 
@@ -641,7 +706,7 @@ pub(super) fn status(
     spent: Spent,
 ) -> CacheKeepAliveStatus {
     use CacheKeepAliveNotKeptReason as Reason;
-    let not_kept = |reason| CacheKeepAliveStatus::NotKept { reason };
+    let not_kept = CacheKeepAliveStatus::not_kept;
     if c.agent == Agent::Codex {
         return not_kept(Reason::Codex);
     }
@@ -673,6 +738,9 @@ pub(super) fn status(
     if let Some(turned_off) = turned_off {
         return turned_off;
     }
+    if c.beat_missed {
+        return not_kept(Reason::BeatMissed);
+    }
     let Some(beat_every_secs) = c.beat_every_secs() else {
         return not_kept(Reason::UnknownTtl);
     };
@@ -683,6 +751,9 @@ pub(super) fn status(
     ) else {
         return not_kept(Reason::NothingPending);
     };
+    if model_changed(c) {
+        return not_kept(Reason::ModelChanged);
+    }
     let past_budget = waiting_secs > give_up_after;
     if parked_wait(c).is_some_and(|parked| !beside_the_turn(c, parked, past_budget)) {
         return not_kept(Reason::Restarted);
@@ -701,10 +772,14 @@ pub(super) fn status(
             odds,
         };
     }
-    match forgotten(c) {
-        Some(SkipReason::UncacheableProvider) => return not_kept(Reason::UncacheableProvider),
-        Some(_) if !past_budget || budget >= 1.0 => return not_kept(Reason::Restarted),
-        _ => {}
+    // A provider-wide reason holds either way. Past a budget under one beat
+    // no ping was ever due, whatever the thread's own memory says.
+    if let Agent::Lucidos(remembered) = c.agent {
+        if let Some((status, provider_wide)) = forgotten_status(remembered) {
+            if provider_wide || !past_budget || budget >= 1.0 {
+                return status;
+            }
+        }
     }
     if past_budget {
         return not_kept(Reason::PastGiveUpTime);
@@ -766,8 +841,7 @@ fn beside_the_turn(c: &Candidate, parked: Parked, past_budget: bool) -> bool {
     c.claim == ThreadClaim::Busy
         && match c.agent {
             Agent::ClaudeCode => parked.copy_ready,
-            // The tick forgets the pair at give-up, so a stopped run
-            // remembers nothing.
+            // A restart loses the pair; a stopped run keeps its give-up cause.
             Agent::Lucidos(remembered) => past_budget || remembered != Remembered::Nothing,
             Agent::Codex => false,
         }
@@ -873,10 +947,27 @@ struct CandidateRow {
     /// The usage block of its latest turn cache write.
     last_write_usage: Option<sqlx::types::Json<WriteSplit>>,
     last_write_model: Option<String>,
+    last_write_effort: Option<String>,
+    missed_beat: Option<sqlx::types::Json<MissedBeat>>,
     stored_status: Option<sqlx::types::Json<CacheKeepAliveStatus>>,
     /// When the user turned the keep-alive off, while that switch holds.
     turned_off_at: Option<DateTime<Utc>>,
     unattended_trigger: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct MissedBeat {
+    model: Option<String>,
+    route: String,
+    read: u64,
+    input: u64,
+}
+
+fn log_missed_beat(thread_id: Uuid, route: &str, model: Option<&str>, read: u64, input: u64) {
+    crate::log!(
+        "[KeepAlive] Missed cache: thread={thread_id} route={route} model={} read={read} input={input}",
+        model.unwrap_or("unknown")
+    );
 }
 
 impl CandidateRow {
@@ -933,9 +1024,7 @@ impl CandidateRow {
 ///   prefill beat writes neither. [`read_candidates`] binds the reason.
 /// - The last refresh is [`last_cache_refresh_started_sql`], the one
 ///   definition the cache-warm line shares.
-/// - The per-thread switch holds while it is later than
-///   [`last_real_request_started_sql`]. CASE evaluates that look-up only for
-///   a thread that has the switch set.
+/// - Only a real request re-arms the per-thread switch or a missed beat.
 /// - The TTL and the model come from the latest capture of the session's own
 ///   that wrote to the cache. A cache hit keeps an entry's lifetime, and a
 ///   sub-agent may run on another TTL or model. A Codex thread never writes
@@ -944,6 +1033,11 @@ fn candidates_sql() -> String {
     let turn_started = last_turn_started_sql("ts.thread_id");
     let refresh_started = last_cache_refresh_started_sql("ts.thread_id");
     let real_request_started = last_real_request_started_sql("ts.thread_id");
+    let held = held_context_sql(
+        "e.payload->'usage'->>'cache_read_tokens'",
+        "e.payload->'usage'->>'input_tokens'",
+    );
+    let beat_purpose = crate::engine::ContextPurpose::CacheKeepAlive.wire();
     // A handed-off session is ending, so there is no cache worth keeping.
     let handoff_pending = crate::engine::successor::pending_handoff_sql("ts.thread_id");
     let in_session =
@@ -975,10 +1069,20 @@ SELECT ts.thread_id,
        i.created AS idle_at,
        w.usage AS last_write_usage,
        w.model AS last_write_model,
+       w.effort AS last_write_effort,
+       CASE WHEN b.sequence IS NOT NULL
+            THEN jsonb_build_object(
+                 'model', b.payload->>'model',
+                 'route', CASE WHEN b.payload->>'purpose' = '{beat_purpose}'
+                               THEN CASE WHEN ts.is_coding_agent THEN 'session-copy' ELSE 'prefill' END
+                               ELSE 'resume' END,
+                 'read', COALESCE((b.payload->'usage'->>'cache_read_tokens')::bigint, 0),
+                 'input', COALESCE((b.payload->'usage'->>'input_tokens')::bigint, 0))
+            END AS missed_beat,
        ts.cache_keep_alive_status AS stored_status,
        CASE WHEN ts.cache_keep_alive_off_at IS NULL THEN NULL
             WHEN ts.cache_keep_alive_off_at
-                 > COALESCE({real_request_started}, '-infinity'::timestamptz)
+                 > COALESCE(r.real_started, '-infinity'::timestamptz)
             THEN ts.cache_keep_alive_off_at END AS turned_off_at,
        ts.trigger_id IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM events m
@@ -989,7 +1093,8 @@ SELECT ts.thread_id,
   FROM thread_summaries ts
   LEFT JOIN LATERAL (
        SELECT {turn_started} AS turn_started,
-              {refresh_started} AS refresh_started) r ON true
+              {refresh_started} AS refresh_started,
+              {real_request_started} AS real_started) r ON true
   LEFT JOIN LATERAL (
        SELECT e.event_type
          FROM events e
@@ -1007,7 +1112,8 @@ SELECT ts.thread_id,
         ORDER BY e.sequence DESC LIMIT 1) i ON true
   LEFT JOIN LATERAL (
        SELECT e.payload->'usage' AS usage,
-              e.payload->>'model' AS model
+              e.payload->>'model' AS model,
+              e.payload->>'reasoning_effort' AS effort
          FROM events e
         WHERE ts.coding_agent IS DISTINCT FROM $5
           AND e.thread_id = ts.thread_id
@@ -1017,6 +1123,31 @@ SELECT ts.thread_id,
           AND (e.payload->'usage'->>'cache_creation_tokens')::bigint > 0
           AND {in_session}
         ORDER BY e.sequence DESC LIMIT 1) w ON true
+  LEFT JOIN LATERAL (
+       SELECT e.sequence, e.payload
+         FROM events e
+        WHERE ts.coding_agent IS DISTINCT FROM $5
+          AND e.thread_id = ts.thread_id
+          AND e.event_type = 'ContextCaptured'
+          AND e.payload->>'parent_tool_use_id' IS NULL
+          AND e.created >= COALESCE(r.real_started, '-infinity'::timestamptz)
+          AND NOT {held}
+          AND NOT EXISTS (
+              SELECT 1 FROM events newer
+               WHERE newer.thread_id = e.thread_id
+                 AND newer.event_type = 'ContextCaptured'
+                 AND newer.sequence > e.sequence
+                 AND COALESCE(newer.payload->>'api_call_id', newer.id::text)
+                     = COALESCE(e.payload->>'api_call_id', e.id::text))
+          AND e.created - make_interval(secs => COALESCE((e.payload->>'duration_ms')::float8, 0) / 1000)
+              > COALESCE(r.real_started, '-infinity'::timestamptz)
+          AND (e.payload->>'purpose' = '{beat_purpose}'
+               OR (COALESCE(e.payload->>'purpose', 'turn') = 'turn'
+                   AND EXISTS (SELECT 1 FROM events a
+                                WHERE a.id = (e.payload->>'request_event_id')::uuid
+                                  AND a.event_type = 'PromptInjected'
+                                  AND a.payload->'origin'->'reason'->>'kind' = '{CACHE_KEEP_ALIVE_REASON_KIND}')))
+        ORDER BY e.sequence DESC LIMIT 1) b ON true
  WHERE NOT {handoff_pending}
    AND (ts.thread_id = ANY($1)
         OR ts.active_children_count > 0
@@ -1284,6 +1415,13 @@ struct RunEnd {
     saved_usd: Option<f64>,
 }
 
+#[derive(sqlx::FromRow)]
+struct RunWake {
+    started: DateTime<Utc>,
+    gap_secs: Option<f64>,
+    usage: Option<sqlx::types::Json<crate::engine::ApiUsage>>,
+}
+
 /// The run's first ping, then the first real request that began after it.
 /// Also the gap between that request and the cache's last refresh before it,
 /// and what that request read from the cache. A resume beat's turn is no real
@@ -1321,10 +1459,11 @@ SELECT w.started,
                    FROM events e
                   WHERE e.thread_id = $1 AND e.event_type = 'ContextCaptured'
                     AND (({MAIN_SESSION_CAPTURE}) OR e.payload->>'purpose' = $3)) r
-          WHERE r.started < w.started AND r.call_id <> w.call_id))::float8,
-       (SELECT max((e.payload->'usage'->>'cache_read_tokens')::bigint)
+           WHERE r.started < w.started AND r.call_id <> w.call_id))::float8 AS gap_secs,
+       (SELECT e.payload->'usage'
           FROM events e
-         WHERE e.thread_id = $1 AND e.event_type = 'ContextCaptured' AND {call} = w.call_id)
+         WHERE e.thread_id = $1 AND e.event_type = 'ContextCaptured' AND {call} = w.call_id
+         ORDER BY e.sequence DESC LIMIT 1) AS usage
   FROM wake w
 "#
     )
@@ -1340,14 +1479,19 @@ async fn read_run_end(
     since: DateTime<Utc>,
     context_tokens: u64,
 ) -> Result<RunEnd, sqlx::Error> {
-    let wake: Option<(DateTime<Utc>, Option<f64>, Option<i64>)> = sqlx::query_as(&run_end_sql())
+    let wake: Option<RunWake> = sqlx::query_as(&run_end_sql())
         .bind(thread_id)
         .bind(since)
         .bind(crate::engine::ContextPurpose::CacheKeepAlive.wire())
         .bind(CACHE_KEEP_ALIVE_REASON_KIND)
         .fetch_optional(pool)
         .await?;
-    let Some((at, gap_secs, read_tokens)) = wake else {
+    let Some(RunWake {
+        started: at,
+        gap_secs,
+        usage,
+    }) = wake
+    else {
         return Ok(RunEnd {
             at: None,
             saved_usd: None,
@@ -1359,7 +1503,12 @@ async fn read_run_end(
     let saved_usd = write.and_then(|write| {
         let lifetime = write.ttl.lifetime()?;
         let warm = gap_secs.is_some_and(|gap| gap <= lifetime.lifetime_secs())
-            && read_tokens.is_some_and(|read| read > 0);
+            && usage.is_some_and(|usage| {
+                held_context(
+                    u64::from(usage.cache_read_tokens),
+                    u64::from(usage.input_tokens),
+                )
+            });
         (warm && context_tokens > 0)
             .then(|| reread_usd(context_tokens, write.model.as_deref()?, lifetime))
             .flatten()
@@ -1381,6 +1530,22 @@ fn continues_run(stored: &CacheKeepAliveStatus, next: Option<&CacheKeepAliveStat
         Some(CacheKeepAliveStatus::Stopped { .. } | CacheKeepAliveStatus::TurnedOff { .. }) => true,
         _ => false,
     }
+}
+
+/// What the run since `since` spent, read from its events. A run beats by
+/// one route, so the route that counts more beats is the run's.
+async fn read_closing_spent(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    since: DateTime<Utc>,
+) -> Result<Spent, sqlx::Error> {
+    let captured = read_capture_spent(pool, thread_id, since).await?;
+    let resumed = read_spent(pool, thread_id, since).await?;
+    Ok(if resumed.beats > captured.beats {
+        resumed
+    } else {
+        captured
+    })
 }
 
 /// What closing a stored status writes.
@@ -1414,6 +1579,14 @@ async fn ended_status(
     } = *stored
     else {
         return Ok(RunClose::NotARun);
+    };
+    // The stored status predates a beat that landed after the last tick,
+    // such as the beat whose miss ended the run. A run's count only grows.
+    let fresh = read_closing_spent(pool, thread_id, since).await?;
+    let (beats, cost_usd) = if fresh.beats > beats {
+        (fresh.beats, fresh.cost_usd)
+    } else {
+        (beats, cost_usd)
     };
     // The reply read a warm cache with or without a keep-alive, so a run that
     // never pinged claims no saving and waits for no wake.
@@ -1575,21 +1748,40 @@ impl LucidosEngine {
         for row in rows {
             let wait = newest.get(&row.thread_id).copied();
             let candidate = self.candidate_of(&row, wait, now).await;
+            if let Some(miss) = row.missed_beat.as_ref().filter(|_| {
+                !matches!(
+                    row.stored_status.as_ref().map(|s| &s.0),
+                    Some(CacheKeepAliveStatus::NotKept {
+                        reason: CacheKeepAliveNotKeptReason::BeatMissed,
+                        ..
+                    })
+                )
+            }) {
+                log_missed_beat(
+                    row.thread_id,
+                    &miss.route,
+                    miss.model.as_deref(),
+                    miss.read,
+                    miss.input,
+                );
+            }
             match decide(&candidate, rule) {
                 // The beat's own turn now holds the thread, so the next idle
                 // tick writes the status, with the ping priced.
                 Beat::Send(BeatRoute::Resume) => {
-                    self.send_keep_alive(row.thread_id).await;
+                    self.send_keep_alive(row.thread_id, &candidate).await;
                     continue;
                 }
                 Beat::Send(BeatRoute::SessionCopy) => {
-                    self.send_keep_alive_copy(row.thread_id);
+                    self.send_keep_alive_copy(row.thread_id, candidate.clone());
                     continue;
                 }
                 // A prefill never holds the thread, so the status syncs now.
-                Beat::Send(BeatRoute::Prefill(cut)) => self.send_prefill_beat(row.thread_id, cut),
+                Beat::Send(BeatRoute::Prefill(cut)) => {
+                    self.send_prefill_beat(row.thread_id, cut, &candidate)
+                }
                 Beat::Skip(SkipReason::PastCutOff) => {
-                    self.remembered_requests.forget(row.thread_id)
+                    self.remembered_requests.give_up(row.thread_id)
                 }
                 Beat::Skip(_) => {}
             }
@@ -1626,12 +1818,30 @@ impl LucidosEngine {
         now: DateTime<Utc>,
     ) -> Candidate {
         let agent = if !row.is_coding_agent {
-            Agent::Lucidos(self.remembered_requests.state(row.thread_id))
+            Agent::Lucidos(self.remembered_requests.state(row.thread_id, now))
         } else {
             match CodingAgent::parse(row.coding_agent.as_deref().unwrap_or("")) {
                 CodingAgent::ClaudeCode => Agent::ClaudeCode,
                 CodingAgent::Codex => Agent::Codex,
             }
+        };
+        let (beat_model, beat_effort) = match agent {
+            Agent::ClaudeCode if row.awaiting_user => self.cc_thread_settings(row.thread_id).await,
+            Agent::ClaudeCode => {
+                self.coding_agent_rung(row.thread_id, CodingAgent::ClaudeCode, None, None)
+                    .await
+            }
+            Agent::Lucidos(_) => self
+                .remembered_requests
+                .pair(row.thread_id, now)
+                .map(|pair| {
+                    (
+                        Some(pair.stable.model.clone()),
+                        pair.stable.reasoning_effort.clone(),
+                    )
+                })
+                .unwrap_or_default(),
+            Agent::Codex => (None, None),
         };
         Candidate {
             agent,
@@ -1646,8 +1856,12 @@ impl LucidosEngine {
             cache_ttl: row.cache_ttl(),
             cache: row.cache(),
             cache_model: row.last_write_model.clone(),
+            cache_effort: row.last_write_effort.clone(),
+            beat_model,
+            beat_effort,
             turned_off_at: row.turned_off_at,
             unattended_trigger: row.unattended_trigger,
+            beat_missed: row.missed_beat.is_some(),
         }
     }
 
@@ -1692,9 +1906,9 @@ impl LucidosEngine {
             .keep_alive_candidate(thread_id, CandidatePick::Always)
             .await?
         else {
-            return Ok(CacheKeepAliveStatus::NotKept {
-                reason: CacheKeepAliveNotKeptReason::NothingPending,
-            });
+            return Ok(CacheKeepAliveStatus::not_kept(
+                CacheKeepAliveNotKeptReason::NothingPending,
+            ));
         };
         let durations = self.keep_alive_durations.current();
         let rule = GiveUpRule::of(self.keep_alive_mode().await, &durations);
@@ -1739,7 +1953,9 @@ impl LucidosEngine {
 
     /// Write the hidden anchor, then resume the session through the same route
     /// a wait re-entry takes. A busy thread skips the beat inside that route.
-    async fn send_keep_alive(self: &Arc<Self>, thread_id: Uuid) {
+    async fn send_keep_alive(self: &Arc<Self>, thread_id: Uuid, candidate: &Candidate) {
+        let model = candidate.beat_model.clone();
+        let effort = candidate.beat_effort.clone();
         self.keep_alive_beats
             .lock()
             .unwrap()
@@ -1779,7 +1995,7 @@ impl LucidosEngine {
                     None,
                     None,
                     None,
-                    None,
+                    effort.as_deref(),
                     None, // provider_override
                     None,
                     None,
@@ -1793,7 +2009,7 @@ impl LucidosEngine {
                     None,
                     None,
                     ActorMode::Engine,
-                    None,
+                    model.as_deref(),
                     None,
                     Some(PreEmittedOrigin::KeepAlive(anchor_id)),
                     None,
@@ -1811,7 +2027,7 @@ impl LucidosEngine {
 
     /// Beat a parked session by asking a copy of it, in the background. The
     /// parked session, its transcript and its card never hear of it (I1).
-    fn send_keep_alive_copy(self: &Arc<Self>, thread_id: Uuid) {
+    fn send_keep_alive_copy(self: &Arc<Self>, thread_id: Uuid, candidate: Candidate) {
         self.keep_alive_beats
             .lock()
             .unwrap()
@@ -1820,12 +2036,12 @@ impl LucidosEngine {
             "[KeepAlive] Asking a copy of parked thread {thread_id} to keep its prompt cache warm"
         );
         let engine = self.clone();
-        tokio::spawn(async move { engine.ask_keep_alive_copy(thread_id).await });
+        tokio::spawn(async move { engine.ask_keep_alive_copy(thread_id, &candidate).await });
     }
 
     /// Ask the copy, then record what it cost. The capture's `duration_ms`
     /// dates the copy's launch, which the next beat's timing reads.
-    async fn ask_keep_alive_copy(&self, thread_id: Uuid) {
+    async fn ask_keep_alive_copy(&self, thread_id: Uuid, candidate: &Candidate) {
         let copy = match self.session_copy(thread_id).await {
             Ok(copy) => copy,
             Err(e) => {
@@ -1849,6 +2065,9 @@ impl LucidosEngine {
             ),
         };
         let args = copy.spawn_args(self.workspace_path(), thread_id);
+        if !candidate.cache_matches(args.model, args.reasoning_effort) {
+            return;
+        }
         let reply =
             match crate::runtime::claude_code::ask_session_copy(args, KEEP_ALIVE_PROMPT, &[], ask)
                 .await
@@ -1859,6 +2078,20 @@ impl LucidosEngine {
                     return;
                 }
             };
+        if let Some(usage) = reply.usage.as_ref().filter(|usage| {
+            !held_context(
+                u64::from(usage.cache_read_tokens),
+                u64::from(usage.input_tokens),
+            )
+        }) {
+            log_missed_beat(
+                thread_id,
+                "session-copy",
+                Some(&copy.model_of(&reply)),
+                u64::from(usage.cache_read_tokens),
+                u64::from(usage.input_tokens),
+            );
+        }
         let detail = crate::engine::model_call::CallDetail {
             reasoning_effort: copy.effort().map(str::to_string),
             duration_ms: u64::try_from(launched.elapsed().as_millis()).ok(),
@@ -1884,14 +2117,19 @@ impl LucidosEngine {
     /// Send a Lucidos Agent thread's remembered request again, in the
     /// background. It claims no thread and writes no event but its capture.
     /// With every beat slot taken, it waits for the next tick.
-    fn send_prefill_beat(self: &Arc<Self>, thread_id: Uuid, cut: PrefillCut) {
-        let Some(pair) = self.remembered_requests.pair(thread_id) else {
+    fn send_prefill_beat(
+        self: &Arc<Self>,
+        thread_id: Uuid,
+        cut: PrefillCut,
+        candidate: &Candidate,
+    ) {
+        let Some(pair) = self.remembered_requests.pair(thread_id, Utc::now()) else {
             return;
         };
-        let body = match cut {
-            PrefillCut::Stable => pair.stable,
-            PrefillCut::Whole => pair.whole,
-        };
+        let body = cut_body(&pair, cut);
+        if !candidate.cache_matches(Some(&body.model), body.reasoning_effort.as_deref()) {
+            return;
+        }
         let engine = self.clone();
         tokio::spawn(async move {
             let Some(_slot) = engine.remembered_requests.claim_slot() else {
@@ -1909,10 +2147,18 @@ impl LucidosEngine {
                 store,
                 provider.as_ref(),
                 thread_id,
-                &body,
+                &pair,
+                cut,
             )
             .await;
         });
+    }
+}
+
+fn cut_body(pair: &PrefillPair, cut: PrefillCut) -> &PrefillBody {
+    match cut {
+        PrefillCut::Stable => &pair.stable,
+        PrefillCut::Whole => &pair.whole,
     }
 }
 
@@ -1924,8 +2170,10 @@ pub(super) async fn beat_once(
     store: &super::RememberedRequests,
     llm: &dyn crate::llm::LlmProvider,
     thread_id: Uuid,
-    body: &PrefillBody,
+    pair: &Arc<PrefillPair>,
+    cut: PrefillCut,
 ) {
+    let body = cut_body(pair, cut);
     let Some(provider) = body.provider else {
         return;
     };
@@ -1939,7 +2187,22 @@ pub(super) async fn beat_once(
     .prefill(llm, body)
     .await;
     let outcome = match reply {
-        Ok(usage) => judge_beat(&usage, body.output_cap),
+        Ok(usage) => {
+            let outcome = judge_beat(&usage, body.output_cap);
+            if !held_context(
+                u64::from(usage.cache_read_tokens.unwrap_or(0)),
+                u64::from(usage.input_tokens.unwrap_or(0)),
+            ) {
+                log_missed_beat(
+                    thread_id,
+                    "prefill",
+                    Some(&body.model),
+                    u64::from(usage.cache_read_tokens.unwrap_or(0)),
+                    u64::from(usage.input_tokens.unwrap_or(0)),
+                );
+            }
+            outcome
+        }
         Err(e) if first && e.is::<crate::llm::prefill::PrefillRefused>() => {
             crate::log!(
                 "[KeepAlive] {} refused its first prefill beat, so it beats no more \
@@ -1957,7 +2220,7 @@ pub(super) async fn beat_once(
     match outcome {
         BeatOutcome::Read => {
             store.mark_proven(provider);
-            store.refreshed(thread_id, started);
+            store.refreshed(thread_id, pair, started);
         }
         BeatOutcome::Talkative => {
             crate::log!(
@@ -1966,17 +2229,20 @@ pub(super) async fn beat_once(
                 provider.as_str()
             );
             store.mark_unable(provider);
-            store.forget(thread_id);
+            store.end_run(thread_id, pair);
         }
-        BeatOutcome::Wrote => {
+        BeatOutcome::Missed | BeatOutcome::Wrote => {
             crate::log!(
-                "[KeepAlive] A prefill beat for thread {thread_id} wrote to the cache, \
+                "[KeepAlive] A prefill beat for thread {thread_id} missed the cache, \
                  so its run ends"
             );
-            if first {
-                store.mark_unable(provider);
+            if let Some(until) = store.mark_missed(thread_id, pair, provider, Utc::now()) {
+                crate::log!(
+                    "[KeepAlive] {} missed {} beats in a row, so its beats pause until {until}",
+                    provider.as_str(),
+                    super::remembered_requests::MISSES_TO_PAUSE
+                );
             }
-            store.forget(thread_id);
         }
     }
 }
@@ -1990,6 +2256,8 @@ pub(super) enum BeatOutcome {
     Talkative,
     /// It wrote over [`BEAT_WRITE_SHARE`] of its input: the cache moved.
     Wrote,
+    /// The beat did not hold the context.
+    Missed,
 }
 
 /// The share of a beat's input it may write before the run ends. A beat
@@ -2008,6 +2276,11 @@ pub(super) fn judge_beat(
     let wrote = f64::from(usage.cache_creation_tokens.unwrap_or(0));
     if wrote > BEAT_WRITE_SHARE * input {
         BeatOutcome::Wrote
+    } else if !held_context(
+        u64::from(usage.cache_read_tokens.unwrap_or(0)),
+        u64::from(usage.input_tokens.unwrap_or(0)),
+    ) {
+        BeatOutcome::Missed
     } else {
         BeatOutcome::Read
     }

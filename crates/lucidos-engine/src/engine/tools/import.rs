@@ -177,6 +177,13 @@ fn walk_dir(
     Ok(())
 }
 
+/// Where `import_file` writes, under `data/artifacts/`: always in `imported/`,
+/// whether the destination names that folder, its data path, or neither.
+fn import_destination(destination: Option<&str>, filename: &str) -> String {
+    let path = destination.map_or(filename, crate::core::artifact_relative_path);
+    format!("imported/{}", path.trim_start_matches("imported/"))
+}
+
 impl LucidosEngine {
     /// `thread_id` anchors the capture for the summary call an `import_file`
     /// makes. The tool dispatcher holds it, so that spend has a home.
@@ -230,9 +237,7 @@ impl LucidosEngine {
                         );
                     }
                 }
-                let dest_relative = dest_arg
-                    .map(|s| format!("imported/{}", s.trim_start_matches("imported/")))
-                    .unwrap_or_else(|| format!("imported/{}", filename));
+                let dest_relative = import_destination(dest_arg, filename);
 
                 // Finder-style auto-suffix on collision: never overwrite an
                 // existing artifact. Resolve before the binary/text branch so
@@ -697,6 +702,23 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_import_destination_lands_in_imported_once() {
+        for given in [
+            "report.pdf",
+            "imported/report.pdf",
+            "artifacts/imported/report.pdf",
+            "artifacts/report.pdf",
+        ] {
+            assert_eq!(
+                import_destination(Some(given), "x.pdf"),
+                "imported/report.pdf",
+                "{given}"
+            );
+        }
+        assert_eq!(import_destination(None, "x.pdf"), "imported/x.pdf");
+    }
 
     /// Regression: `git_clone` wrote the raw URL, `user:token@` included, to
     /// the log, the tool result, the workspace commit message and the

@@ -416,6 +416,7 @@ pub struct ThreadQueue {
     /// reads the same atomic). Held rather than reached through `engine`, so a
     /// trigger fire is held even before the engine is attached.
     shutting_down: Arc<AtomicBool>,
+    boot_recovery: AtomicBool,
     state: tokio::sync::Mutex<QueueState>,
 }
 
@@ -438,6 +439,7 @@ impl ThreadQueue {
             executor: OnceLock::new(),
             engine: OnceLock::new(),
             shutting_down,
+            boot_recovery: AtomicBool::new(false),
             state: tokio::sync::Mutex::new(QueueState {
                 policy,
                 queued: VecDeque::new(),
@@ -544,17 +546,17 @@ impl ThreadQueue {
             .is_ok_and(|configs| configs.get(trigger_id).is_some_and(|c| c.paused))
     }
 
-    /// Whether an entry of `kind` must wait for the next engine.
-    ///
-    /// Once shutdown has begun, the API a trigger's run calls back into is
-    /// closing, so a fire started now fails on its first `lucidos` call. Held,
-    /// it stays `queued`, and the next engine's boot recovery runs it. Spawn
-    /// kinds are not held: running work that spawns one is torn down anyway.
-    ///
-    /// Asked under the state lock at admission, which is the boundary: a fire
-    /// admitted before the flag flips is in flight, and finishes (ADR 0429).
-    fn held_for_shutdown(&self, kind: ThreadQueueKind) -> bool {
-        kind.is_trigger_fire() && self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+    /// Hold trigger work while boot reconstructs its configs and retry reports.
+    pub fn begin_boot_recovery(&self) {
+        self.boot_recovery
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Checked at every trigger admission, including drain hints and Run now.
+    fn trigger_admission_held(&self, kind: ThreadQueueKind) -> bool {
+        kind.is_trigger_fire()
+            && (self.boot_recovery.load(std::sync::atomic::Ordering::SeqCst)
+                || self.shutting_down.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Submit a background spawn. Admits immediately when capacity allows
@@ -613,7 +615,7 @@ impl ThreadQueue {
                 .policy
                 .decide_submit(counts, kind, trigger_id.is_some())
             {
-                AdmissionDecision::Admit if self.held_for_shutdown(kind) => {
+                AdmissionDecision::Admit if self.trigger_admission_held(kind) => {
                     AdmissionDecision::Queue
                 }
                 decision => decision,
@@ -718,8 +720,55 @@ impl ThreadQueue {
         }
     }
 
+    /// Persist a boot retry without starting execution before scheduler registration.
+    pub(crate) async fn submit_boot_retry(
+        self: &Arc<Self>,
+        request: ThreadQueueRequest,
+    ) -> Result<Option<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
+        let kind = request.kind();
+        assert!(kind.is_trigger_fire());
+        let trigger_id = request.trigger_id().map(str::to_owned);
+        let trigger_name = trigger_id.as_deref().and_then(|id| self.trigger_name(id));
+        let mut state = self.state.lock().await;
+        let running = self.read_user_occupancy(&mut state, None).await;
+        let user_active = state.user_active(&running);
+        let counts = state.counts_for(kind, trigger_id.as_deref(), user_active);
+        let decision = state
+            .policy
+            .decide_submit(counts, kind, trigger_id.is_some());
+        if decision == AdmissionDecision::Coalesce {
+            return Ok(None);
+        }
+        let entry = QueueEntry {
+            id: Uuid::new_v4(),
+            kind,
+            trigger_id,
+            trigger_name: trigger_name.clone(),
+            thread_id: None,
+            summary: request.summary(trigger_name.as_deref()),
+            request,
+            queued_at: Utc::now(),
+            cancel: None,
+            completion_tx: None,
+        };
+        self.try_emit_queued(&entry, false, None).await?;
+        let id = entry.id;
+        if decision == AdmissionDecision::Overflow {
+            drop(state);
+            self.handle_persisted_overflow(entry).await;
+        } else {
+            state.queued.push_back(entry);
+        }
+        Ok(Some(id))
+    }
+
     /// Apply the overflow policy: the trigger's queue is at its ceiling.
     async fn handle_overflow(self: &Arc<Self>, entry: QueueEntry, actor: Option<MessageOrigin>) {
+        self.emit_queued(&entry, false, actor).await;
+        self.handle_persisted_overflow(entry).await;
+    }
+
+    async fn handle_persisted_overflow(self: &Arc<Self>, entry: QueueEntry) {
         let trigger_id = entry
             .trigger_id
             .clone()
@@ -732,7 +781,6 @@ impl ThreadQueue {
             let state = self.state.lock().await;
             state.policy.overflow
         };
-        self.emit_queued(&entry, false, actor).await;
         match overflow {
             OverflowPolicy::DropOldest => {
                 let (dropped, cap) = {
@@ -904,7 +952,7 @@ impl ThreadQueue {
                 let e = &state.queued[i];
                 (e.kind, e.trigger_id.clone())
             };
-            if self.held_for_shutdown(kind) {
+            if self.trigger_admission_held(kind) {
                 i += 1;
                 continue;
             }
@@ -1015,9 +1063,9 @@ impl ThreadQueue {
                 .iter()
                 .position(|e| e.id == entry_id)
                 .ok_or_else(|| "entry is not queued (already running or gone)".to_string())?;
-            if self.held_for_shutdown(state.queued[idx].kind) {
+            if self.trigger_admission_held(state.queued[idx].kind) {
                 return Err(
-                    "the engine is shutting down; the next engine runs this fire".to_string(),
+                    "trigger admission is held during engine startup or shutdown".to_string(),
                 );
             }
             let mut entry = state
@@ -1079,6 +1127,10 @@ impl ThreadQueue {
     /// Release an admitted entry's capacity slot — its work finished (any
     /// outcome). Resolves the submitter's completion handle and drains.
     pub async fn complete(self: &Arc<Self>, entry_id: Uuid) {
+        self.finish_entry(entry_id, true).await;
+    }
+
+    async fn finish_entry(self: &Arc<Self>, entry_id: Uuid, completed: bool) {
         let slot = {
             let mut state = self.state.lock().await;
             state.active.remove(&entry_id)
@@ -1099,15 +1151,17 @@ impl ThreadQueue {
         // At the entry's depth, for the same reason it states its trigger: this
         // frame closes that fire, and it goes out on the sibling task that
         // joined the work rather than on the fire's own.
-        self.at_chain_depth(
-            slot.chain_depth,
-            self.bus.emit_or_log_as_trigger(
-                BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id }),
-                "[ThreadQueue] ThreadQueueCompleted",
-                slot.trigger_id.clone(),
-            ),
-        )
-        .await;
+        if completed {
+            self.at_chain_depth(
+                slot.chain_depth,
+                self.bus.emit_or_log_as_trigger(
+                    BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id }),
+                    "[ThreadQueue] ThreadQueueCompleted",
+                    slot.trigger_id.clone(),
+                ),
+            )
+            .await;
+        }
         self.drain().await;
     }
 
@@ -1568,9 +1622,8 @@ impl ThreadQueue {
             .await;
     }
 
-    /// Spawn an admitted entry's work and complete the slot when it resolves
-    /// — even on panic (the JoinHandle surfaces it), so a crashed executor
-    /// can never leak a capacity slot.
+    /// Spawn admitted work and release its slot after execution, even on panic.
+    /// A failed retry deadline check retains the admitted entry for recovery.
     ///
     /// **The spawn is where the chain used to end.** `EVENT_TRIGGER_DEPTH`
     /// follows an await chain and not a `tokio::spawn`, so execution read 0
@@ -1598,10 +1651,19 @@ impl ThreadQueue {
             cancel: entry.cancel,
         };
         let mgr = self.clone();
-        let work = tokio::spawn(
-            crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
-                .scope(depth, async move { executor.execute(executable).await }),
-        );
+        let dispatch = self.clone();
+        let work = tokio::spawn(crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH.scope(
+            depth,
+            async move {
+                let expired = dispatch
+                    .drop_retry_if_expired(executable.id, &executable.request)
+                    .await?;
+                if !expired {
+                    executor.execute(executable).await;
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(!expired)
+            },
+        ));
         // Lives in the joiner, which outlasts the work whether it returns,
         // fails or panics. A script trigger has no chat turn of its own.
         let awake = crate::core::keep_awake::hold(
@@ -1610,16 +1672,33 @@ impl ThreadQueue {
         );
         tokio::spawn(async move {
             let _awake = awake;
-            if let Err(join_err) = work.await {
-                if join_err.is_panic() {
+            let outcome = work.await;
+            match outcome {
+                Ok(Ok(completed)) => mgr.finish_entry(entry_id, completed).await,
+                Ok(Err(error)) => {
+                    // Keep the admitted row and slot for recovery. A failed
+                    // time query must never authorize replaying an old fire.
                     log!(
-                        "[ThreadQueue] Entry {} execution panicked: {:?}",
+                        "[ThreadQueue] Retry deadline check failed for {}: {}",
                         entry_id,
-                        join_err
+                        error
                     );
+                    mgr.notify(
+                        "An interrupted run could not be retried".into(),
+                        "Lucidos could not check the retry deadline. The entry remains in the Thread Queue for recovery.".into(),
+                    ).await;
+                }
+                Err(join_err) => {
+                    if join_err.is_panic() {
+                        log!(
+                            "[ThreadQueue] Entry {} execution panicked: {:?}",
+                            entry_id,
+                            join_err
+                        );
+                    }
+                    mgr.complete(entry_id).await;
                 }
             }
-            mgr.complete(entry_id).await;
         });
     }
 
@@ -1634,7 +1713,8 @@ impl ThreadQueue {
     ///   One rule covers all four kinds: an entry whose `thread_id` names a
     ///   live `thread_summaries` row completes here, and thread-level recovery
     ///   (CC auto-resume / chat settle) owns it from there. An entry with no
-    ///   thread re-queues, because nothing ran.
+    ///   thread re-queues. A trigger entry can re-queue only once: scripts
+    ///   create no thread even when side effects have already happened.
     ///
     /// Draining starts separately via [`Self::start_draining`] once trigger
     /// configs are loaded.
@@ -1650,17 +1730,25 @@ impl ThreadQueue {
             request: serde_json::Value,
             status: String,
             queued_at: DateTime<Utc>,
+            requeued: bool,
         }
         let rows: Vec<Row> = match sqlx::query_as(
-            "SELECT id, kind, trigger_id, trigger_name, thread_id, summary, request, status, queued_at \
-             FROM thread_queue ORDER BY sequence",
+            "SELECT q.id, q.kind, q.trigger_id, q.trigger_name, q.thread_id, q.summary, \
+             q.request, q.status, q.queued_at, COALESCE((SELECT \
+               (e.payload->'data'->>'requeued')::boolean FROM events e \
+               WHERE e.event_type = 'ThreadQueued' AND e.payload->'data'->>'entry_id' = q.id::text \
+               ORDER BY e.sequence DESC LIMIT 1), false) AS requeued \
+             FROM thread_queue q ORDER BY q.sequence",
         )
         .fetch_all(&self.pool)
         .await
         {
             Ok(r) => r,
             Err(e) => {
-                log!("[ThreadQueue] recover_persisted_entries query failed: {}", e);
+                log!(
+                    "[ThreadQueue] recover_persisted_entries query failed: {}",
+                    e
+                );
                 return;
             }
         };
@@ -1790,12 +1878,35 @@ impl ThreadQueue {
                         .await;
                     continue;
                 }
-                // No thread: the process died between admission and thread
-                // creation, so nothing ran and there is nothing to hand off
-                // to. Re-queue. This case is what keeps the guard above from
-                // being over-eager. It is also where a **script** trigger
-                // permanently lives, since a script fire creates no thread at
-                // all. Re-firing it is the existing crash contract.
+                // A crash after the deadline notice but before the drop must
+                // finish that same drop, even on an entry already re-queued.
+                match self.drop_retry_if_expired(row.id, &request).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        log!(
+                            "[ThreadQueue] Failed to check recovered retry deadline for {}: {}",
+                            row.id,
+                            error
+                        );
+                        continue;
+                    }
+                }
+                // Scripts create no thread, so a second cut cannot hand off.
+                // Bound trigger re-admission, including a cut before an intent
+                // fire creates its thread. Spawn kinds keep their own recovery.
+                if let Some(trigger_id) = row.trigger_id.as_deref().filter(|_| row.requeued) {
+                    if let Err(error) = self.drop_interrupted_entry(
+                        row.id,
+                        trigger_id,
+                        None,
+                        "requeue-cut-again",
+                        "An engine restart interrupted this run twice. Lucidos will not run it again until its next fire.",
+                    ).await {
+                        log!("[ThreadQueue] Failed to report repeated interruption for {}: {}", row.id, error);
+                    }
+                    continue;
+                }
                 true
             };
 
@@ -1812,7 +1923,14 @@ impl ThreadQueue {
                 completion_tx: None,
             };
             if requeue {
-                self.emit_queued(&entry, true, None).await;
+                if let Err(error) = self.try_emit_queued(&entry, true, None).await {
+                    log!(
+                        "[ThreadQueue] Failed to persist boot requeue for {}: {}",
+                        entry.id,
+                        error
+                    );
+                    continue;
+                }
             }
             if kind == ThreadQueueKind::Cron {
                 if let Some(tid) = entry.trigger_id.clone() {
@@ -1828,6 +1946,8 @@ impl ThreadQueue {
     /// notification check. Call AFTER the scheduler has replayed trigger
     /// configs — drain consults them for pause/deletion.
     pub fn start_draining(self: &Arc<Self>) {
+        self.boot_recovery
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let mgr = self.clone();
         tokio::spawn(async move {
             loop {
@@ -1897,17 +2017,22 @@ impl ThreadQueue {
     // trigger should still hear that a fire of its was coalesced away.
 
     async fn emit_queued(&self, entry: &QueueEntry, requeued: bool, actor: Option<MessageOrigin>) {
-        let request_json = match serde_json::to_value(&entry.request) {
-            Ok(v) => v,
-            Err(e) => {
-                log!("[ThreadQueue] request serialization failed: {}", e);
-                return;
-            }
-        };
+        if let Err(error) = self.try_emit_queued(entry, requeued, actor).await {
+            log!("[ThreadQueue] Cannot persist queued entry: {}", error);
+        }
+    }
+
+    async fn try_emit_queued(
+        &self,
+        entry: &QueueEntry,
+        requeued: bool,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let request_json = serde_json::to_value(&entry.request)?;
         let depth = entry.request.depth();
         self.at_chain_depth(
             depth,
-            self.bus.emit_or_log_as_trigger(
+            self.bus.emit_as_trigger(
                 BusEvent::System(SystemEvent::ThreadQueued {
                     entry_id: entry.id,
                     kind: entry.kind,
@@ -1919,11 +2044,11 @@ impl ThreadQueue {
                     requeued,
                     actor,
                 }),
-                "[ThreadQueue] ThreadQueued",
                 entry.trigger_id.clone(),
             ),
         )
-        .await;
+        .await?;
+        Ok(())
     }
 
     async fn emit_admitted(
@@ -1961,6 +2086,74 @@ impl ThreadQueue {
                 None,
             )
             .await;
+    }
+
+    /// Persist the notice before removing the entry. A deterministic notice
+    /// id makes a crash between those writes safe to replay at the next boot.
+    async fn drop_interrupted_entry(
+        &self,
+        entry_id: Uuid,
+        trigger_id: &str,
+        cut_thread: Option<Uuid>,
+        reason: &str,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
+        use crate::scheduler::user_tasks::{emit_trigger_notification, TriggerNotification};
+
+        let notice_id = Uuid::new_v5(&entry_id, reason.as_bytes());
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_type = 'NotificationCreated' \
+             AND payload->'data'->>'id' = $1)",
+        )
+        .bind(notice_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if !exists {
+            let configured_name = self
+                .trigger_configs
+                .read()
+                .unwrap()
+                .get(trigger_id)
+                .map(|config| config.name.clone());
+            // The registry is still empty during queue recovery. Its stored
+            // queue label survives deleted triggers and that boot ordering.
+            let name = match configured_name {
+                Some(name) => name,
+                None => sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT trigger_name FROM thread_queue WHERE id = $1",
+                )
+                .bind(entry_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten()
+                .unwrap_or_else(|| "Trigger".into()),
+            };
+            let notice = TriggerNotification::with_id(
+                notice_id,
+                &format!("{name}: run interrupted"),
+                message,
+            );
+            let tap = cut_thread.map_or(Tap::Modal, |thread| Tap::Navigate {
+                to: Box::new(NavigateUi {
+                    target: NavigateTarget::Thread,
+                    id: Some(thread.to_string()),
+                    ..Default::default()
+                }),
+            });
+            emit_trigger_notification(&self.bus, trigger_id, &notice, cut_thread, tap).await?;
+            if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
+                notice.send_push(&engine);
+            }
+        }
+        self.bus
+            .emit(BusEvent::System(SystemEvent::ThreadQueueDropped {
+                entry_id,
+                reason: reason.into(),
+                actor: None,
+            }))
+            .await?;
+        Ok(())
     }
 
     /// Inbox notification + push fan-out for queue-health events. Push is

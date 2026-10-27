@@ -42,6 +42,10 @@ const DISCARD_DRAFT_CONFIRM = 'Discard this unsent draft?';
 const DISCARD_CHANGE_CONFIRM = 'Discard all changes from this session? This cannot be undone.';
 const SET_ASIDE_TOOLTIP =
   'Keep this change for later. It leaves Review and Apply All, and the thread can be archived. Bring it back from the Changes panel.';
+const DISCARD_DRAFT_TOOLTIP = 'Throw away this unsent draft.';
+const DISCARD_TOOLTIP = "Throw away this thread's change. This cannot be undone.";
+const APPLY_TOOLTIP = "Merge this thread's change and land it.";
+const ARCHIVE_TOOLTIP = 'Move this thread out of the inbox into the archive.';
 
 /** Discard the focused thread's unsent draft, confirming first. The confirm
  *  lives HERE, on the action — not in any one entry point — so the "Discard
@@ -213,6 +217,7 @@ function tagAction(
         kind,
         category: 'close',
         label: 'Discard draft',
+        tooltip: DISCARD_DRAFT_TOOLTIP,
         // discardDraft returns a boolean (false = user canceled the confirm),
         // but the cascade only needs to await it, so the wrapper drops the
         // result to keep invoke's `Promise<void>` contract.
@@ -223,6 +228,7 @@ function tagAction(
         kind,
         category: 'close',
         label: 'Discard',
+        tooltip: DISCARD_TOOLTIP,
         invoke: async () => {
           if (await showConfirm(DISCARD_CHANGE_CONFIRM, 'Discard', { variant: 'danger' })) void handleDiscardCCChanges(threadId);
         },
@@ -239,7 +245,7 @@ function tagAction(
         // background-build/switch semantics); the former "Apply & Restart" dual
         // label — which implied the restart happens on click — stays retired.
         label: opts.requiresRestart ? 'Apply*' : 'Apply',
-        tooltip: opts.requiresRestart ? APPLY_NEW_VERSION_TOOLTIP : undefined,
+        tooltip: opts.requiresRestart ? APPLY_NEW_VERSION_TOOLTIP : APPLY_TOOLTIP,
         invoke: () => void endClaudeCodeAndApply(threadId),
       };
     case 'set_aside':
@@ -273,6 +279,7 @@ function tagAction(
         kind,
         category: 'close',
         label: 'Archive',
+        tooltip: ARCHIVE_TOOLTIP,
         // handleArchiveThread confirms internally only when the thread is saved.
         // Its promise is returned, not voided: the close cascade and the delete
         // dialog's Archive both await this to know the archive finished.

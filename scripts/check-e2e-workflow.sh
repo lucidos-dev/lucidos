@@ -19,6 +19,9 @@
 #      Every other job needs the plan job, so only a run's request starts it.
 #      The engine job also runs only when the plan asks for it.
 #   9. Every action is pinned by a full commit sha.
+#  10. A test job runs only after its build job succeeded or was skipped. Its
+#      steps unpack or assemble an engine for those two results alone, so any
+#      other result (cancelled, failed) leaves it without an engine.
 #
 # Tested by scripts/lib/check_e2e_workflow_test.sh.
 #
@@ -130,6 +133,11 @@ for l in code:
     m = re.search(r"uses:\s*(\S+)", l)
     if m and not re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", m.group(1)):
         errors.append(f"action not pinned by commit: {m.group(1)}")
+
+for test_job, build_job in (("linux", "build-linux"), ("macos", "build-macos")):
+    want = f"(needs.{build_job}.result == 'success' || needs.{build_job}.result == 'skipped')"
+    if want not in job_if(test_job):
+        errors.append(f"the {test_job} job must not run after a cancelled or failed build: gate it on {want}")
 
 mac = all_jobs.get("macos", [])
 if "    runs-on: macos-15" not in mac or not any("fromJSON(needs.plan.outputs.macos)" in l for l in mac):

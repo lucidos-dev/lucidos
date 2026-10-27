@@ -1257,6 +1257,7 @@ impl LucidosEngine {
                     // preference). The same three values the loop is about to
                     // call with, so the starter event records the actual run.
                     &resolved,
+                    tc.retry_of.as_ref(),
                 )
             } else {
                 let is_cc = use_coding_agent == Some(true);

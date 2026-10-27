@@ -127,6 +127,10 @@ differ.
   `--tls-cert`.
 - The glossary entries *external address* and *pairing address* land with this
   ADR, marked not shipped. The implementing change drops the marker.
+- As shipped, the stored value is keyed by gateway port: an `[external_address]`
+  table in `network.toml`. That file is machine-global, and two gateways can
+  share a machine, so one shared value would put one gateway's address in the
+  other's QR. The environment variable is per process, so it needs no key.
 
 ## Alternatives considered
 

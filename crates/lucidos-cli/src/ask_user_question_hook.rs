@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-use crate::http::permission_prompt_client;
+use crate::http::{permission_prompt_client, ConnectRetry};
 use crate::workspace::{resolve_from_env, BoxError};
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +90,7 @@ pub(crate) fn post_question<R: serde::de::DeserializeOwned>(
     let resp = client
         .post(endpoint)
         .json(body)
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("request to the engine failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {

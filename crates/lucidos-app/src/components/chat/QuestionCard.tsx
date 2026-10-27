@@ -15,6 +15,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { unsentMessages } from '../../store/unsentMessages';
 import { sendFailureDetail, type SendFailure } from '../../store/actions/sendRetry';
 import { OptionWidgetFrame } from '../widgets/OptionWidgetFrame';
+import { ReplyHtml, hasWidgetEmbedSlot } from '../widgets/useWidgetEmbedSlots';
 
 /** Local name for the wire `AnswerKind`. Aliased rather than restated, because
  *  this card renders every kind the engine can persist. A second copy of the
@@ -23,6 +24,8 @@ export type ResolvedAnswer = AnswerKind;
 
 export interface QuestionBodyProps {
   threadId: string;
+  /** The turn's starter, which a widget pinned from the question text records. */
+  eventId?: string;
   toolUseId: string;
   question: string;
   options: QuestionOption[];
@@ -151,12 +154,19 @@ function OptionSlot({ option, state, children }: {
  *  `<button>`, so links are valid here, unlike inside OptionButton. They route
  *  like a reply's: workspace links through the initiator panel's body click,
  *  web links through the global click handler. Shared across the live, answered
- *  and terminated bodies so all three render the question identically. */
-function QuestionText({ question }: { question: string }) {
+ *  and terminated bodies so all three render the question identically.
+ *  A widget embed draws as in a reply, so a card with no message field (Claude
+ *  Code's) can still show one. Only that text mounts the hook-holding
+ *  `ReplyHtml`; the rest stays hook-free for `vnodeToText`. */
+function QuestionText({ question, threadId, eventId }: { question: string; threadId: string; eventId?: string }) {
+  const html = renderMarkdown(question);
+  if (hasWidgetEmbedSlot(html)) {
+    return <ReplyHtml html={html} final threadId={threadId} eventId={eventId} class="question-text markdown-content" />;
+  }
   return (
     <div
       class="question-text markdown-content authored-html"
-      dangerouslySetInnerHTML={{ __html: renderMarkdown(question) }}
+      dangerouslySetInnerHTML={{ __html: html }}
     />
   );
 }
@@ -180,7 +190,7 @@ function QuestionText({ question }: { question: string }) {
  *  it" row that hands that phrase back as the user's answer. The agent-side half
  *  lives in the `ask_user_question` tool description and the question rules in
  *  the engine prompts. */
-export function QuestionBody({ threadId, toolUseId, question, options, multiSelect, resolved, typedAnswer, terminated }: QuestionBodyProps) {
+export function QuestionBody({ threadId, eventId, toolUseId, question, options, multiSelect, resolved, typedAnswer, terminated }: QuestionBodyProps) {
   // Drain the module-level maps once the persisted answer lands. Without this,
   // selections + optimistic pending leak across the session. The landing the
   // answer deferred runs now too, once the spinner has given way to the mark.
@@ -207,10 +217,10 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
     // A multi-select's ticks were drawn while the reader toggled them, so they
     // stay through the send rather than giving way to a spinner.
     const mark = multiSelect ? 'mark' : pickMark;
-    return <AnsweredBody toolUseId={toolUseId} question={question} options={options} multiSelect={multiSelect} resolved={effective} mark={mark} />;
+    return <AnsweredBody threadId={threadId} eventId={eventId} toolUseId={toolUseId} question={question} options={options} multiSelect={multiSelect} resolved={effective} mark={mark} />;
   }
   if (terminated) {
-    return <TerminatedQuestionBody question={question} options={options} multiSelect={multiSelect} typedAnswer={typedAnswer} />;
+    return <TerminatedQuestionBody threadId={threadId} eventId={eventId} question={question} options={options} multiSelect={multiSelect} typedAnswer={typedAnswer} />;
   }
   const typedBlock = typedAnswer && typedAnswerBlock(typedAnswer);
 
@@ -220,7 +230,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
     const selected = multiSelectedByToolUse.value.get(toolUseId) ?? [];
     return (
       <div class="question-body protected-surface" data-tool-use-id={toolUseId}>
-        <QuestionText question={question} />
+        <QuestionText question={question} threadId={threadId} eventId={eventId} />
         {options.length > 0 && (
           <LiveOptions
             toolUseId={toolUseId}
@@ -254,7 +264,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
 
   return (
     <div class="question-body protected-surface" data-tool-use-id={toolUseId}>
-      <QuestionText question={question} />
+      <QuestionText question={question} threadId={threadId} eventId={eventId} />
       {options.length > 0 && (
         <LiveOptions toolUseId={toolUseId} options={options} unsent={unsentPick} onActivate={onPick} />
       )}
@@ -508,6 +518,8 @@ export const QUESTION_SUPERSEDED_NOTE = 'Replaced by your next message';
  *  carries no id on purpose: a dead question is one nobody can answer, so nothing
  *  ever looks it up. */
 export function AnsweredBody({
+  threadId,
+  eventId,
   toolUseId,
   question,
   options,
@@ -515,6 +527,8 @@ export function AnsweredBody({
   resolved,
   mark = 'mark',
 }: {
+  threadId: string;
+  eventId?: string;
   toolUseId: string;
   question: string;
   options: QuestionBodyProps['options'];
@@ -530,7 +544,7 @@ export function AnsweredBody({
     resolved.kind === 'FreeText' || resolved.kind === 'MultiSelected' ? resolved.image_hashes ?? [] : [];
   return (
     <div class="question-body question-body-answered protected-surface" data-tool-use-id={toolUseId}>
-      <QuestionText question={question} />
+      <QuestionText question={question} threadId={threadId} eventId={eventId} />
       {options.length > 0 && (
         <div class="question-options">
           {options.map(opt => {
@@ -574,11 +588,15 @@ export function AnsweredBody({
  *  engine never confirmed still draws under them. Pure render so tests can
  *  walk the vnode tree directly. */
 export function TerminatedQuestionBody({
+  threadId,
+  eventId,
   question,
   options,
   multiSelect,
   typedAnswer,
 }: {
+  threadId: string;
+  eventId?: string;
   question: string;
   options: QuestionBodyProps['options'];
   multiSelect: boolean | undefined;
@@ -586,7 +604,7 @@ export function TerminatedQuestionBody({
 }) {
   return (
     <div class="question-body question-body-terminated protected-surface">
-      <QuestionText question={question} />
+      <QuestionText question={question} threadId={threadId} eventId={eventId} />
       {options.length > 0 && (
         <div class="question-options">
           {options.map(opt => (

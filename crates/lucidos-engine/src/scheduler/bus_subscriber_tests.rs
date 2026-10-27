@@ -110,7 +110,17 @@ impl SchedulerEffects for Arc<Recorder> {
 
 /// The `ThreadQueued` row `ThreadQueue::submit` writes for an event-trigger fire.
 async fn record_fire(bus: &EventBus, trigger_id: &str, source_event_id: Uuid) {
+    record_fire_with_retry(bus, trigger_id, source_event_id, None).await;
+}
+
+async fn record_fire_with_retry(
+    bus: &EventBus,
+    trigger_id: &str,
+    source_event_id: Uuid,
+    retry_of: Option<crate::engine::thread_events::RetryOf>,
+) {
     let request = ThreadQueueRequest::EventTrigger {
+        retry_of,
         trigger_id: trigger_id.to_string(),
         event_type: "BuildObserved".into(),
         event_payload: json!({}),
@@ -362,6 +372,33 @@ async fn a_recorded_fire_excludes_its_trigger_from_the_replay() {
     record_fire(&h.bus, "t-build", event_id).await;
     h.lag().await;
 
+    assert!(h.recorder.woken_for(event_id).is_empty());
+    drop(h);
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn an_interrupted_fire_retry_keeps_its_source_event_excluded_from_replay() {
+    let (pool, db) = setup_test_db().await;
+    let mut h = Harness::new(&pool, vec![event_trigger("t-build", "BuildObserved")]).await;
+    let event_id = emit_build_observed(&h.bus).await;
+    let deadline: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT now() + make_interval(secs => $1)")
+            .bind(crate::scheduler::cut_fires::FIRE_RETRY_WINDOW_SECS as f64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    record_fire_with_retry(
+        &h.bus,
+        "t-build",
+        event_id,
+        Some(crate::engine::thread_events::RetryOf {
+            thread_id: Uuid::new_v4(),
+            deadline,
+        }),
+    )
+    .await;
+    h.lag().await;
     assert!(h.recorder.woken_for(event_id).is_empty());
     drop(h);
     teardown_test_db(&db).await;

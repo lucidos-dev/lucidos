@@ -994,6 +994,7 @@ mod settle_stranded_trigger_runs_sweep {
             bus,
             thread_id,
             ThreadEvent::TriggerStarted {
+                retry_of: None,
                 provider: None,
                 trigger_id: "t-stranded".into(),
                 trigger_name: Some("watch".into()),
@@ -1192,22 +1193,292 @@ mod settle_stranded_trigger_runs_sweep {
     }
 }
 
-// -- Phase D: what recovery reads off the last restart ------------------------
-//
-// `recover_orphaned_worktrees` asks two questions of an interrupted thread's abort
-// history, and both reduce to "is this `ResponseAborted` newer than the thread's
-// latest start?":
-//
-//   * `switch_was_user_initiated`: auto-resume (a device-attributed teardown abort
-//     proves a real *Switch to new version*) vs the manual Continue affordance (a
-//     crash left no such boundary).
-//   * `boundary_abort_already_emitted`: does this turn still need a "Response
-//     interrupted" boundary, or did the teardown pre-emit already land one?
-//
-// They are tested together because the failure mode is them DISAGREEING about the
-// start set: the same abort then counts as consumed for one and live for the
-// other. The engine's owner lock guarantees the predecessor's teardown emit has landed
-// before recovery reads either (ADR 0438).
+mod cut_trigger_fire_shapes {
+    use crate::engine::agent_recovery::recovery::{
+        settle_orphaned_running_threads, settle_stranded_trigger_runs,
+        settle_unresumed_switch_threads,
+    };
+    use crate::engine::chat::process::trigger_process_result;
+    use crate::engine::chat::recovery::{emit_restart_abort, orphan_threads_sql};
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{
+        emit_response_aborted, emit_response_canceled, AbortCause, CancelCause, EventChannel,
+        EventMeta, MessageOrigin, ThreadEvent, TriggerInvocation,
+    };
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    enum Cut {
+        ChatSweep,
+        RunningSettle,
+        StrandedSettle,
+        UnkeptSwitch,
+        GracefulStop,
+    }
+
+    async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> Uuid {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta: EventMeta {
+                channel: Some(EventChannel::Trigger),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .event_id
+    }
+
+    async fn start(bus: &EventBus, thread_id: Uuid) -> Uuid {
+        emit(
+            bus,
+            thread_id,
+            ThreadEvent::TriggerStarted {
+                retry_of: None,
+                provider: None,
+                trigger_id: "cut-fire".into(),
+                trigger_name: Some("Nightly report".into()),
+                prompt: Some("Prepare the report".into()),
+                invocation: Some(TriggerInvocation::Schedule),
+                origin: None,
+                go_to_review: false,
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .await
+    }
+
+    async fn abort(bus: &EventBus, thread_id: Uuid, start_id: Uuid, switch: bool) {
+        emit_response_aborted(
+            bus,
+            thread_id,
+            AbortCause::EngineShutdown,
+            "This response was interrupted by an engine shutdown.".into(),
+            vec![],
+            None,
+            None,
+            EventMeta {
+                request_event_id: Some(start_id),
+                actor: Some(if switch {
+                    MessageOrigin::Device {
+                        device_id: "test-device".into(),
+                    }
+                } else {
+                    MessageOrigin::system()
+                }),
+                ..EventMeta::NONE
+            },
+            "[Test] teardown boundary",
+        )
+        .await;
+    }
+
+    async fn characterize(cut: Cut) {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let start_id = start(&bus, thread_id).await;
+        match cut {
+            Cut::ChatSweep => {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                emit(
+                    &bus,
+                    thread_id,
+                    ThreadEvent::TextStreamed {
+                        text: "Partial report".into(),
+                    },
+                )
+                .await;
+                type Orphan = (
+                    Uuid,
+                    Option<String>,
+                    Option<Uuid>,
+                    Option<String>,
+                    Option<String>,
+                );
+                let rows: Vec<Orphan> = sqlx::query_as(&orphan_threads_sql())
+                    .bind(Vec::<Uuid>::new())
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].0, thread_id);
+                assert_eq!(rows[0].2, Some(start_id));
+                emit_restart_abort(
+                    &bus,
+                    thread_id,
+                    "Restart interrupted the report".into(),
+                    Some(start_id),
+                    Some(EventChannel::Trigger),
+                )
+                .await
+                .unwrap();
+            }
+            Cut::RunningSettle => {
+                settle_orphaned_running_threads(&pool, &bus, &HashSet::new()).await;
+            }
+            Cut::StrandedSettle => {
+                sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE thread_id = $1")
+                    .bind(thread_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                settle_stranded_trigger_runs(&pool, &bus).await;
+            }
+            Cut::UnkeptSwitch => {
+                abort(&bus, thread_id, start_id, true).await;
+                settle_unresumed_switch_threads(&pool, &bus, &HashSet::new()).await;
+            }
+            Cut::GracefulStop => {
+                abort(&bus, thread_id, start_id, false).await;
+            }
+        }
+
+        crate::scheduler::cut_fires::tests::report_all(&pool, &bus).await;
+
+        let state: (String, String, String) = sqlx::query_as(
+            "SELECT status, archive_state, source FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, ("failed".into(), "inbox".into(), "trigger".into()));
+        let terminal: (String, String) = sqlx::query_as(
+            "SELECT payload->>'cause', payload->>'request_event_id' FROM events \
+             WHERE aggregate_id = $1 AND event_type = 'ResponseAborted' ORDER BY sequence DESC LIMIT 1",
+        ).bind(thread_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(terminal.1, start_id.to_string());
+        assert_eq!(
+            terminal.0,
+            if matches!(cut, Cut::GracefulStop) {
+                "engine_shutdown"
+            } else {
+                "recovery_after_restart"
+            }
+        );
+        let reports: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type IN ('TriggerExecuted', 'NotificationCreated', 'TriggerRunInterrupted')",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(reports, 3, "boot reports a cut fire visibly");
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn chat_sweep_reports_in_the_inbox() {
+        characterize(Cut::ChatSweep).await;
+    }
+
+    #[tokio::test]
+    async fn running_settle_reports_in_the_inbox() {
+        characterize(Cut::RunningSettle).await;
+    }
+
+    #[tokio::test]
+    async fn stranded_settle_reports_in_the_inbox() {
+        characterize(Cut::StrandedSettle).await;
+    }
+
+    #[tokio::test]
+    async fn unkept_switch_reports_in_the_inbox() {
+        characterize(Cut::UnkeptSwitch).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_stop_reports_in_the_inbox() {
+        characterize(Cut::GracefulStop).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_abort_cannot_become_a_successful_trigger_result() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let start_id = start(&bus, thread_id).await;
+        abort(&bus, thread_id, start_id, false).await;
+
+        // Shutdown cancels the loop after persisting its abort. The loop's
+        // cancel arm returns Ok, but its duplicate cancel event is suppressed.
+        emit_response_canceled(
+            &bus,
+            &pool,
+            thread_id,
+            CancelCause::UserStop,
+            String::new(),
+            vec![],
+            None,
+            None,
+            EventMeta {
+                request_event_id: Some(start_id),
+                ..EventMeta::NONE
+            },
+            "[Test] canceled loop",
+        )
+        .await;
+        let result = crate::engine::agentic_loop::terminal_result(
+            String::new(),
+            vec![],
+            Uuid::new_v4(),
+            thread_id,
+            false,
+        );
+        let error = trigger_process_result(&pool, result)
+            .await
+            .expect_err("an aborted trigger must not return success to the scheduler");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::Interrupted,
+        );
+        let canceled: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type = 'ResponseCanceled'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(canceled, 0);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_after_an_abort_is_still_successful() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let start_id = start(&bus, thread_id).await;
+        abort(&bus, thread_id, start_id, false).await;
+        start(&bus, thread_id).await;
+        emit(
+            &bus,
+            thread_id,
+            ThreadEvent::ResponseGenerated {
+                text: "Report prepared".into(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+            },
+        )
+        .await;
+        let result = crate::engine::agentic_loop::terminal_result(
+            "Report prepared".into(),
+            vec![],
+            Uuid::new_v4(),
+            thread_id,
+            false,
+        );
+        assert!(trigger_process_result(&pool, result).await.is_ok());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+}
+
 mod restart_boundary_reads {
     use crate::engine::agent_recovery::recovery::{
         boundary_abort_already_emitted, switch_was_user_initiated,

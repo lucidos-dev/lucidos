@@ -16,6 +16,7 @@ import type { TailscaleInfo } from '../../../utils/tauri';
 const NOTHING: TailscaleInfo = {
   installed: false,
   on_tailnet: false,
+  reason: null,
   tailnet_ip: null,
   magic_dns_name: null,
   serve_url: null,
@@ -47,6 +48,7 @@ describe('tailscaleRowState', () => {
     expect(tailscaleRowState({ ...NOTHING, installed: true, cli_available: true })).toEqual({
       kind: 'sign-in',
       canRun: true,
+      reason: null,
     });
   });
 
@@ -56,7 +58,14 @@ describe('tailscaleRowState', () => {
     expect(tailscaleRowState({ ...NOTHING, installed: true, cli_available: false })).toEqual({
       kind: 'sign-in',
       canRun: false,
+      reason: null,
     });
+  });
+
+  it('carries Tailscale\'s own reason onto the sign-in row', () => {
+    const reason = 'Tailscale is installed, but it did not answer.';
+    const row = tailscaleRowState({ ...NOTHING, installed: true, reason });
+    expect(row).toEqual({ kind: 'sign-in', canRun: false, reason });
   });
 
   it('offers Expose on a tailnet that is not serving yet', () => {

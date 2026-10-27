@@ -10,7 +10,11 @@ Working agreement for AI coding agents (Claude Code, Codex) and human contributo
 
 A plan is not actionable until it lists load-bearing invariants, explicit non-goals, phase ordering, and a verification strategy per invariant. Those invariants stay in view while you edit, rather than first appearing at `/harden`. Enforcement is a durable *plan marker* gating the first edit and Apply ([`docs/glossary.md`](docs/glossary.md) § plan marker), and the engine states the procedure to every session.
 
-Detailed conventions live in `.claude/rules/`. Seven load in every session, and are already in front of you: `glossary.md`, `em-dashes.md`, `no-private-data.md`, `philosophy.md`, `prose.md`, `one-definition-per-value.md`, `temporary-measures.md`. Eleven load on a matching read: `rust.md`, `db.md`, `frontend.md`, `frontend-css.md`, `testing.md`, `dev-runtime.md`, `build-release.md`, `front-door.md`, `system-knowhow.md`, `sdk.md`, `system-widgets.md`.
+- **Build for users.** Fix the general cause for every affected user and workspace; the maintainer's setup is one test bench.
+  Apply the [population check](.claude/rules/build-for-users.md) before editing and in every plan, review and final report.
+
+Detailed conventions live in `.claude/rules/`; scoped rules load on a matching read.
+The resident inventory lives in [`scripts/lib/context_budget.sh`](scripts/lib/context_budget.sh).
 
 **[`docs/agent-config.md`](docs/agent-config.md) is where the mechanism is documented**: how scoping works, where a new instruction belongs (rule, skill, hook, or that page), and the context budget the whole set is gated on. Read it before adding or moving a rule. Three things bind here because they bind *before* any file is touched:
 
@@ -79,8 +83,9 @@ A **workspace** is a user's live Lucidos instance: a workspace directory with gi
 Engine must be restartable at any time without losing user-visible state. PostgreSQL + filesystem are sources of truth; in-memory is cache or active runtime.
 
 - No critical state only in memory. Active processes are expected to die on restart.
-- In-flight threads resume after restart, but the resume is **gated on cause**, for crash-safety. A **user-initiated switch** auto-resumes **coding-agent** threads (via `--resume`) and **chat / trigger** threads (via `continue_chat`, the manual Continue button's entry point). A **crash / OOM / panic / agent-killed** engine does NOT auto-resume: it keeps the manual **Continue** affordance, so work that may have crashed the engine cannot loop. A thread parked awaiting an *AskUserQuestion* answer is preserved either way. The "already merged" check applies only to non-running sessions. See `engine/agent_recovery/recovery.rs` and `engine/chat/recovery.rs`.
+- In-flight threads resume after restart, but the resume is **gated on cause**, for crash-safety. A **user-initiated switch** auto-resumes **coding-agent** threads (via `--resume`) and **chat / trigger** threads (via `continue_chat`, the manual Continue button's entry point). A **crash / OOM / panic / agent-killed** engine keeps manual **Continue** to prevent crash loops. A thread parked awaiting an *AskUserQuestion* answer is preserved either way. The "already merged" check applies only to non-running sessions. See `engine/agent_recovery/recovery.rs` and `engine/chat/recovery.rs`.
 - **The switch fingerprint is `cause = EngineShutdown` AND a device actor, both halves.** `switch_was_user_initiated` is the single definition, shared by the coding-agent and chat resume gates via the `SWITCH_TEARDOWN_ABORT_SQL` / `THREAD_START_EVENTS_SQL` fragments. A device actor alone is NOT enough. `AbortCause::StaleSettle` deliberately carries the actor of the user button that exposed a stuck row: an actor-only gate therefore reads a user *Stop* as a switch, and re-runs abandoned work. When adding an abort site, decide which half it carries.
+- Cut trigger fires may retry once in a new thread (ADR 0579).
 - Orphaned resources recover on startup. Frontend reconnects gracefully — page reload preserves visible UI state.
 - **Allowed ephemeral**: channel senders/receivers, process handles, cancellation signals, `pending_captures`.
 - **Not allowed**: preferences only in `RwLock` without DB write, pending changes only in memory.

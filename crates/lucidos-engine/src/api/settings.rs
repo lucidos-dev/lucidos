@@ -1191,7 +1191,7 @@ pub(super) async fn get_network_config(
         engine_bind,
         inherit: net.engine_inherit,
         gateway_bind: net.gateway_bind.unwrap_or_else(|| "loopback".to_string()),
-        detected_tailscale_ip: crate::net_config::detect_tailscale_ipv4(),
+        detected_tailscale_ip: crate::net_config::detect_tailscale_ipv4().await,
     }))
 }
 
@@ -1228,11 +1228,6 @@ pub(super) async fn put_network_config(
 
 // ===== Tailnet status (this workspace's Tailscale URL) =====
 
-/// Bound on the MagicDNS reverse lookup. The resolver is local (`100.100.100.100`)
-/// whenever we get this far, so this is a stall guard, not a budget. Mirrors
-/// `REVERSE_DNS_TIMEOUT` in `crates/lucidos-app/src/mobile.rs`.
-const MAGIC_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
-
 /// Bound on the round trip that proves the serve URL reaches this workspace.
 /// It leaves on the tailnet interface and comes straight back through the
 /// gateway. So this is a stall guard for a hop that is local in practice.
@@ -1240,12 +1235,10 @@ const SERVE_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// How long an answer is reused before the probes run again.
 ///
-/// The endpoint needs no auth, like every other one here, and each miss costs a
-/// resolver thread plus one outbound TLS connection per [`SERVE_PORTS`] entry.
-/// `magic_dns_name` ABANDONS its worker at the deadline rather than joining it.
-/// So a caller in a loop retires threads slower than it creates them, and an
-/// app iframe with a polling bug is enough. This caps that at one sweep per
-/// window.
+/// The endpoint needs no auth, like every other one here. Each miss asks
+/// Tailscale, which can mean a bounded `lsof` or CLI run, plus one outbound TLS
+/// connection per [`SERVE_PORTS`] entry. An app iframe with a polling bug could
+/// otherwise run those in a loop. This caps that at one sweep per window.
 ///
 /// Short on purpose. The Access page refetches right after an Expose run, and
 /// that run takes far longer than this, so the refetch still sees the new URL.
@@ -1265,19 +1258,21 @@ static TAILNET_STATUS_CACHE: std::sync::Mutex<Option<(std::time::Instant, Tailne
 /// Deliberately NOT folded into [`NetworkConfigResponse`]. Both Access panes
 /// fetch that endpoint separately and read disjoint fields from it. That is
 /// safe only while it stays the cheap local call `SettingsView` documents.
-/// These two fields cost a reverse lookup and a network round trip, and the
-/// bind editor reads neither.
+/// These fields cost asking Tailscale and a network round trip, and the bind
+/// editor reads none of them.
 #[derive(Serialize, Clone)]
 pub(super) struct TailnetStatusResponse {
-    /// `<machine>.<tailnet>.ts.net`, no scheme. `None` off a tailnet. Also
-    /// `None` when MagicDNS is off, a per-tailnet setting that does not mean
-    /// the machine is offline.
+    /// The MagicDNS name Tailscale reports, no scheme. `None` off a tailnet,
+    /// and `None` while MagicDNS is off, which does not mean offline.
     magic_dns_name: Option<String>,
     /// The `https://<name>[:<port>]/<slug>/` URL, set **only** once a request
     /// to it was answered by this very engine. The port is present whenever the
     /// serve route is not on 443. See [`get_tailnet_status`] for why a listener
     /// is not enough to publish it.
     workspace_serve_url: Option<String>,
+    /// Why this machine has no tailnet address, in one sentence. `None` when
+    /// it is joined.
+    reason: Option<String>,
 }
 
 /// GET /api/v1/tailnet-status: the MagicDNS name, and the HTTPS URL that
@@ -1298,40 +1293,32 @@ pub(super) struct TailnetStatusResponse {
 /// compare `workspace_path` with ours. A same-named workspace on the other
 /// gateway lives at a different path.
 ///
-/// Free when the machine is off a tailnet, and bounded when it is on one. This
-/// answers a settings pane, and every probe on that path is bounded for the
-/// reasons recorded in `crates/lucidos-app/src/mobile.rs`.
+/// No candidate at all unless Tailscale can issue a certificate for the name
+/// (`CertDomains`). Every probe here is bounded: this answers a settings pane.
 pub(super) async fn get_tailnet_status(
     State(state): State<AppState>,
 ) -> Json<TailnetStatusResponse> {
     if let Some(fresh) = cached_tailnet_status() {
         return Json(fresh);
     }
-    let Some(addr) = lucidos_tailscale::tailnet_ipv4() else {
-        // Not cached: this branch ran no probe, so repeating it costs nothing,
-        // and a machine that just joined a tailnet answers on the next load.
-        return Json(TailnetStatusResponse {
-            magic_dns_name: None,
-            workspace_serve_url: None,
-        });
-    };
-    // A blocking resolver call, so it never runs on an async worker.
-    let name = tokio::task::spawn_blocking(move || {
-        lucidos_tailscale::magic_dns_name(addr, MAGIC_DNS_TIMEOUT)
-    })
-    .await
-    .ok()
-    .flatten();
-
-    let workspace_serve_url = match (&name, super::base_path::workspace_id()) {
-        // No name, or no slug: there is no candidate URL to verify. A slugless
-        // engine is the direct-port dev mode, which no gateway path addresses.
+    let tailnet = tokio::task::spawn_blocking(lucidos_tailscale::tailnet_state)
+        .await
+        .unwrap_or(lucidos_tailscale::TailnetState::NotRunning);
+    let node = tailnet.node();
+    let workspace_serve_url = match (
+        node.and_then(|n| n.https_name()),
+        super::base_path::workspace_id(),
+    ) {
+        // No certifiable name, or no slug: there is no candidate URL to verify.
+        // A slugless engine is the direct-port dev mode, which no gateway path
+        // addresses.
         (Some(name), Some(slug)) => verified_workspace_serve_url(name, &slug, &state).await,
         _ => None,
     };
     let answer = TailnetStatusResponse {
-        magic_dns_name: name,
+        magic_dns_name: node.and_then(|n| n.magic_dns_name.clone()),
         workspace_serve_url,
+        reason: tailnet.reason(),
     };
     *lock_tailnet_cache() = Some((std::time::Instant::now(), answer.clone()));
     Json(answer)

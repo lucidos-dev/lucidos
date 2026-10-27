@@ -7,11 +7,42 @@ use crate::support::{
     local_process_client, seed_cc_thread_summary, seed_chat_thread_summary, unique_marker,
     user_client, workspace_path,
 };
+use lucidos_engine::core::prefs;
 use lucidos_engine::engine::successor::HANDOFF_OFFER_TOKENS;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// `cache_keep_alive_mode` is workspace-wide. Each test that depends on it
+/// holds this lock and sets the mode it needs. So a mode that a panicked test
+/// left behind cannot leak into the next one.
+static KEEP_ALIVE_MODE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Sets the keep-alive mode, or restores the default on `None`. The handler
+/// answers 200 on failure too, so the body's `success` is the result. A
+/// delete of an unset key reports "not found", which is already the default.
+async fn set_keep_alive_mode(client: &reqwest::Client, mode: Option<&str>) {
+    let url = format!(
+        "{}/api/v1/preferences?key={}",
+        base_url(),
+        prefs::CACHE_KEEP_ALIVE_MODE.key()
+    );
+    let body: Value = match mode {
+        Some(value) => client.put(url).json(&json!({ "value": value })).send(),
+        None => client.delete(url).send(),
+    }
+    .await
+    .expect("keep-alive mode write failed")
+    .json()
+    .await
+    .expect("keep-alive mode reply is not JSON");
+    let unset = mode.is_none()
+        && body["error"]
+            .as_str()
+            .is_some_and(|e| e.ends_with("not found"));
+    assert!(body["success"] == true || unset, "{body}");
+}
 
 async fn connect() -> sqlx::PgPool {
     sqlx::PgPool::connect(&db_url())
@@ -390,7 +421,9 @@ async fn switch_estimate_warns_only_when_the_switch_rewrites_a_warm_cache() {
 /// main-session call is cold, and a write that reported no lifetime unknown.
 #[tokio::test]
 async fn cache_warmth_counts_down_a_fresh_cache_write() {
+    let _mode = KEEP_ALIVE_MODE.lock().await;
     let client = user_client().await;
+    set_keep_alive_mode(&client, None).await;
     let pool = connect().await;
     let warm = Uuid::new_v4();
     let silent = Uuid::new_v4();
@@ -456,8 +489,8 @@ async fn cache_warmth_counts_down_a_fresh_cache_write() {
     );
     assert_eq!(
         fresh_body["keep_alive"],
-        json!({"state": "not_kept", "reason": "nothing_pending"}),
-        "an idle thread waits on no card"
+        json!({"state": "not_kept", "reason": "off"}),
+        "the keep-alive is off by default"
     );
     assert_eq!(cold["warmth"], "cold");
     assert!(cold["remaining_secs"].is_null(), "no call, no warmth");
@@ -465,7 +498,7 @@ async fn cache_warmth_counts_down_a_fresh_cache_write() {
     assert!(lifetime_unknown["remaining_secs"].is_null());
     assert_eq!(
         lifetime_unknown["keep_alive"],
-        json!({"state": "not_kept", "reason": "nothing_pending"}),
+        json!({"state": "not_kept", "reason": "off"}),
         "an unknown lifetime still says what the keep-alive does"
     );
     assert!(
@@ -477,10 +510,13 @@ async fn cache_warmth_counts_down_a_fresh_cache_write() {
 
 /// The per-thread keep-alive switch (ADR 0554): an unidentified caller is
 /// refused, and a device's call records the event under that device and
-/// projects the column. "on" clears it.
+/// projects the column. "on" clears it. The keep-alive is off by default and
+/// records no status then, so the test turns it on first.
 #[tokio::test]
 async fn the_keep_alive_switch_is_recorded_under_the_device() {
+    let _mode = KEEP_ALIVE_MODE.lock().await;
     let client = user_client().await;
+    set_keep_alive_mode(&client, Some("break-even")).await;
     let pool = connect().await;
     let thread_id = Uuid::new_v4();
     seed_cc_thread_summary(&pool, thread_id, "waiting_for_user_answer").await;
@@ -529,6 +565,7 @@ async fn the_keep_alive_switch_is_recorded_under_the_device() {
     let turned_on = switch(client.clone(), "on").await;
     let on = off_at().await;
     let bad = switch(client.clone(), "later").await;
+    set_keep_alive_mode(&client, None).await;
     delete_thread_rows(&pool, thread_id).await;
 
     assert_eq!(refused, 401, "a caller with no actor");

@@ -306,6 +306,7 @@ fn thread_event_type_name_extraction() {
         (ThreadEvent::ThreadArchived, "ThreadArchived"),
         (
             ThreadEvent::TriggerStarted {
+                retry_of: None,
                 provider: None,
                 trigger_id: "id".into(),
                 trigger_name: None,

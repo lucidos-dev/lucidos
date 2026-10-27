@@ -108,7 +108,7 @@ LEFT JOIN LATERAL (
 /// place; a subscription is not a park. That was not always true, and the guard
 /// that used to be the second clause here went with the attached-wait shape
 /// (`docs/plans/2026-08-06-every-event-wait-is-detached.md`).
-fn orphan_threads_sql() -> String {
+pub(crate) fn orphan_threads_sql() -> String {
     format!(
         "{ORPHAN_THREADS_SQL}\nWHERE NOT {}",
         crate::engine::agent_recovery::unanswered_question_exists_sql("o.thread_id::text"),

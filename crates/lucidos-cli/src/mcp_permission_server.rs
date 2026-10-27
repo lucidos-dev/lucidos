@@ -23,7 +23,7 @@ use serde_json::Value;
 use std::io::{BufRead, Write};
 
 use crate::ask_user_question_hook::{card_not_shown_reason, post_question, QUIET_ANSWER_NOTE};
-use crate::http::permission_prompt_client;
+use crate::http::{permission_prompt_client, ConnectRetry};
 use crate::workspace::{resolve_from_env, BoxError};
 
 const TOOL_APPROVE: &str = "approve";
@@ -234,7 +234,9 @@ fn tool_definitions(tools: ToolSet) -> Vec<Value> {
                                             "description": "True for an option that \
                                                 needs nothing more from you, such as \
                                                 \"Leave it as is\" or \"Not now\". \
-                                                Picking it ends your turn."
+                                                Picking it ends your turn. Never for \
+                                                an option that promises work, and \
+                                                never on every option."
                                         }
                                     },
                                     "required": ["label"]
@@ -287,7 +289,7 @@ fn call_approve(
     let resp = client
         .post(&endpoint)
         .json(&body)
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("HTTP failed: {}", e))?
         .error_for_status()
         .map_err(|e| format!("HTTP status: {}", e))?

@@ -215,6 +215,7 @@ async fn a_stalled_emit_is_bounded_and_retried_with_a_fresh_reading() {
     let (stalled_bus, _stalled_rx) = EventBus::new(unresponsive_pool().await);
     let (probe, reading) = settable_probe(Some(12 * GB));
     let mut monitor = make_monitor(Arc::new(stalled_bus), root, probe);
+    let default_timeout = monitor.emit_timeout;
     monitor.emit_timeout = Duration::from_millis(200);
 
     let started = Instant::now();
@@ -229,6 +230,8 @@ async fn a_stalled_emit_is_bounded_and_retried_with_a_fresh_reading() {
     let (bus, _rx) = EventBus::new(pool.clone());
     let bus = Arc::new(bus);
     monitor.bus = bus.clone();
+    // A loaded host can take over 200 ms for a real insert.
+    monitor.emit_timeout = default_timeout;
     *reading.lock().unwrap() = Some(9 * GB);
 
     let rx = bus.subscribe();

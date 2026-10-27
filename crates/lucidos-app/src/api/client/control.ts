@@ -472,6 +472,47 @@ export async function setGatewayNetworkConfig(body: {
   });
 }
 
+// ── External address (ADR 0550) ─────────────────────────────────────────────
+
+/** One of this machine's addresses, offered as a prefill for the field. */
+export interface ExternalAddressSuggestion {
+  interface: string;
+  origin: string;
+}
+
+/** What the gateway's probe found when a save ran. Mirrors the Rust
+ *  `ProbeVerdict`. A save that another gateway answered is refused with a 409,
+ *  so that verdict never arrives here. */
+export type ExternalAddressProbe =
+  | { verdict: 'verified' }
+  | { verdict: 'unreachable'; detail: string }
+  | { verdict: 'unknown'; detail: string };
+
+/** This gateway's external address, mirroring the gateway's
+ *  `external_address_json`. `locked` means `env_var` sets it. */
+export interface ExternalAddressInfo {
+  external_address: string | null;
+  source: 'unset' | 'file' | 'env';
+  locked: boolean;
+  env_var: string;
+  suggestions: ExternalAddressSuggestion[];
+  probe: ExternalAddressProbe | null;
+}
+
+export async function getExternalAddress(): Promise<ExternalAddressInfo> {
+  return controlJson<ExternalAddressInfo>('/external-address');
+}
+
+/** Set this gateway's external address, or clear it with `''`. The gateway
+ *  probes a set, and the answer carries the verdict. */
+export async function setExternalAddress(externalAddress: string): Promise<ExternalAddressInfo> {
+  return controlJson<ExternalAddressInfo>('/external-address', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ external_address: externalAddress }),
+  });
+}
+
 // ── Restore from backup (picker) ───────────────────────────────────────────
 
 /** State of the gateway's restore-from-backup flow. Mirrors the Rust

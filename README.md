@@ -111,6 +111,9 @@ with a clear message; build from source there instead (`--dev`). Two host packag
 runtime and warned about when missing: `git` (coding-agent threads + repository
 features) and `ca-certificates` (outbound TLS: LLM providers, the
 embedding-model download, web push). `python3` is optional (script tooling).
+PostgreSQL bundles its non-glibc shared libraries, including libxml2, with
+relative search paths. Linux builds require `patchelf`, `binutils`, and the
+runtime library packages listed in `.github/workflows/release-tarballs.yml`.
 
 **Remote access & push notifications.** The gateway listens on **localhost
 only** by default (the secure posture) and serves plain HTTP. Browsers grant
@@ -127,6 +130,12 @@ a *secure origin* (https or localhost), so to use Lucidos from other devices:
   serve https (push needs a certificate your browsers trust). A bare
   `--bind all` without TLS serves the app over `http://<host>`, usable, but
   browsers will not grant push/PWA there.
+- Through a route you run (a reverse proxy, WireGuard, a company VPN):
+  `./install.sh --external-address https://lucidos.example.com`. It writes
+  this gateway's *external address* into the same `network.toml`, and pairing
+  QRs then point there ahead of the tailnet. Change it later in Settings →
+  Access → External address or with `lucidos external-address`;
+  `LUCIDOS_EXTERNAL_ADDRESS` in the gateway's environment overrides both.
 
 **Always-on service & multiple gateways.** The default install registers a
 **user-level service** named after the instance. On macOS a launchd LaunchAgent

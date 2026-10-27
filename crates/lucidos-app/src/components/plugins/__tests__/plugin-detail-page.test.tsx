@@ -8,12 +8,18 @@ import { render } from 'preact';
 import { readFileSync } from 'node:fs';
 const uninstallMarketplacePlugin = vi.fn();
 vi.mock('../../../store/actions/plugin-uninstall', () => ({ uninstallMarketplacePlugin }));
+vi.mock('../../../store/actions/plugin-marketplaces', () => ({ refreshPluginCatalog: vi.fn() }));
+vi.mock('../../../store/actions/plugins', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../../store/actions/plugins')>(),
+  loadInstalledPlugins: vi.fn(),
+}));
 
-const { PluginStoreRow } = await import('../StoreTab');
+const { PluginStoreRow, matchesFilters } = await import('../StoreTab');
+const { PluginDetailPage } = await import('../PluginDetailPage');
 const { PluginActions, PluginModifiedNotice, PluginTitle } = await import('../pluginCard');
 import { renderPluginReadme } from '../pluginReadme';
 import { contentViewKey } from '../../layout/contentViewKey';
-import { panelOverlay } from '../../../store/store';
+import { installedPlugins, marketplaceCatalog, panelOverlay } from '../../../store/store';
 import type { MarketplacePlugin, PluginMedia } from '../../../store/types';
 
 const source = (rel: string): string => readFileSync(new URL(rel, import.meta.url), 'utf8');
@@ -42,6 +48,8 @@ function row(over: Partial<MarketplacePlugin>): MarketplacePlugin {
 }
 
 let host: HTMLDivElement | null = null;
+const initialCatalog = marketplaceCatalog.value;
+const initialInstalled = installedPlugins.value;
 
 function show(plugin: MarketplacePlugin, stageInstall: (p: MarketplacePlugin) => void = () => {}): HTMLDivElement {
   host = document.createElement('div');
@@ -64,6 +72,33 @@ afterEach(() => {
   }
   host = null;
   panelOverlay.value = null;
+  marketplaceCatalog.value = initialCatalog;
+  installedPlugins.value = initialInstalled;
+});
+
+describe.each(['panel', 'detail'])('plugin description in the %s', (surface) => {
+  it('renders separate plain-text paragraphs and folds single newlines', () => {
+    const plugin = row({ description: ' First\r\n line.\r\n \t\r\n**Second** <img src=x onerror=alert(1)>\n\nLast searchable phrase. ' });
+    if (surface === 'panel') {
+      show(plugin);
+    } else {
+      marketplaceCatalog.value = {
+        status: 'loaded',
+        data: { marketplaces: [], plugins: [plugin], errors: [], scanned_at: null, scanning: false, scan_error: null },
+      };
+      installedPlugins.value = { status: 'loaded', data: [] };
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      render(<PluginDetailPage marketplaceId={plugin.marketplace_id} pluginId={plugin.id} name={plugin.name} />, host);
+    }
+    const description = host!.querySelector(`.${surface === 'panel' ? 'app-store-plugin' : 'plugin-detail'}-description`)!;
+    expect(Array.from(description.querySelectorAll('p'), (p) => p.textContent)).toEqual([
+      'First line.', '**Second** <img src=x onerror=alert(1)>', 'Last searchable phrase.',
+    ]);
+    expect(description.querySelector('img, strong, script')).toBeNull();
+    expect(description.textContent).toContain('line.\n**Second**');
+    expect(matchesFilters(plugin, 'last searchable phrase', null, null)).toBe(true);
+  });
 });
 
 describe('a Plugins panel row', () => {

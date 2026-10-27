@@ -17,7 +17,7 @@ import { LoadableToggle } from '../shared/LoadableToggle';
  *    moved here from the former Models → Debugging group so all diagnostics share
  *    one home. Calling `currentCaptureContext()` in render subscribes to
  *    preference updates (it reads `preferences.value`), same as LocaleSection.
- *  - "Cache cards" is the server preference `cache_cards`, on by default.
+ *  - "Cache cards" is the server preference `cache_cards`, off by default.
  *    It hides the prompt-cache cards: Cache kept warm and the cache-warm line.
  *  - "Perf instrumentation" toggles the per-device `lucidos:perf` localStorage
  *    flag that gates `recordPerfSample` (see utils/perfQueue.ts). It's NOT a

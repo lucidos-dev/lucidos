@@ -8,8 +8,8 @@
 //! its own. The beat hangs up at `message_start`
 //! ([`super::prefill::send`]), so it never pays for the model's answer.
 
-use super::anthropic_wire::ClaudeRequest;
-use super::prefill::{pair_of, BeatShape, PrefillPair, ReplyShape, StableEnd, TurnRoute};
+use super::anthropic_wire::{ClaudeMessage, ClaudeRequest};
+use super::prefill::{pair_of, BeatShape, CutItem, PrefillPair, ReplyShape, StableEnd, TurnRoute};
 use serde_json::Value;
 
 /// What a beat asks, appended after the last cache marker so it is part of
@@ -23,12 +23,46 @@ pub(crate) const BEAT_PROMPT: &str = "Reply with only the word ok.";
 pub(crate) fn pair(request: &ClaudeRequest, route: TurnRoute<'_>) -> Option<PrefillPair> {
     let value = serde_json::to_value(request).ok()?;
     let end = stable_end(request, &value)?;
+    let prefix_end = match &end {
+        StableEnd::Part { item, part } => Some((*item, *part)),
+        StableEnd::Placeholder { .. } => None,
+    };
+    let stable_fingerprint =
+        super::stable_prefix::fingerprint_through(request, route.wire_model, prefix_end);
+    let whole_fingerprint = super::stable_prefix::fingerprint(request, route.wire_model);
     let shape = BeatShape {
         output_cap: None,
         reply: ReplyShape::MessageStart,
         closing_part: Some(serde_json::json!({"type": "text", "text": BEAT_PROMPT})),
     };
-    pair_of(value, "messages", end, shape, route)
+    let mut pair = pair_of(
+        request,
+        |r: &mut ClaudeRequest| Some(&mut r.messages),
+        end,
+        shape,
+        route,
+    )?;
+    pair.stable.stable_prefix_fingerprint = stable_fingerprint;
+    pair.whole.stable_prefix_fingerprint = whole_fingerprint;
+    Some(pair)
+}
+
+impl CutItem for ClaudeMessage {
+    fn role(&self) -> Option<&str> {
+        Some(&self.role)
+    }
+
+    fn content_mut(&mut self) -> Option<&mut Value> {
+        Some(&mut self.content)
+    }
+
+    fn placeholder() -> Self {
+        Self {
+            role: "user".into(),
+            content: Value::String(".".into()),
+            cache_anchor: None,
+        }
+    }
 }
 
 /// The last block at or before `stable_prefix_end` that carries a cache

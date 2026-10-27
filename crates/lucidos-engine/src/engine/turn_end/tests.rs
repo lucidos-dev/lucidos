@@ -34,7 +34,6 @@ fn session(head: &str, held: Option<ProposalHold>) -> SessionFacts {
     SessionFacts {
         head: Some(head.to_string()),
         held,
-        handoff_pending: false,
     }
 }
 
@@ -100,7 +99,6 @@ fn an_unreadable_head_nudges_once() {
     let held = idle(SessionFacts {
         head: None,
         held: Some(PLAN),
-        handoff_pending: false,
     });
     assert!(ledger.take_due(&held).is_some());
     assert!(ledger.take_due(&held).is_none());
@@ -140,22 +138,6 @@ fn integrated_work_sends_the_agent_nowhere() {
     let mut ledger = ReentryLedger::default();
     let held = idle(session("a1", Some(ProposalHold::IntegratedIntoParent)));
     assert!(ledger.take_due(&held).is_none());
-}
-
-/// A session that handed off ends its turn so the successor session can
-/// start. A re-entry would keep the old session running instead, so the
-/// successor carries the plan and the harden.
-#[test]
-fn a_pending_handoff_sends_the_agent_nowhere() {
-    let mut ledger = ReentryLedger::default();
-    for hold in [PLAN, HARDEN] {
-        let handed_off = idle(SessionFacts {
-            handoff_pending: true,
-            ..session("a1", Some(hold))
-        });
-        assert_eq!(handed_off.unmet(), vec![]);
-        assert!(ledger.take_due(&handed_off).is_none());
-    }
 }
 
 // ---- the forced read decision ----

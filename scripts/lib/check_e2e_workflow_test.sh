@@ -67,7 +67,7 @@ test_each_broken_limit_is_refused() {
     expect_refused "the engine job saving a cache" "job engine may save a cache" "$(doctored engine-save \
         'i = s.index("  engine:"); j = s.index("save-if: false", i); s = s[:j] + "save-if: true" + s[j + 14:]')"
     expect_refused "a test job saving a cache with actions/cache/save" "job macos saves a cache with actions/cache/save" "$(doctored macos-save \
-        'i = s.index("  macos:"); j = s.index("actions/cache/restore@", i); s = s[:j] + "actions/cache/save@" + s[j + 22:]')"
+        'i = s.index("\n  macos:\n"); j = s.index("actions/cache/restore@", i); s = s[:j] + "actions/cache/save@" + s[j + 22:]')"
     expect_refused "the engine job running without the plan" "job engine does not need the plan job" "$(doctored engine-needs \
         'i = s.index("  engine:"); j = s.index("    needs: plan\n", i); s = s[:j] + s[j + 16:]')"
     expect_refused "the engine job running unasked" "only when the plan asks for it" "$(doctored engine-unasked \
@@ -86,6 +86,8 @@ test_each_broken_limit_is_refused() {
         's = s.replace("retention-days: 7", "retention-days: 30", 1)')"
     expect_refused "target/ state kept longer" "retention-days: 2" "$(doctored target-retention \
         's = s.replace("retention-days: 2", "retention-days: 7", 1)')"
+    expect_refused "the macos job running after a cancelled build" "after a cancelled or failed build" "$(doctored macos-cancelled \
+        's = s.replace("(needs.build-macos.result == \x27success\x27 || needs.build-macos.result == \x27skipped\x27)", "needs.build-macos.result != \x27failure\x27")')"
     expect_refused "webkit off macOS" "macos-15" "$(doctored webkit \
         's = s.replace("fromJSON(needs.plan.outputs.macos)", "fromJSON(needs.plan.outputs.linux)")')"
 }

@@ -174,6 +174,7 @@ impl LucidosEngine {
         external_cancel: Option<CancellationToken>,
         // See `TriggerContext::queue_entry_id`.
         queue_entry_id: Uuid,
+        retry_of: Option<crate::engine::thread_events::RetryOf>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // The trigger's own model when it pinned one, else the account's
         // trigger model, so a fire never starts on the chat default. The
@@ -188,46 +189,49 @@ impl LucidosEngine {
             model,
         )
         .await;
-        self.process_message_with_steps_internal(
-            prompt,
-            model.as_deref(),
-            Some(TriggerContext {
-                trigger_id: trigger_id.to_string(),
-                trigger_name: trigger_name.to_string(),
-                slug: slug.to_string(),
-                invocation,
-                go_to_review,
-                side_effect_grant,
-                mcp_servers,
-                queue_entry_id,
-            }),
-            None, // app_context
-            None, // file_context
-            reasoning_effort,
-            provider,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ActorMode::Agent,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            external_cancel,
-            crate::engine::FollowUpUrgency::Normal,
-            None,
-        )
-        .await
+        let result = self
+            .process_message_with_steps_internal(
+                prompt,
+                model.as_deref(),
+                Some(TriggerContext {
+                    retry_of,
+                    trigger_id: trigger_id.to_string(),
+                    trigger_name: trigger_name.to_string(),
+                    slug: slug.to_string(),
+                    invocation,
+                    go_to_review,
+                    side_effect_grant,
+                    mcp_servers,
+                    queue_entry_id,
+                }),
+                None, // app_context
+                None, // file_context
+                reasoning_effort,
+                provider,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ActorMode::Agent,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                external_cancel,
+                crate::engine::FollowUpUrgency::Normal,
+                None,
+            )
+            .await?;
+        trigger_process_result(&self.pool, result).await
     }
 
     // Public chat entry — surface every per-request knob (model / context /
@@ -347,6 +351,35 @@ impl LucidosEngine {
         }
         crate::core::describe_tool(name, args)
     }
+}
+
+pub(in crate::engine) async fn trigger_process_result(
+    pool: &sqlx::PgPool,
+    result: ProcessResult,
+) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+    // The loop can return Ok after shutdown pre-emits an abort. Read the
+    // fire's first terminator so a later wake cannot mask its interruption.
+    let terminal: Option<String> = sqlx::query_scalar(
+        "SELECT event_type FROM events \
+         WHERE aggregate = 'thread' AND aggregate_id = $1 \
+           AND event_type = ANY($2::text[]) \
+           AND sequence > (SELECT MAX(sequence) FROM events \
+                           WHERE aggregate = 'thread' AND aggregate_id = $1 \
+                             AND event_type = 'TriggerStarted') \
+         ORDER BY sequence ASC LIMIT 1",
+    )
+    .bind(result.thread_id.to_string())
+    .bind(crate::engine::thread_events::ThreadEvent::TERMINATOR_EVENT_TYPES)
+    .fetch_optional(pool)
+    .await?;
+    if terminal.as_deref() == Some("ResponseAborted") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "The trigger run was interrupted before it completed",
+        )
+        .into());
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

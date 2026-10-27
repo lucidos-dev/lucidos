@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readWindowItem, writeWindowItem } from '../../utils/windowStorage';
 import { collapseDashboardEntries, pushThreadEntry, removeEntriesById, MAX_THREAD_NAV_STACK, type ThreadNavEntry } from './thread-navigation';
 
 const T = (id: string): ThreadNavEntry => ({ type: 'thread', id });
@@ -194,7 +195,7 @@ describe('the dashboard panel in the thread history', () => {
   });
 
   it('closing a dashboard row with no thread row before it pushes a thread row', () => {
-    localStorage.setItem(KEY, JSON.stringify({ stack: [T('b'), D('a')], cursor: 1 }));
+    writeWindowItem(KEY, JSON.stringify({ stack: [T('b'), D('a')], cursor: 1 }));
     dashboards.openDashboardPanel();
     nav.setDashboardPanelOpen(false);
     expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('b'), D('a'), T('a')], cursor: 2 });
@@ -223,36 +224,36 @@ describe('the dashboard panel in the thread history', () => {
     nav.setDashboardPanelOpen(false);
     nav.collapseDashboardNavEntries();
     expect(nav._threadNavStateForTesting()).toEqual({ stack: [T('a')], cursor: 0 });
-    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual({ stack: [T('a')], cursor: 0 });
+    expect(JSON.parse(readWindowItem(KEY)!)).toEqual({ stack: [T('a')], cursor: 0 });
   });
 
   /** Invariant: an iOS cold launch can read the layout wrong at first, so loading never folds. */
   it('a reload off the phone layout keeps the saved dashboard rows', () => {
     viewport.viewportIsMobile.value = false;
-    localStorage.setItem(KEY, JSON.stringify({ stack: [T('a'), D('a')], cursor: 1 }));
+    writeWindowItem(KEY, JSON.stringify({ stack: [T('a'), D('a')], cursor: 1 }));
     expect(nav.threadNavHistory.value).toEqual({ stack: [T('a'), D('a')], cursor: 1 });
   });
 
   it('a reload with the cursor on a dashboard row reopens the panel', () => {
-    localStorage.setItem(KEY, JSON.stringify({ stack: [T('a'), D('a')], cursor: 1 }));
+    writeWindowItem(KEY, JSON.stringify({ stack: [T('a'), D('a')], cursor: 1 }));
     nav.reopenDashboardPanelFromHistory();
     expect(dashboards.dashboardPanelOpen.value).toBe(true);
   });
 
   it('a reload with the cursor on a thread row leaves the panel closed', () => {
-    localStorage.setItem(KEY, JSON.stringify({ stack: [T('a'), D('a'), T('a')], cursor: 2 }));
+    writeWindowItem(KEY, JSON.stringify({ stack: [T('a'), D('a'), T('a')], cursor: 2 }));
     nav.reopenDashboardPanelFromHistory();
     expect(dashboards.dashboardPanelOpen.value).toBe(false);
   });
 
   it('a dashboard row for a thread that is not open does not reopen the panel', () => {
-    localStorage.setItem(KEY, JSON.stringify({ stack: [T('b'), D('b')], cursor: 1 }));
+    writeWindowItem(KEY, JSON.stringify({ stack: [T('b'), D('b')], cursor: 1 }));
     nav.reopenDashboardPanelFromHistory();
     expect(dashboards.dashboardPanelOpen.value).toBe(false);
   });
 
   it('a saved history of thread rows only still loads', () => {
-    localStorage.setItem(KEY, JSON.stringify({ stack: [T('x'), T('y')], cursor: 1 }));
+    writeWindowItem(KEY, JSON.stringify({ stack: [T('x'), T('y')], cursor: 1 }));
     expect(nav.canGoBackThread.value).toBe(true);
     expect(nav._threadNavStateForTesting().stack).toEqual([T('x'), T('y')]);
   });

@@ -1,3 +1,4 @@
+import { removeWindowItem, writeWindowItem } from '../../utils/windowStorage';
 import {
   activeMenuItem,
   oauthConnectPrefill,
@@ -46,11 +47,11 @@ export function setActiveMenu(item: MenuItem, overlay: PanelOverlay = null) {
   settingsSubview.value = 'main';
 
   panelOverlay.value = overlay;
-  if (overlay?.type !== 'file-preview') localStorage.removeItem('file-preview-open');
-  if (overlay?.type !== 'app-ui') localStorage.removeItem('app-window-open');
+  if (overlay?.type !== 'file-preview') removeWindowItem('file-preview-open');
+  if (overlay?.type !== 'app-ui') removeWindowItem('app-window-open');
 
   activeMenuItem.value = item;
-  localStorage.setItem('lucidos-active-menu-item', item);
+  writeWindowItem('lucidos-active-menu-item', item);
 }
 
 export function switchMenuItem(item: MenuItem) {

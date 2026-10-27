@@ -8,7 +8,8 @@ import { ensureEventTargetResolved, eventHasTarget, jumpableEventId, showEventWh
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, eventConditionDoor, eventConditionPopoverOpenFor, findChangeById, lazyChanges, openImagePopupFromGroup, openSubAgentGroups, showToast, stepDetailModal, toggleEventConditionPopover, toggleSubAgentGroup } from '../../store/store';
 import { prefetchStepDetail } from '../../store/stepDetailCache';
-import { LUCIDOS_AGENT_LABEL, awaitedSubject, continuationCause, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isRedirectCancel, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, awaitedSubject, continuationCause, plainEventName, responseAbortedState, starterEngineReason, groupSubscriptions, isRedirectCancel, isThinking, resumeEngineNote, stepStatus, subscriptionFilterNote, triggerRetrySummary } from '../../store/thread-events';
+import { threadLink } from './ChildCompletionRow';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import { CommitList } from '../shared/CommitList';
@@ -671,6 +672,9 @@ export function triggerFiredBody({
     tone: 'arrived',
     facts: [
       name ? { kind: 'text' as const, text: name } : null,
+      event.retry_of
+        ? { kind: 'node' as const, node: threadLink(event.retry_of.thread_id, 'Retry of an interrupted run') }
+        : null,
       invocation?.kind === 'Event'
         ? {
             kind: 'chip' as const,
@@ -684,6 +688,15 @@ export function triggerFiredBody({
     fold: event.prompt
       ? { label: 'Details', body: <MarkdownBlock html={renderMarkdown(event.prompt)} /> }
       : undefined,
+  });
+}
+
+export function TriggerInterruptionNotice({ event }: { event: Extract<StoredEvent, { type: 'TriggerRunInterrupted' }> }) {
+  return eventRowBody({
+    kind: 'trigger',
+    role: 'trigger-interrupted',
+    subject: 'An engine restart interrupted this run',
+    detail: triggerRetrySummary(event.retry),
   });
 }
 

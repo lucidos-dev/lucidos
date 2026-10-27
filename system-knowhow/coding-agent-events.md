@@ -274,7 +274,9 @@ matching those fields sees the hint.
 - `{ "kind": "Canceled" }`: the user closed the question without picking
 - `{ "kind": "Superseded" }`: a follow-up arrived that could not be the answer, so it replaced the question
 
-**A quiet pick ends the turn.** `quiet: true` on the event means the pick was only *quiet options*, with nothing typed. The engine derives it from the asked options, never from the client. A batch of several questions carries no quiet option, and a chat card with deliveries held behind it wakes the agent anyway. It emits no resume marker and no `ContinuationRequested`, and the projection settles the thread to `idle` instead of `running`. A live agent stops: the Claude Code hook returns `continue: false`, the Lucidos Agent's loop ends without another model call, and Codex's tool result tells it to end its turn.
+**A quiet pick ends the turn.** `quiet: true` on the event means the pick was only *quiet options*, with nothing typed. The engine derives it from the asked options, never from the client. A card whose every option is quiet is refused before it is written.
+
+A batch of several questions carries no quiet option, and a chat card with deliveries held behind it wakes the agent anyway. Otherwise a quiet pick emits no resume marker and no `ContinuationRequested`, and the projection settles the thread to `idle` instead of `running`. A live agent stops: the Claude Code hook returns `continue: false`, the Lucidos Agent's loop ends without another model call, and Codex's tool result tells it to end its turn.
 
 **A typed answer can carry images.** `image_hashes` names the blobs the user attached, and `text` may then be empty. A coding agent reads one line per image in its answer, naming the blob's absolute path under `data/blobs/`, and opens it itself. The Lucidos Agent receives the images as image blocks after its question tool's result. An answer naming a blob the workspace never received is refused with a 409.
 
@@ -290,7 +292,7 @@ The card reads "Replaced by your next message", never "Canceled". Like `Canceled
 
 **An engine restart alone does NOT orphan a pending question.** A thread whose newest event is an unanswered `UserQuestionAsked` is a *preserved checkpoint*. Every teardown and recovery path consults one shared predicate (`agent_recovery::thread_has_unanswered_question`) and leaves it alone. That means no boundary `ResponseAborted`, no synthetic `CodingAgentIdled`, no Continue button, and no graceful interrupt to the subprocess. Claude Code's Esc would cancel the pending `AskUserQuestion` and make the agent race past it.
 
-The card stays answerable across the restart, and answering resumes the thread through `ContinuationRequested` then `--resume`. If anything in `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` lands after the question, the card is dead. The thread then recovers as an ordinary interrupted turn (abort plus Continue).
+The card stays answerable across the restart, and answering resumes the thread through `ContinuationRequested` then `--resume`. If anything in `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`, or the question's own `CodingAgentToolResult`, lands after the question, the card is dead. The thread then recovers as an ordinary interrupted turn (abort plus Continue).
 
 **Answering a question the subprocess is no longer waiting for.** An answer normally travels *in band*: the engine wakes the blocked PreToolUse hook (Claude Code) or MCP call (Codex), and the answer returns as that tool's result. If the subprocess was torn down while the card was on screen, there is no blocked call to wake. The answer then emits `ContinuationRequested { reason: "answered_after_idle" }`, and the resume message carries the answer itself. `agent_recovery::continue_input_for_reason` builds it over `agent_question::answered_question_recap`: the question text, the answer, and whether the user picked an option or typed a reply.
 

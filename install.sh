@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.51.0"
+LUCIDOS_DEFAULT_VERSION="0.52.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -123,6 +123,7 @@ LUCIDOS_UNINSTALL_URL="${LUCIDOS_UNINSTALL_URL:-}"          # URL for uninstall.
 LUCIDOS_TLS_CERT="${LUCIDOS_TLS_CERT:-}"                    # opt-in TLS (--tls-cert): cert path; with --tls-key the gateway serves https
 LUCIDOS_TLS_KEY="${LUCIDOS_TLS_KEY:-}"                      # opt-in TLS (--tls-key): private-key path; both-or-neither
 LUCIDOS_BIND="${LUCIDOS_BIND:-}"                            # optional (--bind): all | loopback | <IP> — written to the machine-global ~/.lucidos/network.toml
+INSTALL_EXTERNAL_ADDRESS=""                                  # optional (--external-address): origin written to network.toml. Flag only: the gateway reads LUCIDOS_EXTERNAL_ADDRESS itself, as a lock
 
 # Source-build (--dev) config — preserves the legacy behavior verbatim.
 LUCIDOS_REPO_URL="${LUCIDOS_REPO_URL:-https://github.com/lucidos-dev/lucidos.git}"
@@ -548,6 +549,7 @@ finish_install() {
     manager="$(service_detect_manager)"
     decision="$(service_compose_decision "$LUCIDOS_NO_SERVICE" "$manager")"
     resolve_instance
+    apply_external_address_config
     report_coexisting_app
 
     if [ "$decision" = "service" ]; then
@@ -604,6 +606,10 @@ validate_remote_access_flags() {
         service_is_bind_value "$LUCIDOS_BIND" \
             || die "--bind must be 'all', 'loopback', or a literal IP address (got '$LUCIDOS_BIND')."
     fi
+    if [ -n "$INSTALL_EXTERNAL_ADDRESS" ]; then
+        service_is_external_address "$INSTALL_EXTERNAL_ADDRESS" \
+            || die "--external-address must be an origin other devices can open, such as https://lucidos.example.com or http://10.8.0.2:$LUCIDOS_PORT, with no path (got '$INSTALL_EXTERNAL_ADDRESS')."
+    fi
 }
 
 # apply_bind_config — write --bind into the machine-global ~/.lucidos/
@@ -626,6 +632,21 @@ apply_bind_config() {
     fi
     service_write_network_toml "$HOME" "$LUCIDOS_BIND" || die "Could not write $path"
     ok "Gateway network bind set to '$LUCIDOS_BIND' ($path)"
+}
+
+# apply_external_address_config — write --external-address into the same
+# network.toml, as this instance's entry (keyed by its resolved port, so it runs
+# after resolve_instance). The gateway reads it live and puts it in the pairing
+# QR (ADR 0550). It cannot probe yet, since no gateway runs: the hint says how
+# to check it once one does.
+apply_external_address_config() {
+    [ -n "$INSTALL_EXTERNAL_ADDRESS" ] || return 0
+    local path
+    path="$(service_network_toml_path "$HOME")"
+    ensure_storage_root "$(dirname "$path")" || die "Could not make $(dirname "$path") owner-only"
+    service_write_network_toml "$HOME" "" "$LUCIDOS_PORT" "$INSTALL_EXTERNAL_ADDRESS" || die "Could not write $path"
+    ok "External address for port $LUCIDOS_PORT set to '$INSTALL_EXTERNAL_ADDRESS' ($path)"
+    info "Check that it reaches this gateway with: lucidos external-address set --port $LUCIDOS_PORT $INSTALL_EXTERNAL_ADDRESS"
 }
 
 # print_remote_access_hints — how to reach this instance from other devices,
@@ -1536,6 +1557,14 @@ Flags:
                         machine-global ~/.lucidos/network.toml (the same knob the
                         picker's Settings → Network access edits). Default: loopback
                         only — use an SSH tunnel or tailscale serve for remote access.
+  --external-address URL
+                        the origin other devices reach this gateway at, through a
+                        route you run: a reverse proxy, a VPN or a company name.
+                        Scheme, host and optional port, no path. Written to
+                        ~/.lucidos/network.toml, and put in every pairing QR ahead
+                        of the tailnet. The same value as Settings → Access and
+                        'lucidos external-address'. LUCIDOS_EXTERNAL_ADDRESS in the
+                        gateway's environment overrides it and locks the setting.
   --tls-cert PATH       serve https instead of http (requires --tls-key). A remote
                         device (phone/laptop) only gets a secure context — service
                         worker, PWA install, web push notifications — over https;
@@ -1609,6 +1638,7 @@ parse_args() {
             --name)           [ $# -ge 2 ] || die "--name requires an argument";     LUCIDOS_INSTANCE="$2"; LUCIDOS_INSTANCE_EXPLICIT=1; shift 2 ;;
             --port)           [ $# -ge 2 ] || die "--port requires an argument";     LUCIDOS_PORT="$2"; LUCIDOS_PORT_EXPLICIT=1; shift 2 ;;
             --bind)           [ $# -ge 2 ] || die "--bind requires an argument";     LUCIDOS_BIND="$2"; shift 2 ;;
+            --external-address) [ $# -ge 2 ] || die "--external-address requires an argument"; INSTALL_EXTERNAL_ADDRESS="$2"; shift 2 ;;
             --tls-cert)       [ $# -ge 2 ] || die "--tls-cert requires a path argument"; LUCIDOS_TLS_CERT="$2"; shift 2 ;;
             --tls-key)        [ $# -ge 2 ] || die "--tls-key requires a path argument";  LUCIDOS_TLS_KEY="$2"; shift 2 ;;
             --force)          LUCIDOS_FORCE=1; shift ;;

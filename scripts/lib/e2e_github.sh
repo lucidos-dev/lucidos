@@ -18,6 +18,8 @@
 source "$(dirname "${BASH_SOURCE[0]}")/touched_specs.sh"
 # shellcheck source=scripts/lib/e2e_warm.sh
 source "$(dirname "${BASH_SOURCE[0]}")/e2e_warm.sh"
+# shellcheck source=scripts/lib/host_busy_exits.sh
+source "$(dirname "${BASH_SOURCE[0]}")/host_busy_exits.sh"
 
 E2E_GITHUB_REPO="lucidos-dev/lucidos"
 E2E_GITHUB_REMOTE="lucidos"
@@ -130,6 +132,66 @@ e2e_github_local_only_env() {
     done
 }
 
+# e2e_github_host_busy_reason <exit code>: name the "host too busy" exit, or
+# print nothing for any other code, a real verdict.
+e2e_github_host_busy_reason() {
+    case "$1" in
+        "$HOST_MEMORY_STOP_EXIT") echo "memory stop" ;;
+        "$HOST_MEMORY_BUILD_REFUSED_EXIT") echo "build memory gate" ;;
+        "$HOST_LOAD_SATURATED_EXIT" | "$E2E_LOCK_BUSY_EXIT") echo "host load or every e2e slot held" ;;
+    esac
+}
+
+e2e_github_repo_head() { git -C "$(dirname "${BASH_SOURCE[0]}")/../.." rev-parse HEAD; }
+
+# The seam for the local leg: this script again, pinned to this host. It takes
+# the leg's NAME=value environment, then `--`, then the script's arguments.
+# It replaces the process, so run it in the background: its pid is the script's.
+e2e_github_run_local_leg() {
+    local assigns=()
+    while [ "$1" != -- ]; do
+        assigns+=("$1")
+        shift
+    done
+    shift
+    exec env "${assigns[@]}" "$0" "$@"
+}
+
+# e2e_github_selects_project: whether E2E_ARGS name a Playwright --project, which
+# GitHub mode refuses (use --webkit or --no-webkit).
+e2e_github_selects_project() {
+    local arg
+    for arg in ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}; do
+        case "$arg" in --project | --project=*) return 0 ;; esac
+    done
+    return 1
+}
+
+# e2e_github_busy_fallback <suite>: run a lean filtered selection here without
+# ever waiting on a busy host, and never return. The leg is this script as a
+# child with every wait at zero. Its own verdict is final. A "host busy" exit
+# hands the same selection to GitHub, pinned to the HEAD recorded before the
+# leg. LUCIDOS_E2E_DEBUG is a local-only variable, so only the child sees it.
+e2e_github_busy_fallback() {
+    local suite="$1" sha rc=0 why leg debug_was_set="${LUCIDOS_E2E_DEBUG+x}"
+    local leg_env=(LUCIDOS_E2E_LOCAL=1 LUCIDOS_BUILD_MEMORY_WAIT_SECS=0 HOST_LOAD_MAX_WAIT_SECS=0 LUCIDOS_E2E_MEMORY_RESUMES=0)
+    e2e_github_lean_local "$suite"
+    if [ -z "$debug_was_set" ] && [ -n "${LUCIDOS_E2E_DEBUG+x}" ]; then
+        leg_env+=("LUCIDOS_E2E_DEBUG=$LUCIDOS_E2E_DEBUG")
+        unset LUCIDOS_E2E_DEBUG
+    fi
+    sha="$(e2e_github_repo_head)"
+    e2e_github_run_local_leg "${leg_env[@]}" -- ${E2E_ARGS[@]+"${E2E_ARGS[@]}"} &
+    leg=$!
+    trap 'kill -TERM "$leg" 2>/dev/null; exit 143' TERM INT
+    wait "$leg" || rc=$?
+    trap - TERM INT
+    why="$(e2e_github_host_busy_reason "$rc")"
+    [ -n "$why" ] || exit "$rc"
+    echo "[e2e] host busy ($why, exit $rc): sending this selection to GitHub at ${sha:0:12}." >&2
+    exec "$(dirname "${BASH_SOURCE[0]}")/../e2e-github.sh" "$suite" --commit "$sha" ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}
+}
+
 # e2e_github_handoff <suite> "$@": GitHub is the default for a whole suite.
 # Replace this process with the driver unless the run must stay here: --local,
 # a filtered run, a local-only flag or variable, an inherited
@@ -138,6 +200,10 @@ e2e_github_local_only_env() {
 # so every nested e2e script stays too. Each e2e script calls this first,
 # before the e2e lock, and then parses E2E_ARGS: its arguments minus --local
 # and --github, plus what e2e_github_lean_local adds.
+#
+# A filtered run that nothing pinned to this host, with GitHub reachable, goes
+# through e2e_github_busy_fallback: a busy host sends it to GitHub, never a wait.
+# A Playwright --project pins it here, since GitHub mode refuses that flag.
 e2e_github_handoff() {
     local suite="$1" arg github="" local_run="" past_dashes="" reason="" env_name lean=""
     shift
@@ -169,7 +235,14 @@ e2e_github_handoff() {
     if [ "${LUCIDOS_E2E_LOCAL:-}" = 1 ]; then
         local_run=1
     elif [ -z "$github" ] && e2e_github_is_filtered ${E2E_ARGS[@]+"${E2E_ARGS[@]}"}; then
-        [ -n "$local_run" ] || echo "[e2e] running on this host: a filtered run. Pass --github to run it on GitHub." >&2
+        if [ -z "$local_run" ] && ! e2e_github_selects_project; then
+            reason="$(e2e_github_unavailable_reason "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)")"
+            if [ -z "$reason" ]; then
+                echo "[e2e] running on this host: a filtered run. Pass --github to run it on GitHub, and a busy host sends it there." >&2
+                e2e_github_busy_fallback "$suite"
+            fi
+            echo "[e2e] running on this host: a filtered run. Pass --github to run it on GitHub." >&2
+        fi
         local_run=1
         lean=1
     elif [ -z "$local_run" ] && [ -z "$github" ]; then

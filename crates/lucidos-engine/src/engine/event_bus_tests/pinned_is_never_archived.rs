@@ -99,6 +99,7 @@ async fn an_unattended_trigger_run_never_archives_a_pinned_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-pinned".into(),
             trigger_name: Some("daily".into()),

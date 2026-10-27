@@ -1032,6 +1032,7 @@ async fn trigger_continuation_started_keeps_trigger_source_and_flag_false() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "morning-report".into(),
             trigger_name: Some("Morning report".into()),

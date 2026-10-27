@@ -148,6 +148,8 @@ struct GatewayInner {
     app_data: PathBuf,
     registry_path: PathBuf,
     gateway_port: u16,
+    /// The interfaces this gateway listens on, as resolved at boot.
+    bind_choice: net_config::BindChoice,
     /// The machine-local token proving a caller is a process on this machine
     /// (`crate::auth`). Minted at startup, never logged.
     ///
@@ -338,6 +340,7 @@ impl GatewayState {
                 app_data: scratch.clone(),
                 registry_path: scratch.join("workspaces.json"),
                 gateway_port: 5251,
+                bind_choice: net_config::BindChoice::Loopback,
                 local_token: local_token.to_string(),
                 hook_socket_token: "test-hook-socket-token".to_string(),
                 paired_devices_path: scratch.join("paired-devices.json"),
@@ -679,6 +682,11 @@ impl GatewayState {
     /// configured for it: under port contention only one of them binds it.
     pub fn gateway_port(&self) -> u16 {
         self.inner.gateway_port
+    }
+
+    /// The interfaces this gateway listens on, as resolved at boot.
+    pub fn bind_choice(&self) -> net_config::BindChoice {
+        self.inner.bind_choice
     }
 
     /// The scheme the spawned engine serves on its TCP port, for the ports file
@@ -3249,6 +3257,7 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
                 app_data,
                 registry_path,
                 gateway_port,
+                bind_choice: gateway_bind_choice,
                 local_token,
                 hook_socket_token,
                 paired_devices_path,
@@ -3373,7 +3382,7 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
 /// the comment stopped being true.
 pub(crate) fn gateway_router(state: GatewayState) -> Router {
     let router = Router::new()
-        .route("/~/api/v1/health", get(gateway_health))
+        .route(crate::peers::GATEWAY_HEALTH_PATH, get(gateway_health))
         .nest("/~/api/v1/control", crate::control::router())
         .nest("/~/api/v1/auth", crate::auth_api::router())
         .fallback(fallback)
@@ -3660,11 +3669,34 @@ async fn gateway_health(State(state): State<GatewayState>) -> axum::Json<serde_j
         .unwrap_or_default();
     axum::Json(serde_json::json!({
         "status": "ok",
-        "role": "gateway",
+        "role": crate::peers::GATEWAY_ROLE,
         "release": crate::LUCIDOS_RELEASE,
+        "instance_id": instance_id(),
         "workspaces": count,
         "pending_binds": pending,
     }))
+}
+
+/// A random id for this gateway process, new on every boot.
+///
+/// A probe that reads this id back through some address has reached this very
+/// gateway, not another one on the same machine or network.
+pub(crate) fn instance_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        use std::io::Read as _;
+        let mut buf = [0u8; 16];
+        let random = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf));
+        if random.is_err() {
+            // Still unique per boot on this machine, which is what a probe compares.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            buf = (nanos ^ u128::from(std::process::id())).to_be_bytes();
+        }
+        buf.iter().map(|b| format!("{b:02x}")).collect()
+    })
 }
 
 /// Everything not handled by a gateway route:

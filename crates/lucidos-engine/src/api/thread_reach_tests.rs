@@ -710,6 +710,7 @@ async fn a_trigger_fire_reaches_its_own_subtree_and_wider() {
     bus.emit(BusEvent::Thread {
         thread_id: trigger_thread,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "nightly".into(),
             trigger_name: Some("Nightly release".into()),

@@ -179,6 +179,8 @@ A re-plan after approval re-runs `lucidos planned mark --plan <path>`, which pro
 
 **A re-ask carries what changed.** The user has already read the plan, so the card says what moved and why, in a sentence or two. The committed file holds the rest.
 
+Fill the Reachable Population section using the [population check](../../rules/build-for-users.md).
+
 ```md
 ## Implementation Plan
 
@@ -192,6 +194,9 @@ A re-plan after approval re-runs `lucidos planned mark --plan <path>`, which pro
 
 ### Non-goals / Deferred Work
 <explicit boundaries so implementation does not drift>
+
+### Reachable Population
+<who the fix covers, who it excludes, and why>
 
 ### Implementation Invariants
 <checklist using the invariant/source/verification/failure-signal shape>

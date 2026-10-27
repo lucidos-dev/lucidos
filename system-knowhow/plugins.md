@@ -682,7 +682,7 @@ Pick this for ad-hoc sharing (Slack, email), pre-publication testing, and plugin
 
        If you cannot stage a view with demo data, leave that shot out and tell the user why.
      - **Tell the user first.** Each capture takes over the screen on their device for a moment. Do one capture at a time, and never capture from two threads at once.
-     - **Capture each view.** Call `navigate_ui(target="app", app_id=..., device=<id>)` to open the view. Then call `capture_app(app_id=..., device=<id>, save_as_artifact="plugin-shots/board.png")`. Pass `fragment` to `navigate_ui` when the app routes by hash. Do this again for each view worth showing.
+     - **Capture each view.** Call `navigate_ui(target="app", app_id=..., device=<id>)` to open the view. Then call `capture_app(app_id=..., device=<id>, save_as_artifact="artifacts/plugin-shots/board.png")`. Pass `fragment` to `navigate_ui` when the app routes by hash. Do this again for each view worth showing.
      - **If the capture finds no app**, the device does not show this thread, so it got a toast instead of the view. Capture on the turn's last used device instead, which shows this thread.
      - **Copy the files into `media/`.** Each file is sharp, at the device's pixel ratio, in the format the extension names. Prefer `.png`, and use `.jpg` for a view over the 4 MB limit.
    - **Videos**: the same demo data rule and procedure apply.

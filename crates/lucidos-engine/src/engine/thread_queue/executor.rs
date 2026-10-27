@@ -18,6 +18,57 @@ use crate::engine::thread_events::{
 use crate::engine::LucidosEngine;
 use crate::scheduler::user_tasks;
 
+impl super::ThreadQueue {
+    /// The deadline rides with the durable request. Check the database clock
+    /// immediately before dispatch, including for a request reloaded at boot.
+    pub(crate) async fn drop_retry_if_expired(
+        &self,
+        entry_id: Uuid,
+        request: &ThreadQueueRequest,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let (trigger_id, retry) = match request {
+            ThreadQueueRequest::Cron {
+                trigger_id,
+                retry_of: Some(retry),
+            }
+            | ThreadQueueRequest::EventTrigger {
+                trigger_id,
+                retry_of: Some(retry),
+                ..
+            } => (trigger_id, retry),
+            _ => return Ok(false),
+        };
+        let expired: bool = sqlx::query_scalar("SELECT now() >= $1::timestamptz")
+            .bind(retry.deadline)
+            .fetch_one(&self.pool)
+            .await?;
+        if expired {
+            self.drop_interrupted_entry(
+                entry_id,
+                trigger_id,
+                Some(retry.thread_id),
+                "retry-deadline-passed",
+                "The retry of an interrupted run was too old to start. Open the run to see how far it got.",
+            )
+            .await?;
+        }
+        Ok(expired)
+    }
+}
+
+/// Boot reports interrupted intent fires at their start, before cron catch-up.
+/// Scripts and ordinary failures retain their completion-time stamps.
+fn should_record_trigger_execution(
+    run: &crate::triggers::TriggerRun,
+    shutting_down: bool,
+    result: &Result<(), Box<dyn std::error::Error + Send + Sync>>,
+) -> bool {
+    !(matches!(run, crate::triggers::TriggerRun::Intent { .. })
+        && result.as_ref().err().is_some_and(|error| {
+            user_tasks::is_shutdown_interruption(shutting_down, error.as_ref())
+        }))
+}
+
 /// An admitted entry handed to the executor. The manager completes the
 /// capacity slot when [`ThreadQueueExecutor::execute`] resolves (or panics).
 pub struct ExecutableEntry {
@@ -288,6 +339,7 @@ impl LucidosEngine {
                 depth,
                 origin_thread_id,
                 source_event_id,
+                retry_of,
             } => {
                 let Some(config) = self.queued_trigger_config(&trigger_id) else {
                     return;
@@ -330,13 +382,20 @@ impl LucidosEngine {
                         Some(&event_payload),
                         entry.cancel,
                         entry.id,
+                        retry_of,
                     )
                     .await;
-                    self.record_trigger_executed(
-                        &config.id,
-                        crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
-                    )
-                    .await;
+                    if should_record_trigger_execution(
+                        &config.run,
+                        self.is_shutting_down(),
+                        &result,
+                    ) {
+                        self.record_trigger_executed(
+                            &config.id,
+                            crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
+                        )
+                        .await;
+                    }
                     result
                 });
                 let result = match origin_thread_id {
@@ -348,7 +407,10 @@ impl LucidosEngine {
                     log!("[Scheduler] Event trigger '{}' failed: {}", config.name, e);
                 }
             }
-            ThreadQueueRequest::Cron { trigger_id } => {
+            ThreadQueueRequest::Cron {
+                trigger_id,
+                retry_of,
+            } => {
                 let Some(config) = self.queued_trigger_config(&trigger_id) else {
                     return;
                 };
@@ -384,15 +446,22 @@ impl LucidosEngine {
                             None,
                             entry.cancel,
                             entry.id,
+                            retry_of,
                         )
                         .await;
                         crate::scheduler::ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
-                        // Record after execution so crash mid-task → catch-up re-executes.
-                        self.record_trigger_executed(
-                            &config.id,
-                            crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
-                        )
-                        .await;
+                        // Boot owns the fire-start stamp for a shutdown interruption.
+                        if should_record_trigger_execution(
+                            &config.run,
+                            self.is_shutting_down(),
+                            &result,
+                        ) {
+                            self.record_trigger_executed(
+                                &config.id,
+                                crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
+                            )
+                            .await;
+                        }
                         result
                     })
                     .await;
@@ -602,6 +671,57 @@ impl LucidosEngine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shutdown_intent_interruption_is_the_only_suppressed_stamp() {
+        use crate::triggers::TriggerRun;
+        let intent = TriggerRun::Intent {
+            intent: "Prepare report".into(),
+        };
+        let script = TriggerRun::Script {
+            path: "report.sh".into(),
+        };
+        let interrupted = Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "cut").into(),
+        );
+        let failed = Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+            std::io::Error::other("failed").into(),
+        );
+        assert!(!super::should_record_trigger_execution(
+            &intent,
+            true,
+            &interrupted
+        ));
+        assert!(super::should_record_trigger_execution(
+            &intent,
+            false,
+            &interrupted
+        ));
+        assert!(super::should_record_trigger_execution(
+            &script,
+            true,
+            &interrupted
+        ));
+        assert!(super::should_record_trigger_execution(
+            &intent, true, &failed
+        ));
+        assert!(super::should_record_trigger_execution(
+            &intent,
+            true,
+            &Ok(())
+        ));
+    }
+
+    #[test]
+    fn both_trigger_arms_guard_the_completion_stamp() {
+        let scopes = trigger_id_scope_bodies(include_str!("executor.rs"));
+        assert_eq!(scopes.len(), 2);
+        for scope in scopes {
+            let guard = scope.find("if should_record_trigger_execution(").unwrap();
+            let stamp = scope.find("self.record_trigger_executed(").unwrap();
+            assert!(guard < stamp, "both trigger kinds leave cut fires for boot");
+        }
+    }
+
     use super::*;
     use crate::engine::thread_events::{MessageOrigin, ThreadDirection, ThreadEvent};
 
@@ -701,6 +821,7 @@ mod tests {
     #[test]
     fn eager_sub_thread_message_is_only_for_sub_threads() {
         let request = ThreadQueueRequest::Cron {
+            retry_of: None,
             trigger_id: "t".into(),
         };
         assert!(

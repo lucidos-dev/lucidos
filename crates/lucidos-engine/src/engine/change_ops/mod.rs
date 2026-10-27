@@ -28,7 +28,8 @@ pub(crate) use propose::{
     HoldOutcome, OpenChangeAfterHold,
 };
 pub(crate) use propose::{
-    emit_change_withdrawn, emit_proposal_withheld, ProposeOutcome, LANE_BRANCH_IS_NOT_A_CHANGE,
+    emit_change_withdrawn, emit_proposal_withheld, withhold_handed_off_work, ProposeOutcome,
+    LANE_BRANCH_IS_NOT_A_CHANGE,
 };
 #[cfg(test)]
 pub(crate) use set_aside::withdraw_for_redecision;

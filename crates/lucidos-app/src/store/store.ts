@@ -1,3 +1,4 @@
+import { readWindowItem, removeWindowItem, writeWindowItem } from '../utils/windowStorage';
 import { signal, computed, batch, type ReadonlySignal, type Signal } from '@preact/signals';
 import type { WidgetParams } from '../utils/widgetParams';
 import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
@@ -66,8 +67,8 @@ import { parseRepoPath } from './repoPath';
 import { archivePending } from './rowIntents';
 import { withoutPendingReads, withPendingReadsShown, type PendingReads } from './notificationReads';
 
-/** localStorage key holding the focused thread id across reloads. Focus is
- *  per-device, not worth round-tripping through the server. */
+/** Window-scoped key holding the focused thread id across reloads. Focus is
+ *  per window, not worth round-tripping through the server. */
 export const FOCUSED_THREAD_KEY = 'lucidos-focused-thread';
 
 // --- Inline form (replaces 5 separate modal booleans) ---
@@ -430,15 +431,15 @@ export function aliasRetiredSettingsSubview(raw: string): string {
 // The per-tab selection keys are retired with them. The panel now uses a
 // single "Installed only" filter rather than Installed and Store tabs.
 {
-  const savedMenu = localStorage.getItem('lucidos-active-menu-item');
+  const savedMenu = readWindowItem('lucidos-active-menu-item');
   const legacyAppsTab = localStorage.getItem('lucidos-apps-tab');
   if (savedMenu === 'app-store' || (savedMenu === 'apps' && legacyAppsTab === 'store')) {
-    localStorage.setItem('lucidos-active-menu-item', 'plugins');
+    writeWindowItem('lucidos-active-menu-item', 'plugins');
   }
   localStorage.removeItem('lucidos-apps-tab');
   localStorage.removeItem('lucidos-plugins-tab');
 }
-const savedMenuItem = localStorage.getItem('lucidos-active-menu-item');
+const savedMenuItem = readWindowItem('lucidos-active-menu-item');
 /** A device with no saved panel opens Files. The dashboard has its own
  *  place: the rail on desktop, the dashboard panel on a phone. */
 export const activeMenuItem = signal<MenuItem>(
@@ -767,9 +768,9 @@ export function setFocusedThread(id: string | null): void {
   focusedThreadId.value = id;
   armRestoreGuard(id);
   if (id) {
-    localStorage.setItem(FOCUSED_THREAD_KEY, id);
+    writeWindowItem(FOCUSED_THREAD_KEY, id);
   } else {
-    localStorage.removeItem(FOCUSED_THREAD_KEY);
+    removeWindowItem(FOCUSED_THREAD_KEY);
   }
 }
 
@@ -1325,7 +1326,7 @@ export const MOBILE_VIEWS: MobileView[] = [...PANE_DEFS];
 export const PANE_INDEX: Record<MobileView, number> =
   Object.fromEntries(PANE_DEFS.map((v, i) => [v, i])) as Record<MobileView, number>;
 export const PANE_COUNT = PANE_DEFS.length;
-// Persisted in localStorage so the last-viewed pane survives the PWA being
+// Window-scoped storage, so the last-viewed pane survives the PWA being
 // killed. Reopening lands on the pane the user left rather than a forced reset
 // to 'thread'. Safe because the content pane's own content is independently
 // restored from the localStorage nav stack (navigation.ts `restoreState`), so
@@ -1333,7 +1334,7 @@ export const PANE_COUNT = PANE_DEFS.length;
 export const MOBILE_VIEW_KEY = 'lucidos-mobile-view';
 
 export function getInitialMobileView(): MobileView {
-  const saved = localStorage.getItem(MOBILE_VIEW_KEY);
+  const saved = readWindowItem(MOBILE_VIEW_KEY);
   return saved && (MOBILE_VIEWS as string[]).includes(saved) ? (saved as MobileView) : 'thread';
 }
 
@@ -1341,7 +1342,7 @@ export const mobileView = signal<MobileView>(getInitialMobileView());
 
 export function setMobileView(view: MobileView) {
   mobileView.value = view;
-  localStorage.setItem(MOBILE_VIEW_KEY, view);
+  writeWindowItem(MOBILE_VIEW_KEY, view);
 }
 
 // --- Input Mode ---
@@ -1628,7 +1629,7 @@ export function normalizeLineRange(
 export const SELECTED_CHANGE_KEY = 'lucidos-repo-selected-change-id';
 // Hydrated from localStorage so the persistence effect's first synchronous
 // fire doesn't wipe a saved ID before startClient can call restore on it.
-export const repoSelectedChangeId = signal<string | null>(localStorage.getItem(SELECTED_CHANGE_KEY));
+export const repoSelectedChangeId = signal<string | null>(readWindowItem(SELECTED_CHANGE_KEY));
 export const repoChanges = signal<Loadable<import('../api/client').RepoChangesState>>({ status: 'not-loaded' });
 export const repoChangesLoadingMore = signal(false);
 export const selectedChange = computed(() => {

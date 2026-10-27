@@ -699,7 +699,7 @@ describe('coding-agent turn with no terminator must not read Working forever', (
       { type: 'UserQuestionAsked', tool_use_id: 'toolu_park', cc_session_id: 's1', question: 'Which line?', options: [{ id: 'opt-0', label: 'A' }], created: t(-280000) },
       // Teardown Esc'd the pending AskUserQuestion: CC reports a rejection the
       // user never made. No terminal follows.
-      { type: 'CodingAgentToolResult', name: '', result: 'The user doesn\'t want to proceed with this tool use.', created: t(-200000) },
+      { type: 'CodingAgentToolResult', name: '', tool_use_id: 'toolu_park', result: 'The user doesn\'t want to proceed with this tool use.', created: t(-200000) },
       ...(trailingText
         ? [{ type: 'CodingAgentTextStreamed' as const, text: '\n\n', created: t(-199000) }]
         : []),

@@ -372,7 +372,8 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
         if hs_is_listed "$p" "$HS_GATEWAY_PINNED"; then gateway=1; fi
         case "$p" in
             scripts/codegen.sh | scripts/lib/codegen*.sh | scripts/lib/codegen_blocks.py | crates/lucidos-engine/build.rs) codegen=1 ;;
-            install.sh | uninstall.sh | scripts/lib/service.sh | scripts/lib/stage_runtime.sh | \
+            install.sh | uninstall.sh | scripts/lib/service.sh | scripts/lib/stage_runtime*.sh | \
+                scripts/lib/stage_runtime*.py | scripts/build-headless.sh | scripts/lib/install_test.sh | \
                 scripts/lib/headless_tarball.sh | scripts/lib/install_common.sh) install=1 ;;
             scripts/release.sh | scripts/lib/release_draft.sh) release=1 ;;
             scripts/harden-suites.sh | scripts/lib/harden_suites*.sh | scripts/lib/proc_tree.sh | scripts/lib/touched_specs*.sh | \
@@ -471,7 +472,8 @@ hs_names_engine_tests() {
 # "<stub> <suite>", so the tests never start a real suite.
 #
 # e2e-touched runs on this host, a filtered run without mobile-webkit
-# (e2e_github_handoff). e2e-touched-webkit sends the specs mobile-webkit runs
+# (e2e_github_handoff), which sends a busy host's run to GitHub (ADR 0584).
+# e2e-touched-webkit sends the specs mobile-webkit runs
 # to GitHub as the run starts, pinned to its start commit.
 hs_suite_command() { # <suite> <early|normal> <state-dir>
     local suite=$1 mode=$2 state=$3 skips="" m specs

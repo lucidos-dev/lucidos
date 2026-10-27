@@ -5,6 +5,7 @@ paths:
   - "scripts/release*.sh"
   - "scripts/lib/build_*.sh"
   - "scripts/lib/stage_runtime*.sh"
+  - "scripts/lib/stage_runtime*.py"
   - "scripts/lib/resource_contract*.sh"
   - "scripts/lib/headless_tarball*.sh"
   - "scripts/lib/install*.sh"

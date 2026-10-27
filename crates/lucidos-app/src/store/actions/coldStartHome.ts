@@ -1,5 +1,8 @@
 import { effect } from '@preact/signals';
-import { focusedThreadId, showToast, threadsLoaded } from '../store';
+import { focusedThreadId, setFocusedThread, showToast, threadsLoaded } from '../store';
+import type { WithheldThread } from '../restoreGuard';
+import { whenWindowSeen } from '../windowPeers';
+import { windowId } from '../../utils/windowStorage';
 import { formatThreadLabel } from './thread-label';
 import { homeThreadId } from './homeThread';
 import { focusThread, focusThreadOrBootstrap } from './threads';
@@ -39,6 +42,16 @@ export function openHomeOnColdStart(storedFocus: boolean): () => void {
   return stop;
 }
 
+/** Give back a withheld thread whose marker another window armed, once that
+ *  window answers: it is alive, so no page died showing the thread. It counts
+ *  only before anything else took the focus. Returns the stop function. */
+export function releaseWithheldToLiveWindow(withheld: WithheldThread | null): () => void {
+  if (withheld === null || withheld.armedBy === windowId()) return () => {};
+  return whenWindowSeen(withheld.armedBy, () => {
+    if (focusedThreadId.peek() === null) setFocusedThread(withheld.threadId);
+  });
+}
+
 /** Offer, once, the thread the restore guard withheld at this launch. The
  *  label waits for the thread list, which holds the title. "Open" focuses the
  *  thread, and that focus arms the guard again. Returns the stop function. */
@@ -48,6 +61,7 @@ export function offerWithheldThread(threadId: string | null): () => void {
   return effect(() => {
     if (offered || !threadsLoaded.value) return;
     offered = true;
+    if (focusedThreadId.peek() === threadId) return;
     showToast(
       `Lucidos closed while ${formatThreadLabel(threadId)} was open, so it started on Home.`,
       'info',

@@ -1,3 +1,4 @@
+import { readWindowItem, removeWindowItem, writeWindowItem } from '../../utils/windowStorage';
 import type { WidgetParams } from '../../utils/widgetParams';
 import {
   appsList,
@@ -105,7 +106,7 @@ async function loadAppsInner(): Promise<void> {
     // (switchMenuItem switches mobileView to 'content').
     if (!appWindowRestoreAttempted) {
       appWindowRestoreAttempted = true;
-      const savedAppId = localStorage.getItem('app-window-open');
+      const savedAppId = readWindowItem('app-window-open');
       if (savedAppId && !currentApp.value) {
         const saved = apps.find((s) => s.id === savedAppId);
         if (saved) {
@@ -138,7 +139,7 @@ async function restoreOpenWidget(appId: string): Promise<void> {
     // keeps it, so the next reload tries again.
     if (!(error instanceof ApiError && error.httpCode === 404)) return;
   }
-  localStorage.removeItem('app-window-open');
+  removeWindowItem('app-window-open');
 }
 
 /** Open an app, optionally at an app fragment (docs/glossary.md): the place
@@ -159,7 +160,7 @@ export function openApp(app: App, fragment?: string, params?: WidgetParams): voi
   panelOverlay.value = { type: 'app-ui', app, fragment, params };
   cancelPendingRefresh();
   if (appRefreshKey.value) appRefreshKey.value = 0;
-  localStorage.setItem('app-window-open', app.id);
+  writeWindowItem('app-window-open', app.id);
   revealContentPane();
   pushNavState();
   if (!wasOpen) {
@@ -326,7 +327,7 @@ function closeAppWindow(): void {
   cancelPendingRefresh();
   if (appRefreshKey.value) appRefreshKey.value = 0;
   panelOverlay.value = null;
-  localStorage.removeItem('app-window-open');
+  removeWindowItem('app-window-open');
   pushNavState();
 }
 
@@ -492,9 +493,6 @@ async function captureAppUIInner(appId: string, requestId: string, saveFormat?: 
   const iframe = getVisibleAppFrame();
 
   if (!iframe) {
-    // A hidden tab stays silent. It shares the device id of the visible one,
-    // which may have the app open, and its quick "no app" would win the race.
-    if (document.visibilityState !== 'visible') return;
     await postAppCapture(requestId, '', 'Error: No app UI is currently open. Open it with navigate_ui (target=app, app_id), then capture again. refresh_app does not open it.');
     return;
   }

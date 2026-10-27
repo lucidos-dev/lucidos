@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { writeWindowItem } from '../../../utils/windowStorage';
 /**
  * The dashboard panel: the phone dashboard over the open thread. Its toggle
  * sits beside the mark in the thread header, on a phone only. Opening never
@@ -173,7 +174,7 @@ describe('what ends the panel', () => {
     threadMap.value = new Map([['t1', makeThreadState('t1', { meta: { title: 'A thread', section: 'inbox' }, eventsLoaded: true })]]);
     focusedThreadId.value = 't1';
     _resetThreadNavForTesting();
-    localStorage.setItem('lucidos-thread-nav-history', JSON.stringify({
+    writeWindowItem('lucidos-thread-nav-history', JSON.stringify({
       stack: [{ type: 'thread', id: 't1' }, { type: 'dashboard', id: 't1' }],
       cursor: 1,
     }));

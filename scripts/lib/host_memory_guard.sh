@@ -182,10 +182,9 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_tree.sh"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/flock.sh"
 
 # A memory stop must never read as a red project, so it carries its own exit
-# code. 71 is sysexits' EX_OSERR: an OS resource condition, not a test verdict.
-# It sits beside the host-load guard's 75 (EX_TEMPFAIL). Playwright exits 0, 1 or
-# 130, so 71 can never collide with a Playwright code.
-HOST_MEMORY_STOP_EXIT=71
+# code, HOST_MEMORY_STOP_EXIT.
+# shellcheck source=host_busy_exits.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_busy_exits.sh"
 
 # The free-headroom floor. A run stops when available memory stays below
 # max(HOST_MEMORY_FREE_FLOOR_ABS_GB, the RAM share) AND a second signal agrees.
@@ -1472,9 +1471,7 @@ report_memory_stop() {
 #
 # Every heavy build passes this first (ADR 0351).
 
-# The build gate's distinct refusal. 71 is a memory stop inside a run and 75 a
-# host-load refusal. 72 says a build never started, so nothing was tested.
-HOST_MEMORY_BUILD_REFUSED_EXIT=72
+# The build gate's distinct refusal, HOST_MEMORY_BUILD_REFUSED_EXIT.
 
 # The current time in epoch seconds, and the wait between polls. Seams, so the
 # tests drive a 15-minute wait without spending it.
@@ -1491,6 +1488,14 @@ _host_mem_secs_or() {
     case "$1" in
         '' | *[!0-9]* | 0) printf '%s' "$2" ;;
         *) printf '%s' "$((10#$1))" ;;
+    esac
+}
+
+# Like _host_mem_secs_or, but 0 is a real cap: do not wait at all.
+_host_mem_wait_cap() {
+    case "$1" in
+        0) printf '0' ;;
+        *) _host_mem_secs_or "$@" ;;
     esac
 }
 
@@ -1563,11 +1568,12 @@ EOF2
 # The ERROR line starts the line on purpose: the engine's build-failure
 # classifier quotes such a line, so an Apply rebuild refused here says why.
 #
-#   LUCIDOS_BUILD_MEMORY_WAIT_SECS  how long to wait for recovery (default 900)
+#   LUCIDOS_BUILD_MEMORY_WAIT_SECS  how long to wait for recovery (default 900,
+#                                   0 refuses at the first NO-GO)
 #   LUCIDOS_BUILD_MEMORY_POLL_SECS  seconds between readings (default 30)
 host_memory_build_gate() {
     local label="${1:-a cargo build}" limit poll start now elapsed=0 reasons announced=""
-    limit="$(_host_mem_secs_or "${LUCIDOS_BUILD_MEMORY_WAIT_SECS:-}" 900)"
+    limit="$(_host_mem_wait_cap "${LUCIDOS_BUILD_MEMORY_WAIT_SECS:-}" 900)"
     poll="$(_host_mem_secs_or "${LUCIDOS_BUILD_MEMORY_POLL_SECS:-}" 30)"
     start="$(_host_mem_now)"
     while :; do

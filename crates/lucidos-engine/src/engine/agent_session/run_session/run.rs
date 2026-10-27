@@ -2616,11 +2616,18 @@ impl LucidosEngine {
                                                 is_shutdown,
                                                 is_resolution_session,
                                                 holds_live_wait,
+                                                handoff_pending: crate::engine::successor::handoff_pending(self.pool(), thread_id).await,
                                             },
                                             &last_terminal_kind,
                                         )
                                         .filter(|_| !keep_alive_turn);
-                                        if let Some(write) = idle_write {
+                                        if idle_write == Some(IdleChangeWrite::HandedOff) {
+                                            match crate::engine::change_ops::withhold_handed_off_work(self.pool(), &self.event_bus, thread_id, &repo_root, &branch_name).await {
+                                                Ok(true) => self.broadcast_changes_updated().await,
+                                                Ok(false) => {}
+                                                Err(e) => log!("[AgentSession] Could not withdraw the handed-off change of thread {}: {}", thread_id, e),
+                                            }
+                                        } else if let Some(write) = idle_write {
                                             // Reuses the single probe above rather than re-asking git.
                                             // `None` means the probe could not be answered, and an
                                             // unanswered probe must never touch durable change state:
@@ -2766,7 +2773,6 @@ impl LucidosEngine {
                                                 crate::engine::turn_end::SessionFacts {
                                                     head: branch_head_sha(&repo_root, &branch_name).await,
                                                     held: Some(hold),
-                                                    handoff_pending: crate::engine::successor::handoff_pending(self.pool(), thread_id).await,
                                                 },
                                             );
                                             if let Some(hold) = reentry_ledger.take_due(&gate) {

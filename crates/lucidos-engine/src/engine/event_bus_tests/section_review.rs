@@ -300,6 +300,7 @@ async fn trigger_threads_skip_review() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("daily".into()),
@@ -360,6 +361,7 @@ async fn trigger_with_go_to_review_surfaces_first_response_in_review() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-review".into(),
             trigger_name: Some("daily summary".into()),
@@ -419,6 +421,7 @@ async fn trigger_followup_response_goes_to_review() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("daily".into()),
@@ -532,6 +535,7 @@ async fn engine_message_received_does_not_promote_trigger_thread_to_review() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-event".into(),
             trigger_name: Some("dashboard re-gen".into()),

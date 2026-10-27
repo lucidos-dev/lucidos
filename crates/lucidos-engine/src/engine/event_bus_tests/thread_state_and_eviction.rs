@@ -14,6 +14,7 @@ async fn trigger_started_creates_active_thread_not_composing() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-active".into(),
             trigger_name: Some("nightly".into()),
@@ -75,6 +76,7 @@ async fn trigger_started_does_not_resurrect_discarded_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-stale".into(),
             trigger_name: Some("nightly".into()),

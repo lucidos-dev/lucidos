@@ -167,6 +167,7 @@ async fn trigger_completed_sets_has_response_true() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("job-tracker".into()),

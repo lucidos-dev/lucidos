@@ -8,6 +8,7 @@ async fn emit_unattended_trigger_start(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-hourly".into(),
             trigger_name: Some("hourly".into()),
@@ -54,6 +55,78 @@ async fn read_status_and_section(pool: &PgPool, thread_id: Uuid) -> (String, Str
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn an_interrupted_fire_report_restores_the_inbox_and_preserves_failure_and_pin() {
+    use crate::engine::thread_events::{
+        emit_response_aborted, AbortCause, FireRetry, RetrySkipReason,
+    };
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    for saved in [false, true] {
+        let thread_id = Uuid::new_v4();
+        emit_unattended_trigger_start(&bus, thread_id).await;
+        if saved {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ThreadSaved,
+                meta: EventMeta::NONE,
+            })
+            .await
+            .unwrap();
+        }
+        emit_response_aborted(
+            &bus,
+            thread_id,
+            AbortCause::RecoveryAfterRestart,
+            String::new(),
+            vec![],
+            None,
+            None,
+            EventMeta::NONE,
+            "[test] interrupted fire",
+        )
+        .await;
+        let before = read_status_and_section(&pool, thread_id).await;
+        assert_eq!(before.0, "failed");
+        assert_eq!(before.1, if saved { "inbox" } else { "archived" });
+        let fire_event_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM events WHERE aggregate_id = $1 AND event_type = 'TriggerStarted'",
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::TriggerRunInterrupted {
+                trigger_id: "t-hourly".into(),
+                trigger_name: "hourly".into(),
+                fire_event_id,
+                retry: FireRetry::Skipped {
+                    reason: RetrySkipReason::TooOld,
+                },
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            read_status_and_section(&pool, thread_id).await,
+            ("failed".into(), "inbox".into()),
+        );
+        let still_saved: bool =
+            sqlx::query_scalar("SELECT is_saved FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_saved, saved);
+    }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 /// The live path: an unattended trigger run asked the user a question, and

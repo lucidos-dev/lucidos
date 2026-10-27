@@ -191,6 +191,7 @@ fn test_trigger_config(id: &str) -> crate::triggers::TriggerConfig {
 
 fn event_trigger_request(trigger_id: &str) -> ThreadQueueRequest {
     ThreadQueueRequest::EventTrigger {
+        retry_of: None,
         trigger_id: trigger_id.to_string(),
         event_type: "TestEvent".to_string(),
         event_payload: serde_json::json!({"n": 1}),
@@ -228,6 +229,7 @@ fn sub_thread_request(child_thread_id: Uuid) -> ThreadQueueRequest {
 
 fn cron_request(trigger_id: &str) -> ThreadQueueRequest {
     ThreadQueueRequest::Cron {
+        retry_of: None,
         trigger_id: trigger_id.to_string(),
     }
 }
@@ -319,6 +321,7 @@ async fn materialize_trigger_thread(bus: &EventBus, thread_id: Uuid, trigger_id:
     bus.emit(BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: trigger_id.to_string(),
             trigger_name: Some(format!("Trigger {trigger_id}")),
@@ -2819,6 +2822,345 @@ async fn run_now_does_not_start_a_held_trigger_fire() {
         Some("queued")
     );
 
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn boot_holds_trigger_admission_across_submit_drain_hints_and_run_now() {
+    let f = fixture(1).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".into(), test_trigger_config("trig-a"));
+    f.queue.begin_boot_recovery();
+    let fire = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(!fire.admitted);
+    f.queue.occupancy_moved().await;
+    f.queue.drain().await;
+    assert!(f.queue.run_now(fire.entry_id, None).await.is_err());
+    assert!(f.executor.executed_ids().is_empty());
+    assert_eq!(
+        row_status(&f.pool, fire.entry_id).await.as_deref(),
+        Some("queued")
+    );
+    f.queue.start_draining();
+    wait_until(|| {
+        let executor = f.executor.clone();
+        async move { !executor.executed_ids().is_empty() }
+    })
+    .await;
+    assert_eq!(f.executor.executed_ids(), vec![fire.entry_id]);
+    f.executor.release_one();
+    fire.completion.await.unwrap();
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn boot_retry_persistence_failure_never_publishes_an_in_memory_entry() {
+    let f = fixture(1).await;
+    f.pool.close().await;
+    assert!(f
+        .queue
+        .submit_boot_retry(cron_request("trig-a"))
+        .await
+        .is_err());
+    assert!(f.queue.state.lock().await.queued.is_empty());
+    assert!(f.executor.executed_ids().is_empty());
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn boot_retry_respects_the_existing_event_backlog_overflow_policy() {
+    let f = fixture(1).await;
+    f.queue.begin_boot_recovery();
+    let mut policy = f.queue.policy().await;
+    policy.max_queued_per_trigger = 1;
+    policy.overflow = OverflowPolicy::DropOldest;
+    f.queue.set_policy(policy, None).await.unwrap();
+    let oldest = f
+        .queue
+        .submit_boot_retry(event_trigger_request("trig-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    let retry = f
+        .queue
+        .submit_boot_retry(event_trigger_request("trig-a"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row_status(&f.pool, oldest).await.is_none());
+    assert_eq!(row_status(&f.pool, retry).await.as_deref(), Some("queued"));
+    assert!(f.executor.executed_ids().is_empty());
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn expired_retry_is_dropped_once_and_opens_the_cut_thread() {
+    let f = fixture(1).await;
+    f.queue.begin_boot_recovery();
+    let cut_thread = Uuid::new_v4();
+    for seconds in [-60, 0, 60] {
+        let deadline = sqlx::query_scalar("SELECT now() + make_interval(secs => $1)")
+            .bind(seconds as f64)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        let request = ThreadQueueRequest::Cron {
+            trigger_id: format!("trig-{seconds}"),
+            retry_of: Some(crate::engine::thread_events::RetryOf {
+                thread_id: cut_thread,
+                deadline,
+            }),
+        };
+        let entry = f
+            .queue
+            .submit_boot_retry(request.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let expired = f
+            .queue
+            .drop_retry_if_expired(entry, &request)
+            .await
+            .unwrap();
+        assert_eq!(expired, seconds <= 0, "at the deadline is already expired");
+        if expired {
+            assert_eq!(
+                dropped_reason(&f.pool, entry).await.as_deref(),
+                Some("retry-deadline-passed")
+            );
+            // Simulate a crash after the notification but before completion.
+            f.queue
+                .drop_retry_if_expired(entry, &request)
+                .await
+                .unwrap();
+        } else {
+            f.queue.emit_dropped(entry, "test cleanup", None).await;
+        }
+    }
+    let notices: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'data' FROM events WHERE event_type = 'NotificationCreated'",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(notices.len(), 2, "one notification for each expired entry");
+    for notice in notices {
+        assert_eq!(notice["thread_id"], cut_thread.to_string());
+        assert_eq!(notice["tap"]["to"]["id"], cut_thread.to_string());
+        assert_eq!(notice["tap"]["to"]["target"], "thread");
+    }
+    assert!(f.executor.executed_ids().is_empty());
+    let started: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'TriggerStarted'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(started, 0);
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn queued_retry_reloads_with_provenance_unchanged() {
+    let f = fixture(1).await;
+    f.queue.begin_boot_recovery();
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".into(), test_trigger_config("trig-a"));
+    let mut request = event_trigger_request("trig-a");
+    if let ThreadQueueRequest::EventTrigger { retry_of, .. } = &mut request {
+        *retry_of = Some(crate::engine::thread_events::RetryOf {
+            thread_id: Uuid::new_v4(),
+            deadline: Utc::now()
+                + chrono::Duration::seconds(crate::scheduler::cut_fires::FIRE_RETRY_WINDOW_SECS),
+        });
+    }
+    let id = f
+        .queue
+        .submit_boot_retry(request.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let (restarted, executor) = restarted_queue(&f, 1);
+    restarted.begin_boot_recovery();
+    restarted.recover_persisted_entries().await;
+    let state = restarted.state.lock().await;
+    assert_eq!(state.queued.len(), 1);
+    assert_eq!(state.queued[0].id, id);
+    assert_eq!(
+        serde_json::to_value(&state.queued[0].request).unwrap(),
+        serde_json::to_value(request).unwrap()
+    );
+    assert_eq!(entry_event_count(&f.pool, id, "ThreadQueued").await, 1);
+    drop(state);
+    restarted.start_draining();
+    wait_for_executed(&executor, vec![id]).await;
+    executor.release_one();
+    wait_until(|| async { row_status(&f.pool, id).await.is_none() }).await;
+    assert_eq!(
+        entry_event_count(&f.pool, id, "ThreadQueueCompleted").await,
+        1
+    );
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn admitted_script_requeues_once_then_drops_and_notifies_once() {
+    let f = fixture(1).await;
+    let id = emit_cron_queued(&f.bus, "trig-a", true).await;
+    let (second, _) = restarted_queue(&f, 1);
+    second.recover_persisted_entries().await;
+    assert_eq!(row_status(&f.pool, id).await.as_deref(), Some("queued"));
+    assert_eq!(entry_event_count(&f.pool, id, "ThreadQueued").await, 2);
+    // A restart while it is merely queued is harmless and keeps its bound.
+    let (third, _) = restarted_queue(&f, 1);
+    third.recover_persisted_entries().await;
+    assert_eq!(entry_event_count(&f.pool, id, "ThreadQueued").await, 2);
+    f.bus
+        .emit(BusEvent::System(SystemEvent::ThreadQueueAdmitted {
+            entry_id: id,
+            thread_id: None,
+            actor: None,
+        }))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let (next, _) = restarted_queue(&f, 1);
+        next.recover_persisted_entries().await;
+        assert!(next.state.lock().await.queued.is_empty());
+    }
+    assert_eq!(
+        dropped_reason(&f.pool, id).await.as_deref(),
+        Some("requeue-cut-again")
+    );
+    assert_eq!(
+        entry_event_count(&f.pool, id, "ThreadQueueDropped").await,
+        1
+    );
+    assert_eq!(entry_event_count(&f.pool, id, "ThreadQueued").await, 2);
+    let notices: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'NotificationCreated'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(notices, 1);
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+async fn dropped_reason(pool: &sqlx::PgPool, id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT payload->'data'->>'reason' FROM events WHERE event_type = 'ThreadQueueDropped' AND payload->'data'->>'entry_id' = $1 ORDER BY sequence DESC LIMIT 1")
+        .bind(id.to_string()).fetch_optional(pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn expired_retry_is_never_dispatched_after_reload() {
+    let f = fixture(1).await;
+    f.queue.begin_boot_recovery();
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".into(), test_trigger_config("trig-a"));
+    let request = ThreadQueueRequest::Cron {
+        trigger_id: "trig-a".into(),
+        retry_of: Some(crate::engine::thread_events::RetryOf {
+            thread_id: Uuid::new_v4(),
+            deadline: sqlx::query_scalar("SELECT now()")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap(),
+        }),
+    };
+    let id = f.queue.submit_boot_retry(request).await.unwrap().unwrap();
+    let (next, executor) = restarted_queue(&f, 1);
+    next.begin_boot_recovery();
+    next.recover_persisted_entries().await;
+    next.start_draining();
+    wait_until(|| async { row_status(&f.pool, id).await.is_none() }).await;
+    assert_eq!(
+        dropped_reason(&f.pool, id).await.as_deref(),
+        Some("retry-deadline-passed")
+    );
+    assert!(executor.executed_ids().is_empty());
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn recovery_finishes_an_expired_requeued_retry_after_notification_before_drop_crash() {
+    let f = fixture(1).await;
+    let id = Uuid::new_v4();
+    let request = ThreadQueueRequest::Cron {
+        trigger_id: "trig-a".into(),
+        retry_of: Some(crate::engine::thread_events::RetryOf {
+            thread_id: Uuid::new_v4(),
+            deadline: sqlx::query_scalar("SELECT now()")
+                .fetch_one(&f.pool)
+                .await
+                .unwrap(),
+        }),
+    };
+    f.bus
+        .emit(BusEvent::System(SystemEvent::ThreadQueued {
+            entry_id: id,
+            kind: ThreadQueueKind::Cron,
+            trigger_id: Some("trig-a".into()),
+            trigger_name: Some("Report".into()),
+            thread_id: None,
+            summary: "Report".into(),
+            request: serde_json::to_value(&request).unwrap(),
+            requeued: true,
+            actor: None,
+        }))
+        .await
+        .unwrap();
+    f.bus
+        .emit(BusEvent::System(SystemEvent::ThreadQueueAdmitted {
+            entry_id: id,
+            thread_id: None,
+            actor: None,
+        }))
+        .await
+        .unwrap();
+    // Fail the drop write only, leaving the preceding durable notice in place.
+    sqlx::raw_sql("CREATE FUNCTION fail_retry_drop_for_test() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.event_type = 'ThreadQueueDropped' THEN RAISE EXCEPTION 'simulated crash before drop';
+        END IF; RETURN NEW; END $$;
+        CREATE TRIGGER fail_retry_drop_for_test BEFORE INSERT ON events
+        FOR EACH ROW EXECUTE FUNCTION fail_retry_drop_for_test();")
+        .execute(&f.pool).await.unwrap();
+    assert!(f.queue.drop_retry_if_expired(id, &request).await.is_err());
+    assert_eq!(row_status(&f.pool, id).await.as_deref(), Some("admitted"));
+    sqlx::raw_sql("DROP TRIGGER fail_retry_drop_for_test ON events; DROP FUNCTION fail_retry_drop_for_test();")
+        .execute(&f.pool).await.unwrap();
+    for _ in 0..2 {
+        let (next, _) = restarted_queue(&f, 1);
+        next.recover_persisted_entries().await;
+        assert!(next.state.lock().await.queued.is_empty());
+    }
+    assert_eq!(
+        dropped_reason(&f.pool, id).await.as_deref(),
+        Some("retry-deadline-passed")
+    );
+    assert_eq!(
+        entry_event_count(&f.pool, id, "ThreadQueueDropped").await,
+        1
+    );
+    let notices: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'data' FROM events WHERE event_type = 'NotificationCreated'",
+    )
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0]["title"], "Report: run interrupted");
     f.pool.close().await;
     teardown_test_db(&f.db).await;
 }

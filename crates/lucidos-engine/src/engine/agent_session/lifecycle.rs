@@ -180,12 +180,19 @@ pub(super) fn terminate_decision(
 /// mid-work, and the wait re-opens the thread. That idle only keeps an existing
 /// change in step with the branch. A wait that ends without re-opening the
 /// thread hands the proposal to `propose_work_a_canceled_wait_held`.
+///
+/// A session whose handoff is pending proposes nothing, whatever its terminal:
+/// its successor session carries the branch work and decides it at its own
+/// turn end. Proposing now would flash Apply in the gap before that session.
 pub(super) fn idle_change_write(
     session: IdleSession,
     terminal_kind: &Option<TerminalKind>,
 ) -> Option<IdleChangeWrite> {
     if session.is_external_repo || session.is_shutdown || session.is_resolution_session {
         return None;
+    }
+    if session.handoff_pending {
+        return Some(IdleChangeWrite::HandedOff);
     }
     match terminal_kind {
         Some(TerminalKind::Generated) if session.holds_live_wait => Some(IdleChangeWrite::Resync),
@@ -208,6 +215,8 @@ pub(super) struct IdleSession {
     /// The thread holds an event wait that has not been delivered, expired or
     /// canceled.
     pub(super) holds_live_wait: bool,
+    /// The session handed off, and its successor session waits to start.
+    pub(super) handoff_pending: bool,
 }
 
 /// How an idle may write change state, from [`idle_change_write`].
@@ -221,6 +230,9 @@ pub(super) enum IdleChangeWrite {
     /// The turn ended holding a live event wait: an open change follows the
     /// branch, and no new one is proposed.
     Resync,
+    /// The session handed off: its successor session carries the branch work.
+    /// A pending change goes back to unproposed work, unannounced.
+    HandedOff,
 }
 
 impl IdleChangeWrite {
@@ -229,7 +241,7 @@ impl IdleChangeWrite {
     }
 
     pub(super) fn may_create(self) -> bool {
-        self != Self::Resync
+        self == Self::Complete || self == Self::Unfinished
     }
 }
 
@@ -743,6 +755,10 @@ pub(super) enum SessionEndAction {
     /// branch is a cheap ref, and the cleanup sweep reclaims fully-merged
     /// branches once the thread is archived.
     KeepEmptyBranch,
+    /// The session handed off with net work on the branch. Its successor
+    /// session carries the work and decides it at its own turn end, so
+    /// nothing is proposed or announced now.
+    CarriedBySuccessor,
 }
 
 /// External repos with commits keep their branch even when the diff is empty.
@@ -759,17 +775,22 @@ pub(super) enum SessionEndAction {
 /// continues on the branch. These rank below the external and crash arms,
 /// which carry more specific semantics. A cancel cannot co-occur with
 /// `safety_net_fired`, because a cancel emits a terminal.
+///
+/// A pending handoff turns net work into `CarriedBySuccessor`, below only the
+/// external and crash arms, as [`idle_change_write`] does at an idle.
 pub(super) fn classify_session_end_action(
     has_commits: bool,
     proposal_files_empty: bool,
     is_external_repo: bool,
     safety_net_fired: bool,
     cancel: TurnCancel,
+    handoff_pending: bool,
 ) -> SessionEndAction {
     let proposable = has_commits && !proposal_files_empty;
     match (has_commits, is_external_repo, safety_net_fired, cancel) {
         (true, true, _, _) => SessionEndAction::KeepExternalBranch,
         (true, false, true, _) => SessionEndAction::CrashedKeepBranch,
+        _ if handoff_pending && proposable => SessionEndAction::CarriedBySuccessor,
         (_, _, _, TurnCancel::Stopped | TurnCancel::Failed) if proposable => {
             SessionEndAction::WithholdUnfinished
         }

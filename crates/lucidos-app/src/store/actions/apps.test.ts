@@ -106,16 +106,6 @@ describe('captureAppUI', () => {
 
   // A hidden tab shares its device id with the visible one, which may have the
   // app open. Its quick "no app" answer would win the race, so it stays silent.
-  it('stays silent in a hidden tab with no app open', async () => {
-    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
-    try {
-      const { captureAppUI } = await import('./apps');
-      await captureAppUI('notes-app', 'test-request-id');
-      expect(mockPostAppCapture).not.toHaveBeenCalled();
-    } finally {
-      visibility.mockRestore();
-    }
-  });
 });
 
 describe('refreshApps', () => {

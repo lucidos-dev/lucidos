@@ -103,17 +103,22 @@ fn default_context_role() -> ContextRole {
 mod tests {
     use super::*;
 
-    /// Rows the retired intent sub-loop wrote still read, and still write back
-    /// the same purpose a cost filter matches on.
+    /// Rows a retired purpose wrote still read, and still write back the same
+    /// purpose a cost filter matches on. The literals pin the stored wire form.
     #[test]
-    fn a_retired_intent_loop_capture_still_round_trips() {
-        let purpose: ContextPurpose = serde_json::from_value(serde_json::json!("intent_loop"))
-            .expect("an old intent_loop row reads");
-        assert_eq!(purpose, ContextPurpose::IntentLoop);
-        assert_eq!(
-            serde_json::to_value(purpose).unwrap(),
-            serde_json::json!("intent_loop")
-        );
+    fn a_retired_purpose_capture_still_round_trips() {
+        for (wire, retired) in [
+            ("intent_loop", ContextPurpose::IntentLoop),
+            ("prefill_probe", ContextPurpose::PrefillProbe),
+        ] {
+            let purpose: ContextPurpose = serde_json::from_value(serde_json::json!(wire))
+                .unwrap_or_else(|e| panic!("an old {wire} row reads: {e}"));
+            assert_eq!(purpose, retired);
+            assert_eq!(
+                serde_json::to_value(purpose).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
     }
 
     fn usage(input: u32, output: u32, read: u32, written: u32, written_1h: u32) -> ApiUsage {
@@ -494,6 +499,13 @@ pub enum ContextPurpose {
     /// session's own model. Its `duration_ms` dates the request that refreshed
     /// the cache.
     CacheKeepAlive,
+    /// Retired: one call of the removed prefill byte-order probe, a synthetic
+    /// turn or beat on the Claude gateway (ADR 0581).
+    ///
+    /// Nothing produces it now. It stays so old `ContextCaptured` rows still
+    /// read, and so a cost filter on `purpose: "prefill_probe"` still matches
+    /// them.
+    PrefillProbe,
 }
 
 /// SQL predicate over an `events` row: true for an *auxiliary capture*, a
@@ -545,6 +557,7 @@ impl ContextPurpose {
             Self::ReadDecision => "Read Decision Request",
             Self::WakeDecision => "Wake Decision Request",
             Self::CacheKeepAlive => "Cache Keep-Alive Request",
+            Self::PrefillProbe => "Prefill Probe Request",
         }
     }
 }

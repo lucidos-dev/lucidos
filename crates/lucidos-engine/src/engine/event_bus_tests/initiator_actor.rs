@@ -56,6 +56,7 @@ async fn initiator_system_trigger() {
     bus.emit(BusEvent::Thread {
         thread_id: tid,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("daily".into()),
@@ -98,6 +99,7 @@ async fn initiator_inherited_system_to_cc_child() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("e2e tests".into()),
@@ -292,6 +294,7 @@ async fn initiator_preserved_on_session_started_upsert() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("nightly".into()),

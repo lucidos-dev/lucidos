@@ -34,6 +34,7 @@ let host: HTMLDivElement;
 beforeEach(() => {
   host = document.createElement('div');
   document.body.appendChild(host);
+  preferences.value = { status: 'loaded', data: { cache_cards: 'true' } };
   threadMap.value = new Map([['tid', makeThreadState('tid', { meta: { status: 'waiting_for_user_answer', cacheKeepAliveStatus: warming } })]]);
 });
 

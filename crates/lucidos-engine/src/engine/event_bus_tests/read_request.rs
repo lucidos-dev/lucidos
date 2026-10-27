@@ -363,6 +363,7 @@ async fn start_trigger_run(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "t-1".into(),
             trigger_name: Some("daily".into()),

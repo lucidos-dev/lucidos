@@ -14,8 +14,9 @@
 # LUCIDOS_NO_GATEWAY=1 falls back to the legacy direct-engine model, the same
 # fork web-dev.sh has. The window then loads the engine root.
 #
-# The window runs from its published launch binary, beside the engine and the
-# gateway. It moves to a new build only when its engine does, on "Switch to new
+# The window runs from its published launch binary, inside a minimal .app on
+# macOS. Sibling links resolve the engine, gateway and CLI in the launch dir.
+# It moves to a new build only when its engine does, on "Switch to new
 # version" (ADR 0461). Frontend changes arrive through the engine, as in any
 # browser.
 set -e
@@ -58,7 +59,8 @@ if [ ! -f "$(dev_window_bin "$DEV_WINDOW_LAUNCH_DIR")" ]; then
 fi
 # Resolved, because the window's re-exec names itself by its resolved path and
 # stop_dev_windows matches on it.
-DEV_WINDOW_BIN="$(dev_window_bin "$(cd "$DEV_WINDOW_LAUNCH_DIR" && pwd -P)")"
+DEV_WINDOW_LAUNCH_DIR="$(cd "$DEV_WINDOW_LAUNCH_DIR" && pwd -P)"
+DEV_WINDOW_BIN="$(dev_window_bin "$DEV_WINDOW_LAUNCH_DIR")"
 # Before the stack starts, so /api/v1/sdk.js is ready immediately.
 generate_build_outputs
 swap_ports
@@ -85,7 +87,7 @@ WINDOW_URL="$(desktop_window_url \
     "${GATEWAY_MODE:-}" "$PROTO" "$GATEWAY_PORT" "${GATEWAY_WS_ID:-}" "$ENGINE_PORT")"
 
 # Replace this checkout's previous window, if one is still running.
-stop_dev_windows "$DEV_WINDOW_BIN"
+stop_dev_windows "$DEV_WINDOW_BIN" "$DEV_WINDOW_LAUNCH_DIR/lucidos-app"
 
 # Leaves the shared gateway and every peer workspace running. See
 # cleanup_processes, which releases only this workspace's own markers.

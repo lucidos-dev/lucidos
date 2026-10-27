@@ -3,12 +3,11 @@
 //! The stable prefix is the part of a chat turn's request that the next turn
 //! sends again unchanged: the tools, the system block and, on a Tree
 //! workspace, the memory view blocks. The per-turn block after it is rebuilt
-//! every turn. A cache keep-alive beat can keep only this part warm, so it
-//! must send exactly these bytes.
+//! every turn. A prefill cut can omit some view blocks, so its fingerprint
+//! follows the cut it sends.
 //!
 //! The fingerprint hashes that prefix with every `cache_control` marker left
-//! out. A beat places its markers differently from a turn, and the question
-//! is whether the content matches. The model and the thinking config are part
+//! out, so a marker move alone cannot change it. The model and thinking config are part
 //! of it: Opus 5.5 renders both into the prefix.
 
 use super::anthropic_wire::{ClaudeOutputConfig, ClaudeRequest, ClaudeThinking};
@@ -20,7 +19,15 @@ use serde_json::Value;
 /// `None` only when the prefix does not serialize, which the real request
 /// would then fail on too.
 pub(crate) fn fingerprint(request: &ClaudeRequest, model: &str) -> Option<String> {
-    let bytes = serde_json::to_vec(&StablePrefix::of(request, model)).ok()?;
+    fingerprint_through(request, model, request.stable_prefix_end)
+}
+
+pub(crate) fn fingerprint_through(
+    request: &ClaudeRequest,
+    model: &str,
+    end: Option<(usize, usize)>,
+) -> Option<String> {
+    let bytes = serde_json::to_vec(&StablePrefix::of(request, model, end)).ok()?;
     Some(short_hash(&bytes))
 }
 
@@ -42,7 +49,7 @@ struct StablePrefix<'a> {
 }
 
 impl<'a> StablePrefix<'a> {
-    fn of(request: &'a ClaudeRequest, model: &'a str) -> Self {
+    fn of(request: &'a ClaudeRequest, model: &'a str, end: Option<(usize, usize)>) -> Self {
         let tools = request
             .tools
             .iter()
@@ -53,7 +60,7 @@ impl<'a> StablePrefix<'a> {
                 input_schema: &tool.input_schema,
             })
             .collect();
-        let messages = match request.stable_prefix_end {
+        let messages = match end {
             None => Vec::new(),
             Some((last, block)) => request.messages[..=last]
                 .iter()

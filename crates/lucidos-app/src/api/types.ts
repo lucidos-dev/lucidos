@@ -147,8 +147,9 @@ export interface NetworkConfigResponse {
  *  What this machine's tailnet looks like, over plain HTTP, so a phone browser
  *  gets the same answer the packaged desktop app does.
  *
- *  `magic_dns_name` carries no scheme (`<machine>.<tailnet>.ts.net`), and is
- *  null off a tailnet or with MagicDNS turned off.
+ *  `magic_dns_name` is the name Tailscale reports, with no scheme, and is null
+ *  off a tailnet or with MagicDNS turned off. A self-hosted control server
+ *  can give it any suffix, so never test it for `.ts.net`.
  *
  *  `workspace_serve_url` is the full `https://<name>/<slug>/` URL, and the
  *  engine sets it ONLY after a request to it came back from that same engine.
@@ -157,6 +158,9 @@ export interface NetworkConfigResponse {
 export interface TailnetStatusResponse {
   magic_dns_name: string | null;
   workspace_serve_url: string | null;
+  /** Why this machine has no tailnet address, in one sentence. Null when it
+   *  is joined. */
+  reason: string | null;
 }
 
 /** One coding agent's effective CLI binary resolution — mirrors the engine

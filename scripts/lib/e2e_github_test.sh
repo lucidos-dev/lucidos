@@ -358,15 +358,17 @@ test_the_handoff_falls_back_only_without_github() {
 }
 
 # lean_outcome <suite> [args]: the hand-off with exec stubbed and no engine
-# profile chosen by the caller, unless LEAN_KEEP_DEBUG keeps LUCIDOS_E2E_DEBUG. Prints "github <args>", or "local <args>
-# debug=<LUCIDOS_E2E_DEBUG or unset>".
+# profile chosen by the caller, unless LEAN_KEEP_DEBUG keeps LUCIDOS_E2E_DEBUG.
+# LEAN_REASON stubs the precondition check. A filtered run needs it non-empty to
+# stay here, since an eligible one runs its leg as a child. Prints "github
+# <args>", or "local <args> debug=<LUCIDOS_E2E_DEBUG or unset>".
 # shellcheck disable=SC2317,SC2031 # exec and the reason check are shadowed; each subshell owns its env
 lean_outcome() {
     (
         unset RELEASE
         [ -n "${LEAN_KEEP_DEBUG:-}" ] || unset LUCIDOS_E2E_DEBUG
         exec() { shift; echo "github $*"; exit 0; }
-        e2e_github_unavailable_reason() { :; }
+        e2e_github_unavailable_reason() { printf '%s' "${LEAN_REASON:-}"; }
         e2e_github_handoff "$@"
         echo "local ${E2E_ARGS[*]-} debug=${LUCIDOS_E2E_DEBUG-unset}"
     ) 2>/dev/null
@@ -375,22 +377,133 @@ lean_outcome() {
 test_a_filtered_run_stays_here_and_runs_lean() {
     echo "test: a filtered run stays on this host, on a debug engine, without mobile-webkit"
     expect_outcome "-f stays, with --no-webkit and a debug engine" "local --no-webkit -f a.spec.ts debug=1" \
-        "$(lean_outcome browser -f a.spec.ts)"
+        "$(LEAN_REASON="no gh" lean_outcome browser -f a.spec.ts)"
     local tail
     for tail in "--grep x" "-g x" "--grep=x" "--grep-invert x" "chat"; do
         # shellcheck disable=SC2086 # the tail splits into its words on purpose
-        expect_outcome "-- $tail is a filter" "local --no-webkit -- $tail debug=1" "$(lean_outcome browser -- $tail)"
+        expect_outcome "-- $tail is a filter" "local --no-webkit -- $tail debug=1" "$(LEAN_REASON="no gh" lean_outcome browser -- $tail)"
     done
     expect_outcome "a positional spec before -- is a filter" "local --no-webkit chat.spec.ts debug=1" \
-        "$(lean_outcome browser chat.spec.ts)"
+        "$(LEAN_REASON="no gh" lean_outcome browser chat.spec.ts)"
     expect_outcome "--webkit keeps WebKit and the release engine" "local --webkit -f a-mobile.spec.ts debug=unset" \
-        "$(lean_outcome browser --webkit -f a-mobile.spec.ts)"
+        "$(LEAN_REASON="no gh" lean_outcome browser --webkit -f a-mobile.spec.ts)"
     expect_outcome "a --project keeps the release engine" "local -- --project mobile-webkit -g x debug=unset" \
-        "$(lean_outcome browser -- --project mobile-webkit -g x)"
+        "$(LEAN_REASON="no gh" lean_outcome browser -- --project mobile-webkit -g x)"
     expect_outcome "a filtered API run stays, on a debug engine" "local -f health debug=1" \
-        "$(lean_outcome api -f health)"
+        "$(LEAN_REASON="no gh" lean_outcome api -f health)"
     expect_outcome "an explicit LUCIDOS_E2E_DEBUG=0 keeps the release engine" "local --no-webkit -f a.spec.ts debug=0" \
-        "$(LEAN_KEEP_DEBUG=1 LUCIDOS_E2E_DEBUG=0 lean_outcome browser -f a.spec.ts)"
+        "$(LEAN_REASON="no gh" LEAN_KEEP_DEBUG=1 LUCIDOS_E2E_DEBUG=0 lean_outcome browser -f a.spec.ts)"
+}
+
+# busy_outcome <leg-exit> <unavailable-reason> <suite> [args]: the hand-off of an
+# eligible run with the local leg and exec stubbed. The leg prints what it saw
+# and exits <leg-exit>. The head moves while the leg runs. Prints the leg line,
+# then "github <args>" if the run was handed over, "exit <rc>" if the hand-off
+# ended the process with the leg's own verdict, or "local ..." if it returned.
+# shellcheck disable=SC2317,SC2031 # the seams are shadowed; each subshell owns its env
+busy_outcome() {
+    local leg_rc="$1" stub_reason="$2"
+    shift 2
+    (
+        unset RELEASE
+        head_file="$SANDBOX/busy-head"
+        echo "aaa111" >"$head_file"
+        exec() { shift; echo "github $* debug=${LUCIDOS_E2E_DEBUG-unset}"; command exit 0; }
+        exit() { echo "exit $1"; command exit "$1"; }
+        e2e_github_unavailable_reason() { printf '%s' "$stub_reason"; }
+        e2e_github_repo_head() { cat "$head_file"; }
+        e2e_github_run_local_leg() {
+            (
+                while [ "$1" != -- ]; do export "${1?}"; shift; done
+                shift
+                echo "leg args=$* local=${LUCIDOS_E2E_LOCAL-} mem=${LUCIDOS_BUILD_MEMORY_WAIT_SECS-} load=${HOST_LOAD_MAX_WAIT_SECS-} resumes=${LUCIDOS_E2E_MEMORY_RESUMES-} debug=${LUCIDOS_E2E_DEBUG-unset}"
+            )
+            echo "bbb222" >"$head_file"
+            return "$leg_rc"
+        }
+        e2e_github_handoff "$@"
+        echo "local ${E2E_ARGS[*]-} env=${LUCIDOS_E2E_LOCAL:-}"
+    ) 2>/dev/null
+}
+
+test_an_eligible_run_never_waits_on_a_busy_host() {
+    echo "test: an eligible filtered run runs its local leg with every wait at zero"
+    expect_outcome "the leg sees every zero-wait variable and the lean shape" \
+        "leg args=--no-webkit -f a.spec.ts local=1 mem=0 load=0 resumes=0 debug=1*" \
+        "$(busy_outcome 0 "" browser -f a.spec.ts)"
+    expect_outcome "the GitHub leg never sees the local-only debug variable" "*debug=unset" \
+        "$(busy_outcome "$HOST_MEMORY_STOP_EXIT" "" browser -f a.spec.ts)"
+    local rc
+    for rc in "$HOST_MEMORY_STOP_EXIT" "$HOST_MEMORY_BUILD_REFUSED_EXIT" "$HOST_LOAD_SATURATED_EXIT" "$E2E_LOCK_BUSY_EXIT"; do
+        expect_outcome "exit $rc hands the same selection to GitHub at the recorded head" \
+            "leg*github browser --commit aaa111 --no-webkit -f a.spec.ts debug=unset" \
+            "$(busy_outcome "$rc" "" browser -f a.spec.ts)"
+    done
+    expect_outcome "a filtered API run hands over too, with no mobile flag" "leg*github api --commit aaa111 -f health debug=unset" \
+        "$(busy_outcome "$HOST_MEMORY_STOP_EXIT" "" api -f health)"
+    expect_outcome "a Playwright filter keeps its arguments after --" \
+        "leg*github browser --commit aaa111 --no-webkit -- --grep x debug=unset" \
+        "$(busy_outcome "$HOST_LOAD_SATURATED_EXIT" "" browser -- --grep x)"
+    expect_outcome "the hand-off says why on one line" "*host busy (memory stop, exit $HOST_MEMORY_STOP_EXIT): sending this selection to GitHub at aaa111*" \
+        "$( (
+            unset RELEASE
+            exec() { shift; command exit 0; }
+            e2e_github_unavailable_reason() { :; }
+            e2e_github_repo_head() { echo aaa111; }
+            e2e_github_run_local_leg() { return "$HOST_MEMORY_STOP_EXIT"; }
+            e2e_github_handoff browser -f a.spec.ts
+        ) 2>&1 )"
+}
+
+test_a_real_verdict_is_never_retried_on_github() {
+    echo "test: a pass or a failing test is the run's own verdict, never a GitHub rerun"
+    expect_outcome "exit 0 passes through" "leg*exit 0" "$(busy_outcome 0 "" browser -f a.spec.ts)"
+    expect_outcome "exit 1 fails through" "leg*exit 1" "$(busy_outcome 1 "" browser -f a.spec.ts)"
+    expect_outcome "exit 76 (no verdict) is not a busy host" "leg*exit 76" "$(busy_outcome 76 "" browser -f a.spec.ts)"
+    expect_outcome "exit 130 (interrupted) is not a busy host" "leg*exit 130" "$(busy_outcome 130 "" browser -f a.spec.ts)"
+}
+
+# shellcheck disable=SC2031 # each export is scoped to its own $(...) on purpose
+test_a_pinned_run_keeps_its_waits() {
+    echo "test: --local, a local-only flag or variable and an inherited mark run in-process, with today's waits"
+    local out
+    for out in "$(busy_outcome 71 "" browser --local -f a.spec.ts)" \
+        "$(busy_outcome 71 "" browser --headed -f a.spec.ts)" \
+        "$(export THREAD_SHOTS=1; busy_outcome 71 "" browser -f a.spec.ts)" \
+        "$(export LUCIDOS_E2E_DEBUG=1; busy_outcome 71 "" api -f health)" \
+        "$(LUCIDOS_E2E_LOCAL=1 busy_outcome 71 "" browser -f a.spec.ts)"; do
+        expect_outcome "no child and no GitHub run" "local *env=1" "$out"
+        [[ "$out" != *leg* && "$out" != *github* ]] || fail "a pinned run left the process: $out"
+    done
+}
+
+test_a_project_pins_the_run_here() {
+    echo "test: a Playwright --project keeps the run in-process, since GitHub mode refuses it"
+    local out
+    out="$(busy_outcome 71 "" browser -f a.spec.ts -- --project mobile)"
+    expect_outcome "no child and no GitHub run" "local -f a.spec.ts -- --project mobile env=1" "$out"
+    out="$(busy_outcome 71 "" browser -f a.spec.ts -- --project=mobile)"
+    expect_outcome "the --project=name form too" "local -f a.spec.ts -- --project=mobile env=1" "$out"
+}
+
+test_the_local_leg_seam_reruns_the_script_with_the_leg_environment() {
+    echo "test: the real seam execs this script with the NAME=value environment and the arguments intact"
+    local fake="$SANDBOX/fake-e2e.sh" out rc
+    # shellcheck disable=SC2016 # the fake script expands these when it runs
+    printf '#!/bin/bash\necho "fake A=${A-} B=${B-} args=$#:$*"\nexit 75\n' >"$fake"
+    chmod +x "$fake"
+    out="$(E2E_LIB="$SCRIPT_DIR/e2e_github.sh" bash -c \
+        'source "$E2E_LIB"; e2e_github_run_local_leg A=1 B=two -- -f "a b.spec.ts" -- --grep q' "$fake")"
+    rc=$?
+    expect_outcome "the leg sees its environment and every argument" "fake A=1 B=two args=5:-f a b.spec.ts -- --grep q" "$out"
+    expect_outcome "the leg's exit code comes back" "75" "$rc"
+}
+
+test_an_unreachable_github_keeps_its_waits() {
+    echo "test: a dirty tree or a missing remote cannot hand off, so the run waits as before"
+    local out
+    out="$(busy_outcome 71 "the tree is dirty" browser -f a.spec.ts)"
+    expect_outcome "no child and no GitHub run" "local --no-webkit -f a.spec.ts env=1" "$out"
 }
 
 test_an_unfiltered_run_still_goes_to_github() {
@@ -1396,6 +1509,12 @@ test_the_handoff_defaults_to_github
 test_the_handoff_stays_local_when_asked_or_inherited
 test_the_handoff_falls_back_only_without_github
 test_a_filtered_run_stays_here_and_runs_lean
+test_an_eligible_run_never_waits_on_a_busy_host
+test_a_real_verdict_is_never_retried_on_github
+test_a_pinned_run_keeps_its_waits
+test_a_project_pins_the_run_here
+test_the_local_leg_seam_reruns_the_script_with_the_leg_environment
+test_an_unreachable_github_keeps_its_waits
 test_an_unfiltered_run_still_goes_to_github
 test_the_unavailable_reason_names_each_precondition
 test_the_main_check_selection_has_no_fallback

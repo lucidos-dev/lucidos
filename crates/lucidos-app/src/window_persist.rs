@@ -39,10 +39,9 @@ pub(crate) fn window_state_flags() -> StateFlags {
 /// Which windows `tauri-plugin-window-state` may restore and save: `main`, and
 /// nothing else. Passed to its builder as the tracking filter.
 ///
-/// The plugin keys on the window LABEL, and `window-<n>` comes off a counter
-/// that resets each process. So that key names a different window every launch,
-/// which is the whole reason ADR 0123 keys the session by workspace instead.
-/// Unfiltered, the plugin restored one runtime window's geometry onto an
+/// The plugin keys on the window LABEL. An extra window's label is
+/// `window-<uuid>`, and the session record owns its frame (ADR 0585). Two owners
+/// of one frame would fight over it. Unfiltered, the plugin restored one runtime window's geometry onto an
 /// unrelated one, and `MAXIMIZED` and `FULLSCREEN` with it. Placing a frame
 /// undoes neither, so a fresh window could come up fullscreen inherited from a
 /// past life.
@@ -228,7 +227,8 @@ pub(crate) fn persist_window_state_only(app: &tauri::AppHandle) {
     save_plugin_state(app, "Failed to persist window state on close");
 }
 
-/// What this launch restores: a workspace per window, and the frame each wants.
+/// What this launch restores: a label and workspace per window, and the frame
+/// each wants.
 ///
 /// Resolved once, in `setup`, and read again by `desktop::launch` on its own
 /// thread once the gateway is healthy. Memoized because the two reads must
@@ -236,9 +236,8 @@ pub(crate) fn persist_window_state_only(app: &tauri::AppHandle) {
 ///
 /// A workspace with no remembered frame still gets a window, built at the
 /// default size.
-pub(crate) fn resolve_window_session_plan(
-) -> &'static [(String, Option<window_restore::RememberedFrame>)] {
-    static PLAN: std::sync::OnceLock<Vec<(String, Option<window_restore::RememberedFrame>)>> =
+pub(crate) fn resolve_window_session_plan() -> &'static [window_session::RestoredWindow] {
+    static PLAN: std::sync::OnceLock<Vec<window_session::RestoredWindow>> =
         std::sync::OnceLock::new();
     PLAN.get_or_init(|| {
         // Dev restores nothing: it shares the packaged app-data dir and
@@ -541,10 +540,9 @@ mod tests {
         ));
     }
 
-    // The plugin keys on the label, and only `main`'s means one window across
-    // launches. Tracking a `window-<n>` restored a past session's second window
-    // onto whatever this session's second window turned out to be, fullscreen
-    // flag included.
+    // The session record owns every frame but `main`'s. Tracking an extra window
+    // once restored a past session's second window onto whatever this session's
+    // second window turned out to be, fullscreen flag included.
     #[test]
     fn the_plugin_tracks_main_and_nothing_else() {
         assert!(plugin_tracks(crate::app_window::MAIN_WINDOW_LABEL));

@@ -71,6 +71,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   HomeThreadCreated: 'metadata',
   ImageUploaded: 'metadata',
   TriggerStarted: 'start',
+  TriggerRunInterrupted: 'metadata',
   TriggerCompleted: 'terminal',
   ChangeProposed: 'action_required',
   ChangeApplied: 'terminal',

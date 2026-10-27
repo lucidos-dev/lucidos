@@ -44,6 +44,8 @@ pub struct PrefillBody {
     pub model: String,
     /// The effort the turn went out at, for the cost record.
     pub reasoning_effort: Option<String>,
+    /// The stable prefix this cut actually sends, when its wire supports it.
+    pub stable_prefix_fingerprint: Option<String>,
     /// The most output tokens this body allows. A beat that reports more
     /// was not a prefill (ADR 0556, the first-beat guard). `None` for a beat
     /// that hangs up before the model answers, whose usage block says nothing
@@ -129,31 +131,62 @@ pub(crate) enum StableEnd {
     Placeholder { keep: usize },
 }
 
-/// The pair a beat on `value` sends. `value` is the turn's request in the
-/// form `shape` asks for. The stable cut shortens the list under `list_key`
-/// to `end`.
-pub(crate) fn pair_of(
-    mut value: serde_json::Value,
-    list_key: &str,
+/// One item of the list a stable cut shortens: a message or an input item.
+pub(crate) trait CutItem {
+    fn role(&self) -> Option<&str>;
+    fn content_mut(&mut self) -> Option<&mut serde_json::Value>;
+    /// An unmarked user message of a single character.
+    fn placeholder() -> Self;
+}
+
+impl CutItem for serde_json::Value {
+    fn role(&self) -> Option<&str> {
+        self.get("role").and_then(serde_json::Value::as_str)
+    }
+
+    fn content_mut(&mut self) -> Option<&mut serde_json::Value> {
+        self.get_mut("content")
+    }
+
+    fn placeholder() -> Self {
+        serde_json::json!({"role": "user", "content": "."})
+    }
+}
+
+/// The pair a beat on `request` sends. `request` is the turn's request in
+/// the form `shape` asks for, and `items` finds the list a stable cut
+/// shortens to `end`.
+///
+/// Each body serializes `request`'s own type, so it keeps the turn's byte
+/// order. A gateway may route on the raw bytes (ADR 0581).
+pub(crate) fn pair_of<R, I>(
+    request: &R,
+    items: impl Fn(&mut R) -> Option<&mut Vec<I>>,
     end: StableEnd,
     shape: BeatShape,
     route: TurnRoute<'_>,
-) -> Option<PrefillPair> {
-    let closing = |items: &mut Vec<serde_json::Value>| match &shape.closing_part {
+) -> Option<PrefillPair>
+where
+    R: Clone + serde::Serialize,
+    I: CutItem,
+{
+    let closing = |items: &mut Vec<I>| match &shape.closing_part {
         Some(part) => append_part(items, part),
         None => Some(()),
     };
-    let mut whole = value.clone();
-    closing(whole.get_mut(list_key)?.as_array_mut()?)?;
+    let mut whole = request.clone();
+    closing(items(&mut whole)?)?;
     let whole = serde_json::to_vec(&whole).ok()?;
-    let items = value.get_mut(list_key)?.as_array_mut()?;
-    cut(items, end);
-    closing(items)?;
-    let stable = serde_json::to_vec(&value).ok()?;
+    let mut stable = request.clone();
+    let list = items(&mut stable)?;
+    cut(list, end);
+    closing(list)?;
+    let stable = serde_json::to_vec(&stable).ok()?;
     let body = |bytes: Vec<u8>| PrefillBody {
         provider: None,
         model: route.wire_model.to_string(),
         reasoning_effort: route.reasoning_effort.map(str::to_string),
+        stable_prefix_fingerprint: None,
         output_cap: shape.output_cap,
         reply: shape.reply,
         wire_model: route.wire_model.to_string(),
@@ -166,13 +199,13 @@ pub(crate) fn pair_of(
     })
 }
 
-fn cut(items: &mut Vec<serde_json::Value>, end: StableEnd) {
+fn cut<I: CutItem>(items: &mut Vec<I>, end: StableEnd) {
     match end {
         StableEnd::Part { item, part } => {
             items.truncate(item + 1);
             if let Some(parts) = items
                 .get_mut(item)
-                .and_then(|i| i.get_mut("content"))
+                .and_then(CutItem::content_mut)
                 .and_then(serde_json::Value::as_array_mut)
             {
                 parts.truncate(part + 1);
@@ -180,19 +213,19 @@ fn cut(items: &mut Vec<serde_json::Value>, end: StableEnd) {
         }
         StableEnd::Placeholder { keep } => {
             items.truncate(keep);
-            items.push(serde_json::json!({"role": "user", "content": "."}));
+            items.push(I::placeholder());
         }
     }
 }
 
 /// Append `part` to the last item's content, which must be the user's. A
 /// string content becomes a list of text parts first. `None` otherwise.
-fn append_part(items: &mut [serde_json::Value], part: &serde_json::Value) -> Option<()> {
+fn append_part<I: CutItem>(items: &mut [I], part: &serde_json::Value) -> Option<()> {
     let last = items.last_mut()?;
-    if last.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+    if last.role() != Some("user") {
         return None;
     }
-    match last.get_mut("content")? {
+    match last.content_mut()? {
         serde_json::Value::Array(parts) => parts.push(part.clone()),
         content => {
             let text = serde_json::json!({"type": "text", "text": content.take()});
@@ -380,6 +413,7 @@ mod tests {
             provider: None,
             model: "m".into(),
             reasoning_effort: None,
+            stable_prefix_fingerprint: None,
             output_cap: None,
             reply: ReplyShape::MessageStart,
             wire_model: "m".into(),
@@ -460,6 +494,7 @@ mod tests {
             provider: None,
             model: "m".into(),
             reasoning_effort: None,
+            stable_prefix_fingerprint: None,
             output_cap: Some(0),
             reply: ReplyShape::Json,
             wire_model: "m".into(),

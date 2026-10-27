@@ -45,7 +45,7 @@ describe('the pill', () => {
     expect(trigger.querySelector('.rung-effort')!.textContent).toBe(' · medium');
   });
 
-  it('is unseen until it has a face, then drops the mark', () => {
+  it('marks the loading face until the current selection arrives', () => {
     draw({ shown: null });
     const pill = host.querySelector('.rung-pill')!;
     expect(pill.hasAttribute('data-pending')).toBe(true);
@@ -65,15 +65,33 @@ describe('the pill', () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps its face and blocks clicks and arrow keys while disabled', () => {
+    const prev = vi.fn();
+    const next = vi.fn();
+    const { onOpen } = draw({ disabledReason: 'Answer the question first', step: { prev, next } });
+    for (const button of host.querySelectorAll<HTMLButtonElement>('button')) {
+      expect(button.getAttribute('aria-disabled')).toBe('true');
+      expect(button.getAttribute('data-tooltip')).toBe('Answer the question first');
+      act(() => {
+        button.click();
+        button.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+      });
+    }
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(prev).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expect(host.querySelector('.rung-name')!.textContent).toBe(shown.name);
+  });
+
   it('names the pair for a screen reader', () => {
     draw();
     expect(host.querySelector('.rung-trigger')!.getAttribute('aria-label'))
       .toBe('Model and effort: Opus 5.5, medium. Choose another');
   });
 
-  it('holds an empty label box until the commands have loaded, so the pill never widens', () => {
+  it('holds a visible loading label until the commands have loaded', () => {
     draw({ shown: null });
-    expect(host.querySelector('.rung-label')!.textContent).toBe('');
+    expect(host.querySelector('.rung-label')!.textContent).toBe('Model and effort');
   });
 
   it('badges the rung with its intelligence band, and says its place to a screen reader', () => {

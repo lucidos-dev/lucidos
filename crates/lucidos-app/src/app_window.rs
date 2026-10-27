@@ -2,7 +2,7 @@
 //! every way one is opened, fronted, parked or reaped.
 //!
 //! One concept holds the module together. An app window is `main` or a
-//! `window-<n>` built by File > New Window. It carries exactly one webview
+//! `window-<uuid>` built by File > New Window. It carries exactly one webview
 //! under its own label, and each can sit on its own workspace. A `url-preview-*`
 //! child webview is NOT one, which is what [`is_app_window`] exists to say.
 //!
@@ -258,11 +258,11 @@ fn build_geometry(frame: Option<window_restore::Rect>) -> BuildGeometry {
     }
 }
 
-/// Counter for generating unique webview/window labels.
+/// Counter for generating unique preview webview labels.
 static WEBVIEW_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The next number for a generated label. One counter for app windows and
-/// preview children together, so no two labels can collide.
+/// The next number for a preview child's label. App windows take a uuid
+/// instead, so their labels mean the same window across launches.
 pub(crate) fn next_webview_label_counter() -> u32 {
     WEBVIEW_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -285,7 +285,7 @@ pub(crate) fn window_order_key(label: &str) -> (bool, &str) {
 
 /// Label prefix for additional top-level app windows opened via File → New
 /// Window. The first window is `main` (declared in `tauri.conf.json`); each
-/// extra window gets `window-<n>`. Panel preview webviews use the
+/// extra window gets `window-<uuid>`. Panel preview webviews use the
 /// `url-preview-<n>` prefix instead, so app-window-only setup (the app-version
 /// injection in `on_page_load`) can tell the two apart.
 const APP_WINDOW_PREFIX: &str = "window-";
@@ -294,6 +294,36 @@ const APP_WINDOW_PREFIX: &str = "window-";
 /// a New-Window child), as opposed to a `url-preview-*` panel webview.
 pub(crate) fn is_app_window(label: &str) -> bool {
     label == MAIN_WINDOW_LABEL || label.starts_with(APP_WINDOW_PREFIX)
+}
+
+/// A label no window has had before. The page keys its window-scoped storage by
+/// the label, so a recurring one would hand a new window a closed one's state.
+fn fresh_app_window_label() -> String {
+    format!("{APP_WINDOW_PREFIX}{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Could this build have given a window `label`? Only such a label may come back
+/// off the session record: every `window-*` webview holds the full IPC
+/// permission set on the gateway origin (ADR 0028).
+pub(crate) fn is_restorable_label(label: &str) -> bool {
+    if label == MAIN_WINDOW_LABEL {
+        return true;
+    }
+    label.strip_prefix(APP_WINDOW_PREFIX).is_some_and(|id| {
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The label a new extra window gets: the recorded one when it may be reused,
+/// else a fresh one. `main` is never one an extra window may take.
+fn label_for_new_window(recorded: Option<&str>, in_use: impl Fn(&str) -> bool) -> String {
+    recorded
+        .filter(|label| *label != MAIN_WINDOW_LABEL)
+        .filter(|label| is_restorable_label(label) && !in_use(label))
+        .map_or_else(fresh_app_window_label, str::to_string)
 }
 
 /// Start a native window drag for the calling window. `useWindowDragRegion`
@@ -406,7 +436,7 @@ pub(crate) fn set_window_title(window: tauri::Window, title: String) -> Result<(
 pub(crate) fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
     let source =
         source_webview(app).and_then(|webview| window_restore::cascade_source(&webview.window()));
-    open_app_window(app, new_window_url(app), Birthplace::Beside(source))
+    open_app_window(app, new_window_url(app), Birthplace::Beside(source), None)
 }
 
 /// Where an extra window is born.
@@ -433,9 +463,12 @@ impl Birthplace {
 
 /// Build a top-level app window at `url`. The one builder every extra window
 /// goes through, so a window opened for a notification tap is identical to a
-/// File → New Window one: same `window-<n>` label (which is what
+/// File → New Window one: same `window-*` label shape (which is what
 /// `desktop::gateway_capability` scopes IPC to), same title-bar style, same
 /// pre-paint tint and traffic-light placement.
+///
+/// `recorded` is the label a restore rebuilds the window under, so the page
+/// finds its own window-scoped state again. Every other caller passes `None`.
 ///
 /// Every window is BUILT at the frame its [`Birthplace`] names, hidden, seated
 /// at that frame, then shown. So it never appears at a default size and jumps,
@@ -449,9 +482,9 @@ fn open_app_window(
     app: &tauri::AppHandle,
     url: WebviewUrl,
     birthplace: Birthplace,
+    recorded: Option<&str>,
 ) -> Result<(), String> {
-    let counter = next_webview_label_counter();
-    let label = format!("{APP_WINDOW_PREFIX}{counter}");
+    let label = label_for_new_window(recorded, |label| app.get_window(label).is_some());
     // The frame is JUDGED before the window exists, as `main`'s is (ADR 0202).
     // A remembered one is resolved against its display (ADR 0269) and clamped.
     // A cascaded or fresh one is computed against the live desk already. No
@@ -755,6 +788,7 @@ pub(crate) fn show_workspace_window(
                 &app,
                 WebviewUrl::External(parse_window_url(&url)?),
                 birthplace,
+                None,
             )
         }
     }
@@ -844,7 +878,8 @@ fn main_frame_owed_now(
 ///
 /// `main` takes the first restored workspace and is navigated by the caller, so
 /// this covers everything after it. The URL is composed by the caller from a
-/// validated slug, never read off the record.
+/// validated slug, never read off the record. Each window keeps its recorded
+/// label, so it comes back on its own thread and history.
 pub(crate) fn restore_extra_windows(app: &tauri::AppHandle, windows: &[desktop::PlannedWindow]) {
     for window in windows {
         let url = &window.url;
@@ -853,7 +888,8 @@ pub(crate) fn restore_extra_windows(app: &tauri::AppHandle, windows: &[desktop::
             continue;
         };
         let birthplace = Birthplace::remembered_or_beside(window.frame.clone(), None);
-        if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), birthplace) {
+        let recorded = window.label.as_deref();
+        if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), birthplace, recorded) {
             eprintln!("[Tauri] Failed to restore a window on {url}: {e}");
         }
     }
@@ -1023,7 +1059,7 @@ pub(crate) fn close_all_to_tray(app: &tauri::AppHandle) {
 /// tray's "Open Lucidos" and the Dock click want the whole arrangement instead,
 /// and go through [`reopen_client`].
 ///
-/// The stand-in is a `window-<n>`, not `main`: only tauri's config declares that
+/// The stand-in is a `window-<uuid>`, not `main`: only tauri's config declares that
 /// label, and nothing can rebuild it. So this reads "a window" rather than "the
 /// main window", and a second call after a stand-in builds a second one. The
 /// packaged client never reaches it, since `main`'s close is prevented.
@@ -1205,7 +1241,9 @@ pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> O
             match url.parse::<tauri::Url>() {
                 Ok(parsed) => {
                     activation::set_menu_bar_only(app, false);
-                    if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), birthplace) {
+                    if let Err(e) =
+                        open_app_window(app, WebviewUrl::External(parsed), birthplace, None)
+                    {
                         eprintln!("[Tauri] Failed to open a window for {url}: {e}");
                     }
                     activation::activate_app_frontmost();
@@ -1435,6 +1473,45 @@ mod tests {
     #[test]
     fn a_settled_main_is_left_exactly_where_it_is() {
         assert_eq!(main_frame_owed(None, true, Some(frame())), None);
+    }
+
+    #[test]
+    fn a_fresh_label_is_one_a_restore_accepts_and_never_recurs() {
+        let first = fresh_app_window_label();
+        assert!(is_restorable_label(&first));
+        assert!(is_app_window(&first));
+        assert_ne!(first, fresh_app_window_label());
+    }
+
+    // The record is a file on disk, and a `window-*` label carries the full IPC
+    // set (ADR 0028). Only the shapes this build makes come back.
+    #[test]
+    fn only_a_label_this_build_makes_is_restorable() {
+        assert!(is_restorable_label("main"));
+        assert!(is_restorable_label(
+            "window-0123456789abcdef0123456789abcdef"
+        ));
+        for forged in [
+            "window-1",
+            "window-0123456789ABCDEF0123456789ABCDEF",
+            "window-0123456789abcdef0123456789abcdef0",
+            "window-../../../../0123456789abcdef0123",
+            "url-preview-1",
+            "Main",
+            "",
+        ] {
+            assert!(!is_restorable_label(forged), "{forged:?}");
+        }
+    }
+
+    #[test]
+    fn a_new_window_reuses_its_recorded_label_only_when_free() {
+        let recorded = "window-0123456789abcdef0123456789abcdef";
+        assert_eq!(label_for_new_window(Some(recorded), |_| false), recorded);
+        assert_ne!(label_for_new_window(Some(recorded), |_| true), recorded);
+        // `main` is the declared window's, never an extra one's.
+        assert_ne!(label_for_new_window(Some("main"), |_| false), "main");
+        assert!(is_restorable_label(&label_for_new_window(None, |_| false)));
     }
 
     #[test]

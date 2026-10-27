@@ -33,6 +33,7 @@ Every e2e script sends a whole suite to GitHub's runners when it can (ADRs 0382,
   - `--local`, or a local-only flag (`--no-reset`, `--headed`, `--ios`, `--packaged`).
   - A local-only variable: `THREAD_SHOTS` and the other screenshot switches, or `LUCIDOS_E2E_DEBUG`.
   - An unmet precondition: a dirty tree, no release libraries, no `lucidos` remote, or no `gh`. The fallback prints its reason.
+- **A busy host sends a filtered run to GitHub instead of waiting** (ADR 0584). The run is eligible when nothing pinned it here and GitHub is available. `e2e_github_handoff` records HEAD and runs the local leg as a child with `LUCIDOS_BUILD_MEMORY_WAIT_SECS`, `HOST_LOAD_MAX_WAIT_SECS` and `LUCIDOS_E2E_MEMORY_RESUMES` at 0. Exit 71, 72 or 75 (`scripts/lib/host_busy_exits.sh`) reruns the selection with `--commit <recorded HEAD>`. Any other exit is the verdict, and a failing test is never retried on GitHub.
 - **`--github` insists.** It sends a filtered run too, and fails instead of falling back.
 - **A local run takes an *e2e slot*** (`acquire_e2e_slots`, `scripts/lib/e2e_lock.sh`). A Chromium-only run takes the first free of `e2e-test` and `e2e-test-2`. A WebKit run or the umbrella takes both.
 - **A GitHub run reuses a built engine** whose *engine input manifest* (`scripts/lib/engine_manifest.sh`) matches the tree. A miss builds under the `e2e` cargo profile.

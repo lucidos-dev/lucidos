@@ -118,19 +118,24 @@ const PENDING_QUESTION_SQL: &str = "SELECT q.payload->>'tool_use_id' \
      WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
      ORDER BY q.sequence DESC LIMIT 1";
 
-const ACTIVE_QUESTION_SQL: &str = "SELECT q.payload->>'tool_use_id' \
-     FROM events q \
-     LEFT JOIN events a ON a.thread_id = q.thread_id \
-          AND a.event_type = 'UserQuestionAnswered' \
-          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
-     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
-       AND NOT EXISTS ( \
-         SELECT 1 FROM events t \
-         WHERE t.thread_id = q.thread_id \
-           AND t.sequence > q.sequence \
-           AND t.event_type = ANY($2::text[]) \
-       ) \
-     ORDER BY q.sequence DESC LIMIT 1";
+static ACTIVE_QUESTION_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT q.payload->>'tool_use_id' \
+         FROM events q \
+         LEFT JOIN events a ON a.thread_id = q.thread_id \
+              AND a.event_type = 'UserQuestionAnswered' \
+              AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+         WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM events t \
+             WHERE t.thread_id = q.thread_id \
+               AND t.sequence > q.sequence \
+               AND (t.event_type = ANY($2::text[]) OR {own_result}) \
+           ) \
+         ORDER BY q.sequence DESC LIMIT 1",
+        own_result = ThreadEvent::question_own_result_sql("q", "t"),
+    )
+});
 
 fn unwrap_tool_use_id_row(
     result: Result<Option<(String,)>, sqlx::Error>,
@@ -188,14 +193,18 @@ pub async fn lookup_pending_question_tool_use_id(
 ///   2. CC parallel-calls `AskUserQuestion` alongside other tool_uses in one
 ///      assistant message. The hook blocks the AskUserQuestion tool_use,
 ///      but sibling tool_uses dispatch and emit
-///      `CodingAgent{TextStreamed,ToolCalled,ToolResult,…}` events.
+///      `CodingAgent{TextStreamed,ToolCalled,…}` events.
 ///      The user types a comment minutes later — without the progression
 ///      filter, the comment is silently absorbed as a `FreeText` answer.
+///
+/// A `CodingAgentToolResult` ends the question only when it is the question's
+/// own (same `tool_use_id`). The late result of a call issued BEFORE the
+/// question leaves it active: the agent is still blocked on the card.
 pub async fn lookup_active_question_tool_use_id(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Option<String> {
-    let result = sqlx::query_as::<_, (String,)>(ACTIVE_QUESTION_SQL)
+    let result = sqlx::query_as::<_, (String,)>(&ACTIVE_QUESTION_SQL)
         .bind(thread_id)
         .bind(ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES)
         .fetch_optional(pool)
@@ -367,6 +376,25 @@ pub(crate) fn check_message_embeds(
     Ok(())
 }
 
+/// Refuse a card whose every option is quiet. Each pick would end the turn.
+/// So an option that promises work ("Save progress and stop") never runs it.
+pub(crate) fn check_quiet_options(
+    parsed: &[crate::engine::agent_session::ParsedQuestion],
+) -> Result<(), QuestionWalkError> {
+    for (idx, q) in parsed.iter().enumerate() {
+        if !q.options.is_empty() && q.options.iter().all(|o| o.quiet) {
+            return Err(format!(
+                "Question {idx} cannot be asked: every option is quiet, so every pick \
+                 ends your turn with no more work. Mark quiet only a pick that needs \
+                 nothing from you. An option that promises work (save, write, commit) \
+                 is never quiet. Re-ask with at least one option that is not quiet."
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 impl LucidosEngine {
     /// Walk a batch of questions sequentially (one card on screen at a
     /// time), emit `UserQuestionAsked` for each, and block until each is
@@ -435,6 +463,7 @@ impl LucidosEngine {
         }
         // A broken option widget, or one drawn in the message instead of its
         // option, refuses the whole batch before any card is asked (ADR 0415).
+        // So does a card whose every option is quiet.
         // A batch already asked is a re-fire after a restart: its cards and any
         // answers stand, whatever happened to a widget since.
         let first_asked = user_question_already_asked(
@@ -447,6 +476,7 @@ impl LucidosEngine {
         if !first_asked {
             check_option_widgets(&self.app_manager, &parsed, thread_id)?;
             check_message_embeds(message.as_ref().map(|m| m.text), &parsed)?;
+            check_quiet_options(&parsed)?;
         }
 
         let mut answer_kinds: Vec<serde_json::Value> = Vec::with_capacity(total);

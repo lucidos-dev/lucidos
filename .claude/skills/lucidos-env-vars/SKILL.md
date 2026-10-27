@@ -40,6 +40,9 @@ Add a variable to that allowlist only when its absence makes a provider or a
 tool unreachable.
 
 - `LUCIDOS_WORKSPACE` — workspace dir (default `./workspace`)
+- `LUCIDOS_CLI_CONNECT_WAIT_SECS`: CLI engine connection retry window in whole
+  seconds (default 30; `0` disables). Invalid values use the default.
+  See `system-knowhow/lucidos-cli.md` for retry safety and response deadlines.
 - `LUCIDOS_SYSTEM_KNOWHOW_DIR` / `LUCIDOS_SYSTEM_WIDGETS_DIR`: the shipped
   `system-knowhow/` and `system-widgets/` (the *built-in widgets*, ADR 0415).
   Both shipped launchers set them to the staged copies, and e2e points them at
@@ -116,10 +119,11 @@ tool unreachable.
 - **Network bind.** It defaults to loopback-only everywhere, and a malformed value fails safe to loopback, never to all.
   - Resolution precedence, highest first: `LUCIDOS_BIND_LOOPBACK` (engine only, the behind-gateway floor) → `LUCIDOS_BIND_ADDR` / `LUCIDOS_GATEWAY_BIND_ADDR` (a literal IP, e.g. a Tailscale `100.x` address) → `LUCIDOS_BIND_ALL` / `LUCIDOS_GATEWAY_BIND_ALL` (`1` = all interfaces, `[::]` dual-stack) → the machine-global `~/.lucidos/network.toml` → loopback.
   - The engine and gateway resolvers live in `crates/lucidos-{engine,gateway}/src/net_config.rs`, duplicated per ADR 0014 §1.
-  - `~/.lucidos/network.toml` (`[gateway] bind = "loopback" | "all" | "<IP>"`, `[engine] inherit = true|false`) is the durable, UI-editable config both binaries read at boot. The gateway binds `[gateway].bind`. An engine binds the gateway's bind when `inherit` (default), or its own per-workspace `network_bind` preference when not. Env vars override the file, so launch scripts and e2e are unaffected.
+  - `~/.lucidos/network.toml` (`[gateway] bind = "loopback" | "all" | "<IP>"`, `[engine] inherit = true|false`, and an optional `[external_address]` table of `<port> = "<origin>"`) is the durable, UI-editable config both binaries read at boot. The gateway binds `[gateway].bind`. An engine binds the gateway's bind when `inherit` (default), or its own per-workspace `network_bind` preference when not. Env vars override the file, so launch scripts and e2e are unaffected.
   - **A specific `<IP>` bind ALSO binds `127.0.0.1`** (loopback retention, `net_config::bind_socket_addrs`). Co-located callers reach these processes over loopback: the dev scripts POST the gateway control API over `localhost`, and the engine's Apply-restart callback hits `127.0.0.1:<gateway_port>`. Binding ONLY the tailnet IP wedged those callers. Binding the IP **and** loopback fixes it without widening exposure, since loopback is host-only. The gateway reaches its engines over their engine sockets, never TCP (ADR 0445).
   - It is edited from the picker (machine-global, `/~/api/v1/control/network-config`) and per workspace in Settings → Access → Network access (`/api/v1/network-config`). A change takes effect only after a gateway or engine **restart**, because a live socket cannot be re-bound.
   - An engine that stays unreachable past `BOOT_ESCAPE_BUDGET` (gateway `server.rs`) gets a manual "Back to workspaces" link on the boot splash, instead of a refresh forever.
+- `LUCIDOS_EXTERNAL_ADDRESS` (gateway only). This gateway's *external address*: the origin other devices reach it at through a route the user runs (ADR 0550). A valid origin wins over the `[external_address]` entry for this gateway's port in `~/.lucidos/network.toml`, and locks every writer: the control `PUT /~/api/v1/control/external-address` answers 409. Empty is unset, and an invalid value is logged and ignored, as an invalid bind address is. Resolved per request in `net_config::resolve_external_address`, so the file half needs no restart. `install.sh --external-address` writes the file, never this variable.
 - `LUCIDOS_GATEWAY_ENGINE_LOOPBACK` (gateway only). Whether the engines this gateway spawns bind loopback. Default yes, packaged and dev alike, since ADR 0096: the gateway authenticates every network caller (ADR 0094), so a network-bound engine port used to be a way straight past pairing. Nothing in the tree sets it now, and `0` / `false` / `no` / `off` restores the old all-interfaces dev topology. Since ADR 0155 that no longer restores the bypass: an engine on a wide bind requires the *local token* on every path but `/api/v1/health`.
 
   It also decides the scheme the engine serves on its TCP port, since a loopback engine gets its TLS cert stripped. The gateway's own hop is the engine socket either way (ADR 0445).

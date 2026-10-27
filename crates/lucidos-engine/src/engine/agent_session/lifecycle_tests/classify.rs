@@ -1082,9 +1082,29 @@ fn classify_session_end_action_table() {
                 is_external,
                 safety_net_fired,
                 cancel,
+                false,
             ),
             expected,
             "(has_commits={has_commits}, files_empty={files_empty}, is_external={is_external}, safety_net_fired={safety_net_fired}, cancel={cancel:?})",
+        );
+        // A pending handoff carries any net work over to the successor
+        // session. Only the external and crash arms rank above it.
+        let handed_off = match expected {
+            KeepExternalBranch | CrashedKeepBranch => expected,
+            _ if has_commits && !files_empty => CarriedBySuccessor,
+            other => other,
+        };
+        assert_eq!(
+            classify_session_end_action(
+                has_commits,
+                files_empty,
+                is_external,
+                safety_net_fired,
+                cancel,
+                true,
+            ),
+            handed_off,
+            "handed off: (has_commits={has_commits}, files_empty={files_empty}, is_external={is_external}, safety_net_fired={safety_net_fired}, cancel={cancel:?})",
         );
     }
 }

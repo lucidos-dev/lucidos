@@ -113,6 +113,11 @@ asks for it, and no `npm ci` when the dependencies already match.
 - **`--local` runs a whole suite here.** A local-only flag such as
   `--no-reset` or `--headed` implies it, and so does a screenshot switch such
   as `THREAD_SHOTS=1`, since GitHub would never see it.
+- **A busy host sends a filtered run to GitHub by itself** (ADR 0584). Its
+  local leg runs with every memory and load wait at zero. Exit 71, 72 or 75
+  reruns the same selection on GitHub at the HEAD recorded at the start, and
+  prints `[e2e] host busy`. Any other exit is the run's verdict. `--local`
+  and a dirty tree keep the waits.
 - **`--github` sends a filtered run to GitHub.** Use it when both slots are
   busy, for a mobile-webkit spec, or to confirm a fix on Linux and macOS
   (`./scripts/e2e-browser.sh --github -f <spec>`). Wait for the lock only for
@@ -148,6 +153,10 @@ lines at the end of the log:
 | 71 | memory stop the harness could not resume | report the unverified range it printed as the carry-over |
 | 72 | the build memory gate refused: nothing was built or tested | report it; the host was in trouble |
 | 75 | the host-load guard refused the launch | report it; nothing ran |
+
+A filtered run that nothing pinned here never shows you these codes: it waits
+for nothing and reruns on GitHub (ADR 0584). They reach you from `--local`,
+a local-only flag or variable, a dirty tree, the nightly and the main check.
 
 **After one of these, never start a second leg, a discharge or a retry.** Never
 start a cargo build or `/harden` suites while the host reads NO-GO either. Each

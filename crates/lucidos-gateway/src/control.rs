@@ -70,6 +70,12 @@ pub fn router() -> Router<GatewayState> {
             "/network-config",
             get(network_config).put(set_network_config),
         )
+        // The external address (ADR 0550), stored in that same file. A save
+        // probes the address, and only "another gateway answered" refuses it.
+        .route(
+            "/external-address",
+            get(external_address).put(set_external_address),
+        )
         .route("/workspaces/:id/rename", post(rename))
         .route("/workspaces/:id/restart", post(restart))
         .route("/workspaces/:id/stop", post(stop))
@@ -704,7 +710,7 @@ async fn network_config() -> Json<Value> {
     Json(json!({
         "gateway_bind": net.gateway_bind.unwrap_or_else(|| "loopback".to_string()),
         "inherit": net.engine_inherit,
-        "detected_tailscale_ip": net_config::detect_tailscale_ipv4(),
+        "detected_tailscale_ip": net_config::detect_tailscale_ipv4().await,
     }))
 }
 
@@ -719,9 +725,99 @@ async fn set_network_config(Json(body): Json<NetworkConfigBody>) -> Result<Statu
         "all" => "all".to_string(),
         _ => body.gateway_bind.trim().to_string(),
     };
-    net_config::write_network_toml(&gateway_bind, body.inherit)
-        .map_err(|e| ApiError::internal(format!("failed to write network.toml: {e}")))?;
+    // Only the bind changes, so the external addresses stored beside it stay.
+    net_config::update_network_toml(|net| {
+        net.gateway_bind = Some(gateway_bind);
+        net.engine_inherit = body.inherit;
+    })
+    .map_err(|e| ApiError::internal(format!("failed to write network.toml: {e}")))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Body for the external address write.
+#[derive(Deserialize)]
+struct ExternalAddressBody {
+    /// An origin, or `""` / `null` to clear it.
+    external_address: Option<String>,
+}
+
+/// The external address in effect, for the Access page and the CLI. Every
+/// field is read live, so a write shows at once.
+fn external_address_json(
+    state: &GatewayState,
+    probe: Option<&crate::external_address::ProbeVerdict>,
+) -> Value {
+    let resolved = net_config::external_address(state.gateway_port());
+    let scheme = if net_config::serves_tls_from_env() {
+        net_config::SCHEME_HTTPS
+    } else {
+        net_config::SCHEME_HTTP
+    };
+    json!({
+        "external_address": resolved.origin,
+        "source": resolved.source,
+        "locked": resolved.locked(),
+        "env_var": net_config::EXTERNAL_ADDRESS_ENV,
+        "suggestions": crate::external_address::suggestions(
+            scheme,
+            state.gateway_port(),
+            state.bind_choice(),
+        ),
+        "probe": probe,
+    })
+}
+
+/// GET /~/api/v1/control/external-address: the address, who set it, and the
+/// one-tap suggestions. `probe` is null, since only a save probes.
+async fn external_address(State(state): State<GatewayState>) -> Json<Value> {
+    Json(external_address_json(&state, None))
+}
+
+/// PUT /~/api/v1/control/external-address: set or clear this gateway's.
+///
+/// Refused when the environment variable owns it (409), when it is not an
+/// origin (400), or when another gateway answers there (409). Otherwise saved,
+/// and the answer carries the probe verdict for the caller to show.
+async fn set_external_address(
+    State(state): State<GatewayState>,
+    Json(body): Json<ExternalAddressBody>,
+) -> Result<Json<Value>, ApiError> {
+    let port = state.gateway_port();
+    if net_config::external_address(port).locked() {
+        return Err(ApiError::conflict(format!(
+            "{} sets the external address, so it cannot be changed here",
+            net_config::EXTERNAL_ADDRESS_ENV
+        )));
+    }
+    let requested = body.external_address.unwrap_or_default();
+    let (origin, probe) = if requested.trim().is_empty() {
+        (None, None)
+    } else {
+        let origin =
+            net_config::valid_external_address(&requested).map_err(ApiError::bad_request)?;
+        let verdict = crate::external_address::probe(&origin).await;
+        crate::log!(
+            "[NetConfig] external address probe: {}",
+            crate::external_address::describe(&origin, &verdict)
+        );
+        if verdict.refuses() {
+            return Err(ApiError::conflict(format!(
+                "{origin} reaches a different Lucidos gateway, so a pairing code from this \
+                 one would not work there. Check the host and port"
+            )));
+        }
+        (Some(origin), Some(verdict))
+    };
+    // Only this gateway's entry changes: another gateway on this machine keeps
+    // its own.
+    net_config::update_network_toml(|net| {
+        match origin {
+            Some(origin) => net.external_addresses.insert(port, origin),
+            None => net.external_addresses.remove(&port),
+        };
+    })
+    .map_err(|e| ApiError::internal(format!("failed to write network.toml: {e}")))?;
+    Ok(Json(external_address_json(&state, probe.as_ref())))
 }
 
 /// Dismiss a terminal restore result (back to Idle). 409 while one is running.
@@ -1090,6 +1186,10 @@ mod authz_tests {
         ("POST", "/~/api/v1/control/gateway/reload"),
         ("GET", "/~/api/v1/control/network-config"),
         ("PUT", "/~/api/v1/control/network-config"),
+        // A read that names this machine's addresses, and a write that changes
+        // where every pairing QR points.
+        ("GET", "/~/api/v1/control/external-address"),
+        ("PUT", "/~/api/v1/control/external-address"),
         // A read, and still behind the credential: it enumerates this user's
         // install paths, launch agents and data directories.
         ("GET", "/~/api/v1/control/installs"),
@@ -1192,6 +1292,66 @@ mod authz_tests {
                 "token {token:?} must not authenticate"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_external_address_that_is_not_a_reachable_origin_is_a_bad_request() {
+        use tower::ServiceExt as _;
+        for bad in [
+            "https://lucidos.example.com/lucidos",
+            "http://127.0.0.1:5252",
+        ] {
+            let state = crate::server::GatewayState::for_tests();
+            let response = crate::server::gateway_router(state)
+                .oneshot(
+                    axum::extract::Request::builder()
+                        .method("PUT")
+                        .uri("/~/api/v1/control/external-address")
+                        .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(
+                            json!({ "external_address": bad }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Refused before the probe and before any write.
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_external_address_read_names_its_source_and_suggestions() {
+        use tower::ServiceExt as _;
+        let state = crate::server::GatewayState::for_tests();
+        let response = crate::server::gateway_router(state)
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/~/api/v1/control/external-address")
+                    .header(auth::HEADER_LOCAL_TOKEN, "test-local-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        for key in [
+            "external_address",
+            "source",
+            "locked",
+            "env_var",
+            "suggestions",
+            "probe",
+        ] {
+            assert!(body.get(key).is_some(), "missing {key}: {body}");
+        }
+        assert!(body["suggestions"].is_array(), "{body}");
+        assert!(body["probe"].is_null(), "a read never probes: {body}");
     }
 
     #[tokio::test]

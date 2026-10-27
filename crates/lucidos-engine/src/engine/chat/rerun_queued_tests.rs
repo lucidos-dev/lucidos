@@ -512,6 +512,7 @@ async fn a_trigger_thread_keeps_its_channel_through_the_recovery() {
         &bus,
         thread_id,
         ThreadEvent::TriggerStarted {
+            retry_of: None,
             provider: None,
             trigger_id: "morning-digest".into(),
             trigger_name: Some("Morning digest".into()),

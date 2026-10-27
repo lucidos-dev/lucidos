@@ -98,7 +98,14 @@ mod tests {
         assert!(take(tmp.path()).unwrap().is_none());
         assert_eq!(client::published_pid(tmp.path()), Some(std::process::id()));
         drop(first);
-        assert!(take(tmp.path()).unwrap().is_some());
+        // Other tests spawn children in parallel, and a child holds a copy of
+        // the lock file between its fork and its exec. So the lock frees soon,
+        // not at once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while take(tmp.path()).unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the lock never freed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     // A relaunch watcher outlives the client, and the in-place restart execs.

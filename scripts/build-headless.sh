@@ -204,6 +204,11 @@ stage_runtime_assemble "$STAGE" \
 # it is sealed. An omitted resource is invisible in a .tar.gz nobody unpacks.
 resource_contract_assert_staged "$STAGE" \
     || die "the staged tree does not match the resource contract (see the errors above)"
+case "$TRIPLE" in
+    *-unknown-linux-gnu)
+        stage_runtime_linux_postgres check "$STAGE/postgres" \
+            || die "the staged PostgreSQL library bundle is incomplete" ;;
+esac
 
 # ── 5. emit the headless tarball + .sha256 ───────────────────────────────────
 step "Emitting headless tarball + .sha256 → $OUT_DIR"

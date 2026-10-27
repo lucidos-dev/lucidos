@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { panelOverlay, focusedThreadId, toasts } from '../store';
 import type { App } from '../types';
 
@@ -429,5 +429,67 @@ describe('app capture and refresh scoping', () => {
   it('reloads the app for the unscoped end-of-turn refresh', () => {
     handleThreadEvent(refresh());
     expect(refreshAppUI).toHaveBeenCalledWith('habit-tracker');
+  });
+});
+
+describe('with a second window on this device', () => {
+  let other: BroadcastChannel;
+  let stop: () => void;
+
+  /** The other window reports what it shows, touched after this one. */
+  function otherShows(state: { focusedThreadId?: string | null; appId?: string | null }): Promise<void> {
+    other.postMessage({
+      type: 'state',
+      state: {
+        id: 'other-window', focusedThreadId: null, appId: null, authorizing: null,
+        activeAt: Date.now() + 1000, ...state,
+      },
+    });
+    return new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    toasts.value = [];
+    focusedThreadId.value = 'thread-A';
+    const { installWindowPeers } = await import('../windowPeers');
+    const { WORKSPACE_ID } = await import('../../utils/basePath');
+    other = new BroadcastChannel(`lucidos-window-peers:${WORKSPACE_ID ?? ''}`);
+    stop = installWindowPeers(() => ({
+      focusedThreadId: focusedThreadId.peek(), appId: null, authorizing: null,
+    }));
+  });
+  afterEach(() => {
+    stop();
+    other.close();
+  });
+
+  it('leaves a navigate to the window touched last when both show the thread', async () => {
+    await otherShows({ focusedThreadId: 'thread-A' });
+    handleThreadEvent(navEvent('thread-A'));
+    expect(openAppById).not.toHaveBeenCalled();
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('acts here when only this window shows the thread', async () => {
+    await otherShows({ focusedThreadId: 'thread-C' });
+    handleThreadEvent(navEvent('thread-A'));
+    expect(openAppById).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers the jump only in the window touched last', async () => {
+    await otherShows({ focusedThreadId: 'thread-C' });
+    handleThreadEvent(navEvent('thread-B'));
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('leaves a capture to the window showing the app', async () => {
+    getDeviceId.mockReturnValue('this-device');
+    await otherShows({ appId: 'habit-tracker' });
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      event: { type: 'AppUiCaptureRequested', app_id: 'habit-tracker', request_id: 'req-1' },
+    });
+    expect(captureAppUI).not.toHaveBeenCalled();
   });
 });

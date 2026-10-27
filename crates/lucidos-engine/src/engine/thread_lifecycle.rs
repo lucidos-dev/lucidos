@@ -283,6 +283,8 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Metadata
         "ThreadTitleGenerated" | "ThreadTitleRenamed" => EventClass::Metadata,
         "ThreadSaved" | "ThreadUnsaved" => EventClass::Metadata,
+        // Boot reports the cut fire without starting or completing another turn.
+        "TriggerRunInterrupted" => EventClass::Metadata,
         // A request, not the archive: the resolver's `ThreadArchived` moves
         // the thread, so this bumps nothing.
         "ThreadArchiveRequested" => EventClass::Metadata,
@@ -560,6 +562,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "HomeThreadCreated",
         "ImageUploaded",
         "TriggerStarted",
+        "TriggerRunInterrupted",
         "TriggerCompleted",
         "ChangeProposed",
         "ChangeApplied",
@@ -791,6 +794,7 @@ pub fn resolve_transition(
         // archived thread leaves it actionless: `available_thread_actions`
         // returns no close actions when stored_section != Inbox.
         "ResponseAborted" | "ResponseFailed" | "ResponseCanceled" => to_inbox,
+        "TriggerRunInterrupted" => to_inbox,
         // ChangeProposed surfaces coding-agent threads to inbox — proposed changes require
         // user action (apply/discard) and must surface in REVIEW. Without this,
         // coding-agent sessions that finish without an intermediate CodingAgentIdled (or where
@@ -1081,11 +1085,13 @@ pub fn resolve_transition(
     //
     // `ThreadUnarchived` is exempt too: it is the user's own Undo, and the
     // toast promises the thread is back in Current (ADR 0349).
+    // A restart-cut fire never made its read decision, so its report stays visible (ADR 0579).
     if is_unattended
         && thread_type != ThreadType::CodingAgent
         && result.new_section == Some(ArchiveState::Inbox)
         && !WAITING_FOR_USER_ANSWER_EVENTS.contains(&event_type)
         && event_type != "ThreadUnarchived"
+        && event_type != "TriggerRunInterrupted"
     {
         return Ok(TransitionResult {
             new_section: Some(ArchiveState::Archived),

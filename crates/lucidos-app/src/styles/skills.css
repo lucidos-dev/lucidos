@@ -443,7 +443,7 @@
     padding-right: 0.375rem;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
-    border-radius: calc(var(--radius-control) * 0.5);
+    border-radius: calc(var(--radius-control) * 0.75);
     transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
 }
 

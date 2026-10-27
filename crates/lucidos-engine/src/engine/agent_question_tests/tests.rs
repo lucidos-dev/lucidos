@@ -1280,7 +1280,7 @@ async fn coding_agent_idled_orphans_only_active_lookup() {
 // CC's parallel-tool-call race: AskUserQuestion is emitted alongside
 // sibling tool_uses in one assistant message; the hook blocks the
 // question, but the siblings dispatch concurrently and emit
-// CodingAgent{TextStreamed,ToolCalled,ToolResult,…} while the question
+// CodingAgent{TextStreamed,ToolCalled,…} while the question
 // is still unanswered. Without progression-event filtering, the user's
 // next typed text is absorbed as a FreeText answer to the dead question.
 
@@ -1331,6 +1331,82 @@ async fn coding_agent_tool_called_orphans_only_active_lookup() {
         },
     )
     .await;
+}
+
+fn tool_result(tool_use_id: &str) -> ThreadEvent {
+    ThreadEvent::CodingAgentToolResult {
+        name: "Bash".into(),
+        result: "done".into(),
+        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        tool_use_id: tool_use_id.into(),
+        parent_tool_use_id: None,
+    }
+}
+
+#[tokio::test]
+async fn the_questions_own_tool_result_orphans_only_active_lookup() {
+    assert_terminator_orphans_only_active_lookup("toolu-own-result", |bus, thread_id| async move {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: tool_result("toolu-own-result"),
+            meta: cc_meta(),
+        })
+        .await
+        .expect("CodingAgentToolResult emit")
+        .expect("CodingAgentToolResult persisted");
+    })
+    .await;
+}
+
+/// A call issued before the question finishes after it. The agent is still
+/// blocked on the card, so typed text must still answer it.
+#[tokio::test]
+async fn a_late_result_of_an_earlier_call_keeps_the_question_active() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    emit_user_question(&bus, thread_id, "toolu-live").await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: tool_result("toolu-issued-before-the-question"),
+        meta: cc_meta(),
+    })
+    .await
+    .expect("CodingAgentToolResult emit")
+    .expect("CodingAgentToolResult persisted");
+
+    assert_eq!(
+        lookup_active_question_tool_use_id(&pool, thread_id)
+            .await
+            .as_deref(),
+        Some("toolu-live")
+    );
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentToolCalled {
+            name: "Bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+            description: String::new(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            tool_use_id: "toolu-issued-after".into(),
+            parent_tool_use_id: None,
+            api_call_id: None,
+        },
+        meta: cc_meta(),
+    })
+    .await
+    .expect("CodingAgentToolCalled emit")
+    .expect("CodingAgentToolCalled persisted");
+    assert_eq!(
+        lookup_active_question_tool_use_id(&pool, thread_id).await,
+        None,
+        "a call issued after the question still overtakes it"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 #[tokio::test]
@@ -1976,7 +2052,11 @@ fn the_walk_checks_option_widgets_before_any_card() {
     let src = include_str!("../agent_question.rs");
     let walk = &src[src.find("pub(crate) async fn walk_question_batch").unwrap()..];
     let card = walk.find("ThreadEvent::UserQuestionAsked {").unwrap();
-    for check in ["check_option_widgets(", "check_message_embeds("] {
+    for check in [
+        "check_option_widgets(",
+        "check_message_embeds(",
+        "check_quiet_options(",
+    ] {
         assert!(walk.find(check).unwrap() < card, "{check}");
     }
 }
@@ -2002,4 +2082,30 @@ fn a_message_embed_no_option_names_passes() {
         r#"The full take: ![Full VO](app:lucidos-sound-player?params={"clip": "vo.mp3"})"#;
     check_message_embeds(Some(message), &parsed).expect("no option names it");
     check_message_embeds(None, &parsed).expect("no message");
+}
+
+fn stop_card(labels: &[&str]) -> Vec<crate::engine::agent_session::ParsedQuestion> {
+    let options: Vec<_> = labels
+        .iter()
+        .map(|label| serde_json::json!({ "label": label }))
+        .collect();
+    crate::engine::agent_session::parse_ask_user_question_inputs(&serde_json::json!({
+        "questions": [{ "question": "Save where we are?", "options": options }]
+    }))
+}
+
+/// Every pick on an all-quiet card ends the turn, so "Save progress and
+/// stop" could never save anything. The card is refused before it is asked.
+#[test]
+fn a_card_whose_every_option_is_quiet_is_refused() {
+    let parsed = stop_card(&["[quiet] Save progress and stop", "[quiet] Just stop"]);
+    let err = check_quiet_options(&parsed).unwrap_err().to_string();
+    assert!(err.contains("every option is quiet"), "{err}");
+}
+
+#[test]
+fn a_card_with_one_working_option_keeps_its_quiet_one() {
+    let parsed = stop_card(&["Save progress and stop", "[quiet] Just stop"]);
+    check_quiet_options(&parsed).expect("one pick still needs the agent");
+    check_quiet_options(&stop_card(&["Yes", "No"])).expect("no quiet option");
 }

@@ -65,6 +65,14 @@ pub enum PrefValue {
     IanaTimezone,
     /// Free-form non-empty text (e.g. a model id, a URL, a language name).
     Text,
+    /// Free-form non-empty text of at most `max_chars` characters: a short
+    /// instruction a prompt carries on every call, so a pasted document must
+    /// not ride along.
+    Instruction {
+        max_chars: usize,
+        /// The wording of the unset behaviour, shown where the field is empty.
+        standard: &'static str,
+    },
     /// A theme id: well formed, and never a theme mode value. An unknown id
     /// is accepted and paints the default theme.
     ThemeId,
@@ -453,6 +461,35 @@ pub const RESPONSE_STYLES: Pref<Optional> = Pref::optional(PrefSpec {
     value: PrefValue::Text,
     default: PrefDefault::Unset("the shipped styles only"),
     description: "The user's own response styles, as a JSON array of {id, label, instruction} objects. It holds ONLY what they changed: an entry whose id is 'concise', 'minimal' or 'learning' overrides that shipped style, one with a fresh kebab-case id adds a style, and removing an entry restores the shipped text. 'standard' is the off switch and is REFUSED here. THIS KEY REPLACES THE WHOLE ARRAY, so read the current value first and send it back with your edit applied, or you will delete every style the user wrote. Bounds, all refused rather than trimmed: 40 chars of id, 40 of label, 1000 of instruction, 20 entries. The instruction is injected verbatim under a 'RESPONSE STYLE:' heading, and the engine appends a rule that keeps warnings and caveats in whatever the style asks for.",
+    side_effect: PrefSideEffect::None,
+});
+
+/// The longest title style, in chars.
+pub const TITLE_STYLE_MAX_CHARS: usize = 500;
+
+/// The standard title style as a literal, so `concat!` can splice it into
+/// the description below. Everything else reads `STANDARD_TITLE_STYLE`.
+macro_rules! standard_title_style {
+    () => {
+        "a very short title (3-6 words)"
+    };
+}
+
+/// The title style an unset preference stands for. The title prompt opens
+/// with it, and Settings shows it as the empty field's placeholder.
+pub const STANDARD_TITLE_STYLE: &str = standard_title_style!();
+
+pub const TITLE_STYLE: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "title_style",
+    label: "Title style",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Instruction {
+        max_chars: TITLE_STYLE_MAX_CHARS,
+        standard: STANDARD_TITLE_STYLE,
+    },
+    default: PrefDefault::Unset("titles keep the standard format"),
+    description: concat!("How automatic thread titles are worded, as one short instruction in plain language, for example 'lower-kebab-case, at most 4 words'. It is appended to the title model's instructions and overrides the standard length and wording, so the model still returns only the title. Unset, titles keep the standard style, '", standard_title_style!(), "' (shown in Settings as the empty field's placeholder). At most 500 chars. Whatever the style asks, a title past 12 words is rejected. An empty write is refused, and you cannot clear it: the user restores the standard format with Reset in Settings > Models > Background tasks. It shapes only titles the model writes from now on. It does not rename existing threads, and a title the caller gave a thread keeps its name. When the user asks how their threads should be named, SET THIS."),
     side_effect: PrefSideEffect::None,
 });
 
@@ -1132,8 +1169,8 @@ pub const CACHE_KEEP_ALIVE_MODE: Pref<Text> = Pref::text(PrefSpec {
     access: PrefAccess::Agent,
     scope: PrefScope::Global,
     value: PrefValue::Enum(crate::engine::event_wait::keep_alive::CACHE_KEEP_ALIVE_MODES),
-    default: PrefDefault::Value("default"),
-    description: "When the cache keep-alive gives up on a waiting Claude Code session or Lucidos Agent thread. 'default' beats an event wait or working children until the beats cost one cache rewrite (break-even), and a thread parked on a question card or permission prompt until half of that. 'workspace-data' gives up at the point that would have cost least over this workspace's last 30 days, per wait type, and keeps the default for a type with under 50 waits. 'off' sends no beats, so every wait past the cache lifetime pays its rewrite.",
+    default: PrefDefault::Value("off"),
+    description: "When the cache keep-alive gives up on a waiting Claude Code session or Lucidos Agent thread. 'off' (the default) sends no beats, so every wait past the cache lifetime pays its rewrite. 'break-even' beats an event wait or working children until the beats cost one cache rewrite, and a thread parked on a question card or permission prompt until half of that. 'workspace-data' gives up at the point that would have cost least over this workspace's last 30 days, per wait type, and keeps break-even for a type with under 50 waits.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1418,7 +1455,7 @@ pub const COMMAND_GUARD_CODING_AGENTS: Pref<Flag> = Pref::flag(PrefSpec {
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
-    default: PrefDefault::Value("false"),
+    default: PrefDefault::Value("true"),
     description: "Whether the command guard answers the permission cards of coding-agent commands (Codex command_execution, Claude Code Bash). On, a command the guard places as safe or reversible runs without a card. There is no undo for a wrong reversible verdict. Off, a Codex command card is skipped only when the guard places it as safe, and a Claude Code Bash card always asks. Read only while command_guard is on.",
     side_effect: PrefSideEffect::None,
 });
@@ -1560,7 +1597,7 @@ pub const CACHE_CARDS: Pref<Flag> = Pref::flag(PrefSpec {
     },
     scope: PrefScope::Global,
     value: PrefValue::Bool,
-    default: PrefDefault::Value("true"),
+    default: PrefDefault::Value("false"),
     description: "Whether a thread draws its prompt-cache cards: the Cache kept warm card and the cache-warm line. Off hides both, and skips the read behind the line. Pings and costs never change.",
     side_effect: PrefSideEffect::None,
 });
@@ -1915,6 +1952,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &CHAT_REASONING_EFFORTS.spec,
     &RESPONSE_STYLE.spec,
     &RESPONSE_STYLES.spec,
+    &TITLE_STYLE.spec,
     &TECHNICAL_LITERACY.spec,
     &IMAGE_MODEL.spec,
     &MODEL_TITLE.spec,
@@ -2221,6 +2259,22 @@ pub fn validate(spec: &PrefSpec, value: &str) -> Result<(), String> {
                 Ok(())
             }
         }
+        PrefValue::Instruction { max_chars, .. } => {
+            let chars = value.chars().count();
+            if value.trim().is_empty() {
+                Err(format!(
+                    "'{}' must not be empty: it is cleared by deleting the preference, which Settings does with Reset",
+                    spec.key
+                ))
+            } else if chars > max_chars {
+                Err(format!(
+                    "'{}' must be at most {max_chars} characters (got {chars})",
+                    spec.key
+                ))
+            } else {
+                Ok(())
+            }
+        }
         PrefValue::ThemeId => {
             crate::core::themes::validate_id(value).map_err(|e| format!("'{}': {}", spec.key, e))
         }
@@ -2327,6 +2381,7 @@ pub fn allowed_values_hint(spec: &PrefSpec) -> String {
         PrefValue::Number { min, max } => format!("number {}–{}", min, max),
         PrefValue::IanaTimezone => "IANA timezone name".to_string(),
         PrefValue::Text => "text".to_string(),
+        PrefValue::Instruction { max_chars, .. } => format!("text, at most {max_chars} chars"),
         PrefValue::ThemeId => "a theme id".to_string(),
         PrefValue::ModelBytes => "model=bytes, model=bytes".to_string(),
         PrefValue::ModelEfforts => format!(
@@ -2672,6 +2727,37 @@ mod tests {
         assert!(library
             .iter()
             .any(|s| s.id == RESPONSE_STYLE.default_text()));
+    }
+
+    #[test]
+    fn an_instruction_is_bounded_and_never_empty() {
+        let spec = &TITLE_STYLE.spec;
+        assert_eq!(spec.scope, PrefScope::Global);
+        assert_eq!(validate(spec, "lower-kebab-case, at most 4 words"), Ok(()));
+        let longest = "a".repeat(TITLE_STYLE_MAX_CHARS);
+        assert_eq!(validate(spec, &longest), Ok(()));
+        let too_long = validate(spec, &format!("{longest}a")).unwrap_err();
+        assert!(too_long.contains("title_style") && too_long.contains("500"));
+        for blank in ["", "  \n "] {
+            let refusal = validate(spec, blank).unwrap_err();
+            assert!(refusal.contains("title_style") && refusal.contains("Reset"));
+        }
+    }
+
+    /// The bound counts characters, not bytes, so a non-Latin style is not
+    /// refused at a third of its length.
+    #[test]
+    fn an_instruction_bound_counts_chars_not_bytes() {
+        let multibyte = "å".repeat(TITLE_STYLE_MAX_CHARS);
+        assert_eq!(validate(&TITLE_STYLE.spec, &multibyte), Ok(()));
+    }
+
+    #[test]
+    fn the_title_style_description_states_the_real_bound() {
+        assert!(TITLE_STYLE
+            .spec
+            .description
+            .contains(&format!("At most {TITLE_STYLE_MAX_CHARS} chars")));
     }
 
     /// The description quotes the bounds the write gate enforces. A number that

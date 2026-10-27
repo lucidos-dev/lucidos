@@ -440,12 +440,15 @@ fn picture(format: image::ImageFormat) -> String {
 fn a_save_path_must_stay_in_artifacts_and_name_a_format() {
     let target = |path: &str| parse_save_target(&json!({ "save_as_artifact": path }));
     assert_eq!(parse_save_target(&json!({})), Ok(None));
+    let board = Ok(Some(SaveTarget {
+        artifact_path: "shots/Board.PNG".into(),
+        format: CaptureFormat::Png,
+    }));
+    assert_eq!(target("shots/Board.PNG"), board);
     assert_eq!(
-        target("shots/Board.PNG"),
-        Ok(Some(SaveTarget {
-            path: "shots/Board.PNG".into(),
-            format: CaptureFormat::Png,
-        }))
+        target("artifacts/shots/Board.PNG"),
+        board,
+        "the data path names the same file, not data/artifacts/artifacts/"
     );
     assert_eq!(
         target("a.jpg").unwrap().unwrap().format,
@@ -542,7 +545,7 @@ async fn a_saved_capture_is_written_announced_and_still_seen() {
     );
     assert!(out.starts_with(&format!("[APP_CAPTURE:{png}]")), "{out}");
     assert!(
-        out.contains("Saved the screenshot to shots/board.png (image/png, 6x4 px"),
+        out.contains("Saved the screenshot to artifacts/shots/board.png (image/png, 6x4 px"),
         "{out}"
     );
     assert!(out.contains("<main/>"), "{out}");
@@ -554,6 +557,25 @@ async fn a_saved_capture_is_written_announced_and_still_seen() {
     assert_eq!(created, vec!["shots/board.png".to_string()]);
 }
 
+/// The data path an agent links in chat saves where that link points.
+#[tokio::test]
+async fn a_save_path_given_as_a_data_path_is_not_nested_twice() {
+    let png = picture(image::ImageFormat::Png);
+    let (out, _, workspace, created) =
+        saved_capture("artifacts/shots/board.png", &png, "<main/>").await;
+
+    assert!(
+        out.contains("Saved the screenshot to artifacts/shots/board.png"),
+        "{out}"
+    );
+    assert!(workspace
+        .path()
+        .join("data/artifacts/shots/board.png")
+        .exists());
+    assert!(!workspace.path().join("data/artifacts/artifacts").exists());
+    assert_eq!(created, vec!["shots/board.png".to_string()]);
+}
+
 /// A device that sent another format than the path names saves nothing.
 #[tokio::test]
 async fn a_picture_in_the_wrong_format_is_not_saved() {
@@ -561,7 +583,7 @@ async fn a_picture_in_the_wrong_format_is_not_saved() {
     let (out, _, workspace, created) = saved_capture("board.png", &jpeg, "<main/>").await;
 
     assert!(
-        out.starts_with("Error: Nothing saved to board.png"),
+        out.starts_with("Error: Nothing saved to artifacts/board.png"),
         "{out}"
     );
     assert!(out.contains("sent image/jpeg, not image/png"), "{out}");
@@ -576,7 +598,9 @@ async fn a_capture_without_a_picture_saves_nothing() {
         saved_capture("board.png", "", "[screenshot unavailable: decode]\n<main/>").await;
 
     assert!(
-        out.starts_with("Error: Nothing saved to board.png: the capture carried no picture."),
+        out.starts_with(
+            "Error: Nothing saved to artifacts/board.png: the capture carried no picture."
+        ),
         "{out}"
     );
     assert!(
@@ -609,7 +633,7 @@ async fn a_failed_write_is_reported() {
     resolve_capture(&pending, &request_id, Some(LAPTOP), answer(&png, "<main/>")).unwrap();
     let out = tool.await.expect("tool task");
     assert!(
-        out.starts_with("Error: Saving shots/board.png failed:"),
+        out.starts_with("Error: Saving artifacts/shots/board.png failed:"),
         "{out}"
     );
 

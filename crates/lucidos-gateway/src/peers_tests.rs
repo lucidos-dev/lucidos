@@ -297,10 +297,10 @@ fn gateway_body() -> Value {
     json!({"status": "ok", "role": "gateway", "release": "0.0.0"})
 }
 
-/// A server answering `PEER_HEALTH_PATH` with `body`, and nothing else.
+/// A server answering `GATEWAY_HEALTH_PATH` with `body`, and nothing else.
 fn stand_in_router(body: Value) -> Router {
     Router::new().route(
-        PEER_HEALTH_PATH,
+        GATEWAY_HEALTH_PATH,
         get(move || {
             let body = body.clone();
             async move { axum::Json(body) }

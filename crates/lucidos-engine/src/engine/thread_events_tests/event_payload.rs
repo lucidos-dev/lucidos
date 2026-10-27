@@ -2,6 +2,61 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn trigger_retry_wire_shapes_survive_replay() {
+    let thread_id = uuid::Uuid::new_v4();
+    let entry_id = uuid::Uuid::new_v4();
+    let fire_event_id = uuid::Uuid::new_v4();
+    // These literals pin the persisted wire contract.
+    let deadline = "2030-01-01T12:00:00Z";
+    let retry_of = json!({ "thread_id": thread_id, "deadline": deadline });
+    let started: ThreadEvent = serde_json::from_value(json!({
+        "type": "TriggerStarted", "trigger_id": "daily-report", "retry_of": retry_of,
+    }))
+    .unwrap();
+    assert_eq!(serde_json::to_value(started).unwrap()["retry_of"], retry_of);
+
+    let retries = std::iter::once(json!({
+        "kind": "queued", "entry_id": entry_id, "deadline": deadline,
+    }))
+    .chain(
+        [
+            "already_retried",
+            "fire_completed",
+            "spawned_work",
+            "too_old",
+            "later_slot_due",
+            "newer_fire",
+            "trigger_unavailable",
+            "request_unavailable",
+            "already_queued",
+        ]
+        .map(|reason| json!({ "kind": "skipped", "reason": reason })),
+    );
+    for retry in retries {
+        let wire = json!({
+            "type": "TriggerRunInterrupted", "trigger_id": "daily-report",
+            "trigger_name": "Daily report", "fire_event_id": fire_event_id, "retry": retry,
+        });
+        let event: ThreadEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert!(event.is_persisted());
+        assert_eq!(event.event_type(), "TriggerRunInterrupted");
+        assert_eq!(serde_json::to_value(event).unwrap(), wire);
+    }
+}
+
+#[test]
+fn old_trigger_started_is_not_a_retry() {
+    let event: ThreadEvent = serde_json::from_value(json!({
+        "type": "TriggerStarted", "trigger_id": "daily-report",
+    }))
+    .unwrap();
+    let ThreadEvent::TriggerStarted { retry_of, .. } = event else {
+        panic!("expected TriggerStarted");
+    };
+    assert!(retry_of.is_none());
+}
+
+#[test]
 fn claude_code_idled_has_changes_serialization() {
     // With has_changes=true → field included
     let event = ThreadEvent::CodingAgentIdled {
@@ -395,6 +450,7 @@ fn message_received_without_optional_fields() {
 #[test]
 fn trigger_started_with_details() {
     let event = ThreadEvent::TriggerStarted {
+        retry_of: None,
         provider: None,
         trigger_id: "t-1".into(),
         trigger_name: Some("daily-report".into()),
@@ -416,6 +472,7 @@ fn trigger_started_with_details() {
 fn trigger_started_event_invocation_serializes_event_type_and_id() {
     let event_id = uuid::Uuid::new_v4();
     let event = ThreadEvent::TriggerStarted {
+        retry_of: None,
         provider: None,
         trigger_id: "t-2".into(),
         trigger_name: Some("sleep-import".into()),

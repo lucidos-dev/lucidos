@@ -11,13 +11,14 @@ import { installMarketplacePlugin } from '../../store/actions/plugin-install';
 import { openImageGallery } from '../../store/imagePopup';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
-import { SkeletonProvider, SkText, useSkeleton } from '../shared/Skeleton';
+import { SkeletonProvider, useSkeleton } from '../shared/Skeleton';
 import { ProseSkeleton } from '../files/previewSkeletons';
 import { pluginRowsInScope, pluginRowsSettled, refreshPluginsPanel } from './StoreTab';
 import {
   PluginActions, PluginIcon, PluginMeta, PluginModifiedNotice, PluginSource, PluginTitle,
 } from './pluginCard';
 import { renderPluginReadme } from './pluginReadme';
+import { PluginDescription } from './PluginDescription';
 
 interface PluginDetailPageProps {
   marketplaceId: string;
@@ -108,7 +109,7 @@ function PluginDetailHead({ plugin }: { plugin?: MarketplacePlugin }) {
         <PluginActions plugin={plugin} busy={busy} onInstall={(p) => void stageInstall(p)} />
       </div>
       {(sk || plugin?.description) && (
-        <SkText class="plugin-detail-description" as="div" w="20rem">{plugin?.description}</SkText>
+        <PluginDescription class="plugin-detail-description" w="20rem" description={plugin?.description} />
       )}
       <PluginMeta plugin={plugin} />
     </div>

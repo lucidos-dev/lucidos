@@ -16,7 +16,7 @@
 //! process behind it, not a workspace capability, so it has no LLM tool and no
 //! SDK facade.
 
-use crate::http::client as http_client;
+use crate::http::{client as http_client, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
 fn endpoint(ws: &Workspace, suffix: &str) -> String {
@@ -62,7 +62,7 @@ fn post(ws: &Workspace, suffix: &str, body: serde_json::Value) -> Result<(), Box
     let resp = http_client()?
         .post(&url)
         .json(&body)
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("POST {} failed: {}", url, e))?;
     let status = resp.status();
     let text = resp
@@ -92,7 +92,7 @@ pub(crate) fn cmd_status(ws: &Workspace) -> Result<(), BoxError> {
     let url = endpoint(ws, "");
     let resp = http_client()?
         .get(&url)
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("GET {} failed: {}", url, e))?;
     let status = resp.status();
     let text = resp

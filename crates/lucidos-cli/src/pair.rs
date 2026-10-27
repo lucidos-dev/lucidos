@@ -8,24 +8,20 @@
 //! `--qr` draws the code instead, so a phone scans it. That needs an address
 //! the phone can reach, which is the hard part of the whole feature: this
 //! command talks to `127.0.0.1`, and a QR aimed there helps nobody. The
-//! hostname comes from Tailscale or from `--host`, and the gateway builds and
-//! encodes the URL.
+//! address comes from `--host`, else the gateway's external address, else
+//! Tailscale's own status. The gateway builds and encodes the URL.
 //!
 //! It reaches the gateway rather than a workspace engine, so it finds it
 //! through `crate::gateway`.
 
-use crate::gateway::{self, FoundGateway};
+use crate::gateway;
 use crate::workspace::BoxError;
 
 /// Where the gateway's own surface lives, behind the reserved sigil namespace.
 const PAIRING_CODE_PATH: &str = "/~/api/v1/auth/pairing-code";
 
-/// How long to wait for the MagicDNS reverse lookup. Short: a name we cannot
-/// resolve promptly is one we fall back from, and the tailnet address works.
-const MAGIC_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(700);
-
-/// How long to wait for one reachability probe. Two run back to back, and a
-/// dead address is the ordinary answer. So this bounds what `--qr` costs on a
+/// How long to wait for one reachability probe. Up to four run back to back,
+/// and a dead address is the ordinary answer. So this bounds what `--qr` costs on a
 /// machine nothing can reach.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -40,17 +36,12 @@ pub struct PairArgs<'a> {
 pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     let client = gateway::client()?;
 
-    let base = match args.port {
-        Some(p) => gateway::find_gateways(&client, &[p])
-            .into_iter()
-            .next()
-            .map(|g| g.base)
-            .ok_or_else(|| gateway::no_gateway_on(p))?,
-        None => {
-            let found = gateway::find_gateways(&client, &gateway::candidate_ports());
-            choose_gateway(&found, gateway::dev_port_override())?
-        }
-    };
+    let base = gateway::the_gateway(
+        &client,
+        args.port,
+        "A pairing code only works on the gateway that minted it, so pass --port to name \
+         the one the new device will reach",
+    )?;
 
     let token = lucidos_local_token::read().ok_or_else(|| -> BoxError {
         "no local token found. Only a process on the gateway's own machine can \
@@ -62,15 +53,19 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     // hostname that is not loopback. `None` means we found nothing reachable,
     // and then there is no QR to draw.
     let origin = if args.qr {
+        let probe = gateway::probe_client()?;
         match args.host.map(str::trim).filter(|h| !h.is_empty()) {
             // An explicit host is an assertion about a network we cannot see,
             // so it is never refused. Probing only picks which of its two
             // origins to use, and falls back to the ported one.
             Some(host) => Some(
-                reachable_origin(&client, &base, host)
+                reachable_origin(&probe, &base, host)
                     .unwrap_or_else(|| origin_at_host(&base, host)),
             ),
-            None => reachable_host().and_then(|host| reachable_origin(&client, &base, &host)),
+            None => pairing_origin(
+                crate::external_address::stored(&client, &base, &token),
+                || tailnet_origin(&probe, &base),
+            ),
         }
     } else {
         None
@@ -130,7 +125,8 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
             None => {
                 println!("  Nothing here answers from outside this machine, so there is no QR.");
                 println!("  Allow tailnet or LAN access under Settings -> Access -> Network");
-                println!("  access, set up `tailscale serve`, or pass --host.");
+                println!("  access, set up `tailscale serve`, set an address with");
+                println!("  `lucidos external-address set`, or pass --host.");
                 println!();
             }
         }
@@ -154,18 +150,54 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// A hostname another device on the tailnet can open, or `None`.
+/// Pure: the pairing address, in the one order ADR 0550 sets. The external
+/// address comes first, since the user typed it. Then the tailnet origin, asked
+/// for only when there is no external address. The Access page's
+/// `pairingOrigin` follows the same order, and adds two steps this command
+/// cannot see: the reader's own origin and the LAN address.
+fn pairing_origin(
+    external: Option<String>,
+    tailnet: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    external.or_else(tailnet)
+}
+
+/// The tailnet origin another device can open, or `None` with the reason
+/// printed.
 ///
-/// Tailscale is used to FIND A NAME TO PRINT, never in the auth decision, which
-/// is what keeps ADR 0094 intact. Both lookups read the interface list with no
-/// subprocess. The MagicDNS name comes first, because it is the one a person
-/// can retype.
-fn reachable_host() -> Option<String> {
-    let addr = lucidos_tailscale::tailnet_ipv4()?;
-    Some(
-        lucidos_tailscale::magic_dns_name(addr, MAGIC_DNS_TIMEOUT)
-            .unwrap_or_else(|| addr.to_string()),
-    )
+/// Tailscale is asked, through `lucidos-tailscale`, and only to FIND AN ADDRESS
+/// TO PRINT, never in the auth decision, which keeps ADR 0094 intact. The
+/// address and name are the ones Tailscale reports (ADR 0588).
+fn tailnet_origin(client: &reqwest::blocking::Client, base: &str) -> Option<String> {
+    let state = lucidos_tailscale::tailnet_state();
+    let Some(node) = state.node() else {
+        if let Some(reason) = state.reason() {
+            eprintln!("  No tailnet address: {reason}");
+        }
+        return None;
+    };
+    let ours = our_instance(client, base, "No tailnet address")?;
+    tailnet_candidates(base, node)
+        .into_iter()
+        .find(|origin| reaches_this_gateway(client, origin, &ours))
+}
+
+/// The tailnet origins worth trying, most useful first.
+///
+/// `https://<name>` leads, but only when Tailscale can certify the name: that is
+/// the address with the installable app and push. Then the gateway's own port
+/// at the name a person can retype, then at the bare address.
+fn tailnet_candidates(base: &str, node: &lucidos_tailscale::TailnetNode) -> Vec<String> {
+    let mut origins = Vec::new();
+    if let Some(name) = node.https_name() {
+        origins.push(format!("https://{name}"));
+    }
+    if let Some(name) = &node.magic_dns_name {
+        origins.push(origin_at_host(base, name));
+    }
+    origins.push(origin_at_host(base, &node.ipv4.to_string()));
+    origins.dedup();
+    origins
 }
 
 /// The origin at `host` that actually answers, or `None`.
@@ -176,13 +208,12 @@ fn reachable_host() -> Option<String> {
 /// case: it fronts 443 on that same name and proxies to `127.0.0.1`, so it
 /// answers where the gateway's own port does not.
 ///
-/// So this asks instead of inferring, and health is the question it asks. Same
-/// standard the Access page holds itself to, reached a different way: the page
-/// reads the configured bind, and a terminal can just knock on the door.
+/// So this asks instead of inferring, and health is the question it asks.
 fn reachable_origin(client: &reqwest::blocking::Client, base: &str, host: &str) -> Option<String> {
+    let ours = our_instance(client, base, "Using the gateway's own port at --host")?;
     qr_origin_candidates(base, host)
         .into_iter()
-        .find(|origin| answers_health(client, origin))
+        .find(|origin| reaches_this_gateway(client, origin, &ours))
 }
 
 /// The origins worth trying for `host`, most specific first.
@@ -199,16 +230,50 @@ fn qr_origin_candidates(base: &str, host: &str) -> Vec<String> {
     }
 }
 
-/// Does a gateway answer its health endpoint at `origin`?
+/// Does `origin` reach the gateway whose health carries `ours`?
 ///
-/// Its own short-lived client: two of these run back to back, and a dead
+/// Two gateways can run on one machine, and `serve` on 443 fronts only one of
+/// them. A pairing code works only on the gateway that minted it, so an answer
+/// from the other one is a dead QR. So the answer must carry our id, and a
+/// gateway older than `instance_id` proves nothing.
+fn reaches_this_gateway(client: &reqwest::blocking::Client, origin: &str, ours: &str) -> bool {
+    health_instance(client, origin).as_deref() == Some(ours)
+}
+
+/// This gateway's `instance_id` over loopback, or `None` with `outcome` and
+/// the reason printed.
+fn our_instance(client: &reqwest::blocking::Client, base: &str, outcome: &str) -> Option<String> {
+    let ours = health_instance(client, base);
+    if ours.is_none() {
+        eprintln!(
+            "  {outcome}: the gateway is older than this CLI and cannot prove which \
+             gateway answers there. Restart Lucidos to update it."
+        );
+    }
+    ours
+}
+
+/// The `instance_id` the gateway's health answers with at `origin`.
+fn health_instance(client: &reqwest::blocking::Client, origin: &str) -> Option<String> {
+    health(client, origin)?
+        .get("instance_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// The health body at `origin`, or `None` when nothing answered in time.
+///
+/// Its own short timeout: several of these run back to back, and a dead
 /// address is the ordinary answer rather than the exceptional one.
-fn answers_health(client: &reqwest::blocking::Client, origin: &str) -> bool {
+fn health(client: &reqwest::blocking::Client, origin: &str) -> Option<serde_json::Value> {
     client
         .get(format!("{origin}{}", gateway::HEALTH_PATH))
         .timeout(PROBE_TIMEOUT)
         .send()
-        .is_ok_and(|r| r.status().is_success())
+        .ok()
+        .filter(|r| r.status().is_success())?
+        .json()
+        .ok()
 }
 
 /// `base` with its hostname swapped for `host`, keeping the scheme and port.
@@ -266,94 +331,58 @@ fn colorize(block: &str, plain: bool) -> String {
     out
 }
 
-/// Pure: which gateway to mint on, or why the caller has to say.
-///
-/// Ambiguity is refused rather than guessed. A code and the device it enrols
-/// both live on the gateway that minted them. Minting on the wrong one hands
-/// the user a code their phone is then told has expired. That is invisible:
-/// both gateways answer, and the refusal names no port.
-///
-/// `preferred` is a port the caller chose, through `--port` or the dev
-/// override. It wins whenever it answered.
-fn choose_gateway(found: &[FoundGateway], preferred: Option<u16>) -> Result<String, BoxError> {
-    if let Some(hit) = gateway::preferred(found, preferred) {
-        return Ok(hit.base.clone());
-    }
-    match found {
-        [] => Err(gateway::NO_GATEWAY.into()),
-        [only] => Ok(only.base.clone()),
-        many => {
-            let ports: Vec<String> = many.iter().map(|g| g.port.to_string()).collect();
-            Err(format!(
-                "{} gateways are running (ports {}). A pairing code only works on the gateway \
-                 that minted it, so pass --port to name the one the new device will reach",
-                many.len(),
-                ports.join(", ")
-            )
-            .into())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn found(ports: &[u16]) -> Vec<FoundGateway> {
-        ports
-            .iter()
-            .map(|&port| FoundGateway {
-                port,
-                base: format!("https://127.0.0.1:{port}"),
-            })
-            .collect()
+
+    /// A loopback origin that answers one request with `response`.
+    fn answer_once(response: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read(&mut [0u8; 4096]);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        origin
     }
 
     #[test]
-    fn one_running_gateway_is_used_without_asking() {
-        let only = found(&[5252]);
+    fn an_identity_probe_does_not_follow_a_redirect() {
+        let body = r#"{"instance_id":"ours"}"#;
+        let ours = answer_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ));
+        let elsewhere = answer_once(format!(
+            "HTTP/1.1 302 Found\r\nLocation: {ours}{}\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+            gateway::HEALTH_PATH
+        ));
+        let probe = gateway::probe_client().unwrap();
+        assert!(!reaches_this_gateway(&probe, &elsewhere, "ours"));
+    }
+
+    #[test]
+    fn the_external_address_leads_and_spares_the_tailnet_probe() {
+        let external = Some("https://lucidos.example.com".to_string());
+        let origin = pairing_origin(external.clone(), || {
+            panic!("the tailnet must not be probed when an external address is set")
+        });
+        assert_eq!(origin, external);
+    }
+
+    #[test]
+    fn without_an_external_address_the_tailnet_answers() {
+        let tailnet = || Some("http://mymac.tailnet-name.ts.net:5252".to_string());
         assert_eq!(
-            choose_gateway(&only, None).unwrap(),
-            "https://127.0.0.1:5252"
+            pairing_origin(None, tailnet).as_deref(),
+            Some("http://mymac.tailnet-name.ts.net:5252")
         );
-    }
-
-    #[test]
-    fn two_running_gateways_are_refused_rather_than_guessed() {
-        // The reported bug. Both answer, the first wins, and the code is minted
-        // on a gateway the new device may never reach. Its own store holds the
-        // device, so the phone is told the code expired.
-        let both = found(&[5252, 5251]);
-        let err = choose_gateway(&both, None).unwrap_err().to_string();
-        assert!(err.contains("5252") && err.contains("5251"), "{err}");
-        assert!(err.contains("--port"), "the refusal must say what to do");
-    }
-
-    #[test]
-    fn a_preferred_port_wins_over_a_second_gateway() {
-        // `--port` and the dev override are both the caller saying which one.
-        let both = found(&[5252, 5251]);
-        assert_eq!(
-            choose_gateway(&both, Some(5251)).unwrap(),
-            "https://127.0.0.1:5251"
-        );
-    }
-
-    #[test]
-    fn a_preferred_port_that_did_not_answer_falls_back_to_the_rules() {
-        // A stale override must not mint on a gateway nobody chose either.
-        let both = found(&[5252, 5251]);
-        assert!(choose_gateway(&both, Some(5999)).is_err());
-        let one = found(&[5252]);
-        assert_eq!(
-            choose_gateway(&one, Some(5999)).unwrap(),
-            "https://127.0.0.1:5252"
-        );
-    }
-
-    #[test]
-    fn no_gateway_at_all_says_how_to_start_one() {
-        let err = choose_gateway(&[], None).unwrap_err().to_string();
-        assert!(err.contains("no gateway found"), "{err}");
+        assert_eq!(pairing_origin(None, || None), None);
     }
 
     #[test]
@@ -390,6 +419,49 @@ mod tests {
         assert_eq!(
             qr_origin_candidates("https://127.0.0.1", "mac.ts.net"),
             vec!["https://mac.ts.net".to_string()]
+        );
+    }
+
+    fn node(name: Option<&str>, https: bool) -> lucidos_tailscale::TailnetNode {
+        lucidos_tailscale::TailnetNode {
+            ipv4: std::net::Ipv4Addr::new(100, 70, 0, 1),
+            magic_dns_name: name.map(str::to_string),
+            can_serve_https: https,
+        }
+    }
+
+    #[test]
+    fn a_certifiable_name_is_tried_over_https_first() {
+        assert_eq!(
+            tailnet_candidates(
+                "http://127.0.0.1:5252",
+                &node(Some("mymac.tailnet-name.ts.net"), true)
+            ),
+            vec![
+                "https://mymac.tailnet-name.ts.net".to_string(),
+                "http://mymac.tailnet-name.ts.net:5252".to_string(),
+                "http://100.70.0.1:5252".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_certificate_there_is_no_https_candidate() {
+        // Headscale issues no certificates, so no serve URL can exist.
+        assert_eq!(
+            tailnet_candidates(
+                "http://127.0.0.1:5252",
+                &node(Some("mymac.example-tailnet.test"), false)
+            ),
+            vec![
+                "http://mymac.example-tailnet.test:5252".to_string(),
+                "http://100.70.0.1:5252".to_string(),
+            ]
+        );
+        // MagicDNS off: the address Tailscale reported is all there is.
+        assert_eq!(
+            tailnet_candidates("http://127.0.0.1:5252", &node(None, false)),
+            vec!["http://100.70.0.1:5252".to_string()]
         );
     }
 

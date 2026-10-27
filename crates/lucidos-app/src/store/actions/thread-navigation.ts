@@ -1,3 +1,4 @@
+import { readWindowItem, removeWindowItem, writeWindowItem } from '../../utils/windowStorage';
 import { signal, computed } from '@preact/signals';
 import { focusedThreadId } from '../store';
 import { closeDashboardPanel, dashboardPanelOpen, openDashboardPanel } from '../dashboards';
@@ -88,7 +89,7 @@ function isValidEntry(v: unknown): v is ThreadNavEntry {
 
 function saveThreadNavState(): void {
   try {
-    localStorage.setItem(THREAD_NAV_STORAGE_KEY, JSON.stringify({
+    writeWindowItem(THREAD_NAV_STORAGE_KEY, JSON.stringify({
       stack: threadNavStack.value,
       cursor: threadNavCursor.value,
     }));
@@ -99,7 +100,7 @@ function ensureInitialized(): void {
   if (_initialized) return;
   _initialized = true;
   try {
-    const saved = localStorage.getItem(THREAD_NAV_STORAGE_KEY);
+    const saved = readWindowItem(THREAD_NAV_STORAGE_KEY);
     if (saved) {
       const parsed = JSON.parse(saved) as { stack: unknown; cursor: unknown };
       const stack = parsed.stack;
@@ -279,6 +280,6 @@ export function _resetThreadNavForTesting(): void {
   threadNavStack.value = [];
   threadNavCursor.value = -1;
   _initialized = false;
-  try { localStorage.removeItem(THREAD_NAV_STORAGE_KEY); } catch { /* noop */ }
+  try { removeWindowItem(THREAD_NAV_STORAGE_KEY); } catch { /* noop */ }
 }
 

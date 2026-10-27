@@ -113,7 +113,7 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                     "save_as_artifact": {
                         "type": "string",
                         "description": format!(
-                            "Also save a sharp screenshot file here, under data/artifacts/. Ends in {}.",
+                            "Also save a sharp screenshot file at this artifacts/ path (e.g. 'artifacts/shots/board.png'). Ends in {}.",
                             crate::engine::thread_events::CaptureFormat::extensions()
                         )
                     },

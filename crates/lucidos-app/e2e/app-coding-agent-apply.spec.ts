@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, waitForActionPanel } from './helpers';
+import { navigateToApp, assertHealthy, waitForActionPanel, clickChangeAction } from './helpers';
 import { createIframeAppFixture, createAppCCThreadWithChange, cleanupCCThread, git } from './db-helpers';
 
 test.describe('App coding-agent thread — Apply', () => {
@@ -66,8 +66,8 @@ test.describe('App coding-agent thread — Apply', () => {
 
       // Click Apply — the action panel surfaces "Apply" / "Discard" once
       // the projection's coding_agent_change_state is 'proposed' (seeded).
-      const panel = await waitForActionPanel(page, 'Apply', 15_000);
-      await panel.locator('button', { hasText: /^Apply/ }).first().click();
+      await waitForActionPanel(page, 'Apply', 15_000);
+      await clickChangeAction(page, 'Apply');
 
       // After Apply, the iframe is remounted with a cache-busted src
       // (appRefreshKey > 0 → ?_r=N). Wait for the src to differ.

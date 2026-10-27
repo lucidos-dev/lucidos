@@ -83,6 +83,42 @@ pub(crate) async fn withhold_unfinished_work(
     Ok(open == OpenChangeAfterHold::Withdrawn)
 }
 
+/// Withdraw the open change of a turn that handed off, unannounced, and say
+/// whether it withdrew one. The successor session carries the work, and its own
+/// turn end decides it. So a pending change goes back to unproposed work even
+/// when it still carries everything: nothing may offer Apply before that
+/// session. A set-aside change stays set aside unless the branch moved past it,
+/// and a queued one stays queued: the landing lane lands the snapshot it froze.
+pub(crate) async fn withhold_handed_off_work(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+    thread_id: Uuid,
+    repo_root: &Path,
+    branch_name: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let open = bus
+        .changes_projection()
+        .get_open_by_branch(branch_name)
+        .await
+        .map_err(|e| format!("get_open_by_branch({branch_name}): {e}"))?;
+    let Some(open) = open else {
+        return Ok(false);
+    };
+    let queued = crate::engine::landing_lane::queued_snapshot(pool, thread_id, open.id)
+        .await
+        .map_err(|e| format!("could not read the landing lane for this thread: {e}"))?;
+    if queued.is_some() {
+        return Ok(false);
+    }
+    if open.status() == ChangeStatus::SetAside
+        && !branch_moved_since_last_idle(pool, thread_id, repo_root, branch_name).await
+    {
+        return Ok(false);
+    }
+    emit_change_withdrawn(bus, thread_id, open.id, None).await?;
+    Ok(true)
+}
+
 /// Whether the branch head moved since the thread's last idle recorded it. An
 /// open change covers the head of the idle that last proposed it. Engine idles
 /// that record no head are skipped. An unreadable head on either side counts
@@ -184,11 +220,7 @@ pub(crate) async fn withhold_unready(
     );
     let moved =
         branch_moved_since_last_idle(pool, input.thread_id, repo_root, input.branch_name).await;
-    // A pending handoff's successor session owes what the hold asks for, and
-    // its own turn end announces the verdict. Announcing it now would show a
-    // Not ready strip in the gap before that session starts.
-    let announced = !crate::engine::successor::handoff_pending(pool, input.thread_id).await;
-    let open = withhold_work(bus, input, moved, announced.then(|| hold.into())).await?;
+    let open = withhold_work(bus, input, moved, Some(hold.into())).await?;
     Ok(HoldOutcome::Held(hold, open))
 }
 

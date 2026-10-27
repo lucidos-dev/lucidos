@@ -44,6 +44,7 @@ mod chain_tests;
 mod control;
 mod engine_hop;
 mod error;
+mod external_address;
 mod file_backup;
 mod hook_socket;
 mod installs;

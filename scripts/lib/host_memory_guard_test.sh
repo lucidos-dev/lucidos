@@ -2538,6 +2538,20 @@ test_the_build_gate_waits_for_recovery_then_refuses_at_the_deadline() {
     assert_eq "72" "$rc" "a host that never recovers is refused with 72"
     assert_eq "4" "$(wc -l < "$BG_WAITS" | tr -d ' ')" "it stopped waiting at the 120 s deadline"
     assert_says "$OUT/bg-refuse.out" "ERROR: build refused on host memory: the /harden rust suite did not start, the host read NO-GO for 120s: available 5.00 GB under 8 GB" "the refusal is one ERROR line naming the reason"
+
+    echo 1000 > "$BG_CLOCK"
+    : > "$BG_WAITS"
+    (
+        _host_mem_now() { cat "$BG_CLOCK"; }
+        _host_mem_gate_wait() { echo "$1" >> "$BG_WAITS"; }
+        LUCIDOS_BUILD_MEMORY_WAIT_SECS=0 HOST_PRESSURE_LEVEL_OVERRIDE=2 \
+            HOST_AVAIL_GB_OVERRIDE=5.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+            HOST_COMPRESSOR_GB_OVERRIDE=5 HOST_PHYSMEM_GB_OVERRIDE=48 \
+            host_memory_build_gate "the /harden rust suite"
+    ) >"$OUT/bg-nowait.out" 2>&1
+    rc=$?
+    assert_eq "72" "$rc" "a zero wait cap refuses at the first NO-GO"
+    assert_eq "0" "$(wc -l < "$BG_WAITS" | tr -d ' ')" "a zero wait cap never sleeps"
 }
 
 # A pass holds for 60 s in the process tree, so a nested build skips the

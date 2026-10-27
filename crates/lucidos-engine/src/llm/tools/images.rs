@@ -54,7 +54,7 @@ pub fn get_save_thread_image_tool() -> ToolDefinition {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Destination relative to data/artifacts/ (e.g. 'projects/reports/photo.jpg'). Committed to git."
+                    "description": "Destination artifacts/ path (e.g. 'artifacts/projects/reports/photo.jpg'). Committed to git."
                 }
             },
             "required": ["image", "path"]
@@ -92,7 +92,7 @@ pub fn get_image_generation_tool() -> ToolDefinition {
                 },
                 "save_as_artifact": {
                     "type": "string",
-                    "description": "Optional path relative to data/artifacts/ to save it (e.g. 'generated/logo.png'). Git-committed."
+                    "description": "Optional artifacts/ path to save it at (e.g. 'artifacts/generated/logo.png'). Git-committed."
                 }
             },
             "required": ["prompt"]

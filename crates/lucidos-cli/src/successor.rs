@@ -2,7 +2,7 @@
 //! in a *successor session*: a fresh session in the same thread, which carries
 //! on with a clean context.
 
-use crate::http::client as http_client;
+use crate::http::{client as http_client, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
 /// `lucidos successor --help`: the whole procedure, so the engine prompt can
@@ -352,7 +352,7 @@ fn post_checkpoint(
         .ok()?
         .post(&url)
         .json(&checkpoint_body(run, kind))
-        .send()
+        .send_with_connect_retry()
         .ok()?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -435,7 +435,7 @@ pub(crate) fn cmd_start(
     let resp = http_client()?
         .post(&url)
         .json(&start_body(narrative, choice, at))
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format!("POST {url} failed: {e}"))?;
     let status = resp.status();
     let body: serde_json::Value = resp

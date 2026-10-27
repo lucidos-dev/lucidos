@@ -55,7 +55,8 @@
 #                             The mid-run sampler classifies against this SAME cap.
 #   HOST_LOAD_POLL_SECS       seconds between polls while over-ratio (default 15).
 #                             Also the mid-run sampling interval.
-#   HOST_LOAD_MAX_WAIT_SECS   total seconds to wait before refusing (default 300)
+#   HOST_LOAD_MAX_WAIT_SECS   total seconds to wait before refusing (default 300,
+#                             0 refuses at once)
 #   HOST_LOAD_SUSTAINED_MIN_SECS
 #                             longest contiguous over-cap stretch that counts as
 #                             "sustained" for the mid-run banner (default 120).
@@ -83,9 +84,10 @@
 # Sourced by scripts/lib/e2e.sh; invoked by scripts/e2e-browser.sh — the gate
 # right before the Playwright browser swarm spawns, the sampler around it.
 
-# Distinct exit code for "host still saturated, refusing to launch". Overridable
-# for tests, but 75 (EX_TEMPFAIL) is the contract the nightly orchestrator keys on.
-: "${HOST_LOAD_SATURATED_EXIT:=75}"
+# Distinct exit code for "host still saturated, refusing to launch":
+# HOST_LOAD_SATURATED_EXIT.
+# shellcheck source=host_busy_exits.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_busy_exits.sh"
 
 # ── measurement seams (overridable in tests) ───────────────────────────────
 # Both readers honor a test override env var FIRST, then read the real host.

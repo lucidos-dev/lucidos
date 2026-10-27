@@ -987,6 +987,7 @@ fn the_idle_arm_proposes_before_it_idles() {
         .find("self.emit_coding_agent_idled(")
         .expect("the Result arm must still emit this turn's CodingAgentIdled");
     for write in [
+        "withhold_handed_off_work(",
         "self.propose_turn_work(",
         "self.reconcile_emptied_pending_change(",
     ] {
@@ -999,6 +1000,14 @@ fn the_idle_arm_proposes_before_it_idles() {
              so a change written afterwards never reaches it",
         );
     }
+    let handed_off = arm
+        .find("if idle_write == Some(IdleChangeWrite::HandedOff)")
+        .expect("the Result arm must still route a handed-off idle on its own");
+    let propose = arm.find("self.propose_turn_work(").unwrap();
+    assert!(
+        handed_off < propose,
+        "a handed-off idle must branch off before the propose, or Apply flashes"
+    );
 }
 
 /// The turn-end gate brackets the idle (ADR 0417). The forced read and wake

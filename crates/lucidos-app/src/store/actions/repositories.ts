@@ -1,3 +1,4 @@
+import { readWindowItem, removeWindowItem } from '../../utils/windowStorage';
 import {
   repoSource, repoFiles, repoDiff, repoPending,
   repoViewMode, repoExpandedFolders, expandedFolders, revealedFolder, selectedLines, lineScrollTarget, findRequest,
@@ -390,7 +391,7 @@ export async function loadChangeContextById(changeId: string): Promise<void> {
  *  retries — silently nuking on transient errors would lose the user's
  *  selection because of a momentary outage. */
 export async function restoreRepoSelectionFromStorage(): Promise<void> {
-  const savedId = localStorage.getItem(SELECTED_CHANGE_KEY);
+  const savedId = readWindowItem(SELECTED_CHANGE_KEY);
   if (!savedId) return;
   // If a file-preview overlay re-hydrated for the same change, RepoFilePreview's
   // useEffect already calls loadChangeContextById — skip to avoid a duplicate
@@ -405,7 +406,7 @@ export async function restoreRepoSelectionFromStorage(): Promise<void> {
     await loadChangeContext(change);
   } catch (e) {
     if (e instanceof ApiError && e.httpCode === 404) {
-      localStorage.removeItem(SELECTED_CHANGE_KEY);
+      removeWindowItem(SELECTED_CHANGE_KEY);
     }
     // Transient errors (network, 5xx): keep the saved id and let next reload retry.
   }

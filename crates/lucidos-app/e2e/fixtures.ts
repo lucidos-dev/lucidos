@@ -2,6 +2,7 @@ import { test as base, request as pwRequest } from '@playwright/test';
 import type { APIRequestContext, BrowserContext, Page as PlaywrightPage } from '@playwright/test';
 import { coverageDir, recordCoverage, type CoverageRecorder } from './coverage';
 import { HARNESS_DEVICE_ID, registerHarnessDevice } from './harnessDevice';
+import { TAB_WINDOW_ID_KEY } from '../src/utils/windowIdKey';
 
 export { expect } from '@playwright/test';
 export type { APIRequestContext, Locator, Page } from '@playwright/test';
@@ -136,7 +137,21 @@ export const test = base.extend({
     }
   },
   // The test's page waits until coverage records it, so its first script counts.
+  //
+  // Every load also starts as a fresh window (ADR 0585). Specs seed navigation
+  // through the plain localStorage key, the shared seed, and a tab's own copy
+  // from an earlier load would win over it. Writes still reach the seed, so a
+  // reload keeps what the page showed.
   page: async ({ page, context }, use) => {
+    await page.addInitScript((idKey: string) => {
+      if (window.parent !== window) return;
+      try {
+        for (let i = sessionStorage.length - 1; i >= 0; i--) {
+          const key = sessionStorage.key(i);
+          if (key?.endsWith(idKey)) sessionStorage.removeItem(key);
+        }
+      } catch { /* no sessionStorage: every load is a fresh window already */ }
+    }, TAB_WINDOW_ID_KEY);
     await coverageRecorders.get(context)?.started(page);
     await use(page);
   },

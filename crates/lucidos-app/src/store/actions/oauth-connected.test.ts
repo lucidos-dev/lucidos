@@ -11,7 +11,7 @@
  * window of the desktop app shares it: only the page that opened the
  * authorization URL fronts itself.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import { oauthAccounts, panelOverlay, toasts } from '../store';
 
 const THIS_DEVICE = 'device-aaa';
@@ -29,6 +29,7 @@ vi.mock('../../utils/platform', () => ({
 const focusCallingWindow = vi.hoisted(() => vi.fn());
 const openExternal = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock('../../utils/tauri', () => ({
+  currentWindowLabel: () => null,
   focusCallingWindow,
   openExternal,
   setTitlebarColor: () => Promise.resolve(),
@@ -129,7 +130,7 @@ describe('handleOAuthAccountConnected', () => {
   it('does not front a window that never opened an authorization page', () => {
     handleOAuthAccountConnected(connected(THIS_DEVICE));
     expect(focusCallingWindow).not.toHaveBeenCalled();
-    // The toast is deliberately still device-scoped, not narrowed with it.
+    // A lone window is the last-touched one, so it still shows the toast.
     expect(toasts.value).toHaveLength(1);
   });
 
@@ -202,6 +203,56 @@ describe('handleOAuthAccountConnected', () => {
  * or the SSE never arrived. Without a fallback the button would just stop
  * spinning, which is what the first cut of this change shipped.
  */
+describe('the OAuth toast across windows', () => {
+  let other: BroadcastChannel;
+  let stop: () => void;
+
+  async function otherAuthorizes(provider: string | null): Promise<void> {
+    const { windowId } = await import('../../utils/windowStorage');
+    other.postMessage({
+      type: 'state',
+      state: {
+        id: `${windowId()}-other`, focusedThreadId: null, appId: null,
+        authorizing: { provider }, activeAt: Date.now() + 1000,
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  beforeEach(async () => {
+    oauthAuthFlow.value = null;
+    toasts.value = [];
+    const { installWindowPeers } = await import('../windowPeers');
+    const { WORKSPACE_ID } = await import('../../utils/basePath');
+    other = new BroadcastChannel(`lucidos-window-peers:${WORKSPACE_ID ?? ''}`);
+    stop = installWindowPeers(() => ({
+      focusedThreadId: null,
+      appId: null,
+      authorizing: oauthAuthFlow.peek() && { provider: oauthAuthFlow.peek()!.provider },
+    }));
+  });
+  afterEach(() => {
+    stop();
+    other.close();
+  });
+
+  // Two windows waiting on the same provider: one toast, in the last-touched.
+  it('toasts once when two windows authorize the same provider', async () => {
+    openOAuthAuthorizationUrl(AUTH_URL, 'dropbox');
+    await otherAuthorizes('dropbox');
+    handleOAuthAccountConnected(connected(THIS_DEVICE));
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  // The window waiting on THIS provider wins over one waiting on another.
+  it('toasts in the window authorizing this provider', async () => {
+    openOAuthAuthorizationUrl(AUTH_URL, 'dropbox');
+    await otherAuthorizes('google');
+    handleOAuthAccountConnected(connected(THIS_DEVICE));
+    expect(toasts.value).toHaveLength(1);
+  });
+});
+
 describe('grantOAuthScope success feedback', () => {
   beforeEach(() => {
     panelOverlay.value = null;

@@ -25,14 +25,11 @@
     align-items: stretch;
     height: var(--rung-height);
     margin-block: calc((var(--send-round-size) - var(--rung-height)) / 2);
-    animation: rung-arrive var(--duration-normal) ease;
 }
 
-/* A pill whose face is not whole yet keeps its box but is not seen: it fades in
- * once, when the attribute drops, at the width it keeps. */
+/* Keep the loading face in the same box as the selected model. */
 .rung-control[data-pending] {
-    visibility: hidden;
-    animation: none;
+    color: var(--text-muted);
 }
 
 @media (--phone-layout) {
@@ -43,11 +40,6 @@
 
 [data-composer-compact] .rung-control {
     --rung-label-width: 2.75rem;
-}
-
-@keyframes rung-arrive {
-    from { opacity: 0; }
-    to   { opacity: 1; }
 }
 
 .rung-menu-icon {
@@ -132,7 +124,7 @@
 }
 
 @media (hover: hover) {
-    .rung-pill:has(> .rung-trigger:hover) {
+    .rung-pill:has(> .rung-trigger:not([aria-disabled="true"]):hover) {
         border-color: var(--accent);
     }
 }
@@ -194,4 +186,10 @@
 
 [data-composer-compact] .rung-pill .rung-trigger {
     border-inline: 0;
+}
+
+.rung-pill .rung-trigger[aria-disabled="true"],
+.rung-pill:has(.rung-trigger[aria-disabled="true"]) .rung-intelligence {
+    color: var(--text-muted);
+    cursor: default;
 }

@@ -140,6 +140,23 @@ describe('resolveThreadActions', () => {
     expect(kinds(resolveThreadActions('t1'))).toEqual(['apply_when_settled', 'save']);
   });
 
+  // The compact action slot shows the icon alone, and the tooltip layer drops
+  // a tooltip that repeats the label. So each action needs a description.
+  it('every close and change action describes itself beyond its label', () => {
+    setThread(makeThreadState('t1', {
+      meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},
+    }));
+    changes.value = { status: 'loaded', data: [pendingChangeRow('t1')] };
+    const changeActions = resolveThreadActions('t1');
+    setThread(makeThreadState('t1', { meta: { section: 'inbox', status: 'idle' } }));
+    const archive = resolveThreadActions('t1').filter((a) => a.kind === 'archive');
+    for (const action of [...changeActions.filter((a) => a.category !== 'save'), ...archive]) {
+      expect(action.tooltip, action.kind).toBeTruthy();
+      expect(action.tooltip?.toLowerCase(), action.kind).not.toBe(action.label.toLowerCase());
+    }
+    expect(archive).toHaveLength(1);
+  });
+
   it('Apply gets a compact "Apply*" marker for a restart-requiring change (restart is the separate switch)', () => {
     setThread(makeThreadState('t1', {
       meta: { channel: 'claude_code', section: 'inbox', status: 'idle', codingAgentChangeState: { kind: 'proposed', requires_restart: false }},

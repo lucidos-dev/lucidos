@@ -23,6 +23,7 @@ import { openSettingsSubview } from '../../store/actions/menu';
 import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 import { applyNavFocus } from '../shared/focusMarker';
 import { scrollBehavior } from '../../utils/motion';
+import { PluginDescription } from './PluginDescription';
 
 /** Jump to Settings → Marketplaces from anywhere. One call: `openSettingsSubview`
  *  lands the Settings panel and the sub-section together, so the jump is a single
@@ -539,7 +540,7 @@ export function PluginStoreRow({ plugin, installingSource, stageInstall }: Parti
           <SkText class="title list-row-name" w="9rem">{plugin?.name}</SkText>
         </div>
         {(sk || plugin?.description) && (
-          <SkText class="app-store-plugin-description" as="div" w="18rem">{plugin?.description}</SkText>
+          <PluginDescription class="app-store-plugin-description" w="18rem" description={plugin?.description} />
         )}
         <PluginRowNote plugin={plugin} />
       </div>

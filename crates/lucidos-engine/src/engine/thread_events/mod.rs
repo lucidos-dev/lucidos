@@ -33,7 +33,7 @@ pub use agent_exit::{CodingAgentExit, CodingAgentExitStage};
 pub use apply_now::ApplyNowOutcome;
 pub use capture::CaptureFormat;
 pub use cause::{AbortCause, CancelCause, EventWaitCancelCause, UnproposedReason, UnqueueReason};
-pub use channel::{EventChannel, TriggerInvocation};
+pub use channel::{EventChannel, FireRetry, RetryOf, RetrySkipReason, TriggerInvocation};
 pub use dashboard::{ArrangedTile, Dashboard, LegacyArrangedTile};
 pub use event::ThreadEvent;
 pub use event_impl::{
@@ -87,3 +87,8 @@ pub(crate) mod ts_codegen;
 #[cfg(test)]
 #[path = "../thread_events_tests/variants.rs"]
 mod variant_tests;
+
+/// A human follow-up makes a trigger thread attended. Both projection and
+/// recovery bind `$2` from `ActorMode::Human`, including legacy missing modes.
+pub(crate) const HUMAN_MESSAGE_SQL: &str =
+    "event_type = 'MessageReceived' AND COALESCE(payload->>'mode', $2) = $2";

@@ -173,7 +173,9 @@ jobs:
           set -euo pipefail
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential perl pkg-config curl ca-certificates git python3 binutils zstd
+            build-essential perl pkg-config curl ca-certificates git python3 binutils zstd \
+            patchelf libxml2 libssl3 libgssapi-krb5-2 liblz4-1 libzstd1 zlib1g \
+            libreadline8 libxslt1.1 libossp-uuid16 libpython3.11
           git --version && python3 --version
 
       # The ubuntu:22.04 container has no Rust toolchain (the preinstalled one lives

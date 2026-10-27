@@ -78,32 +78,56 @@ impl LucidosEngine {
         trigger_id: &str,
         status: crate::triggers::TriggerRunStatus,
     ) {
-        let now = chrono::Utc::now();
-        {
-            let mut configs = self.trigger_configs.write().unwrap();
-            if let Some(c) = configs.get_mut(trigger_id) {
-                c.last_run = Some(now);
-                c.last_run_status = Some(status);
-            }
-        }
-        if let Err(e) = self
-            .event_bus
-            .emit(BusEvent::System(SystemEvent::TriggerExecuted {
-                trigger_id: trigger_id.to_string(),
-                payload: serde_json::json!({
-                    "trigger_id": trigger_id,
-                    "last_run": now.to_rfc3339(),
-                    "status": status.as_str(),
-                }),
-            }))
+        if let Err(error) = self
+            .record_trigger_executed_at(trigger_id, status, chrono::Utc::now())
             .await
         {
-            log!("[Triggers] Failed to persist TriggerExecuted event: {}", e);
+            log!(
+                "[Triggers] Failed to persist TriggerExecuted event: {}",
+                error
+            );
         }
+    }
+
+    /// Record a recovered fire at its start, so catch-up can see later slots.
+    pub(crate) async fn record_trigger_executed_at(
+        &self,
+        trigger_id: &str,
+        status: crate::triggers::TriggerRunStatus,
+        ran_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.event_bus
+            .record_trigger_executed_at(trigger_id, status, ran_at)
+            .await?;
+        let mut configs = self.trigger_configs.write().unwrap();
+        if let Some(config) = configs.get_mut(trigger_id) {
+            config.last_run = Some(ran_at);
+            config.last_run_status = Some(status);
+        }
+        Ok(())
     }
 }
 
 impl EventBus {
+    /// Shared durable trigger stamp for live execution and boot recovery.
+    pub(crate) async fn record_trigger_executed_at(
+        &self,
+        trigger_id: &str,
+        status: crate::triggers::TriggerRunStatus,
+        ran_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.emit(BusEvent::System(SystemEvent::TriggerExecuted {
+            trigger_id: trigger_id.to_string(),
+            payload: serde_json::json!({
+                "trigger_id": trigger_id,
+                "last_run": ran_at.to_rfc3339(),
+                "status": status.as_str(),
+            }),
+        }))
+        .await?;
+        Ok(())
+    }
+
     /// The one write path for a domain event, durable or transient.
     ///
     /// On the bus rather than the engine, so a test can drive the LLM tool's

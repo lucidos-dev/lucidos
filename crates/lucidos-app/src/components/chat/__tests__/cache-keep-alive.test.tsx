@@ -422,8 +422,12 @@ describe('the Prompt cache section', () => {
       mount(<KeepAliveSection threadId="t1" status={{ state: 'not_kept', reason }} />).textContent;
     expect(detail('no_wake_children')).toContain('These sub-threads finish without waking this thread');
     expect(detail('children_awaiting_user')).toContain('The sub-threads are waiting on you.');
-    expect(detail('uncacheable_provider')).toContain("This model's provider has no prompt cache that a ping keeps warm.");
+    expect(detail('uncacheable_provider')).toContain('Lucidos cannot safely prefill this prompt cache.');
+    expect(detail('provider_paused')).toContain('Pings on this provider are paused after a failed ping.');
+    expect(detail('prefill_paused')).toContain('Prefill pings are temporarily paused.');
     expect(detail('restarted')).toContain('Lucidos restarted since the last request');
+    expect(detail('model_changed')).toContain('The model or reasoning effort changed');
+    expect(detail('beat_missed')).toContain('A ping missed the cache');
     expect(detail('codex')).toContain('Codex sessions get no keep-alive');
   });
 

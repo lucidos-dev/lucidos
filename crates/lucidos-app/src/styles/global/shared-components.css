@@ -538,7 +538,7 @@ input[type="checkbox"]:disabled {
     cursor: pointer;
     min-width: 3.5rem;
     padding: 0.25rem 0.625rem;
-    border-radius: var(--radius-control);
+    border-radius: calc(var(--radius-control) * 0.75);
     font-size: var(--font-size-xs);
     font-family: var(--font-ui);
     font-weight: 500;

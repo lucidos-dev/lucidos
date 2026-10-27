@@ -30,8 +30,12 @@ blocking its own Apply. So:
    change lands, and a red one opens a fix thread.
 3. **Say so.** Name the spec that did not run in your report.
 
-`/harden` does this for you: a touched-spec suite refused with 75 reads `SKIP`,
-and a `SKIP` passes.
+A filtered run that nothing pinned to this host does step 1 for you
+(ADR 0584): a refusal with 75, or a memory or load refusal, hands the same
+selection to GitHub at the HEAD it recorded, and says `[e2e] host busy`.
+`/harden`'s touched-spec suites take that path, so they get a verdict. Only a
+run pinned here (`--local`, a local-only flag or variable) or on a dirty tree
+still reads `SKIP` on 75.
 
 ## A wait armed before this rule
 

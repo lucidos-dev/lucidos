@@ -156,8 +156,13 @@ expect_eq "Makefile" "shell-lint" "$(select_for Makefile)"
 expect_eq "installer" "shell-lint gateway install" "$(select_for install.sh)"
 expect_eq "installer: service.sh" "shell-lint gateway install" "$(select_for scripts/lib/service.sh)"
 for f in uninstall.sh scripts/lib/stage_runtime.sh \
+    scripts/lib/stage_runtime_test.sh scripts/lib/stage_runtime_linux_smoke.sh \
+    scripts/build-headless.sh scripts/lib/install_test.sh \
     scripts/lib/headless_tarball.sh scripts/lib/install_common.sh; do
     expect_eq "installer: $f" "shell-lint install" "$(select_for "$f")"
+done
+for f in scripts/lib/stage_runtime_linux.py scripts/lib/stage_runtime_linux_test.py; do
+    expect_eq "Linux closure: $f" "install" "$(select_for "$f")"
 done
 expect_eq "a script both crates pin" "shell-lint engine-filtered gateway" \
     "$(select_for scripts/lib/workspace_constants.sh)"

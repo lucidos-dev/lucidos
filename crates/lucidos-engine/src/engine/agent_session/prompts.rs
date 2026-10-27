@@ -376,9 +376,9 @@ const ASK_USER_QUESTION_RULE: &str =
      a decision you can act on is still welcome (\"None of these\", \"Neither, ask me later\", \
      \"Cancel the deploy\"); what is banned is an option whose only meaning is \"I will type it \
      instead\".\n\n\
-     QUIET OPTIONS: start a label with `[quiet]` when that pick needs nothing more from you \
-     (`[quiet] Not now`). The tag is hidden, and the pick ends your turn: no reply, no more \
-     work.\n\n\
+     QUIET OPTIONS: start a label with `[quiet]` when that pick needs no work from you \
+     (`[quiet] Not now`), never when it promises some. The tag is hidden, and the pick ends \
+     your turn.\n\n\
      WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
      waiting. It parks the thread in the waiting-for-answer state, which is what lights the \
      Blocked badge, keeps the thread in the live working set, and can push a \
@@ -608,8 +608,8 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     choices only. An option carrying a decision you can act on is different and still welcome \
     (\"None of these\", \"Neither, ask me later\"); what is banned is one whose only meaning is \
     \"I will type it instead\". \
-    QUIET OPTIONS: pass `{label, quiet: true}` when that pick needs nothing more from you \
-    (\"Not now\"). Picking it ends your turn: no reply, no more work. \
+    QUIET OPTIONS: pass `{label, quiet: true}` when that pick needs no work from you \
+    (\"Not now\"), never when it promises some. Picking it ends your turn. \
     WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
     waiting. It parks the thread in the waiting-for-answer state, which lights the \
     Blocked badge, keeps the thread in the live working set, and can notify the user. A \

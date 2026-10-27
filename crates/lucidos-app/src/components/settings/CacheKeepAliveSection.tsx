@@ -10,8 +10,8 @@ import { Explainer } from '../shared/Explainer';
 import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 
 const CACHE_KEEP_ALIVE_COPY: Record<CacheKeepAliveMode, { label: string; description: string }> = {
-  default: {
-    label: 'Default',
+  'break-even': {
+    label: 'Break-even',
     description: 'Gives up once the pings cost one cache rewrite',
   },
   'workspace-data': {
@@ -66,17 +66,17 @@ export function CacheKeepAliveSection() {
             and asks for no reply. Either way the conversation stays as it is.
           </p>
           <p>
-            <strong>{CACHE_KEEP_ALIVE_COPY[DEFAULT_CACHE_KEEP_ALIVE].label}</strong> stops
+            <strong>{CACHE_KEEP_ALIVE_COPY['break-even'].label}</strong> stops
             once the pings would cost one rewrite, and at half of that for a card: an
             answer that late is rare.
           </p>
           <p>
             <strong>{CACHE_KEEP_ALIVE_COPY['workspace-data'].label}</strong> picks the stop
             point per kind of wait from this workspace's last 30 days. A kind with fewer
-            than 50 waits keeps the default.
+            than 50 waits keeps break-even.
           </p>
           <p>
-            <strong>{CACHE_KEEP_ALIVE_COPY.off.label}</strong> sends no pings.
+            <strong>{CACHE_KEEP_ALIVE_COPY.off.label}</strong>, the default, sends no pings.
           </p>
         </Explainer>
       </div>

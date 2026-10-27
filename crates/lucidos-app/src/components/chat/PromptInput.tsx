@@ -24,7 +24,7 @@ import { getDraft } from '../../store/composeDrafts';
 import { askSideQuestion, routeSideQuestion, sideQuestionModeOn } from '../../store/sideQuestions';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage, followSideQuestion } from './scrollState';
-import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, ReturnArrowIcon, SendArrowIcon, StopIcon, WarningIcon } from '../shared/icons';
+import { CaptureIcon, CheckIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon, WarningIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { closeControlMenus, codingAgentMenuOpenRequest, rungFoldOpenRequest } from './controlMenuRequests';
 import {
@@ -33,6 +33,7 @@ import {
 import { CODING_AGENT_MENU_FOLD_KEY, menuCodingAgent } from './ControlMenuTrigger';
 import { LazyRungControl } from './LazyRungControl';
 import { RUNG_FOLD_KEY, RungMenuIcon } from './RungButtons';
+import { rungLockedReason } from './rungLockedReason';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
 import { useComposerCompact } from '../../hooks/useComposerCompact';
@@ -1224,7 +1225,7 @@ export function PromptInput() {
       data-tooltip={uploadsBlocking ? 'Send after image upload' : 'Submit answer'}
       data-row-item
     >
-      <SlotFace icon={() => <ReturnArrowIcon />} label={submitLabel} />
+      <SlotFace icon={() => <CheckIcon />} label={submitLabel} />
     </button>
   ) : answerMode === 'cancel' ? (
     // Lone destructive Cancel — keep the scroll-vs-tap gate so an iOS PWA scroll
@@ -1261,9 +1262,9 @@ export function PromptInput() {
 
   // The rung control, for a coding agent and for the Lucidos Agent alike: a
   // pill beside the send button, with a step at each end.
-  // A pending question or permission card has its own answer control, so it
-  // carries no pill.
-  const showsRungControl = !answersCard;
+  const rungDisabledReason = answersCard
+    ? 'Answer or cancel the pending question or permission request before changing the model and effort'
+    : inComposeContext ? null : rungLockedReason(focusedStatus);
   // The banner's members: Diff, and the one control in the action slot. With
   // the banner suppressed the standalone pair stands in. So a branch with
   // commits always shows a Diff whatever the coding agent's run-state, and a
@@ -1423,13 +1424,14 @@ export function PromptInput() {
       promptCodingAgent, inComposeContext, focusedThread,
       sideQuestionRefusal === null ? sideQuestionToggleAction(sideQuestionMode, toggleSideQuestionMode) : null,
     ),
-    rung: showsRungControl ? {
+    rung: {
       key: RUNG_FOLD_KEY,
       dataRole: 'rung-control',
       label: 'Model and effort',
+      disabledTooltip: rungDisabledReason ?? undefined,
       icon: () => <RungMenuIcon />,
       onMenuClick: (anchor) => { if (anchor) rungFoldOpenRequest.value = anchor; },
-    } : null,
+    },
     situational: situationalActions,
   });
   const foldActions = [...members.row, ...members.cluster];
@@ -1476,6 +1478,7 @@ export function PromptInput() {
     ),
     [RUNG_FOLD_KEY]: (folded) => (
       <LazyRungControl
+        disabledReason={rungDisabledReason}
         threadId={promptCodingAgent === null ? focusedThreadId.value ?? undefined : codingAgentControlThreadId}
         composeThreadId={composeControlThreadId}
         composeContext={inComposeContext}

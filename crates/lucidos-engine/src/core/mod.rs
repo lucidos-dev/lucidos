@@ -849,6 +849,16 @@ pub fn is_path_traversal(path: &str) -> bool {
     path.contains("..") || path.starts_with('/') || path.starts_with('\\')
 }
 
+/// The path under `data/artifacts/` that a tool's save-path argument names.
+///
+/// Agents pass the data path they paste into chat (`artifacts/x.png`) as often
+/// as the artifact-relative one (`x.png`), so both name `x.png`. Taken
+/// literally, the first lands in `data/artifacts/artifacts/`, where no link
+/// the agent writes afterwards points.
+pub fn artifact_relative_path(path: &str) -> &str {
+    path.strip_prefix("artifacts/").unwrap_or(path)
+}
+
 /// Stage `repo_path` into `index`, unless git ignores it.
 ///
 /// `index.add_path` does NOT consult `.gitignore`. It stages whatever path it

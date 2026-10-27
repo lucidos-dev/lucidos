@@ -158,6 +158,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'access:add-device', label: 'Add a device', subview: 'access', path: 'Settings → Access', anchor: 'access:add-device', keywords: 'pair pairing code qr scan phone new device enrol add' },
   { id: 'access:tailscale', label: 'Tailscale', subview: 'access', path: 'Settings → Access', anchor: 'access:tailscale', keywords: 'tailscale tailnet vpn magicdns serve https sign in' },
   { id: 'access:network', label: 'Network access', subview: 'access', path: 'Settings → Access', anchor: 'access:network', keywords: 'network bind loopback lan address listen expose engine' },
+  { id: 'access:external-address', label: 'External address', subview: 'access', path: 'Settings → Access', anchor: 'access:external-address', keywords: 'external address pairing qr vpn wireguard zerotier netbird headscale reverse proxy domain origin' },
   // Its heading changes with the device's state, so the label names the section.
   { id: 'access:steps', label: 'Getting Lucidos onto a device', subview: 'access', path: 'Settings → Access', anchor: 'access:steps', keywords: 'install set up setup steps another device this device home screen' },
   { id: 'access:machine', label: 'The machine running Lucidos', subview: 'access', path: 'Settings → Access', anchor: 'access:machine', keywords: 'host machine tailscale tailnet serve https' },
@@ -199,6 +200,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:voice-talker-voice', label: 'Spoken voice', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'spoken voice sounds like speaker persona' },
   { id: 'models:voice-resident-sections', label: 'Resident context', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'resident context call knows voice sections' },
   ...VOICE_RESIDENT_SECTIONS.map((s): SettingsSearchEntry => ({ id: `models:voice-section-${s.id}`, label: s.title, subview: 'models', path: 'Settings → Models → Voice → Resident context', anchor: 'models:voice-enabled', keywords: 'voice resident context call knows' })),
+  { id: 'models:title-style', label: 'Title style', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-style', keywords: 'title style thread name naming kebab case format reset' },
   { id: 'models:change-summary', label: 'Change summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:change-summary', keywords: 'change summary pending change diff describe' },
   { id: 'models:summary-compaction', label: 'Summary compaction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:summary-compaction', keywords: 'summary compaction compactor tree memory', when: () => currentMemoryModule() === 'tree' },
   { id: 'models:response-style-picker', label: 'Style', subview: 'models', path: 'Settings → Models → Response style', anchor: 'models:response-style-picker', keywords: 'response style pick choose preset library' },

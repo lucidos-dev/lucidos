@@ -79,7 +79,7 @@ describe('Mobile Access reachability', () => {
     // The tailnet rows are derived from the two plain-HTTP reads, never from
     // the bridge, which is what lets them render with no Tauri at all.
     expect(page).toContain('tailnetConnectRows({');
-    expect(page).toContain('workspaceServeUrl: tailnet.workspace_serve_url');
+    expect(page).toContain('workspaceServeUrl: status.workspace_serve_url');
   });
 
   it('renders the Connect URLs anchor in every state, not only when loaded', () => {
@@ -110,6 +110,7 @@ describe('Mobile Access reachability', () => {
     // slug-agnostic; a literal slug here would be the regression.
     expect(page).toContain('workspaceUrlAt(connect.localhost_url, SCOPE_PATH)');
     expect(page).toContain('workspaceUrlAt(lan.url, SCOPE_PATH)');
+    expect(page).toContain('workspaceUrlAt(external, SCOPE_PATH)');
     expect(page).toContain('scope: SCOPE_PATH');
   });
 
@@ -161,7 +162,7 @@ describe('Mobile Access reachability', () => {
     expect(page).toContain('deviceSetupState(');
     expect(page).toContain('window.location.hostname');
     expect(page).toContain('isStandalone()');
-    expect(page).toContain('hostTailnetState(netConfig)');
+    expect(page).toContain('hostTailnetState(netConfig, ');
     // Whether the app CAN be installed here is a separate fact from whether
     // Tailscale is connected, and a hardcoded `true` would put the page back to
     // naming an install control that plain HTTP never offers.

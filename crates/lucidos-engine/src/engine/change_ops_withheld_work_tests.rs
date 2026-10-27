@@ -228,88 +228,82 @@ async fn unhardened_work_is_held_but_a_plan_alone_is_not() {
     teardown_test_db(&db).await;
 }
 
-/// The turn that hands off still holds its unhardened work, but announces no
-/// verdict: its successor session owes the harden, and that session's turn end
-/// decides. Once the successor session starts, the hold announces again.
+/// A turn that handed off withdraws the pending change even when it still
+/// carries all the work. So no Apply or Review shows before the successor
+/// session starts. Nothing is announced. A branch with no open change gets no
+/// write, and a set-aside change the branch has not moved past stays put.
 #[tokio::test]
-async fn a_pending_handoff_holds_the_work_but_announces_no_verdict() {
-    use crate::engine::git_ops::{record_planned, PlanMarkerKind};
-    use crate::engine::thread_events::{HandoffOpening, SessionContinuity};
-
+async fn handed_off_work_withdraws_the_pending_change_unannounced() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let (_tmp, repo, thread_id) = thread_with_work(&bus).await;
-    let repo_str = repo.to_string_lossy().to_string();
-    record_planned(
-        &pool,
-        &repo,
-        BRANCH,
-        PlanMarkerKind::Planned,
-        None,
-        None,
-        &[],
-        "abc",
-    )
-    .await
-    .expect("mark planned");
-    let code = files(&["a.txt"]);
-    let message = "A fresh session starts here.";
-    emit(
-        &bus,
-        thread_id,
-        ThreadEvent::SessionHandedOff {
-            opening: HandoffOpening::Narrative,
-            message: message.into(),
-            checkpoint: Some("pre-harden".into()),
-            progress: None,
-            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-            coding_agent_model: None,
-            reasoning_effort: None,
-            request: None,
-        },
-    )
-    .await;
+    let plan = files(&["docs/plans/x.md"]);
+    let change_id = Uuid::new_v4();
+    emit(&bus, thread_id, proposed(change_id, "plan", &plan, false)).await;
 
-    let hold = hold_of(&pool, &bus, &input(thread_id, &repo_str, "work", &code)).await;
-    assert_eq!(hold, Some(ProposalHold::HardeningMissing));
+    let withdrew = withhold_handed_off_work(&pool, &bus, thread_id, &repo, BRANCH)
+        .await
+        .expect("withhold");
+
+    assert!(withdrew);
+    assert_eq!(status_of(&pool, change_id).await, ChangeStatus::Withdrawn);
     assert!(payloads(&pool, thread_id, "ProposalWithheld")
         .await
         .is_empty());
-    assert_ne!(
+    assert_eq!(
         read_change_state(&pool, thread_id).await,
-        CodingAgentChangeState::Unproposed {
-            reason: Some(UnproposedReason::HardeningMissing)
-        },
-        "no Not ready strip before the successor session starts"
+        CodingAgentChangeState::Unproposed { reason: None },
+        "no Apply, Review or Not ready strip before the successor session starts"
     );
+    assert!(
+        !withhold_handed_off_work(&pool, &bus, thread_id, &repo, BRANCH)
+            .await
+            .expect("withhold")
+    );
+    assert_eq!(payloads(&pool, thread_id, "ChangeWithdrawn").await.len(), 1);
 
+    // The idle that set it aside recorded the head it covers.
+    let parked = Uuid::new_v4();
+    emit(&bus, thread_id, proposed(parked, "plan", &plan, true)).await;
     emit(
         &bus,
         thread_id,
-        ThreadEvent::SessionStarted {
+        ThreadEvent::CodingAgentIdled {
+            has_changes: true,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
-            session_id: "successor-session".into(),
-            branch: BRANCH.into(),
-            repo_id: None,
-            coding_agent_kind: Default::default(),
-            coding_agent_folder: String::new(),
-            app_id: None,
-            integrated: false,
-            auto_compact_window: None,
-            auto_compact_arm: None,
-            continuity: Some(SessionContinuity::Handoff {
-                checkpoint: Some("pre-harden".into()),
-                progress: None,
-                opening: HandoffOpening::Narrative,
-                message: message.into(),
-            }),
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: Some(branch_head(&repo).await),
+            bg_bash_pending: false,
         },
     )
     .await;
-    hold_of(&pool, &bus, &input(thread_id, &repo_str, "work", &code)).await;
-    let withheld = payloads(&pool, thread_id, "ProposalWithheld").await;
-    assert_eq!(withheld.len(), 1, "{withheld:?}");
-    assert_eq!(withheld[0]["reason"], "hardening_missing");
+    assert!(
+        !withhold_handed_off_work(&pool, &bus, thread_id, &repo, BRANCH)
+            .await
+            .expect("withhold")
+    );
+    assert_eq!(
+        status_of(&pool, parked).await,
+        ChangeStatus::SetAside,
+        "a set-aside change stays where the user put it"
+    );
+
+    // A turn that committed past it withdraws it, or Apply would merge
+    // commits it never covered.
+    let wt = repo.parent().unwrap().join("wt");
+    std::fs::write(wt.join("b.txt"), "more").unwrap();
+    git_cmd(&["add", "."], &wt).await.unwrap();
+    git_cmd(&["commit", "-m", "more"], &wt).await.unwrap();
+    assert!(
+        withhold_handed_off_work(&pool, &bus, thread_id, &repo, BRANCH)
+            .await
+            .expect("withhold")
+    );
+    assert_eq!(status_of(&pool, parked).await, ChangeStatus::Withdrawn);
 
     pool.close().await;
     teardown_test_db(&db).await;

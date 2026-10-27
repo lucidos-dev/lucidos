@@ -54,20 +54,20 @@
 # says what became worth paying for on every request. Set to the measured total
 # at the time of writing, so the gate starts exactly where the tree does.
 # shellcheck disable=SC2034 # read by scripts/check-context-budget.sh, which sources this file
-CONTEXT_BUDGET_CEILING=49632
+CONTEXT_BUDGET_CEILING=51150
 
 # Every file that is allowed to be resident, relative to the repo root. An
 # unscoped rule not on this list fails the membership arm even when the total is
 # comfortably under the ceiling. Adding a name here is the deliberate act of
 # saying "this must be in front of the agent before it touches any file".
 #
-# `CLAUDE.md` plus the six rules that genuinely cannot be gated on a path:
+# `CLAUDE.md` plus rules that genuinely cannot be gated on a path:
 # safety rules and rules that govern prose and chat replies as well as code.
-# Each one states its own reason in its opening line; see also
-# `.claude/rules/` and the always-loaded section of `CLAUDE.md`.
+# Each rule states why it always loads; see `.claude/rules/`.
 # shellcheck disable=SC2034 # read by scripts/check-context-budget.sh, which sources this file
 CONTEXT_BUDGET_EXPECTED_ALWAYS=(
     "CLAUDE.md"
+    ".claude/rules/build-for-users.md"
     ".claude/rules/glossary.md"
     ".claude/rules/em-dashes.md"
     ".claude/rules/no-private-data.md"

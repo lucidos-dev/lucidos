@@ -14,7 +14,8 @@
 //!      its own destructive control plane, so a default launch is never exposed).
 //!
 //! This file ALSO owns reading + writing `network.toml` (the picker's machine-
-//! global Network access control writes it through the gateway control plane).
+//! global Network access control writes it through the gateway control plane),
+//! and resolving the *external address* stored beside the bind (ADR 0550).
 //! The per-workspace engine half — `[engine] inherit` and each engine's own
 //! `network_bind` preference — is resolved in
 //! `crates/lucidos-engine/src/net_config.rs`. The **bind resolution** in the two
@@ -25,6 +26,7 @@
 //! which is small enough for the gateway to depend on.
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
@@ -47,6 +49,12 @@ pub struct NetworkToml {
     /// `[engine] inherit` — true (default) = engines bind the gateway's bind;
     /// false = each engine reads its own `network_bind` preference.
     pub engine_inherit: bool,
+    /// `[external_address]`: per gateway port, the origin other devices reach
+    /// that gateway at, through a route the user runs (ADR 0550). Keyed by
+    /// port because this file is machine-global and two gateways can run on
+    /// one machine: a QR aimed at the other one carries a code it never
+    /// minted. Every value is one [`valid_external_address`] accepted.
+    pub external_addresses: BTreeMap<u16, String>,
 }
 
 impl Default for NetworkToml {
@@ -54,6 +62,7 @@ impl Default for NetworkToml {
         NetworkToml {
             gateway_bind: None,
             engine_inherit: true,
+            external_addresses: BTreeMap::new(),
         }
     }
 }
@@ -62,6 +71,8 @@ impl Default for NetworkToml {
 struct RawNetworkToml {
     gateway: Option<RawGateway>,
     engine: Option<RawEngine>,
+    /// Values stay untyped, so one bad entry drops itself and not the file.
+    external_address: Option<BTreeMap<String, toml::Value>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -93,13 +104,17 @@ pub fn network_toml_exists() -> bool {
 
 /// Read + parse the machine-global config. Any failure yields safe defaults.
 pub fn read_network_toml() -> NetworkToml {
-    let Some(path) = network_toml_path() else {
-        return NetworkToml::default();
-    };
-    match std::fs::read_to_string(&path) {
+    match network_toml_path() {
+        Some(path) => read_network_toml_at(&path),
+        None => NetworkToml::default(),
+    }
+}
+
+fn read_network_toml_at(path: &Path) -> NetworkToml {
+    match std::fs::read_to_string(path) {
         Ok(contents) => parse_network_toml(&contents),
         Err(e) => {
-            if let Some(warning) = read_failure_warning(&path, &e) {
+            if let Some(warning) = read_failure_warning(path, &e) {
                 crate::log!("{warning}");
             }
             NetworkToml::default()
@@ -127,6 +142,12 @@ pub fn parse_network_toml(contents: &str) -> NetworkToml {
         Ok(raw) => NetworkToml {
             gateway_bind: raw.gateway.and_then(|g| g.bind),
             engine_inherit: raw.engine.map(|e| e.inherit).unwrap_or(true),
+            external_addresses: raw
+                .external_address
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(port, origin)| parse_external_entry(&port, &origin))
+                .collect(),
         },
         Err(e) => {
             crate::log!(
@@ -138,8 +159,25 @@ pub fn parse_network_toml(contents: &str) -> NetworkToml {
 }
 
 /// Render the config file with explanatory comments (the `toml` crate's
-/// serializer drops comments, so we template it).
-pub fn render_network_toml(gateway_bind: &str, engine_inherit: bool) -> String {
+/// serializer drops comments, so we template it). An unset bind renders as
+/// loopback, which is what it resolves to.
+///
+/// `scripts/lib/service.sh` (`service_render_network_toml`) writes the same
+/// shape, so keep the two in step.
+pub fn render_network_toml(net: &NetworkToml) -> String {
+    let gateway_bind = net.gateway_bind.as_deref().unwrap_or("loopback");
+    let engine_inherit = net.engine_inherit;
+    // A validated origin holds no quote or backslash, so it needs no escaping.
+    let external_table = if net.external_addresses.is_empty() {
+        String::new()
+    } else {
+        let entries: String = net
+            .external_addresses
+            .iter()
+            .map(|(port, origin)| format!("{port} = \"{origin}\"\n"))
+            .collect();
+        format!("\n[external_address]\n{entries}")
+    };
     format!(
         "# Lucidos machine-level network bind configuration.\n\
          # Read at process start by the gateway AND every directly-launched\n\
@@ -152,23 +190,187 @@ pub fn render_network_toml(gateway_bind: &str, engine_inherit: bool) -> String {
          # [engine].inherit  true  = every workspace engine binds the gateway's\n\
          #                          bind; false = each engine reads its own\n\
          #                          per-workspace bind (Settings -> Network access).\n\
+         # [external_address]  optional, per gateway port: the origin other\n\
+         #                  devices reach that gateway at, such as\n\
+         #                  5252 = \"https://lucidos.example.com\". It goes in\n\
+         #                  the pairing QR, and is read live (no restart).\n\
          \n\
          [gateway]\n\
          bind = \"{gateway_bind}\"\n\
          \n\
          [engine]\n\
-         inherit = {engine_inherit}\n"
+         inherit = {engine_inherit}\n\
+         {external_table}"
     )
 }
 
-/// Write `network.toml` atomically (temp + rename), asserting the Lucidos home
-/// as a storage root first. Values are assumed already validated by
-/// [`validate_bind_input`].
-pub fn write_network_toml(gateway_bind: &str, engine_inherit: bool) -> std::io::Result<()> {
-    let path = lucidos_home::ensure()?.join("network.toml");
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, render_network_toml(gateway_bind, engine_inherit))?;
-    std::fs::rename(&tmp, &path)
+/// The lock every `network.toml` writer holds across its read-modify-write.
+/// `service_write_network_toml` in `scripts/lib/service.sh` takes it too.
+pub const NETWORK_TOML_LOCK: &str = "network.toml.lock";
+
+/// Change `network.toml` in place, asserting the Lucidos home as a storage
+/// root first. Values are assumed already validated by [`validate_bind_input`]
+/// and [`valid_external_address`].
+pub fn update_network_toml(change: impl FnOnce(&mut NetworkToml)) -> std::io::Result<()> {
+    update_network_toml_in(&lucidos_home::ensure()?, change)
+}
+
+/// Two gateways share the file, so the read, the change and the write happen
+/// under one lock, or each could drop the other's entry. The write is atomic
+/// through a temp file of its own.
+fn update_network_toml_in(
+    dir: &Path,
+    change: impl FnOnce(&mut NetworkToml),
+) -> std::io::Result<()> {
+    use fs2::FileExt;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(NETWORK_TOML_LOCK))?;
+    lock.lock_exclusive()?;
+    let path = dir.join("network.toml");
+    let mut net = read_network_toml_at(&path);
+    change(&mut net);
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut tmp, render_network_toml(&net).as_bytes())?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// The environment variable that sets the external address and locks it.
+pub const EXTERNAL_ADDRESS_ENV: &str = "LUCIDOS_EXTERNAL_ADDRESS";
+
+/// Accept `raw` as an external address, or say why not.
+///
+/// An origin only, by the same rule as a pairing QR origin
+/// ([`crate::pairing_qr::valid_origin`]). A loopback host is refused as well:
+/// it reaches this machine alone, so the probe would verify an address no
+/// other device can open.
+pub fn valid_external_address(raw: &str) -> Result<String, String> {
+    let origin = crate::pairing_qr::valid_origin(raw).ok_or_else(|| {
+        format!(
+            "'{}' is not an origin. Use a scheme, a host and an optional port, \
+             such as https://lucidos.example.com or http://10.8.0.2:5252, with no path",
+            raw.trim()
+        )
+    })?;
+    // Judge the host as the HTTP client will read it, so `127.1` or
+    // `[::ffff:127.0.0.1]` cannot pass as a name.
+    let parsed = reqwest::Url::parse(origin)
+        .map_err(|e| format!("'{origin}' is not an origin the gateway can open ({e})"))?;
+    let host = parsed.host_str().unwrap_or_default();
+    let ip = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .ok()
+        .map(|ip| ip.to_canonical());
+    let loopback = host == "localhost"
+        || host.ends_with(".localhost")
+        || ip.is_some_and(|ip| ip.is_loopback());
+    if loopback {
+        return Err(format!(
+            "'{origin}' only reaches this machine. Use an address other devices can open"
+        ));
+    }
+    // No VPN hands out these, and the save probe must not reach a cloud
+    // metadata service at 169.254.169.254.
+    let unroutable = ip.is_some_and(|ip| match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_unicast_link_local() || v6.is_unspecified(),
+    });
+    if unroutable {
+        return Err(format!(
+            "'{origin}' is a link-local or unspecified address, which no other device can open"
+        ));
+    }
+    Ok(origin.to_string())
+}
+
+/// One `[external_address]` entry, or `None` with a log line when the port or
+/// the origin is refused.
+fn parse_external_entry(port: &str, origin: &toml::Value) -> Option<(u16, String)> {
+    let Ok(port) = port.parse::<u16>() else {
+        crate::log!("[NetConfig] ignoring external address key '{port}': not a gateway port");
+        return None;
+    };
+    let Some(origin) = origin.as_str() else {
+        crate::log!("[NetConfig] ignoring the external address for port {port}: not a string");
+        return None;
+    };
+    let origin = external_address_or_warn(origin, "~/.lucidos/network.toml")?;
+    Some((port, origin))
+}
+
+/// [`valid_external_address`] for a value read from `source`: a refused one is
+/// logged and reads as unset, like an invalid bind.
+fn external_address_or_warn(raw: &str, source: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    valid_external_address(raw)
+        .map_err(|why| crate::log!("[NetConfig] ignoring the external address in {source}: {why}"))
+        .ok()
+}
+
+/// Where the external address in effect came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExternalAddressSource {
+    /// Nothing sets one.
+    Unset,
+    /// `~/.lucidos/network.toml`, which Settings and the CLI write.
+    File,
+    /// [`EXTERNAL_ADDRESS_ENV`], which locks every writer out.
+    Env,
+}
+
+/// The external address in effect, and who set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAddress {
+    pub origin: Option<String>,
+    pub source: ExternalAddressSource,
+}
+
+impl ExternalAddress {
+    /// The environment variable owns the value, so a write must be refused.
+    pub fn locked(&self) -> bool {
+        self.source == ExternalAddressSource::Env
+    }
+}
+
+/// Resolve the external address. Pure: the caller supplies the environment
+/// value and the file's value.
+///
+/// A valid environment value wins and locks. An empty one is unset, and an
+/// invalid one is logged and ignored, as an invalid bind address is.
+pub fn resolve_external_address(env: Option<&str>, file: Option<&str>) -> ExternalAddress {
+    if let Some(origin) = env.and_then(|raw| external_address_or_warn(raw, EXTERNAL_ADDRESS_ENV)) {
+        return ExternalAddress {
+            origin: Some(origin),
+            source: ExternalAddressSource::Env,
+        };
+    }
+    match file {
+        Some(origin) => ExternalAddress {
+            origin: Some(origin.to_string()),
+            source: ExternalAddressSource::File,
+        },
+        None => ExternalAddress {
+            origin: None,
+            source: ExternalAddressSource::Unset,
+        },
+    }
+}
+
+/// [`resolve_external_address`] for the gateway on `port`, over this
+/// process's environment and the current `network.toml`.
+pub fn external_address(port: u16) -> ExternalAddress {
+    let net = read_network_toml();
+    resolve_external_address(
+        std::env::var(EXTERNAL_ADDRESS_ENV).ok().as_deref(),
+        net.external_addresses.get(&port).map(String::as_str),
+    )
 }
 
 /// Map a config string to a [`BindChoice`]; unparseable → warn + loopback.
@@ -366,22 +568,20 @@ pub fn bind_scope_label(choice: &BindChoice) -> String {
     }
 }
 
-/// Best-effort detection of this machine's Tailscale `100.x` IPv4, for the
-/// picker's Network access hint. `None` when Tailscale is absent or logged out.
+/// This machine's tailnet IPv4 as Tailscale reports it, for the picker's
+/// Network access hint. `None` when Tailscale is absent, not joined, or holds
+/// no such address on this host (userspace networking).
 ///
 /// **A display hint only.** It never influences what this process binds to; the
 /// resolvers above own that, and they fail safe to loopback.
 ///
-/// Reads the interface list rather than running `tailscale ip -4`. The spawn was
-/// the whole problem: the packaged gateway is started by Finder/launchd with
-/// **no `PATH` at all**, so the bare name never resolved, the picker offered no
-/// address to click, and Tailnet / IP became unselectable because an empty
-/// address is not a valid bind. Absolute-path resolution fixed that on
-/// 2026-07-31, but the deeper answer is that a machine already on a tailnet can
-/// simply be asked, at the cost of two syscalls and no CLI whatsoever. See
-/// `lucidos-tailscale`.
-pub fn detect_tailscale_ipv4() -> Option<String> {
-    lucidos_tailscale::tailnet_ipv4().map(|ip| ip.to_string())
+/// Asking Tailscale is bounded blocking I/O, so it runs off the async workers.
+pub async fn detect_tailscale_ipv4() -> Option<String> {
+    tokio::task::spawn_blocking(lucidos_tailscale::bindable_tailnet_ipv4)
+        .await
+        .ok()
+        .flatten()
+        .map(|ip| ip.to_string())
 }
 
 #[cfg(test)]
@@ -445,15 +645,216 @@ mod tests {
 
     #[test]
     fn render_then_parse_roundtrips() {
-        let rendered = render_network_toml(TAILNET, false);
-        let parsed = parse_network_toml(&rendered);
-        assert_eq!(parsed.gateway_bind.as_deref(), Some(TAILNET));
-        assert!(!parsed.engine_inherit);
+        let configs = [
+            NetworkToml {
+                gateway_bind: Some(TAILNET.to_string()),
+                engine_inherit: false,
+                external_addresses: BTreeMap::new(),
+            },
+            NetworkToml {
+                gateway_bind: Some("loopback".to_string()),
+                engine_inherit: true,
+                external_addresses: BTreeMap::from([(
+                    5252,
+                    "https://lucidos.example.com".to_string(),
+                )]),
+            },
+            NetworkToml {
+                gateway_bind: Some("all".to_string()),
+                engine_inherit: true,
+                external_addresses: BTreeMap::from([
+                    (5251, "http://[2001:db8::2]:5251".to_string()),
+                    (5252, "http://10.8.0.2:5252".to_string()),
+                ]),
+            },
+        ];
+        for net in configs {
+            assert_eq!(parse_network_toml(&render_network_toml(&net)), net);
+        }
+    }
 
-        let rendered2 = render_network_toml("loopback", true);
-        let parsed2 = parse_network_toml(&rendered2);
-        assert_eq!(parsed2.gateway_bind.as_deref(), Some("loopback"));
-        assert!(parsed2.engine_inherit);
+    #[test]
+    fn an_unset_bind_renders_as_the_loopback_it_resolves_to() {
+        let rendered = render_network_toml(&NetworkToml::default());
+        assert_eq!(
+            parse_network_toml(&rendered).gateway_bind.as_deref(),
+            Some("loopback")
+        );
+        assert!(!rendered.contains("\n[external_address]"), "{rendered}");
+    }
+
+    /// Two gateways share this file, so each reads only its own port's entry.
+    #[test]
+    fn each_gateway_reads_only_its_own_external_address() {
+        let parsed = parse_network_toml(
+            "[gateway]\nbind = \"all\"\n\n[external_address]\n\
+             5252 = \"https://lucidos.example.com\"\n",
+        );
+        let ours = parsed.external_addresses.get(&5252).map(String::as_str);
+        assert_eq!(
+            resolve_external_address(None, ours).origin.as_deref(),
+            Some("https://lucidos.example.com")
+        );
+        let other = parsed.external_addresses.get(&5251).map(String::as_str);
+        assert_eq!(resolve_external_address(None, other).origin, None);
+    }
+
+    /// A hand-edited entry that is not a string must not cost the bind.
+    #[test]
+    fn a_non_string_external_address_drops_only_itself() {
+        let parsed = parse_network_toml(
+            "[gateway]\nbind = \"all\"\n\n[external_address]\n\
+             5251 = 5251\n5252 = \"https://lucidos.example.com\"\n",
+        );
+        assert_eq!(parsed.gateway_bind.as_deref(), Some("all"));
+        assert_eq!(
+            parsed.external_addresses,
+            BTreeMap::from([(5252, "https://lucidos.example.com".to_string())])
+        );
+    }
+
+    /// Two gateways saving at once must each keep the other's entry. flock
+    /// binds to an open file, so threads stand in for processes here.
+    #[test]
+    fn concurrent_writers_keep_every_gateways_entry() {
+        let home = tempfile::tempdir().unwrap();
+        let writers: Vec<_> = (0..8u16)
+            .map(|i| {
+                let dir = home.path().to_path_buf();
+                std::thread::spawn(move || {
+                    for round in 0..20 {
+                        update_network_toml_in(&dir, |net| {
+                            net.external_addresses
+                                .insert(5000 + i, format!("https://gw{i}-{round}.example.com"));
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let net = read_network_toml_at(&home.path().join("network.toml"));
+        let ports: Vec<u16> = net.external_addresses.keys().copied().collect();
+        assert_eq!(ports, (5000..5008).collect::<Vec<_>>());
+        assert_eq!(net.external_addresses[&5003], "https://gw3-19.example.com");
+    }
+
+    #[test]
+    fn a_stored_external_address_that_is_not_an_origin_reads_as_unset() {
+        for bad in [
+            "https://lucidos.example.com/path",
+            "lucidos.example.com",
+            "ftp://lucidos.example.com",
+            "http://127.0.0.1:5252",
+        ] {
+            let parsed = parse_network_toml(&format!(
+                "[gateway]\nbind = \"all\"\n\n[external_address]\n\
+                 5252 = \"{bad}\"\n5251 = \"https://lucidos.example.com\"\n"
+            ));
+            assert_eq!(parsed.external_addresses.get(&5252), None, "{bad}");
+            // The rest of the file still counts.
+            assert_eq!(parsed.gateway_bind.as_deref(), Some("all"), "{bad}");
+            assert!(parsed.external_addresses.contains_key(&5251), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_external_address_under_a_key_that_is_no_port_is_ignored() {
+        let parsed = parse_network_toml(
+            "[external_address]\nmain = \"https://lucidos.example.com\"\n\
+             99999 = \"https://lucidos.example.com\"\n",
+        );
+        assert!(parsed.external_addresses.is_empty(), "{parsed:?}");
+    }
+
+    #[test]
+    fn an_external_address_is_an_origin_only() {
+        for good in [
+            "https://lucidos.example.com",
+            " http://10.8.0.2:5252 ",
+            "https://mymac.example-tailnet.test",
+            "http://[2001:db8::2]:5252",
+        ] {
+            assert_eq!(valid_external_address(good), Ok(good.trim().to_string()));
+        }
+        for bad in [
+            "",
+            "https://lucidos.example.com/",
+            "https://lucidos.example.com/lucidos",
+            "https://user@lucidos.example.com",
+            "https://lucidos.example.com?x=1",
+            "lucidos.example.com:5252",
+            "http://10.8.0.2:99999",
+        ] {
+            assert!(valid_external_address(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_external_address_is_refused() {
+        for bad in [
+            "http://127.0.0.1:5252",
+            "http://127.4.5.6",
+            "http://localhost:5252",
+            "https://app.localhost",
+            "http://[::1]:5252",
+            // The forms an HTTP client reads as 127.0.0.1.
+            "http://127.1:5252",
+            "http://2130706433:5252",
+            "http://0x7f.1",
+            "http://[::ffff:127.0.0.1]:5252",
+        ] {
+            let why = valid_external_address(bad).expect_err(bad);
+            assert!(why.contains("only reaches this machine"), "{bad}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_link_local_or_unspecified_external_address_is_refused() {
+        for bad in [
+            "http://169.254.169.254",
+            "http://169.254.3.4:5252",
+            "http://0.0.0.0:5252",
+            "http://[fe80::1]:5252",
+            "http://[::]:5252",
+            "http://0:5252",
+            "http://169.254.43518",
+            "http://[::ffff:169.254.169.254]",
+        ] {
+            let why = valid_external_address(bad).expect_err(bad);
+            assert!(why.contains("link-local or unspecified"), "{bad}: {why}");
+        }
+    }
+
+    #[test]
+    fn the_environment_variable_wins_and_locks() {
+        let file = Some("https://file.example.com");
+        let env = resolve_external_address(Some("https://env.example.com"), file);
+        assert_eq!(env.origin.as_deref(), Some("https://env.example.com"));
+        assert_eq!(env.source, ExternalAddressSource::Env);
+        assert!(env.locked());
+
+        let from_file = resolve_external_address(None, file);
+        assert_eq!(from_file.origin.as_deref(), file);
+        assert_eq!(from_file.source, ExternalAddressSource::File);
+        assert!(!from_file.locked());
+
+        let unset = resolve_external_address(None, None);
+        assert_eq!(unset.origin, None);
+        assert_eq!(unset.source, ExternalAddressSource::Unset);
+        assert!(!unset.locked());
+    }
+
+    #[test]
+    fn an_empty_or_invalid_environment_value_neither_wins_nor_locks() {
+        let file = Some("https://file.example.com");
+        for env in ["", "   ", "not an origin", "https://env.example.com/path"] {
+            let resolved = resolve_external_address(Some(env), file);
+            assert_eq!(resolved.origin.as_deref(), file, "{env:?}");
+            assert!(!resolved.locked(), "{env:?}");
+        }
     }
 
     #[test]

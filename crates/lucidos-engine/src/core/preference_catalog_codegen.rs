@@ -25,6 +25,7 @@ fn type_name(value: PrefValue) -> &'static str {
         PrefValue::CodingAgentModel(_) => "coding-agent-model",
         PrefValue::IanaTimezone
         | PrefValue::Text
+        | PrefValue::Instruction { .. }
         | PrefValue::ThemeId
         | PrefValue::ModelBytes
         | PrefValue::ModelEfforts
@@ -88,6 +89,15 @@ pub(crate) fn render() -> String {
             }
             PrefValue::Number { min, max } => {
                 out.push_str(&format!("  min: {min},\n  max: {max},\n"));
+            }
+            PrefValue::Instruction {
+                max_chars,
+                standard,
+            } => {
+                out.push_str(&format!(
+                    "  maxChars: {max_chars},\n  standard: {},\n",
+                    quoted(standard)
+                ));
             }
             _ => {}
         }

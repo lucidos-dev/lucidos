@@ -12,9 +12,8 @@ const settingsView: string = readFileSync(resolve(here, '../SettingsView.tsx'), 
 /** The Command safety section says which agent's commands it reaches, because
  *  nothing else on the page does and the answer is not the obvious one. The
  *  guard covers the Lucidos Agent's own tools. A coding agent's permissions
- *  live in the two lists below it, and a Codex sandbox escape asks on its own
- *  whatever this section says. The one overlap is the LLM judge, which places
- *  an ambiguous Codex escape only while the master toggle is on.
+ *  live in the two lists below it. With the master toggle on, the guard also
+ *  judges coding-agent commands, unless the coding-agents child is off.
  *
  *  Asserted over WHITESPACE-COLLAPSED source, so a reflow of the JSX cannot
  *  fail a claim that is still on the page. What each assertion pins is the
@@ -48,9 +47,13 @@ describe('Settings → Permissions: the Command safety explainer', () => {
     expect(body).toMatch(/side-effect grant it declared/);
   });
 
-  it('says a coding agent is not covered, and where its permissions are', () => {
-    expect(body).toMatch(/does not gate a coding agent's tools/);
+  /** `command_guard_coding_agents` defaults on, so turning the guard on also
+   *  answers coding-agent commands. Copy that said "by default it does not"
+   *  promised cards the guard no longer raises. */
+  it('says when a coding agent is covered, and where its permissions are', () => {
+    expect(body).toMatch(/With the guard off, it does not gate a coding agent's tools/);
     expect(body).toMatch(/Claude Code asks through its own permissions list below/);
+    expect(body).toMatch(/With the guard on, it also judges those commands, unless you turn off Enabled for coding agents/);
   });
 
   /** Two exceptions send a Codex escape through without a card, and only one

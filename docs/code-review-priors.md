@@ -13,6 +13,16 @@ invalidates an entry, delete it in the same commit. Deliberate design *no*s
 with deeper rationale live in `docs/adr/`; this file is for the smaller
 "looks wrong, isn't" patterns that don't warrant an ADR.
 
+## CLI
+
+- **The connection retry window bounds when attempts may start.** A reviewer
+  asks for a final attempt after the last backoff reaches the deadline.
+  `ConnectRetry` deliberately checks the elapsed time after sleeping, so it
+  never starts another attempt once the window expires.
+  An attempt already in flight keeps its command's response deadline.
+  Re-flag only if a new attempt starts after the window expires.
+  (`crates/lucidos-cli/src/http.rs`, `system-knowhow/lucidos-cli.md`.)
+
 ## Repository gates
 
 - **Codegen checks coverage on the test executables that contain its writers.**
@@ -36,6 +46,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if a marker conceals current terminology or a changed identifier.
 
 ## Rust engine
+
+- **A beat without usable usage cannot prove it held the context.** The
+  keep-alive latch deliberately fails closed when a capture has missing or
+  zero input. `held_context` and its SQL form both require positive input
+  before comparing the read share (ADR 0581). Excluding those captures would
+  re-arm an unproven run. Copy completion logs only reported usage; the next
+  tick handles captures without usage. Re-flag only if missing evidence
+  permits another beat, or SQL and Rust disagree on the held predicate.
 
 - **A withdrawn input is never read afterwards.** A reviewer reports that a
   child report a take withdrew can still be read, since it stays in the input
@@ -3219,6 +3237,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Scripts (bash)
 
+- **Linux PostgreSQL needs collection before and after a fresh pgvector build.**
+  A reviewer proposes moving collection after the conditional extension build.
+  `pg_config --sharedir` executes before that build and requires PostgreSQL's shared libraries too.
+  The first collection makes it runnable; the second covers newly built extensions.
+  Re-flag if PostgreSQL supplies a standalone `pg_config` without those dependencies.
+  (`scripts/lib/stage_runtime.sh`, ADR 0577.)
+
 - **A cargo test command may carry several name filters.** A reviewer reports
   that `test-engine.sh -- -- --exact a b` fails because libtest accepts one
   positional filter. libtest takes any number, and `--exact` applies to each,
@@ -4658,3 +4683,10 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   exact `yes` and `no` commands buys nothing. Re-flag only with a Claude Code
   release that matches a prefix across an operator.
   (`crates/lucidos-engine/src/engine/claude_code/mod.rs`.)
+
+- **A paused provider's reason belongs in `SETTING_CANNOT_APPLY`.** A reviewer
+  reads `pings_paused` there as hiding a setting that still applies once the
+  pause ends. The set names reasons no setting changes *now*, and it already
+  holds the temporary `provider_paused` and the historical `prefill_paused`. The link's only
+  lead for such a reason would be "Set up the keep-alive in", which misreads a
+  pause. (`crates/lucidos-app/src/components/chat/CacheKeepAlive.tsx`.)

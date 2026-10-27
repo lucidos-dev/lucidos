@@ -74,6 +74,41 @@ pub enum TriggerInvocation {
     },
 }
 
+/// Provenance and admission deadline for a fresh fire retrying an interrupted thread.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryOf {
+    pub thread_id: uuid::Uuid,
+    pub deadline: chrono::DateTime<chrono::Utc>,
+}
+
+/// The durable retry decision reported on an interrupted fire.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FireRetry {
+    Queued {
+        entry_id: uuid::Uuid,
+        deadline: chrono::DateTime<chrono::Utc>,
+    },
+    Skipped {
+        reason: RetrySkipReason,
+    },
+}
+
+/// The first eligibility rule that prevented an interrupted fire's retry.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrySkipReason {
+    AlreadyRetried,
+    FireCompleted,
+    SpawnedWork,
+    TooOld,
+    LaterSlotDue,
+    NewerFire,
+    TriggerUnavailable,
+    RequestUnavailable,
+    AlreadyQueued,
+}
+
 #[cfg(test)]
 mod channel_tests {
     use super::*;

@@ -220,7 +220,9 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
         ContextPurpose::JudgeTool | ContextPurpose::WebSearch => {
             return AuxModelSource::BackendPinned
         }
-        ContextPurpose::Proxy => return AuxModelSource::CallerChosen,
+        ContextPurpose::Proxy | ContextPurpose::PrefillProbe => {
+            return AuxModelSource::CallerChosen
+        }
         ContextPurpose::IntentLoop
         | ContextPurpose::MemoryCorrection
         | ContextPurpose::ArtifactSummary
@@ -547,7 +549,8 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         | ContextPurpose::SideQuestion
         | ContextPurpose::CacheKeepAlive
         | ContextPurpose::WebSearch
-        | ContextPurpose::Proxy => SHORT_CALL_BUDGET,
+        | ContextPurpose::Proxy
+        | ContextPurpose::PrefillProbe => SHORT_CALL_BUDGET,
     }
 }
 
@@ -699,6 +702,7 @@ pub(crate) const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::ReadDecision,
     ContextPurpose::WakeDecision,
     ContextPurpose::CacheKeepAlive,
+    ContextPurpose::PrefillProbe,
 ];
 
 #[cfg(test)]
@@ -737,10 +741,11 @@ mod tests {
                 | ContextPurpose::Proxy
                 | ContextPurpose::ReadDecision
                 | ContextPurpose::WakeDecision
-                | ContextPurpose::CacheKeepAlive => {}
+                | ContextPurpose::CacheKeepAlive
+                | ContextPurpose::PrefillProbe => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 22);
+        assert_eq!(ALL_PURPOSES.len(), 23);
     }
 
     /// The key an unset handle inherits, if any.
@@ -774,10 +779,12 @@ mod tests {
                     ),
                     "{purpose:?} claims its backend fixes its model"
                 ),
-                AuxModelSource::CallerChosen => assert_eq!(
-                    *purpose,
-                    ContextPurpose::Proxy,
-                    "the proxy is the only purpose whose caller names the model"
+                AuxModelSource::CallerChosen => assert!(
+                    matches!(
+                        purpose,
+                        ContextPurpose::Proxy | ContextPurpose::PrefillProbe
+                    ),
+                    "{purpose:?} claims its caller names the model"
                 ),
                 AuxModelSource::AgentModel => assert!(
                     matches!(

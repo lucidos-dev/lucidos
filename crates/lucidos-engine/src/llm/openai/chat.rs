@@ -251,8 +251,8 @@ fn prefill_pair(
     object.insert("max_tokens".into(), CHAT_OUTPUT_CAP.into());
     object.insert("stream".into(), false.into());
     pair_of(
-        value,
-        "messages",
+        &value,
+        |v: &mut serde_json::Value| v.get_mut("messages")?.as_array_mut(),
         end,
         BeatShape::json_reply(CHAT_OUTPUT_CAP),
         route,
@@ -1917,6 +1917,23 @@ mod tests {
         assert_eq!(stable["messages"][3]["content"][0]["text"], "memory view");
         assert!(stable["messages"][3]["content"][0]["cache_control"].is_object());
         assert_eq!(pair.stable.output_cap, Some(CHAT_OUTPUT_CAP));
+    }
+
+    /// The beat writes the bytes the turn writes: the same serializer over
+    /// the same body, edited only where a beat differs (ADR 0581).
+    #[test]
+    fn an_openrouter_beat_keeps_the_turns_bytes() {
+        let ChatBody { body, stable_end } = chat_body(CLAUDE, &history(), Some("system"));
+        let end = stable_end.expect("a marked view ends the cut");
+        let pair = prefill_pair(&body, end, chat_route(CLAUDE)).expect("a pair");
+
+        let mut whole = as_prefill(&body);
+        assert_eq!(&*pair.whole.body, serde_json::to_vec(&whole).unwrap());
+
+        let messages = whole["messages"].as_array_mut().unwrap();
+        messages.truncate(4);
+        messages[3]["content"].as_array_mut().unwrap().truncate(1);
+        assert_eq!(&*pair.stable.body, serde_json::to_vec(&whole).unwrap());
     }
 
     /// With no view, a marked system block ends the cut, and a placeholder

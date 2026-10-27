@@ -200,13 +200,13 @@ impl CostSink for TurnSlot {
             Reported::Chat(response) => Some(response),
             _ => None,
         };
+        let detail = CallDetail::of(&cost);
         *self.call.lock().unwrap_or_else(|p| p.into_inner()) = TurnCall {
             model: cost.model.to_string(),
             report: TurnReport {
                 usage: response.and_then(usage_from_response),
-                detail: CallDetail::of(&cost),
-                stable_prefix_fingerprint: response
-                    .and_then(|response| response.stable_prefix_fingerprint.clone()),
+                stable_prefix_fingerprint: detail.stable_prefix_fingerprint.clone(),
+                detail,
             },
         };
     }

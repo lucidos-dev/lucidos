@@ -1259,6 +1259,24 @@ function stillRunning(exchange: Exchange): boolean {
   return !latestRunSteps(exchange).some(({ event }) => TERMINAL_EVENT_TYPES.has(event.type));
 }
 
+/** The ended turn a `CodingAgentIdled` closes when it lands after the next
+ *  message. The engine records a superseding follow-up beside the cancel, so it
+ *  can beat the session's idle. The message's own turn has written no step yet,
+ *  so the idle cannot be its own. Messages queued behind the ended turn hold no
+ *  steps either, so the walk passes over them. */
+function turnClosedByLateIdle(state: GroupFoldState, current: Exchange | null, event: StoredEvent): Exchange | null {
+  if (event.type !== 'CodingAgentIdled' || current?.userEvent.type !== 'MessageReceived') return null;
+  if (current.steps.length > 0) return null;
+  let i = state.exchanges.indexOf(current) - 1;
+  while (i >= 0 && state.exchanges[i].steps.length === 0) i--;
+  const previous = state.exchanges[i];
+  if (!previous) return null;
+  const run = latestRunSteps(previous);
+  const ended = run.some(({ event: step }) => TERMINAL_EVENT_TYPES.has(step.type));
+  const idled = run.some(({ event: step }) => step.type === 'CodingAgentIdled');
+  return ended && !idled ? previous : null;
+}
+
 /** Does this event belong to a coding-agent session? `EventMeta` stamps the
  *  channel on every payload, though not every TS type declares it. */
 function onCodingAgentChannel(event: { type: string }): boolean {
@@ -1393,6 +1411,9 @@ export function sortEventsChronologically(
  *  constant (see
  *  `crates/lucidos-engine/src/engine/thread_events/event_impl.rs`).
  *
+ *  A `CodingAgentToolResult` is not listed: it ends a question only when it
+ *  carries the question's own `tool_use_id` (see `overtakesQuestion`).
+ *
  *  **Keep both lists in sync.** Four gates hang off them. Server-side, the
  *  engine constant gates typed-text routing, and, unioned with three extras,
  *  the restart preserve guard (`unanswered_question_exists_sql`). Client-side,
@@ -1409,7 +1430,6 @@ const QUESTION_OVERTAKEN_STEP_TYPES: ReadonlySet<string> = new Set([
   // CC progression
   'CodingAgentTextStreamed',
   'CodingAgentToolCalled',
-  'CodingAgentToolResult',
   'CodingAgentPromptSent',
   // Chat-agent progression (symmetry; harmless on CC threads)
   'TextStreamed',
@@ -1417,6 +1437,18 @@ const QUESTION_OVERTAKEN_STEP_TYPES: ReadonlySet<string> = new Set([
   'ToolCalled',
   'ToolResult',
 ]);
+
+/** Does this event show the agent moved past the card? For a question, asked
+ *  as `questionToolUseId`, a coding agent's tool result does only when it is the
+ *  question's own: the late result of a call issued before the question leaves
+ *  the card live (mirrors `ThreadEvent::question_own_result_sql`). `null` means
+ *  the card is no question, and any tool result is the agent working. */
+function overtakesQuestion(event: { type: string }, questionToolUseId: string | null): boolean {
+  if (QUESTION_OVERTAKEN_STEP_TYPES.has(event.type)) return true;
+  if (event.type !== 'CodingAgentToolResult') return false;
+  return questionToolUseId === null
+    || (questionToolUseId !== '' && toolUseIdOf(event) === questionToolUseId);
+}
 
 function markOvertakenQuestionDividers(exchanges: Exchange[]): void {
   for (const exchange of exchanges) {
@@ -1434,9 +1466,7 @@ function markOvertakenForExchange(exchange: Exchange): void {
     exchange.questionOvertaken = false;
     return;
   }
-  exchange.questionOvertaken = exchange.steps.some(s =>
-    QUESTION_OVERTAKEN_STEP_TYPES.has(s.event.type),
-  );
+  exchange.questionOvertaken = exchange.steps.some(s => overtakesQuestion(s.event, toolUseId));
 }
 
 /** Resumable fold state behind `groupIntoExchanges` and the incremental cache.
@@ -2060,8 +2090,10 @@ function ownsRequestContinuation(state: GroupFoldState, divider: Exchange): bool
  *  The fold and the bottom pin both ask it (ADR 0284). */
 export function agentWorkedSince(exchanges: Exchange[], from: number): boolean {
   if (from === -1) return false;
+  const card = exchanges[from].userEvent;
+  const questionToolUseId = card.type === 'UserQuestionAsked' ? card.tool_use_id : null;
   for (let i = from; i < exchanges.length; i++) {
-    if (exchanges[i].steps.some(s => QUESTION_OVERTAKEN_STEP_TYPES.has(s.event.type))) return true;
+    if (exchanges[i].steps.some(s => overtakesQuestion(s.event, questionToolUseId))) return true;
   }
   return false;
 }
@@ -2166,6 +2198,26 @@ function foldEvent(
   // The walk body runs as a closure so its many early exits all funnel
   // through the single `state.current = current` sync below.
   const step = (): void => {
+    if (event.type === 'TriggerRunInterrupted') {
+      // Boot reports the cut after its abort, outside the fire's request routing.
+      // Keep the notice beneath that abort even if a later message is loaded.
+      const fire = exchanges.findIndex(ex => ex.userEvent._eventId === event.fire_event_id);
+      let target = fire >= 0 ? exchanges[fire] : undefined;
+      for (let i = exchanges.length - 1; i > fire; i--) {
+        if (exchanges[i].userEvent.type === 'TriggerStarted') break;
+        if (exchanges[i].userEvent.type === 'ResponseAborted') {
+          target = exchanges[i];
+          break;
+        }
+      }
+      if (target) appendStep(target, seq, event);
+      else {
+        target = { userEvent: event, userSeq: seq, steps: [], continuationFragment: true };
+        exchanges.push(target);
+      }
+      touched?.add(target);
+      return;
+    }
     // A read marks the message it names and never becomes a step. The message
     // may sit outside the loaded window, and then there is nothing to mark.
     if (event.type === 'CodingAgentInputRead') {
@@ -2748,6 +2800,12 @@ function foldEvent(
         next.awaitingRead = undefined;
         touched?.add(next);
         current = takeTurnFromQueue(state, next);
+      }
+      const closed = turnClosedByLateIdle(state, current, event);
+      if (closed) {
+        appendStep(closed, seq, event);
+        touched?.add(closed);
+        return;
       }
       const runningTurn = chatTurnQueuedBehind(state, current, event);
       // Nowhere to put the step, which on a PAGED thread means the boundary

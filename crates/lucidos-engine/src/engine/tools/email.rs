@@ -555,7 +555,7 @@ impl LucidosEngine {
                                 .to_string(),
                         );
                     }
-                    dest.to_string()
+                    crate::core::artifact_relative_path(dest).to_string()
                 } else {
                     // The default path never overwrites, the same rule
                     // `import_file` follows, so two attachments named

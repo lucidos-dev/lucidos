@@ -1,4 +1,5 @@
 import { switchMenuItem, openSettingsSubview, setActiveMenu } from './menu';
+import { isChosenByPreference, type PeerState } from '../windowPeers';
 import { openAppById, exitAppFullscreen } from './apps';
 import { openFilePreview, openUrl } from './artifacts';
 import { resolveFileTarget } from './fileTarget';
@@ -422,9 +423,10 @@ export const NIL_THREAD_ID = '00000000-0000-0000-0000-000000000000';
 /** Route an engine-asked navigation from `sourceThreadId`: a `NavigationRequested`,
  *  or the OAuth authorization page a form request carries.
  *
- *  It acts on this page directly only when it comes from the thread the user
- *  is viewing, or from an app iframe. From any other thread it must not hijack
- *  the page, so it offers the jump instead: Open lands on BOTH the source
+ *  Every window of this device gets it, and exactly one acts (window peers):
+ *  the last-touched window showing the source thread (or, from an app iframe,
+ *  showing an app). From any other thread it must not hijack a page, so the
+ *  last-touched window offers the jump instead: Open lands on BOTH the source
  *  thread and the target. The offer is keyed per source thread, so repeated
  *  navigates refresh one offer instead of stacking. */
 export function routeThreadNavigation(
@@ -434,6 +436,11 @@ export function routeThreadNavigation(
 ): void {
   if (!isForThisDevice(actor)) return;
   const fromApp = sourceThreadId === NIL_THREAD_ID;
+  const showsSource = (window: PeerState) => fromApp
+    ? window.appId !== null
+    : window.focusedThreadId === sourceThreadId;
+  const anyWindow = () => true;
+  if (!isChosenByPreference(showsSource, anyWindow)) return;
   if (fromApp || sourceThreadId === focusedThreadId.value) {
     // Named in any "couldn't open" toast downstream, so the error says where
     // it came from instead of swallowing it.

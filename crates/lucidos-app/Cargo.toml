@@ -63,6 +63,12 @@ tauri-plugin-updater = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Extra window labels (`window-<uuid>`), which must never recur: the page keys
+# its per-window state by label.
+uuid = { version = "1", features = ["v4"] }
+# Asks `https://<name>` which gateway answers before the Access page calls it
+# served. The updater already compiles reqwest and rustls into the binary.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 
 # Native macOS notifications via Apple's modern UserNotifications framework
 # (UNUserNotificationCenter), driven directly through objc2. Replaces the

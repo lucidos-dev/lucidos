@@ -28,6 +28,9 @@ export type {
   ContextRole,
   ContextSection,
   MemorySource,
+  FireRetry,
+  RetryOf,
+  RetrySkipReason,
   ModalityUsage,
   RecalledMemory,
 } from '../generated/thread-event-wire';

@@ -1,4 +1,5 @@
 import { signal } from '@preact/signals';
+import { isChosenByPreference, type PeerState } from '../windowPeers';
 import {
   knownOAuthProviders,
   oauthAccounts,
@@ -82,10 +83,9 @@ export function openOAuthAuthorizationUrl(authUrl: string, provider: string | nu
  *  leaving its marker up would let `grantOAuthScope`'s fallback toast fire for a
  *  connection this page did not make.
  *
- *  The toast deliberately stays device-scoped rather than following the
- *  fronting. It costs nothing in a second window, and a page that reloaded
- *  mid-authorization has lost the marker: narrowing it too would trade a
- *  visible window bug for a silent missing notice. */
+ *  The toast shows in one window: the one authorizing this provider, else any
+ *  window authorizing, else the last-touched one (window peers). A page that reloaded mid-authorization
+ *  has lost the marker, so the fallback keeps the notice from going missing. */
 export function handleOAuthAccountConnected(payload: {
   provider?: string;
   email?: string | null;
@@ -99,11 +99,19 @@ export function handleOAuthAccountConnected(payload: {
   const flow = oauthAuthFlow.value;
   const startedHere =
     flow !== null && (flow.provider === null || flow.provider === payload.provider);
+  const authorizingThis = (window: PeerState) => window.authorizing !== null
+    && (window.authorizing.provider === null || window.authorizing.provider === payload.provider);
+  // Elected before the flow clears, so this window still counts as authorizing.
+  const toastHere = isChosenByPreference(
+    authorizingThis, (window) => window.authorizing !== null, () => true,
+  );
   oauthAuthFlow.value = null;
 
   const provider = payload.provider || 'Account';
   const email = payload.email;
-  showToast(email ? `${provider} connected (${email})` : `${provider} connected`, 'success');
+  if (toastHere) {
+    showToast(email ? `${provider} connected (${email})` : `${provider} connected`, 'success');
+  }
 
   if (startedHere && isTauri()) focusCallingWindow();
 }

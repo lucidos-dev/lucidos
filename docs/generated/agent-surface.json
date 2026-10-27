@@ -812,6 +812,83 @@
         "commands": [
           {
             "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "port"
+            ],
+            "hidden": false,
+            "name": "clear"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "clear"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "set"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "show"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "port"
+            ],
+            "hidden": false,
+            "name": "set"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "port"
+            ],
+            "hidden": false,
+            "name": "show"
+          }
+        ],
+        "flags": [
+          "help",
+          "port"
+        ],
+        "hidden": false,
+        "name": "external-address"
+      },
+      {
+        "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
             "commands": [
               {
                 "aliases": [],
@@ -1394,6 +1471,35 @@
             "flags": [],
             "hidden": false,
             "name": "events"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "clear"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "set"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "show"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "external-address"
           },
           {
             "aliases": [],
@@ -4407,6 +4513,7 @@
       "HomeThreadCreated",
       "ImageUploaded",
       "TriggerStarted",
+      "TriggerRunInterrupted",
       "TriggerCompleted",
       "ChangeProposed",
       "ChangeApplied",

@@ -384,7 +384,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                                             },
                                             "quiet": {
                                                 "type": "boolean",
-                                                "description": "True when this pick needs nothing more from you (\"Not now\"): it ends your turn, no reply."
+                                                "description": "True only when this pick needs no work from you (\"Not now\"); it ends your turn."
                                             }
                                         },
                                         "required": ["label"]

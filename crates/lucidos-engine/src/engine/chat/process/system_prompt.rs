@@ -940,7 +940,7 @@ impl LucidosEngine {
                 handle to load it back into your vision, then answer from what \
                 you see — do NOT claim you have no image or ask the user to re-send it. \
                 You can save any conversation image to an artifact file with the save_thread_image tool \
-                (image: its handle, path: relative to data/artifacts/, e.g. 'photos/reaction.jpg').", system_prompt);
+                (image: its handle, path: under artifacts/, e.g. 'artifacts/photos/reaction.jpg').", system_prompt);
             if capabilities.gates.image_provider {
                 section.push_str(
                     " You can also generate or edit images with the generate_image tool. \

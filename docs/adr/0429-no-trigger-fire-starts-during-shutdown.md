@@ -1,6 +1,7 @@
 # 0429: No trigger fire starts once engine shutdown has begun
 
 - **Status**: Accepted
+- **Amended by**: [0579](0579-restart-cut-trigger-fire-fails-visibly-and-retries-once.md)
 - **Date**: 2026-10-11
 
 ## Context

@@ -325,7 +325,7 @@ export function computeMorphMode(args: {
 // prominent default while the agent is waiting on the user.
 // Each mode is one lone button, so the control never means two things at once.
 //   canceling — disabled Cancel with a spinner (a Cancel is in flight)
-//   submit    — green Submit with a return arrow: an answer is ready. That is a
+//   submit    — green Submit with a checkmark: an answer is ready. That is a
 //               typed answer, or a multi-select pick, text or image.
 //   cancel    — red Cancel with an X: nothing to submit (no pick, empty box,
 //               permission card); the forward action lives in the card above.

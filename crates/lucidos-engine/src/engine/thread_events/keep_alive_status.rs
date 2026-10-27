@@ -109,7 +109,12 @@ pub enum CacheKeepAliveStatus {
         odds: Option<CapOdds>,
     },
     /// The thread waits, and the engine does not keep it warm.
-    NotKept { reason: CacheKeepAliveNotKeptReason },
+    NotKept {
+        reason: CacheKeepAliveNotKeptReason,
+        /// When paused pings start again. Set for `pings_paused` only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<DateTime<Utc>>,
+    },
 }
 
 /// Why a waiting thread gets no keep-alive.
@@ -125,10 +130,23 @@ pub enum CacheKeepAliveNotKeptReason {
     /// Every active child that would wake the parent waits on the user, which
     /// has no bound. A `no-wake` child may still run beside them.
     ChildrenAwaitingUser,
-    /// The provider cannot prefill the Lucidos Agent's last request.
+    /// The last request has no prefill pair or backend.
     UncacheableProvider,
-    /// Lucidos restarted since the thread's last request, or its Claude Code
-    /// session ended, so a beat would miss the cached prefix.
+    /// A refused or talkative ping paused this provider until the engine
+    /// restarts.
+    ProviderPaused,
+    /// Historical: recorded while prefill beats were paused (ADR 0581), never
+    /// emitted now. Stored events still carry it, so it keeps reading.
+    PrefillPaused,
+    /// The provider's recent pings kept missing, so pings pause until the
+    /// status's `until` (ADR 0580).
+    PingsPaused,
+    /// The thread's cache went cold before a ping reached it, so a ping
+    /// would write, not read.
+    CacheExpired,
+    /// Lucidos holds no record of the thread's last request: it restarted
+    /// since, or the thread's Claude Code session ended. A beat would miss
+    /// the cached prefix.
     Restarted,
     /// The wait passed its give-up time before the first ping was due, so no
     /// ping went out. A run that pinged and then gave up is `Stopped`.
@@ -140,9 +158,29 @@ pub enum CacheKeepAliveNotKeptReason {
     /// No response said how long the thread's cache lives, so no ping can be
     /// timed. A provider's documented default never counts (ADR 0575).
     UnknownTtl,
+    /// The beat would use another model or reasoning effort.
+    ModelChanged,
+    /// A ping failed to hold the context; only a real request re-arms the run.
+    BeatMissed,
 }
 
 impl CacheKeepAliveStatus {
+    /// Not kept for `reason`, which is never `pings_paused`.
+    pub fn not_kept(reason: CacheKeepAliveNotKeptReason) -> Self {
+        Self::NotKept {
+            reason,
+            until: None,
+        }
+    }
+
+    /// Not kept: the provider's pings pause until `until`.
+    pub fn pings_paused(until: DateTime<Utc>) -> Self {
+        Self::NotKept {
+            reason: CacheKeepAliveNotKeptReason::PingsPaused,
+            until: Some(until),
+        }
+    }
+
     /// The status the thread's projection holds. A reason that names no wait
     /// (`codex`, `off`, `nothing_pending`, `unattended_trigger`) records nothing:
     /// the cache-warmth route says it, and no card or panel section follows.
@@ -154,6 +192,7 @@ impl CacheKeepAliveStatus {
                     | CacheKeepAliveNotKeptReason::Off
                     | CacheKeepAliveNotKeptReason::NothingPending
                     | CacheKeepAliveNotKeptReason::UnattendedTrigger,
+                ..
             } => None,
             status => Some(status),
         }
@@ -172,4 +211,20 @@ pub struct CapOdds {
     pub slots: Vec<u32>,
     /// The waits that outlasted the cap: they paid every ping and the reread.
     pub after_cap: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_historical_prefill_paused_status_still_reads() {
+        let stored = r#"{"state":"not_kept","reason":"prefill_paused"}"#;
+        let status: CacheKeepAliveStatus = serde_json::from_str(stored).unwrap();
+        assert_eq!(
+            status,
+            CacheKeepAliveStatus::not_kept(CacheKeepAliveNotKeptReason::PrefillPaused)
+        );
+        assert_eq!(serde_json::to_string(&status).unwrap(), stored);
+    }
 }

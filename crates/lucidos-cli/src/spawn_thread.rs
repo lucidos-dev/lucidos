@@ -41,6 +41,7 @@
 
 use std::path::PathBuf;
 
+use crate::http::ConnectRetry;
 use crate::workspace::{read_ports, BoxError};
 use crate::{CliMode, CliRelation, SpawnThreadArgs};
 
@@ -292,7 +293,7 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         // a default of the same name.
         .header(crate::http::HEADER_TARGET_WORKSPACE, &target_basename)
         .json(&body)
-        .send()
+        .send_with_connect_retry()
         // A scheme this had to guess is the likeliest reason for a transport
         // failure here, so the message names the file that failed to say.
         .map_err(|e| {

@@ -194,7 +194,7 @@ pub(super) fn mailbox_tools() -> Vec<ToolDefinition> {
                     },
                     "destination": {
                         "type": "string",
-                        "description": "Destination relative to data/artifacts/ (default 'imported/email/<filename>')."
+                        "description": "Destination artifacts/ path (default 'artifacts/imported/email/<filename>')."
                     },
                     "account": {
                         "type": "string",

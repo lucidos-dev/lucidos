@@ -233,6 +233,7 @@ async fn run_task_loop(
             .thread_queue
             .submit(
                 crate::engine::thread_queue::ThreadQueueRequest::Cron {
+                    retry_of: None,
                     trigger_id: trigger_id.clone(),
                 },
                 None,
@@ -476,6 +477,7 @@ async fn check_and_execute_missed(
             .thread_queue
             .submit(
                 crate::engine::thread_queue::ThreadQueueRequest::Cron {
+                    retry_of: None,
                     trigger_id: trigger_id.to_string(),
                 },
                 None,
@@ -942,6 +944,7 @@ pub(super) async fn fire_matching_triggers(
             .thread_queue
             .submit(
                 crate::engine::thread_queue::ThreadQueueRequest::EventTrigger {
+                    retry_of: None,
                     trigger_id: config.id.clone(),
                     event_type: event_type.to_string(),
                     event_payload: payload.clone(),
@@ -1831,5 +1834,27 @@ mod tests {
             !cap_notification_due(&trigger),
             "an immediate repeat is inside the cooldown"
         );
+    }
+
+    #[tokio::test]
+    async fn backdated_cut_failure_skips_its_slot_and_preserves_a_later_missed_slot() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let slot = utc("2026-10-11T16:10:00Z");
+        seed_trigger_that_ran_yesterday(&pool, "cut-fire").await;
+        bus.record_trigger_executed_at("cut-fire", crate::triggers::TriggerRunStatus::Failed, slot)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_engine_decision(&pool, "cut-fire", slot).await,
+            CatchUp::Skip(SkipReason::AlreadyRan)
+        );
+        assert_eq!(
+            next_engine_decision(&pool, "cut-fire", slot + chrono::Duration::minutes(15)).await,
+            CatchUp::Fire
+        );
+        pool.close().await;
+        teardown_test_db(&db).await;
     }
 }

@@ -1374,8 +1374,8 @@ select_dev_windows() {
 # ── stop_dev_windows ────────────────────────────────────────────────────
 # Stop this checkout's previous dev window, so a relaunch leaves one.
 stop_dev_windows() {
-    local window
-    for window in $(select_dev_windows "$1"); do
+    local window window_bin
+    for window in $(for window_bin in "$@"; do select_dev_windows "$window_bin"; done | sort -u); do
         if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$window"; then
             continue
         fi
@@ -1564,13 +1564,16 @@ publish_launch_binaries() {
 }
 
 # ── The dev window's launch binary (ADR 0461) ───────────────────────────
-# tauri-dev.sh runs the desktop window from the launch dir, beside the engine
-# and gateway. The build that publishes them publishes it too, so one switch
-# moves all three. Only a checkout that has run a dev window builds it: its
-# first published binary is the opt-in, so a worktree, an e2e build or a
-# machine without Tauri's libraries never compiles the app.
+# tauri-dev.sh runs the desktop window from the launch dir, in a minimal macOS
+# app bundle so Accessibility can identify it. The engine build publishes the
+# window too, so one switch moves all three. A published window opts the
+# checkout into building it. Worktrees and headless checkouts skip the app.
 dev_window_bin() {
-    echo "$1/lucidos-app"
+    if [ "$(uname -s)" = Darwin ]; then
+        echo "$1/Lucidos Dev.app/Contents/MacOS/lucidos-app"
+    else
+        echo "$1/lucidos-app"
+    fi
 }
 
 run_dev_window_cargo_build() {
@@ -1580,7 +1583,40 @@ run_dev_window_cargo_build() {
 # A running window re-execs onto a NEW file at its path after the next switch,
 # so a rebuild with identical bytes must leave the published file alone.
 publish_dev_window_binary() {
-    local src="$1" dst="$2"
+    local src="$1" launch_dir="$2" dst contents sibling
+    [ -f "$src" ] || return 1
+    dst="$(dev_window_bin "$launch_dir")"
+    if [ "$(uname -s)" = Darwin ]; then
+        contents="$(dirname "$(dirname "$dst")")"
+        mkdir -p "$contents/MacOS" || return 1
+        # Keep the real binaries at their existing variant paths. Code looking
+        # beside current_exe() sees the same engine, gateway and CLI.
+        for sibling in lucidos-engine lucidos-gateway lucidos; do
+            ln -sfn "../../../$sibling" "$contents/MacOS/$sibling" || return 1
+        done
+        local plist_tmp="$contents/Info.plist.tmp.$$"
+        if ! cat > "$plist_tmp" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>com.lucidos.dev-launcher</string>
+    <key>CFBundleName</key><string>Lucidos Dev</string>
+    <key>CFBundleExecutable</key><string>lucidos-app</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+        then
+            rm -f "$plist_tmp"
+            return 1
+        fi
+        if ! mv -f "$plist_tmp" "$contents/Info.plist"; then
+            rm -f "$plist_tmp"
+            return 1
+        fi
+    fi
     if cmp -s "$src" "$dst"; then
         return 0
     fi
@@ -1594,8 +1630,7 @@ build_dev_window() {
     echo ""
     echo "Building the dev window..."
     run_dev_window_cargo_build || return 1
-    publish_dev_window_binary "$(dev_window_bin "$PROJECT_DIR/target/$(engine_build_profile)")" \
-        "$(dev_window_bin "$launch_dir")"
+    publish_dev_window_binary "$PROJECT_DIR/target/$(engine_build_profile)/lucidos-app" "$launch_dir"
 }
 
 # Classify a published binary's baked build id against the checkout's current
@@ -1692,7 +1727,7 @@ publish_all_launch_binaries() {
     # After the engine: an engine started after the window's publish time must
     # already run this build, or the window would move ahead of it.
     if [ -n "$with_window" ]; then
-        publish_dev_window_binary "$(dev_window_bin "$uplift_dir")" "$(dev_window_bin "$launch_dir")" \
+        publish_dev_window_binary "$uplift_dir/lucidos-app" "$launch_dir" \
             || return 1
     fi
 }
@@ -1820,7 +1855,9 @@ build_or_find_engine() {
     local launch_dir uplift_dir with_window=""
     launch_dir="$(launch_bin_dir)"
     uplift_dir="$PROJECT_DIR/target/$(engine_build_profile)"
-    if [ -f "$(dev_window_bin "$launch_dir")" ]; then
+    # A previous bare publish is only an opt-in marker for migration. Nothing
+    # launches it: the new build publishes the bundle before the next launch.
+    if [ -f "$(dev_window_bin "$launch_dir")" ] || [ -f "$launch_dir/lucidos-app" ]; then
         with_window=1
     fi
 

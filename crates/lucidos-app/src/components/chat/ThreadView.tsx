@@ -1073,11 +1073,11 @@ export function ThreadView() {
     // could only estimate from a detached probe, which on iOS over-reports by the
     // ::-webkit-scrollbar width the transcript does not actually reserve, leaving
     // the composer's right edge inside the question cards it docks under
-    // (utils/scrollbarGutter.ts). Mount-only: what a scroll container reserves is
-    // content-independent (`overflow-y: scroll` + `scrollbar-gutter: stable`), so
-    // one forced layout read per entry into thread mode is enough, and it runs
-    // before paint so the corrected inset is never a visible jump.
-    useLayoutEffect(() => { publishScrollbarGutter(); }, []);
+    // (utils/scrollbarGutter.ts). It runs again when the thread lands in the map:
+    // the loading tree has no `has-scroll-indicator`, so on the phone it reserves
+    // a scrollbar that the loaded tree hides. It runs before paint, so the
+    // corrected inset is never a visible jump.
+    useLayoutEffect(() => { publishScrollbarGutter(); }, [eventThread !== undefined]);
 
     // Force-restart CSS animation imperatively — works even when the
     // .revealing class is already on the element from a prior thread switch.

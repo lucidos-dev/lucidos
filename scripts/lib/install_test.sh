@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tests for install.sh (step 3 of docs/plans/2026-06-30-installer-step3-download-and-run.md)
-# and its pure helper lib scripts/lib/install_common.sh. Two halves:
+# and its pure helper lib scripts/lib/install_common.sh. Coverage:
+#   • PACKAGING: staging, Linux ELF closure, and headless tarball regressions.
 #   • PURE helpers — sourced + asserted directly (triple→URL, version, runtime dir),
 #     the same way stage_runtime_test.sh / headless_tarball_test.sh do.
 #   • INTEGRATION — install.sh invoked as a subprocess in --no-launch mode against a
@@ -12,6 +13,10 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INSTALL="$PROJECT_DIR/install.sh"
+
+bash "$SCRIPT_DIR/stage_runtime_test.sh" || exit 1
+python3 "$SCRIPT_DIR/stage_runtime_linux_test.py" || exit 1
+bash "$SCRIPT_DIR/headless_tarball_test.sh" || exit 1
 
 # Sandbox env-as-flag inputs a live dev workspace exports (its engine carries
 # LUCIDOS_TLS_CERT/KEY for https serving) so they can't leak into the installer

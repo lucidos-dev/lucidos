@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { groupIntoExchanges, exchangeResponseEvents, exchangeSteps, exchangeStatus, type StoredEvent, type ThreadEvent } from '../thread-events';
+import { groupIntoExchanges, agentWorkedSince, exchangeResponseEvents, exchangeSteps, exchangeStatus, type StoredEvent, type ThreadEvent } from '../thread-events';
 
 const ANSWER_FIRST = "You need light + dark: light for the macOS dock, dark for the PWA splash.";
 
@@ -178,7 +178,7 @@ describe('groupIntoExchanges — ActionRequired events as exchange boundaries', 
 describe('groupIntoExchanges — question divider marked overtaken when agent progresses past it without an answer', () => {
   // CC's parallel-tool-call race: AskUserQuestion is emitted alongside
   // sibling tool_uses; the hook blocks the question while the siblings
-  // dispatch and emit CodingAgent{TextStreamed,ToolCalled,ToolResult,…}
+  // dispatch and emit CodingAgent{TextStreamed,ToolCalled,…}
   // as steps of the divider before any answer lands. `questionOvertaken`
   // lets ChatExchange disable the QuestionCard buttons in that window.
 
@@ -202,6 +202,40 @@ describe('groupIntoExchanges — question divider marked overtaken when agent pr
     const exchanges = groupIntoExchanges(events);
     const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
     expect(divider.questionOvertaken).toBe(true);
+  });
+
+  it('the question\'s own CC ToolResult marks the divider as overtaken', () => {
+    // Claude Code records an Esc\'d AskUserQuestion as its own rejected result.
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'do stuff' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: 's', question: 'X?', options: [{ id: 'a', label: 'X' }] }),
+      ev(3, { type: 'CodingAgentToolResult', name: 'AskUserQuestion', result: 'rejected', tool_use_id: 'tu-q' }),
+    );
+    const divider = groupIntoExchanges(events).find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider.questionOvertaken).toBe(true);
+  });
+
+  it('any CC ToolResult after a permission card counts as the agent working past it', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'edit foo' }),
+      ev(2, { type: 'CodingAgentPermissionRequest', request_id: 'r1', tool_use_id: 'tu', tool_name: 'Edit', input: { file_path: '/foo' }, summary: 'Edit /foo' }),
+      ev(3, { type: 'CodingAgentToolResult', name: 'Bash', result: 'done', tool_use_id: 'tu-sibling' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    const card = exchanges.findIndex(e => e.userEvent.type === 'CodingAgentPermissionRequest');
+    expect(agentWorkedSince(exchanges, card)).toBe(true);
+  });
+
+  it('a late CC ToolResult of an earlier call leaves the divider live', () => {
+    const events = thread(
+      ev(1, { type: 'MessageReceived', text: 'do stuff' }),
+      ev(2, { type: 'UserQuestionAsked', tool_use_id: 'tu-q', cc_session_id: 's', question: 'X?', options: [{ id: 'a', label: 'X' }] }),
+      ev(3, { type: 'CodingAgentToolResult', name: 'Bash', result: 'done', tool_use_id: 'tu-before-the-question' }),
+    );
+    const exchanges = groupIntoExchanges(events);
+    const divider = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
+    expect(divider.questionOvertaken).toBe(false);
+    expect(agentWorkedSince(exchanges, exchanges.indexOf(divider))).toBe(false);
   });
 
   it('chat TextStreamed after UserQuestionAsked marks divider as overtaken (chat symmetry)', () => {

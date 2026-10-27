@@ -890,7 +890,8 @@ fn startup_clamp_and_show(app: &tauri::AppHandle) {
                 app,
                 window_persist::resolve_window_session_plan()
                     .first()
-                    .and_then(|(_, frame)| frame.clone()),
+                    .filter(|window| window.main_may_take())
+                    .and_then(|window| window.frame.clone()),
             ),
             // Cheap insurance on the first visible frame. The placement above is
             // deferred, so this reads the geometry the window still has. That

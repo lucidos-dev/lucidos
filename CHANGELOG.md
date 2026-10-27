@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.52.0 — 2026-10-27
+
+### Added
+- Set an external address under Settings > Access, for a phone that reaches this machine over any VPN. Lucidos probes the address before it saves it, and pairing tries it first. The address belongs to the gateway, so it covers every workspace on it. The `lucidos external-address` command shows, sets and clears it.
+- Give automatic thread titles a style of your own under Settings > Title style. The field shows the standard style, and Reset brings it back.
+- Each window keeps its own navigation. Every desktop window reopens on its own thread and panel after a relaunch, and two windows on one workspace both come back.
+
+### Changed
+- The pairing address comes from Tailscale itself. Settings > Access says why there is no tailnet address: not installed, not running, signed out, turned off or awaiting approval.
+- A trigger run that an engine restart cuts off shows as interrupted, and Lucidos runs it once more.
+- The prompt cache keep-alive is off by default, and the cache cards are hidden. Turn either on in Settings. A choice you already made stays. The keep-alive mode once called Default is now Break-even.
+- A keep-alive ping that misses the cache ends the keep-alive for its own thread only. Three misses in a row pause that provider's pings for an hour.
+- When the command guard is on, it also answers coding-agent commands by default. Turn that off under Settings > Coding Agents.
+- Buttons, dropdowns and text inputs share one corner radius.
+
+### Fixed
+- A paired phone on a plain-HTTP tailnet or LAN address can send messages again. Every POST from it got a 403.
+- Pairing shows the Tailscale address on a Mac where another VPN also uses a 100.64 address.
+- The Linux tarball starts on Ubuntu 26.04 and on any machine without libxml2. The bundled PostgreSQL carries every shared library it needs.
+- The `lucidos` CLI waits for the engine to come back when it restarts, so a script or trigger no longer fails on a refused connection.
+- Automatic titles and Suggest name title a short message instead of answering it.
+- A widget in a coding agent's question card draws.
+- A coding agent's question stays open when a late result of an earlier tool call arrives.
+- A coding-agent handoff leaves its open change to the next session.
+- The Thinking row of a message that replaces a running coding-agent turn stays live until the agent finishes.
+- Files that `capture_app`, `generate_image`, `save_thread_image`, `import_file` and email attachments save land at the path the tool reports.
+- The composer model picker stays visible while a coding-agent turn runs.
+- The composer row on a phone no longer shifts sideways after a thread loads.
+- Only one window shows the OAuth connected notice.
+- The Archive, Discard and Apply tooltips say what each action does.
+- Plugin descriptions show their paragraphs on the detail page and in the Plugins panel.
+- The Submit button on a question card shows a checkmark.
 ## v0.51.0 — 2026-10-26
 
 ### Added

@@ -317,22 +317,20 @@ pub fn bind_scope_label(choice: &BindChoice) -> String {
     }
 }
 
-/// Best-effort detection of this machine's Tailscale `100.x` IPv4, for the
-/// Settings hint/placeholder. `None` when Tailscale is absent or logged out, and
-/// the UI falls back to a generic placeholder.
+/// This machine's tailnet IPv4 as Tailscale reports it, for the Settings
+/// hint/placeholder. `None` when Tailscale is absent, not joined, or holds no
+/// such address on this host (userspace networking).
 ///
 /// **A display hint only.** It never influences what this process binds to; the
 /// resolvers above own that, and they fail safe to loopback.
 ///
-/// Reads the interface list rather than running `tailscale ip -4`. The spawn was
-/// the whole problem: a packaged engine inherits the gateway's environment and
-/// therefore has **no `PATH` at all**, so the bare name never resolved and the
-/// hint silently never appeared. Absolute-path resolution fixed that on
-/// 2026-07-31, but the deeper answer is that a machine already on a tailnet can
-/// simply be asked, at the cost of two syscalls and no CLI whatsoever. See
-/// `lucidos-tailscale`.
-pub fn detect_tailscale_ipv4() -> Option<String> {
-    lucidos_tailscale::tailnet_ipv4().map(|ip| ip.to_string())
+/// Asking Tailscale is bounded blocking I/O, so it runs off the async workers.
+pub async fn detect_tailscale_ipv4() -> Option<String> {
+    tokio::task::spawn_blocking(lucidos_tailscale::bindable_tailnet_ipv4)
+        .await
+        .ok()
+        .flatten()
+        .map(|ip| ip.to_string())
 }
 
 /// Install the one rustls crypto provider this crate uses.

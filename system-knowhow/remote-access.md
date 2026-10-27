@@ -143,14 +143,18 @@ Five things here surprise people:
   or copy the credential off the machine. Within those sub-trees it still calls
   the API as you.
 
-### Still do not put Lucidos on the open internet
+### Public only behind a front door you own
 
-Authentication raises the floor. It does not make a public origin a good idea.
+Authentication raises the floor. It does not make a bare public origin a good
+idea: pairing is then the only gate, and wrong guesses are only rate limited.
 
 - Use `tailscale serve` (tailnet-private), **never `tailscale funnel`** on the
   gateway's own port.
-- No router port-forward, no public reverse proxy, no ngrok-style tunnel.
-- Keep the tailnet as the outer boundary, with pairing as the inner one.
+- No bare router port-forward and no ngrok-style tunnel straight at the port.
+- A public address needs an outer gate you own: an identity proxy, proxy auth
+  or mTLS, in front of a reverse proxy. Pairing stays the inner gate. Set that
+  address as the external address (§ Any other VPN).
+- A tailnet or a private VPN is the simpler outer boundary.
 
 ### The one exception: a webhook's own socket
 
@@ -411,7 +415,8 @@ Point Lucidos at the pair:
   service environment. Both or neither: a lone flag is refused.
 - A Lucidos process serves https **iff both** variables point at readable files.
   TLS material is read at process start, so **restart the gateway** after a
-  change; a live socket cannot be re-bound.
+  change; a live socket cannot be re-bound. See
+  [Restarting the gateway](#restarting-the-gateway): Cmd-Q is not a restart.
 
 **The critical caveat: mkcert signs with a local development CA.** Only
 machines that trust that CA will connect, so every other device needs the root
@@ -441,6 +446,49 @@ Other mkcert gotchas:
 app including push, with no certificate at all, because **localhost is a secure
 origin**. Useless on a phone, ideal for a second laptop.
 
+## Any other VPN
+
+**Lucidos only recognises Tailscale's address, because only Tailscale can tell
+it.** WireGuard, ZeroTier, NetBird, a company VPN or a reverse proxy cannot
+prove that a phone routes to them. So Lucidos never puts one in the QR on a
+guess. You name it once, as the gateway's *external address*, and the pairing
+QR uses it ahead of the tailnet (ADR 0550).
+
+Set it in any of four ways:
+
+- **Settings → Access → External address**, at the bottom of the page. The empty
+  field shows the Tailscale address pairing falls back to. This machine's other
+  addresses are links that fill the field, labelled by interface. A link only
+  fills it: Save still checks it.
+- `lucidos external-address set https://lucidos.example.com` in a terminal on
+  the machine (`lucidos-cli.md` § `lucidos external-address`).
+- `install.sh --external-address <origin>`, for a headless install that has no
+  paired browser yet.
+- `LUCIDOS_EXTERNAL_ADDRESS` in the gateway's environment. It wins and locks the
+  other three.
+
+What to know:
+
+- **An origin only:** scheme, host and optional port, no path. Lucidos serves
+  workspaces at `/<slug>/` and the picker at `/~/`, so a proxy must forward the
+  whole host, not a sub-path. A loopback, link-local or unspecified address is
+  refused, since no other device can open it.
+- **One per gateway**, stored in `~/.lucidos/network.toml` under the gateway's
+  port. A second gateway on the same machine keeps its own.
+- **Saving checks it.** The gateway fetches `<origin>/~/api/v1/health` and
+  compares its per-boot `instance_id`. A match is verified. No answer from this
+  machine saves with a warning, since hairpin NAT and client-only VPN routes
+  are ordinary: test from the phone. An answer it cannot compare, such as an
+  identity proxy's login page or a redirect, which it never follows, also saves
+  with a warning. Only an answer from a different gateway refuses, because a
+  code minted here does not work there.
+- **The certificate is checked** against public roots. A company CA the probe
+  does not trust reads as unreachable, with the reason, and still saves.
+- **HTTPS on it** gives the installable app and push, as Route B and C do. A
+  plain `http://` address pairs and works, without those two.
+- **Pairing still guards it**, as on every route. For a public address, see
+  § Public only behind a front door you own.
+
 ## Settings → Access
 
 The page that drives all of this: point the user here before hand-running
@@ -456,7 +504,9 @@ first must be true before the second buys anything:
 | 2. This device | Has the device reading the page joined that tailnet? | The address this device was served on |
 
 **Add a device is the action they lead to**, not a third question: pairing a
-new device at one of those addresses. See its own section below.
+new device at one of those addresses. See its own section below. **External
+address**, at the bottom of the page, is for a route other than Tailscale
+(§ Any other VPN).
 
 Every section renders **everywhere**, phone browsers and the installed PWA
 included, Connect URLs among them. Platform changes how much each can say,
@@ -478,7 +528,7 @@ the host it was served on:
 | How this device got here | The page shows |
 |---|---|
 | Loopback (`localhost`, `127.0.0.0/8`, `::1`, `*.localhost`) | "You are reading this on the machine that runs Lucidos". No install offer and no app-install step: this device IS the machine, so section 1 is its whole answer |
-| A `*.ts.net` name | "Tailscale is connected on this device" |
+| The machine's own MagicDNS name, or any `*.ts.net` name | "Tailscale is connected on this device" |
 | The exact `100.x` address section 1 reports for the machine | the same, for the same reason |
 | Any other address | **Get Tailscale**, then all three steps (install Tailscale, copy the machine's Tailscale address, install the app) |
 
@@ -494,10 +544,10 @@ not one:
 | already the installed app | nothing |
 
 Each proof is sound. A MagicDNS name resolves only on a device signed in to
-its tailnet. A request to the machine's tailnet address arrived over that
-tailnet. The engine read that address off a Tailscale **interface**:
-`lucidos_tailscale::tailnet_ipv4` requires the interface *and* the range. A
-loopback request never left the machine.
+its tailnet. The machine's own name is matched exactly, so a Headscale domain
+counts too. A request to the machine's tailnet address arrived over that
+tailnet, and Tailscale itself reported that address. A loopback request never
+left the machine.
 
 A bare `100.64/10` host that does **not** match the reported address is not
 proof. That range is real CGNAT space an ISP can hand to a physical interface.
@@ -544,6 +594,11 @@ mints a *pairing code* and draws it as a QR, so a phone scans rather than
 typing eight digits. The reader is already paired, which makes the offer safe:
 a paired device holds full authority and may enrol another.
 
+**The section opens on one button, Create a pairing code.** No QR, digits or
+address show until the user presses it. So when you walk someone through
+pairing, tell them to press **Create a pairing code** first. Never promise a QR
+on arrival.
+
 **A live code shows as three cards**, one per way to use it: scan the QR (the
 big card), type the digits, or open the address. The cards are alternatives, so
 each after the first says "Or". The digits are always there, large enough to
@@ -560,10 +615,17 @@ installs before it pairs.
 
 **The address is the hard part.** The machine minting a code usually reads this
 page over loopback, and a QR aimed at `127.0.0.1` helps nobody. So the section
-uses the same order as the Tailscale row. First the verified `serve` origin,
-else the MagicDNS name, else the tailnet address, each only while something
-listens on it. Then the LAN address, on the packaged desktop app. With none of
-those it mints the code and says there is no QR.
+takes the first *pairing address* that exists (ADR 0550):
+
+1. The gateway's external address, when one is set (§ Any other VPN).
+2. The tailnet origin, as the Tailscale row derives it: the verified `serve`
+   origin, else the MagicDNS name, else the tailnet address, each only while
+   something listens on it.
+3. The address this page is on, when it is not loopback.
+4. The LAN address, on the packaged desktop app.
+
+With none of those it mints the code and says there is no QR. With no external
+address set, which is the default, a machine on a tailnet pairs over it.
 
 **The expiry is a live countdown**, above the cards beside the New code button.
 When a code expires the cards go, leaving the countdown's verdict and the
@@ -693,11 +755,12 @@ two fields, each a string or null:
 
 | Field | Meaning |
 |---|---|
-| `magic_dns_name` | `<machine>.<tailnet>.ts.net`, no scheme. Null off a tailnet, and null with MagicDNS turned off |
+| `magic_dns_name` | The name Tailscale reports, no scheme. Null off a tailnet, and null with MagicDNS turned off |
 | `workspace_serve_url` | The `https://<name>/<slug>/` URL, published only once verified |
+| `reason` | Why the machine has no tailnet address, in one sentence. Null when it has one |
 
-Only the machine can run the reverse lookup behind the name, so a browser has
-no other way to learn it. The plain-HTTP row prefers the name over the bare
+Only the machine can ask Tailscale for the name, so a browser has no other way
+to learn it. The plain-HTTP row prefers the name over the bare
 `100.x` address: it resolves anywhere on the tailnet, and a person can retype
 it on another device.
 
@@ -706,26 +769,36 @@ listener.** With two gateways (443 fronting 5252, 8443 fronting 5251), a live
 443 can belong to one that has never heard of this slug. So the engine fetches
 the candidate URL's own `api/v1/health`, with TLS validated, and compares the
 reported `workspace_path` with its own. A same-named workspace on the other
-gateway lives at a different path, so a match is proof. The probe costs nothing
-off a tailnet, and both halves are bounded.
+gateway lives at a different path, so a match is proof. No candidate is probed
+unless Tailscale can issue a certificate for the name (`CertDomains`), and every
+probe is bounded.
 
 It is a separate route from `network-config` on purpose: the bind editor
-fetches that one too, and must not pay for a reverse lookup and a round trip.
+fetches that one too, and must not pay for asking Tailscale and a round trip.
 The packaged app's own `serve_url` (from `get_connect_info`) answers "is this
 MACHINE serving", for the Expose row. This endpoint answers "what is the URL for
 THIS workspace".
 
-**Tailnet state is read without the Tailscale CLI.** The page takes the tailnet
-address from the machine's interface list and the MagicDNS name from a reverse
-lookup. So it reports correctly however Tailscale was installed (App Store,
-standalone app or Homebrew), even in a packaged process with no `PATH`. When
+**Tailnet state comes from Tailscale itself** (ADR 0588). The machine asks
+Tailscale's LocalAPI for its status, the way the Tailscale CLI does, and falls
+back to `tailscale status --json`. It reads the first IPv4 in
+`Self.TailscaleIPs`, and `Self.DNSName` while MagicDNS is on. No interface name
+or address range is ever used. So it reports correctly for the App Store app,
+the standalone app, Homebrew or a Linux `tailscaled`, even with no `PATH`. When
 debugging:
 
+- **Not on a tailnet** always comes with Tailscale's own reason: not installed,
+  not running, signed out, turned off, waiting for admin approval, or an answer
+  that could not be read. The page and `lucidos pair --qr` both show it.
 - A machine with **MagicDNS disabled** has a tailnet address and no name. It is
   still on the tailnet, with no HTTPS name to serve.
-- A machine with **Use Tailscale DNS settings** turned off still gets its name.
-  When the system lookup finds nothing, the reverse lookup goes straight to
-  Tailscale's resolver at `100.100.100.100`, which answers either way.
+- A **Headscale** tailnet keeps its own MagicDNS domain, and gets no `https://`
+  candidate: Headscale issues no certificates, so `CertDomains` is empty.
+- **Another VPN in `100.64.0.0/10`** (Appgate, Zscaler, a corporate CGNAT) never
+  takes the tailnet's place, because Tailscale does not report its address. To
+  pair over such a VPN, set the external address (§ Any other VPN).
+- In **userspace-networking mode** Tailscale reports an address this host does
+  not hold, so the Network access picker offers no tailnet bind hint.
 - A CLI is needed for **`tailscale serve` only** (and the Sign in button).
   `serve` has no GUI, config-file or admin-console equivalent. So a Mac without
   a CLI can be described but not exposed. The page says so and names two ways
@@ -846,7 +919,36 @@ bound beyond loopback. `tailscale serve` does not, since it proxies locally.
 - `./install.sh --bind all` writes the same file.
 - Default is **loopback**, and a malformed value fails safe to loopback, never
   to all interfaces.
-- A change takes effect only after a **restart**.
+- A change takes effect only after a **restart** of the gateway. See
+  [Restarting the gateway](#restarting-the-gateway).
+
+### Restarting the gateway
+
+On an installed build the gateway is the always-on background service. How to
+restart it depends on the install:
+
+- **macOS app (DMG)**: in the **desktop app window**, press **Settings → System
+  → Debugging → Restart engine**. There it restarts the whole service: the
+  gateway and every workspace engine it spawned.
+- **The same button in a browser or on a phone** restarts only that
+  workspace's engine. The gateway keeps running, so a bind or TLS change does
+  not apply.
+- **Headless install**: restart the service from a terminal on the machine.
+  On macOS run `launchctl kickstart -k gui/$(id -u)/com.lucidos.gateway.<slug>`.
+  On Linux run `systemctl --user restart lucidos-gateway-<slug>.service`.
+  `<slug>` is the instance name, `default` unless installed with `--name`.
+
+Every route also restarts the engine you run in, so your turn ends. Tell the
+user before, and let them start it.
+
+**Cmd-Q does not restart it.** On the macOS app, Cmd-Q is *Close to Menu Bar*:
+it hides the windows and stops nothing. Never tell the user to quit with Cmd-Q
+and reopen to apply a bind or TLS change. *Quit and Stop Background Service*,
+then reopening, also works, but halts triggers and sessions in between. Prefer
+Restart engine.
+
+After the restart, `GET /~/api/v1/health` lists any address the gateway still
+awaits as `pending_binds`.
 
 ### An engine that faces a network asks for a credential
 

@@ -45,7 +45,9 @@ consumes the header it judged.**
 - `origin` joins `gateway_owns_header` on the **upgrade path only**. The engine
   then sees a hop carrying none, which is what a spliced handover from a local
   process is.
-- The HTTP path is untouched, and the engine's gate is unchanged.
+- The HTTP path is untouched, and the engine's gate is unchanged. (Amended by
+  [0587](0587-gateway-vouches-for-plain-http-origin.md): an ordinary request
+  with no fetch metadata is now judged here too.)
 
 ## Rationale
 

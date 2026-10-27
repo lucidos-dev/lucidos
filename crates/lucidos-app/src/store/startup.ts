@@ -1,3 +1,4 @@
+import { pruneClosedWindows, readWindowItem } from '../utils/windowStorage';
 import { checkConnection, handleResume, bounceToPickerIfStranded } from './actions/connection';
 import { loadArtifacts, openUrl } from './actions/artifacts';
 import {
@@ -41,7 +42,9 @@ import {
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
 import { refreshChangesState, restoreRestartState } from './actions/chat-changes';
-import { offerWithheldThread, openHomeOnColdStart } from './actions/coldStartHome';
+import { offerWithheldThread, openHomeOnColdStart, releaseWithheldToLiveWindow } from './actions/coldStartHome';
+import { announceWindow, installWindowPeers } from './windowPeers';
+import { oauthAuthFlow } from './actions/oauth';
 import { installRestoreGuard, takeWithheldThread } from './restoreGuard';
 import { installDevWindowFollow } from './actions/dev-window';
 import { restoreRepoSelectionFromStorage } from './actions/repositories';
@@ -57,7 +60,7 @@ import { CHECK_ICON, COPY_ICON } from '../utils/copyIcons';
 import { clipboardOrReport } from '../utils/clipboard';
 import { effect, untracked } from '@preact/signals';
 import { markBoot } from '../utils/bootTiming';
-import { activeMenuItem, connectionStatus, intelligenceLadderVersion, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, focusedThreadId, setFocusedThread } from './store';
+import { activeMenuItem, connectionStatus, intelligenceLadderVersion, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, focusedThreadId, setFocusedThread, currentApp } from './store';
 import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from '../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './actions/client-update';
@@ -146,18 +149,37 @@ export function startClient(): () => void {
   // re-mints at half-life, because the shell holds the device credential.
   startFrameCapabilityRenewal();
 
-  // Restore focused thread from localStorage (set at signal init, reinforce here).
+  pruneClosedWindows();
+  // Restore this window's focused thread (set at signal init, reinforce here).
   // setFocusedThread short-circuits when the value is unchanged, so this is a
   // no-op on cold start where the signal initializer already populated it.
-  const savedThreadId = localStorage.getItem(FOCUSED_THREAD_KEY);
+  const savedThreadId = readWindowItem(FOCUSED_THREAD_KEY);
   if (savedThreadId) {
     setFocusedThread(savedThreadId);
   }
   reopenDashboardPanelFromHistory();
-  // A device with no stored focus starts in Home (ADR 0411). A returning user
-  // keeps their last thread, so this reads the key before anything writes it.
+  // A window with no stored focus, its own or the shared seed, starts in Home
+  // (ADR 0411). A returning user keeps their last thread, so this reads the key
+  // before anything writes it.
   const stopColdStartHome = openHomeOnColdStart(savedThreadId !== null);
-  const stopRestoreOffer = offerWithheldThread(takeWithheldThread());
+  const authorizingNow = () => {
+    const flow = oauthAuthFlow.peek();
+    return flow === null ? null : { provider: flow.provider };
+  };
+  const stopWindowPeers = installWindowPeers(() => ({
+    focusedThreadId: focusedThreadId.peek(),
+    appId: currentApp.peek()?.id ?? null,
+    authorizing: authorizingNow(),
+  }));
+  const stopAnnouncingWindow = effect(() => {
+    void focusedThreadId.value;
+    void currentApp.value;
+    void oauthAuthFlow.value;
+    announceWindow();
+  });
+  const withheld = takeWithheldThread();
+  const stopReleasingWithheld = releaseWithheldToLiveWindow(withheld);
+  const stopRestoreOffer = offerWithheldThread(withheld?.threadId ?? null);
   const stopRestoreGuard = installRestoreGuard(() => focusedThreadId.peek());
 
   // Restore the restart state from localStorage BEFORE the first
@@ -719,6 +741,9 @@ export function startClient(): () => void {
     stopChatLadderReads();
     stopColdStartHome();
     stopRestoreOffer();
+    stopReleasingWithheld();
+    stopAnnouncingWindow();
+    stopWindowPeers();
     stopRestoreGuard();
     stopDevWindowFollow();
     stopAppBridge();

@@ -233,6 +233,7 @@ impl LucidosEngine {
             .thread_queue
             .submit(
                 crate::engine::thread_queue::ThreadQueueRequest::Cron {
+                    retry_of: None,
                     trigger_id: trigger_id.to_string(),
                 },
                 None,

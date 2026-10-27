@@ -217,7 +217,7 @@ Three lanes. A clearly catastrophic command (`rm -rf /`, a fork bomb, formatting
 
 Two sub-settings apply while the guard is on. Turning off the **LLM judge** uses the static dangerous-command classifier and destruction scan. If an enabled judge fails, the permission card asks the user and explains why. The **judge model** defaults to `gemini-3.1-flash-lite`.
 
-A third sub-setting, **Enabled for coding agents** (off by default), lets the guard also answer the permission cards of coding-agent commands (Codex, Claude Code `Bash`). On, a command the guard places as safe or reversible runs without a card, and a wrong reversible verdict has no undo.
+A third sub-setting, **Enabled for coding agents** (on by default), lets the guard also answer the permission cards of coding-agent commands (Codex, Claude Code `Bash`). On, a command the guard places as safe or reversible runs without a card, and a wrong reversible verdict has no undo.
 
 "Always allow" commands live in an editable list under **Settings → Permissions → Lucidos Agent permissions**. The list is **per workspace** (`<workspace>/.lucidos/agent-allowed-commands`), so another workspace asks again.
 
@@ -903,7 +903,7 @@ The browser cookie carries a window, refreshed each day the device is seen, but 
 See also: *device*, *pairing code*, `system-knowhow/remote-access.md` § Devices pair before Lucidos answers them.
 
 ### Pairing code
-The one-time code that makes a device a *paired device*. It works once and expires in five minutes. Two places produce one to pass on: **Settings → Access → Add a device**, and `lucidos pair` on the machine Lucidos runs on. The desktop app mints a third silently for itself: it reads the local file that proves it is on the machine, and pairs its own window on launch.
+The one-time code that makes a device a *paired device*. It works once and expires in five minutes. Two places produce one to pass on: **Settings → Access → Add a device** (press **Create a pairing code**), and `lucidos pair` on the machine Lucidos runs on. The desktop app mints a third silently for itself: it reads the local file that proves it is on the machine, and pairs its own window on launch.
 
 Both also draw it as a **QR**: the same code wrapped in a reachable address, never a second credential. Typing the digits does the same, so a failed scan is never a dead end.
 
@@ -913,8 +913,6 @@ Only a process on that machine can mint one, which stops a stranger pairing in. 
 See also: *paired device*, `system-knowhow/lucidos-cli.md` § `lucidos pair`, `system-knowhow/remote-access.md` § Settings → Access.
 
 ### Pairing address
-**Not shipped yet** (ADR 0550): today the QR tries the tailnet, then the local network address on the desktop app.
-
 The address a *pairing code*'s QR carries, so the new device lands on the gateway that minted the code. Lucidos picks the first that exists, in this order:
 1. the *external address*;
 2. the tailnet address, Tailscale's or a self-hosted Headscale one;
@@ -925,11 +923,9 @@ With none, Lucidos shows the code alone.
 See also: *pairing code*, *external address*, `system-knowhow/remote-access.md` § Add a device.
 
 ### External address
-**Not shipped yet** (ADR 0550): no such setting exists today.
+The address other devices use to reach this gateway, when you run the route yourself: a reverse proxy, WireGuard, a company VPN, or a Headscale name with your own certificate. One per gateway: scheme, host and optional port, no path. It wins in the *pairing address*, and an empty one leaves the QR on the tailnet address. Saving it checks that it reaches this gateway. A failed check only warns; an answer from a different gateway refuses the save. Pairing still guards it: a device on it pairs like any other.
 
-The address other devices use to reach this gateway, when you run the route yourself: a reverse proxy, a company VPN name, or a Headscale name with your own certificate. One per gateway: scheme, host and optional port, no path. It wins in the *pairing address*. Lucidos checks that it reaches this gateway, and warns when the check fails. Pairing still guards it: a device on it pairs like any other.
-
-Set it at install (`--external-address`), with the `LUCIDOS_EXTERNAL_ADDRESS` environment variable, with the `lucidos` CLI, or in **Settings → Access**.
+Set it at install (`--external-address`), with the `LUCIDOS_EXTERNAL_ADDRESS` environment variable (which locks the other three), with `lucidos external-address set`, or in **Settings → Access → External address**.
 See also: *pairing address*, *paired device*, `system-knowhow/remote-access.md`.
 
 ### Parent thread
@@ -1333,6 +1329,9 @@ Background ordering is FIFO, strict per trigger and best-effort across triggers.
 Background entries persist in the `thread_queue` projection, event-sourced from `ThreadQueued` / `ThreadQueueAdmitted` / `ThreadQueueDropped` / `ThreadQueueCompleted`. So a restart re-queues work that never ran and drains it as capacity frees. User-initiated work counts while its thread is running, and is never re-fired after a restart. The **Thread Queue panel** shows it all (Running counts background + user; run now, drop, edit the capacity policy). A badly delayed trigger or a full pool raises notifications that tap through to the panel.
 See also: `system-knowhow/thread-queue.md`, ADR 0008.
 
+### Title style
+One short instruction that shapes how the title model words automatic *thread* titles, for example "lower-kebab-case, at most 4 words". It is the `title_style` *preference*, stored per workspace, and it overrides the standard length and wording. Set it in **Settings → Models → Background tasks → Title generation**, or tell the agent. **Reset** deletes it and restores the standard titles. It shapes only titles written from then on, never existing names. See ADR 0586.
+
 ### Thread triage
 The Lucidos Agent sorting the user's inbox threads into proposed actions, each with a reason drawn from facts, never from a title. It is the `threads` tool's `triage` and `apply_triage` actions. A *triage action* is one of `archive`, `pin`, `delete`, `follow_up` (needs the user), `dismiss_question` or `keep`. Trigger runs group per trigger: the newest is kept, older ones are proposed for archive, and an older run's lone question for dismissal.
 
@@ -1467,6 +1466,10 @@ The row also shows the **next runs**: the next few fire times, merged across eve
 See also: `system-knowhow/triggers.md`, `docs/taxonomy.md` § Triggers.
 <!--gloss-trigger-end-->
 
+### Interrupted run
+A trigger run cut by an engine restart. Its thread stays failed in the inbox, with a notification and a notice explaining the retry decision. A qualifying run retries once in a new thread; its header links back to the interrupted run. A retry cannot retry again. A working automatic resume after a user-initiated switch does not count.
+See `system-knowhow/triggers.md` § "A fire due while the engine restarts" for eligibility and deadlines.
+
 ### Off-schedule run
 A firing of an existing *trigger* asked for by a person rather than by its schedule or an *event subscription*: `triggers(action="run")`, `lucidos triggers run --id`, `lucidos.triggers.run(id)`, or the **Run once** button on the trigger's panel row. It is **indistinguishable downstream** from a scheduled fire. Same `TriggerExecuted` / `TriggerCompleted`, `last_run` and last-run status, *trigger thread*, `go_to_review` routing and *side-effect grant*, and no actor stamp. A manual run also suppresses a redundant catch-up of the slot it covered.
 
@@ -1579,7 +1582,7 @@ An `ask_user_question` called with exactly one option. The *Lucidos Agent* uses 
 See also: `system-knowhow/running-python.md` § The drain pattern.
 
 ### Quiet option
-A question-card option that needs nothing more from the agent, such as "Leave it as posted" or "Not now". Picking it records the answer and ends the turn: the agent does not wake, so it writes no reply and does no more work. Typed text beside a pick always wakes it, and only a one-question ask can carry one: a later card still needs the agent. The Lucidos Agent and Codex mark one with `quiet: true`, and Claude Code with a `[quiet]` label prefix that the card never shows.
+A question-card option that needs nothing more from the agent, such as "Leave it as posted" or "Not now". Picking it records the answer and ends the turn: the agent does not wake, so it writes no reply and does no more work. An option that promises work is therefore never quiet, and a card whose every option is quiet is refused. Typed text beside a pick always wakes it, and only a one-question ask can carry one: a later card still needs the agent. The Lucidos Agent and Codex mark one with `quiet: true`, and Claude Code with a `[quiet]` label prefix that the card never shows.
 See also: *wake question*.
 
 ### Release notice
@@ -2194,7 +2197,7 @@ A Lucidos Agent thread is kept warm too: a chat, Home or a trigger thread. It qu
 
 Lucidos times a ping only from a cache lifetime the model's reply reported. With no such reply, as with Codex or most OpenRouter models, it sends no pings, and the card says the lifetime is unknown.
 
-By default it stops when the pings would cost one cache rewrite: from about 40 minutes to 3 hours on a 5-minute cache, by model, and far longer on a 1-hour one. For a card it stops at half of that, since late answers are rare. The `cache_keep_alive_mode` *preference* picks another rule, under **Settings → Models → Cache keep-alive**. It can tune the stop to this workspace's last 30 days of waits, or turn the keep-alive off.
+The keep-alive is off by default. Under `break-even` it stops when the pings would cost one cache rewrite: from about 40 minutes to 3 hours on a 5-minute cache, by model, and far longer on a 1-hour one. For a card it stops at half of that, since late answers are rare. The `cache_keep_alive_mode` *preference* picks the rule, under **Settings → Models → Cache keep-alive**. It can also tune the stop to this workspace's last 30 days of waits.
 
 You see the keep-alive as a whole, never the pings. Each wait it kept warm leaves one card in the transcript, a parked wait included. It carries a state word: Warming, Stopped, Ended or Turned off. Its title reads "Cache kept warm" for a run whose pings kept the cache warm (Warming, Ended) and "Cache keep-alive" otherwise. A wait that never got a ping leaves no card.
 

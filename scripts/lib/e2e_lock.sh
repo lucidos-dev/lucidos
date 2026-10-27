@@ -76,9 +76,10 @@
 # runs reclaiming the same stale lock, one wins and the other refuses.
 
 # The refusal line, and the exit code of a run refused because every slot it
-# needs is held. EX_TEMPFAIL: the run did not happen, which is not a failure.
+# needs is held (E2E_LOCK_BUSY_EXIT).
+# shellcheck source=host_busy_exits.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_busy_exits.sh"
 E2E_LOCK_HELD_MESSAGE="another e2e run is in progress on the e2e-test workspace."
-E2E_LOCK_BUSY_EXIT=75
 
 E2E_LOCK_OWNED=""
 

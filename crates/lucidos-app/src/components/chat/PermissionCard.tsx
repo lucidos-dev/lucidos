@@ -2,7 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { showToast } from '../../store/store';
 import { openCommandGuardCodingAgentsSettings } from '../../store/actions/menu';
-import { currentCommandGuardCodingAgents } from '../../store/actions/preferences';
+import { currentCommandGuard, currentCommandGuardCodingAgents } from '../../store/actions/preferences';
 import { SettingsIcon } from '../shared/icons';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
 import { changeKindName, type AllowScope } from '../../store/thread-events';
@@ -588,7 +588,9 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       mark={mark}
       terminated={!!terminated}
       note={engineResolutionNote(resolved)}
-      commandGuardLink={isCommandTool(event.tool_name) && !currentCommandGuardCodingAgents()}
+      commandGuardLink={
+        isCommandTool(event.tool_name) && !(currentCommandGuard() && currentCommandGuardCodingAgents())
+      }
     />
   );
 }

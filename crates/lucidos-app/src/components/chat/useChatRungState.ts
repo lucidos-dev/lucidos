@@ -1,3 +1,4 @@
+import { rungLockedReason } from './rungLockedReason';
 import { useEffect } from 'preact/hooks';
 import {
   chatLadder, chatModels, effectiveThreadStatus, showToast, threadMap,
@@ -25,7 +26,7 @@ import { openIntelligenceLadder } from '../../store/actions/menu';
 import { errorDetail } from '../../utils/errorDetail';
 import { providerStepOptions, providerStepCommit } from '../shared/ModelSelectionPicker';
 import type { RungProviderStep } from './RungPicker';
-import { rungIntelligence, rungLockedReason, stepTargets, type ShownRung } from './rungControlParts';
+import { rungIntelligence, stepTargets, type ShownRung } from './rungControlParts';
 import { LADDER_LINK_VALUE, rungListRows } from './rungRows';
 import { askRungSwitch } from './rungSwitch';
 
@@ -270,5 +271,5 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     void pick(commit.encoded, undefined, true);
   }
 
-  return { shown, rungList, providerStep, pickRung, steps, step };
+  return { lockedReason: lockedNow(), shown, rungList, providerStep, pickRung, steps, step };
 }

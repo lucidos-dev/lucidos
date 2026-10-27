@@ -96,6 +96,7 @@ const CLOCK_BLOCK: &str =
 #[test]
 fn trigger_context_has_no_preload_fields() {
     let _tc = TriggerContext {
+        retry_of: None,
         trigger_id: "id".to_string(),
         trigger_name: "name".to_string(),
         slug: "name".to_string(),
@@ -122,6 +123,7 @@ fn build_trigger_started_event_preserves_config_id_verbatim() {
         "Run the check.",
         false,
         &sel(None, None, None),
+        None,
     );
     assert_eq!(meta.channel, Some(EventChannel::Trigger));
     let ThreadEvent::TriggerStarted {
@@ -161,6 +163,7 @@ fn build_trigger_started_event_records_the_resolved_model_and_effort() {
         "Summarize today.",
         false,
         &sel(Some("gemini-3.8-flash"), Some("low"), Some("anthropic")),
+        None,
     );
     let ThreadEvent::TriggerStarted {
         model,
@@ -2435,4 +2438,28 @@ async fn the_trigger_model_never_reaches_a_chat_turn() {
     assert_eq!(resolved.model.as_deref(), Some("chat-account-model"));
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn trigger_started_carries_retry_provenance() {
+    let retry_of = crate::engine::thread_events::RetryOf {
+        thread_id: uuid::Uuid::new_v4(),
+        deadline: chrono::Utc::now(),
+    };
+    let (event, _) = build_trigger_started_event(
+        "daily-report",
+        "Daily report",
+        &TriggerInvocation::Schedule,
+        "Run the check.",
+        false,
+        &sel(None, None, None),
+        Some(&retry_of),
+    );
+    let ThreadEvent::TriggerStarted {
+        retry_of: actual, ..
+    } = event
+    else {
+        panic!("expected TriggerStarted");
+    };
+    assert_eq!(actual, Some(retry_of));
 }

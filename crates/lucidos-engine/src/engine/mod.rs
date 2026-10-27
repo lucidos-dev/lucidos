@@ -18,6 +18,8 @@ mod change_ops;
 pub mod change_summary_consumer;
 pub mod changelog;
 pub(in crate::engine) mod chat;
+// Scheduler boot recovery shares the turn boundary list with chat sweeps.
+pub(crate) use chat::recovery::turn_terminal_events;
 pub(crate) mod claude_code;
 pub(crate) mod claude_gateway_sign_in;
 pub(crate) mod command_guard;

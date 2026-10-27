@@ -265,3 +265,24 @@ The permission card for a pending command links to the setting.
 Implementation: `engine/cc_permission.rs` (`attended_command_allowed`,
 `lane_allows_escalation`), `api/internal.rs`, `core/preference_catalog.rs`. Plan:
 `docs/plans/2026-10-22-command-guard-answers-coding-agent-commands.md`.
+
+## Addendum (2026-10-26): `command_guard_coding_agents` defaults on
+
+**Decision.** The flag now defaults on. This replaces "off by default" above.
+The master `command_guard` still ships dark, so a workspace that never turned
+the guard on sees no change. A workspace that turned it on now gets the wider
+gate unless it switched the child off.
+
+**Why.** A user who opts in to the guard and its judge wants the routine
+coding-agent cards gone. The opt-in point is the master switch, and a second
+opt-in hid the reason to turn it on.
+
+**Accepted cost.** A wrong `ReversibleDanger` verdict still runs with no
+checkpoint and no undo. The 2026-10-22 addendum accepted that through an
+explicit child opt-in. The user now accepts it by turning on the master guard.
+So the section explainer and the row explainer both say what the guard does to
+coding-agent commands. The card's link hides only while both switches are on,
+since the child alone no longer means the guard answers.
+
+Implementation: `core/preference_catalog.rs`, and the card link in
+`components/chat/PermissionCard.tsx`.

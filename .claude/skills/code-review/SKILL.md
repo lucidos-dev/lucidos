@@ -79,6 +79,8 @@ missing `await`, falsy-zero checks, wrong-variable copy-paste, error swallowed
 in catch, unescaped regex metachars. Also look for security holes the diff
 opens: injection, auth bypass, data exposure.
 
+Report [population check](../../rules/build-for-users.md) violations as correctness findings of at least medium severity. Flag machine-specific guesses and fixes covering only one platform or setup.
+
 **Angle B — removed-behavior auditor.** For every line the diff DELETES or
 replaces, name the invariant or behavior it enforced, then search the new code
 for where that invariant is re-established. If you can't find it, that's a

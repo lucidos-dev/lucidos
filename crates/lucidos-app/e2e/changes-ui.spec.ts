@@ -39,9 +39,7 @@ test.describe('Claude Code changes - apply and discard via UI', () => {
       await navigateToApp(page);
 
       // The action panel with Apply/Discard should appear for this CC thread
-      const applyBtn = page.locator('.thread-action-buttons:visible button.action-btn-confirm:has-text("Apply")').first();
-      await expect(applyBtn).toBeVisible({ timeout: 15_000 });
-      await applyBtn.click();
+      await clickChangeAction(page, 'Apply');
 
       // Wait for the change to leave the pending list
       await page.waitForFunction(async (cid) => {

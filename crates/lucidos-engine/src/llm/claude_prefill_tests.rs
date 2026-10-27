@@ -131,6 +131,49 @@ fn the_whole_cut_is_the_turn_with_one_block_after_its_last_marker() {
     assert_eq!(markers(&whole), markers(&sent(&turn)), "markers kept");
 }
 
+/// `body` with the beat block taken out, as raw bytes.
+fn without_beat_block(body: &[u8]) -> Vec<u8> {
+    let block = format!(",{}", beat_block());
+    let text = std::str::from_utf8(body).expect("a body is UTF-8");
+    assert_eq!(text.matches(&block).count(), 1, "one beat block: {text}");
+    text.replacen(&block, "", 1).into_bytes()
+}
+
+/// The turn's request as the bytes it sent.
+fn sent_bytes(request: &ClaudeRequest) -> Vec<u8> {
+    serde_json::to_vec(request).unwrap()
+}
+
+/// A beat repeats the turn's bytes, key order included. A gateway can route
+/// on the raw body, so a key-sorted copy may reach a cache the turn never
+/// wrote (ADR 0581).
+#[test]
+fn the_whole_cut_sends_the_turns_own_bytes() {
+    let turn = request(vec![user_message(true)], MODEL, "high");
+    let whole = pair(&turn, route()).unwrap().whole;
+    assert_eq!(
+        String::from_utf8(without_beat_block(&whole.body)).unwrap(),
+        String::from_utf8(sent_bytes(&turn)).unwrap()
+    );
+}
+
+#[test]
+fn the_stable_cut_sends_the_turns_own_bytes_through_the_cut() {
+    let turn = request(vec![user_message(true)], MODEL, "high");
+    let stable = pair(&turn, route()).unwrap().stable;
+    let (message, block) = turn.stable_prefix_end.unwrap();
+    let mut cut = request(vec![user_message(true)], MODEL, "high");
+    cut.messages.truncate(message + 1);
+    let Value::Array(blocks) = &mut cut.messages[message].content else {
+        panic!("a Tree message is blocks");
+    };
+    blocks.truncate(block + 1);
+    assert_eq!(
+        String::from_utf8(without_beat_block(&stable.body)).unwrap(),
+        String::from_utf8(sent_bytes(&cut)).unwrap()
+    );
+}
+
 #[test]
 fn both_bodies_carry_the_turn_route_and_read_to_message_start() {
     let turn = request(vec![user_message(true)], MODEL, "high");
@@ -188,7 +231,8 @@ fn the_stable_cut_ends_at_the_stable_prefix_end() {
 #[test]
 fn the_stable_cut_matches_the_turn_fingerprint() {
     let turn = request(vec![user_message(true)], MODEL, "high");
-    let mut stable = json(&pair(&turn, route()).unwrap().stable.body);
+    let cut = pair(&turn, route()).unwrap().stable;
+    let mut stable = json(&cut.body);
     let (message, block) = turn.stable_prefix_end.unwrap();
     let blocks = stable["messages"][message]["content"]
         .as_array_mut()
@@ -201,6 +245,10 @@ fn the_stable_cut_matches_the_turn_fingerprint() {
     };
     blocks.truncate(block + 1);
     assert_eq!(stable["messages"], sent(&rebuilt)["messages"]);
+    assert_eq!(
+        cut.stable_prefix_fingerprint,
+        crate::llm::stable_prefix::fingerprint(&rebuilt, MODEL)
+    );
     assert_eq!(
         crate::llm::stable_prefix::fingerprint(&turn, MODEL),
         crate::llm::stable_prefix::fingerprint(&rebuilt, MODEL),
@@ -231,6 +279,34 @@ fn the_stable_cut_stops_at_the_last_marked_block() {
     assert_eq!(last.len(), block + 1, "one block short of the prefix end");
     assert!(last[block - 1].get("cache_control").is_some());
     assert_eq!(last[block], beat_block());
+}
+
+#[test]
+fn a_resumed_turns_cut_already_has_a_marker_but_omits_a_view_block() {
+    let mut messages = resume_blocks();
+    messages.push(user_message(true));
+    let turn = request(messages, MODEL, "high");
+    let pair = pair(&turn, route()).unwrap();
+    let stable = json(&pair.stable.body);
+    let (message, block) = turn.stable_prefix_end.unwrap();
+    let original = sent(&turn);
+    let through = block - 1;
+    assert!(original["messages"][message]["content"][through]
+        .get("cache_control")
+        .is_some());
+    assert_eq!(
+        &stable["messages"][message]["content"].as_array().unwrap()[..=through],
+        &original["messages"][message]["content"].as_array().unwrap()[..=through],
+    );
+    assert_eq!(
+        pair.whole.stable_prefix_fingerprint,
+        crate::llm::stable_prefix::fingerprint(&turn, MODEL),
+    );
+    assert_ne!(
+        pair.stable.stable_prefix_fingerprint,
+        pair.whole.stable_prefix_fingerprint
+    );
+    assert!(pair.stable.stable_prefix_fingerprint.is_some());
 }
 
 /// A Classic turn has no view blocks, so its stable prefix ends at the

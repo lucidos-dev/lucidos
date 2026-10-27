@@ -7,6 +7,11 @@
   [0547](0547-keep-alive-beats-a-parked-session-by-copy.md) (the cache-warm
   line as the only place a parked wait shows).
 
+- **Amended by**: [0581](0581-keep-alive-never-pings-a-cache-it-cannot-read.md).
+  Only a warm wake that held the context claims a saving.
+- **Amended by**: [0580](0580-keep-alive-missed-ping-is-thread-scoped.md).
+  `not_kept` gains `pings_paused` and `cache_expired`.
+
 ## Context
 
 Three surfaces showed the *cache keep-alive*: the transcript card, the

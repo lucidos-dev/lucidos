@@ -7,13 +7,28 @@ import {
   RESTORE_GUARD_KEY,
   RESTORE_GUARD_SURVIVAL_MS,
   armRestoreGuard,
+  disarmRestoreGuard,
   installRestoreGuard,
   readGuardedFocus,
   restoredFocus,
   takeWithheldThread,
 } from './restoreGuard';
+import {
+  _resetWindowStorageForTests, readWindowItem, windowId, writeWindowItem,
+} from '../utils/windowStorage';
 
 const FOCUS_KEY = 'test-focused-thread';
+
+/** The thread this window's marker names, without the arming window. */
+function markerThread(): string | null {
+  return readWindowItem(RESTORE_GUARD_KEY)?.split(' ')[0] ?? null;
+}
+
+/** Boot as another window: a fresh tab id, as a second window would have. */
+function becomeAnotherWindow(): void {
+  sessionStorage.clear();
+  _resetWindowStorageForTests();
+}
 
 function setVisibility(state: DocumentVisibilityState): void {
   Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
@@ -45,16 +60,25 @@ describe('readGuardedFocus', () => {
     localStorage.setItem(FOCUS_KEY, 't1');
     localStorage.setItem(RESTORE_GUARD_KEY, 't1');
     expect(readGuardedFocus(FOCUS_KEY)).toBeNull();
-    expect(localStorage.getItem(FOCUS_KEY)).toBeNull();
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBeNull();
-    expect(takeWithheldThread()).toBe('t1');
+    expect(readWindowItem(FOCUS_KEY)).toBeNull();
+    expect(markerThread()).toBeNull();
+    expect(takeWithheldThread()).toEqual({ threadId: 't1', armedBy: '' });
     expect(takeWithheldThread()).toBeNull();
+  });
+
+  it('names the window that armed the marker, so a live one can release it', () => {
+    writeWindowItem(FOCUS_KEY, 't1');
+    armRestoreGuard('t1');
+    const armedBy = windowId();
+    becomeAnotherWindow();
+    expect(readGuardedFocus(FOCUS_KEY)).toBeNull();
+    expect(takeWithheldThread()).toEqual({ threadId: 't1', armedBy });
   });
 
   it('restores an unguarded focus and withholds nothing', () => {
     localStorage.setItem(FOCUS_KEY, 't1');
     expect(readGuardedFocus(FOCUS_KEY)).toBe('t1');
-    expect(localStorage.getItem(FOCUS_KEY)).toBe('t1');
+    expect(readWindowItem(FOCUS_KEY)).toBe('t1');
     expect(takeWithheldThread()).toBeNull();
   });
 });
@@ -70,11 +94,11 @@ describe('arming', () => {
 
   it('names the focused thread until the page survives the window', () => {
     armRestoreGuard('t1');
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBe('t1');
+    expect(markerThread()).toBe('t1');
     vi.advanceTimersByTime(RESTORE_GUARD_SURVIVAL_MS - 1);
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBe('t1');
+    expect(markerThread()).toBe('t1');
     vi.advanceTimersByTime(1);
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBeNull();
+    expect(markerThread()).toBeNull();
   });
 
   it('restarts the window on a new focus', () => {
@@ -82,13 +106,20 @@ describe('arming', () => {
     vi.advanceTimersByTime(RESTORE_GUARD_SURVIVAL_MS - 1);
     armRestoreGuard('t2');
     vi.advanceTimersByTime(1);
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBe('t2');
+    expect(markerThread()).toBe('t2');
+  });
+
+  it("never disarms another window's marker", () => {
+    armRestoreGuard('t1');
+    becomeAnotherWindow();
+    disarmRestoreGuard();
+    expect(localStorage.getItem(RESTORE_GUARD_KEY)?.split(' ')[0]).toBe('t1');
   });
 
   it('clears the marker when the focus goes', () => {
     armRestoreGuard('t1');
     armRestoreGuard(null);
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBeNull();
+    expect(markerThread()).toBeNull();
   });
 });
 
@@ -110,27 +141,27 @@ describe('installRestoreGuard', () => {
   });
 
   it('arms for the focus it boots with', () => {
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBe('t1');
+    expect(markerThread()).toBe('t1');
   });
 
   it('clears the marker on pagehide, so a reload restores the thread', () => {
     window.dispatchEvent(new Event('pagehide'));
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBeNull();
+    expect(markerThread()).toBeNull();
   });
 
   it('clears the marker when the page is hidden, and arms again on return', () => {
     setVisibility('hidden');
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBeNull();
+    expect(markerThread()).toBeNull();
     vi.advanceTimersByTime(RESTORE_GUARD_SURVIVAL_MS);
     focus = 't2';
     setVisibility('visible');
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBe('t2');
+    expect(markerThread()).toBe('t2');
   });
 
   it('stops listening after teardown', () => {
     stop?.();
     stop = null;
     window.dispatchEvent(new Event('pagehide'));
-    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBe('t1');
+    expect(markerThread()).toBe('t1');
   });
 });

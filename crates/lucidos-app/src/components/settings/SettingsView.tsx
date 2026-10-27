@@ -35,6 +35,7 @@ import {
 import { type ModelChoice } from '../../store/modelSelection';
 import { ModelSelectionRow } from './ModelSelectionRow';
 import { BackgroundModelRow } from './BackgroundModelRow';
+import { TitleStyleRow } from './TitleStyleRow';
 import { useBackgroundModels } from './useBackgroundModels';
 import { ResponseStylesSection } from './ResponseStylesSection';
 import { ModelsManager } from './ModelsManager';
@@ -70,7 +71,6 @@ import { usePairedDevices, revokePaired } from './pairedDevices';
 import { pairedRows, pairingIsKnown } from '../../store/actions/pairedDevices';
 import { SectionHeader } from '../shared/SectionHeader';
 import { buildDeviceRows, isUnusedDevice, deviceRowName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
-import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
@@ -991,26 +991,21 @@ export function SettingsView() {
     );
   }
 
-  /** Access: how you reach this engine from somewhere else. The mobile-access
-   *  guide and the engine's network bind are two halves of one question, and
-   *  the guide's own "Local network is off" row used to have to deep-link into
-   *  System → Network access to finish the job. Now it scrolls.
+  /** Access: how you reach this engine from somewhere else. `MobileAccessPage`
+   *  renders the whole page, the engine's Network access section included, so
+   *  its own "Local network is off" row scrolls there rather than deep-linking.
    *
-   *  The two halves each fetch `GET /api/v1/network-config` on mount, so opening
-   *  this page costs two requests for one payload. Left as two independent
-   *  `Loadable`s deliberately, because they read DISJOINT fields (the guide uses
+   *  The guide and the Network access section each fetch
+   *  `GET /api/v1/network-config` on mount, so opening this page costs two
+   *  requests for one payload. Left as two independent `Loadable`s
+   *  deliberately, because they read DISJOINT fields (the guide uses
    *  `gateway_bind` / `detected_tailscale_ip`, the bind editor uses
    *  `engine_bind` / `inherit`) and the call is a cheap local one. That
-   *  disjointness is the invariant: give both halves a field in common and one
-   *  side goes stale after the other's Save, at which point the fetch has to be
+   *  disjointness is the invariant: give both a field in common and one side
+   *  goes stale after the other's Save, at which point the fetch has to be
    *  hoisted into a single owner rather than duplicated. */
   function accessSection() {
-    return (
-      <>
-        <MobileAccessPage />
-        <NetworkAccessPage />
-      </>
-    );
+    return <MobileAccessPage />;
   }
 
   function commandSafetySection() {
@@ -1043,9 +1038,11 @@ export function SettingsView() {
               every command the agent runs goes straight through.
             </p>
             <p>
-              By default it does not gate a coding agent's tools. Claude Code asks through
-              its own permissions list below. Codex asks when a command has to escape its
-              sandbox. Lucidos answers the plain reads for you, whatever these toggles say.
+              With the guard off, it does not gate a coding agent's tools. Claude Code asks
+              through its own permissions list below. Codex asks when a command has to
+              escape its sandbox. With the guard on, it also judges those commands, unless
+              you turn off Enabled for coding agents. Lucidos answers the plain reads for
+              you, whatever these toggles say.
             </p>
             <p>
               The <strong>LLM judge</strong> places the commands the static check cannot.
@@ -1313,6 +1310,7 @@ export function SettingsView() {
             reasoningKey="reasoning_title"
             background={background}
           />
+          <TitleStyleRow />
           {/* Under the title model, because it inherits it while unset: both
               write one line naming a piece of work. */}
           <BackgroundModelRow

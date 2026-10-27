@@ -28,12 +28,12 @@ use std::time::Duration;
 /// Where every gateway keeps its registry, relative to its data dir.
 const REGISTRY_REL: &str = "config/workspaces.json";
 
-/// The only path this module ever asks a peer for. Public
-/// (`auth_api::is_public_path`), so the probe presents no credential.
-const PEER_HEALTH_PATH: &str = "/~/api/v1/health";
+/// The gateway's own health. Public (`auth_api::is_public_path`), so a probe
+/// presents no credential: the only path a peer or address probe asks for.
+pub(crate) const GATEWAY_HEALTH_PATH: &str = "/~/api/v1/health";
 
 /// What `/~/api/v1/health` calls a gateway, as opposed to an engine.
-const GATEWAY_ROLE: &str = "gateway";
+pub(crate) const GATEWAY_ROLE: &str = "gateway";
 
 /// How long one probe may take. Two schemes are tried, so this is half the
 /// worst case a user waits on their click.
@@ -173,7 +173,7 @@ pub async fn probe_scheme(client: &reqwest::Client, port: u16) -> Option<&'stati
 /// Did a Lucidos gateway answer here? The port alone proves nothing: it is a
 /// well-known number and anything may hold it.
 async fn answered_as_gateway(client: &reqwest::Client, scheme: &str, port: u16) -> bool {
-    let url = format!("{scheme}://127.0.0.1:{port}{PEER_HEALTH_PATH}");
+    let url = format!("{scheme}://127.0.0.1:{port}{GATEWAY_HEALTH_PATH}");
     let Ok(res) = client.get(&url).timeout(PROBE_TIMEOUT).send().await else {
         return false;
     };

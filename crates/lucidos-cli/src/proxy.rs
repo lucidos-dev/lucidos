@@ -10,7 +10,7 @@
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
-use crate::http::{client_with_timeout, format_request_error};
+use crate::http::{client_with_timeout, format_request_error, ConnectRetry};
 use crate::workspace::{BoxError, Workspace};
 
 /// How long `lucidos proxy` waits on the engine: the engine's 600 s cap on one
@@ -55,7 +55,7 @@ pub(crate) fn run(ws: &Workspace, args: ProxyArgs) -> Result<u8, BoxError> {
 
     let start = Instant::now();
     let resp = req
-        .send()
+        .send_with_connect_retry()
         .map_err(|e| format_request_error(&method_str, &url, &e, start.elapsed()))?;
     let status = resp.status();
     let resp_headers = resp.headers().clone();

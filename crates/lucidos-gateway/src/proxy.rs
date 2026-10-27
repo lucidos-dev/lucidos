@@ -57,9 +57,10 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 ///
 /// `keep_handover` marks the upgrade path, where three headers differ.
 /// `connection` and `upgrade` are kept: there they ARE the handshake, not
-/// framing to discard (ADR 0151). `origin` goes the other way. The HTTP path
-/// forwards it for the engine's gate, and the upgrade path judges it here, in
-/// [`foreign_handshake_origin`], and consumes it (ADR 0163).
+/// framing to discard (ADR 0151). `origin` goes the other way. The upgrade path
+/// judges it here, in [`foreign_origin`], and consumes it (ADR 0163). The HTTP
+/// path forwards it for the engine's gate, except where [`vouches_for_origin`]
+/// consumes it.
 fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
     let n = name.as_str();
     if name == header::HOST
@@ -117,7 +118,7 @@ fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
     url.scheme() == "https" && url.port().is_none() && origin_host.eq_ignore_ascii_case(host)
 }
 
-/// The page this handshake came from, when it is not one of ours.
+/// The page this request came from, when it is not one of ours.
 ///
 /// A browser sends no `Sec-Fetch-Site` on a WebSocket handshake: Chromium and
 /// Gecko send no fetch metadata there at all. So the engine's same-origin gate
@@ -131,13 +132,36 @@ fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
 /// browser and is left to the bind topology, exactly as the engine's gate
 /// leaves it. An `Origin` with no `Host` to compare against is refused rather
 /// than guessed at, for the same reason the engine refuses it.
-fn foreign_handshake_origin(headers: &HeaderMap) -> Option<&str> {
+///
+/// An ordinary request meets the same question when it carries no fetch
+/// metadata, see [`vouches_for_origin`].
+fn foreign_origin(headers: &HeaderMap) -> Option<&str> {
     let origin = headers.get(header::ORIGIN)?.to_str().ok()?;
     let ours = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|host| origin_authority_matches_host(origin, host));
     (!ours).then_some(origin)
+}
+
+/// Does this gateway answer the engine's same-origin question for an ordinary
+/// request, so the engine need not?
+///
+/// A browser sends `Sec-Fetch-Site` only to https and loopback URLs. A
+/// plain-HTTP tailnet or LAN address gets none, so the engine's gate falls back
+/// to `Origin == Host`. Behind this hop its `Host` is the internal upstream, and
+/// every POST from our own page would fail. The client's own `Host` is here, so
+/// the compare is made here.
+///
+/// A request with fetch metadata is left to the engine, since that tells
+/// same-site from cross-site where a host compare cannot. A foreign `Origin` is
+/// forwarded, and the engine refuses it. This hop never refuses an ordinary
+/// request itself: the engine's app-asset exemption admits a font fetch from an
+/// opaque-origin frame, which carries `Origin: null`.
+fn vouches_for_origin(headers: &HeaderMap) -> bool {
+    headers.contains_key(header::ORIGIN)
+        && !headers.contains_key("sec-fetch-site")
+        && foreign_origin(headers).is_none()
 }
 
 /// Is this a WebSocket upgrade request?
@@ -257,10 +281,14 @@ pub async fn proxy(
     //     keys push, preferences and actor attribution on the id, so a forged
     //     value would let a caller act as any device. `enforce` stamps the
     //     extension; a client cannot.
+    //   - `origin` is consumed when [`vouches_for_origin`] answers the engine's
+    //     same-origin question here. Otherwise the engine's gate reads it.
     let (parts, body) = req.into_parts();
+    let origin_vouched = vouches_for_origin(&parts.headers);
     let mut upstream = Request::builder().method(parts.method).uri(rest);
     for (name, value) in &parts.headers {
-        if !gateway_owns_header(name, false) {
+        let consumed = origin_vouched && name == header::ORIGIN;
+        if !consumed && !gateway_owns_header(name, false) {
             upstream = upstream.header(name, value);
         }
     }
@@ -357,9 +385,9 @@ async fn proxy_upgrade(
 ) -> Response {
     // The same-origin question, answered where the client's own authority still
     // is. Refused before the engine is dialled, so a foreign page cannot even
-    // open the connection. See `foreign_handshake_origin` for why this hop owns
+    // open the connection. See `foreign_origin` for why this hop owns
     // the question rather than the engine's gate.
-    if let Some(origin) = foreign_handshake_origin(req.headers()) {
+    if let Some(origin) = foreign_origin(req.headers()) {
         // Named in full, because the browser hides a refused handshake's
         // response and this log line is the only place the reason appears.
         crate::log!(
@@ -1505,6 +1533,70 @@ mod proxy_tests {
         );
     }
 
+    /// What the engine sees when a browser POSTs through the gateway. A
+    /// plain-HTTP origin gets no `Sec-Fetch-Site` from any browser, so `Origin`
+    /// is the only signal there is.
+    async fn upstream_saw_post(host: &str, origin: &str, sec_fetch_site: Option<&str>) -> String {
+        let (_dir, target, captured) = capturing_upstream().await;
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/dev/api/v1/notification/read")
+            .header("host", host)
+            .header("origin", origin);
+        if let Some(site) = sec_fetch_site {
+            builder = builder.header("sec-fetch-site", site);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = captured.lock().await;
+        seen.to_lowercase()
+    }
+
+    #[tokio::test]
+    async fn our_own_page_on_plain_http_reaches_the_engine_with_no_origin() {
+        let got = upstream_saw_post("100.70.0.1:5252", "http://100.70.0.1:5252", None).await;
+        assert!(
+            !got.contains("origin:"),
+            "a vouched Origin must be consumed; upstream saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_origin_still_reaches_the_engine_to_be_refused() {
+        for origin in [
+            "http://100.70.0.1:5251",
+            "https://evil.example",
+            "http://100.70.0.1",
+            "null",
+        ] {
+            let got = upstream_saw_post("100.70.0.1:5252", origin, None).await;
+            assert!(
+                got.contains(&format!("origin: {origin}")),
+                "a foreign Origin must be forwarded verbatim; upstream saw:\n{got}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn with_fetch_metadata_the_engine_gets_both_headers() {
+        let got =
+            upstream_saw_post("name.ts.net", "https://name.ts.net", Some("same-origin")).await;
+        assert!(got.contains("origin: https://name.ts.net"), "{got}");
+        assert!(got.contains("sec-fetch-site: same-origin"), "{got}");
+    }
+
+    #[test]
+    fn an_origin_with_no_host_is_not_vouched_for() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "http://100.70.0.1:5252".parse().unwrap());
+        assert!(!vouches_for_origin(&headers));
+        headers.insert(header::HOST, "100.70.0.1:5252".parse().unwrap());
+        assert!(vouches_for_origin(&headers));
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(!vouches_for_origin(&headers));
+    }
+
     #[tokio::test]
     async fn the_gateway_vouches_for_its_own_hop() {
         // A wide-bound engine requires this, and a loopback one ignores it. It
@@ -2202,8 +2294,8 @@ mod upgrade_tests {
             assert!(!gateway_owns_header(&name, true), "{handover}");
         }
         // The other way round. An ordinary request's `Origin` is the engine
-        // gate's to read, and stripping it there would blind the gate on the
-        // one path where it works.
+        // gate's to read. `proxy` consumes it only when `vouches_for_origin`
+        // has already answered the gate's question.
         let origin = HeaderName::from_static("origin");
         assert!(!gateway_owns_header(&origin, false));
         assert!(gateway_owns_header(&origin, true));

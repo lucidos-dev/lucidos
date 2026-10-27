@@ -1,3 +1,4 @@
+import { readWindowItem, removeWindowItem, writeWindowItem } from '../../utils/windowStorage';
 import { signal, computed, effect } from '@preact/signals';
 import {
   activeMenuItem,
@@ -227,7 +228,7 @@ function restoreState(entry: NavEntry): void {
     // Validate menuItem — old nav stack entries may contain removed values like 'pinned'
     const menuItem = (MENU_ITEMS as readonly string[]).includes(migrated.menuItem) ? migrated.menuItem : 'files';
     activeMenuItem.value = menuItem;
-    localStorage.setItem('lucidos-active-menu-item', menuItem);
+    writeWindowItem('lucidos-active-menu-item', menuItem);
     settingsSubview.value = migrated.settingsSubview;
     // The one overlay guard, and it asks about THIS device rather than about
     // the entry: don't restore a url-preview when the in-app browser isn't the
@@ -241,14 +242,14 @@ function restoreState(entry: NavEntry): void {
     const overlay = suppressUrlPreview ? null : migrated.overlay;
     panelOverlay.value = overlay;
     if (overlay?.type === 'file-preview') {
-      localStorage.setItem('file-preview-open', overlay.path);
+      writeWindowItem('file-preview-open', overlay.path);
     } else {
-      localStorage.removeItem('file-preview-open');
+      removeWindowItem('file-preview-open');
     }
     if (overlay?.type === 'app-ui') {
-      localStorage.setItem('app-window-open', overlay.app.id);
+      writeWindowItem('app-window-open', overlay.app.id);
     } else {
-      localStorage.removeItem('app-window-open');
+      removeWindowItem('app-window-open');
     }
     if (overlay?.type === 'url-preview') {
       webviewInitialUrl.value = normalizeUrl(overlay.url);
@@ -270,7 +271,7 @@ let _initialized = false;
 
 function saveNavState(): void {
   try {
-    localStorage.setItem(NAV_KEY, JSON.stringify({
+    writeWindowItem(NAV_KEY, JSON.stringify({
       stack: navStack.value,
       cursor: navCursor.value,
     }));
@@ -281,7 +282,7 @@ function ensureInitialized(): void {
   if (_initialized) return;
   _initialized = true;
   try {
-    const saved = localStorage.getItem(NAV_KEY);
+    const saved = readWindowItem(NAV_KEY);
     if (saved) {
       const { stack, cursor } = JSON.parse(saved) as { stack: NavEntry[]; cursor: number };
       if (Array.isArray(stack) && stack.length > 0 && cursor >= 0 && cursor < stack.length) {
@@ -310,12 +311,12 @@ export function pruneNavHistory(isStale: (entry: NavEntry) => boolean): void {
     return;
   }
   try {
-    const saved = localStorage.getItem(NAV_KEY);
+    const saved = readWindowItem(NAV_KEY);
     if (!saved) return;
     const { stack, cursor } = JSON.parse(saved) as { stack: unknown; cursor: number };
     if (!Array.isArray(stack)) return;
     const result = pruneEntries(stack.map(migrateEntry), cursor, isStale);
-    if (result) localStorage.setItem(NAV_KEY, JSON.stringify(result));
+    if (result) writeWindowItem(NAV_KEY, JSON.stringify(result));
   } catch { /* corrupt data: ensureInitialized starts fresh from it anyway */ }
 }
 
