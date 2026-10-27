@@ -142,6 +142,12 @@ export function isChosenByPreference(
   return false;
 }
 
+/** Does THIS window act on what `threadId` asked for? The window showing that
+ *  thread wins, else the window the user touched last. */
+export function isChosenForThread(threadId: string): boolean {
+  return isChosenByPreference((window) => window.focusedThreadId === threadId, () => true);
+}
+
 /** Call `listener` once a window with `id` is heard from, now or later.
  *  Returns the unsubscribe. */
 export function whenWindowSeen(id: string, listener: () => void): () => void {

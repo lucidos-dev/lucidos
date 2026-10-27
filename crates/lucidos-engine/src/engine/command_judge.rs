@@ -156,8 +156,8 @@ pub async fn classify_for_eval(
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
         }),
-        input_tokens: judgment.usage.input_tokens,
-        output_tokens: judgment.usage.output_tokens,
+        input_tokens: judgment.usage.unwrap_or_default().input_tokens,
+        output_tokens: judgment.usage.unwrap_or_default().output_tokens,
     })
 }
 
@@ -206,7 +206,8 @@ impl LucidosEngine {
 mod tests {
     use super::*;
     use crate::engine::event_bus::EventBus;
-    use crate::llm::judgment::{Answer, Answers, ChoiceAnswer, Judgment, JudgmentUsage, Question};
+    use crate::engine::ApiUsage;
+    use crate::llm::judgment::{Answer, Answers, ChoiceAnswer, Judgment, Question};
     use crate::llm::tool_names as tn;
     use crate::test_support::{aux_captures, setup_test_db, teardown_test_db};
     use uuid::Uuid;
@@ -244,12 +245,13 @@ mod tests {
 
     /// What [`StubJudge`] reports having spent. Any non-zero pair does, since
     /// what the tests assert is that the numbers reach the row unchanged.
-    const STUB_USAGE: JudgmentUsage = JudgmentUsage {
-        input_tokens: 312,
-        output_tokens: 48,
-        cache_read_tokens: 0,
-        cache_creation_tokens: 0,
-    };
+    fn stub_usage() -> ApiUsage {
+        ApiUsage {
+            input_tokens: 312,
+            output_tokens: 48,
+            ..ApiUsage::default()
+        }
+    }
 
     /// The version a real response names, where the request asks for an alias.
     const STUB_MODEL: &str = "jev-1.13.0";
@@ -273,8 +275,9 @@ mod tests {
             self.asked.lock().unwrap().push((state, questions));
             Ok(Judgment {
                 answers: self.answers.clone(),
-                usage: STUB_USAGE,
+                usage: Some(stub_usage()),
                 model: Some(STUB_MODEL.to_string()),
+                served_model: None,
                 request_chars,
             })
         }
@@ -489,11 +492,11 @@ mod tests {
         assert_eq!(captures[0]["producer"], "auxiliary");
         assert_eq!(
             captures[0]["usage"]["input_tokens"],
-            STUB_USAGE.input_tokens
+            stub_usage().input_tokens
         );
         assert_eq!(
             captures[0]["usage"]["output_tokens"],
-            STUB_USAGE.output_tokens
+            stub_usage().output_tokens
         );
         assert_eq!(
             captures[0]["model"], STUB_MODEL,

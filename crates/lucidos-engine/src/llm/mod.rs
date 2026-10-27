@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod anthropic_wire;
+pub mod api_usage;
 mod aux_provider;
 pub mod cache_lifetime;
 /// Temporary diagnostic, off unless `LUCIDOS_CACHE_PROBE` is set. Tracked in
@@ -361,9 +362,7 @@ async fn send_streaming_request_with_timeout(
             Ok(Ok(resp)) => {
                 call_trace::response_received(
                     resp.status().as_u16(),
-                    resp.headers()
-                        .get("request-id")
-                        .and_then(|value| value.to_str().ok()),
+                    call_trace::request_id_of(resp.headers()).as_deref(),
                 );
                 return StreamSend::Got(resp);
             }

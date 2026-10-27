@@ -206,10 +206,7 @@ fn completed_attributes(
     usage: &ApiUsage,
     ttft_ms: Option<u64>,
 ) -> Vec<(&'static str, String)> {
-    let fresh_input = usage
-        .input_tokens
-        .saturating_sub(usage.cache_read_tokens)
-        .saturating_sub(usage.cache_creation_tokens);
+    let fresh_input = usage.uncached_input_tokens();
     let day = row.created.with_timezone(&chrono::Local).date_naive();
     let cost = usage.usd_on(&row.model, day);
     let cache_write_1h = usage

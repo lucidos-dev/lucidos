@@ -1,9 +1,9 @@
 import { render } from 'preact';
 import { useLayoutEffect, useState } from 'preact/hooks';
-import { COPY_ID_NONCE, WIDGET_EMBED_ATTR, WIDGET_EMBED_SLOT_ATTR } from '../../utils/markedConfig';
+import { COPY_ID_NONCE, WIDGET_EMBED_ATTR, WIDGET_EMBED_ERROR_ATTR, WIDGET_EMBED_SLOT_ATTR } from '../../utils/markedConfig';
 import type { WidgetEmbed } from '../../generated/thread-event-wire';
 import { InlineWidget, UnavailableWidget } from './InlineWidget';
-import { embedDraws } from '../../utils/widgetEmbed';
+import { embedRefusal } from '../../utils/widgetEmbed';
 
 const SLOT_MARK = `${WIDGET_EMBED_SLOT_ATTR}="${COPY_ID_NONCE}"`;
 const SLOT_SELECTOR = `[${SLOT_MARK}]`;
@@ -35,6 +35,7 @@ export function useWidgetEmbedSlots(host: HTMLElement | null, html: string, fina
     const mounted = Array.from(host.querySelectorAll<HTMLElement>(SLOT_SELECTOR));
     for (const slot of mounted) {
       const embed = slotEmbed(slot);
+      const syntaxError = slot.getAttribute(WIDGET_EMBED_ERROR_ATTR) ?? undefined;
       slot.textContent = '';
       render(
         embed
@@ -45,10 +46,10 @@ export function useWidgetEmbedSlots(host: HTMLElement | null, html: string, fina
               params={embed.params}
               label={embed.label}
               eventId={eventId}
-              mayDraw={(app) => embedDraws(app, embed, threadId)}
+              refusal={(app) => embedRefusal(app, embed, threadId)}
             />
           )
-          : <UnavailableWidget />,
+          : <UnavailableWidget reason={syntaxError} />,
         slot,
       );
     }

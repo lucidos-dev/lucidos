@@ -1675,12 +1675,12 @@ impl LucidosEngine {
                 // normally as an empty ResponseGenerated (the UI renders a
                 // neutral "empty response" note instead of a red error).
                 let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
-                let output_tokens_n = response.output_tokens.unwrap_or(0);
+                let reported_output = response.usage.map(|u| u.output_tokens);
+                let output_tokens_n = reported_output.unwrap_or(0);
                 let model_thought = response.thinking_chars.unwrap_or(0) > 0
                     || response.thinking_blocks.unwrap_or(0) > 0;
                 let unknown_sse_dropped = response.unknown_sse_dropped;
-                let output_tokens = response
-                    .output_tokens
+                let output_tokens = reported_output
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "?".to_string());
                 let thinking_chars = response

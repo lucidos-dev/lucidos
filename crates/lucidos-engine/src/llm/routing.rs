@@ -416,7 +416,9 @@ impl LlmProvider for RoutingProvider {
         response.provider = Some(route.provider);
         // Probes showed only OpenRouter keeps a marker's TTL (ADR 0575).
         if route.provider != ProviderKind::OpenRouter {
-            response.cache_creation_requested_ttl = None;
+            if let Some(usage) = response.usage.as_mut() {
+                usage.cache_creation_requested_ttl = None;
+            }
         }
         if let Some(pair) = response.prefill.as_mut() {
             pair.routed(route.provider, &resolved.model);
@@ -932,7 +934,11 @@ mod tests {
                 .await
                 .expect("the backend answers");
             let expected = kept.then_some(crate::llm::cache_lifetime::CacheLifetime::FiveMinutes);
-            assert_eq!(response.cache_creation_requested_ttl, expected, "{kind:?}");
+            assert_eq!(
+                response.usage.and_then(|u| u.cache_creation_requested_ttl),
+                expected,
+                "{kind:?}"
+            );
         }
     }
 

@@ -1,5 +1,5 @@
 import { API } from '../../api/client';
-import { isChosenByPreference } from '../windowPeers';
+import { isChosenByPreference, isChosenForThread } from '../windowPeers';
 import { forgetThreadWidgets, onWidgetEvent } from './widgets';
 import type { ApplyEstimates, Change, LandingLane, MainCheck } from '../../api/client';
 import { EVENT_STREAM_RETRY_MS, eventStreamTargets, openEventStream, type EventStreamTargets, type StreamDrop } from '@lucidos/event-stream';
@@ -1386,6 +1386,7 @@ function handleTransientSideEffects(
       break;
 
     case 'PushNotificationRequested':
+      if (!isChosenForThread(sourceThreadId)) break;
       void (async () => {
         try {
           const ok = await showConfirm(

@@ -82,8 +82,11 @@ impl LlmProvider for StubRouter {
         }
         Ok(LlmResponse {
             content: Some("A summary.".to_string()),
-            input_tokens: Some(120),
-            output_tokens: Some(8),
+            usage: Some(crate::engine::ApiUsage {
+                input_tokens: 120,
+                output_tokens: 8,
+                ..Default::default()
+            }),
             ..LlmResponse::default()
         })
     }

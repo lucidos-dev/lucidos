@@ -280,9 +280,12 @@ impl LlmProvider for CacheReporting {
             .chat(messages, tools, selection, system_prompt, on_token, call)
             .await?;
         Ok(LlmResponse {
-            input_tokens: Some(50_000),
-            cache_creation_tokens: Some(40_000),
-            cache_creation_1h_tokens: Some(0),
+            usage: Some(crate::engine::ApiUsage {
+                input_tokens: 50_000,
+                cache_creation_tokens: 40_000,
+                cache_creation_1h_tokens: Some(0),
+                ..response.usage.unwrap_or_default()
+            }),
             stable_prefix_fingerprint: Some("0123456789abcdef".to_string()),
             ..response
         })
@@ -770,7 +773,7 @@ impl crate::llm::web_search::WebSearchProvider for Answering {
     ) -> Result<crate::llm::web_search::WebSearchResult, BoxError> {
         Ok(crate::llm::web_search::WebSearchResult {
             text: "found it".to_string(),
-            usage: Some(crate::llm::usage_wire::ProviderUsage {
+            usage: Some(crate::engine::ApiUsage {
                 input_tokens: 70,
                 output_tokens: 9,
                 ..Default::default()
@@ -803,5 +806,65 @@ async fn a_web_search_records_the_backend_that_answered() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["model"], "search-model");
     assert_eq!(rows[0]["usage"]["input_tokens"], 70);
+    teardown_test_db(&db).await;
+}
+
+/// A judgment provider the router sent to a backend, whose reply named the
+/// model that served it.
+struct Routed;
+
+#[async_trait::async_trait]
+impl crate::llm::judgment::JudgmentProvider for Routed {
+    async fn ask(
+        &self,
+        _state: serde_json::Value,
+        _questions: Vec<(String, crate::llm::judgment::Question)>,
+        _call: crate::llm::metered::CallToken,
+    ) -> Result<crate::llm::judgment::Judgment, BoxError> {
+        crate::llm::call_trace::routed_to(crate::llm::ProviderKind::ClaudeGateway);
+        Ok(crate::llm::judgment::Judgment {
+            model: Some("gemini-3.5-flash".to_string()),
+            served_model: Some("gemini-3.6-flash".to_string()),
+            ..Default::default()
+        })
+    }
+}
+
+/// A judgment row keeps the call's clock, the backend the router chose, and
+/// the model the reply named.
+#[tokio::test]
+async fn a_judgment_records_its_time_backend_and_served_model() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+
+    AuxCapture::new(&bus, thread, ContextPurpose::CommandJudge)
+        .judge(&Routed, serde_json::json!({}), vec![])
+        .await
+        .expect("the judge answers");
+
+    let rows = aux_captures(&pool, thread, "command_judge").await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["duration_ms"].is_u64(), "row: {}", rows[0]);
+    assert_eq!(rows[0]["provider"], "claude-gateway");
+    assert_eq!(rows[0]["served_model"], "gemini-3.6-flash");
+    teardown_test_db(&db).await;
+}
+
+/// A web search row keeps the call's clock too.
+#[tokio::test]
+async fn a_web_search_records_its_time() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = Uuid::new_v4();
+    let chain = WebSearchChain::new(vec![std::sync::Arc::new(Answering)]);
+
+    AuxCapture::new(&bus, thread, ContextPurpose::WebSearch)
+        .search(&chain, "weather in Oslo", 5)
+        .await
+        .expect("the backend answers");
+
+    let rows = aux_captures(&pool, thread, "web_search").await;
+    assert!(rows[0]["duration_ms"].is_u64(), "row: {}", rows[0]);
     teardown_test_db(&db).await;
 }

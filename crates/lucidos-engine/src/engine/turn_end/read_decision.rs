@@ -582,8 +582,8 @@ pub async fn decide_read_for_eval(
     Ok(EvalReadDecision {
         read: decision_from(&judgment.answers) == ReadDecision::Requested,
         probability: judgment.answers.noul(READ_QUESTION_ID),
-        input_tokens: judgment.usage.input_tokens,
-        output_tokens: judgment.usage.output_tokens,
+        input_tokens: judgment.usage.unwrap_or_default().input_tokens,
+        output_tokens: judgment.usage.unwrap_or_default().output_tokens,
     })
 }
 

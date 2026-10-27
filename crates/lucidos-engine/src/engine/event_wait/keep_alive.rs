@@ -2187,18 +2187,19 @@ pub(super) async fn beat_once(
     .prefill(llm, body)
     .await;
     let outcome = match reply {
-        Ok(usage) => {
+        Ok(beat) => {
+            let usage = beat.usage.unwrap_or_default();
             let outcome = judge_beat(&usage, body.output_cap);
             if !held_context(
-                u64::from(usage.cache_read_tokens.unwrap_or(0)),
-                u64::from(usage.input_tokens.unwrap_or(0)),
+                u64::from(usage.cache_read_tokens),
+                u64::from(usage.input_tokens),
             ) {
                 log_missed_beat(
                     thread_id,
                     "prefill",
                     Some(&body.model),
-                    u64::from(usage.cache_read_tokens.unwrap_or(0)),
-                    u64::from(usage.input_tokens.unwrap_or(0)),
+                    u64::from(usage.cache_read_tokens),
+                    u64::from(usage.input_tokens),
                 );
             }
             outcome
@@ -2265,20 +2266,17 @@ pub(super) enum BeatOutcome {
 /// matches.
 const BEAT_WRITE_SHARE: f64 = 0.02;
 
-pub(super) fn judge_beat(
-    usage: &crate::llm::provider::LlmResponse,
-    output_cap: Option<u32>,
-) -> BeatOutcome {
-    if output_cap.is_some_and(|cap| usage.output_tokens.unwrap_or(0) > cap) {
+pub(super) fn judge_beat(usage: &crate::engine::ApiUsage, output_cap: Option<u32>) -> BeatOutcome {
+    if output_cap.is_some_and(|cap| usage.output_tokens > cap) {
         return BeatOutcome::Talkative;
     }
-    let input = f64::from(usage.input_tokens.unwrap_or(0));
-    let wrote = f64::from(usage.cache_creation_tokens.unwrap_or(0));
+    let input = f64::from(usage.input_tokens);
+    let wrote = f64::from(usage.cache_creation_tokens);
     if wrote > BEAT_WRITE_SHARE * input {
         BeatOutcome::Wrote
     } else if !held_context(
-        u64::from(usage.cache_read_tokens.unwrap_or(0)),
-        u64::from(usage.input_tokens.unwrap_or(0)),
+        u64::from(usage.cache_read_tokens),
+        u64::from(usage.input_tokens),
     ) {
         BeatOutcome::Missed
     } else {

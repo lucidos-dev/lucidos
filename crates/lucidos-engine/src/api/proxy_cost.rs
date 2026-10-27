@@ -20,9 +20,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::engine::model_call::CallDetail;
+use crate::engine::ApiUsage;
 use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
 use crate::llm::served_model::served_model_of;
-use crate::llm::usage_wire::{self, ProviderUsage};
+use crate::llm::usage_wire;
 
 /// The Gemini API's host. Vertex hosts are recognised by `llm::vertex`.
 const GEMINI_API_HOST: &str = "generativelanguage.googleapis.com";
@@ -116,7 +117,12 @@ pub(crate) async fn record_model_call(
     };
     let streamed = is_event_stream(&parts.headers);
     if let Some(call) = reported(&bytes, streamed, request_body, path) {
-        record(engine, cost_thread, call, request_body);
+        record(
+            engine,
+            cost_thread,
+            call.answered_by(&parts.headers),
+            request_body,
+        );
     }
     Response::from_parts(parts, Body::from(bytes))
 }
@@ -136,9 +142,10 @@ pub(crate) fn record(
             .record_usage_detailed(
                 &call.model,
                 request_chars,
-                Some(crate::engine::model_call::usage_from_provider(call.usage)),
+                Some(call.usage),
                 CallDetail {
                     served_model: call.served_model,
+                    request_id: call.request_id,
                     ..CallDetail::default()
                 },
             )
@@ -157,11 +164,23 @@ pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
 /// What one forwarded call reported.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ReportedCall {
-    pub(crate) usage: ProviderUsage,
+    pub(crate) usage: ApiUsage,
     /// The model the request asked for, else the one the reply named.
     pub(crate) model: String,
-    /// The model the reply named. A streamed reply is not read for it.
+    /// The model the reply named.
     pub(crate) served_model: Option<String>,
+    /// The upstream's id for the reply, from its headers.
+    pub(crate) request_id: Option<String>,
+}
+
+impl ReportedCall {
+    /// This call, with the request id the upstream's reply headers carry.
+    pub(crate) fn answered_by(self, headers: &HeaderMap) -> Self {
+        Self {
+            request_id: crate::llm::call_trace::request_id_of(headers),
+            ..self
+        }
+    }
 }
 
 /// What a reply reported, or `None` when it names no prompt tokens.
@@ -169,16 +188,17 @@ fn reported(reply: &[u8], streamed: bool, request_body: &[u8], path: &str) -> Op
     let reply_json = (!streamed)
         .then(|| serde_json::from_slice::<serde_json::Value>(reply).ok())
         .flatten();
+    let reply_text = String::from_utf8_lossy(reply);
     let usage = match &reply_json {
         Some(serde_json::Value::Array(chunks)) => usage_wire::from_chunks(chunks),
         Some(json) => usage_wire::from_json(json),
-        None => usage_wire::from_event_stream(&String::from_utf8_lossy(reply)),
+        None => usage_wire::from_event_stream(&reply_text),
     }?;
     let served_model = match &reply_json {
-        Some(serde_json::Value::Array(chunks)) => chunks.last(),
-        other => other.as_ref(),
-    }
-    .and_then(served_model_of);
+        Some(serde_json::Value::Array(chunks)) => chunks.last().and_then(served_model_of),
+        Some(json) => served_model_of(json),
+        None => streamed_model_of(&reply_text),
+    };
     let model = requested_model_of(request_body, path)
         .or_else(|| served_model.clone())
         .unwrap_or_default();
@@ -186,7 +206,20 @@ fn reported(reply: &[u8], streamed: bool, request_body: &[u8], path: &str) -> Op
         usage,
         model,
         served_model,
+        request_id: None,
     })
+}
+
+/// The model a streamed reply names: in an OpenAI frame, or in an Anthropic
+/// `message_start`.
+fn streamed_model_of(stream: &str) -> Option<String> {
+    stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data.trim()).ok())
+        .find_map(|frame| {
+            served_model_of(&frame).or_else(|| served_model_of(frame.get("message")?))
+        })
 }
 
 /// The model the request asked for: the body's, else the one a Gemini path

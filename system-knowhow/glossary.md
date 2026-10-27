@@ -525,7 +525,7 @@ Every font Lucidos offers, one entry each: its id, label, CSS stack, kind (`ui` 
 The `font-family` *preference* takes a font id or `theme`, which follows the *theme*'s suggestion. A theme may name any catalog font. The engine serves the catalog at `GET /api/v1/fonts`, followed by any *workspace font*. See `system-knowhow/themes.md` § Fonts.
 
 ### Form request
-Something the agent put in front of the user to fill in or confirm: a credential form, a plugin install or uninstall panel, an email confirmation, or an OAuth authorization page. It is persisted, so it survives a reload or a dropped connection. It stays open until answered, cancelled, or replaced by something newer, and one `FormRequestResolved` records which. An open one shows in its thread with an Open button and leaves the thread's status alone.
+Something the agent put in front of the user to fill in or confirm: a credential form, a plugin install or uninstall panel, an email confirmation, or an OAuth authorization page. It is persisted, so it survives a reload or a dropped connection. It stays open until answered, cancelled, or replaced by something newer, and one `FormRequestResolved` records which. An open one shows in its thread with an Open button and leaves the thread's status alone. A form opens on every device, an authorization page on the device it names, and either opens in one window per device: the window showing its thread, else the one used last.
 See also: `system-knowhow/thread-events.md` § Form requests.
 
 ### Event address
@@ -1721,7 +1721,7 @@ A class the app stylesheet serves for a *widget*'s main shape: `.ring` for a gau
 The JSON object a *widget* receives for one place it is shown, read with `lucidos.params()`. It arrives in the frame URL as `?params=`. Its *app manifest* declares the names it takes. Params are visible in the URL, so they never carry a credential (ADR 0415).
 
 ### Widget embed
-`![label](app:<id>?params={...})` in markdown, which draws the *widget* live wherever a picture draws: an option's description or preview, a card's `message`, a reply. It is the one way a widget shows in a thread. The alt text is the label. In a reply it draws an *inline widget*; in an option, the widget alone inside the option's box. An embed records no event. A bad embed in an option refuses the card, and a bad one in a reply reads "This widget is not available" (ADRs 0415, 0466).
+`![label](app:<id>?params={...})` in markdown, which draws the *widget* live wherever a picture draws: an option's description or preview, a card's `message`, a reply. It is the one way a widget shows in a thread, and its alt text is the label. In a reply it draws an *inline widget*; in an option, the widget alone inside the option's box. An embed records no event. A bad embed in an option refuses the card. A bad one in a reply reads "This widget is not available" and gives the reason (ADRs 0415, 0466).
 
 ### Widget instance
 One *widget* with one set of *widget params*. *Thread widgets* and the *widget shelf* key on it, so two instances of one widget can both be pinned. Its label is not part of the key. The same names and values in a different order are one instance (ADR 0415).

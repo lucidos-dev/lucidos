@@ -336,6 +336,9 @@ impl OpenAiProvider {
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = data.get("delta").and_then(|d| d.as_str()) {
+                    if !delta.is_empty() {
+                        crate::llm::call_trace::content_arrived();
+                    }
                     content.push_str(delta);
                 }
             }
@@ -343,6 +346,7 @@ impl OpenAiProvider {
             "response.output_item.added" => {
                 if let Some(item) = data.get("item") {
                     if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        crate::llm::call_trace::content_arrived();
                         let call_id = item
                             .get("call_id")
                             .and_then(|c| c.as_str())
@@ -1119,9 +1123,9 @@ mod tests {
         assert_eq!(content, "ok");
         // 11 processed, 4 of them a cache read. `input_tokens` already covers
         // `input_tokens_details.cached_tokens`, so the two overlap.
-        assert_eq!(meta.input_tokens, Some(11));
-        assert_eq!(meta.output_tokens, Some(3));
-        assert_eq!(meta.cache_read_tokens, Some(4));
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(11));
+        assert_eq!(meta.usage.map(|u| u.output_tokens), Some(3));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(4));
         assert_eq!(meta.stop_reason.as_deref(), Some("completed"));
         assert_eq!(
             meta.served_model.as_deref(),
@@ -1147,8 +1151,8 @@ mod tests {
             &mut meta,
         )
         .unwrap();
-        assert_eq!(meta.input_tokens, Some(42));
-        assert_eq!(meta.cache_read_tokens, Some(12));
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(42));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(12));
     }
 
     /// GPT-5.6 on reports what it wrote to the cache, also as a part of the
@@ -1168,9 +1172,9 @@ mod tests {
             &mut meta,
         )
         .unwrap();
-        assert_eq!(meta.input_tokens, Some(5476));
-        assert_eq!(meta.cache_write_tokens, Some(5435));
-        assert_eq!(meta.cache_read_tokens, None);
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(5476));
+        assert_eq!(meta.usage.map(|u| u.cache_creation_tokens), Some(5435));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(0));
     }
 
     /// The `response.completed` data of one live turn, with `usage` details
@@ -1202,9 +1206,15 @@ mod tests {
             r#"{"cached_tokens":0,"cache_write_tokens":16439,"cache_write_tokens_details":{"ttl_30m_tokens":16439,"ttl_12h_tokens":0}}"#,
             r#""prompt_cache_options":{"mode":"implicit","ttl":"30m"},"#,
         );
-        assert_eq!(response.cache_creation_tokens, Some(16439));
-        assert_eq!(response.cache_creation_30m_tokens, Some(16439));
-        assert_eq!(response.cache_creation_12h_tokens, Some(0));
+        assert_eq!(response.usage.map(|u| u.cache_creation_tokens), Some(16439));
+        assert_eq!(
+            response.usage.and_then(|u| u.cache_creation_30m_tokens),
+            Some(16439)
+        );
+        assert_eq!(
+            response.usage.and_then(|u| u.cache_creation_12h_tokens),
+            Some(0)
+        );
     }
 
     /// With no split, the echoed TTL names the whole write's lifetime.
@@ -1214,8 +1224,14 @@ mod tests {
             r#"{"cached_tokens":0,"cache_write_tokens":16007}"#,
             r#""prompt_cache_options":{"mode":"explicit","ttl":"12h"},"#,
         );
-        assert_eq!(response.cache_creation_30m_tokens, None);
-        assert_eq!(response.cache_creation_12h_tokens, Some(16007));
+        assert_eq!(
+            response.usage.and_then(|u| u.cache_creation_30m_tokens),
+            None
+        );
+        assert_eq!(
+            response.usage.and_then(|u| u.cache_creation_12h_tokens),
+            Some(16007)
+        );
     }
 
     /// A split whose parts each fit but together claim more than the write is
@@ -1226,17 +1242,29 @@ mod tests {
             r#"{"cached_tokens":0,"cache_write_tokens":1000,"cache_write_tokens_details":{"ttl_30m_tokens":900,"ttl_12h_tokens":900}}"#,
             r#""prompt_cache_options":{"mode":"implicit","ttl":"30m"},"#,
         );
-        assert_eq!(response.cache_creation_tokens, Some(1000));
-        assert_eq!(response.cache_creation_30m_tokens, None);
-        assert_eq!(response.cache_creation_12h_tokens, None);
+        assert_eq!(response.usage.map(|u| u.cache_creation_tokens), Some(1000));
+        assert_eq!(
+            response.usage.and_then(|u| u.cache_creation_30m_tokens),
+            None
+        );
+        assert_eq!(
+            response.usage.and_then(|u| u.cache_creation_12h_tokens),
+            None
+        );
     }
 
     /// A write with neither a split nor an echo has no known TTL.
     #[test]
     fn a_responses_write_with_no_split_and_no_echo_is_unknown() {
         let response = completed_response(r#"{"cached_tokens":0,"cache_write_tokens":880}"#, "");
-        assert_eq!(response.cache_creation_30m_tokens, None);
-        assert_eq!(response.cache_creation_12h_tokens, None);
+        assert_eq!(
+            response.usage.and_then(|u| u.cache_creation_30m_tokens),
+            None
+        );
+        assert_eq!(
+            response.usage.and_then(|u| u.cache_creation_12h_tokens),
+            None
+        );
     }
 
     /// A response that read no cache leaves the count unset.
@@ -1255,8 +1283,8 @@ mod tests {
             &mut meta,
         )
         .unwrap();
-        assert_eq!(meta.input_tokens, Some(42));
-        assert_eq!(meta.cache_read_tokens, None);
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(42));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(0));
     }
 
     /// `incomplete_details.reason` takes precedence over `status` when both
@@ -1281,8 +1309,8 @@ mod tests {
 
         assert!(done, "response.incomplete is a terminal event");
         assert_eq!(meta.stop_reason.as_deref(), Some("max_output_tokens"));
-        assert_eq!(meta.input_tokens, Some(50));
-        assert_eq!(meta.output_tokens, Some(4096));
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(50));
+        assert_eq!(meta.usage.map(|u| u.output_tokens), Some(4096));
     }
 
     /// A top-level `error` event surfaces its own message, never the generic
@@ -1452,13 +1480,48 @@ mod tests {
         )
         .await
         .expect("the beat answers");
-        assert_eq!(beat.cache_read_tokens, Some(880));
-        assert_eq!(beat.output_tokens, Some(16));
+        assert_eq!(beat.usage.map(|u| u.cache_read_tokens), Some(880));
+        assert_eq!(beat.usage.map(|u| u.output_tokens), Some(16));
 
         let sent = bodies.lock().unwrap().clone();
         let [_, beat_body] = sent.as_slice() else {
             panic!("expected a turn and a beat, saw {}", sent.len());
         };
         assert_eq!(beat_body, &json(&pair.stable.body));
+    }
+
+    /// The first text or tool-call delta stamps the call trace. A chunk that
+    /// carries no content does not.
+    #[tokio::test]
+    async fn a_responses_stream_marks_its_first_content() {
+        let feed = |event: &'static str, chunk: &'static str| async move {
+            let ((), trace) = crate::llm::call_trace::scoped(async move {
+                let mut content = String::new();
+                let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+                let mut item_id_map: HashMap<String, usize> = HashMap::new();
+                let mut meta = StreamMeta::default();
+                OpenAiProvider::process_responses_chunk(
+                    event,
+                    chunk,
+                    &mut content,
+                    &mut tools,
+                    &mut item_id_map,
+                    &mut meta,
+                )
+                .unwrap();
+            })
+            .await;
+            trace.first_delta.is_some()
+        };
+        assert!(feed("response.output_text.delta", r#"{"delta":"ok"}"#).await);
+        assert!(
+            feed(
+                "response.output_item.added",
+                r#"{"item":{"type":"function_call","call_id":"c1","name":"f","id":"i1"}}"#
+            )
+            .await
+        );
+        assert!(!feed("response.output_text.delta", r#"{"delta":""}"#).await);
+        assert!(!feed("response.created", r#"{"response":{}}"#).await);
     }
 }

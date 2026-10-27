@@ -172,10 +172,11 @@ impl LlmProvider for EchoProvider {
                 flatten(&step).chars().take(60).collect::<String>()
             )
         };
-        Ok(LlmResponse {
-            service_tier: selection.service_tier,
-            ..line_response(line)
-        })
+        let mut response = line_response(line);
+        if let Some(usage) = response.usage.as_mut() {
+            usage.service_tier = selection.service_tier;
+        }
+        Ok(response)
     }
 
     fn default_model(&self) -> &str {
@@ -189,15 +190,12 @@ pub(super) fn line_response(line: String) -> LlmResponse {
         content: Some(line),
         tool_calls: vec![],
         stop_reason: Some("end_turn".to_string()),
-        output_tokens: Some(10),
-        input_tokens: Some(100),
-        cache_creation_tokens: None,
-        cache_creation_1h_tokens: None,
-        cache_creation_30m_tokens: None,
-        cache_creation_12h_tokens: None,
-        cache_creation_requested_ttl: None,
+        usage: Some(crate::engine::types::ApiUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..Default::default()
+        }),
         stable_prefix_fingerprint: None,
-        cache_read_tokens: None,
         served_model: None,
         provider: None,
         thinking_chars: None,
@@ -206,7 +204,6 @@ pub(super) fn line_response(line: String) -> LlmResponse {
         model_only_text: None,
         progress_notes: Vec::new(),
         prefill: None,
-        service_tier: None,
     }
 }
 

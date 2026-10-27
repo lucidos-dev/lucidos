@@ -22,9 +22,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{
-    Answer, Answers, ChoiceAnswer, Judgment, JudgmentProvider, JudgmentUsage, NoulAnswer, Question,
-};
+use super::{Answer, Answers, ChoiceAnswer, Judgment, JudgmentProvider, NoulAnswer, Question};
 use crate::llm::OPENAI_DEFAULT_BASE_URL;
 
 /// The model the Decisions API answers on.
@@ -190,21 +188,14 @@ pub(crate) fn parse_response(
         }
     }
 
-    let count = |pointer: &str| -> u32 {
-        value.pointer(pointer).and_then(Value::as_u64).unwrap_or(0) as u32
-    };
     Ok(Judgment {
         answers: Answers::new(answers),
-        usage: JudgmentUsage {
-            input_tokens: count("/usage/input_tokens"),
-            output_tokens: count("/usage/output_tokens"),
-            cache_read_tokens: count("/usage/input_tokens_details/cached_tokens"),
-            cache_creation_tokens: count("/usage/input_tokens_details/cache_write_tokens"),
-        },
+        usage: crate::llm::usage_wire::from_frame(&value),
         model: value
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string),
+        served_model: None,
         request_chars: 0,
     })
 }

@@ -101,8 +101,8 @@ fn a_response_reads_back_as_answers_and_usage() {
         judgment.answers.choice("lane").map(|c| c.choice.as_str()),
         Some("safe")
     );
-    assert_eq!(judgment.usage.input_tokens, 312);
-    assert_eq!(judgment.usage.output_tokens, 48);
+    assert_eq!(judgment.usage.map(|u| u.input_tokens), Some(312));
+    assert_eq!(judgment.usage.map(|u| u.output_tokens), Some(48));
 }
 
 /// The request asks for an alias and the response names the version that
@@ -148,12 +148,12 @@ fn a_response_with_no_answers_object_is_an_error() {
     assert!(parse_response("not json at all").is_err());
 }
 
-/// Absent usage is zero rather than a parse failure. The counts are for
+/// Absent usage is no usage rather than a parse failure. The counts are for
 /// reporting, so a backend that stops sending them must not break a judgment.
 #[test]
-fn absent_usage_reads_as_zero() {
+fn absent_usage_reads_as_none() {
     let judgment = parse_response(r#"{"answers":{}}"#).expect("a readable response");
-    assert_eq!(judgment.usage, JudgmentUsage::default());
+    assert_eq!(judgment.usage, None);
     assert!(judgment.answers.is_empty());
 }
 
@@ -174,5 +174,5 @@ fn a_cloudflare_result_envelope_reads_like_a_bare_body() {
     let judgment = parse_response(body).expect("a readable response");
     assert_eq!(judgment.answers.noul("needs_memory"), Some(0.7));
     assert_eq!(judgment.model.as_deref(), Some("clef-flash"));
-    assert_eq!(judgment.usage.input_tokens, 40);
+    assert_eq!(judgment.usage.map(|u| u.input_tokens), Some(40));
 }

@@ -1,5 +1,6 @@
 //! CC stream-output line parser, split out of claude_code.rs.
 use super::*;
+use crate::engine::ApiUsage;
 use std::collections::HashSet;
 
 /// The little parse state that spans lines of ONE Claude Code stdout stream.
@@ -31,57 +32,23 @@ pub struct CcStreamState {
     held_sub_agent_usage: Vec<(String, AgentEvent)>,
 }
 
-/// One API call's token counts, as Anthropic's `usage` block spells them.
-#[derive(Debug, Clone, Copy, Default)]
-struct CallUsage {
-    input: u32,
-    output: u32,
-    cache_read: u32,
-    cache_creation: u32,
-    /// The 1-hour part of `cache_creation`, from the nested
-    /// `cache_creation.ephemeral_1h_input_tokens`. `None` with no split.
-    cache_creation_1h: Option<u32>,
+/// One API call's token counts, from a frame's `usage` block.
+fn call_usage(usage: &serde_json::Value) -> ApiUsage {
+    crate::llm::usage_wire::from_block(usage).unwrap_or_default()
 }
 
-impl CallUsage {
-    fn read(usage: &serde_json::Value) -> Self {
-        Self::default().updated_by(usage)
-    }
-
-    /// These counts with every count `usage` carries taking precedence. A
-    /// `message_delta` holds the final counts, and may omit the input ones.
-    fn updated_by(self, usage: &serde_json::Value) -> Self {
-        let count_in = |block: &serde_json::Value, key: &str| {
-            block
-                .get(key)
-                .and_then(|v| v.as_u64())
-                .map(|n| crate::llm::clamp_provider_token_count(n, "ClaudeCode"))
-        };
-        let count = |key: &str, fallback: u32| count_in(usage, key).unwrap_or(fallback);
-        let split_1h = usage
-            .get("cache_creation")
-            .and_then(|split| count_in(split, "ephemeral_1h_input_tokens"));
-        Self {
-            input: count("input_tokens", self.input),
-            output: count("output_tokens", self.output),
-            cache_read: count("cache_read_input_tokens", self.cache_read),
-            cache_creation: count("cache_creation_input_tokens", self.cache_creation),
-            cache_creation_1h: split_1h.or(self.cache_creation_1h),
-        }
-    }
-
-    /// CC sometimes emits a continuation message with zeroed usage. No API
-    /// call happened, so reporting one would be misleading.
-    fn is_from_a_real_call(&self) -> bool {
-        self.input > 0 || self.output > 0 || self.cache_read > 0 || self.cache_creation > 0
-    }
+/// CC sometimes emits a continuation message with zeroed usage. No API call
+/// happened, so reporting one would be misleading. `input_tokens` holds both
+/// cache counts, so it covers them.
+fn is_from_a_real_call(usage: &ApiUsage) -> bool {
+    usage.input_tokens > 0 || usage.output_tokens > 0
 }
 
 #[derive(Debug)]
 struct OpenCall {
     message_id: Option<String>,
     model: Option<String>,
-    usage: CallUsage,
+    usage: ApiUsage,
     opened_at: std::time::Instant,
 }
 
@@ -141,20 +108,20 @@ impl CcStreamState {
         &mut self,
         message_id: Option<&str>,
         model: Option<String>,
-        usage: CallUsage,
+        usage: ApiUsage,
         parent_tool_use_id: Option<String>,
         duration_ms: Option<u64>,
     ) -> Option<AgentEvent> {
         // The `&&` order matters: an all-zero frame must not claim the id,
         // so a later real frame carrying the same id still reports.
-        (usage.is_from_a_real_call() && self.claim_usage_report(message_id)).then_some(
+        (is_from_a_real_call(&usage) && self.claim_usage_report(message_id)).then_some(
             AgentEvent::Usage {
                 model,
-                input_tokens: usage.input,
-                output_tokens: usage.output,
-                cache_read_tokens: usage.cache_read,
-                cache_creation_tokens: usage.cache_creation,
-                cache_creation_1h_tokens: usage.cache_creation_1h,
+                input_tokens: usage.uncached_input_tokens(),
+                output_tokens: usage.output_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_creation_tokens: usage.cache_creation_tokens,
+                cache_creation_1h_tokens: usage.cache_creation_1h_tokens,
                 parent_tool_use_id,
                 api_call_id: message_id.map(String::from),
                 duration_ms,
@@ -506,7 +473,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                     let report = state.report(
                         message_id,
                         model.map(String::from),
-                        CallUsage::read(usage),
+                        call_usage(usage),
                         parent_tool_use_id,
                         None,
                     );
@@ -723,16 +690,16 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                         model: state.streaming_model.clone(),
                         usage: message
                             .and_then(|m| m.get("usage"))
-                            .map(CallUsage::read)
+                            .map(call_usage)
                             .unwrap_or_default(),
                         opened_at: std::time::Instant::now(),
                     });
                 }
                 Some("message_delta") if from_the_parent => {
                     if let Some(open) = state.open_call.take() {
-                        let usage = event
-                            .and_then(|e| e.get("usage"))
-                            .map_or(open.usage, |u| open.usage.updated_by(u));
+                        let usage = event.and_then(|e| e.get("usage")).map_or(open.usage, |u| {
+                            crate::llm::usage_wire::merge(open.usage, call_usage(u))
+                        });
                         let duration_ms = open.duration_ms();
                         events.extend(state.report(
                             open.message_id.as_deref(),

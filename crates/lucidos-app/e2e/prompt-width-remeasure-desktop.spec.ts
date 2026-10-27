@@ -29,9 +29,17 @@ const WIDE_FLOOR = 600;
 
 // One paragraph, no newlines, so every line break is the box's own wrapping
 // decision and the line count is a pure function of the width.
+//
+// Long enough that the two widths differ by several lines in any monospace
+// font. `--font-mono` falls back to the platform's `monospace`, whose glyphs
+// are wider on Linux than SF Mono. A draft near a line boundary can then need
+// the same line count at both widths, and the height rightly stays put.
 const PARAGRAPH =
   'This single paragraph carries no newline of its own, so every line break in '
-  + 'the composer is one the box chose for the width it currently has.';
+  + 'the composer is one the box chose for the width it currently has. It runs to '
+  + 'several lines on purpose: a narrow pane and a wide one then differ by more than '
+  + 'a single wrapped word, whatever monospace font the platform falls back to, so '
+  + 'the line count cannot land on the same number at both widths by luck.';
 
 // The pane geometry settles within var(--duration-slow) (300ms).
 const SETTLE_MS = 600;

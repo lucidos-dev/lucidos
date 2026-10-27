@@ -692,6 +692,20 @@ fn side_question_result_keeps_the_usage_as_a_total() {
     assert_eq!(usage.output_tokens, 40);
 }
 
+/// A side question's write keeps its lifetime split, so its row reads the TTL.
+#[test]
+fn side_question_result_keeps_the_write_split() {
+    use crate::engine::cache_ttl::{CacheLifetime, CacheTtl};
+    let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"a","usage":{"input_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":625,"cache_creation":{"ephemeral_1h_input_tokens":625,"ephemeral_5m_input_tokens":0},"output_tokens":40}}"#;
+    let (_, usage) = session_copy_result(line).unwrap();
+    let usage = usage.expect("usage reported");
+    assert_eq!(usage.cache_creation_1h_tokens, Some(625));
+    assert_eq!(
+        CacheTtl::of_write(&usage),
+        CacheTtl::Reported(CacheLifetime::OneHour)
+    );
+}
+
 #[test]
 fn init_model_reads_only_the_init_line() {
     assert_eq!(

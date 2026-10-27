@@ -144,6 +144,12 @@
     font-size: var(--font-size-sm);
 }
 
+.inline-widget-gone-reason {
+    margin-top: var(--space-xs);
+    font-size: var(--font-size-xs);
+    overflow-wrap: anywhere;
+}
+
 .widget-bar {
     display: flex;
     align-items: center;

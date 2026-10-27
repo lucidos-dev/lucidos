@@ -158,37 +158,11 @@ pub struct LlmResponse {
     /// truncation when content is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// What the provider reported the call used. `None` when it reported
+    /// nothing. `input_tokens` is the full prompt the model processed, both
+    /// cache counts included, so the UI can replace its chars/4 estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<u32>,
-    /// Real prompt-token count from the provider's `usage`. Sums uncached input,
-    /// cache-write, and cache-read tokens — the full size the model processed.
-    /// `None` for providers that don't report it. Lets the UI replace the
-    /// chars/4 estimate (which over-counts base64 image bytes).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<u32>,
-    /// Cache-write token count: Anthropic, OpenRouter's Anthropic models, and
-    /// OpenAI from GPT-5.6 on. `None` on providers that report none. Together
-    /// with `cache_read_tokens` lets the modal show hit/miss rate so the user
-    /// can see why a turn was cheap or expensive.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_tokens: Option<u32>,
-    /// Part of `cache_creation_tokens`: the tokens written to the 1-hour
-    /// cache. `None` when the provider split no write by lifetime.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_1h_tokens: Option<u32>,
-    /// Part of `cache_creation_tokens`: OpenAI Responses' 30-minute write.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_30m_tokens: Option<u32>,
-    /// Part of `cache_creation_tokens`: OpenAI Responses' 12-hour write.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_12h_tokens: Option<u32>,
-    /// The cache lifetime the request's markers asked for. A provider reports
-    /// what it asked, and the router keeps it only on a route that honours it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_requested_ttl: Option<crate::llm::cache_lifetime::CacheLifetime>,
-    /// Cache-read token count. `None` on providers that report none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_tokens: Option<u32>,
+    pub usage: Option<crate::llm::api_usage::ApiUsage>,
     /// The *served model*: the model id the provider's reply names, verbatim.
     /// `None` when the reply names none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,10 +175,6 @@ pub struct LlmResponse {
     /// the Anthropic and Vertex Claude providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stable_prefix_fingerprint: Option<String>,
-    /// The service tier the reply says served the call, when not the
-    /// standard one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<ServiceTier>,
     /// Total characters of thinking text. High value with empty content
     /// distinguishes "thought hard then gave up" from "said nothing".
     #[serde(default, skip_serializing_if = "Option::is_none")]

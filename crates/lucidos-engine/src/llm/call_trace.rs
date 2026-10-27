@@ -8,7 +8,7 @@
 //! The metered call reads it back when the call ends, either way.
 //!
 //! One trace holds one call, retries and a model fallback included. The
-//! per-attempt facts (status, `request-id`, first delta) describe the LAST
+//! per-attempt facts (status, request id, first delta) describe the LAST
 //! attempt, which answered or failed the call. A write outside [`scoped`] is a
 //! no-op.
 
@@ -43,7 +43,7 @@ pub(crate) struct CallTrace {
     pub(crate) attempts: u32,
     /// The last attempt's response status, when a response arrived.
     pub(crate) status: Option<u16>,
-    /// The last attempt's `request-id` header, when it carried one.
+    /// The last attempt's request id header, when it carried one.
     pub(crate) request_id: Option<String>,
     /// When the last attempt's stream delivered its first content.
     pub(crate) first_delta: Option<Instant>,
@@ -101,6 +101,15 @@ pub(crate) fn attempt_began() {
         trace.first_delta = None;
         trace.transport_failure = None;
     });
+}
+
+/// The provider's id for a response: Anthropic's `request-id`, else the
+/// `x-request-id` OpenAI, OpenRouter and xAI send.
+pub(crate) fn request_id_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    ["request-id", "x-request-id"]
+        .iter()
+        .find_map(|name| headers.get(*name)?.to_str().ok())
+        .map(str::to_string)
 }
 
 /// The attempt got a response head.

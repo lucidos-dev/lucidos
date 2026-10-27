@@ -94,6 +94,8 @@ marked.setOptions({
 export const WIDGET_EMBED_SLOT_ATTR = 'data-widget-embed-slot';
 /** The slot's embed as JSON, or absent when its syntax is broken. */
 export const WIDGET_EMBED_ATTR = 'data-widget-embed';
+/** Why the slot's embed syntax is broken, beside a missing embed. */
+export const WIDGET_EMBED_ERROR_ATTR = 'data-widget-embed-error';
 
 marked.use({
   extensions: [{
@@ -113,7 +115,9 @@ marked.use({
     renderer(token) {
       const { embed } = token as unknown as { embed: EmbedMatch['embed'] };
       const label = embed.ok ? embed.value.label ?? '' : '';
-      const data = embed.ok ? ` ${WIDGET_EMBED_ATTR}="${escapeHtmlAttr(JSON.stringify(embed.value))}"` : '';
+      const data = embed.ok
+        ? ` ${WIDGET_EMBED_ATTR}="${escapeHtmlAttr(JSON.stringify(embed.value))}"`
+        : ` ${WIDGET_EMBED_ERROR_ATTR}="${escapeHtmlAttr(embed.reason)}"`;
       return `<span class="widget-embed-slot" ${WIDGET_EMBED_SLOT_ATTR}="${COPY_ID_NONCE}"${data}>${escapeHtmlAttr(label)}</span>`;
     },
   }],

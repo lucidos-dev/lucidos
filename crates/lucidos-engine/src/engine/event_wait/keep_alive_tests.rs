@@ -4166,12 +4166,11 @@ fn status_at(c: &Candidate) -> CacheKeepAliveStatus {
 
 #[test]
 fn a_beat_is_judged_by_its_usage_block() {
-    let usage = |input: u32, wrote: u32, output: u32| crate::llm::provider::LlmResponse {
-        input_tokens: Some(input),
-        cache_creation_tokens: Some(wrote),
-        cache_read_tokens: Some(input - wrote),
-        output_tokens: Some(output),
-        stop_reason: Some("refusal".to_string()),
+    let usage = |input: u32, wrote: u32, output: u32| crate::engine::ApiUsage {
+        input_tokens: input,
+        cache_creation_tokens: wrote,
+        cache_read_tokens: input - wrote,
+        output_tokens: output,
         ..Default::default()
     };
     let cases = [
@@ -4183,8 +4182,8 @@ fn a_beat_is_judged_by_its_usage_block() {
         ),
         (
             "only the system prompt held",
-            crate::llm::provider::LlmResponse {
-                cache_read_tokens: Some(15_000),
+            crate::engine::ApiUsage {
+                cache_read_tokens: 15_000,
                 ..usage(100_000, 0, 0)
             },
             Some(0),
@@ -4320,10 +4319,13 @@ impl crate::llm::LlmProvider for PrefillStub {
 
 fn beat_usage(input: u32, wrote: u32, output: u32) -> PrefillStub {
     PrefillStub(Ok(crate::llm::provider::LlmResponse {
-        input_tokens: Some(input),
-        cache_read_tokens: Some(input - wrote),
-        cache_creation_tokens: Some(wrote),
-        output_tokens: Some(output),
+        usage: Some(crate::engine::ApiUsage {
+            input_tokens: input,
+            cache_read_tokens: input - wrote,
+            cache_creation_tokens: wrote,
+            output_tokens: output,
+            ..Default::default()
+        }),
         ..Default::default()
     }))
 }

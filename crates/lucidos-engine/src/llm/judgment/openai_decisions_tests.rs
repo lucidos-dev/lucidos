@@ -108,9 +108,9 @@ fn a_response_reads_back_as_answers_usage_and_model() {
     assert_eq!(lane.choice, "safe");
     assert_eq!(lane.probability("irreversible"), 0.1);
     assert_eq!(lane.confidence, 0.7);
-    assert_eq!(judgment.usage.input_tokens, 264);
-    assert_eq!(judgment.usage.output_tokens, 3);
-    assert_eq!(judgment.usage.cache_read_tokens, 12);
+    assert_eq!(judgment.usage.map(|u| u.input_tokens), Some(264));
+    assert_eq!(judgment.usage.map(|u| u.output_tokens), Some(3));
+    assert_eq!(judgment.usage.map(|u| u.cache_read_tokens), Some(12));
     assert_eq!(judgment.model.as_deref(), Some("gpt-6-luna"));
 }
 
@@ -150,8 +150,8 @@ fn a_response_with_no_answers_array_is_an_error() {
 }
 
 #[test]
-fn absent_usage_reads_as_zero() {
+fn absent_usage_reads_as_none() {
     let judgment = parse_response(r#"{"answers":[]}"#, &two_questions()).expect("readable");
-    assert_eq!(judgment.usage, JudgmentUsage::default());
+    assert_eq!(judgment.usage, None);
     assert_eq!(judgment.model, None);
 }

@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.52.1 - 2026-10-27
+
+### Changed
+
+- Judgments, web searches and image calls record their duration and the backend that served them. OpenAI-shaped calls and streamed proxy replies also record the served model and the upstream request id, and Vertex calls appear in the call trace.
+- Settings, Access says the External address applies to every workspace on the gateway.
+
+### Fixed
+
+- Cache-write costs keep their 5-minute and 1-hour split on every usage path, so Token Cost prices 1-hour writes correctly everywhere.
+- A turn with no prompt tokens keeps its output usage.
+- Gemini cache hits count as cache reads on the proxy and grounding-search paths, the same as in chat.
+- Plugin install and uninstall panels, credential and email forms, and the push-notification confirm open in one window per device: the window showing the thread that asked, else the window used last.
+- A form one window passed over does not pop up again there later.
+- A widget embed in a reply that cannot draw now says why: an unknown or missing param (named), another thread's widget, the size cap, broken syntax, or no such widget.
 ## v0.52.0 — 2026-10-27
 
 ### Added

@@ -215,18 +215,6 @@ impl Answers {
     }
 }
 
-/// What one judgment call cost, for the caller that records it.
-///
-/// The cache counters stay zero on a System One endpoint, which has no prompt
-/// cache. A chat model may report both, and the cost rollup needs them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct JudgmentUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub cache_read_tokens: u32,
-    pub cache_creation_tokens: u32,
-}
-
 /// The answers to one request, with everything a caller needs to record it.
 ///
 /// The provider fills `model` and `request_chars` rather than the caller. The
@@ -237,10 +225,15 @@ pub struct JudgmentUsage {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Judgment {
     pub answers: Answers,
-    pub usage: JudgmentUsage,
+    /// What the call cost, as the backend reported it. `None` when it
+    /// reported nothing.
+    pub usage: Option<crate::llm::api_usage::ApiUsage>,
     /// What the response says answered, or `None` when it named nothing. The
     /// caller then falls back to the alias it asked for.
     pub model: Option<String>,
+    /// The model a chat judgment's reply named, when it named one. A provider
+    /// that fills `model` from its own reply leaves this `None`.
+    pub served_model: Option<String>,
     /// Chars in the request body the provider sent.
     pub request_chars: usize,
 }

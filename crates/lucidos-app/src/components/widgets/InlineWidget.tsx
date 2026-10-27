@@ -11,6 +11,7 @@ import { appById } from '../../store/appsById';
 import { threadWidget } from '../../store/widgets';
 import type { App, AppReveal } from '../../store/types';
 import type { WidgetParams } from '../../utils/widgetParams';
+import { widgetRefusal } from '../../utils/widgetEmbed';
 import type { WidgetMenuTarget } from './WidgetMenu';
 import { WidgetMenuItems } from './widgetMenuChunks';
 import { WidgetFrame, defaultWidgetHeight } from './WidgetFrame';
@@ -19,11 +20,19 @@ import { WidgetFrame, defaultWidgetHeight } from './WidgetFrame';
  *  refused, since a reply cannot be (ADR 0415). */
 export const WIDGET_UNAVAILABLE_TEXT = 'This widget is not available';
 
-/** An inline widget that cannot draw, in the same box. */
-export function UnavailableWidget({ appId, stamp }: { appId?: string; stamp?: string }) {
+/** `reason` as a sentence: the embed parser words its reasons as clauses. */
+function asSentence(reason: string): string {
+  const capped = reason.charAt(0).toUpperCase() + reason.slice(1);
+  return /[.!?]$/.test(capped) ? capped : `${capped}.`;
+}
+
+/** An inline widget that cannot draw, in the same box. `reason` says why, so
+ *  whoever wrote the embed can fix it. */
+export function UnavailableWidget({ appId, stamp, reason }: { appId?: string; stamp?: string; reason?: string }) {
   return (
     <div class="widget-panel inline-widget inline-widget-gone" data-event-id={stamp} data-inline-widget={appId}>
       {WIDGET_UNAVAILABLE_TEXT}
+      {reason && <div class="inline-widget-gone-reason">{asSentence(reason)}</div>}
     </div>
   );
 }
@@ -113,16 +122,16 @@ export function WidgetPanel({ class: className, stamp, inlineWidget, target, ico
  *  target (`stampedEventIds`). A reply's widget names its turn's starter,
  *  which the turn root already wears.
  *
- *  `mayDraw` is a reply embed's check, run once the widget is read. An old
+ *  `refusal` is a reply embed's check, run once the widget is read. An old
  *  showing was checked when it was written, so it passes none. */
-export function InlineWidget({ threadId, appId, params, label, eventId, stamped = false, mayDraw }: {
+export function InlineWidget({ threadId, appId, params, label, eventId, stamped = false, refusal = widgetRefusal }: {
   threadId: string;
   appId: string;
   params?: WidgetParams;
   label?: string;
   eventId?: string;
   stamped?: boolean;
-  mayDraw?: (app: App) => boolean;
+  refusal?: (app: App) => string | null;
 }) {
   const stamp = stamped ? eventId : undefined;
   const read = appById(appId);
@@ -130,8 +139,11 @@ export function InlineWidget({ threadId, appId, params, label, eventId, stamped 
     if (read.status === 'not-loaded') void readAppsById([appId]);
   }, [read.status, appId]);
   const app = read.status === 'loaded' ? read.data : undefined;
-  if (read.status === 'failed' || app === null || (app && (app.kind !== 'widget' || (mayDraw && !mayDraw(app))))) {
-    return <UnavailableWidget appId={appId} stamp={stamp} />;
+  const reason = read.status === 'failed'
+    ? read.error
+    : app === null ? `No widget '${appId}' exists.` : app ? refusal(app) : null;
+  if (reason !== null) {
+    return <UnavailableWidget appId={appId} stamp={stamp} reason={reason} />;
   }
   // The thread's widgets carry the pin, and refresh as a widget is renamed or
   // made reusable. The app read stands in until they name this instance.

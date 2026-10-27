@@ -79,6 +79,9 @@ export function ExternalAddressSection({
           </p>
         </Explainer>
       </div>
+      <p class="settings-section-desc">
+        This address belongs to the gateway and applies to every workspace on it.
+      </p>
       {body}
     </div>
   );

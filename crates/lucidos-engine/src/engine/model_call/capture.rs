@@ -13,10 +13,8 @@
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::{ApiUsage, ContextProducer, ContextPurpose, ContextRole, ContextSection};
-use crate::llm::judgment::JudgmentUsage;
 use crate::llm::metered::{CallCost, CallFailed, CostSink, Reported};
 use crate::llm::provider::LlmResponse;
-use crate::llm::usage_wire::ProviderUsage;
 use uuid::Uuid;
 
 /// Build the `ContextCaptured` for one auxiliary call.
@@ -77,6 +75,7 @@ impl CallDetail {
             provider: cost
                 .reported
                 .provider()
+                .or(cost.provider)
                 .map(|kind| kind.as_str().to_string()),
             ttft_ms: cost.ttft_ms,
             request_id: cost.request_id.map(str::to_string),
@@ -149,54 +148,21 @@ pub(crate) fn model_call_failed(purpose: ContextPurpose, failed: &CallFailed<'_>
     }
 }
 
-/// The usage block from a provider response, mapped exactly as the chat
-/// agentic loop maps it. `None` when the provider reported no prompt tokens.
+/// The usage a provider response reported. `None` when it named no tokens in
+/// either direction, since a zeroed block would read as a call that cost
+/// nothing. A zero prompt with output is kept: a local server answering from
+/// its KV cache reports exactly that.
 pub(crate) fn usage_from_response(response: &LlmResponse) -> Option<ApiUsage> {
-    response.input_tokens.map(|input_tokens| ApiUsage {
-        input_tokens,
-        output_tokens: response.output_tokens.unwrap_or(0),
-        cache_read_tokens: response.cache_read_tokens.unwrap_or(0),
-        cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
-        // Chat providers report one blended total per direction.
-        modality: None,
-        service_tier: response.service_tier,
-        cache_creation_1h_tokens: response.cache_creation_1h_tokens,
-        cache_creation_30m_tokens: response.cache_creation_30m_tokens,
-        cache_creation_12h_tokens: response.cache_creation_12h_tokens,
-        cache_creation_requested_ttl: response.cache_creation_requested_ttl,
-    })
+    response
+        .usage
+        .filter(|u| u.input_tokens > 0 || u.output_tokens > 0)
 }
 
-/// The usage block from a typed judgment.
-///
-/// `None` when it reported no input tokens, for the reason
-/// [`usage_from_response`] returns `None`: a zeroed block reads as a call that
-/// cost nothing. The judgment wire reports an absent count as zero, so the two
-/// cases arrive here indistinguishable and take the safer reading.
-///
-/// The cache counters pass through: zero from a System One endpoint, and what
-/// a chat model reported from the chat provider. `modality` stays `None`: both
-/// report one total per direction.
-pub(crate) fn usage_from_judgment(usage: &JudgmentUsage) -> Option<ApiUsage> {
-    (usage.input_tokens > 0).then_some(ApiUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_creation_tokens: usage.cache_creation_tokens,
-        ..ApiUsage::default()
-    })
-}
-
-/// The usage block a raw provider body reported, read by `llm::usage_wire`.
-pub(crate) fn usage_from_provider(usage: ProviderUsage) -> ApiUsage {
-    ApiUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_creation_tokens: usage.cache_creation_tokens,
-        // Every raw shape it reads reports one blended total per direction.
-        ..ApiUsage::default()
-    }
+/// `usage` unless it names no prompt tokens. A judgment backend reports an
+/// absent prompt count as zero. Every judgment has a prompt, so zero is where
+/// a report of nothing is drawn.
+fn billed(usage: Option<ApiUsage>) -> Option<ApiUsage> {
+    usage.filter(|u| u.input_tokens > 0)
 }
 
 /// The usage block for an image call, from what the image provider reported.
@@ -370,12 +336,12 @@ impl CostSink for AuxCapture {
         let detail = CallDetail::of(&cost);
         let usage = match cost.reported {
             Reported::Chat(response) => usage_from_response(response),
-            Reported::Judgment(judgment) => usage_from_judgment(&judgment.usage),
+            Reported::Judgment(judgment) => billed(judgment.usage),
             Reported::Image {
                 input_tokens,
                 output_tokens,
             } => usage_from_image(input_tokens, output_tokens),
-            Reported::Usage(usage) => usage.map(usage_from_provider),
+            Reported::Usage(usage) => usage,
         };
         self.emit(auxiliary_capture_detailed(
             self.purpose,
@@ -459,12 +425,23 @@ mod tests {
     #[test]
     fn the_usage_carries_the_write_split_and_requested_ttl() {
         use crate::engine::cache_ttl::{CacheLifetime, CacheTtl};
-        let base = response_reporting(Some(16_500), Some(9), None, Some(16_000));
-        let usage_of = |response: LlmResponse| usage_from_response(&response).expect("usage");
-        let thirty = usage_of(LlmResponse {
+        let base = ApiUsage {
+            input_tokens: 16_500,
+            output_tokens: 9,
+            cache_creation_tokens: 16_000,
+            ..ApiUsage::default()
+        };
+        let usage_of = |usage: ApiUsage| {
+            usage_from_response(&LlmResponse {
+                usage: Some(usage),
+                ..LlmResponse::default()
+            })
+            .expect("usage")
+        };
+        let thirty = usage_of(ApiUsage {
             cache_creation_30m_tokens: Some(1_000),
             cache_creation_12h_tokens: Some(15_000),
-            ..base.clone()
+            ..base
         });
         assert_eq!(thirty.cache_creation_30m_tokens, Some(1_000));
         assert_eq!(thirty.cache_creation_12h_tokens, Some(15_000));
@@ -472,17 +449,17 @@ mod tests {
             CacheTtl::of_write(&thirty),
             CacheTtl::Reported(CacheLifetime::ThirtyMinutes)
         );
-        let twelve = usage_of(LlmResponse {
+        let twelve = usage_of(ApiUsage {
             cache_creation_12h_tokens: Some(16_000),
-            ..base.clone()
+            ..base
         });
         assert_eq!(
             CacheTtl::of_write(&twelve),
             CacheTtl::Reported(CacheLifetime::TwelveHours)
         );
-        let requested = usage_of(LlmResponse {
+        let requested = usage_of(ApiUsage {
             cache_creation_requested_ttl: Some(CacheLifetime::FiveMinutes),
-            ..base.clone()
+            ..base
         });
         assert_eq!(
             CacheTtl::of_write(&requested),
@@ -491,53 +468,32 @@ mod tests {
         assert_eq!(CacheTtl::of_write(&usage_of(base)), CacheTtl::Unknown);
     }
 
-    /// A response reporting only the token counts the test cares about.
-    fn response_reporting(
-        input: Option<u32>,
-        output: Option<u32>,
-        cache_read: Option<u32>,
-        cache_write: Option<u32>,
-    ) -> LlmResponse {
-        LlmResponse {
-            content: None,
-            tool_calls: vec![],
-            stop_reason: None,
-            output_tokens: output,
-            input_tokens: input,
-            cache_creation_tokens: cache_write,
-            cache_creation_1h_tokens: None,
-            cache_creation_30m_tokens: None,
-            cache_creation_12h_tokens: None,
-            cache_creation_requested_ttl: None,
-            stable_prefix_fingerprint: None,
-            cache_read_tokens: cache_read,
-            served_model: None,
-            provider: None,
-            thinking_chars: None,
-            thinking_blocks: None,
-            unknown_sse_dropped: 0,
-            model_only_text: None,
-            progress_notes: Vec::new(),
-            prefill: None,
-            service_tier: None,
-        }
-    }
-
-    #[test]
-    fn usage_maps_every_field_the_provider_reported() {
-        let response = response_reporting(Some(1200), Some(30), Some(900), Some(100));
-        let usage = usage_from_response(&response).expect("usage present");
-        assert_eq!(usage.input_tokens, 1200);
-        assert_eq!(usage.output_tokens, 30);
-        assert_eq!(usage.cache_read_tokens, 900);
-        assert_eq!(usage.cache_creation_tokens, 100);
-    }
-
-    /// A provider that reports no prompt tokens yields no usage block, rather
-    /// than a zero one that would read as a free call.
+    /// A provider that reports no usage, or only zero counts, yields no usage
+    /// block. A zero block would read as a free call.
     #[test]
     fn a_provider_reporting_nothing_yields_no_usage() {
-        assert!(usage_from_response(&response_reporting(None, None, None, None)).is_none());
+        assert!(usage_from_response(&LlmResponse::default()).is_none());
+        let zeroed = LlmResponse {
+            usage: Some(ApiUsage::default()),
+            ..LlmResponse::default()
+        };
+        assert!(usage_from_response(&zeroed).is_none());
+    }
+
+    /// A zero prompt with output still bills its output tokens.
+    #[test]
+    fn a_zero_prompt_with_output_keeps_its_usage() {
+        let response = LlmResponse {
+            usage: Some(ApiUsage {
+                output_tokens: 250,
+                ..ApiUsage::default()
+            }),
+            ..LlmResponse::default()
+        };
+        assert_eq!(
+            usage_from_response(&response).map(|u| u.output_tokens),
+            Some(250)
+        );
     }
 
     /// OpenAI's image endpoints report tokens, so an image call is accounted
@@ -560,51 +516,11 @@ mod tests {
         assert!(usage_from_image(None, None).is_none());
     }
 
-    /// Gemini reports prompt tokens but no cache counters. The absent ones
-    /// must read as zero rather than suppressing the whole usage block.
-    #[test]
-    fn a_partial_report_still_yields_usage() {
-        let usage = usage_from_response(&response_reporting(Some(400), Some(12), None, None))
-            .expect("usage present");
-        assert_eq!(usage.input_tokens, 400);
-        assert_eq!(usage.cache_read_tokens, 0);
-        assert_eq!(usage.cache_creation_tokens, 0);
-    }
-
-    /// Jev reports two counts and no cache, so a row carries what it spent and
-    /// zeroes it cannot know.
-    #[test]
-    fn a_judgment_maps_the_counts_the_backend_reported() {
-        let usage = usage_from_judgment(&JudgmentUsage {
-            input_tokens: 312,
-            output_tokens: 48,
-            ..JudgmentUsage::default()
-        })
-        .expect("usage present");
-        assert_eq!(usage.input_tokens, 312);
-        assert_eq!(usage.output_tokens, 48);
-        assert_eq!(usage.cache_read_tokens, 0, "no prompt cache on this wire");
-    }
-
-    /// A chat model answering a judgment may read from or write to its prompt
-    /// cache, and the rollup prices both. They reach the row unchanged.
-    #[test]
-    fn a_chat_judgments_cache_counters_reach_the_row() {
-        let usage = usage_from_judgment(&JudgmentUsage {
-            input_tokens: 40,
-            output_tokens: 12,
-            cache_read_tokens: 2_048,
-            cache_creation_tokens: 512,
-        })
-        .expect("usage present");
-        assert_eq!(usage.cache_read_tokens, 2_048);
-        assert_eq!(usage.cache_creation_tokens, 512);
-    }
-
     /// A backend that reported nothing must not read as a free call. The wire
     /// gives an absent count as zero, so zero is where that line is drawn.
     #[test]
     fn a_judgment_reporting_nothing_yields_no_usage() {
-        assert!(usage_from_judgment(&JudgmentUsage::default()).is_none());
+        assert!(billed(None).is_none());
+        assert!(billed(Some(ApiUsage::default())).is_none());
     }
 }

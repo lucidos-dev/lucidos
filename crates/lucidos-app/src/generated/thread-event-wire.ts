@@ -115,7 +115,7 @@ export interface ApiUsage {
   /** Part of `cache_creation_tokens`: the tokens written to the 1-hour
    *  cache, billed at 2x base input rather than 1.25x. A Claude Code
    *  session and a Claude chat call on Anthropic or Vertex split a write by
-   *  lifetime, and the rest of the write went to the 5-minute cache.
+   *  lifetime. The rest of the write went to the 5-minute cache.
    *  `CacheTtl::of_write` reads the call's TTL from the split. */
   cache_creation_1h_tokens?: number;
   /** Part of `cache_creation_tokens`: the tokens OpenAI's Responses API

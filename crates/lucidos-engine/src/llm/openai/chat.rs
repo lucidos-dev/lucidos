@@ -3,6 +3,7 @@
 //! module.
 
 use crate::llm::anthropic_wire::{ephemeral_cache_marker, MAX_CACHE_BREAKPOINTS};
+use crate::llm::api_usage::ApiUsage;
 use crate::llm::cache_lifetime::CacheLifetime;
 use crate::llm::prefill::{pair_of, BeatShape, PrefillPair, StableEnd, TurnRoute};
 use crate::llm::provider::{
@@ -468,9 +469,9 @@ impl OpenAiProvider {
             "model": model,
             "stream": true,
             // Ask OpenAI to append a final chunk carrying token usage so the
-            // provider parser can populate `LlmResponse.{input,output}_tokens`
-            // — without this, streaming Chat Completions silently drops
-            // usage, breaking cross-provider cost analytics.
+            // provider parser can populate `LlmResponse.usage`. Without it,
+            // streaming Chat Completions silently drops usage, breaking
+            // cross-provider cost analytics.
             "stream_options": { "include_usage": true },
             "max_completion_tokens": DEFAULT_MAX_COMPLETION_TOKENS,
             "messages": openai_messages,
@@ -589,7 +590,7 @@ impl OpenAiProvider {
 
         // Top-level usage object (final include_usage chunk has choices: []).
         if let Some(usage) = data.get("usage") {
-            meta.absorb_chat_usage(usage);
+            meta.absorb_usage(crate::llm::usage_wire::from_block(usage));
         }
         // Every chunk names the model; the first one that does is kept.
         if meta.served_model.is_none() {
@@ -618,10 +619,16 @@ impl OpenAiProvider {
         };
 
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+            if !text.is_empty() {
+                crate::llm::call_trace::content_arrived();
+            }
             content.push_str(text);
         }
 
         if let Some(tc_array) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            if !tc_array.is_empty() {
+                crate::llm::call_trace::content_arrived();
+            }
             for tc in tc_array {
                 let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
 
@@ -742,11 +749,15 @@ impl OpenAiProvider {
 
             match self.parse_chat_stream(resp, &on_token).await {
                 Ok(response) => {
+                    let usage = response.usage.map(|usage| ApiUsage {
+                        cache_creation_requested_ttl: requested_ttl,
+                        ..usage
+                    });
                     return Ok(LlmResponse {
                         prefill,
-                        cache_creation_requested_ttl: requested_ttl,
+                        usage,
                         ..response
-                    })
+                    });
                 }
                 Err(e) => {
                     let err_str = e.to_string();
@@ -922,18 +933,18 @@ mod tests {
         assert_eq!(meta.stop_reason.as_deref(), Some("stop"));
         // 42 processed, 12 of them a cache read. The two overlap, because a
         // stored `input_tokens` is the whole prompt the model read.
-        assert_eq!(meta.input_tokens, Some(42));
-        assert_eq!(meta.output_tokens, Some(7));
-        assert_eq!(meta.cache_read_tokens, Some(12));
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(42));
+        assert_eq!(meta.usage.map(|u| u.output_tokens), Some(7));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(12));
 
         let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
         assert_eq!(resp.content.as_deref(), Some("hi"));
         assert_eq!(resp.stop_reason.as_deref(), Some("stop"));
-        assert_eq!(resp.input_tokens, Some(42));
-        assert_eq!(resp.output_tokens, Some(7));
-        assert_eq!(resp.cache_read_tokens, Some(12));
-        // OpenAI doesn't separate cache writes from reads, so this stays None.
-        assert_eq!(resp.cache_creation_tokens, None);
+        assert_eq!(resp.usage.map(|u| u.input_tokens), Some(42));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(7));
+        assert_eq!(resp.usage.map(|u| u.cache_read_tokens), Some(12));
+        // OpenAI doesn't separate cache writes from reads, so this stays zero.
+        assert_eq!(resp.usage.map(|u| u.cache_creation_tokens), Some(0));
         assert_eq!(
             resp.served_model.as_deref(),
             Some("google/gemini-3.8-flash")
@@ -955,8 +966,8 @@ mod tests {
             &mut meta,
         )
         .unwrap();
-        assert_eq!(meta.input_tokens, Some(42));
-        assert_eq!(meta.cache_read_tokens, Some(12));
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(42));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(12));
     }
 
     /// OpenRouter reports an Anthropic cache write beside the read, both
@@ -973,23 +984,23 @@ mod tests {
             &mut meta,
         )
         .unwrap();
-        assert_eq!(meta.input_tokens, Some(5476));
-        assert_eq!(meta.cache_read_tokens, None);
-        assert_eq!(meta.cache_write_tokens, Some(5435));
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(5476));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(0));
+        assert_eq!(meta.usage.map(|u| u.cache_creation_tokens), Some(5435));
 
         let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
-        assert_eq!(resp.cache_creation_tokens, Some(5435));
+        assert_eq!(resp.usage.map(|u| u.cache_creation_tokens), Some(5435));
     }
 
     #[test]
     fn a_zero_cache_write_stays_unset() {
         let mut meta = StreamMeta::default();
-        meta.absorb_chat_usage(&serde_json::json!({
+        meta.absorb_usage(crate::llm::usage_wire::from_block(&serde_json::json!({
             "prompt_tokens": 40,
             "prompt_tokens_details": {"cached_tokens": 12, "cache_write_tokens": 0}
-        }));
-        assert_eq!(meta.cache_read_tokens, Some(12));
-        assert_eq!(meta.cache_write_tokens, None);
+        })));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(12));
+        assert_eq!(meta.usage.map(|u| u.cache_creation_tokens), Some(0));
     }
 
     /// A prompt that read no cache leaves the count unset, so "read nothing"
@@ -1006,8 +1017,8 @@ mod tests {
             &mut meta,
         )
         .unwrap();
-        assert_eq!(meta.input_tokens, Some(42));
-        assert_eq!(meta.cache_read_tokens, None);
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(42));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(0));
     }
 
     /// More cached than prompt is a corrupt block. The wire records what
@@ -1025,8 +1036,8 @@ mod tests {
             &mut meta,
         )
         .unwrap();
-        assert_eq!(meta.input_tokens, Some(10));
-        assert_eq!(meta.cache_read_tokens, Some(99));
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(10));
+        assert_eq!(meta.usage.map(|u| u.cache_read_tokens), Some(99));
     }
 
     /// Empty content with `finish_reason=length` is the truncation case. We
@@ -1057,8 +1068,8 @@ mod tests {
         assert_eq!(resp.content, None);
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.stop_reason.as_deref(), Some("length"));
-        assert_eq!(resp.input_tokens, Some(16000));
-        assert_eq!(resp.output_tokens, Some(0));
+        assert_eq!(resp.usage.map(|u| u.input_tokens), Some(16000));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(0));
     }
 
     /// The incident this guard exists for: `finish_reason: stop`, no content,
@@ -1091,7 +1102,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(meta.stop_reason.as_deref(), Some("stop"));
-        assert_eq!(meta.input_tokens, None, "no usage chunk arrived");
+        assert_eq!(meta.usage, None, "no usage chunk arrived");
 
         let err = OpenAiProvider::build_llm_response(content, tools, meta)
             .expect_err("a usage-less empty stream must not build a response")
@@ -1174,7 +1185,7 @@ mod tests {
 
         let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
         assert_eq!(resp.content.as_deref(), Some("partial answer"));
-        assert_eq!(resp.input_tokens, None);
+        assert_eq!(resp.usage.map(|u| u.input_tokens), None);
     }
 
     /// A stream that produced a tool call stays a success even with no usage
@@ -1197,7 +1208,7 @@ mod tests {
         let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].name, "read_file");
-        assert_eq!(resp.input_tokens, None);
+        assert_eq!(resp.usage.map(|u| u.input_tokens), None);
     }
 
     /// A server that reports only one half of the token pair is odd, not
@@ -1224,10 +1235,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(meta.input_tokens, None, "this server omits prompt_tokens");
+        assert_eq!(
+            meta.usage.map(|u| u.input_tokens),
+            Some(0),
+            "this server omits prompt_tokens"
+        );
         let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
         assert_eq!(resp.content, None);
-        assert_eq!(resp.output_tokens, Some(0));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(0));
     }
 
     /// The case ADR 0009 protects: the model finished cleanly and chose to say
@@ -1258,8 +1273,8 @@ mod tests {
         assert_eq!(resp.content, None);
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.stop_reason.as_deref(), Some("stop"));
-        assert_eq!(resp.input_tokens, Some(900));
-        assert_eq!(resp.output_tokens, Some(0));
+        assert_eq!(resp.usage.map(|u| u.input_tokens), Some(900));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(0));
     }
 
     /// Feed one SSE error frame through the chunk parser and return the
@@ -1465,8 +1480,8 @@ mod tests {
     }
 
     /// `stream_options.include_usage` must be present in the Chat
-    /// Completions request body — without it, OpenAI never sends the final
-    /// usage chunk and `meta.input_tokens` / `meta.output_tokens` stay None.
+    /// Completions request body. Without it, OpenAI never sends the final
+    /// usage chunk and `meta.usage` stays `None`.
     #[test]
     fn chat_body_requests_usage_in_stream() {
         let provider = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
@@ -2016,13 +2031,38 @@ mod tests {
         )
         .await
         .expect("the beat answers");
-        assert_eq!(beat.cache_read_tokens, Some(880));
-        assert_eq!(beat.output_tokens, Some(1));
+        assert_eq!(beat.usage.map(|u| u.cache_read_tokens), Some(880));
+        assert_eq!(beat.usage.map(|u| u.output_tokens), Some(1));
 
         let sent = bodies.lock().unwrap().clone();
         let [_, beat_body] = sent.as_slice() else {
             panic!("expected a turn and a beat, saw {}", sent.len());
         };
         assert_eq!(beat_body, &json(&pair.stable.body));
+    }
+
+    /// The first text or tool-call delta stamps the call trace, which is how a
+    /// reply's time to first token reaches its row. A chunk that carries no
+    /// content does not.
+    #[tokio::test]
+    async fn a_chat_stream_marks_its_first_content() {
+        let feed = |chunk: &'static str| async move {
+            let ((), trace) = crate::llm::call_trace::scoped(async move {
+                let mut content = String::new();
+                let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+                let mut meta = StreamMeta::default();
+                OpenAiProvider::process_chat_chunk(chunk, &mut content, &mut tools, &mut meta)
+                    .unwrap();
+            })
+            .await;
+            trace.first_delta.is_some()
+        };
+        assert!(feed(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).await);
+        assert!(
+            feed(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"f","arguments":"{}"}}]}}]}"#)
+                .await
+        );
+        assert!(!feed(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#).await);
+        assert!(!feed(r#"{"choices":[{"delta":{"content":""}}]}"#).await);
     }
 }

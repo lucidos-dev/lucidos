@@ -1,10 +1,12 @@
+// @vitest-environment jsdom
 /**
  * The sentence under the External address field. A save's probe verdict
  * reaches the user only here. So does the news that an empty field means
  * Tailscale.
  */
 import { describe, it, expect } from 'vitest';
-import { externalAddressNote } from './ExternalAddressSection';
+import { h, render } from 'preact';
+import { ExternalAddressSection, externalAddressNote } from './ExternalAddressSection';
 import type { ExternalAddressInfo } from '../../api/client/control';
 
 const TAILNET = 'http://mymac.tailnet-name.ts.net:5252';
@@ -18,6 +20,26 @@ const unset: ExternalAddressInfo = {
   probe: null,
 };
 const set: ExternalAddressInfo = { ...unset, external_address: 'https://lucidos.example.com', source: 'file' };
+
+describe('ExternalAddressSection', () => {
+  it.each([true, false])('shows the gateway scope when gateway controls are available: %s', (available) => {
+    const host = document.createElement('div');
+    try {
+      render(h(ExternalAddressSection, {
+        available,
+        info: { status: 'loaded', data: unset },
+        tailnetDefault: TAILNET,
+        onSaved: () => {},
+      }), host);
+      expect(host.querySelector('.settings-section-desc')?.textContent?.trim()).toBe(
+        'This address belongs to the gateway and applies to every workspace on it.',
+      );
+      expect(host.textContent?.includes('lucidos external-address')).toBe(!available);
+    } finally {
+      render(null, host);
+    }
+  });
+});
 
 describe('externalAddressNote', () => {
   it('says the empty field means Tailscale', () => {

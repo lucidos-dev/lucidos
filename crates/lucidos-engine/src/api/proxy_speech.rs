@@ -21,8 +21,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::api::proxy_cost::{is_event_stream, ReportedCall};
+use crate::engine::ApiUsage;
 use crate::engine::LucidosEngine;
-use crate::llm::usage_wire::ProviderUsage;
 
 const CONTENT_DIGEST: HeaderName = HeaderName::from_static("content-digest");
 const DIGEST: HeaderName = HeaderName::from_static("digest");
@@ -142,7 +142,7 @@ pub(crate) async fn finish(
         SpeechPlan::Streamed(container) => restore_audio(container, response).await,
         SpeechPlan::PerCharacter { model, characters } => {
             if response.status().is_success() {
-                let call = per_character_call(model, characters);
+                let call = per_character_call(model, characters).answered_by(response.headers());
                 crate::api::proxy_cost::record(engine, cost_thread, call, request_body);
             }
             response
@@ -154,12 +154,13 @@ pub(crate) async fn finish(
 /// card is per 1M characters.
 fn per_character_call(model: String, characters: usize) -> ReportedCall {
     ReportedCall {
-        usage: ProviderUsage {
+        usage: ApiUsage {
             input_tokens: u32::try_from(characters).unwrap_or(u32::MAX),
-            ..ProviderUsage::default()
+            ..ApiUsage::default()
         },
         model,
         served_model: None,
+        request_id: None,
     }
 }
 

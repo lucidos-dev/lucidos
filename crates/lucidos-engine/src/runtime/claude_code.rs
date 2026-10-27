@@ -358,33 +358,9 @@ fn replays_an_input(line: &str) -> bool {
         && serde_json::from_str(line.trim()).is_ok_and(|value| parse::is_input_replay(&value))
 }
 
-/// The usage block of a `result` line. Claude Code reports the uncached input
-/// alone, and `ApiUsage.input_tokens` is the total, so the cache counts are
-/// added in, as the main session's capture does.
+/// The usage block of a `result` line.
 fn result_usage(value: &serde_json::Value) -> Option<crate::engine::ApiUsage> {
-    let usage = value.get("usage")?;
-    let count = |key: &str| {
-        crate::llm::clamp_provider_token_count(
-            usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0),
-            "ClaudeCode",
-        )
-    };
-    let cache_read_tokens = count("cache_read_input_tokens");
-    let cache_creation_tokens = count("cache_creation_input_tokens");
-    Some(crate::engine::ApiUsage {
-        input_tokens: count("input_tokens")
-            .saturating_add(cache_read_tokens)
-            .saturating_add(cache_creation_tokens),
-        output_tokens: count("output_tokens"),
-        cache_read_tokens,
-        cache_creation_tokens,
-        modality: None,
-        service_tier: None,
-        cache_creation_1h_tokens: None,
-        cache_creation_30m_tokens: None,
-        cache_creation_12h_tokens: None,
-        cache_creation_requested_ttl: None,
-    })
+    crate::llm::usage_wire::from_block(value.get("usage")?)
 }
 
 /// Read a stdout line as the copy's closing `result`: the answer or why there

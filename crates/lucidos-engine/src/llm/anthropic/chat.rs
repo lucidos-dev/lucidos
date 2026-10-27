@@ -851,7 +851,7 @@ mod tests {
                 .prefill_anthropic(&pair.whole)
                 .await
                 .expect("the beat answers");
-            assert_eq!(beat.input_tokens, Some(9));
+            assert_eq!(beat.usage.map(|u| u.input_tokens), Some(9));
 
             let sent = bodies.lock().unwrap().clone();
             let [turn_body, beat_body] = sent.as_slice() else {

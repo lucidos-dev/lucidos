@@ -102,25 +102,41 @@ describe('ReplyHtml', () => {
 
   // A reply cannot be refused, so the frontend applies the rules the engine
   // applies to an option: params the manifest takes, and the owner rule.
-  it('reads "not available" for unknown params, a missing one, or another thread\'s widget', () => {
+  // The reason is the one the engine gives for an option, so whoever wrote the
+  // embed can fix it.
+  const reasons = () => Array.from(host.querySelectorAll('.inline-widget-gone-reason'), (el) => el.textContent);
+
+  it('reads "not available", and why, for unknown params, a missing one, or another thread\'s widget', () => {
     widgetApps.value = new Map([
       [player.id, { status: 'loaded', data: player }],
       ['mine', { status: 'loaded', data: { ...player, id: 'mine', reusable: false, built_in: false, origin_thread_id: 'other' } }],
     ]);
-    const md = '![a](app:lucidos-sound-player?params={"clip":"a","speed":2}) ![b](app:lucidos-sound-player) '
+    const md = '![a](app:lucidos-sound-player?params={"clip":"a","date":"2026-10-27"}) ![b](app:lucidos-sound-player) '
       + '![c](app:mine?params={"clip":"a"})';
     act(() => { render(<ReplyHtml html={renderMarkdown(md)} final threadId="t" />, host); });
     expect(host.querySelectorAll('.inline-widget-gone')).toHaveLength(3);
+    expect(reasons()).toEqual([
+      "Widget 'lucidos-sound-player' takes no param 'date'. It takes: clip.",
+      "Widget 'lucidos-sound-player' needs the param 'clip'.",
+      "Widget 'mine' belongs to another thread. Make it reusable first.",
+    ]);
     expect(frames()).toHaveLength(0);
   });
 
-  it('reads "not available" for a broken embed and for a missing widget', () => {
+  it('names the unknown param the engine names: the first in sorted order', () => {
+    const md = '![a](app:lucidos-sound-player?params={"clip":"a","zeta":1,"alpha":2})';
+    act(() => { render(<ReplyHtml html={renderMarkdown(md)} final threadId="t" />, host); });
+    expect(reasons()).toEqual(["Widget 'lucidos-sound-player' takes no param 'alpha'. It takes: clip."]);
+  });
+
+  it('reads "not available", and why, for a broken embed and for a missing widget', () => {
     widgetApps.value = new Map([['gone', { status: 'loaded', data: null }]]);
     act(() => {
       render(<ReplyHtml html={renderMarkdown('![x](app:player?params=[1]) ![y](app:gone)')} final threadId="t" />, host);
     });
     const notes = host.querySelectorAll('.inline-widget-gone');
     expect(notes).toHaveLength(2);
-    for (const note of notes) expect(note.textContent).toBe(WIDGET_UNAVAILABLE_TEXT);
+    for (const note of notes) expect(note.textContent).toContain(WIDGET_UNAVAILABLE_TEXT);
+    expect(reasons()).toEqual(["The params for 'player' must be a JSON object.", "No widget 'gone' exists."]);
   });
 });

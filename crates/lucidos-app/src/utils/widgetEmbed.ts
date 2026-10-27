@@ -224,16 +224,35 @@ function hasOwn(record: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(record, key);
 }
 
-/** Whether this embed may draw in this thread: a widget, reusable or made
- *  here, given only the params its manifest takes and every required one.
- *  The engine checks an option's embed before the card; a reply's embed has
- *  only this check. */
-export function embedDraws(app: App, embed: WidgetEmbed, threadId: string): boolean {
-  if (app.kind !== 'widget') return false;
-  if (!app.reusable && app.origin_thread_id !== threadId) return false;
+/** Why this app cannot draw as a widget, or `null` when it can. */
+export function widgetRefusal(app: App): string | null {
+  return app.kind === 'widget' ? null : `'${app.id}' is an app, not a widget.`;
+}
+
+/** Why this embed may not draw in this thread, or `null` when it may: a
+ *  widget, reusable or made here, given only the params its manifest takes
+ *  and every required one. The engine checks an option's embed before the
+ *  card (`check_widget_params`), and these reasons read as its do. A reply's
+ *  embed has only this check. */
+export function embedRefusal(app: App, embed: WidgetEmbed, threadId: string): string | null {
+  const notWidget = widgetRefusal(app);
+  if (notWidget) return notWidget;
+  if (!app.reusable && app.origin_thread_id !== threadId) {
+    return `Widget '${app.id}' belongs to another thread. Make it reusable first.`;
+  }
   const declared = app.params ?? {};
   const given = embed.params ?? {};
-  if (Object.keys(given).some((name) => !hasOwn(declared, name))) return false;
-  if (new TextEncoder().encode(canonicalWidgetParams(given)).length > WIDGET_PARAMS_MAX_BYTES) return false;
-  return Object.entries(declared).every(([name, param]) => !param.required || hasOwn(given, name));
+  // Sorted, as the engine's maps are, so both name the same param.
+  const declaredNames = Object.keys(declared).sort();
+  const unknown = Object.keys(given).sort().find((name) => !hasOwn(declared, name));
+  if (unknown !== undefined) {
+    const takes = declaredNames.join(', ') || 'none';
+    return `Widget '${app.id}' takes no param '${unknown}'. It takes: ${takes}.`;
+  }
+  const missing = declaredNames.find((name) => declared[name].required && !hasOwn(given, name));
+  if (missing !== undefined) return `Widget '${app.id}' needs the param '${missing}'.`;
+  if (new TextEncoder().encode(canonicalWidgetParams(given)).length > WIDGET_PARAMS_MAX_BYTES) {
+    return `Widget '${app.id}' params are over the ${WIDGET_PARAMS_MAX_BYTES}-byte cap.`;
+  }
+  return null;
 }

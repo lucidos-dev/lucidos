@@ -52,7 +52,49 @@ fn a_streamed_reply_takes_its_model_from_the_request() {
     let call = reported(reply, true, &request, "/messages").unwrap();
     assert_eq!((call.usage.input_tokens, call.usage.output_tokens), (7, 9));
     assert_eq!(call.model, "claude-sonnet-5");
-    assert_eq!(call.served_model, None);
+    assert_eq!(call.served_model, None, "this stream names no model");
+}
+
+/// An Anthropic stream names its model in `message_start`, and an OpenAI
+/// stream in every chunk.
+#[test]
+fn a_streamed_reply_reports_the_model_it_names() {
+    let anthropic = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-5-20260101\",\"usage\":{\"input_tokens\":7}}}\n\n\
+        data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
+    let request = body(json!({"model": "claude-sonnet-5", "stream": true}));
+    let call = reported(anthropic, true, &request, "/messages").unwrap();
+    assert_eq!(call.model, "claude-sonnet-5");
+    assert_eq!(
+        call.served_model.as_deref(),
+        Some("claude-sonnet-5-20260101")
+    );
+
+    let openai = b"data: {\"model\":\"gpt-6.1-2026\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+        data: {\"model\":\"gpt-6.1-2026\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n\n\
+        data: [DONE]\n\n";
+    let request = body(json!({"model": "gpt-6.1", "stream": true}));
+    let call = reported(openai, true, &request, "/chat/completions").unwrap();
+    assert_eq!(call.model, "gpt-6.1");
+    assert_eq!(call.served_model.as_deref(), Some("gpt-6.1-2026"));
+}
+
+/// The upstream's own id for the reply rides along into the row, from either
+/// header a provider uses.
+#[test]
+fn a_reply_header_names_the_request_id() {
+    let call = || ReportedCall {
+        usage: Default::default(),
+        model: "gpt-6.1".to_string(),
+        served_model: None,
+        request_id: None,
+    };
+    let mut headers = HeaderMap::new();
+    assert_eq!(call().answered_by(&headers).request_id, None);
+    headers.insert("x-request-id", "req_openai".parse().unwrap());
+    assert_eq!(
+        call().answered_by(&headers).request_id.as_deref(),
+        Some("req_openai")
+    );
 }
 
 /// The stream `api::proxy_speech` asks OpenAI's speech endpoint for. Its last

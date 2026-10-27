@@ -40,8 +40,8 @@ pub use vertex::VertexGroundingSearch;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::llm::api_usage::ApiUsage;
 use crate::llm::metered::CallToken;
-use crate::llm::usage_wire::ProviderUsage;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -50,7 +50,7 @@ pub struct WebSearchResult {
     /// The answer text, then a `Sources:` list.
     pub text: String,
     /// What the backend reported, when it reported tokens.
-    pub usage: Option<ProviderUsage>,
+    pub usage: Option<ApiUsage>,
     /// The model that answered, for the cost row.
     pub model: String,
 }

@@ -213,12 +213,12 @@ describe('InlineWidget', () => {
     expect(host.querySelector('.inline-widget')!.hasAttribute('data-event-id')).toBe(false);
   });
 
-  it('says it is not available for a missing widget, or a reply embed that may not draw', () => {
+  it('says it is not available, and why, for a missing widget or a refused reply embed', () => {
     appsById.value = new Map([...appsById.value, ['gone', { status: 'loaded', data: null }]]);
     act(() => { render(<InlineWidget threadId={THREAD} appId="gone" />, host); });
-    expect(host.textContent).toBe(WIDGET_UNAVAILABLE_TEXT);
-    act(() => { render(<InlineWidget threadId={THREAD} appId="flight-picker" mayDraw={() => false} />, host); });
-    expect(host.textContent).toBe(WIDGET_UNAVAILABLE_TEXT);
+    expect(host.textContent).toBe(`${WIDGET_UNAVAILABLE_TEXT}No widget 'gone' exists.`);
+    act(() => { render(<InlineWidget threadId={THREAD} appId="flight-picker" refusal={() => 'Because.'} />, host); });
+    expect(host.querySelector('.inline-widget-gone-reason')!.textContent).toBe('Because.');
     expect(frames()).toHaveLength(0);
   });
 });

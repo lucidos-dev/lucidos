@@ -243,10 +243,7 @@ pub(crate) fn reply_usage(reply: &serde_json::Value) -> Result<LlmResponse, BoxE
         .ok_or("the prefill reply carried no usage block")?;
     let text = |key: &str| reply.get(key).and_then(|v| v.as_str()).map(str::to_string);
     Ok(LlmResponse {
-        input_tokens: Some(usage.input_tokens),
-        output_tokens: Some(usage.output_tokens),
-        cache_read_tokens: Some(usage.cache_read_tokens),
-        cache_creation_tokens: Some(usage.cache_creation_tokens),
+        usage: Some(usage),
         stop_reason: text("stop_reason"),
         served_model: text("model"),
         ..LlmResponse::default()
@@ -381,13 +378,31 @@ mod tests {
                 "output_tokens": 0
             }
         });
-        let usage = reply_usage(&reply).expect("a usage block");
-        assert_eq!(usage.input_tokens, Some(90_003));
-        assert_eq!(usage.cache_read_tokens, Some(90_000));
-        assert_eq!(usage.cache_creation_tokens, Some(0));
-        assert_eq!(usage.output_tokens, Some(0));
-        assert_eq!(usage.stop_reason.as_deref(), Some("refusal"));
-        assert_eq!(usage.served_model.as_deref(), Some("claude-opus-5-5"));
+        let beat = reply_usage(&reply).expect("a usage block");
+        let usage = beat.usage.expect("the usage");
+        assert_eq!(usage.input_tokens, 90_003);
+        assert_eq!(usage.cache_read_tokens, 90_000);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(beat.stop_reason.as_deref(), Some("refusal"));
+        assert_eq!(beat.served_model.as_deref(), Some("claude-opus-5-5"));
+    }
+
+    /// A keep-alive beat that writes the cache keeps the write's lifetime.
+    #[test]
+    fn a_beat_keeps_the_write_split() {
+        let reply = serde_json::json!({
+            "usage": {
+                "input_tokens": 3,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 4_000,
+                "cache_creation": {"ephemeral_1h_input_tokens": 4_000},
+                "output_tokens": 0
+            }
+        });
+        let response = reply_usage(&reply).expect("a usage block");
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.cache_creation_1h_tokens, Some(4_000));
     }
 
     #[test]
@@ -459,7 +474,7 @@ mod tests {
             .await
             .expect("the beat does not wait for the answer")
             .expect("message_start carries the usage");
-        assert_eq!(beat.cache_read_tokens, Some(500));
+        assert_eq!(beat.usage.map(|u| u.cache_read_tokens), Some(500));
         assert_eq!(beat.served_model.as_deref(), Some("claude-test"));
     }
 

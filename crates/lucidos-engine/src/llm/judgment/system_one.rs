@@ -18,7 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Answer, Answers, Judgment, JudgmentProvider, JudgmentUsage, Question};
+use super::{Answer, Answers, Judgment, JudgmentProvider, Question};
 
 /// TypeSafe's API root. The builtin `typesafe` proxy pins it too.
 pub const TYPESAFE_API_BASE_URL: &str = "https://api.typesafe.ai/v1";
@@ -109,24 +109,16 @@ pub(crate) fn parse_response(
         }
     }
 
-    let usage = value.get("usage");
-    let count = |key: &str| -> u32 {
-        usage
-            .and_then(|u| u.get(key))
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32
-    };
     Ok(Judgment {
         answers: Answers::new(answers),
-        usage: JudgmentUsage {
-            input_tokens: count("input_tokens"),
-            output_tokens: count("output_tokens"),
-            ..JudgmentUsage::default()
-        },
+        usage: value
+            .get("usage")
+            .and_then(crate::llm::usage_wire::from_block),
         model: value
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string),
+        served_model: None,
         request_chars: 0,
     })
 }

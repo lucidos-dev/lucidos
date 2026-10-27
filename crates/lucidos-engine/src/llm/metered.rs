@@ -17,7 +17,6 @@ use crate::llm::prefill::PrefillBody;
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
 };
-use crate::llm::usage_wire::ProviderUsage;
 use crate::llm::web_search::{WebSearchChain, WebSearchProvider, WebSearchResult};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -59,16 +58,17 @@ pub(crate) enum Reported<'a> {
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
     },
-    Usage(Option<ProviderUsage>),
+    Usage(Option<crate::llm::api_usage::ApiUsage>),
 }
 
 impl Reported<'_> {
-    /// The *served model* a chat reply named. Every other shape already
-    /// reports the serving model as the call's `model`.
+    /// The *served model* a chat reply or a chat judgment named. Every other
+    /// shape already reports the serving model as the call's `model`.
     pub(crate) fn served_model(&self) -> Option<&str> {
         match self {
             Self::Chat(response) => response.served_model.as_deref(),
-            Self::Judgment(_) | Self::Image { .. } | Self::Usage(_) => None,
+            Self::Judgment(judgment) => judgment.served_model.as_deref(),
+            Self::Image { .. } | Self::Usage(_) => None,
         }
     }
 
@@ -97,8 +97,11 @@ pub(crate) struct CallCost<'a> {
     /// Time to the first content delta of the stream that answered, from the
     /// same start as `duration_ms`. `None` when no delta was seen.
     pub(crate) ttft_ms: Option<u64>,
-    /// The `request-id` header of the response that answered, when it had one.
+    /// The request id header of the response that answered, when it had one.
     pub(crate) request_id: Option<&'a str>,
+    /// The backend the router sent the call to, when one chose. A chat reply
+    /// names its own in [`Reported::provider`].
+    pub(crate) provider: Option<crate::llm::ProviderKind>,
 }
 
 /// How a metered chat call failed, as facts. Never the error message: a
@@ -207,6 +210,7 @@ pub(crate) async fn chat<P: LlmProvider + ?Sized>(
             .first_delta
             .map(|first| first.saturating_duration_since(started).as_millis() as u64),
         request_id: trace.request_id.as_deref(),
+        provider: trace.provider,
     })
     .await;
     Ok(response)
@@ -250,6 +254,7 @@ pub(crate) async fn prefill<P: LlmProvider + ?Sized>(
         duration_ms: Some(started.elapsed().as_millis() as u64),
         ttft_ms: None,
         request_id: trace.request_id.as_deref(),
+        provider: trace.provider,
     })
     .await;
     Ok(response)
@@ -263,15 +268,19 @@ pub(crate) async fn judge<J: JudgmentProvider + ?Sized>(
     state: serde_json::Value,
     questions: Vec<(String, Question)>,
 ) -> Result<Judgment, BoxError> {
-    let judgment = within(sink, judge.ask(state, questions, CallToken::mint())).await?;
+    let started = std::time::Instant::now();
+    let call = within(sink, judge.ask(state, questions, CallToken::mint()));
+    let (outcome, trace) = call_trace::scoped(call).await;
+    let judgment = outcome?;
     sink.record(CallCost {
         model: judgment.model.as_deref().unwrap_or_default(),
         request_chars: judgment.request_chars,
         reported: Reported::Judgment(&judgment),
         reasoning_effort: None,
-        duration_ms: None,
+        duration_ms: Some(elapsed_ms(started)),
         ttft_ms: None,
-        request_id: None,
+        request_id: trace.request_id.as_deref(),
+        provider: trace.provider,
     })
     .await;
     Ok(judgment)
@@ -287,8 +296,13 @@ pub(crate) async fn generate<I: ImageProvider + ?Sized>(
     size: ImageSize,
 ) -> Result<ImageResult, BoxError> {
     let request_chars = prompt.chars().count() + input_images.iter().map(Vec::len).sum::<usize>();
-    let call = provider.generate(prompt, input_images, size, CallToken::mint());
-    let result = within(sink, call).await?;
+    let started = std::time::Instant::now();
+    let call = within(
+        sink,
+        provider.generate(prompt, input_images, size, CallToken::mint()),
+    );
+    let (outcome, trace) = call_trace::scoped(call).await;
+    let result = outcome?;
     sink.record(CallCost {
         model: &result.model,
         request_chars,
@@ -297,9 +311,10 @@ pub(crate) async fn generate<I: ImageProvider + ?Sized>(
             output_tokens: result.output_tokens,
         },
         reasoning_effort: None,
-        duration_ms: None,
+        duration_ms: Some(elapsed_ms(started)),
         ttft_ms: None,
-        request_id: None,
+        request_id: trace.request_id.as_deref(),
+        provider: trace.provider,
     })
     .await;
     Ok(result)
@@ -312,17 +327,24 @@ pub(crate) async fn search(
     query: &str,
     max_results: usize,
 ) -> Result<String, BoxError> {
-    let WebSearchResult { text, usage, model } =
-        within(sink, chain.search(query, max_results, CallToken::mint())).await?;
+    let started = std::time::Instant::now();
+    let call = within(sink, chain.search(query, max_results, CallToken::mint()));
+    let (outcome, trace) = call_trace::scoped(call).await;
+    let WebSearchResult { text, usage, model } = outcome?;
     sink.record(CallCost {
         model: &model,
         request_chars: query.chars().count(),
         reported: Reported::Usage(usage),
         reasoning_effort: None,
-        duration_ms: None,
+        duration_ms: Some(elapsed_ms(started)),
         ttft_ms: None,
-        request_id: None,
+        request_id: trace.request_id.as_deref(),
+        provider: trace.provider,
     })
     .await;
     Ok(text)
+}
+
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    started.elapsed().as_millis() as u64
 }

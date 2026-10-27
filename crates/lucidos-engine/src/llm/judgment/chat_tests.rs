@@ -56,6 +56,23 @@ async fn a_tool_answer_reads_back_as_typed_answers() {
     assert_eq!(judgment.answers.noul("needs_memory"), Some(0.6));
 }
 
+/// The judgment keeps the model the reply named, beside the alias it asked
+/// for, so a row shows when the provider answered with another model.
+#[tokio::test]
+async fn a_judgment_keeps_the_model_the_reply_named() {
+    let (_, chat) = provider(JudgmentChatStub::answering(json!({})).served_by("gemini-3.6-flash"));
+    let judgment = chat
+        .ask(
+            json!({}),
+            lane_and_memory(),
+            crate::llm::metered::CallToken::for_test(),
+        )
+        .await
+        .expect("answered");
+    assert_eq!(judgment.served_model.as_deref(), Some("gemini-3.6-flash"));
+    assert_ne!(judgment.model.as_deref(), Some("gemini-3.6-flash"));
+}
+
 /// Every question, its id, its option names and the state reach the model,
 /// and the tool schema requires an answer to each.
 #[tokio::test]
@@ -177,7 +194,11 @@ async fn an_unreadable_reply_is_an_empty_answer_set() {
             .await
             .expect("answered");
         assert!(judgment.answers.is_empty(), "{reply:?}");
-        assert_eq!(judgment.usage.input_tokens, 210, "the cost still reports");
+        assert_eq!(
+            judgment.usage.map(|u| u.input_tokens),
+            Some(210),
+            "the cost still reports"
+        );
     }
 }
 
@@ -210,9 +231,30 @@ async fn the_judgment_reports_what_it_cost() {
         judgment.model.as_deref(),
         Some(crate::core::prefs::MODEL_COMMAND_JUDGE.default_text())
     );
-    assert_eq!(judgment.usage.input_tokens, 210);
-    assert_eq!(judgment.usage.output_tokens, 4);
+    assert_eq!(judgment.usage.map(|u| u.input_tokens), Some(210));
+    assert_eq!(judgment.usage.map(|u| u.output_tokens), Some(4));
     assert!(judgment.request_chars > SYSTEM_PROMPT.chars().count());
+}
+
+/// A judgment that writes the cache keeps the write's lifetime for its row.
+#[tokio::test]
+async fn the_judgment_keeps_the_write_split() {
+    use crate::engine::cache_ttl::{CacheLifetime, CacheTtl};
+    let stub = JudgmentChatStub::answering(json!({ "needs_memory": 1 })).writing_the_1h_cache(150);
+    let (_, chat) = provider(stub);
+    let judgment = chat
+        .ask(
+            json!({ "message": "hi" }),
+            lane_and_memory(),
+            crate::llm::metered::CallToken::for_test(),
+        )
+        .await
+        .expect("answered");
+    let usage = judgment.usage.expect("usage");
+    assert_eq!(
+        CacheTtl::of_write(&usage),
+        CacheTtl::Reported(CacheLifetime::OneHour)
+    );
 }
 
 #[tokio::test]

@@ -11,11 +11,12 @@
 //! `crate::llm::openai::OpenAiProvider` (and re-exported from `crate::llm`).
 
 use crate::core::AuthType;
-use crate::llm::cache_lifetime::CacheLifetime;
+use crate::llm::api_usage::ApiUsage;
 use crate::llm::model_registry::{gpt_major_version, gpt_version};
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolCall, ToolDefinition,
 };
+use crate::llm::usage_wire;
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -333,7 +334,7 @@ impl OpenAiProvider {
         // EITHER token count proves the terminal frame arrived, so both must be
         // absent. A server that reports only one of the pair is odd but not
         // truncated, and retrying its every silent turn would be wrong.
-        let no_usage_at_all = meta.input_tokens.is_none() && meta.output_tokens.is_none();
+        let no_usage_at_all = meta.usage.is_none();
         if final_content.is_none() && tool_call_map.is_empty() && no_usage_at_all {
             return Err(format!(
                 "OpenAI stream truncated: ended with no content, no tool call and no usage \
@@ -368,27 +369,21 @@ impl OpenAiProvider {
             })
             .collect::<Result<Vec<ToolCall>, String>>()?;
 
-        let (written_30m, written_12h) = meta.write_split();
         Ok(LlmResponse {
             content: final_content,
             tool_calls,
-            stop_reason: meta.stop_reason,
-            output_tokens: meta.output_tokens,
-            input_tokens: meta.input_tokens,
-            // Both are parts of `input_tokens`, as OpenAI reports them. Writes
-            // come from the Responses API (GPT-5.6 on) and from OpenRouter's
-            // Anthropic models.
-            cache_creation_tokens: meta.cache_write_tokens,
-            cache_creation_1h_tokens: None,
-            cache_creation_30m_tokens: written_30m,
-            cache_creation_12h_tokens: written_12h,
-            // The Chat Completions flow fills it in for the markers it placed.
-            cache_creation_requested_ttl: None,
+            // Cache reads and writes are parts of `input_tokens`, as OpenAI
+            // reports them. Writes come from the Responses API (GPT-5.6 on)
+            // and from OpenRouter's Anthropic models. The Chat Completions
+            // flow fills in the requested TTL for the markers it placed.
+            usage: meta.usage.map(|usage| ApiUsage {
+                service_tier: meta.service_tier,
+                ..usage
+            }),
             stable_prefix_fingerprint: None,
-            cache_read_tokens: meta.cache_read_tokens,
+            stop_reason: meta.stop_reason,
             served_model: meta.served_model,
             provider: None,
-            service_tier: meta.service_tier,
             thinking_chars: None,
             thinking_blocks: None,
             unknown_sse_dropped: 0,
@@ -410,22 +405,13 @@ struct AccumulatedToolCall {
 /// Per-turn metadata accumulated from streamed chunks. Both OpenAI APIs
 /// surface `finish_reason` / `status` and token usage near the end of the
 /// stream rather than per-chunk; the parser stashes them here so
-/// `build_llm_response` can populate `LlmResponse.{stop_reason,
-/// input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens}` in
-/// one place.
+/// `build_llm_response` reads them in one place.
 #[derive(Default)]
 struct StreamMeta {
     stop_reason: Option<String>,
-    input_tokens: Option<u32>,
-    output_tokens: Option<u32>,
-    cache_read_tokens: Option<u32>,
-    cache_write_tokens: Option<u32>,
-    /// The Responses API's split of the write, as `ttl_30m_tokens` and
-    /// `ttl_12h_tokens` report it. Zeros stay: a zero part is evidence.
-    cache_write_30m_tokens: Option<u32>,
-    cache_write_12h_tokens: Option<u32>,
-    /// The `prompt_cache_options.ttl` the completed response echoes.
-    echoed_cache_ttl: Option<CacheLifetime>,
+    /// The usage the stream reported, read by `llm::usage_wire`. `None`
+    /// until a usage block names a count.
+    usage: Option<ApiUsage>,
     /// The *served model*: what a chunk, or the completed response, names.
     served_model: Option<String>,
     /// The tier the completed response says served it.
@@ -433,71 +419,10 @@ struct StreamMeta {
 }
 
 impl StreamMeta {
-    /// Pull `prompt_tokens` / `completion_tokens` / cached-tokens out of a
-    /// Chat Completions `usage` object. Above-u32 token counts indicate a
-    /// corrupt upstream block — clamp rather than panic so a single bad
-    /// chunk can't tank the stream.
-    fn absorb_chat_usage(&mut self, usage: &serde_json::Value) {
-        if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-            self.input_tokens = Some(crate::llm::clamp_provider_token_count(prompt, "OpenAI"));
-        }
-        if let Some(completion) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
-            self.output_tokens = Some(crate::llm::clamp_provider_token_count(completion, "OpenAI"));
-        }
-        if let Some(details) = usage.get("prompt_tokens_details") {
-            self.absorb_cache_details(details);
-        }
-    }
-
-    /// Read the cache counts from a `*_tokens_details` object. A zero stays
-    /// unset, so "cached nothing" reads the same as a server that reports no
-    /// count.
-    fn absorb_cache_details(&mut self, details: &serde_json::Value) {
-        let count = |field: &str| {
-            details
-                .get(field)
-                .and_then(|v| v.as_u64())
-                .filter(|&n| n > 0)
-                .map(|n| crate::llm::clamp_provider_token_count(n, "OpenAI"))
-        };
-        if let Some(read) = count("cached_tokens") {
-            self.cache_read_tokens = Some(read);
-        }
-        if let Some(written) = count("cache_write_tokens") {
-            self.cache_write_tokens = Some(written);
-        }
-        if let Some(split) = details.get("cache_write_tokens_details") {
-            let part = |field: &str| {
-                split
-                    .get(field)
-                    .and_then(|v| v.as_u64())
-                    .map(|n| crate::llm::clamp_provider_token_count(n, "OpenAI"))
-            };
-            self.cache_write_30m_tokens = part("ttl_30m_tokens");
-            self.cache_write_12h_tokens = part("ttl_12h_tokens");
-        }
-    }
-
-    /// The write's 30-minute and 12-hour parts. The reported split wins.
-    /// Without one, the echoed TTL names the whole write's lifetime. A split
-    /// whose parts add up to more than the write is dropped, so its TTL
-    /// stays Unknown rather than claim tokens nobody wrote.
-    fn write_split(&self) -> (Option<u32>, Option<u32>) {
-        let Some(written) = self.cache_write_tokens else {
-            return (None, None);
-        };
-        let (split_30m, split_12h) = (self.cache_write_30m_tokens, self.cache_write_12h_tokens);
-        if split_30m.is_some() || split_12h.is_some() {
-            let named = u64::from(split_30m.unwrap_or(0)) + u64::from(split_12h.unwrap_or(0));
-            return match named <= u64::from(written) {
-                true => (split_30m, split_12h),
-                false => (None, None),
-            };
-        }
-        match self.echoed_cache_ttl {
-            Some(CacheLifetime::ThirtyMinutes) => (Some(written), None),
-            Some(CacheLifetime::TwelveHours) => (None, Some(written)),
-            _ => (None, None),
+    /// Merge one frame's usage into the stream's.
+    fn absorb_usage(&mut self, frame: Option<ApiUsage>) {
+        if let Some(frame) = frame {
+            self.usage = Some(self.usage.map_or(frame, |u| usage_wire::merge(u, frame)));
         }
     }
 
@@ -514,20 +439,7 @@ impl StreamMeta {
             .get("service_tier")
             .and_then(|t| t.as_str())
             .and_then(crate::llm::ServiceTier::from_wire);
-        self.echoed_cache_ttl = resp
-            .pointer("/prompt_cache_options/ttl")
-            .and_then(|ttl| serde_json::from_value(ttl.clone()).ok());
-        if let Some(usage) = resp.get("usage") {
-            if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                self.input_tokens = Some(crate::llm::clamp_provider_token_count(input, "OpenAI"));
-            }
-            if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-                self.output_tokens = Some(crate::llm::clamp_provider_token_count(output, "OpenAI"));
-            }
-            if let Some(details) = usage.get("input_tokens_details") {
-                self.absorb_cache_details(details);
-            }
-        }
+        self.absorb_usage(usage_wire::from_frame(resp));
         // For incomplete responses the reason lives at
         // `incomplete_details.reason` (e.g. "max_output_tokens",
         // "content_filter"). For normal completions the top-level `status`
@@ -643,9 +555,9 @@ mod tests {
             "prompt_tokens": u64::MAX,
             "completion_tokens": (u32::MAX as u64) + 1,
         });
-        meta.absorb_chat_usage(&absurd);
-        assert_eq!(meta.input_tokens, Some(u32::MAX));
-        assert_eq!(meta.output_tokens, Some(u32::MAX));
+        meta.absorb_usage(usage_wire::from_block(&absurd));
+        assert_eq!(meta.usage.map(|u| u.input_tokens), Some(u32::MAX));
+        assert_eq!(meta.usage.map(|u| u.output_tokens), Some(u32::MAX));
     }
 
     /// A stored `openai` credential wins over the env var (and the Codex key) so

@@ -79,15 +79,8 @@ mod reply_text_tests {
             content: content.map(str::to_string),
             tool_calls: vec![],
             stop_reason: None,
-            output_tokens: None,
-            input_tokens: None,
-            cache_creation_tokens: None,
-            cache_creation_1h_tokens: None,
-            cache_creation_30m_tokens: None,
-            cache_creation_12h_tokens: None,
-            cache_creation_requested_ttl: None,
+            usage: None,
             stable_prefix_fingerprint: None,
-            cache_read_tokens: None,
             served_model: None,
             provider: None,
             thinking_chars: None,
@@ -96,7 +89,6 @@ mod reply_text_tests {
             model_only_text: model_only.map(str::to_string),
             progress_notes: Vec::new(),
             prefill: None,
-            service_tier: None,
         }
     }
 

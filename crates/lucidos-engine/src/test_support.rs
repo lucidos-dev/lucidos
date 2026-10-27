@@ -161,15 +161,12 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             content: Some(next),
             tool_calls: vec![],
             stop_reason: Some("end_turn".to_string()),
-            output_tokens: Some(self.output_tokens),
-            input_tokens: Some(self.input_tokens),
-            cache_creation_tokens: None,
-            cache_creation_1h_tokens: None,
-            cache_creation_30m_tokens: None,
-            cache_creation_12h_tokens: None,
-            cache_creation_requested_ttl: None,
+            usage: Some(crate::engine::types::ApiUsage {
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                ..Default::default()
+            }),
             stable_prefix_fingerprint: None,
-            cache_read_tokens: None,
             served_model: None,
             provider: None,
             thinking_chars: None,
@@ -178,7 +175,6 @@ impl crate::llm::provider::LlmProvider for ScriptedProvider {
             model_only_text: None,
             progress_notes: Vec::new(),
             prefill: None,
-            service_tier: None,
         })
     }
 
@@ -221,6 +217,14 @@ impl JudgmentChatStub {
         })))
     }
 
+    /// Has the reply name `model` as the one that served it.
+    pub fn served_by(mut self, model: &str) -> Self {
+        if let Ok(reply) = self.reply.as_mut() {
+            reply["served_model"] = model.into();
+        }
+        self
+    }
+
     /// Ignores the tool and replies in text.
     pub fn replying(text: &str) -> Self {
         Self::new(Ok(serde_json::json!({ "content": text, "tool_calls": [] })))
@@ -229,6 +233,15 @@ impl JudgmentChatStub {
     /// The call itself fails.
     pub fn failing(error: &str) -> Self {
         Self::new(Err(error.to_string()))
+    }
+
+    /// This stub, reporting a write of `tokens` to the 1-hour cache.
+    pub fn writing_the_1h_cache(mut self, tokens: u32) -> Self {
+        if let Ok(reply) = &mut self.reply {
+            reply["usage"]["cache_creation_tokens"] = tokens.into();
+            reply["usage"]["cache_creation_1h_tokens"] = tokens.into();
+        }
+        self
     }
 
     /// The user messages sent so far.
@@ -263,8 +276,14 @@ impl crate::llm::provider::LlmProvider for JudgmentChatStub {
             .join("\n");
         self.sent.lock().expect("sent").push((text, tools));
         let mut reply = self.reply.clone()?;
-        reply["input_tokens"] = 210.into();
-        reply["output_tokens"] = 4.into();
+        let usage = &mut reply["usage"];
+        usage["input_tokens"] = 210.into();
+        usage["output_tokens"] = 4.into();
+        for count in ["cache_read_tokens", "cache_creation_tokens"] {
+            if usage[count].is_null() {
+                usage[count] = 0.into();
+            }
+        }
         Ok(serde_json::from_value(reply)?)
     }
 

@@ -20,8 +20,7 @@
 mod capture;
 
 pub(crate) use capture::{
-    auxiliary_capture, model_call_failed, usage_from_provider, usage_from_response, AuxCapture,
-    CallDetail,
+    auxiliary_capture, model_call_failed, usage_from_response, AuxCapture, CallDetail,
 };
 
 use crate::engine::event_bus::{BusEvent, EventBus};

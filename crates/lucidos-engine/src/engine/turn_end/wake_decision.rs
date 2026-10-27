@@ -441,8 +441,8 @@ pub async fn decide_wake_for_eval(
     Ok(EvalWakeDecision {
         wake: read_wake_answer(&judgment.answers) == WakeDecision::Requested,
         probability: judgment.answers.noul(WAKE_QUESTION_ID),
-        input_tokens: judgment.usage.input_tokens,
-        output_tokens: judgment.usage.output_tokens,
+        input_tokens: judgment.usage.unwrap_or_default().input_tokens,
+        output_tokens: judgment.usage.unwrap_or_default().output_tokens,
     })
 }
 

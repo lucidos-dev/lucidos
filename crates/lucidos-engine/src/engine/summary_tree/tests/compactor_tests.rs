@@ -2030,10 +2030,10 @@ const PRICED_MODEL: &str = "gpt-6.1-sol";
 /// What one [`EchoProvider`] call costs on [`PRICED_MODEL`] on `tier`, from
 /// the token counts [`line_response`] reports.
 fn priced_call_usd(tier: Option<crate::llm::ServiceTier>) -> f64 {
-    let answer = line_response(String::new());
+    let answer = line_response(String::new()).usage.unwrap_or_default();
     let tokens = crate::engine::summary_tree::compactor_models::Tokens {
-        input: f64::from(answer.input_tokens.unwrap_or_default()),
-        output: f64::from(answer.output_tokens.unwrap_or_default()),
+        input: f64::from(answer.input_tokens),
+        output: f64::from(answer.output_tokens),
         ..Default::default()
     };
     crate::engine::summary_tree::compactor_models::priced(PRICED_MODEL)

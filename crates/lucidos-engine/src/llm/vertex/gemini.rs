@@ -27,7 +27,7 @@ impl VertexProvider {
         query: &str,
         max_results: usize,
     ) -> Result<
-        (String, Option<crate::llm::usage_wire::ProviderUsage>),
+        (String, Option<crate::llm::api_usage::ApiUsage>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let model = super::GROUNDING_MODEL;
@@ -354,35 +354,29 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         }
     }
 
-    let (input_tokens, output_tokens) = parsed
-        .usage_metadata
-        .map(|u| {
-            (
-                u.prompt_token_count
-                    .map(|n| crate::llm::clamp_provider_token_count(n, "Vertex")),
-                u.output_token_count()
-                    .map(|n| crate::llm::clamp_provider_token_count(n, "Vertex")),
-            )
+    let usage = parsed.usage_metadata.and_then(|u| {
+        let input = u.prompt_token_count;
+        let output = u.output_token_count();
+        let cache_read = u.cached_content_token_count;
+        let clamp =
+            |n: Option<u64>| crate::llm::clamp_provider_token_count(n.unwrap_or(0), "Vertex");
+        (input.is_some() || output.is_some() || cache_read.is_some()).then(|| {
+            crate::llm::api_usage::ApiUsage {
+                input_tokens: clamp(input),
+                output_tokens: clamp(output),
+                // Gemini bills no premium to write a cache, so only reads are known.
+                cache_read_tokens: clamp(cache_read),
+                ..Default::default()
+            }
         })
-        .unwrap_or((None, None));
+    });
 
     LlmResponse {
         content,
         tool_calls,
         stop_reason,
-        output_tokens,
-        input_tokens,
-        // Gemini exposes `cachedContentTokenCount` separately, but that's a
-        // distinct caching model (named caches, not Anthropic's ephemeral
-        // prompt cache). Keep both fields None to avoid conflating the two
-        // until the cost UI explicitly grows a Gemini-cached lane.
-        cache_creation_tokens: None,
-        cache_creation_1h_tokens: None,
-        cache_creation_30m_tokens: None,
-        cache_creation_12h_tokens: None,
-        cache_creation_requested_ttl: None,
+        usage,
         stable_prefix_fingerprint: None,
-        cache_read_tokens: None,
         // The reply's own field, which `parse_gemini_reply` reads.
         served_model: None,
         provider: None,
@@ -397,7 +391,6 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         model_only_text: narration,
         progress_notes: Vec::new(),
         prefill: None,
-        service_tier: None,
     }
 }
 
@@ -656,6 +649,9 @@ struct VertexResponseContent {
 struct VertexUsageMetadata {
     #[serde(rename = "promptTokenCount", default)]
     prompt_token_count: Option<u64>,
+    /// The part of the prompt served from a cache. `promptTokenCount` counts it.
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: Option<u64>,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates_token_count: Option<u64>,
     /// Billed at the output rate but reported apart from the candidates, so
@@ -1185,8 +1181,8 @@ mod tests {
         let parsed: VertexResponse = serde_json::from_value(body).unwrap();
         let resp = build_gemini_llm_response(parsed);
 
-        assert_eq!(resp.input_tokens, Some(20));
-        assert_eq!(resp.output_tokens, Some(128));
+        assert_eq!(resp.usage.map(|u| u.input_tokens), Some(20));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(128));
     }
 
     /// A turn that thought without returning a thought part still reports
@@ -1208,7 +1204,7 @@ mod tests {
         let parsed: VertexResponse = serde_json::from_value(body).unwrap();
         let resp = build_gemini_llm_response(parsed);
 
-        assert_eq!(resp.output_tokens, Some(200));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(200));
         assert_eq!(resp.thinking_blocks, Some(1));
         assert_eq!(resp.thinking_chars, None);
     }
@@ -1219,6 +1215,27 @@ mod tests {
     /// The previous mapping discarded both fields and we couldn't
     /// distinguish "model said nothing" from a content-policy block or a
     /// token-budget cutoff. The pure helper must preserve both.
+    /// `promptTokenCount` already counts the cached part, so input stays whole
+    /// and the cached part rides as a cache read, priced at Gemini's read rate.
+    #[test]
+    fn a_gemini_cache_hit_is_recorded_as_a_cache_read() {
+        let body = r#"{
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {
+                "promptTokenCount": 5000,
+                "cachedContentTokenCount": 4096,
+                "candidatesTokenCount": 3
+            }
+        }"#;
+        let parsed: VertexResponse = serde_json::from_str(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        let usage = resp.usage.expect("usage");
+        assert_eq!(usage.input_tokens, 5000);
+        assert_eq!(usage.cache_read_tokens, 4096);
+        assert_eq!(usage.cache_creation_tokens, 0, "Gemini bills no write");
+    }
+
     #[test]
     fn build_gemini_llm_response_preserves_empty_completion_metadata() {
         let body = r#"{
@@ -1242,8 +1259,8 @@ mod tests {
             Some("SAFETY"),
             "finishReason MUST survive — distinguishes silence from a content-policy block"
         );
-        assert_eq!(resp.input_tokens, Some(1234));
-        assert_eq!(resp.output_tokens, Some(0));
+        assert_eq!(resp.usage.map(|u| u.input_tokens), Some(1234));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(0));
     }
 
     /// Normal `STOP` completion path — both finishReason and usage flow
@@ -1268,8 +1285,8 @@ mod tests {
 
         assert_eq!(resp.content.as_deref(), Some("ok"));
         assert_eq!(resp.stop_reason.as_deref(), Some("STOP"));
-        assert_eq!(resp.input_tokens, Some(42));
-        assert_eq!(resp.output_tokens, Some(7));
+        assert_eq!(resp.usage.map(|u| u.input_tokens), Some(42));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(7));
     }
 
     /// MAX_TOKENS truncation: model spent the whole budget without ending
@@ -1292,7 +1309,7 @@ mod tests {
         let resp = build_gemini_llm_response(parsed);
 
         assert_eq!(resp.stop_reason.as_deref(), Some("MAX_TOKENS"));
-        assert_eq!(resp.output_tokens, Some(32768));
+        assert_eq!(resp.usage.map(|u| u.output_tokens), Some(32768));
     }
 
     #[test]

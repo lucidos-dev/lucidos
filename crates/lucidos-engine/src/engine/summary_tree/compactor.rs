@@ -1482,12 +1482,12 @@ async fn fit_line(
                 NodeError::from(e)
             }
         })?;
-        let count = |n: Option<u32>| f64::from(n.unwrap_or_default());
-        spent.tokens.input += count(response.input_tokens);
-        spent.tokens.cache_read += count(response.cache_read_tokens);
-        spent.tokens.cache_write += count(response.cache_creation_tokens);
-        spent.tokens.output += count(response.output_tokens);
-        spent.served_tier = response.service_tier;
+        let usage = response.usage.unwrap_or_default();
+        spent.tokens.input += f64::from(usage.input_tokens);
+        spent.tokens.cache_read += f64::from(usage.cache_read_tokens);
+        spent.tokens.cache_write += f64::from(usage.cache_creation_tokens);
+        spent.tokens.output += f64::from(usage.output_tokens);
+        spent.served_tier = usage.service_tier;
         let line = response.content.unwrap_or_default().trim().to_string();
         if line.is_empty() {
             return Err(NodeError::Failed("the model returned an empty line".into()));

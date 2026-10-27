@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { panelOverlay, focusedThreadId, toasts } from '../store';
+import { panelOverlay, focusedThreadId, toasts, confirmState } from '../store';
 import type { App } from '../types';
 
 // Mock all side-effect imports that handleNavigationRequest calls
@@ -481,6 +481,12 @@ describe('with a second window on this device', () => {
     await otherShows({ focusedThreadId: 'thread-C' });
     handleThreadEvent(navEvent('thread-B'));
     expect(toasts.value).toHaveLength(0);
+  });
+
+  it('asks to enable push only in the window showing the thread', async () => {
+    await otherShows({ focusedThreadId: 'thread-A' });
+    handleThreadEvent({ thread_id: 'thread-A', event: { type: 'PushNotificationRequested' } });
+    expect(confirmState.value.visible).toBe(false);
   });
 
   it('leaves a capture to the window showing the app', async () => {

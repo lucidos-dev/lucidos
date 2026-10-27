@@ -12,6 +12,7 @@
 //! `read_location` / `vertex_host` / `get_cached_access_token` helpers) is
 //! unchanged and still reachable at `crate::llm::vertex::*`.
 
+use crate::llm::call_trace;
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, ModelSelection, TokenCallback, ToolDefinition,
 };
@@ -480,9 +481,21 @@ impl VertexProvider {
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
                 .json(body);
+            call_trace::attempt_began();
             let response = match super::cap_attempt(request, attempt_timeout).send().await {
-                Ok(r) => r,
+                Ok(r) => {
+                    call_trace::response_received(
+                        r.status().as_u16(),
+                        call_trace::request_id_of(r.headers()).as_deref(),
+                    );
+                    r
+                }
                 Err(e) => {
+                    call_trace::transport_failed(if e.is_timeout() {
+                        call_trace::CallFailure::Timeout
+                    } else {
+                        call_trace::CallFailure::Connection
+                    });
                     if attempt <= super::MAX_RETRIES {
                         let delay = super::retry_delay(attempt, 1);
                         super::log_retry(model, &format!("Network error: {:?}", e), attempt, delay);
@@ -1102,5 +1115,31 @@ mod tests {
             "URL must not still contain the old region, got: {}",
             after
         );
+    }
+
+    /// A Vertex call reaches the call trace: its sends count and the answering
+    /// status shows, like any other provider's.
+    #[tokio::test]
+    async fn a_vertex_call_traces_its_attempts_and_status() {
+        let app = axum::Router::new().fallback(|| async { (axum::http::StatusCode::OK, "{}") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/call", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider =
+            VertexProvider::new("my-project".into(), "eu".into(), "gemini-3.5-flash".into())
+                .unwrap();
+
+        let (outcome, trace) = crate::llm::call_trace::scoped(provider.request_with_retry(
+            "gemini-3.5-flash",
+            &url,
+            "token",
+            &serde_json::json!({}),
+            None,
+        ))
+        .await;
+
+        outcome.expect("the server answers");
+        assert_eq!(trace.attempts, 1);
+        assert_eq!(trace.status, Some(200));
     }
 }

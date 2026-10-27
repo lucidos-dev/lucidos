@@ -20,9 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
-use super::{
-    Answer, Answers, ChoiceAnswer, Judgment, JudgmentProvider, JudgmentUsage, NoulAnswer, Question,
-};
+use super::{Answer, Answers, ChoiceAnswer, Judgment, JudgmentProvider, NoulAnswer, Question};
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, MessageContent, ToolDefinition};
 
 /// The one tool the model answers through.
@@ -275,13 +273,9 @@ impl JudgmentProvider for ChatJudgmentProvider {
         let model = self.provider.default_model();
         Ok(Judgment {
             answers: read_answers(&response, &questions),
-            usage: JudgmentUsage {
-                input_tokens: response.input_tokens.unwrap_or(0),
-                output_tokens: response.output_tokens.unwrap_or(0),
-                cache_read_tokens: response.cache_read_tokens.unwrap_or(0),
-                cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
-            },
+            usage: response.usage,
             model: (!model.is_empty()).then(|| model.to_string()),
+            served_model: response.served_model,
             request_chars,
         })
     }

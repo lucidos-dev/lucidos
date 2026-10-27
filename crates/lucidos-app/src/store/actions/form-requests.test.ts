@@ -8,7 +8,7 @@
  * one frame carrying a credential request was dropped, and no form ever
  * appeared.
  */
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { activeInlineForm, panelOverlay } from '../store';
 import type { CredentialRequest } from '../types';
 import type { FormRequestEvent } from '../thread-events/thread-event-types';
@@ -195,6 +195,95 @@ describe('an open request the user walked away from', () => {
     await syncPendingFormRequests();
 
     expect(openCredentialRequest).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('with a second window on this device', () => {
+  let other: BroadcastChannel;
+  let stop: () => void;
+  let shownHere: string | null;
+
+  /** The other window reports what it shows, touched after this one. */
+  function otherShows(focusedThreadId: string | null): Promise<void> {
+    other.postMessage({
+      type: 'state',
+      state: {
+        id: 'other-window', focusedThreadId, appId: null, authorizing: null,
+        activeAt: Date.now() + 1000,
+      },
+    });
+    return new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  beforeEach(async () => {
+    shownHere = null;
+    const { installWindowPeers } = await import('../windowPeers');
+    const { WORKSPACE_ID } = await import('../../utils/basePath');
+    other = new BroadcastChannel(`lucidos-window-peers:${WORKSPACE_ID ?? ''}`);
+    stop = installWindowPeers(() => ({ focusedThreadId: shownHere, appId: null, authorizing: null }));
+  });
+  afterEach(() => {
+    stop();
+    other.close();
+  });
+
+  it('leaves a live form to the window showing its thread', async () => {
+    await otherShows(THREAD);
+    openFormRequest(THREAD, credentialRequest('req-1'));
+    expect(openCredentialRequest).not.toHaveBeenCalled();
+  });
+
+  it('opens a live form here when only this window shows its thread', async () => {
+    shownHere = THREAD;
+    await otherShows('thread-elsewhere');
+    openFormRequest(THREAD, credentialRequest('req-1'));
+    expect(openCredentialRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves a form for an unseen thread to the window touched last', async () => {
+    await otherShows('thread-elsewhere');
+    openFormRequest(THREAD, credentialRequest('req-1'));
+    expect(openCredentialRequest).not.toHaveBeenCalled();
+  });
+
+  it('does not reopen a form the other window has, on a stream open here', async () => {
+    await otherShows(THREAD);
+    listPendingFormRequests.mockResolvedValue([pending(credentialRequest('req-1'))]);
+    await syncPendingFormRequests();
+    expect(openCredentialRequest).not.toHaveBeenCalled();
+  });
+
+  it('does not pop a live form here later, once the other window moves on', async () => {
+    await otherShows(THREAD);
+    const request = credentialRequest('req-1');
+    openFormRequest(THREAD, request);
+    shownHere = THREAD;
+    await otherShows('thread-elsewhere');
+    const { PEER_CHANGE_GRACE_MS } = await import('../windowPeers');
+    const later = Date.now() + PEER_CHANGE_GRACE_MS;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+    listPendingFormRequests.mockResolvedValue([pending(request)]);
+    await syncPendingFormRequests();
+    clock.mockRestore();
+    expect(openCredentialRequest).not.toHaveBeenCalled();
+  });
+
+  it('opens the older request this window shows, past a newer one it leaves', async () => {
+    shownHere = THREAD;
+    await otherShows('thread-elsewhere');
+    listPendingFormRequests.mockResolvedValue([
+      pending(credentialRequest('older', 'maps')),
+      { ...pending(credentialRequest('newer', 'weather')), thread_id: 'thread-elsewhere' },
+    ]);
+    await syncPendingFormRequests();
+    expect(openCredentialRequest).toHaveBeenCalledTimes(1);
+    expect(openCredentialRequest.mock.calls[0][0].form_request_id).toBe('older');
+  });
+
+  it('still opens here when the user presses Open', async () => {
+    await otherShows(THREAD);
+    openFormRequest(THREAD, credentialRequest('req-1'), { byUser: true });
+    expect(openCredentialRequest).toHaveBeenCalledTimes(1);
   });
 });
 

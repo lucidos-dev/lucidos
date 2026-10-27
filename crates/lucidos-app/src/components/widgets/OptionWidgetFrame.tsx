@@ -9,7 +9,7 @@ import { WidgetFrame, defaultWidgetHeight } from './WidgetFrame';
  *  its params, once the widget's manifest is read. The engine checked the
  *  embed before the card was asked, so a missing or non-widget id is all that
  *  reads "This widget is not available". A reply's embed is an inline widget
- *  instead (`useWidgetEmbedSlots.tsx`). */
+ *  instead, which also says why (`useWidgetEmbedSlots.tsx`). */
 export function OptionWidgetFrame({ embed }: { embed: WidgetEmbed }) {
   const read = appById(embed.app_id);
   useEffect(() => {

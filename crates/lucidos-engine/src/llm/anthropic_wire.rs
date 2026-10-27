@@ -15,6 +15,7 @@
 //! thinking/effort config, and the SSE parser — is identical, so it lives here
 //! once.
 
+use crate::llm::api_usage::ApiUsage;
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolCall, ToolDefinition,
 };
@@ -762,18 +763,12 @@ pub(crate) async fn parse_claude_stream(
         }
     }
 
+    let usage = turn_meta.usage();
     Ok(LlmResponse {
         content,
         tool_calls,
         stop_reason: turn_meta.stop_reason,
-        output_tokens: turn_meta.output_tokens,
-        input_tokens: turn_meta.input_tokens,
-        cache_creation_tokens: turn_meta.cache_creation_tokens,
-        cache_creation_1h_tokens: turn_meta.cache_creation_1h_tokens,
-        cache_creation_30m_tokens: None,
-        cache_creation_12h_tokens: None,
-        cache_creation_requested_ttl: None,
-        cache_read_tokens: turn_meta.cache_read_tokens,
+        usage,
         served_model: turn_meta.served_model,
         provider: None,
         // The provider stamps it, since only the request knows it.
@@ -787,7 +782,6 @@ pub(crate) async fn parse_claude_stream(
         model_only_text: None,
         progress_notes,
         prefill: None,
-        service_tier: None,
     })
 }
 
@@ -1039,36 +1033,15 @@ fn process_sse_data(
         }
         "message_start" => {
             // Anthropic's first SSE event carries the exact input-token cost.
-            // Sum uncached + cache write + cache read — the user's "context
-            // size" is everything the model processed, not just the uncached
-            // remainder.
-            let usage = &data["message"]["usage"];
-            let input = usage["input_tokens"].as_u64().unwrap_or(0);
-            let cache_write = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-            let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-            // saturating_add so a corrupt upstream usage block with near-u64::MAX
-            // counts in all three fields can't overflow before
-            // clamp_provider_token_count clamps it to u32::MAX.
-            let total = input.saturating_add(cache_write).saturating_add(cache_read);
-            if total > 0 {
-                meta.input_tokens =
-                    Some(crate::llm::clamp_provider_token_count(total, provider_tag));
-            }
-            if cache_write > 0 {
-                meta.cache_creation_tokens = Some(crate::llm::clamp_provider_token_count(
-                    cache_write,
-                    provider_tag,
-                ));
-            }
-            if cache_read > 0 {
-                meta.cache_read_tokens = Some(crate::llm::clamp_provider_token_count(
-                    cache_read,
-                    provider_tag,
-                ));
-            }
-            meta.cache_creation_1h_tokens = usage["cache_creation"]["ephemeral_1h_input_tokens"]
-                .as_u64()
-                .map(|n| crate::llm::clamp_provider_token_count(n, provider_tag));
+            // A zero count stays unset, as a server reporting none.
+            let usage =
+                crate::llm::usage_wire::from_block(&data["message"]["usage"]).unwrap_or_default();
+            let nonzero = |n: u32| (n > 0).then_some(n);
+            meta.input_tokens = nonzero(usage.input_tokens).or(meta.input_tokens);
+            meta.cache_creation_tokens =
+                nonzero(usage.cache_creation_tokens).or(meta.cache_creation_tokens);
+            meta.cache_read_tokens = nonzero(usage.cache_read_tokens).or(meta.cache_read_tokens);
+            meta.cache_creation_1h_tokens = usage.cache_creation_1h_tokens;
             meta.served_model = crate::llm::served_model::served_model_of(&data["message"]);
         }
         "message_delta" => {
@@ -1409,6 +1382,23 @@ pub(crate) struct TurnMeta {
     /// empty-completion diagnostic surfaces this to distinguish parser misses
     /// from intentional silence.
     pub unknown_sse_dropped: u32,
+}
+
+impl TurnMeta {
+    /// The counts as one usage block, `None` when the stream reported none.
+    fn usage(&self) -> Option<ApiUsage> {
+        if self.input_tokens.is_none() && self.output_tokens.is_none() {
+            return None;
+        }
+        Some(ApiUsage {
+            input_tokens: self.input_tokens.unwrap_or(0),
+            output_tokens: self.output_tokens.unwrap_or(0),
+            cache_read_tokens: self.cache_read_tokens.unwrap_or(0),
+            cache_creation_tokens: self.cache_creation_tokens.unwrap_or(0),
+            cache_creation_1h_tokens: self.cache_creation_1h_tokens,
+            ..ApiUsage::default()
+        })
+    }
 }
 
 #[cfg(test)]

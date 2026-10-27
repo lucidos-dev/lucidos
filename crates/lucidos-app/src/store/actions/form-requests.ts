@@ -9,6 +9,7 @@ import { openPluginUninstallRequest } from './plugin-uninstall';
 import { openEmailConfirmRequest } from './email-confirm';
 import { getDeviceId } from './devices';
 import { isForThisDevice } from './device-scope';
+import { isChosenForThread } from '../windowPeers';
 import { handleNavigationRequest, routeThreadNavigation } from './navigation-request';
 import { formatThreadLabel } from './thread-label';
 
@@ -34,14 +35,17 @@ export function resetOfferedFormRequests(): void {
  *  transcript's Open button all come here.
  *
  *  `byUser` is the Open button. An authorization page the engine sent goes to
- *  one device, and never hijacks another thread's page. A user who pressed Open
+ *  one device, and never hijacks another thread's page. Any other unasked form
+ *  opens in one window per device (window peers). A user who pressed Open
  *  asked for it here and now. */
 export function openFormRequest(
   threadId: string,
   event: FormRequestEvent,
   { byUser = false }: { byUser?: boolean } = {},
 ): void {
+  // A window the choice passes over still counts it offered: the device has it.
   offered.add(event.request_id);
+  if (!byUser && !opensInThisWindow(threadId, event)) return;
   let payload: Record<string, unknown>;
   try {
     payload = JSON.parse(event.payload) as Record<string, unknown>;
@@ -84,6 +88,12 @@ function requestIsForThisDevice(event: FormRequestEvent): boolean {
   return isForThisDevice(event.actor);
 }
 
+/** Whether this window, of the ones on this device, opens `event` unasked. An
+ *  authorization page is routed like a navigation, by `routeThreadNavigation`. */
+function opensInThisWindow(threadId: string, event: FormRequestEvent): boolean {
+  return event.type === 'OAuthAuthorizationRequested' || isChosenForThread(threadId);
+}
+
 /** Read the open requests and offer the newest one this page has not offered.
  *
  *  Called on every stream open, after the open, so a request emitted between
@@ -102,7 +112,10 @@ export async function syncPendingFormRequests(): Promise<void> {
     return;
   }
   if (activeInlineForm.value) return;
-  const fresh = pending.filter((p) => !offered.has(p.request_id) && requestIsForThisDevice(p.event));
+  const fresh = pending.filter((p) =>
+    !offered.has(p.request_id)
+    && requestIsForThisDevice(p.event)
+    && opensInThisWindow(p.thread_id, p.event));
   const newest = fresh[fresh.length - 1];
   if (newest) openFormRequest(newest.thread_id, newest.event);
 }

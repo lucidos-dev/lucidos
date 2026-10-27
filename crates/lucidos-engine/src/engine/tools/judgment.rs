@@ -75,8 +75,8 @@ pub(crate) async fn ask_and_render<J: JudgmentProvider + ?Sized>(
         judgment.answers.len(),
         asked,
         model,
-        judgment.usage.input_tokens,
-        judgment.usage.output_tokens
+        judgment.usage.unwrap_or_default().input_tokens,
+        judgment.usage.unwrap_or_default().output_tokens
     );
 
     // The count travels beside the answers so the model can see that one was

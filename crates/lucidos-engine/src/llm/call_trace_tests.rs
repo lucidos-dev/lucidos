@@ -113,3 +113,32 @@ fn a_failure_serializes_as_its_snake_case_name() {
         "\"connection\""
     );
 }
+
+#[test]
+fn the_request_id_comes_from_either_header_the_providers_use() {
+    let headers = |pairs: &[(&'static str, &'static str)]| {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().expect("a header value"));
+        }
+        map
+    };
+    assert_eq!(
+        request_id_of(&headers(&[("request-id", "req_a")])).as_deref(),
+        Some("req_a")
+    );
+    assert_eq!(
+        request_id_of(&headers(&[("x-request-id", "req_b")])).as_deref(),
+        Some("req_b")
+    );
+    assert_eq!(
+        request_id_of(&headers(&[
+            ("request-id", "req_a"),
+            ("x-request-id", "req_b")
+        ]))
+        .as_deref(),
+        Some("req_a"),
+        "Anthropic's header wins when both are present"
+    );
+    assert_eq!(request_id_of(&headers(&[])), None);
+}

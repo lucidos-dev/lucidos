@@ -5335,7 +5335,7 @@ How the client keeps navigation per window (`utils/windowStorage.ts`; ADR 0585).
 Preferences and pane layout are NOT window-scoped: they stay device-wide.
 
 ### Window peers
-The windows of one workspace on one device, telling each other what they show (`store/windowPeers.ts`; ADR 0585). They share a device id, so a device-scoped engine event reaches all of them: `NavigationRequested`, `AppUiCaptureRequested` and the OAuth completion toast. Each window announces its *window id*, focused thread, open app, whether it started an OAuth authorization, and last activity. It speaks on a `BroadcastChannel` named per workspace. Each one runs the same pure `chooseWindow` over the same list, so exactly one acts, with no leader to elect.
+The windows of one workspace on one device, telling each other what they show (`store/windowPeers.ts`; ADR 0585). They share a device id, so a device-scoped engine event reaches all of them: `NavigationRequested`, `AppUiCaptureRequested`, the OAuth completion toast, an unasked *form request* and the push-enable confirm. Each window announces its *window id*, focused thread, open app, whether it started an OAuth authorization, and last activity. It speaks on a `BroadcastChannel` named per workspace. Each one runs the same pure `chooseWindow` over the same list, so exactly one acts, with no leader to elect.
 
 Each page load holds a Web Lock for its life, and its peers wait on it. So a closed or crashed window drops out of the next choice, goodbye or not. A window still counts for what it showed for `PEER_CHANGE_GRACE_MS` after a change, since the winner often changes what it shows at once. Two tabs that share an id, as a duplicated tab does, settle it: the younger takes a new one.
 

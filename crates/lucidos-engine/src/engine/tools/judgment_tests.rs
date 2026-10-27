@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::engine::event_bus::EventBus;
-use crate::llm::judgment::{Answer, Answers, ChoiceAnswer, Judgment, JudgmentUsage, NoulAnswer};
+use crate::llm::judgment::{Answer, Answers, ChoiceAnswer, Judgment, NoulAnswer};
 use crate::test_support::{aux_captures, setup_test_db, teardown_test_db};
 use uuid::Uuid;
 
@@ -98,12 +98,13 @@ impl JudgmentProvider for CostlyStub {
     ) -> Result<Judgment, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Judgment {
             answers: Answers::default(),
-            usage: JudgmentUsage {
+            usage: Some(crate::engine::ApiUsage {
                 input_tokens: 1_204,
                 output_tokens: 16,
-                ..JudgmentUsage::default()
-            },
+                ..Default::default()
+            }),
             model: Some("jev-1.13.0".to_string()),
+            served_model: None,
             request_chars: 890,
         })
     }
