@@ -2146,7 +2146,7 @@ lucidos proxy anthropic /messages -X POST \
 - **`opencode-free` has no proxy.** The keyless free tier serves chat only, so nothing may build on it (ADR 0104).
 - **`claude-gateway` has no proxy.** The Claude gateway sign-in is the user's own, granted for chat, so no script may spend it.
 - The Lucidos Agent reaches the same proxies with `proxy_request`, and its context lists each one with its base and whether it is configured.
-- **A model call through the proxy records what it cost.** A builtin proxy, or an `apis.json` entry pointing at a model provider's host, writes a `ContextCaptured` with `purpose: "proxy"` from the usage block the reply carries. It lands on the thread that ran the script, else on the home thread. So a script never reports its own model spend, and the Token Cost app counts it like any other call. The engine asks a model provider for an uncompressed reply, so it can read that usage block.
+- **A model call through the proxy records what it cost.** A builtin proxy, or an `apis.json` entry pointing at a model provider's host, writes a `ContextCaptured` with `purpose: "proxy"` from the usage block the reply carries. It lands on the thread that ran the script, else on the home thread. A call made during a trigger fire also names the trigger in `emitting_trigger_id`, the only link for a script fire, which has no thread. So a script never reports its own model spend, and the Token Cost app counts it like any other call. The engine asks a model provider for an uncompressed reply, so it can read that usage block.
 - **OpenAI speech (`/audio/speech`) records too.** OpenAI reports speech usage only on an SSE stream. So for `mp3`, `aac`, `pcm` and `wav` the engine asks for one and hands you plain audio. `tts-1` records its input's character count, which is what it is billed by. **`flac` and `opus` are refused with a 400**, because neither can report its cost: ask for another format (ADR 0423).
 
 The full table of bases and injected headers is in `system-knowhow/js-sdk.md` § `lucidos.proxy`.
@@ -2366,10 +2366,19 @@ lucidos pair --qr                   # draw it as a QR to scan.
 lucidos pair --host mac.ts.net      # pick the hostname the QR points at.
 lucidos pair --label "My iPhone"    # name the device in the paired list.
 lucidos pair --port 5300            # a gateway on an unusual port.
+lucidos pair --gateway              # a code for another gateway instead.
 ```
 
 Run it in a terminal on the machine Lucidos runs on, then type the code into the
 device you want to let in. It works once and expires in five minutes.
+
+**`--gateway` lets another gateway in, not a device.** It mints a *gateway
+pairing code*, which never pairs a device (ADR 0590). Enter it on the other
+gateway under **Settings → Access**, in **Add a remote gateway**, with the
+`https` address this command prints. Gateways pair over `https` only, so with no such
+address it says what to set up: `tailscale serve`, or an external address.
+`--label` names the other gateway in this one's paired list. `--qr` and
+`--host` do not combine with it.
 
 **With two gateways running it refuses rather than guessing.** A device pairs to
 a gateway, so a code only works on the one that minted it (ADR 0132). This

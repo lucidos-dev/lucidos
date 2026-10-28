@@ -200,21 +200,40 @@ fn only_a_model_provider_loses_the_callers_accept_encoding() {
     assert_eq!(plain.get(ACCEPT_ENCODING).unwrap(), "gzip, br");
 }
 
+fn origin_headers(token: &str) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(
+        crate::api::actor::HEADER_AGENT_ORIGIN_TOKEN,
+        token.parse().unwrap(),
+    );
+    h
+}
+
 /// A proxied call's cost lands on the thread whose subprocess the origin
 /// token proves made it. No token, or a forged one, names no thread.
 #[test]
 fn only_a_verified_origin_token_names_the_cost_thread() {
-    use crate::api::actor::HEADER_AGENT_ORIGIN_TOKEN;
     use crate::api::actor::{init_agent_origin_secret, mint_agent_origin_token};
     let thread = uuid::Uuid::new_v4();
     init_agent_origin_secret("secret-for-actor-tests".into());
     let token = mint_agent_origin_token(Some(thread), 0, None).expect("the secret is installed");
-    let with = |value: &str| {
-        let mut h = HeaderMap::new();
-        h.insert(HEADER_AGENT_ORIGIN_TOKEN, value.parse().unwrap());
-        h
-    };
-    assert_eq!(cost_thread(&with(&token)), Some(thread));
-    assert_eq!(cost_thread(&with("forged.00ff")), None);
-    assert_eq!(cost_thread(&HeaderMap::new()), None);
+    let owner = cost_owner(&origin_headers(&token));
+    assert_eq!((owner.thread, owner.trigger), (Some(thread), None));
+    assert_eq!(
+        cost_owner(&origin_headers("forged.00ff")),
+        CostOwner::default()
+    );
+    assert_eq!(cost_owner(&HeaderMap::new()), CostOwner::default());
+}
+
+/// A script trigger fire has no thread, so its token's trigger is all that
+/// names who spent the call.
+#[test]
+fn a_trigger_fires_token_names_the_cost_trigger() {
+    use crate::api::actor::{init_agent_origin_secret, mint_agent_origin_token};
+    init_agent_origin_secret("secret-for-actor-tests".into());
+    let token = mint_agent_origin_token(None, 1, Some("trg-hourly")).expect("installed");
+    let owner = cost_owner(&origin_headers(&token));
+    assert_eq!(owner.thread, None);
+    assert_eq!(owner.trigger.as_deref(), Some("trg-hourly"));
 }

@@ -1830,8 +1830,8 @@ function turnLandingClearancePx(turn: HTMLElement): number {
  *  is a function of its content, and no layout rule reads the follow flag. A
  *  reserved screenful was tried and rejected: see ADR 0064, docs/adr/.
  *
- *  It DOES reserve a bottom PADDING, `--prompt-fade + --nav-focus-reach`. That
- *  is the room the composer dissolve paints over, and it is why a submit rests
+ *  It DOES reserve a bottom PADDING, `--transcript-end-reserve`. That is the
+ *  room the composer dissolve and the follow toggle take, and it is why a submit rests
  *  on the live edge (ADR 0080). Any rest short of the live edge parks content
  *  inside that band. For a fresh send the content parked there is the row the
  *  reader waits for, the agent's status line. */

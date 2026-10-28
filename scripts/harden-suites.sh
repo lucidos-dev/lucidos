@@ -13,7 +13,9 @@
 #   ./scripts/harden-suites.sh timings         # each suite's start, end and exit, as JSON
 #
 # `start` selects suites from `git diff main...HEAD`, runs them, and records
-# the start commit. An early run skips the two Codex driver modules. Once the
+# the start commit. The Rust suites follow the crates the diff reaches in the
+# workspace's dependency graph, which `start` reads once from `cargo metadata`
+# (hs_reached_crates). An early run skips the two Codex driver modules. Once the
 # other-model review is joined, `wait` starts them alone in the background
 # and joins them like any suite, so no `wait` blocks past its budget.
 #
@@ -48,6 +50,11 @@
 #
 # A cargo suite waits on the build memory gate before it starts, and exits 72
 # when the host never recovers (ADR 0351).
+#
+# When a selected suite reads codegen's output (ts, vitest, knowhow-generated),
+# the cargo lane first runs codegen-step, behind the same gate. Those suites
+# wait for it, then run outside the lane and never compile. A failed step fails
+# each of them, and a refused gate voids them.
 #
 # The run carries the caller's agent run marker, so the turn-end teardown
 # still reaches it (ADR 0391). A Switch leaves it running for the resumed
@@ -133,7 +140,7 @@ retry_round() { [ -f "$STATE/retry" ]; }
 
 selected_suites() {
     cat "$STATE/suites" 2>/dev/null
-    if [ "$(cat "$STATE/mode" 2>/dev/null)" = early ] && ! retry_round && grep -q -x rust "$STATE/suites" 2>/dev/null; then
+    if [ "$(cat "$STATE/mode" 2>/dev/null)" = early ] && ! retry_round && grep -q -x engine "$STATE/suites" 2>/dev/null; then
         echo driver
     fi
 }
@@ -150,43 +157,86 @@ memory_gate() { # <label>
     "${HS_MEMORY_GATE_CMD:-$SCRIPT_DIR/build-memory-gate.sh}" --label "$1"
 }
 
-# A cargo suite first waits on the build memory gate (ADR 0351). A refusal is
-# the suite's result, exit 72, and its command never runs.
+# Run one step's command from the root, appending to <name>.log. A gate label
+# first waits on the build memory gate (ADR 0351): a refusal is the result,
+# exit 72, and the command never runs.
+run_step() { # <name> <command> [<gate label>]
+    local name=$1 cmd=$2 rc=0 passed_at=""
+    if [ -n "${3:-}" ]; then
+        memory_gate "$3" >> "$STATE/$name.log" 2>&1 || rc=$?
+        passed_at="$(date +%s)"
+    fi
+    if [ "$rc" = 0 ]; then
+        date +%s > "$STATE/$name.start"
+        (cd "$ROOT" && LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$passed_at" bash -c "$cmd") >> "$STATE/$name.log" 2>&1
+        rc=$?
+    fi
+    date +%s > "$STATE/$name.end"
+    changed_now > "$STATE/$name.changed"
+    # The exit file goes last: its presence is what marks the step done.
+    echo "$rc" > "$STATE/$name.exit"
+}
+
+# The lane's codegen step. Its exit file is what the waiting suites read.
+run_codegen_step() {
+    local cmd
+    : > "$STATE/codegen-step.log"
+    if ! cmd="$(hs_suite_command codegen-step "$(cat "$STATE/mode")" "$STATE")"; then
+        echo 1 > "$STATE/codegen-step.exit"
+        return
+    fi
+    run_step codegen-step "$cmd" "the /harden codegen step"
+}
+
+# A suite that waits for the codegen step takes a failed step's exit code as
+# its own, so a refused gate (72) voids it and any other failure fails it.
 run_suite() { # <suite>
-    local suite=$1 cmd rc=0 passed_at=""
+    local suite=$1 cmd gate="" codegen_rc
     if ! cmd="$(hs_suite_command "$suite" "$(cat "$STATE/mode")" "$STATE")"; then
         echo 1 > "$STATE/$suite.exit"
         return
     fi
     cat "$STATE/$suite.note" > "$STATE/$suite.log" 2>/dev/null || : > "$STATE/$suite.log"
-    if hs_is_cargo_suite "$suite"; then
-        memory_gate "the /harden $suite suite" >> "$STATE/$suite.log" 2>&1 || rc=$?
-        passed_at="$(date +%s)"
+    if hs_waits_for_codegen "$suite"; then
+        while [ ! -f "$STATE/codegen-step.exit" ]; do
+            # A lane gone with no exit file leaves this suite MISSING, so the verdict reruns.
+            if ! kill -0 "$(cat "$STATE/codegen-step.pid" 2>/dev/null)" 2>/dev/null; then
+                [ -f "$STATE/codegen-step.exit" ] || return
+            fi
+            sleep 1
+        done
+        codegen_rc="$(cat "$STATE/codegen-step.exit")"
+        if [ "$codegen_rc" != 0 ]; then
+            cmd="$(printf 'echo %q >&2; exit %q' "The codegen step failed, see $STATE/codegen-step.log" "$codegen_rc")"
+        fi
     fi
-    if [ "$rc" = 0 ]; then
-        date +%s > "$STATE/$suite.start"
-        (cd "$ROOT" && LUCIDOS_BUILD_MEMORY_GATE_PASSED_AT="$passed_at" bash -c "$cmd") >> "$STATE/$suite.log" 2>&1
-        rc=$?
-    fi
-    date +%s > "$STATE/$suite.end"
-    changed_now > "$STATE/$suite.changed"
-    # The exit file goes last: its presence is what marks the suite done.
-    echo "$rc" > "$STATE/$suite.exit"
+    hs_is_cargo_suite "$suite" && gate="the /harden $suite suite"
+    run_step "$suite" "$cmd" "$gate"
 }
 
 # Start each suite in the background: the cargo suites one after another in
 # one lane (two cargo runs in one worktree can OOM the host), the rest at once.
+# The lane runs the codegen step first, once per run, when a suite waits for it.
 launch_suites() { # <newline-separated suites>
-    local s cargo_lane="" other=""
+    local s cargo_lane="" other="" codegen=""
     for s in $1; do
+        date +%s > "$STATE/$s.queued"
         if hs_is_cargo_suite "$s"; then
             cargo_lane="$cargo_lane $s"
         else
             other="$other $s"
         fi
     done
-    if [ -n "$cargo_lane" ]; then
-        (for s in $cargo_lane; do run_suite "$s"; done) &
+    if hs_needs_codegen "$1" && [ ! -f "$STATE/codegen-step.queued" ]; then
+        date +%s > "$STATE/codegen-step.queued"
+        codegen=1
+    fi
+    if [ -n "$cargo_lane$codegen" ]; then
+        (
+            [ -z "$codegen" ] || run_codegen_step
+            for s in $cargo_lane; do run_suite "$s"; done
+        ) &
+        [ -z "$codegen" ] || echo $! > "$STATE/codegen-step.pid"
     fi
     for s in $other; do run_suite "$s" & done
 }
@@ -219,8 +269,13 @@ cmd_start() {
     branch_paths | sort -u > "$STATE/paths"
     { hs_compile_inputs "$ROOT"; hs_source_includes "$ROOT"; } | sort -u > "$STATE/compile-inputs"
     hs_source_includes "$ROOT" 'crates/lucidos-cli/*.rs' > "$STATE/cli-inputs"
+    hs_test_inputs "$ROOT" > "$STATE/test-inputs"
     hs_vitest_inputs "$ROOT" > "$STATE/vitest-inputs"
     hs_generated_drift "$ROOT" > "$STATE/generated-drift"
+    # cargo runs here, before the first suite starts: the lane then holds the
+    # only cargo process (ADR 0351).
+    hs_crate_graph "$ROOT" > "$STATE/crate-graph"
+    hs_compile_owners "$ROOT" "$STATE/crate-graph" > "$STATE/compile-owners"
 
     if ! disabled="$(hs_read_check "$ROOT")"; then
         printf '%s\n' "$disabled" > "$STATE/allowlist-disabled"
@@ -247,7 +302,7 @@ cmd_start() {
 
     # Only e2e-touched reads the specs, and it is no cargo suite, so the cargo
     # lane starts once, before the slow selection.
-    early="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" /dev/null < "$STATE/paths" | sed '/^$/d')"
+    early="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" /dev/null "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths" | sed '/^$/d')"
     launch_suites "$early"
     if ! select_touched_specs "$STATE/paths" "$STATE/touched-specs.tmp" "$STATE/e2e-touched.note"; then
         stop_tree "$(descendants $$ | grep -v -x $$)"
@@ -256,7 +311,7 @@ cmd_start() {
     fi
     mv "$STATE/touched-specs.tmp" "$STATE/touched-specs"
 
-    suites="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" "$STATE/touched-specs" < "$STATE/paths" | sed '/^$/d')"
+    suites="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" "$STATE/touched-specs" "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths" | sed '/^$/d')"
     for s in $suites; do
         case $'\n'"$early"$'\n' in
             *$'\n'"$s"$'\n'*) ;;
@@ -354,7 +409,7 @@ start_driver() {
 
 driver_due() {
     selected_suites | grep -q -x driver && [ ! -f "$STATE/driver.started" ] && [ ! -f "$STATE/stopped" ] \
-        && { ! grep -q -x rust "$STATE/suites" || [ "$(suite_state rust)" = PASS ]; }
+        && { ! grep -q -x engine "$STATE/suites" || [ "$(suite_state engine)" = PASS ]; }
 }
 
 cmd_wait() {
@@ -403,6 +458,11 @@ allowlist_off_note() { # <path>
         "$(cut -d' ' -f1 "$STATE/allowlist-disabled" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 }
 
+engine_dead_filters() {
+    # shellcheck disable=SC2046 # one argument per filter
+    hs_dead_filters "$STATE/engine-filtered.log" $(hs_engine_filters "$STATE/test-inputs" < "$STATE/paths")
+}
+
 # Print the state of one suite: PASS, SKIP <reason>, FAIL, VOID <reason>,
 # RUNNING or MISSING.
 suite_state() { # <suite>
@@ -435,6 +495,8 @@ suite_state() { # <suite>
     elif { hs_is_filtered_suite "$suite" || { hs_names_engine_tests "$suite" && [ -s "$STATE/$suite.retry" ]; }; } \
         && ! grep -q -E '^running [1-9]' "$STATE/$suite.log"; then
         echo "FAIL ran no tests"
+    elif [ "$suite" = engine-filtered ] && [ ! -s "$STATE/$suite.retry" ] && [ -n "$(engine_dead_filters)" ]; then
+        echo "FAIL no test matched the filter: $(engine_dead_filters)"
     else
         echo PASS
     fi
@@ -457,7 +519,7 @@ cmd_verdict() {
         branch_paths | sort -u > "$STATE/paths-now"
         select_touched_specs "$STATE/paths-now" "$STATE/touched-specs-now" \
             || echo "(the touched specs could not be selected)" > "$STATE/touched-specs-now"
-        now="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift-now" "$(recorded_tier)" "$STATE/touched-specs-now" < "$STATE/paths-now")"
+        now="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift-now" "$(recorded_tier)" "$STATE/touched-specs-now" "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths-now")"
         if [ "$now" != "$(cat "$STATE/suites")" ]; then
             echo "selection VOID the diff now selects: $(printf '%s' "$now" | tr '\n' ' ')"
             rerun=1
@@ -518,23 +580,34 @@ failure_record() { # <suite>
     fi
 }
 
-# Each suite's start, end and exit code, as one JSON object for the
-# HardenRunCompleted payload. A suite that never started has nulls.
+# One step's queued, start, end and exit code as a JSON object, with null for
+# a field it never reached.
+step_timings() { # <name>
+    local queued start end rc
+    queued="$(cat "$STATE/$1.queued" 2>/dev/null)"
+    start="$(cat "$STATE/$1.start" 2>/dev/null)"
+    end="$(cat "$STATE/$1.end" 2>/dev/null)"
+    rc="$(cat "$STATE/$1.exit" 2>/dev/null)"
+    printf '{"queued": %s, "start": %s, "end": %s, "exit": %s}' \
+        "${queued:-null}" "${start:-null}" "${end:-null}" "${rc:-null}"
+}
+
+# Each suite's timings, and the codegen step's when it ran, as one JSON object
+# for the HardenRunCompleted payload. Queued to start is the wait for the lane
+# or the codegen step.
 cmd_timings() {
-    local s first=1 start end rc round=full
+    local s first=1 round=full codegen=null
     if [ ! -f "$STATE/suites" ]; then
         echo '{}'
         return 0
     fi
     retry_round && round=retry
-    printf '{"round": "%s", "mode": "%s", "suites": {' "$round" "$(cat "$STATE/mode")"
+    [ ! -f "$STATE/codegen-step.queued" ] || codegen="$(step_timings codegen-step)"
+    printf '{"round": "%s", "mode": "%s", "codegen_step": %s, "suites": {' "$round" "$(cat "$STATE/mode")" "$codegen"
     for s in $(running_suites); do
-        start="$(cat "$STATE/$s.start" 2>/dev/null)"
-        end="$(cat "$STATE/$s.end" 2>/dev/null)"
-        rc="$(cat "$STATE/$s.exit" 2>/dev/null)"
         [ "$first" = 1 ] || printf ', '
         first=0
-        printf '"%s": {"start": %s, "end": %s, "exit": %s}' "$s" "${start:-null}" "${end:-null}" "${rc:-null}"
+        printf '"%s": %s' "$s" "$(step_timings "$s")"
     done
     echo '}}'
 }
@@ -543,7 +616,7 @@ case "${1:-}" in
     start) shift; cmd_start "$@" ;;
     stop) cmd_stop ;;
     wait) shift; cmd_wait "$@" ;;
-    run-driver) run_suite driver ;;
+    run-driver) date +%s > "$STATE/driver.queued"; run_suite driver ;;
     verdict) cmd_verdict ;;
     timings) cmd_timings ;;
     -h | --help) usage ;;

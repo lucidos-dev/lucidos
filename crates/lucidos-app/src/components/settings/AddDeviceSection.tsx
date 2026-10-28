@@ -29,7 +29,7 @@
 //   search anchor render either way, for the reason Connect URLs records: an
 //   absent section drops a Search Everywhere hit at the top of the page.
 
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { mintPairingCode } from '../../api/client/pairing';
 import { LoadableError } from '../shared/LoadableError';
@@ -38,6 +38,7 @@ import { copyToClipboard } from '../../utils/clipboard';
 import { clipboardAbilities } from '../../utils/platform';
 import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
+import { useCodeCountdown } from './useCodeCountdown';
 
 /** A minted code, and the moment it stops working. */
 export interface MintedCode {
@@ -95,11 +96,6 @@ export function targetSentence(target: PairTarget): ComponentChildren {
   }
 }
 
-/** Pure: how long is left, in whole seconds, never below zero. */
-export function secondsLeft(expiresAt: number, now: number): number {
-  return Math.max(0, Math.ceil((expiresAt - now) / 1000));
-}
-
 /** Pure: the expiry line, which has to keep saying something true.
  *
  *  A code sitting on a screen for ten minutes stops working silently, and a
@@ -133,7 +129,6 @@ export function AddDeviceSection({
   target: PairTarget;
 }) {
   const [minted, setMinted] = useState<Loadable<MintedCode>>({ status: 'not-loaded' });
-  const [now, setNow] = useState(() => Date.now());
   const origin = target.kind === 'origin' ? target.url : null;
 
   // Mints a code, and every button in the section is wired to it.
@@ -145,7 +140,6 @@ export function AddDeviceSection({
         // Stamping it when the request went out would open the countdown at
         // however long the round trip took, so "5:02" on a slow one.
         const landed = Date.now();
-        setNow(landed);
         setMinted({
           status: 'loaded',
           data: {
@@ -160,27 +154,7 @@ export function AddDeviceSection({
     );
   }, [origin]);
 
-  // Ticks only while a live code is on screen, and stops itself once that code
-  // is dead. A countdown is the one thing here that has to keep moving.
-  const live = minted.status === 'loaded';
-  const left = live ? secondsLeft(minted.data.expiresAt, now) : 0;
-  const dead = left <= 0;
-  useEffect(() => {
-    if (!live || dead) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [live, dead]);
-
-  // A hidden tab throttles the interval above, so `now` comes back stale and
-  // the countdown would show time a dead code no longer has. Re-read the clock
-  // on the way in.
-  useEffect(() => {
-    const onVisibility = () => {
-      if (document.visibilityState !== 'hidden') setNow(Date.now());
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => document.removeEventListener('visibilitychange', onVisibility);
-  }, []);
+  const left = useCodeCountdown(minted.status === 'loaded' ? minted.data.expiresAt : null);
 
   function body() {
     if (minted.status === 'failed') {
@@ -256,7 +230,7 @@ export function AddDeviceSection({
  *  `kind` names the card in the DOM, and is closed rather than a bare string so
  *  a typo cannot invent a fourth. The QR and the code each take a rule of their
  *  own; the address card rides the base class alone today. */
-function PairCard({
+export function PairCard({
   kind,
   label,
   action,
@@ -284,7 +258,7 @@ function PairCard({
  *  has none at all. This page is often read over a plain-HTTP LAN address,
  *  where the button would fail on every tap. The digits and the address stay
  *  selectable either way. */
-function CopyButton({ text, what }: { text: string; what: string }) {
+export function CopyButton({ text, what }: { text: string; what: string }) {
   if (!clipboardAbilities().copy) return null;
   return (
     <button class="action-btn" aria-label={`Copy the ${what}`} onClick={() => copyToClipboard(text)}>

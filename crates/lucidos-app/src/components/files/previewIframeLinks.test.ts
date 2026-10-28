@@ -119,10 +119,33 @@ describe('classifyPreviewLink', () => {
     });
   });
 
-  it('routes a `#thread=` link that names a different workspace', () => {
+  it('routes a `#thread=` link that names a different workspace by its route', () => {
     expect(classifyPreviewLink(`https://localhost:5251/other-ws/#thread=${TID}`, ctx())).toEqual({
+      kind: 'workspace-thread',
+      target: { route: 'other-ws', threadId: TID },
+    });
+  });
+
+  // Passed on as a bare name, `dev` would mean the remote gateway's dev on a
+  // page inside one. The URL's path names this gateway's own, so the route
+  // travels as it is.
+  it('keeps a local route local from inside a remote workspace', () => {
+    const remote = ctx({ hostPath: '/notes@cloud/', workspaceId: 'notes@cloud' });
+    expect(classifyPreviewLink(`https://localhost:5251/dev/#thread=${TID}`, remote)).toEqual({
+      kind: 'workspace-thread',
+      target: { route: 'dev', threadId: TID },
+    });
+    expect(classifyPreviewLink(`https://localhost:5251/notes@cloud/#thread=${TID}`, remote)).toEqual({
       kind: 'thread',
-      workspace: 'other-ws',
+      workspace: undefined,
+      threadId: TID,
+    });
+  });
+
+  it('routes a gateway-qualified thread: link as written', () => {
+    expect(classifyPreviewLink(`thread:dev@cloud/${TID}`, ctx())).toEqual({
+      kind: 'thread',
+      workspace: 'dev@cloud',
       threadId: TID,
     });
   });

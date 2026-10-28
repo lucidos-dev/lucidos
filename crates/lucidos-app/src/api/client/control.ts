@@ -10,6 +10,7 @@
  * these routes don't exist, so callers treat a failure as "no gateway".
  */
 
+import { workspaceRouteUrlSegment } from '../../utils/basePath';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { replaceDocument } from '../../utils/documentNavigation';
 import { landingHash, type WorkspaceLanding } from '../../utils/workspaceLanding';
@@ -167,7 +168,7 @@ export async function deleteWorkspace(id: string, confirm: string): Promise<void
  *  has origin-wide scope, so `/<slug>/` stays inside the app while a new window
  *  drops the user into the browser. */
 export function openWorkspace(id: string, landing?: WorkspaceLanding): void {
-  replaceDocument(`/${encodeURIComponent(id)}/${landingHash(landing)}`);
+  replaceDocument(`/${workspaceRouteUrlSegment(id)}/${landingHash(landing)}`);
 }
 
 // ── Gateway self-update (picker reload control) ────────────────────────────
@@ -529,7 +530,7 @@ export async function setExternalAddress(externalAddress: string): Promise<Exter
 export type GwRestoreStatus =
   | { status: 'idle' }
   | { status: 'running'; id: string; name: string; phase: string }
-  | { status: 'completed'; id: string; name: string }
+  | { status: 'completed'; id: string; name: string; warnings: string[] }
   | { status: 'failed'; name: string; error: string };
 
 export interface RestoreStarted {
@@ -603,10 +604,14 @@ export class GatewayError extends Error {
   }
 }
 
-async function authJson<T>(path: string, init?: RequestInit): Promise<T> {
+function authJson<T>(path: string, init?: RequestInit): Promise<T> {
+  return gatewayJson<T>(`${AUTH}${path}`, init);
+}
+
+async function gatewayJson<T>(url: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(`${AUTH}${path}`, init);
+    res = await fetch(url, init);
   } catch (e) {
     throw new GatewayError(e instanceof Error ? e.message : 'could not reach the gateway', 0);
   }
@@ -627,6 +632,91 @@ export function listPairedDevices(): Promise<PairedDevice[]> {
  *  response, so this browser lands back on the pairing screen. */
 export async function revokePairedDevice(id: string): Promise<void> {
   await authJson<void>(`/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+// Gateway pairing (ADR 0590). This gateway, as B, grants another gateway
+// access with a gateway pairing code. As A, it adds remote gateways.
+
+/** A gateway pairing code. It never pairs a device. */
+export interface GatewayPairingCode {
+  code: string;
+  expires_in_secs: number;
+}
+
+/** A gateway this one has granted access to. */
+export interface PairedGateway {
+  id: string;
+  label: string;
+  paired_at: string;
+}
+
+/** A remote gateway this one has paired with. Never carries the credential. */
+export interface RemoteGateway {
+  name: string;
+  address: string;
+  pairing_id: string;
+  gateway_protocol: number;
+  added_at: string;
+}
+
+/** What Remove reports: whether the remote gateway forgot the pairing too. */
+export interface RemovedRemoteGateway {
+  remote_forgot: boolean;
+  detail?: string;
+}
+
+export function mintGatewayPairingCode(): Promise<GatewayPairingCode> {
+  return authJson<GatewayPairingCode>('/gateway-pairing-code', { method: 'POST' });
+}
+
+export function listPairedGateways(): Promise<PairedGateway[]> {
+  return authJson<PairedGateway[]>('/gateways');
+}
+
+export async function unpairGateway(id: string): Promise<void> {
+  await authJson<void>(`/gateways/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+const REMOTE_GATEWAYS = '/~/api/v1/remote-gateways';
+
+export function listRemoteGateways(): Promise<RemoteGateway[]> {
+  return gatewayJson<RemoteGateway[]>(REMOTE_GATEWAYS);
+}
+
+/** Pair with a remote gateway. The gateway checks it over https first, and
+ *  its refusal sentence names what to fix. */
+export function addRemoteGateway(request: {
+  address: string;
+  code: string;
+  name: string;
+}): Promise<RemoteGateway> {
+  return gatewayJson<RemoteGateway>(REMOTE_GATEWAYS, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+  });
+}
+
+/** One of a remote gateway's workspaces. Mirrors `gateway_protocol::ListedWorkspace`,
+ *  which carries the fields `workspaceState` reads and no port. */
+export type ListedWorkspace = Pick<WorkspaceStatus, 'id' | 'name' | 'health' | 'last_error'>;
+
+/** One remote gateway's workspaces, or why this gateway could not list them.
+ *  Mirrors `remote_workspaces::RemoteGatewayListing`. */
+export type RemoteGatewayListing = { gateway: string } & (
+  | { state: 'reachable'; workspaces: ListedWorkspace[] }
+  | { state: 'unreachable'; reason: string }
+);
+
+/** Every remote gateway's workspaces, asked of each one at once. */
+export function listRemoteWorkspaces(): Promise<RemoteGatewayListing[]> {
+  return gatewayJson<RemoteGatewayListing[]>('/~/api/v1/remote-workspaces');
+}
+
+export function removeRemoteGateway(name: string): Promise<RemovedRemoteGateway> {
+  return gatewayJson<RemovedRemoteGateway>(`${REMOTE_GATEWAYS}/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
 }
 
 /** The file suffixes a backup archive carries: `.age` now, `.enc` before the

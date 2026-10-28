@@ -282,7 +282,8 @@
    no reply and only qualified once the agent picked it up.
 
    What IS reserved is this container's `padding-bottom`, the room the composer
-   dissolve paints over, and a submit rests past it on the live edge. See
+   dissolve and the follow toggle take, and a submit rests past it on the live
+   edge. See
    `landAtLiveEdge` in components/chat/scrollState.ts, and ADR 0080. */
 
 /* scrollToEventAndPulse lands the event at the scroll-container top, which would

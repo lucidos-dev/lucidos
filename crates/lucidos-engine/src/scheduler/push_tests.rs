@@ -57,24 +57,53 @@ fn declarative_envelope_has_web_push_magic_and_notification_object() {
 }
 
 #[test]
-fn gateway_scope_is_a_path_deeper_than_root() {
+fn badge_scope_reads_who_served_the_install() {
     // The discriminator behind the whole aggregate-badge rule: a subscription
     // whose recorded SW scope has a path is one the GATEWAY served, and the
     // gateway re-stamps every manifest it serves with `scope: "/"`, so that
     // install's single icon covers every workspace on the origin.
-    assert!(is_gateway_scoped(Some("https://lucidos.test/dev/")));
-    assert!(is_gateway_scoped(Some("http://192.0.2.10:5251/myws/")));
+    assert_eq!(
+        badge_scope(Some("https://lucidos.test/dev/")),
+        BadgeScope::Gateway
+    );
+    assert_eq!(
+        badge_scope(Some("http://192.0.2.10:5251/myws/")),
+        BadgeScope::Gateway
+    );
     // The picker itself is under the sigil, so it is gateway-scoped too.
-    assert!(is_gateway_scoped(Some("https://lucidos.test/~/")));
+    assert_eq!(
+        badge_scope(Some("https://lucidos.test/~/")),
+        BadgeScope::Gateway
+    );
+
+    // A page relayed by another gateway: that origin's icon counts that
+    // gateway's workspaces, which this engine cannot see.
+    assert_eq!(
+        badge_scope(Some("https://gateway-a.test/dev@cloud/")),
+        BadgeScope::Relayed
+    );
 
     // A direct engine port serves exactly one workspace: own count.
-    assert!(!is_gateway_scoped(Some("https://lucidos.test:5250/")));
-    assert!(!is_gateway_scoped(Some("http://localhost:5250/")));
+    assert_eq!(
+        badge_scope(Some("https://lucidos.test:5250/")),
+        BadgeScope::Own
+    );
+    assert_eq!(badge_scope(Some("http://localhost:5250/")), BadgeScope::Own);
     // A legacy row from before the column existed, and any unparseable value,
     // keep the own-count behaviour rather than guessing.
-    assert!(!is_gateway_scoped(None));
-    assert!(!is_gateway_scoped(Some("not a url")));
-    assert!(!is_gateway_scoped(Some("")));
+    assert_eq!(badge_scope(None), BadgeScope::Own);
+    assert_eq!(badge_scope(Some("not a url")), BadgeScope::Own);
+    assert_eq!(badge_scope(Some("")), BadgeScope::Own);
+}
+
+#[test]
+fn a_relayed_install_leaves_the_badge_alone() {
+    // Neither this workspace's count nor this gateway's total is the number
+    // the outside origin's icon shows, so the push must not overwrite it.
+    assert_eq!(
+        app_badge_for(Some("https://gateway-a.test/dev@cloud/"), Some(2), Some(9)),
+        None
+    );
 }
 
 #[test]
@@ -490,6 +519,36 @@ fn declarative_navigate_root_when_no_params() {
     let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, None);
     assert_eq!(payload["notification"]["navigate"], ".");
     assert_eq!(payload["notification"]["data"]["navigate"], ".");
+}
+
+#[test]
+fn a_relayed_subscription_taps_through_the_outside_origin() {
+    // B's engine pushes directly, but the page lived on gateway A under
+    // `/<slug>@<gateway>/`. The tap must reopen it there, never on B's origin.
+    let tid = uuid::Uuid::new_v4();
+    let tap = nav_thread(&tid.to_string(), None);
+    let payload = build_push_payload(
+        "T",
+        "B",
+        None,
+        None,
+        Some(tid),
+        None,
+        &tap,
+        Some("https://gateway-a.test/dev@cloud/"),
+        None,
+    );
+    let nav = payload["notification"]["navigate"].as_str().unwrap();
+    assert!(
+        nav.starts_with("https://gateway-a.test/dev@cloud/?"),
+        "iOS navigate must keep the outside prefix, got: {nav}"
+    );
+    // The service-worker form resolves against the registration scope, which
+    // is the same outside prefix.
+    assert!(payload["notification"]["data"]["navigate"]
+        .as_str()
+        .unwrap()
+        .starts_with('#'));
 }
 
 #[test]

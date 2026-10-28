@@ -89,6 +89,8 @@ import type { BackfillProgress, EmbeddingModelStatus } from '../../api/types';
 /** Keyed so a second failure replaces the first instead of stacking, and so the
  *  tap can dismiss the toast it just acted on. */
 const BACKUP_FAILED_TOAST_KEY = 'backup-failed';
+const MAIN_PUSH_FAILED_TOAST_KEY = 'main-push-failed';
+const MAIN_FOLLOW_REFUSED_TOAST_KEY = 'main-follow-refused';
 
 /** Keyed for the same reason: the engine re-announces its refused `apis.json`
  *  entries on every boot, and a reconnecting client must not stack them. */
@@ -1100,6 +1102,22 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // arrives with the `ChangesUpdated` the lane sends beside it.
       handleLaneFrame(type, data);
       break;
+
+    case 'MainPushFailed': {
+      // An Apply outside the landing lane moved `main`, but origin did not
+      // take it. `main` stays moved here, so the user has to know (ADR 0589).
+      const reason = typeof data.reason === 'string' && data.reason ? data.reason : 'Unknown error';
+      showToast(`Could not push main to origin: ${reason}`, 'error', { key: MAIN_PUSH_FAILED_TOAST_KEY });
+      break;
+    }
+
+    case 'MainFollowRefused': {
+      // origin has a newer `main`, but local `main` could not fast-forward to
+      // it, so this gateway stays on the version it has (ADR 0589).
+      const reason = typeof data.reason === 'string' && data.reason ? data.reason : 'Unknown error';
+      showToast(`Could not follow main from origin: ${reason}`, 'error', { key: MAIN_FOLLOW_REFUSED_TOAST_KEY });
+      break;
+    }
 
     case 'MainCheckStarted':
     case 'MainCheckRunLinked':

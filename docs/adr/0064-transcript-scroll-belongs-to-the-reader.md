@@ -24,7 +24,8 @@ Nothing moves the transcript on its own. The app moves it only as the direct
 result of an explicit user action that asks for it, and that list is exhaustive:
 
 - the two chevrons (`scrollToTop` / `scrollToBottomAnimated`),
-- the follow toggle (`setFollowLiveEdge`),
+- the follow toggle (`setFollowLiveEdge`), which floats under the down chevron
+  (ADR 0596),
 - the five submits, all through `followSubmit`: sending a message, answering a
   question card, deciding a permission card, Continue after an abort, and the
   prompt row's Cancel (ADR 0080 added the fifth),

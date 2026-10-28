@@ -1,8 +1,15 @@
 import { signal } from '@preact/signals';
 import { showToast, workspaceName } from '../store';
 import { fetchWorkspaces } from '../../api/client';
-import { listWorkspaces, locateWorkspace } from '../../api/client/control';
-import { GATEWAY_PORT, WORKSPACE_ID, isWorkspaceSlug } from '../../utils/basePath';
+import { listRemoteWorkspaces, listWorkspaces, locateWorkspace } from '../../api/client/control';
+import {
+  GATEWAY_PORT,
+  REMOTE_GATEWAY,
+  WORKSPACE_ID,
+  parseWorkspaceRoute,
+  workspaceRouteSegment,
+  workspaceRouteUrlSegment,
+} from '../../utils/basePath';
 import { slugifyWorkspaceName } from '../../utils/slug';
 import { isTauri } from '../../utils/platform';
 import { showWorkspaceInNativeWindow } from '../../utils/tauri';
@@ -13,6 +20,12 @@ import { openNewTab } from '../../utils/newTab';
 import { replaceDocument } from '../../utils/documentNavigation';
 import { isCanonicalThreadId, landingHash } from '../../utils/workspaceLanding';
 import { separateViewIsAvailable, workspaceTabName } from '../../utils/workspaceWindow';
+import {
+  isThisWorkspace,
+  linkedWorkspaceRoute,
+  resolveLinkedWorkspace,
+  type LinkedWorkspace,
+} from '../../utils/threadLinkWorkspace';
 
 /** Hash-channel deep link to a thread. Hash (not `?thread=`) is deliberate:
  *  `startClient` strips `?thread=` unconditionally to defuse stale SW deep-
@@ -22,22 +35,51 @@ export const THREAD_HASH_RE = /^#thread=([0-9a-f-]+)$/;
 
 /** Where a peer workspace is reachable, and what to name the tab that shows it.
  *
- *  `tabKey` is the SLUG behind the gateway, which is what a workspace row keys
+ *  `tabKey` is the ROUTE behind the gateway, which is what a workspace row keys
  *  its own tab on. So a thread link and a row reach one tab between them. On a
- *  dedicated port there is no slug, so the workspace name is the key.
+ *  dedicated port there is no route, so the workspace name is the key.
  *
- *  `gatewaySlug` is set only when THIS page's gateway serves the workspace.
- *  Only then can the packaged shell open it in a native window, because the
- *  shell composes a window URL on the calling window's own origin. */
+ *  `gatewayRoute` is set only when THIS page's gateway serves the workspace,
+ *  itself or through its relay. Only then can the packaged shell open it in a
+ *  native window, because the shell composes a window URL on the calling
+ *  window's own origin. */
 interface WorkspaceReach {
   base: string;
   tabKey: string;
-  gatewaySlug: string | null;
+  gatewayRoute: string | null;
 }
 
-/** The reach for `slug` behind the gateway this page is served by. */
-function reachOnThisGateway(slug: string): WorkspaceReach {
-  return { base: `${location.origin}/${encodeURIComponent(slug)}`, tabKey: slug, gatewaySlug: slug };
+/** The reach for `route` (`<slug>` or `<slug>@<gateway>`) behind the gateway
+ *  this page is served by. */
+function reachOnThisGateway(route: string): WorkspaceReach {
+  return { base: `${location.origin}/${workspaceRouteUrlSegment(route)}`, tabKey: route, gatewayRoute: route };
+}
+
+/** The reach for a workspace on a remote gateway, through this gateway's relay.
+ *  Matched on name, then on a slugified-name id, against that gateway's list.
+ *  A silent gateway leaves navigation to the name's slug, as a silent control
+ *  plane does for a local workspace. A passive caller gives up instead. */
+async function reachRemoteWorkspace(
+  linked: LinkedWorkspace,
+  gateway: string,
+  opts: { lazyStart: boolean },
+): Promise<WorkspaceReach | null> {
+  const guess = () => (opts.lazyStart ? reachOnThisGateway(linkedWorkspaceRoute(linked)) : null);
+  let listings: Awaited<ReturnType<typeof listRemoteWorkspaces>>;
+  try {
+    listings = await listRemoteWorkspaces();
+  } catch {
+    return guess();
+  }
+  const listing = listings.find((l) => l.gateway === gateway);
+  if (!listing) return null; // no remote gateway goes by that name
+  if (listing.state === 'unreachable') return guess();
+  const entry =
+    listing.workspaces.find((w) => w.name === linked.name) ??
+    listing.workspaces.find((w) => w.id === slugifyWorkspaceName(linked.name));
+  if (!entry) return null;
+  if (!opts.lazyStart && entry.health !== 'healthy') return null;
+  return reachOnThisGateway(workspaceRouteSegment({ slug: entry.id, gateway }));
 }
 
 /** Base URL (no trailing slash) for reaching a target workspace's engine from the
@@ -51,6 +93,10 @@ function reachOnThisGateway(slug: string): WorkspaceReach {
  *   • Served directly on an engine port (`WORKSPACE_ID` null) → reach peers on
  *     *their own dedicated ports* (`https://<host>:<port>`), discovered via
  *     `/api/v1/workspaces`.
+ *   • A workspace on a remote gateway → through this gateway's relay, at
+ *     `/<slug>@<gateway>`, matched against that gateway's list
+ *     (`reachRemoteWorkspace`). Only behind the gateway: an engine port relays
+ *     nothing.
  *
  *  Either way it keeps the user's host (localhost or Tailscale) and never mixes
  *  the two topologies.
@@ -70,9 +116,14 @@ function reachOnThisGateway(slug: string): WorkspaceReach {
  *  answer. A navigating caller takes a null on to `reachPeerInstall`, which
  *  looks across the machine's other installs. */
 async function resolveWorkspaceBaseUrl(
-  workspace: string,
+  linked: LinkedWorkspace,
   opts: { lazyStart: boolean },
 ): Promise<WorkspaceReach | null> {
+  const workspace = linked.name;
+  // Only a gateway relays, so an engine-port page reaches no remote workspace.
+  if (linked.gateway !== null) {
+    return WORKSPACE_ID === null ? null : reachRemoteWorkspace(linked, linked.gateway, opts);
+  }
   if (WORKSPACE_ID !== null) {
     // This page is served under a gateway slug prefix, so its origin IS the
     // gateway — route cross-workspace traffic back through it.
@@ -99,7 +150,7 @@ async function resolveWorkspaceBaseUrl(
   return {
     base: `${location.protocol}//${location.hostname}:${entry.port}`,
     tabKey: workspace,
-    gatewaySlug: null,
+    gatewayRoute: null,
   };
 }
 
@@ -173,7 +224,7 @@ async function reachPeerInstall(workspace: string): Promise<WorkspaceReach | nul
     // Keyed on the peer's port too: two installs may both serve a slug, and
     // one tab name between them would re-point the wrong workspace's tab.
     tabKey: `${found.gateway_port}-${found.slug}`,
-    gatewaySlug: null,
+    gatewayRoute: null,
   };
 }
 
@@ -195,11 +246,12 @@ async function reachPeerInstall(workspace: string): Promise<WorkspaceReach | nul
  *  Another origin is outside the app, so it keeps `window.open`, which hands it
  *  to the browser rather than stranding the app there. */
 export async function openThreadInWorkspace(workspace: string, threadId: string): Promise<void> {
+  const linked = resolveLinkedWorkspace(workspace, REMOTE_GATEWAY);
   let reach: WorkspaceReach | null;
   try {
     reach =
-      (await resolveWorkspaceBaseUrl(workspace, { lazyStart: true })) ??
-      (await reachPeerInstall(workspace));
+      (await resolveWorkspaceBaseUrl(linked, { lazyStart: true })) ??
+      (linked.gateway === null ? await reachPeerInstall(workspace) : remoteUnavailable(linked));
   } catch (e) {
     toastOpenThreadFailed(workspace, e);
     return;
@@ -208,6 +260,12 @@ export async function openThreadInWorkspace(workspace: string, threadId: string)
   // a shared message here could.
   if (reach === null) return;
   await openThreadAt(reach, threadId, workspace);
+}
+
+/** Say a remote workspace cannot be reached, and answer the null that means. */
+function remoteUnavailable(linked: LinkedWorkspace): null {
+  showToast(`Workspace '${linked.name}' on remote gateway '${linked.gateway}' is not available`, 'error');
+  return null;
 }
 
 function toastOpenThreadFailed(workspace: string, err: unknown): void {
@@ -224,9 +282,9 @@ function toastOpenThreadFailed(workspace: string, err: unknown): void {
  *  `openUrl`. */
 async function openThreadAt(reach: WorkspaceReach, threadId: string, workspace: string): Promise<void> {
   const landing = { thread: threadId };
-  if (isTauri() && reach.gatewaySlug !== null) {
+  if (isTauri() && reach.gatewayRoute !== null) {
     try {
-      await showWorkspaceInNativeWindow(reach.gatewaySlug, landing);
+      await showWorkspaceInNativeWindow(reach.gatewayRoute, landing);
     } catch (e) {
       toastOpenThreadFailed(workspace, e);
     }
@@ -246,14 +304,15 @@ async function openThreadAt(reach: WorkspaceReach, threadId: string, workspace: 
   }
 }
 
-/** A *workspace thread URL*, read back into the workspace and the thread. */
+/** A *workspace thread URL*, read back into the workspace route and the thread. */
 export interface WorkspaceThreadUrl {
-  slug: string;
+  /** `<slug>`, or `<slug>@<gateway>` for a workspace on a remote gateway. */
+  route: string;
   threadId: string;
 }
 
 /** Read `href` as a workspace thread URL on THIS page's origin
- *  (`<origin>/<slug>/#thread=<uuid>`), or `null` for any other URL.
+ *  (`<origin>/<route>/#thread=<uuid>`), or `null` for any other URL.
  *
  *  Strict on purpose: a null keeps a link on its ordinary route. So a link that
  *  only resembles one (another origin, a deeper path, a query) opens as a page. */
@@ -265,20 +324,20 @@ export function parseWorkspaceThreadUrl(href: string): WorkspaceThreadUrl | null
     return null;
   }
   if (url.origin !== location.origin || url.search !== '') return null;
-  const slug = /^\/([^/]+)\/?$/.exec(url.pathname)?.[1];
+  const route = /^\/([^/]+)\/?$/.exec(url.pathname)?.[1];
   const threadId = THREAD_HASH_RE.exec(url.hash)?.[1];
-  if (!slug || !threadId || !isWorkspaceSlug(slug) || !isCanonicalThreadId(threadId)) return null;
-  return { slug, threadId };
+  if (!route || !threadId || !parseWorkspaceRoute(route) || !isCanonicalThreadId(threadId)) return null;
+  return { route, threadId };
 }
 
 /** Open a workspace thread URL inside Lucidos: in place when it names this
  *  workspace, else in that workspace's own window or tab. */
-export function openWorkspaceThreadUrl({ slug, threadId }: WorkspaceThreadUrl): void {
-  if (slug === WORKSPACE_ID) {
+export function openWorkspaceThreadUrl({ route, threadId }: WorkspaceThreadUrl): void {
+  if (route === WORKSPACE_ID) {
     focusThreadOrBootstrap(threadId);
     return;
   }
-  openThreadAt(reachOnThisGateway(slug), threadId, slug).catch((e) => toastOpenThreadFailed(slug, e));
+  openThreadAt(reachOnThisGateway(route), threadId, route).catch((e) => toastOpenThreadFailed(route, e));
 }
 
 /** Route a thread link to the engine that owns it: a same-workspace link
@@ -288,7 +347,11 @@ export function openWorkspaceThreadUrl({ slug, threadId }: WorkspaceThreadUrl): 
  *  `.thread-link` click handler (startClient) and the message-route popover's
  *  Workspace-origin link so the two routing decisions can't drift. */
 export function openThreadAcrossWorkspaces(workspace: string | undefined, threadId: string): void {
-  if (workspace && workspaceName.value && workspace !== workspaceName.value) {
+  if (
+    workspace &&
+    workspaceName.value &&
+    !isThisWorkspace(resolveLinkedWorkspace(workspace, REMOTE_GATEWAY), REMOTE_GATEWAY, workspaceName.value)
+  ) {
     void openThreadInWorkspace(workspace, threadId);
     return;
   }
@@ -328,7 +391,9 @@ export async function ensureCrossWorkspaceThreadTitle(
   if (crossWsTitles.value.has(key) || crossWsInFlight.has(key)) return;
   crossWsInFlight.add(key);
   try {
-    const reach = await resolveWorkspaceBaseUrl(workspace, { lazyStart: false });
+    const reach = await resolveWorkspaceBaseUrl(resolveLinkedWorkspace(workspace, REMOTE_GATEWAY), {
+      lazyStart: false,
+    });
     if (!reach) return;
     const res = await fetch(`${reach.base}/api/v1/threads/${threadId}`);
     if (!res.ok) return;

@@ -16,7 +16,11 @@
  * before proxying).
  */
 
-import { SIGIL } from '../generated/gateway-constants';
+import {
+  REMOTE_GATEWAY_NAME_MAX_LEN,
+  REMOTE_ROUTE_SEPARATOR,
+  SIGIL,
+} from '../generated/gateway-constants';
 
 /** The literal `<base href>` the server stamped, or `'/'` when absent (no DOM /
  *  unit tests / a server that didn't stamp one). */
@@ -94,7 +98,8 @@ export function computeGatewayPickerHref(opts: {
   return `${opts.protocol}//${opts.hostname}:${opts.gatewayPort}/${SIGIL}/?pick`;
 }
 
-/** The workspace id (slug) this bundle is serving, or `null` outside a workspace
+/** The workspace route segment this bundle is serving (`<slug>`, or
+ *  `<slug>@<gateway>` for a remote workspace), or `null` outside a workspace
  *  (the picker, or a legacy root). */
 export const WORKSPACE_ID: string | null =
   IS_PICKER || BASE_PATH === '' ? null : BASE_PATH.slice(1);
@@ -131,15 +136,61 @@ export function isWorkspaceSlug(segment: string): boolean {
   return SLUG_RE.test(segment);
 }
 
+/** A remote gateway's short name: `registry::is_valid_id` capped at
+ *  `REMOTE_GATEWAY_NAME_MAX_LEN`, the rule `remote_gateways::valid_name` applies. */
+function isRemoteGatewayName(name: string): boolean {
+  return (
+    name.length <= REMOTE_GATEWAY_NAME_MAX_LEN && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(name)
+  );
+}
+
+/** Where a workspace lives, read from its route segment: `<slug>` on this
+ *  gateway, or `<slug>@<gateway>` on a remote gateway (ADR 0591). */
+export interface WorkspaceRoute {
+  slug: string;
+  /** The remote gateway's short name, or null for this gateway's own. */
+  gateway: string | null;
+}
+
+/** Read a route segment, or `null` for one the gateway would not route.
+ *  Mirrors `relay::remote_route` for the remote form. */
+export function parseWorkspaceRoute(segment: string): WorkspaceRoute | null {
+  const at = segment.indexOf(REMOTE_ROUTE_SEPARATOR);
+  if (at < 0) return isWorkspaceSlug(segment) ? { slug: segment, gateway: null } : null;
+  const slug = segment.slice(0, at);
+  const gateway = segment.slice(at + 1);
+  return isWorkspaceSlug(slug) && isRemoteGatewayName(gateway) ? { slug, gateway } : null;
+}
+
+/** The route segment for `route`, the inverse of {@link parseWorkspaceRoute}. */
+export function workspaceRouteSegment(route: WorkspaceRoute): string {
+  return route.gateway === null ? route.slug : `${route.slug}${REMOTE_ROUTE_SEPARATOR}${route.gateway}`;
+}
+
+/** `id` as a URL path segment. Escapes like `encodeURIComponent`, except the
+ *  route separator: the gateway reads the raw path, so `%40` would miss a
+ *  remote route. */
+export function workspaceRouteUrlSegment(id: string): string {
+  return encodeURIComponent(id)
+    .split(encodeURIComponent(REMOTE_ROUTE_SEPARATOR))
+    .join(REMOTE_ROUTE_SEPARATOR);
+}
+
+/** The remote gateway this page's workspace lives on, or null when it is this
+ *  gateway's own (or no workspace at all). An unqualified workspace name in a
+ *  thread link resolves against it. */
+export const REMOTE_GATEWAY: string | null =
+  WORKSPACE_ID === null ? null : (parseWorkspaceRoute(WORKSPACE_ID)?.gateway ?? null);
+
 /** Pure predicate (testable without the DOM): does this served context let the
  *  app build valid workspace URLs? The picker (`/~`, slug null) and a legacy
  *  direct-engine root (`''`, slug null) are always valid. A workspace context is
- *  valid iff its slug is well-formed — that slug IS the string the base-path
- *  (and thus every origin-relative API URL + the SW scope) is built from, so a
- *  malformed one is exactly what yields the WebKit "string did not match the
- *  expected pattern" failures across every fetch + SW registration. */
+ *  valid iff its route segment is well-formed. That segment IS the string the
+ *  base path, every origin-relative API URL and the SW scope are built from. A
+ *  malformed one yields WebKit's "string did not match the expected pattern"
+ *  on every fetch and SW registration. */
 export function baseContextValidFor(workspaceId: string | null): boolean {
-  return workspaceId === null || isWorkspaceSlug(workspaceId);
+  return workspaceId === null || parseWorkspaceRoute(workspaceId) !== null;
 }
 
 /** True when THIS bundle's served base-path context can build valid workspace

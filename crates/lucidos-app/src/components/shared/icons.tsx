@@ -321,7 +321,7 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
  *  ON AND OFF BY FILL, like `StandingApplyIcon`. A theme without a hue sets the
  *  accent to the text colour, so colour alone cannot show the state.
  *
- *  INK IS 0.750 OF THE BOX on both axes, as for this row's other glyphs. That
+ *  INK IS 0.750 OF THE BOX on both axes, as for the composer row's glyphs. That
  *  is the GEOMETRIC extent, stroke excluded (0.833 with it, for every glyph).
  *  No inline size either: `.icon-btn` sizes the svg. */
 export function FollowLiveEdgeIcon({ armed = false }: { armed?: boolean }) {

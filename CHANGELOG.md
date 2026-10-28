@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.53.0 - 2026-10-28
+
+### Added
+
+- Remote gateways. Pair one Lucidos gateway with another from Settings, Access, or with `lucidos pair --gateway`. The paired gateway's workspaces show in the workspace picker as `<slug>@<name>` and open under `/<slug>@<name>/`. Thread links and notifications from a remote workspace open in it.
+- Every backup bundles your pending change branches. If a restore cannot bring a branch back, it tells you which one.
+- A gateway can follow main: it fast-forwards to `origin/main` on an interval.
+- Token Cost shows spend by trigger. Each proxy call and spawn from a script trigger fire names the trigger that made it.
+
+### Changed
+
+- On mobile, the follow toggle floats over the composer in the bottom slot, and the down chevron sits one tap above it.
+- Lucidos builds ONNX Runtime from the Lucidos mirror first and checks its hash. It falls back to the upstream server only when the mirror fails. A fresh source install no longer fails when the upstream server is slow or down.
+- A shipped engine that links ONNX Runtime dynamically is refused at release.
+- Landing pushes to `origin/main` first, and a push that fails says so. A landing whose answer was lost keeps its merge.
+- A packaged install lands local-first. It lands origin-first only while the gateway holds a pairing.
+- Hardening picks lint and tests by the crates a change reaches, so a small Rust change runs a small suite.
+
+### Fixed
+
+- Mobile Access explains when the control server cannot turn on HTTPS, and treats a 404 answer the same as a 501.
+- In search, a category that arrives late lands below the sections already drawn.
+- In a workspace opened through another gateway, the call toggle and voice search entries are hidden.
+- A gateway saves its pairing store before it changes it in memory.
+- The relay credential is marked sensitive, and your cookies and origin-wide state stay away from the remote gateway.
+- A pairing QR with an http external address no longer hides a tailnet https address.
+- Apply pushes main after every merged apply outside the landing lane.
+- The model pill spec matches the pill that stays openable during a turn.
+- ONNX Runtime fetch gives up on a missing file or a bad hash at once, and retries only network errors.
 ## v0.52.2 - 2026-10-28
 
 ### Added

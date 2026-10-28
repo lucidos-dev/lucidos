@@ -41,7 +41,7 @@ import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
 import { watchTitlebarBand } from '../../store/actions/trafficLights';
 import { applyAppBadge } from '../../store/actions/app-badge';
-import { WORKSPACE_ID } from '../../utils/basePath';
+import { WORKSPACE_ID, parseWorkspaceRoute } from '../../utils/basePath';
 import {
   alternateOpenMode,
   defaultOpenMode,
@@ -61,6 +61,7 @@ import {
 import { isPairingShellDocument } from '../../utils/pairingShell';
 import {
   listWorkspaces,
+  listRemoteWorkspaces,
   createWorkspace,
   renameWorkspace,
   deleteWorkspace,
@@ -104,8 +105,22 @@ import {
   type RestoreDraft,
 } from './workspaceForms';
 import { pickerFooter, type FooterMode } from './PickerFooter';
-import { restoreBanner } from './RestoreBanner';
+import { restoreBanner, restoreNeedsReading } from './RestoreBanner';
+import {
+  EMPTY_REMOTE_GATEWAY_DRAFT,
+  remoteGatewayBlocker,
+  submitRemoteGateway,
+  type RemoteGatewayDraft,
+} from '../settings/remoteGatewayForm';
 import { GlyphBadge } from '../shared/GlyphBadge';
+import { RemoteWorkspaceRows } from './RemoteWorkspaceRows';
+import { mergeRemoteListings, type RemoteGatewayView } from './remoteWorkspaces';
+import { singleFlight } from './singleFlight';
+
+/** Background ticks between two asks of the remote gateways. Each ask crosses
+ *  a network and can wait seconds on a silent gateway. So it skips most of the
+ *  2s ticks that keep the local list live. */
+const REMOTE_POLL_EVERY_TICKS = 8;
 
 /** Window-drag gate (Tauri desktop): the picker's whole background drags the
  *  window, except presses on its controls and inside an open popover.
@@ -324,6 +339,10 @@ export function WorkspacePicker() {
   useTooltip();
 
   const workspaces = useSignal<Loadable<WorkspaceStatus[]>>({ status: 'not-loaded' });
+  const remoteWorkspaces = useSignal<Loadable<RemoteGatewayView[]>>({ status: 'not-loaded' });
+  // One ask of the remote gateways at a time, and how many ticks since the last.
+  const remoteAsk = useRef<((fresh?: boolean) => Promise<void>) | null>(null);
+  const ticksSinceRemoteAsk = useRef(0);
   const busy = useSignal(false);
   const error = useSignal<string | null>(null);
   // Skeleton row count, captured once at mount (see where it's read below).
@@ -332,6 +351,8 @@ export function WorkspacePicker() {
   // entry points stay on screen whatever is open (they're how the user switches
   // between them), so "both forms open at once" must not be representable.
   const footerMode = useSignal<FooterMode>('none');
+  const remoteDraft = useSignal<RemoteGatewayDraft>(EMPTY_REMOTE_GATEWAY_DRAFT);
+  const pairedRemote = useSignal<string | null>(null);
   const newName = useSignal('');
   const renamingId = useSignal<string | null>(null);
   const renameValue = useSignal('');
@@ -414,6 +435,29 @@ export function WorkspacePicker() {
     }
   }
 
+  /** Ask every remote gateway for its workspaces. A gateway that does not
+   *  answer keeps its last rows, greyed (`mergeRemoteListings`). `true` asks
+   *  for an answer begun after the call, since an ask in flight may predate a
+   *  gateway just added. */
+  remoteAsk.current ??= singleFlight(async () => {
+    ticksSinceRemoteAsk.current = 0;
+    const listings = await listRemoteWorkspaces();
+    const previous = remoteWorkspaces.value;
+    remoteWorkspaces.value = {
+      status: 'loaded',
+      data: mergeRemoteListings(previous.status === 'loaded' ? previous.data : [], listings),
+    };
+  });
+  const fetchRemoteWorkspaces = remoteAsk.current;
+
+  async function refreshRemoteWorkspaces(): Promise<void> {
+    try {
+      await fetchRemoteWorkspaces(true);
+    } catch (e) {
+      remoteWorkspaces.value = toFailed(e);
+    }
+  }
+
   async function fetchRestoreStatus(): Promise<void> {
     restoreStatus.value = await getRestoreStatus();
   }
@@ -445,6 +489,15 @@ export function WorkspacePicker() {
       await fetchWorkspaces();
     } catch (e) {
       console.warn('[picker] background refresh failed; keeping last-good list', e);
+    }
+    // Best-effort, like the list above: a blip keeps the last-good rows, and
+    // each gateway's own silence already shows as a greyed row.
+    if (++ticksSinceRemoteAsk.current >= REMOTE_POLL_EVERY_TICKS) {
+      try {
+        await fetchRemoteWorkspaces();
+      } catch (e) {
+        console.warn('[picker] remote workspace poll failed; keeping last-good rows', e);
+      }
     }
     // Best-effort restore-status poll (drives the restore banner / phase). A
     // blip just keeps the last-good status; the next tick recovers.
@@ -552,6 +605,12 @@ export function WorkspacePicker() {
       if (!autoOpening.value) return;
       const list = workspaces.value;
       const remembered = recallLastWorkspace();
+      // A remote workspace is not in the local list. Open it anyway: the relay
+      // sends a page load back here when its gateway is gone or unreachable.
+      if (remembered && parseWorkspaceRoute(remembered)?.gateway) {
+        openWorkspace(remembered);
+        return;
+      }
       if (list.status === 'loaded' && remembered) {
         const w = list.data.find((x) => x.id === remembered);
         // Only auto-open a workspace that isn't already known-unhealthy — opening
@@ -567,6 +626,8 @@ export function WorkspacePicker() {
       }
       autoOpening.value = false; // nothing to open / unhealthy / load failed → show the picker
     })();
+    remoteWorkspaces.value = { status: 'loading' };
+    void refreshRemoteWorkspaces();
     // Seed the restore banner so a reload mid-restore re-attaches to the live
     // phase (the gateway holds the authoritative single-slot status).
     void fetchRestoreStatus().catch(() => { /* no banner until the poll lands */ });
@@ -626,7 +687,9 @@ export function WorkspacePicker() {
   // key can change.
   const clearRetry = useSignal(0);
   const completedRestoreId =
-    restoreStatus.value?.status === 'completed' ? restoreStatus.value.id : null;
+    restoreStatus.value?.status === 'completed' && !restoreNeedsReading(restoreStatus.value)
+      ? restoreStatus.value.id
+      : null;
   useEffect(() => {
     if (!completedRestoreId) return;
     const timer = setTimeout(() => {
@@ -716,6 +779,27 @@ export function WorkspacePicker() {
   function closeRestore() {
     footerMode.value = 'none';
     restoreDraft.value = EMPTY_RESTORE_DRAFT;
+  }
+
+  function patchRemote(patch: Partial<RemoteGatewayDraft>) {
+    remoteDraft.value = { ...remoteDraft.value, ...patch };
+    pairedRemote.value = null;
+  }
+
+  function closeRemote() {
+    footerMode.value = 'none';
+    remoteDraft.value = EMPTY_REMOTE_GATEWAY_DRAFT;
+    pairedRemote.value = null;
+  }
+
+  function onAddRemote() {
+    if (remoteGatewayBlocker(remoteDraft.value) !== null) return;
+    void withBusy(async () => {
+      const added = await submitRemoteGateway(remoteDraft.value);
+      remoteDraft.value = EMPTY_REMOTE_GATEWAY_DRAFT;
+      pairedRemote.value = added.name;
+      await refreshRemoteWorkspaces();
+    });
   }
 
   function onRestore() {
@@ -1336,6 +1420,24 @@ export function WorkspacePicker() {
         )}
         </LoadingFade>
 
+        {remoteWorkspaces.value.status === 'failed' && (
+          <div class="ws-picker-error">
+            Failed to load remote workspaces: {remoteWorkspaces.value.error}
+          </div>
+        )}
+        {/* Nothing while the first ask is out: the local list above is already
+            the whole picker for a gateway with no remote gateways. */}
+        {remoteWorkspaces.value.status === 'loaded' && (
+          <RemoteWorkspaceRows
+            views={remoteWorkspaces.value.data}
+            onOpen={(route, mode) => {
+              void withBusy(async () => {
+                await openWorkspaceIn(mode, route);
+              });
+            }}
+          />
+        )}
+
         {restoreBanner({ status: restore, busy: busy.value, onDismiss: onDismissRestore })}
 
         {pickerFooter({
@@ -1365,6 +1467,11 @@ export function WorkspacePicker() {
           // inventing a second, weaker destructive path: deleting a workspace
           // drops its database.
           onDeleteColliding: (id) => { deletingId.value = id; deleteConfirm.value = ''; },
+          remoteDraft: remoteDraft.value,
+          onRemoteDraft: patchRemote,
+          onAddRemote,
+          onCancelRemote: closeRemote,
+          pairedRemote: pairedRemote.value,
         })}
       </div>
     </div>

@@ -260,8 +260,8 @@ html {
     /* How far the navigation focus marker (.nav-focus-stuck, host-components.css)
        reaches beyond a turn's box. The marker is a background wash whose visible
        edge IS the box, plus a glow blooming past it; this is the reach the
-       transcript reserves for that bloom. At the bottom it is padding past
-       --prompt-fade. At the top the first turn's feed padding covers it, and
+       transcript reserves for that bloom. At the bottom --transcript-end-reserve
+       adds it. At the top the first turn's feed padding covers it, and
        the fade is off at rest there. So a first or last turn's marker is never
        dissolved by a fade. Deliberately kept at the old outline frame's exact reach (its
        0.1875rem offset + 0.1875rem width) rather than grown to the glow's full
@@ -283,12 +283,23 @@ html {
     --scroll-chevron-size: 1.5rem; /* button diameter (width == height) */
     --scroll-chevron-glyph: var(--icon-size-md);
     --scroll-chevron-top: 0.75rem; /* desktop top inset (see @media hover) */
+    /* The bottom slot stack over the composer's top edge. The follow toggle
+       (.follow-toggle) holds the bottom slot, this inset over the composer. The
+       down chevron stands one slot higher, this gap over the toggle. */
+    --scroll-chevron-inset: 0.75rem;
+    --scroll-chevron-stack-gap: 0.5rem;
     /* Height of the transcript's bottom dissolve: the bg-colored gradient band
        .prompt-area::before (panels/content.css) draws over the scroll area. The
-       transcript's bottom padding reserves this plus --nav-focus-reach so the
-       last turn's focus marker clears it. The band sizes itself from this var,
-       so the two are coupled by construction rather than by hand. */
+       band sizes itself from this var, so the two are coupled by construction. */
     --prompt-fade: 1rem;
+    /* The transcript's bottom padding. It clears the taller of the dissolve and
+       the follow toggle, plus --nav-focus-reach, so the last turn and its focus
+       marker end above both. It is a constant: no layout rule reads the follow
+       flag (ADR 0064). */
+    --transcript-end-reserve: calc(
+        max(var(--prompt-fade), var(--scroll-chevron-inset) + var(--scroll-chevron-size))
+        + var(--nav-focus-reach)
+    );
     /* Left inset shared by a turn's body content — LLM response body and every
        initiator body (change card, question, permission, child completion) line
        up against the same edge. Also the UNIFORM gap the navigation focus marker
@@ -420,10 +431,13 @@ html {
     :root {
         --scroll-chevron-size: var(--mobile-header-icon-box);
         /* How far a chevron's tap target reaches past its circle, on every
-           side (chat/input-messages.css). It equals the 0.75rem gap each
-           chevron keeps to the title bar and the composer, so it never takes
-           their taps. */
+           side (chat/input-messages.css). It equals the 0.75rem gap the up
+           chevron keeps to the title bar and the follow toggle keeps to the
+           composer, so it never takes their taps. */
         --scroll-chevron-reach: 0.75rem;
+        /* The down chevron and the follow toggle split this gap between their
+           reaches. One reach is the tightest that keeps each target 44px. */
+        --scroll-chevron-stack-gap: var(--scroll-chevron-reach);
     }
 }
 

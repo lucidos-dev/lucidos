@@ -720,6 +720,51 @@ week. Most are automated browser runs, since every fresh browser profile
 arrives as a new device. A device someone named, paired, or turned push on for
 never drops off this way. See *one-off device* in the glossary.
 
+### Pair a gateway
+
+A *gateway pairing* lets one gateway open another gateway's workspaces, for
+every device paired with it (ADR 0590). Two sections on **Settings → Access**
+carry it, right under **Add a device**:
+
+| Section | On which gateway | What it does |
+|---|---|---|
+| **Pair a gateway** | B, the one being opened | Mints a *gateway pairing code* and shows the `https` address to use with it. Lists the gateways that may open this one, with **Unpair**. |
+| **Remote gateways** | A, the one opening | Takes B's address, the code and a short name, then pairs. Lists the remote gateways, with **Remove**. |
+
+`lucidos pair --gateway` on B mints the same code from a terminal. The
+Workspaces picker also has **Add a remote gateway**, with the same form.
+
+Five rules hold, whatever the network:
+
+- **Add only a gateway you run.** B's pages open on A's own address, so they
+  can do anything A's devices can do on A. A paired gateway is trusted like
+  A itself. A's form says so.
+- **`https` only.** A refuses a plain `http` address, because the credential
+  would cross the network in clear text. Give B an `https` address first:
+  Route B below, or an *external address*.
+- **B must be new enough.** A reads `gateway_protocol` from B's health and
+  refuses a gateway too old to pair. Update B, then try again.
+- **A prefers B's external address**, but only when A reaches the same B
+  there. Otherwise it keeps the address you typed.
+- **Codes never cross over.** A device *pairing code* never pairs a gateway,
+  and a *gateway pairing code* never pairs a device.
+
+**Unpair** on B refuses A's very next request. **Remove** on A also asks B to
+forget the pairing. When B does not answer, A says so, and you unpair on B.
+
+**A remote workspace has no voice.** A relays pages and requests, but no
+call, so the call toggle is absent there. Settings → Models → Voice says why.
+
+While a gateway holds a pairing, in either direction, its engines land a
+change on `origin` first and follow `origin`'s `main` (*origin-first
+landing*). Without one, they land locally and push after, as before.
+
+When A pushes a change to `main` on `origin`, it nudges each remote gateway.
+B's engines then check for the new `main` at once, instead of at the next
+`follow_main_interval_minutes` tick (ADR 0589). B still builds in the
+background and waits for a tap on **Switch to new version**. An older B that
+lacks the nudge just follows on its usual interval.
+
 ### What a device is called
 
 Each half carries its own name, and the row prefers the one you can edit.
@@ -824,6 +869,11 @@ name, `tailscale <cmd> failed: <stderr>`, or a post-condition that reported
 success and changed nothing. So read the toast as the CLI's own words. For a
 syntax rejection the CLI prints the exact command it wants, and that line
 **is** the fix.
+
+One case gets a Lucidos sentence first: a control server that answers the
+feature-enable call with `501 Not Implemented` or `404 Not Found`, such as
+Headscale. The toast says HTTPS cannot be served there, then quotes the CLI
+after `Tailscale said:`.
 
 One line is filtered out: `Warning: client version "..." != tailscaled server
 version "..."`. Tailscale prints it on stderr for *every* command when CLI and
@@ -1025,6 +1075,7 @@ their single address is required, and failing to bind it is a hard error
 | "Not trusted" on one device only | iOS trust step 4 (Certificate Trust Settings) was skipped. |
 | `500 ... your Tailscale account does not support getting TLS certs` | The account-level HTTPS toggle is off. Nothing local will fix it. |
 | `tailscale serve` prints a `login.tailscale.com/f/serve` link and never returns | Serve is not enabled for the tailnet. Open that exact link and approve; the command finishes by itself. Not a hang. |
+| `error enabling https feature: error 501 Not Implemented` | The control server (Headscale, or another self-hosted one) has no feature-enable API and issues no certificates. Route B cannot work there. Use Route A, or C with your own certificate. |
 | Expose reports a CLI syntax change on a current CLI | Read past it. That line comes from the pre-1.52 fallback attempt, which now runs only on a rejected flag; if you see it on 1.52+, the build predates that gate. |
 | Works on 5252, fails on 5251 (or vice versa) | Two gateways, two TLS setups. Probe the failing port on its own. |
 | No push notifications | Not a secure origin (check that first), or the OS-level permission was never granted. |

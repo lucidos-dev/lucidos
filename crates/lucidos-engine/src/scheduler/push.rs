@@ -1074,31 +1074,46 @@ async fn read_unread_count(pool: &sqlx::PgPool) -> Option<i64> {
 /// is one loopback request.
 const GATEWAY_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// Whether a subscription's recorded service-worker scope belongs to a
-/// GATEWAY-served install, i.e. one whose app-icon badge must be the
-/// cross-workspace total rather than this workspace's own count.
+/// Who served the install a subscription belongs to, which decides what its
+/// app-icon badge counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BadgeScope {
+    /// A direct engine port, or a legacy row with no scope: this workspace.
+    Own,
+    /// This engine's gateway: every workspace on that origin.
+    Gateway,
+    /// Another gateway relaying this workspace under `/<slug>@<gateway>/`.
+    /// That origin's icon counts workspaces this engine cannot see.
+    Relayed,
+}
+
+/// Classify a subscription's recorded service-worker scope.
 ///
 /// `scope_url` is the SW scope the page captured, validated at subscribe time
 /// against the forwarded prefix. It is `https://host/<slug>/` behind the
 /// gateway and `https://host:<engine-port>/` on a direct engine, so a path
-/// deeper than `/` means the gateway served the page.
+/// deeper than `/` means a gateway served the page. A first segment holding
+/// the remote route separator means a remote gateway relayed it.
 ///
 /// The gateway re-stamps every manifest it serves with `scope: "/"`, so ONE
-/// installed icon covers the picker and every workspace on that origin. A
-/// legacy row with no `scope_url` keeps the own-count behaviour.
-fn is_gateway_scoped(scope_url: Option<&str>) -> bool {
-    let Some(raw) = scope_url else {
-        return false;
+/// installed icon covers the picker and every workspace on that origin.
+fn badge_scope(scope_url: Option<&str>) -> BadgeScope {
+    let Some(url) = scope_url.and_then(|raw| reqwest::Url::parse(raw.trim()).ok()) else {
+        return BadgeScope::Own;
     };
-    let Ok(url) = reqwest::Url::parse(raw.trim()) else {
-        return false;
-    };
-    url.path() != "/"
+    let first_segment = url.path().trim_start_matches('/').split('/').next();
+    match first_segment {
+        None | Some("") => BadgeScope::Own,
+        Some(segment) if segment.contains(lucidos_gateway_constants::REMOTE_ROUTE_SEPARATOR) => {
+            BadgeScope::Relayed
+        }
+        Some(_) => BadgeScope::Gateway,
+    }
 }
 
 /// The `app_badge` value one subscription should carry: the cross-workspace
-/// total for a gateway-served install, this workspace's own unread count
-/// otherwise. `None` leaves the badge untouched.
+/// total for a gateway-served install, this workspace's own unread count for
+/// a direct one. `None` leaves the badge untouched, as for a relayed install.
 ///
 /// The aggregate falls back to the own count rather than to nothing. An
 /// unreachable gateway then leaves the icon slightly low, instead of frozen at
@@ -1108,10 +1123,10 @@ fn app_badge_for(
     own_unread: Option<i64>,
     cross_workspace_total: Option<i64>,
 ) -> Option<i64> {
-    if is_gateway_scoped(scope_url) {
-        cross_workspace_total.or(own_unread)
-    } else {
-        own_unread
+    match badge_scope(scope_url) {
+        BadgeScope::Own => own_unread,
+        BadgeScope::Gateway => cross_workspace_total.or(own_unread),
+        BadgeScope::Relayed => None,
     }
 }
 
@@ -1124,7 +1139,7 @@ fn app_badge_for(
 async fn cross_workspace_unread_total(subscriptions: &[PushSubscription]) -> Option<i64> {
     if !subscriptions
         .iter()
-        .any(|sub| is_gateway_scoped(sub.scope_url.as_deref()))
+        .any(|sub| badge_scope(sub.scope_url.as_deref()) == BadgeScope::Gateway)
     {
         return None;
     }

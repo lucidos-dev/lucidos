@@ -808,7 +808,7 @@ impl LucidosEngine {
                     // apply that merged it may never have pushed.
                     self.reset_worktree_and_idle(thread_id, worktree_path, branch_name)
                         .await;
-                    push_main_in_background(repo_root);
+                    push_main_in_background(repo_root, &self.event_bus);
                     self.broadcast_changes_updated().await;
                     return Ok(());
                 }
@@ -1428,7 +1428,7 @@ impl LucidosEngine {
         // the applied change's branch markers, so new work re-triggers both.
         self.reset_worktree_and_idle(thread_id, worktree_path, branch_name)
             .await;
-        push_main_in_background(repo_root);
+        push_main_in_background(repo_root, &self.event_bus);
         self.broadcast_changes_updated().await;
 
         commits

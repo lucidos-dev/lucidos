@@ -15,7 +15,7 @@
 /// leading/trailing hyphen), which is itself `registry::slugify`'s output shape.
 /// The gateway's reserved sigil (`/~/…`, ADR 0014) fails it on the character
 /// class, which is why nothing tests for `~` separately.
-pub(crate) fn is_workspace_slug(segment: &str) -> bool {
+fn is_workspace_slug(segment: &str) -> bool {
     !segment.is_empty()
         && !segment.starts_with('-')
         && !segment.ends_with('-')
@@ -23,6 +23,25 @@ pub(crate) fn is_workspace_slug(segment: &str) -> bool {
         && segment
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A route segment the gateway serves a workspace under: a slug, or
+/// `<slug>@<name>` for a workspace on a remote gateway (ADR 0591). Mirrors
+/// `parseWorkspaceRoute` in `utils/basePath.ts`, except the name's length cap.
+/// No character it admits needs escaping in a URL path.
+pub(crate) fn is_workspace_route(segment: &str) -> bool {
+    match segment.split_once('@') {
+        None => is_workspace_slug(segment),
+        Some((slug, name)) => {
+            is_workspace_slug(slug)
+                && !name.is_empty()
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        }
+    }
 }
 
 /// Everything after `http://` / `https://`, or `None` for any other scheme.
@@ -68,7 +87,7 @@ pub(crate) fn window_workspace(url: &str) -> Option<&str> {
         _ => return None,
     };
     let segment = &path[..path.find(['/', '?', '#']).unwrap_or(path.len())];
-    is_workspace_slug(segment).then_some(segment)
+    is_workspace_route(segment).then_some(segment)
 }
 
 /// Has this window reached the gateway at all?
@@ -88,8 +107,8 @@ pub(crate) fn is_bundled_app_url(url: &str) -> bool {
 }
 
 /// The gateway URL serving `workspace`, e.g. `http://localhost:3210/myws/`.
-/// `origin` carries no trailing slash; the slug is known-safe (callers gate on
-/// [`is_workspace_slug`]), so nothing needs escaping.
+/// `origin` carries no trailing slash; the route is known-safe (callers gate on
+/// [`is_workspace_route`]), so nothing needs escaping.
 pub(crate) fn workspace_url(origin: &str, workspace: &str) -> String {
     format!("{origin}/{workspace}/")
 }
@@ -100,7 +119,7 @@ pub(crate) fn workspace_url(origin: &str, workspace: &str) -> String {
 /// fragment itself. Every `window-*` webview holds the full IPC permission set
 /// on the gateway origin (ADR 0028). A page-supplied URL part would therefore
 /// let the page choose what loads in a window carrying that grant. Same
-/// reasoning [`is_workspace_slug`] exists for.
+/// reasoning [`is_workspace_route`] exists for.
 ///
 /// `utils/workspaceLanding.ts` is the frontend mirror, and writes the same
 /// fragment for the two mechanisms that never reach this process.
@@ -251,7 +270,7 @@ pub(crate) enum WorkspaceTarget {
 /// Pick the window a click on `workspace`'s row should land in. Takes every
 /// top-level app window as `(label, url)`, plus the calling window's label.
 ///
-/// `None` for a slug the gateway would not serve. The page supplies that slug.
+/// `None` for a route the gateway would not serve. The page supplies that route.
 /// So the refusal is the whole gate on what can load in a window holding the
 /// `window-*` IPC grant (ADR 0028).
 ///
@@ -280,7 +299,7 @@ pub(crate) fn choose_workspace_target(
     origin: &str,
     landing: Option<WorkspaceLanding>,
 ) -> Option<WorkspaceTarget> {
-    if !is_workspace_slug(workspace) {
+    if !is_workspace_route(workspace) {
         return None;
     }
     let url = format!(
@@ -409,19 +428,41 @@ mod tests {
     }
 
     #[test]
-    fn is_workspace_slug_matches_what_the_gateway_would_serve() {
-        assert!(is_workspace_slug("myws"));
-        assert!(is_workspace_slug("my-ws-2"));
+    fn a_remote_route_is_a_slug_and_a_gateway_name() {
+        assert!(is_workspace_route("myws@cloud"));
+        assert!(is_workspace_route("my-ws@box-2"));
+        for bad in [
+            "myws@",
+            "@cloud",
+            "@",
+            "MyWs@cloud",
+            "myws@Cloud",
+            "myws@cl@oud",
+            "myws@-x",
+            "myws@a/b",
+        ] {
+            assert!(!is_workspace_route(bad), "{bad}");
+        }
+        assert_eq!(
+            window_workspace("http://localhost:3210/myws@cloud/#thread=x"),
+            Some("myws@cloud")
+        );
+    }
+
+    #[test]
+    fn is_workspace_route_matches_what_the_gateway_would_serve() {
+        assert!(is_workspace_route("myws"));
+        assert!(is_workspace_route("my-ws-2"));
         // The gateway's reserved sigil fails on the character class alone.
-        assert!(!is_workspace_slug("~"));
-        assert!(!is_workspace_slug(""));
-        assert!(!is_workspace_slug("-ws"));
-        assert!(!is_workspace_slug("ws-"));
-        assert!(!is_workspace_slug("my--ws"));
-        assert!(!is_workspace_slug("MyWs"));
-        assert!(!is_workspace_slug("my ws"));
-        assert!(!is_workspace_slug("my/ws"));
-        assert!(!is_workspace_slug(".."));
+        assert!(!is_workspace_route("~"));
+        assert!(!is_workspace_route(""));
+        assert!(!is_workspace_route("-ws"));
+        assert!(!is_workspace_route("ws-"));
+        assert!(!is_workspace_route("my--ws"));
+        assert!(!is_workspace_route("MyWs"));
+        assert!(!is_workspace_route("my ws"));
+        assert!(!is_workspace_route("my/ws"));
+        assert!(!is_workspace_route(".."));
     }
 
     #[test]

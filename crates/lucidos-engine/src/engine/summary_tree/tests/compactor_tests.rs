@@ -1509,6 +1509,66 @@ async fn a_restart_after_early_ready_keeps_the_flag_and_keeps_filling() {
     teardown_test_db(&db_name).await;
 }
 
+/// A re-seed while the backfill runs finds a built thread dirty again, because
+/// its log grew. That thread is live work now, so the count never steps back.
+#[tokio::test]
+async fn a_re_seed_never_takes_a_built_scope_back_out_of_the_count() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+    c.seed().await.unwrap();
+    assert_eq!(
+        c.drain_next().await.map(|d| d.0),
+        Some(SummaryScope::Workspace)
+    );
+    let (built, _) = c.drain_next().await.expect("a thread drains");
+    let SummaryScope::Thread(built) = built else {
+        panic!("the workspace drained once already");
+    };
+    let before = c.backfill_progress().expect("a backfill runs").done;
+
+    seed(
+        &bus,
+        built,
+        EventChannel::Chat,
+        vec![json!({"type": "MessageReceived", "text": SHORT_USER_TEXT, "mode": "human"})],
+    )
+    .await;
+    c.seed().await.unwrap();
+
+    let after = c.backfill_progress().expect("a backfill runs").done;
+    assert!(after >= before, "done went from {before} to {after}");
+    teardown_test_db(&db_name).await;
+}
+
+/// The last unbuilt gate thread ages out of the window before a re-seed, with
+/// the workspace already built. The workspace's drain still sets the flag.
+#[tokio::test]
+async fn a_re_seed_after_the_workspace_is_built_still_sets_the_flag() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let fixture = seed_workspace(&pool, &bus).await;
+    make_old(&pool, fixture.coding).await;
+    let c = compactor(&pool, &bus, deps(EchoProvider::new()));
+    c.seed().await.unwrap();
+    assert_eq!(
+        c.drain_next().await.map(|d| d.0),
+        Some(SummaryScope::Workspace)
+    );
+    assert_eq!(
+        c.drain_next().await.map(|d| d.0),
+        Some(SummaryScope::Thread(fixture.chat))
+    );
+
+    make_old(&pool, fixture.home).await;
+    c.seed().await.unwrap();
+    while c.drain_next().await.is_some() {}
+
+    assert!(store::is_ready(&pool).await.unwrap());
+    teardown_test_db(&db_name).await;
+}
+
 /// A model that holds every call until the test opens it, and counts the
 /// calls it holds. No call returns while the count grows, so the count is how
 /// many calls the compactor runs at once, however slowly it launched them.

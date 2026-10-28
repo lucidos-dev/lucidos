@@ -922,6 +922,26 @@ The address a *pairing code*'s QR carries, so the new device lands on the gatewa
 With none, Lucidos shows the code alone.
 See also: *pairing code*, *external address*, `system-knowhow/remote-access.md` § Add a device.
 
+### Gateway pairing
+A one-way grant from one *workspace gateway* to another: gateway B lets gateway A open its *workspaces*, for every device paired with A. B mints a *gateway pairing code*, and A enters it. Each side records the pairing in its own file, so auth state stays per gateway (ADR 0590).
+
+The grant is one-way: access both ways means pairing twice. **The trust is not.** B's pages open on A's address, so they can do anything A's devices can do on A. Add only a gateway you run.
+
+**Unpair** on B ends it on A's next request. **Remove** on A ends it on A and asks B to forget it too. Gateways pair over `https` only.
+See also: *gateway pairing code*, *remote gateway*, `system-knowhow/remote-access.md` § Pair a gateway.
+
+### Gateway pairing code
+The one-time code that makes a *gateway pairing*. Like a *pairing code*, it works once and expires in five minutes. It never pairs a device, and a device's code never pairs a gateway. Two places mint one: **Settings → Access → Pair a gateway**, and `lucidos pair --gateway`.
+See also: *gateway pairing*, *pairing code*, `system-knowhow/lucidos-cli.md` § `lucidos pair`.
+
+### Remote gateway
+Another *workspace gateway* this one has a *gateway pairing* with, listed under **Settings → Access → Remote gateways**. You give it a short name, such as `cloud`, when you add it.
+See also: *gateway pairing*, *remote workspace*, `system-knowhow/remote-access.md` § Pair a gateway.
+
+### Remote workspace
+A *workspace* on a *remote gateway*, opened through this gateway at `/<slug>@<name>/`, such as `/dev@cloud/`. The Workspaces list shows it under the local ones, greyed while its gateway does not answer. A thread link names one as `thread:dev@cloud/<uuid>`. Inside a remote workspace, a link without `@` means a workspace on that same remote gateway, since that gateway's agent wrote it.
+See also: *remote gateway*, *gateway pairing*.
+
 ### External address
 The address other devices use to reach this gateway, when you run the route yourself: a reverse proxy, WireGuard, a company VPN, or a Headscale name with your own certificate. One per gateway: scheme, host and optional port, no path. It wins in the *pairing address*, and an empty one leaves the QR on the tailnet address. Saving it checks that it reaches this gateway. A failed check only warns; an answer from a different gateway refuses the save. Pairing still guards it: a device on it pairs like any other.
 
@@ -1538,13 +1558,13 @@ Two caveats. A child parked on a question waits on a *human*, so urgency cannot 
 See also: *child follow-up*, *coding agent*.
 
 ### Call toggle
-The handset button in the prompt input, beside the follow toggle, that starts and ends a *voice session*: press to call, press again to ring off. It is green while a call is up and grey while hanging up. Point at it and it turns red, which is what the next press does. A slow connect says it is waiting for microphone access, which the browser asks for once per launch.
+The handset button in the prompt input's row that starts and ends a *voice session*: press to call, press again to ring off. It is green while a call is up and grey while hanging up. Point at it and it turns red, which is what the next press does. A slow connect says it is waiting for microphone access, which the browser asks for once per launch.
 
 It is a toggle, not a hold-to-talk microphone: the microphone stays open for the whole call. It sits in the *home thread*'s prompt input, the one place a call runs.
 
 **Holding it picks which microphone a call opens**, from those this browser can see. Otherwise a call takes the system default, which on a Mac can be a nearby iPhone. The choice is per device and applies from your next call.
 
-**Two things hide it, and a live call overrides them both**, so you never lose the ring-off button. Voice ships off; Settings → Models → Voice is the switch. And every thread but the home thread draws no handset.
+**Three things hide it, and a live call overrides them all**, so you never lose the ring-off button. Voice ships off; Settings → Models → Voice is the switch. Every thread but the home thread draws no handset. And a workspace opened through another gateway draws none, because that relay carries no call.
 See also: *voice session*, *home thread*.
 
 ### Voice session
@@ -1555,6 +1575,8 @@ It starts and ends at the *call toggle*. It also ends when you open another thre
 **A call runs on the home thread, and nowhere else.** Every other thread offers no call: the handset is absent, and the engine refuses one placed any other way. From Home, Lucidos can still reach the rest of your work: it reads any thread and follows one up when you ask.
 
 During a call the handset stays green; there is no separate panel. What each of you says lands in the thread as it is said. Your bubble appears as you start speaking and pulses until your words arrive. Speaking over the assistant stops it mid-word, as on the phone.
+
+**Not in a workspace opened through another gateway.** That gateway relays pages and requests, but no call. Settings → Models → Voice says so there, with no switch.
 
 **Experimental, and off until you turn it on** at **Settings → Models → Voice**. The voice page also holds the call's two models, its voice, and what it loads before starting. One model talks; the other turns your speech into text. A call with no talker says so, with a button straight there.
 
@@ -1886,6 +1908,22 @@ The lane has one line in the Lucidos menu while a batch is open or a change wait
 - the *main check*: passing, running, or red with its *fix thread* and **Close**.
 
 A change's Changes panel row and its thread's prompt row say the same. In the open batch they read "Landing in a batch" and link the lane thread. A waiting change reads "Waiting to land", and its Changes panel row offers **Remove** (`DELETE /api/v1/changes/:id/queue`).
+
+While this gateway holds a *gateway pairing*, the lane uses *origin-first landing*.
+
+### Origin-first landing
+How the *landing lane* lands a Lucidos-source change while this gateway holds a *gateway pairing*, in either direction (ADR 0589). A change has landed only once `origin/main` holds it. The lane fetches, builds on the newer of `main` and `origin/main`, and pushes before `main` moves. Sometimes `origin` cannot take the push, or the gateway cannot say whether it is paired. The lane's line then reads "Waiting for origin", and its changes stay queued.
+
+Without a pairing, the lane lands locally and pushes afterwards, and a failed push raises a toast.
+See also: *landing lane*, *follow main*, *gateway pairing*.
+
+### Follow main
+How a source checkout with an `origin` remote keeps its `main` current, only while a *gateway pairing* exists. Every `follow_main_interval_minutes` it fetches `origin/main` and fast-forwards local `main` to a newer one, which then builds in the background. **Switch to new version** still waits for a tap. A *landing nudge* makes it check at once.
+See also: *origin-first landing*, *landing nudge*.
+
+### Landing nudge
+The call a gateway makes to each *remote gateway* after it pushes a new `main` to `origin`. Each one then *follows main* at once, rather than at its next interval. A lost nudge costs one interval, and an older gateway that lacks the call is skipped quietly.
+See also: *follow main*, *gateway pairing*.
 
 ### Lane batch
 The changes a *landing lane* pass could not merge cleanly onto `main`, resolving together in one *lane thread*. At most one resolves at a time. The batch lands whole, one merge commit per change, or fails whole. A failed batch leaves every member pending and *apply-ready*, and nothing queues it again until Apply is pressed. Announced by `LaneBatchStarted`, and ended by `LaneBatchLanded` or `LaneBatchFailed`. Cancel one with `POST /api/v1/changes/lane/cancel`.

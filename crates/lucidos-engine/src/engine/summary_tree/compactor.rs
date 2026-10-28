@@ -172,6 +172,9 @@ struct Backfill {
     nodes: HashMap<SummaryScope, NodeCount>,
     /// The owed scopes whose last drain failed, until one completes.
     failing: HashSet<SummaryScope>,
+    /// The scopes this backfill has built. A re-seed never owes one again, so
+    /// the count never steps back; live work keeps the tree current.
+    built: HashSet<SummaryScope>,
 }
 
 /// One owed scope's nodes: built so far, and needed in all.
@@ -453,43 +456,56 @@ impl Compactor {
                 gate.insert(scope);
             }
         }
-        log!(
-            "[SummaryTree] Seeding {} scopes (ready: {}, {} owed, {} before ready, swept {} nodes of deleted threads)",
-            scopes.len(),
-            ready,
-            owed.len(),
-            gate.len(),
-            swept
-        );
-        let owed_nothing = owed.is_empty();
-        {
+        let scope_count = scopes.len();
+        let nothing_left = {
             let mut q = self.queue.lock().unwrap();
             // A drain running through the re-seed keeps counting its nodes,
             // and a failing scope keeps failing until it completes.
-            let (nodes, failing) = match q.backfill.take() {
-                Some(old) => (
-                    old.nodes
-                        .into_iter()
-                        .filter(|(scope, _)| owed.contains(scope))
-                        .collect(),
-                    old.failing.intersection(&owed).copied().collect(),
-                ),
+            let (nodes, failing, built) = match q.backfill.take() {
+                Some(old) => {
+                    // A built scope is never owed again, so the count never
+                    // steps back. The workspace stays in the gate: its drain
+                    // is what sets the ready flag.
+                    owed.retain(|scope| !old.built.contains(scope));
+                    gate.retain(|scope| {
+                        *scope == SummaryScope::Workspace || !old.built.contains(scope)
+                    });
+                    (
+                        old.nodes
+                            .into_iter()
+                            .filter(|(scope, _)| owed.contains(scope))
+                            .collect(),
+                        old.failing.intersection(&owed).copied().collect(),
+                        old.built,
+                    )
+                }
                 None => Default::default(),
             };
-            q.backfill = (!owed_nothing).then(|| Backfill {
+            log!(
+                "[SummaryTree] Seeding {} scopes (ready: {}, {} owed, {} before ready, swept {} nodes of deleted threads)",
+                scope_count,
+                ready,
+                owed.len(),
+                gate.len(),
+                swept
+            );
+            let nothing_left = owed.is_empty() && gate.is_empty();
+            q.backfill = (!nothing_left).then(|| Backfill {
                 // A thread created between the two reads is owed but uncounted.
-                total: trees.max(scopes.len()),
+                total: trees.max(scope_count),
                 owed,
                 gate,
                 ready,
                 nodes,
                 failing,
+                built,
             });
             for scope in scopes {
                 mark_dirty_in(&mut q, scope, false);
             }
-        }
-        if owed_nothing {
+            nothing_left
+        };
+        if nothing_left {
             self.close_episode().await;
         }
         self.wake.notify_waiters();
@@ -806,6 +822,9 @@ impl Compactor {
                 match outcome {
                     Drained::Complete => {
                         progressed = backfill.owed.remove(&scope);
+                        if progressed {
+                            backfill.built.insert(scope);
+                        }
                         backfill.nodes.remove(&scope);
                         backfill.failing.remove(&scope);
                         if backfill.gate.remove(&scope) && backfill.gate.is_empty() {

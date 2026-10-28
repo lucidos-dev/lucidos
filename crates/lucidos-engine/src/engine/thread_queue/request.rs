@@ -210,6 +210,12 @@ pub enum ThreadQueueRequest {
         /// spawn that queues across a restart still folds into its parent.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         integrated: bool,
+        /// The trigger whose fire asked for this thread: a script fire's
+        /// `lucidos spawn-thread`, read off its verified origin token. Cost
+        /// attribution reads it from the `ThreadQueued` payload. It marks no
+        /// event, so the spawn still wakes the trigger (ADR 0137).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawning_trigger_id: Option<String>,
     },
 }
 
@@ -422,6 +428,7 @@ mod tests {
             wake_mode: None,
             app_id: None,
             integrated: false,
+            spawning_trigger_id: None,
         };
         assert_eq!(mk(false).kind(), ThreadQueueKind::SubThread);
         assert_eq!(mk(true).kind(), ThreadQueueKind::CodingAgent);

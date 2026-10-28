@@ -140,11 +140,12 @@ codegen_sync() { # <rendering> <root>
     python3 "$root/scripts/lib/codegen_blocks.py" sync "$from/$CODEGEN_BLOCKS" "$root"
 }
 
-# The rendering for <fingerprint>, if the cache holds one.
+# The rendering for <fingerprint>, if the cache holds one. A hit refreshes its
+# mtime, so the prune keeps what checkouts still read.
 codegen_cached() { # <root> <fingerprint>
     local dir
     dir="$(codegen_cache_root "$1")/$2"
-    [ -d "$dir" ] && echo "$dir"
+    [ -d "$dir" ] && touch "$dir" && echo "$dir"
 }
 
 # Render into the cache under <fingerprint>. With <bin>, run that freshly built

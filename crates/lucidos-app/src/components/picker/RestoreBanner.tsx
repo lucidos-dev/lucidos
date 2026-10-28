@@ -7,13 +7,13 @@
  *
  * Two rules the states do NOT share:
  *
- * - **Completed carries no buttons and leaves on its own.** By the time it says
- *   "Restored X" the restored workspace is already a row in the list above,
- *   healthy and clickable, so an Open button duplicates the row and a Dismiss
- *   button asks the user to tidy up after a success. The caller clears the
- *   gateway's terminal status on a timer instead (see `WorkspacePicker`).
- * - **Failed keeps its Dismiss.** An error the user has not read must not
- *   disappear on a timer.
+ * - **A clean completion carries no buttons and leaves on its own.** By the
+ *   time it says "Restored X" the restored workspace is already a row in the
+ *   list above, healthy and clickable. An Open button duplicates the row, and
+ *   a Dismiss button asks the user to tidy up after a success. The caller clears
+ *   the gateway's terminal status on a timer instead (see `WorkspacePicker`).
+ * - **Failed, and completed with warnings, keep a Dismiss.** Something the user
+ *   has not read must not disappear on a timer.
  */
 
 import type { VNode } from 'preact';
@@ -35,8 +35,13 @@ export interface RestoreBannerProps {
   /** Latest gateway restore status, or null before the first poll lands. */
   status: GwRestoreStatus | null;
   busy: boolean;
-  /** Acknowledge a FAILED restore. Not offered for the other states. */
+  /** Acknowledge a failed restore, or one completed with warnings. */
   onDismiss: () => void;
+}
+
+/** A completed restore with warnings waits for a Dismiss, like a failure. */
+export function restoreNeedsReading(s: GwRestoreStatus): boolean {
+  return s.status === 'completed' && s.warnings.length > 0;
 }
 
 export function restoreBanner(p: RestoreBannerProps): VNode | null {
@@ -61,10 +66,21 @@ export function restoreBanner(p: RestoreBannerProps): VNode | null {
     );
   }
 
-  if (s.status === 'completed') {
+  if (s.status === 'completed' && !restoreNeedsReading(s)) {
     return (
       <div class="ws-picker-restore-banner" data-state="completed">
         <span class="ws-picker-restore-text">Restored “{s.name}”</span>
+      </div>
+    );
+  }
+
+  if (s.status === 'completed') {
+    return (
+      <div class="ws-picker-restore-banner" data-state="completed-with-warnings">
+        <span class="ws-picker-restore-text">
+          Restored “{s.name}”, but: {s.warnings.join(' ')} The backup still holds them.
+        </span>
+        <button class="ws-picker-btn" disabled={p.busy} onClick={p.onDismiss}>Dismiss</button>
       </div>
     );
   }

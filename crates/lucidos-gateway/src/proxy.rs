@@ -36,24 +36,26 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-fn is_hop_by_hop(name: &HeaderName) -> bool {
+pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
     let n = name.as_str();
     HOP_BY_HOP.iter().any(|h| n.eq_ignore_ascii_case(h))
 }
 
 /// Does the gateway own this request header, rather than forwarding it?
 ///
-/// The trust boundary, and one definition for both paths. Six names are the
+/// The trust boundary, and one definition for every hop. Nine names are the
 /// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, the device id and label,
-/// and the two engine credentials. A client-supplied one must never reach the
-/// engine. The caller re-injects the prefix, the device headers and the local
-/// token with its own values. Whoever sends the upstream request re-frames
-/// `HOST` and `CONTENT_LENGTH`.
+/// the two engine credentials, the gateway credential and the relay claim and
+/// its signature. A client-supplied one must never reach the engine, nor
+/// another gateway. The caller re-injects the prefix, the device headers and
+/// the local token with its own values. Whoever sends the upstream request
+/// re-frames `HOST` and `CONTENT_LENGTH`.
 ///
 /// The two credentials are here for the reason the device id is, one step
 /// sharper. A wide-bound engine reads them as authorization
 /// (`lucidos_engine::api::local_auth`), so a client-chosen value would BE the
-/// authorization. Only the hook socket presents the hook socket token.
+/// authorization. Only the hook socket presents the hook socket token. A gateway
+/// credential (ADR 0590) is a secret no engine reads, so it never leaves here.
 ///
 /// `keep_handover` marks the upgrade path, where three headers differ.
 /// `connection` and `upgrade` are kept: there they ARE the handshake, not
@@ -61,7 +63,7 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// judges it here, in [`foreign_origin`], and consumes it (ADR 0163). The HTTP
 /// path forwards it for the engine's gate, except where [`vouches_for_origin`]
 /// consumes it.
-fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
+pub(crate) fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
     let n = name.as_str();
     if name == header::HOST
         || name == header::CONTENT_LENGTH
@@ -71,6 +73,9 @@ fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
         || n.eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_LABEL)
         || n.eq_ignore_ascii_case(crate::auth::HEADER_LOCAL_TOKEN)
         || n.eq_ignore_ascii_case(crate::auth::HEADER_HOOK_SOCKET_TOKEN)
+        || n.eq_ignore_ascii_case(crate::gateway_protocol::HEADER_GATEWAY_CREDENTIAL)
+        || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_CLAIM)
+        || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_SIGNATURE)
     {
         return true;
     }
@@ -158,7 +163,7 @@ fn foreign_origin(headers: &HeaderMap) -> Option<&str> {
 /// forwarded, and the engine refuses it. This hop never refuses an ordinary
 /// request itself: the engine's app-asset exemption admits a font fetch from an
 /// opaque-origin frame, which carries `Origin: null`.
-fn vouches_for_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn vouches_for_origin(headers: &HeaderMap) -> bool {
     headers.contains_key(header::ORIGIN)
         && !headers.contains_key("sec-fetch-site")
         && foreign_origin(headers).is_none()
@@ -169,7 +174,7 @@ fn vouches_for_origin(headers: &HeaderMap) -> bool {
 /// Both halves are required. `Connection` is a comma-separated LIST and a
 /// browser sends `keep-alive, Upgrade`, so a whole-value compare misses it.
 /// `Upgrade` names the protocol, and only websocket takes the splice path.
-fn is_websocket_upgrade(req: &axum::extract::Request) -> bool {
+pub(crate) fn is_websocket_upgrade(req: &axum::extract::Request) -> bool {
     let hands_over = req
         .headers()
         .get(header::CONNECTION)
@@ -232,13 +237,17 @@ fn strip_frame_capability(path_and_query: &str) -> Cow<'_, str> {
 }
 
 /// Proxy `req` to the engine at `engine`, stripping the `/<slug>` prefix and
-/// any frame capability, and adding `X-Forwarded-Prefix: /<slug>/`.
+/// any frame capability, and adding `X-Forwarded-Prefix: <prefix>`.
+///
+/// `prefix` is where the browser sees this workspace: `/<slug>/` here, or
+/// `/<slug>@<name>/` for a request another gateway relayed (ADR 0591).
 ///
 /// The hop is the engine socket ([`crate::engine_hop`]), so nothing below is
 /// written to a listener the kernel does not name as this user's.
 pub async fn proxy(
     engine: &EngineAddress,
     slug: &str,
+    prefix: &str,
     boot_label: &str,
     local_token: &str,
     req: axum::extract::Request,
@@ -252,10 +261,10 @@ pub async fn proxy(
 
     let Some(rest) = strip_prefix(&path_and_query, slug) else {
         // "/<slug>" with no trailing slash → redirect so the SPA shell loads at
-        // a path where the engine's injected <base href="/<slug>/"> resolves.
+        // a path where the engine's injected <base href="<prefix>"> resolves.
         return Response::builder()
             .status(StatusCode::TEMPORARY_REDIRECT)
-            .header(header::LOCATION, format!("/{slug}/"))
+            .header(header::LOCATION, prefix)
             .body(Body::empty())
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     };
@@ -263,7 +272,7 @@ pub async fn proxy(
     let rest = rest.as_ref();
 
     if is_websocket_upgrade(&req) {
-        return proxy_upgrade(engine, rest, slug, local_token, req).await;
+        return proxy_upgrade(engine, rest, slug, prefix, local_token, req).await;
     }
 
     // Forward request headers verbatim except the ones the gateway owns
@@ -292,7 +301,7 @@ pub async fn proxy(
             upstream = upstream.header(name, value);
         }
     }
-    upstream = upstream.header("x-forwarded-prefix", format!("/{slug}/"));
+    upstream = upstream.header("x-forwarded-prefix", prefix);
     if let Some(device) = parts.extensions.get::<crate::auth::AuthenticatedDevice>() {
         for (name, value) in device.forwarded_headers() {
             upstream = upstream.header(name, value);
@@ -380,6 +389,7 @@ async fn proxy_upgrade(
     engine: &EngineAddress,
     rest: &str,
     slug: &str,
+    prefix: &str,
     local_token: &str,
     mut req: axum::extract::Request,
 ) -> Response {
@@ -418,7 +428,7 @@ async fn proxy_upgrade(
             upstream = upstream.header(name, value);
         }
     }
-    upstream = upstream.header("x-forwarded-prefix", format!("/{slug}/"));
+    upstream = upstream.header("x-forwarded-prefix", prefix);
     if let Some(device) = req.extensions().get::<crate::auth::AuthenticatedDevice>() {
         for (name, value) in device.forwarded_headers() {
             upstream = upstream.header(name, value);
@@ -1403,7 +1413,15 @@ mod proxy_tests {
             .header("accept-language", "en-US")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -1429,6 +1447,7 @@ mod proxy_tests {
         let resp = proxy(
             &target,
             "dev",
+            "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
             request(
@@ -1492,7 +1511,15 @@ mod proxy_tests {
             .header("x-forwarded-prefix", "/evil/")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -1520,7 +1547,15 @@ mod proxy_tests {
             .header("x-forwarded-host", "evil.example")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -1547,7 +1582,15 @@ mod proxy_tests {
             builder = builder.header("sec-fetch-site", site);
         }
         let req = builder.body(Body::empty()).unwrap();
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let seen = captured.lock().await;
         seen.to_lowercase()
@@ -1603,7 +1646,15 @@ mod proxy_tests {
         // is sent either way so the two topologies take one code path.
         let (_dir, target, captured) = capturing_upstream().await;
         let req = request("GET", "/dev/api/v1/threads/list", Body::empty());
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -1632,7 +1683,15 @@ mod proxy_tests {
                 .header(spoofed, "client-forged-secret")
                 .body(Body::empty())
                 .unwrap();
-            let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+            let resp = proxy(
+                &target,
+                "dev",
+                "/dev/",
+                DEFAULT_LABEL,
+                TEST_LOCAL_TOKEN,
+                req,
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::OK);
             let got = captured.lock().await.to_lowercase();
             assert!(
@@ -1648,7 +1707,15 @@ mod proxy_tests {
         // proxied request a second credential, and widen what a proxy bug leaks.
         let (_dir, target, captured) = capturing_upstream().await;
         let req = request("GET", "/dev/", Body::empty());
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -1664,7 +1731,15 @@ mod proxy_tests {
         let (_dir, target, captured) = capturing_upstream().await;
         let mut req = request("GET", "/dev/", Body::empty());
         req.extensions_mut().insert(test_device("device-1"));
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -1690,7 +1765,15 @@ mod proxy_tests {
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(test_device("device-1"));
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -1719,7 +1802,15 @@ mod proxy_tests {
             .header("x-lucidos-device-label", "unproven-label")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await;
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -1733,6 +1824,7 @@ mod proxy_tests {
         let resp = proxy(
             &test_engine::unreachable(&test_engine::scratch()),
             "dev",
+            "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
             request("GET", "/dev", Body::empty()),
@@ -1755,6 +1847,7 @@ mod proxy_tests {
         let resp = proxy(
             &target,
             "dev",
+            "/dev/",
             "Running migrations…",
             TEST_LOCAL_TOKEN,
             request("GET", "/dev/", Body::empty()),
@@ -1791,6 +1884,7 @@ mod proxy_tests {
         let resp = proxy(
             &test_engine::unreachable(&dir),
             "dev",
+            "/dev/",
             "Starting engine…",
             TEST_LOCAL_TOKEN,
             req,
@@ -1841,6 +1935,7 @@ mod proxy_tests {
         let resp = proxy(
             &engine,
             "dev",
+            "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
             request("GET", "/dev/api/v1/events", Body::empty()),
@@ -1876,6 +1971,7 @@ mod proxy_tests {
         let resp = proxy(
             &target.held_by_a_stranger(),
             "dev",
+            "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
             req,
@@ -1981,7 +2077,15 @@ mod upgrade_tests {
                 if let Some(id) = device {
                     req.extensions_mut().insert(test_device(id));
                 }
-                proxy(&target, "dev", DEFAULT_LABEL, TEST_LOCAL_TOKEN, req).await
+                proxy(
+                    &target,
+                    "dev",
+                    "/dev/",
+                    DEFAULT_LABEL,
+                    TEST_LOCAL_TOKEN,
+                    req,
+                )
+                .await
             }
         });
         tokio::spawn(async move {

@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   fetchWorkspaces: vi.fn(),
   listWorkspaces: vi.fn(),
+  listRemoteWorkspaces: vi.fn(),
   locateWorkspace: vi.fn(),
   openUrl: vi.fn(),
   showToast: vi.fn(),
@@ -25,14 +26,20 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../api/client', () => ({ fetchWorkspaces: mocks.fetchWorkspaces }));
 vi.mock('../../api/client/control', () => ({
   listWorkspaces: mocks.listWorkspaces,
+  listRemoteWorkspaces: mocks.listRemoteWorkspaces,
   locateWorkspace: mocks.locateWorkspace,
 }));
 vi.mock('../../utils/basePath', async () => {
   const actual = await vi.importActual<typeof import('../../utils/basePath')>('../../utils/basePath');
   return {
-    isWorkspaceSlug: actual.isWorkspaceSlug,
+    parseWorkspaceRoute: actual.parseWorkspaceRoute,
+    workspaceRouteSegment: actual.workspaceRouteSegment,
+    workspaceRouteUrlSegment: actual.workspaceRouteUrlSegment,
     get WORKSPACE_ID() {
       return mocks.workspaceId;
+    },
+    get REMOTE_GATEWAY() {
+      return mocks.workspaceId === null ? null : (actual.parseWorkspaceRoute(mocks.workspaceId)?.gateway ?? null);
     },
     get GATEWAY_PORT() {
       return mocks.gatewayPort;
@@ -472,23 +479,124 @@ describe('openThreadAcrossWorkspaces', () => {
   });
 });
 
+describe('thread links on and to a remote gateway', () => {
+  const remoteList = (workspaces: { id: string; name: string; health: 'healthy' | 'unhealthy' }[]) => [
+    { gateway: 'cloud', state: 'reachable', workspaces },
+  ];
+
+  beforeEach(() => {
+    stubLocation('https://localhost:5251');
+    mocks.listWorkspaces.mockResolvedValue([gwEntry({ id: 'dev', name: 'dev' })]);
+    mocks.listRemoteWorkspaces.mockResolvedValue(remoteList([{ id: 'dev', name: 'dev', health: 'healthy' }]));
+  });
+
+  // The invariant: B's agent writes `thread:dev/<uuid>` about B's own dev. On
+  // A's origin that must open B's dev through the relay, never A's own dev.
+  it("opens an unqualified link inside a remote workspace on that gateway, not this gateway's namesake", async () => {
+    mocks.workspaceId = 'notes@cloud';
+    workspaceName.value = 'notes';
+
+    openThreadAcrossWorkspaces('dev', TID);
+    await vi.waitFor(() => expect(mocks.windowOpen).toHaveBeenCalled());
+
+    expect(mocks.windowOpen).toHaveBeenCalledWith(
+      `https://localhost:5251/dev@cloud/#thread=${TID}`,
+      'lucidos-ws-dev@cloud',
+    );
+    expect(mocks.listWorkspaces).not.toHaveBeenCalled();
+  });
+
+  it('focuses in place when an unqualified link inside a remote workspace names it', () => {
+    mocks.workspaceId = 'dev@cloud';
+    workspaceName.value = 'dev';
+
+    openThreadAcrossWorkspaces('dev', TID);
+
+    expect(mocks.focusThreadOrBootstrap).toHaveBeenCalledWith(TID);
+  });
+
+  it('opens a qualified link from a local page through the relay', async () => {
+    mocks.workspaceId = 'dev';
+    workspaceName.value = 'dev';
+
+    openThreadAcrossWorkspaces('dev@cloud', TID);
+    await vi.waitFor(() => expect(mocks.windowOpen).toHaveBeenCalled());
+
+    expect(mocks.windowOpen).toHaveBeenCalledWith(
+      `https://localhost:5251/dev@cloud/#thread=${TID}`,
+      'lucidos-ws-dev@cloud',
+    );
+  });
+
+  it('opens the remote workspace in a native window under Tauri', async () => {
+    mocks.workspaceId = 'dev';
+    mocks.isTauri.mockReturnValue(true);
+
+    await openThreadInWorkspace('dev@cloud', TID);
+
+    expect(mocks.showWorkspaceInNativeWindow).toHaveBeenCalledWith('dev@cloud', { thread: TID });
+  });
+
+  it('says so, naming the gateway, when the remote gateway lists no such workspace', async () => {
+    mocks.workspaceId = 'dev';
+    mocks.listRemoteWorkspaces.mockResolvedValue(remoteList([]));
+
+    await openThreadInWorkspace('gone@cloud', TID);
+
+    expect(mocks.showToast).toHaveBeenCalledWith(
+      "Workspace 'gone' on remote gateway 'cloud' is not available",
+      'error',
+    );
+    expect(mocks.windowOpen).not.toHaveBeenCalled();
+    expect(mocks.locateWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('navigates to the slug of the name while the remote gateway is silent', async () => {
+    mocks.workspaceId = 'dev';
+    mocks.listRemoteWorkspaces.mockResolvedValue([{ gateway: 'cloud', state: 'unreachable', reason: 'down' }]);
+
+    await openThreadInWorkspace('My Notes@cloud', TID);
+
+    expect(mocks.windowOpen).toHaveBeenCalledWith(
+      `https://localhost:5251/my-notes@cloud/#thread=${TID}`,
+      'lucidos-ws-my-notes@cloud',
+    );
+  });
+
+  it('reads no title from a remote workspace that is not running', async () => {
+    mocks.workspaceId = 'dev';
+    mocks.listRemoteWorkspaces.mockResolvedValue(remoteList([{ id: 'dev', name: 'dev', health: 'unhealthy' }]));
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+
+    await ensureCrossWorkspaceThreadTitle('dev@cloud', TID);
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe('parseWorkspaceThreadUrl', () => {
   beforeEach(() => {
     stubLocation('https://localhost:5251');
   });
 
-  it('reads the slug and the thread out of a workspace thread URL', () => {
+  it('reads the route and the thread out of a workspace thread URL', () => {
     expect(parseWorkspaceThreadUrl(`https://localhost:5251/demo/#thread=${TID}`)).toEqual({
-      slug: 'demo',
+      route: 'demo',
       threadId: TID,
     });
     expect(parseWorkspaceThreadUrl(`https://localhost:5251/my-ws/#thread=${TID}`)).toEqual({
-      slug: 'my-ws',
+      route: 'my-ws',
       threadId: TID,
     });
     // Without the trailing slash too.
     expect(parseWorkspaceThreadUrl(`https://localhost:5251/demo#thread=${TID}`)).toEqual({
-      slug: 'demo',
+      route: 'demo',
+      threadId: TID,
+    });
+    // A workspace on a remote gateway, served here through the relay.
+    expect(parseWorkspaceThreadUrl(`https://localhost:5251/dev@cloud/#thread=${TID}`)).toEqual({
+      route: 'dev@cloud',
       threadId: TID,
     });
   });
@@ -504,6 +612,7 @@ describe('parseWorkspaceThreadUrl', () => {
       `https://localhost:5251/#thread=${TID}`,
       `https://localhost:5251/~/#thread=${TID}`,
       `https://localhost:5251/Demo/#thread=${TID}`,
+      `https://localhost:5251/demo@/#thread=${TID}`,
       `https://localhost:5251/demo/?x=1#thread=${TID}`,
       'https://localhost:5251/demo/',
       `https://localhost:5251/demo/#notification=${TID}&thread=${TID}`,
@@ -527,7 +636,7 @@ describe('openWorkspaceThreadUrl', () => {
   it('focuses the thread in place when the URL names this workspace', () => {
     mocks.isTauri.mockReturnValue(true);
 
-    openWorkspaceThreadUrl({ slug: 'demo', threadId: TID });
+    openWorkspaceThreadUrl({ route: 'demo', threadId: TID });
 
     expect(mocks.focusThreadOrBootstrap).toHaveBeenCalledWith(TID);
     expect(mocks.showWorkspaceInNativeWindow).not.toHaveBeenCalled();
@@ -539,7 +648,7 @@ describe('openWorkspaceThreadUrl', () => {
   it("opens another workspace's window on the thread under Tauri", async () => {
     mocks.isTauri.mockReturnValue(true);
 
-    openWorkspaceThreadUrl({ slug: 'dev', threadId: TID });
+    openWorkspaceThreadUrl({ route: 'dev', threadId: TID });
     await vi.waitFor(() =>
       expect(mocks.showWorkspaceInNativeWindow).toHaveBeenCalledWith('dev', { thread: TID }),
     );
@@ -550,7 +659,7 @@ describe('openWorkspaceThreadUrl', () => {
 
   // The same named tab a workspace row and a thread link reach.
   it("opens another workspace's tab on the thread in a browser", () => {
-    openWorkspaceThreadUrl({ slug: 'dev', threadId: TID });
+    openWorkspaceThreadUrl({ route: 'dev', threadId: TID });
 
     expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5251/dev/#thread=${TID}`, 'lucidos-ws-dev');
   });

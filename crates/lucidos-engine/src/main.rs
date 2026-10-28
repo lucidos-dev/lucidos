@@ -518,7 +518,9 @@ async fn run_secrets() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// The key and the connection string both arrive through the environment, so
 /// neither lands in argv, which `ps` shows. Prints
 /// `LUCIDOS_RESTORE_PHASE=<phase>:<pct>` lines so the gateway can show coarse
-/// progress in the picker, and exits non-zero with the error on stderr.
+/// progress in the picker, and one `LUCIDOS_RESTORE_WARNING=<text>` line per
+/// warning the picker shows once it is done. Exits non-zero with the error on
+/// stderr.
 async fn run_restore_archive() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::io::Write;
 
@@ -545,7 +547,7 @@ async fn run_restore_archive() -> Result<(), Box<dyn std::error::Error + Send + 
         .map_err(|e| format!("restore-archive: {e}"))?;
     let database_url = lucidos_engine::core::database_url();
 
-    lucidos_engine::core::backup::restore_archive_into(
+    let warnings = lucidos_engine::core::backup::restore_archive_into(
         &workspace_dir,
         &database_url,
         key,
@@ -559,6 +561,15 @@ async fn run_restore_archive() -> Result<(), Box<dyn std::error::Error + Send + 
         },
     )
     .await?;
+    let mut out = std::io::stdout().lock();
+    for warning in warnings {
+        writeln!(
+            out,
+            "LUCIDOS_RESTORE_WARNING={}",
+            warning.replace('\n', " ")
+        )?;
+    }
+    out.flush()?;
     Ok(())
 }
 
@@ -1082,6 +1093,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
     shared_engine.start_landing_lane_driver();
+    lucidos_engine::landing_gateway::enable();
+    shared_engine.start_follow_main();
     shared_engine.start_main_check_driver();
     shared_engine.start_standing_apply_resolver();
     shared_engine.start_archive_request_resolver();

@@ -20,6 +20,10 @@ pub struct LaneSnapshot {
     /// The queue waits for an Apply All press to hand over the rest of its
     /// changes, with no batch open (ADR 0480).
     pub gathering: bool,
+    /// Why the repository's `origin` could not take the last
+    /// landing. The lane holds what it could not push and retries (ADR 0589).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_origin: Option<String>,
 }
 
 /// The open lane batch.
@@ -61,7 +65,14 @@ impl LaneSnapshot {
             }),
             waiting: lane.waiting().iter().map(|m| m.change_id).collect(),
             gathering: lane.gathering(),
+            waiting_for_origin: None,
         }
+    }
+
+    /// The same snapshot, saying why `origin` holds the lane, if it does.
+    pub(crate) fn waiting_for_origin(mut self, why: Option<String>) -> Self {
+        self.waiting_for_origin = why;
+        self
     }
 }
 
@@ -116,6 +127,7 @@ mod tests {
                 }),
                 waiting: vec![id(3), id(4)],
                 gathering: false,
+                waiting_for_origin: None,
             }
         );
     }
@@ -171,5 +183,19 @@ mod tests {
         assert_eq!(json["waiting"], serde_json::json!([]));
         let empty = serde_json::to_value(LaneSnapshot::default()).unwrap();
         assert_eq!(empty["open_batch"], serde_json::Value::Null);
+        assert!(empty.get("waiting_for_origin").is_none());
+    }
+
+    /// While `origin` holds the lane, the snapshot carries why, for the
+    /// client to show beside what waits.
+    #[test]
+    fn the_snapshot_says_why_origin_holds_the_lane() {
+        let mut lane = Lane::default();
+        lane.wait(member(1));
+        let snapshot =
+            LaneSnapshot::of(&lane, None).waiting_for_origin(Some("could not fetch".into()));
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["waiting_for_origin"], "could not fetch");
+        assert_eq!(json["waiting"][0], id(1).to_string());
     }
 }

@@ -58,8 +58,13 @@ pub enum RestoreStatus {
         name: String,
         phase: String,
     },
-    /// Registered, and started on a best-effort basis.
-    Completed { id: String, name: String },
+    /// Registered, and started on a best-effort basis. `warnings` are what
+    /// did not come back, such as a pending change branch, for the user.
+    Completed {
+        id: String,
+        name: String,
+        warnings: Vec<String>,
+    },
     /// Failed before committing, so nothing was registered: cleanup removed the
     /// half-provisioned workspace. `error` is the user-facing message.
     Failed { name: String, error: String },
@@ -183,6 +188,15 @@ struct GatewayInner {
     /// Pairing codes minted and not yet redeemed. Never persisted: a code lives
     /// five minutes, so surviving a restart would buy nothing.
     pending_pairings: Mutex<auth::PendingPairings>,
+    /// The gateways this one has granted access to, and their pairing codes
+    /// (ADR 0590). Apart from the device store and its codes on purpose.
+    paired_gateways: crate::gateway_protocol::PairedGatewayStore,
+    /// The remote gateways this one has paired with, holding their credentials
+    /// (ADR 0590).
+    remote_gateways: crate::remote_gateways::RemoteGatewayStore,
+    /// The client every relayed request to a remote gateway goes out on, so
+    /// its connections are pooled across requests (ADR 0591).
+    relay_client: crate::relay::RelayClient,
     /// Keeps [`GatewayState::log_device_refusal`] to one line a minute. An
     /// unpaired browser is refused once per asset, so an ungated line would
     /// bury the one a reader came for.
@@ -348,6 +362,15 @@ impl GatewayState {
                 paired_devices: Mutex::new(auth::PairedDevices::default()),
                 paired_devices_writing: Mutex::new(()),
                 pending_pairings: Mutex::new(auth::PendingPairings::default()),
+                paired_gateways: crate::gateway_protocol::PairedGatewayStore::load(
+                    crate::gateway_protocol::paired_gateways_path(&scratch),
+                )
+                .unwrap(),
+                remote_gateways: crate::remote_gateways::RemoteGatewayStore::load(
+                    crate::remote_gateways::remote_gateways_path(&scratch),
+                )
+                .unwrap(),
+                relay_client: crate::relay::RelayClient::new().unwrap(),
                 refusal_log: Mutex::new(auth::LogThrottle::default()),
                 serves_tls: false,
                 engine_bin: scratch.join("lucidos-engine"),
@@ -448,6 +471,20 @@ impl GatewayState {
                 self.paired_devices().devices.len(),
             )
         );
+    }
+
+    /// The gateways this one has granted access to (ADR 0590).
+    pub fn paired_gateways(&self) -> &crate::gateway_protocol::PairedGatewayStore {
+        &self.inner.paired_gateways
+    }
+
+    /// The remote gateways this one has paired with (ADR 0590).
+    pub fn remote_gateways(&self) -> &crate::remote_gateways::RemoteGatewayStore {
+        &self.inner.remote_gateways
+    }
+
+    pub fn relay_client(&self) -> &crate::relay::RelayClient {
+        &self.inner.relay_client
     }
 
     /// The credential cookie name this gateway writes (`auth::device_cookie_name`).
@@ -662,6 +699,15 @@ impl GatewayState {
     /// The engine serving `id`, if routed. Hot path, so no async locks.
     fn route(&self, id: &str) -> Option<EngineAddress> {
         self.inner.routes.read().ok()?.get(id).cloned()
+    }
+
+    /// Every routed engine, the ones the proxy would reach now.
+    pub fn routed_engines(&self) -> Vec<EngineAddress> {
+        self.inner
+            .routes
+            .read()
+            .map(|r| r.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// The engine serving workspace `slug`, if one is running. `None` covers
@@ -2017,9 +2063,10 @@ impl GatewayState {
             let outcome = me.run_restore(ws, &archive_tmp, &backup_key).await;
             let _ = std::fs::remove_file(&archive_tmp);
             let next = match outcome {
-                Ok(()) => RestoreStatus::Completed {
+                Ok(warnings) => RestoreStatus::Completed {
                     id: id_done,
                     name: name_done,
+                    warnings,
                 },
                 Err(e) => {
                     crate::log!("[Gateway] restore '{}' failed: {}", id_done, e);
@@ -2046,7 +2093,7 @@ impl GatewayState {
         ws: Workspace,
         archive_tmp: &Path,
         backup_key: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         let resolved_dir = ws.resolve_dir(self.app_data());
         // Created exclusively, because every failure below deletes this tree.
         // The id is free in the registry, not on disk: a delete whose move to
@@ -2083,13 +2130,16 @@ impl GatewayState {
         };
 
         self.set_restore_phase("restoring");
-        if let Err(e) = self
+        let warnings = match self
             .run_restore_cli(&resolved_dir, &prov.database_url, archive_tmp, backup_key)
             .await
         {
-            self.cleanup_failed_restore(&resolved_dir, Some(&prov.handle));
-            return Err(e);
-        }
+            Ok(warnings) => warnings,
+            Err(e) => {
+                self.cleanup_failed_restore(&resolved_dir, Some(&prov.handle));
+                return Err(e);
+            }
+        };
 
         // Commit the registry entry now that the dir + database carry the restore.
         {
@@ -2146,20 +2196,21 @@ impl GatewayState {
                 );
             }
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// Shell out to `lucidos-engine restore-archive` to decrypt, unpack and
     /// pg_restore the archive. The key and database URL go via env, out of
     /// argv. Stdout `LUCIDOS_RESTORE_PHASE=<phase>:<pct>` lines drive the
-    /// picker's phase, and the tail of stderr is the failure message.
+    /// picker's phase, and `LUCIDOS_RESTORE_WARNING=<text>` lines come back as
+    /// warnings. The tail of stderr is the failure message.
     async fn run_restore_cli(
         &self,
         ws_dir: &Path,
         database_url: &str,
         archive_tmp: &Path,
         backup_key: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<String>, String> {
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
@@ -2176,19 +2227,23 @@ impl GatewayState {
             .spawn()
             .map_err(|e| format!("spawn restore-archive: {e}"))?;
 
-        // Stream stdout for coarse phase updates.
-        if let Some(stdout) = child.stdout.take() {
+        // Stream stdout for coarse phase updates and the warnings.
+        let stdout_reader = child.stdout.take().map(|stdout| {
             let me = self.clone();
             tokio::spawn(async move {
+                let mut warnings = Vec::new();
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Some(rest) = line.strip_prefix("LUCIDOS_RESTORE_PHASE=") {
                         let phase = rest.split(':').next().unwrap_or(rest);
                         me.set_restore_phase(phase);
+                    } else if let Some(warning) = line.strip_prefix("LUCIDOS_RESTORE_WARNING=") {
+                        warnings.push(warning.to_string());
                     }
                 }
-            });
-        }
+                warnings
+            })
+        });
 
         // Collect stderr for the failure message.
         let mut stderr_buf = String::new();
@@ -2209,7 +2264,14 @@ impl GatewayState {
                 msg
             });
         }
-        Ok(())
+        // The restore succeeded, so a lost reader is a warning, never a failure
+        // that would clean the restored workspace away.
+        Ok(match stdout_reader {
+            Some(reader) => reader
+                .await
+                .unwrap_or_else(|e| vec![format!("The restore's warnings could not be read: {e}")]),
+            None => Vec::new(),
+        })
     }
 
     /// Tear down a half-provisioned restore: stop the Postgres this attempt
@@ -3250,6 +3312,12 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
         );
     }
     let paired_devices = seeded.devices;
+    let paired_gateways = crate::gateway_protocol::PairedGatewayStore::load(
+        crate::gateway_protocol::paired_gateways_path(&app_data),
+    )?;
+    let remote_gateways = crate::remote_gateways::RemoteGatewayStore::load(
+        crate::remote_gateways::remote_gateways_path(&app_data),
+    )?;
     crate::log!(
         "[Gateway] inbound auth ready: {} paired device(s), local token at {}",
         paired_devices.devices.len(),
@@ -3281,6 +3349,9 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
                 paired_devices: Mutex::new(paired_devices),
                 paired_devices_writing: Mutex::new(()),
                 pending_pairings: Mutex::new(auth::PendingPairings::default()),
+                paired_gateways,
+                remote_gateways,
+                relay_client: crate::relay::RelayClient::new()?,
                 refusal_log: Mutex::new(auth::LogThrottle::default()),
                 serves_tls,
                 engine_bin,
@@ -3402,6 +3473,18 @@ pub(crate) fn gateway_router(state: GatewayState) -> Router {
         .route(crate::peers::GATEWAY_HEALTH_PATH, get(gateway_health))
         .nest("/~/api/v1/control", crate::control::router())
         .nest("/~/api/v1/auth", crate::auth_api::router())
+        .nest(
+            "/~/api/v1/remote-gateways",
+            crate::remote_gateways::router(),
+        )
+        .nest(
+            "/~/api/v1/remote-workspaces",
+            crate::remote_workspaces::router(),
+        )
+        .nest(
+            crate::gateway_protocol::GATEWAY_API_ROOT,
+            crate::gateway_protocol::router(state.clone()),
+        )
         .fallback(fallback)
         // Authorization sits in front of EVERYTHING: the proxy into each
         // workspace, the control plane and the picker's own API. Layered after
@@ -3689,6 +3772,7 @@ async fn gateway_health(State(state): State<GatewayState>) -> axum::Json<serde_j
         "role": crate::peers::GATEWAY_ROLE,
         "release": crate::LUCIDOS_RELEASE,
         "instance_id": instance_id(),
+        "gateway_protocol": crate::gateway_protocol::GATEWAY_PROTOCOL,
         "workspaces": count,
         "pending_binds": pending,
     }))
@@ -3738,24 +3822,37 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
         return serve_sigil(&state, rest, req).await;
     }
 
-    // Proxy to that workspace's engine. The one exception is the manifest: a
-    // gateway-fronted install must cover the whole gateway origin, not only
-    // `/<slug>/`, or switching workspaces leaves the installed PWA's scope.
-    let slug = path
-        .trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let slug = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    // `@` never appears in a slug, so a remote route shadows no local one.
+    if let Some((remote_slug, name)) = crate::relay::remote_route(slug) {
+        return crate::relay::relay(&state, remote_slug, name, req).await;
+    }
+    let prefix = format!("/{slug}/");
+    serve_workspace(&state, slug, &prefix, req).await
+}
+
+/// Serve `/<slug>/…` from that workspace's engine, with `prefix` as the path
+/// the browser sees it under: `/<slug>/` here, `/<slug>@<name>/` when relayed.
+///
+/// The one exception is the manifest: a gateway-fronted install must cover the
+/// whole gateway origin, not only the workspace, or switching workspaces
+/// leaves the installed PWA's scope.
+pub(crate) async fn serve_workspace(
+    state: &GatewayState,
+    slug: &str,
+    prefix: &str,
+    req: axum::extract::Request,
+) -> Response {
+    let path = req.uri().path().to_string();
     let rest = path
         .trim_start_matches('/')
         .split_once('/')
         .map(|(_, rest)| rest)
         .unwrap_or("");
-    match state.route(&slug) {
+    match state.route(slug) {
         Some(engine) => {
             if rest == "manifest.json" {
-                return serve_workspace_manifest(&state, &slug);
+                return serve_workspace_manifest(state, prefix);
             }
             // A document navigation to a workspace stuck past
             // [`BOOT_ESCAPE_BUDGET`] escapes to the manual "Back to workspaces"
@@ -3772,14 +3869,14 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 // does not land here: it renders as the ordinary splash label
                 // below, keeping the auto-refresh that carries the user in the
                 // moment an attempt succeeds.
-                if let Some(failure) = state.boot_failure(&slug).filter(|f| f.is_terminal()) {
+                if let Some(failure) = state.boot_failure(slug).filter(|f| f.is_terminal()) {
                     return if frame {
                         proxy::frame_failed_page()
                     } else {
                         proxy::failed_page(&failure.message())
                     };
                 }
-                if boot_window_stalled(state.boot_elapsed(&slug)) {
+                if boot_window_stalled(state.boot_elapsed(slug)) {
                     return if frame {
                         proxy::frame_stalled_page()
                     } else {
@@ -3792,8 +3889,8 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // than on the no-route branch below. The boot phase goes with it so
             // the proxy's connect-failure splash can narrate what the engine
             // reported. A transient restart has no phase set.
-            let boot_label = state.boot_splash_label(&slug);
-            proxy::proxy(&engine, &slug, &boot_label, state.local_token(), req).await
+            let boot_label = state.boot_splash_label(slug);
+            proxy::proxy(&engine, slug, prefix, &boot_label, state.local_token(), req).await
         }
         None => {
             // No live route. A registered-but-stopped workspace lazy-starts on
@@ -3802,10 +3899,10 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // on API, SSE, asset or service-worker traffic from an open tab.
             // Otherwise the picker's Stop shuts the engine down only for the
             // stopped app to resurrect it.
-            let registered = state.inner.registry.lock().unwrap().contains(&slug);
+            let registered = state.inner.registry.lock().unwrap().contains(slug);
             if registered {
                 if rest == "manifest.json" {
-                    return serve_workspace_manifest(&state, &slug);
+                    return serve_workspace_manifest(state, prefix);
                 }
                 let navigation = classify_navigation(&req);
                 // A frame waits for whoever starts the workspace, and lands
@@ -3827,11 +3924,11 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                     // multi-second provision and spawn. The page's auto-refresh
                     // lands once the engine is healthy.
                     let st = state.clone();
-                    let id = slug.clone();
+                    let id = slug.to_string();
                     tokio::spawn(async move { st.lazy_start(&id).await });
                     // Default until the background lazy-start records a phase.
                     // The page's poll picks up later phases.
-                    return proxy::starting_page(&state.boot_splash_label(&slug));
+                    return proxy::starting_page(&state.boot_splash_label(slug));
                 }
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -4347,9 +4444,8 @@ fn picker_start_url(pair_code: Option<&str>) -> String {
 /// the bundled relative manifest, and therefore a per-workspace scope. Gateway
 /// access widens `scope` to `/` so in-app workspace switches stay inside the
 /// PWA installed from the gateway's stable port.
-fn serve_workspace_manifest(state: &GatewayState, slug: &str) -> Response {
-    let workspace_url = format!("/{slug}/");
-    serve_gateway_manifest(state, &workspace_url, &workspace_url)
+fn serve_workspace_manifest(state: &GatewayState, workspace_url: &str) -> Response {
+    serve_gateway_manifest(state, workspace_url, workspace_url)
 }
 
 fn serve_gateway_manifest(state: &GatewayState, start_url: &str, id: &str) -> Response {

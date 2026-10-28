@@ -15,7 +15,7 @@ use super::runner::{spawn_runner, MainCheckCommand, ReportedVerdict, RunTarget, 
 use super::snapshot::{MainCheckSnapshot, MainCheckState};
 use super::{forward_landings, landing_of, CloseRefusal, LANDING_EVENT_TYPES};
 use crate::engine::event_bus::{BusEvent, EventBus, LagReplay, ReplayScope};
-use crate::engine::git_ops::git_cmd;
+use crate::engine::git_ops::{git_cmd, LandingOrder};
 use crate::engine::thread_events::{
     EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
@@ -484,12 +484,14 @@ impl Fixture {
             publish_clean_pass(
                 crate::engine::git_ops::MainLocks::private_for_test(),
                 &self.repo,
+                &LandingOrder::OriginFirst,
                 &[input],
             ),
         )
         .await
         .expect("the landing waits on nothing")
-        .expect("the landing published");
+        .expect("the landing published")
+        .published();
         assert_eq!(published.failed, None);
         assert_ne!(published.main_now(), published.base, "main moved");
         git(&self.repo, &["rev-parse", "main"]).await

@@ -70,6 +70,7 @@ const GATED_ROUTES: &[&str] = &[
     "/engine/rebuild",
     "/env-vars",
     "/events/emit",
+    "/follow-main/nudge",
     "/form-requests/:request_id/cancel",
     "/frontend-preview/start",
     "/frontend-preview/stop",

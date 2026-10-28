@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { normalizeBasePath, baseContextValidFor, computeGatewayPickerHref } from './basePath';
+import {
+  normalizeBasePath,
+  baseContextValidFor,
+  computeGatewayPickerHref,
+  parseWorkspaceRoute,
+  workspaceRouteUrlSegment,
+} from './basePath';
 
 // `normalizeBasePath` turns the server-stamped `<base href>` into a path prefix
 // (no trailing slash, '' at root). It is slug-agnostic — any workspace name
@@ -44,11 +50,39 @@ describe('baseContextValidFor', () => {
     expect(baseContextValidFor('a1b2')).toBe(true);
   });
 
+  it('accepts a workspace on a remote gateway, routed as <slug>@<name>', () => {
+    expect(baseContextValidFor('dev@cloud')).toBe(true);
+    expect(baseContextValidFor('work-2@box-1')).toBe(true);
+  });
+
+  it('rejects a remote route missing a half, or holding a second @', () => {
+    for (const bad of ['dev@', '@cloud', '@', 'Dev@cloud', 'dev@Cloud', 'dev@cl@oud', 'dev@-x']) {
+      expect(baseContextValidFor(bad), bad).toBe(false);
+    }
+  });
+
   it('rejects a malformed slug the gateway would never mint', () => {
     expect(baseContextValidFor('My Workspace')).toBe(false);
     expect(baseContextValidFor('-bad')).toBe(false);
     expect(baseContextValidFor('weird~slug')).toBe(false);
     expect(baseContextValidFor('a/b')).toBe(false);
+  });
+});
+
+describe('parseWorkspaceRoute', () => {
+  it('reads a local slug and a remote route apart', () => {
+    expect(parseWorkspaceRoute('dev')).toEqual({ slug: 'dev', gateway: null });
+    expect(parseWorkspaceRoute('dev@cloud')).toEqual({ slug: 'dev', gateway: 'cloud' });
+  });
+
+  it('keeps @ literal in a URL segment, since the gateway reads the raw path', () => {
+    expect(workspaceRouteUrlSegment('dev@cloud')).toBe('dev@cloud');
+    expect(workspaceRouteUrlSegment('a b')).toBe('a%20b');
+  });
+
+  it('caps a gateway name at the 32 characters the gateway allows', () => {
+    expect(parseWorkspaceRoute(`dev@${'a'.repeat(32)}`)).not.toBeNull();
+    expect(parseWorkspaceRoute(`dev@${'a'.repeat(33)}`)).toBeNull();
   });
 });
 

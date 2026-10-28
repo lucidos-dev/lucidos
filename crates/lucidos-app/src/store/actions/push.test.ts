@@ -120,6 +120,67 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
   });
 
   /**
+   * A page relayed by another gateway carries the base `/<slug>@<gateway>/`.
+   * The service worker registers under that outside prefix and the stored
+   * scope names it, so B's pushes tap back through A's origin.
+   */
+  it('a relayed page registers and subscribes under its outside prefix', async () => {
+    // The test document is a stub, so stand in the base element the engine
+    // stamps. `basePath` reads it once, at module load.
+    const stampedBase = { getAttribute: (name: string) => (name === 'href' ? '/dev@cloud/' : null) };
+    const querySelector = vi
+      .spyOn(document, 'querySelector')
+      .mockImplementation(((selector: string) =>
+        selector === 'base' ? stampedBase : null) as unknown as typeof document.querySelector);
+    try {
+      const seen: Array<{ url: string; body?: string }> = [];
+      globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        seen.push({ url, body: typeof init?.body === 'string' ? init.body : undefined });
+        if (url.endsWith('/api/v1/push/vapid-key')) {
+          return new Response(JSON.stringify({ public_key: makeVapidKey() }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+      }) as typeof fetch;
+
+      const fakeRegistration = {
+        pushManager: {
+          getSubscription: async () => null,
+          subscribe: async () => ({
+            toJSON: () => ({ endpoint: 'https://push/relayed', keys: { p256dh: 'p', auth: 'a' } }),
+          }),
+        },
+      };
+      const registrations: Array<{ script: string; scope?: string }> = [];
+      Object.defineProperty(globalThis.navigator, 'serviceWorker', {
+        value: {
+          register: async (script: string, opts?: RegistrationOptions) => {
+            registrations.push({ script, scope: opts?.scope });
+            return fakeRegistration;
+          },
+          ready: Promise.resolve(fakeRegistration),
+        },
+        configurable: true,
+      });
+      installPermissionStubs();
+
+      const { initPushSubscription } = await import('./push');
+      expect(await initPushSubscription()).toBe(true);
+
+      expect(registrations).toContainEqual({ script: '/dev@cloud/sw.js', scope: '/dev@cloud/' });
+      const subscribe = seen.find((s) => s.url === '/dev@cloud/api/v1/push/subscribe');
+      expect(subscribe, 'the subscribe POST must go under the outside prefix').toBeDefined();
+      const payload = JSON.parse(subscribe!.body!) as Record<string, string>;
+      expect(payload.scope_url).toBe('https://lucidos.test/dev@cloud/');
+    } finally {
+      querySelector.mockRestore();
+    }
+  });
+
+  /**
    * Regression guard for the divergence where `devices.push_enabled = true`
    * yet `push_subscriptions` has no row for the device, so the engine pushes
    * to no Chrome endpoint and the user sees nothing. Two known causes: the

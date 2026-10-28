@@ -459,6 +459,9 @@ mod tests {
         assert!(!is_valid_id("trail-"));
         assert!(!is_valid_id("under_score"));
         assert!(!is_valid_id("~admin")); // sigil-prefixed
+                                         // `@` separates a remote route, `/<slug>@<gateway>/` (ADR 0591).
+        assert!(!is_valid_id("dev@cloud"));
+        assert!(!is_valid_id("@cloud"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ import type { ModelChoice } from '../../store/modelSelection';
 import { preferences } from '../../store/store';
 import { Explainer } from '../shared/Explainer';
 import { Dropdown } from '../shared/Dropdown';
+import { voiceReachable } from '../../voice/socketUrl';
 import {
   DEFAULT_VOICE_TALKER_VOICE,
   VOICE_RESIDENT_SECTIONS,
@@ -166,6 +167,17 @@ export function TranscriberModelExplainer() {
 }
 
 export function VoiceSection() {
+  if (!voiceReachable()) {
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="models:voice">Voice</div>
+        <p class="settings-section-desc" data-role="voice-unreachable">
+          Voice is not available here, because this workspace is opened through another
+          gateway. Calls need a direct connection to the workspace's own gateway.
+        </p>
+      </div>
+    );
+  }
   // Subscribe to the preference signal.
   preferences.value;
   const on = voiceEnabled();

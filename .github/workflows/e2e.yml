@@ -99,6 +99,10 @@ jobs:
           prefix-key: v0-rust-e2e
           shared-key: linux
           save-if: false
+      - name: Block parcel.pyke.io (the ONNX Runtime mirror must be enough, ADR 0595)
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh
+
       # The newest target/ state the plan found, so cargo compiles only what changed.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         if: needs.plan.outputs.linux_target_run != ''
@@ -150,6 +154,10 @@ jobs:
           prefix-key: v0-rust-e2e
           shared-key: macos
           save-if: false
+      - name: Block parcel.pyke.io (the ONNX Runtime mirror must be enough, ADR 0595)
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh
+
       # The newest target/ state the plan found, so cargo compiles only what changed.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         if: needs.plan.outputs.macos_target_run != ''
@@ -219,6 +227,10 @@ jobs:
           prefix-key: v0-rust-e2e
           shared-key: linux
           save-if: false
+      - name: Block parcel.pyke.io (the ONNX Runtime mirror must be enough, ADR 0595)
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         if: needs.build-linux.result == 'success'
         with:
@@ -348,6 +360,10 @@ jobs:
           prefix-key: v0-rust-e2e
           shared-key: linux
           save-if: false
+      - name: Block parcel.pyke.io (the ONNX Runtime mirror must be enough, ADR 0595)
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh
+
       - name: Prepare the runner
         run: |
           git config --global user.name "Lucidos e2e"
@@ -394,6 +410,10 @@ jobs:
           prefix-key: v0-rust-e2e
           shared-key: ${{ matrix.key }}
           save-if: true
+      - name: Block parcel.pyke.io (the ONNX Runtime mirror must be enough, ADR 0595)
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh
+
       - id: build
         run: ./scripts/e2e-github-shard.sh build build-out
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2

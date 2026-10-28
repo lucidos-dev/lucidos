@@ -8,6 +8,12 @@ import type { ComponentChildren, VNode } from 'preact';
 import { pickerFooter, type FooterMode, type PickerFooterProps } from '../PickerFooter';
 import type { WorkspaceStatus } from '../../../api/client/control';
 import { restoreBlocker, EMPTY_RESTORE_DRAFT, type RestoreDraft } from '../workspaceForms';
+import { EMPTY_REMOTE_GATEWAY_DRAFT, TRUST_NOTE } from '../../settings/remoteGatewayForm';
+
+/** A closed form rolls away, so the walks below read it as absent. */
+function isClosedDisclosure(v: VNode<Record<string, unknown>>): boolean {
+  return typeof v.type === 'function' && v.type.name === 'Disclosure' && !v.props?.open;
+}
 
 /** Flatten a vnode tree, keeping the markers we assert on. Mirrors
  *  network-access-popover.test.tsx. */
@@ -20,7 +26,8 @@ function vnodeToText(node: ComponentChildren): string {
   // test can assert on the shared components the footer delegates to.
   const tag =
     typeof v.type === 'string' ? v.type : typeof v.type === 'function' ? v.type.name : '';
-  const attrs = ['class', 'data-picked', 'aria-pressed', 'accept', 'disabled']
+  if (isClosedDisclosure(v)) return '';
+  const attrs = ['class', 'data-picked', 'aria-expanded', 'accept', 'disabled']
     .filter((k) => v.props?.[k] !== undefined && v.props?.[k] !== false)
     .map((k) => ` ${k}="${String(v.props[k])}"`)
     .join('');
@@ -29,6 +36,15 @@ function vnodeToText(node: ComponentChildren): string {
 }
 
 const NOOP = () => {};
+
+/** The remote gateway form's props, empty and inert. */
+const REMOTE_DEFAULTS = {
+  remoteDraft: EMPTY_REMOTE_GATEWAY_DRAFT,
+  onRemoteDraft: NOOP,
+  onAddRemote: NOOP,
+  onCancelRemote: NOOP,
+  pairedRemote: null,
+};
 
 function ws(id: string, name = id): WorkspaceStatus {
   return { id, name, port: 5000, health: 'healthy', autostart: true };
@@ -57,12 +73,13 @@ function render(over: Partial<PickerFooterProps> = {}): string {
       blocker: restoreBlocker(draft, []),
       fileNote: null,
       onDeleteColliding: NOOP,
+      ...REMOTE_DEFAULTS,
       ...over,
     }),
   );
 }
 
-const MODES: FooterMode[] = ['none', 'create', 'restore'];
+const MODES: FooterMode[] = ['none', 'create', 'restore', 'remote'];
 
 describe('both entry points are always on screen', () => {
   it('renders New workspace AND Restore from backup in every mode', () => {
@@ -73,13 +90,14 @@ describe('both entry points are always on screen', () => {
       const text = render({ mode });
       expect(text, `mode=${mode}`).toContain('+ New workspace');
       expect(text, `mode=${mode}`).toContain('Restore from backup');
+      expect(text, `mode=${mode}`).toContain('Add a remote gateway');
     }
   });
 
-  it('marks the open one pressed and nothing else', () => {
-    expect(render({ mode: 'none' })).not.toContain('aria-pressed="true"');
-    expect(render({ mode: 'create' }).match(/aria-pressed="true"/g)).toHaveLength(1);
-    expect(render({ mode: 'restore' }).match(/aria-pressed="true"/g)).toHaveLength(1);
+  it('marks the open one expanded and nothing else', () => {
+    expect(render({ mode: 'none' })).not.toContain('aria-expanded="true"');
+    expect(render({ mode: 'create' }).match(/aria-expanded="true"/g)).toHaveLength(1);
+    expect(render({ mode: 'restore' }).match(/aria-expanded="true"/g)).toHaveLength(1);
   });
 
   it('opens exactly one form at a time', () => {
@@ -198,6 +216,7 @@ describe('a collision offers the workspace holding the address', () => {
       blocker: restoreBlocker(colliding, renamed),
       fileNote: null,
       onDeleteColliding,
+      ...REMOTE_DEFAULTS,
     });
     const button = findButton(node, 'Delete');
     (button?.props as { onClick?: () => void }).onClick?.();
@@ -220,6 +239,7 @@ function findSubmittingInput(node: ComponentChildren): VNode<Record<string, unkn
     return null;
   }
   const v = node as VNode<Record<string, unknown> & { children?: ComponentChildren }>;
+  if (isClosedDisclosure(v)) return null;
   if (v.type === 'input' && typeof v.props?.onKeyDown === 'function') return v;
   return findSubmittingInput(v.props?.children);
 }
@@ -235,6 +255,7 @@ function findButton(node: ComponentChildren, label: string): VNode<Record<string
     return null;
   }
   const v = node as VNode<Record<string, unknown> & { children?: ComponentChildren }>;
+  if (isClosedDisclosure(v)) return null;
   if (v.type === 'button' && vnodeToText(v.props?.children).trim().startsWith(label)) return v;
   return findButton(v.props?.children, label);
 }
@@ -264,6 +285,7 @@ describe('Enter cannot do what the button refuses', () => {
       blocker: null,
       fileNote: null,
       onDeleteColliding: NOOP,
+      ...REMOTE_DEFAULTS,
       ...over,
     });
     const input = findSubmittingInput(node);
@@ -290,3 +312,73 @@ describe('Enter cannot do what the button refuses', () => {
     expect(pressEnter({ mode: 'restore', draft: ready, blocker: null }, NOOP)).toBe(true);
   });
 });
+
+describe('the remote gateway form', () => {
+  const ready = { address: 'https://cloud.example.com', code: '12345678', name: 'cloud' };
+
+  it('holds Pair until every field is filled', () => {
+    const empty = render({ mode: 'remote' });
+    expect(empty).toMatch(/<button class="ws-picker-btn ws-picker-btn-confirm" disabled="true">Pair/);
+    const full = render({ mode: 'remote', remoteDraft: ready });
+    expect(full).toMatch(/<button class="ws-picker-btn ws-picker-btn-confirm">Pair/);
+  });
+
+  it('says early that plain http will not pair', () => {
+    const text = render({ mode: 'remote', remoteDraft: { ...ready, address: 'http://cloud.example.com' } });
+    expect(text).toContain('https only');
+    expect(text).toMatch(/ws-picker-btn-confirm" disabled="true">Pair/);
+  });
+
+  /** A paired gateway's pages run as this gateway's own, so the form says
+   *  so before anyone fills it in. */
+  it('warns to add only a gateway you run', () => {
+    expect(render({ mode: 'remote' })).toContain(TRUST_NOTE);
+  });
+
+  it('names the gateway it just paired with', () => {
+    expect(render({ mode: 'remote', pairedRemote: 'cloud' })).toContain('Paired with cloud.');
+  });
+
+  it('does not send on Enter while a field is empty', () => {
+    let sent = 0;
+    const press = (remoteDraft: typeof ready) => {
+      const node = pickerFooter({
+        ...propsFor('remote'),
+        remoteDraft,
+        onAddRemote: () => { sent += 1; },
+      });
+      const input = findSubmittingInput(node);
+      (input?.props as { onKeyDown?: (e: unknown) => void }).onKeyDown?.({ key: 'Enter' });
+    };
+    press({ ...ready, code: '' });
+    expect(sent).toBe(0);
+    press(ready);
+    expect(sent).toBe(1);
+  });
+});
+
+/** Every prop, inert, in `mode`. */
+function propsFor(mode: FooterMode): PickerFooterProps {
+  return {
+    mode,
+    onMode: NOOP,
+    busy: false,
+    restoreRunning: false,
+    name: '',
+    onName: NOOP,
+    onCreate: NOOP,
+    onCancelCreate: NOOP,
+    suggestions: [],
+    onSuggestion: NOOP,
+    createNote: null,
+    draft: EMPTY_RESTORE_DRAFT,
+    onDraft: NOOP,
+    onPickFile: NOOP,
+    onRestore: NOOP,
+    onCancelRestore: NOOP,
+    blocker: null,
+    fileNote: null,
+    onDeleteColliding: NOOP,
+    ...REMOTE_DEFAULTS,
+  };
+}

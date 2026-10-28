@@ -105,6 +105,37 @@ async fn a_call_records_on_its_own_thread_and_reuses_home() {
     teardown_test_db(&db).await;
 }
 
+/// A script fire's proxied call records on Home, stamped with the fire's
+/// trigger. The record's own task never sees the fire's ambient marker,
+/// so an unstated capture stays unstamped.
+#[tokio::test]
+async fn a_capture_stated_as_a_trigger_fire_stamps_its_row() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    AuxCapture::for_thread_or_home(&bus, None, ContextPurpose::Proxy)
+        .for_trigger_fire(Some("trg-hourly".into()))
+        .record_usage("gpt-5.4", 10, None)
+        .await;
+    crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
+        .scope("trg-ambient".into(), async {
+            AuxCapture::for_thread_or_home(&bus, None, ContextPurpose::Proxy)
+                .record_usage("gpt-5.4", 10, None)
+                .await;
+        })
+        .await;
+
+    let stamps: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT emitting_trigger_id FROM events \
+         WHERE event_type = 'ContextCaptured' ORDER BY sequence",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stamps, vec![Some("trg-hourly".to_string()), None]);
+    teardown_test_db(&db).await;
+}
+
 /// A turn row the loop never finished still records its usage.
 #[tokio::test]
 async fn an_unfinished_turn_capture_still_records() {

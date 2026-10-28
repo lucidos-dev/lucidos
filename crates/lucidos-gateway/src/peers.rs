@@ -10,7 +10,8 @@
 //! credential is forwarded, and nothing is proxied. The client navigates to the
 //! peer gateway's own origin, which authenticates the browser itself. ADR 0132
 //! refused to widen a pairing minted here into authority over another install's
-//! workspaces, and a proxy hop would do that for every link.
+//! workspaces, and a proxy hop would do that for every link. A paired remote
+//! gateway is the one proxied hop, and only by a deliberate grant (ADR 0591).
 //!
 //! **The scheme is measured.** The packaged gateway serves plain http and a dev
 //! checkout serves https, and TLS comes from launch environment recorded nowhere

@@ -1620,6 +1620,7 @@ impl LucidosEngine {
                 tx
             },
             landing_lane_snapshot: std::sync::RwLock::default(),
+            follow_main_nudge: tokio::sync::Notify::new(),
             main_check_tx: {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 crate::engine::MAIN_CHECK_RX.with(|cell| cell.borrow_mut().replace(rx));

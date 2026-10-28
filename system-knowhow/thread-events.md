@@ -841,7 +841,7 @@ cannot says why: a fixed backend, or the agent's own chat model.
 | `artifact_summary` | The summary written for a file the `import_file` tool imported. | the agent's own |
 | `side_question` | One *side question*: a Lucidos Agent round, or a Claude Code session copy's whole run. | the agent's own |
 | `web_search` | One `web_search` call, on whichever backend answered. | fixed per backend |
-| `proxy` | One model call an app or script made through the credentialed proxy (`/api/v1/proxy/...`, `lucidos proxy`). Recorded on the thread whose subprocess made it, else on the home thread. Only a reply carrying a usage block records. | the caller's |
+| `proxy` | One model call an app or script made through the credentialed proxy (`/api/v1/proxy/...`, `lucidos proxy`). Recorded on the thread whose subprocess made it, else on the home thread. A call made during a trigger fire also carries that trigger in `emitting_trigger_id`, beside its thread when the fire has one. Only a reply carrying a usage block records. | the caller's |
 
 `memory_correction`, `artifact_summary` and `side_question` run
 on the agent's own chat model, as `intent_loop` did. They own no preference, so Settings offers no

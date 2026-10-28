@@ -43,13 +43,19 @@ function bestRank(items: SearchResultItem[], query: string): TitleRank {
 
 /** The All tab's sections, each capped, ordered by the title rank of its best
  *  hit. So "settings" lists the Settings page above files that only mention
- *  it, whichever category answered first. Text lines come after every name
- *  section, whatever their rank (ADR 0383). */
+ *  it. Sections in `drawn`, already on screen for this query, keep that order
+ *  above every later one: a late answer never pushes down a row being read.
+ *  Text lines come after every name section, whatever their rank (ADR 0383). */
 export function rankedSections(
   results: Record<string, SearchResultItem[]>,
   query: string,
   textHits: TextHitItem[] = [],
+  drawn: readonly string[] = [],
 ): Section[] {
+  const drawnAt = (section: string) => {
+    const at = drawn.indexOf(section);
+    return at < 0 ? drawn.length : at;
+  };
   const ranked: { section: string; items: PaletteItem[] }[] = SECTION_ORDER
     .filter(section => results[section]?.length)
     .map(section => {
@@ -57,7 +63,7 @@ export function rankedSections(
       return { section, items, rank: bestRank(items, query) };
     })
     // Stable, so SECTION_ORDER breaks every tie.
-    .sort((a, b) => bestFirst(a.rank, b.rank));
+    .sort((a, b) => drawnAt(a.section) - drawnAt(b.section) || bestFirst(a.rank, b.rank));
   // The engine's preview already holds the Text section's share of the tab.
   if (textHits.length) ranked.push({ section: 'text', items: textHits });
   let offset = 0;

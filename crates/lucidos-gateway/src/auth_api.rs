@@ -9,7 +9,8 @@
 //! short. The picker's shell and assets are public because an unpaired browser
 //! needs a surface to pair *from*: gating them would answer a new phone with a
 //! bare 401 and no way forward. Every API under `/~/api/` is gated except the
-//! two pairing calls and health.
+//! two pairing calls and health. The gateway-to-gateway namespace is gated
+//! too, by a gateway credential its own router checks (ADR 0590).
 //!
 //! Under a workspace slug there are two exemptions. [`is_public_app_asset`]
 //! covers the handful of `/api/v1` files an app frame loads as tags on its own
@@ -39,6 +40,7 @@ use crate::server::GatewayState;
 
 pub fn router() -> Router<GatewayState> {
     Router::new()
+        .merge(crate::gateway_protocol::management_router())
         .route("/pairing-code", post(pairing_code))
         .route("/devices", get(list_devices))
         .route("/devices/:id", axum::routing::delete(revoke_device))
@@ -86,7 +88,7 @@ pub fn is_public_path(path: &str) -> bool {
 /// `/<slug>/~cap/<token>/data/../api/v1/credentials` out of a capability.
 ///
 /// Both exemptions call it first, so neither can forget it.
-fn carries_a_dot_segment(path: &str) -> bool {
+pub(crate) fn carries_a_dot_segment(path: &str) -> bool {
     path.split(['/', '\\']).any(is_dot_segment)
 }
 
@@ -270,7 +272,7 @@ fn wants_html(headers: &HeaderMap) -> bool {
 /// the ordinary one. The other is a browser old enough to send `Sec-Fetch-Mode`
 /// and not `Sec-Fetch-Dest`, which Chrome shipped four versions apart. Such a
 /// browser keeps today's behaviour, including the shell in a nested frame.
-fn is_top_level_navigation(headers: &HeaderMap) -> bool {
+pub(crate) fn is_top_level_navigation(headers: &HeaderMap) -> bool {
     match headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
         Some(dest) => dest == "document",
         None => wants_html(headers),
@@ -296,7 +298,18 @@ const REFUSED_FRAME_PAGE: &str = concat!(
 /// Applied in front of everything: the proxy into each workspace, the control
 /// plane and the picker's own API.
 pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: Next) -> Response {
-    if is_public_path(req.uri().path()) || frame_capability_admits(&state, &req) {
+    if is_public_path(req.uri().path())
+        || frame_capability_admits(&state, &req)
+        || crate::relay::carries_a_remote_frame_capability(&req)
+    {
+        return next.run(req).await;
+    }
+    // The gateway-to-gateway namespace has a door of its own: a gateway
+    // credential, which that router checks. A device cookie opens nothing
+    // there, so the device gate stands aside rather than letting one in.
+    if crate::gateway_protocol::is_gateway_api_path(req.uri().path())
+        && !carries_a_dot_segment(req.uri().path())
+    {
         return next.run(req).await;
     }
     // One scan of the `Cookie` header for a decision this then acts on twice:

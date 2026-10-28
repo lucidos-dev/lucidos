@@ -105,6 +105,10 @@ export interface LandingLane {
   /** The queue waits for an Apply All press to hand over the rest of its
    *  changes, with no batch open (ADR 0480). */
   gathering: boolean;
+  /** Why GitHub (the repository's `origin`) could not take the last landing.
+   *  The lane holds what it could not push and retries (ADR 0589). Absent
+   *  while GitHub takes landings. */
+  waiting_for_origin?: string;
 }
 
 /** Where the *main check* stands. Mirrors the engine's `MainCheckState`. */

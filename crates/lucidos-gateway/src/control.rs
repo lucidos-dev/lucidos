@@ -50,6 +50,17 @@ pub fn router() -> Router<GatewayState> {
         // session that cannot install asks it to.
         .route("/desktop-client/heartbeat", post(desktop_client_heartbeat))
         .route("/update-relay", post(request_update_relay))
+        // An engine pushed to `origin`, so the remote gateways follow now.
+        .route(
+            crate::nudge::MAIN_LANDED_PATH,
+            post(crate::nudge::main_landed),
+        )
+        // Does this gateway hold a pairing? Its engines land origin-first only
+        // while it does.
+        .route(
+            crate::nudge::GATEWAY_PAIRINGS_PATH,
+            get(crate::nudge::gateway_pairings),
+        )
         // Is Lucidos slow, and why (ADRs 0274, 0283)? The cached answer only,
         // since every workspace window polls it.
         .route("/slowness", get(slowness_status))

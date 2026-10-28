@@ -79,21 +79,35 @@ fn is_model_host(base_url: &str) -> bool {
         || crate::llm::vertex::is_vertex_host(&host)
 }
 
-/// The thread a proxied call's cost belongs to: the one the origin token
-/// proves made it. Anything else records on the home thread.
-pub(crate) fn cost_thread(headers: &axum::http::HeaderMap) -> Option<Uuid> {
+/// Who a proxied call's cost belongs to, as the origin token proves it.
+/// Both are `None` for a caller with no verified token.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct CostOwner {
+    /// The thread the row records on. `None` records on the home thread.
+    pub(crate) thread: Option<Uuid>,
+    /// The trigger whose fire made the call. A script fire has no thread,
+    /// so this is all that names it.
+    pub(crate) trigger: Option<String>,
+}
+
+pub(crate) fn cost_owner(headers: &HeaderMap) -> CostOwner {
     match crate::api::actor::subprocess_origin(headers) {
         crate::api::actor::SubprocessOrigin::Subprocess {
-            source_thread_id, ..
-        } => source_thread_id,
-        crate::api::actor::SubprocessOrigin::NotSubprocess => None,
+            source_thread_id,
+            emitting_trigger_id,
+            ..
+        } => CostOwner {
+            thread: source_thread_id,
+            trigger: emitting_trigger_id,
+        },
+        crate::api::actor::SubprocessOrigin::NotSubprocess => CostOwner::default(),
     }
 }
 
 /// Record what a proxied model call cost, and hand back its response.
 pub(crate) async fn record_model_call(
     engine: &Arc<LucidosEngine>,
-    cost_thread: Option<Uuid>,
+    owner: CostOwner,
     upstream: Upstream<'_>,
     path: &str,
     request_body: &Bytes,
@@ -119,7 +133,7 @@ pub(crate) async fn record_model_call(
     if let Some(call) = reported(&bytes, streamed, request_body, path) {
         record(
             engine,
-            cost_thread,
+            owner,
             call.answered_by(&parts.headers),
             request_body,
         );
@@ -130,12 +144,13 @@ pub(crate) async fn record_model_call(
 /// Record one proxied call's cost, on a task of its own.
 pub(crate) fn record(
     engine: &Arc<LucidosEngine>,
-    cost_thread: Option<Uuid>,
+    owner: CostOwner,
     call: ReportedCall,
     request_body: &[u8],
 ) {
     let capture =
-        AuxCapture::for_thread_or_home(&engine.event_bus, cost_thread, ContextPurpose::Proxy);
+        AuxCapture::for_thread_or_home(&engine.event_bus, owner.thread, ContextPurpose::Proxy)
+            .for_trigger_fire(owner.trigger);
     let request_chars = String::from_utf8_lossy(request_body).chars().count();
     tokio::spawn(async move {
         capture

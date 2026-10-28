@@ -39,6 +39,7 @@ pub mod engine_version;
 pub(crate) mod eval_capture;
 pub mod event_bus;
 pub mod event_wait;
+mod follow_main;
 pub mod form_requests;
 pub mod frontend_preview;
 mod frontend_refresh;
@@ -797,6 +798,9 @@ pub struct LucidosEngine {
     /// The lane as clients see it. Only the lane's driver writes it, after
     /// each message it handles.
     pub(crate) landing_lane_snapshot: std::sync::RwLock<landing_lane::LaneSnapshot>,
+    /// Wakes the follow task before its interval runs out. A paired gateway
+    /// that just landed sends it (ADR 0589).
+    pub(crate) follow_main_nudge: tokio::sync::Notify,
     /// The main check's driver channel. The bus subscriber, Close and
     /// recovery send here, and only the driver task reads it.
     pub(crate) main_check_tx: tokio::sync::mpsc::UnboundedSender<main_check::MainCheckMsg>,

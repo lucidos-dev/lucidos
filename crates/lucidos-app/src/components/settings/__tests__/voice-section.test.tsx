@@ -6,7 +6,7 @@
  * page with no such row. This is the test that the rows exist, and that they
  * appear only once the workspace has opted in.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import {
   VoiceSection,
@@ -22,6 +22,12 @@ import {
   DEFAULT_VOICE_TRANSCRIBER_MODEL,
   VOICE_RESIDENT_SECTIONS,
 } from '../../../store/actions/preferences';
+
+const reach = vi.hoisted(() => ({ reachable: true }));
+vi.mock('../../../voice/socketUrl', async (original) => ({
+  ...(await original<typeof import('../../../voice/socketUrl')>()),
+  voiceReachable: () => reach.reachable,
+}));
 
 /** Flatten a vnode tree to text, keeping scalar props. Same shallow walk as
  *  `opencode-free-notice.test.tsx`.
@@ -58,6 +64,18 @@ function render(stored: Record<string, string>): string {
 describe('the Voice settings section', () => {
   afterEach(() => {
     preferences.value = { status: 'not-loaded' };
+    reach.reachable = true;
+  });
+
+  /** The relay carries no socket. So the section says why there is no voice,
+   *  and offers no switch that could not work. */
+  it('explains, with no switch, that a relayed workspace has no voice', () => {
+    reach.reachable = false;
+    const rendered = render({ voice_enabled: 'true' });
+    expect(rendered).toContain('opened through another gateway');
+    expect(rendered).toContain('models:voice"');
+    expect(rendered).not.toContain('models:voice-enabled');
+    expect(rendered).not.toContain('Talker model');
   });
 
   /** Voice is experimental and ships off, so the switch is the whole section

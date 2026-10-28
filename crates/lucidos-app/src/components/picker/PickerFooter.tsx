@@ -14,11 +14,19 @@
  */
 
 import type { Ref, VNode } from 'preact';
+import { Disclosure } from '../shared/Disclosure';
 import { HiddenFileInput } from '../shared/HiddenFileInput';
 import type { CreateNote, RestoreBlocker, RestoreDraft } from './workspaceForms';
+import {
+  HTTPS_ONLY_NOTE,
+  TRUST_NOTE,
+  remoteGatewayBlocker,
+  shortNameInput,
+  type RemoteGatewayDraft,
+} from '../settings/remoteGatewayForm';
 
 /** Which form is unfolded under the entry points. */
-export type FooterMode = 'none' | 'create' | 'restore';
+export type FooterMode = 'none' | 'create' | 'restore' | 'remote';
 
 export interface PickerFooterProps {
   mode: FooterMode;
@@ -56,6 +64,14 @@ export interface PickerFooterProps {
   fileNote: string | null;
   /** Offer to remove the workspace holding the address the user asked for. */
   onDeleteColliding: (id: string) => void;
+
+  // Add a remote gateway form, the one Settings → Access also shows (ADR 0590).
+  remoteDraft: RemoteGatewayDraft;
+  onRemoteDraft: (patch: Partial<RemoteGatewayDraft>) => void;
+  onAddRemote: () => void;
+  onCancelRemote: () => void;
+  /** Which remote gateway the last Pair added, or null. */
+  pairedRemote: string | null;
 }
 
 export function pickerFooter(p: PickerFooterProps): VNode {
@@ -68,27 +84,52 @@ export function pickerFooter(p: PickerFooterProps): VNode {
   // it was the gateway answering 409.
   const canCreate = !p.busy && p.name.trim() !== '' && p.createNote?.blocking !== true;
   const canRestore = !p.busy && p.blocker === null;
+  const remoteBlocker = remoteGatewayBlocker(p.remoteDraft);
+  const canAddRemote = !p.busy && remoteBlocker === null;
+  const remoteField = (label: string, key: keyof RemoteGatewayDraft, placeholder: string) => (
+    <label class="ws-picker-field">
+      <span class="ws-picker-field-label">{label}</span>
+      <input
+        class="ws-picker-input"
+        placeholder={placeholder}
+        spellcheck={false}
+        value={p.remoteDraft[key]}
+        onInput={(e) => {
+          const value = (e.target as HTMLInputElement).value;
+          p.onRemoteDraft({ [key]: key === 'name' ? shortNameInput(value) : value });
+        }}
+        onKeyDown={(e) => e.key === 'Enter' && canAddRemote && p.onAddRemote()}
+      />
+    </label>
+  );
   return (
     <footer class="ws-picker-footer">
       <div class="ws-picker-footer-actions">
         <button
           class={`ws-picker-new${p.mode === 'create' ? ' is-open' : ''}`}
-          aria-pressed={p.mode === 'create'}
+          aria-expanded={p.mode === 'create'}
           onClick={() => p.onMode('create')}
         >
           + New workspace
         </button>
         <button
           class={`ws-picker-new ws-picker-restore-open${p.mode === 'restore' ? ' is-open' : ''}`}
-          aria-pressed={p.mode === 'restore'}
+          aria-expanded={p.mode === 'restore'}
           disabled={p.restoreRunning}
           onClick={() => p.onMode('restore')}
         >
           Restore from backup
         </button>
+        <button
+          class={`ws-picker-new${p.mode === 'remote' ? ' is-open' : ''}`}
+          aria-expanded={p.mode === 'remote'}
+          onClick={() => p.onMode('remote')}
+        >
+          Add a remote gateway
+        </button>
       </div>
 
-      {p.mode === 'create' && (
+      <Disclosure open={p.mode === 'create'}>
         <div class="ws-picker-create">
           {!p.name.trim() && p.suggestions.length > 0 && (
             <div class="ws-picker-suggestions">
@@ -135,9 +176,9 @@ export function pickerFooter(p: PickerFooterProps): VNode {
             </p>
           )}
         </div>
-      )}
+      </Disclosure>
 
-      {p.mode === 'restore' && (
+      <Disclosure open={p.mode === 'restore'}>
         <div class="ws-picker-restore-form">
           <p class="ws-picker-lead">
             Restore a workspace from an encrypted backup. You need the <code>.age</code> or{' '}
@@ -244,7 +285,36 @@ export function pickerFooter(p: PickerFooterProps): VNode {
             <button class="ws-picker-btn" onClick={p.onCancelRestore}>Cancel</button>
           </div>
         </div>
-      )}
+      </Disclosure>
+
+      <Disclosure open={p.mode === 'remote'}>
+        <div class="ws-picker-restore-form">
+          <p class="ws-picker-lead">
+            Open another Lucidos gateway's workspaces from here. On that gateway, open
+            Settings → Access → Pair a gateway for a code and its https address.
+          </p>
+          <p class="ws-picker-note ws-picker-note-warn">{TRUST_NOTE}</p>
+          {remoteField('Address', 'address', 'https://lucidos.example.com')}
+          {remoteField('Gateway pairing code', 'code', '8 digits')}
+          {remoteField('Short name', 'name', 'cloud')}
+          {p.pairedRemote && (
+            <p class="ws-picker-note">Paired with {p.pairedRemote}.</p>
+          )}
+          {remoteBlocker?.kind === 'plain-http' && (
+            <p class="ws-picker-note ws-picker-note-warn">{HTTPS_ONLY_NOTE}</p>
+          )}
+          <div class="ws-picker-inline">
+            <button
+              class="ws-picker-btn ws-picker-btn-confirm"
+              disabled={!canAddRemote}
+              onClick={p.onAddRemote}
+            >
+              {p.busy ? 'Pairing…' : 'Pair'}
+            </button>
+            <button class="ws-picker-btn" onClick={p.onCancelRemote}>Cancel</button>
+          </div>
+        </div>
+      </Disclosure>
     </footer>
   );
 }

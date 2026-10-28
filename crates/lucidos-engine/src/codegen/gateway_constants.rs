@@ -2,7 +2,9 @@
 //! live in `lucidos-gateway-constants`, so the engine renders them without
 //! depending on the gateway (ADR 0014).
 
-use lucidos_gateway_constants::{PAIRING_CODE_DIGITS, PAIR_PARAM, SIGIL};
+use lucidos_gateway_constants::{
+    PAIRING_CODE_DIGITS, PAIR_PARAM, REMOTE_GATEWAY_NAME_MAX_LEN, REMOTE_ROUTE_SEPARATOR, SIGIL,
+};
 
 use super::{quoted, REGENERATE};
 
@@ -21,6 +23,15 @@ pub(super) fn render() -> String {
     out.push_str(&format!(
         "export const PAIR_PARAM = {};\n\n",
         quoted(PAIR_PARAM)
+    ));
+    out.push_str("/** `REMOTE_GATEWAY_NAME_MAX_LEN` in `lucidos-gateway-constants`. */\n");
+    out.push_str(&format!(
+        "export const REMOTE_GATEWAY_NAME_MAX_LEN = {REMOTE_GATEWAY_NAME_MAX_LEN};\n\n"
+    ));
+    out.push_str("/** `REMOTE_ROUTE_SEPARATOR` in `lucidos-gateway-constants`. */\n");
+    out.push_str(&format!(
+        "export const REMOTE_ROUTE_SEPARATOR = {};\n\n",
+        quoted(&REMOTE_ROUTE_SEPARATOR.to_string())
     ));
     out.push_str("/** `SIGIL` in `lucidos-gateway-constants`. */\n");
     out.push_str(&format!(

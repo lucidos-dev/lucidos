@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# Compare a fresh rendering with committed output; never rewrite the checkout.
+# Compare a rendering with committed output; never rewrite the checkout.
 # Missing, empty, malformed or stale committed output fails closed.
+#
+# The rendering is the codegen cache's entry for this tree's fingerprint when
+# there is one: codegen_check_inputs verified the render that wrote it, so it
+# is byte-identical to a fresh one. A miss renders, which compiles the engine.
+# --cached-only fails on a miss instead, for a caller that must not compile.
 set -euo pipefail
-[ "$#" -eq 0 ] || { echo 'check-knowhow-generated: takes no arguments.' >&2; exit 1; }
+CACHED_ONLY=""
+case "$*" in
+    "") ;;
+    --cached-only) CACHED_ONLY=1 ;;
+    *) echo 'check-knowhow-generated: takes only --cached-only.' >&2; exit 1 ;;
+esac
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 # shellcheck source=scripts/lib/codegen.sh
@@ -17,7 +27,15 @@ fi
 [ -s "$ROOT/$MANIFEST" ] && [ -s "$OUT/committed.json" ] || {
     echo "knowhow-generated: $MANIFEST is missing or empty." >&2; exit 1;
 }
-codegen_render_to "$ROOT" "$OUT/rendered"
+if CACHED="$(codegen_cached "$ROOT" "$(codegen_fingerprint "$ROOT")")"; then
+    echo "knowhow-generated: comparing with the cached rendering for this tree"
+    ln -s "$CACHED" "$OUT/rendered"
+elif [ -n "$CACHED_ONLY" ]; then
+    echo "knowhow-generated: no cached rendering for this tree. Run ./scripts/codegen.sh first." >&2
+    exit 1
+else
+    codegen_render_to "$ROOT" "$OUT/rendered"
+fi
 python3 - "$OUT" "$MANIFEST" <<'PY'
 import json
 import pathlib

@@ -4,9 +4,13 @@
 # `/harden` Phase 4.5 test suites and owns the early suite run (ADR 0292).
 # Sourced by that script and by harden_suites_test.sh. Defines functions only.
 #
-# Seven rules live here and nowhere else:
+# Eight rules live here and nowhere else:
+#   - which workspace crates a list of changed paths reaches (hs_reached_crates):
+#     the owners of each path, then every crate that depends on one, read from
+#     the graph `cargo metadata` gives (hs_crate_graph, hs_compile_owners);
 #   - which suites a list of changed paths selects (hs_select_suites), the
-#     two touched-spec suites among them (the specs come from touched_specs.sh);
+#     Rust ones from those crates and the two touched-spec suites among them
+#     (the specs come from touched_specs.sh);
 #   - whether the branch changes what codegen renders (hs_generated_drift);
 #   - what the fast tier drops from that selection (hs_fast_tier_suite);
 #   - the command each suite runs, whole or for its failed tests alone
@@ -35,13 +39,31 @@ HS_DRIVER_MODULES="runtime::codex::driver_tests runtime::codex_app_server::drive
 # shellcheck disable=SC2034 # read by scripts/harden-suites.sh and its test
 HS_WAIT_BUDGET=230
 
-# Suites that run Cargo, including npm hooks that invoke codegen, share a lane.
-# They run one at a time, since overlapping Cargo tests can OOM the host. Every other
-# suite gets a lane of its own.
+# Suites that run Cargo share a lane. They run one at a time, since
+# overlapping Cargo tests can OOM the host. Every other suite gets a lane of
+# its own.
 hs_is_cargo_suite() {
     case "$1" in
-        rust | lint | shell-lint | app-lib | cli | gateway | engine-filtered | driver | knowhow-generated | ts | vitest) return 0 ;;
+        lint | shell-lint | crates | gateway | cli | app-lib | eval | engine | engine-filtered | driver) return 0 ;;
     esac
+    return 1
+}
+
+# Suites that read codegen's output. They never run codegen themselves: the
+# cargo lane runs it once, as its first step, and they wait for that step.
+hs_waits_for_codegen() { # <suite>
+    case "$1" in
+        ts | vitest | knowhow-generated) return 0 ;;
+    esac
+    return 1
+}
+
+# True when a selection holds a suite that waits for the codegen step.
+hs_needs_codegen() { # <newline-separated suites>
+    local s
+    for s in $1; do
+        hs_waits_for_codegen "$s" && return 0
+    done
     return 1
 }
 
@@ -69,8 +91,7 @@ hs_resolve_tier() { # <engine-answer> <HARDEN_TIER>
 # parent runs them all once.
 hs_fast_tier_suite() { # <suite>
     case "$1" in
-        rust) echo lint ;;
-        codegen | knowhow-generated | shell-lint | ts | vite | vitest | harden-suites | harden-scope | harden-other-model-review) echo "$1" ;;
+        codegen | knowhow-generated | lint | shell-lint | ts | vite | vitest | harden-suites | harden-scope | harden-other-model-review) echo "$1" ;;
     esac
     return 0
 }
@@ -98,6 +119,17 @@ hs_is_filtered_suite() {
         driver | engine-filtered) return 0 ;;
     esac
     return 1
+}
+
+# Print the filters no passing test's name contains, space-separated, from a
+# cargo test log. One live filter must not hide a dead one beside it.
+hs_dead_filters() { # <log> <filter>...
+    local log=$1 f dead=""
+    shift
+    for f in "$@"; do
+        grep -q -E "^test [^ ]*${f}[^ ]* \.\.\. ok$" "$log" 2>/dev/null || dead="$dead $f"
+    done
+    printf '%s' "${dead# }"
 }
 
 # A file matching this can reach a repo file: it anchors a path at the checkout.
@@ -182,11 +214,14 @@ hs_changed_paths() { # <root> <start-sha> <untracked-at-start-file>
 }
 
 # Read paths on stdin and print each as a normalised repo-relative path:
-# the root prefix stripped, and `.` and `..` segments resolved.
+# the root prefix stripped, and `.` and `..` segments resolved. A line may
+# carry more tab-separated fields after the path, which pass through.
 hs_normalize_paths() { # <root>
     awk -v root="$1/" '
-        index($0, root) == 1 { $0 = substr($0, length(root) + 1) }
         {
+            rest = ""; t = index($0, "\t")
+            if (t) { rest = substr($0, t); $0 = substr($0, 1, t - 1) }
+            if (index($0, root) == 1) $0 = substr($0, length(root) + 1)
             n = split($0, part, "/"); k = 0
             for (i = 1; i <= n; i++) {
                 if (part[i] == "..") { if (k > 0) k-- }
@@ -194,7 +229,7 @@ hs_normalize_paths() { # <root>
             }
             out = ""
             for (i = 1; i <= k; i++) out = out (i > 1 ? "/" : "") seg[i]
-            if (out != "") print out
+            if (out != "") print out rest
         }'
 }
 
@@ -208,34 +243,238 @@ hs_compile_inputs() { # <root>
         | hs_normalize_paths "$root" | sort -u
 }
 
-# Print every file an include_str! or include_bytes! literal in source names,
-# so a worktree with no build still knows its compile inputs. A plain literal
-# resolves against its file, and a CARGO_MANIFEST_DIR concat against its crate.
-# The pathspec narrows the search to one crate's sources.
-hs_source_includes() { # <root> [pathspec]
-    local root=$1 pathspec=${2:-crates/*.rs} f dir crate base lit
+# Print one "<path> <kind> <test-fn> <crate>" line, tab-separated, for each
+# include_str! or include_bytes! literal in source. So a worktree with no build
+# still knows its compile inputs. A plain literal resolves against its file,
+# and a CARGO_MANIFEST_DIR concat against its crate. The pathspec narrows the
+# search to one crate's sources.
+#
+# The kind is `test` for a site inside a fn carrying a test attribute, which
+# compiles only under cfg(test), with that fn's name. Any other site is `prod`
+# with no name. rustfmt indentation finds the enclosing fn, and a layout the
+# scan cannot read comes out `prod`, which selects more, never less.
+hs_include_sites() { # <root> [pathspec]
+    local root=$1 pathspec=${2:-crates/*.rs} f dir crate base lit kind fn
     git -C "$root" grep -l -E 'include_(str|bytes)!' -- "$pathspec" 2>/dev/null \
         | while IFS= read -r f; do
             dir="$(dirname "$f")"
             crate="$dir"
             while [ "$crate" != . ] && [ ! -f "$root/$crate/Cargo.toml" ]; do crate="$(dirname "$crate")"; done
-            awk '{ buf = buf $0 "\n" }
+            awk '
+                function indent(s) { match(s, /^[ \t]*/); return RLENGTH }
+                function fn_name(s) {
+                    if (!match(s, /^[ \t]*(pub(\([a-z]+\))?[ \t]+)?(async[ \t]+)?fn[ \t]+[A-Za-z0-9_]+/)) return ""
+                    s = substr(s, 1, RLENGTH); sub(/^.*fn[ \t]+/, "", s); return s
+                }
+                function test_fn(j,   a) {
+                    for (a = j - 1; a >= 1 && L[a] ~ /^[ \t]*(#\[|\/\/)/; a--)
+                        if (L[a] ~ /^[ \t]*#\[([A-Za-z_]+::)*test(\]|\()/) return "test\t" fn_name(L[j])
+                    return "prod"
+                }
+                function classify(i,   j, s, cur) {
+                    if (fn_name(L[i]) != "") return test_fn(i)
+                    cur = indent(L[i])
+                    for (j = i - 1; j >= 1; j--) {
+                        s = L[j]
+                        if (s ~ /^[ \t]*$/ || indent(s) >= cur) continue
+                        if (fn_name(s) != "") return test_fn(j)
+                        if (indent(s) == 0 || s ~ /^[ \t]*(pub(\([a-z]+\))?[ \t]+)?(mod|impl|trait)[ \t<]/) return "prod"
+                        cur = indent(s)
+                    }
+                    return "prod"
+                }
+                { L[NR] = $0 }
                 END {
-                    while (match(buf, /include_(str|bytes)!\(/)) {
-                        buf = substr(buf, RSTART + RLENGTH)
-                        rest = substr(buf, 1, 400)
-                        if (match(rest, /^[ \t\n]*concat!\([ \t\n]*env!\("CARGO_MANIFEST_DIR"\)[ \t\n]*,[ \t\n]*"[^"]*"/)) {
-                            lit = substr(rest, 1, RLENGTH); sub(/^.*"CARGO_MANIFEST_DIR"\)[ \t\n]*,[ \t\n]*"/, "", lit)
-                            print "crate\t" substr(lit, 1, length(lit) - 1)
-                        } else if (match(rest, /^[ \t\n]*"[^"]*"/)) {
-                            lit = substr(rest, 1, RLENGTH); sub(/^[ \t\n]*"/, "", lit)
-                            print "file\t" substr(lit, 1, length(lit) - 1)
+                    for (i = 1; i <= NR; i++) {
+                        line = L[i]
+                        while (match(line, /include_(str|bytes)!\(/)) {
+                            line = substr(line, RSTART + RLENGTH)
+                            rest = line
+                            for (k = i + 1; k <= NR && length(rest) < 400; k++) rest = rest "\n" L[k]
+                            rest = substr(rest, 1, 400)
+                            if (match(rest, /^[ \t\n]*concat!\([ \t\n]*env!\("CARGO_MANIFEST_DIR"\)[ \t\n]*,[ \t\n]*"[^"]*"/)) {
+                                lit = substr(rest, 1, RLENGTH); sub(/^.*"CARGO_MANIFEST_DIR"\)[ \t\n]*,[ \t\n]*"/, "", lit)
+                                print "crate\t" substr(lit, 1, length(lit) - 1) "\t" classify(i)
+                            } else if (match(rest, /^[ \t\n]*"[^"]*"/)) {
+                                lit = substr(rest, 1, RLENGTH); sub(/^[ \t\n]*"/, "", lit)
+                                print "file\t" substr(lit, 1, length(lit) - 1) "\t" classify(i)
+                            }
                         }
                     }
-                }' "$root/$f" | while IFS="$(printf '\t')" read -r base lit; do
-                if [ "$base" = crate ]; then echo "$crate/$lit"; else echo "$dir/$lit"; fi
+                }' "$root/$f" | while IFS="$(printf '\t')" read -r base lit kind fn; do
+                if [ "$base" = crate ]; then base="$crate/$lit"; else base="$dir/$lit"; fi
+                # A --lib suite never runs a test outside the lib target.
+                case "${f#"$crate"/}" in src/main.rs | src/bin/* | tests/* | benches/* | examples/*) kind=prod ;; esac
+                printf '%s\t%s\t%s\t%s\n' "$base" "$kind" "$fn" "$crate"
             done
         done | hs_normalize_paths "$root" | sort -u
+}
+
+# Print every file an include site names (hs_include_sites).
+hs_source_includes() { # <root> [pathspec]
+    hs_include_sites "$@" | cut -f1 | sort -u
+}
+
+# Print "<path> <suite> <test-fn>", tab-separated, for each site of a test-only
+# include: a path whose every include site is a test fn in a crate with a
+# suite of its own. The test fn is empty for any suite but engine-filtered.
+# A path a build script names stays out: the build may read it.
+hs_test_inputs() { # <root>
+    local root=$1
+    # The leading echo keeps the first file non-empty, so NR == FNR marks it.
+    hs_include_sites "$root" | awk -F '\t' '
+        NR == FNR { builds = builds $0 "\n"; next }
+        function suite(c) {
+            if (c == "crates/lucidos-engine") return "engine-filtered"
+            if (c == "crates/lucidos-cli") return "cli"
+            if (c == "crates/lucidos-gateway") return "gateway"
+            if (c == "crates/lucidos-app") return "app-lib"
+            return ""
+        }
+        {
+            s = suite($4)
+            n = split($1, part, "/")
+            if ($2 != "test" || s == "" || index(builds, part[n])) { bad[$1] = 1; next }
+            line[++count] = $1 "\t" s "\t" (s == "engine-filtered" ? $3 : "")
+        }
+        END {
+            for (i = 1; i <= count; i++) {
+                split(line[i], f, "\t")
+                if (!(f[1] in bad)) print line[i]
+            }
+        }' <(echo; git -C "$root" grep -h -I -e '' -- 'crates/*build.rs' 2>/dev/null) - | sort -u
+}
+
+# Print "<crate><TAB><dir><TAB><path dependencies>" for each workspace member:
+# its directory relative to the root, and the members it depends on through a
+# path, of any kind (normal, dev or build), space-separated. cargo is the only
+# source, so a new crate or edge needs no edit here. Prints nothing when cargo
+# or the parse fails: hs_reached_crates then selects every crate.
+# HS_CARGO_METADATA_CMD replaces the cargo call in the tests.
+hs_crate_graph() { # <root>
+    local cmd=${HS_CARGO_METADATA_CMD:-cargo metadata --no-deps --offline --locked --format-version 1}
+    (cd "$1" && bash -c "$cmd") 2> /dev/null | python3 -I -c '
+import json, os, sys
+meta = json.load(sys.stdin)
+root = meta["workspace_root"]
+members = {}
+for pkg in meta["packages"]:
+    rel = os.path.relpath(os.path.dirname(pkg["manifest_path"]), root)
+    if not rel.startswith(".."):
+        members[pkg["name"]] = (rel, pkg["dependencies"])
+for name in sorted(members):
+    rel, deps = members[name]
+    path_deps = sorted({d["name"] for d in deps if d.get("path") and d["name"] in members})
+    print("\t".join([name, rel, " ".join(path_deps)]))
+' 2> /dev/null
+}
+
+# Print "<path><TAB><crate dir>" for each path that a member's build compiles
+# in from outside its own directory. A dep-info file belongs to the members
+# whose own .rs sources it lists: its name says nothing, since an integration
+# test or a build script is named after neither crate. Every include site adds
+# its crate too, so a worktree with no build still has owners.
+hs_compile_owners() { # <root> <graph-file>
+    local root=$1 graph=$2 deps="${CARGO_TARGET_DIR:-$1/target}/debug/deps"
+    [ -r "$graph" ] || graph=/dev/null
+    {
+        if [ -d "$deps" ]; then
+            find "$deps" -name '*.d' -exec awk -v root="$root/" '
+                /^#/ { next }
+                {
+                    n = split($0, tok, " ")
+                    for (i = 1; i <= n; i++) {
+                        t = tok[i]; sub(/:$/, "", t)
+                        if (t == "" || (substr(t, 1, 1) == "/" && index(t, root) != 1)) continue
+                        print t "\t" FILENAME
+                    }
+                }' {} + 2> /dev/null | hs_normalize_paths "$root" | awk -F '\t' '
+                function owner_dir(p,   q) {
+                    for (q = p; q != ""; ) {
+                        if (q in dir) return q
+                        if (!sub(/\/[^\/]*$/, "", q)) break
+                    }
+                    return ""
+                }
+                sect == "graph" { dir[$2] = 1; next }
+                $1 ~ /^target\// { next }
+                {
+                    f = $2
+                    if (!(f in count)) order[++files] = f
+                    tokens[f, ++count[f]] = $1
+                    if ($1 ~ /\.rs$/ && (od = owner_dir($1)) != "" && index(own[f], " " od " ") == 0) own[f] = own[f] " " od " "
+                }
+                END {
+                    for (k = 1; k <= files; k++) {
+                        f = order[k]
+                        m = split(own[f], d, " ")
+                        for (j = 1; j <= m; j++)
+                            for (i = 1; i <= count[f]; i++)
+                                if (index(tokens[f, i], d[j] "/") != 1) print tokens[f, i] "\t" d[j]
+                    }
+                }' sect=graph "$graph" sect=deps -
+        fi
+        hs_include_sites "$root" | cut -f1,4
+    } | sort -u
+}
+
+# Read changed paths on stdin and print the workspace crates they reach, one
+# per line: the owners of each Rust-relevant path, and every crate that
+# depends on an owner, however far down. Prints `*` when the diff can reach
+# any crate: a path no member owns, one of the files that configure every
+# build, or a graph that is missing or empty. Prints nothing when no path
+# is Rust-relevant. A Rust-relevant path is Rust source, a Cargo manifest,
+# Cargo.lock, a migration, or a compile input that no test alone includes.
+hs_reached_crates() { # <compile-inputs> <test-inputs> <graph> <owners>
+    local inputs=$1 test_inputs=$2 graph=$3 owners=$4
+    [ -r "$inputs" ] || inputs=/dev/null
+    [ -r "$test_inputs" ] || test_inputs=/dev/null
+    [ -r "$graph" ] || graph=/dev/null
+    [ -r "$owners" ] || owners=/dev/null
+    awk -F '\t' '
+        function owner_dir(p,   q) {
+            for (q = p; q != ""; ) {
+                if (q in name) return q
+                if (!sub(/\/[^\/]*$/, "", q)) break
+            }
+            return ""
+        }
+        function seed(dirs,   n, i, e, found) {
+            n = split(dirs, e, " ")
+            for (i = 1; i <= n; i++) if (e[i] in name) { want[name[e[i]]] = 1; found++ }
+            return found
+        }
+        sect == "inputs" { input[$1] = 1; next }
+        sect == "tests" { testonly[$1] = 1; next }
+        sect == "graph" {
+            name[$2] = $1; deps[$1] = $3
+            n = split($3, d, " ")
+            for (i = 1; i <= n; i++) users[d[i]] = users[d[i]] " " $1
+            next
+        }
+        sect == "owners" { owned[$1] = owned[$1] " " $2; next }
+        {
+            p = $0
+            if (p == "Cargo.lock" || p == "Cargo.toml" || p == "rust-toolchain.toml" || p == "clippy.toml" || p == "Makefile" \
+                || p ~ /^\.cargo\// || p ~ /^crates\/vendor\//) { all = 1; next }
+            if (!(p ~ /\.rs$/ || p ~ /(^|\/)Cargo\.toml$/ || p ~ /\.sql$/ || ((p in input) && !(p in testonly)))) next
+            hit = 0
+            if ((od = owner_dir(p)) != "") { want[name[od]] = 1; hit = 1 }
+            if (p in owned && seed(owned[p]) > 0) hit = 1
+            if (!hit) all = 1
+            any = 1
+        }
+        END {
+            if (all) { print "*"; exit }
+            if (!any) exit
+            for (c in want) { todo[++top] = c; reached[c] = 1 }
+            while (top > 0) {
+                c = todo[top--]
+                n = split(users[c], u, " ")
+                for (i = 1; i <= n; i++) if (!(u[i] in reached)) { reached[u[i]] = 1; todo[++top] = u[i] }
+            }
+            for (c in reached) print c | "sort"
+        }' sect=inputs "$inputs" sect=tests "$test_inputs" sect=graph "$graph" sect=owners "$owners" sect=paths -
 }
 
 # Read paths on stdin and print the ones that void an early result. With the
@@ -284,20 +523,27 @@ hs_is_listed() { # <path> <space-separated list>
 
 # The engine tests a system-knowhow or engine-pinned edit needs. The engine
 # reads those files at run time rather than compiling them in, so no compile
-# input selects them. The full engine suite subsumes the filter when Rust is
+# input selects them. A test-only include (hs_test_inputs) adds the test fns
+# that include it. The full engine suite subsumes the filter when Rust is
 # selected anyway.
-hs_engine_filters() { # changed paths on stdin
-    local p knowhow="" pinned="" filters=""
+hs_engine_filters() { # [test-inputs-file], changed paths on stdin
+    local test_inputs=${1:-/dev/null} p knowhow="" pinned="" filters="" fns=""
     while IFS= read -r p; do
         case "$p" in system-knowhow/*) knowhow=1 ;; esac
         if hs_is_listed "$p" "$HS_ENGINE_PINNED"; then pinned=1; fi
+        fns="$fns$(awk -F '\t' -v p="$p" '$1 == p && $2 == "engine-filtered" { printf " %s", $3 }' "$test_inputs" 2>/dev/null)"
     done
     if [ -n "$knowhow" ]; then
         filters="always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized "
     fi
     if [ -n "$knowhow$pinned" ]; then
-        echo "${filters}value_pins_tests"
+        filters="${filters}value_pins_tests "
     fi
+    # Sorted and unique, so the command is the same whatever order paths came in.
+    # shellcheck disable=SC2086 # split the fn names into one per line
+    fns="$(printf '%s\n' $fns | sed '/^$/d' | sort -u | tr '\n' ' ')"
+    filters="$(printf '%s' "$filters$fns" | sed 's/ *$//')"
+    [ -n "$filters" ] && echo "$filters"
     return 0
 }
 
@@ -320,54 +566,94 @@ hs_generated_drift() { # <root>
     return 0
 }
 
+# The workspace crates with a suite of their own, or no harden suite at all
+# (lucidos-e2e needs a running engine). Every other member is a small crate,
+# which the `crates` suite tests together.
+HS_SUITE_CRATES="lucidos-engine lucidos-eval lucidos-gateway lucidos-app lucidos-cli lucidos-e2e"
+
+# True when a reached set (hs_reached_crates) holds <crate>: `*` holds them all.
+hs_reach_has() { # <reach> <crate>
+    [ "$1" = '*' ] && return 0
+    printf '%s\n' "$1" | grep -q -x -F -- "$2"
+}
+
+# Print the small crates a reached set holds, one per line, or `*` for every
+# one. An empty set prints nothing.
+hs_small_crates() { # <reach>
+    local c
+    if [ "$1" = '*' ]; then
+        echo '*'
+        return 0
+    fi
+    for c in $1; do
+        hs_is_listed "$c" "$HS_SUITE_CRATES" || echo "$c"
+    done
+    return 0
+}
+
+# Print the crates a run's changed paths reach: hs_reached_crates over the
+# state directory's records. `start` writes them all before any suite runs.
+hs_state_reach() { # <state-dir>
+    hs_reached_crates "$1/compile-inputs" "$1/test-inputs" "$1/crate-graph" "$1/compile-owners" < "$1/paths"
+}
+
 # Read changed paths on stdin and print the selected suites, one per line.
-# This is the `/harden` Phase 4.5 test-selection table. A path listed in the
-# compile-inputs file selects the Rust suite whatever its extension: a crate
-# compiles it in, so a docs-only or frontend-only edit to it can break a build.
-# A path in the cli-inputs file also selects the CLI tests. The CLI pins engine
-# files that way, and `make test` never runs its tests. A path in the
-# vitest-inputs file (hs_vitest_inputs) selects the Vitest suite. A non-empty
-# drift file (hs_generated_drift) selects the TS suite. A non-empty
-# touched-specs file (ts_touched_specs) selects the e2e-touched suite, and a
-# spec mobile-webkit runs among them selects e2e-touched-webkit too. The
+# This is the `/harden` Phase 4.5 test-selection table. The crates a diff
+# reaches (hs_reached_crates) pick the lint scope and each crate's tests. A path
+# listed in the compile-inputs file reaches the crates that compile it in,
+# whatever its extension: a docs-only or frontend-only edit to it can break a
+# build. A compile input the test-inputs file lists (hs_test_inputs) only a
+# test fn includes, so it selects that crate's suite instead, and no production
+# build can break. A path in the cli-inputs file also selects the CLI tests: the
+# CLI pins engine files that way, and the crate graph does not show it. A path in the vitest-inputs file (hs_vitest_inputs) selects the Vitest
+# suite. A non-empty drift file (hs_generated_drift) selects the TS suite. A
+# non-empty touched-specs file (ts_touched_specs) selects the e2e-touched suite,
+# and a spec mobile-webkit runs among them selects e2e-touched-webkit too. The
 # `fast` tier narrows the selection through hs_fast_tier_suite.
-hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [tier] [touched-specs-file]
+hs_select_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [tier] [touched-specs-file] [test-inputs-file] [crate-graph-file] [compile-owners-file]
     local suite
     if [ "$(hs_normalize_tier "${5:-}")" = fast ]; then
-        hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${6:-}" | while IFS= read -r suite; do
+        hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}" | while IFS= read -r suite; do
             hs_fast_tier_suite "$suite"
         done
         echo knowhow-generated
         return 0
     fi
-    hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${6:-}"
+    hs_select_full_tier_suites "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${6:-}" "${7:-}" "${8:-}" "${9:-}"
     echo knowhow-generated
 }
 
 # The full tier's selection, which hs_select_suites narrows for the fast tier.
-hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [touched-specs-file]
-    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} touched=${5:-/dev/null} p rust="" shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" other_model="" codegen="" paths=""
+# The cargo suites come first, in the order their lane runs them.
+hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest-inputs-file] [drift-file] [touched-specs-file] [test-inputs-file] [crate-graph-file] [compile-owners-file]
+    local inputs=${1:-/dev/null} cli_inputs=${2:-/dev/null} vitest_inputs=${3:-/dev/null} drift=${4:-/dev/null} touched=${5:-/dev/null} test_inputs=${6:-/dev/null} graph=${7:-/dev/null} owners=${8:-/dev/null} p s reach shell="" app="" cli="" gateway="" ts="" css="" vitest="" install="" release="" firstpaint="" self="" scope="" other_model="" codegen="" ort_download="" paths=""
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         paths="$paths$p
 "
         case "$p" in
-            *.rs | Cargo.toml | */Cargo.toml | Cargo.lock | *.sql) rust=1 ;;
+            *.rs | Cargo.toml | */Cargo.toml | Cargo.lock | *.sql) ;;
             *)
                 if grep -q -x -F -- "$p" "$inputs"; then
-                    rust=1
-                    case "$p" in crates/lucidos-app/*) app=1 ;; esac
+                    # A test-only include may name several crates' suites.
+                    # engine-filtered comes from hs_engine_filters, below.
+                    s=" $(awk -F '\t' -v p="$p" '$1 == p { printf "%s ", $2 }' "$test_inputs" 2>/dev/null)"
+                    case "$s" in *" cli "*) cli=1 ;; esac
+                    case "$s" in *" gateway "*) gateway=1 ;; esac
+                    case "$s" in *" app-lib "*) app=1 ;; esac
                 fi
                 ;;
         esac
         case "$p" in
-            crates/lucidos-app/src/*.rs) app=1 ;;
             # The CLI's build script renders its commands from the manifest.
             crates/lucidos-cli/* | crates/lucidos-capabilities/*) cli=1 ;;
             *) grep -q -x -F -- "$p" "$cli_inputs" 2>/dev/null && cli=1 ;;
         esac
         case "$p" in
             *.sh | .shellcheckrc | Makefile) shell=1 ;;
+        esac
+        case "$p" in
+            crates/vendor/ort-sys/* | scripts/lib/onnxruntime_mirror*.sh) ort_download=1 ;;
         esac
         if hs_is_listed "$p" "$HS_GATEWAY_PINNED"; then gateway=1; fi
         case "$p" in
@@ -396,19 +682,26 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
         { p = $0; while (p != "") { if (p in want) { hit = 1; exit } if (!sub(/\/[^\/]*$/, "", p)) break } }
         END { exit !hit }' "$vitest_inputs" - 2>/dev/null && vitest=1
     [ -s "$drift" ] && ts=1
+    reach="$(printf '%s' "$paths" | hs_reached_crates "$inputs" "$test_inputs" "$graph" "$owners")"
+    hs_reach_has "$reach" lucidos-app && app=1
+    hs_reach_has "$reach" lucidos-cli && cli=1
+    hs_reach_has "$reach" lucidos-gateway && gateway=1
 
-    if [ -n "$rust" ]; then
-        echo rust
+    if [ -n "$reach" ]; then
+        echo lint
     elif [ -n "$shell" ]; then
         echo shell-lint
     fi
-    [ -n "$app" ] && echo app-lib
+    [ -n "$(hs_small_crates "$reach")" ] && echo crates
+    [ -n "$gateway" ] && echo gateway
     [ -n "$cli" ] && echo cli
-    if [ -z "$rust" ] && [ -n "$(printf '%s' "$paths" | hs_engine_filters)" ]; then
+    [ -n "$app" ] && echo app-lib
+    hs_reach_has "$reach" lucidos-eval && echo eval
+    if hs_reach_has "$reach" lucidos-engine; then
+        echo engine
+    elif [ -n "$(printf '%s' "$paths" | hs_engine_filters "$test_inputs")" ]; then
         echo engine-filtered
     fi
-    # `make test` runs the gateway's tests, so the Rust suite subsumes this one.
-    [ -z "$rust" ] && [ -n "$gateway" ] && echo gateway
     if [ -n "$ts" ]; then
         echo ts
     else
@@ -423,6 +716,7 @@ hs_select_full_tier_suites() { # [compile-inputs-file] [cli-inputs-file] [vitest
     [ -n "$self" ] && echo harden-suites
     [ -n "$scope" ] && echo harden-scope
     [ -n "$other_model" ] && echo harden-other-model-review
+    [ -n "$ort_download" ] && echo ort-download
     [ -n "$codegen" ] && echo codegen
     return 0
 }
@@ -460,16 +754,43 @@ hs_is_e2e_suite() {
 
 hs_names_engine_tests() {
     case "$1" in
-        rust | engine-filtered | driver) return 0 ;;
+        engine | engine-filtered | driver) return 0 ;;
     esac
     return 1
+}
+
+# The lint command: clippy scoped to the crates the diff reaches. A diff that
+# reaches every crate, or one the state cannot attribute, lints the workspace.
+hs_lint_command() { # <state-dir>
+    local reach crates="" c
+    reach="$(hs_state_reach "$1" 2> /dev/null)"
+    if [ -z "$reach" ] || [ "$reach" = '*' ] \
+        || [ "$(printf '%s\n' "$reach" | wc -l)" -ge "$(wc -l < "$1/crate-graph")" ]; then
+        echo "make lint"
+        return 0
+    fi
+    for c in $reach; do crates="$crates -p $c"; done
+    echo "make lint CLIPPY_SCOPE='${crates# }'"
+}
+
+# The small crates' test command, for the ones the diff reaches.
+hs_crates_command() { # <state-dir>
+    local small crates="" c
+    small="$(hs_small_crates "$(hs_state_reach "$1" 2> /dev/null)")"
+    if [ -z "$small" ] || [ "$small" = '*' ]; then
+        echo "make test-crates"
+        return 0
+    fi
+    for c in $small; do crates="$crates -p $c"; done
+    echo "cargo test --locked${crates}"
 }
 
 # Print the shell command a suite runs, from the run's state directory: its
 # changed paths, its touched specs, its start commit, and <suite>.retry. A
 # non-empty <suite>.retry names the tests a failed round left, and the suite
 # then runs those alone. HS_STUB_CMD, when set, replaces every command with
-# "<stub> <suite>", so the tests never start a real suite.
+# "<stub> <suite>", so the tests never start a real suite. codegen-step is
+# the cargo lane's first step, not a suite (hs_waits_for_codegen).
 #
 # e2e-touched runs on this host, a filtered run without mobile-webkit
 # (e2e_github_handoff), which sends a busy host's run to GitHub (ADR 0584).
@@ -489,24 +810,29 @@ hs_suite_command() { # <suite> <early|normal> <state-dir>
         hs_is_e2e_suite "$suite" && specs="$state/$suite.retry"
     fi
     case "$suite" in
-        rust)
+        lint) hs_lint_command "$state" ;;
+        ort-download) echo "./scripts/lib/onnxruntime_mirror_test.sh" ;;
+        shell-lint) echo "make lint-shell lint-eval lint-knowhow lint-fmt" ;;
+        crates) hs_crates_command "$state" ;;
+        eval) echo "cargo test --locked -p lucidos-eval" ;;
+        engine)
             if [ "$mode" = early ]; then
                 for m in $HS_DRIVER_MODULES; do skips="$skips --skip $m"; done
-                echo "make lint && make test ENGINE_TEST_ARGS='-- --$skips'"
+                echo "./scripts/test-engine.sh -- --$skips"
             else
-                echo "make lint && make test"
+                echo "./scripts/test-engine.sh"
             fi
             ;;
-        knowhow-generated) echo "./scripts/check-knowhow-generated.sh" ;;
-        shell-lint | lint) echo "make lint" ;;
+        codegen-step) echo "./scripts/codegen.sh" ;;
+        knowhow-generated) echo "./scripts/check-knowhow-generated.sh --cached-only" ;;
         app-lib) echo "cargo test --locked -p lucidos-app --lib" ;;
         cli) echo "cargo test --locked -p lucidos-cli" ;;
         gateway) echo "cargo test --locked -p lucidos-gateway" ;;
-        engine-filtered) echo "./scripts/test-engine.sh -- -- $(hs_engine_filters < "$state/paths")" ;;
+        engine-filtered) echo "./scripts/test-engine.sh -- -- $(hs_engine_filters "$state/test-inputs" < "$state/paths")" ;;
         driver) echo "./scripts/test-engine.sh -- -- $HS_DRIVER_MODULES" ;;
-        ts) echo "cd crates/lucidos-app && npm run typecheck && npm test && npx vite build" ;;
+        ts) echo "cd crates/lucidos-app && npx tsc --noEmit && npm test --ignore-scripts && npx vite build" ;;
         vite) echo "cd crates/lucidos-app && npx vite build" ;;
-        vitest) echo "cd crates/lucidos-app && npm test" ;;
+        vitest) echo "cd crates/lucidos-app && npm test --ignore-scripts" ;;
         first-paint) echo "cd crates/lucidos-app && node first-paint-growth.mjs check" ;;
         e2e-touched) hs_specs_command "${specs:-$state/touched-specs}" ;;
         e2e-touched-webkit)
@@ -532,11 +858,14 @@ hs_suite_command() { # <suite> <early|normal> <state-dir>
 # Read a failure record on stdin ("<suite>" or "<suite> <test>" lines) and plan
 # a retry round: write each suite's tests to <state>/<suite>.retry and print the
 # suites to run. A spec the branch no longer has is dropped, and so is a
-# touched-spec suite left with none.
+# touched-spec suite left with none. So is a record naming a suite that no
+# longer exists, which leaves the next run a full one.
 hs_retry_plan() { # <root> <state-dir>
     local root=$1 state=$2 suite name suites=""
     while read -r suite name; do
         [ -n "$suite" ] || continue
+        # A suite this script no longer has, from a record an older run left.
+        hs_suite_command "$suite" normal /dev/null > /dev/null 2>&1 || continue
         if [ -n "$name" ]; then
             if hs_is_e2e_suite "$suite" && [ ! -f "$root/crates/lucidos-app/e2e/$name" ]; then
                 continue

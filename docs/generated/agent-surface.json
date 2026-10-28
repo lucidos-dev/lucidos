@@ -2908,6 +2908,7 @@
         "aliases": [],
         "commands": [],
         "flags": [
+          "gateway",
           "help",
           "host",
           "label",
@@ -4433,6 +4434,8 @@
       "LaneBatchStarted",
       "LaneBatchLanded",
       "LaneBatchFailed",
+      "MainPushFailed",
+      "MainFollowRefused",
       "MainCheckStarted",
       "MainCheckRunLinked",
       "MainCheckPassed",

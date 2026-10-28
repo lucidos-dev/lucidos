@@ -543,7 +543,13 @@ The unread count is mirrored onto the installed app **icon** (surface 3 in §1),
 
 **Under the packaged client the landing crosses to Rust by NAME**, never as a fragment. `window_target::WorkspaceLanding` composes the URL, for the reason ADR 0028 gives. A window already on that workspace is navigated rather than merely fronted. Only a navigation carries the hash into a page that is already loaded.
 
-**The push payload's `app_badge` follows the same origin rule, per subscription.** The engine resolves it in `app_badge_for` (`scheduler/push.rs`) from the subscription's recorded `scope_url`: a path deeper than `/` means the gateway served that page, so the payload carries the cross-workspace total the engine reads once per fan-out from `GET /~/api/v1/control/unread-total`; a root scope (direct engine) or a legacy row with no `scope_url` carries the workspace's own count. The hop is bounded and best-effort, and falls back to the own count, so a push is never delayed or dropped for a badge refinement. This is also why `sw.js` needs no cross-workspace logic of its own: it mirrors `app_badge` verbatim, and iOS reads the same field natively.
+**The push payload's `app_badge` follows the same origin rule, per subscription.** The engine resolves it in `app_badge_for` (`scheduler/push.rs`) from the subscription's recorded `scope_url`:
+
+- **A path deeper than `/`** means the gateway served that page. The payload carries the cross-workspace total, read once per fan-out from `GET /~/api/v1/control/unread-total`.
+- **A root scope** (direct engine) or a legacy row with no `scope_url` carries the workspace's own count.
+- **A remote workspace route** (`/<slug>@<gateway>/`) as the first segment means another gateway relayed the page. That origin's icon counts workspaces this engine cannot see, so the payload omits `app_badge` and leaves the icon alone. The tap still uses that scope, so it opens the page on the relaying gateway's origin.
+
+The hop is bounded and best-effort, and falls back to the own count, so a push is never delayed or dropped for a badge refinement. This is also why `sw.js` needs no cross-workspace logic of its own: it mirrors `app_badge` verbatim, and iOS reads the same field natively.
 
 **Re-assert, never diff (the bell and the icon must never disagree about THIS workspace).** The icon badge is an **externally written surface**, written while the page is backgrounded or closed. iOS writes it from the push payload's `app_badge` in its parent process, without running the page. The SW `push` handler writes it on Chrome/Android.
 
@@ -606,7 +612,7 @@ Built by `build_push_payload` in `crates/lucidos-engine/src/scheduler/push.rs`. 
 The top-level **`app_badge`** is the Declarative Web Push app-icon-badge field (sibling of `web_push` / `notification`). It is set at send time to the count that subscription's install should show: `0` clears the badge, and it is omitted only when no count can be read.
 - It is the **only** way a *closed* iOS PWA updates its home-screen badge: iOS reads `app_badge` in its parent process WITHOUT running the service worker.
 - On Chrome/Android the SW `push` handler reads it and calls `navigator.setAppBadge()`.
-- The count is decided per subscription from its recorded `scope_url`. A gateway-served install gets the cross-workspace total, a direct-engine one this engine's own count (see "App-icon badge" above).
+- The count is decided per subscription from its recorded `scope_url`. A gateway-served install gets the cross-workspace total, a direct-engine one this engine's own count, and a relayed one none (see "App-icon badge" above).
 
 **The pushed body is size-capped; the notification row is not.** The web-push transport refuses a payload over **3052 bytes** of serialized JSON. `web-push` 0.11 checks `content.len() > 3052` on the plaintext handed to `set_payload`, *before* encryption. Its error text says "maximum payload size of 3070 characters exceeded", the wrong number and unit, so budgeting against 3070 still overflows. An unguarded long body dies inside `build()` and reaches **zero** devices, while the row and the bell badge still count it.
 

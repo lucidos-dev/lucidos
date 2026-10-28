@@ -1,6 +1,7 @@
 import { useRef, useLayoutEffect } from 'preact/hooks';
 import { focusedThreadId, promptAnimating, promptSendCollapsing, activeThreadIsComposing, composeViewActive, homeWelcomeActive, scaledDurationMs } from '../../store/store';
 import { PromptInput } from '../chat/PromptInput';
+import { FollowLiveEdgeToggle } from '../chat/FollowToggle';
 import { CreateThreadView } from '../chat/CreateThreadView';
 import { ThreadView } from '../chat/ThreadView';
 import { HomeWelcomeTitle } from '../chat/HomeWelcomeTitle';
@@ -161,6 +162,7 @@ export function ThreadPane() {
           : <CreateThreadView key="compose" />}
         <div key="prompt" class="prompt-area" ref={promptRef}>
           <PromptInput />
+          <FollowLiveEdgeToggle />
         </div>
       </div>
     </div>

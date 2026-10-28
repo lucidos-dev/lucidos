@@ -25,7 +25,9 @@
 # teardown_test_db, but a PANICKING test exits first and leaks its database.
 # An EXIT trap (`sweep_orphan_test_dbs`) drops every leftover `lucidos_test_*`
 # DB after the run, so mem/disk inside the container is reclaimed after every
-# invocation regardless of how individual tests ended.
+# invocation regardless of how individual tests ended. Each test database is a
+# clone of a migrated `lucidos_template_*` database, one per migration set,
+# which the sweep keeps. setup_test_db builds and retires those itself.
 #
 # Usage:
 #   ./scripts/test-engine.sh                  # cargo test -p lucidos-engine --lib
@@ -79,6 +81,32 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
+# The container holds only throwaway databases, so it skips paying for crash
+# safety: a crash loses nothing anyone keeps. All three settings reload without
+# a restart, so a container made before them gets them through ALTER SYSTEM,
+# and tests running against it keep going.
+NO_DURABILITY_SETTINGS="fsync synchronous_commit full_page_writes"
+NO_DURABILITY_FLAGS=()
+for setting in $NO_DURABILITY_SETTINGS; do
+    NO_DURABILITY_FLAGS+=(-c "$setting=off")
+done
+
+drop_durability() {
+    local setting changed=0
+    for setting in $NO_DURABILITY_SETTINGS; do
+        if [ "$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc "SHOW $setting")" != "off" ]; then
+            docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
+                "ALTER SYSTEM SET $setting = off" >/dev/null
+            changed=1
+        fi
+    done
+    if [ "$changed" = "1" ]; then
+        docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
+            "SELECT pg_reload_conf()" >/dev/null
+        echo "[test-db] turned off $NO_DURABILITY_SETTINGS on $PG_CONTAINER"
+    fi
+}
+
 ensure_test_pg() {
     if [ "$FRESH" = "1" ]; then
         echo "[test-db] --fresh: removing existing $PG_CONTAINER"
@@ -131,12 +159,13 @@ ensure_test_pg() {
             -e POSTGRES_DB=lucidos \
             -p "127.0.0.1:$PG_PORT:5432" \
             "$PG_IMAGE" \
-            postgres -c max_connections=500 >/dev/null
+            postgres -c max_connections=500 "${NO_DURABILITY_FLAGS[@]}" >/dev/null
     fi
 
     echo -n "[test-db] waiting for Postgres"
     if wait_pg_ready "$PG_CONTAINER" "$PG_USER" 30; then
         echo " ready"
+        drop_durability
         return 0
     fi
     echo ""

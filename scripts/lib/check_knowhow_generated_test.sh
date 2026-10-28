@@ -39,6 +39,8 @@ class Freshness(unittest.TestCase):
     cp "$1/source.json" "$2/docs/generated/agent-surface.json"
     cp "$1/fragments.json" "$2/.codegen/knowhow-blocks.json"
 }
+codegen_fingerprint() { echo fp; }
+codegen_cached() { [ -d "$1/cache/$2" ] && echo "$1/cache/$2"; }
 CODEGEN_BLOCKS=.codegen/knowhow-blocks.json
 """)
         subprocess.run(['git', 'add', '.'], cwd=self.root, check=True)
@@ -50,9 +52,18 @@ CODEGEN_BLOCKS=.codegen/knowhow-blocks.json
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body)
 
-    def check(self, expected):
-        result = subprocess.run(['bash', str(CHECK)], cwd=self.root, text=True, capture_output=True)
+    def check(self, expected, *args):
+        result = subprocess.run(['bash', str(CHECK), *args], cwd=self.root, text=True, capture_output=True)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+    def cache(self, surface, fragments):
+        """A cached rendering for this tree's fingerprint, as codegen.sh leaves it."""
+        self.put('cache/fp/docs/generated/agent-surface.json', surface)
+        self.put('cache/fp/.codegen/knowhow-blocks.json', fragments)
+
+    def break_renderer(self):
+        self.put('scripts/lib/codegen.sh', (self.root / 'scripts/lib/codegen.sh').read_text()
+                 .replace('mkdir -p "$2/docs/generated"', 'return 1; mkdir -p "$2/docs/generated"'))
 
     def test_fresh_and_stale_committed_output(self):
         self.check(0)
@@ -116,6 +127,26 @@ CODEGEN_BLOCKS=.codegen/knowhow-blocks.json
                         'commit', '-qm', 'unlisted markers'], cwd=self.root, check=True)
         self.put(unlisted, 'Handwritten prose only')
         self.check(1)
+
+    def test_a_cached_rendering_is_compared_without_rendering(self):
+        self.break_renderer()
+        self.cache(self.surface, self.fragments)
+        self.check(0)
+        self.check(0, '--cached-only')
+
+    def test_a_stale_commit_fails_against_the_cached_rendering(self):
+        self.cache(self.surface.replace('sample', 'new-flag'), self.fragments)
+        self.check(1)
+        self.check(1, '--cached-only')
+        self.cache(self.surface, self.fragments.replace('fresh', 'renamed'))
+        self.check(1, '--cached-only')
+
+    def test_a_cached_only_miss_fails_closed(self):
+        self.check(1, '--cached-only')
+        self.check(0)
+
+    def test_an_unknown_argument_is_refused(self):
+        self.check(1, '--render')
 
 
 unittest.main()

@@ -4793,6 +4793,7 @@ dependencies = [
  "dotenvy",
  "fs2",
  "futures",
+ "hmac",
  "hyper",
  "hyper-util",
  "libc",
@@ -5746,11 +5747,8 @@ dependencies = [
 [[package]]
 name = "ort-sys"
 version = "2.0.0-rc.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c41d7757331aef2d04b9cb09b45583a59217628beaf91895b7e76187b6e8c088"
 dependencies = [
  "flate2",
- "pkg-config",
  "sha2 0.10.9",
  "tar",
  "ureq",

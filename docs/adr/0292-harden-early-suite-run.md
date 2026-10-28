@@ -9,6 +9,8 @@
   The early run survives a Switch, and the resumed `/harden` joins it.
 - **Amended by**: [0558](0558-harden-other-model-review.md). The driver tests
   wait for the other-model review, Codex or Claude, not for Codex alone.
+- **Amended by**: [0592](0592-harden-selects-tests-not-crates.md). A file only
+  test fns compile in selects those tests, not the Rust suite.
 
 ## Context
 

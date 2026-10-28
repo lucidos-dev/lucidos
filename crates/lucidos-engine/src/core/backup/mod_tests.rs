@@ -415,6 +415,7 @@ fn test_tar_and_compress_excludes_lucidos_and_postgres() {
         ws,
         sql_dump.path(),
         secret_key_file().path(),
+        None,
         output.path(),
         &BackupIgnore::default(),
     )
@@ -488,6 +489,7 @@ fn test_tar_and_compress_includes_data_blobs() {
         ws,
         sql_dump.path(),
         secret_key_file().path(),
+        None,
         output.path(),
         &BackupIgnore::default(),
     )
@@ -543,6 +545,7 @@ fn test_tar_and_compress_excludes_postgres_migrated_archives() {
         ws,
         sql_dump.path(),
         secret_key_file().path(),
+        None,
         output.path(),
         &BackupIgnore::default(),
     )
@@ -596,6 +599,7 @@ fn test_full_pipeline_encrypt_decrypt() {
         ws,
         sql_dump.path(),
         secret_key_file().path(),
+        None,
         compressed_path.path(),
         &BackupIgnore::default(),
     )
@@ -786,6 +790,7 @@ fn test_tar_omits_user_dir_keeps_git() {
         ws,
         sql_dump.path(),
         secret_key_file().path(),
+        None,
         output.path(),
         &BackupIgnore::default(),
     )
@@ -1381,6 +1386,7 @@ fn tar_and_compress_honors_backupignore() {
         ws,
         sql_dump.path(),
         secret_key_file().path(),
+        None,
         output.path(),
         &ignore,
     )
@@ -1915,4 +1921,104 @@ fn secret_key_file() -> tempfile::NamedTempFile {
     )
     .unwrap();
     file
+}
+
+/// The bundles ride inside the tar, so the archive seals them (ADR 0520).
+#[tokio::test]
+async fn tar_and_compress_carries_the_pending_change_bundles() {
+    use pending_bundles::tests::{pending_branch, repo_at};
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir_all(ws.join("data")).unwrap();
+    let repo = repo_at(&tmp.path().join("repo")).await;
+    pending_branch(&repo, "change").await;
+    let bundles = tmp.path().join(pending_bundles::ARCHIVE_DIR);
+    let rows = [(repo.to_string_lossy().into_owned(), "change".to_string())];
+    assert!(pending_bundles::write_bundles(&ws, &rows, &bundles)
+        .await
+        .unwrap());
+
+    let sql_dump = tempfile::NamedTempFile::new().unwrap();
+    let output = tempfile::NamedTempFile::new().unwrap();
+    tar_and_compress(
+        &ws,
+        sql_dump.path(),
+        secret_key_file().path(),
+        Some(&bundles),
+        output.path(),
+        &BackupIgnore::default(),
+    )
+    .unwrap();
+
+    let decoder = zstd::Decoder::new(std::fs::File::open(output.path()).unwrap()).unwrap();
+    let names: Vec<String> = tar::Archive::new(decoder)
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let dir = pending_bundles::ARCHIVE_DIR;
+    for expected in [format!("{dir}/manifest.json"), format!("{dir}/0.bundle")] {
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
+    }
+}
+
+/// A restore puts each pending branch back into its repository and keeps the
+/// bundles out of the restored workspace.
+#[tokio::test]
+async fn restore_archive_into_brings_back_pending_change_branches() {
+    use pending_bundles::tests::{git, pending_branch, repo_at};
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(src.join("data")).unwrap();
+    std::fs::write(src.join("data/note.md"), "note").unwrap();
+    let repo = repo_at(&tmp.path().join("repo")).await;
+    let tip = pending_branch(&repo, "change").await;
+    let bundles = tmp.path().join(pending_bundles::ARCHIVE_DIR);
+    let rows = [(repo.to_string_lossy().into_owned(), "change".to_string())];
+    assert!(pending_bundles::write_bundles(&src, &rows, &bundles)
+        .await
+        .unwrap());
+
+    // No dump, so the restore skips the database phase.
+    let compressed = tempfile::NamedTempFile::new().unwrap();
+    {
+        let file = std::fs::File::create(compressed.path()).unwrap();
+        let mut builder = tar::Builder::new(zstd::Encoder::new(file, 3).unwrap());
+        builder.append_dir_all("data", src.join("data")).unwrap();
+        builder
+            .append_dir_all(pending_bundles::ARCHIVE_DIR, &bundles)
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+    let (identity, recipient) = crypto::generate_key_pair();
+    let encrypted = tempfile::NamedTempFile::new().unwrap();
+    crypto::seal(
+        &crypto::SealingKey::Recipient(recipient),
+        std::fs::File::open(compressed.path()).unwrap(),
+        &mut std::fs::File::create(encrypted.path()).unwrap(),
+    )
+    .unwrap();
+    git(&repo, &["branch", "-D", "change"]).await;
+
+    let ws_dir = tmp.path().join("restored");
+    let warnings = restore_archive_into(
+        &ws_dir,
+        "postgres://unused@nowhere/none-should-not-be-touched",
+        crypto::OpeningKey::Age(identity),
+        encrypted.path(),
+        |_phase, _cur, _total| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(warnings, Vec::<String>::new());
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/change"]).await, tip);
+    assert!(ws_dir.join("data/note.md").exists());
+    assert!(
+        !ws_dir.join(pending_bundles::ARCHIVE_DIR).exists(),
+        "the bundles go back into their repositories, not the workspace"
+    );
 }

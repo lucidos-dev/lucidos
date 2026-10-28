@@ -40,6 +40,7 @@ const DESCRIBE = `(x, y) => {
   if (!el) return 'nothing';
   if (el.closest('.scroll-to-top')) return 'up chevron';
   if (el.closest('.scroll-to-bottom')) return 'down chevron';
+  if (el.closest('.follow-toggle')) return 'follow toggle';
   if (el.closest('[data-role="step-context"]')) return 'step-context';
   if (el.closest('[data-role="step-main"]')) return 'step-main';
   const control = el.closest('button, a, [role="button"]');
@@ -201,9 +202,12 @@ test.describe('The floating scroll chevrons take a near miss', () => {
         expect(p.hit.right - p.hit.left, `${where}: hit width`).toBeGreaterThanOrEqual(target);
         expect(p.hit.bottom - p.hit.top, `${where}: hit height`).toBeGreaterThanOrEqual(target);
 
+        // Below the down chevron, past half the stack gap, is the follow toggle's.
+        const halfGap = (await lengthPx(page, 'var(--scroll-chevron-stack-gap)')) / 2;
         for (const d of offsets) {
           for (const side of ['left', 'right', 'above', 'below']) {
-            expect(p.offsets[`${side}+${d}`], `${where}: a tap ${d}px ${side} of the circle`).toBe(`${c.name} chevron`);
+            const owner = c.name === 'down' && side === 'below' && d >= halfGap ? 'follow toggle' : `${c.name} chevron`;
+            expect(p.offsets[`${side}+${d}`], `${where}: a tap ${d}px ${side} of the circle`).toBe(owner);
           }
         }
       }
@@ -228,7 +232,9 @@ test.describe('The floating scroll chevrons take a near miss', () => {
           const b = (await page.locator(c.sel).boundingBox())!;
           const cx = b.x + b.width / 2;
           const cy = b.y + b.height / 2;
-          const [x, y] = side === 'left' ? [b.x - d, cy] : side === 'above' ? [cx, b.y - d] : [cx, b.y + b.height + d];
+          // Half as far below the down chevron, inside its half of the stack gap.
+          const below = c.name === 'down' ? d / 2 : d;
+          const [x, y] = side === 'left' ? [b.x - d, cy] : side === 'above' ? [cx, b.y - d] : [cx, b.y + b.height + below];
           const where = `${c.name} at ${scale}, tapped ${side}`;
           await parkCounterUnderPoint(page, y);
           expect((await page.locator(c.sel).boundingBox())!.y, `${where}: the chevron moved on the park`).toBeCloseTo(b.y, 0);

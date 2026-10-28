@@ -136,6 +136,11 @@ a *secure origin* (https or localhost), so to use Lucidos from other devices:
   QRs then point there ahead of the tailnet. Change it later in Settings →
   Access → External address or with `lucidos external-address`;
   `LUCIDOS_EXTERNAL_ADDRESS` in the gateway's environment overrides both.
+- From another Lucidos: pair the two gateways. On the machine being opened,
+  Settings → Access → **Pair a gateway** (or `lucidos pair --gateway`) mints a
+  code. On the opening machine, **Add a remote gateway** takes the `https`
+  address and the code. Its workspaces then list as `<slug>@<name>`, for every
+  device paired with it. See `system-knowhow/remote-access.md` § Pair a gateway.
 
 **Always-on service & multiple gateways.** The default install registers a
 **user-level service** named after the instance. On macOS a launchd LaunchAgent

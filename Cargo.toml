@@ -24,7 +24,7 @@ members = [
 ]
 # Third-party source carried for a patch, never linted or formatted as ours.
 # A temporary measure: docs/temporary-measures.md, "chromiumoxide is vendored
-# for a pipe transport".
+# for a pipe transport"; "ort-sys is vendored for an ONNX Runtime mirror".
 exclude = ["crates/vendor"]
 
 [workspace.package]
@@ -56,5 +56,9 @@ incremental = false
 
 # chromiumoxide gains a pipe transport here, so the agent browser opens no TCP
 # debugging port. A temporary measure: see crates/vendor/chromiumoxide/Cargo.toml.
+# ort-sys fetches ONNX Runtime from a Lucidos mirror before parcel.pyke.io. A
+# temporary measure: docs/temporary-measures.md, "ort-sys is vendored for an
+# ONNX Runtime mirror" (ADR 0595).
 [patch.crates-io]
 chromiumoxide = { path = "crates/vendor/chromiumoxide" }
+ort-sys = { path = "crates/vendor/ort-sys" }

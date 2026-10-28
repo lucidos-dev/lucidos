@@ -186,7 +186,7 @@ Run `git diff main...HEAD --name-only`. If every changed file ends in `.md` or `
   correctness angles look for code-shaped bugs that prose does not have.
 - Phase 3, Phase 4 and Phase 5 still run.
 - Phase 2.5 auto-skips for docs-only via its own packaged-runtime gate.
-- Phase 4.5 still runs `scripts/harden-suites.sh`, which picks the suites a docs-only diff needs. A `system-knowhow/**` edit runs the always-loaded budget tests, and a compiled-in file such as `CHANGELOG.md` runs the Rust suite.
+- Phase 4.5 still runs `scripts/harden-suites.sh`, which picks the suites a docs-only diff needs. A `system-knowhow/**` edit runs the always-loaded budget tests. A compiled-in file such as `CHANGELOG.md` runs the suites of the crates that compile it.
 
 Do NOT extend this fast path to "string-only" or "comment-only" `.rs` edits. Strings can carry format args, escape sequences, regexes, or be parsed at runtime — any `.rs` change keeps the full cycle.
 
@@ -237,9 +237,12 @@ lucidos events emit HardenRunCompleted --summary "harden iteration <n>: <pass|fa
 
 - `failed_phase` names the gate that failed, such as `4.5 prose` or
   `4.5 engine tests`.
-- `suites` is each suite's start, end and exit code in epoch seconds. It also
-  says whether the round was a full run or a retry of what failed. The next
-  round of tuning reads per-suite time from it.
+- `suites` is each suite's queued, start, end and exit code in epoch seconds.
+  Queued to start is the wait for the cargo lane or the codegen step.
+  `codegen_step` has the same fields for the lane's codegen step, or is null
+  when no suite waited for it. `round` says whether the round was a full run
+  or a retry of what failed. The next round of tuning reads per-suite time
+  from it.
 - `findings` counts this iteration's findings by source. `code_review` is what
   the review returned, and `other_model` what the other-model review returned
   (0 when it did not run). `fixed` is how many of them led to a fix. A
@@ -635,10 +638,10 @@ Each script header holds the mechanism.
 | `./scripts/lib/hooks_registered_test.sh` | A `.claude/settings.json` hook that is not valid, missing or not executable. | Fix the mode or path. |
 
 The `knowhow-generated` suite runs `./scripts/check-knowhow-generated.sh` for every
-diff, including docs-only and fast-tier changes. It compares the committed surface
-with a fresh rendering. Missing inputs or a mismatch fail closed. Regenerate with
-`./scripts/codegen.sh` and commit the surface. Both writers run in the suite's
-serialized Cargo lane, after any prior Cargo suite has ended.
+diff, including docs-only and fast-tier changes. It runs `--cached-only`: it
+compares the committed surface with the rendering the Cargo lane's codegen step
+cached, so the suite itself runs outside the lane. Missing inputs or a mismatch
+fail closed. Regenerate with `./scripts/codegen.sh` and commit the surface.
 
 ### Then the test suites: join, and read the verdict
 
@@ -670,7 +673,8 @@ write your whole context again when it returns (ADR 0517).
 
 Run tests only through `harden-suites.sh`. Never call `cargo test`, `make test`
 or `./scripts/test-engine.sh` directly: the script's one cargo lane keeps two
-cargo runs from overlapping. On FAIL, fix the root cause, never weaken or skip
+cargo runs from overlapping. The lane runs `codegen.sh` once first, and the
+frontend suites wait for it outside the lane. On FAIL, fix the root cause, never weaken or skip
 a test.
 
 **A FAIL makes the next round a retry of what failed** (ADR 0536). The verdict records the failed
@@ -729,8 +733,17 @@ rows a reader would not guess.
 
 These matter when you read a verdict:
 
-- **A file a crate compiles in selects the Rust suite, whatever its extension.**
-  `CHANGELOG.md` and `sdk_iframe.css` both do.
+- **A file a crate compiles in selects that crate's suites, whatever its
+  extension.** `CHANGELOG.md` and `sdk_iframe.css` both do.
+- **Rust selection follows the reached crates** (ADR 0594). A Rust-relevant path
+  maps to its owning crates, and the reached set is their reverse closure over
+  the `cargo metadata` graph. The suites are `lint` (clippy scoped by
+  `CLIPPY_SCOPE`), `crates` (the small crates), `gateway`, `cli`, `app-lib`,
+  `eval`, `engine` and `engine-filtered`. A gateway edit therefore skips the
+  engine suite.
+- **These paths select every crate:** `Cargo.lock`, the root `Cargo.toml`,
+  `.cargo/**`, `rust-toolchain.toml`, `clippy.toml`, `Makefile`,
+  `crates/vendor/**`, a Rust path no crate owns, and a failed graph.
 - **A `system-knowhow/**` edit is never a docs-only skip.**
 - **CSS is never a skip.** The script runs `npx vite build` beside the other suites.
 - **A first-paint input runs the growth check** (ADR 0454). On FAIL, move what the

@@ -11,7 +11,7 @@
 use crate::engine_hop::{self, Credential, EngineAddress};
 use crate::postgres::PgHandle;
 use crate::registry::Workspace;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -46,7 +46,7 @@ pub(crate) fn path_is_in_cc_worktree(path: &Path) -> bool {
 // § "the opt-out stops at the gateway".
 
 /// Per-workspace health, surfaced on the control API and rendered in the picker.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Health {
     /// Spawned/adopted but not yet answering `/api/v1/health`.

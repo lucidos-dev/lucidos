@@ -22,6 +22,7 @@ import { LANE_PLACE_LABEL } from '../../store/actions/landingLane';
 import { cancelLaneBatch, closeMainCheck, removeFromLandingLane } from '../../store/actions/laneControls';
 import {
   LANE_GATHERING_LABEL,
+  LANE_WAITING_FOR_ORIGIN_LABEL,
   LANE_STEP_LABEL,
   liveLandingLaneView,
   type LaneEntry,
@@ -221,7 +222,7 @@ function mainCheckStatus(line: MainCheckLine, props: ActivityGroupProps): VNode 
 
 /** The lane's status lines, in order: the open batch's step on its lane
  *  thread, how many changes wait for the next batch, or that the lane gathers
- *  an Apply All press, then the main check. */
+ *  an Apply All press, then why origin holds the lane, then the main check. */
 function laneStatusLines(body: LaneView, props: ActivityGroupProps): VNode[] {
   const lines: VNode[] = [];
   const { batch } = body;
@@ -243,6 +244,13 @@ function laneStatusLines(body: LaneView, props: ActivityGroupProps): VNode[] {
     lines.push(
       <div key="gathering" class="brand-menu-activity-position">
         {LANE_GATHERING_LABEL}
+      </div>,
+    );
+  }
+  if (body.waitingForOrigin) {
+    lines.push(
+      <div key="waiting-for-origin" class="brand-menu-activity-position" data-role="lane-waiting-for-origin">
+        {LANE_WAITING_FOR_ORIGIN_LABEL}: {body.waitingForOrigin}
       </div>,
     );
   }

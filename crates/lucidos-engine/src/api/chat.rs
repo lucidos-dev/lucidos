@@ -1468,6 +1468,14 @@ pub(super) async fn chat_submit(
 
     let request_title = request.title;
     let request_integrated = request.integrated;
+    // A script fire's spawn names its fire, but only on a verified token.
+    let spawning_trigger_id = match crate::api::actor::subprocess_origin(&headers) {
+        crate::api::actor::SubprocessOrigin::Subprocess {
+            emitting_trigger_id,
+            ..
+        } => emitting_trigger_id,
+        crate::api::actor::SubprocessOrigin::NotSubprocess => None,
+    };
     // Everything from here to the ack runs as one detached task the handler
     // awaits. A dropped request then drops only that wait: it can never split
     // an admitted input from the work that records it (ADR 0449).
@@ -1563,6 +1571,7 @@ pub(super) async fn chat_submit(
                 wake_mode,
                 app_id: app_id_to_stash.map(|(_, app_id)| app_id),
                 integrated: request_integrated,
+                spawning_trigger_id,
             };
             let outcome = engine
                 .thread_queue

@@ -175,6 +175,7 @@ fn agent_chat_spawn(child: Uuid, parent: Uuid, integrated: bool) -> ThreadQueueR
         wake_mode: None,
         app_id: None,
         integrated,
+        spawning_trigger_id: None,
     }
 }
 

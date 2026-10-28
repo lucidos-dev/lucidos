@@ -1217,7 +1217,7 @@
     /* The ::before spacer replaces padding-top, so zero out the base padding-top
        on .thread-content. The spacer carries the anchor rest the desktop padding
        does, and the sticky title covers the top.
-       padding-bottom keeps the base's prompt-fade clearance (below). .thread-content
+       padding-bottom keeps the base's end reserve (below). .thread-content
        must stay display:block: Safari ignores scrollTo on a flex-column scroll
        container. */
     .mobile-swipe-pane .thread-content-wrap {
@@ -1232,10 +1232,9 @@
 
     .mobile-swipe-pane .thread-content {
         padding-top: 0;
-        /* Matches the desktop base rule: reserve room past the prompt dissolve
-           (--prompt-fade) plus the focus-marker reach (--nav-focus-reach) so the
-           last turn's .nav-focus-stuck highlight clears the fade. */
-        padding-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach));
+        /* Matches the desktop base rule: the last turn and its focus marker
+           clear the prompt dissolve and the follow toggle. */
+        padding-bottom: var(--transcript-end-reserve);
         position: relative;
         flex: 1;
         min-height: 0;
@@ -1690,14 +1689,24 @@
     }
 
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .thread-content {
-        padding-bottom: calc(var(--prompt-fade) + var(--nav-focus-reach) + var(--mobile-prompt-height, 0rem));
+        padding-bottom: calc(var(--transcript-end-reserve) + var(--mobile-prompt-height, 0rem));
     }
 
     /* The chevron follows the prompt down, but stops short by the bottom safe
        area, so it never lands on the home indicator once the prompt is away. */
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .scroll-to-bottom {
-        bottom: calc(0.75rem + var(--mobile-prompt-height, 0rem));
+        bottom: calc(
+            var(--scroll-chevron-inset) + var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap)
+            + var(--mobile-prompt-height, 0rem)
+        );
         translate: 0 max(0rem, calc(var(--mobile-prompt-offset, 0rem) - var(--safe-area-bottom)));
+    }
+
+    /* The follow toggle rides the prompt, so it stops short by the same safe
+       area: it takes back what the prompt travels past the chevron's floor. So
+       it stays one slot under the chevron. */
+    :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .follow-toggle {
+        translate: 0 calc(-1 * min(var(--mobile-prompt-offset, 0rem), var(--safe-area-bottom)));
     }
 
     /* The welcome floats in the middle of the free space instead of docking on

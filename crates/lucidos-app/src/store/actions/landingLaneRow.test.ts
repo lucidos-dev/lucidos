@@ -99,6 +99,12 @@ describe('landingLaneView', () => {
     expect(landingLaneView({ ...IDLE, lane })).toMatchObject({ batch: null, gathering: true });
   });
 
+  it('carries why origin holds the lane, and nothing while it does not', () => {
+    const lane: LandingLane = { open_batch: null, waiting: ['c-3'], gathering: false, waiting_for_origin: 'could not push to origin: denied' };
+    expect(landingLaneView({ ...IDLE, lane }).waitingForOrigin).toBe('could not push to origin: denied');
+    expect(landingLaneView({ ...IDLE, lane: LANE })).not.toHaveProperty('waitingForOrigin');
+  });
+
   it('carries a pressed Cancel for this batch only', () => {
     const canceling = (laneCanceling: string) => landingLaneView({ ...IDLE, lane: LANE, laneCanceling }).canceling;
     expect(canceling('b-1')).toBe(true);

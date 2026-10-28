@@ -43,11 +43,7 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
          the one the new device will reach",
     )?;
 
-    let token = lucidos_local_token::read().ok_or_else(|| -> BoxError {
-        "no local token found. Only a process on the gateway's own machine can \
-         mint a pairing code"
-            .into()
-    })?;
+    let token = local_token()?;
 
     // The origin the NEW device should open, which is this gateway at a
     // hostname that is not loopback. `None` means we found nothing reachable,
@@ -84,29 +80,11 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     if let Some(origin) = &origin {
         request = request.query(&[("origin", origin.as_str())]);
     }
-    let response = request.send()?;
-    if !response.status().is_success() {
-        // The gateway's own sentence, not just the status. A rejected
-        // `--host` returns a 400 explaining what shape an origin has to be,
-        // and "400 Bad Request" alone says nothing anyone can act on.
-        let status = response.status();
-        let reason = response
-            .json::<serde_json::Value>()
-            .ok()
-            .and_then(|b| b.get("error").and_then(|e| e.as_str()).map(str::to_string))
-            .unwrap_or_else(|| status.to_string());
-        return Err(format!("the gateway refused to mint a code: {reason}").into());
-    }
-    let body: serde_json::Value = response.json()?;
-    let code = body
-        .get("code")
-        .and_then(|c| c.as_str())
-        .ok_or_else(|| -> BoxError { "the gateway returned no code".into() })?;
-    let minutes = body
-        .get("expires_in_secs")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(300)
-        / 60;
+    let Minted {
+        code,
+        minutes,
+        body,
+    } = mint(request)?;
     let pair_url = body.get("pair_url").and_then(|u| u.as_str());
 
     // User-facing CLI output that a person reads off the screen and types into
@@ -150,6 +128,112 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// `lucidos pair --gateway`: mint a code that lets another gateway relay this
+/// one's workspaces (ADR 0590).
+///
+/// It prints the `https` address the other gateway should use, found the way a
+/// device QR finds one. Without one there is nothing to pair over, so it says
+/// what to set up instead.
+pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), BoxError> {
+    let client = gateway::client()?;
+    let base = gateway::the_gateway(
+        &client,
+        port,
+        "A gateway pairing code only works on the gateway that minted it, so pass --port to \
+         name the one the other gateway will reach",
+    )?;
+    let token = local_token()?;
+    let probe = gateway::probe_client()?;
+    let address = gateway_pairing_origin(
+        crate::external_address::stored(&client, &base, &token),
+        || tailnet_origin(&probe, &base),
+    );
+
+    let mut request = client
+        .post(format!("{base}{GATEWAY_PAIRING_CODE_PATH}"))
+        .header(lucidos_local_token::HEADER_LOCAL_TOKEN, token);
+    if let Some(label) = label {
+        request = request.query(&[("label", label)]);
+    }
+    let Minted { code, minutes, .. } = mint(request)?;
+
+    println!();
+    println!("  Gateway pairing code: {code}");
+    println!();
+    println!("  On the other gateway, open Settings -> Access -> Add a remote gateway,");
+    match &address {
+        Some(address) => {
+            println!("  and enter this address and code:");
+            println!();
+            println!("    {address}");
+        }
+        None => {
+            println!("  and enter this code with an https address for this gateway.");
+            println!();
+            println!("  This gateway has no https address another gateway can reach yet.");
+            println!("  Gateways pair over https only. Set up `tailscale serve`, or set one");
+            println!("  with `lucidos external-address set`.");
+        }
+    }
+    println!();
+    println!("  It works once and expires in {minutes} minutes.");
+    println!();
+    Ok(())
+}
+
+/// Where the gateway mints a gateway pairing code, apart from device codes.
+const GATEWAY_PAIRING_CODE_PATH: &str = "/~/api/v1/auth/gateway-pairing-code";
+
+/// The machine-local token, which only a process on the gateway's machine can
+/// read.
+fn local_token() -> Result<String, BoxError> {
+    lucidos_local_token::read().ok_or_else(|| -> BoxError {
+        "no local token found. Only a process on the gateway's own machine can \
+         mint a pairing code"
+            .into()
+    })
+}
+
+/// A code the gateway minted, with the whole answer for any extra fields.
+struct Minted {
+    code: String,
+    minutes: u64,
+    body: serde_json::Value,
+}
+
+/// Send a mint request and read the code out of the answer.
+fn mint(request: reqwest::blocking::RequestBuilder) -> Result<Minted, BoxError> {
+    let response = request.send()?;
+    if !response.status().is_success() {
+        // The gateway's own sentence, not just the status. A rejected
+        // `--host` returns a 400 explaining what shape an origin has to be,
+        // and "400 Bad Request" alone says nothing anyone can act on.
+        let status = response.status();
+        let reason = response
+            .json::<serde_json::Value>()
+            .ok()
+            .and_then(|b| b.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_else(|| status.to_string());
+        return Err(format!("the gateway refused to mint a code: {reason}").into());
+    }
+    let body: serde_json::Value = response.json()?;
+    let code = body
+        .get("code")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| -> BoxError { "the gateway returned no code".into() })?
+        .to_string();
+    let minutes = body
+        .get("expires_in_secs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(300)
+        / 60;
+    Ok(Minted {
+        code,
+        minutes,
+        body,
+    })
+}
+
 /// Pure: the pairing address, in the one order ADR 0550 sets. The external
 /// address comes first, since the user typed it. Then the tailnet origin, asked
 /// for only when there is no external address. The Access page's
@@ -160,6 +244,16 @@ fn pairing_origin(
     tailnet: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
     external.or_else(tailnet)
+}
+
+/// The origin a gateway pairing prints: the first `https` one, external
+/// address first. An `http` external address never hides a tailnet one.
+fn gateway_pairing_origin(
+    external: Option<String>,
+    tailnet: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let https = |origin: &String| origin.starts_with("https://");
+    pairing_origin(external.filter(https), || tailnet().filter(https))
 }
 
 /// The tailnet origin another device can open, or `None` with the reason
@@ -383,6 +477,22 @@ mod tests {
             Some("http://mymac.tailnet-name.ts.net:5252")
         );
         assert_eq!(pairing_origin(None, || None), None);
+    }
+
+    #[test]
+    fn an_http_external_address_never_hides_a_tailnet_https_one() {
+        let tailnet = || Some("https://mymac.tailnet-name.ts.net".to_string());
+        assert_eq!(
+            gateway_pairing_origin(Some("http://10.8.0.2:5252".to_string()), tailnet).as_deref(),
+            Some("https://mymac.tailnet-name.ts.net")
+        );
+        let plain = || Some("http://mymac.tailnet-name.ts.net:5252".to_string());
+        assert_eq!(gateway_pairing_origin(None, plain), None);
+        let external = Some("https://lucidos.example.com".to_string());
+        let origin = gateway_pairing_origin(external.clone(), || {
+            panic!("an https external address spares the tailnet probe")
+        });
+        assert_eq!(origin, external);
     }
 
     #[test]

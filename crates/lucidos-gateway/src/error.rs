@@ -73,6 +73,23 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    /// 401, for a gateway-to-gateway call without a current pairing's
+    /// credential (ADR 0590).
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    /// 502, when a remote gateway did not answer or answered wrongly.
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

@@ -289,9 +289,11 @@ describe('--mobile-header-offset stays off the document root', () => {
 
   it('keeps the prompt offset off the root too, on the prompt and the down chevron', () => {
     // The prompt takes a translate directly; the down chevron reads the var.
+    // The prompt carries the var too, for the follow toggle inside it.
     expect(hookSource).not.toMatch(/documentElement\.style\.setProperty\(\s*['"]--mobile-prompt-offset/);
     expect(hookSource).toMatch(/promptEl\.style\.translate = promptOffsetRem/);
     expect(hookSource).toMatch(/downChevronEl\?\.style\.setProperty\(\s*['"]--mobile-prompt-offset/);
+    expect(hookSource).toMatch(/promptEl\.style\.setProperty\(\s*['"]--mobile-prompt-offset/);
   });
 
   it('moves every bar by `translate` alone, never by `transform`', () => {

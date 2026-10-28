@@ -18,7 +18,6 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::api::proxy_cost::{is_event_stream, ReportedCall};
 use crate::engine::ApiUsage;
@@ -132,7 +131,7 @@ fn refusal(format: &str) -> (StatusCode, String) {
 /// Hand the caller what it asked for, and record a per-character call.
 pub(crate) async fn finish(
     engine: &Arc<LucidosEngine>,
-    cost_thread: Option<Uuid>,
+    owner: crate::api::proxy_cost::CostOwner,
     plan: SpeechPlan,
     request_body: &[u8],
     response: Response,
@@ -143,7 +142,7 @@ pub(crate) async fn finish(
         SpeechPlan::PerCharacter { model, characters } => {
             if response.status().is_success() {
                 let call = per_character_call(model, characters).answered_by(response.headers());
-                crate::api::proxy_cost::record(engine, cost_thread, call, request_body);
+                crate::api::proxy_cost::record(engine, owner, call, request_body);
             }
             response
         }

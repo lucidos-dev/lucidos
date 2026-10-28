@@ -126,3 +126,35 @@ describe('handleGlobalEvent: main check frames', () => {
     expect(mainCheck.value).toEqual(IDLE_MAIN_CHECK);
   });
 });
+
+describe('a failed push of main', () => {
+  beforeEach(() => showToast.mockClear());
+
+  it('raises an error toast that names the reason', () => {
+    handleGlobalEvent('MainPushFailed', { repo: '/home/user/src/lucidos', reason: 'origin/main has moved' });
+    expect(showToast).toHaveBeenCalledWith(
+      'Could not push main to origin: origin/main has moved',
+      'error',
+      expect.objectContaining({ key: 'main-push-failed' }),
+    );
+  });
+
+  it('raises an error toast when main could not follow origin', () => {
+    handleGlobalEvent('MainFollowRefused', { repo: '/home/user/src/lucidos', reason: 'main and origin/main have diverged' });
+    expect(showToast).toHaveBeenCalledWith(
+      'Could not follow main from origin: main and origin/main have diverged',
+      'error',
+      expect.objectContaining({ key: 'main-follow-refused' }),
+    );
+  });
+
+  it('carries the lane snapshot\'s origin wait into the signal', () => {
+    handleGlobalEvent('ChangesUpdated', {
+      pending: [],
+      applied: [],
+      set_aside: [],
+      landing_lane: { open_batch: null, waiting: ['c-1'], gathering: false, waiting_for_origin: 'could not fetch' },
+    });
+    expect(landingLane.value.waiting_for_origin).toBe('could not fetch');
+  });
+});

@@ -38,17 +38,19 @@ import {
 } from '../../utils/linkifyPaths';
 import { openFilePreview, openUrl, openLocalFileOnConfirm } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
-import { openThreadAcrossWorkspaces } from '../../store/actions/cross-workspace';
+import {
+  openThreadAcrossWorkspaces,
+  openWorkspaceThreadUrl,
+  type WorkspaceThreadUrl,
+} from '../../store/actions/cross-workspace';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { openRepoFileLink } from '../../store/actions/repoFileLink';
 import { encodeRepoPath, type RepoLocator } from '../../store/repoPath';
 import { showToast, workspacePath } from '../../store/store';
 import { HEADING_ID_PREFIX } from '../../utils/headingSlug';
 import { scrollBehavior } from '../../utils/motion';
+import { THREAD_LINK_RE } from '../../utils/threadLinkWorkspace';
 
-/** `thread:<workspace>/<uuid>` and the bare `thread:<uuid>` form, mirroring the
- *  markdown rewrite in `utils/renderMarkdown.ts`. */
-const THREAD_SCHEME_RE = /^thread:(?:([a-zA-Z0-9_-]+)\/)?([0-9a-f-]+)$/;
 /** The cross-workspace landing fragment (`store/actions/cross-workspace.ts`),
  *  matched here against a link's own hash rather than `window.location`. */
 const THREAD_FRAGMENT_RE = /^#?thread=([0-9a-f-]+)$/;
@@ -85,6 +87,10 @@ export interface PreviewLinkContext {
 export type PreviewLinkAction =
   | { kind: 'fragment'; id: string }
   | { kind: 'thread'; workspace: string | undefined; threadId: string }
+  /** A workspace thread URL naming another workspace by its ROUTE, which a
+   *  `thread:` workspace name cannot carry: inside a remote workspace, a bare
+   *  name means that remote gateway's workspace. */
+  | { kind: 'workspace-thread'; target: WorkspaceThreadUrl }
   /** `fragment` is the app fragment the link named, absent when it named
    *  none. An artifact citing one item inside a shared app carries it. */
   | { kind: 'app'; appId: string; fragment?: string }
@@ -163,14 +169,6 @@ function samePath(a: string, b: string): boolean {
   return trim(a) === trim(b);
 }
 
-/** The workspace a same-origin app URL points at, or undefined when it is this
- *  page's own workspace (so the router focuses in place instead of hopping). */
-function workspaceOfPath(pathname: string, ctx: PreviewLinkContext): string | undefined {
-  const first = pathname.split('/').filter(Boolean)[0];
-  if (!first || first === ctx.workspaceId) return undefined;
-  return first;
-}
-
 /** Decide what a click on `rawHref` inside a preview should do. Pure, so the
  *  whole routing table is unit-testable without a DOM.
  *
@@ -192,7 +190,7 @@ export function classifyPreviewLink(
     return { kind: 'fragment', id: decodeFragment(href.slice(1)) };
   }
 
-  const asThreadScheme = THREAD_SCHEME_RE.exec(href);
+  const asThreadScheme = THREAD_LINK_RE.exec(href);
   if (asThreadScheme) {
     return { kind: 'thread', workspace: asThreadScheme[1], threadId: asThreadScheme[2] };
   }
@@ -209,11 +207,12 @@ export function classifyPreviewLink(
       // bare `#anchor`. Same destinations, so the same routing.
       const asThreadHash = THREAD_FRAGMENT_RE.exec(url.hash);
       if (asThreadHash) {
-        return {
-          kind: 'thread',
-          workspace: workspaceOfPath(url.pathname, ctx),
-          threadId: asThreadHash[1],
-        };
+        const threadId = asThreadHash[1];
+        const route = url.pathname.split('/').filter(Boolean)[0];
+        // This page's own workspace focuses in place instead of hopping.
+        return !route || route === ctx.workspaceId
+          ? { kind: 'thread', workspace: undefined, threadId }
+          : { kind: 'workspace-thread', target: { route, threadId } };
       }
       if (url.hash && samePath(url.pathname, ctx.hostPath)) {
         return { kind: 'fragment', id: decodeFragment(url.hash.slice(1)) };
@@ -301,6 +300,9 @@ export function runPreviewLinkAction(action: PreviewNavigation, artifactPath: st
   switch (action.kind) {
     case 'thread':
       openThreadAcrossWorkspaces(action.workspace, action.threadId);
+      return;
+    case 'workspace-thread':
+      openWorkspaceThreadUrl(action.target);
       return;
     case 'app':
       void openAppById(action.appId, 'a file preview', action.fragment);

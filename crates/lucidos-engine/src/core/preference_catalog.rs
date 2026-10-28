@@ -876,6 +876,17 @@ pub const PROXY_TIMEOUT_SECS: Pref<Number> = Pref::number(PrefSpec {
 });
 
 // ---- Behavior (global) ----
+pub const FOLLOW_MAIN_INTERVAL_MINUTES: Pref<Number> = Pref::number(PrefSpec {
+    key: "follow_main_interval_minutes",
+    label: "Follow origin main every (minutes)",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Number { min: 1.0, max: 60.0 },
+    default: PrefDefault::Value("3"),
+    description: "How often a source checkout asks its origin remote for a newer main, in minutes. A newer main fast-forwards local main and builds in the background, and 'Switch to new version' still waits for a tap. Only a checkout with an origin remote follows. Lower it to pick up another gateway's landings sooner. Applies from the next round.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const NOTIFICATIONS_FILTER: Pref<Text> = Pref::text(PrefSpec {
     key: "notifications_filter",
     label: "Notifications filter",
@@ -1983,6 +1994,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &VERTEX_REGION.spec,
     &OPENCODE_FREE_ENABLED.spec,
     &PROXY_TIMEOUT_SECS.spec,
+    &FOLLOW_MAIN_INTERVAL_MINUTES.spec,
     &NOTIFICATIONS_FILTER.spec,
     &NOTIFICATION_TOASTS.spec,
     &COMPOSER_ENTER_KEY.spec,

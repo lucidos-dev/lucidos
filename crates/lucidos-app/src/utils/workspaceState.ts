@@ -13,11 +13,11 @@
  * whole chunk into the app bundle for the sake of one predicate.
  */
 
-import type { WorkspaceStatus } from '../api/client/control';
+import type { ListedWorkspace } from '../api/client/control';
 
 export type WorkspaceState = 'healthy' | 'booting' | 'stopped' | 'unhealthy';
 
-export function workspaceState(w: WorkspaceStatus): WorkspaceState {
+export function workspaceState(w: ListedWorkspace): WorkspaceState {
   if (w.health === 'healthy') return 'healthy';
   if (w.health === 'booting') return 'booting';
   return w.last_error === 'not started' ? 'stopped' : 'unhealthy';
@@ -34,7 +34,7 @@ export const WORKSPACE_STATE_LABEL: Record<WorkspaceState, string> = {
  *  state word otherwise. Both surfaces put this on `data-tooltip` AND on
  *  `aria-label`, since a tooltip is hover-only and the error would otherwise be
  *  unreachable. */
-export function workspaceStateLabel(w: WorkspaceStatus): string {
+export function workspaceStateLabel(w: ListedWorkspace): string {
   return w.last_error || WORKSPACE_STATE_LABEL[workspaceState(w)];
 }
 
@@ -50,6 +50,6 @@ export function workspaceStateLabel(w: WorkspaceStatus): string {
  *
  *  Pure and separate from the rendering so the four states are unit-testable,
  *  and so no surface has to re-derive which one is the fault. */
-export function workspaceFaultNote(w: WorkspaceStatus): string | null {
+export function workspaceFaultNote(w: ListedWorkspace): string | null {
   return workspaceState(w) === 'unhealthy' ? workspaceStateLabel(w) : null;
 }

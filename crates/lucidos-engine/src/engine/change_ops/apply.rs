@@ -67,8 +67,10 @@ pub(crate) async fn resolve_harden_worktree(
     }
 }
 
-/// Where a merge left `main`, and the commit subjects it brought in.
-struct MergedShas {
+/// Which repository's `main` a merge moved, where it left it, and the commit
+/// subjects it brought in.
+struct MergedMain<'a> {
+    repo_root: &'a Path,
     pre_sha: String,
     post_sha: String,
     commits: Vec<String>,
@@ -225,9 +227,9 @@ impl LucidosEngine {
         )
     }
 
-    /// The success tail every merge path shares once `main` has moved:
-    /// announce the apply, refresh what caches the change's files, and build
-    /// the result.
+    /// The success tail every merge path shares once `main` has moved: push
+    /// it, announce the apply, refresh what caches the change's files, and
+    /// build the result.
     async fn finish_merged_apply(
         &self,
         change: &crate::core::changes::Change,
@@ -235,14 +237,19 @@ impl LucidosEngine {
         actor: Option<MessageOrigin>,
         kind_ctx: &ApplyKindContext,
         effective_requires_restart: bool,
-        merged: MergedShas,
+        merged: MergedMain<'_>,
     ) -> ApplyResult {
         let change_id = claim.change_id();
-        let MergedShas {
+        let MergedMain {
+            repo_root,
             pre_sha,
             post_sha,
             commits,
         } = merged;
+        // An app thread merges into the workspace git, whose `main` stays local.
+        if !kind_ctx.is_app() {
+            push_main_in_background(repo_root, &self.event_bus);
+        }
         self.emit_change_applied(
             claim,
             change.thread_id.unwrap_or(change_id),
@@ -449,7 +456,8 @@ impl LucidosEngine {
                             actor,
                             &kind_ctx,
                             effective_requires_restart,
-                            MergedShas {
+                            MergedMain {
+                                repo_root: &repo_root,
                                 pre_sha,
                                 post_sha,
                                 commits,
@@ -1059,7 +1067,8 @@ impl LucidosEngine {
                                 actor,
                                 &kind_ctx,
                                 effective_requires_restart,
-                                MergedShas {
+                                MergedMain {
+                                    repo_root: &repo_root,
                                     pre_sha,
                                     post_sha,
                                     commits,
@@ -1353,12 +1362,6 @@ impl LucidosEngine {
                 // main now, and the thread may resume CC against it later. No
                 // worktree exists for this branch in Tier 3, so there's
                 // nothing to reset.
-                // Lucidos-source threads push main to remote so origin tracks
-                // the merged work. App threads merge to the workspace git's
-                // main, which is local-only by design — no remote push.
-                if !kind_ctx.is_app() {
-                    push_main_in_background(repo_root);
-                }
                 return Ok(self
                     .finish_merged_apply(
                         change,
@@ -1366,7 +1369,8 @@ impl LucidosEngine {
                         actor,
                         kind_ctx,
                         effective_requires_restart,
-                        MergedShas {
+                        MergedMain {
+                            repo_root,
                             pre_sha: shas.0,
                             post_sha: shas.1,
                             commits,
@@ -1409,7 +1413,8 @@ impl LucidosEngine {
                             actor,
                             kind_ctx,
                             effective_requires_restart,
-                            MergedShas {
+                            MergedMain {
+                                repo_root,
                                 pre_sha,
                                 post_sha,
                                 commits,

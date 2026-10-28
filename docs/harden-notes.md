@@ -16,12 +16,26 @@ explains the ones a reader would not guess.
   other gate models: the DMG-gate dispatch with its failure classes, and the draft
   wait that decides whether Phase B adopts the rc tarballs or rebuilds all four.
   A regression there stays invisible until someone is mid-release.
-- **A compile input selects the Rust suite, whatever its extension.** `start`
-  lists cargo's dep-info plus every `include_str!` and `include_bytes!` literal.
-  An edit to only `CHANGELOG.md`, `VERSION` or `sdk_iframe.css` therefore still
-  runs `make lint && make test`. The guard often sits across the diff:
+- **A compile input selects its crates' suites, whatever its extension.** `start`
+  lists cargo's dep-info plus every `include_str!` and `include_bytes!` literal,
+  and records which crate compiles each one in `compile-owners`. An edit to only
+  `CHANGELOG.md`, `VERSION` or `sdk_iframe.css` therefore still runs lint and
+  tests for the crates that include it. The guard often sits across the diff:
   `voice/language.rs` includes `LocaleSection.tsx` to check its dropdown, and
   `tsc` never compiles that guard. Hand-kept rows missed files this way.
+- **Rust suites follow the reached crates (ADR 0594).** `start` runs
+  `cargo metadata` once and records the crate graph. A path maps to its owning
+  crates, and the reached set is the reverse closure over the graph. `lint` runs
+  clippy on that set through `CLIPPY_SCOPE`, both feature passes. `crates` runs
+  the small crates, and `gateway`, `cli`, `app-lib`, `eval` and `engine` run when
+  reached. The graph decides how far an edit reaches, so a `lucidos-home` edit
+  still reaches most crates.
+- **Some paths select every crate.** `Cargo.lock`, the root `Cargo.toml`,
+  `.cargo/**`, `rust-toolchain.toml`, `clippy.toml`, `Makefile` and
+  `crates/vendor/**` can change any crate. So can a Rust path no crate owns, or a
+  graph that failed to load. The selection fails safe, toward more.
+- **A shell-only diff skips clippy.** `shell-lint` runs the shell, eval,
+  knowhow and fmt linters, because a shell path reaches no crate.
 - **A file the CLI source includes selects the CLI row, even an engine path.**
   `make test` covers the engine crate alone, and `make lint` compiles CLI tests
   without running them. CLI tests include engine files (the two menu JSONs, and

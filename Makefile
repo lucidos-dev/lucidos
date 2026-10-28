@@ -18,14 +18,20 @@ WORKSPACE ?= ./test-workspace
 #   --locked        ADR 0020: every cargo call in scripts/** and this Makefile is
 #                   --locked, so the gate ERRORS on Cargo.toml<->Cargo.lock drift
 #                   instead of silently rewriting the lockfile.
-#   --workspace     Explicit rather than relying on the virtual-manifest default.
+#   --workspace     CLIPPY_SCOPE's default: explicit rather than relying on the
+#                   virtual-manifest default.
 #   --all-targets   lib, bins, tests, examples, benches — catches dead_code /
 #                   unused that a lib-only lint misses.
 #
 # Deliberately NOT --release: clippy's lint set is profile-independent, a release
 # lint uses a separate target dir (no cache sharing with cargo check/test), and
 # debug lints MORE code because cfg(debug_assertions) blocks compile.
-CLIPPY_FLAGS := --locked --workspace --all-targets
+#
+# CLIPPY_SCOPE names the crates to lint. `/harden` passes `-p a -p b` for the
+# crates a diff reaches (scripts/lib/harden_suites.sh); a bare `make lint`
+# lints the whole workspace.
+CLIPPY_SCOPE ?= --workspace
+CLIPPY_FLAGS := --locked $(CLIPPY_SCOPE) --all-targets
 
 # Build locally (for development)
 build-local:
@@ -57,7 +63,7 @@ lint-knowhow:
 # tracked .rs files had drifted.
 #
 #   --all     Explicit rather than relying on the virtual-manifest default, for
-#             the same reason CLIPPY_FLAGS spells out --workspace.
+#             the same reason CLIPPY_SCOPE spells out --workspace.
 #   --check   Report and exit non-zero; never rewrite. `make fmt` is the fix.
 #
 # No --locked here, and that is not an oversight in ADR 0020's "every cargo call

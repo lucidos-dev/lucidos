@@ -15,7 +15,11 @@ vi.mock('../components/chat/WaitingBanner', async (importOriginal) => {
 });
 vi.mock('../components/chat/PromptRowControls', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/chat/PromptRowControls')>();
-  return { ...actual, toggleFollowLiveEdge: vi.fn(), pressCallToggleIfShown: vi.fn() };
+  return { ...actual, pressCallToggleIfShown: vi.fn() };
+});
+vi.mock('../components/chat/FollowToggle', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../components/chat/FollowToggle')>();
+  return { ...actual, toggleFollowLiveEdge: vi.fn() };
 });
 vi.mock('../components/layout/ContentHeaderActions', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/layout/ContentHeaderActions')>();
@@ -46,7 +50,8 @@ import { openHighlightedThreadActions } from '../components/drawer/ThreadDrawer'
 import { openThreadTitleMenu } from '../components/chat/ThreadTitle';
 import { promptStopRequested, promptSideQuestionRequested } from '../components/chat/prompt-input-helpers';
 import { applyFocusedThreadChange, showFocusedThreadDiff } from '../components/chat/WaitingBanner';
-import { toggleFollowLiveEdge, pressCallToggleIfShown } from '../components/chat/PromptRowControls';
+import { pressCallToggleIfShown } from '../components/chat/PromptRowControls';
+import { toggleFollowLiveEdge } from '../components/chat/FollowToggle';
 import { toggleAppFullscreenIfShown, toggleSourceView, toggleLineWrap } from '../components/layout/ContentHeaderActions';
 
 const here: string = dirname(fileURLToPath(import.meta.url));

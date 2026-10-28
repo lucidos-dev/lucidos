@@ -7,7 +7,7 @@
 //! Anything that waits on the lane itself, or on the lane thread, runs in a
 //! spawned task, or the lane would wait on itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ use super::integration::{
     IntegrationLanding, LaneWorktree,
 };
 use super::landing::{
-    find_landing_merge, publish_clean_pass, LandingInput, LandingMerge, LandingStep,
+    find_landing_merge, publish_clean_pass, CleanPass, LandingInput, LandingMerge, LandingStep,
 };
 use super::lane_thread::{
     lane_thread_closures, lane_thread_state, lane_thread_title, lane_turn_reason, LaneThreadEnd,
@@ -39,7 +39,7 @@ use crate::engine::change_ops::apply_claim::ApplyClaim;
 use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope, SystemEvent};
 use crate::engine::git_ops::{
     branch_head_sha, commits_in_range, files_have_client_update, find_worktree_for_branch,
-    lane_branch, push_main_in_background, PlanMarkerKind, WorktreeLookup, MAIN_LOCKS,
+    lane_branch, push_main_in_background, LandingOrder, PlanMarkerKind, WorktreeLookup, MAIN_LOCKS,
 };
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent, UnqueueReason};
 use crate::engine::until_restored::UntilRestored;
@@ -90,6 +90,9 @@ pub(crate) enum LaneMsg {
     /// A waiting member's apply claim went free after a pass found it held,
     /// or a pass could not read its row. The waiting pass runs again.
     ClaimReleased(Uuid),
+    /// `origin` answered the follow task. A landing that waited for it tries
+    /// again.
+    OriginAnswered,
     /// The user removed a waiting change from the lane.
     Remove {
         change_id: Uuid,
@@ -118,6 +121,8 @@ const GATHERING_FOR_PRESS: &str = "Queued in the landing lane. It would not merg
      main, so it resolves in one batch with the rest of the Apply All.";
 const RESOLVING_IN_BATCH: &str = "It would not merge cleanly onto main, so it resolves in a \
      lane batch. It lands when the batch does.";
+const WAITING_FOR_ORIGIN: &str = "Queued in the landing lane. origin did not take the push, so \
+     it lands on the lane's next try.";
 const LANDING_FAILED: &str = "The landing lane could not land this change";
 const CANCELED: &str = "Canceled from the landing lane.";
 const REMOVED: &str = "Removed from the landing lane.";
@@ -150,6 +155,15 @@ struct Driver {
     /// The batch being landed: from its lane thread's clean finish until it
     /// lands, fails, or goes back to its lane thread for a catch-up turn.
     landing: Option<Uuid>,
+    /// Why `origin` could not take the last landing. Cleared by the next
+    /// landing it takes (ADR 0589).
+    waiting_for_origin: Option<String>,
+    /// A batch whose lane thread finished, waiting for `origin` to land, with
+    /// its lane thread.
+    batch_waiting_for_origin: Option<(Uuid, Uuid)>,
+    /// Waiting members a pass returned because `origin` refused it. They pass
+    /// again when `origin` answers, even while a batch holds the queue.
+    origin_waiters: HashSet<Uuid>,
     /// Every message waits here until recovery restored the lane.
     until_restored: UntilRestored<LaneMsg>,
 }
@@ -257,6 +271,12 @@ impl LucidosEngine {
         self.notify_landing_lane(LaneMsg::PressSubmitted(press_id));
     }
 
+    /// `origin` answered the follow task, so a landing waiting for it can try
+    /// again.
+    pub(crate) fn notify_origin_answered(&self) {
+        self.notify_landing_lane(LaneMsg::OriginAnswered);
+    }
+
     /// The lane as clients see it, as the driver last published it.
     pub(crate) fn landing_lane_snapshot(&self) -> LaneSnapshot {
         match self.landing_lane_snapshot.read() {
@@ -280,6 +300,9 @@ impl LucidosEngine {
             actors: HashMap::new(),
             held: HashMap::new(),
             landing: None,
+            waiting_for_origin: None,
+            batch_waiting_for_origin: None,
+            origin_waiters: HashSet::new(),
             until_restored: UntilRestored::default(),
         };
         // Weak: the claims live on the engine, so a strong handle would cycle.
@@ -352,7 +375,7 @@ impl LucidosEngine {
         if records.is_empty() {
             return Ok(LaneRestore::default());
         }
-        let pending: std::collections::HashSet<Uuid> =
+        let pending: HashSet<Uuid> =
             sqlx::query_scalar("SELECT id FROM changes WHERE status = 'pending'")
                 .fetch_all(self.pool())
                 .await?
@@ -397,6 +420,7 @@ impl Driver {
                 log!("[LandingLane] {} is free to claim again", change_id);
                 self.run_waiting().await;
             }
+            LaneMsg::OriginAnswered => self.retry_origin().await,
             LaneMsg::Remove {
                 change_id,
                 actor,
@@ -432,7 +456,8 @@ impl Driver {
 
     /// Publish the lane as clients see it.
     fn publish(&self) {
-        let snapshot = LaneSnapshot::of(&self.lane, self.landing);
+        let snapshot = LaneSnapshot::of(&self.lane, self.landing)
+            .waiting_for_origin(self.waiting_for_origin.clone());
         match self.engine.landing_lane_snapshot.write() {
             Ok(mut published) => *published = snapshot,
             Err(poisoned) => *poisoned.into_inner() = snapshot,
@@ -561,8 +586,18 @@ impl Driver {
     /// `ChangeUnqueued`, so no restart queues it again.
     /// `skip` is a member the caller already holds.
     async fn claim_waiting(&mut self, skip: Option<Uuid>) -> Vec<PassMember> {
+        let taken = self.lane.take_pass();
+        self.claim_members(taken, skip).await
+    }
+
+    /// Claim each of `taken` for a pass, as [`Self::claim_waiting`] describes.
+    async fn claim_members(
+        &mut self,
+        taken: Vec<LaneMember>,
+        skip: Option<Uuid>,
+    ) -> Vec<PassMember> {
         let mut members = Vec::new();
-        for member in self.lane.take_pass() {
+        for member in taken {
             if Some(member.change_id) == skip {
                 continue;
             }
@@ -621,6 +656,49 @@ impl Driver {
             .await;
     }
 
+    /// A local-first landing moved `main`, so `origin` gets it now. A failed
+    /// push shows the user a toast, and the landing stands.
+    fn push_after(&self, order: &LandingOrder) {
+        if *order == LandingOrder::LocalFirst {
+            push_main_in_background(&self.repo_root, &self.engine.event_bus);
+        }
+    }
+
+    /// Record why `origin` could not take a landing. The next lane message
+    /// tries again.
+    fn wait_for_origin(&mut self, why: String) {
+        log!("[LandingLane] waiting for origin: {}", why);
+        self.waiting_for_origin = Some(why);
+    }
+
+    /// `origin` answered: land the batch that waited for it, and pass the
+    /// members it refused. While a batch holds the queue, only those pass.
+    async fn retry_origin(&mut self) {
+        if self.waiting_for_origin.is_none() {
+            return;
+        }
+        log!("[LandingLane] origin answered, trying the landing again");
+        self.land_batch_waiting_for_origin();
+        let waiters = std::mem::take(&mut self.origin_waiters);
+        let taken = if self.lane.queue_held() {
+            self.lane.take_members(&waiters)
+        } else {
+            self.lane.take_pass()
+        };
+        let members = self.claim_members(taken, None).await;
+        self.run_pass(members).await;
+    }
+
+    /// Land the batch that waited for `origin`, if it is still open.
+    fn land_batch_waiting_for_origin(&mut self) {
+        if let Some((batch_id, thread_id)) = self.batch_waiting_for_origin.take() {
+            if self.lane.resolving_batch(batch_id).is_some() {
+                self.landing = Some(batch_id);
+                self.land_when_free(batch_id, thread_id);
+            }
+        }
+    }
+
     /// Land what merges cleanly, set the rest aside, and announce each
     /// member's outcome. Every member that leaves the lane settles its source
     /// thread. Returns each member's answer.
@@ -631,8 +709,22 @@ impl Driver {
         }
         let inputs: Vec<LandingInput> = members.iter().map(landing_input).collect();
         let mut settle = Vec::new();
-        let publication = match publish_clean_pass(&MAIN_LOCKS, &self.repo_root, &inputs).await {
-            Ok(publication) => publication,
+        let order = crate::landing_gateway::landing_order().await;
+        let published = publish_clean_pass(&MAIN_LOCKS, &self.repo_root, &order, &inputs).await;
+        let publication = match published {
+            Ok(CleanPass::Published(publication)) => publication,
+            Ok(CleanPass::WaitingForOrigin(why)) => {
+                self.wait_for_origin(why);
+                for m in members {
+                    let id = m.member.change_id;
+                    answers.insert(id, Ok(queued(id, m.change.thread_id, WAITING_FOR_ORIGIN)));
+                    self.actors.insert(id, m.actor);
+                    self.origin_waiters.insert(id);
+                    self.lane.wait(m.member);
+                }
+                self.announce().await;
+                return answers;
+            }
             Err(e) => {
                 for m in members {
                     let id = m.member.change_id;
@@ -643,6 +735,12 @@ impl Driver {
                 return answers;
             }
         };
+        if publication.moved_main() {
+            self.push_after(&order);
+        }
+        // `origin` took this pass, so a batch that waited for it lands too.
+        self.waiting_for_origin = None;
+        self.land_batch_waiting_for_origin();
         let mut members: HashMap<Uuid, PassMember> = members
             .into_iter()
             .map(|m| (m.member.change_id, m))
@@ -666,9 +764,6 @@ impl Driver {
                 }
             };
             answers.insert(*change_id, answer);
-        }
-        if publication.main_now() != publication.base {
-            push_main_in_background(&self.repo_root);
         }
         self.take_in_set_aside(set_aside, publication.main_now(), &mut answers)
             .await;
@@ -849,16 +944,28 @@ impl Driver {
                 return;
             }
         };
-        match land_integration(&MAIN_LOCKS, &self.repo_root, &lane.path).await {
+        let order = crate::landing_gateway::landing_order().await;
+        match land_integration(&MAIN_LOCKS, &self.repo_root, &order, &lane.path).await {
             Ok(IntegrationLanding::Landed { pre, post }) => {
+                if pre != post {
+                    self.push_after(&order);
+                }
                 let mut landed = Vec::new();
                 for (change_id, merge) in merges {
                     if let Some(m) = self.held.remove(&change_id) {
                         landed.push(self.land_member(m, &merge).await);
                     }
                 }
+                self.waiting_for_origin = None;
                 self.close_landed(&batch, pre, post, Some(hold), landed)
                     .await;
+            }
+            Ok(IntegrationLanding::WaitingForOrigin(why)) => {
+                drop(hold);
+                self.landing = None;
+                self.batch_waiting_for_origin = Some((batch_id, batch.lane_thread_id));
+                self.wait_for_origin(why);
+                self.announce().await;
             }
             Ok(IntegrationLanding::CatchUpConflict { main_sha, commits }) => {
                 log!(
@@ -943,7 +1050,6 @@ impl Driver {
             )
             .await;
         self.lane.end_batch(batch.batch_id);
-        push_main_in_background(&self.repo_root);
         self.cleanup_lane_worktree(batch.batch_id, batch.lane_thread_id, hold);
         self.announce().await;
         for (change, snapshot) in landed {
@@ -1303,7 +1409,7 @@ impl Driver {
     /// closed batch left. No run is alive at startup, so it goes now. Only
     /// a batch this workspace opened: another workspace on the same checkout
     /// owns the rest.
-    async fn remove_closed_lane_worktrees(&self, opened_here: &std::collections::HashSet<Uuid>) {
+    async fn remove_closed_lane_worktrees(&self, opened_here: &HashSet<Uuid>) {
         let open = self.lane.resolving().map(|b| b.batch_id);
         match lane_worktrees(&self.repo_root, &self.workspace).await {
             Ok(lanes) => {
@@ -1425,7 +1531,6 @@ impl Driver {
     /// change whose landing merge is already on `main`. Announce it now.
     async fn heal_landed_waiting(&mut self) {
         let waiting = self.lane.waiting().to_vec();
-        let mut healed = false;
         for member in waiting {
             let merge = match find_landing_merge(&self.repo_root, &member.snapshot_sha).await {
                 Ok(Some(merge)) => merge,
@@ -1463,10 +1568,6 @@ impl Driver {
             };
             self.announce_landing(m, Some(&merge)).await;
             self.spawn_settle_source(change, snapshot, true);
-            healed = true;
-        }
-        if healed {
-            push_main_in_background(&self.repo_root);
         }
     }
 
@@ -1765,6 +1866,7 @@ pub(super) fn unqueue_reason_for(status: Option<ChangeStatus>) -> Option<Unqueue
 /// What a clean pass did with one member.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum PassOutcome<'a> {
+    /// It landed with this merge, made by this pass or by an earlier one.
     Lands(&'a LandingMerge),
     /// Its snapshot was already on `main`: it lands with no merge.
     AlreadyOnMain,
@@ -1779,7 +1881,8 @@ impl<'a> PassOutcome<'a> {
         match (step, failed) {
             (LandingStep::Landed(merge), None) => Self::Lands(merge),
             (LandingStep::Landed(_), Some(e)) => Self::Fails(e),
-            (LandingStep::AlreadyOnMain, _) => Self::AlreadyOnMain,
+            (LandingStep::AlreadyOnMain(Some(merge)), _) => Self::Lands(merge),
+            (LandingStep::AlreadyOnMain(None), _) => Self::AlreadyOnMain,
             (LandingStep::SetAside, _) => Self::SetAside,
         }
     }

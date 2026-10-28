@@ -65,6 +65,9 @@ dotenvy = "0.15"
 # crate already in the lockfile via the engine, so it does not widen the
 # gateway's dependency surface in any real sense.
 sha2 = "0.10"
+# The relay signs each device claim with an HMAC keyed by the gateway
+# credential (ADR 0591). Already in the lockfile via the engine.
+hmac = "0.12"
 # A pairing code is eight digits somebody types into a phone. The Access page
 # offers a QR instead, so the phone scans the whole pairing URL. `svg` is a
 # pure-code feature and `image` is the crate's only dependency, gated off here,

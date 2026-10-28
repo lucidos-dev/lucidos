@@ -74,7 +74,10 @@ impl LucidosEngine {
             None,
             headers,
             body,
-            Some(thread_id),
+            crate::api::proxy_cost::CostOwner {
+                thread: Some(thread_id),
+                trigger: crate::scheduler::user_tasks::current_trigger_id(),
+            },
         )
         .await
         {

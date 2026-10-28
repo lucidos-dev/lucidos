@@ -84,6 +84,11 @@ describe('picker cold-start fast path', () => {
     );
   });
 
+  it('opens a remembered remote workspace with its @ intact', () => {
+    // The gateway reads `<slug>@<name>` off the raw path, so `%40` misses it.
+    expect(run({ slug: 'dev@cloud' })).toBe('/dev@cloud/');
+  });
+
   it('stands down for a scanned pairing code', () => {
     // The whole point: `/~/` is public and stamps the code into the manifest,
     // `/<slug>/` is gated and cannot.

@@ -348,7 +348,7 @@ pub struct RestoredWindow {
     /// The label to rebuild it under, so its window-scoped storage comes back
     /// with it. `None` asks for a fresh one.
     pub label: Option<String>,
-    /// A slug `window_target::is_workspace_slug` accepts.
+    /// A route `window_target::is_workspace_route` accepts.
     pub workspace: String,
     /// Its own frame, else its workspace's, else none for the declared default.
     pub frame: Option<RememberedFrame>,
@@ -384,7 +384,7 @@ pub fn restore_plan(session: &WindowSession, restore: bool) -> Vec<RestoredWindo
     let mut taken: Vec<&str> = Vec::new();
     let mut plan: Vec<RestoredWindow> = Vec::new();
     for entry in &session.open {
-        if !crate::window_target::is_workspace_slug(&entry.workspace) {
+        if !crate::window_target::is_workspace_route(&entry.workspace) {
             continue;
         }
         let label = entry

@@ -21,13 +21,13 @@
 
 #[cfg(any(target_os = "macos", test))]
 use crate::window_target::{
-    is_workspace_slug, labels_in, preferred_label, window_context, window_origin, workspace_url,
+    is_workspace_route, labels_in, preferred_label, window_context, window_origin, workspace_url,
     WindowContext,
 };
 
-/// Separator between the workspace slug and the engine notification id inside a
-/// UN request identifier. Safe on both sides: a uuid never contains it, and a
-/// gateway slug is `[a-z0-9]+(-[a-z0-9]+)*` (`SLUG_RE` in `utils/basePath.ts`).
+/// Separator between the workspace route and the engine notification id inside
+/// a UN request identifier. Safe on both sides: a uuid never contains it, and a
+/// route is what `window_target::is_workspace_route` accepts.
 #[cfg(any(target_os = "macos", test))]
 const IDENTIFIER_SEPARATOR: char = '|';
 
@@ -194,7 +194,7 @@ pub(crate) fn choose_tap_target(
     owner: Option<&str>,
     origin: &str,
 ) -> TapTarget {
-    let Some(owner) = owner.filter(|o| is_workspace_slug(o)) else {
+    let Some(owner) = owner.filter(|o| is_workspace_route(o)) else {
         return TapTarget::MainWindow;
     };
     let url = workspace_url(origin, owner);
@@ -867,6 +867,32 @@ mod tests {
             TapTarget::NewWindow {
                 url: "http://localhost:3210/myws/".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn a_tap_from_a_remote_workspace_lands_on_its_outside_route() {
+        // A banner raised by a page relayed under `/<slug>@<gateway>/`. The
+        // tap stays on this gateway's origin, under that same route.
+        let open = windows(&[
+            ("main", "http://localhost:3210/dev/"),
+            ("window-1", "http://localhost:3210/dev@cloud/#thread=t1"),
+        ]);
+        assert_eq!(
+            choose_tap_target(&open, Some("dev@cloud"), ORIGIN),
+            TapTarget::Focus("window-1".to_string())
+        );
+        // The local workspace of the same slug is a different workspace.
+        let open = windows(&[("main", "http://localhost:3210/dev/")]);
+        assert_eq!(
+            choose_tap_target(&open, Some("dev@cloud"), ORIGIN),
+            TapTarget::NewWindow {
+                url: "http://localhost:3210/dev@cloud/".to_string(),
+            }
+        );
+        assert_eq!(
+            split_identifier(&notification_identifier("dev@cloud", "n1")),
+            (Some("dev@cloud"), "n1")
         );
     }
 

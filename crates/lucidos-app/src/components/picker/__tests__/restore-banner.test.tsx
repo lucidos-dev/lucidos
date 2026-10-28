@@ -5,7 +5,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { restoreBanner } from '../RestoreBanner';
+import { restoreBanner, restoreNeedsReading } from '../RestoreBanner';
 import type { GwRestoreStatus } from '../../../api/client/control';
 
 /** Flatten a vnode tree, keeping the markers we assert on. Mirrors
@@ -63,13 +63,28 @@ describe('restoreBanner', () => {
   });
 
   it('confirms a completed restore with no buttons at all', () => {
-    const out = render({ status: 'completed', id: 'w1', name: 'personal' });
+    const out = render({ status: 'completed', id: 'w1', name: 'personal', warnings: [] });
     expect(out).toContain('data-state="completed"');
     expect(out).toContain('Restored');
     expect(out).toContain('personal');
     // No Open (the restored row is right above) and no Dismiss (the picker
     // clears the status on a timer instead).
     expect(out).not.toContain('<button');
+  });
+
+  it('keeps Dismiss on a restore with warnings, so they cannot vanish unread', () => {
+    const status = {
+      status: 'completed' as const,
+      id: 'w1',
+      name: 'personal',
+      warnings: ['A pending change branch was not restored: /repo feature: no repository'],
+    };
+    const out = render(status);
+    expect(out).toContain('data-state="completed-with-warnings"');
+    expect(out).toContain('/repo feature: no repository');
+    expect(out).toContain('Dismiss');
+    expect(restoreNeedsReading(status)).toBe(true);
+    expect(restoreNeedsReading({ ...status, warnings: [] })).toBe(false);
   });
 
   it('keeps Dismiss on a failure, so an error cannot vanish unread', () => {

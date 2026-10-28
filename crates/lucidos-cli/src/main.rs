@@ -176,12 +176,13 @@ enum Command {
     /// read the machine-local token file, so even a browser here has to pair.
     /// Run this in a terminal, then type the code into the device.
     ///
-    /// The code works once and expires in five minutes.
+    /// The code works once and expires in five minutes. `--gateway` mints a
+    /// gateway pairing code instead, for another gateway.
     Pair {
         /// Gateway port, when it is not on 5252 (packaged) or 5251 (dev).
         #[arg(long)]
         port: Option<u16>,
-        /// What to call the device in the paired list.
+        /// What to call the device, or the gateway, in the paired list.
         #[arg(long)]
         label: Option<String>,
         /// Also draw the code as a QR, so a phone scans instead of typing.
@@ -195,6 +196,11 @@ enum Command {
         /// or absent. Implies `--qr`.
         #[arg(long)]
         host: Option<String>,
+        /// Mint a gateway pairing code instead, so another gateway can relay
+        /// this one's workspaces. Enter it there under Settings, Access, Add a
+        /// remote gateway.
+        #[arg(long, conflicts_with_all = ["qr", "host"])]
+        gateway: bool,
     },
     /// Read or change this gateway's external address: the origin other
     /// devices reach it at, through a reverse proxy, a VPN or a company name.
@@ -1915,8 +1921,18 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Pair {
             port,
             label,
+            gateway: true,
+            ..
+        } => {
+            pair::cmd_pair_gateway(port, label.as_deref())?;
+            Ok(0)
+        }
+        Command::Pair {
+            port,
+            label,
             qr,
             host,
+            gateway: false,
         } => {
             pair::cmd_pair(pair::PairArgs {
                 port,

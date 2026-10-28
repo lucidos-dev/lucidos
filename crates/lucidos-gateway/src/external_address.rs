@@ -128,7 +128,7 @@ async fn fetch_health(origin: &str) -> HealthAnswer {
 }
 
 /// `e` with its causes, so a certificate or DNS failure says which.
-fn error_chain(e: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(e: &dyn std::error::Error) -> String {
     let mut text = e.to_string();
     let mut source = e.source();
     while let Some(cause) = source {

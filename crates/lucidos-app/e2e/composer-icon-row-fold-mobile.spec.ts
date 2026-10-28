@@ -4,6 +4,7 @@ import {
   assertHealthy,
   closeComposerFold,
   composerControl,
+  followToggle,
   navigateToApp,
   setVoiceEnabled,
   waitForVisibleInput,
@@ -19,8 +20,9 @@ import { ensureHomeThread } from './db-helpers';
  *  real row at a real width actually folds, and whether a folded control still
  *  works when the user reaches it through the menu.
  *
- *  It also pins the order: the call and follow toggles stand before attach
- *  image, so they fold before it. Clear draft stands last among the icons.
+ *  It also pins the order: the call toggle stands before attach image, so it
+ *  folds before it. Clear draft stands last among the icons. The follow toggle
+ *  floats over the composer, so it stays put and never reaches the ⋯.
  *
  *  Voice is ON for this file, which is the reported case: a call toggle is one
  *  more box, and the row was reported crowded with one standing. It goes off
@@ -65,7 +67,7 @@ test.describe('the composer row folds its middle when it runs out of room', () =
 
     const more = page.locator(COMPOSER_FOLD_TRIGGER);
     const attach = page.locator('.prompt-actions-row [data-role="attach-image"]:visible');
-    const follow = page.locator('.prompt-actions-row [data-role="follow-live-edge"]:visible');
+    const follow = followToggle(page);
     let foldedAt = 0;
     for (const width of WIDTH_LADDER) {
       await page.setViewportSize({ width, height: restore?.height ?? 812 });
@@ -76,15 +78,15 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     }
     expect(foldedAt, `the row never folded, down to ${WIDTH_LADDER.at(-1)}px`).toBeGreaterThan(0);
 
-    // The fold takes a prefix: once attach leaves, both leading toggles have
-    // left too. The action slot stays on the right.
+    // The fold takes a prefix: once attach leaves, the leading toggle has left
+    // too. The action slot stays on the right, and the follow toggle stands.
     await expect(attach).toHaveCount(0);
     await expect(page.locator('.prompt-actions-row .control-menu:visible')).toHaveCount(0);
-    await expect(follow).toHaveCount(0);
-    await expect(await composerControl(page, '[data-role="follow-live-edge"]')).toHaveAttribute('role', 'menuitemcheckbox');
-    await closeComposerFold(page);
     await expect(await composerControl(page, '[data-role="call-toggle"]')).toHaveAttribute('role', 'menuitemcheckbox');
+    await expect(page.locator('.thread-overflow-menu [data-role="follow-live-edge"]')).toHaveCount(0);
     await closeComposerFold(page);
+    await expect(follow).toBeVisible();
+    await expect(page.locator('.prompt-actions-row [data-role="follow-live-edge"]')).toHaveCount(0);
     await expect(page.locator('.send-cancel-morph:visible')).toHaveCount(1);
 
     // The same selector reaches a folded action behind the ⋯, which is the
@@ -107,8 +109,8 @@ test.describe('the composer row folds its middle when it runs out of room', () =
     const startWidth = Math.max(restore?.width ?? 390, foldedAt);
     await page.setViewportSize({ width: startWidth, height: restore?.height ?? 812 });
     if (foldedAt < startWidth) await expect.poll(() => attach.count()).toBe(1);
-    await expect(follow).toHaveCount(1);
-    // The rung pill stands right of follow, and the fold takes a prefix.
+    await expect(follow).toBeVisible();
+    // The rung pill stands right of the icons, and the fold takes a prefix.
     await expect(page.locator('.prompt-actions-row .rung-pill:visible')).toHaveCount(1);
 
     await assertHealthy(page);

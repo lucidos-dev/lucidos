@@ -9,7 +9,7 @@ import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { activityMenuGroup, ActivityMenuGroup, type ActivityGroupProps } from '../ActivityMenuRows';
 import type { ActivityRow, ApplyThread } from '../../../store/actions/activityRows';
-import { LANE_GATHERING_LABEL, type LaneView, type MainCheckLine } from '../../../store/actions/landingLaneRow';
+import { LANE_GATHERING_LABEL, LANE_WAITING_FOR_ORIGIN_LABEL, type LaneView, type MainCheckLine } from '../../../store/actions/landingLaneRow';
 import { backgroundActivities } from '../../../store/backgroundActivity';
 import {
   applyAllCanceling,
@@ -303,6 +303,17 @@ describe('activityMenuGroup', () => {
     const body = el.querySelector('[data-role="activity-body"]')!;
     expect(body.textContent).toContain(LANE_GATHERING_LABEL);
     expect(body.textContent).not.toContain('for the next batch');
+  });
+
+  it('says why origin holds the lane, beside what waits', () => {
+    const waitingOnly: ActivityRow = { ...laneRow, label: '1 change waiting to land', detail: undefined, queued: true };
+    const el = draw(props({
+      rows: [waitingOnly],
+      lane: { ...EMPTY_LANE, waiting: LANE.waiting, waitingForOrigin: 'could not fetch from origin: timed out' },
+      open: new Set(['landing-lane']),
+    }));
+    const line = el.querySelector('[data-role="lane-waiting-for-origin"]');
+    expect(line?.textContent).toBe(`${LANE_WAITING_FOR_ORIGIN_LABEL}: could not fetch from origin: timed out`);
   });
 
   /** A lane row whose body carries `mainCheck`, unfolded. */

@@ -646,6 +646,32 @@ pub async fn sub_thread_pending_changes(
         .collect())
 }
 
+/// The statuses whose branch still holds work nobody has merged or thrown away.
+pub const UNRESOLVED_STATUSES: [ChangeStatus; 3] = [
+    ChangeStatus::Pending,
+    ChangeStatus::SetAside,
+    ChangeStatus::Withdrawn,
+];
+
+/// Every `(repo_root, branch_name)` an unresolved change lives on, once each.
+/// A backup bundles these, so a restore brings the work back.
+pub async fn unresolved_change_branches(
+    pool: &PgPool,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT DISTINCT repo_root, branch_name FROM changes \
+         WHERE status = ANY($1) ORDER BY repo_root, branch_name",
+    )
+    .bind(
+        UNRESOLVED_STATUSES
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// The status each of `ids` has now. An id with no row is absent. One query.
 pub async fn current_statuses(
     pool: &PgPool,
@@ -1487,6 +1513,21 @@ mod tests {
         .await
         .expect("insert raw change");
         id
+    }
+
+    #[tokio::test]
+    async fn unresolved_change_branches_skip_applied_and_discarded_work() {
+        let (pool, db) = setup_test_db().await;
+        let mut kept = Vec::new();
+        for status in ChangeStatus::ALL {
+            let id = insert_raw_change(&pool, status.as_str(), None).await;
+            if UNRESOLVED_STATUSES.contains(&status) {
+                kept.push(("/repo".to_string(), format!("b-{id}")));
+            }
+        }
+        kept.sort();
+        assert_eq!(unresolved_change_branches(&pool).await.unwrap(), kept);
+        teardown_test_db(&db).await;
     }
 
     /// The column decodes into the enum and binds back as the same text.

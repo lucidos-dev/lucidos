@@ -202,6 +202,8 @@ pub(crate) struct AuxCapture {
     purpose: ContextPurpose,
     /// When each provider call must have answered. See [`Self::until`].
     deadline: Option<tokio::time::Instant>,
+    /// The trigger whose fire made the call. See [`Self::for_trigger_fire`].
+    emitting_trigger_id: Option<String>,
 }
 
 /// Where a capture goes. Only a test can make one that goes nowhere.
@@ -228,6 +230,7 @@ impl AuxCapture {
             thread_id,
             purpose,
             deadline: None,
+            emitting_trigger_id: None,
         }
     }
 
@@ -241,6 +244,16 @@ impl AuxCapture {
         }
     }
 
+    /// This capture, with its rows stamped as `trigger`'s fire. The record
+    /// runs on its own task, which the fire's ambient marker never reaches.
+    /// So a caller that knows the fire states it here.
+    pub(crate) fn for_trigger_fire(self, trigger: Option<String>) -> Self {
+        Self {
+            emitting_trigger_id: trigger,
+            ..self
+        }
+    }
+
     /// A capture that records nothing, for a test that drives a model call
     /// with no database behind it.
     #[cfg(test)]
@@ -250,6 +263,7 @@ impl AuxCapture {
             thread_id: None,
             purpose,
             deadline: None,
+            emitting_trigger_id: None,
         }
     }
 
@@ -269,6 +283,7 @@ impl AuxCapture {
             Sink::Discard => return,
         };
         let thread_id = self.thread_id;
+        let trigger = self.emitting_trigger_id.clone();
         let task = tokio::spawn(async move {
             let thread_id = match thread_id {
                 Some(id) => id,
@@ -282,13 +297,14 @@ impl AuxCapture {
                     }
                 }
             };
-            bus.emit_or_log(
+            bus.emit_or_log_as_trigger(
                 BusEvent::Thread {
                     thread_id,
                     event,
                     meta: EventMeta::NONE,
                 },
                 "[AuxCapture] row",
+                trigger,
             )
             .await;
         });

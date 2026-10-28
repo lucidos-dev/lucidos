@@ -20,6 +20,9 @@
  * (ADR 0362, ADR 0165). Same reasoning. `available` carries both, so one gate
  * decides and the live-call exemption below covers every reason at once.
  *
+ * **Nor in a workspace opened through another gateway.** The relay carries no
+ * socket, so a call could never connect (ADR 0591).
+ *
  * **Every phase is on the button, visibly.** A call has four non-idle phases
  * and two of them are WORK: the connect takes seconds, and the hang-up takes a
  * network round trip. Painting one binary on-state left both reading as a dead
@@ -46,6 +49,7 @@ import type { OverflowMenuOpener } from '../shared/OverflowMenu';
 import { useLongPress } from '../../hooks/useLongPress';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { callStatusLabel, isOnCall } from '../../voice/callState';
+import { voiceReachable } from '../../voice/socketUrl';
 import type { CallPhase } from '../../voice/callState';
 import { pressCallToggle } from '../../store/voice';
 import { voiceCall } from '../../store/voiceCall';
@@ -139,7 +143,7 @@ export function CallToggle({ available = true, attrs }: { available?: boolean; a
   // A call already up survives either reason arriving mid-call, so the reader
   // never loses the control they ring off with. The switch can be turned off
   // and the destination can move; both leave the button where it was.
-  if ((!voiceEnabled() || !available) && !on) return null;
+  if (!callOffered(available) && !on) return null;
   return (
     <>
       <ToggleIconButton
@@ -182,6 +186,12 @@ export function CallToggle({ available = true, attrs }: { available?: boolean; a
   );
 }
 
+/** Whether the composer offers a call: voice is on, the Lucidos Agent holds
+ *  the destination, and this page can reach the engine's socket. */
+function callOffered(available: boolean): boolean {
+  return voiceEnabled() && available && voiceReachable();
+}
+
 /** The call toggle as a foldable member, or `null` when it would draw nothing.
  *
  *  The factory lives here rather than in the composer because deciding whether
@@ -196,7 +206,7 @@ export function callToggleAction(available: boolean): HeaderActionSpec | null {
   preferences.value;
   const call = voiceCall.value;
   const on = isOnCall(call.phase);
-  if ((!voiceEnabled() || !available) && !on) return null;
+  if (!callOffered(available) && !on) return null;
   return {
     key: 'call-toggle',
     dataRole: 'call-toggle',

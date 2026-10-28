@@ -137,9 +137,14 @@ async fn a_conflicted_batch_lands_as_one_landing_merge_per_member() {
     let merges = verify_integration(&lane.path, &base, &members)
         .await
         .expect("a complete integration branch");
-    let landed = land_integration(MainLocks::private_for_test(), &fx.repo, &lane.path)
-        .await
-        .unwrap();
+    let landed = land_integration(
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+    )
+    .await
+    .unwrap();
     let head = git(&lane.path, &["rev-parse", "HEAD"]).await;
     assert_eq!(
         landed,
@@ -199,6 +204,7 @@ async fn a_pass_through_lands_mid_resolution_and_the_batch_catches_up() {
     let published = publish_clean_pass(
         MainLocks::private_for_test(),
         &fx.repo,
+        &LandingOrder::OriginFirst,
         &[LandingInput {
             change_id: Uuid::new_v4(),
             snapshot_sha: pass.clone(),
@@ -207,7 +213,8 @@ async fn a_pass_through_lands_mid_resolution_and_the_batch_catches_up() {
         }],
     )
     .await
-    .unwrap();
+    .unwrap()
+    .published();
     let LandingStep::Landed(pass_merge) = &published.chain.steps[0].1 else {
         panic!("the clean change lands at once");
     };
@@ -215,9 +222,14 @@ async fn a_pass_through_lands_mid_resolution_and_the_batch_catches_up() {
     verify_integration(&lane.path, &base, &members)
         .await
         .unwrap();
-    let landed = land_integration(MainLocks::private_for_test(), &fx.repo, &lane.path)
-        .await
-        .unwrap();
+    let landed = land_integration(
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+    )
+    .await
+    .unwrap();
     let IntegrationLanding::Landed { pre, post } = landed else {
         panic!("a clean catch-up lands: {landed:?}");
     };
@@ -258,6 +270,7 @@ async fn a_catch_up_conflict_goes_back_to_the_lane_thread_and_never_fails() {
     publish_clean_pass(
         MainLocks::private_for_test(),
         &fx.repo,
+        &LandingOrder::OriginFirst,
         &[LandingInput {
             change_id: Uuid::new_v4(),
             snapshot_sha: pass.clone(),
@@ -266,7 +279,8 @@ async fn a_catch_up_conflict_goes_back_to_the_lane_thread_and_never_fails() {
         }],
     )
     .await
-    .unwrap();
+    .unwrap()
+    .published();
     let main_after_pass = git(&fx.repo, &["rev-parse", "main"]).await;
 
     std::fs::write(lane.path.join("e.txt"), "resolver\n").unwrap();
@@ -276,9 +290,14 @@ async fn a_catch_up_conflict_goes_back_to_the_lane_thread_and_never_fails() {
         .await
         .unwrap();
     let head_before = git(&lane.path, &["rev-parse", "HEAD"]).await;
-    let landed = land_integration(MainLocks::private_for_test(), &fx.repo, &lane.path)
-        .await
-        .unwrap();
+    let landed = land_integration(
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+    )
+    .await
+    .unwrap();
     let IntegrationLanding::CatchUpConflict { main_sha, commits } = landed else {
         panic!("the catch-up must conflict: {landed:?}");
     };
@@ -311,9 +330,14 @@ async fn a_catch_up_conflict_goes_back_to_the_lane_thread_and_never_fails() {
     verify_integration(&lane.path, &base, &members)
         .await
         .unwrap();
-    let landed = land_integration(MainLocks::private_for_test(), &fx.repo, &lane.path)
-        .await
-        .unwrap();
+    let landed = land_integration(
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(landed, IntegrationLanding::Landed { .. }),
         "{landed:?}"
@@ -575,4 +599,138 @@ fn the_lane_never_reports_a_concurrent_main_conflict() {
         .map(|(rel, _)| rel)
         .collect();
     assert!(lane_files.is_empty(), "{lane_files:?}");
+}
+
+impl Fixture {
+    /// Give the repo a bare `origin` holding its `main`, and a second clone
+    /// that plays another gateway. Returns `(origin, other)`.
+    async fn with_origin(&self) -> (PathBuf, PathBuf) {
+        let root = self.repo.parent().unwrap();
+        let origin = root.join("origin.git");
+        let other = root.join("other");
+        git(
+            root,
+            &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+        )
+        .await;
+        git(
+            &self.repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await;
+        git(&self.repo, &["push", "origin", "main"]).await;
+        git(
+            root,
+            &["clone", origin.to_str().unwrap(), other.to_str().unwrap()],
+        )
+        .await;
+        git(&other, &["config", "user.email", "test@example.com"]).await;
+        git(&other, &["config", "user.name", "Test"]).await;
+        (origin, other)
+    }
+}
+
+/// The other clone writes `text` into `file` and pushes, as another gateway
+/// landing first. Returns the new `origin/main`.
+async fn other_pushes(other: &Path, file: &str, text: &str) -> String {
+    std::fs::write(other.join(file), text).unwrap();
+    git(other, &["commit", "-am", &format!("other: write {file}")]).await;
+    git(other, &["push", "origin", "main"]).await;
+    git(other, &["rev-parse", "HEAD"]).await
+}
+
+/// Another gateway landed while the batch resolved. The batch catches up with
+/// `origin/main`, pushes, and only then moves local `main` (ADR 0589).
+#[tokio::test]
+async fn a_batch_catches_up_with_origin_and_pushes_before_main_moves() {
+    let fx = fixture().await;
+    let (origin, other) = fx.with_origin().await;
+    let s1 = fx.member("b1", "a.txt", "m1\n").await;
+    fx.main_writes(&["a.txt"], "main\n").await;
+    git(&fx.repo, &["push", "origin", "main"]).await;
+    git(&other, &["pull", "--ff-only", "origin", "main"]).await;
+    let (lane, base) = fx.lane().await;
+    land_conflicting(&lane.path, &s1, "one", "a.txt", "main+m1\n").await;
+    verify_integration(&lane.path, &base, &[member(1, &s1)])
+        .await
+        .unwrap();
+    let theirs = other_pushes(&other, "d.txt", "other\n").await;
+
+    let landed = land_integration(
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+    )
+    .await
+    .unwrap();
+    let IntegrationLanding::Landed { pre, post } = landed else {
+        panic!("the batch lands: {landed:?}");
+    };
+    assert_eq!(pre, theirs, "the batch built on origin/main");
+    assert_eq!(git(&origin, &["rev-parse", "main"]).await, post);
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]).await, post);
+    assert_eq!(read(&fx.repo, "d.txt"), "other\n");
+    assert_eq!(read(&fx.repo, "a.txt"), "main+m1\n");
+}
+
+/// An outside push that conflicts goes back to the lane thread, and nothing
+/// reaches `origin`.
+#[tokio::test]
+async fn an_outside_push_that_conflicts_goes_back_to_the_lane_thread() {
+    let fx = fixture().await;
+    let (origin, other) = fx.with_origin().await;
+    let s1 = fx.member("b1", "a.txt", "m1\n").await;
+    let (lane, base) = fx.lane().await;
+    git(&lane.path, &["merge", "--no-ff", &s1, "-m", "Land: one"]).await;
+    verify_integration(&lane.path, &base, &[member(1, &s1)])
+        .await
+        .unwrap();
+    let theirs = other_pushes(&other, "a.txt", "other\n").await;
+
+    let landed = land_integration(
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+    )
+    .await
+    .unwrap();
+    let IntegrationLanding::CatchUpConflict { main_sha, .. } = landed else {
+        panic!("the catch-up conflicts: {landed:?}");
+    };
+    assert_eq!(main_sha, theirs);
+    assert_eq!(git(&origin, &["rev-parse", "main"]).await, theirs);
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]).await, base);
+}
+
+/// With `origin` out of reach, the batch waits and `main` stays put.
+#[tokio::test]
+async fn an_unreachable_origin_keeps_the_batch_waiting() {
+    let fx = fixture().await;
+    let (origin, _other) = fx.with_origin().await;
+    let s1 = fx.member("b1", "a.txt", "m1\n").await;
+    let (lane, base) = fx.lane().await;
+    git(&lane.path, &["merge", "--no-ff", &s1, "-m", "Land: one"]).await;
+    let gone = origin.with_file_name("gone.git");
+    git(
+        &fx.repo,
+        &["remote", "set-url", "origin", gone.to_str().unwrap()],
+    )
+    .await;
+
+    let landed = land_integration(
+        MainLocks::private_for_test(),
+        &fx.repo,
+        &LandingOrder::OriginFirst,
+        &lane.path,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&landed, IntegrationLanding::WaitingForOrigin(why) if why.contains("could not fetch")),
+        "{landed:?}"
+    );
+    assert_eq!(git(&fx.repo, &["rev-parse", "main"]).await, base);
+    assert_eq!(git(&origin, &["rev-parse", "main"]).await, base);
 }

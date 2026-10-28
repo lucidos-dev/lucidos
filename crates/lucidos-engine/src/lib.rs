@@ -70,6 +70,7 @@ pub mod codegen;
 pub mod core;
 pub mod engine;
 pub mod gateway_auth;
+pub mod landing_gateway;
 pub mod llm;
 pub mod mcp;
 pub mod memory;

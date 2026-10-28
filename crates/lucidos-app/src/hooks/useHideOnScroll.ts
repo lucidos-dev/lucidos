@@ -443,6 +443,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       applyTransform();
     }
 
+    function clearPromptOffset() {
+      if (!promptEl) return;
+      promptEl.style.translate = '';
+      promptEl.style.removeProperty('--mobile-prompt-offset');
+    }
+
     /** Bind the thread pane's prompt, the element the prompt offset moves. It
      *  mounts with the swipe panes, which can land after this hook's effect. */
     function bindPrompt() {
@@ -450,7 +456,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       if (next === promptEl) return;
       promptResizeObserver?.disconnect();
       promptResizeObserver = null;
-      if (promptEl) promptEl.style.translate = '';
+      clearPromptOffset();
       promptEl = next;
       lastPromptOffsetRem = NaN;
       if (next) {
@@ -523,8 +529,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       const promptOffsetRem = promptOffset / cachedRemSize;
       if (promptOffsetRem !== lastPromptOffsetRem) {
         lastPromptOffsetRem = promptOffsetRem;
-        // Never a layout property, and on the two consumers only.
-        if (promptEl) promptEl.style.translate = promptOffsetRem ? `0 ${promptOffsetRem}rem` : '';
+        // Never a layout property, and on the two consumers only. The prompt
+        // carries the var for the follow toggle inside it.
+        if (promptEl) {
+          promptEl.style.translate = promptOffsetRem ? `0 ${promptOffsetRem}rem` : '';
+          promptEl.style.setProperty('--mobile-prompt-offset', `${promptOffsetRem}rem`);
+        }
         downChevronEl?.style.setProperty('--mobile-prompt-offset', `${promptOffsetRem}rem`);
       }
       // The app panel follows the header's scroll away, never the keyboard's:
@@ -1038,7 +1048,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       unsubFind();
       unsubCompose();
       promptResizeObserver?.disconnect();
-      if (promptEl) promptEl.style.translate = '';
+      clearPromptOffset();
       downChevronEl?.style.removeProperty('--mobile-prompt-offset');
       document.documentElement.removeAttribute('data-mobile-dynamic-bars');
       document.documentElement.style.removeProperty('--mobile-prompt-height');

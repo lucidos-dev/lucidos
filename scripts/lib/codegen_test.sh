@@ -252,8 +252,11 @@ fi
 echo "prune"
 CACHE=$(codegen_cache_root "$R")
 for i in $(seq 1 40); do mkdir -p "$CACHE/fp$i"; done
+touch -t 202001010000 "$CACHE/fp1"
+codegen_cached "$R" fp1 > /dev/null
 CODEGEN_CACHE_KEEP=5 codegen_prune "$CACHE"
 expect_eq "the cache keeps the newest renderings" "5" "$(find "$CACHE" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+expect_eq "a cache hit counts as recent" "yes" "$([ -d "$CACHE/fp1" ] && echo yes)"
 
 echo ""
 echo "codegen_test: $PASS passed, $FAIL failed"

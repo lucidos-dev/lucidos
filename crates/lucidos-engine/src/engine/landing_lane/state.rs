@@ -2,7 +2,7 @@
 //! a batch, and when a batch ends. No git and no events here. The driver feeds
 //! facts in and acts on what comes out.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use super::LaneMember;
 use uuid::Uuid;
@@ -206,6 +206,16 @@ impl Lane {
             return Vec::new();
         }
         std::mem::take(&mut self.waiting)
+    }
+
+    /// The waiting members named in `ids`, in queue order, even while the
+    /// queue is held. The rest keep waiting.
+    pub(crate) fn take_members(&mut self, ids: &HashSet<Uuid>) -> Vec<LaneMember> {
+        let (taken, rest) = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .partition(|m| ids.contains(&m.change_id));
+        self.waiting = rest;
+        taken
     }
 
     /// Take in what a clean pass could not merge. With the queue free they
@@ -493,6 +503,20 @@ mod tests {
         );
         assert_eq!(lane.take_pass(), vec![member(2), member(3)]);
         assert!(lane.waiting().is_empty());
+    }
+
+    /// Members `origin` refused pass while a batch holds the queue. The rest
+    /// keep their places.
+    #[test]
+    fn taking_named_members_passes_the_held_queue_in_order() {
+        let mut lane = lane_with_batch(vec![member(1)]);
+        for n in [2, 3, 4] {
+            lane.wait(member(n));
+        }
+        assert!(lane.take_pass().is_empty(), "the batch holds the queue");
+        let ids = HashSet::from([member(4).change_id, member(2).change_id]);
+        assert_eq!(lane.take_members(&ids), vec![member(2), member(4)]);
+        assert_eq!(lane.waiting(), &[member(3)]);
     }
 
     /// A failed batch queues nothing by itself: its members leave the lane,

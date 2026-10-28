@@ -271,6 +271,13 @@ jobs:
           prefix-key: v0-rust-smoke
           key: source-install-${{ matrix.os }}
 
+      # The mirror must be enough on its own (ADR 0595). Wiping the ort cache and
+      # ort-sys's build artifacts after the rust-cache restore forces a real
+      # fetch, and the assert step below fails if it did not come from the mirror.
+      - name: Block parcel.pyke.io and clear cached ONNX Runtime state
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh --wipe
+
       # macOS GitHub runners cannot run Docker Desktop. install.sh needs a
       # Docker daemon for Postgres, so provide one via Colima. (Ubuntu runners
       # ship Docker natively — no setup needed there.)
@@ -426,6 +433,10 @@ jobs:
           echo "Frontend serving 200 at $fe_url"
 
           echo "OK — clean-machine smoke test passed on ${{ matrix.os }}"
+
+      - name: Assert ONNX Runtime came from the mirror
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh --assert
 
       - name: Tear down
         if: always()
@@ -1086,6 +1097,10 @@ jobs:
         with:
           prefix-key: v0-rust-smoke
           key: tarball-${{ env.TRIPLE }}-ubuntu-22.04
+
+      - name: Block parcel.pyke.io (the ONNX Runtime mirror must be enough, ADR 0595)
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh
 
       - name: Build the prebuilt headless tarball (the download artifact)
         shell: bash

@@ -9,12 +9,20 @@ import { marked } from 'marked';
 // slug this bundle is served under, or null when served directly / in tests with
 // no stamped <base>). Read via a getter so renderMarkdown sees the current value.
 const base = vi.hoisted(() => ({ workspaceId: null as string | null }));
-vi.mock('./basePath', () => ({
-  get WORKSPACE_ID() {
-    return base.workspaceId;
-  },
-  API: '/myws/api/v1',
-}));
+vi.mock('./basePath', async () => {
+  const actual = await vi.importActual<typeof import('./basePath')>('./basePath');
+  return {
+    workspaceRouteSegment: actual.workspaceRouteSegment,
+    workspaceRouteUrlSegment: actual.workspaceRouteUrlSegment,
+    get WORKSPACE_ID() {
+      return base.workspaceId;
+    },
+    get REMOTE_GATEWAY() {
+      return base.workspaceId === null ? null : (actual.parseWorkspaceRoute(base.workspaceId)?.gateway ?? null);
+    },
+    API: '/myws/api/v1',
+  };
+});
 
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown, renderMarkdownInline, sanitizeHtmlFragments } from './renderMarkdown';
@@ -1011,6 +1019,35 @@ Use this pattern for all prompts.`;
       expect(html).toContain('href="https://localhost:5251/dev/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0003"');
       // raw (un-slugified) workspace name is preserved for the click handler
       expect(html).toContain('data-thread-workspace="Dev"');
+    });
+  });
+
+  describe('thread reference links — on and to a remote gateway', () => {
+    beforeEach(() => {
+      vi.stubGlobal('location', { origin: 'https://localhost:5251' });
+    });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      base.workspaceId = null;
+    });
+
+    it('points a gateway-qualified link at its relayed route', () => {
+      base.workspaceId = 'myws';
+      const html = renderMarkdown('See [it](thread:dev@cloud/aa11aaaa-bbbb-cccc-dddd-eeeeffff0011)');
+      expect(html).toContain('href="https://localhost:5251/dev@cloud/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0011"');
+      expect(html).toContain('data-thread-workspace="dev@cloud"');
+    });
+
+    it("points an unqualified link inside a remote workspace at that gateway's workspace", () => {
+      base.workspaceId = 'notes@cloud';
+      const html = renderMarkdown('See [it](thread:dev/aa11aaaa-bbbb-cccc-dddd-eeeeffff0012)');
+      expect(html).toContain('href="https://localhost:5251/dev@cloud/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0012"');
+    });
+
+    it('points an untagged link inside a remote workspace at that workspace', () => {
+      base.workspaceId = 'notes@cloud';
+      const html = renderMarkdown('See [it](thread:aa11aaaa-bbbb-cccc-dddd-eeeeffff0013)');
+      expect(html).toContain('href="https://localhost:5251/notes@cloud/#thread=aa11aaaa-bbbb-cccc-dddd-eeeeffff0013"');
     });
   });
 

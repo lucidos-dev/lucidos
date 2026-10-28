@@ -104,11 +104,6 @@ pub async fn for_workspace(pool: &PgPool) -> Option<SpokenLanguage> {
 mod tests {
     use super::*;
 
-    /// The Locale dropdown itself, read at compile time. The same reach the
-    /// engine already makes for the shared stylesheet in `api/sdk.rs`.
-    const LOCALE_SECTION: &str =
-        include_str!("../../../lucidos-app/src/components/settings/LocaleSection.tsx");
-
     fn resolved(preference: &str) -> SpokenLanguage {
         SpokenLanguage::resolve(preference).expect("a non-blank preference resolves")
     }
@@ -117,10 +112,12 @@ mod tests {
     /// It would offer the user a language that pins no code, which is the
     /// defect this module fixed, arriving through the other file.
     ///
-    /// `/harden` runs this for a `.tsx`-only diff because the `include_str!`
-    /// makes `LocaleSection.tsx` a compile input, which selects the Rust suite.
+    /// The `include_str!` stays inside this fn, so `/harden` runs only this
+    /// test for a `LocaleSection.tsx` edit, not the whole Rust suite.
     #[test]
     fn every_language_the_dropdown_offers_resolves_to_a_code() {
+        const LOCALE_SECTION: &str =
+            include_str!("../../../lucidos-app/src/components/settings/LocaleSection.tsx");
         let start = LOCALE_SECTION
             .find("const COMMON_LANGUAGES = [")
             .expect("the dropdown still declares COMMON_LANGUAGES");

@@ -15,7 +15,7 @@ use crate::engine::git_ops::{
     auto_commit_preserving_marker, branch_changed_files, commits_in_range, consume_harden_marker,
     default_local_branch, describe_branch_changes, ff_merge_to_main, files_have_client_update,
     files_require_restart, git_cmd, git_commit_no_edit, git_ran_ok, has_branch_commits,
-    worktree_current_branch,
+    push_main_in_background, worktree_current_branch,
 };
 use crate::engine::thread_events::EventChannel;
 use crate::engine::{AgentSession, LucidosEngine, ProcessResult, StopReason};
@@ -890,6 +890,11 @@ impl LucidosEngine {
                             .await;
                             let requires_restart_effective =
                                 change.requires_restart && !kind_ctx.is_app();
+                            // App changes merge to the workspace repo's
+                            // local-only main, as on every Apply tier.
+                            if !kind_ctx.is_app() {
+                                push_main_in_background(&repo_root, &self.event_bus);
+                            }
                             self.emit_change_applied(
                                 apply_claim,
                                 change.thread_id.unwrap_or(thread_id),

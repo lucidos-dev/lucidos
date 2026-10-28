@@ -287,5 +287,22 @@ if (
 else pass "a failed dependency audit aborts even with cached pgvector"; fi
 rm -rf "$PG_TEST_WORK"
 
+echo ""
+echo "test: stage_runtime_assert_static_onnxruntime rejects a dynamic onnxruntime"
+ORT_TEST_DIR="$(mktemp -d)"
+for tool in otool readelf; do
+    printf '#!/bin/sh\ncat "%s/listing"\n' "$ORT_TEST_DIR" > "$ORT_TEST_DIR/$tool"
+    chmod +x "$ORT_TEST_DIR/$tool"
+done
+printf 'libSystem.B.dylib\nlibc.so.6\n' > "$ORT_TEST_DIR/listing"
+if PATH="$ORT_TEST_DIR:$PATH" stage_runtime_assert_static_onnxruntime /bin/sh; then pass "a binary without onnxruntime passes"; else fail "clean listing rejected"; fi
+printf 'libSystem.B.dylib\nlibonnxruntime.1.20.0.dylib\nlibonnxruntime.so.1\n' > "$ORT_TEST_DIR/listing"
+if PATH="$ORT_TEST_DIR:$PATH" stage_runtime_assert_static_onnxruntime /bin/sh 2>/dev/null; then fail "a dynamic onnxruntime entry passed"; else pass "a dynamic onnxruntime entry fails"; fi
+if [ "$(uname -s)" = "Darwin" ]; then
+    printf '/src/onnxruntime-fix/target/lucidos-engine:\nlibSystem.B.dylib\n' > "$ORT_TEST_DIR/listing"
+    if PATH="$ORT_TEST_DIR:$PATH" stage_runtime_assert_static_onnxruntime /bin/sh; then pass "otool's own-path line is ignored"; else fail "a binary path naming onnxruntime was rejected"; fi
+fi
+rm -rf "$ORT_TEST_DIR"
+
 echo "stage_runtime: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

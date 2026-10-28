@@ -15,6 +15,11 @@ const RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL: &str =
 const MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL: &str =
     include_str!("../migrations/20260516195912_migrate_trigger_on_to_subscription_list.sql");
 
+/// When the bad migration ran. Every row's `created` is relative to it, since
+/// a cloned template database carries the time the template was built.
+const BAD_MIGRATION_INSTALLED_ON: &str =
+    "(SELECT installed_on FROM _sqlx_migrations WHERE version = 20260420164143)";
+
 /// Which payload field naming a `TriggerStarted` row uses.
 #[derive(Clone, Copy)]
 enum StartedShape {
@@ -39,10 +44,10 @@ async fn insert_trigger_config(
         "on": on_event,
         "schedule": schedule,
     });
-    sqlx::query(
-        r#"INSERT INTO events (id, event_type, payload, created)
-           VALUES ($1, $2, $3, NOW() - make_interval(secs => $4))"#,
-    )
+    sqlx::query(&format!(
+        "INSERT INTO events (id, event_type, payload, created)
+         VALUES ($1, $2, $3, {BAD_MIGRATION_INSTALLED_ON} - make_interval(secs => $4))"
+    ))
     .bind(Uuid::new_v4())
     .bind(event_type)
     .bind(payload)
@@ -80,11 +85,11 @@ async fn insert_trigger_started(
         "invocation": invocation,
     });
     let created_sql = match when {
-        CreatedAt::BeforeBadMigration { offset_secs } => format!(
-            "(SELECT installed_on FROM _sqlx_migrations WHERE version = 20260420164143) - make_interval(secs => {offset_secs})"
-        ),
+        CreatedAt::BeforeBadMigration { offset_secs } => {
+            format!("{BAD_MIGRATION_INSTALLED_ON} - make_interval(secs => {offset_secs})")
+        }
         CreatedAt::AfterBadMigration => {
-            "(SELECT installed_on FROM _sqlx_migrations WHERE version = 20260420164143) + INTERVAL '1 second'".to_string()
+            format!("{BAD_MIGRATION_INSTALLED_ON} + INTERVAL '1 second'")
         }
     };
     sqlx::query(&format!(
@@ -115,7 +120,7 @@ async fn fix_invocation_promotes_event_only_legacy_runs_to_event_kind() {
     let schedule_only = "22222222-2222-2222-2222-222222222222";
     let hybrid = "33333333-3333-3333-3333-333333333333";
 
-    // Configs created 2 hours ago, well before the bad migration ran.
+    // Configs created 2 hours before the bad migration ran.
     insert_trigger_config(
         &pool,
         "TriggerCreated",
@@ -147,8 +152,8 @@ async fn fix_invocation_promotes_event_only_legacy_runs_to_event_kind() {
     )
     .await;
 
-    // Legacy TriggerStarted rows — all wrongly defaulted to Schedule by the
-    // bad migration. Created 1 hour ago (before bad migration's installed_on).
+    // Legacy TriggerStarted rows, all wrongly defaulted to Schedule by the
+    // bad migration. Created 1 hour before the bad migration ran.
     let legacy_event_only = insert_trigger_started(
         &pool,
         StartedShape::Modern,

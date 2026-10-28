@@ -1,13 +1,16 @@
 import { workspaceName } from '../store/store';
+import { REMOTE_GATEWAY } from './basePath';
 import { copyToClipboard } from './clipboard';
+import { linkedWorkspaceRef } from './threadLinkWorkspace';
 
 /** Refs are always workspace-qualified so they keep meaning when pasted across
- *  workspaces. The link's visible text is the thread title; the title-prompt
- *  sanitizer (see crates/lucidos-engine/src/engine/chat/title.rs) strips it
- *  out before the LLM sees it, so pasting a ref into a new thread does not
- *  bias the generated title toward the referenced thread's subject. */
+ *  workspaces. Inside a remote workspace they are gateway-qualified too.
+ *
+ *  The link's visible text is the thread title. The title-prompt sanitizer
+ *  (crates/lucidos-engine/src/engine/chat/title.rs) strips it before the LLM
+ *  sees it. So a pasted ref does not bias the new thread's generated title. */
 function buildThreadRef(threadId: string, title: string): string {
-    const ws = workspaceName.value || 'unknown';
+    const ws = linkedWorkspaceRef(workspaceName.value || 'unknown', REMOTE_GATEWAY);
     const safeTitle = (title || 'Untitled Thread').replace(/[\[\]]/g, '');
     return `[${safeTitle}](thread:${ws}/${threadId})`;
 }

@@ -231,6 +231,11 @@ no task-local reaches. It is a cache, not state:
   ever clear one, and the resume is gated on cause, so a crashed loop cannot
   restart itself into a fresh budget.
 
+A spawn a script trigger fire asks for (`lucidos spawn-thread` from the
+script) records that trigger as `spawning_trigger_id` on its queued request.
+Cost attribution reads it from the `ThreadQueued` payload. It is no trigger
+marker: the spawn's frames stay unmarked, so they still wake the trigger.
+
 Draining starts after the scheduler has replayed trigger configs, so paused or
 deleted triggers are honored from the first admission decision.
 

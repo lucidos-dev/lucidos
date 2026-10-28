@@ -158,6 +158,26 @@ stage_runtime_build_binaries() {
     ( cd "$repo_root" && cargo build --locked "${pkg_args[@]}" --release ) || return 1
 }
 
+# stage_runtime_assert_static_onnxruntime <binary> — fail if <binary> loads a
+# libonnxruntime dylib at run time. The vendored ort-sys links the pinned static
+# archive (ADR 0595), so any onnxruntime entry means a host library crept in and
+# the shipped engine would not start on a machine without it. Fails closed when
+# the inspection tool is missing.
+stage_runtime_assert_static_onnxruntime() {
+    local bin="$1" listing
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # The first line of otool -L is the binary's own path, not a load command.
+        listing="$(otool -L "$bin")" || { echo "ERROR: otool -L failed on $bin" >&2; return 1; }
+        listing="$(printf '%s\n' "$listing" | tail -n +2)"
+    else
+        listing="$(readelf -d "$bin")" || { echo "ERROR: readelf -d failed on $bin" >&2; return 1; }
+    fi
+    if printf '%s\n' "$listing" | grep -qi 'onnxruntime'; then
+        echo "ERROR: $bin links a dynamic onnxruntime library; it must link the static archive (ADR 0595)." >&2
+        return 1
+    fi
+}
+
 # stage_runtime_fetch_postgres <pg-version> <pgvector-version> <triple> <work-dir>
 # Fetch the relocatable PostgreSQL <pg-version> for <triple> into <work-dir> and
 # compile pgvector <pgvector-version> against it (cached: re-extract / re-build only

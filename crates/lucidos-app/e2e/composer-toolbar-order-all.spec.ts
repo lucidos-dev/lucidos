@@ -18,11 +18,12 @@ test('composer icons and right-aligned controls stay put when clear draft toggle
     const input = await waitForVisibleInput(page);
     const row = page.locator('.prompt-actions-row:visible');
     const icons = [
-      '[data-role="follow-live-edge"]', '[data-role="side-question-toggle"]',
-      '[data-role="attach-image"]', '[data-role="todo-indicator"]',
+      '[data-role="side-question-toggle"]', '[data-role="attach-image"]', '[data-role="todo-indicator"]',
     ];
     const controls = [...icons, '.rung-control', '.action-slot'];
     for (const selector of controls) await expect(row.locator(selector)).toBeVisible();
+    // The follow toggle floats over the composer, so it takes no box here.
+    await expect(row.locator('[data-role="follow-live-edge"]')).toHaveCount(0);
     const positions = () => Promise.all(controls.map((selector) => row.locator(selector).boundingBox()));
     const empty = await positions();
     for (let i = 1; i < empty.length; i++) {
@@ -34,8 +35,8 @@ test('composer icons and right-aligned controls stay put when clear draft toggle
     const clear = row.locator('.prompt-clear');
     await expect(clear).toBeVisible();
     const clearBox = (await clear.boundingBox())!;
-    expect(clearBox.x).toBeGreaterThanOrEqual(empty[3]!.x + empty[3]!.width);
-    expect(clearBox.x + clearBox.width).toBeLessThanOrEqual(empty[4]!.x);
+    expect(clearBox.x).toBeGreaterThanOrEqual(empty[2]!.x + empty[2]!.width);
+    expect(clearBox.x + clearBox.width).toBeLessThanOrEqual(empty[3]!.x);
     await expect.poll(positions).toEqual(empty);
 
     await clear.click();

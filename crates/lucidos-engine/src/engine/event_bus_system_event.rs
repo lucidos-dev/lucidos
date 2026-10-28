@@ -1485,6 +1485,20 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// An Apply outside the landing lane moved `main`, but pushing it to
+    /// `origin` failed. `main` stays moved locally. `repo` names the
+    /// repository's root directory, and `reason` is git's answer (ADR 0589).
+    MainPushFailed {
+        repo: String,
+        reason: String,
+    },
+    /// Local `main` could not fast-forward to a newer `origin/main`, so it
+    /// stays where it was. Sent once per distinct reason. `repo` names the
+    /// repository's root directory (ADR 0589).
+    MainFollowRefused {
+        repo: String,
+        reason: String,
+    },
     /// The *main check* started on GitHub against a stripped copy of
     /// `to_sha`, covering what landed since `from_sha` (ADR 0464).
     MainCheckStarted {
@@ -1865,6 +1879,8 @@ impl SystemEvent {
         "LaneBatchStarted",
         "LaneBatchLanded",
         "LaneBatchFailed",
+        "MainPushFailed",
+        "MainFollowRefused",
         "MainCheckStarted",
         "MainCheckRunLinked",
         "MainCheckPassed",
@@ -2055,6 +2071,8 @@ impl SystemEvent {
             Self::LaneBatchStarted { .. } => "LaneBatchStarted",
             Self::LaneBatchLanded { .. } => "LaneBatchLanded",
             Self::LaneBatchFailed { .. } => "LaneBatchFailed",
+            Self::MainPushFailed { .. } => "MainPushFailed",
+            Self::MainFollowRefused { .. } => "MainFollowRefused",
             Self::MainCheckStarted { .. } => "MainCheckStarted",
             Self::MainCheckRunLinked { .. } => "MainCheckRunLinked",
             Self::MainCheckPassed { .. } => "MainCheckPassed",
@@ -2232,6 +2250,8 @@ impl SystemEvent {
         "LaneBatchStarted",
         "LaneBatchLanded",
         "LaneBatchFailed",
+        "MainPushFailed",
+        "MainFollowRefused",
         "MainCheckStarted",
         "MainCheckRunLinked",
         "MainCheckPassed",
@@ -2397,6 +2417,8 @@ impl SystemEvent {
             Self::LaneBatchStarted { .. }
             | Self::LaneBatchLanded { .. }
             | Self::LaneBatchFailed { .. } => "landing_lane",
+            Self::MainPushFailed { .. } => "main_push",
+            Self::MainFollowRefused { .. } => "main_follow",
             Self::MainCheckStarted { .. }
             | Self::MainCheckRunLinked { .. }
             | Self::MainCheckPassed { .. }
@@ -2544,6 +2566,9 @@ impl SystemEvent {
             Self::LaneBatchStarted { batch_id, .. }
             | Self::LaneBatchLanded { batch_id, .. }
             | Self::LaneBatchFailed { batch_id, .. } => batch_id.to_string(),
+            Self::MainPushFailed { repo, .. } | Self::MainFollowRefused { repo, .. } => {
+                repo.clone()
+            }
             Self::MainCheckStarted { check_id, .. }
             | Self::MainCheckRunLinked { check_id, .. }
             | Self::MainCheckPassed { check_id, .. }

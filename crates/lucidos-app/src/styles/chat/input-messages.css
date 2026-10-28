@@ -1036,11 +1036,10 @@
     scrollbar-gutter: stable;
     overflow-anchor: none; /* manual scroll anchoring — prevent browser interference */
     overscroll-behavior: contain;
-    /* Bottom padding reserves room for the last turn's navigation focus marker
-       (.nav-focus-stuck): past the prompt dissolve (--prompt-fade), plus the
-       marker's reach (--nav-focus-reach). The last turn cannot scroll clear of
-       the dissolve, so the padding is what gives it room. Mobile re-sets
-       padding-bottom in mobile.css.
+    /* Bottom padding (--transcript-end-reserve) clears the prompt dissolve and
+       the follow toggle floating over the composer, plus the focus marker's
+       reach. The last turn cannot scroll clear of either, so the padding is
+       what gives it room. Mobile re-sets padding-bottom in mobile.css.
 
        The top reserve holds no fade clearance. The first turn starts right
        under the thread title, where the top fade begins, and its own feed
@@ -1054,7 +1053,7 @@
     padding:
         var(--anchor-subpixel, 0px)
         var(--thread-pane-gutter)
-        calc(var(--prompt-fade) + var(--nav-focus-reach));
+        var(--transcript-end-reserve);
 }
 
 .thread-content.visible {
@@ -1121,11 +1120,13 @@
 }
 
 .scroll-to-top,
-.scroll-to-bottom {
+.scroll-to-bottom,
+.follow-toggle {
     position: absolute;
     right: calc(1.125rem + var(--phone-side-inset));
     width: var(--scroll-chevron-size);
     height: var(--scroll-chevron-size);
+    padding: 0;
     border-radius: var(--radius-round);
     background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
     backdrop-filter: blur(0.5rem);
@@ -1136,8 +1137,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    opacity: 0;
-    pointer-events: none;
     /* `translate` glides with the mobile dynamic bars (styles/mobile.css). */
     transition: opacity var(--duration-normal), background-color var(--duration-fast),
         color var(--duration-fast), border-color var(--duration-fast),
@@ -1146,17 +1145,31 @@
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
 }
 
+/* The chevrons show only while there is somewhere to scroll. */
+.scroll-to-top,
+.scroll-to-bottom {
+    opacity: 0;
+    pointer-events: none;
+}
+
 .scroll-to-top svg,
-.scroll-to-bottom svg {
+.scroll-to-bottom svg,
+.follow-toggle svg {
     width: var(--scroll-chevron-glyph);
     height: var(--scroll-chevron-glyph);
 }
 
 .scroll-to-top { top: max(calc(var(--header-controls-top) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
-.scroll-to-bottom { bottom: 0.75rem; }
+
+/* The bottom slot stack (base.css). The follow toggle always stands in the
+   bottom slot, over the composer's top edge. It renders inside `.prompt-area`,
+   so it rides a growing prompt. The down chevron stands one slot higher. */
+.follow-toggle { bottom: calc(100% + var(--scroll-chevron-inset)); }
+.scroll-to-bottom { bottom: calc(var(--scroll-chevron-inset) + var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap)); }
 
 .scroll-to-top.visible,
-.scroll-to-bottom.visible {
+.scroll-to-bottom.visible,
+.follow-toggle {
     opacity: 0.85;
     pointer-events: auto;
 }
@@ -1168,11 +1181,17 @@
    hidden chevron's reach takes no tap. */
 @media (pointer: coarse) {
     .scroll-to-top::before,
-    .scroll-to-bottom::before {
+    .scroll-to-bottom::before,
+    .follow-toggle::before {
         content: '';
         position: absolute;
         inset: calc(-1 * var(--scroll-chevron-reach));
     }
+
+    /* The down chevron and the follow toggle each reach half the stack gap
+       toward the other, so the two reaches meet and never overlap. */
+    .scroll-to-bottom::before { bottom: calc(-0.5 * var(--scroll-chevron-stack-gap)); }
+    .follow-toggle::before { top: calc(-0.5 * var(--scroll-chevron-stack-gap)); }
 }
 
 @media (--desktop-layout) {
@@ -1186,7 +1205,8 @@
        .thread-content padding box, so 1.5rem keeps the same 0.75rem inset); the two
        expressions meet exactly at the collapse width, so the inset stays constant. */
     .scroll-to-top,
-    .scroll-to-bottom {
+    .scroll-to-bottom,
+    .follow-toggle {
         right: max(1.5rem, calc(50% - var(--content-max-width) / 2 + 0.75rem));
     }
 
@@ -1242,7 +1262,8 @@
 @media (hover: hover) {
     .scroll-to-top { top: max(var(--scroll-chevron-top), calc(var(--safe-area-top) + var(--scroll-chevron-top))); }
     .scroll-to-top:hover,
-    .scroll-to-bottom:hover {
+    .scroll-to-bottom:hover,
+    .follow-toggle:hover {
         opacity: 1;
         background: var(--bg-hover);
         color: var(--text-primary);
@@ -1566,8 +1587,8 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
 /* The LAST turn drops the bottom half of that rhythm, because the rhythm is
    what separates a turn from the NEXT one and there is no next one. Below the
    last turn sits the transcript's own bottom padding
-   (--prompt-fade + --nav-focus-reach, which reserves the composer dissolve and
-   the focus marker's reach), and the feed rhythm stacked on top of that read as
+   (--transcript-end-reserve, which clears the composer dissolve, the follow
+   toggle and the focus marker's reach), and the feed rhythm stacked on top of that read as
    a hole under the running step: the reply's live edge floated well clear of
    the composer it was about to be answered in.
 
@@ -1608,7 +1629,7 @@ html[data-theme-mode="dark"] .thread-status-question-badge::after {
    turn's bottom padding plus this top padding, which tops it up to the same
    height (e2e/cache-warm-line-gaps-all.spec.ts). */
 .cache-warm-card {
-    padding: calc(var(--prompt-fade) + var(--nav-focus-reach) - var(--turn-feed-pad-y)) var(--turn-body-inset) 0 0;
+    padding: calc(var(--transcript-end-reserve) - var(--turn-feed-pad-y)) var(--turn-body-inset) 0 0;
 }
 
 /* A thin meter of the pings spent against the break-even budget. The card,

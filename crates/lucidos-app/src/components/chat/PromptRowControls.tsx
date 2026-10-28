@@ -3,7 +3,7 @@ import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { focusedThreadId, threadMap } from '../../store/store';
 import type { ThreadState } from '../../store/thread-events/thread-meta';
 import type { HeaderActionSpec } from '../layout/headerActions';
-import { FollowLiveEdgeIcon, SideQuestionIcon } from '../shared/icons';
+import { SideQuestionIcon } from '../shared/icons';
 import { callToggleAction } from './CallToggle';
 import { pressCallToggle } from '../../store/voice';
 import { callIsOffered } from '../../voice/callOffer';
@@ -15,7 +15,6 @@ import {
   CODING_AGENT_MENU_FOLD_KEY, CodingAgentIcon, ControlMenuTrigger, codingAgentMenuLabel, menuCodingAgent,
   type CodingAgentMenuProps,
 } from './ControlMenuTrigger';
-import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
 
 /** The coding-agent menu's button, drawn until the menu's code arrives. A
  *  press is held for the menu, which takes it as it mounts (ADR 0436). */
@@ -63,7 +62,7 @@ export function codingAgentMenuAction(agent: CodingAgent): HeaderActionSpec | nu
  *  edge. A fold only removes boxes, so no standing member crosses another.
  *
  *  **The toggles lead the row on every thread.** A coding-agent thread puts
- *  its menu after them, so the follow and side-question toggles stand where a
+ *  its menu after them, so the call and side-question toggles stand where a
  *  Lucidos Agent thread has them.
  *
  *  **The picker stands right of the situational members.** Diff and the
@@ -89,7 +88,7 @@ export function composerRowMembers(m: {
   /** Diff and the standing apply, whichever stand. */
   situational: readonly HeaderActionSpec[];
   rung: HeaderActionSpec | null;
-}): { row: HeaderActionSpec[]; cluster: HeaderActionSpec[]; foldOrder: HeaderActionSpec[] } {
+}): { row: HeaderActionSpec[]; cluster: HeaderActionSpec[]; foldOrder: HeaderActionSpec[]; mergeAt: string } {
   const present = (a: HeaderActionSpec | null): a is HeaderActionSpec => a !== null;
   const rest = [m.codingAgentMenu, m.attachImage].filter(present);
   const tail = [m.wipPreview, m.clearDraft].filter(present);
@@ -98,65 +97,25 @@ export function composerRowMembers(m: {
     row: [...m.toggles, ...rest, ...m.readouts, ...tail],
     cluster,
     foldOrder: [...m.readouts, ...m.toggles, ...rest, ...tail, ...cluster],
+    // Diff and the standing apply merge before the first member after the
+    // readouts folds. Attach image always stands, so one always exists.
+    mergeAt: [...m.toggles, ...rest][0].key,
   };
 }
 
 /** The row's toggles, left to right: the call toggle where a call is offered,
- *  the follow toggle, which renders in every state, then the side-question
- *  toggle where a side question can be asked. */
+ *  then the side-question toggle where a side question can be asked. */
 export function promptRowToggles(
   codingAgent: CodingAgent | null,
-  composeContext: boolean,
   thread: ThreadState | undefined,
   sideQuestion: HeaderActionSpec | null,
 ): HeaderActionSpec[] {
   const call = callToggleAction(callIsOffered(thread, codingAgent));
-  return [call, followLiveEdgeAction(composeContext), sideQuestion].filter((a): a is HeaderActionSpec => a !== null);
+  return [call, sideQuestion].filter((a): a is HeaderActionSpec => a !== null);
 }
-
-/** The follow toggle's fold key. The composer row merges Diff and the standing
- *  apply before this member folds. */
-export const FOLLOW_LIVE_EDGE_KEY = 'follow-live-edge';
 
 /** The side-question toggle's fold key. */
 const SIDE_QUESTION_KEY = 'side-question';
-
-/** The follow toggle.
- *
- *  **It RENDERS the follow rather than owning it.** `followingLiveEdge` is
- *  read-only, and the reader's own scroll writes it too. So the button goes off
- *  by itself when they scroll away from a live reply.
- *
- *  It lives in the prompt area rather than on the down chevron, which cannot
- *  hold both jobs. Nor in the turn header, which repeats per turn while this is
- *  one transcript-wide mode. Being here is what lets it be armed BEFORE a send.
- *
- *  It is offered in the COMPOSE view too, and that is the point of it living
- *  here. A new thread is where a reader most reliably wants carrying through
- *  the answer. It was also the one place the follow could not be armed at all.
- *  Compose has no transcript for `followingLiveEdge` to describe. So there it
- *  shows the FOLLOW SEED, which is what the thread this compose becomes starts
- *  as, and the press writes it. Everywhere else the live flag is what shows, so
- *  the button can never sit lit over an unfollowed transcript. */
-export function followLiveEdgeAction(composeContext: boolean): HeaderActionSpec {
-  const followOn = composeContext ? followLiveEdgeSeed.value : followingLiveEdge.value;
-  return {
-    key: FOLLOW_LIVE_EDGE_KEY,
-    dataRole: 'follow-live-edge',
-    label: followOn ? 'Stop following the live edge' : 'Follow the live edge',
-    tooltip: tooltipWithShortcut(
-      followOn
-        ? 'Following the live edge. Click to stop, and stay where you are.'
-        : 'Follow the live edge: go to the newest content and stay with it as the agent writes.',
-      'followLiveEdge',
-    ),
-    icon: () => <FollowLiveEdgeIcon armed={followOn} />,
-    active: followOn,
-    tone: 'glyph',
-    keepsFocus: true,
-    onClick: () => setFollowLiveEdge(!followOn),
-  };
-}
 
 /** The side-question toggle, offered only where `sideQuestionBlocker` allows
  *  one. It renders the per-thread mode, which the shortcut, the pill's × and
@@ -181,15 +140,9 @@ export function isComposeContext(thread: ThreadState | undefined): boolean {
   return !thread || thread.meta.state === 'composing';
 }
 
-function focusedThread(): ThreadState | undefined {
+export function focusedThread(): ThreadState | undefined {
   const id = focusedThreadId.value;
   return id ? threadMap.value.get(id) : undefined;
-}
-
-/** The follow shortcut. It makes the press the toggle would make for the
- *  focused thread, so the two never disagree about what they light. */
-export function toggleFollowLiveEdge(): void {
-  setFollowLiveEdge(!followLiveEdgeAction(isComposeContext(focusedThread())).active);
 }
 
 /** The call shortcut. It presses only where the composer draws the toggle,

@@ -24,7 +24,9 @@ const mobileCss = styles('mobile.css');
 const chevronCss = styles('chat/input-messages.css');
 
 const TOUCH = '@media (pointer: coarse)';
-const REACH = '.scroll-to-top::before, .scroll-to-bottom::before';
+const REACH = '.scroll-to-top::before, .scroll-to-bottom::before, .follow-toggle::before';
+const SURFACE = '.scroll-to-top, .scroll-to-bottom, .follow-toggle';
+const CHEVRONS = '.scroll-to-top, .scroll-to-bottom';
 
 /** The one rule in `css` with this selector at this at-rule scope. */
 function rule(css: string, selector: string, atRules = ''): Map<string, string> {
@@ -48,7 +50,7 @@ describe('the scroll chevrons reach past their circle on touch', () => {
     expect(touchRoot().get('--scroll-chevron-size')).toBe('var(--mobile-header-icon-box)');
     const box = rem(rule(mobileCss, ':root').get('--mobile-header-icon-box'));
     // `inset` counts from the padding box, so the border comes off each side.
-    const border = /^(\d+)px /.exec(rule(chevronCss, '.scroll-to-top, .scroll-to-bottom').get('border') ?? '')?.[1];
+    const border = /^(\d+)px /.exec(rule(chevronCss, SURFACE).get('border') ?? '')?.[1];
     expect(border, 'the circle\'s border is no longer a px width').toBeDefined();
     expect((box + 2 * reach()) * 16 - 2 * Number(border)).toBeGreaterThan(44);
   });
@@ -59,35 +61,50 @@ describe('the scroll chevrons reach past their circle on touch', () => {
     expect(before.get('position'), 'absolute, so it moves neither the circle nor the glyph').toBe('absolute');
     expect(before.get('inset')).toBe('calc(-1 * var(--scroll-chevron-reach))');
     expect(before.has('background'), 'the reach is never painted').toBe(false);
-    expect(cssRules(chevronCss).filter(r => r.selector.includes('::before') && r.selector.includes('scroll-to-')))
-      .toHaveLength(1);
+    // Besides it, only the two trims where the stacked pair face each other.
+    expect(cssRules(chevronCss).filter(r => r.selector.includes('::before') && /scroll-to-|follow-toggle/.test(r.selector))
+      .map(r => r.selector))
+      .toEqual([REACH, '.scroll-to-bottom::before', '.follow-toggle::before']);
   });
 
   it('takes no tap while its chevron is hidden', () => {
     // The overlay inherits `pointer-events` from its button. A value of its
     // own would keep a faded chevron catching taps meant for the counters.
     expect(rule(chevronCss, REACH, TOUCH).has('pointer-events')).toBe(false);
-    expect(rule(chevronCss, '.scroll-to-top, .scroll-to-bottom').get('pointer-events')).toBe('none');
-    expect(rule(chevronCss, '.scroll-to-top.visible, .scroll-to-bottom.visible').get('pointer-events')).toBe('auto');
+    expect(rule(chevronCss, SURFACE).has('pointer-events'), 'the follow toggle always takes taps').toBe(false);
+    expect(rule(chevronCss, CHEVRONS).get('pointer-events')).toBe('none');
+    expect(rule(chevronCss, '.scroll-to-top.visible, .scroll-to-bottom.visible, .follow-toggle').get('pointer-events'))
+      .toBe('auto');
   });
 
   it('paints, and hit-tests, above the transcript', () => {
     // The chevrons are siblings of `.thread-content`, which is z-index 2 on
     // mobile. The overlay rides the button's own layer, so it has no z-index.
     expect(rule(chevronCss, REACH, TOUCH).has('z-index')).toBe(false);
-    expect(rule(chevronCss, '.scroll-to-top, .scroll-to-bottom').get('z-index')).toBe('calc(var(--z-float) + 1)');
+    expect(rule(chevronCss, SURFACE).get('z-index')).toBe('calc(var(--z-float) + 1)');
     const zFloat = Number(rule(baseCss, ':root').get('--z-float'));
     const transcriptZ = Number(rule(mobileCss, '.mobile-swipe-pane .thread-content', '@media (--phone-layout)').get('z-index'));
     expect(zFloat + 1).toBeGreaterThan(transcriptZ);
   });
 
-  it('stops at the gap each chevron keeps to the chrome beside it', () => {
-    // The up chevron sits a gap below the title bar and the down chevron a gap
+  it('stops at the gap each button keeps to the chrome beside it', () => {
+    // The up chevron sits a gap below the title bar and the follow toggle a gap
     // above the composer. A longer reach would take their taps.
-    const downGap = rem(rule(chevronCss, '.scroll-to-bottom').get('bottom'));
+    expect(rule(chevronCss, '.follow-toggle').get('bottom')).toBe('calc(100% + var(--scroll-chevron-inset))');
+    const composerGap = rem(rule(baseCss, ':root').get('--scroll-chevron-inset'));
     const upTop = rule(mobileCss, '.mobile-swipe-pane .scroll-to-top', '@media (--phone-layout)').get('top') ?? '';
     const upGap = rem(/\+ ([\d.]+rem)\)$/.exec(upTop)?.[1]);
-    expect(reach()).toBeLessThanOrEqual(downGap);
+    expect(reach()).toBeLessThanOrEqual(composerGap);
     expect(reach()).toBeLessThanOrEqual(upGap);
+  });
+
+  it('meets, never overlaps, between the down chevron and the follow toggle', () => {
+    // The chevron stands one stack gap over the toggle. Each reaches half of it.
+    expect(rule(chevronCss, '.scroll-to-bottom').get('bottom'))
+      .toBe('calc(var(--scroll-chevron-inset) + var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap))');
+    expect(touchRoot().get('--scroll-chevron-stack-gap')).toBe('var(--scroll-chevron-reach)');
+    const half = 'calc(-0.5 * var(--scroll-chevron-stack-gap))';
+    expect(rule(chevronCss, '.scroll-to-bottom::before', TOUCH).get('bottom')).toBe(half);
+    expect(rule(chevronCss, '.follow-toggle::before', TOUCH).get('top')).toBe(half);
   });
 });

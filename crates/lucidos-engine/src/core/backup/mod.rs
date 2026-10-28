@@ -2,6 +2,7 @@ pub mod crypto;
 pub mod dropbox;
 pub mod google_drive;
 pub mod key;
+pub mod pending_bundles;
 pub mod recipient;
 
 use std::path::{Path, PathBuf};
@@ -668,6 +669,8 @@ pub fn parse_workspace_name_from_archive(filename: &str) -> Option<String> {
 /// The gateway has already reserved the registry entry, provisioned Postgres,
 /// and created `workspace_dir`. Here we only decrypt, decompress, move the
 /// workspace files in, and `pg_restore` the dump into `database_url`.
+/// Returns the warnings the user must see, such as a pending change branch
+/// that could not come back.
 ///
 /// Deliberately NARROWER than the old cloud `restore_backup`:
 ///   * **No provider / download** — the archive is already on disk (`encrypted_path`).
@@ -686,7 +689,7 @@ pub async fn restore_archive_into(
     key: crypto::OpeningKey,
     encrypted_path: &Path,
     progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
-) -> Result<(), BoxError> {
+) -> Result<Vec<String>, BoxError> {
     // Fail fast (before decrypt/decompress) if the bundled PG client tools can't
     // be resolved — restore drives pg_restore + psql. Path-bearing message.
     pg_tools_preflight(database_url)?;
@@ -701,12 +704,16 @@ pub async fn restore_archive_into(
 
     // Phases 1-2: decrypt + decompress/untar into staging, then drop user_dir/
     // (blocking I/O on the blocking pool).
-    let (staging_dir, secret_key) = {
+    let (staging_dir, secret_key, bundles) = {
         let progress = progress.clone();
         let encrypted_path = encrypted_path.to_path_buf();
         let temp_path = temp_dir.path().to_path_buf();
 
-        type Staged = (PathBuf, Option<crate::core::secret_store::SecretKey>);
+        type Staged = (
+            PathBuf,
+            Option<crate::core::secret_store::SecretKey>,
+            Option<PathBuf>,
+        );
         tokio::task::spawn_blocking(move || -> Result<Staged, BoxError> {
             // Phase 1: decrypt
             progress("decrypting", 0, 100);
@@ -764,7 +771,18 @@ pub async fn restore_archive_into(
                 Err(e) => return Err(e.into()),
             };
 
-            Ok((staging_dir, secret_key))
+            // The pending change bundles go back into their repositories,
+            // never into the workspace directory.
+            let staged_bundles = staging_dir.join(pending_bundles::ARCHIVE_DIR);
+            let bundles = if staged_bundles.exists() {
+                let kept = temp_path.join(pending_bundles::ARCHIVE_DIR);
+                std::fs::rename(&staged_bundles, &kept)?;
+                Some(kept)
+            } else {
+                None
+            };
+
+            Ok((staging_dir, secret_key, bundles))
         })
         .await??
     };
@@ -778,6 +796,23 @@ pub async fn restore_archive_into(
             move_contents(&staging_dir, &workspace_dir)
         })
         .await??;
+    }
+
+    // A branch that cannot come back is a warning for the user, never fatal:
+    // the workspace and the rest of its pending changes still restore.
+    let mut warnings = Vec::new();
+    if let Some(bundles) = bundles {
+        match pending_bundles::restore_bundles(&bundles).await {
+            Ok(problems) => warnings.extend(
+                problems
+                    .into_iter()
+                    .map(|problem| format!("A pending change branch was not restored: {problem}")),
+            ),
+            Err(e) => warnings.push(format!("No pending change branch was restored: {e}")),
+        }
+    }
+    for warning in &warnings {
+        log!("[Restore] {warning}");
     }
 
     // Phase 4: restore the database dump into the provisioned Postgres. Skipped
@@ -823,12 +858,14 @@ pub async fn restore_archive_into(
     }
 
     progress("done", 100, 100);
-    Ok(())
+    Ok(warnings)
 }
 
 /// Create an encrypted backup of a workspace and its database.
 ///
 /// Pipeline: pg_dump -> tar (exclude .lucidos/) -> zstd compress -> seal -> upload.
+/// `pending_branches` are the `(repo_root, branch)` pairs of unresolved changes,
+/// bundled into the archive by [`pending_bundles::write_bundles`].
 /// `key` seals the archive: the backup recipient, or a legacy key until the
 /// switch.
 ///
@@ -837,6 +874,7 @@ pub async fn restore_archive_into(
 pub async fn create_backup(
     workspace: &Path,
     database_url: &str,
+    pending_branches: &[(String, String)],
     key: crypto::SealingKey,
     provider: &dyn BackupProvider,
     progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
@@ -869,6 +907,13 @@ pub async fn create_backup(
 
     let temp_dir = tempfile::tempdir()?;
     let progress = Arc::new(progress);
+
+    // Bundle unresolved change branches into the staging area, so the archive
+    // seals them with everything else and the temp dir removes them.
+    let pending_dir = temp_dir.path().join(pending_bundles::ARCHIVE_DIR);
+    let pending_dir = pending_bundles::write_bundles(workspace, pending_branches, &pending_dir)
+        .await?
+        .then_some(pending_dir);
 
     let suffix = key.archive_suffix();
     // Phases 1-3: blocking I/O — run on the blocking thread pool
@@ -909,6 +954,7 @@ pub async fn create_backup(
                 &workspace,
                 &dump_path,
                 &secret_key_path,
+                pending_dir.as_deref(),
                 &compressed_path,
                 &ignore,
             )?;
@@ -1781,6 +1827,7 @@ fn tar_and_compress(
     workspace: &Path,
     sql_dump: &Path,
     secret_key: &Path,
+    pending_dir: Option<&Path>,
     output: &Path,
     ignore: &BackupIgnore,
 ) -> Result<(), BoxError> {
@@ -1811,6 +1858,9 @@ fn tar_and_compress(
     std::fs::metadata(sql_dump)?;
     append_file(&mut builder, sql_dump, Path::new("lucidos_backup.dump"))?;
     append_file(&mut builder, secret_key, Path::new(SECRET_STORE_KEY_ENTRY))?;
+    if let Some(dir) = pending_dir {
+        builder.append_dir_all(pending_bundles::ARCHIVE_DIR, dir)?;
+    }
 
     let encoder = builder.into_inner()?;
     encoder.finish()?;

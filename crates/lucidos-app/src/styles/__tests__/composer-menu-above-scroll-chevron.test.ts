@@ -37,7 +37,7 @@ function floatOffset(value: string | undefined): number {
 
 describe('composer menu above the scroll chevron', () => {
   const chevron = cssRules(styles('chat/input-messages.css'))
-    .find(r => r.selector === '.scroll-to-top, .scroll-to-bottom');
+    .find(r => r.selector === '.scroll-to-top, .scroll-to-bottom, .follow-toggle');
   const chevronOffset = floatOffset(chevron?.props.get('z-index'));
 
   it('lifts every z-indexed composer above the chevron while a menu is open', () => {

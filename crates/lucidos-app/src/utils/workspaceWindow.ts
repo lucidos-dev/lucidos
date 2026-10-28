@@ -24,6 +24,7 @@
  */
 
 import { openWorkspace } from '../api/client/control';
+import { workspaceRouteUrlSegment } from './basePath';
 import { isMac, isStandalone, isTauri } from './platform';
 import type { ClickModifiers } from './documentNavigation';
 import { openNewTab } from './newTab';
@@ -164,7 +165,7 @@ export function middleClickHandler(activate: (e: MouseEvent) => void) {
  *  `openWorkspace` navigates to, so a new tab and a switch cannot disagree
  *  about where a workspace lives. */
 export function workspacePath(id: string, landing?: WorkspaceLanding): string {
-  return `/${encodeURIComponent(id)}/${landingHash(landing)}`;
+  return `/${workspaceRouteUrlSegment(id)}/${landingHash(landing)}`;
 }
 
 /** The browser tab a workspace gets. Naming it is what makes a second

@@ -1250,6 +1250,43 @@ async fn a_sub_thread_a_fire_submits_does_not_inherit_the_fires_marker() {
     teardown_test_db(&f.db).await;
 }
 
+/// A script fire's `lucidos spawn-thread` names its fire for cost
+/// attribution, in the queued request. Its frames still carry no marker,
+/// so the spawn keeps waking the trigger.
+#[tokio::test]
+async fn a_spawn_from_a_script_fire_names_the_fire_without_marking_its_frames() {
+    let f = fixture(10).await;
+    let mut rx = f.bus.subscribe();
+    let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+        "type": "agent-chat",
+        "message": "summarise the inbox",
+        "thread_id": Uuid::new_v4(),
+        "mode": "agent",
+        "parent_thread_id": Uuid::new_v4(),
+        "spawning_trigger_id": "trig-a",
+    }))
+    .expect("an agent-chat request");
+    let spawn = f.queue.submit(request, None, None).await;
+    assert!(spawn.admitted);
+    f.executor.release_one();
+
+    for (name, marker) in entry_frame_markers(&mut rx, spawn.entry_id).await {
+        assert_eq!(marker, None, "{name} carries the fire's marker");
+    }
+    let named: Option<String> = sqlx::query_scalar(
+        "SELECT payload->'data'->'request'->>'spawning_trigger_id' FROM events \
+         WHERE event_type = 'ThreadQueued' AND payload->'data'->>'entry_id' = $1",
+    )
+    .bind(spawn.entry_id.to_string())
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(named.as_deref(), Some("trig-a"));
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
 #[tokio::test]
 async fn pause_trigger_overflow_pauses_via_bus_event() {
     let f = fixture(10).await;

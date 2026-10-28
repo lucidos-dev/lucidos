@@ -16,6 +16,7 @@ import {
 } from '../../store/actions/preferences';
 import { SYSTEM_ONE_PROVIDERS, SYSTEM_ONE_PROVIDER_LOCATION } from '../settings/judgmentBackend';
 import { rankByTitle } from './titleMatch';
+import { voiceReachable } from '../../voice/socketUrl';
 
 type Subview = Exclude<SettingsSubview, 'main'>;
 
@@ -156,6 +157,8 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // browser user came looking for, from behind the section showing it.
   { id: 'access:urls', label: 'Connect URLs', subview: 'access', path: 'Settings → Access', anchor: 'access:urls', keywords: 'connect url localhost lan tailnet magicdns address phone open elsewhere' },
   { id: 'access:add-device', label: 'Add a device', subview: 'access', path: 'Settings → Access', anchor: 'access:add-device', keywords: 'pair pairing code qr scan phone new device enrol add' },
+  { id: 'access:pair-gateway', label: 'Pair a gateway', subview: 'access', path: 'Settings → Access', anchor: 'access:pair-gateway', keywords: 'pair gateway code another gateway let in unpair relay remote' },
+  { id: 'access:remote-gateways', label: 'Remote gateways', subview: 'access', path: 'Settings → Access', anchor: 'access:remote-gateways', keywords: 'remote gateway add another machine cloud server workspaces elsewhere pair' },
   { id: 'access:tailscale', label: 'Tailscale', subview: 'access', path: 'Settings → Access', anchor: 'access:tailscale', keywords: 'tailscale tailnet vpn magicdns serve https sign in' },
   { id: 'access:network', label: 'Network access', subview: 'access', path: 'Settings → Access', anchor: 'access:network', keywords: 'network bind loopback lan address listen expose engine' },
   { id: 'access:external-address', label: 'External address', subview: 'access', path: 'Settings → Access', anchor: 'access:external-address', keywords: 'external address pairing qr vpn wireguard zerotier netbird headscale reverse proxy domain origin' },
@@ -192,14 +195,15 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // header is always there, and carries the switch that brings the row back.
   { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Providers → Vertex AI', anchor: 'models:vertex-ai' },
   { id: 'models:voice', label: 'Voice', subview: 'models', path: 'Settings → Models', anchor: 'models:voice', keywords: 'voice call talk speak speech audio microphone realtime talker transcriber experimental' },
-  { id: 'models:voice-enabled', label: 'Voice (experimental)', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'voice call enable turn on off home thread' },
+  { id: 'models:voice-enabled', label: 'Voice (experimental)', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'voice call enable turn on off home thread', when: voiceReachable },
   // The rows below render only while voice is on. So, like Region above, they
-  // land on the switch row, which always renders.
-  { id: 'models:voice-talker', label: 'Talker model', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'talker speech to speech realtime voice model' },
-  { id: 'models:voice-transcriber', label: 'Transcriber model', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'transcriber transcription speech to text whisper voice model' },
-  { id: 'models:voice-talker-voice', label: 'Spoken voice', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'spoken voice sounds like speaker persona' },
-  { id: 'models:voice-resident-sections', label: 'Resident context', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'resident context call knows voice sections' },
-  ...VOICE_RESIDENT_SECTIONS.map((s): SettingsSearchEntry => ({ id: `models:voice-section-${s.id}`, label: s.title, subview: 'models', path: 'Settings → Models → Voice → Resident context', anchor: 'models:voice-enabled', keywords: 'voice resident context call knows' })),
+  // land on the switch row. A relayed workspace draws no switch, so there only
+  // the Voice heading above is found.
+  { id: 'models:voice-talker', label: 'Talker model', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'talker speech to speech realtime voice model', when: voiceReachable },
+  { id: 'models:voice-transcriber', label: 'Transcriber model', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'transcriber transcription speech to text whisper voice model', when: voiceReachable },
+  { id: 'models:voice-talker-voice', label: 'Spoken voice', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'spoken voice sounds like speaker persona', when: voiceReachable },
+  { id: 'models:voice-resident-sections', label: 'Resident context', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'resident context call knows voice sections', when: voiceReachable },
+  ...VOICE_RESIDENT_SECTIONS.map((s): SettingsSearchEntry => ({ id: `models:voice-section-${s.id}`, label: s.title, subview: 'models', path: 'Settings → Models → Voice → Resident context', anchor: 'models:voice-enabled', keywords: 'voice resident context call knows', when: voiceReachable })),
   { id: 'models:title-style', label: 'Title style', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-style', keywords: 'title style thread name naming kebab case format reset' },
   { id: 'models:change-summary', label: 'Change summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:change-summary', keywords: 'change summary pending change diff describe' },
   { id: 'models:summary-compaction', label: 'Summary compaction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:summary-compaction', keywords: 'summary compaction compactor tree memory', when: () => currentMemoryModule() === 'tree' },

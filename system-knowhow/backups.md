@@ -21,6 +21,10 @@ Included:
   `pg_dump` custom-format archive at the archive root.
 - The workspace **files** under the workspace dir, **including `.git/`** (artifact
   version history).
+- The branches of **pending changes** in repositories outside the workspace,
+  such as a Lucidos source checkout, as git bundles. Only commits `main` lacks
+  are bundled. A backup that cannot read such a repository fails rather than
+  leave the work out.
 
 Excluded:
 
@@ -190,3 +194,8 @@ Restore is **not** an engine operation, and the agent does not do it. It
 happens in the **workspace picker**: the gateway provisions a new workspace and
 unpacks the archive into it. Point the user there. The picker takes a `.age`
 backup with its backup key, or an older `.enc` backup with its base64 key.
+
+A restore puts each pending change branch back into its repository, at the same
+path. A branch that cannot come back, because that repository is missing or
+already holds newer work on it, does not stop the restore. The picker lists it
+as a warning, and the backup still holds it.

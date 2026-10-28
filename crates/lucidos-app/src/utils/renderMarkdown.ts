@@ -8,8 +8,8 @@ import {
 import { COPY_ICON } from './copyIcons';
 import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
-import { WORKSPACE_ID } from './basePath';
-import { slugifyWorkspaceName } from './slug';
+import { REMOTE_GATEWAY, WORKSPACE_ID, workspaceRouteUrlSegment } from './basePath';
+import { THREAD_LINK_SOURCE, linkedWorkspaceRoute, resolveLinkedWorkspace } from './threadLinkWorkspace';
 import { landingHash } from './workspaceLanding';
 import { createHeadingSlugger, HEADING_ID_PREFIX } from './headingSlug';
 import { markImageUnavailable } from './markdownImageFallback';
@@ -27,9 +27,13 @@ import { markdownLinkTooltip } from './markdownLinkTooltip';
  *  is no peer URL to build synchronously, so `#` stands. */
 function threadLinkHref(workspace: string | undefined, threadId: string): string {
   if (WORKSPACE_ID === null || typeof location === 'undefined') return '#';
-  const slug = workspace ? slugifyWorkspaceName(workspace) : WORKSPACE_ID;
-  return `${location.origin}/${encodeURIComponent(slug)}/${landingHash({ thread: threadId })}`;
+  const route = workspace
+    ? linkedWorkspaceRoute(resolveLinkedWorkspace(workspace, REMOTE_GATEWAY))
+    : WORKSPACE_ID;
+  return `${location.origin}/${workspaceRouteUrlSegment(route)}/${landingHash({ thread: threadId })}`;
 }
+
+const THREAD_HREF_RE = new RegExp(`href="${THREAD_LINK_SOURCE}"`, 'g');
 
 // Drops the <a> wrapper while preserving nested inline markdown. Two reasons:
 // the helper's outputs nest inside <button>, where <a> is an invalid
@@ -686,7 +690,7 @@ export function renderMarkdown(md: string, opts?: { cache?: boolean; document?: 
     html = spaceUnspacedEmDashes(html);
     // The workspace-qualified form is what the copy-ref button emits.
     html = html.replace(
-      /href="thread:(?:([a-zA-Z0-9_-]+)\/)?([0-9a-f-]+)"/g,
+      THREAD_HREF_RE,
       (_match, workspace: string | undefined, threadId: string) => {
         const wsAttr = workspace ? ` data-thread-workspace="${escapeHtmlAttr(workspace)}"` : '';
         const href = escapeHtmlAttr(threadLinkHref(workspace, threadId));

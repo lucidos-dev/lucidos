@@ -208,29 +208,40 @@ pub struct PairedDevices {
     pub devices: Vec<PairedDevice>,
 }
 
+/// Load a JSON credential store. A missing file is an empty store, which is
+/// the first-run state.
+///
+/// A malformed one is an error rather than an empty store. Silently forgetting
+/// every grant would lock the user out and read as "nothing was ever paired".
+pub fn load_store<T: Default + serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<T, crate::BoxError> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) if raw.trim().is_empty() => Ok(T::default()),
+        Ok(raw) => Ok(serde_json::from_str(&raw)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+/// Write a JSON credential store atomically, owner-only.
+pub fn save_store<T: Serialize>(store: &T, path: &Path) -> Result<(), crate::BoxError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    local_token::write_owner_only(&tmp, &serde_json::to_string_pretty(store)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 impl PairedDevices {
-    /// Load the store. A missing file is an empty store, which is the first-run
-    /// state. A malformed one is an error rather than an empty store: silently
-    /// forgetting every paired device would lock the user out of their own
-    /// machine and read as "nothing was ever paired".
     pub fn load(path: &Path) -> Result<Self, crate::BoxError> {
-        match std::fs::read_to_string(path) {
-            Ok(raw) if raw.trim().is_empty() => Ok(Self::default()),
-            Ok(raw) => Ok(serde_json::from_str(&raw)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(Box::new(e)),
-        }
+        load_store(path)
     }
 
-    /// Write the store atomically, owner-only.
     pub fn save(&self, path: &Path) -> Result<(), crate::BoxError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        local_token::write_owner_only(&tmp, &serde_json::to_string_pretty(self)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        save_store(self, path)
     }
 
     /// The device whose credential digest matches, if any.

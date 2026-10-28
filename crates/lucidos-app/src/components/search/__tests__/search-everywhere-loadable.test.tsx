@@ -193,7 +193,7 @@ describe('hits before everything has loaded', () => {
     expect(results().querySelector('.search-everywhere-pending')).toBeNull();
   });
 
-  it('keeps the keyboard selection on its row when a category lands above it', async () => {
+  it('lands a late category below the rows already drawn, keeping the selection', async () => {
     let landApps: (items: SearchResultItem[]) => void = () => {};
     answerAll([]);
     engine.answers.apps = new Promise(resolve => { landApps = resolve; });
@@ -203,12 +203,13 @@ describe('hits before everything has loaded', () => {
     press('ArrowDown');
     expect(selectedTitle()).toBe(first);
 
-    // Neither title holds the query, so the tie keeps Apps above Settings.
+    // A tie would put Apps above Settings, but Settings is already on screen.
     await act(async () => {
       landApps([hit('apps', 'habit-tracker')]);
       for (let i = 0; i < 5; i++) await Promise.resolve();
     });
-    expect(rowTitles()[0]).toBe('habit-tracker');
+    expect(rowTitles()[0]).toBe(first);
+    expect(rowTitles()).toContain('habit-tracker');
     expect(selectedTitle()).toBe(first);
   });
 });

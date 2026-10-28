@@ -308,12 +308,18 @@ fn only_the_lane_and_the_app_path_move_main() {
         "ff_main_to_branch(",
         "catchup_and_ff_to_main(",
         "ff_merge_to_main(",
+        "move_local_main(",
+        "follow_origin_main(",
     ];
     // (file, why it may move `main`)
     const ALLOWED: &[(&str, &str)] = &[
         ("engine/git_ops/merge.rs", "the primitives themselves"),
         ("engine/landing_lane/landing.rs", "the landing lane"),
         ("engine/landing_lane/integration.rs", "the landing lane"),
+        (
+            "engine/follow_main.rs",
+            "following origin/main, a fast-forward only (ADR 0589)",
+        ),
         ("engine/change_ops/apply.rs", "the app path's Tiers 1 to 3"),
         (
             "engine/agent_session/apply_now.rs",
@@ -903,10 +909,12 @@ fn every_member_leaving_a_pass_settles_its_source_thread() {
         merge_sha: "m".into(),
     };
     let landed = LandingStep::Landed(merge.clone());
+    let landed_earlier = LandingStep::AlreadyOnMain(Some(merge.clone()));
     let cases = [
         (&landed, None, Some(true)),
         (&landed, Some("update-ref failed"), Some(false)),
-        (&LandingStep::AlreadyOnMain, None, Some(true)),
+        (&LandingStep::AlreadyOnMain(None), None, Some(true)),
+        (&landed_earlier, Some("update-ref failed"), Some(true)),
         (&LandingStep::SetAside, None, None),
     ];
     for (step, failed, settles) in cases {
@@ -1417,11 +1425,15 @@ fn a_failed_batch_unqueues_every_member_before_reading_its_status() {
 #[test]
 fn a_waiting_member_held_elsewhere_is_tried_again_when_its_claim_goes() {
     let driver = production("engine/landing_lane/driver.rs");
-    let claim_waiting = fn_body(&driver, "claim_waiting");
-    assert!(claim_waiting.contains(".try_claim_for_lane(member.change_id)"));
-    assert!(!claim_waiting.contains(".try_claim(member.change_id)"));
+    let claim_members = fn_body(&driver, "claim_members");
+    assert!(claim_members.contains(".try_claim_for_lane(member.change_id)"));
+    assert!(!claim_members.contains(".try_claim(member.change_id)"));
     assert!(fn_body(&driver, "start_landing_lane_driver").contains(".on_lane_wait_release("));
     assert!(fn_body(&driver, "handle").contains("LaneMsg::ClaimReleased"));
+    assert!(
+        fn_body(&driver, "handle").contains("LaneMsg::OriginAnswered => self.retry_origin()"),
+        "the follow task's answer from origin retries a landing that waited for it"
+    );
     assert!(
         !driver.contains("tokio::time::"),
         "the lane waits on messages, never on a clock (plan non-goal: no timers)"

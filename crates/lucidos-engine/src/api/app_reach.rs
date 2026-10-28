@@ -154,6 +154,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/events/emit", App, &["POST"]),
     ("/events/query", App, &["GET"]),
     ("/events/types", App, &["GET"]),
+    ("/follow-main/nudge", Host, &[]),
     ("/fonts", App, &["GET"]),
     // Loaded as a tag too. A capture also reads the bytes over the bridge, to
     // embed the face in its snapshot. They are public vendored fonts.

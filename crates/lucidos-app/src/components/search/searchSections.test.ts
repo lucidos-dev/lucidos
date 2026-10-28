@@ -10,6 +10,31 @@ function line(path: string, lineNo: number, text: string): TextSearchHit {
   return { path, line: lineNo, before: '', matched: text, after: '' };
 }
 
+describe('sections that answer late on the All tab', () => {
+  const settings = [hit('settings', 'Open links in the in-app browser')];
+  const threads = [hit('threads', 'iOS PWA External Browser Fix')];
+
+  it('rank by their best hit when all answer together', () => {
+    expect(rankedSections({ settings, threads }, 'browser').map(s => s.section)).toEqual(['threads', 'settings']);
+  });
+
+  it('slot below the sections already drawn, even when they rank higher', () => {
+    const sections = rankedSections({ settings, threads }, 'browser', [], ['settings']);
+    expect(sections.map(s => s.section)).toEqual(['settings', 'threads']);
+    expect(sections[1].offset).toBe(1);
+  });
+
+  it('keep their own rank among each other', () => {
+    const files = [hit('files', 'notes-on-browser-support-and-more.md')];
+    const sections = rankedSections({ settings, files, threads }, 'browser', [], ['settings']);
+    expect(sections.map(s => s.section)).toEqual(['settings', 'threads', 'files']);
+  });
+
+  it('leave out a drawn section that has no hits now', () => {
+    expect(rankedSections({ threads }, 'browser', [], ['settings']).map(s => s.section)).toEqual(['threads']);
+  });
+});
+
 describe('the Text section on the All tab', () => {
   it('comes after every name section, even when its line is the query exactly', () => {
     const sections = rankedSections(

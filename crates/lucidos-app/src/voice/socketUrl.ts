@@ -10,7 +10,13 @@
  * No credential is appended. The gateway authenticates a same-origin handshake
  * by cookie, exactly as it does an ordinary request (ADR 0151).
  */
-import { API } from '../utils/basePath';
+import { API, REMOTE_GATEWAY } from '../utils/basePath';
+
+/** Whether this page can open a call at all. A workspace opened through
+ *  another gateway cannot: the relay carries no socket (ADR 0591). */
+export function voiceReachable(): boolean {
+  return REMOTE_GATEWAY === null;
+}
 
 /** The socket scheme matching a page scheme. */
 export function socketScheme(pageProtocol: string): 'ws:' | 'wss:' {

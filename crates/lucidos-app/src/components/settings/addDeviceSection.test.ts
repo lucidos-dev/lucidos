@@ -13,7 +13,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { qrImageSrc, secondsLeft, expiryLabel, targetSentence } from './AddDeviceSection';
+import { qrImageSrc, expiryLabel, targetSentence } from './AddDeviceSection';
+import { secondsLeft } from './useCodeCountdown';
 import { findSettingsEntry, getSettingsSearchResults } from '../search/searchIndex';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
 

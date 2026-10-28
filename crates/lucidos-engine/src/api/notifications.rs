@@ -603,6 +603,17 @@ mod tests {
         assert!(scope.is_none());
     }
 
+    /// A relayed page subscribes under gateway A's outside prefix. A's relay
+    /// vouches for the origin and consumes the header, so none arrives here.
+    #[test]
+    fn sanitize_push_scope_url_keeps_a_relayed_outside_prefix() {
+        let scope = sanitize_push_scope_url(
+            Some("https://gateway-a.test/dev@cloud/".into()),
+            &headers("/dev@cloud/", None),
+        );
+        assert_eq!(scope.as_deref(), Some("https://gateway-a.test/dev@cloud/"));
+    }
+
     #[test]
     fn sanitize_push_scope_url_rejects_wrong_workspace_prefix() {
         let scope = sanitize_push_scope_url(

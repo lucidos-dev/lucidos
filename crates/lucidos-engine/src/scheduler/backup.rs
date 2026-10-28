@@ -70,7 +70,13 @@ pub(crate) async fn run_backup(
     // `load_recent_runs`).
     let started_at = chrono::Utc::now();
     let monotonic_start = std::time::Instant::now();
-    let result = backup::create_backup(workspace, database_url, key, provider, progress).await;
+    // A backup that cannot list pending work fails rather than omit it.
+    let result = match crate::core::changes::unresolved_change_branches(pool).await {
+        Ok(branches) => {
+            backup::create_backup(workspace, database_url, &branches, key, provider, progress).await
+        }
+        Err(e) => Err(format!("could not list the pending changes to back up: {e}").into()),
+    };
     let finished_at = chrono::Utc::now();
 
     match result {

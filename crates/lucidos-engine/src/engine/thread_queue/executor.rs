@@ -563,6 +563,8 @@ impl LucidosEngine {
                 // The child's first message records it, read from this
                 // request's queue row (`integrated::queued_spawn_is_integrated`).
                 integrated: _,
+                // Read only by cost attribution, off the queue row.
+                spawning_trigger_id: _,
             } => {
                 if let Some(app) = app_id {
                     match self.pending_app_spawn.lock() {

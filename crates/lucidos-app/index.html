@@ -92,7 +92,7 @@
       `location.replace` so the picker is not left in history. A since-deleted slug
       is caught by the gateway, which 302s it to `/~/?pick` (server.rs) — `?pick`
       then stands this redirect down, so there is no loop. Mirrors openWorkspace()
-      (`/${encodeURIComponent(id)}/`).
+      (`/${workspaceRouteUrlSegment(id)}/`).
 
       PRESERVES `location.search` + `location.hash` through the redirect. A push
       tap can cold-launch the PWA in picker context with a deep link on the URL
@@ -128,7 +128,9 @@
           // Preserve the deep link (notification/thread/tap query + any hash) so a
           // push tap that cold-launches into the picker still reaches the workspace
           // WITH its params, instead of a bare /<slug>/.
-          if (slug) location.replace('/' + encodeURIComponent(slug) + '/' + location.search + location.hash);
+          // `@` stays literal, as `workspaceRouteUrlSegment` keeps it: the
+          // gateway reads a remote route `<slug>@<name>` off the raw path.
+          if (slug) location.replace('/' + encodeURIComponent(slug).replace('%40', '@') + '/' + location.search + location.hash);
         } catch (e) { /* fall through to the normal picker render */ }
       })();
     </script>

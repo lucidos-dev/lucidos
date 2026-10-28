@@ -1,10 +1,11 @@
 //! Shared helpers for unit tests that need a real Postgres connection.
-//! Each call to `setup_test_db` creates a fresh database, runs migrations,
-//! and returns the pool plus the database name to pass back to `teardown_test_db`.
+//! Each call to `setup_test_db` clones a fresh, migrated database, and returns
+//! the pool plus the database name to pass back to `teardown_test_db`.
 
 #![cfg(test)]
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::Connection;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -374,30 +375,197 @@ pub fn install_agent_database_url() {
     crate::core::set_agent_database_url(AGENT_DATABASE_URL.to_string());
 }
 
+/// A fresh database with this branch's full schema, cloned from the migrated
+/// template (`template_db_name`). Each call gets its own database.
 pub async fn setup_test_db() -> (PgPool, String) {
-    let base_url = admin_url();
     let db_name = format!(
         "lucidos_test_{}",
         Uuid::new_v4().to_string().replace('-', "")
     );
-    let admin_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&base_url)
-        .await
-        .expect("admin connect");
-    sqlx::query(&format!("CREATE DATABASE \"{}\"", db_name))
-        .execute(&admin_pool)
-        .await
-        .expect("create db");
-    admin_pool.close().await;
-    let test_url = test_db_url(&db_name);
+    clone_template_db(&template_db_name(&sqlx::migrate!()), &db_name).await;
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&test_url)
+        .connect(&test_db_url(&db_name))
         .await
         .expect("connect test db");
-    sqlx::migrate!().run(&pool).await.expect("migrations");
     (pool, db_name)
+}
+
+/// The template a migration set clones from. The hash covers every migration's
+/// version and checksum, so an edited or added migration names a new template.
+/// The prefix stays outside `lucidos_test_%`, which `test-engine.sh` sweeps.
+fn template_db_name(migrator: &sqlx::migrate::Migrator) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for migration in migrator.iter() {
+        hasher.update(migration.version.to_le_bytes());
+        hasher.update(&migration.checksum);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("lucidos_template_{}", &digest[..16])
+}
+
+/// The next template build drops any other template built longer ago than
+/// this. So a container shared by many branches does not keep every schema.
+const STALE_TEMPLATE_SECS: i64 = 7 * 24 * 3600;
+
+/// Clone `template` into `db_name`, building the template first if needed.
+///
+/// Locking, on `hashtext(template)` as a session advisory lock: a clone holds
+/// it shared, a build or a stale-template drop holds it exclusive. So a
+/// template never disappears or half-exists under a clone, across worktrees.
+async fn clone_template_db(template: &str, db_name: &str) {
+    let mut admin = sqlx::PgConnection::connect(&admin_url())
+        .await
+        .expect("admin connect");
+    loop {
+        sqlx::query("SELECT pg_advisory_lock_shared(hashtext($1))")
+            .bind(template)
+            .execute(&mut admin)
+            .await
+            .expect("take template lock");
+        let ready = template_is_ready(&mut admin, template).await;
+        if ready {
+            create_from_template(&mut admin, template, db_name).await;
+        }
+        sqlx::query("SELECT pg_advisory_unlock_shared(hashtext($1))")
+            .bind(template)
+            .execute(&mut admin)
+            .await
+            .expect("release template lock");
+        if ready {
+            break;
+        }
+        build_template_db(&mut admin, template).await;
+    }
+    admin.close().await.ok();
+}
+
+async fn template_is_ready(admin: &mut sqlx::PgConnection, template: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT datistemplate FROM pg_database WHERE datname = $1")
+        .bind(template)
+        .fetch_optional(admin)
+        .await
+        .expect("read template state")
+        .unwrap_or(false)
+}
+
+/// `FILE_COPY` copies the template's files, which beats the WAL-logged default
+/// for a small database. Servers before 15 know only the plain clone.
+async fn create_from_template(admin: &mut sqlx::PgConnection, template: &str, db_name: &str) {
+    let server_version: i32 =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&mut *admin)
+            .await
+            .expect("read server version");
+    let strategy = if server_version >= 150_000 {
+        " STRATEGY FILE_COPY"
+    } else {
+        ""
+    };
+    let sql = format!("CREATE DATABASE \"{db_name}\" TEMPLATE \"{template}\"{strategy}");
+    // Postgres refuses a clone while any session is connected to the template
+    // (55006). Nobody should be, since it disallows connections, but a backend
+    // still closing can linger for a moment.
+    for attempt in 1.. {
+        match sqlx::query(&sql).execute(&mut *admin).await {
+            Ok(_) => return,
+            Err(sqlx::Error::Database(e))
+                if e.code().as_deref() == Some("55006") && attempt < 20 =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("clone {template} into {db_name}: {e}"),
+        }
+    }
+}
+
+/// Build `template` with the same migrations a fresh database used to run, then
+/// mark it a template that refuses connections. The mark is the ready signal,
+/// so a build that died half-way is dropped and redone.
+async fn build_template_db(admin: &mut sqlx::PgConnection, template: &str) {
+    sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
+        .bind(template)
+        .execute(&mut *admin)
+        .await
+        .expect("take template build lock");
+    if !template_is_ready(admin, template).await {
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{template}\""))
+            .execute(&mut *admin)
+            .await
+            .expect("drop half-built template");
+        sqlx::query(&format!("CREATE DATABASE \"{template}\""))
+            .execute(&mut *admin)
+            .await
+            .expect("create template");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&test_db_url(template))
+            .await
+            .expect("connect template");
+        sqlx::migrate!().run(&pool).await.expect("migrations");
+        pool.close().await;
+        sqlx::query(&format!(
+            "COMMENT ON DATABASE \"{template}\" IS '{}'",
+            chrono::Utc::now().timestamp()
+        ))
+        .execute(&mut *admin)
+        .await
+        .expect("stamp template");
+        sqlx::query(&format!(
+            "ALTER DATABASE \"{template}\" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false"
+        ))
+        .execute(&mut *admin)
+        .await
+        .expect("mark template ready");
+        drop_stale_templates(admin, template).await;
+    }
+    sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+        .bind(template)
+        .execute(&mut *admin)
+        .await
+        .expect("release template build lock");
+}
+
+/// Drop every other template built more than `STALE_TEMPLATE_SECS` ago that no
+/// clone holds right now. A branch still using one rebuilds it on its next test.
+async fn drop_stale_templates(admin: &mut sqlx::PgConnection, keep: &str) {
+    let stale: Vec<String> = sqlx::query_scalar(
+        "SELECT datname FROM (
+           SELECT d.datname, shobj_description(d.oid, 'pg_database') AS built
+           FROM pg_database d
+           WHERE d.datname LIKE 'lucidos\\_template\\_%' AND d.datname <> $1
+         ) t
+         WHERE CASE WHEN built ~ '^[0-9]+$' THEN built::bigint ELSE 0 END
+               < extract(epoch FROM now())::bigint - $2",
+    )
+    .bind(keep)
+    .bind(STALE_TEMPLATE_SECS)
+    .fetch_all(&mut *admin)
+    .await
+    .expect("list stale templates");
+    for name in stale {
+        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+            .bind(&name)
+            .fetch_one(&mut *admin)
+            .await
+            .expect("try stale template lock");
+        if !locked {
+            continue;
+        }
+        // Best effort: a template that will not drop costs only disk.
+        let _ = sqlx::query(&format!("ALTER DATABASE \"{name}\" WITH IS_TEMPLATE false"))
+            .execute(&mut *admin)
+            .await;
+        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\""))
+            .execute(&mut *admin)
+            .await;
+        sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+            .bind(&name)
+            .execute(&mut *admin)
+            .await
+            .expect("release stale template lock");
+    }
 }
 
 /// Emit one thread event as test setup and return the id of the row it wrote.
@@ -1047,3 +1215,6 @@ pub mod source_scan {
         out
     }
 }
+
+#[path = "test_support_tests.rs"]
+mod tests;

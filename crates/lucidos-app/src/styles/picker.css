@@ -618,6 +618,25 @@
   overflow-wrap: anywhere;
 }
 
+/* Workspaces on remote gateways, set apart from the local list by a gap. */
+.ws-picker-remote-list {
+  margin-top: 1.5rem;
+}
+
+/* A row nothing opens: its gateway is silent, or its engine is unhealthy and
+   only that gateway can restart it. Greyed rows are the silent gateway's. */
+.ws-picker-open[aria-disabled='true'] {
+  cursor: default;
+}
+@media (hover: hover) {
+  .ws-picker-open[aria-disabled='true']:hover {
+    background: none;
+  }
+}
+.ws-picker-row-unreachable .ws-picker-open {
+  opacity: 0.5;
+}
+
 @keyframes ws-dot-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
@@ -1166,6 +1185,9 @@
 }
 .ws-picker-restore-banner[data-state="completed"] {
   border-color: rgba(86, 211, 100, 0.6);
+}
+.ws-picker-restore-banner[data-state="completed-with-warnings"] {
+  border-color: var(--accent-yellow);
 }
 .ws-picker-restore-banner[data-state="failed"] {
   border-color: rgba(255, 138, 128, 0.6);

@@ -304,6 +304,15 @@ export const PREF_PROXY_TIMEOUT_SECS = {
   fallback: "30",
 } as const;
 
+export const PREF_FOLLOW_MAIN_INTERVAL_MINUTES = {
+  key: "follow_main_interval_minutes",
+  scope: "global",
+  type: "number",
+  min: 1,
+  max: 60,
+  fallback: "3",
+} as const;
+
 export const PREF_NOTIFICATIONS_FILTER = {
   key: "notifications_filter",
   scope: "global",
@@ -940,6 +949,7 @@ export const PREFERENCE_CATALOG = {
   "vertex_region": PREF_VERTEX_REGION,
   "opencode_free_enabled": PREF_OPENCODE_FREE_ENABLED,
   "proxy_timeout_secs": PREF_PROXY_TIMEOUT_SECS,
+  "follow_main_interval_minutes": PREF_FOLLOW_MAIN_INTERVAL_MINUTES,
   "notifications_filter": PREF_NOTIFICATIONS_FILTER,
   "notification_toasts": PREF_NOTIFICATION_TOASTS,
   "composer_enter_key": PREF_COMPOSER_ENTER_KEY,

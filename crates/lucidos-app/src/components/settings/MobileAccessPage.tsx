@@ -23,6 +23,7 @@ import { SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
 import { Explainer } from '../shared/Explainer';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
+import { PairGatewaySection, RemoteGatewaysSection } from './GatewayPairingSections';
 import { AddDeviceSection } from './AddDeviceSection';
 import { ExternalAddressSection } from './ExternalAddressSection';
 import { NetworkAccessPage } from './NetworkAccessPage';
@@ -1276,6 +1277,11 @@ export function MobileAccessPage() {
           , where you can revoke one.
         </p>
       </div>
+
+      {/* Who else gets in, one level up: whole gateways rather than devices
+          (ADR 0590). Beside device pairing because it is the same question. */}
+      <PairGatewaySection available={gatewayIsOurOrigin} target={pairTarget()} />
+      <RemoteGatewaysSection available={gatewayIsOurOrigin} />
 
       {/* The one static paragraph on this page, so the one thing behind an
           explainer. Everything else here is a `state.kind` branch of the setup

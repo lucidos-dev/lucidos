@@ -6,15 +6,15 @@
 //! as its own landing merge. Landing then merges whatever reached `main`
 //! meanwhile and fast-forwards `main` to the result, under the merge lock.
 
-use super::landing::{landing_merge_of, LandingMerge};
+use super::landing::{landing_merge_of, move_local_main, LandingMerge, MAX_PUSH_ATTEMPTS};
 use super::LaneMember;
 use crate::engine::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use crate::engine::git_ops::{
-    add_paths_to_worktree_exclude, branch_head_sha, clear_stranded_worktree_dir,
-    consume_harden_marker, consume_plan_marker, ff_main_to_locked, git_answer, git_answer_when_ok,
-    git_cmd, lane_branch, lane_branch_batch, parse_worktree_list, worktree_add,
-    worktree_current_branch, worktree_liveness, worktrees_dir, GitAnswer, MainLocks,
-    LANE_BRANCH_PREFIX,
+    add_paths_to_worktree_exclude, clear_stranded_worktree_dir, consume_harden_marker,
+    consume_plan_marker, git_answer, git_answer_when_ok, git_cmd, landing_base, lane_branch,
+    lane_branch_batch, parse_worktree_list, push_to_origin_main, worktree_add,
+    worktree_current_branch, worktree_liveness, worktrees_dir, BaseRefusal, GitAnswer,
+    LandingOrder, MainLocks, PushOutcome, LANE_BRANCH_PREFIX,
 };
 use crate::engine::worktree_cleanup::{
     remove_worktree_and_optionally_delete_branch, BranchDisposal,
@@ -218,24 +218,69 @@ pub(crate) enum IntegrationLanding {
         main_sha: String,
         commits: Vec<String>,
     },
+    /// `origin` could not take the batch, so `main` did not move. The batch
+    /// lands on a later try (ADR 0589).
+    WaitingForOrigin(String),
 }
 
-/// Land a verified integration branch. Under the merge and repo locks, so
-/// nothing moves `main` between the read and the move. When `main` moved
-/// since the branch last held it, `main` merges in first. A clean catch-up
-/// lands. A conflicting one is aborted and reported, never a failure.
+/// Land a verified integration branch, under the merge lock, so nothing moves
+/// `main` between the read and the move. When `main` moved since the branch
+/// last held it, `main` merges in first. A clean catch-up lands. A
+/// conflicting one is aborted and reported, never a failure.
+///
+/// Origin-first, `main` means `origin/main`. The batch is fetched against,
+/// pushed, and only then moves local `main`. A rejected push catches up again.
+/// Local-first, the caller pushes after.
 pub(crate) async fn land_integration(
     locks: &MainLocks,
     repo_root: &Path,
+    order: &LandingOrder,
     worktree: &Path,
 ) -> Result<IntegrationLanding, String> {
     let _merge = locks.lock_merge().await;
-    let held = locks.lock_repo().await;
-    let main = branch_head_sha(repo_root, "main")
-        .await
-        .ok_or_else(|| "could not read main".to_string())?;
-    match git_answer(&["merge-base", "--is-ancestor", &main, "HEAD"], worktree).await {
-        GitAnswer::Yes => {}
+    let mut rejected = String::new();
+    for _ in 0..MAX_PUSH_ATTEMPTS {
+        let base = match landing_base(repo_root, order).await {
+            Ok(base) => base,
+            Err(BaseRefusal::MainUnreadable(e)) => return Err(e),
+            Err(BaseRefusal::Origin(why)) => return Ok(IntegrationLanding::WaitingForOrigin(why)),
+        };
+        if let Some(conflict) = catch_up(worktree, &base.base).await? {
+            return Ok(conflict);
+        }
+        let head = git_stdout(&["rev-parse", "HEAD"], worktree).await?;
+        if base.origin.needs_push(&head) {
+            match push_to_origin_main(repo_root, &head).await {
+                PushOutcome::Pushed => {}
+                PushOutcome::Rejected(e) => {
+                    rejected = e;
+                    continue;
+                }
+                PushOutcome::Failed(e) => {
+                    return Ok(IntegrationLanding::WaitingForOrigin(format!(
+                        "could not push to origin: {e}"
+                    )))
+                }
+            }
+        }
+        if let Some(e) = move_local_main(locks, repo_root, &base, &head).await {
+            return Err(e);
+        }
+        return Ok(IntegrationLanding::Landed {
+            pre: base.base,
+            post: head,
+        });
+    }
+    Ok(IntegrationLanding::WaitingForOrigin(format!(
+        "origin/main kept moving, and {MAX_PUSH_ATTEMPTS} pushes in a row were refused: {rejected}"
+    )))
+}
+
+/// Merge `main` into the integration branch when the branch lacks it. `Some`
+/// on a conflict, after aborting the merge.
+async fn catch_up(worktree: &Path, main: &str) -> Result<Option<IntegrationLanding>, String> {
+    match git_answer(&["merge-base", "--is-ancestor", main, "HEAD"], worktree).await {
+        GitAnswer::Yes => Ok(None),
         GitAnswer::No => {
             let merged = git_cmd(
                 &[
@@ -244,44 +289,31 @@ pub(crate) async fn land_integration(
                     "--no-edit",
                     "-m",
                     CATCH_UP_SUBJECT,
-                    &main,
+                    main,
                 ],
                 worktree,
             )
             .await?;
-            if !merged.status.success() {
-                let range = format!("HEAD..{main}");
-                let commits = git_stdout(&["log", "--format=%h %s", &range], worktree)
-                    .await
-                    .map(|log| log.lines().map(str::to_string).collect())
-                    .unwrap_or_default();
-                if let Err(e) = git_stdout(&["merge", "--abort"], worktree).await {
-                    log!("[LandingLane] catch-up merge --abort: {}", e);
-                }
-                return Ok(IntegrationLanding::CatchUpConflict {
-                    main_sha: main,
-                    commits,
-                });
+            if merged.status.success() {
+                return Ok(None);
             }
+            let range = format!("HEAD..{main}");
+            let commits = git_stdout(&["log", "--format=%h %s", &range], worktree)
+                .await
+                .map(|log| log.lines().map(str::to_string).collect())
+                .unwrap_or_default();
+            if let Err(e) = git_stdout(&["merge", "--abort"], worktree).await {
+                log!("[LandingLane] catch-up merge --abort: {}", e);
+            }
+            Ok(Some(IntegrationLanding::CatchUpConflict {
+                main_sha: main.to_string(),
+                commits,
+            }))
         }
         GitAnswer::Unknown => {
-            return Err("git could not say whether the integration branch holds main".into())
+            Err("git could not say whether the integration branch holds main".into())
         }
     }
-    let head = git_stdout(&["rev-parse", "HEAD"], worktree).await?;
-    match ff_main_to_locked(&held, repo_root, &head, &main).await {
-        Ok(_) => {}
-        // The ref moved but the repo-root tree did not follow. The landing
-        // happened, so it is reported as one, and the error is logged.
-        Err(e) if branch_head_sha(repo_root, "main").await.as_deref() == Some(&head) => {
-            log!("[LandingLane] main moved to {} but: {}", head, e);
-        }
-        Err(e) => return Err(e.to_string()),
-    }
-    Ok(IntegrationLanding::Landed {
-        pre: main,
-        post: head,
-    })
 }
 
 /// `main` just before its last move, from its reflog. Recovery reads it to

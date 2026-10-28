@@ -176,6 +176,7 @@ CLI_BIN="$REPO_ROOT/target/release/lucidos"
 [ -x "$ENGINE_BIN" ]  || die "engine binary not found at $ENGINE_BIN"
 [ -x "$GATEWAY_BIN" ] || die "gateway binary not found at $GATEWAY_BIN"
 [ -x "$CLI_BIN" ]     || die "lucidos CLI binary not found at $CLI_BIN"
+stage_runtime_assert_static_onnxruntime "$ENGINE_BIN" || die "the engine is not statically linked to ONNX Runtime"
 
 # ── 2. generated files, SDK bundle and frontend ──────────────────────────────
 # After the binaries: codegen renders with the release lucidos-codegen.

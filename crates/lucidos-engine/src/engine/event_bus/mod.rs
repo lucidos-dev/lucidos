@@ -1047,8 +1047,9 @@ impl EventBus {
     }
 
     /// Emit on behalf of `emitting_trigger_id`'s fire, whatever task this runs
-    /// on. [`Self::emit`] passes the ambient marker. Two callers state one
-    /// instead: the *Thread Queue* and `emit_domain_event`.
+    /// on. [`Self::emit`] passes the ambient marker. Three callers state one
+    /// instead: the *Thread Queue*, `emit_domain_event` and
+    /// `AuxCapture::record_usage`.
     ///
     /// A queue entry's lifecycle frames go out on tasks the fire does not own.
     /// `ThreadQueued` precedes the fire, and `ThreadQueueCompleted` comes from
@@ -1058,6 +1059,9 @@ impl EventBus {
     /// A domain event has the opposite problem. An HTTP emit runs on a request
     /// task with no ambient scope, and the fire that caused it may be another
     /// process. Its marker comes off the verified origin token (ADR 0137).
+    ///
+    /// A captured usage row records on its own spawned task, so the capture
+    /// carries the trigger its caller knew.
     ///
     /// `None` states the opposite just as firmly. A sub-thread the fire
     /// submitted is not the fire, and must not inherit its marker. Suppressing

@@ -793,6 +793,8 @@ fn supervise_serve(
                 }
                 let message = if output.is_empty() {
                     format!("tailscale serve failed ({status})")
+                } else if control_server_lacks_feature(&output) {
+                    format!("{CONTROL_SERVER_LACKS_FEATURE}\n\nTailscale said: {output}")
                 } else {
                     format!("tailscale serve failed: {output}")
                 };
@@ -939,6 +941,30 @@ fn is_flag_rejection(output: &str) -> bool {
         || lowered.contains("unknown flag")
         || lowered.contains("unknown shorthand flag")
 }
+
+/// Did the tailnet's control server refuse to turn a feature on, because it does
+/// not implement that API at all?
+///
+/// The CLI asks the control server to enable HTTPS certificates (and Serve)
+/// before it writes a mapping. Tailscale's own servers walk the user through
+/// that. A self-hosted one such as Headscale answers 501, and no approval or
+/// retry changes that. A server with no such route at all may answer 404. The
+/// status is the server's own answer, so it is the authority here, whichever
+/// control server sent it.
+fn control_server_lacks_feature(output: &str) -> bool {
+    let lowered = output.to_ascii_lowercase();
+    lowered.contains("error enabling")
+        && ["501 not implemented", "404 not found"]
+            .iter()
+            .any(|status| lowered.contains(status))
+}
+
+/// What to say when [`control_server_lacks_feature`] matched.
+const CONTROL_SERVER_LACKS_FEATURE: &str = "Your tailnet's control server cannot turn on \
+     HTTPS certificates, so Tailscale cannot serve an HTTPS address for this Mac. Self-hosted \
+     servers such as Headscale do not support it. Use the plain-HTTP tailnet address under \
+     Connect URLs instead. It needs Network access set to your tailnet address or to all \
+     interfaces.";
 
 /// Drop Tailscale's client/daemon version-skew warning.
 ///
@@ -1222,6 +1248,47 @@ mod tests {
         // one reason, not two.
         let same = "tailscale serve failed: access denied";
         assert_eq!(both_serve_forms_failed(same, same), same);
+    }
+
+    /// Verbatim from CLI 1.104.2 on a self-hosted Headscale tailnet, minus the
+    /// timestamp's date. The control server has no feature-enable endpoint.
+    const HTTPS_FEATURE_NOT_IMPLEMENTED: &str =
+        "14:57:15 error enabling https feature: error 501 Not Implemented: Not implemented yet:\n";
+
+    #[test]
+    fn a_control_server_without_the_https_feature_says_so() {
+        let cancel = AtomicBool::new(false);
+        let script = format!("printf '{HTTPS_FEATURE_NOT_IMPLEMENTED}' >&2; exit 1");
+        let err = supervise_serve(
+            sh(&script),
+            &cancel,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            &mut no_phases(),
+        )
+        .expect_err("a 501 is a failure");
+        let ServeAttemptError::Failed(message) = err else {
+            panic!("a 501 is not a flag rejection, so it must not retry the old syntax");
+        };
+        assert!(message.contains("control server"), "{message}");
+        assert!(message.contains("plain-HTTP"), "{message}");
+        // The CLI's own words stay, so the reader can still search for them.
+        assert!(message.contains("501 Not Implemented"), "{message}");
+    }
+
+    #[test]
+    fn only_a_501_on_a_feature_enable_gets_the_control_server_reading() {
+        assert!(control_server_lacks_feature(HTTPS_FEATURE_NOT_IMPLEMENTED));
+        assert!(control_server_lacks_feature(
+            "error enabling serve feature: error 501 Not Implemented"
+        ));
+        assert!(control_server_lacks_feature(
+            "error enabling https feature: error 404 Not Found"
+        ));
+        assert!(!control_server_lacks_feature(
+            "error enabling https feature: context deadline exceeded"
+        ));
+        assert!(!control_server_lacks_feature("error 501 Not Implemented"));
     }
 
     #[test]

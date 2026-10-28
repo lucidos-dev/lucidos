@@ -1101,14 +1101,10 @@ async fn push_main_does_not_dirty_working_tree() {
     let _ = git_cmd(&["commit", "-m", "init"], repo).await;
 
     // Push should be a no-op with no remote -- must not dirty anything
-    push_main_in_background(repo);
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(merge::push_main(repo).await, None);
 
     let dirty = auto_commit_safe_files_if_dirty(repo).await;
-    assert!(
-        !dirty,
-        "push_main_in_background must not dirty working tree"
-    );
+    assert!(!dirty, "push_main must not dirty working tree");
 
     // HEAD should still be on main (not detached)
     let head_ref = git_cmd(&["symbolic-ref", "HEAD"], repo).await;

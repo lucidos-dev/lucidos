@@ -164,6 +164,26 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** `active`.
 - **Investigation:** none.
 
+### ort-sys is vendored for an ONNX Runtime mirror
+
+- **Added:** 2026-10-28
+- **Lives in:** `crates/vendor/ort-sys/`, wired in by `[patch.crates-io]` in the
+  root `Cargo.toml`. The patch is every commit after the one that added the
+  directory: `git log -p crates/vendor/ort-sys`. The `exclude` and the prose
+  gate's `crates/vendor/` exemption are shared with chromiumoxide.
+- **Impermanent because:** `ort-sys` 2.0.0-rc.9 downloads a static ONNX Runtime
+  from `parcel.pyke.io` with one attempt and no second source. A pyke blip failed
+  three release CI legs, and an outage blocks every from-source build (ADR 0595).
+  The patch fetches from our mirror first, then pyke, with retries.
+- **Removal / resolution condition:** an `ort-sys` release lets a build name its
+  download origin, or a pure-Rust runtime replaces `ort`. Move the engine to it,
+  point the origin at the mirror, and keep the CI hosts-block legs passing with
+  `parcel.pyke.io` unreachable. Then delete the vendored copy, the patch entry,
+  the scripts `mirror-onnxruntime.sh` and `check-onnxruntime-mirror.sh`, and the
+  hosts-block steps.
+- **Status:** `active`.
+- **Investigation:** none.
+
 ### Shared-fetch reload of app frames
 
 - **Added:** 2026-10-10

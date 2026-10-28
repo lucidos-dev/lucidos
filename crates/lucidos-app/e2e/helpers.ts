@@ -1159,16 +1159,20 @@ export async function pressComposerControl(page: Page, selector: string): Promis
   }).toPass({ timeout: 15_000 });
 }
 
-const FOLLOW_TOGGLE = '[data-role="follow-live-edge"]';
-
-/** The follow toggle's state, standing or folded. */
-export function followToggleState(page: Page): Promise<string | null> {
-  return composerToggleState(page, FOLLOW_TOGGLE);
+/** The follow toggle. It floats over the composer's top edge, in the down
+ *  chevron's slot, so it never folds into the row's ⋯. */
+export function followToggle(page: Page): Locator {
+  return page.locator('.prompt-area > [data-role="follow-live-edge"]:visible').first();
 }
 
-/** Press the follow toggle wherever the row's fold has put it. */
-export function pressFollowToggle(page: Page): Promise<void> {
-  return pressComposerControl(page, FOLLOW_TOGGLE);
+/** The follow toggle's state, `'true'` or `'false'`. */
+export function followToggleState(page: Page): Promise<string | null> {
+  return followToggle(page).getAttribute('aria-pressed', { timeout: 2_000 });
+}
+
+/** Press the follow toggle. */
+export async function pressFollowToggle(page: Page): Promise<void> {
+  await followToggle(page).click();
 }
 
 export async function assertHealthy(page: Page): Promise<void> {

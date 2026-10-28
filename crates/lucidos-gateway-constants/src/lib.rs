@@ -14,3 +14,11 @@ pub const PAIR_PARAM: &str = "pair";
 /// The reserved sigil that prefixes all gateway-owned paths (`/~/…`). A
 /// workspace slug can never start with it.
 pub const SIGIL: char = '~';
+
+/// Joins a workspace slug to a remote gateway's short name in a route:
+/// `/<slug>@<name>/` (ADR 0591). A slug never contains it.
+pub const REMOTE_ROUTE_SEPARATOR: char = '@';
+
+/// The longest short name a remote gateway may take, since it becomes part of
+/// every route to its workspaces.
+pub const REMOTE_GATEWAY_NAME_MAX_LEN: usize = 32;

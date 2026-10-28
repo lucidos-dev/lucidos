@@ -8,6 +8,7 @@ mod commits;
 mod conflict_probe;
 mod harden_marker;
 mod merge;
+mod origin;
 mod plan_approval;
 mod plan_marker;
 mod restart_detection;
@@ -19,6 +20,7 @@ pub(crate) use commits::*;
 pub(crate) use conflict_probe::*;
 pub(crate) use harden_marker::*;
 pub(crate) use merge::*;
+pub(crate) use origin::*;
 pub(crate) use plan_approval::PlanApprovalError;
 pub(crate) use plan_marker::*;
 pub(crate) use restart_detection::*;
@@ -182,9 +184,9 @@ pub(crate) async fn git_cmd_env(
     git_cmd_env_timeout(args, dir, envs, GIT_TIMEOUT).await
 }
 
-/// [`git_cmd_env`] with an explicit ceiling. The timeout is a parameter only so
-/// tests can force the expiry branch; production callers go through
-/// [`git_cmd`] / [`git_cmd_env`] and get [`GIT_TIMEOUT`].
+/// [`git_cmd_env`] with an explicit ceiling. Tests use it to force the expiry
+/// branch. Production callers get [`GIT_TIMEOUT`], unless the command moves a
+/// whole repository's history, like a restore fetching `origin`.
 pub(crate) async fn git_cmd_env_timeout(
     args: &[&str],
     dir: &Path,
@@ -485,11 +487,15 @@ pub(crate) async fn git_cmd_await_lock_file(
 
 #[cfg(test)]
 #[path = "../git_ops_tests/common.rs"]
-mod common;
+pub(crate) mod common;
 
 #[cfg(test)]
 #[path = "../git_ops_tests/answer.rs"]
 mod answer_tests;
+
+#[cfg(test)]
+#[path = "../git_ops_tests/origin.rs"]
+mod origin_tests;
 
 #[cfg(test)]
 #[path = "../git_ops_tests/program.rs"]

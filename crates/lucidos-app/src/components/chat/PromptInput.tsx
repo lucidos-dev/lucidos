@@ -28,7 +28,7 @@ import { CaptureIcon, CheckIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, Cle
 import { BlobImage } from '../shared/BlobImage';
 import { closeControlMenus, codingAgentMenuOpenRequest, rungFoldOpenRequest } from './controlMenuRequests';
 import {
-  codingAgentMenuAction, composerRowMembers, FOLLOW_LIVE_EDGE_KEY, isComposeContext, LazyCodingAgentControlMenu, promptRowToggles, sideQuestionToggleAction,
+  codingAgentMenuAction, composerRowMembers, isComposeContext, LazyCodingAgentControlMenu, promptRowToggles, sideQuestionToggleAction,
 } from './PromptRowControls';
 import { CODING_AGENT_MENU_FOLD_KEY, menuCodingAgent } from './ControlMenuTrigger';
 import { LazyRungControl } from './LazyRungControl';
@@ -1420,7 +1420,7 @@ export function PromptInput() {
     wipPreview: wipPreviewAction(focusedThread),
     clearDraft: clearDraftAction,
     toggles: promptRowToggles(
-      promptCodingAgent, inComposeContext, focusedThread,
+      promptCodingAgent, focusedThread,
       sideQuestionRefusal === null ? sideQuestionToggleAction(sideQuestionMode, toggleSideQuestionMode) : null,
     ),
     rung: {
@@ -1444,12 +1444,13 @@ export function PromptInput() {
     () => foldActions.map((a) => (clusterKeys.has(a.key) ? 'cluster' : 'row')),
     [foldSignature],
   );
-  // Diff and the standing apply merge into one box before the follow toggle
-  // folds. Only when both stand, and adjacent, as the standalone row has them.
+  // Diff and the standing apply merge into one box before the row's first
+  // member after the readouts folds. Only when both stand, and adjacent, as
+  // the standalone row has them.
   const pairAt = foldKeys.indexOf(DIFF_APPLY_MERGE.keys[0]);
   const mergeSpec = useMemo<PromptMerge | null>(
     () => (pairAt !== -1 && foldKeys[pairAt + 1] === DIFF_APPLY_MERGE.keys[1]
-      ? { ...DIFF_APPLY_MERGE, atKey: FOLLOW_LIVE_EDGE_KEY }
+      ? { ...DIFF_APPLY_MERGE, atKey: members.mergeAt }
       : null),
     [foldSignature],
   );

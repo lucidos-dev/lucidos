@@ -27,6 +27,8 @@ export const LANE_STEP_LABEL: Record<LaneStep, string> = {
 /** What the lane row says while it holds conflicts back for an Apply All
  *  press still handing changes over (ADR 0480). */
 export const LANE_GATHERING_LABEL = 'Waiting for Apply All to queue the rest';
+/** The lead of the line saying origin holds the lane. The reason follows. */
+export const LANE_WAITING_FOR_ORIGIN_LABEL = 'Waiting for origin';
 
 /** A change in the landing lane, as its row lists it. */
 export interface LaneEntry {
@@ -65,6 +67,8 @@ export interface LaneView {
   gathering: boolean;
   /** The batch's Cancel was pressed and it has not closed yet. */
   canceling: boolean;
+  /** Why origin could not take the last landing, while it holds the lane. */
+  waitingForOrigin?: string;
   mainCheck: MainCheckLine | null;
 }
 
@@ -126,6 +130,7 @@ export function landingLaneView({ lane, laneCanceling, pending, mainCheck, mainC
     waiting: lane.waiting.map(entry),
     gathering: lane.gathering,
     canceling: !!open && laneCanceling === open.batch_id,
+    ...(lane.waiting_for_origin ? { waitingForOrigin: lane.waiting_for_origin } : {}),
     mainCheck: mainCheckLine(mainCheck, mainCheckClosing),
   };
 }

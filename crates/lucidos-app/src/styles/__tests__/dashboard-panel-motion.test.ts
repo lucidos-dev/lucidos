@@ -60,7 +60,7 @@ describe('the dashboard panel motion', () => {
     // Both share the pane's stacking context (mobile.css), so the panel must
     // clear the chevrons' z-index or they draw over the dashboard.
     const chevrons = cssRules(readFileSync(resolve(stylesDir, 'chat/input-messages.css'), 'utf-8'))
-      .filter((r) => r.selector === '.scroll-to-top, .scroll-to-bottom' && r.atRules === '');
+      .filter((r) => r.selector === '.scroll-to-top, .scroll-to-bottom, .follow-toggle' && r.atRules === '');
     expect(chevrons).toHaveLength(1);
     expect(chevrons[0].props.get('z-index')).toBe('calc(var(--z-float) + 1)');
     expect(rule('.dashboard-panel').props.get('z-index')).toBe('calc(var(--z-float) + 2)');

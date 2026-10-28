@@ -11,6 +11,10 @@ paths:
   - "scripts/lib/install*.sh"
   - "scripts/lib/service*.sh"
   - "scripts/lib/release_*.sh"
+  - "scripts/*onnxruntime*.sh"
+  - "scripts/block-ort-upstream.sh"
+  - "scripts/lib/onnxruntime_*.sh"
+  - "crates/vendor/ort-sys/build.rs"
   - "scripts/lib/tauri_signing_key.sh"
   # Carries beforeBuildCommand, which is the build gate's only hook inside
   # `cargo tauri build`. Editing it is a build change, so this rule loads.

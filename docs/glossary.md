@@ -650,6 +650,9 @@ The tiny shared crate (`crates/lucidos-tailscale/`, `libc` its only dependency) 
 ### Sigil namespace
 The single reserved path prefix — `~` — under which **all** *Workspace gateway*-owned surface lives: `/~/api/v1/health`, `/~/api/v1/control/*`, and the picker + its bundled assets (`/~/assets/*`, `/~/sw.js`, …). Introduced by ADR 0014 to make the first path segment unambiguous between a workspace and the gateway's own root files **without a growing reserved-word list**: the only rule is that a workspace slug can never start with the sigil — and slugs are `[a-z0-9-]`, so that's automatic (`gateway::registry::slugify`/`is_valid_id`). Replaces 0013's `/ws/<id>/` prefix (which kept workspaces in their own namespace) by flipping it: workspaces get the bare `/<slug>/` and the gateway retreats behind `/~/`.
 
+### Outside prefix
+The path prefix under which the browser sees a workspace: `/<slug>/` locally, or `/<slug>@<name>/` for a *remote workspace*. The gateway sends it to the engine as `X-Forwarded-Prefix`, and the engine stamps it into `<base href>`. On the relay, A's signed claim carries it and B checks that it names the relayed slug (ADR 0591). A push subscription records its page's outside prefix in `scope_url`, so a tap opens the page where it was installed.
+
 ### Open mode
 Where activating a *workspace* row puts that workspace. `in-place` replaces this view; `separate` puts it beside. One rule for every surface that lists workspaces, in `crates/lucidos-app/src/utils/workspaceWindow.ts` (`WorkspaceOpenMode`). Three read it, so they cannot disagree: the *workspace picker*, the *in-app workspace switcher*, and the Lucidos menu's notifications rows.
 
@@ -1956,7 +1959,7 @@ Every event keeps that true. Anything that would slide the edge out from under a
 
 `keepTheLiveEdge` has one term of its own, RIDING, and three stand-downs. It waits out a tween, which is going somewhere the reader asked for more recently. It waits out a *deep-link anchor* in flight, whose landing decides the ride. And it waits out an *anchor write*, where `honourAnchoredMutation` has already retired a ride the hold left off the edge.
 
-Exactly one CONTROL arms it, and it is the reader's: the **follow toggle** in the prompt area. It is `setFollowLiveEdge(true)`, a member of `.prompt-actions-row` (`followLiveEdgeAction` in `PromptRowControls.tsx`), standing right before the side-question toggle and the rung pill. It wears a horseshoe MAGNET, poles down over the line that is the live edge. The arrow-onto-a-line it used to wear is `DownloadIcon`, one row above on the thread header. The reader either presses the toggle here, or pressed it earlier and carried it in as the *follow seed*. A reader who has pressed NEITHER way also rides, the seed shipping armed, which is the one arm no press stands behind.
+Exactly one CONTROL arms it, and it is the reader's: the **follow toggle** in the prompt area. It is `setFollowLiveEdge(true)`, floating over the composer's top edge under the down chevron (`FollowLiveEdgeToggle`, ADR 0596). It wears a horseshoe MAGNET, poles down over the line that is the live edge. The arrow-onto-a-line it used to wear is `DownloadIcon`, one row above on the thread header. The reader either presses the toggle here, or pressed it earlier and carried it in as the *follow seed*. A reader who has pressed NEITHER way also rides, the seed shipping armed, which is the one arm no press stands behind.
 
 Nothing else does. Not either chevron, which navigate and nothing else. Not a *submit* in any of its five shapes, which get the *submit landing* instead. Not an SSE sync confirming a pending message. Not a change applied, a granted permission, a coding-agent action, a lazy load, a deep link, or a thread opening. Nor the question card ARRIVING, which is the agent's doing.
 
@@ -2882,7 +2885,7 @@ The coding-agent menu and the rung stay mounted while folded. Their `⋯` rows o
 
 `computePromptCollapse` takes WIDTHS rather than counts, because an icon box sits beside an Apply split button several times its size. It walks every count from 0 to N and takes the smallest that fits. No rule says "never fold one": folding one icon saves nothing and will not fit, while folding one wide button saves its width.
 
-**Merge step.** Diff and the standing apply, when both stand, may draw as ONE icon box before the follow toggle folds. The box is an `OverflowMenu` whose face is the Diff glyph, in the armed tone while the standing apply is armed (`DiffApplyMenu`, role `diff-apply-menu`). Its rows are the two members' own menu rows. Candidates run unmerged up to the follow toggle, then merged, and a merged pair folds whole into two rows of the `⋯`. The banner state never merges.
+**Merge step.** Diff and the standing apply, when both stand, may draw as ONE icon box before the row's first member after the readouts folds (`mergeAt`). The box is an `OverflowMenu` whose face is the Diff glyph, in the armed tone while the standing apply is armed (`DiffApplyMenu`, role `diff-apply-menu`). Its rows are the two members' own menu rows. Candidates run unmerged up to that member, then merged, and a merged pair folds whole into two rows of the `⋯`. The banner state never merges.
 
 **A measured width cannot lie, because no member may shrink.** Every member is `flex-shrink: 0`. Without that, `.action-btn`'s `min-width` lets a button squeeze while its nowrap label spills, and the fold reads the squeezed box and folds nothing. Every other input is a count or a remembered width, never a read of the rendered set, so the decision cannot oscillate. A folded member's width is remembered by key, and the cluster's gaps are counted from the candidate rather than from the DOM.
 
@@ -3361,6 +3364,12 @@ Dev-only bash wrapper (`scripts/lib/gateway_supervisor.sh`, function `run_gatewa
 - **Launched `disown`ed**, with `ENGINE_SUPERVISOR_PID` left empty, so `web-dev.sh` never `wait`s on the daemon.
 
 The **packaged** app needs no bash equivalent: the Rust `--service` process (`crates/lucidos-app/src/desktop.rs::run_service`) supervises the gateway under launchd `KeepAlive`. Call it the **gateway supervisor**, and keep it distinct from the *engine supervisor*.
+
+### Gateway relay
+How gateway A serves a paired gateway B's workspaces to A's own devices (`lucidos-gateway/src/relay.rs`, ADR 0591). A routes `/<slug>@<name>/*` to B's `/~/api/gateway/v1/relay/<slug>/*`. B serves it through its ordinary workspace route, so B's engine sees the outside prefix and a namespaced device. It is the one hop that proxies another gateway's workspaces. Keep it distinct from the *update relay* and the *Vertex relay*.
+
+### Relay claim
+What A signs on every relayed request: the issue time, the outside prefix and the calling device (ADR 0591). An HMAC keyed by the gateway credential signs it, in the `x-lucidos-relay-claim` and `x-lucidos-relay-signature` headers. B refuses a claim that is unsigned, older than five minutes, or names another workspace. B's engine sees the device as `<pairing id>:<device id>`.
 
 ### GitAnswer
 The tri-state result of a yes/no question the engine asks git (`engine/git_ops/mod.rs`): `Yes`, `No`, and `Unknown`. **`Unknown` means git could not be asked at all** (spawn failure, or the call exceeded `GIT_TIMEOUT`), which is routine while the host is saturated and NOT the same as git answering "no". Produced by `git_answer` / `git_answer_with` (exit status is the answer) and `git_answer_when_ok` (a non-zero exit is a failure rather than an answer, as with `git status --porcelain`, which exits non-zero when the path is not a work tree at all). The type deliberately has no `Into<bool>`: collapsing it goes through `GitAnswer::or_unknown(true|false)`, which forces the call site to name the side `Unknown` falls to, in the open where a reviewer sees it. The rule for picking that side is that **an unanswered probe must never authorize a destructive or discarding action** (`.claude/rules/rust.md`); the whole type exists because a timed-out `git rev-parse` read as "this branch and this worktree are gone" and the recovery path that followed ran `git worktree remove --force` over a live coding-agent worktree on 2026-08-03. Every current predicate and its chosen default are tabulated in `docs/plans/2026-08-03-unknown-git-state-must-not-delete-worktrees.md`.
@@ -5867,6 +5876,9 @@ Where the engine keeps its workspace keys: the *secret store key* and the backup
 
 ### Agent role
 The database role behind `LUCIDOS_DATABASE_URL`: `<database>_agent` (shortened with a hash past 63 bytes), a member of the `NOLOGIN` group `lucidos_agents` (names in `lucidos-pg-url`). It can select no secret column and connect to no other database. The engine re-creates it at every boot with a fresh in-memory password and grants derived from `SECRET_COLUMNS` (`core/agent_role.rs`). The gateway drops it with its database. Decision: ADR 0509, amending ADR 0481.
+
+### ONNX Runtime mirror
+The Lucidos-owned copy of the static ONNX Runtime archives that `fastembed` links, kept as release assets on `lucidos-dev/onnxruntime-mirror`. The vendored `ort-sys` build script (`crates/vendor/ort-sys/`) fetches from it first, then from `parcel.pyke.io`. It checks every download against the SHA-256 in the unchanged upstream `dist.txt`. It holds only the archives for the four shipped triples. It is not the *public mirror* of this repository. A *temporary measure* (ADR 0595).
 
 ## When to add a term
 

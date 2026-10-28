@@ -9,12 +9,18 @@
  * Rendered rather than called, because the toggle holds hooks now: it owns the
  * long-press gesture and the handle its microphone picker is opened through.
  */
-import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render } from 'preact';
 import { CallToggle } from '../CallToggle';
 import { preferences } from '../../../store/store';
 import { voiceCall } from '../../../store/voiceCall';
 import { CALL_IDLE } from '../../../voice/callState';
+
+const reach = vi.hoisted(() => ({ reachable: true }));
+vi.mock('../../../voice/socketUrl', async (original) => ({
+  ...(await original<typeof import('../../../voice/socketUrl')>()),
+  voiceReachable: () => reach.reachable,
+}));
 
 let host: HTMLDivElement;
 
@@ -38,6 +44,7 @@ afterEach(() => {
   host.remove();
   preferences.value = { status: 'not-loaded' };
   voiceCall.value = CALL_IDLE;
+  reach.reachable = true;
 });
 
 describe('the call toggle behind the voice switch', () => {
@@ -87,5 +94,15 @@ describe('the call toggle behind the destination', () => {
     voiceIsOn();
     voiceCall.value = { ...CALL_IDLE, phase: 'listening', threadId: 't' };
     expect(toggle(false)).not.toBeNull();
+  });
+});
+
+describe('the call toggle in a workspace opened through another gateway', () => {
+  /** The relay carries no socket, so a call could never connect. Absent
+   *  rather than inert, as for the switch. */
+  it('renders nothing, voice on or not', () => {
+    voiceIsOn();
+    reach.reachable = false;
+    expect(toggle()).toBeNull();
   });
 });

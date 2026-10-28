@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -249,7 +250,6 @@ pub(crate) async fn catchup_and_ff_to_main_under(
     let shas = ff_main_to_branch(&held, repo_root, branch_name).await?;
     drop(held);
     let _ = git_cmd(&["branch", "-D", branch_name], repo_root).await;
-    push_main_in_background(repo_root);
     Ok(shas)
 }
 
@@ -290,7 +290,6 @@ pub(crate) async fn ff_merge_to_main(
                 // `-d`, not `-D`: git itself refuses to drop a branch main lacks.
                 let _ = git_cmd(&["branch", "-d", feature_branch], repo_root).await;
             }
-            push_main_in_background(repo_root);
             return Ok(shas);
         }
         Err(e) => e,
@@ -355,45 +354,50 @@ async fn temp_branch_contains_change(
     .or_unknown(false)
 }
 
-/// Check if an `origin` remote exists in the repository.
-///
-/// `or_unknown(false)`: the only consequence is skipping a background push,
-/// which the next apply retries. Nothing is deleted on either answer.
-async fn has_origin_remote(repo_root: &Path) -> bool {
-    git_answer(&["remote", "get-url", "origin"], repo_root)
-        .await
-        .or_unknown(false)
-}
-
-/// Push main to origin in the background if the remote exists.
-/// If the push is rejected (origin diverged), logs and moves on -- next apply retries.
-pub(crate) fn push_main_in_background(repo_root: &Path) {
+/// Push `main` to `origin` in the background, for an Apply outside the landing
+/// lane. A repository without `origin` pushes nothing. A failed push emits
+/// `MainPushFailed`, so the user sees it (ADR 0589).
+pub(crate) fn push_main_in_background(repo_root: &Path, bus: &EventBus) {
     let repo_root = repo_root.to_path_buf();
+    let bus = bus.clone();
     tokio::spawn(async move {
-        if !has_origin_remote(&repo_root).await {
-            return;
-        }
-        // Push directly -- don't use `pull --rebase` because it modifies the working
-        // tree and can detach HEAD on conflict, leaving dirty files that block
-        // subsequent change applies. If the push is rejected (origin diverged),
-        // the next apply's push will retry.
-        match git_cmd(&["push", "origin", "main"], &repo_root).await {
-            Ok(o) if o.status.success() => {
-                log!("[Changes] Pushed main to origin");
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                // Non-fast-forward is expected if origin diverged -- log and move on
-                log!(
-                    "[Changes] Push main to origin failed (will retry on next apply): {}",
-                    stderr.trim()
-                );
-            }
-            Err(e) => {
-                log!("[Changes] Push main to origin failed: {}", e);
-            }
+        if let Some(reason) = push_main(&repo_root).await {
+            log!("[Changes] Push main to origin failed: {}", reason);
+            bus.emit_or_log(
+                BusEvent::System(SystemEvent::MainPushFailed {
+                    repo: repo_root.display().to_string(),
+                    reason,
+                }),
+                "[Changes] MainPushFailed",
+            )
+            .await;
         }
     });
+}
+
+/// Push `main` to `origin`. `None` when it went, or when there is no `origin`.
+/// Otherwise why it failed. An unanswered remote check counts as a failure.
+pub(super) async fn push_main(repo_root: &Path) -> Option<String> {
+    match origin_remote(repo_root).await {
+        GitAnswer::No => return None,
+        GitAnswer::Yes => {}
+        GitAnswer::Unknown => {
+            return Some("git could not say whether the repository has an origin remote".into())
+        }
+    }
+    let Some(main) = branch_head_sha(repo_root, "main").await else {
+        return Some("could not read main".into());
+    };
+    match push_to_origin_main(repo_root, &main).await {
+        PushOutcome::Pushed => {
+            log!("[Changes] Pushed main to origin");
+            None
+        }
+        PushOutcome::Rejected(e) => Some(format!(
+            "origin/main has moved, so main was not pushed: {e}"
+        )),
+        PushOutcome::Failed(e) => Some(e),
+    }
 }
 
 /// Characters that can continue a git ref name. Used to tell a mention of
@@ -564,7 +568,7 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
 /// Returns `Some("origin/main")` (or whatever the default is) when the remote exists,
 /// or `None` when there is no `origin` remote (so the worktree will branch from HEAD).
 pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<String> {
-    if !has_origin_remote(repo_root).await {
+    if !origin_remote(repo_root).await.or_unknown(false) {
         log!("[Changes] No 'origin' remote found -- will branch from HEAD");
         return None;
     }

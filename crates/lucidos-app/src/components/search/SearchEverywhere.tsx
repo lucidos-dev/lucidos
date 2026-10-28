@@ -353,6 +353,9 @@ export function SearchEverywhere() {
   const [recents, setRecents] = useState<SearchResultItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
+  // The All tab's section order as last drawn for `query`, so a category that
+  // answers later slots in below what the user is already reading.
+  const drawnSections = useRef<{ query: string; order: string[] }>({ query: '', order: [] });
 
   const isRecentsMode = !query && category === 'all';
   const isOpen = searchEverywhereOpen.value;
@@ -487,7 +490,11 @@ export function SearchEverywhere() {
 
   const textHits = useMemo(() => textHitItems(textState), [textState]);
   const textFiles = useMemo(() => new Set(textHits.map(item => item.hit.path)).size, [textHits]);
-  const sections = category === 'all' && !isRecentsMode ? rankedSections(results, query, textHits) : [];
+  if (drawnSections.current.query !== query) drawnSections.current = { query, order: [] };
+  const sections = category === 'all' && !isRecentsMode
+    ? rankedSections(results, query, textHits, drawnSections.current.order)
+    : [];
+  if (sections.length) drawnSections.current.order = sections.map(s => s.section);
   let flat: PaletteItem[];
   if (isRecentsMode) flat = recents;
   else if (category === 'all') flat = sections.flatMap(s => s.items);

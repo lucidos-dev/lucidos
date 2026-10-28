@@ -1684,8 +1684,8 @@ pub(crate) async fn resolve_named_proxy(
 /// Dispatch a [`ResolvedProxy`]. Both arms bind a [`ScopedPipeline`] before
 /// anything reaches the network.
 ///
-/// A model provider's reply records what the call cost, on `cost_thread` or
-/// the home thread (`api::proxy_cost`). A speech call is rewritten, recorded
+/// A model provider's reply records what the call cost, for `owner`
+/// (`api::proxy_cost`). A speech call is rewritten, recorded
 /// or refused so its cost is never lost (`api::proxy_speech`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_resolved(
@@ -1697,7 +1697,7 @@ pub(crate) async fn dispatch_resolved(
     query: Option<String>,
     mut headers: HeaderMap,
     body: Bytes,
-    cost_thread: Option<uuid::Uuid>,
+    owner: crate::api::proxy_cost::CostOwner,
 ) -> Result<Response, (StatusCode, String)> {
     use crate::api::proxy_cost::{prepare_request, record_model_call, Upstream};
     use crate::api::proxy_speech::{ask_for_usage, finish};
@@ -1723,7 +1723,7 @@ pub(crate) async fn dispatch_resolved(
                 body.clone(),
             )
             .await?;
-            record_model_call(engine, cost_thread, upstream, &path, &body, response).await
+            record_model_call(engine, owner.clone(), upstream, &path, &body, response).await
         }
         // The builtin arm builds its own layers, so it binds its own pipeline.
         // Same gate, same type, no second way to reach the network.
@@ -1746,7 +1746,7 @@ pub(crate) async fn dispatch_resolved(
             .await?;
             record_model_call(
                 engine,
-                cost_thread,
+                owner.clone(),
                 Upstream::Builtin,
                 &path,
                 &body,
@@ -1755,7 +1755,7 @@ pub(crate) async fn dispatch_resolved(
             .await
         }
     };
-    Ok(finish(engine, cost_thread, speech, &body, response).await)
+    Ok(finish(engine, owner, speech, &body, response).await)
 }
 
 async fn proxy_handle_inner(
@@ -1782,7 +1782,7 @@ async fn proxy_handle_inner(
     let method = req.method().clone();
     let query = req.uri().query().map(|s| s.to_string());
     let headers = req.headers().clone();
-    let cost_thread = crate::api::proxy_cost::cost_thread(&headers);
+    let owner = crate::api::proxy_cost::cost_owner(&headers);
     let body = match axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -1799,7 +1799,7 @@ async fn proxy_handle_inner(
         query,
         headers,
         body,
-        cost_thread,
+        owner,
     )
     .await
     {

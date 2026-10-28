@@ -502,8 +502,8 @@ export function DiffApplyMenu({ members, attrs }: { members: readonly HeaderActi
 /** The change action a still-working thread offers: arm a *standing apply*, or
  *  cancel the one it carries (ADR 0168 clause 5).
  *
- *  An ICON toggle, wearing the shape the follow toggle beside it already wears
- *  (`followLiveEdgeAction`). As a green pill it took over half a phone's prompt
+ *  An ICON toggle, wearing the shape the follow toggle already wears
+ *  (`FollowLiveEdgeToggle`). As a green pill it took over half a phone's prompt
  *  row. No label short enough to fix that still said what it does.
  *
  *  The word survives twice over, because the label was the only explanation a

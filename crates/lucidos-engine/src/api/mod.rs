@@ -21,6 +21,7 @@ mod disk_usage;
 pub mod engine_socket;
 pub(crate) mod error;
 mod file_response;
+mod follow_main;
 mod fonts;
 mod form_requests;
 mod frame_capability;
@@ -1559,6 +1560,7 @@ pub fn create_router(
         .merge(threads::router())
         .merge(changes::router())
         .merge(main_check::router())
+        .merge(follow_main::router())
         .merge(notifications::router())
         .merge(artifacts::router())
         .merge(settings::router())

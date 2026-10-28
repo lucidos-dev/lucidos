@@ -251,6 +251,10 @@ jobs:
           key: ${{ matrix.triple }}-${{ matrix.runner }}-${{ matrix.container || 'runner' }}
           save-if: ${{ startsWith(github.ref, 'refs/heads/rc/') }}
 
+      - name: Block parcel.pyke.io (the ONNX Runtime mirror must be enough, ADR 0595)
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh
+
       - name: Build headless tarball (${{ matrix.triple }})
         run: |
           set -euo pipefail
