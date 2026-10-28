@@ -26,6 +26,7 @@ fn option(id: &str, label: &str, description: Option<&str>) -> QuestionOption {
         preview: None,
         widget: None,
         quiet: false,
+        quiet_reply: None,
     }
 }
 

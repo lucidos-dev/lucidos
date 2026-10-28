@@ -13,6 +13,7 @@ pub(crate) fn opt(id: &str, label: &str) -> QuestionOption {
         preview: None,
         widget: None,
         quiet: false,
+        quiet_reply: None,
     }
 }
 

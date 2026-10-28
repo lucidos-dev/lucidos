@@ -35,6 +35,10 @@ export class ApiError extends Error {
      *  than the engine answering for itself. Not a verdict about the request,
      *  so `isTransientFetchError` folds it in with the aborts. */
     public readonly bootSplash: boolean = false,
+    /** The gateway answered for a workspace it has stopped, so no engine is
+     *  there to ask. Unlike `bootSplash` it is not transient: nothing starts the
+     *  engine until the user does. */
+    public readonly workspaceStopped: boolean = false,
   ) {
     super(`${httpCode} ${reason}`);
     this.name = 'ApiError';
@@ -175,6 +179,13 @@ function looksLikeMarkup(res: Response, text: string): boolean {
   return text.trimStart().startsWith('<');
 }
 
+/** The gateway's marker for a workspace it has stopped, and its value
+ *  (`WORKSPACE_STATE_HEADER` and `WORKSPACE_STOPPED` in
+ *  `crates/lucidos-gateway/src/server.rs`). Only the registered-but-stopped 503
+ *  carries it, never an unknown slug or a booting engine. */
+const WORKSPACE_STATE_HEADER = 'x-lucidos-workspace-state';
+const WORKSPACE_STOPPED = 'stopped';
+
 /** The workspace gateway answered for an engine it could not reach.
  *
  *  `proxy_request` serves its boot splash for EVERY proxied request whose
@@ -233,6 +244,7 @@ export async function throwIfNotOk(res: Response): Promise<void> {
     errorReason(res, text, json),
     json,
     isBootSplashResponse(res, text),
+    res.headers.get(WORKSPACE_STATE_HEADER) === WORKSPACE_STOPPED,
   );
 }
 

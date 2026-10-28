@@ -864,6 +864,63 @@ fn tier2_merge_session_is_detached_from_the_caller_future() {
     );
 }
 
+/// An Apply that sends `/harden` to a live session must still end in
+/// `ChangeApplied` or `ChangeApplyFailed`. The session's own turn end only
+/// proposes, so the apply hands the turn's receiver to a task that re-enters
+/// it. Dropping the receiver left an Apply All batch waiting forever.
+///
+/// Source-text assertion: nothing in this crate constructs a live
+/// `LucidosEngine` outside `main.rs`. The settle wait it relies on is tested at
+/// runtime in `claude_code::spawn::tests`.
+#[test]
+fn a_live_session_harden_re_enters_the_apply() {
+    let apply = include_str!("change_ops/apply.rs");
+    let send = apply
+        .find(".request_hardening_in_session(thread_id, &session.msg_tx)")
+        .expect("the live-session arm still routes hardening through the session");
+    let arm = &apply[send..];
+    let arm = &arm[..arm
+        .find("ApplyResult::hardening(")
+        .expect("the arm reports hardening")];
+    assert!(
+        arm.contains("Ok(answered) =>") && arm.contains("spawn_apply_after_session_harden("),
+        "the live-session harden must hand its receiver to the follow-up apply. Arm was:\n{arm}"
+    );
+
+    let spawn = include_str!("claude_code/spawn.rs");
+    let production = &spawn[..spawn.find("\n#[cfg(test)]").unwrap()];
+    let follow_up = &production[production
+        .find("pub(crate) fn spawn_apply_after_session_harden(")
+        .unwrap()..];
+    let follow_up = &follow_up[..follow_up.find("\n    }\n").unwrap()];
+    let turn = follow_up.find("wait_for_prompt_turn(").unwrap();
+    let settle = follow_up.find("wait_until_settled(").unwrap();
+    let apply_again = follow_up.find(".apply_after_hardening(").unwrap();
+    assert!(
+        turn < settle && settle < apply_again,
+        "the follow-up waits for the turn, then its settle, then applies"
+    );
+    assert!(
+        follow_up.contains("HardeningRun::Unsettled"),
+        "a turn that never settles must not apply: its proposal may still write the branch"
+    );
+
+    let after = &production[production
+        .find("pub(crate) async fn apply_after_hardening(")
+        .unwrap()..];
+    let after = &after[..after.find("\n    }\n").unwrap()];
+    assert!(
+        !after.contains("ThreadEvent::ChangeApplyFailed"),
+        "every post-hardening failure goes through an emitter that notifies Apply All"
+    );
+    let unsettled = &after[after.find("HardeningRun::Unsettled =>").unwrap()..];
+    let unsettled = &unsettled[..unsettled.find("return;").unwrap()];
+    assert!(
+        unsettled.contains("emit_apply_failed(") && !unsettled.contains("apply_change("),
+        "an unsettled hardening turn reports the apply failed. Arm was:\n{unsettled}"
+    );
+}
+
 /// The other half of the same invariant, checked at the API boundary: no axum
 /// handler may drive a coding-agent session itself.
 ///

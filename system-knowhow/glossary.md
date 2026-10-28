@@ -1583,7 +1583,15 @@ See also: `system-knowhow/running-python.md` § The drain pattern.
 
 ### Quiet option
 A question-card option that needs nothing more from the agent, such as "Leave it as posted" or "Not now". Picking it records the answer and ends the turn: the agent does not wake, so it writes no reply and does no more work. An option that promises work is therefore never quiet, and a card whose every option is quiet is refused. Typed text beside a pick always wakes it, and only a one-question ask can carry one: a later card still needs the agent. The Lucidos Agent and Codex mark one with `quiet: true`, and Claude Code with a `[quiet]` label prefix that the card never shows.
-See also: *wake question*.
+
+A quiet option may also carry a *quiet reply*.
+See also: *quiet pick*, *quiet reply*, *wake question*.
+
+### Quiet pick
+An answer that picks only *quiet options* and types no text beside them. It ends the turn rather than waking the agent.
+
+### Quiet reply
+A fixed acknowledgement a *quiet option* carries, written by the agent when it asked, such as "Then everything is set up correctly." A *quiet pick* shows it as the agent's final reply, and no model call writes it. The Lucidos Agent and Codex write it as `quiet_reply`, and Claude Code as `[quiet: <reply>]`, which ends at the first `]`. A pick of several quiet options shows their replies in option order, one per paragraph. Only a quiet option may carry one. A Claude Code or Codex agent that is no longer running shows no reply, and neither does a turn the user stopped.
 
 ### Release notice
 Something a release needs you to KNOW or DO, shown once on the first open after you upgrade. "Run a workspace audit" was the first. The release notes in *What's New* say what changed; a release notice says what to do about it. Most releases carry none, which keeps the ones that do worth reading.

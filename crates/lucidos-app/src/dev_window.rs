@@ -3,7 +3,7 @@
 //!
 //! `scripts/tauri-dev.sh` runs this binary from its published launch binary in
 //! `.launch/`, and names the page to show in [`URL_ENV`]. The build that Apply
-//! starts may publish a newer one at the same path. The window adopts it only
+//! starts may publish a newer one at the same path. The window moves to it only
 //! once the engine it shows has moved too, so it is never newer than the stack.
 
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -35,12 +35,17 @@ struct Published {
     at: SystemTime,
 }
 
-/// A window the launcher started: the binary it runs, and the origin of the
-/// page it was pointed at.
+/// Where the launcher wants the page to reopen on, when the window exits to
+/// follow a switch. The launcher then starts the binary published at its path.
+pub const RELAUNCH_FILE_ENV: &str = "LUCIDOS_DEV_WINDOW_RELAUNCH_FILE";
+
+/// A window the launcher started: the binary it runs, the origin of the page it
+/// was pointed at, and where to hand the launcher a relaunch.
 struct LaunchedWindow {
     path: PathBuf,
     id: FileId,
     origin: String,
+    relaunch_file: PathBuf,
 }
 
 /// Set once, by [`launch`], and only for a window the launcher started.
@@ -64,11 +69,14 @@ pub fn launch(app: &AppHandle) {
         }
     };
     let origin = parsed.origin().ascii_serialization();
-    if let Some((path, id)) = read_running_image() {
+    if let (Some((path, id)), Some(relaunch_file)) =
+        (read_running_image(), std::env::var_os(RELAUNCH_FILE_ENV))
+    {
         let _ = LAUNCHED.set(LaunchedWindow {
             path,
             id,
             origin: origin.clone(),
+            relaunch_file: relaunch_file.into(),
         });
     }
     if let Err(e) = app.add_capability(crate::desktop::gateway_capability(&origin)) {
@@ -86,14 +94,17 @@ pub fn launch(app: &AppHandle) {
     });
 }
 
-/// Re-exec onto the window binary now published at this one's path, when the
+/// Move onto the window binary now published at this one's path, when the
 /// engine the page shows started after it was published. Returns whether it
-/// did; on success it never returns, since the exec replaces this process.
+/// did; on success it never returns, since the window exits.
 ///
 /// The page calls this with its engine's `started_at` on its first health
 /// answer and on every restart, so a switch from any device reaches it. Only a
-/// page on the launcher's origin counts. The new image opens on the page the
-/// window showed, so the user stays where they were.
+/// page on the launcher's origin counts. The launcher starts the new binary on
+/// the page the window showed, so the user stays where they were.
+///
+/// It never execs in place. macOS registers a self-exec'd app again with pid
+/// -1, and window managers such as Rectangle then cannot find the window.
 #[tauri::command]
 pub fn follow_engine_switch(
     webview: tauri::Webview,
@@ -113,11 +124,21 @@ pub fn follow_engine_switch(
         return Ok(false);
     }
     eprintln!(
-        "[dev-window] the engine moved to a new version; re-exec {} on {page}",
+        "[dev-window] the engine moved to a new version; relaunching {} on {page}",
         window.path.display()
     );
-    reexec(&window.path, page.as_str())?;
-    Ok(true)
+    std::fs::write(&window.relaunch_file, page.as_str()).map_err(|e| {
+        format!(
+            "cannot hand the launcher the relaunch at {}: {e}",
+            window.relaunch_file.display()
+        )
+    })?;
+    // The same exit as restart_app, so the new window keeps this one's frame.
+    let app = webview.app_handle();
+    crate::window_persist::persist_windows(app);
+    crate::window_persist::begin_teardown();
+    app.cleanup_before_exit();
+    std::process::exit(0);
 }
 
 /// Whether the window should move onto what is published at its path.
@@ -140,22 +161,6 @@ fn should_follow(
 /// before it navigates, and that page may be another workspace's engine.
 fn is_on_origin(page: &tauri::Url, origin: &str) -> bool {
     page.origin().ascii_serialization() == origin
-}
-
-/// Replace this process with the binary at `exe`, opening on `page`.
-#[cfg(unix)]
-fn reexec(exe: &Path, page: &str) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new(exe)
-        .args(crate::desktop::relaunch_args())
-        .env(URL_ENV, page)
-        .exec();
-    Err(format!("exec failed: {err}"))
-}
-
-#[cfg(not(unix))]
-fn reexec(_exe: &Path, _page: &str) -> Result<(), String> {
-    Err("the dev window re-execs only on Unix".to_string())
 }
 
 fn read_running_image() -> Option<(PathBuf, FileId)> {
@@ -252,21 +257,21 @@ mod tests {
         assert!(!is_on_origin(&dev_url, origin));
     }
 
-    /// The launcher sets the variable this module reads. Shell cannot import
-    /// the name, so the scripts are pinned to it here.
+    /// The launcher sets the variables this module reads. Shell cannot import
+    /// the names, so the scripts are pinned to them here.
     #[test]
-    fn the_scripts_name_the_variable_the_window_reads() {
-        for (script, source) in [
+    fn the_scripts_name_the_variables_the_window_reads() {
+        let launcher = include_str!("../../../scripts/lib/workspace.sh");
+        for (script, source, name) in [
+            ("workspace.sh", launcher, URL_ENV),
+            ("workspace.sh", launcher, RELAUNCH_FILE_ENV),
             (
-                "tauri-dev.sh",
-                include_str!("../../../scripts/tauri-dev.sh"),
+                "status.sh",
+                include_str!("../../../scripts/status.sh"),
+                URL_ENV,
             ),
-            ("status.sh", include_str!("../../../scripts/status.sh")),
         ] {
-            assert!(
-                source.contains(URL_ENV),
-                "{script} no longer names {URL_ENV}"
-            );
+            assert!(source.contains(name), "{script} no longer names {name}");
         }
     }
 

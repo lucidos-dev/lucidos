@@ -74,6 +74,7 @@ async function startWorker() {
 }
 
 const types = (port: FakePort) => port.received.map((m) => m.t);
+const lastReceived = (port: FakePort) => port.received[port.received.length - 1];
 
 describe('shared worker upstream watchdog', () => {
   beforeEach(() => {
@@ -101,10 +102,10 @@ describe('shared worker upstream watchdog', () => {
     expect(FakeEventSource.all[0].closed).toBe(true);
     expect(FakeEventSource.live).toHaveLength(1);
     for (const port of [first, second]) {
-      expect(port.received.at(-1)).toEqual({ t: 'error', silentMs: STREAM_STALL_AFTER_MS });
+      expect(lastReceived(port)).toEqual({ t: 'error', silentMs: STREAM_STALL_AFTER_MS });
     }
     FakeEventSource.live[0].onopen!();
-    expect(first.received.at(-1)).toEqual({ t: 'open' });
+    expect(lastReceived(first)).toEqual({ t: 'open' });
   });
 
   it('never reopens an upstream whose keepalives arrive on time', async () => {
@@ -145,8 +146,8 @@ describe('shared worker upstream watchdog', () => {
 
     expect(FakeEventSource.all).toHaveLength(2);
     expect(FakeEventSource.all[0].closed).toBe(true);
-    expect(first.received.at(-1)).toMatchObject({ t: 'error' });
-    expect(late.received.at(-1)).toMatchObject({ t: 'error' });
+    expect(lastReceived(first)).toMatchObject({ t: 'error' });
+    expect(lastReceived(late)).toMatchObject({ t: 'error' });
     expect(types(late)).not.toContain('open');
   });
 
@@ -178,9 +179,9 @@ describe('shared worker upstream watchdog', () => {
 
     expect(FakeEventSource.all).toHaveLength(2);
     expect(FakeEventSource.all[0].closed).toBe(true);
-    expect(port.received.at(-1)).toEqual({ t: 'error', silentMs: LATE_JOIN_STALL_AFTER_MS });
+    expect(lastReceived(port)).toEqual({ t: 'error', silentMs: LATE_JOIN_STALL_AFTER_MS });
     FakeEventSource.live[0].onopen!();
-    expect(port.received.at(-1)).toEqual({ t: 'open' });
+    expect(lastReceived(port)).toEqual({ t: 'open' });
   });
 
   it('keeps a live upstream when a port asks for a check', async () => {
@@ -205,7 +206,7 @@ describe('shared worker upstream watchdog', () => {
 
     FakeEventSource.live[0].onerror!();
 
-    expect(port.received.at(-1)).toEqual({ t: 'error' });
+    expect(lastReceived(port)).toEqual({ t: 'error' });
     expect(FakeEventSource.all).toHaveLength(1);
     vi.advanceTimersByTime(3000);
     expect(FakeEventSource.all).toHaveLength(2);

@@ -829,6 +829,9 @@ export interface QuestionOption {
   /** A *quiet option*: picking it records the answer and ends the turn
    *  without waking the agent. */
   quiet?: boolean;
+  /** The *quiet reply*: the fixed acknowledgement the thread shows when the
+   *  user picks this quiet option. Only a quiet option carries one. */
+  quiet_reply?: string;
 }
 
 /** One long-term memory the pre-turn recall injected into the turn's context,

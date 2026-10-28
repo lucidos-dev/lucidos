@@ -539,7 +539,6 @@ impl Band {
         } else {
             // A multiple below 0.5 has a small positive -log10, so the cast
             // never truncates or wraps.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let first_digit = (-multiple.log10()).ceil() as usize;
             first_digit.max(2)
         };
@@ -948,9 +947,7 @@ pub(crate) fn list_cost_steps(estimate: &EstimatedPair, share: f64) -> Option<f6
 fn grid_steps(steps: f64) -> i32 {
     // Cost steps between two priced pairs stay within a few dozen, so the
     // cast never truncates.
-    #[allow(clippy::cast_possible_truncation)]
-    let snapped = steps.round() as i32;
-    snapped
+    steps.round() as i32
 }
 
 /// The reference rung's bands, in the units each band divides by.

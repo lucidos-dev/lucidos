@@ -174,7 +174,7 @@ pub(crate) fn claim_thread_for(
             current_reasoning_effort,
             reasoning_effort_in_force: None,
             question_resume_pending: false,
-            quiet_answer_pending: false,
+            quiet_answer_pending: None,
             tools_in_flight: entry.tools_in_flight.clone(),
             question_flushes: entry.question_flushes.clone(),
             coding_agent,

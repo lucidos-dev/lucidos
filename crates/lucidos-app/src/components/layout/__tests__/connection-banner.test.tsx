@@ -5,16 +5,16 @@
  * Three properties. It renders for exactly the states the mark recedes in, which
  * is the pairing the whole notice family is built on. It renders ONCE per
  * viewport, the dual-render rule every app-shell banner obeys. And it is a
- * statement: no button, no dismissal, nothing that promises a tap, because the
- * sentence is the whole message and neither remedy in the Lucidos menu can fix a
- * disconnect.
+ * statement: no dismissal, and no button except Start while the workspace is
+ * stopped. The sentence is the whole message, and neither remedy in the
+ * Lucidos menu can fix a disconnect.
  *
  * Components are invoked as plain functions and the returned vnode tree is
  * walked (the repo idiom, no DOM render library), which is why the markup lives
  * in the hook-free `connectionBannerBody` and the gate in
  * `shouldRenderConnectionBanner`.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   CONNECTING_QUIET_MS,
   CONNECTION_BANNER_HEIGHT_VAR,
@@ -126,7 +126,7 @@ describe('connectionBannerBody renders the bar', () => {
   });
 
   it('keys its wash on the state, so the two degraded states are told apart', () => {
-    for (const status of ['disconnected', 'connecting'] as ConnectionStatus[]) {
+    for (const status of ['disconnected', 'connecting', 'stopped'] as ConnectionStatus[]) {
       const bar = findByClass(body(status), 'connection-banner')[0];
       expect(bar.props['data-conn']).toBe(status);
     }
@@ -140,6 +140,38 @@ describe('connectionBannerBody renders the bar', () => {
     expect(bar.props.role).toBe('status');
     expect(bar.props.onClick).toBeUndefined();
     expect(findByType(body('disconnected'), 'button')).toHaveLength(0);
+  });
+
+  it('shows a stopped workspace at once, with the same states it recedes in', () => {
+    expect(shouldRenderConnectionBanner({
+      ...DESKTOP, status: 'stopped', connectingSettled: false,
+    })).toBe(true);
+  });
+
+  it('offers Start while stopped, and only then', () => {
+    const onStart = vi.fn();
+    const stopped = connectionBannerBody({ layout: 'desktop', status: 'stopped', workspace: 'dev', onStart });
+    const buttons = findByType(stopped, 'button');
+    expect(buttons).toHaveLength(1);
+    expect(textOf(buttons[0])).toBe('Start');
+    (buttons[0].props.onClick as () => void)();
+    expect(onStart).toHaveBeenCalledOnce();
+
+    const disconnected = connectionBannerBody({ layout: 'desktop', status: 'disconnected', workspace: 'dev', onStart });
+    expect(findByType(disconnected, 'button')).toHaveLength(0);
+  });
+
+  it('draws no Start without a handler, as in a window with no gateway', () => {
+    expect(findByType(body('stopped'), 'button')).toHaveLength(0);
+  });
+
+  it('disables the button while a Start is in flight, so it cannot double-fire', () => {
+    const starting = connectionBannerBody({
+      layout: 'desktop', status: 'stopped', workspace: 'dev', onStart: vi.fn(), starting: true,
+    });
+    const [button] = findByType(starting, 'button');
+    expect(button.props.disabled).toBe(true);
+    expect(textOf(button)).toBe('Starting…');
   });
 
   it('carries no left-accent stripe hook', () => {

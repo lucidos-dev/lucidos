@@ -107,6 +107,15 @@ export async function restartWorkspace(id: string): Promise<void> {
   });
 }
 
+/** Start a workspace that is not running, from its own window. A workspace
+ *  that already runs is left alone, which is what {@link restartWorkspace}
+ *  cannot promise: its respawn would interrupt the threads of an engine another
+ *  window started a moment earlier. Resolves once the gateway accepts it. The
+ *  engine boots afterwards, and the window's health poll carries it back. */
+export async function startWorkspace(id: string): Promise<void> {
+  await controlJson<void>(`/workspaces/${encodeURIComponent(id)}/start`, { method: 'POST' });
+}
+
 /** Stop a workspace's engine. It stays listed in the picker as stopped (the
  *  registry entry survives, since membership is "all ever launched").
  *

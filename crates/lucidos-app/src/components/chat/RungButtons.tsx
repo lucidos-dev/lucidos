@@ -78,9 +78,10 @@ function stepOnArrow(step: RungSteps | undefined, e: KeyboardEvent): void {
 }
 
 /** One end of the pill: ‹ steps to the previous rung, › to the next. */
-function RungStep({ dir, step, disabledReason }: {
+function RungStep({ dir, step, disabledReason, lockedReason }: {
   dir: 'prev' | 'next';
   disabledReason?: string | null;
+  lockedReason?: string | null;
   step: RungSteps | undefined;
 }) {
   const label = dir === 'prev' ? 'Previous model and effort' : 'Next model and effort';
@@ -89,7 +90,7 @@ function RungStep({ dir, step, disabledReason }: {
       type="button"
       class="rung-step"
       aria-label={label}
-      data-tooltip={disabledReason ?? label}
+      data-tooltip={disabledReason ?? lockedReason ?? label}
       aria-disabled={!!disabledReason || !step?.[dir]}
       onMouseDown={keepFocusOnPress}
       onKeyDown={(e) => stepOnArrow(disabledReason ? undefined : step, e)}
@@ -104,10 +105,13 @@ function RungStep({ dir, step, disabledReason }: {
  *  placeholder shown until its code arrives both draw them, so the box never
  *  changes as it loads. */
 export function RungButtons({
-  shown, rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step, disabledReason,
+  shown, rowAttrs = PINNED_ROW_ATTRS, expanded, triggerRef, onOpen, step, disabledReason, lockedReason,
 }: {
   rowAttrs?: Record<string, string>;
   disabledReason?: string | null;
+  /** Why a pick is refused right now. The pill stays live, so the list still
+   *  opens to show the rungs, and the tooltip says why a pick will not land. */
+  lockedReason?: string | null;
   /** What the control names, or null until its face is whole. A null face
    *  keeps a visible label until the selection arrives. */
   shown: ShownRung | null;
@@ -125,11 +129,11 @@ export function RungButtons({
       data-pending={shown === null || undefined}
       {...rowAttrs}
     >
-      <RungStep dir="prev" step={step} disabledReason={disabledReason} />
+      <RungStep dir="prev" step={step} disabledReason={disabledReason} lockedReason={lockedReason} />
       <button
         type="button"
         class="rung-trigger"
-        data-tooltip={disabledReason ?? tooltipWithShortcut(pairName(shown), 'openAgentMenu')}
+        data-tooltip={disabledReason ?? lockedReason ?? tooltipWithShortcut(pairName(shown), 'openAgentMenu')}
         aria-disabled={!!disabledReason}
         ref={triggerRef}
         aria-label={openLabel(shown)}
@@ -142,7 +146,7 @@ export function RungButtons({
         {shown ? <RungLabel shown={shown} /> : <span class="rung-label">Model and effort</span>}
         <ChevronDownIcon size="0.75rem" />
       </button>
-      <RungStep dir="next" step={step} disabledReason={disabledReason} />
+      <RungStep dir="next" step={step} disabledReason={disabledReason} lockedReason={lockedReason} />
     </div>
   );
 }

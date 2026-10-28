@@ -152,6 +152,17 @@ export function isReducedMotionRule(rule: CssRule): boolean {
   return selectorList(rule.selector).every(s => s.startsWith(REDUCED_MOTION_ROOT));
 }
 
+/** The classes a content-pane column view root carries, as ContentPane mounts them. */
+export const COLUMN_VIEW_ROOTS = [
+  'content-view', 'panel-content', 'settings-panel', 'apps-view', 'plugins-view',
+  'notification-detail', 'plugin-detail', 'inline-form',
+] as const;
+
+/** Every content-pane view root: the columns plus the full-bleed views. */
+export const CONTENT_VIEW_ROOTS = [
+  ...COLUMN_VIEW_ROOTS, 'file-preview-frame', 'app-ui-inline', 'url-preview-inline',
+] as const;
+
 /**
  * A rule's selector list, one member per entry, trimmed.
  *

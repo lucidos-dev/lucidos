@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, relative, resolve } from 'node:path';
 
-import { clientSourcePaths, cssRules, selectorList, styleSheetPaths } from './css-rule-helpers';
+import { COLUMN_VIEW_ROOTS, CONTENT_VIEW_ROOTS, clientSourcePaths, cssRules, selectorList, styleSheetPaths } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesRoot: string = resolve(here, '..');
@@ -28,8 +28,8 @@ const ALL_RULES = styleSheetPaths(stylesRoot).flatMap((path: string) =>
 
 const SPACER = '.content-pane-body > :not(.content-view-full-bleed)::after';
 
-/** The classes a view root carries, as ContentPane mounts them. */
-const VIEW_ROOT = /\.(content-view|panel-content|settings-panel|apps-view|plugins-view|notification-detail|inline-form|file-preview-frame|app-ui-inline|url-preview-inline)\b/;
+const VIEW_ROOT = new RegExp(`\\.(${CONTENT_VIEW_ROOTS.join('|')})(?![\\w-])`);
+const COLUMN_ROOT = new RegExp(`\\.(${COLUMN_VIEW_ROOTS.join('|')})(?![\\w-])`);
 
 /** A selector's last compound, the element it styles, with every functional
  *  pseudo-class argument dropped so a `:has(...)` cannot pose as the subject. */
@@ -67,8 +67,7 @@ describe('the content pane end space', () => {
     const pinned = ALL_RULES.filter(rule =>
       rule.props.has('height') &&
       selectorList(rule.selector).some(s =>
-        /(\.content-view\.active|\.panel-content|\.notification-detail)$/.test(s) &&
-        !s.includes('full-bleed')));
+        COLUMN_ROOT.test(subject(s)) && !s.includes('full-bleed')));
     expect(pinned.map(r => `${relative(stylesRoot, r.path)}: ${r.selector}`)).toEqual([]);
   });
 
@@ -90,7 +89,7 @@ describe('the content pane end space', () => {
       .filter((path: string) => readFileSync(path, 'utf8').includes('content-view-full-bleed'))
       .map((path: string) => relative(srcRoot, path))
       .sort();
-    expect(marked, 'a new full-bleed view drops the end space; add it to FULL_BLEED with why')
+    expect(marked, 'a new full-bleed view drops the end space and the content column; add it to FULL_BLEED with why')
       .toEqual(Object.keys(FULL_BLEED).sort());
   });
 });

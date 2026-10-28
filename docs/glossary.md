@@ -2323,6 +2323,11 @@ is a structural guarantee pinned by `e2e/mobile-threads-title-alignment-all.spec
 so text there would push the mark off that axis and spend clearance the spec
 measures. A bar costs the row's width budget nothing at any viewport.
 
+### Stopped (connection state)
+A fourth `ConnectionStatus`, beside `connecting`, `connected` and `disconnected`. It means the gateway answered but the workspace's engine is not running, for example after the user stopped it from the picker. The gateway marks that 503 with the `x-lucidos-workspace-state: stopped` header (`WORKSPACE_STATE_HEADER` in `crates/lucidos-gateway/src/server.rs`). `checkHealth` reads the mark and returns `{ status: 'stopped' }`, and `ApiError.workspaceStopped` carries it for other calls. An unmarked 503, a refused socket or a timeout stays `disconnected`.
+
+The *connection banner* then says the workspace is stopped and offers **Start**. Start posts to `POST /~/api/v1/control/workspaces/:id/start`, a start-only route: it lazy-starts a registered workspace and never respawns a running engine, which is why it is not `/restart`. The health poll turns the bar green when the engine answers. The state needs a gateway-fronted window. A window on a direct engine port, or one served by an older gateway that sends no mark, keeps the "cannot reach" wording.
+
 ### Progress dialog
 The modal that says the workspace is going away and coming back
 (`components/shared/ProgressDialog.tsx`). Third surface in the taxonomy, beside
@@ -2410,6 +2415,11 @@ The room every content-pane view keeps below its last element: `--space-xl` plus
 It is **default-deny**. A view loses it only by carrying `content-view-full-bleed`, which says it fills the pane and scrolls inside itself (an app, a preview). A phone's flowing file preview opts back in.
 
 A column view grows with its content instead of taking the pane's height. Pinned, its content would overflow its own box and run past the spacer. `FillSkeleton` subtracts the spacer, so a full-pane skeleton still fits. Pinned by `styles/__tests__/content-pane-end-space.test.ts` and `e2e/content-pane-end-space-all.spec.ts`.
+
+### Content column
+The one column every content-pane view sits in, tab or overlay: capped at `--content-max-width` like the transcript, centred, with `--space-md` above its first element. It is `.content-pane-body > :not(.content-view-full-bleed)` in `panels/content.css`.
+
+It is **default-deny**, like the *end space*. A view leaves it only by carrying `content-view-full-bleed`. A view root never sets its own width, margin or top padding, and pads only its sides with `--space-lg`. Pinned by `styles/__tests__/content-pane-one-column.test.ts` and `e2e/content-pane-one-column-desktop.spec.ts`.
 
 ### Content view key
 The content pane's single answer to "has this pane navigated" (`components/layout/contentViewKey.ts`). It resolves the *panel overlay* (else the active menu item) down to the identity of the thing on screen. Its consumers must agree, or they break together in the same direction. The scroll memory would restore the outgoing view's offset onto the incoming one. The *navigation cover* would hard-cut the same swap.
@@ -2862,7 +2872,9 @@ The `.prompt-actions-row` contract: it is ONE row, nothing leaves its box, and t
 
 Exactly one control never folds: the *action slot*'s. It fits at any width the app supports, so a row too narrow for its members is not a state it can settle in. Everything else folds, and the `⋯` stands at the row's left edge. No member shortens instead: the rung pill and the action slot keep one width per *composer face set* (ADR 0573, 0576): the compact faces (the phone layout, or a row under 36rem) or the desktop ones.
 
-Fold order is the row's own order, left to right. First come the coding-agent menu, the call toggle, the follow toggle and the side-question toggle (where a side question can be asked). Next come attach image, the todo and waiting indicators, the WIP preview and clear draft. Then the right-hand cluster: Diff and the standing apply, then the rung pill. The fold takes a PREFIX, so the leftmost member folds first and the last one standing is the one nearest the action slot. A fold therefore never moves a standing member across the row, and a row with room to spare looks unchanged.
+The row draws the call, follow and side-question toggles first, left to right. The coding-agent menu follows them. Next come attach image, the todo and waiting indicators, the WIP preview and clear draft. Then the right-hand cluster: Diff and the standing apply, then the rung pill.
+
+Fold order is that order with the todo and waiting indicators moved to the front, since they only report state. The fold takes a PREFIX of it, so the last one standing is the one nearest the action slot. A fold only removes boxes, so no standing member crosses another, and a row with room to spare looks unchanged.
 
 The row holds one icon tap target of height whatever stands (`min-height` on `.prompt-actions-row`), so the transcript's scroll end never moves with the fold.
 
@@ -3328,7 +3340,7 @@ A shared flock a consumer of something holds for its whole life. Whoever would t
 One exists: every engine serving a checkout's `dist/` holds `crates/lucidos-app/.build-watch/consumers.lock`, and the *shared build-watch*'s teardown takes it exclusively. See ADR 0438.
 
 ### Dev window
-The desktop window a developer runs from source: `scripts/tauri-dev.sh` builds the `lucidos-app` crate unbundled, publishes it as a *launch binary*, and runs it pointed at `LUCIDOS_DEV_WINDOW_URL`. It moves to a new build only at *Switch to new version*, never on a file change. It re-execs onto a newer published binary once the engine its page shows started after that binary was published (`crates/lucidos-app/src/dev_window.rs`, `store/actions/dev-window.ts`). Distinct from the packaged desktop client, which moves with its bundle through the app updater. See ADR 0461.
+The desktop window a developer runs from source: `scripts/tauri-dev.sh` builds the `lucidos-app` crate, publishes it as a *launch binary* (inside a minimal `Lucidos Dev.app` on macOS), and runs it pointed at `LUCIDOS_DEV_WINDOW_URL`. It moves to a new build only at *Switch to new version*, never on a file change. It follows a newer published binary once the engine its page shows started after that binary was published. The window exits, and the launcher starts the binary as a new process, never an exec in place (`crates/lucidos-app/src/dev_window.rs`, `store/actions/dev-window.ts`). Distinct from the packaged desktop client, which moves with its bundle through the app updater. See ADR 0461.
 
 ### Launch binary
 The copy of `lucidos-engine` / `lucidos-gateway` / the `lucidos` CLI that a workspace actually **launches**, published by `build_or_find_engine` (`scripts/lib/workspace.sh`) into `.launch/<profile>/<variant>/`, where `<profile>` is `debug` | `release` and `<variant>` is `plain` for a default build or a slug of `ENGINE_BUILD_FEATURES` (`e2e-test-hooks`). `ENGINE_BIN` / `GATEWAY_BIN` / `LUCIDOS_ENGINE_BIN` and the engine's own `current_exe()` all resolve here. Distinct from **cargo's uplift path** (`target/<profile>/lucidos-engine`), which every cargo variant in the checkout writes to and which nothing launches from any more: a workspace-scope `cargo test`, an e2e feature build, and a build whose `build.rs` ran before an Apply moved HEAD all compete for that one path, so launching from it ran (and compared `ENGINE_BUILD_ID` against) a binary from another commit or another feature configuration: the cause half of the 2026-07-26 downgrade/toast loop. A launch dir is written **only by completed builds of the same profile AND variant**, published by temp-file + atomic rename (a failed publish leaves the previous binary intact, because the launch path must never go missing), verified against HEAD with one bounded rebuild, and signed with the stable dev identity. Staying inside the CHECKOUT is load-bearing, but staying inside `target/` is not (ADR 0063): *repo root* resolution walks `current_exe()`'s ancestors for `scripts/web-dev.sh` and so is indifferent to which top-level dir holds the binary, and ADR 0021's worktree refusal is a pure substring test for `/.lucidos/worktrees/` on `LUCIDOS_ENGINE_BIN`. Both hold for a checkout-local dot-dir, and the dir sits outside `target/` precisely so a `cargo clean` cannot delete the `lucidos` CLI the engine puts on PATH for every spawned trigger and coding-agent session (the 2026-08-13 eight-hour outage). Reclaim the disk with `rm -rf .launch`. See ADR 0022, ADR 0063, and `docs/plans/2026-07-27-launch-binary-published-per-variant.md`.

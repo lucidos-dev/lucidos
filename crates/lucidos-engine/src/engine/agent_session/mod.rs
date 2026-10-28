@@ -34,8 +34,8 @@ pub(crate) use coding_agent_kind::{
 #[cfg(test)]
 pub(crate) use apply_now::{decide_in_place_merge_claim, release_change_claim, InPlaceMergeClaim};
 pub(crate) use apply_now::{
-    end_interrupted_applies, probe_merge_conflicts, send_awaited_prompt, ChangeClaimGuard,
-    InPlaceMergeStart,
+    end_interrupted_applies, probe_merge_conflicts, send_awaited_prompt, wait_for_prompt_turn,
+    ChangeClaimGuard, InPlaceMergeStart,
 };
 pub(crate) use external_edits::git_head_sha as external_edits_for_recovery_head_sha;
 pub(crate) use external_edits::worktree_serves_branch;

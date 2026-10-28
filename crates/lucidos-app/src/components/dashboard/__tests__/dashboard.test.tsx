@@ -68,9 +68,11 @@ import { PANE_TRANSITION_MS } from '../../layout/splitHelpers';
 import type { FrameState } from '../../widgets/widgetFrameState';
 
 const openApp = vi.hoisted(() => vi.fn());
+const editApp = vi.hoisted(() => vi.fn());
 vi.mock('../../../store/actions/apps', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/apps')>()),
   openAppById: openApp,
+  openEditApp: editApp,
 }));
 
 function tile(appId: string, size: WidgetDashboardTile['size'], extra: Partial<WidgetDashboardTile> = {}): WidgetDashboardTile {
@@ -428,6 +430,18 @@ describe('<Dashboard> app shortcuts', () => {
     act(() => { shortcutTile().dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })); });
     const items = [...document.querySelectorAll('.thread-overflow-menu [role="menuitem"]')].map((b) => b.textContent);
     expect(items).toContain('Remove from dashboard');
+    expect(openApp).not.toHaveBeenCalled();
+  });
+
+  it('its menu offers Edit app, which opens the app edit form', () => {
+    editApp.mockClear();
+    setDashboard([shortcut('notes')]);
+    act(() => render(<Dashboard dashboard="desktop" />, host));
+    act(() => { shortcutTile().dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })); });
+    const items = [...document.querySelectorAll<HTMLElement>('.thread-overflow-menu [role="menuitem"]')];
+    expect(items.map((b) => b.textContent)).toEqual(['Open', 'Edit app', 'Remove from dashboard', 'Edit dashboard']);
+    act(() => items.find((b) => b.textContent === 'Edit app')!.click());
+    expect(editApp).toHaveBeenCalledWith('notes');
     expect(openApp).not.toHaveBeenCalled();
   });
 

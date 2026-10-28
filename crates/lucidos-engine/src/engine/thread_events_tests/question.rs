@@ -14,6 +14,7 @@ fn user_question_asked_serialization() {
                 preview: Some("![first](artifacts/first.png)".into()),
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             },
             QuestionOption {
                 id: "o2".into(),
@@ -22,6 +23,7 @@ fn user_question_asked_serialization() {
                 preview: None,
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             },
         ],
         worktree_path: Some("/tmp/cc-abc".into()),

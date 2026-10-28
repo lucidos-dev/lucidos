@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /**
  * A started coding-agent thread keeps its rung while a turn runs (ADR 0542).
- * The disabled pill explains the lock and records nothing.
+ * The pill still opens its list, explains the lock and records nothing.
  * Once the thread is idle a pick records again.
  */
 import { beforeAll, describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -100,36 +100,39 @@ async function pickHigh(): Promise<void> {
   await settle();
 }
 
+const lockToasts = () => toasts.value.filter(t => t.type === 'info' && /while a turn runs/.test(t.message));
+
 describe('the rung pill on a started coding-agent thread', () => {
-  it.each(LOCKED)('stays visible and disabled while the thread is %s', async (_state, seed) => {
+  it.each(LOCKED)('opens but refuses a pick while the thread is %s', async (_state, seed) => {
     seed();
     render(<RungControl threadId="t1" codingAgent="claude-code" />, host);
     await settle();
-    expect(trigger().getAttribute('aria-disabled')).toBe('true');
+    expect(trigger().getAttribute('aria-disabled')).toBe('false');
     expect(trigger().getAttribute('data-tooltip')).toMatch(/while a turn runs/);
     expect(host.querySelector('.rung-name')!.textContent).toBe('Opus 5.6');
-    trigger().click();
+    await pickHigh();
+    expect(lockToasts()).toHaveLength(1);
+    toasts.value = [];
     document.querySelector<HTMLElement>('.rung-step:last-child')!.click();
     await settle();
+    expect(lockToasts()).toHaveLength(1);
     expect(sendCodingAgentControl).not.toHaveBeenCalled();
     expect(fetchSwitchEstimate).not.toHaveBeenCalled();
-    expect(document.querySelector('.control-dropdown')).toBeNull();
-    expect(toasts.value).toEqual([]);
   });
 
-  it('closes an open list when the turn locks and keeps the same trigger', async () => {
+  it('keeps an open list open when a turn starts, and refuses its pick', async () => {
     seedThread('idle');
     render(<RungControl threadId="t1" codingAgent="claude-code" />, host);
     await settle();
-    const before = trigger();
-    before.click();
+    trigger().click();
     await settle();
-    expect(document.querySelector('.control-dropdown')).not.toBeNull();
     seedThread('running');
     await settle();
-    expect(trigger()).toBe(before);
-    expect(trigger().getAttribute('aria-disabled')).toBe('true');
-    expect(trigger().getAttribute('aria-expanded')).toBe('false');
+    expect(trigger().getAttribute('aria-expanded')).toBe('true');
+    Array.from(document.querySelectorAll<HTMLElement>('.control-option'))
+      .find(e => e.textContent?.includes('Opus 5.6 · high'))!.click();
+    await settle();
+    expect(lockToasts()).toHaveLength(1);
     expect(sendCodingAgentControl).not.toHaveBeenCalled();
   });
 

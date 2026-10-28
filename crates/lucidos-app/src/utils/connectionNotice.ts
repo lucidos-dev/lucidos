@@ -61,6 +61,10 @@ function connectionTarget(workspace: string | null): string {
  *  what a screen reader is told and what the panel says cannot drift into two
  *  different claims about one state.
  *
+ *  `stopped` is the one state that claims the engine, because the gateway said
+ *  so itself: it answered for a workspace it stopped. Every other state comes
+ *  from a poll that got no answer, which proves nothing about the engine.
+ *
  *  The workspace matters as much as the state: the name beside the mark hides
  *  itself when the pane is narrow, so this answers "connected to what?" at any
  *  width.
@@ -74,6 +78,7 @@ const CONNECTION_PHRASE: Record<string, (target: string) => string> = {
   connected: (target) => `connected to ${target}`,
   connecting: (target) => `connecting to ${target}`,
   disconnected: (target) => `cannot reach ${target}`,
+  stopped: (target) => `${target} is stopped`,
 };
 
 export function connectionPhrase(status: string, workspace: string | null): string {
@@ -133,7 +138,21 @@ const CONNECTION_DETAIL: Record<string, { consequence: string; recovery: string 
     consequence: 'Threads and messages will not load or send in this window.',
     recovery: 'Retrying every few seconds.',
   },
+  // Nothing retries here: the gateway never starts an engine for an open
+  // window's polls, or Stop would undo itself. The connection bar carries the
+  // Start button, so the recovery names the action.
+  stopped: {
+    consequence: 'Threads and messages will not load or send in this window.',
+    recovery: 'Start it to continue.',
+  },
 };
+
+/** Whether this window cannot reach its engine, whatever the cause. For a
+ *  surface that only needs to know it is cut off, such as a thread's empty
+ *  state. */
+export function isEngineUnreachable(status: ConnectionStatus): boolean {
+  return status === 'disconnected' || status === 'stopped';
+}
 
 /** Whether this state has anything to say, for a surface deciding whether to
  *  exist at all. Keyed on the same table the words come from, so a bar and a

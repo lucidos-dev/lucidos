@@ -39,6 +39,7 @@ async fn emit_unanswered_question(bus: &EventBus, thread_id: Uuid, tool_use_id: 
                 preview: None,
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             }],
             worktree_path: None,
             multi_select: false,

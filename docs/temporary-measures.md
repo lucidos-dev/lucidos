@@ -3695,7 +3695,9 @@ event that retires it.
   rename, and `rg -n 'successor spawn'` over this tree finds no instruction
   outside `docs/plans/`, `docs/adr/` and `CHANGELOG.md`. Then delete the alias,
   and the sentence naming it in `system-knowhow/lucidos-cli.md`.
-- **Status:** active
+- **Status:** removed 2026-10-27. v0.51.0, v0.52.0 and v0.52.1 all carry the
+  rename, and the search found only this row. The alias and its sentence went,
+  and `docs/generated/agent-surface.json` was regenerated without it.
 
 ---
 

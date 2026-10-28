@@ -1,5 +1,71 @@
 use super::*;
+use crate::engine::agent_session::wait_for_prompt_turn;
+use crate::engine::event_bus::BusEvent;
 use crate::engine::thread_events::{ActorMode, EngineReason};
+use std::time::Duration;
+
+/// How long a hardening turn may take from its end to its idle before the
+/// apply gives up. The run loop only proposes in between.
+const HARDEN_TURN_SETTLE_LIMIT: Duration = Duration::from_secs(120);
+
+const HARDEN_TURN_UNSETTLED: &str = "Hardening finished, but its thread did not settle in time, \
+     so the change was not applied. Apply it again.";
+
+/// How often a settle wait re-asks when no event on its thread arrives.
+const SETTLE_RECHECK: Duration = Duration::from_secs(5);
+
+/// How a hardening run ended, for [`LucidosEngine::apply_after_hardening`].
+pub(crate) enum HardeningRun {
+    /// The run finished. `aborted` is true when it was cancelled.
+    Ended {
+        aborted: bool,
+    },
+    Failed(String),
+    /// The run's thread did not settle in time, or its settle could not be
+    /// read. Applying could merge a branch its proposal still writes.
+    Unsettled,
+}
+
+/// Wait until `settled` answers true, re-asking on each event `wakes` carries
+/// that `is_wake` accepts and on every recheck tick. Returns false once
+/// `limit` passes unsettled.
+pub(crate) async fn wait_until_settled<T, F, Fut>(
+    mut settled: F,
+    wakes: &mut tokio::sync::broadcast::Receiver<T>,
+    is_wake: impl Fn(&T) -> bool,
+    limit: Duration,
+) -> bool
+where
+    T: Clone,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if settled().await {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let next_wake = async {
+            loop {
+                match wakes.recv().await {
+                    Ok(event) if is_wake(&event) => return,
+                    Ok(_) => {}
+                    // A skipped event may be the settle itself.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return,
+                    // Only the tick wakes a closed bus.
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        std::future::pending::<()>().await
+                    }
+                }
+            }
+        };
+        let _ = tokio::time::timeout(left.min(SETTLE_RECHECK), next_wake).await;
+    }
+}
 
 impl LucidosEngine {
     /// Spawn a Claude Code subprocess to run `/harden` on the given branch's worktree.
@@ -110,130 +176,200 @@ impl LucidosEngine {
                 return;
             };
 
-            // Idempotency: if another device clicked Apply while CC was
-            // running /harden, the change row is already applied and the
-            // marker has been consumed by the apply. Both arms of the match
-            // below would otherwise emit a spurious `ChangeApplyFailed` ~15s
-            // after the user saw `ChangeApplied` (Ok arm via the false
-            // `branch_is_hardened` post-check; Err arm via the
-            // "Hardening failed" fallthrough).
-            let concurrent_status = match engine.changes().get_by_id(change_id).await {
-                Ok(change) => change.map(|c| c.status()),
-                Err(e) => {
-                    log!(
-                        "[ClaudeCode] Concurrent-apply check: get_by_id({}): {}. Treating as not applied",
-                        change_id,
-                        e
-                    );
-                    None
-                }
+            let run = match result {
+                Ok(_) => HardeningRun::Ended {
+                    aborted: cancel_token.is_cancelled(),
+                },
+                Err(e) => HardeningRun::Failed(e.to_string()),
             };
-            if change_applied_concurrently(concurrent_status) {
+            engine
+                .apply_after_hardening(thread_id, change_id, run, actor)
+                .await;
+        });
+    }
+
+    /// Finish an Apply that routed `/harden` through the thread's live
+    /// session, whose own turn end proposes but never applies. Re-enters the
+    /// apply once that turn has settled. Its idle follows the proposal, and an
+    /// earlier apply would race the proposal on the same branch.
+    pub(crate) fn spawn_apply_after_session_harden(
+        &self,
+        thread_id: Uuid,
+        change_id: Uuid,
+        answered: tokio::sync::oneshot::Receiver<crate::engine::InputAnswered>,
+        actor: Option<MessageOrigin>,
+    ) {
+        let engine = self.clone_arc();
+        // Subscribed before the task starts, so the idle cannot slip past it.
+        let mut wakes = self.event_bus.subscribe();
+        tokio::spawn(async move {
+            // A rejected prompt or an ended session ran no `/harden`, and the
+            // marker check in `apply_after_hardening` reports that.
+            if let Err(e) = wait_for_prompt_turn(answered, "waiting for hardening").await {
+                log!("[ClaudeCode] Hardening for change {}: {}", change_id, e);
+            }
+            let settled = wait_until_settled(
+                || engine.agent_turn_settled(thread_id),
+                &mut wakes,
+                |event| match &event.typed {
+                    BusEvent::Thread { thread_id: t, .. } => *t == thread_id,
+                    BusEvent::System(_) => false,
+                },
+                HARDEN_TURN_SETTLE_LIMIT,
+            )
+            .await;
+            let run = if settled {
+                HardeningRun::Ended { aborted: false }
+            } else {
                 log!(
-                    "[ClaudeCode] Hardening session for change {} found change already applied (concurrent apply) — skipping post-CC failure emit",
+                    "[ClaudeCode] Thread {} did not settle within {:?} of its hardening turn; \
+                     not applying change {}",
+                    thread_id,
+                    HARDEN_TURN_SETTLE_LIMIT,
                     change_id
                 );
-                engine.broadcast_changes_updated().await;
+                HardeningRun::Unsettled
+            };
+            engine
+                .apply_after_hardening(thread_id, change_id, run, actor)
+                .await;
+        });
+    }
+
+    /// No agent turn on the thread sits between its terminal and its idle.
+    /// An unanswered probe reads as unsettled, so the wait asks again.
+    async fn agent_turn_settled(&self, thread_id: Uuid) -> bool {
+        use crate::engine::standing_apply::{read_turn_settle, TurnSettle};
+        matches!(
+            read_turn_settle(&self.pool, thread_id, &self.agent_sessions).await,
+            Some(TurnSettle::Settled | TurnSettle::CutOff)
+        )
+    }
+
+    /// Re-enter an apply once its hardening run ended: apply the change when
+    /// the marker landed, else report the apply failed. Every report reaches
+    /// an Apply All batch the change belongs to.
+    pub(crate) async fn apply_after_hardening(
+        self: &Arc<Self>,
+        thread_id: Uuid,
+        change_id: Uuid,
+        run: HardeningRun,
+        actor: Option<MessageOrigin>,
+    ) {
+        // Idempotency: if another device clicked Apply while CC was
+        // running /harden, the change row is already applied and the
+        // marker has been consumed by the apply. Every arm below would
+        // otherwise report a spurious failure after the user saw
+        // `ChangeApplied`.
+        let concurrent_status = match self.changes().get_by_id(change_id).await {
+            Ok(change) => change.map(|c| c.status()),
+            Err(e) => {
+                log!(
+                    "[ClaudeCode] Concurrent-apply check: get_by_id({}): {}. Treating as not applied",
+                    change_id,
+                    e
+                );
+                None
+            }
+        };
+        if change_applied_concurrently(concurrent_status) {
+            log!(
+                "[ClaudeCode] Hardening for change {} found it already applied (concurrent apply), skipping the post-hardening apply",
+                change_id
+            );
+            self.broadcast_changes_updated().await;
+            return;
+        }
+
+        let was_aborted = match run {
+            HardeningRun::Ended { aborted } => aborted,
+            HardeningRun::Failed(e) => {
+                log!(
+                    "[ClaudeCode] Hardening session failed for change {}: {}",
+                    change_id,
+                    e
+                );
+                self.emit_apply_failed(
+                    thread_id,
+                    change_id,
+                    &format!("Hardening failed: {}", e),
+                    actor,
+                )
+                .await;
                 return;
             }
-
-            match result {
-                Ok(_) => {
-                    let was_aborted = cancel_token.is_cancelled();
-                    let hardened = match engine.changes().get_by_id(change_id).await {
-                        Ok(Some(c)) => {
-                            crate::engine::change_ops::branch_is_hardened(
-                                &engine.pool,
-                                engine.changes(),
-                                std::path::Path::new(&c.repo_root),
-                                &c.branch_name,
-                            )
-                            .await
-                        }
-                        Ok(None) => false,
-                        Err(e) => {
-                            log!(
-                                "[ClaudeCode] Hardening check: get_by_id({}): {} — treating as unhardened",
-                                change_id,
-                                e
-                            );
-                            false
-                        }
-                    };
-
-                    if !hardening_succeeded(was_aborted, hardened) {
-                        log!(
-                            "[ClaudeCode] Hardening for change {} did not succeed (aborted={}, hardened={}) — skipping apply",
-                            change_id,
-                            was_aborted,
-                            hardened
-                        );
-                        engine
-                            .emit_apply_failed_unhardened(
-                                thread_id,
-                                &change_id.to_string(),
-                                actor.clone(),
-                                "[ClaudeCode] ChangeApplyFailed (incomplete hardening)",
-                            )
-                            .await;
-                        engine.broadcast_changes_updated().await;
-                        return;
-                    }
-
-                    log!(
-                        "[ClaudeCode] Hardening completed for change {}, auto-applying",
-                        change_id
-                    );
-                    // Emit ChangeHardened so apply_change doesn't re-enter the
-                    // unhardened path and respawn hardening.
-                    engine
-                        .emit_change_hardened(thread_id, change_id, "[ClaudeCode] ChangeHardened")
-                        .await;
-                    match engine.apply_change(change_id, actor.clone()).await {
-                        Ok(r) => {
-                            log!(
-                                "[ClaudeCode] Auto-applied change {} after hardening: {}",
-                                change_id,
-                                r.message
-                            );
-                            engine.broadcast_changes_updated().await;
-                        }
-                        // Log only: `apply_change` announces its own failures,
-                        // and a second emit draws the same card twice.
-                        Err(e) => {
-                            log!(
-                                "[ClaudeCode] Auto-apply failed after hardening for change {}: {}",
-                                change_id,
-                                e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    log!(
-                        "[ClaudeCode] Hardening session failed for change {}: {}",
-                        change_id,
-                        e
-                    );
-                    engine
-                        .event_bus
-                        .emit_or_log(
-                            crate::engine::event_bus::BusEvent::Thread {
-                                thread_id,
-                                event:
-                                    crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
-                                        change_id: change_id.to_string(),
-                                        error: format!("Hardening failed: {}", e),
-                                        actor: actor.clone(),
-                                    },
-                                meta: crate::engine::thread_events::EventMeta::NONE,
-                            },
-                            "[ClaudeCode] ChangeApplyFailed (hardening)",
-                        )
-                        .await;
-                }
+            HardeningRun::Unsettled => {
+                self.emit_apply_failed(thread_id, change_id, HARDEN_TURN_UNSETTLED, actor)
+                    .await;
+                return;
             }
-        });
+        };
+        let hardened = match self.changes().get_by_id(change_id).await {
+            Ok(Some(c)) => {
+                crate::engine::change_ops::branch_is_hardened(
+                    &self.pool,
+                    self.changes(),
+                    std::path::Path::new(&c.repo_root),
+                    &c.branch_name,
+                )
+                .await
+            }
+            Ok(None) => false,
+            Err(e) => {
+                log!(
+                    "[ClaudeCode] Hardening check: get_by_id({}): {}. Treating as unhardened",
+                    change_id,
+                    e
+                );
+                false
+            }
+        };
+
+        if !hardening_succeeded(was_aborted, hardened) {
+            log!(
+                "[ClaudeCode] Hardening for change {} did not succeed (aborted={}, hardened={}), skipping apply",
+                change_id,
+                was_aborted,
+                hardened
+            );
+            self.emit_apply_failed_unhardened(
+                thread_id,
+                &change_id.to_string(),
+                actor,
+                "[ClaudeCode] ChangeApplyFailed (incomplete hardening)",
+            )
+            .await;
+            self.broadcast_changes_updated().await;
+            return;
+        }
+
+        log!(
+            "[ClaudeCode] Hardening completed for change {}, auto-applying",
+            change_id
+        );
+        // Emit ChangeHardened so apply_change doesn't re-enter the
+        // unhardened path and respawn hardening.
+        self.emit_change_hardened(thread_id, change_id, "[ClaudeCode] ChangeHardened")
+            .await;
+        match self.apply_change(change_id, actor).await {
+            Ok(r) => {
+                log!(
+                    "[ClaudeCode] Auto-applied change {} after hardening: {}",
+                    change_id,
+                    r.message
+                );
+                self.broadcast_changes_updated().await;
+            }
+            // Log only: `apply_change` announces its own failures,
+            // and a second emit draws the same card twice.
+            Err(e) => {
+                log!(
+                    "[ClaudeCode] Auto-apply failed after hardening for change {}: {}",
+                    change_id,
+                    e
+                );
+            }
+        }
     }
 
     /// Discard pending CC changes without ending the session.
@@ -490,6 +626,9 @@ impl LucidosEngine {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     /// This file with its test module cut off, through the shared reader the
     /// engine's other source scans use.
     fn production_src() -> String {
@@ -554,5 +693,80 @@ mod tests {
             }
         }
         None
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_wait_re_asks_on_its_threads_event() {
+        let (tx, mut wakes) = tokio::sync::broadcast::channel::<u32>(8);
+        let done = Arc::new(AtomicBool::new(false));
+        let asked = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let flip = done.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send(9).unwrap();
+            // Unsettled while the other thread's event is read.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            flip.store(true, Ordering::SeqCst);
+            tx.send(7).unwrap();
+            // Keeps the bus open, so only the event can end the wait early.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        let started = tokio::time::Instant::now();
+        let settled = wait_until_settled(
+            || {
+                let done = done.clone();
+                let asked = asked.clone();
+                async move {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    done.load(Ordering::SeqCst)
+                }
+            },
+            &mut wakes,
+            |event| *event == 7,
+            Duration::from_secs(600),
+        )
+        .await;
+        assert!(settled);
+        assert!(
+            started.elapsed() < SETTLE_RECHECK,
+            "the event on the thread wakes the wait, not the recheck tick"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "another thread's event never re-asks"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_wait_that_never_settles_gives_up_at_its_limit() {
+        let (tx, mut wakes) = tokio::sync::broadcast::channel::<u32>(8);
+        let limit = Duration::from_secs(60);
+        let started = tokio::time::Instant::now();
+        let settled = wait_until_settled(|| async { false }, &mut wakes, |_| true, limit).await;
+        drop(tx);
+        assert!(!settled);
+        assert!(started.elapsed() >= limit);
+        assert!(started.elapsed() < limit + SETTLE_RECHECK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_bus_still_re_asks_on_the_tick() {
+        let (tx, mut wakes) = tokio::sync::broadcast::channel::<u32>(8);
+        drop(tx);
+        let asked = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = asked.clone();
+        let settled = wait_until_settled(
+            || {
+                let count = count.clone();
+                async move { count.fetch_add(1, Ordering::SeqCst) >= 2 }
+            },
+            &mut wakes,
+            |_| true,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(settled);
+        assert_eq!(asked.load(Ordering::SeqCst), 3, "one ask per tick, no spin");
     }
 }

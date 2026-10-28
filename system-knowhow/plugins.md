@@ -217,7 +217,7 @@ The user clicks **Install** (or **Update**) or **Cancel**. Until they click, no 
 
 Uninstall is symmetric: confirming it deletes the recorded files and commits the deletion (`"Uninstall plugin: <id> v<version>"`) before emitting `PluginUninstalled`.
 
-**Confirming does not close the panel: it becomes a receipt.** It turns into a read-only record of what the engine wrote or deleted, with a timestamp and no buttons. It lists any affected triggers under **Triggers to check**. The header's back arrow leaves it. It keeps its nav-history row, relabelled "Installed <name>" / "Uninstalled <name>", so Back or a reload still shows what happened. Cancel closes the panel, since nothing happened.
+**Confirming does not close the panel: it becomes a receipt.** It turns into a read-only, timestamped record of what the engine wrote or deleted. It lists any affected triggers under **Triggers to check**, and an install receipt offers **Open app** for each app it installed. The header's back arrow leaves it. It keeps its nav-history row, relabelled "Installed <name>" / "Uninstalled <name>", so Back or a reload still shows what happened. Cancel closes the panel, since nothing happened.
 
 **Setup runs on confirm, but only when there's *new* setup to run.** If the manifest carried a non-empty `setup` field, confirming spawns a **Lucidos Agent setup thread** and navigates the user into it.
 
@@ -330,7 +330,7 @@ Every marketplace mutation is **announced**, so an open Plugins panel and Settin
 Marketplace HTTP surface:
 
 - `GET /api/v1/plugins/marketplaces` -> registered marketplace list.
-- `POST /api/v1/plugins/marketplaces` with `{ "source": "...", "name"?: "..." }` -> register or rename a marketplace.
+- `POST /api/v1/plugins/marketplaces` with `{ "source": "...", "name"?: "..." }` -> register or rename a marketplace. Without a `name`, the default is the owner plus the repo, minus the word "lucidos" and any word the owner repeats: `acme/lucidos-plugins` becomes "acme plugins".
 - `DELETE /api/v1/plugins/marketplaces/{id}` -> unregister a marketplace.
 - `GET /api/v1/plugins/catalog` -> `{ marketplaces, plugins, errors, scanned_at, scanning, scan_error }`. `marketplaces` is live from the registry; `plugins` and `errors` come from the cache. Each installed plugin row also carries `setup_thread_id`, `setup_complete`, and `app_id` to drive the card's Install→Setup→Open button.
 - `POST /api/v1/plugins/catalog/rescan` -> queue a marketplace scan. Answers `{ "queued": true }` at once; the result arrives as `PluginCatalogScanned`. A scan already running goes round once more after it, so the result comes from a scan that started after the request.

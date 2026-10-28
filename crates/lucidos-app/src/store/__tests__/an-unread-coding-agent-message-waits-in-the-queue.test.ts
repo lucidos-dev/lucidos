@@ -8,6 +8,7 @@ import { describe, it, expect } from 'vitest';
 import {
   computeExchanges,
   exchangeResponseEvents,
+  exchangeStatus,
   exchangeSteps,
   groupIntoExchanges,
   isThinking,
@@ -333,5 +334,61 @@ describe('a withdrawn coding-agent message', () => {
     const resent = exchanges.filter(ex => ex.userEvent._eventId === 'm2' || ex.userEvent._eventId === 'm3');
     expect(resent.map(ex => ex.userEvent._eventId)).toEqual(['m3']);
     expect(texts(resent[0])).toEqual(['checking the totals']);
+  });
+});
+
+// Reported: the reader typed a follow-up under an open question card, then
+// pressed Cancel. The engine settled the stopped turn with a withheld proposal,
+// an idle and a settings row, then the agent read the follow-up. That
+// bookkeeping took the follow-up out of the queue, so the old turn's idle
+// closed the new one. It read Done with no Thinking row while the agent worked.
+describe('a follow-up read after the turn it waited behind is settled', () => {
+  const asked = {
+    type: 'UserQuestionAsked',
+    tool_use_id: 'q1#q0',
+    question: 'Which origin?',
+    options: [{ id: 'opt-0', label: 'Document the trust' }],
+    channel: 'claude_code',
+  };
+  const settled = [
+    ev(1, message('start'), 'm1'),
+    ev(2, read('m1')),
+    ev(3, said('working on it')),
+    ev(4, message('relay or pair?'), 'm2'),
+    ev(5, { type: 'CodingAgentPromptSent', text: 'relay or pair?', input_event_id: 'm2', channel: 'claude_code' }),
+    ev(6, asked, 'q1'),
+    ev(7, { type: 'UserQuestionAnswered', tool_use_id: 'q1#q0', answer: { kind: 'Canceled' }, channel: 'claude_code' }),
+    ev(8, { type: 'CodingAgentToolResult', name: 'AskUserQuestion', result: 'rejected', tool_use_id: 'q1', channel: 'claude_code' }),
+    ev(9, { type: 'ResponseCanceled', cause: 'user_stop', channel: 'claude_code' }),
+    ev(10, { type: 'ProposalWithheld', reason: 'turn_incomplete', files: ['src/a.rs'], branch_name: 'b', channel: 'claude_code' }),
+    ev(11, idled),
+    ev(12, { type: 'CodingAgentSettingsChanged', model: 'opus', channel: 'claude_code' }),
+    ev(13, { ...read('m2'), started_turn: true }),
+  ];
+
+  it.each([
+    ['in one load', false],
+    ['as each event arrives', true],
+  ])('leaves the settling rows with the stopped turn, %s', (_, live) => {
+    const thread = makeOptimisticThreadState({
+      id: 't1',
+      title: 'A coding-agent thread',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+    });
+    for (const [seq, event] of settled) {
+      thread.events.set(seq, event);
+      if (live) computeExchanges(thread);
+    }
+    const exchanges = computeExchanges(thread);
+    const followUp = byMessage(exchanges, 'relay or pair?');
+    expect(exchanges.indexOf(followUp)).toBe(exchanges.length - 1);
+    expect(followUp.steps).toEqual([]);
+    const card = exchanges.find(ex => ex.userEvent.type === 'UserQuestionAsked')!;
+    expect(card.steps.map(s => s.event.type)).toEqual(expect.arrayContaining(['ProposalWithheld', 'CodingAgentIdled']));
+    expect(exchangeStatus(followUp, '', true, false, true)).toBe('pending');
+    expect(exchangeSteps(followUp, true).map(s => [s.description, s.outcome]))
+      .toEqual([['Thinking', 'pending']]);
   });
 });

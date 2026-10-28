@@ -276,6 +276,7 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
                     preview: None,
                     widget: None,
                     quiet: false,
+                    quiet_reply: None,
                 },
                 QuestionOption {
                     id: "opt-1".into(),
@@ -284,6 +285,7 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
                     preview: None,
                     widget: None,
                     quiet: false,
+                    quiet_reply: None,
                 },
             ],
             worktree_path: None,

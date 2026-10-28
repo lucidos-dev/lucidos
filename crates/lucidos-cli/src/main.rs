@@ -40,9 +40,6 @@ mod gateway;
 mod intelligence_ladder;
 /// Manifest-generated subcommands, one per `cli = true` capability domain,
 /// rendered by `build.rs` from `lucidos-capabilities`. Wire each enum below.
-/// Variant names come verbatim from the manifest's operation names, and the
-/// query vector gets one `push` per optional argument, hence the two allows.
-#[allow(clippy::enum_variant_names, clippy::vec_init_then_push)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/cli_commands.rs"));
 }
@@ -1453,8 +1450,7 @@ enum SuccessorCmd {
         default_floor: bool,
     },
     /// Start a successor session in this thread from a handoff narrative
-    /// file. `spawn` is a temporary alias (docs/temporary-measures.md).
-    #[command(alias = "spawn")]
+    /// file.
     Start {
         /// The handoff narrative, a markdown file with the six sections
         /// `lucidos successor --help` names.
@@ -2426,8 +2422,7 @@ mod tests {
         }
     }
 
-    /// A repo flow written against an older CLI keeps working: `offer` keeps
-    /// its flags, and `spawn` still runs `start`.
+    /// A repo flow keeps working: `offer` and `start` keep their flags.
     #[test]
     fn the_successor_flags_a_flow_calls_still_parse() {
         let parse = |argv: &[&str]| {
@@ -2450,23 +2445,20 @@ mod tests {
             ]),
             SuccessorCmd::Offer { ask: true, .. }
         ));
-        for verb in ["start", "spawn"] {
-            let action = parse(&[
+        assert!(matches!(
+            parse(&[
                 "lucidos",
                 "successor",
-                verb,
+                "start",
                 "--narrative",
                 "n.md",
                 "--at",
                 "phase-commit",
                 "--progress",
                 "2/5",
-            ]);
-            assert!(
-                matches!(&action, SuccessorCmd::Start { at: Some(at), .. } if at == "phase-commit"),
-                "{verb} does not run `start`"
-            );
-        }
+            ]),
+            SuccessorCmd::Start { at: Some(at), .. } if at == "phase-commit"
+        ));
     }
 
     /// Both spellings of one filter reach the engine, so a caller who follows

@@ -58,6 +58,69 @@ fn add_marketplace_dedupes_by_stable_source_id() {
 }
 
 #[test]
+fn default_name_tells_same_named_repos_apart_by_owner() {
+    let mut registry = PluginMarketplaceRegistry::default();
+    let (ours, _) = add_marketplace(
+        &mut registry,
+        "https://github.com/lucidos-dev/lucidos-plugins",
+        None,
+    )
+    .unwrap();
+    let (theirs, _) = add_marketplace(
+        &mut registry,
+        "https://github.com/acme/lucidos-plugins",
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ours.name, "lucidos-dev plugins");
+    assert_eq!(theirs.name, "acme plugins");
+}
+
+#[test]
+fn default_name_covers_tree_urls_and_plain_git_hosts() {
+    for (source, expected) in [
+        (
+            "https://github.com/acme/team-plugins/tree/main/community",
+            "acme team plugins",
+        ),
+        (
+            "https://github.com/acme/ua-lucidos-plugins",
+            "acme ua plugins",
+        ),
+        (
+            "https://github.com/acme/globex-lucidos-plugins",
+            "acme globex plugins",
+        ),
+        (
+            "https://github.com/globex/globex-lucidos-plugins",
+            "globex plugins",
+        ),
+        ("https://github.com/acme/Lucidos_Plugins", "acme Plugins"),
+        ("https://github.com/acme/lucidos", "acme lucidos"),
+        ("https://github.com/acme/acme", "acme"),
+        ("https://github.com/acme/acme-lucidos", "acme lucidos"),
+        ("/srv/repos/team-plugins.git", "team plugins"),
+        ("/home/user/team-plugins/.git", "team plugins"),
+        (
+            "https://git.example.com/acme/lucidos-plugins.git",
+            "acme plugins",
+        ),
+        ("git@git.example.com:acme/plugins.git", "acme plugins"),
+        ("file:///srv/repos/team-plugins/.git", "team plugins"),
+    ] {
+        assert_eq!(display_name_for_source(source), expected, "{source}");
+    }
+}
+
+#[test]
+fn marketplace_id_ignores_the_owner_in_the_display_name() {
+    let parsed = parse_marketplace_source("https://github.com/lucidos-dev/plugins").unwrap();
+    let id = marketplace_id(&parsed, "https://github.com/lucidos-dev/plugins");
+    assert!(id.starts_with("plugins-"), "{id}");
+}
+
+#[test]
 fn install_source_appends_plugin_path_to_github_tree_marketplace() {
     let parsed =
         parse_marketplace_source("https://github.com/lucidos-dev/plugins/tree/main/community")

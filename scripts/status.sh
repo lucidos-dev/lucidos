@@ -162,7 +162,7 @@ show_workspace_status() {
     fi
 
     # The dev window tauri-dev.sh pointed at this workspace, through the gateway
-    # (/<slug>/) or the engine's own port (LUCIDOS_NO_GATEWAY). After a re-exec
+    # (/<slug>/) or the engine's own port (LUCIDOS_NO_GATEWAY). After a relaunch
     # the variable holds the page it showed, so match a prefix.
     local tauri_found="" tpid window_url
     while IFS= read -r tpid; do

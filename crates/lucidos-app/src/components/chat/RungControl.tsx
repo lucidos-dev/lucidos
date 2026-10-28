@@ -16,8 +16,10 @@ import { useRungState } from './useRungState';
 
 /** The control's trigger and the list it opens in an overlay. What the list
  *  holds, and what a pick means, belong to the thread kind that draws it. */
-function RungShell({ folded, rowAttrs, shown, step, disabledReason, children }: {
+function RungShell({ folded, rowAttrs, shown, step, disabledReason, lockedReason, children }: {
   disabledReason?: string | null;
+  /** A turn runs: the list still opens, and the thread kind refuses a pick. */
+  lockedReason: string | null;
   folded: RungControlProps['folded'];
   rowAttrs: RungControlProps['rowAttrs'];
   shown: ShownRung | null;
@@ -104,6 +106,7 @@ function RungShell({ folded, rowAttrs, shown, step, disabledReason, children }: 
         <RungButtons
           shown={shown}
           disabledReason={disabledReason}
+          lockedReason={lockedReason}
           rowAttrs={rowAttrs}
           expanded={open.value}
           triggerRef={(el) => { triggerRef.current = el; }}
@@ -145,7 +148,8 @@ function CodingAgentRungControl({ folded, rowAttrs, threadId, composeThreadId, c
       folded={folded}
       rowAttrs={rowAttrs}
       shown={rung.shown}
-      disabledReason={disabledReason ?? rung.lockedReason ?? (rung.sending.value ? 'Changing the model and effort' : null)}
+      disabledReason={disabledReason ?? (rung.sending.value ? 'Changing the model and effort' : null)}
+      lockedReason={rung.lockedReason}
       step={{
         prev: rung.steps.prev === null ? null : () => rung.step(-1),
         next: rung.steps.next === null ? null : () => rung.step(1),
@@ -178,7 +182,8 @@ function ChatRungControl({ folded, rowAttrs, threadId, composeContext, disabledR
       folded={folded}
       rowAttrs={rowAttrs}
       shown={chat.shown}
-      disabledReason={disabledReason ?? chat.lockedReason}
+      disabledReason={disabledReason}
+      lockedReason={chat.lockedReason}
       step={{
         prev: chat.steps.prev === null ? null : () => chat.step(-1),
         next: chat.steps.next === null ? null : () => chat.step(1),

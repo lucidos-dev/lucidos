@@ -1788,8 +1788,9 @@ impl LucidosEngine {
             // scheduler fails the trigger. Reset per outer-loop iteration.
             let mut trigger_fail_reason: Option<String> = None;
             // The user picked a *quiet option*: the turn ends after this batch
-            // with no further model call.
+            // with no further model call. It ends on the pick's *quiet reply*.
             let mut quiet_answer = false;
+            let mut quiet_reply = String::new();
 
             // Helper: push a circuit-breaker response into the messages array.
             // Must add the assistant's tool_use message AND matching tool_result blocks
@@ -2405,6 +2406,9 @@ impl LucidosEngine {
                                 )
                                 .await;
                             quiet_answer |= asked.quiet;
+                            if let Some(reply) = asked.quiet_reply {
+                                quiet_reply = reply;
+                            }
                             crate::engine::tools::lift_legacy_string(asked.result)
                         } else if let Some(r) = self
                             .handle_special_tool(
@@ -2666,7 +2670,7 @@ impl LucidosEngine {
                     thread_id,
                     origin_id,
                     read_decided,
-                    "",
+                    &quiet_reply,
                     crate::engine::turn_end::TurnFinish::Finished(
                         crate::engine::thread_events::ChildCompletionStatus::Success,
                     ),
@@ -2679,7 +2683,7 @@ impl LucidosEngine {
                         crate::engine::event_bus::BusEvent::Thread {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                                text: String::new(),
+                                text: quiet_reply.clone(),
                                 images: images.clone(),
                                 model: effective_model.clone(),
                                 reasoning_effort: effective_effort.clone(),
@@ -2693,7 +2697,7 @@ impl LucidosEngine {
                     .await;
                 *terminator_settled = true;
                 return Ok(terminal_result(
-                    String::new(),
+                    quiet_reply,
                     images,
                     request_id,
                     thread_id,

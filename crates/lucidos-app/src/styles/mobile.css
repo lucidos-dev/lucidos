@@ -1168,24 +1168,11 @@
         padding-inline: var(--phone-side-inset);
     }
 
-    /* The inline form (trigger/credential/app/plugin editors) sits INSIDE the
-       .content-pane-body scroll container, which already carries the ::before
-       header spacer above. Its desktop `height: 100%` + own `overflow-y: auto`
-       made it a SECOND scroller sized to the full pane height — so positioned
-       after the spacer, its box bottom landed a header-height BELOW the viewport
-       and the Cancel/Save actions at the form's end were clipped off-screen and
-       unreachable on mobile. Let the form flow in the pane's own scroller
-       instead. The pane's end space clears the home indicator below it. */
-    .mobile-swipe-pane .inline-form {
-        height: auto;
-        overflow-y: visible;
-    }
-
     /* The repo preview (a diff, the rendered diff, the whole file) flows in the
-       pane's own scroller too, for the same reason as the form above. As a
-       pane-height box with its own inner scroller, it hid from the header: a
-       drag on the diff never hid the header, and a drag on the path row stuck
-       after one header height. The `:has()` names the text bodies only. A repo
+       pane's own scroller, as every column view does. As a pane-height box
+       with its own inner scroller, it hid from the header: a drag on the diff
+       never hid the header, and a drag on the path row stuck after one header
+       height. The `:has()` names the text bodies only. A repo
        PDF or video, whole-file in a diff included, keeps the definite height
        it sizes itself by. */
     .mobile-swipe-pane .file-preview-frame:has(.diff-view, .rendered-diff, .repo-file-content, .repo-file-rendered),

@@ -148,6 +148,7 @@ async fn teardown_skips_abort_for_question_parked_chat_thread() {
                 preview: None,
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             }],
             worktree_path: None,
             multi_select: false,

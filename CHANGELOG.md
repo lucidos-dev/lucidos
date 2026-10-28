@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.52.2 - 2026-10-28
+
+### Added
+
+- A stopped workspace offers Start in its connection bar. If the boot fails, the bar shows the error and offers Start again.
+- The plugin install receipt has an Open app button for each app the plugin installed.
+- The dashboard app shortcut menu offers Edit app.
+- A question option that needs no follow-up work can carry a quiet reply. Picking it ends the turn with that reply, with no model call.
+
+### Changed
+
+- A marketplace added without a name is named after its owner and repo, so two `lucidos-plugins` marketplaces read differently. Local paths keep the folder name.
+- The model pill stays openable during a turn. A pick made mid-turn is refused with a note that says why.
+- Every content-pane view, including plugin detail and inline forms, sits in one centred column.
+- In the composer row, the todo and waiting indicators fold away first when space runs out.
+- A curl command that sends a local file or an environment variable without a body flag goes to the command judge.
+- Dependency security updates: dompurify 3.4.17, undici 7.30.1, vite 6.4.5, vitest 4.1.12, plus the Dependabot safe bumps.
+
+### Fixed
+
+- Apply on a live coding-agent session with an unhardened change applies once the hardening finishes. Apply All no longer waits forever.
+- After you stop a coding-agent turn under a question, the next message shows its Thinking row while the agent works.
+- An MCP server's launch secrets are masked in its logs.
+- A trigger with a corrupt legacy cron schedule logs a warning before it falls back to the default.
+- A trigger fire cut short reads its cron with the standard day of week.
+
+### Removed
+
+- The `lucidos successor spawn` alias. Use `lucidos successor start`.
 ## v0.52.1 - 2026-10-27
 
 ### Changed

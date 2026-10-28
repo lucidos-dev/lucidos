@@ -237,6 +237,13 @@ fn tool_definitions(tools: ToolSet) -> Vec<Value> {
                                                 Picking it ends your turn. Never for \
                                                 an option that promises work, and \
                                                 never on every option."
+                                        },
+                                        "quiet_reply": {
+                                            "type": "string",
+                                            "description": "Optional, quiet options \
+                                                only: the fixed answer the thread \
+                                                shows when this is picked, written \
+                                                as your own reply."
                                         }
                                     },
                                     "required": ["label"]
@@ -432,6 +439,9 @@ fn engine_option(option: &Value) -> Option<Value> {
     }
     if option.get("quiet").and_then(Value::as_bool) == Some(true) {
         out["quiet"] = Value::Bool(true);
+    }
+    if let Some(reply) = option.get("quiet_reply").and_then(Value::as_str) {
+        out["quiet_reply"] = Value::from(reply);
     }
     Some(out)
 }
@@ -664,11 +674,12 @@ mod tests {
     /// Object options used to be dropped without a word, so a card could
     /// arrive with no buttons at all.
     #[test]
-    fn an_object_option_keeps_its_label_description_preview_and_quiet() {
+    fn an_object_option_keeps_its_label_description_preview_quiet_and_reply() {
         let options: Vec<Value> = [
             serde_json::json!("Ship it"),
             serde_json::json!({ "label": "Not now", "quiet": true }),
             serde_json::json!({ "label": "Later", "quiet": false }),
+            serde_json::json!({ "label": "Fine", "quiet": true, "quiet_reply": "All set." }),
             serde_json::json!({
                 "label": "D",
                 "description": "Split by a dot",
@@ -687,6 +698,7 @@ mod tests {
                 serde_json::json!({ "label": "Ship it" }),
                 serde_json::json!({ "label": "Not now", "quiet": true }),
                 serde_json::json!({ "label": "Later" }),
+                serde_json::json!({ "label": "Fine", "quiet": true, "quiet_reply": "All set." }),
                 serde_json::json!({
                     "label": "D",
                     "description": "Split by a dot",

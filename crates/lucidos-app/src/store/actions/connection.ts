@@ -136,7 +136,7 @@ let lastTransitionAt: number | null = null;
  *  and is not awaited, so a slow or failing breadcrumb cannot delay or fail the
  *  probe it describes; if one is lost, the dot is still the user-facing surface
  *  and the next transition logs again. */
-function recordConnectionTransition(to: 'connected' | 'disconnected', probeOk: boolean): void {
+function recordConnectionTransition(to: 'connected' | 'disconnected' | 'stopped', probeOk: boolean): void {
   const now = Date.now();
   const heldMs = lastTransitionAt === null ? null : now - lastTransitionAt;
   lastTransitionAt = now;
@@ -501,7 +501,7 @@ async function runConnectionCheck(): Promise<boolean> {
     consecutiveSuccesses = 0;
   }
 
-  const nextStatus = connected ? 'connected' : 'disconnected';
+  const nextStatus = connected ? 'connected' : healthResult.status === 'stopped' ? 'stopped' : 'disconnected';
   if (nextStatus !== connectionStatus.value) {
     recordConnectionTransition(nextStatus, healthOk);
   }

@@ -630,7 +630,8 @@
 
 /* Disconnected: receded to the muted base and dimmed on top of it, standing
    still. */
-.brand-mark[data-conn="disconnected"] .brand-mark-glyph {
+.brand-mark[data-conn="disconnected"] .brand-mark-glyph,
+.brand-mark[data-conn="stopped"] .brand-mark-glyph {
     opacity: var(--header-mark-disconnected-opacity);
 }
 

@@ -3,7 +3,7 @@ import { useLayoutEffect, useState } from 'preact/hooks';
 import { WIDGET_SIZES } from '@lucidos/engine-constants';
 import type { AppDashboardTile, DashboardTile as Tile, WidgetDashboardTile } from '../../api/client/widgets';
 import type { Dashboard } from '../../generated/thread-event-wire';
-import { openAppById } from '../../store/actions/apps';
+import { openAppById, openEditApp } from '../../store/actions/apps';
 import { removeFromDashboard } from '../../store/actions/dashboards';
 import type { TileSize, WidgetSize } from '../../store/types';
 import { dashboardTileKey } from '../../store/widgets';
@@ -211,6 +211,7 @@ function AppShortcutTile({ tile, order, actions, editing }: TileProps<AppDashboa
         items={(ctx) => (
           <>
             <Item label="Open" onClick={ctx.run(() => void openAppById(tile.app_id))} />
+            <Item label="Edit app" onClick={ctx.run(() => openEditApp(tile.app_id))} />
             <div class="thread-overflow-divider" role="separator" />
             <Item
               label="Remove from dashboard"

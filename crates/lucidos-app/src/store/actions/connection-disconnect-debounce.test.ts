@@ -153,6 +153,52 @@ describe('connection dot debounces transient health failures', () => {
 });
 
 /**
+ * A gateway re-exec can briefly answer "stopped" while the new image adopts its
+ * workspaces. So a `stopped` probe goes through the same tolerance as a failed
+ * one. Only a sustained answer paints the bar and its Start button.
+ */
+describe('a stopped workspace obeys the same debounce as a failed probe', () => {
+  const stopped = { status: 'stopped' as const };
+
+  async function stoppedOnce(): Promise<void> {
+    mockCheckHealth.mockResolvedValueOnce(stopped);
+    await checkConnection();
+  }
+
+  it('keeps connected through the tolerated probes', async () => {
+    await settleConnected();
+    await stoppedOnce();
+    await stoppedOnce();
+    await stoppedOnce();
+    expect(connectionStatus.value).toBe('connected');
+  });
+
+  it('reads stopped, not disconnected, once the outage is sustained', async () => {
+    await settleConnected();
+    for (let i = 0; i < 4; i++) await stoppedOnce();
+    expect(connectionStatus.value).toBe('stopped');
+  });
+
+  it('reads stopped at once from a window that was never connected', async () => {
+    connectionStatus.value = 'connecting';
+    await stoppedOnce();
+    expect(connectionStatus.value).toBe('stopped');
+  });
+
+  it('leaves stopped to disconnected while the engine is booting, then to connected', async () => {
+    await settleConnected();
+    for (let i = 0; i < 4; i++) await stoppedOnce();
+    expect(connectionStatus.value).toBe('stopped');
+
+    await failOnce();
+    expect(connectionStatus.value).toBe('disconnected');
+    await succeedOnce();
+    await succeedOnce();
+    expect(connectionStatus.value).toBe('connected');
+  });
+});
+
+/**
  * iOS cuts a backgrounded PWA's network and freezes its timers, while the 5s
  * poll keeps probing. So the phone went red behind the user's back. It then
  * stayed red for a hysteresis window after they came back, on a link that was fine.

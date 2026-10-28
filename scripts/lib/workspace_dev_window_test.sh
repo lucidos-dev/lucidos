@@ -281,6 +281,39 @@ else
     pass "the previous version stays whole"
 fi
 
+# ── run_dev_window ──────────────────────────────────────────────────────
+# The stub window logs each start's URL, asks for one relaunch on its first
+# start, then exits with status 3.
+STUB_WINDOW="$SANDBOX/stub-window"
+STUB_LOG="$SANDBOX/stub-window.log"
+cat > "$STUB_WINDOW" <<EOF
+#!/bin/bash
+echo "\$LUCIDOS_DEV_WINDOW_URL" >> "$STUB_LOG"
+if [ "\$LUCIDOS_DEV_WINDOW_URL" = "https://localhost:5251/dev/" ]; then
+    printf '%s' "https://localhost:5251/dev/threads/a" > "\$LUCIDOS_DEV_WINDOW_RELAUNCH_FILE"
+    exit 0
+fi
+exit 3
+EOF
+chmod +x "$STUB_WINDOW"
+
+echo "test: a window that asks for a relaunch is started again as a new process on its page"
+status=0
+run_dev_window "$STUB_WINDOW" "https://localhost:5251/dev/" >/dev/null || status=$?
+starts="$(tr '\n' ' ' < "$STUB_LOG")"
+if [ "$starts" = "https://localhost:5251/dev/ https://localhost:5251/dev/threads/a " ]; then
+    pass "relaunched once, on the page the window showed"
+else
+    fail "unexpected starts: '$starts'"
+fi
+
+echo "test: the window's own exit status ends the run"
+if [ "$status" -eq 3 ]; then
+    pass "returned the last window's status"
+else
+    fail "expected status 3, got $status"
+fi
+
 echo ""
 echo "dev window launch binary: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

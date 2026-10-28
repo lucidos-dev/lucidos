@@ -141,8 +141,10 @@ export const MENU_ITEM_LABELS: Record<MenuItem, string> = {
 // Connection status. 'connecting' is the initial state before the first
 // /health poll resolves — it renders the dot neutral grey (no red, no blink),
 // so a page refresh never flashes red while the first check is in flight. The
-// 5s poll only ever resolves to 'connected' or 'disconnected' thereafter.
-export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
+// 5s poll only ever resolves to 'connected', 'disconnected' or 'stopped'
+// thereafter. 'stopped' is the gateway saying it stopped this workspace's
+// engine: no retry brings it back, only a Start does.
+export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting' | 'stopped';
 
 /** What became of a step. The value set doubles as the CSS class name
  *  (`.inline-step.<outcome>`, `.step-detail-icon.<outcome>`); `stepStatus`

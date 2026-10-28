@@ -640,16 +640,24 @@ impl LucidosEngine {
                     .request_hardening_in_session(thread_id, &session.msg_tx)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(answered) => {
                         log!(
                             "[Changes] Reusing existing session on thread {} for hardening",
                             thread_id
+                        );
+                        // The session's turn end never applies, so this apply
+                        // owes its own outcome once hardening settles.
+                        self.spawn_apply_after_session_harden(
+                            thread_id,
+                            change_id,
+                            answered,
+                            actor.clone(),
                         );
                         return Ok(ApplyResult::hardening(
                             change_id,
                             thread_id,
                             change.files.len(),
-                            "Hardening sent to existing session — please wait.",
+                            "Hardening sent to the live session. The change will be applied after hardening completes.",
                         ));
                     }
                     Err(e) => {

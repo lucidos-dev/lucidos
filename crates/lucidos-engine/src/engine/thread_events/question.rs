@@ -23,6 +23,10 @@ pub struct QuestionOption {
     /// without waking the agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet: bool,
+    /// The *quiet reply*: the fixed acknowledgement the thread shows when the
+    /// user picks this quiet option. Only a quiet option carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_reply: Option<String>,
 }
 
 /// A *widget embed*, `![label](app:<id>?params={...})`, as the engine reads

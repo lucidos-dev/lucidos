@@ -1352,7 +1352,7 @@ kill_stale_processes() {
 # published dev window binary.
 #
 # Selection is on argv[0] alone (ADR 0025). The launcher starts the window by
-# its resolved path, and the window's own re-exec keeps that path, so a window
+# its resolved path, and `run_dev_window` relaunches it by that path, so a window
 # from another checkout, or a process that only mentions the path, never
 # matches. A path holding a space is matched as a prefix ending in a space.
 #
@@ -1382,6 +1382,30 @@ stop_dev_windows() {
         echo "Stopping the previous dev window (PID $window)..."
         kill "$window" 2>/dev/null || true
     done
+}
+
+# ── run_dev_window ──────────────────────────────────────────────────────
+# Run the dev window in the foreground until it exits for good, and return its
+# exit status. A window that follows an engine switch writes the page it showed
+# to LUCIDOS_DEV_WINDOW_RELAUNCH_FILE and exits, and this starts the binary now
+# published at its path on that page.
+#
+# A relaunch must be a new process. A macOS app that execs itself in place is
+# registered again with pid -1, so window managers such as Rectangle lose it.
+run_dev_window() {
+    local window_bin="$1" url="$2" relaunch_file status
+    relaunch_file="$(mktemp "${TMPDIR:-/tmp}/lucidos-dev-window.XXXXXX")" || return 1
+    while :; do
+        : > "$relaunch_file"
+        status=0
+        LUCIDOS_DEV_WINDOW_URL="$url" LUCIDOS_DEV_WINDOW_RELAUNCH_FILE="$relaunch_file" \
+            "$window_bin" || status=$?
+        [ -s "$relaunch_file" ] || break
+        url="$(cat "$relaunch_file")"
+        echo "Relaunching the dev window on the new version at $url ..."
+    done
+    rm -f "$relaunch_file"
+    return "$status"
 }
 
 # ── Published launch binaries (ADR 0022) ────────────────────────────────
@@ -1580,7 +1604,7 @@ run_dev_window_cargo_build() {
     cargo_build_in_slot "dev window build" -p lucidos-app
 }
 
-# A running window re-execs onto a NEW file at its path after the next switch,
+# `run_dev_window` relaunches a NEW file at its path after the next switch,
 # so a rebuild with identical bytes must leave the published file alone.
 publish_dev_window_binary() {
     local src="$1" launch_dir="$2" dst contents sibling

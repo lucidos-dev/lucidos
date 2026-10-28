@@ -17,7 +17,7 @@ use crate::engine::git_ops::{
 use crate::engine::thread_events::{
     CodingAgentExit, CodingAgentExitStage, EventChannel, SessionEndReason,
 };
-use crate::engine::{AgentUserInput, LucidosEngine, ProcessResult, StopReason};
+use crate::engine::{AgentUserInput, LucidosEngine, ProcessResult, QuietPick, StopReason};
 use crate::runtime::{AgentEvent, AgentExitFacts, AgentInput, CodingAgent};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -691,6 +691,9 @@ impl LucidosEngine {
         result
     }
 
+    // `run_direct_agent`'s inputs, its resolved lane duty and its
+    // `lane_answered` flag, passed on one-to-one. A struct would only rename
+    // the same fields.
     #[allow(clippy::too_many_arguments)]
     async fn run_agent_session(
         &self,
@@ -2456,19 +2459,27 @@ impl LucidosEngine {
                                         );
                                         // A quiet pick ends the turn with no
                                         // reply by design, so its empty Result
-                                        // is not the killed-tool failure.
-                                        let ended_on_quiet_answer = self
+                                        // is not the killed-tool failure. The
+                                        // option's quiet reply, when it has
+                                        // one, is the turn's reply.
+                                        let quiet_pick = self
                                             .agent_sessions
                                             .lock()
                                             .await
                                             .get_mut(&thread_id)
-                                            .is_some_and(|s| std::mem::take(&mut s.quiet_answer_pending));
+                                            .and_then(|s| s.quiet_answer_pending.take());
+                                        let ended_on_quiet_answer = quiet_pick.is_some();
                                         let (terminal_kind, emit_idle) = classify_result(
                                             user_hit_stop,
                                             redirect_cause,
                                             is_shutdown,
                                             cc_error,
                                             buffered_text_empty && result_text_empty && !ended_on_quiet_answer,
+                                        );
+                                        let terminal_text = QuietPick::terminal_text(
+                                            quiet_pick,
+                                            &text,
+                                            matches!(terminal_kind, TerminalKind::Generated),
                                         );
                                         // Capture before the terminal emit below moves
                                         // it out. The idle gate and the post-loop
@@ -2506,7 +2517,7 @@ impl LucidosEngine {
                                                 .await;
                                             let terminal_event = Self::make_terminal_event(
                                                 terminal_kind,
-                                                text.clone(),
+                                                terminal_text,
                                                 model,
                                                 reasoning_effort,
                                             );

@@ -1343,6 +1343,15 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   that clamps the pragma. (`codex_exec_question_rule` in
   `engine/agent_session/prompts.rs`.)
 
+- **Awaiting a live session's prompt oneshot needs no wall-clock bound.** A
+  reviewer asks for a timeout on `wait_for_prompt_turn`, fearing a stuck
+  session never answers. The in-loop and external watchdogs drop a silent
+  session, which drops the queued prompt's sender, so the wait returns `Err`.
+  A long, active turn is legitimate, and `/harden` can take most of an hour.
+  Re-flag only if a session can stay silent in `agent_sessions` past the
+  watchdogs. (`spawn_apply_after_session_harden` in
+  `engine/claude_code/spawn.rs`, `engine/agent_session/external_watchdog.rs`.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -3234,6 +3243,16 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   stops costing money, or the read becomes synchronous.
   (`store/actions/treeBackfill.ts`,
   `docs/plans/2026-10-07-tree-memory-settings-polish.md`.)
+
+- **`settlesEndedTurn` matching every coding-agent `metadata` row does not
+  misroute a follow-up's first row.** A reviewer reads it as sending a new
+  turn's `BackgroundBashStarted` into the canceled turn before it. Only the
+  Lucidos chat tools emit that row, so it never carries the `claude_code`
+  channel. And `turnSettledLate` moves a row only when the earlier turn ended
+  without an idle, while a stopped turn always writes `CodingAgentIdled`.
+  Re-flag only if a coding-agent turn can end with no idle and its successor
+  starts without a `SessionStarted`.
+  (`store/thread-events/exchange-grouping.ts`.)
 
 ## Scripts (bash)
 

@@ -43,10 +43,10 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
             arr.iter()
                 .enumerate()
                 .map(|(i, opt)| {
-                    let (label, prefixed_quiet) = strip_quiet_label_prefix(
+                    let prefixed = strip_quiet_label_prefix(
                         opt.get("label").and_then(|v| v.as_str()).unwrap_or("?"),
                     );
-                    let quiet = prefixed_quiet
+                    let quiet = prefixed.quiet
                         || opt.get("quiet").and_then(|v| v.as_bool()).unwrap_or(false);
                     let non_empty = |field: &str| {
                         opt.get(field)
@@ -56,11 +56,12 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
                     };
                     lift_widget_embed(crate::engine::thread_events::QuestionOption {
                         id: format!("opt-{}", i),
-                        label,
+                        label: prefixed.label,
                         description: non_empty("description"),
                         preview: non_empty("preview"),
                         widget: None,
                         quiet,
+                        quiet_reply: prefixed.reply.or_else(|| non_empty("quiet_reply")),
                     })
                 })
                 .collect()
@@ -79,15 +80,45 @@ fn parse_one_question(q: &serde_json::Value) -> ParsedQuestion {
 
 /// The label prefix that marks a *quiet option* on Claude Code. Its native
 /// `AskUserQuestion` refuses any option field beyond label, description and
-/// preview, so the mark rides in the label. The Lucidos Agent and Codex tools
-/// take a `quiet` field instead.
+/// preview, so the mark rides in the label: `[quiet]`, or `[quiet: <reply>]`
+/// to add a *quiet reply*. The Lucidos Agent and Codex tools take `quiet` and
+/// `quiet_reply` fields instead.
 pub(crate) const QUIET_LABEL_PREFIX: &str = "[quiet]";
 
-/// The label with any [`QUIET_LABEL_PREFIX`] removed, and whether it had one.
-pub(crate) fn strip_quiet_label_prefix(label: &str) -> (String, bool) {
-    match label.trim_start().strip_prefix(QUIET_LABEL_PREFIX) {
-        Some(rest) => (rest.trim_start().to_string(), true),
-        None => (label.to_string(), false),
+const QUIET_REPLY_PREFIX: &str = "[quiet:";
+
+/// A label split from its quiet mark.
+pub(crate) struct QuietLabel {
+    pub label: String,
+    pub quiet: bool,
+    pub reply: Option<String>,
+}
+
+/// The label with any quiet prefix removed, whether it had one, and its reply.
+/// The reply ends at the first `]`. A `[quiet:` with no closing `]` is no mark.
+pub(crate) fn strip_quiet_label_prefix(label: &str) -> QuietLabel {
+    let trimmed = label.trim_start();
+    let marked = |rest: &str, reply: Option<&str>| QuietLabel {
+        label: rest.trim_start().to_string(),
+        quiet: true,
+        reply: reply
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(String::from),
+    };
+    if let Some(rest) = trimmed.strip_prefix(QUIET_LABEL_PREFIX) {
+        return marked(rest, None);
+    }
+    if let Some((reply, rest)) = trimmed
+        .strip_prefix(QUIET_REPLY_PREFIX)
+        .and_then(|after| after.split_once(']'))
+    {
+        return marked(rest, Some(reply));
+    }
+    QuietLabel {
+        label: label.to_string(),
+        quiet: false,
+        reply: None,
     }
 }
 
@@ -166,6 +197,39 @@ mod tests {
         assert_eq!(
             shape,
             [("Draft it", false), ("Leave it", true), ("Not now", true)]
+        );
+    }
+
+    #[test]
+    fn quiet_reply_comes_from_the_field_or_the_label_prefix() {
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Which currency?",
+                "options": [
+                    { "label": "Other" },
+                    { "label": "USD", "quiet": true, "quiet_reply": "USD it is." },
+                    { "label": "[quiet: All set.] EUR" },
+                    { "label": "[quiet:] GBP" },
+                    { "label": "[quiet: no end NOK" },
+                    { "label": "[quiet] SEK", "quiet_reply": "  " },
+                ],
+            }],
+        });
+        let options = &parse_ask_user_question_inputs(&input)[0].options;
+        let shape: Vec<(&str, bool, Option<&str>)> = options
+            .iter()
+            .map(|o| (o.label.as_str(), o.quiet, o.quiet_reply.as_deref()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("Other", false, None),
+                ("USD", true, Some("USD it is.")),
+                ("EUR", true, Some("All set.")),
+                ("GBP", true, None),
+                ("[quiet: no end NOK", false, None),
+                ("SEK", true, None),
+            ]
         );
     }
 

@@ -288,9 +288,9 @@ pub use oauth_registry::OAuthProviderRow;
 pub use pinned_apps::{PinnedAppStore, PinnedAppUi};
 pub use shell::{command_shell, TaskOutcome};
 pub use subprocess_secrets::{
-    inherited_secret_env, is_secret_env_name, redact_subprocess_output,
-    redact_subprocess_output_in_json, subprocess_secret_values, InheritedSecretEnv,
-    InheritedSecrets,
+    argv_secret_values, inherited_secret_env, is_secret_env_name, redact_argv,
+    redact_subprocess_output, redact_subprocess_output_in_json, subprocess_secret_values,
+    InheritedSecretEnv, InheritedSecrets,
 };
 pub use system_knowhow::{is_system_knowhow_path, resolve_system_knowhow_dir, SystemKnowhowStore};
 pub use system_widgets::{resolve_system_widgets_dir, BUILT_IN_WIDGET_PREFIX};

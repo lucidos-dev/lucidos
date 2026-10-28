@@ -534,7 +534,7 @@ impl SchedulerManager {
 
         let count = rows.len();
         for (id, name, legacy_target, _args, cron_json, timezone, enabled, _last_run) in rows {
-            let schedule: Vec<String> = serde_json::from_value(cron_json).unwrap_or_default();
+            let schedule = legacy_schedule(id, cron_json, |w| log!("{w}"));
             let trigger_id_str = id.to_string();
             let payload = serde_json::json!({
                 "trigger_id": trigger_id_str,
@@ -1302,6 +1302,26 @@ async fn disable_push_on_stale_devices(pool: &PgPool, event_bus: &EventBus, cuto
     }
 }
 
+/// A legacy `trigger_crons.cron_expressions` value as a schedule. A corrupt
+/// value still migrates, with an empty schedule, but `warn` names the
+/// trigger and the raw value so the loss is visible.
+fn legacy_schedule(
+    trigger_id: uuid::Uuid,
+    cron_json: serde_json::Value,
+    warn: impl FnOnce(String),
+) -> Vec<String> {
+    match serde_json::from_value(cron_json.clone()) {
+        Ok(schedule) => schedule,
+        Err(e) => {
+            warn(format!(
+                "[Scheduler] (legacy migration) trigger {trigger_id} has an unreadable \
+                 cron_expressions value {cron_json}: {e}. Migrating it with an empty schedule."
+            ));
+            Vec::new()
+        }
+    }
+}
+
 /// Try to find a script matching a trigger name by keyword overlap.
 ///
 /// Searches `data/triggers/*/scripts/` and `data/apps/*/scripts/` for `run.py`.
@@ -1345,6 +1365,38 @@ mod tests {
 
     use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
     use crate::engine::thread_events::{EventMeta, ThreadEvent};
+
+    #[test]
+    fn a_corrupt_legacy_cron_warns_and_falls_back_to_an_empty_schedule() {
+        let id = uuid::Uuid::new_v4();
+        let corrupt = serde_json::json!({ "not": "a list" });
+        let mut warnings = Vec::new();
+
+        let schedule = legacy_schedule(id, corrupt, |w| warnings.push(w));
+
+        assert!(schedule.is_empty());
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        assert!(warnings[0].contains(&id.to_string()), "{}", warnings[0]);
+        assert!(
+            warnings[0].contains(r#"{"not":"a list"}"#),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_valid_legacy_cron_parses_without_a_warning() {
+        let mut warnings = Vec::new();
+
+        let schedule = legacy_schedule(
+            uuid::Uuid::new_v4(),
+            serde_json::json!(["0 0 8 * * *"]),
+            |w| warnings.push(w),
+        );
+
+        assert_eq!(schedule, vec!["0 0 8 * * *".to_string()]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
 
     /// One broadcast frame, at a stated chain depth, emitted by no trigger.
     fn emitted(typed: BusEvent, depth: u32) -> EmittedEvent {

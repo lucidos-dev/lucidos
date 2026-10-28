@@ -64,6 +64,23 @@ mod question_card_tests {
         assert!(branch.contains("return Ok(terminal_result("));
     }
 
+    /// A quiet pick ends its turn on the option's quiet reply. The event, the
+    /// turn-end gate and the result all carry it, and no model call writes it.
+    #[test]
+    fn a_quiet_answer_ends_the_turn_on_the_quiet_reply() {
+        let run = include_str!("../agentic_loop/run.rs");
+        let quiet = run
+            .find("if quiet_answer && injection_rx.is_empty() {\n                self.gate_chat_turn_end(")
+            .unwrap();
+        let next_round = run
+            .find("// 1. Add the assistant's tool_use response as a message")
+            .unwrap();
+        let branch = &run[quiet..next_round];
+        assert!(branch.contains("&quiet_reply,"));
+        assert!(branch.contains("text: quiet_reply.clone(),"));
+        assert!(branch.contains("terminal_result(\n                    quiet_reply,"));
+    }
+
     const NOTE: &str = "I've drafted the refund message and the two links it needs.";
 
     /// A tool round whose text reached the user only as a summary tells the

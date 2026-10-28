@@ -14,6 +14,7 @@ import { revealContentPane } from './pane';
 import { focusSpawnedThread } from './threads';
 import type { MarketplacePlugin, PluginInstallRequest } from '../types';
 import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
+import { refreshApps } from './apps';
 
 /** Open the plugin install panel for the staged install in `request`. The
  *  panel takes over the content pane (same surface as the credential
@@ -122,6 +123,8 @@ export async function confirmPluginInstallAction(
     return;
   }
   void refreshPluginCatalogAfterMutation();
+  // The receipt's Open buttons read the apps list, which must hold the new app.
+  void refreshApps();
   const receipted = markPluginInstalled(form, result);
   // When the plugin shipped NEW `setup` instructions the engine spawns a
   // Lucidos Agent thread to walk the user through them. Drop the user straight

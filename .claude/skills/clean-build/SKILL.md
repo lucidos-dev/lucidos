@@ -164,17 +164,30 @@ git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.tes
 (cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, re-counted on 2026-10-12. The audit
-found six `too_many_arguments` silencers that silenced nothing. Each sat on a
-function with seven or fewer parameters, `self` included, and clippy's
-default threshold fires only above seven. That run removed all six:
-`core/credentials.rs` `upsert_row`, `chat/process/run.rs` `fail_turn`, the
-`walk` test helper in `tools/import.rs`, and three in
-`scheduler/task_runner.rs`. The check below now catches that form.
+The currently-accepted categories, re-counted on 2026-10-27. That run
+removed six allow attributes that silenced nothing:
 
-`@ts-expect-error` grew with the test suite, and a fourth Vitest-only helper
-joined: `__tests__/staticImportGraph.ts`. The ten `eslint-disable` sites were
-unchanged.
+- three `too_many_arguments` allows in `agent_session/apply_now.rs`, each on
+  a function with seven parameters, `self` included;
+- two allows in `runtime/intelligence_ladder.rs`, naming
+  `cast_possible_truncation` and, on one, `cast_sign_loss`. Both lints are
+  pedantic, and nothing in the repo enables pedantic lints;
+- the `enum_variant_names, vec_init_then_push` allow on the CLI's generated
+  module. The first never fired. The second is fixed at source:
+  `lucidos-capabilities/src/codegen.rs` starts the query vector with the
+  values every call sends.
+
+It also gave the bare allow on `run_session/run.rs` `run_agent_session` its
+missing comment.
+
+**`crates/vendor/` is outside this inventory.** It is third-party source,
+excluded from the workspace, so `make lint` never lints it. The first grep
+and the bare-allow audit still print its upstream allows
+(`unused_variables`, `missing_debug_implementations`, `single_match`) in
+`chromiumoxide`. Leave them as upstream wrote them.
+
+`@ts-expect-error` grew with the test suite, and a second Vite plugin joined:
+`vite/ensureGenerated.ts`. The ten `eslint-disable` sites were unchanged.
 
 **The first grep and the bare-allow audit both print one false hit.** It is
 `git_ops_tests/branch_queries.rs`, where `#[allow(dead_code)]` sits inside
@@ -186,7 +199,7 @@ silencers from the gateway's slowness watcher, which the first grep above
 had missed. The cfg_attr grep now covers that form.
 Anything not on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 82 sites across 55 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 80 sites across 54 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -194,9 +207,9 @@ Anything not on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 82 shares an attribute with `format_in_format_args`, which is
+  One of the 80 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 81 across 54 files. Both numbers here count the shared attribute.
+  reports 79 across 53 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 3 sites, all test scaffolding
   (`thread_lifecycle_tests/scenario_tests.rs`,
   `change_ops_engine_origin_stamping_tests.rs`, `tools/plugins/mod.rs`).
@@ -218,8 +231,8 @@ Anything not on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 931 sites across 322 files, all but one of
-  them test-only code: 303 `*.test.ts`, fourteen `*.test.tsx`
+  `@types/node` in project**, 1002 sites across 348 files, all but two of
+  them test-only code: 328 `*.test.ts`, fourteen `*.test.tsx`
   (`components/changes/__tests__/bulk-row-layout.test.tsx`,
   `components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/typed-answer-spins-on-its-card.test.tsx`,
@@ -238,9 +251,11 @@ Anything not on this list is fair game to remove and re-fix:
   `components/shared/__tests__/loading-guard-scan.ts`,
   `components/search/__tests__/renderedSearchAnchors.ts` and
   `__tests__/staticImportGraph.ts` carry three each.
-  The one file outside test code is `vite/sourceCommitStamp.ts`, with three
-  sites. It is a Vite plugin, so it runs in Node at build time, and `tsc`
-  reaches it only because its test imports it. No browser code imports it.
+  The two files outside test code are Vite plugins, which run in Node at
+  build time, and no browser code imports either. `vite/sourceCommitStamp.ts`
+  has four sites, and `tsc` reaches it only because its test imports it.
+  `vite/ensureGenerated.ts` has two, and only `vite.config.ts` imports it, so
+  no phase type checks it.
   The expectation is real: TS does not know about Node globals, but Vitest
   provides them. Adding
   `@types/node` to the project would contaminate the browser type-graph.
@@ -251,7 +266,7 @@ Anything not on this list is fair game to remove and re-fix:
   older wording asserted there were none, and nothing checked it. The
   count grows with the test suite, so treat a mismatch here as ordinary
   drift to restate rather than as a finding, and check only that every
-  leftover the snippet prints is still test-only code or that one plugin.
+  leftover the snippet prints is still test-only code or one of those plugins.
   The helpers are why that says test-only code rather than a test file:
   each lives under `__tests__/` and only test files import it.
 - **`// eslint-disable-next-line`**, 10 sites across 6 files and 5 rules:
@@ -282,7 +297,8 @@ one, fix the code and remove the annotation.
 
 Check that mechanically rather than by eye. This prints every Rust allow
 whose preceding non-attribute line is not a comment. It must print
-nothing but the `branch_queries.rs` string-literal hit named above:
+nothing but the `branch_queries.rs` string-literal hit and the vendored
+`chromiumoxide` lines named above:
 
 ```sh
 for f in $(git ls-files '*.rs'); do awk -v F="$f" '
@@ -331,9 +347,9 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
 
 - **`packages/lucidos-sdk`'s own `npm run typecheck` RUNS now, and exits 0.
   No phase above invokes it.** Recorded 2026-08-04 as unrunnable, reopened
-  and cleared on the 2026-09-15 run, and still exit 0 on 2026-09-23. The entry
-  stays because the coverage gap it describes is still real: no phase reads the
-  SDK's test files.
+  and cleared on the 2026-09-15 run. It failed again on 2026-10-27, and that
+  run fixed it. The entry stays because the coverage gap it describes is
+  still real: no phase reads the SDK's test files.
 
   The old blocker is gone. It was a resolution gap: the SDK's test files
   import `vitest`, which only `crates/lucidos-app` declares, and the lockfile
@@ -349,6 +365,11 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   empty, in `src/_fetch.test.ts` and `src/openExternal.test.ts`. Both now
   carry the repo's `vi.fn<Signature>()` idiom, and the two casts to
   `typeof fetch` are gone with it. The 29 tests in those files still pass.
+
+  **The gap bit again on 2026-10-27.** `src/worker/sseWorker.test.ts` had
+  seven `TS2550` errors: it called ES2022 `Array.prototype.at` against the
+  SDK's ES2020 `lib`. Vitest ran the file green, and no phase type checked it.
+  A `lastReceived` helper now indexes the last element.
 
   **Do not "fix" a future failure here by trimming the SDK tsconfig's
   `include`.** That would drop the test files from type checking rather
@@ -406,6 +427,12 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   It now goes through the *scroll state handle*, which `startShell` fills,
   and a static-graph test keeps `scrollState.ts` out of the entry. That took
   it to 517.37 kB.
+  On 2026-10-27 it measured 582.90 kB and the first-paint set 1318.68 kB,
+  both past their soft lines. The growth is spread over dozens of store
+  modules, with no single culprit. A 14 kB cut of the voice runner was
+  reverted that day: a cold press lost the iOS audio gesture.
+  `store/thread-events.ts` dominates about 163 kB of unminified entry code,
+  because `store.ts` derives exchanges through `computeExchanges`.
 
   The entry chunk is the data layer and startup. The UI is the shell chunk,
   loaded beside it under the boot splash.

@@ -4,6 +4,7 @@ import {
   locateWorkspace,
   createWorkspace,
   restartWorkspace,
+  startWorkspace,
   stopWorkspace,
   restoreBackup,
   getGatewayStatus,
@@ -118,6 +119,13 @@ describe('control client', () => {
     expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspaces/dev/restart');
     expect(mock.mock.calls[0][1]?.method).toBe('POST');
     expect(headersOf(mock)['x-lucidos-device-id']).toBe('device-abc');
+  });
+
+  it('starts a workspace through its own start route, never restart', async () => {
+    const mock = withFetch(() => Promise.resolve(new Response(null, { status: 202 })));
+    await startWorkspace('dev');
+    expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspaces/dev/start');
+    expect(mock.mock.calls[0][1]?.method).toBe('POST');
   });
 
   it('sends the device-id header on stop', async () => {

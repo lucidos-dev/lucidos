@@ -83,8 +83,10 @@ Each `--duration-*` token is its 1x literal times `var(--duration-scale)`. That 
   - **The scale** is `--space-{xs,sm,md,lg,xl}`, in `base.css` and mirrored in `api/sdk_iframe.css`. Keep the two blocks identical. Never redefine a step.
   - **Every content-pane view shares the `--space-lg` horizontal gutter** on its structural padding: the toolbar, list rows, empty states and headers. `/harden` flags a raw `padding: N rem` gutter.
   - **Carve-outs, each with a comment at the site:** full-bleed views (app-ui iframe, previews, diffs), the Files tree (`.file-item`), card-like elements (boxes, pills, chips, badges), inline controls, computed-px values, `1px` borders, `0` and `env()`.
-- **A content-pane column view reserves the scroll gutter while it fits.** `.content-pane-body` uses `overflow-y: scroll` plus `scrollbar-gutter: stable`, as `.thread-content` does. A full-bleed view is excluded. Pinned by `content-pane-scroll-gutter.test.ts` and `e2e/settings-column-holds-still-desktop.spec.ts`.
-- **Every content-pane view gets the *end space* below its last element, and no view sets its own** (`docs/glossary.md` § End space). One default-deny spacer in `panels/content.css` provides it. Never pin a column view to the pane's height. Never style a view root's `::after`. A new full-bleed view takes `content-view-full-bleed` and a row in `content-pane-end-space.test.ts`.
+- **The content pane places every view; no view places itself.** Default-deny rules on `.content-pane-body` children, overlays included, give the *content column*, scroll gutter and *end space* (`docs/glossary.md`). Opt out only with `content-view-full-bleed`.
+  - **Column** (`panels/content.css`): cap, centre, top padding. A view root sets only `padding-inline: var(--space-lg)`. Pinned by `content-pane-one-column.test.ts` and e2e.
+  - **Scroll gutter** (`panels/shell.css`), kept while the view fits. Pinned by `content-pane-scroll-gutter.test.ts` and e2e.
+  - **End space**: never pin a column view to the pane height or style a view root's `::after`. Pinned by `content-pane-end-space.test.ts`.
 - **Thread-pane surfaces share ONE content edge, scroll gutter included.** The transcript (`.thread-content`) and the composer (`.prompt-area` → `.prompt-input-container`) resolve to the same left and right insets. Four parts:
   1. **The shared `--thread-pane-gutter`** on both sides of both surfaces.
   2. **A `--turn-body-inset` padding** on the composer column and on the compose-empty `.welcome-hero`.

@@ -23,10 +23,11 @@ import {
   connectionNoticeSentence,
   connectionPhrase,
   hasConnectionNotice,
+  isEngineUnreachable,
 } from './connectionNotice';
 import type { ConnectionStatus } from '../store/types';
 
-const DIMMED: ConnectionStatus[] = ['disconnected', 'connecting'];
+const DIMMED: ConnectionStatus[] = ['disconnected', 'connecting', 'stopped'];
 
 /** The mark's readable half. It is the accessible name AND the desktop hover
  *  tooltip, so it has to read as English in all three states and survive the
@@ -40,6 +41,11 @@ describe('connectionPhrase', () => {
     expect(connectionPhrase('connected', 'dev')).toBe('connected to the dev engine');
     expect(connectionPhrase('connecting', 'dev')).toBe('connecting to the dev engine');
     expect(connectionPhrase('disconnected', 'dev')).toBe('cannot reach the dev engine');
+  });
+
+  it('says a stopped workspace is stopped, because the gateway said so itself', () => {
+    expect(connectionPhrase('stopped', 'dev')).toBe('the dev engine is stopped');
+    expect(connectionPhrase('stopped', null)).toBe('the engine is stopped');
   });
 
   it('claims the reach and never the engine, which is all a failed poll knows', () => {
@@ -134,6 +140,14 @@ describe('connectionNotice', () => {
     }
   });
 
+  it('names the action that ends a stopped state, and promises no retry', () => {
+    // Nothing retries a stopped workspace: the gateway never starts an engine
+    // for a window's polls, or Stop would undo itself.
+    const detail = connectionNotice('stopped', 'dev', 'short')!.detail;
+    expect(detail).toBe('Start it to continue.');
+    expect(detail).not.toContain('Retrying');
+  });
+
   it('names what cannot load and where, since a refutation waits on each', () => {
     // The Workspaces row reaches the GATEWAY, so it keeps listing and switching
     // through an engine outage, from inside this very window. A location scope
@@ -151,6 +165,15 @@ describe('connectionNotice', () => {
     }
     expect(connectionNotice('disconnected', 'dev', 'short')!.detail)
       .not.toContain('load or send');
+  });
+});
+
+describe('isEngineUnreachable', () => {
+  it('is true for a failed poll and a stopped workspace, false otherwise', () => {
+    expect(isEngineUnreachable('disconnected')).toBe(true);
+    expect(isEngineUnreachable('stopped')).toBe(true);
+    expect(isEngineUnreachable('connecting')).toBe(false);
+    expect(isEngineUnreachable('connected')).toBe(false);
   });
 });
 
@@ -205,6 +228,7 @@ describe('the wording lives in exactly one module', () => {
       'Waiting for an answer.',
       'Threads and messages will not load or send in this window.',
       'Retrying every few seconds.',
+      'Start it to continue.',
     ];
     for (const file of sources(srcDir)) {
       const text: string = readFileSync(file, 'utf-8');

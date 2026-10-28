@@ -8,6 +8,10 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 
 use super::types::*;
 use crate::core::user_path::augmented_user_path;
+use crate::core::{
+    argv_secret_values, inherited_secret_env, redact_argv, redact_subprocess_output,
+    subprocess_secret_values,
+};
 use crate::engine::thread_events::ActorMode;
 
 /// The most one JSON-RPC frame may carry, its newline excluded.
@@ -35,6 +39,27 @@ fn mcp_client_name(mode: ActorMode) -> &'static str {
         ActorMode::Engine => "Lucidos Engine",
         ActorMode::Human => "Lucidos",
     }
+}
+
+/// The line a spawn logs. Like the env map, which it leaves out, an argument
+/// can carry a key, so the argv is masked.
+fn spawn_log_line(server_label: &str, command: &str, args: &[String]) -> String {
+    format!(
+        "[MCP] Spawning '{server_label}': {command} {}",
+        redact_argv(args)
+    )
+}
+
+/// The secret values a server starts with, which its stderr may echo: those
+/// its argv carries, its secret-shaped env, and what it inherits.
+fn launch_secret_values(args: &[String], env: &HashMap<String, String>) -> Vec<String> {
+    let env_pairs: Vec<(String, String)> = env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let mut secrets = subprocess_secret_values(&env_pairs, inherited_secret_env());
+    secrets.extend(argv_secret_values(args));
+    secrets
 }
 
 /// What one capped read off a server's pipe found.
@@ -139,12 +164,7 @@ impl McpClient {
         env: &HashMap<String, String>,
         mode: ActorMode,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        log!(
-            "[MCP] Spawning '{}': {} {}",
-            server_label,
-            command,
-            args.join(" ")
-        );
+        log!("{}", spawn_log_line(server_label, command, args));
 
         let mut cmd = tokio::process::Command::new(command);
         cmd.args(args)
@@ -202,16 +222,21 @@ impl McpClient {
             .take()
             .ok_or("Failed to capture MCP server stdout")?;
 
-        // Spawn a task to drain stderr and log it, in bounded pieces.
+        // Spawn a task to drain stderr and log it masked, in bounded pieces.
         if let Some(stderr) = child.stderr.take() {
             let label = server_label.to_string();
+            let secrets = launch_secret_values(args, env);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 while let Some(chunk) = next_stderr_chunk(&mut reader).await {
                     let text = String::from_utf8_lossy(&chunk);
                     let trimmed = text.trim_end();
                     if !trimmed.is_empty() {
-                        log!("[MCP:stderr] [{}] {}", label, trimmed);
+                        log!(
+                            "[MCP:stderr] [{}] {}",
+                            label,
+                            redact_subprocess_output(trimmed, &secrets)
+                        );
                     }
                 }
             });
@@ -576,6 +601,38 @@ impl Drop for McpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Several published servers take their key as an argument, and this
+    /// line runs on every start, the on-demand one inside `call_tool` too.
+    #[test]
+    fn the_spawn_log_line_never_carries_an_argument_secret() {
+        let args: Vec<String> = ["-y", "search-server", "--api-key", "opaque-secret-value"]
+            .map(String::from)
+            .to_vec();
+        let line = spawn_log_line("search", "npx", &args);
+        assert_eq!(
+            line,
+            "[MCP] Spawning 'search': npx -y search-server --api-key [REDACTED]"
+        );
+    }
+
+    /// A server that echoes its launch secrets to stderr, say in a debug
+    /// banner, must not land them in the engine log either.
+    #[test]
+    fn a_stderr_line_echoing_a_launch_secret_is_masked() {
+        let args: Vec<String> = ["--api-key", "opaque-argv-secret"]
+            .map(String::from)
+            .to_vec();
+        let env = HashMap::from([(
+            "SEARCH_API_KEY".to_string(),
+            "opaque-env-secret".to_string(),
+        )]);
+        let secrets = launch_secret_values(&args, &env);
+        assert_eq!(
+            redact_subprocess_output("key opaque-argv-secret, env opaque-env-secret", &secrets),
+            "key [REDACTED], env [REDACTED]"
+        );
+    }
 
     #[test]
     fn mcp_client_name_returns_lucidos_agent_for_agent_mode() {

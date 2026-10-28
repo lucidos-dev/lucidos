@@ -1,8 +1,3 @@
-/* Panel content (used by Changes, Notifications, etc. inside PanelPane) */
-.panel-content {
-    padding: 0;
-}
-
 .dropdown-panel-toolbar {
     display: flex;
     justify-content: space-between;
@@ -151,25 +146,22 @@
 /* ─── Notification detail (rendered in the content pane) ─── */
 /* The pane's own .content-pane-body scrolls, so the detail lays out at natural
    height — no nested flex:1/overflow scroll region (which had no defined height
-   outside the former modal's flex column).
-   Capped and centred like the transcript (`.thread-content > *`), so on a wide
-   pane the date, the chevrons and the centred actions stay one column. */
+   outside the former modal's flex column). */
 .notification-detail {
     display: flex;
     flex-direction: column;
     min-height: 0;
-    max-width: var(--content-max-width);
-    margin-inline: auto;
 }
 
 /* Nav row above the title. The date sits on the title's left edge and the
- * newer/older chevrons on the right. The bottom padding is the whole gap down
- * to the title, which sets no top padding. */
+ * newer/older chevrons on the right. The content column sets the space above
+ * it. The bottom padding is the whole gap down to the title, which sets no top
+ * padding. */
 .notification-detail-header {
     display: flex;
     align-items: center;
     gap: var(--space-sm);
-    padding: var(--space-md) var(--space-lg) var(--space-lg);
+    padding: 0 var(--space-lg) var(--space-lg);
 }
 
 .notification-detail-date {
@@ -312,13 +304,22 @@
     height: 100%;
 }
 
-/* Every content-pane view (Apps, Triggers, Plugins, Files, Settings, Changes,
-   Notifications) owns the space above its first element, so every view starts
-   at the same height. A view's first toolbar or row sets no top spacing of its
-   own. The 1rem side gutter stays on each row, so a row's hover wash reaches
-   the column edges. */
-.content-pane-body > .content-view.active,
-.content-pane-body > .panel-content {
+/* The content column, default-deny like the end space below: every view the
+   pane mounts, tab or overlay, is one column capped and centred like the
+   transcript (`.thread-content > *`) with the same token. A view opts out only
+   by being full-bleed. No view root restates the cap or centres itself.
+   The column owns the space above its first element, so every view starts at
+   the same height. The 1rem side gutter stays on each row, so a row's hover
+   wash reaches the column edges. Files is full-bleed, since a diff needs the
+   whole pane, but starts at the same height.
+   Pinned by content-pane-one-column.test.ts and its e2e spec. */
+.content-pane-body > :not(.content-view-full-bleed) {
+    max-width: var(--content-max-width);
+    margin-inline: auto;
+}
+
+.content-pane-body > :not(.content-view-full-bleed),
+.content-pane-body > .content-view.active {
     padding-top: var(--space-md);
 }
 
@@ -338,21 +339,6 @@
     height: var(--pane-end-space);
 }
 
-/* The end space replaces a form's own bottom padding, wrapped in a
-   `LoadingFade` or not. */
-.content-pane-body .inline-form {
-    padding-bottom: 0;
-}
-
-/* Each is one column, capped and centred like the transcript
-   (`.thread-content > *`) with the same token. The pane body scrolls, so the
-   scrollbar stays at the pane edge. Files is full-bleed: a diff needs the whole
-   pane, and the whole pane is its import drop zone. */
-.content-pane-body > .content-view.active:not(.content-view-full-bleed),
-.content-pane-body > .panel-content {
-    max-width: var(--content-max-width);
-    margin-inline: auto;
-}
 
 /* Workspace files wrapper: fills the panel's import drop zone as a column. */
 .workspace-files-view {

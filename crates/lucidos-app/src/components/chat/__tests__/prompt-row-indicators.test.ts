@@ -97,15 +97,14 @@ describe('the composer wires both indicators as foldable members', () => {
     expect(prompt).toMatch(/const waitingAction = waitingIndicatorAction\(\);/);
   });
 
-  /** They follow the coding-agent menu and attach image, so the ⋯ menu takes
-   *  them right after those two. */
-  it('puts them in the row in todo, waiting, WIP order', () => {
+  /** The row draws todo, then waiting. The WIP preview is a toggle, not a
+   *  readout, so it keeps its own slot. */
+  it('puts todo before waiting, and leaves the WIP preview out of them', () => {
     const todoAt = prompt.indexOf('if (todoAction) readouts.push(todoAction);');
     const waitingAt = prompt.indexOf('if (waitingAction) readouts.push(waitingAction);');
-    const wipAt = prompt.indexOf('if (wipAction) readouts.push(wipAction);');
     expect(todoAt).toBeGreaterThan(-1);
     expect(waitingAt).toBeGreaterThan(todoAt);
-    expect(wipAt).toBeGreaterThan(waitingAt);
+    expect(prompt).toContain('wipPreview: wipPreviewAction(focusedThread),');
   });
 
   /** A panel cannot live inside the control that folds away. Both are mounted

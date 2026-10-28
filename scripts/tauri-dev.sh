@@ -57,8 +57,8 @@ DEV_WINDOW_LAUNCH_DIR="$(launch_bin_dir)"
 if [ ! -f "$(dev_window_bin "$DEV_WINDOW_LAUNCH_DIR")" ]; then
     build_dev_window "$DEV_WINDOW_LAUNCH_DIR"
 fi
-# Resolved, because the window's re-exec names itself by its resolved path and
-# stop_dev_windows matches on it.
+# Resolved, because stop_dev_windows matches a window by the exact path it was
+# started from, and a later launch must name it the same way.
 DEV_WINDOW_LAUNCH_DIR="$(cd "$DEV_WINDOW_LAUNCH_DIR" && pwd -P)"
 DEV_WINDOW_BIN="$(dev_window_bin "$DEV_WINDOW_LAUNCH_DIR")"
 # Before the stack starts, so /api/v1/sdk.js is ready immediately.
@@ -96,7 +96,8 @@ trap 'cleanup_processes; exit 0' SIGINT SIGTERM
 echo "Launching Tauri desktop app at $WINDOW_URL ..."
 
 # Run the window in the foreground. Closing it ends this script; Ctrl-C signals
-# the whole process group and fires the trap. No file watcher restarts it: the
-# window re-execs onto a newer published binary once its engine has switched.
+# the whole process group and fires the trap. No file watcher restarts it:
+# run_dev_window relaunches the newer published binary once its engine has
+# switched.
 cd "$FRONTEND_DIR"
-LUCIDOS_DEV_WINDOW_URL="$WINDOW_URL" "$DEV_WINDOW_BIN"
+run_dev_window "$DEV_WINDOW_BIN" "$WINDOW_URL"

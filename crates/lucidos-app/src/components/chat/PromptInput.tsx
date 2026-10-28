@@ -33,7 +33,6 @@ import {
 import { CODING_AGENT_MENU_FOLD_KEY, menuCodingAgent } from './ControlMenuTrigger';
 import { LazyRungControl } from './LazyRungControl';
 import { RUNG_FOLD_KEY, RungMenuIcon } from './RungButtons';
-import { rungLockedReason } from './rungLockedReason';
 import { renderHeaderAction, renderMenuAction, type HeaderActionSpec } from '../layout/headerActions';
 import { OverflowMenu } from '../shared/OverflowMenu';
 import { useComposerCompact } from '../../hooks/useComposerCompact';
@@ -1261,10 +1260,11 @@ export function PromptInput() {
   ) : null;
 
   // The rung control, for a coding agent and for the Lucidos Agent alike: a
-  // pill beside the send button, with a step at each end.
+  // pill beside the send button, with a step at each end. A running turn does
+  // not disable it: the list still opens, and the control refuses the pick.
   const rungDisabledReason = answersCard
     ? 'Answer or cancel the pending question or permission request before changing the model and effort'
-    : inComposeContext ? null : rungLockedReason(focusedStatus);
+    : null;
   // The banner's members: Diff, and the one control in the action slot. With
   // the banner suppressed the standalone pair stands in. So a branch with
   // commits always shows a Diff whatever the coding agent's run-state, and a
@@ -1325,7 +1325,7 @@ export function PromptInput() {
     : 'prompt-actions-row';
   // ── The row's FOLDABLE members, left to right ──
   //
-  // `composerRowMembers` orders them, and the fold takes a PREFIX of that
+  // `composerRowMembers` orders them, and the fold takes a PREFIX of its fold
   // order. Only the action slot never folds: Send, the answer control, or the
   // banner's one control in its place. It fits at any width the app supports,
   // so a row too narrow for its members is not a state this can settle in.
@@ -1334,8 +1334,6 @@ export function PromptInput() {
   if (todoAction) readouts.push(todoAction);
   const waitingAction = waitingIndicatorAction();
   if (waitingAction) readouts.push(waitingAction);
-  const wipAction = wipPreviewAction(focusedThread);
-  if (wipAction) readouts.push(wipAction);
   const attachImageAction: HeaderActionSpec = {
     key: 'attach-image',
     dataRole: 'attach-image',
@@ -1419,6 +1417,7 @@ export function PromptInput() {
     ),
     attachImage: attachImageAction,
     readouts,
+    wipPreview: wipPreviewAction(focusedThread),
     clearDraft: clearDraftAction,
     toggles: promptRowToggles(
       promptCodingAgent, inComposeContext, focusedThread,
@@ -1434,7 +1433,7 @@ export function PromptInput() {
     },
     situational: situationalActions,
   });
-  const foldActions = [...members.row, ...members.cluster];
+  const foldActions = members.foldOrder;
 
   // Where each member renders. The cluster declares a gap and the rest of the
   // row does not. So a member folding out of the cluster takes a gap with it.

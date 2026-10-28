@@ -72,6 +72,27 @@ describe.each([
   });
 });
 
+// An unfinished turn proposes nothing, and the engine records that before the
+// idle. The withheld proposal is the superseded turn's, not the new message's.
+describe.each([
+  ['in one load', false],
+  ['as each event arrives', true],
+])('a superseded turn that withholds its proposal before the idle, %s', (_, live) => {
+  const withheld = ev(6, { type: 'ProposalWithheld', reason: 'turn_incomplete', files: ['src/a.rs'], branch_name: 'b', channel: 'claude_code' });
+  const exchanges = fold([...superseded, withheld, ev(6.5, idled), ...takenOver], live);
+
+  it('closes the superseded turn', () => {
+    expect(stepTypes(byText(exchanges, 'build it'))).toEqual(expect.arrayContaining(['ProposalWithheld', 'CodingAgentIdled']));
+  });
+
+  it('keeps the new turn thinking', () => {
+    const next = byText(exchanges, 'hand off');
+    expect(stepTypes(next)).not.toContain('CodingAgentIdled');
+    expect(exchangeSteps(next, true).map(s => [s.description, s.outcome]))
+      .toEqual([['Thinking', 'pending']]);
+  });
+});
+
 it('closes the superseded turn past a message queued behind it', () => {
   const [sent, readIt, said, canceled, handOff] = superseded;
   const exchanges = fold([

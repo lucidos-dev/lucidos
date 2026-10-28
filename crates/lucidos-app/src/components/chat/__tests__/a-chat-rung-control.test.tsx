@@ -345,22 +345,20 @@ describe('a pick on a started thread', () => {
 
 describe('a started thread while a turn runs', () => {
   for (const status of ['running', 'waiting_for_user_answer', 'paused'] as const) {
-    it(`keeps the current model disabled while ${status}`, async () => {
+    it(`opens the list but keeps the current model while ${status}`, async () => {
       setStatus(status);
       renderControl({ threadId: 't1', composeContext: false });
       await settle();
       const trigger = host.querySelector<HTMLElement>('.rung-trigger')!;
-      expect(trigger.getAttribute('aria-disabled')).toBe('true');
+      expect(trigger.getAttribute('aria-disabled')).toBe('false');
       expect(trigger.getAttribute('data-tooltip')).toBe(LOCKED);
       expect(host.querySelector('.rung-name')!.textContent).toContain('Opus 5.5');
-      trigger.click();
+      await pickHaiku();
       trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
-      for (const step of host.querySelectorAll<HTMLElement>('.rung-step')) {
-        expect(step.getAttribute('aria-disabled')).toBe('true');
-        step.click();
-      }
+      for (const step of host.querySelectorAll<HTMLElement>('.rung-step')) step.click();
       await settle();
-      expect(document.querySelector('.control-dropdown')).toBeNull();
+      expect(toasts.value.filter(t => t.type === 'info' && t.message === LOCKED).length).toBeGreaterThan(0);
+      expect(host.querySelector('.rung-name')!.textContent).toContain('Opus 5.5');
       expect(fetchSwitchEstimate).not.toHaveBeenCalled();
       expect(recordChatSettings).not.toHaveBeenCalled();
     });

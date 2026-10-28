@@ -43,6 +43,7 @@ import { reportThreadRenderProbe } from '../../utils/threadRenderProbe';
 import { postClientLog } from '../../utils/liveness';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { FindBar } from '../shared/FindBar';
+import { isEngineUnreachable } from '../../utils/connectionNotice';
 import { transcriptRenderRequest } from '../../store/actions/transcriptRenderRequest';
 
 /** Only sample a grouping fold this slow (ms) — keeps cheap incremental folds
@@ -1212,7 +1213,7 @@ export function ThreadView() {
         animating,
         eventsLoadFailed,
         historyLoaded,
-        disconnected: connectionStatus.value === 'disconnected',
+        disconnected: isEngineUnreachable(connectionStatus.value),
     };
     const delayElapsed = useDelayedFlag(threadIsLoadingNow(loadingState));
     const showThreadSkeleton = showThreadSkeletonNow(loadingState, delayElapsed);
@@ -1946,7 +1947,7 @@ export function ThreadView() {
         // While we wait for the thread to enter the map, honour the disconnected
         // signal too: a cold boot into an unreachable engine never populates the
         // map, so without this the skeleton would spin into "Tap to reload".
-        const waitingReason: EmptyReason = connectionStatus.value === 'disconnected'
+        const waitingReason: EmptyReason = isEngineUnreachable(connectionStatus.value)
             ? { kind: 'disconnected', threadId }
             : { kind: 'loading', threadId };
         // KEYED, and the keys are the whole reason this shape works. The
@@ -2019,7 +2020,7 @@ export function ThreadView() {
                             />
                         </div>
                     ) : (
-                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, historyLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />
+                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, historyLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, isEngineUnreachable(connectionStatus.value), isMidTurn(effectiveThreadStatus(eventThread)))} />
                     )}
                 </div>
                 <ThreadSkeletonOverlay key="skeleton" show={showThreadSkeleton} />

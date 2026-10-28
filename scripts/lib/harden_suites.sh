@@ -112,7 +112,7 @@ crates/lucidos-app/src/styles/__tests__/iframe-css-no-shared-component-restyle.t
 crates/lucidos-engine/src/core/changes.rs 1
 crates/lucidos-engine/src/engine/agent_session/lifecycle_tests/propose.rs 1
 crates/lucidos-engine/src/engine/agent_session/prompts.rs 6
-crates/lucidos-engine/src/engine/change_ops_withheld_work_tests.rs 2
+crates/lucidos-engine/src/engine/change_ops_withheld_work_tests.rs 3
 crates/lucidos-engine/src/engine/event_bus_tests/proposed_apply_cycle.rs 1
 crates/lucidos-engine/src/engine/frontend_refresh.rs 1
 crates/lucidos-engine/src/engine/git_ops/plan_marker.rs 1

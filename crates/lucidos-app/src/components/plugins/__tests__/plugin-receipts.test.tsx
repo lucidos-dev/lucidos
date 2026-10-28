@@ -12,10 +12,11 @@
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { PluginInstallPanel, PluginInstallReceiptPanel } from '../PluginInstallPanel';
+import { PluginInstallPanel, PluginInstallReceiptPanel, installedApps } from '../PluginInstallPanel';
+import type { App } from '../../../store/types';
 import { PluginUninstallPanel, PluginUninstallReceiptPanel } from '../PluginUninstallPanel';
 import { PluginFileList } from '../PluginFileList';
-import { panelOverlay } from '../../../store/store';
+import { appsList, panelOverlay } from '../../../store/store';
 import type { InlineForm, PluginInstallForm, PluginUninstallForm } from '../../../store/store';
 
 type AnyVNode = VNode<Record<string, unknown>>;
@@ -109,6 +110,7 @@ function open(form: InlineForm): void {
 
 beforeEach(() => {
   panelOverlay.value = null;
+  appsList.value = { status: 'not-loaded' };
 });
 
 describe('plugin panel dispatchers', () => {
@@ -192,15 +194,50 @@ describe('plugin install receipt', () => {
     expect(acc.text).toContain('Installed');
   });
 
-  it('offers no buttons', () => {
+  it('offers no buttons when the plugin installed no app', () => {
     const acc = render(PluginInstallReceiptPanel({
       form: installForm({
         at: '2026-08-06T10:00:00.000Z',
         summary: 'Installed Habit Tracker',
-        installed_files: [],
+        installed_files: ['knowhow/habits/tracking.md'],
       }),
     }));
 
     expect(buttonLabels(acc)).toEqual([]);
+  });
+
+  it('offers Open app when the plugin installed one app', () => {
+    const acc = render(PluginInstallReceiptPanel({
+      form: installForm({
+        at: '2026-08-06T10:00:00.000Z',
+        summary: 'Installed Habit Tracker',
+        installed_files: ['apps/habit-tracker/manifest.json', 'apps/habit-tracker/index.html'],
+      }),
+    }));
+
+    expect(buttonLabels(acc)).toEqual(['Open app']);
+  });
+});
+
+describe('installedApps', () => {
+  const files = [
+    'apps/habit-tracker/index.html',
+    'apps/habit-tracker/manifest.json',
+    'apps/streak-widget/manifest.json',
+    'knowhow/habits/tracking.md',
+  ];
+
+  it('reads app ids off manifest paths before the apps list loads', () => {
+    expect(installedApps(files, { status: 'not-loaded' })).toEqual([
+      { id: 'habit-tracker', name: 'habit-tracker' },
+      { id: 'streak-widget', name: 'streak-widget' },
+    ]);
+  });
+
+  it('keeps only listed apps, with their names, once the list loads', () => {
+    const app = { id: 'habit-tracker', name: 'Habit Tracker' } as App;
+    expect(installedApps(files, { status: 'loaded', data: [app] })).toEqual([
+      { id: 'habit-tracker', name: 'Habit Tracker' },
+    ]);
   });
 });

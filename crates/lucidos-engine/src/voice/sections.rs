@@ -770,6 +770,7 @@ mod tests {
                     preview: None,
                     widget: None,
                     quiet: false,
+                    quiet_reply: None,
                 },
                 QuestionOption {
                     id: "opt-1".to_string(),
@@ -778,6 +779,7 @@ mod tests {
                     preview: None,
                     widget: None,
                     quiet: false,
+                    quiet_reply: None,
                 },
             ],
             multi_select,

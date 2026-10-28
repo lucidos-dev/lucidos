@@ -78,6 +78,7 @@ pub fn router() -> Router<GatewayState> {
         )
         .route("/workspaces/:id/rename", post(rename))
         .route("/workspaces/:id/restart", post(restart))
+        .route("/workspaces/:id/start", post(start))
         .route("/workspaces/:id/stop", post(stop))
         .route("/workspaces/:id/autostart", post(set_autostart))
         // A booting engine reports its current phase here (best-effort) so the
@@ -892,6 +893,21 @@ async fn restart(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// Start a registered workspace that is not running. The window of a stopped
+/// workspace calls this from its Start button.
+///
+/// 202 whether the workspace starts or already runs, 404 for a slug this gateway
+/// does not know. Never respawns a running engine. See
+/// [`GatewayState::start_workspace`].
+async fn start(
+    State(state): State<GatewayState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    reject_invalid_id(&id)?;
+    state.start_workspace(&id)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 /// Stop a workspace's engine but keep its registry entry (it stays listed in the
 /// picker as stopped). The dev `stop.sh` calls this so the shared gateway forgets
 /// the stack and its supervisor stops respawning the engine.
@@ -1179,6 +1195,7 @@ mod authz_tests {
         ("POST", "/~/api/v1/control/workspaces"),
         ("POST", "/~/api/v1/control/workspaces/adopt"),
         ("POST", "/~/api/v1/control/workspaces/restore"),
+        ("POST", "/~/api/v1/control/workspaces/dev/start"),
         ("POST", "/~/api/v1/control/workspaces/dev/stop"),
         ("POST", "/~/api/v1/control/workspaces/dev/restart"),
         ("POST", "/~/api/v1/control/workspaces/dev/rename"),
@@ -1465,18 +1482,20 @@ mod authz_tests {
         // caller authenticates, so `enforce` passes it, and `control_authz`
         // then refuses it for the document it came from.
         let state = crate::server::GatewayState::for_tests();
-        let status = control_call(
-            &state,
-            "POST",
-            "/~/api/v1/control/workspaces/dev/stop",
-            &[
-                (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
-                ("sec-fetch-site", "same-origin"),
-                ("referer", "https://localhost:5251/dev/app/habit-tracker/"),
-            ],
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        for verb in ["start", "stop"] {
+            let status = control_call(
+                &state,
+                "POST",
+                &format!("/~/api/v1/control/workspaces/dev/{verb}"),
+                &[
+                    (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
+                    ("sec-fetch-site", "same-origin"),
+                    ("referer", "https://localhost:5251/dev/app/habit-tracker/"),
+                ],
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{verb}");
+        }
     }
 
     #[tokio::test]

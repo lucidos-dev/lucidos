@@ -3291,9 +3291,7 @@
             "name": "offer"
           },
           {
-            "aliases": [
-              "spawn"
-            ],
+            "aliases": [],
             "commands": [],
             "flags": [
               "at",

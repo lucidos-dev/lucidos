@@ -344,7 +344,7 @@ async fn arm_question_resume_sets_flag_on_live_session() {
             text: "Y".into(),
             image_hashes: vec![],
         },
-        false,
+        None,
     )
     .await;
     assert!(armed, "must report a live subprocess was armed");
@@ -376,7 +376,7 @@ async fn arm_question_resume_skips_exited_session() {
             text: "Y".into(),
             image_hashes: vec![],
         },
-        false,
+        None,
     )
     .await;
     assert!(!armed, "an exited subprocess must not be armed");
@@ -404,7 +404,7 @@ async fn arm_question_resume_skips_absent_session() {
             text: "Y".into(),
             image_hashes: vec![],
         },
-        false,
+        None,
     )
     .await;
     assert!(!armed, "an absent session must not be armed");
@@ -421,7 +421,7 @@ async fn arm_question_resume_skips_canceled_even_when_live() {
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
     let armed =
-        arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Canceled, false).await;
+        arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Canceled, None).await;
     assert!(!armed, "Canceled must never arm a resume");
     assert!(
         !sessions
@@ -447,7 +447,7 @@ async fn arm_question_resume_arms_superseded_on_live_session() {
     let sessions = Arc::new(tokio::sync::Mutex::new(map));
 
     let armed =
-        arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Superseded, false).await;
+        arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Superseded, None).await;
     assert!(
         armed,
         "a superseded session keeps running, so it must be armed"
@@ -483,14 +483,23 @@ async fn arm_question_resume_records_a_quiet_answer_on_a_live_session() {
             .get(&thread_id)
             .unwrap()
             .quiet_answer_pending
+            .clone()
     };
 
-    assert!(arm_question_resume_if_live(&sessions, thread_id, &pick, true).await);
-    assert!(quiet_pending().await, "a quiet pick must be recorded");
+    let quiet = QuietPick {
+        reply: Some("Left as is.".into()),
+    };
+    assert!(arm_question_resume_if_live(&sessions, thread_id, &pick, Some(quiet.clone())).await);
+    assert_eq!(
+        quiet_pending().await,
+        Some(quiet),
+        "a quiet pick must be recorded with its reply"
+    );
 
-    assert!(arm_question_resume_if_live(&sessions, thread_id, &pick, false).await);
-    assert!(
-        !quiet_pending().await,
+    assert!(arm_question_resume_if_live(&sessions, thread_id, &pick, None).await);
+    assert_eq!(
+        quiet_pending().await,
+        None,
         "a loud answer owes a reply, so it must clear the record"
     );
 }
@@ -2108,4 +2117,54 @@ fn a_card_with_one_working_option_keeps_its_quiet_one() {
     let parsed = stop_card(&["Save progress and stop", "[quiet] Just stop"]);
     check_quiet_options(&parsed).expect("one pick still needs the agent");
     check_quiet_options(&stop_card(&["Yes", "No"])).expect("no quiet option");
+}
+
+#[test]
+fn a_quiet_reply_on_a_working_option_is_refused() {
+    let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&serde_json::json!({
+        "questions": [{
+            "question": "Save where we are?",
+            "options": [
+                { "label": "Save it", "quiet_reply": "Saved." },
+                { "label": "Skip", "quiet": true, "quiet_reply": "Skipped." },
+            ],
+        }]
+    }));
+    let err = check_quiet_options(&parsed).unwrap_err().to_string();
+    assert!(err.contains("\"Save it\" has a quiet reply"), "{err}");
+}
+
+/// The reply is read from the stored options, so the answer carries none.
+#[test]
+fn a_quiet_pick_shows_the_reply_of_each_picked_option_in_option_order() {
+    let reply = |id: &str, text: Option<&str>| QuestionOption {
+        quiet: true,
+        quiet_reply: text.map(str::to_string),
+        ..opt(id, id)
+    };
+    let options = vec![
+        reply("opt-0", Some("First.")),
+        reply("opt-1", None),
+        reply("opt-2", Some("Third.")),
+        opt("opt-3", "Work"),
+    ];
+    let selected = |id: &str| AnswerKind::Selected {
+        option_id: id.into(),
+    };
+    let multi = |ids: &[&str]| AnswerKind::MultiSelected {
+        option_ids: ids.iter().map(|id| id.to_string()).collect(),
+        text: None,
+        image_hashes: vec![],
+    };
+    assert_eq!(
+        quiet_reply(&selected("opt-0"), &options).as_deref(),
+        Some("First.")
+    );
+    assert_eq!(quiet_reply(&selected("opt-1"), &options), None);
+    assert_eq!(
+        quiet_reply(&multi(&["opt-2", "opt-0", "opt-1"]), &options).as_deref(),
+        Some("First.\n\nThird.")
+    );
+    assert_eq!(quiet_reply(&multi(&["opt-0", "opt-3"]), &options), None);
+    assert_eq!(quiet_reply(&selected("opt-3"), &options), None);
 }

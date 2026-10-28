@@ -385,6 +385,10 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                                             "quiet": {
                                                 "type": "boolean",
                                                 "description": "True only when this pick needs no work from you (\"Not now\"); it ends your turn."
+                                            },
+                                            "quiet_reply": {
+                                                "type": "string",
+                                                "description": "Quiet options only: the fixed reply shown when picked."
                                             }
                                         },
                                         "required": ["label"]

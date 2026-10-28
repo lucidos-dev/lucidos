@@ -378,6 +378,25 @@ fn cron_deadline_uses_the_first_slot_after_the_cut_fire() {
     );
 }
 
+/// Stored crons use the standard day of week, where 0 is Sunday. The slot
+/// must match the scheduler's reading. Otherwise a weekday trigger cut on a
+/// Friday gets a Sunday deadline, and a Sunday-only trigger never retries.
+#[test]
+fn cron_deadline_reads_the_standard_day_of_week() {
+    let friday = "2026-10-23T09:00:00Z".parse().unwrap();
+    let mut config = test_config();
+    config.schedule = vec!["0 0 9 * * 1-5".into()];
+    assert_eq!(
+        next_slot(&config, friday).unwrap().unwrap(),
+        friday + chrono::Duration::days(3)
+    );
+    config.schedule = vec!["0 0 9 * * 0".into()];
+    assert_eq!(
+        next_slot(&config, friday).unwrap().unwrap(),
+        friday + chrono::Duration::days(2)
+    );
+}
+
 fn test_config() -> crate::triggers::TriggerConfig {
     crate::triggers::TriggerConfig::from_created_payload(&json!({
         "trigger_id": "cut-fire", "name": "Nightly report",

@@ -41,7 +41,8 @@ engine and the gateway (ADR 0063). The switch adopts all three, in this order:
    image performs the workspace restart.
 2. **The engine**, respawned by that gateway from the published binary.
 3. **The window**, which follows the engine it shows. Once that engine started
-   after the published window binary, the window re-execs onto it.
+   after the published window binary, the window exits and `tauri-dev.sh`
+   starts that binary on the page the window showed.
 
 `tauri-dev.sh` no longer runs `cargo tauri dev`. It builds and publishes the
 window binary, then runs that binary in the foreground. No file watcher
@@ -59,9 +60,14 @@ restarts the window, and `crates/.taurignore` is gone.
 - **Gateway first gives a clean order.** The window relaunches only on seeing
   the new engine, and only the new gateway can show it the new engine. No
   window loads against a gateway that is about to re-exec.
-- **It reuses what exists.** The window already re-execs itself in place
-  (`restart_process` in `lib.rs`). The gateway already re-execs in place
+- **It reuses what exists.** The gateway already re-execs in place
   (`reload_gateway`). The build already publishes atomically into `.launch/`.
+- **The window relaunches as a new process, never an exec in place.** The
+  first version re-exec'd the window like the gateway. On macOS, a GUI app that
+  execs itself is registered again with pid -1. Rectangle and other window
+  managers then lost the window after the first switch. The window now hands
+  the page to the launcher through `LUCIDOS_DEV_WINDOW_RELAUNCH_FILE` and exits
+  (`run_dev_window` in `scripts/lib/workspace.sh`).
 - **ADR 0021 still holds.** `tauri-dev.sh` keeps refusing a worktree, and a
   worktree never has a published window binary, so its builds never compile
   the app.

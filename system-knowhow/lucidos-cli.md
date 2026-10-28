@@ -1952,7 +1952,7 @@ The card prints this thread's implementer and the ladder with this thread's rung
 
 ### `lucidos successor start --narrative <file>`
 
-Continue this thread in a *successor session*: a fresh session in this same thread, with a clean context. Use it when the user says "handoff this session" or picks an `Implement in a fresh session` option. In a Lucidos thread, advice from anywhere to run `/clear` or to write a handoff file means this too. Wraps `POST /api/v1/threads/:id/successor` for `$LUCIDOS_THREAD_ID`. `spawn` still runs as an alias of `start`, for flows written before the rename.
+Continue this thread in a *successor session*: a fresh session in this same thread, with a clean context. Use it when the user says "handoff this session" or picks an `Implement in a fresh session` option. In a Lucidos thread, advice from anywhere to run `/clear` or to write a handoff file means this too. Wraps `POST /api/v1/threads/:id/successor` for `$LUCIDOS_THREAD_ID`.
 
 1. **Write a *handoff narrative*** to a file outside the repo. It needs one markdown heading for each of: Outcomes, Decisions, Gotchas, State, Next step, Files. The engine names any it lacks and refuses the handoff.
 2. **Run the command, then end your turn.** The successor session starts in this thread once the turn ends, and reads the narrative first.

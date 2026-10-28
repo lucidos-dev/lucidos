@@ -65,6 +65,7 @@ impl NoDecisions {
                     preview: None,
                     widget: None,
                     quiet: false,
+                    quiet_reply: None,
                 }],
                 false,
                 false,
@@ -3596,6 +3597,7 @@ fn asks_the_caller() -> ThreadEvent {
                 preview: None,
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             },
             QuestionOption {
                 id: "opt-1".to_string(),
@@ -3604,6 +3606,7 @@ fn asks_the_caller() -> ThreadEvent {
                 preview: None,
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             },
         ],
         worktree_path: None,
@@ -3980,6 +3983,7 @@ fn the_choices_are_read_out_with_the_ids_that_settle_them() {
         preview: None,
         widget: None,
         quiet: false,
+        quiet_reply: None,
     }];
     let single = decision_to_ask(
         &OpenDecision::question("toolu_q0", "Ready?", &one, false, false),

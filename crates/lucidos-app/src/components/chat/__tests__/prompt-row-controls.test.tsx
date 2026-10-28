@@ -1,8 +1,9 @@
-/** The composer row's order, which is also its fold order.
+/** The composer row's order and its fold order.
  *
- *  The fold takes a prefix, so the leftmost member folds first. The user asked
- *  for the Claude menu and attach image to fold before the model picker. They
- *  also asked that a fold follow the order the row is arranged in.
+ *  The fold takes a prefix of the fold order. That follows the row left to
+ *  right, except that todo and waiting fold first: the toggles keep their slots.
+ *  The user asked for the Claude menu and attach image to fold before the model
+ *  picker. The WIP preview toggle keeps its place in the order.
  *
  *  Plan: `docs/plans/2026-10-21-coding-agent-menu-folds-before-the-model-picker.md`. */
 import { describe, expect, it, vi } from 'vitest';
@@ -25,18 +26,22 @@ const spec = (key: string): HeaderActionSpec => ({ key, label: key, icon: () => 
 const members = (codingAgent: boolean, hasText = true) => composerRowMembers({
   codingAgentMenu: codingAgent ? codingAgentMenuAction('claude-code') : null,
   attachImage: spec('attach-image'),
-  readouts: [spec('todo-indicator'), spec('waiting'), spec('wip')],
+  readouts: [spec('todo-indicator'), spec('waiting')],
+  wipPreview: spec('wip'),
   clearDraft: hasText ? spec('prompt-clear') : null,
   toggles: [spec('call-toggle'), spec('follow-live-edge'), spec('side-question')],
   situational: [spec('thread-diff'), spec('standing-apply')],
   rung: spec(RUNG_FOLD_KEY),
 });
 
-/** Left to right, which is the order the fold takes them in. */
+/** Left to right, as the row draws them. */
 const order = (codingAgent: boolean) => {
   const { row, cluster } = members(codingAgent);
   return [...row, ...cluster].map((a) => a.key);
 };
+
+/** The order the fold takes them in. */
+const foldOrder = (codingAgent: boolean) => members(codingAgent).foldOrder.map((a) => a.key);
 
 describe('the composer row order', () => {
   it('runs from the toggles to the model picker, as arranged', () => {
@@ -47,10 +52,29 @@ describe('the composer row order', () => {
     ]);
   });
 
+  it('folds todo and waiting first, then the rest as arranged', () => {
+    expect(foldOrder(true)).toEqual([
+      'todo-indicator', 'waiting',
+      'call-toggle', 'follow-live-edge', 'side-question', CODING_AGENT_MENU_FOLD_KEY,
+      'attach-image', 'wip', 'prompt-clear',
+      'thread-diff', 'standing-apply', RUNG_FOLD_KEY,
+    ]);
+  });
+
+  it('folds todo and waiting before the follow and side-question toggles', () => {
+    for (const codingAgent of [false, true]) {
+      const keys = foldOrder(codingAgent);
+      for (const readout of ['todo-indicator', 'waiting']) {
+        expect(keys.indexOf(readout)).toBeLessThan(keys.indexOf('follow-live-edge'));
+        expect(keys.indexOf(readout)).toBeLessThan(keys.indexOf('side-question'));
+      }
+    }
+  });
+
   /** The picker holds its spot: what comes and goes stands left of it, so it
    *  folds first and never pushes the picker. */
   it('folds Diff and the standing apply before the model picker', () => {
-    const keys = order(true);
+    const keys = foldOrder(true);
     expect(keys.indexOf('thread-diff')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
     expect(keys.indexOf('standing-apply')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
   });
@@ -58,7 +82,7 @@ describe('the composer row order', () => {
   /** It reads no thread state, so this holds in compose context and in a
    *  started thread alike. */
   it('folds the Claude menu and attach image before the model picker', () => {
-    const keys = order(true);
+    const keys = foldOrder(true);
     expect(keys.indexOf(CODING_AGENT_MENU_FOLD_KEY)).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
     expect(keys.indexOf('attach-image')).toBeLessThan(keys.indexOf(RUNG_FOLD_KEY));
   });

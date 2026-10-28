@@ -5,7 +5,7 @@ import { invoke } from '../../utils/tauri';
 
 /** Tell the desktop shell when the engine this page shows started, so a
  *  development window can follow a switch to a new version (ADR 0461). The
- *  shell decides whether to re-exec onto a newer window binary, and a packaged
+ *  shell decides whether to relaunch on a newer window binary, and a packaged
  *  window never does. Every start goes through, including the first, so a
  *  reload or a switch from another device reaches the same answer. Returns the
  *  teardown. */

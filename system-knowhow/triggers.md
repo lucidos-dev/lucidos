@@ -723,7 +723,7 @@ Groups are orthogonal to `app_id`: an app-owned trigger can live in any group. `
 
 ## Side-effect grant: authorizing unattended risk
 
-This matters **only when the workspace has the command guard on** (Settings → Permissions → Command safety; off by default). The guard then classifies every `run_bash` / `run_python` command a trigger's intent runs. Most commands (reads, data crunching, downloads, writes inside the workspace) run untouched. An **irreversible** one is gated: sending email, a mutating HTTP request (POST/PUT/DELETE), a cloud-CLI change (`gh`/`aws`/`gcloud`), destroying files outside the workspace.
+This matters **only when the workspace has the command guard on** (Settings → Permissions → Command safety; off by default). The guard then classifies every `run_bash` / `run_python` command a trigger's intent runs. Most commands (reads, data crunching, downloads, writes inside the workspace) run untouched. An **irreversible** one is gated: sending email, a mutating HTTP request (POST/PUT/DELETE), a cloud-CLI change (`gh`/`aws`/`gcloud`), destroying files outside the workspace. A request that sends a local file or an environment variable (`curl -H @file`, `--url-query @file`, `--variable`) counts as mutating HTTP too.
 
 A chat turn would *ask* the user to approve such a command, but a trigger fires with nobody to ask. So the trigger carries a **side-effect grant**: the irreversible side-effect categories it is pre-authorized to perform. At fire time:
 
@@ -742,7 +742,7 @@ A `gh` read such as `gh run view` or `gh pr checks` is not a cloud-CLI side effe
 - an irreversible side-effect is allowed only if its category is in the grant;
 - a catastrophic command is always denied.
 
-The chat command guard fails the *whole* run on an ungranted side-effect, but this path denies just the one request. The agent gets the denial and works around it or reports the step failed. This holds whatever the command safety toggle says. So a coding-agent trigger that needs a mutating HTTP call still needs **Call external APIs** ticked. Otherwise that one call is denied, and the rest of the run proceeds. See `coding-agent-events.md` § "Unattended auto-resolution".
+The chat command guard fails the *whole* run on an ungranted side-effect, but this path denies just the one request. The agent gets the denial and works around it or reports the step failed. This holds whatever the command safety toggle says. So a coding-agent trigger that needs an external API call still needs **Call external APIs** ticked. Otherwise that one call is denied, and the rest of the run proceeds. See `coding-agent-events.md` § "Unattended auto-resolution".
 
 The flow follows child spawns only. A top spawn, by `spawn_thread` with `relation: "top"` or by `lucidos spawn-thread` without `--relation child`, is independent of the trigger: its cards wait for a human. Spawn the coding agent as a child when the run must finish unattended. A spawn into another workspace is always a top spawn, so it always asks.
 

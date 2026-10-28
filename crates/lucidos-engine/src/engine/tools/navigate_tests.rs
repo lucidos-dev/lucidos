@@ -91,6 +91,7 @@ async fn answer_from(bus: &EventBus, thread_id: Uuid, from: &str) {
                 preview: None,
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             }],
             worktree_path: None,
             multi_select: false,

@@ -108,10 +108,10 @@ describe('the composer has one control on its right edge', () => {
     expect(at('<OverflowMenu')).toBeLessThan(at('<div class="prompt-actions-right">'));
   });
 
-  // The fold takes a prefix of the same list the row renders. So the ⋯ always
-  // holds the leftmost members, and it stands first, where they were.
-  it('renders the row from the list the fold takes its prefix of', () => {
-    expect(promptSource).toContain('const foldActions = [...members.row, ...members.cluster];');
+  // The fold takes a prefix of `composerRowMembers`' fold order, and the row
+  // renders its own order. The ⋯ stands first, left of every standing member.
+  it('folds from the fold order and renders the row order', () => {
+    expect(promptSource).toContain('const foldActions = members.foldOrder;');
     expect(at('<OverflowMenu')).toBeLessThan(at('{members.row.map(renderMember)}'));
     expect(at('{members.row.map(renderMember)}')).toBeLessThan(at('<div class="prompt-actions-right">'));
   });

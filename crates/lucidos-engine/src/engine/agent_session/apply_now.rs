@@ -200,7 +200,7 @@ pub(crate) fn send_awaited_prompt(
 ///
 /// A turn already running when the prompt was sent ends first, and does not
 /// answer it (ADR 0268). A session that ends first drops the sender.
-async fn wait_for_prompt_turn(
+pub(crate) async fn wait_for_prompt_turn(
     answered: tokio::sync::oneshot::Receiver<InputAnswered>,
     context: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -567,7 +567,6 @@ impl LucidosEngine {
     }
 
     /// Inner implementation for apply_now — runs in a background task.
-    #[allow(clippy::too_many_arguments)]
     async fn apply_now_inner(
         self: &Arc<Self>,
         thread_id: Uuid,
@@ -1043,7 +1042,6 @@ impl LucidosEngine {
     /// Fast path: try ff directly. If main diverged, send CC a single prompt
     /// to merge, resolve conflicts, harden, and test — then ff again.
     /// Returns (pre_sha, post_sha) on success.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn merge_via_cc_session(
         &self,
         thread_id: Uuid,
@@ -1076,7 +1074,6 @@ impl LucidosEngine {
     /// Tier-1 path can run the fast ff inline (synchronous, sub-second) and
     /// hand only this slow half to a background task — keeping the parent
     /// thread's turn free instead of blocking it for the whole resolution.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn cc_assisted_merge_then_ff(
         &self,
         thread_id: Uuid,

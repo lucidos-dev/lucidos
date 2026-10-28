@@ -16,7 +16,7 @@ import { cssRules } from './css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const RULES = cssRules(readFileSync(resolve(here, '../panels/shell.css'), 'utf8'));
-const COLUMN = '.content-pane-body:has(> .content-view.active:not(.content-view-full-bleed), > .panel-content)';
+const COLUMN = '.content-pane-body:has(> :not(.content-view-full-bleed))';
 
 function prop(selector: string, name: string): string | undefined {
   return RULES.find(r => r.selector === selector && r.props.has(name))?.props.get(name);

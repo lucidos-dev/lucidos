@@ -98,10 +98,10 @@
 
 /* ===== Inline Form (panel pane forms) ===== */
 
+/* Flows in the scrolling pane like every column view. The content column sets
+   the space above it, and the end space the room below. */
 .inline-form {
-    padding: var(--space-lg);
-    overflow-y: auto;
-    height: 100%;
+    padding-inline: var(--space-lg);
 }
 
 /* ===== Email confirm modal ===== */
@@ -367,15 +367,11 @@
 
 /* Shared by the install and uninstall panels and both receipts. One column,
    with the confirm panels' actions in the header, above lists that start
-   folded. Centred on the Plugins view's own text column: that view is
-   capped at --content-max-width and insets its rows by the --space-lg gutter,
-   which .inline-form's padding already supplies here. */
+   folded. */
 .plugin-install-panel {
     display: flex;
     flex-direction: column;
     gap: var(--space-md);
-    max-width: calc(var(--content-max-width) - 2 * var(--space-lg));
-    margin-inline: auto;
 }
 
 /* Actions sit top right at every width. The text keeps at least its
@@ -1016,7 +1012,7 @@
    and video, the README, and what was left out. */
 .plugin-detail {
     container-type: inline-size;
-    padding: var(--space-lg);
+    padding-inline: var(--space-lg);
 }
 
 /* Inside the loading fade's wrapper, so the gap reaches each section. */

@@ -1,7 +1,9 @@
 import type { Ref, VNode } from 'preact';
-import { useRef } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { startThisWorkspace } from '../../store/actions/workspace-start';
 import { connectionStatus, visibleWorkspaceName } from '../../store/store';
 import type { ConnectionStatus } from '../../store/types';
+import { WORKSPACE_ID } from '../../utils/basePath';
 import { connectionNotice, hasConnectionNotice } from '../../utils/connectionNotice';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -51,13 +53,16 @@ export function shouldRenderConnectionBanner(opts: {
  *  flex child the shell (and the mobile header) lays out is the same box the
  *  ResizeObserver measures.
  *
- *  A STATEMENT, not a control. There is nothing to press: the sentence is the
- *  whole message, the menu notice it shares its words with is a statement for
- *  the same reason, and neither remedy in the menu can fix a disconnect anyway
- *  (see `connectionNotice`). It is not dismissable either, which is the
- *  difference between this and the backup reminder: that one stays true until
- *  the user acts, so it needs a way out, while this one retracts itself on the
- *  next good poll and a dismissal would only hide a live fault.
+ *  A STATEMENT, except while the workspace is `stopped`. For a disconnect there
+ *  is nothing to press: the sentence is the whole message. The menu notice that
+ *  shares its words is a statement for the same reason. Neither remedy in the
+ *  menu can fix a disconnect anyway (see `connectionNotice`). A stopped
+ *  workspace has no retry coming, so the bar carries the one action that ends
+ *  it: Start, given as `onStart`.
+ *
+ *  It is not dismissable either. The backup reminder stays true until the user
+ *  acts, so it needs a way out. This bar retracts itself on the next good poll,
+ *  and a dismissal would hide a live fault.
  *
  *  `role="status"` rather than `alert`: the state is already announced by the
  *  mark's accessible name, and this is polite news about a condition, not an
@@ -67,6 +72,11 @@ export function connectionBannerBody(props: {
   layout: BannerLayout;
   status: ConnectionStatus;
   workspace: string | null;
+  /** Start the workspace, offered only while it is `stopped`. Absent in a window
+   *  with no gateway, which has no stopped state and nothing to start it. */
+  onStart?: () => void;
+  /** A Start is in flight: the button stays, disabled, so it cannot double-fire. */
+  starting?: boolean;
   elRef?: Ref<HTMLDivElement>;
 }): VNode | null {
   // The one surface that takes the FULL detail. It spans the window, so both
@@ -86,6 +96,11 @@ export function connectionBannerBody(props: {
       <span class="connection-banner-text">
         <b>{notice.title}</b>{' '}{notice.detail}
       </span>
+      {props.status === 'stopped' && props.onStart && (
+        <button class="action-btn" onClick={props.onStart} disabled={props.starting}>
+          {props.starting ? 'Starting…' : 'Start'}
+        </button>
+      )}
     </div>
   );
 }
@@ -116,6 +131,12 @@ export function ConnectionBanner({ layout }: { layout: BannerLayout }) {
   const ref = useRef<HTMLDivElement>(null);
   const status = connectionStatus.value;
   const connectingSettled = useDelayedFlag(status === 'connecting', CONNECTING_QUIET_MS);
+  const [starting, setStarting] = useState(false);
+  // The bar leaves `stopped` once the engine boots, and a Start that did not
+  // take effect must offer itself again the next time it appears.
+  useEffect(() => {
+    if (status !== 'stopped') setStarting(false);
+  }, [status]);
   const show = shouldRenderConnectionBanner({
     layout,
     mobileViewport: viewportIsMobile.value,
@@ -127,10 +148,21 @@ export function ConnectionBanner({ layout }: { layout: BannerLayout }) {
 
   if (!show) return null;
 
+  const workspaceId = WORKSPACE_ID;
+  const onStart = workspaceId === null ? undefined : () => {
+    if (starting) return;
+    setStarting(true);
+    void startThisWorkspace(workspaceId).then((started) => {
+      if (!started) setStarting(false);
+    });
+  };
+
   return connectionBannerBody({
     layout,
     status,
     workspace: visibleWorkspaceName.value,
+    onStart,
+    starting,
     elRef: ref,
   });
 }

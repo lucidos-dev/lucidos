@@ -75,6 +75,21 @@ Each agent prompt must be **self-contained** (agents have no conversation contex
    (if no issues found)
    ```
 
+### End-of-pass handoff checkpoint
+
+Wait for all eight module agents to finish before collecting their results one chunk at a time.
+After collecting each chunk's audit pass, run
+`lucidos successor offer --at harden-project-pass --progress <done>/<total>` and follow what it prints.
+Here, `<done>` counts chunks whose results you collected; `<total>` is the eight chunks listed above.
+This checkpoint is automatic and asks the user nothing.
+
+On a handoff, write the narrative and run `lucidos successor start` with the flags the checkpoint prints.
+Quote the remaining checkpoint instructions in the narrative, including this command and its progress definition.
+Record the checklists, collected results, outstanding chunks, uncommitted fixes, cross-module findings, and remaining phases.
+End your turn after starting the successor session.
+The successor resumes with the next uncollected chunk, without relaunching agents or repeating the checkpoint that started it.
+After collecting all eight results, continue with Phase 3.
+
 ## Phase 3: Cross-Module Sweep
 
 After all 8 module agents complete, launch ONE agent to find cross-module issues:

@@ -1,7 +1,8 @@
 import { useState } from 'preact/hooks';
-import { activeInlineForm } from '../../store/store';
+import { activeInlineForm, appsList } from '../../store/store';
 import type { PluginInstallForm } from '../../store/store';
-import type { PluginInstallRequest, PluginLocalChangeOutcome } from '../../store/types';
+import type { App, Loadable, PluginInstallRequest, PluginLocalChangeOutcome } from '../../store/types';
+import { openAppById } from '../../store/actions/apps';
 import {
   cancelPluginInstallAction,
   confirmPluginInstallAction,
@@ -269,15 +270,34 @@ function SetupStepsSection({ setup, request, note }: {
   );
 }
 
+/** The apps an install wrote, as `{ id, name }`, read off each
+ *  `apps/<id>/` path. Once the apps list is loaded it also drops what it does
+ *  not hold, such as a widget, and supplies the display name. Before that, the
+ *  id stands in and `openAppById` loads the list on click. */
+export function installedApps(
+  files: string[],
+  apps: Loadable<App[]>,
+): { id: string; name: string }[] {
+  const ids = [...new Set(files.flatMap((f) => {
+    const m = /^apps\/([^/]+)\//.exec(f);
+    return m ? [m[1]] : [];
+  }))];
+  if (apps.status !== 'loaded') return ids.map((id) => ({ id, name: id }));
+  return ids.flatMap((id) => {
+    const app = apps.data.find((a) => a.id === id);
+    return app ? [{ id, name: app.name }] : [];
+  });
+}
+
 /** The panel after a confirmed install: a read-only record of what the engine
  *  actually wrote, holding the nav-history slot the pending confirm had (see
  *  `markPluginInstalled`). The list comes off the receipt marker, not off
  *  `request.files`, which was only what the install *would* write.
  *
- *  Deliberately offers NO buttons at all. Install and Cancel are gone because
- *  the files have landed and the staged `install_id` is popped. Close is gone
- *  because a receipt is a page in the nav history. The header's back arrow is
- *  how you leave it, same as any other panel page.
+ *  Its header buttons open the apps the plugin installed. Install and Cancel are
+ *  gone because the files have landed and the staged `install_id` is popped.
+ *  Close is gone because a receipt is a page in the nav history. The header's
+ *  back arrow is how you leave it, same as any other panel page.
  *
  *  The plugin's setup steps stay on it, folded, as a record of what the setup
  *  thread works through.
@@ -289,6 +309,21 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
   const req = form.request;
   const installed = form.installed!;
   const local = installed.local_changes;
+  const apps = installedApps(installed.installed_files, appsList.value);
+  const actions = apps.length > 0 ? (
+    <div class="plugin-install-actions">
+      {apps.map((app) => (
+        <button
+          key={app.id}
+          type="button"
+          class="action-btn"
+          onClick={() => void openAppById(app.id, `the ${req.plugin_name} install receipt`)}
+        >
+          {apps.length === 1 ? 'Open app' : `Open ${app.name}`}
+        </button>
+      ))}
+    </div>
+  ) : undefined;
   return (
     <div class="inline-form protected-surface">
       <div class="plugin-install-panel">
@@ -298,6 +333,7 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
           name: req.plugin_name,
           version: req.plugin_version,
           description: installed.summary,
+          actions,
         })}
 
         {local && (

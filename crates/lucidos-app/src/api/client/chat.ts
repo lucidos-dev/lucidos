@@ -1,6 +1,6 @@
 import { toFailed } from '../../store/types';
 import { HEALTH_PROBE_TIMEOUT_MS } from '../../store/store';
-import { API, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from './_core';
+import { API, ApiError, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from './_core';
 import type { DiffFile } from '../../store/store';
 import type { AnswerKind, AllowScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
@@ -43,20 +43,26 @@ export interface HealthInfo {
   database_pool_exhausted?: boolean;
 }
 
+/** What a health probe found: the engine's answer, a failure, or the gateway
+ *  saying it stopped this workspace. `stopped` is not a failure to retry: no
+ *  engine exists until somebody starts it. */
+export type HealthProbe = Loadable<HealthInfo> | { status: 'stopped' };
+
 /** Probe `/api/v1/health`. Failed without `httpCode` = transport unreachable;
- *  with `httpCode` = engine answered non-2xx. The connection watchdog only
- *  reads `loaded` vs `failed` today, but downstream telemetry / smarter
- *  recovery can branch on the discriminator without another round-trip.
+ *  with `httpCode` = engine answered non-2xx. `stopped` = the gateway reports
+ *  the workspace as stopped. The connection watchdog branches on the
+ *  discriminator without another round-trip.
  *
  *  Its own deadline rather than the shared 10s default, because this probe's
  *  latency IS its answer and it has to answer before the next poll: see
  *  `HEALTH_PROBE_TIMEOUT_MS` for why that number is what it is. The service
  *  worker leaves this endpoint alone (`public/sw.js`) so the whole budget
  *  belongs to one attempt. */
-export async function checkHealth(): Promise<Loadable<HealthInfo>> {
+export async function checkHealth(): Promise<HealthProbe> {
   try {
     return { status: 'loaded', data: await json<HealthInfo>(`${API}/health`, undefined, HEALTH_PROBE_TIMEOUT_MS) };
   } catch (err) {
+    if (err instanceof ApiError && err.workspaceStopped) return { status: 'stopped' };
     return toFailed<HealthInfo>(err);
   }
 }

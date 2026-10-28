@@ -104,6 +104,29 @@ fn default_context_role() -> ContextRole {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_quiet_reply_replaces_the_agents_result_text() {
+        let pick = |reply: Option<&str>| {
+            Some(QuietPick {
+                reply: reply.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            QuietPick::terminal_text(pick(Some("Done.")), "ok", true),
+            "Done."
+        );
+        assert_eq!(QuietPick::terminal_text(pick(None), "ok", true), "ok");
+        assert_eq!(QuietPick::terminal_text(None, "ok", true), "ok");
+    }
+
+    #[test]
+    fn a_stopped_or_aborted_turn_keeps_its_own_text_over_the_quiet_reply() {
+        let pick = Some(QuietPick {
+            reply: Some("Done.".to_string()),
+        });
+        assert_eq!(QuietPick::terminal_text(pick, "partial", false), "partial");
+    }
+
     /// Rows a retired purpose wrote still read, and still write back the same
     /// purpose a cost filter matches on. The literals pin the stored wire form.
     #[test]
@@ -656,6 +679,23 @@ pub enum SessionPhase {
     },
 }
 
+/// A *quiet pick* that ends a live turn, with the *quiet reply* the turn ends
+/// on when the picked option carries one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuietPick {
+    pub reply: Option<String>,
+}
+
+impl QuietPick {
+    /// The text a turn ends on. A turn that completed ends on the pick's
+    /// *quiet reply*. A stopped, aborted or failed one keeps its own text.
+    pub fn terminal_text(pick: Option<Self>, result_text: &str, turn_completed: bool) -> String {
+        pick.filter(|_| turn_completed)
+            .and_then(|pick| pick.reply)
+            .unwrap_or_else(|| result_text.to_string())
+    }
+}
+
 /// State for a single active coding-agent session.
 ///
 /// **Single agent per thread — deliberate.** The owning HashMap is keyed by
@@ -854,10 +894,10 @@ pub struct AgentSession {
     /// hook; default `false` so a genuine trailing straggler still drops. See
     /// docs/plans/2026-06-27-cc-question-answer-resume-straggler-drop.md.
     pub question_resume_pending: bool,
-    /// The answer that woke this live turn picked only *quiet options*, so the
-    /// agent ends the turn without a reply. The run loop takes it at the turn's
-    /// `Result`, where an empty reply then counts as finished, not failed.
-    pub quiet_answer_pending: bool,
+    /// The answer that woke this live turn was a *quiet pick*. The run loop
+    /// takes it at the turn's `Result`: the turn ends on the pick's *quiet
+    /// reply* when it has one, and an empty reply counts as finished.
+    pub quiet_answer_pending: Option<QuietPick>,
     /// Paired ToolCalled / ToolResult counter, mirrored from the local
     /// counter inside `run_session`. Read by the external watchdog
     /// (`external_watchdog::tick`) — which lives outside `run_session`'s
@@ -1014,7 +1054,7 @@ impl AgentSession {
             reasoning_effort_in_force: None,
             last_event_at: Arc::new(AtomicI64::new(0)),
             question_resume_pending: false,
-            quiet_answer_pending: false,
+            quiet_answer_pending: None,
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             question_flushes: Default::default(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,

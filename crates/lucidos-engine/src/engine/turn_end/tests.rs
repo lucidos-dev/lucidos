@@ -781,6 +781,7 @@ fn asked(tool_use_id: &str, question: &str, options: &[(&str, &str)]) -> ThreadE
                 preview: None,
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             })
             .collect(),
         worktree_path: None,

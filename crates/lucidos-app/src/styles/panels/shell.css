@@ -157,7 +157,8 @@
     background: color-mix(in srgb, var(--accent-red) var(--banner-tint-strength), var(--bg-secondary));
 }
 
-.connection-banner[data-conn='connecting'] {
+.connection-banner[data-conn='connecting'],
+.connection-banner[data-conn='stopped'] {
     background: color-mix(in srgb, var(--accent-yellow) var(--banner-tint-strength), var(--bg-secondary));
 }
 
@@ -171,6 +172,20 @@
     height: var(--connection-banner-dot);
     align-self: flex-start;
     margin-top: calc((1em * var(--banner-line-height) - var(--connection-banner-dot)) / 2);
+}
+
+/* The Start button, shown only while stopped. The shared banner button size
+   restated through the bar's own tunables, which the style remote can reach.
+   It keeps its width against a wrapping sentence, as the other banners' do. */
+.connection-banner .action-btn {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    min-height: var(--connection-banner-button-height);
+    padding: 0 var(--connection-banner-button-inset);
+    border-radius: var(--radius-control);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
 }
 
 /* Takes the slack, and wraps rather than truncating: this is the whole message,
@@ -245,7 +260,8 @@
    Both bars, one rule, for the reason the grouped rules above are grouped.
    The backup reminder is NOT here: its trailing X is a dismiss. Sent down to
    a row of actions, a dismiss reads as a third action. The connection bar
-   carries no control at all, so its sentence already spans the bar.
+   carries a control only while stopped, and keeps its sentence beside its
+   leading dot, which a full-width basis would strand on a line of its own.
 
    Stacked, the shared --space-md gap reads as a hole between the sentence and
    its own button, so the row gap alone is tighter. */
@@ -585,7 +601,7 @@
    column sideways. Both declarations are needed: WebKit reserves only once a
    scrollbar is drawn. The idle track paints `--bg-primary`, so an empty gutter
    is invisible. A full-bleed view keeps its right edge. */
-.content-pane-body:has(> .content-view.active:not(.content-view-full-bleed), > .panel-content) {
+.content-pane-body:has(> :not(.content-view-full-bleed)) {
     overflow-y: scroll;
     scrollbar-gutter: stable;
 }
@@ -2079,6 +2095,12 @@
 
 .status-dot.disconnected {
     background: var(--accent-red);
+}
+
+/* A deliberate stop is no fault, so the muted base is the right dot. Named so
+   the rule is explicit and the class never reads as an omission. */
+.status-dot.stopped {
+    background: var(--text-muted);
 }
 
 /* --- The desktop brand label: the Lucidos mark and the workspace name --- */

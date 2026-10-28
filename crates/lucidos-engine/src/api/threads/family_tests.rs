@@ -889,6 +889,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
                 preview: None,
                 widget: None,
                 quiet: false,
+                quiet_reply: None,
             }],
             worktree_path: None,
             multi_select: false,

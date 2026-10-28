@@ -158,12 +158,17 @@ describe('the bar states each thing once', () => {
   });
 
   it('washes each degraded state in the colour its dot already carries', () => {
-    const wash = (status: string) =>
-      decl(block(shellCss, `.connection-banner[data-conn='${status}'] {`), 'background') ?? '';
-    expect(wash('disconnected')).toContain('var(--accent-red)');
-    expect(wash('connecting')).toContain('var(--accent-yellow)');
-    for (const status of ['disconnected', 'connecting']) {
-      expect(wash(status), 'the wash strength is a shared token, not a per-bar guess')
+    // `stopped` shares the amber rule: a deliberate stop is no fault, so it takes
+    // the in-between colour rather than the red of a settled disconnect.
+    const wash = (selector: string) => decl(block(shellCss, `${selector} {`), 'background') ?? '';
+    const washes: Record<string, string> = {
+      disconnected: wash(`.connection-banner[data-conn='disconnected']`),
+      connecting: wash(`.connection-banner[data-conn='connecting'],\n.connection-banner[data-conn='stopped']`),
+    };
+    expect(washes.disconnected).toContain('var(--accent-red)');
+    expect(washes.connecting).toContain('var(--accent-yellow)');
+    for (const [status, value] of Object.entries(washes)) {
+      expect(value, `${status}: the wash strength is a shared token, not a per-bar guess`)
         .toContain('var(--banner-tint-strength)');
     }
   });

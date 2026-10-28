@@ -235,6 +235,9 @@ html {
        shared `.status-dot` scale carries colour only: every host sizes its own
        (see `--brand-menu-notice-dot`, the same dot inside the Lucidos menu). */
     --connection-banner-dot: 0.5rem;
+    /* The bar's Start button, sized as the other banners' buttons are. */
+    --connection-banner-button-height: 1.75rem;
+    --connection-banner-button-inset: 0.75rem;
     /* Height of the desktop transcript's top fade (the mask that dissolves
        messages as they scroll up under the thread title header — see
        .thread-content in chat/input-messages.css). Shared so the deep-link /

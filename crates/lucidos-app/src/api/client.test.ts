@@ -209,6 +209,25 @@ describe('checkHealth returns a discriminated Loadable shape', () => {
     }
   });
 
+  it('returns stopped when the gateway marks its 503 as a stopped workspace', async () => {
+    mockFetch.mockResolvedValueOnce(new Response("workspace 'dev' is stopped", {
+      status: 503,
+      headers: { 'x-lucidos-workspace-state': 'stopped' },
+    }));
+
+    expect(await checkHealth()).toEqual({ status: 'stopped' });
+  });
+
+  it('does not read an unmarked 503 as stopped', async () => {
+    // A booting engine and a gateway that predates the marker both answer a
+    // plain 503. Neither is a verdict that nothing is coming.
+    mockFetch.mockResolvedValueOnce(new Response('booting', { status: 503 }));
+
+    const result = await checkHealth();
+
+    expect(result.status).toBe('failed');
+  });
+
   it('transport failure and HTTP failure are distinguishable to the caller', async () => {
     mockFetch.mockRejectedValueOnce(new TypeError('Failed to fetch'));
     const transport = await checkHealth();

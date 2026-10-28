@@ -219,6 +219,90 @@ pub fn redact_subprocess_output(text: &str, secrets: &[String]) -> String {
     )))
 }
 
+/// Words that mark a flag, query key or header as carrying a secret. Matched
+/// anywhere in the uppercased name, unlike [`SECRET_NAME_SUFFIXES`]: a flag
+/// fuses its words (`--apikey`), and a suffix's `PAT` would hit `--path`.
+const SECRET_ARG_NAME_WORDS: &[&str] = &[
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+];
+
+fn is_secret_arg_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    SECRET_ARG_NAME_WORDS.iter().any(|word| name.contains(word))
+}
+
+/// Whether `arg` is a flag naming a secret that its next argument carries.
+fn is_secret_flag(arg: &str) -> bool {
+    arg.starts_with('-') && !arg.contains('=') && is_secret_arg_name(arg.trim_start_matches('-'))
+}
+
+/// The secrets inside one argument: any URL credential, a secret-named
+/// header's value, and the value of a secret-named `--flag=`, env assignment
+/// or URL query key. A header may also sit after a `--flag=`.
+fn named_secret_values(arg: &str) -> impl Iterator<Item = String> + '_ {
+    static USERINFO: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"[A-Za-z][A-Za-z0-9+.-]*://([^/?#@\s]+)@")
+            .expect("URL credential regex must compile")
+    });
+    static HEADER: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^([A-Za-z][A-Za-z0-9-]*)\s*:\s*(\S.*)$")
+            .expect("header regex must compile")
+    });
+    static PAIR: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?:^-{0,2}|[?&;])([A-Za-z_][A-Za-z0-9_.-]*)=([^&;#\s]*)")
+            .expect("argv pair regex must compile")
+    });
+    let userinfo = USERINFO.captures_iter(arg).map(|caps| caps[1].to_string());
+    let flag_value = arg
+        .starts_with('-')
+        .then(|| arg.split_once('=').map(|(_, value)| value))
+        .flatten();
+    let headers = std::iter::once(arg)
+        .chain(flag_value)
+        .filter_map(|text| HEADER.captures(text))
+        .filter(|caps| is_secret_arg_name(&caps[1]))
+        .map(|caps| caps[2].to_string());
+    let pairs = PAIR
+        .captures_iter(arg)
+        .filter(|caps| is_secret_arg_name(&caps[1]))
+        .map(|caps| caps[2].to_string());
+    userinfo.chain(headers).chain(pairs)
+}
+
+/// The secret values an argument vector carries, ready for
+/// [`redact_subprocess_output`]: each argument after a secret flag
+/// (`--api-key sk-…`), plus each argument's [`named_secret_values`].
+///
+/// A flag never counts as a value, since a secret-named flag may take none.
+/// Like any guessed secret, a value shorter than [`MIN_GUESSED_SECRET_LEN`]
+/// stays unmasked.
+pub fn argv_secret_values(args: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut follows_secret_flag = false;
+    for arg in args {
+        if follows_secret_flag && !arg.starts_with('-') {
+            values.push(arg.clone());
+            follows_secret_flag = false;
+        } else {
+            follows_secret_flag = is_secret_flag(arg);
+            values.extend(named_secret_values(arg));
+        }
+    }
+    values.retain(|value| value.len() >= MIN_GUESSED_SECRET_LEN);
+    values
+}
+
+/// `args` joined for a log line, with every secret masked.
+pub fn redact_argv(args: &[String]) -> String {
+    redact_subprocess_output(&args.join(" "), &argv_secret_values(args))
+}
+
 /// [`redact_subprocess_output`] over every string in a JSON value, such as a
 /// tool call's input. A command can carry a token its author read from env.
 pub fn redact_subprocess_output_in_json(value: &mut serde_json::Value, secrets: &[String]) {
@@ -461,5 +545,123 @@ mod tests {
             redact_subprocess_output(text, &secrets),
             "a=[REDACTED] b=ghp_[REDACTED] c=postgres://u:***@h:5432/d"
         );
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// The value is opaque on purpose: no token shape catches it, so only
+    /// the name it travels under can mask it.
+    const OPAQUE: &str = "opaque-secret-value";
+
+    #[test]
+    fn the_value_after_a_secret_flag_is_masked() {
+        for flag in [
+            "--api-key",
+            "--apiKey",
+            "--apikey",
+            "-token",
+            "--access_token",
+            "--client-secret",
+            "--password",
+            "--auth",
+        ] {
+            assert_eq!(
+                redact_argv(&argv(&["-y", "server", flag, OPAQUE, "--port", "8080"])),
+                format!("-y server {flag} [REDACTED] --port 8080"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_secret_value_under_a_name_is_masked() {
+        let cases = [
+            ("--api-key=VALUE", "--api-key=[REDACTED]"),
+            ("GITHUB_TOKEN=VALUE", "GITHUB_TOKEN=[REDACTED]"),
+            (
+                "https://mcp.example.com/sse?apiKey=VALUE&region=eu",
+                "https://mcp.example.com/sse?apiKey=[REDACTED]&region=eu",
+            ),
+            ("Authorization: Bearer VALUE", "Authorization: [REDACTED]"),
+            ("x-api-key:VALUE", "x-api-key:[REDACTED]"),
+            (
+                "https://user:VALUE@git.example.com/x",
+                "https://[REDACTED]@git.example.com/x",
+            ),
+        ];
+        for (arg, masked) in cases {
+            assert_eq!(redact_argv(&argv(&[&arg.replace("VALUE", OPAQUE)])), masked);
+        }
+    }
+
+    #[test]
+    fn a_bare_token_or_database_url_in_argv_is_masked() {
+        assert_eq!(
+            redact_argv(&argv(&[
+                "ghp_Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7d",
+                "postgresql://u:hunter2@h:5432/d",
+            ])),
+            "ghp_[REDACTED] postgresql://[REDACTED]@h:5432/d"
+        );
+    }
+
+    #[test]
+    fn ordinary_arguments_survive_unmasked() {
+        let args = argv(&[
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/Users/me/projects",
+            "--path",
+            "/tmp",
+            "--region=eu",
+            "https://mcp.example.com/sse?region=eu",
+            "C:\\Users\\me",
+            "--verbose",
+        ]);
+        assert_eq!(redact_argv(&args), args.join(" "));
+    }
+
+    /// `--oauth` names a secret word but takes no value, so the flag after
+    /// it must still mark its own value.
+    #[test]
+    fn a_boolean_secret_flag_does_not_swallow_the_next_flag() {
+        assert_eq!(
+            redact_argv(&argv(&["--oauth", "--client-secret", OPAQUE])),
+            "--oauth --client-secret [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn a_credential_inside_a_flag_value_is_masked() {
+        let cases = [
+            (
+                "--url=https://user:VALUE@h/x",
+                "--url=https://[REDACTED]@h/x",
+            ),
+            (
+                "--header=Authorization: Bearer VALUE",
+                "--header=Authorization: [REDACTED]",
+            ),
+            (
+                "DATABASE_URL=mysql://u:VALUE@h/d",
+                "DATABASE_URL=mysql://[REDACTED]@h/d",
+            ),
+        ];
+        for (arg, masked) in cases {
+            assert_eq!(redact_argv(&argv(&[&arg.replace("VALUE", OPAQUE)])), masked);
+        }
+    }
+
+    /// A short value under a guessed name would otherwise hide that word in
+    /// every stderr line the server prints.
+    #[test]
+    fn a_short_value_under_a_guessed_name_is_not_a_secret() {
+        assert!(argv_secret_values(&argv(&["--auth", "true", "--author=bob"])).is_empty());
+    }
+
+    #[test]
+    fn a_trailing_secret_flag_with_no_value_is_kept() {
+        assert_eq!(redact_argv(&argv(&["--token"])), "--token");
     }
 }

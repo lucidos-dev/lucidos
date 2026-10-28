@@ -29,21 +29,23 @@ for (const status of ['idle', 'running', 'waiting_for_user_answer'] as const) {
       const trigger = picker.locator('.rung-trigger');
       await expect(picker).toHaveCount(1);
       await expect(picker).not.toHaveAttribute('data-pending');
-      await expect(trigger).toHaveAttribute('aria-disabled', String(status !== 'idle'));
+      // A running turn keeps the list openable and refuses the pick. A pending
+      // question card disables the pill until it is answered.
+      const answering = status === 'waiting_for_user_answer';
+      await expect(trigger).toHaveAttribute('aria-disabled', String(answering));
       await expect(trigger).toHaveAttribute('aria-label', /Model.*\S/);
       const before = await picker.boundingBox();
-      await trigger.click({ force: status !== 'idle' });
-      if (status === 'idle') {
+      if (status === 'running') await expect(trigger).toHaveAttribute('data-tooltip', /turn runs/);
+      if (answering) {
+        await expect(trigger).toHaveAttribute('data-tooltip', /pending question/);
+        await trigger.click({ force: true });
+        await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
+      } else {
+        await trigger.click();
         await expect(page.locator('.control-dropdown:visible')).toBeVisible();
         await page.keyboard.press('Escape');
-      } else {
-        await expect(trigger).toHaveAttribute('data-tooltip', /turn runs|pending question/);
-        await expect(page.locator('.control-dropdown:visible')).toHaveCount(0);
-        await trigger.focus();
-        await page.keyboard.press('Enter');
-        await page.keyboard.press('ArrowRight');
-        await expect(trigger).toHaveAttribute('aria-expanded', 'false');
       }
+      await expect(trigger).toHaveAttribute('aria-expanded', 'false');
       const after = await picker.boundingBox();
       expect(after!.width).toBeCloseTo(before!.width, 1);
       expect(after!.x).toBeCloseTo(before!.x, 1);

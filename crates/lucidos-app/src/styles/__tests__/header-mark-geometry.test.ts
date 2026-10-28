@@ -287,7 +287,10 @@ describe('the mark says its connection in strength alone', () => {
   });
 
   it('states the two receded states as opacity only', () => {
-    const disconnected = block(markCss, '.brand-mark[data-conn="disconnected"] .brand-mark-glyph {');
+    const disconnected = block(
+      markCss,
+      '.brand-mark[data-conn="disconnected"] .brand-mark-glyph,\n.brand-mark[data-conn="stopped"] .brand-mark-glyph {',
+    );
     expect(decl(disconnected, 'opacity')).toBe('var(--header-mark-disconnected-opacity)');
     // No colour of its own: a receded state falls back to the muted base every
     // other glyph in the bar wears, so the ladder stays one-dimensional. The

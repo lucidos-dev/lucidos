@@ -378,7 +378,7 @@ const ASK_USER_QUESTION_RULE: &str =
      instead\".\n\n\
      QUIET OPTIONS: start a label with `[quiet]` when that pick needs no work from you \
      (`[quiet] Not now`), never when it promises some. The tag is hidden, and the pick ends \
-     your turn.\n\n\
+     your turn. Write `[quiet: <your reply>]` to show that reply as your final answer.\n\n\
      WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
      waiting. It parks the thread in the waiting-for-answer state, which is what lights the \
      Blocked badge, keeps the thread in the live working set, and can push a \
@@ -609,7 +609,8 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     (\"None of these\", \"Neither, ask me later\"); what is banned is one whose only meaning is \
     \"I will type it instead\". \
     QUIET OPTIONS: pass `{label, quiet: true}` when that pick needs no work from you \
-    (\"Not now\"), never when it promises some. Picking it ends your turn. \
+    (\"Not now\"), never when it promises some. Picking it ends your turn. Add \
+    `quiet_reply` to show that text as your final answer. \
     WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
     waiting. It parks the thread in the waiting-for-answer state, which lights the \
     Blocked badge, keeps the thread in the live working set, and can notify the user. A \
@@ -1627,7 +1628,9 @@ mod tests {
     fn the_claude_code_rule_names_the_quiet_label_prefix() {
         let prefix = crate::engine::agent_session::parsing::QUIET_LABEL_PREFIX;
         assert!(ASK_USER_QUESTION_RULE.contains(&format!("`{prefix}`")));
+        assert!(ASK_USER_QUESTION_RULE.contains("[quiet: <your reply>]"));
         assert!(CODEX_ASK_USER_QUESTION_RULE.contains("quiet: true"));
+        assert!(CODEX_ASK_USER_QUESTION_RULE.contains("quiet_reply"));
     }
 
     /// A yielded exec cell turns an open card into a billed `wait` loop. The
@@ -2452,26 +2455,30 @@ mod tests {
         // Claude Code by 181 bytes, Codex by 150. Without it an agent cannot
         // offer a "Not now" that leaves the thread asleep.
         //
+        // The twelve non-conflict rows rose again for quiet replies: Claude Code
+        // by 68 to 71 bytes, Codex by 58. A reply is what lets a "Not now" show
+        // an answer without waking the agent.
+        //
         // EVERY Codex row rose by 240 to 243 bytes for `codex_exec_question_rule`.
         // A question asked from a code-mode `exec` cell otherwise yields after
         // 30 s, and the model re-bills its whole context on each `wait` poll.
-        ("worktree", "claude-code", 25603),
-        ("worktree", "codex", 25784),
+        ("worktree", "claude-code", 25674),
+        ("worktree", "codex", 25842),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 18419),
-        ("external_repo", "codex", 18597),
-        ("recovery", "claude-code", 24320),
-        ("recovery", "codex", 24501),
-        ("external_repo_recovery", "claude-code", 18321),
-        ("external_repo_recovery", "codex", 18499),
-        ("app_worktree", "claude-code", 20911),
-        ("app_worktree", "codex", 21089),
-        ("app_worktree_recovery", "claude-code", 19471),
-        ("app_worktree_recovery", "codex", 19649),
+        ("external_repo", "claude-code", 18487),
+        ("external_repo", "codex", 18655),
+        ("recovery", "claude-code", 24391),
+        ("recovery", "codex", 24559),
+        ("external_repo_recovery", "claude-code", 18389),
+        ("external_repo_recovery", "codex", 18557),
+        ("app_worktree", "claude-code", 20979),
+        ("app_worktree", "codex", 21147),
+        ("app_worktree_recovery", "claude-code", 19539),
+        ("app_worktree_recovery", "codex", 19707),
         // Both conflict_resolution rows rose by about 115 bytes when
         // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
         // either. The other rows had the slack to absorb it. Both rose again,

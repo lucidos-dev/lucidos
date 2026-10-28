@@ -2330,6 +2330,23 @@ impl GatewayState {
         }
     }
 
+    /// Start a registered workspace that is not running, and return at once: the
+    /// caller's health poll sees the engine come up. A running workspace is a
+    /// no-op. That is the difference from [`Self::restart_workspace`], whose
+    /// respawn would interrupt the threads of an engine another window started a
+    /// moment earlier.
+    ///
+    /// A slug this gateway does not know is a 404, as for [`Self::stop_workspace`].
+    pub fn start_workspace(&self, id: &str) -> Result<(), ApiError> {
+        if !self.inner.registry.lock().unwrap().contains(id) {
+            return Err(ApiError::not_found(format!("workspace '{id}' not found")));
+        }
+        let state = self.clone();
+        let id = id.to_string();
+        tokio::spawn(async move { state.lazy_start(&id).await });
+        Ok(())
+    }
+
     /// Stop one workspace's engine and drop its runtime stack, but KEEP its
     /// registry entry: membership is "all ever launched", so it stays listed in
     /// the picker as stopped. Dropping the stack is also what makes the
@@ -3818,6 +3835,7 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                 }
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
+                    [(WORKSPACE_STATE_HEADER, WORKSPACE_STOPPED)],
                     format!("workspace '{slug}' is stopped"),
                 )
                     .into_response();
@@ -4231,6 +4249,13 @@ fn attr_tail(raw: &str) -> (&str, &str) {
 /// service worker shows it and caches nothing. Mirrors the boot splash's
 /// `X-Lucidos-Boot-Splash`.
 pub(crate) const PAIRING_SHELL_HEADER: &str = "x-lucidos-pairing";
+
+/// Names the 503 a registered-but-stopped workspace gives non-document traffic,
+/// so an open window can tell "stopped" from a network fault and offer Start.
+/// Its value is [`WORKSPACE_STOPPED`]. The frontend mirrors both
+/// (`api/client/_core.ts`).
+pub(crate) const WORKSPACE_STATE_HEADER: &str = "x-lucidos-workspace-state";
+pub(crate) const WORKSPACE_STOPPED: &str = "stopped";
 
 /// Marks the DOCUMENT as the pairing screen, for script that runs before the
 /// bundle. The header above marks the RESPONSE, which only the service worker
@@ -5836,6 +5861,59 @@ mod tests {
         );
     }
 
+    /// The two sibling cases the stopped marker must keep apart: a registered
+    /// stopped workspace says so, and starts nothing for a health probe.
+    #[tokio::test]
+    async fn a_health_probe_of_a_stopped_workspace_is_marked_stopped_and_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .add(Workspace::gateway_provisioned(
+                "dev".into(),
+                "Dev".into(),
+                51996,
+            ))
+            .unwrap();
+
+        let request = axum::extract::Request::builder()
+            .method("GET")
+            .uri("/dev/api/v1/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = fallback(State(state.clone()), request).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(WORKSPACE_STATE_HEADER).unwrap(),
+            WORKSPACE_STOPPED
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            state.inner.stacks.lock().await.is_empty(),
+            "an open tab's health poll must never undo Stop"
+        );
+        assert!(state.inner.starting.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_workspace_is_never_marked_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        let request = axum::extract::Request::builder()
+            .method("GET")
+            .uri("/nowhere/api/v1/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = fallback(State(state), request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get(WORKSPACE_STATE_HEADER).is_none());
+    }
+
     /// A workspace whose route is set but whose engine never answers, and a
     /// widget frame asking it for its document.
     fn routed_but_unreachable() -> (GatewayState, tempfile::TempDir, axum::extract::Request) {
@@ -7324,6 +7402,68 @@ mod tests {
             StatusCode::ACCEPTED,
             "and stopping it twice is not one either"
         );
+    }
+
+    /// POST the start endpoint for `id`, answering with its status alone.
+    async fn start_call(state: &GatewayState, id: &str) -> StatusCode {
+        use tower::ServiceExt as _;
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri(format!("/workspaces/{id}/start"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        crate::control::router()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_start_for_a_slug_this_gateway_does_not_know_is_a_404() {
+        let (state, _root) = adopting_state();
+        assert_eq!(
+            start_call(&state, "no-such-workspace").await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(state.inner.stacks.lock().await.is_empty());
+    }
+
+    /// Another window or the picker may have started the workspace a moment
+    /// before this Start. The same stack must survive, or its threads would be
+    /// interrupted by a respawn.
+    #[tokio::test]
+    async fn a_start_for_a_running_workspace_is_accepted_and_leaves_its_stack_alone() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+        let _engine = StubEngine::serving(&state, &ws, minutes_ago(5));
+        state.adopt_running_engines().await;
+        let before = state
+            .inner
+            .stacks
+            .lock()
+            .await
+            .get("eval-lean-1")
+            .cloned()
+            .expect("the engine was adopted");
+
+        assert_eq!(
+            start_call(&state, "eval-lean-1").await,
+            StatusCode::ACCEPTED
+        );
+        tokio::task::yield_now().await;
+
+        let after = state
+            .inner
+            .stacks
+            .lock()
+            .await
+            .get("eval-lean-1")
+            .cloned()
+            .expect("the stack is still there");
+        assert!(Arc::ptr_eq(&before, &after), "a start must not replace it");
     }
 
     /// A Stop must stick. The engine answers for the whole of its graceful

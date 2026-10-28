@@ -861,9 +861,10 @@ fn canonical_source_key(source: &MarketplaceSource) -> String {
     }
 }
 
+/// The id slug reads the repo segment alone, never the display name, so a
+/// change to how marketplaces are named never changes an existing id.
 fn slug_for_source(source: &str) -> String {
-    let trimmed = source.trim();
-    let label = display_name_for_source(trimmed);
+    let label = id_repo_segment(source.trim());
     let mut out = String::new();
     let mut prev_dash = true;
     for c in label.chars() {
@@ -885,19 +886,84 @@ fn slug_for_source(source: &str) -> String {
     }
 }
 
-fn display_name_for_source(source: &str) -> String {
+fn id_repo_segment(source: &str) -> String {
     if let Ok(parsed) = parse_marketplace_source(source) {
         if let Some(repo) = parsed.github_repo {
-            return repo.replace('-', " ");
+            return repo;
         }
     }
     source
         .trim_end_matches('/')
         .rsplit(['/', ':'])
         .next()
-        .unwrap_or("Marketplace")
+        .unwrap_or_default()
         .trim_end_matches(".git")
-        .replace('-', " ")
+        .to_string()
+}
+
+/// Owner plus repo, so `acme/lucidos-plugins` and `globex/lucidos-plugins` read
+/// apart. The repo drops the word "lucidos" and any word the owner already says.
+fn display_name_for_source(source: &str) -> String {
+    let (owner, repo) = owner_and_repo(source);
+    let owner_words: Vec<String> = owner
+        .as_deref()
+        .map(|o| name_words(o).map(str::to_ascii_lowercase).collect())
+        .unwrap_or_default();
+    let new_words: Vec<&str> = name_words(&repo)
+        .filter(|w| !owner_words.contains(&w.to_ascii_lowercase()))
+        .collect();
+    let without_lucidos: Vec<&str> = new_words
+        .iter()
+        .copied()
+        .filter(|w| !w.eq_ignore_ascii_case("lucidos"))
+        .collect();
+    let repo_label = if without_lucidos.is_empty() {
+        new_words.join(" ")
+    } else {
+        without_lucidos.join(" ")
+    };
+    match (owner, repo_label.is_empty()) {
+        (Some(owner), false) => format!("{owner} {repo_label}"),
+        (Some(owner), true) => owner,
+        (None, false) => repo_label,
+        (None, true) => "Marketplace".to_string(),
+    }
+}
+
+fn name_words(s: &str) -> impl Iterator<Item = &str> {
+    s.split(['-', '_', '.', ' ']).filter(|w| !w.is_empty())
+}
+
+fn owner_and_repo(source: &str) -> (Option<String>, String) {
+    let source = source.trim();
+    if let Ok(MarketplaceSource {
+        github_owner: Some(owner),
+        github_repo: Some(repo),
+        ..
+    }) = parse_marketplace_source(source)
+    {
+        return (Some(owner), repo);
+    }
+    let (path, remote) = match source.split_once("://") {
+        Some((_, rest)) => (
+            rest.split_once('/').map_or("", |(_, path)| path),
+            !crate::core::git_auth::is_local_url(source),
+        ),
+        None => match source.split_once(':') {
+            Some((host, path)) if !host.contains('/') => (path, true),
+            _ => (source, false),
+        },
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix("/.git").unwrap_or(path);
+    let mut segments = path.rsplit('/').filter(|s| !s.is_empty());
+    let repo = segments
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".git")
+        .to_string();
+    let owner = segments.next().filter(|_| remote).map(ToOwned::to_owned);
+    (owner, repo)
 }
 
 #[cfg(test)]

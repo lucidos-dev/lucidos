@@ -56,11 +56,11 @@ export function codingAgentMenuAction(agent: CodingAgent): HeaderActionSpec | nu
 }
 
 /** The composer row's foldable members, left to right, split by where each
- *  renders. The row takes them in this order, and so does the fold.
+ *  renders, plus the order the fold takes them in.
  *
- *  **The fold takes a prefix, so the leftmost member folds first.** The ⋯
- *  stands at the left edge, where the folded members came from. So a fold never
- *  moves a standing member across the row.
+ *  **The readouts fold first, then the rest left to right.** Todo and waiting
+ *  only report state, so the toggles outlast them. The ⋯ stands at the left
+ *  edge. A fold only removes boxes, so no standing member crosses another.
  *
  *  **The toggles lead the row on every thread.** A coding-agent thread puts
  *  its menu after them, so the follow and side-question toggles stand where a
@@ -79,19 +79,25 @@ export function composerRowMembers(m: {
   /** The coding-agent menu, absent on a Lucidos Agent or Codex thread. */
   codingAgentMenu: HeaderActionSpec | null;
   attachImage: HeaderActionSpec;
-  /** The todo and waiting indicators and the WIP preview that are shown. */
+  /** The todo and waiting indicators that are shown. */
   readouts: readonly HeaderActionSpec[];
+  /** The WIP preview toggle, present only while it can preview. */
+  wipPreview: HeaderActionSpec | null;
   /** Clear draft, present only while there is a draft to clear. */
   clearDraft: HeaderActionSpec | null;
   toggles: readonly HeaderActionSpec[];
   /** Diff and the standing apply, whichever stand. */
   situational: readonly HeaderActionSpec[];
   rung: HeaderActionSpec | null;
-}): { row: HeaderActionSpec[]; cluster: HeaderActionSpec[] } {
+}): { row: HeaderActionSpec[]; cluster: HeaderActionSpec[]; foldOrder: HeaderActionSpec[] } {
   const present = (a: HeaderActionSpec | null): a is HeaderActionSpec => a !== null;
+  const rest = [m.codingAgentMenu, m.attachImage].filter(present);
+  const tail = [m.wipPreview, m.clearDraft].filter(present);
+  const cluster = [...m.situational, m.rung].filter(present);
   return {
-    row: [...m.toggles, m.codingAgentMenu, m.attachImage, ...m.readouts, m.clearDraft].filter(present),
-    cluster: [...m.situational, m.rung].filter(present),
+    row: [...m.toggles, ...rest, ...m.readouts, ...tail],
+    cluster,
+    foldOrder: [...m.readouts, ...m.toggles, ...rest, ...tail, ...cluster],
   };
 }
 

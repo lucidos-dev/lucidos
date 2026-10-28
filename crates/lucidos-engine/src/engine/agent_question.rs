@@ -18,7 +18,7 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
     AnswerKind, EventChannel, EventMeta, MessageOrigin, QuestionOption, ThreadEvent,
 };
-use crate::engine::{AgentSession, LucidosEngine};
+use crate::engine::{AgentSession, LucidosEngine, QuietPick};
 
 /// Outcome of answering a pending question. Maps to HTTP status codes in the API layer.
 #[derive(Debug)]
@@ -250,6 +250,8 @@ pub(crate) struct QuestionWalkOutcome {
     /// Every question was answered with *quiet options*, so the caller ends
     /// the turn instead of handing the answers back to the agent.
     pub quiet: bool,
+    /// The *quiet reply* the picked options carry, when `quiet`.
+    pub quiet_reply: Option<String>,
 }
 
 /// Why a `walk_question_batch` call failed. Boxed because no caller today
@@ -376,12 +378,26 @@ pub(crate) fn check_message_embeds(
     Ok(())
 }
 
-/// Refuse a card whose every option is quiet. Each pick would end the turn.
-/// So an option that promises work ("Save progress and stop") never runs it.
+/// Refuse a card whose non-quiet option carries a quiet reply, or whose every
+/// option is quiet: each pick would end the turn, so an option that promises
+/// work ("Save progress and stop") would never run it.
 pub(crate) fn check_quiet_options(
     parsed: &[crate::engine::agent_session::ParsedQuestion],
 ) -> Result<(), QuestionWalkError> {
     for (idx, q) in parsed.iter().enumerate() {
+        if let Some(option) = q
+            .options
+            .iter()
+            .find(|o| !o.quiet && o.quiet_reply.is_some())
+        {
+            return Err(format!(
+                "Question {idx} cannot be asked: option \"{}\" has a quiet reply but is not \
+                 quiet. A quiet reply is the fixed answer shown when a quiet option is \
+                 picked. Mark the option quiet, or drop its quiet reply.",
+                option.label
+            )
+            .into());
+        }
         if !q.options.is_empty() && q.options.iter().all(|o| o.quiet) {
             return Err(format!(
                 "Question {idx} cannot be asked: every option is quiet, so every pick \
@@ -436,12 +452,14 @@ impl LucidosEngine {
         if total > 1 {
             for option in parsed.iter_mut().flat_map(|q| q.options.iter_mut()) {
                 option.quiet = false;
+                option.quiet_reply = None;
             }
         }
         if total == 0 {
             return Ok(QuestionWalkOutcome {
                 answer_kinds: vec![],
                 quiet: false,
+                quiet_reply: None,
             });
         }
 
@@ -484,6 +502,7 @@ impl LucidosEngine {
         // below repeats that kind rather than assuming a cancel.
         let mut ended_at: Option<(usize, AnswerKind)> = None;
         let mut quiet = true;
+        let mut quiet_reply = None;
         for (i, q) in parsed.into_iter().enumerate() {
             let sub_id = synth_question_id(outer_tool_use_id, i);
             let options = q.options.clone();
@@ -501,6 +520,7 @@ impl LucidosEngine {
                     self.question_wait_registry.forget(&sub_id).await;
                     let ending = batch_ending_answer(&prior);
                     quiet &= answer_value_is_quiet(&prior, &options);
+                    quiet_reply = answer_value_quiet_reply(&prior, &options);
                     answer_kinds.push(prior);
                     if let Some(kind) = ending {
                         ended_at = Some((i, kind));
@@ -577,6 +597,7 @@ impl LucidosEngine {
 
             let ending = batch_ending_answer(&payload.answers);
             quiet &= answer_value_is_quiet(&payload.answers, &options);
+            quiet_reply = answer_value_quiet_reply(&payload.answers, &options);
             answer_kinds.push(payload.answers);
             if let Some(kind) = ending {
                 ended_at = Some((i, kind));
@@ -623,6 +644,7 @@ impl LucidosEngine {
         Ok(QuestionWalkOutcome {
             answer_kinds,
             quiet,
+            quiet_reply: quiet_reply.filter(|_| quiet),
         })
     }
 }
@@ -753,6 +775,36 @@ fn answer_value_is_quiet(answer: &serde_json::Value, options: &[QuestionOption])
         .is_ok_and(|answer| answer_is_quiet(&answer, options))
 }
 
+/// [`quiet_reply`] for an answer still in its persisted JSON form.
+fn answer_value_quiet_reply(
+    answer: &serde_json::Value,
+    options: &[QuestionOption],
+) -> Option<String> {
+    serde_json::from_value::<AnswerKind>(answer.clone())
+        .ok()
+        .and_then(|answer| quiet_reply(&answer, options))
+}
+
+/// The *quiet reply* a quiet answer shows in place of an agent turn: the picked
+/// options' replies in option order, joined by a blank line. `None` when the
+/// answer is not quiet or no picked option carries a reply.
+pub(crate) fn quiet_reply(answer: &AnswerKind, options: &[QuestionOption]) -> Option<String> {
+    if !answer_is_quiet(answer, options) {
+        return None;
+    }
+    let picked = |id: &String| match answer {
+        AnswerKind::Selected { option_id } => option_id == id,
+        AnswerKind::MultiSelected { option_ids, .. } => option_ids.contains(id),
+        AnswerKind::FreeText { .. } | AnswerKind::Canceled | AnswerKind::Superseded => false,
+    };
+    let replies: Vec<&str> = options
+        .iter()
+        .filter(|o| picked(&o.id))
+        .filter_map(|o| o.quiet_reply.as_deref())
+        .collect();
+    (!replies.is_empty()).then(|| replies.join("\n\n"))
+}
+
 /// True when the answer picks only *quiet options*, so the turn ends without
 /// waking the agent. Typed text or an image is a reply the agent must read, so
 /// it always wakes, even beside quiet picks.
@@ -835,7 +887,7 @@ fn lookup_option_label(
                 .and_then(|opts| opts.get(idx))
                 .and_then(|opt| opt.get("label"))
                 .and_then(|v| v.as_str())
-                .map(|s| crate::engine::agent_session::strip_quiet_label_prefix(s).0)
+                .map(|s| crate::engine::agent_session::strip_quiet_label_prefix(s).label)
         })
         .unwrap_or_else(|| opt_id.to_string())
 }
@@ -1361,31 +1413,35 @@ pub async fn answer_pending_question_with_event_id(
     // Validate the answer shape against the persisted question. The pending
     // lookup above guarantees the question exists, so a `None` here is a
     // race we treat as a conflict for symmetry with the answered-already arm.
-    let quiet = match lookup_question_options(engine.pool(), thread_id, &tool_use_id).await {
-        Ok(Some((options, multi_select))) => {
-            if let Err(msg) = validate_answer(&answer, &options, multi_select)
-                .and_then(|()| check_answer_images(engine.workspace_path(), &answer))
-            {
-                return AnswerResult::Conflict(msg);
+    let (quiet, quiet_reply) =
+        match lookup_question_options(engine.pool(), thread_id, &tool_use_id).await {
+            Ok(Some((options, multi_select))) => {
+                if let Err(msg) = validate_answer(&answer, &options, multi_select)
+                    .and_then(|()| check_answer_images(engine.workspace_path(), &answer))
+                {
+                    return AnswerResult::Conflict(msg);
+                }
+                (
+                    answer_is_quiet(&answer, &options),
+                    quiet_reply(&answer, &options),
+                )
             }
-            answer_is_quiet(&answer, &options)
-        }
-        Ok(None) => {
-            return AnswerResult::Conflict(format!(
-                "Question {} on thread {} disappeared before validation",
-                tool_use_id, thread_id
-            ));
-        }
-        Err(e) => {
-            log!(
-                "[CCQuestion] DB lookup for question options failed {}/{}: {}",
-                thread_id,
-                tool_use_id,
-                e
-            );
-            return AnswerResult::Conflict("Database lookup failed".into());
-        }
-    };
+            Ok(None) => {
+                return AnswerResult::Conflict(format!(
+                    "Question {} on thread {} disappeared before validation",
+                    tool_use_id, thread_id
+                ));
+            }
+            Err(e) => {
+                log!(
+                    "[CCQuestion] DB lookup for question options failed {}/{}: {}",
+                    thread_id,
+                    tool_use_id,
+                    e
+                );
+                return AnswerResult::Conflict("Database lookup failed".into());
+            }
+        };
 
     // Read the originating question's channel so we can propagate it onto
     // the answer (so the persisted pair shares a wire-channel) and decide
@@ -1464,8 +1520,14 @@ pub async fn answer_pending_question_with_event_id(
         // resume, and `Superseded` is followed by the message that replaced the
         // question, which drives the next turn itself.
         if !had_waiter && quiet {
-            end_restart_orphaned_turn_quietly(engine, thread_id, &tool_use_id, answer_channel)
-                .await;
+            end_restart_orphaned_turn_quietly(
+                engine,
+                thread_id,
+                &tool_use_id,
+                answer_channel,
+                quiet_reply,
+            )
+            .await;
         } else if !had_waiter && !answer_resolves_without_resume(&answer) {
             // Resume on the ORIGINATING channel — this branch runs for both
             // `Chat` and `Trigger` questions (both skip CC side effects), so a
@@ -1508,7 +1570,8 @@ pub async fn answer_pending_question_with_event_id(
     // Only a waiting hook ends the live turn quietly. A card whose process died
     // must not mark the newer turn that now holds the session.
     let quiet_wake = quiet && engine.question_wait_registry.has_waiter(&tool_use_id).await;
-    arm_question_resume_if_live(&engine.agent_sessions, thread_id, &answer, quiet_wake).await;
+    let quiet_pick = quiet_wake.then_some(QuietPick { reply: quiet_reply });
+    arm_question_resume_if_live(&engine.agent_sessions, thread_id, &answer, quiet_pick).await;
 
     // Wake the blocked hook (if any). No-op if nothing is registered:
     // - The subprocess died with the hook (teardown, restart, kill). Nothing
@@ -1735,12 +1798,13 @@ async fn has_held_deliveries(engine: &LucidosEngine, thread_id: Uuid, tool_use_i
 
 /// Close a chat turn a restart left open, after a quiet answer. Pair the
 /// dangling call with the answer so a later turn reads it. Then end the turn as
-/// the live loop would, with an empty reply.
+/// the live loop would, on the pick's *quiet reply* or an empty one.
 async fn end_restart_orphaned_turn_quietly(
     engine: &Arc<LucidosEngine>,
     thread_id: Uuid,
     sub_tool_use_id: &str,
     channel: EventChannel,
+    quiet_reply: Option<String>,
 ) {
     let anchor =
         emit_restart_orphaned_ask_result(engine, thread_id, sub_tool_use_id, channel).await;
@@ -1754,7 +1818,7 @@ async fn end_restart_orphaned_turn_quietly(
             BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::ResponseGenerated {
-                    text: String::new(),
+                    text: quiet_reply.unwrap_or_default(),
                     images: vec![],
                     model: None,
                     reasoning_effort: None,
@@ -2003,13 +2067,13 @@ async fn ensure_resume_after_answer(
 /// reads the follow-up only after that. Its post-answer events need the same
 /// re-arming a real answer's do.
 ///
-/// `quiet` records a *quiet option* pick as `quiet_answer_pending`: the agent
-/// then ends the turn with no reply, which must not read as a failure.
+/// `quiet_pick` is recorded as `quiet_answer_pending`. The turn then ends on
+/// the pick's *quiet reply*, and an empty reply must not read as a failure.
 async fn arm_question_resume_if_live(
     agent_sessions: &Arc<tokio::sync::Mutex<HashMap<Uuid, AgentSession>>>,
     thread_id: Uuid,
     answer: &AnswerKind,
-    quiet: bool,
+    quiet_pick: Option<QuietPick>,
 ) -> bool {
     if matches!(answer, AnswerKind::Canceled) {
         return false;
@@ -2018,7 +2082,7 @@ async fn arm_question_resume_if_live(
     match sessions.get_mut(&thread_id) {
         Some(s) if s.is_live() && s.is_running() => {
             s.question_resume_pending = true;
-            s.quiet_answer_pending = quiet;
+            s.quiet_answer_pending = quiet_pick;
             true
         }
         _ => false,

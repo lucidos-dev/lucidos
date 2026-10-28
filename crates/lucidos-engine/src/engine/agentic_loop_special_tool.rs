@@ -345,10 +345,12 @@ impl Relation {
 }
 
 /// What a chat `ask_user_question` hands the loop: the tool result, and
-/// whether every pick was a *quiet option*, which ends the turn.
+/// whether every pick was a *quiet option*, which ends the turn, and the
+/// *quiet reply* that turn ends on.
 pub(super) struct ChatAskOutcome {
     pub result: String,
     pub quiet: bool,
+    pub quiet_reply: Option<String>,
 }
 
 impl ChatAskOutcome {
@@ -356,6 +358,7 @@ impl ChatAskOutcome {
         Self {
             result: result.into(),
             quiet: false,
+            quiet_reply: None,
         }
     }
 }
@@ -1074,6 +1077,7 @@ impl LucidosEngine {
         ChatAskOutcome {
             result: with_answer_images(result, &outcome.answer_kinds),
             quiet: outcome.quiet,
+            quiet_reply: outcome.quiet_reply,
         }
     }
 }

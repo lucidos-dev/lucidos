@@ -1259,14 +1259,25 @@ function stillRunning(exchange: Exchange): boolean {
   return !latestRunSteps(exchange).some(({ event }) => TERMINAL_EVENT_TYPES.has(event.type));
 }
 
-/** The ended turn a `CodingAgentIdled` closes when it lands after the next
- *  message. The engine records a superseding follow-up beside the cancel, so it
- *  can beat the session's idle. The message's own turn has written no step yet,
- *  so the idle cannot be its own. Messages queued behind the ended turn hold no
- *  steps either, so the walk passes over them. */
-function turnClosedByLateIdle(state: GroupFoldState, current: Exchange | null, event: StoredEvent): Exchange | null {
-  if (event.type !== 'CodingAgentIdled' || current?.userEvent.type !== 'MessageReceived') return null;
-  if (current.steps.length > 0) return null;
+/** Does the engine write this row while it settles a coding-agent turn that
+ *  has ended? That is the idle, and every row the lifecycle contract classes as
+ *  `metadata`, such as a withheld proposal or a settings row. Such a row never
+ *  takes a turn. A session start is the exception: it opens the next turn. */
+function settlesEndedTurn(event: StoredEvent): boolean {
+  if (event.type === 'CodingAgentIdled') return true;
+  return onCodingAgentChannel(event)
+    && EVENT_CLASSIFICATION[event.type] === 'metadata'
+    && event.type !== 'SessionStarted';
+}
+
+/** The ended turn a settling row closes when it lands after the next message.
+ *  The engine records a superseding follow-up beside the cancel, so it can beat
+ *  the turn's withheld proposal and the session's idle. The message's own turn
+ *  has written no step yet, so the row cannot be its own. Messages queued behind
+ *  the ended turn hold no steps either, so the walk passes over them. */
+function turnSettledLate(state: GroupFoldState, current: Exchange | null, event: StoredEvent): Exchange | null {
+  if (!settlesEndedTurn(event)) return null;
+  if (current?.userEvent.type !== 'MessageReceived' || current.steps.length > 0) return null;
   let i = state.exchanges.indexOf(current) - 1;
   while (i >= 0 && state.exchanges[i].steps.length === 0) i--;
   const previous = state.exchanges[i];
@@ -2792,16 +2803,16 @@ function foldEvent(
     } else {
       // The turn ended with a message still unread, as when the agent died
       // before reading it. The next step is the message's own. The turn's
-      // trailing terminals, such as the `CodingAgentIdled` after its
-      // `ResponseGenerated`, still close it.
+      // trailing terminals and the rows that settle it still close it.
       const next = state.unreadMessages[0];
-      if (next && current && !stillRunning(current) && !TERMINAL_EVENT_TYPES.has(event.type)) {
+      if (next && current && !stillRunning(current)
+        && !TERMINAL_EVENT_TYPES.has(event.type) && !settlesEndedTurn(event)) {
         state.unreadMessages.shift();
         next.awaitingRead = undefined;
         touched?.add(next);
         current = takeTurnFromQueue(state, next);
       }
-      const closed = turnClosedByLateIdle(state, current, event);
+      const closed = turnSettledLate(state, current, event);
       if (closed) {
         appendStep(closed, seq, event);
         touched?.add(closed);

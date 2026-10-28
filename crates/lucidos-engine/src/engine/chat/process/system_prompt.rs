@@ -1961,14 +1961,15 @@ mod tests {
         ),
         (
             "ask_user_question",
-            2_217,
+            2_309,
             "the \"Other\"-option ban is deliberately mirrored between \
              ASK_USER_QUESTION_RULE and this schema, and pinned by a test in \
              each place; the nested question / options / label object is 434 \
              chars of frozen shape. Raised from 1,950 by `message`: a tool input \
              is never summarized, so it is the one place an always-thinking \
              model can hand the user an answer before a card. Raised by 135 \
-             for `quiet`, the one way to offer a pick that ends the turn",
+             for `quiet`, the one way to offer a pick that ends the turn. Raised by \
+             92 for `quiet_reply`, the fixed answer a quiet pick shows",
         ),
         (
             "edit_file",

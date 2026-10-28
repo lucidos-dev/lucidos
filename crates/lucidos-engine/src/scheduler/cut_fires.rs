@@ -226,7 +226,7 @@ fn next_slot(
     let schedules = config
         .schedule
         .iter()
-        .map(|s| s.parse::<cron::Schedule>())
+        .map(|s| crate::engine::tools::scheduler::parse_standard_cron(s).map_err(Error::from))
         .collect::<Result<Vec<_>, _>>()?;
     let timezone = config.timezone.parse::<chrono_tz::Tz>()?;
     Ok(
