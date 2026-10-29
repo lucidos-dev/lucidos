@@ -218,6 +218,13 @@ pub(super) async fn create_credential(
     {
         return ApiResult::err(reason);
     }
+    if auth_type == AuthType::OauthClient {
+        if let Err(reason) =
+            crate::core::oauth::check_client_endpoints(&service_name, &request.auth_value)
+        {
+            return ApiResult::err(reason);
+        }
+    }
     // `upsert` emits `Credential{Created,Updated}` itself, so this handler
     // resolves the device actor up front and passes it down. The emit is not
     // the caller's to make (see `CredentialStore`'s type doc).
@@ -316,13 +323,14 @@ pub(super) async fn update_credential(
 
     // Neither side of the edit may be the service account. Keeping the stored
     // value across that type change would make its token injectable.
+    let stored = match CredentialStore::get_by_id(&state.pool, id).await {
+        Ok(stored) => stored,
+        Err(e) => return ApiResult::err(format!("Failed to update credential: {}", e)),
+    };
     let touches_service_account = auth_type == AuthType::OnepasswordServiceAccount
-        || match CredentialStore::get_by_id(&state.pool, id).await {
-            Ok(stored) => {
-                stored.is_some_and(|stored| stored.auth_type == AuthType::OnepasswordServiceAccount)
-            }
-            Err(e) => return ApiResult::err(format!("Failed to update credential: {}", e)),
-        };
+        || stored
+            .as_ref()
+            .is_some_and(|stored| stored.auth_type == AuthType::OnepasswordServiceAccount);
     if touches_service_account {
         return ApiResult::err(SERVICE_ACCOUNT_IS_SETTINGS_ONLY.to_string());
     }
@@ -331,6 +339,14 @@ pub(super) async fn update_credential(
             crate::core::credentials::check_secret_references(&state.pool, auth_type, secret).await
         {
             return ApiResult::err(reason);
+        }
+        // No stored row means the update below writes nothing.
+        if let (AuthType::OauthClient, Some(stored)) = (auth_type, &stored) {
+            if let Err(reason) =
+                crate::core::oauth::check_client_endpoints(&stored.service_name, secret)
+            {
+                return ApiResult::err(reason);
+            }
         }
     }
 
@@ -1110,28 +1126,31 @@ pub(super) async fn set_preference(
     Query(query): Query<KeyQuery>,
     headers: HeaderMap,
     Json(request): Json<SetPreferenceRequest>,
-) -> Json<ApiResult> {
+) -> Result<Json<ApiResult>, ApiError> {
     // Route through the single write chokepoint (engine/preferences.rs) so the
     // Settings UI gets the same side-effects the set_preference tool does:
     // language/timezone refresh the engine's in-memory locale + emit
     // LanguageSet/TimezoneSet, push syncs devices.push_enabled, everything else
-    // emits PreferencesChanged. The HTTP path is intentionally permissive about
-    // the key, because the human edits internal keys here. The agent's gate is
-    // in the tool handler, and an app's is `app_reach::enforce_app_reach`.
+    // emits PreferencesChanged. The human edits internal keys here. An agent
+    // is held to the keys its tool may write, and an app is refused by
+    // `app_reach::enforce_app_reach`.
+    refuse_agent_human_only_preference(&headers, &query.key)?;
     let actor = super::actor::user_actor(&headers, request.device_id.as_deref());
-    match state
-        .engine
-        .apply_preference_write(
-            &query.key,
-            &request.value,
-            request.device_id.as_deref(),
-            actor,
-        )
-        .await
-    {
-        Ok(_) => ApiResult::ok(),
-        Err(e) => ApiResult::err(format!("Failed to set preference: {}", e)),
-    }
+    Ok(
+        match state
+            .engine
+            .apply_preference_write(
+                &query.key,
+                &request.value,
+                request.device_id.as_deref(),
+                actor,
+            )
+            .await
+        {
+            Ok(_) => ApiResult::ok(),
+            Err(e) => ApiResult::err(format!("Failed to set preference: {}", e)),
+        },
+    )
 }
 
 /// Delete a preference
@@ -1139,15 +1158,40 @@ pub(super) async fn delete_preference(
     State(state): State<AppState>,
     Query(query): Query<KeyQuery>,
     headers: HeaderMap,
-) -> Json<ApiResult> {
+) -> Result<Json<ApiResult>, ApiError> {
     let key = query.key;
+    // Deleting a key restores its default, which is a write like any other.
+    refuse_agent_human_only_preference(&headers, &key)?;
     // `delete` emits the `PreferencesChanged` with `value: None` ("back to the
     // default") itself; resolve the device actor for it.
     let actor = crate::api::actor::user_actor(&headers, None);
-    match PreferenceStore::delete(&state.pool, &state.engine.event_bus, &key, actor).await {
-        Ok(true) => ApiResult::ok(),
-        Ok(false) => ApiResult::err(format!("Preference '{}' not found", key)),
-        Err(e) => ApiResult::err(format!("Failed to delete preference: {}", e)),
+    Ok(
+        match PreferenceStore::delete(&state.pool, &state.engine.event_bus, &key, actor).await {
+            Ok(true) => ApiResult::ok(),
+            Ok(false) => ApiResult::err(format!("Preference '{}' not found", key)),
+            Err(e) => ApiResult::err(format!("Failed to delete preference: {}", e)),
+        },
+    )
+}
+
+/// Refuse an agent writing a preference its own tool may not write.
+///
+/// The preference catalog is the one list: every key with no agent access
+/// (`prefs::internal_hint`). That covers the command guard, the tool-call cap,
+/// the network bind, the provider switches and the local model host. An agent
+/// refused by `set_preference` must not reach the same key through
+/// `lucidos preferences set` or a raw HTTP call. See
+/// [`super::actor::refuse_agent_caller`] for what this layer does not close.
+pub(in crate::api) fn refuse_agent_human_only_preference(
+    headers: &HeaderMap,
+    key: &str,
+) -> Result<(), ApiError> {
+    match crate::core::prefs::internal_hint(key) {
+        Some(hint) => super::actor::refuse_agent_caller(
+            headers,
+            format!("An agent cannot write the preference '{key}': {hint}."),
+        ),
+        None => Ok(()),
     }
 }
 
@@ -1203,6 +1247,8 @@ pub(super) async fn put_network_config(
     headers: HeaderMap,
     Json(request): Json<SetNetworkConfigRequest>,
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
+    refuse_agent_human_only_preference(&headers, crate::core::prefs::NETWORK_BIND.key())
+        .map_err(|e| (e.status, e.message))?;
     if let Err(msg) = crate::net_config::validate_bind_input(&request.engine_bind) {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
@@ -1696,13 +1742,30 @@ pub(super) async fn send_email_confirmed(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // This route is the user's answer to a confirm form, so an agent pressing
+    // it would skip `require_send_confirmation`. A 403 rather than the
+    // `success: false` shape: no confirm form reads this refusal, the agent does.
+    crate::api::actor::refuse_agent_caller(
+        &headers,
+        "An agent cannot confirm an email send. The user confirms the draft on the \
+         form `send_email` opened, and only that sends it.",
+    )?;
+    Ok(send_confirmed_draft(&state, &headers, &body).await)
+}
+
+/// The send behind [`send_email_confirmed`], once an agent has been refused.
+async fn send_confirmed_draft(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &serde_json::Value,
 ) -> Json<serde_json::Value> {
     use crate::core::email::{EmailClient, EmailStore};
 
     // Before the send, which leaves the machine and cannot be recalled. This
     // route answers 200 with `success: false`, so the refusal wears that shape
     // rather than a status the caller's own error path would not read.
-    let actor = match crate::api::actor::require_user_actor(&headers, &state.pool, None).await {
+    let actor = match crate::api::actor::require_user_actor(headers, &state.pool, None).await {
         Ok(a) => a,
         Err(e) => {
             return Json(serde_json::json!({ "success": false, "error": e.message }));

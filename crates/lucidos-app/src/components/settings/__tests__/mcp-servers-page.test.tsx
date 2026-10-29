@@ -70,6 +70,8 @@ function server(over: Partial<McpServerStatus> = {}): McpServerStatus {
     running: true,
     auto_approve: false,
     dispatchable: true,
+    launch_line: 'npx -y slack-mcp',
+    launch_approved: true,
     tools_source: 'live',
     tools_observed_at: new Date(Date.now() - 3 * 86400000).toISOString(),
     tools: [tool()],

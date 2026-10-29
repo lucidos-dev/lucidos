@@ -75,7 +75,8 @@ function fixture(opts: { resolveThread?: () => string; awaitThread?: () => Promi
       releases++;
     },
     openAudio: () => Promise.resolve(device()),
-    openSocket: (threadId, socketHandlers) => {
+    mintCallTicket: () => Promise.resolve('ticket'),
+    openSocket: (threadId, _ticket, socketHandlers) => {
       dialled.push(threadId);
       handlers = socketHandlers;
       return socket;

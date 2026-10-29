@@ -1429,6 +1429,24 @@ html[data-font-bold="none"] .markdown-content :is(strong, b) {
     white-space: pre-line;
 }
 
+/* The key combo of a shortcut tooltip, as a chip on its own row. */
+.tooltip-shortcut {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 0.375rem;
+}
+
+.tooltip-shortcut kbd {
+    padding: 0.0625rem 0.375rem;
+    font-family: ui-monospace, monospace;
+    font-size: var(--font-size-2xs);
+    color: var(--text-primary);
+    white-space: nowrap;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: calc(var(--radius-control) * 0.75);
+}
+
 /* Structured two-column label/value tooltip (e.g. thread drawer rows). The dim
    label sits in the left column, the bright value right-aligned in the right.
    `display: contents` lets each .tt-row's children join the parent grid, so the

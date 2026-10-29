@@ -197,6 +197,8 @@ fn the_deliberate_omissions_stay_denied() {
         // The credential never enters the iframe.
         ("/credential-value", "GET"),
         ("/credential-reveal-token", "POST"),
+        // A call speaks as the owner.
+        ("/voice/ticket", "POST"),
         ("/credential-base-urls", "PUT"),
         ("/credentials", "GET"),
         ("/backup/key", "GET"),
@@ -461,6 +463,35 @@ async fn a_stamped_write_of_a_coding_agent_spawn_preference_is_refused() {
         .await,
         StatusCode::OK,
         "Settings writes the coding-agent paths through this same route"
+    );
+}
+
+/// `opencode_free_enabled` sends chat to an anonymous relay whose free models
+/// may train on it. ADR 0104 makes that the human's informed opt-in, so an app
+/// may not flip it. Settings still writes it.
+#[tokio::test]
+async fn a_stamped_write_of_the_opencode_free_switch_is_refused() {
+    use axum::http::StatusCode;
+    for query in [
+        "key=opencode_free_enabled",
+        "key=opencode%5Ffree%5Fenabled",
+        "key=theme&key=opencode_free_enabled",
+    ] {
+        assert_eq!(
+            status_of(
+                "PUT",
+                &format!("/api/v1/preferences?{query}"),
+                Some("habit-tracker")
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "an app switched on the OpenCode Free relay in `{query}`"
+        );
+    }
+    assert_eq!(
+        status_of("PUT", "/api/v1/preferences?key=opencode_free_enabled", None).await,
+        StatusCode::OK,
+        "Settings writes the OpenCode Free switch through this same route"
     );
 }
 

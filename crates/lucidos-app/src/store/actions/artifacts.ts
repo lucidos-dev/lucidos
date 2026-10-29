@@ -333,12 +333,26 @@ export function openUrlOutsideApp(url: string, source?: string): void {
   );
 }
 
+/** Schemes the in-app browser renders. Its page text goes to the model with the
+ *  next message, so a `file:` page would send a local file there. Mirrors
+ *  `previewable_url` in `panel_preview.rs`, which refuses the rest. */
+const IN_APP_BROWSER_SCHEMES = new Set(['http:', 'https:']);
+
+export function inAppBrowserRenders(url: string): boolean {
+  try {
+    return IN_APP_BROWSER_SCHEMES.has(new URL(url).protocol);
+  } catch {
+    return false;
+  }
+}
+
 /** Open a URL wherever the user's preferences point it. The experimental in-app
  *  browser is opt-in and desktop-only, so it mounts the url-preview panel only
- *  when it is the live target. Everything else goes to `openUrlOutsideApp`. */
+ *  when it is the live target and the URL is a web page. Everything else goes to
+ *  `openUrlOutsideApp`, which asks before a `file:` target reaches the OS. */
 export function openUrl(url: string, source?: string): void {
   if (refuseDangerousUrl(url, source)) return;
-  if (!inAppBrowserAvailable()) {
+  if (!inAppBrowserAvailable() || !inAppBrowserRenders(url)) {
     openUrlOutsideApp(url, source);
     return;
   }

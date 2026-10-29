@@ -730,6 +730,8 @@ lucidos.events.emit(type: string, payload: Record<string, unknown>, options?: Em
 lucidos.events.query(params?: EventQuery): Promise<LucidosEvent[]>
 ```
 
+`query` masks every payload against the credentials stored now, so a value a stored credential holds comes back as `[REDACTED]`. When the mask cannot load them, the call fails with a 500 rather than returning raw rows.
+
 ### Types
 
 ```ts
@@ -870,6 +872,10 @@ OpenAI speech (`/audio/speech`) reports usage only on an SSE stream. So for `mp3
 - the `anthropic-` and `openai-` header families, for every proxy entry
 
 The engine drops everything else. That covers `Set-Cookie`, `Clear-Site-Data`, `Strict-Transport-Security`, a CSP, CORS headers, `Alt-Svc` and `WWW-Authenticate`, and any other vendor header. Every response carries `X-Content-Type-Options: nosniff`. An HTML, XML or untyped one also carries `Content-Security-Policy: sandbox`, so a proxy URL opened in a tab never runs upstream script.
+
+**The injected credential never comes back.** An upstream can repeat what it received: a pagination `Link`, a redirect `Location`, an error body quoting the request. The engine replaces every credential it injected with `[REDACTED]` in the response headers, the body and its own error text. That covers the raw value, a bearer or basic token and a basic password, each also URL-encoded or with `/` written as `\/`. Other escapes, such as `\uXXXX`, are not matched. A reply that names none arrives byte for byte.
+
+A credentialed call asks the upstream for an uncompressed reply, so `Content-Encoding` is absent. An upstream that compresses anyway gets a 502, because the engine cannot check that body. A `Link` you follow back through the proxy carries `[REDACTED]` where the key was, and the engine injects the real one again.
 
 **A response is buffered, so it does not stream.** The engine reads the whole upstream body before it answers, from a frame or a standalone tab. A token stream arrives complete, so render the finished answer.
 
@@ -1489,7 +1495,8 @@ so it keeps that shell's theme. Otherwise the tab reads the workspace-scoped
 `command_guard`, `max_tool_calls`, `network_bind` or `local_base_url`. Those
 are security settings the user changes in Settings. It also refuses the keys
 that choose what a coding-agent session spawns (`coding_agent_claude_path`,
-`coding_agent_codex_path`, `coding_agent_claude_permission_mode`).
+`coding_agent_codex_path`, `coding_agent_claude_permission_mode`), and
+`opencode_free_enabled`, which sends chat to an anonymous third-party relay.
 
 Engine bookkeeping, such as the last backup's outcome in `backup_last_run`, is
 not a setting: `get()` leaves it out, and `set()` refuses it.
@@ -2396,6 +2403,8 @@ interface ConfirmOptions {
 
 Resolves `true` on OK click or Enter, and `false` on Cancel, Esc or backdrop click. A second `confirm` while one is visible resolves the first `false` and replaces it.
 
+Only the Lucidos shell that hosts the frame sees or answers a dialog. The SDK posts every `ui` request to the shell's origin and ignores a reply from any other page. A page that frames your app from another origin reads no dialog and cannot answer one.
+
 **Example:**
 
 ```js
@@ -2575,7 +2584,7 @@ you add later is covered too. Never hand-roll a tooltip in an app.
 
 | Attribute | Effect |
 |---|---|
-| `data-tooltip` | The tooltip text. For the normal case this is the whole contract. |
+| `data-tooltip` | The tooltip text. For the normal case this is the whole contract. Text after a U+001F character draws as a key chip on its own row, for a keyboard shortcut (`"Refresh\u001f⌘R"` from script). |
 | `data-tooltip-title` | A bold heading above the text. |
 | `data-tooltip-rows` | A JSON array of `{label, value, tone?}`, rendered as a two-column grid. Use it for a small property list. `tone` paints a leading dot and takes `running`, `changes`, `waiting` or `failed`. |
 | `data-tooltip-below` | Always place the tooltip below the element, never above. |

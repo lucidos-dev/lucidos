@@ -225,6 +225,103 @@ fn find_manifest_roots_skips_build_output_dirs() {
     assert_eq!(roots, vec![repo_dir.path().join("real")]);
 }
 
+#[cfg(unix)]
+#[test]
+fn find_manifest_roots_never_follows_a_symlink_out_of_the_repo() {
+    use std::os::unix::fs::symlink;
+    let outside = tempfile::tempdir().unwrap();
+    write_plugin(
+        &outside.path().join("plugin"),
+        "outside",
+        "0.1.0",
+        "Outside",
+    );
+    let repo_dir = tempfile::tempdir().unwrap();
+    write_plugin(&repo_dir.path().join("real"), "real", "0.1.0", "Real");
+    symlink(outside.path(), repo_dir.path().join("linked-dir")).unwrap();
+    symlink(
+        outside.path().join("plugin"),
+        repo_dir.path().join("linked-plugin"),
+    )
+    .unwrap();
+    let manifest_only = repo_dir.path().join("linked-manifest");
+    std::fs::create_dir_all(manifest_only.join("knowhow")).unwrap();
+    symlink(
+        outside.path().join("plugin/manifest.toml"),
+        manifest_only.join("manifest.toml"),
+    )
+    .unwrap();
+
+    let roots = find_manifest_roots(repo_dir.path()).unwrap();
+
+    assert_eq!(roots, vec![repo_dir.path().join("real")]);
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_catalog_skips_a_committed_symlink_that_points_outside_the_repo() {
+    use std::os::unix::fs::symlink;
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write_plugin(
+        &outside.path().join("plugin"),
+        "outside",
+        "0.1.0",
+        "Outside",
+    );
+    let repo_dir = tempfile::tempdir().unwrap();
+    std::fs::write(repo_dir.path().join("README.md"), "Links only").unwrap();
+    symlink(outside.path(), repo_dir.path().join("linked-dir")).unwrap();
+    symlink(
+        outside.path().join("plugin"),
+        repo_dir.path().join("linked-plugin"),
+    )
+    .unwrap();
+    commit_all(repo_dir.path());
+
+    let mut registry = PluginMarketplaceRegistry::default();
+    add_local_marketplace(&mut registry, repo_dir.path());
+
+    let catalog = scan_catalog(workspace.path(), &registry, &[], &GitCredentials::none());
+
+    assert!(catalog.plugins.is_empty(), "{:?}", catalog.plugins);
+    assert_eq!(catalog.errors.len(), 1, "{:?}", catalog.errors);
+    assert_eq!(
+        catalog.errors[0].error,
+        "no plugin manifest.toml files found"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn clone_marketplace_refuses_a_subpath_that_resolves_through_a_symlink() {
+    use std::os::unix::fs::symlink;
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write_plugin(
+        &outside.path().join("plugin"),
+        "outside",
+        "0.1.0",
+        "Outside",
+    );
+    let repo_dir = tempfile::tempdir().unwrap();
+    write_plugin(&repo_dir.path().join("real"), "real", "0.1.0", "Real");
+    symlink(outside.path(), repo_dir.path().join("linked-dir")).unwrap();
+    commit_all(repo_dir.path());
+
+    let source = MarketplaceSource {
+        clone_url: format!("file://{}", repo_dir.path().join(".git").display()),
+        github_owner: None,
+        github_repo: None,
+        branch: None,
+        subpath: Some("linked-dir/plugin".to_string()),
+    };
+
+    let err = clone_marketplace(workspace.path(), &source, &GitCredentials::none())
+        .expect_err("a symlinked subpath must not resolve");
+    assert!(err.contains("subpath not found inside repo"), "{err}");
+}
+
 fn catalog_plugin(
     id: &str,
     version: &str,

@@ -16,7 +16,7 @@ mod http;
 pub(crate) mod image;
 mod import;
 mod judgment;
-mod mcp;
+pub(crate) mod mcp;
 mod memory;
 mod models;
 pub(crate) mod navigate;
@@ -557,7 +557,7 @@ impl LucidosEngine {
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        query_events_impl(&self.event_store, args, thread_id).await
+        query_events_impl(&self.pool, args, thread_id).await
     }
 
     /// Thin wrapper over [`count_events_impl`], which owns the arg parsing.
@@ -2056,11 +2056,16 @@ pub(crate) async fn count_events_impl(
 /// `caller_thread_id` is the thread the tool call runs in, ambient from
 /// `execute_tool`. It is what the `current` alias resolves to, so the model
 /// cannot point the alias at somebody else's conversation.
+///
+/// Every payload is masked against the stored secrets on the way out. A row
+/// written before the write-time masks, such as a background task's output or
+/// a script trigger's summary, can still hold a raw credential.
 pub(crate) async fn query_events_impl(
-    event_store: &crate::core::store::EventStore,
+    pool: &sqlx::PgPool,
     args: &serde_json::Value,
     caller_thread_id: uuid::Uuid,
 ) -> ToolOutcome {
+    let event_store = crate::core::store::EventStore::new(pool.clone());
     let event_type = args.get("event_type").and_then(|v| v.as_str());
     let since = parse_time_filter(args, "since")?;
     let until = parse_time_filter(args, "until")?;
@@ -2133,6 +2138,9 @@ pub(crate) async fn query_events_impl(
             }
         }
     }
+    crate::engine::engine_impl::mask_stored_events(pool, &mut events)
+        .await
+        .map_err(|e| format!("Error: events withheld, since they could not be masked: {e}"))?;
     Ok(build_query_events_response(&events, byte_limit))
 }
 

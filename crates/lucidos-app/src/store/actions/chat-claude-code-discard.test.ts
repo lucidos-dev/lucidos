@@ -28,6 +28,7 @@ vi.mock('../../api/client', () => ({
 }));
 vi.mock('./changeToast', () => ({ changeToastMessage }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
+vi.mock('./send-probe', () => ({ probeStreamAfterSend: vi.fn() }));
 
 const { handleDiscardCCChanges } = await import('./chat-claude-code');
 

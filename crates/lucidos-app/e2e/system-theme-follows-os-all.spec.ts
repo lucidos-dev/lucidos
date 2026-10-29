@@ -110,6 +110,10 @@ test.describe('system theme follows the OS', () => {
     await page.emulateMedia({ colorScheme: 'dark' });
     await gotoWithRetry(page, '/');
     await expect(page.locator('html')).toHaveAttribute('data-theme-mode', 'dark');
+    // The boot script paints that attribute before the app module loads, so it
+    // does not prove the OS follower is attached. A flip sent earlier makes a
+    // slow runner spend the grace on loading. The first repaint proves it.
+    await startupRepainted;
   });
 
   test('a flip announced while the page is visible is applied', async ({ page }) => {
@@ -121,9 +125,8 @@ test.describe('system theme follows the OS', () => {
   });
 
   test('a flip announced while hidden waits for the resume, then lands', async ({ page }) => {
-    // Startup's first preference load repaints the theme. Hiding before it
-    // lands tests that race, which the late-load test above covers on purpose.
-    await startupRepainted;
+    // Hiding before startup's first repaint lands tests that race, which the
+    // late-load test above covers on purpose. `beforeEach` waits for it.
     await setHidden(page, true);
     await page.emulateMedia({ colorScheme: 'light' });
 

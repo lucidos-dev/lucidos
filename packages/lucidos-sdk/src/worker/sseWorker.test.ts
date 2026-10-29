@@ -62,18 +62,29 @@ const HELLO = {
   pongUrl: 'http://test/api/v1/presence-pong',
 };
 
-async function startWorker() {
+/** Load a fresh worker and return what the browser calls for each port, before
+ *  the page has said anything. A relaunched worker gets exactly this for every
+ *  port its previous instance held. */
+async function loadWorker() {
   const scope: { onconnect?: (e: { ports: MessagePort[] }) => void } = {};
   vi.stubGlobal('self', scope);
   vi.resetModules();
   await import('./sseWorker');
+  return (port: FakePort & MessagePort) => scope.onconnect!({ ports: [port] });
+}
+
+async function startWorker() {
+  const connect = await loadWorker();
   return (port: FakePort & MessagePort) => {
-    scope.onconnect!({ ports: [port] });
+    connect(port);
     port.send(HELLO);
   };
 }
 
-const types = (port: FakePort) => port.received.map((m) => m.t);
+const INTRODUCE = { t: 'introduce' };
+
+/** What the worker told a port after its greeting. */
+const types = (port: FakePort) => port.received.slice(1).map((m) => m.t);
 const lastReceived = (port: FakePort) => port.received[port.received.length - 1];
 
 describe('shared worker upstream watchdog', () => {
@@ -165,7 +176,7 @@ describe('shared worker upstream watchdog', () => {
     expect(FakeEventSource.all).toHaveLength(1);
     expect(es.closed).toBe(false);
     expect(types(first)).toEqual(['open']);
-    expect(late.received).toEqual([{ t: 'open', lateJoin: true }]);
+    expect(late.received).toEqual([INTRODUCE, { t: 'open', lateJoin: true }]);
   });
 
   it('restarts a silent upstream when a port asks for a check', async () => {
@@ -179,12 +190,15 @@ describe('shared worker upstream watchdog', () => {
 
     expect(FakeEventSource.all).toHaveLength(2);
     expect(FakeEventSource.all[0].closed).toBe(true);
-    expect(lastReceived(port)).toEqual({ t: 'error', silentMs: LATE_JOIN_STALL_AFTER_MS });
+    expect(port.received.slice(-2)).toEqual([
+      { t: 'error', silentMs: LATE_JOIN_STALL_AFTER_MS },
+      { t: 'checked' },
+    ]);
     FakeEventSource.live[0].onopen!();
     expect(lastReceived(port)).toEqual({ t: 'open' });
   });
 
-  it('keeps a live upstream when a port asks for a check', async () => {
+  it('keeps a live upstream when a port asks for a check, and answers it', async () => {
     const attach = await startWorker();
     const port = fakePort();
     attach(port);
@@ -196,7 +210,77 @@ describe('shared worker upstream watchdog', () => {
 
     expect(FakeEventSource.all).toHaveLength(1);
     expect(es.closed).toBe(false);
-    expect(types(port)).toEqual(['open']);
+    expect(types(port)).toEqual(['open', 'checked']);
+  });
+
+  it('greets each port as it attaches, before the page says anything', async () => {
+    const connect = await loadWorker();
+    const port = fakePort();
+
+    connect(port);
+
+    expect(port.received).toEqual([INTRODUCE]);
+    expect(FakeEventSource.all).toHaveLength(0);
+  });
+
+  it('opens no stream for a check from a port that never said hello, says it is down, and asks again', async () => {
+    // A relaunched worker inherits its predecessor's ports with none of their
+    // hellos. A check from one used to open `new EventSource('')`, which
+    // fetched the worker's own script and failed with nobody told.
+    const connect = await loadWorker();
+    const orphan = fakePort();
+    connect(orphan);
+
+    orphan.send({ t: 'check' });
+
+    expect(FakeEventSource.all).toHaveLength(0);
+    expect(orphan.received).toEqual([INTRODUCE, { t: 'error' }, INTRODUCE, { t: 'checked' }]);
+  });
+
+  it('opens no stream for a restart from a port that never said hello, and asks again', async () => {
+    const connect = await loadWorker();
+    const orphan = fakePort();
+    connect(orphan);
+
+    orphan.send({ t: 'restart' });
+
+    expect(FakeEventSource.all).toHaveLength(0);
+    expect(orphan.received).toEqual([INTRODUCE, { t: 'error' }, INTRODUCE]);
+  });
+
+  it('serves an inherited port once its page says hello again', async () => {
+    const connect = await loadWorker();
+    const port = fakePort();
+    connect(port);
+    port.send({ t: 'check' });
+
+    port.send(HELLO);
+    FakeEventSource.live[0].onopen!();
+
+    expect(FakeEventSource.all.map((es) => es.url)).toEqual([HELLO.streamUrl]);
+    expect(lastReceived(port)).toEqual({ t: 'open' });
+  });
+
+  it('reopens a live upstream once for every port when a port asks to restart', async () => {
+    const attach = await startWorker();
+    const first = fakePort();
+    const second = fakePort();
+    attach(first);
+    attach(second);
+    FakeEventSource.live[0].onopen!();
+
+    first.send({ t: 'restart' });
+
+    expect(FakeEventSource.all).toHaveLength(2);
+    expect(FakeEventSource.all[0].closed).toBe(true);
+    expect(FakeEventSource.live).toHaveLength(1);
+    for (const port of [first, second]) {
+      expect(lastReceived(port)).toEqual({ t: 'error' });
+    }
+    FakeEventSource.live[0].onopen!();
+    for (const port of [first, second]) {
+      expect(lastReceived(port)).toEqual({ t: 'open' });
+    }
   });
 
   it('retries a plain upstream error after the retry delay, with no stall reason', async () => {

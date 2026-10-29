@@ -34,6 +34,11 @@ export interface McpServerStatus {
    *  server can ever be called. Starting it is refused, and Remove is the only
    *  thing to offer. */
   dispatchable: boolean;
+  /** The launch line a start would spawn, plain env values masked. `null`
+   *  when the engine's working directory is unknown. */
+  launch_line: string | null;
+  /** Whether someone approved that exact line. */
+  launch_approved: boolean;
   tools_source: McpToolsSource;
   /** ISO timestamp of the last successful connect, or `null` if there has
    *  never been one. */

@@ -75,6 +75,43 @@ pub fn validate_data_write(
     super::workspace_fonts::validate_data_write(data_dir, data_path, bytes)
 }
 
+/// Where `data_path` really lands once every symlink on it resolves, as a
+/// path relative to `data_dir`.
+///
+/// The prefix allowlist reads a string, and a symlink makes the string lie: a
+/// link under `artifacts/` can point at `.env`, `postgres/` or anywhere on the
+/// host. A caller runs its own prefix rule again on the answer.
+///
+/// The part of the path that does not exist yet stays unresolved. So a new
+/// file under a linked directory still resolves. An entry that exists but
+/// cannot resolve, such as a dangling link, is an error: a write through it
+/// would create its target, wherever that is.
+pub fn resolved_data_path(data_dir: &std::path::Path, data_path: &str) -> Result<String, String> {
+    // No `data/` yet means nothing below it exists, so nothing is linked.
+    let Ok(root) = data_dir.canonicalize() else {
+        return Ok(data_path.to_string());
+    };
+    let full = data_dir.join(data_path);
+    let existing = full
+        .ancestors()
+        .find(|p| p.symlink_metadata().is_ok())
+        .unwrap_or(data_dir);
+    let missing = full
+        .strip_prefix(existing)
+        .expect("an ancestor is a prefix of its path");
+    let real = existing
+        .canonicalize()
+        .map_err(|e| format!("'{data_path}' cannot be resolved: {e}"))?
+        .join(missing);
+    let relative = real
+        .strip_prefix(&root)
+        .map_err(|_| format!("'{data_path}' resolves outside data/ through a symlink"))?;
+    relative
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("'{data_path}' resolves to a path that is not UTF-8"))
+}
+
 /// The data prefixes as one comma-separated line, for a refusal to name.
 pub fn known_data_prefixes_text() -> String {
     known_data_prefixes().collect::<Vec<_>>().join(", ")
@@ -133,6 +170,66 @@ mod tests {
         assert!(is_known_data_prefix("themes/harbour.json"));
         assert!(is_known_data_prefix("fonts/brand/font.json"));
         assert!(is_known_data_prefix("system-knowhow/themes.md"));
+    }
+
+    /// A workspace `data/` dir holding `artifacts/real.md` and `.env`, plus a
+    /// file outside the workspace altogether.
+    fn linked_tree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let ws = tempfile::tempdir().unwrap();
+        let data = ws.path().join("data");
+        std::fs::create_dir_all(data.join("artifacts")).unwrap();
+        std::fs::write(data.join("artifacts/real.md"), "mine").unwrap();
+        std::fs::write(data.join(".env"), "KEY=1").unwrap();
+        let outside = ws.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "private").unwrap();
+        (ws, data, outside)
+    }
+
+    #[test]
+    fn a_plain_path_resolves_to_itself_whether_or_not_it_exists() {
+        let (_ws, data, _) = linked_tree();
+        for path in ["artifacts/real.md", "artifacts/new/deep/file.md"] {
+            assert_eq!(resolved_data_path(&data, path).unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn a_symlink_resolves_to_the_file_it_reaches() {
+        use std::os::unix::fs::symlink;
+        let (_ws, data, outside) = linked_tree();
+        let artifacts = data.join("artifacts");
+        symlink(artifacts.join("real.md"), artifacts.join("alias.md")).unwrap();
+        symlink(data.join(".env"), artifacts.join("env")).unwrap();
+        symlink(outside.join("secret.txt"), artifacts.join("file-out")).unwrap();
+        symlink(&outside, artifacts.join("dir-out")).unwrap();
+        symlink(outside.join("absent"), artifacts.join("dangling")).unwrap();
+
+        assert_eq!(
+            resolved_data_path(&data, "artifacts/alias.md").unwrap(),
+            "artifacts/real.md"
+        );
+        // Inside data/ but past the allowlist: the caller's prefix rule refuses it.
+        assert_eq!(resolved_data_path(&data, "artifacts/env").unwrap(), ".env");
+        for path in [
+            "artifacts/file-out",
+            "artifacts/dir-out/secret.txt",
+            "artifacts/dir-out/new.md",
+            "artifacts/dangling",
+        ] {
+            assert!(resolved_data_path(&data, path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_data_dir_behind_a_symlink_still_resolves_its_own_files() {
+        let (ws, data, _) = linked_tree();
+        let linked = ws.path().join("linked-data");
+        std::os::unix::fs::symlink(&data, &linked).unwrap();
+        assert_eq!(
+            resolved_data_path(&linked, "artifacts/real.md").unwrap(),
+            "artifacts/real.md"
+        );
     }
 
     #[test]

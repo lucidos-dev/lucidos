@@ -341,18 +341,45 @@ pub fn is_git_url(s: &str) -> bool {
         || s.ends_with(".git")
 }
 
+/// The plugin root a tree-URL `subpath` names inside a fresh clone. Every
+/// segment must be a real directory: a committed symlink could point anywhere
+/// on the host, and the install would copy what it finds there.
+pub fn clone_subpath_root(clone_target: &Path, subpath: Option<&str>) -> Result<PathBuf, String> {
+    let not_found = || format!("subpath not found inside repo: {}", subpath.unwrap_or(""));
+    let mut root = clone_target.to_path_buf();
+    for component in Path::new(subpath.unwrap_or("")).components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(not_found());
+        };
+        root.push(part);
+        if !std::fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir()) {
+            return Err(not_found());
+        }
+    }
+    if !root.is_dir() {
+        return Err(not_found());
+    }
+    Ok(root)
+}
+
+/// Read and parse `<root>/manifest.toml`, the one way any fetched tree's
+/// manifest is read. No-follow: a linked manifest is host data, and a parse
+/// error quotes the line it failed on.
+pub fn read_manifest(root: &Path) -> Result<PluginManifest, ValidationError> {
+    let manifest_path = root.join("manifest.toml");
+    if !std::fs::symlink_metadata(&manifest_path).is_ok_and(|m| m.is_file()) {
+        return Err(ValidationError::MissingManifest);
+    }
+    let toml_text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
+    parse_manifest(&toml_text)
+}
+
 /// Validate the on-disk structure of an unpacked plugin at `root`. Walks the
 /// content directories once and returns the parsed manifest plus the install
 /// plan, so the install path doesn't have to walk again.
 pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), ValidationError> {
-    let manifest_path = root.join("manifest.toml");
-    if !manifest_path.is_file() {
-        return Err(ValidationError::MissingManifest);
-    }
-
-    let toml_text = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
-    let manifest = parse_manifest(&toml_text)?;
+    let manifest = read_manifest(root)?;
 
     let entries =
         std::fs::read_dir(root).map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
@@ -427,7 +454,11 @@ fn validate_widgets(plugin_id: &str, root: &Path) -> Result<(), ValidationError>
         if name.starts_with('.') || !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(entry.path().join("manifest.json")) else {
+        let manifest_path = entry.path().join("manifest.json");
+        if !std::fs::symlink_metadata(&manifest_path).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&manifest_path) else {
             continue;
         };
         let Ok(app) = serde_json::from_str::<AppManifest>(&text) else {

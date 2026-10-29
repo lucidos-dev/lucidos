@@ -13,6 +13,8 @@ The result type cannot simply leave the list. After a restart Esc'd a parked `As
 
 `CodingAgentToolResult` leaves the shared list. It ends a question only when its `tool_use_id` equals the question's own. Chat `ToolResult` stays in the list, because the chat loop asks sequentially.
 
+The thread status follows the same rule. A result moves a thread off `waiting_for_user_answer` only when a question set the park and the result is its own. A late result of an earlier call leaves the park in place, whether a question or a permission card holds it. A permission card ends only through its resolution.
+
 ## Rationale
 
 A result completes a call issued earlier. A call issued after the question already overtakes it through its own `CodingAgentToolCalled`. Only two results add information. One is for a call issued before the question, which is the false positive. The other is the question's own call, which is a real end. The `tool_use_id` separates the two.
@@ -23,7 +25,8 @@ One SQL helper, `ThreadEvent::question_own_result_sql`, serves the typed-text lo
 
 - A late result of an earlier call leaves the card live and typed text answers it.
 - In Claude Code's parallel-tool-call race, a sibling's late result no longer kills a live card. The agent is still blocked on it, so that is right.
-- Five readers now share one pairing rule. A new reader of "the question ended" must use the helper.
+- Six readers now share one pairing rule, the status projection among them. A new reader of "the question ended" must use the helper.
+- Both hang watchdogs spare a tool in flight past the 45-minute ceiling only when the status reads the park. A late result once flipped the status to `running`. The watchdog then killed a session that only waited on the user, and the resumed agent asked again. Meanwhile the card read "Needs your answer" under a live Stop button.
 - Held deliveries no longer count a late result as agent activity.
 
 ## Alternatives considered

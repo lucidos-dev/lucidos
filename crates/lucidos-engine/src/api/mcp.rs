@@ -197,15 +197,44 @@ fn start_failed_error(id: &str, e: impl std::fmt::Display) -> ApiError {
     )
 }
 
-/// POST /api/v1/mcp/servers/:id/start: start a registered server.
+/// Record the owner's click as approval of `server`'s current launch line, so
+/// the start gate lets it spawn whatever the command guard setting.
+///
+/// Only the owner's registered device approves. Any other caller's start
+/// still runs, through the start gate: an agent's `lucidos mcp start`, the
+/// local token, or an app an agent wrote. Otherwise one of them could approve
+/// a line the guard never showed the user.
+async fn approve_launch_by_owner_click(
+    manager: &crate::mcp::McpManager,
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+    server: &McpServer,
+) -> Result<(), ApiError> {
+    let Ok(owner) = super::actor::require_owner_device(headers, pool).await else {
+        return Ok(());
+    };
+    manager
+        .approve_launch(server, Some(owner))
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("Failed to approve MCP server '{}': {e}", server.id))
+        })
+}
+
+/// POST /api/v1/mcp/servers/:id/start: start a registered server. The owner's
+/// click approves its launch line (ADR 0002, MCP addendum).
 pub(super) async fn start_mcp_server(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    super::actor::require_user_actor(&headers, &state.pool, None).await?;
     let server = load_server(&state, &id).await?;
     if let Some(e) = unusable_id_error(&server) {
         return Err(e);
     }
+    approve_launch_by_owner_click(&state.engine.mcp_manager, &state.pool, &headers, &server)
+        .await?;
 
     let outcome = state
         .engine
@@ -262,7 +291,8 @@ async fn require_thread(state: &AppState, thread_id: Uuid) -> Result<(), ApiErro
 }
 
 /// POST /api/v1/threads/:thread_id/mcp-servers/:id/enable: enable a server in
-/// one thread, starting it if it is not running (ADR 0430).
+/// one thread, starting it if it is not running (ADR 0430). The owner's click
+/// approves its launch line, as Start does.
 pub(super) async fn enable_thread_mcp_server(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -274,6 +304,8 @@ pub(super) async fn enable_thread_mcp_server(
     if let Some(e) = unusable_id_error(&server) {
         return Err(e);
     }
+    approve_launch_by_owner_click(&state.engine.mcp_manager, &state.pool, &headers, &server)
+        .await?;
 
     let outcome = state
         .engine
@@ -438,6 +470,53 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent's `lucidos mcp start` reaches the same route as the Start
+    /// button. Only the button may approve the line.
+    #[tokio::test]
+    async fn only_the_owners_click_approves_a_launch_line() {
+        use crate::api::actor::{
+            init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+            HEADER_DEVICE_ID,
+        };
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        crate::core::DeviceStore::register(&pool, &bus, "owner-phone", None, None, None)
+            .await
+            .unwrap();
+        let server = McpServerStore::register(
+            &pool,
+            &bus,
+            "srv",
+            "srv",
+            "/usr/local/bin/srv",
+            &[],
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let manager = crate::mcp::McpManager::new(pool.clone(), bus, workspace.path().into());
+
+        init_agent_origin_secret("mcp-click-test-secret".to_string());
+        let mut agent = HeaderMap::new();
+        let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None).unwrap();
+        agent.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
+        approve_launch_by_owner_click(&manager, &pool, &agent, &server)
+            .await
+            .unwrap();
+        assert!(!manager.is_launch_approved(&server).await.unwrap());
+
+        let mut owner = HeaderMap::new();
+        owner.insert(HEADER_DEVICE_ID, "owner-phone".parse().unwrap());
+        approve_launch_by_owner_click(&manager, &pool, &owner, &server)
+            .await
+            .unwrap();
+        assert!(manager.is_launch_approved(&server).await.unwrap());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
 
     #[test]
     fn mcp_consent_response_deserializes_persist_scope_as_typed_enum() {

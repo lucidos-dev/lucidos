@@ -385,6 +385,7 @@ pub const ROUTE_REACH: &[(&str, Reach, &[&str])] = &[
     ("/triggers/run", App, &["POST"]),
     ("/ui/navigate", App, &["POST"]),
     ("/voice", Host, &[]),
+    ("/voice/ticket", Host, &[]),
     ("/webhooks", Host, &[]),
     ("/webhooks/:id", Host, &[]),
     ("/webhooks/:id/deliver", Host, &[]),
@@ -531,14 +532,21 @@ fn human_only_preference(
         })
 }
 
-/// Preferences that choose what a coding-agent session spawns and what it may
-/// do unasked. An app writes files under its own folder, which is the app
+/// Preferences the agent may write but an app may not.
+///
+/// The coding-agent keys choose what a session spawns and what it may do
+/// unasked. An app writes files under its own folder, which is the app
 /// thread's working directory. So a path pointed at `/bin/sh` runs the app's
 /// own script as the user when the next session starts.
+///
+/// The OpenCode Free switch sends chat anonymously to a third-party relay whose
+/// free models may train on it. ADR 0104 makes that the human's informed
+/// opt-in, so no app may turn it on unasked.
 const APP_REFUSED_PREFERENCES: &[&str] = &[
     crate::core::prefs::CODING_AGENT_CLAUDE_PATH.key(),
     crate::core::prefs::CODING_AGENT_CODEX_PATH.key(),
     crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE.key(),
+    crate::core::prefs::OPENCODE_FREE_ENABLED.key(),
 ];
 
 /// Decode one `application/x-www-form-urlencoded` component, as axum's `Query`

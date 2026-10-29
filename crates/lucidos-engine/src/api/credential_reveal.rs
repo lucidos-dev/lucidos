@@ -26,6 +26,12 @@ const MINT_ROUTE: &str = "/api/v1/credential-reveal-token";
 /// What the 403 calls the secret this module guards.
 const SUBJECT_LABEL: &str = "a credential value";
 
+/// What an agent is told by both steps. A credential reaches an agent's work
+/// through the proxy, which never shows it the value.
+const AGENT_REFUSAL: &str = "An agent cannot reveal a credential value. Call the API \
+     through the credential proxy, which signs the request without showing the value, \
+     or ask the user to copy it in Settings.";
+
 /// `POST /api/v1/credential-reveal-token`: mint a one-shot reveal token.
 ///
 /// Step one of two. The Settings page mints, then immediately spends. Splitting
@@ -40,6 +46,8 @@ pub(super) async fn mint_reveal_token(
         log!("[Credentials] refused a reveal-token mint from an app document");
         return Err(forbidden(SUBJECT_LABEL));
     }
+    crate::api::actor::refuse_agent_caller(&headers, AGENT_REFUSAL)
+        .map_err(|e| (e.status, e.message))?;
     // Refuse to mint against a row that does not exist, so a caller learns that
     // here rather than after spending the token.
     match CredentialStore::get_by_id(&state.pool, query.id).await {
@@ -98,6 +106,8 @@ pub(super) async fn get_credential_value(
     }
     // Before the redeem, which is one-shot: a caller refused after it would
     // have spent its token on a request that never saw the credential.
+    crate::api::actor::refuse_agent_caller(&headers, AGENT_REFUSAL)
+        .map_err(|e| (e.status, e.message))?;
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None)
         .await
         .map_err(|e| (e.status, e.message))?;

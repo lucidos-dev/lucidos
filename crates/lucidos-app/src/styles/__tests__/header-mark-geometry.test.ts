@@ -298,7 +298,10 @@ describe('the mark says its connection in strength alone', () => {
     expect(decl(disconnected, 'color')).toBeNull();
     expect(decl(disconnected, 'background')).toBeNull();
 
-    const connecting = block(markCss, '.brand-mark[data-conn="connecting"] .brand-mark-glyph {');
+    const connecting = block(
+      markCss,
+      '.brand-mark[data-conn="connecting"] .brand-mark-glyph,\n.brand-mark[data-conn="starting"] .brand-mark-glyph {',
+    );
     expect(decl(connecting, 'animation')).toContain('brand-mark-breathe');
     expect(decl(connecting, 'color')).toBeNull();
   });
@@ -316,15 +319,16 @@ describe('the mark says its connection in strength alone', () => {
     // cancelling it has to leave the state legible.
     const markRules = cssRules(markCss).filter(r => r.selector.startsWith('.brand-mark'));
     const animated = markRules.filter(r => r.props.has('animation') && r.props.get('animation') !== 'none');
-    expect(animated.map(r => r.selector), 'connecting is meant to be the only animated state').toEqual([
-      '.brand-mark[data-conn="connecting"] .brand-mark-glyph',
+    expect(animated.map(r => r.selector), 'connecting and starting are the only animated states').toEqual([
+      '.brand-mark[data-conn="connecting"] .brand-mark-glyph, .brand-mark[data-conn="starting"] .brand-mark-glyph',
     ]);
 
     const cancels = cssRules(markCss).filter(r =>
       isReducedMotionRule(r) && r.props.get('animation') === 'none'
       && r.selector.slice(`${REDUCED_MOTION_ROOT} `.length).startsWith('.brand-mark'));
+    const unprefixed = (selector: string) => selector.split(`${REDUCED_MOTION_ROOT} `).join('');
     expect(
-      cancels.map(r => r.selector.slice(`${REDUCED_MOTION_ROOT} `.length)),
+      cancels.map(r => unprefixed(r.selector)),
       'the reduce override must repeat the animated selector, or it loses on specificity',
     ).toEqual(animated.map(r => r.selector));
 

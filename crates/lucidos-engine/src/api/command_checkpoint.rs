@@ -5,6 +5,8 @@
 //! command changed so the Undo is not a blind button.
 
 use super::*;
+use crate::api::thread_reach::{refuse_without_authority, ThreadReachVerb};
+use crate::engine::command_permission::{command_checkpoint_origin, CommandCheckpointOrigin};
 
 #[derive(Deserialize)]
 pub(super) struct CommandCheckpointUndoRequest {
@@ -20,10 +22,17 @@ pub(super) async fn undo_command_checkpoint(
     headers: HeaderMap,
     Json(body): Json<CommandCheckpointUndoRequest>,
 ) -> impl IntoResponse {
+    let origin =
+        match authorize_checkpoint_undo(&state.engine.event_bus, &headers, &body.checkpoint_id)
+            .await
+        {
+            Ok(origin) => origin,
+            Err(refusal) => return refusal.into_response(),
+        };
     let actor = super::actor::user_actor(&headers, None);
     match state
         .engine
-        .undo_command_checkpoint(&body.checkpoint_id, actor)
+        .undo_command_checkpoint(&body.checkpoint_id, origin, actor)
         .await
     {
         Ok(()) => StatusCode::OK.into_response(),
@@ -36,6 +45,37 @@ pub(super) async fn undo_command_checkpoint(
             (StatusCode::BAD_REQUEST, format!("[ERROR] {e}")).into_response()
         }
     }
+}
+
+/// Resolve the checkpoint's thread, then refuse a caller with no reach over it.
+///
+/// Undo restores files in the shared workspace on behalf of the thread whose
+/// command changed them. So it is that thread's Revert, and an agent outside
+/// its subtree needs the owner's authority (ADR 0168). Both run before any
+/// restore, so a refusal changes nothing.
+pub(in crate::api) async fn authorize_checkpoint_undo(
+    bus: &crate::engine::event_bus::EventBus,
+    headers: &HeaderMap,
+    checkpoint_id: &str,
+) -> Result<CommandCheckpointOrigin, (StatusCode, String)> {
+    let origin = command_checkpoint_origin(bus.pool(), checkpoint_id)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("[ERROR] {e}")))?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("[ERROR] no command checkpoint with id {checkpoint_id}"),
+            )
+        })?;
+    refuse_without_authority(
+        bus,
+        headers,
+        Some(origin.thread_id),
+        ThreadReachVerb::Revert,
+    )
+    .await
+    .map_err(|e| (e.status_code(), format!("[ERROR] {e}")))?;
+    Ok(origin)
 }
 
 #[derive(Deserialize)]

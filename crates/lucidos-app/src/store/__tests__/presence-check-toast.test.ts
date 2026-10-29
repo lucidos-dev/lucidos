@@ -49,7 +49,7 @@ provideScrollState(scrollState);
 
 /** The pongs this page sent, as `[notification_id, answer]` pairs. */
 const submitPong = vi.fn();
-setEventStream({ submitPong, close: () => {}, ownsReconnect: false, revalidate: () => 'live' });
+setEventStream({ submitPong, close: () => {}, ownsReconnect: false, revalidate: () => 'live', restart: () => {} });
 
 const DEADLINE_MS = 2000;
 

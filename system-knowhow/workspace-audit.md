@@ -1,6 +1,6 @@
 ---
 name: Workspace Consistency Audit
-description: Audits workspace apps, triggers, knowhow, intents, scripts, plugins, artifacts and prompt footprint against current conventions. Use to audit the workspace and check for drift. Finds stale or unused items, and moves apps off a retired pattern or onto SDK UI helpers.
+description: Audits workspace apps, triggers, knowhow, intents, scripts, plugins, MCP servers, artifacts and prompt footprint against current conventions. Use to check the workspace for drift. Finds stale or unused items, and moves apps off a retired pattern or onto SDK UI helpers.
 ---
 
 <!-- domain-event: WorkspaceAuditCompleted: This audit emits its own domain event when its report is complete. -->
@@ -23,6 +23,7 @@ report. Each section carries its own scan, checks and fixes.
 | `intents` | `system-knowhow/workspace-audit/intents` | frontmatter, knowhow ids, tone |
 | `scripts` | `system-knowhow/workspace-audit/scripts` | CLI usage, machine paths |
 | `plugins` | `system-knowhow/workspace-audit/plugins` | the `engine` requirement |
+| `mcp-servers` | `system-knowhow/workspace-audit/mcp-servers` | MCP server launch lines: unapproved, or not statically safe |
 | `artifacts` | `system-knowhow/workspace-audit/artifacts` | structural rules only |
 | `cross-cutting` | `system-knowhow/workspace-audit/cross-cutting` | credentials in code, broken references, removed flags and fields |
 | `prompt-footprint` | `system-knowhow/workspace-audit/prompt-footprint` | the *workspace prompt footprint*: sections over their ceilings, clipped descriptions, unused items |
@@ -113,6 +114,7 @@ Resolve `data/` paths via the `lucidos` CLI. The audit covers:
 | Scripts | `data/scripts/`, `data/apps/<id>/scripts/`, `data/triggers/<slug>/scripts/`, `data/knowhow/<id>/scripts/` |
 | Authored plugin trees | any `manifest.toml` under `data/` that is a plugin root (has `id`, `version`, `name`, `description`) |
 | Installed plugins | the `PluginInstalled` / `PluginUninstalled` event projection, not a `data/` path |
+| MCP servers | `mcp(action="list")`, not a `data/` path |
 | Artifacts (structural only) | `data/artifacts/` |
 | The prompt footprint | `lucidos workspace-prompt-footprint show`, not a `data/` path |
 
@@ -129,7 +131,8 @@ From memory, a check gets skipped, and a skipped check reads like a clean one.
 Build the call from three parts: the preamble below, then each section's
 `## Scan` lines, then the tail below. A full pass takes every section's lines.
 One audit section takes its own. The `prompt-footprint` section's scan is a
-CLI call that runs on its own, and adds its own receipts row.
+CLI call that runs on its own, and adds its own receipts row. The
+`mcp-servers` section's scan is a tool call, and adds its row the same way.
 
 Each scan prints its hit count, and the tail repeats them as one table. That
 table is the **receipt**: proof the scan ran, and the only honest basis for
@@ -164,6 +167,7 @@ calling a category clean.
 | `db-defaults` | database access that may lean on libpq defaults the engine no longer sets | `scripts` |
 | `plugin-manifests` | authored plugin-root `manifest.toml` files and whether each declares `engine` | `plugins` |
 | `prompt-footprint` | the sections the footprint report lists | `prompt-footprint` |
+| `mcp-servers` | the servers `mcp(action="list")` lists, each with its launch line | `mcp-servers` |
 
 The preamble:
 

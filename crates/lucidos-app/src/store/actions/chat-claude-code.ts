@@ -22,6 +22,7 @@ import { changeToastMessage } from './changeToast';
 import { focusThread } from './threads';
 import { errorDetail } from '../../utils/errorDetail';
 import { generateUuid } from '../../utils/uuid';
+import { probeStreamAfterSend } from './send-probe';
 
 /** End the click's bridge: the engine refused it, or it failed to send. */
 function dropApplyNowRequest(threadId: string): void {
@@ -143,6 +144,16 @@ export function answerFailureMessage(
  *   - 'refused': the engine said no, and a toast says why. */
 export type AnswerOutcome = 'sent' | 'unsent' | 'refused';
 
+/** Does the thread already hold the engine's `UserQuestionAnswered` for this card? */
+function questionAnswerRecorded(threadId: string, toolUseId: string): boolean {
+  const thread = threadMap.value.get(threadId);
+  if (!thread) return false;
+  for (const [seq, stored] of thread.events) {
+    if (seq > 0 && stored.type === 'UserQuestionAnswered' && stored.tool_use_id === toolUseId) return true;
+  }
+  return false;
+}
+
 /** Answer a pending question card on a thread, with the quiet retries every
  *  send gets. Never throws.
  *
@@ -188,7 +199,10 @@ export async function answerThreadQuestion(
     ));
   // A 409 after a dropped attempt almost always means that attempt arrived:
   // the engine 409s a repeated answer. SSE shows what was recorded.
-  if (result.kind === 'done' && (result.value || result.attempts > 1)) return 'sent';
+  if (result.kind === 'done' && (result.value || result.attempts > 1)) {
+    probeStreamAfterSend(threadId, () => questionAnswerRecorded(threadId, toolUseId));
+    return 'sent';
+  }
   clearThreadAnswering(threadId);
   clearThreadRerenderStart(threadId); // no render coming → don't mis-fire later
   if (result.kind === 'gave-up') {

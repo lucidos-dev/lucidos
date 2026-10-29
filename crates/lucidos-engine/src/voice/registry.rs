@@ -43,6 +43,15 @@ impl LiveVoiceSessions {
         })
     }
 
+    /// Whether a session holds this thread's slot. A ticket mint asks, so a
+    /// busy thread is refused where the caller can read why.
+    pub fn is_busy(&self, thread_id: Uuid) -> bool {
+        self.live
+            .lock()
+            .expect("voice session registry lock")
+            .contains_key(&thread_id)
+    }
+
     /// How many threads hold a slot. `api/voice.rs` asserts on this to prove a
     /// refusal claimed nothing, which a `claim` return cannot show: the refusal
     /// paths never reach `claim` at all.

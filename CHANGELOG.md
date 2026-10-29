@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.53.1 - 2026-10-29
+
+### Changed
+
+- With the command guard on, starting a registered MCP server needs your approval of its exact launch line. Only a click on your own registered device approves it.
+- Setting up an MCP server asks before it spawns, and the card shows the command it will run.
+- The MCP server list shows each server's launch line with secrets masked, whether it is approved, and the command guard's verdict.
+- A send checks the live event stream and reopens it if a frame was missed.
+- Voice calls dial with a call ticket minted after the microphone opens.
+- Tooltips draw a keyboard shortcut as a key chip on its own row.
+- Stored secrets stay masked when an agent or app reads back events or background output.
+- An agent cannot change human-only settings, confirm its own email draft, or reveal a credential or the backup key.
+- The command guard reads the destinations of `cp`, `mv`, `tee` and `install` more precisely, and asks before an MCP setup spawns.
+- The coding-agent bash guard refuses kill commands fed by `pkill -f`, `pgrep -f` or piped `ps` output.
+- The installer writes `data/.env` and the service file owner-only before they hold a key.
+- Dependency updates for four security advisories.
+
+### Fixed
+
+- Two Applies at the same moment no longer race when they push main to origin.
+- Shift+Tab from the prompt reaches the follow toggle and the destination dropdowns, and leaves an open overlay panel alone.
+- A quiet reply shows in the transcript and in copied text.
+- A thread stays waiting for your answer when a late tool result from an earlier call arrives.
+- The Archive count stays right when threads move in or out, or are not loaded yet.
+- A page recovers when its shared event stream worker is relaunched or lost.
+- A workspace you just started reads as starting, not unreachable, while it boots.
+- Links in a preview popup open in place.
+- URL previews handle Cmd+Z and Shift+Cmd+Z themselves, so page undo works in sites like Google Docs.
+- The in-app browser, URL previews and `browser_open` load only http and https pages, never local files.
+- A symlink cannot reach outside `data/`, an app folder, a plugin install or a marketplace clone.
+- OAuth refuses a cleartext http endpoint, and never follows a redirect to one.
+- The API proxy masks an injected credential that the upstream service echoes back.
+- Removing a queued message, cancelling Apply All, checkpoint undo and draft routes check that the caller can reach the thread.
+- A path-scoped credential is checked against every decoded form of the path.
+- App SDK messages go only to the hosting Lucidos page, and SDK dialogs answer only that page.
+- The voice socket refuses a caller it cannot identify.
+- The `--no-launch` launch hint quotes paths so they paste correctly.
 ## v0.53.0 - 2026-10-28
 
 ### Added

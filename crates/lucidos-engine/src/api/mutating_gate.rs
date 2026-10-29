@@ -95,6 +95,55 @@ fn is_exempt(route: &str) -> bool {
     EXEMPT_ROUTES.contains(&route)
 }
 
+/// GET routes whose upgrade opens a socket the caller then writes through.
+///
+/// The method says read and the socket writes. A voice call records what the
+/// caller says, starts turns on it, and answers cards. So each route here owes
+/// a name like any POST. A browser socket cannot set a header, so with none the
+/// device a live call ticket binds names the caller (`api::voice_ticket`).
+pub(super) const MUTATING_SOCKET_ROUTES: &[&str] = &["/voice"];
+
+/// Does a request to `route` change something?
+fn request_mutates(method: &Method, route: &str) -> bool {
+    method_mutates(method) || MUTATING_SOCKET_ROUTES.contains(&route)
+}
+
+/// Refuse a mutating request to `matched` that names nobody. `Ok` for a read,
+/// an exempt route, and the fallback (`matched` is `None`).
+async fn refuse_unidentified(
+    pool: &sqlx::PgPool,
+    tickets: &super::voice_ticket::CallTickets,
+    method: &Method,
+    matched: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<(), super::error::ApiError> {
+    let Some(matched) = matched else {
+        return Ok(());
+    };
+    let route = mounted_route(matched);
+    if !request_mutates(method, route) || is_exempt(route) {
+        return Ok(());
+    }
+    // Peeked, not spent: the handler redeems the ticket and re-checks it.
+    let socket_claim = (MUTATING_SOCKET_ROUTES.contains(&route)
+        && !headers.contains_key(super::actor::HEADER_DEVICE_ID))
+    .then(|| super::voice_ticket::ticket_in(uri))
+    .flatten()
+    .and_then(|ticket| tickets.peek_device(&ticket));
+    if let Err(refusal) =
+        super::actor::require_user_actor(headers, pool, socket_claim.as_deref()).await
+    {
+        crate::log!(
+            "[API] Refusing an unidentified {} {}: no credential to record who is acting",
+            method,
+            matched
+        );
+        return Err(refusal);
+    }
+    Ok(())
+}
+
 /// Refuse a mutating request carrying no identity, before it reaches a handler.
 ///
 /// Layered inside [`crate::api::target_workspace::enforce_target_workspace`], so
@@ -112,27 +161,20 @@ pub(crate) async fn enforce_caller_identified(
     request: Request,
     next: Next,
 ) -> Response {
-    if !method_mutates(request.method()) {
-        return next.run(request).await;
-    }
-    let Some(route) = request
+    let matched = request
         .extensions()
         .get::<MatchedPath>()
-        .map(|p| p.as_str().to_string())
-    else {
-        return next.run(request).await;
-    };
-    if is_exempt(mounted_route(&route)) {
-        return next.run(request).await;
-    }
-    if let Err(refusal) =
-        super::actor::require_user_actor(request.headers(), &state.pool, None).await
+        .map(|p| p.as_str().to_string());
+    if let Err(refusal) = refuse_unidentified(
+        &state.pool,
+        &state.call_tickets,
+        request.method(),
+        matched.as_deref(),
+        request.headers(),
+        request.uri(),
+    )
+    .await
     {
-        crate::log!(
-            "[API] Refusing an unidentified {} {}: no credential to record who is acting",
-            request.method(),
-            route
-        );
         return refusal.into_response();
     }
     next.run(request).await

@@ -12,7 +12,7 @@
  * app may layer its own sounds (docs/plans/2026-10-10-one-sound-at-a-time.md).
  */
 
-import { onHostPush } from './_bridge';
+import { onHostPush, postToHost } from './_bridge';
 
 /** What a frame posts when one of its media elements starts making sound. */
 export const SOUND_STARTED_MESSAGE_TYPE = 'lucidos:sound:started';
@@ -94,7 +94,7 @@ export function installOneSound(): void {
   const unwatch = watchAudibleMediaStarts(document, () => {
     lastStartedAt = soundClock();
     const message: SoundStarted = { type: SOUND_STARTED_MESSAGE_TYPE, startedAt: lastStartedAt };
-    window.parent.postMessage(message, '*');
+    postToHost(message);
   });
   const unlisten = onHostPush(SOUND_PAUSE_CHANNEL, (data) => {
     const seen = (data as Partial<SoundPause> | null)?.seenStartedAt;

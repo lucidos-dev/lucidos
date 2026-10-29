@@ -137,21 +137,56 @@ describe('resyncLoadedThreads', () => {
     expect(refreshThreadEvents).not.toHaveBeenCalled();
   });
 
-  it('coalesces concurrent calls into one network round-trip', async () => {
+  it('reruns once for a gap that opened while a resync ran', async () => {
+    // The running resync's metadata read may have been answered before the
+    // second gap's events existed, so folding into it would keep a drawer
+    // status stale. Only a read that starts after the call can repair it.
+    threadMap.value = new Map([
+      ['thread-a', { meta: { id: 'thread-a' }, eventsLoaded: true }],
+    ]);
+    focusedThreadId.value = 'thread-a';
+    const reads: Array<() => void> = [];
+    const heldRead = () => new Promise<void>((resolve) => reads.push(resolve));
+    refreshThreadList.mockImplementationOnce(heldRead).mockImplementationOnce(heldRead);
+
+    void resyncLoadedThreads();
+    let secondDone = false;
+    const second = resyncLoadedThreads().then(() => { secondDone = true; });
+    expect(refreshThreadList).toHaveBeenCalledTimes(1);
+
+    reads[0]();
+    await vi.waitFor(() => expect(refreshThreadList).toHaveBeenCalledTimes(2));
+    expect(markLoadedThreadsStale).toHaveBeenCalledTimes(2);
+    expect(secondDone).toBe(false);
+
+    reads[1]();
+    await second;
+    expect(refreshThreadEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it('folds every call that lands mid-resync into one trailing run', async () => {
     threadMap.value = new Map([
       ['thread-a', { meta: { id: 'thread-a' }, eventsLoaded: true }],
     ]);
     focusedThreadId.value = 'thread-a';
 
-    // Three callers race — only one resync should actually run.
+    // A burst of Lagged frames or back-to-back reconnects costs at most two
+    // round trips: the running one and a single rerun.
     await Promise.all([
       resyncLoadedThreads(),
       resyncLoadedThreads(),
       resyncLoadedThreads(),
     ]);
 
-    expect(refreshThreadList).toHaveBeenCalledTimes(1);
-    expect(markLoadedThreadsStale).toHaveBeenCalledTimes(1);
-    expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
+    expect(refreshThreadList).toHaveBeenCalledTimes(2);
+    expect(markLoadedThreadsStale).toHaveBeenCalledTimes(2);
+    expect(refreshThreadEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it('starts a fresh resync, with no rerun, for a call after the last one ended', async () => {
+    await resyncLoadedThreads();
+    await resyncLoadedThreads();
+
+    expect(refreshThreadList).toHaveBeenCalledTimes(2);
   });
 });

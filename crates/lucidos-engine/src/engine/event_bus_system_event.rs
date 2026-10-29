@@ -1222,6 +1222,16 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// Someone approved an MCP server's current launch line: its command,
+    /// args, env and spawn directory. With the command guard on, a start of a
+    /// line nobody approved is refused. Emitted by
+    /// `McpServerStore::approve_launch`, only for a new approval. Carries no
+    /// line, since plain env values are sealed at rest.
+    McpLaunchApproved {
+        server_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// One of the three permission allowlists was rewritten wholesale, through
     /// its Settings editor.
     ///
@@ -1859,6 +1869,7 @@ impl SystemEvent {
         "McpServerDisabledToolsChanged",
         "McpServerRemoved",
         "McpServerStopped",
+        "McpLaunchApproved",
         "PermissionGrantsChanged",
         "OAuthAccountConnected",
         "OAuthAccountDeleted",
@@ -2049,6 +2060,7 @@ impl SystemEvent {
             Self::McpServerDisabledToolsChanged { .. } => "McpServerDisabledToolsChanged",
             Self::McpServerRemoved { .. } => "McpServerRemoved",
             Self::McpServerStopped { .. } => "McpServerStopped",
+            Self::McpLaunchApproved { .. } => "McpLaunchApproved",
             Self::PermissionGrantsChanged { .. } => "PermissionGrantsChanged",
             Self::OAuthAccountConnected { .. } => "OAuthAccountConnected",
             Self::OAuthAccountDeleted { .. } => "OAuthAccountDeleted",
@@ -2230,6 +2242,7 @@ impl SystemEvent {
         "McpServerDisabledToolsChanged",
         "McpServerRemoved",
         "McpServerStopped",
+        "McpLaunchApproved",
         "PermissionGrantsChanged",
         "OAuthAccountConnected",
         "OAuthAccountDeleted",
@@ -2390,7 +2403,8 @@ impl SystemEvent {
             | Self::McpServerUpdated { .. }
             | Self::McpServerDisabledToolsChanged { .. }
             | Self::McpServerRemoved { .. }
-            | Self::McpServerStopped { .. } => "mcp_server",
+            | Self::McpServerStopped { .. }
+            | Self::McpLaunchApproved { .. } => "mcp_server",
             Self::PermissionGrantsChanged { .. } => "permission_grant",
             Self::OAuthAccountConnected { .. } | Self::OAuthAccountDeleted { .. } => {
                 "oauth_account"
@@ -2542,7 +2556,8 @@ impl SystemEvent {
             | Self::McpServerUpdated { server_id, .. }
             | Self::McpServerDisabledToolsChanged { server_id, .. }
             | Self::McpServerRemoved { server_id, .. }
-            | Self::McpServerStopped { server_id, .. } => server_id.clone(),
+            | Self::McpServerStopped { server_id, .. }
+            | Self::McpLaunchApproved { server_id, .. } => server_id.clone(),
             Self::PermissionGrantsChanged { grant_file, .. } => grant_file.file_name().to_string(),
             Self::OAuthAccountConnected { account_id, .. }
             | Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),

@@ -1159,7 +1159,7 @@ async fn a_route_specific_owner_refusal_names_its_own_act() {
         .expect("the secret is installed, so a token mints");
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
 
-    let refusal = require_owner_device_for(&h, &pool, "The backup key is the owner's")
+    let refusal = require_owner_device_for(&h, &pool, None, "The backup key is the owner's")
         .await
         .expect_err("no agent may change the backup recipient");
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
@@ -1339,4 +1339,35 @@ fn pairing_label_for_refuses_a_device_the_header_does_not_name() {
     assert_eq!(pairing_label_for(&headers_with(&[]), "phone-1"), None);
     let blank = headers_with(&[(HEADER_DEVICE_ID, "phone-1"), (HEADER_DEVICE_LABEL, "%20")]);
     assert_eq!(pairing_label_for(&blank, "phone-1"), None);
+}
+
+// ── refuse_agent_caller ────────────────────────────────────────────────
+
+/// Regression: a human-only route asked only whether the caller was
+/// identified, and a verified origin token is an identity. So an agent could
+/// confirm its own email draft or read a credential through the same route the
+/// Settings page uses.
+#[test]
+fn a_verified_origin_token_is_refused_as_an_agent() {
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token_for(Some(Uuid::new_v4())))]);
+    let refusal = refuse_agent_caller(&h, "only the owner sends this").unwrap_err();
+    assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(refusal.message, "only the owner sends this");
+}
+
+/// A device, the user's own terminal holding the machine-local token, and a
+/// token that does not verify all pass. The last one is no agent the engine
+/// can prove, and the identity gate answers it on its own.
+#[test]
+fn only_a_verified_origin_token_is_refused() {
+    let local = crate::api::local_auth::publish_test_local_token();
+    install_test_secret();
+    for h in [
+        headers_with(&[(HEADER_DEVICE_ID, "device-abc")]),
+        headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, local)]),
+        headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, "not-a-token")]),
+        headers_with(&[]),
+    ] {
+        assert!(refuse_agent_caller(&h, "refused").is_ok(), "{h:?}");
+    }
 }

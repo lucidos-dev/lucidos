@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::contained_path::join_data_contained;
 use crate::core::data_prefixes::MUTABLE_PREFIXES;
 use std::sync::LazyLock;
 
@@ -63,6 +64,43 @@ fn validate_data_path_mutate(path: &str) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+/// Refuse a read whose real file, once symlinks resolve, is not one this API
+/// serves by name. Run after [`validate_data_path_read`], which reads only the
+/// string.
+fn validate_resolved_read(
+    data_dir: &std::path::Path,
+    path: &str,
+) -> Result<(), (StatusCode, String)> {
+    let real = crate::core::data_prefixes::resolved_data_path(data_dir, path)
+        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
+    validate_data_path_read(&real).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            format!("'{path}' resolves outside the readable data tree through a symlink"),
+        )
+    })
+}
+
+/// A mutation names the file by its stored path, never by an alias. A symlink
+/// is one alias. On a case-insensitive volume, another letter case is one too.
+/// Everything downstream keys on the path string, as [`is_noncanonical_path`]
+/// explains. A write through an alias would also skip the checks its real
+/// path runs.
+fn validate_resolved_mutation(
+    data_dir: &std::path::Path,
+    path: &str,
+) -> Result<(), (StatusCode, String)> {
+    let real = crate::core::data_prefixes::resolved_data_path(data_dir, path)
+        .map_err(|e| (StatusCode::FORBIDDEN, e))?;
+    if real != path {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("'{path}' is stored as '{real}'. Name the file by that path."),
+        ));
+    }
+    Ok(())
+}
+
 /// A built-in widget is read-only from the data API too, and no new app may
 /// take its reserved prefix (ADR 0415).
 fn built_in_widget_refusal(state: &AppState, path: &str) -> Option<Response> {
@@ -111,12 +149,33 @@ async fn serve_workspace_data(
     req: axum::extract::Request,
 ) -> Response {
     let is_directory = req.uri().path().ends_with('/');
-    let Some(rel) = data_mount_target(req.uri().path()) else {
+    let served = data_mount_target(req.uri().path()).filter(|rel| {
+        let file = if is_directory {
+            format!("{rel}/index.html")
+        } else {
+            rel.clone()
+        };
+        join_data_contained(&data_dir, &file).is_some()
+    });
+    let Some(rel) = served else {
         // Logged because `request_logger` skips `/data`, so a refusal is
         // otherwise invisible to whoever has to explain the 404.
         log!("[data] refused {} on the /data mount", req.uri().path());
         return StatusCode::NOT_FOUND.into_response();
     };
+    let served = if is_directory {
+        format!("{rel}/index.html")
+    } else {
+        rel.clone()
+    };
+    if let Err((_, why)) = validate_resolved_read(&data_dir, &served) {
+        log!(
+            "[data] refused {} on the /data mount: {}",
+            req.uri().path(),
+            why
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match ServeDir::new(&data_dir).oneshot(req).await {
         Ok(resp) => {
             // A directory request is answered with its `index.html`.
@@ -192,7 +251,7 @@ fn list_data_inner(data_dir: &std::path::Path, pattern: Option<&glob::Pattern>) 
     let mut files = Vec::new();
     for prefix in MUTABLE_PREFIXES {
         let subdir = data_dir.join(prefix.trim_end_matches('/'));
-        if !subdir.is_dir() {
+        if !subdir.symlink_metadata().is_ok_and(|m| m.is_dir()) {
             continue;
         }
         match walkdir(data_dir, &subdir) {
@@ -210,20 +269,27 @@ fn list_data_inner(data_dir: &std::path::Path, pattern: Option<&glob::Pattern>) 
     files
 }
 
-/// Recursively walk a directory and collect relative paths.
+/// Recursively walk a directory and collect relative paths. A symlink is
+/// skipped, never followed: it can lead out of the tree or round in a loop.
 fn walkdir(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<String>, std::io::Error> {
     let mut result = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.starts_with('.') {
                     continue;
                 }
             }
             result.extend(walkdir(root, &path)?);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             if let Ok(rel) = path.strip_prefix(root) {
                 result.push(rel.to_string_lossy().to_string());
             }
@@ -250,10 +316,22 @@ pub(super) async fn read_data(
             let Some(dir) = state.engine.system_knowhow_dir() else {
                 return (StatusCode::NOT_FOUND, "System knowhow not available").into_response();
             };
-            dir.join(rel)
+            crate::core::contained_path::join_contained(dir, rel)
         } else {
-            state.workspace_path.join(crate::core::DATA_DIR).join(&path)
+            // A link out of its tree reads as missing, as on the `/data` mount.
+            let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
+            let contained = join_data_contained(&data_dir, &path);
+            if contained.is_some() {
+                if let Err((code, msg)) = validate_resolved_read(&data_dir, &path) {
+                    return (code, msg).into_response();
+                }
+            }
+            contained
         };
+    let Some(file_path) = file_path else {
+        log!("[data] refused {path}: it resolves outside its tree through a symlink");
+        return (StatusCode::NOT_FOUND, "File not found").into_response();
+    };
     let content_type = content_type_for_ext(&extension_of(&path));
 
     super::file_response::sandbox_documents(
@@ -352,6 +430,9 @@ pub(super) async fn write_data(
         return resp;
     }
     let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
+    if let Err((code, msg)) = validate_resolved_mutation(&data_dir, &path) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
     if let Err(msg) = crate::core::data_prefixes::validate_data_write(&data_dir, &path, &body) {
         return ApiError::with_code(422, msg).into_response();
     }
@@ -396,13 +477,13 @@ pub(super) async fn write_data(
             }
         }
     } else {
-        let file_path = state.workspace_path.join(crate::core::DATA_DIR).join(&path);
+        let file_path = data_dir.join(&path);
         if let Some(parent) = file_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("Failed to create directory: {}", e) }))).into_response();
             }
         }
-        if let Err(e) = std::fs::write(&file_path, &body) {
+        if let Err(e) = tokio::fs::write(&file_path, &body).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("Failed to write file: {}", e) })),
@@ -467,6 +548,13 @@ pub(super) async fn delete_data(
     }
     if let Some(resp) = built_in_widget_refusal(&state, &path) {
         return resp;
+    }
+    // The directory only: removing a symlink itself removes the link, never
+    // what it points at.
+    let parent = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
+    if let Err((code, msg)) = validate_resolved_mutation(&data_dir, parent) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
 
     // Before the delete, for the reason `write_data` gives above.
@@ -572,6 +660,10 @@ pub(super) async fn edit_data(
     }
     if let Some(resp) = built_in_widget_refusal(&state, &body.path) {
         return resp;
+    }
+    let data_dir = state.workspace_path.join(crate::core::DATA_DIR);
+    if let Err((code, msg)) = validate_resolved_mutation(&data_dir, &body.path) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
     // A theme is validated whole, which an operation-by-operation edit cannot
     // honour, so a theme is saved with `PUT` instead.
@@ -723,6 +815,151 @@ mod tests {
         std::fs::write(p, "x").unwrap();
     }
 
+    /// A workspace whose `data/artifacts/` holds a real file and four links:
+    /// one to that file, one to `data/.env`, one to a file outside the
+    /// workspace and one to a directory outside it. Returns the `data/` dir.
+    fn data_dir_with_links(ws: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::symlink;
+        let data = ws.join("data");
+        touch(&data, "artifacts/real.md");
+        touch(&data, "apps/todo/index.html");
+        touch(&data, ".env");
+        touch(ws, "outside/secret.txt");
+        touch(ws, "outside/index.html");
+        let artifacts = data.join("artifacts");
+        symlink(artifacts.join("real.md"), artifacts.join("alias.md")).unwrap();
+        symlink(data.join(".env"), artifacts.join("env")).unwrap();
+        symlink(ws.join("outside/secret.txt"), artifacts.join("file-out")).unwrap();
+        symlink(ws.join("outside"), artifacts.join("dir-out")).unwrap();
+        data
+    }
+
+    /// Regression: a symlink under a readable prefix must not carry a read
+    /// past the allowlist. The string check alone served the link's target.
+    #[test]
+    fn a_read_through_a_symlink_must_land_on_a_readable_file() {
+        let ws = tempfile::tempdir().unwrap();
+        let data = data_dir_with_links(ws.path());
+
+        for path in [
+            "artifacts/real.md",
+            "artifacts/alias.md",
+            "artifacts/new.md",
+        ] {
+            assert!(validate_resolved_read(&data, path).is_ok(), "{path}");
+        }
+        for path in [
+            "artifacts/env",
+            "artifacts/file-out",
+            "artifacts/dir-out/secret.txt",
+        ] {
+            let (code, _) = validate_resolved_read(&data, path).unwrap_err();
+            assert_eq!(code, StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    /// Regression: `PUT`, `DELETE` and `POST /data/edit` must not write
+    /// through a symlink. One out of the tree reaches host files, and one
+    /// inside it is a second spelling of a file.
+    #[test]
+    fn a_mutation_must_name_the_file_itself() {
+        let ws = tempfile::tempdir().unwrap();
+        let data = data_dir_with_links(ws.path());
+
+        for path in ["artifacts/real.md", "artifacts/new/deep.md", "artifacts"] {
+            assert!(validate_resolved_mutation(&data, path).is_ok(), "{path}");
+        }
+        for path in [
+            "artifacts/alias.md",
+            "artifacts/env",
+            "artifacts/file-out",
+            "artifacts/dir-out/secret.txt",
+            "artifacts/dir-out/new.md",
+            "artifacts/dir-out",
+        ] {
+            let (code, _) = validate_resolved_mutation(&data, path).unwrap_err();
+            assert_eq!(code, StatusCode::FORBIDDEN, "{path}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("outside/secret.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    /// On a case-insensitive volume, the macOS default, another letter case
+    /// is a second spelling of a stored file. The refusal names the stored
+    /// path and blames no symlink.
+    #[test]
+    fn a_mutation_in_another_letter_case_names_the_stored_path() {
+        let ws = tempfile::tempdir().unwrap();
+        let data = ws.path().join("data");
+        touch(&data, "artifacts/notes.md");
+
+        let result = validate_resolved_mutation(&data, "artifacts/NOTES.md");
+        if data.join("artifacts/NOTES.md").exists() {
+            let (code, msg) = result.unwrap_err();
+            assert_eq!(code, StatusCode::FORBIDDEN);
+            assert!(msg.contains("stored as 'artifacts/notes.md'"), "{msg}");
+            assert!(!msg.contains("symlink"), "{msg}");
+        } else {
+            assert!(result.is_ok(), "a case-sensitive volume holds two files");
+        }
+    }
+
+    /// Regression: the listing followed symlinks. A link to a directory
+    /// outside leaked its file names, and a loop emptied the whole listing.
+    #[test]
+    fn list_data_inner_skips_symlinks() {
+        let ws = tempfile::tempdir().unwrap();
+        let data = data_dir_with_links(ws.path());
+        std::os::unix::fs::symlink(&data, data.join("artifacts/loop")).unwrap();
+        touch(ws.path(), "outside/knowhow/far.md");
+        std::os::unix::fs::symlink(ws.path().join("outside/knowhow"), data.join("knowhow"))
+            .unwrap();
+
+        assert_eq!(
+            list_data_inner(&data, None),
+            vec!["apps/todo/index.html", "artifacts/real.md"]
+        );
+    }
+
+    /// Regression: the `/data` mount runs the same symlink check, for a file
+    /// and for the `index.html` a directory request is answered with.
+    #[tokio::test]
+    async fn the_mount_does_not_serve_through_a_symlink_out_of_the_tree() {
+        use tower::ServiceExt;
+
+        let ws = tempfile::tempdir().unwrap();
+        let data = data_dir_with_links(ws.path());
+        let app = Router::new().nest_service("/data", static_mount(data));
+
+        let get_status = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(get_status("/data/artifacts/alias.md").await, StatusCode::OK);
+        assert_eq!(get_status("/data/apps/todo/").await, StatusCode::OK);
+        for path in [
+            "/data/artifacts/env",
+            "/data/artifacts/file-out",
+            "/data/artifacts/dir-out/secret.txt",
+            "/data/artifacts/dir-out/",
+        ] {
+            assert_eq!(get_status(path).await, StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
     /// Regression: the `/data` static mount is gated by the same allowlist the
     /// API route runs.
     ///
@@ -806,6 +1043,58 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a blob that exists on disk must not be served by the mount"
         );
+    }
+
+    /// The allowlist reads the path string, so a symlink under an allowed
+    /// prefix reached any host file, and `data/.env`, through the mount.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_mount_never_follows_a_symlink_out_of_its_tree() {
+        use std::os::unix::fs::symlink;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        touch(outside.path(), "secret.txt");
+        touch(outside.path(), "site/index.html");
+        touch(data, ".env");
+        touch(data, "artifacts/ok.md");
+        symlink(
+            outside.path().join("secret.txt"),
+            data.join("artifacts/leak"),
+        )
+        .unwrap();
+        symlink(outside.path().join("site"), data.join("artifacts/site")).unwrap();
+        symlink(data.join(".env"), data.join("artifacts/env")).unwrap();
+        symlink(
+            data.join("artifacts/ok.md"),
+            data.join("artifacts/alias.md"),
+        )
+        .unwrap();
+        let app = Router::new().nest_service("/data", static_mount(data.to_path_buf()));
+
+        for (path, expected) in [
+            ("/data/artifacts/ok.md", StatusCode::OK),
+            ("/data/artifacts/alias.md", StatusCode::OK),
+            ("/data/artifacts/leak", StatusCode::NOT_FOUND),
+            ("/data/artifacts/site/index.html", StatusCode::NOT_FOUND),
+            ("/data/artifacts/site/", StatusCode::NOT_FOUND),
+            ("/data/artifacts/env", StatusCode::NOT_FOUND),
+        ] {
+            let status = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, expected, "{path}");
+        }
     }
 
     /// `ServeDir` picks the type from the extension, so this proves the

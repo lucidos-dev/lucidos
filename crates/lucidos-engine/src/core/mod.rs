@@ -7,6 +7,7 @@ pub mod backup;
 pub mod blobs;
 pub mod changes;
 pub mod changes_projection;
+pub mod contained_path;
 pub mod credentials;
 pub mod data_prefixes;
 pub mod db_retry;
@@ -53,6 +54,7 @@ pub mod system_knowhow;
 pub mod system_widgets;
 pub mod technical_literacy;
 pub mod themes;
+pub mod url_scope;
 pub mod user_dir;
 pub mod user_path;
 pub mod webhook_deliveries;
@@ -192,26 +194,66 @@ pub fn redact_postgres_secrets_in_json(value: &mut serde_json::Value) {
 /// far longer, so this never weakens redaction of actual secrets.
 pub const MIN_REDACTABLE_SECRET_LEN: usize = 4;
 
+/// What a redacted secret value reads as.
+pub const REDACTED_MARKER: &str = "[REDACTED]";
+
 /// Replace every occurrence of each known secret value in `text` with
-/// `[REDACTED]`. Keeps credential material out of logs and error messages that
-/// untrusted code could otherwise echo. Longest secrets are scrubbed first, so
-/// a secret that is a substring of another leaves no partial match behind.
+/// [`REDACTED_MARKER`]. Keeps credential material out of logs and error
+/// messages that untrusted code could otherwise echo.
 pub fn redact_secret_values(text: &str, secrets: &[String]) -> String {
-    let mut ordered: Vec<&String> = secrets
+    match redact_secret_bytes(text.as_bytes(), secrets) {
+        // A UTF-8 secret matches only on character boundaries, and the marker
+        // is ASCII, so the result stays UTF-8.
+        Some(redacted) => String::from_utf8(redacted)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        None => text.to_string(),
+    }
+}
+
+/// [`redact_secret_values`] over raw bytes, for a body that need not be text.
+/// Returns `None` when no secret occurs, so the caller keeps its own bytes.
+/// Longest secrets are scrubbed first, so a secret that is a substring of
+/// another leaves no partial match behind.
+pub fn redact_secret_bytes(bytes: &[u8], secrets: &[String]) -> Option<Vec<u8>> {
+    let mut ordered: Vec<&[u8]> = secrets
         .iter()
+        .map(|s| s.as_bytes())
         .filter(|s| s.len() >= MIN_REDACTABLE_SECRET_LEN)
         .collect();
-    if ordered.is_empty() {
-        return text.to_string();
-    }
     ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    let mut out = text.to_string();
+    let mut out: Option<Vec<u8>> = None;
     for secret in ordered {
-        if out.contains(secret.as_str()) {
-            out = out.replace(secret.as_str(), "[REDACTED]");
+        let current = out.as_deref().unwrap_or(bytes);
+        if let Some(replaced) = replace_all_bytes(current, secret, REDACTED_MARKER.as_bytes()) {
+            out = Some(replaced);
         }
     }
     out
+}
+
+/// Every non-overlapping `needle` in `haystack` replaced by `with`, or `None`
+/// when `needle` does not occur. `needle` must not be empty.
+fn replace_all_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Option<Vec<u8>> {
+    let find = |from: usize| {
+        haystack[from..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map(|at| from + at)
+    };
+    let mut at = find(0)?;
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut copied = 0;
+    loop {
+        out.extend_from_slice(&haystack[copied..at]);
+        out.extend_from_slice(with);
+        copied = at + needle.len();
+        match find(copied) {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    out.extend_from_slice(&haystack[copied..]);
+    Some(out)
 }
 
 /// Directory structure within workspace/data/
@@ -464,7 +506,7 @@ pub fn ensure_state_dir_excluded_from_file_backup(
 
 pub use device_presence::DevicePresenceStore;
 pub use events::EventRow;
-pub use mcp_servers::{McpEnvValue, McpServer, McpServerStore};
+pub use mcp_servers::{LaunchLineMode, LaunchSpec, McpEnvValue, McpServer, McpServerStore};
 pub use models::{validate_routes, Model, ModelFields, ModelStore, Route};
 pub use preferences::{ModelDefaults, PreferenceStore, ResolvedModelSelection};
 pub use store::{
@@ -835,7 +877,8 @@ pub fn commit_index_unless_unchanged(
 }
 
 /// Reject paths that would escape the directory they get joined onto: any `..`
-/// component, or an absolute path.
+/// component, or an absolute path. A symlink escape needs
+/// [`contained_path::join_contained`] on top.
 ///
 /// The single canonical traversal guard for the whole engine. HTTP handlers,
 /// LLM file tools, the proxy script runner and script triggers all funnel

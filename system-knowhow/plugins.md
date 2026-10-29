@@ -74,7 +74,7 @@ Install validates the tree (`crates/lucidos-engine/src/core/plugins.rs::validate
 - The file walk silently skips hidden files (any path component starting with `.`), such as `.DS_Store` and editor swap files.
 - The file walk silently skips build output. It does not enter a directory named `node_modules`, `target`, `dist`, `build`, `out`, `__pycache__`, `venv`, `.venv`, `.next`, `.pytest_cache` or `.git`, at any depth. It also skips any `*.pyc` or `*.pyo` file. These files are machine-specific, so they never reach the install record or the uninstall list. A tree that holds only build output fails as `EmptyTree`.
 - An app, trigger or font folder with one of those names (`apps/dist/`, `triggers/build/`, `fonts/out/`) fails as `ItemNamedLikeBuildOutput`, so install never drops a whole item silently. Deeper down, install drops such a folder without a warning, so do not put real content in one.
-- Symbolic links are never followed. A file symlink is skipped and a dir symlink is not walked. A top-level symlink named as a content dir is rejected. This keeps a plugin from reaching a file outside its own tree.
+- Symbolic links are never followed. A file symlink is skipped and a dir symlink is not walked. A top-level symlink named as a content dir is rejected. A symlinked `manifest.toml` counts as missing, at install and when `update` or `check_updates` reads the remote version. A tree-URL subpath that passes through a symlink fails with `subpath not found inside repo`. This keeps a plugin from reaching a file outside its own tree.
 - No archive entry uses `..` or absolute paths (`/`, `\`): zip-slip protection.
 
 There is no separate install destination. `apps/foo/index.html` in the plugin lands at `data/apps/foo/index.html` in the workspace. Sub-trees (`triggers/foo/foo.md`, `apps/foo/sdk-prefs.js`) are preserved verbatim.
@@ -372,6 +372,10 @@ looking for `manifest.toml`:
 - **At every depth, the walk skips hidden directories and build-output
   directories** (the same list as the install walk, see "Plugin layout"). So a
   `manifest.toml` inside `node_modules/` or `dist/` is never a plugin root.
+- **The walk never follows a symlink.** A symlinked directory is not entered,
+  and a symlinked `manifest.toml` does not make a plugin root. A tree-URL
+  subpath that passes through a symlink fails with `subpath not found inside
+  repo`. Commit real files, not links.
 - **Duplicate plugin `id`s are de-duplicated**: the first root wins, later ones
   are silently dropped. Keep directory name == manifest `id` to make collisions
   obvious.

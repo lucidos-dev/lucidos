@@ -140,6 +140,36 @@ fn redact_secret_values_leaves_text_without_secrets_alone() {
 }
 
 #[test]
+fn redact_secret_bytes_masks_a_secret_inside_bytes_that_are_not_text() {
+    let secrets = vec!["tok-1234".to_string()];
+    let mut body = vec![0xff, 0x00, 0xfe];
+    body.extend_from_slice(b"tok-1234");
+    body.extend_from_slice(&[0x80, 0x81]);
+    body.extend_from_slice(b"tok-1234");
+
+    let mut expected = vec![0xff, 0x00, 0xfe];
+    expected.extend_from_slice(REDACTED_MARKER.as_bytes());
+    expected.extend_from_slice(&[0x80, 0x81]);
+    expected.extend_from_slice(REDACTED_MARKER.as_bytes());
+    assert_eq!(redact_secret_bytes(&body, &secrets), Some(expected));
+}
+
+#[test]
+fn redact_secret_bytes_reports_no_change_when_no_secret_occurs() {
+    let secrets = vec!["tok-1234".to_string(), "ab".to_string()];
+    assert_eq!(redact_secret_bytes(b"ab tok-123 ab", &secrets), None);
+}
+
+#[test]
+fn redact_secret_values_keeps_multibyte_text_around_a_secret() {
+    let secrets = vec!["tøken-æ".to_string()];
+    assert_eq!(
+        redact_secret_values("før tøken-æ etter", &secrets),
+        format!("før {REDACTED_MARKER} etter")
+    );
+}
+
+#[test]
 fn redact_postgres_secrets_in_json_walks_nested_strings() {
     let mut v = serde_json::json!({
         "command": "psql postgres://lucidos:lucidos@localhost:5432/lucidos -c 'select 1'",

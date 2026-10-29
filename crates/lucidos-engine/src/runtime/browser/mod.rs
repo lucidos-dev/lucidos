@@ -6,19 +6,28 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-/// Extract the host/domain from a URL using simple string parsing.
-fn extract_domain(url: &str) -> Option<String> {
-    // Drop the scheme prefix ("scheme://"), keeping the whole string when absent.
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    // Take everything before the first '/' or '?' or '#'
-    let host = rest.split(&['/', '?', '#'][..]).next().unwrap_or(rest);
-    // Strip port
-    let host = host.split(':').next().unwrap_or(host);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_lowercase())
+/// The only schemes the agent browser navigates to (ADR 0597). Any other
+/// scheme (`file:`, `data:`, `chrome:`, `javascript:`, `view-source:`) reads
+/// local files or browser internals, past the workspace path limits and the
+/// command guard.
+const NAVIGABLE_SCHEMES: [&str; 2] = ["http", "https"];
+
+/// Parse a model-supplied URL, refusing any scheme outside
+/// [`NAVIGABLE_SCHEMES`].
+///
+/// Chrome must receive the returned canonical form, never the raw string.
+/// Chrome strips tabs, newlines and leading control characters before it
+/// parses, so a raw string can carry a scheme the check never saw.
+fn navigable_url(raw: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|e| format!("'{raw}' is not a full http or https URL ({e})."))?;
+    if !NAVIGABLE_SCHEMES.contains(&url.scheme()) {
+        return Err(format!(
+            "The browser opens only http and https URLs. Refused the '{}:' scheme.",
+            url.scheme()
+        ));
     }
+    Ok(url)
 }
 
 /// Detect common bot-blocking patterns in page content.
@@ -178,6 +187,75 @@ mod session;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SCHEME_REFUSAL: &str = "opens only http and https URLs";
+
+    #[test]
+    fn only_http_and_https_urls_are_navigable() {
+        for ok in ["https://example.com/a?b#c", "http://example.com:8080/"] {
+            assert!(navigable_url(ok).is_ok(), "url: {ok}");
+        }
+        for refused in [
+            "file:///etc/hosts",
+            "FILE:///etc/hosts",
+            "data:text/html,<p>hi</p>",
+            "chrome://settings",
+            "javascript:alert(1)",
+            "view-source:https://example.com",
+            "about:blank",
+        ] {
+            let err = navigable_url(refused).expect_err(refused);
+            assert!(err.contains(SCHEME_REFUSAL), "url: {refused}, err: {err}");
+        }
+    }
+
+    /// Chrome drops tabs and leading spaces before it parses, so these
+    /// reach Chrome as `file:` unless the check parses the same way.
+    #[test]
+    fn a_disguised_file_scheme_is_still_refused() {
+        for disguised in [" file:///etc/hosts", "fi\tle:///etc/hosts", "\nfile:///x"] {
+            let err = navigable_url(disguised).expect_err(disguised);
+            assert!(
+                err.contains(SCHEME_REFUSAL),
+                "url: {disguised:?}, err: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_without_a_scheme_is_refused() {
+        assert!(navigable_url("example.com").is_err());
+        assert!(navigable_url("/etc/hosts").is_err());
+    }
+
+    /// The refusal comes before the browser launches, so a refused URL
+    /// leaves no browser and no page behind. `screenshot` navigates through
+    /// `open`, so its `url` argument is held to the same rule.
+    #[tokio::test]
+    async fn browser_open_refuses_a_file_url_and_opens_no_page() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let runtime = BrowserRuntime::new(
+            workspace.path().to_path_buf(),
+            crate::test_support::offline_pool(),
+        );
+
+        let err = runtime
+            .open("s", "file:///etc/hosts", None, false)
+            .await
+            .expect_err("a file URL must be refused");
+        assert!(err.contains(SCHEME_REFUSAL), "err: {err}");
+
+        let err = runtime
+            .screenshot("s", "shot.png", None, false, Some("file:///etc/hosts"))
+            .await
+            .expect_err("a file URL must be refused");
+        assert!(err.contains(SCHEME_REFUSAL), "err: {err}");
+
+        assert!(
+            runtime.instances.lock().await.is_empty(),
+            "a refused URL must not launch a browser"
+        );
+    }
 
     /// A plain 4xx page is short and says "forbidden", and it is no bot wall.
     /// One such page used to blocklist the whole domain for every headless

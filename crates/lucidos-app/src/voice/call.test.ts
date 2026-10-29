@@ -62,6 +62,13 @@ interface Harness {
   /** Make every device handed out from here refuse to close. */
   armCloseFailure(error: unknown): void;
   armSocketFailure(error: unknown): void;
+  /** Make the next ticket mint refuse. */
+  armMintFailure(error: unknown): void;
+  /** Hold every ticket mint until {@link releaseMint}. */
+  armSlowMint(): void;
+  releaseMint(): Promise<void>;
+  /** The thread each ticket was minted for, newest last. */
+  minted: string[];
   /** Make the echo report that no hop carries an upgrade. */
   armBlockedUpgrade(): void;
   /** Make the probe itself fail, so it answers nothing either way. */
@@ -103,6 +110,7 @@ class FakeSocket {
 
   constructor(
     readonly threadId: string,
+    readonly ticket: string,
     readonly handlers: SocketHandlers,
   ) {}
 
@@ -152,6 +160,10 @@ function harness(opts: { microphone?: string; note?: string } = {}): Harness {
   let slow = false;
   let failure: unknown = null;
   let socketFailure: unknown = null;
+  let mintFailure: unknown = null;
+  let slowMint = false;
+  let pendingMint: (() => void) | null = null;
+  const minted: string[] = [];
   let releases = 0;
   let deviceCloseError: unknown = null;
   let upgradeCarried = true;
@@ -173,9 +185,15 @@ function harness(opts: { microphone?: string; note?: string } = {}): Harness {
       devices.push(device);
       return device;
     },
-    openSocket: (threadId, handlers) => {
+    mintCallTicket: async (threadId) => {
+      if (slowMint) await new Promise<void>((resolve) => (pendingMint = resolve));
+      if (mintFailure !== null) throw mintFailure;
+      minted.push(threadId);
+      return `ticket-for-${threadId}`;
+    },
+    openSocket: (threadId, ticket, handlers) => {
       if (socketFailure !== null) throw socketFailure;
-      const socket = new FakeSocket(threadId, handlers);
+      const socket = new FakeSocket(threadId, ticket, handlers);
       sockets.push(socket);
       return socket;
     },
@@ -224,6 +242,19 @@ function harness(opts: { microphone?: string; note?: string } = {}): Harness {
     armSocketFailure(error) {
       socketFailure = error;
     },
+    armMintFailure(error) {
+      mintFailure = error;
+    },
+    armSlowMint() {
+      slowMint = true;
+    },
+    async releaseMint() {
+      pendingMint?.();
+      pendingMint = null;
+      await Promise.resolve();
+      await Promise.resolve();
+    },
+    minted,
     armBlockedUpgrade() {
       upgradeCarried = false;
     },
@@ -268,6 +299,20 @@ describe('placing a call', () => {
     await Promise.resolve();
     expect(h.devices).toHaveLength(1);
     expect(h.socket().threadId).toBe(THREAD);
+  });
+
+  it('dials with a ticket minted for this thread, after the microphone opens', async () => {
+    const h = harness();
+    h.armSlowAudio();
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    // A first-use permission prompt can sit here for a long time. A ticket
+    // minted before it could expire before the caller ever answered.
+    expect(h.minted).toHaveLength(0);
+    await h.releaseAudio();
+    await Promise.resolve();
+    expect(h.minted).toEqual([THREAD]);
+    expect(h.socket().ticket).toBe(`ticket-for-${THREAD}`);
   });
 
   it('is listening once the engine says the call is up', async () => {
@@ -623,6 +668,36 @@ describe('every way a call ends releases the microphone', () => {
     expect(h.device().closes).toBe(1);
     expect(h.last().phase).toBe('idle');
     expect(h.last().note).toBe(UNEXPECTED_SETUP_FAILURE);
+  });
+
+  it('a refused mint shows the engine\'s reason and releases the microphone', async () => {
+    const h = harness();
+    const reason = 'Only one of your own devices can place a call.';
+    h.armMintFailure(new CallSetupError(reason));
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    // A `fetch` shows the engine's words where a handshake hides them, so the
+    // reader gets the real reason rather than the generic refusal.
+    expect(h.last().phase).toBe('idle');
+    expect(h.last().note).toBe(reason);
+    expect(h.last().note).not.toBe(CALL_REFUSED);
+    expect(h.device().closes).toBe(1);
+    expect(h.sockets).toHaveLength(0);
+  });
+
+  it('a call hung up while its ticket mints never dials', async () => {
+    const h = harness();
+    h.armSlowMint();
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    h.runner.press(THREAD);
+    expect(h.device().closes).toBe(1);
+    await h.releaseMint();
+    expect(h.sockets).toHaveLength(0);
+    expect(h.device().closes).toBe(1);
   });
 
   it('closes only once, however many endings arrive', async () => {

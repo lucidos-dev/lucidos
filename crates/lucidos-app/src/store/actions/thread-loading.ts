@@ -219,6 +219,8 @@ export function _clearFamilyExtensionIdsForTest(): void {
 
 /** Prevents duplicate concurrent loadAllThreads calls. */
 let loadingAll = false;
+/** A call declined while a load ran, so that load reads once more. */
+let loadAllAgain = false;
 
 /** Load thread list metadata, then lazy-load events by priority. Resolves TRUE
  *  when THIS call performed a load, FALSE when it declined.
@@ -237,13 +239,24 @@ let loadingAll = false;
  *  something that blocks every later caller for the suspension's length.
  *  Releasing the guard early to escape that puts two loads in flight, where
  *  the older can land last and write stale `meta` over newer. Sharing safely
- *  needs a superseded-attempt token like `fetchAttemptSeq`. */
+ *  needs a superseded-attempt token like `fetchAttemptSeq`.
+ *
+ *  After a decline, the load in flight reads once more. Its read may predate
+ *  what made the declined caller ask, such as an event gap. All the declines
+ *  during one read earn a single further read. */
 export async function loadAllThreads(): Promise<boolean> {
-  if (loadingAll || engineRestarting.value) return false;
+  if (engineRestarting.value) return false;
+  if (loadingAll) {
+    loadAllAgain = true;
+    return false;
+  }
   loadingAll = true;
 
   try {
-    await loadAllThreadsInner();
+    do {
+      loadAllAgain = false;
+      await loadAllThreadsInner();
+    } while (loadAllAgain && !engineRestarting.value);
     return true;
   } finally {
     loadingAll = false;
@@ -373,6 +386,7 @@ async function loadAllThreadsInner(): Promise<void> {
   if (sources || triggerIds || repoIds || appIds) {
     void refreshArchivedCount();
   } else {
+    archivedCountGeneration++;
     archiveThreadCount.value = response.archive_count ?? 0;
   }
 
@@ -1294,6 +1308,8 @@ export function currentThreadFilterParams(): {
  *  fetch, the rows themselves still loading via pagination. So a transient miss
  *  must not pop a toast (per the frontend telemetry carve-out). */
 export async function refreshArchivedCount(): Promise<void> {
+  // Every writer bumps this, so only the newest-started write lands.
+  const generation = ++archivedCountGeneration;
   // Empty channel filter = nothing shown by intent → the archive is empty.
   if (appliedThreadFilter.value.channels.size === 0) {
     archiveThreadCount.value = 0;
@@ -1301,10 +1317,29 @@ export async function refreshArchivedCount(): Promise<void> {
   }
   const { sources, triggerIds, repoIds, appIds } = currentThreadFilterParams();
   try {
-    archiveThreadCount.value = await fetchArchivedCount(sources, triggerIds, repoIds, appIds);
+    const count = await fetchArchivedCount(sources, triggerIds, repoIds, appIds);
+    if (generation === archivedCountGeneration) archiveThreadCount.value = count;
   } catch (err) {
     console.warn('[threads] archived-count refresh failed:', errorDetail(err));
   }
+}
+
+let archivedCountGeneration = 0;
+let archivedCountRefresh: Promise<void> | null = null;
+let archivedCountStale = false;
+
+/** Re-read the Archive badge after a live frame moved a thread into or out of
+ *  the archive. A burst (Archive all) runs one read in flight and one trailing
+ *  read, rather than one read per frame. */
+export function refreshArchivedCountAfterFlip(): void {
+  archivedCountStale = true;
+  if (archivedCountRefresh) return;
+  archivedCountRefresh = (async () => {
+    while (archivedCountStale) {
+      archivedCountStale = false;
+      await refreshArchivedCount();
+    }
+  })().finally(() => { archivedCountRefresh = null; });
 }
 
 /** Load older threads for infinite scroll. Self-guards against concurrent calls.

@@ -1369,6 +1369,7 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
 }
 
 mod engine_impl;
+pub(crate) use engine_impl::mask_stored_events;
 
 /// `processing_thread_ids - all_cc_thread_ids`. Idle coding-agent sessions stay in
 /// `active_threads` between turns, so the exclusion set must cover them or

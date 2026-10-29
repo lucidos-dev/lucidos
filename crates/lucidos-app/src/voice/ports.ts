@@ -1,17 +1,20 @@
 /**
- * The two devices a call needs, behind one interface each.
+ * The two devices a call needs, behind one interface each, and the ticket
+ * that lets it dial.
  *
- * Everything in this file talks to `AudioContext`, `getUserMedia` and
- * `WebSocket`, and nothing else in the voice client does. The runner takes
+ * Everything in this file talks to `AudioContext`, `getUserMedia`,
+ * `WebSocket` and the ticket mint, and nothing else in the voice client does. The runner takes
  * these as ports. So its rules are driven by fakes in a test, rather than by an
  * audio device that does not exist under Vitest.
  */
+import { ApiError, isTransportError, mintCallTicket as postCallTicket } from '../api/client';
 import { CAPTURE_WORKLET_NAME, captureWorkletUrl } from './captureWorklet';
 import { microphoneConstraints, openWithFallback } from './microphone';
 import { CHANNELS, SAMPLE_RATE_HZ, pcm16DurationSeconds, pcm16ToFloat } from './pcm';
 import {
   CallSetupError,
   NO_MICROPHONE_API,
+  NO_ROUTE_FOR_A_CALL,
   NO_WEB_AUDIO,
   microphoneRefusal,
   wrongAudioRate,
@@ -92,7 +95,15 @@ export interface CallPorts {
     onFrame: (samples: Float32Array) => void,
     deviceId: string | null,
   ): Promise<AudioDevice>;
-  openSocket(threadId: string, handlers: SocketHandlers): CallSocket;
+  /**
+   * Mint the single-use ticket that lets this device dial this thread.
+   *
+   * Asked after the microphone opens, so a first-use permission prompt cannot
+   * outlive the ticket. A refusal throws a `CallSetupError` with the engine's
+   * own message. Unlike a handshake, a `fetch` lets the reader see why.
+   */
+  mintCallTicket(threadId: string): Promise<string>;
+  openSocket(threadId: string, ticket: string, handlers: SocketHandlers): CallSocket;
   /**
    * Did an upgrade survive every hop between here and the engine?
    *
@@ -324,8 +335,18 @@ async function openAudio(
   };
 }
 
-function openSocket(threadId: string, handlers: SocketHandlers): CallSocket {
-  const socket = new WebSocket(voiceSocketUrl(threadId));
+async function mintCallTicket(threadId: string): Promise<string> {
+  try {
+    return await postCallTicket(threadId);
+  } catch (err) {
+    if (err instanceof ApiError) throw new CallSetupError(err.reason);
+    if (isTransportError(err)) throw new CallSetupError(NO_ROUTE_FOR_A_CALL);
+    throw err;
+  }
+}
+
+function openSocket(threadId: string, ticket: string, handlers: SocketHandlers): CallSocket {
+  const socket = new WebSocket(voiceSocketUrl(threadId, ticket));
   socket.binaryType = 'arraybuffer';
   socket.onopen = () => handlers.onOpen();
   socket.onmessage = (event: MessageEvent) => {
@@ -400,6 +421,7 @@ export const browserPorts: CallPorts = {
   prime: primeContext,
   release: releaseContext,
   openAudio,
+  mintCallTicket,
   openSocket,
   probeUpgrade,
 };

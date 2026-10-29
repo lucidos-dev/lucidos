@@ -182,9 +182,12 @@ missing comment.
 
 **`crates/vendor/` is outside this inventory.** It is third-party source,
 excluded from the workspace, so `make lint` never lints it. The first grep
-and the bare-allow audit still print its upstream allows
-(`unused_variables`, `missing_debug_implementations`, `single_match`) in
-`chromiumoxide`. Leave them as upstream wrote them.
+and the bare-allow audit still print its upstream allows. `chromiumoxide`
+carries `unused_variables`, `missing_debug_implementations` and
+`single_match`. `ort-sys`, vendored on 2026-10-28, carries
+`type_complexity`, `cast_possible_truncation`, `unusual_byte_groupings` and
+two `non_camel_case_types`, one with `upper_case_acronyms`. Leave them as
+upstream wrote them.
 
 `@ts-expect-error` grew with the test suite, and a second Vite plugin joined:
 `vite/ensureGenerated.ts`. The ten `eslint-disable` sites were unchanged.
@@ -298,7 +301,7 @@ one, fix the code and remove the annotation.
 Check that mechanically rather than by eye. This prints every Rust allow
 whose preceding non-attribute line is not a comment. It must print
 nothing but the `branch_queries.rs` string-literal hit and the vendored
-`chromiumoxide` lines named above:
+`chromiumoxide` and `ort-sys` lines named above:
 
 ```sh
 for f in $(git ls-files '*.rs'); do awk -v F="$f" '
@@ -433,6 +436,11 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   reverted that day: a cold press lost the iOS audio gesture.
   `store/thread-events.ts` dominates about 163 kB of unminified entry code,
   because `store.ts` derives exchanges through `computeExchanges`.
+  On 2026-10-28 it measured 586.00 kB and the set 1323.00 kB, still past
+  both soft lines. Built bytes put about 70 kB of the entry in
+  `exchange-grouping.ts`, `exchange-render.ts` and `exchange.ts`. Moving
+  them to the shell would clear the entry line but not the set's. The set
+  needs about 90 kB behind dynamic imports.
 
   The entry chunk is the data layer and startup. The UI is the shell chunk,
   loaded beside it under the boot splash.

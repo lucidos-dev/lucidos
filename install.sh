@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.53.0"
+LUCIDOS_DEFAULT_VERSION="0.53.1"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -1031,7 +1031,7 @@ print_service_running() {
 }
 
 print_installed() {
-    local runtime_dir="$1"
+    local runtime_dir="$1" pair
     printf '\n%s========================================%s\n' "$C_GREEN" "$C_RESET"
     printf '%s  Lucidos installed ✓%s\n' "$C_BOLD" "$C_RESET"
     printf '========================================\n'
@@ -1042,12 +1042,14 @@ print_installed() {
     printf '  Re-run the installer without --no-launch to start it — by default it\n'
     printf '  registers an always-on user service (launchd / systemd --user); add\n'
     printf '  --no-service to run it in the foreground instead. Or launch directly:\n'
-    printf '    LUCIDOS_API_PORT=%s LUCIDOS_GATEWAY_DATA=%s \\\n' "$LUCIDOS_PORT" "$LUCIDOS_GATEWAY_DATA"
-    printf '    LUCIDOS_GATEWAY_PG_BACKEND=embedded \\\n'
-    printf '    LUCIDOS_PG_BIN_DIR=%s/postgres/bin LUCIDOS_PG_LIB_DIR=%s/postgres/lib \\\n' "$runtime_dir" "$runtime_dir"
-    printf '    LUCIDOS_ENGINE_BIN=%s/lucidos-engine \\\n' "$runtime_dir"
-    printf '    LUCIDOS_STATIC_DIR=%s/frontend LUCIDOS_SDK_DIR=%s/sdk \\\n' "$runtime_dir" "$runtime_dir"
-    printf '    %s/lucidos-gateway\n' "$runtime_dir"
+    # The same env contract the foreground launch execs, never a restated copy.
+    # %q keeps a path with a space or a quote pasteable.
+    while IFS= read -r pair; do
+        [ -n "$pair" ] && printf '    %s=%q \\\n' "${pair%%=*}" "${pair#*=}"
+    done <<EOF
+$(append_tls_env "$(service_runtime_env_pairs "$runtime_dir" "$LUCIDOS_GATEWAY_DATA" "$LUCIDOS_PORT")")
+EOF
+    printf '    %q\n' "$(service_runtime_program "$runtime_dir")"
     printf '  Then open: %s%s://localhost:%s/%s\n' "$C_BLUE" "$(install_url_scheme)" "$LUCIDOS_PORT" "$C_RESET"
     printf '%s========================================%s\n\n' "$C_GREEN" "$C_RESET"
 }
@@ -1394,24 +1396,27 @@ VERTEX_REGION=$VERTEX_REGION"
     # Only rewrite data/.env when we have a fresh managed block to install. Strip
     # any prior managed block first so re-runs don't duplicate it. When no creds
     # are supplied we never touch the file, so an existing config survives.
+    # The new file is built in a temp file that mktemp creates at 0600, then
+    # renamed over data/.env, so the key never sits in a readable file.
     if [ -n "$block" ]; then
-        if [ -f "$env_file" ]; then
-            awk '
-                /^# >>> lucidos install\.sh \(managed\) >>>$/ { skip=1; next }
-                /^# <<< lucidos install\.sh \(managed\) <<<$/ { skip=0; next }
-                !skip { print }
-            ' "$env_file" > "$env_file.tmp" && mv "$env_file.tmp" "$env_file"
+        local tmp
+        tmp="$(mktemp "$env_file.XXXXXX")" || die "Could not create a temp file beside $env_file"
+        if ! { { [ ! -f "$env_file" ] || awk '
+                    /^# >>> lucidos install\.sh \(managed\) >>>$/ { skip=1; next }
+                    /^# <<< lucidos install\.sh \(managed\) <<<$/ { skip=0; next }
+                    !skip { print }
+                ' "$env_file"; } > "$tmp" \
+                && printf '# >>> lucidos install.sh (managed) >>>\n%s\n# <<< lucidos install.sh (managed) <<<\n' \
+                    "$block" >> "$tmp" \
+                && chmod 600 "$tmp" && mv -f "$tmp" "$env_file"; }; then
+            rm -f "$tmp"
+            die "Could not write $env_file"
         fi
-        {
-            printf '# >>> lucidos install.sh (managed) >>>\n'
-            printf '%s\n' "$block"
-            printf '# <<< lucidos install.sh (managed) <<<\n'
-        } >> "$env_file"
     fi
 
     # data/.env holds secrets — keep it private whenever it exists (covers the
     # re-run-in-mock-mode case where we wrote no block this time).
-    if [ -f "$env_file" ]; then chmod 600 "$env_file" 2>/dev/null || true; fi
+    if [ -f "$env_file" ]; then chmod 600 "$env_file" || die "Could not make $env_file owner-only"; fi
 }
 
 # ── launch (source build) ───────────────────────────────────────────────────

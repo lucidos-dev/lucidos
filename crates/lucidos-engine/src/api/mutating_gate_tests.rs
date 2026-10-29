@@ -178,6 +178,7 @@ const GATED_ROUTES: &[&str] = &[
     "/triggers",
     "/triggers/run",
     "/ui/navigate",
+    "/voice/ticket",
     "/webhooks",
     "/webhooks/:id",
     "/widgets/arrange",
@@ -371,4 +372,138 @@ fn a_route_that_merely_looks_exempt_is_gated() {
     ] {
         assert!(!is_exempt(route), "{route} should be gated");
     }
+}
+
+/// Socket routes that reach nothing, so a caller needs no name to open one.
+const READ_ONLY_SOCKET_ROUTES: &[&str] = &["/ws-echo"];
+
+/// Every socket route is on exactly one side, and adding one is a decision.
+///
+/// The voice socket slipped past [`every_mutating_route_is_gated_or_deliberately_exempt`]
+/// because an upgrade is a GET. A file that takes a `WebSocketUpgrade` fails
+/// here until each of its routes says whether its socket writes.
+#[test]
+fn every_socket_route_is_classified() {
+    let api_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api");
+    let mut sockets = BTreeSet::new();
+    for hit in crate::api::route_scan::scan_api_routes() {
+        let src = std::fs::read_to_string(api_dir.join(&hit.file)).expect("source is readable");
+        if src.contains("WebSocketUpgrade") {
+            sockets.insert(hit.path);
+        }
+    }
+    assert!(
+        sockets.contains("/voice"),
+        "the scan found no voice socket, so it protects nothing: {sockets:?}"
+    );
+    for route in &sockets {
+        let writes = MUTATING_SOCKET_ROUTES.contains(&route.as_str());
+        let reads = READ_ONLY_SOCKET_ROUTES.contains(&route.as_str());
+        assert!(
+            writes != reads,
+            "{route} takes a socket upgrade. List it in MUTATING_SOCKET_ROUTES if the \
+             caller writes through it, or in READ_ONLY_SOCKET_ROUTES if it reaches nothing."
+        );
+    }
+}
+
+fn voice_uri(ticket: Option<&str>) -> axum::http::Uri {
+    let ticket = ticket.map_or(String::new(), |t| {
+        format!("&{}={t}", crate::api::voice_ticket::QUERY_CALL_TICKET)
+    });
+    format!(
+        "{}/voice?thread_id={}{ticket}",
+        crate::api::API_V1_PREFIX,
+        uuid::Uuid::new_v4()
+    )
+    .parse()
+    .expect("a valid URI")
+}
+
+fn matched_voice() -> String {
+    format!("{}/voice", crate::api::API_V1_PREFIX)
+}
+
+/// The finding this layer now closes. An upgrade is a GET, and the voice
+/// socket behind it writes, so a caller naming nobody is refused before the
+/// handler runs. An ordinary GET still passes untouched.
+#[tokio::test]
+async fn an_unidentified_voice_upgrade_is_refused_though_it_is_a_get() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let tickets = crate::api::voice_ticket::CallTickets::new();
+    let nobody = axum::http::HeaderMap::new();
+
+    for ticket in [None, Some("never-minted")] {
+        let refusal = refuse_unidentified(
+            &pool,
+            &tickets,
+            &Method::GET,
+            Some(&matched_voice()),
+            &nobody,
+            &voice_uri(ticket),
+        )
+        .await
+        .expect_err("an unidentified voice upgrade must be refused");
+        assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    let list = format!("{}/threads/list", crate::api::API_V1_PREFIX);
+    refuse_unidentified(
+        &pool,
+        &tickets,
+        &Method::GET,
+        Some(&list),
+        &nobody,
+        &list.parse().expect("a valid URI"),
+    )
+    .await
+    .expect("an ordinary read names nobody and passes");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A browser socket cannot set a header, so with none the layer takes the
+/// device a live call ticket binds. It peeks rather than spends, so the handler
+/// can still redeem. A header is never overridden by a ticket.
+#[tokio::test]
+async fn a_voice_upgrade_is_named_by_its_ticket_but_never_over_the_header() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    crate::test_support::seed_device(&pool, "owners-phone", Some("Mozilla/5.0"), None).await;
+    let tickets = crate::api::voice_ticket::CallTickets::new();
+    let thread_id = uuid::Uuid::new_v4();
+    let ticket = tickets.mint("owners-phone", thread_id).expect("a ticket");
+
+    refuse_unidentified(
+        &pool,
+        &tickets,
+        &Method::GET,
+        Some(&matched_voice()),
+        &axum::http::HeaderMap::new(),
+        &voice_uri(Some(&ticket)),
+    )
+    .await
+    .expect("a live ticket identifies the caller");
+    assert!(
+        tickets.peek_device(&ticket).is_some(),
+        "the gate must not spend the ticket the handler redeems"
+    );
+
+    let mut forged = axum::http::HeaderMap::new();
+    forged.insert(
+        crate::api::actor::HEADER_DEVICE_ID,
+        "nobody-registered".parse().expect("a valid header value"),
+    );
+    let refusal = refuse_unidentified(
+        &pool,
+        &tickets,
+        &Method::GET,
+        Some(&matched_voice()),
+        &forged,
+        &voice_uri(Some(&ticket)),
+    )
+    .await
+    .expect_err("the ticket must not stand in for the header's device");
+    assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
+
+    crate::test_support::teardown_test_db(&db_name).await;
 }

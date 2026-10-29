@@ -307,6 +307,18 @@ pub const TABLES: &[TableRule] = &[
         },
     },
     TableRule {
+        table: "mcp_launch_approvals",
+        owners: &["core/mcp_servers.rs"],
+        announcement: Announcement::Announced {
+            events: &["McpLaunchApproved"],
+            exempt: &[ExemptWriter {
+                function: "delete_row",
+                why: "Removing a server deletes its approvals in the same \
+                      statement. McpServerRemoved announces that removal.",
+            }],
+        },
+    },
+    TableRule {
         table: "mcp_servers",
         owners: &["core/mcp_servers.rs"],
         announcement: Announcement::Announced {

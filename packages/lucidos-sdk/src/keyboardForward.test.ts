@@ -11,6 +11,9 @@ import {
 
 const SEARCH_FILES = { mod: true, shift: false, alt: false, key: 'p' };
 
+/** The origin the host serves app frames from, as the SDK reads it. */
+const HOST_ORIGIN = 'https://localhost:5251';
+
 describe('matchesHostBinding', () => {
   it('matches by the host rule, where Cmd and Ctrl both count', () => {
     expect(matchesHostBinding({ metaKey: true, ctrlKey: false, shiftKey: false, altKey: false, key: 'p' }, [SEARCH_FILES])).toBe(true);
@@ -86,6 +89,7 @@ describe('installKeyboardForwarding', () => {
   function withParent(): ReturnType<typeof vi.fn> {
     const postMessage = vi.fn();
     (window as unknown as { parent: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
     return postMessage;
   }
 
@@ -103,7 +107,7 @@ describe('installKeyboardForwarding', () => {
     expect(postMessage).toHaveBeenCalledTimes(1);
     expect(postMessage).toHaveBeenCalledWith(
       expect.objectContaining({ type: FORWARD_KEYDOWN_TYPE, key: '3', metaKey: true, shiftKey: true }),
-      '*',
+      HOST_ORIGIN,
     );
   });
 
@@ -114,7 +118,7 @@ describe('installKeyboardForwarding', () => {
     expect(postMessage).toHaveBeenCalledTimes(1);
     expect(postMessage).toHaveBeenCalledWith(
       expect.objectContaining({ type: FORWARD_KEYDOWN_TYPE, key: 'Escape' }),
-      '*',
+      HOST_ORIGIN,
     );
   });
 
@@ -138,7 +142,7 @@ describe('installKeyboardForwarding', () => {
   it('cancels the browser default for a host-bound chord, so ⌘P is not a print', () => {
     const parent = { postMessage: vi.fn() };
     (window as unknown as { parent: unknown }).parent = parent;
-    vi.stubGlobal('location', { origin: 'https://localhost:5251' });
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
     cleanup = installKeyboardForwarding();
     // The host's push, as _bridge.ts receives it: from the parent, on the frame's
     // origin, on the channel.

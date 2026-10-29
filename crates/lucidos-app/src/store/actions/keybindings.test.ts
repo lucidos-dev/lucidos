@@ -14,6 +14,7 @@ import {
   recordChord,
   KEYBINDINGS_PREF_KEY,
 } from './keybindings';
+import { splitTooltipShortcut } from '@lucidos/tooltip';
 
 type Evt = Parameters<typeof matchShortcut>[0];
 function evt(over: Partial<Evt>): Evt {
@@ -174,8 +175,10 @@ describe('recordChord', () => {
 describe('tooltipWithShortcut', () => {
   it('reflects the current binding (non-Mac form in the test env)', () => {
     setPrefs({});
-    expect(tooltipWithShortcut('Search everywhere', 'searchEverywhere')).toBe('Search everywhere · Ctrl+K');
+    expect(splitTooltipShortcut(tooltipWithShortcut('Search everywhere', 'searchEverywhere')))
+      .toEqual({ text: 'Search everywhere', shortcut: 'Ctrl+K' });
     setPrefs({ searchEverywhere: 'mod+shift+p' });
-    expect(tooltipWithShortcut('Search everywhere', 'searchEverywhere')).toBe('Search everywhere · Ctrl+Shift+P');
+    expect(splitTooltipShortcut(tooltipWithShortcut('Search everywhere', 'searchEverywhere')))
+      .toEqual({ text: 'Search everywhere', shortcut: 'Ctrl+Shift+P' });
   });
 });

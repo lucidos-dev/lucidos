@@ -13,6 +13,7 @@
  */
 
 import { isTextEntryField } from './textEntry';
+import { postToHost } from './_bridge';
 
 // Direction lock threshold (px) — below this, direction is undecided
 const LOCK_THRESHOLD = 8;
@@ -359,9 +360,8 @@ export function installFramePaneSwipe(
  */
 export function installAppPaneSwipe(): () => void {
   if (typeof window === 'undefined' || window.parent === window) return () => {};
-  const post = (message: object) => window.parent.postMessage(message, '*');
   return installFramePaneSwipe(window, {
-    onDrag: (dx) => post({ type: APP_SWIPE_MESSAGE_TYPE, dx }),
-    onRelease: (paneDelta) => post({ type: APP_SWIPE_END_MESSAGE_TYPE, paneDelta }),
+    onDrag: (dx) => postToHost({ type: APP_SWIPE_MESSAGE_TYPE, dx }),
+    onRelease: (paneDelta) => postToHost({ type: APP_SWIPE_END_MESSAGE_TYPE, paneDelta }),
   }, { yieldToWidePage: false });
 }

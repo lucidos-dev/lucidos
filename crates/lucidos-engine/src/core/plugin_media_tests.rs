@@ -164,6 +164,25 @@ fn the_single_app_icon_stands_in() {
     assert_eq!(media.index.icon, None, "two apps have no single icon");
 }
 
+/// A symlinked app manifest is never read, so its app lends no icon.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_app_manifest_lends_no_icon() {
+    let outside = tempfile::tempdir().unwrap();
+    write_app(outside.path(), "board", None, true);
+    let tree = tempfile::tempdir().unwrap();
+    write(tree.path(), "apps/board/assets/icon.svg", b"<svg/>");
+    std::os::unix::fs::symlink(
+        outside.path().join("apps/board/manifest.json"),
+        tree.path().join("apps/board/manifest.json"),
+    )
+    .unwrap();
+
+    let media = resolve(tree.path(), &MediaDeclaration::default());
+
+    assert_eq!(media.index.icon, None);
+}
+
 /// Invariant I13: a copy serves only what its index lists.
 #[test]
 fn a_copy_serves_only_listed_files() {

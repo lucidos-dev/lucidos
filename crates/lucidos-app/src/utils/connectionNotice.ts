@@ -61,9 +61,9 @@ function connectionTarget(workspace: string | null): string {
  *  what a screen reader is told and what the panel says cannot drift into two
  *  different claims about one state.
  *
- *  `stopped` is the one state that claims the engine, because the gateway said
- *  so itself: it answered for a workspace it stopped. Every other state comes
- *  from a poll that got no answer, which proves nothing about the engine.
+ *  `stopped` and `starting` are the states that claim the engine. The gateway
+ *  said it stopped this workspace, or accepted a Start for it. Every other state
+ *  comes from a poll that got no answer, which proves nothing about the engine.
  *
  *  The workspace matters as much as the state: the name beside the mark hides
  *  itself when the pane is narrow, so this answers "connected to what?" at any
@@ -79,6 +79,7 @@ const CONNECTION_PHRASE: Record<string, (target: string) => string> = {
   connecting: (target) => `connecting to ${target}`,
   disconnected: (target) => `cannot reach ${target}`,
   stopped: (target) => `${target} is stopped`,
+  starting: (target) => `${target} is starting`,
 };
 
 export function connectionPhrase(status: string, workspace: string | null): string {
@@ -144,6 +145,12 @@ const CONNECTION_DETAIL: Record<string, { consequence: string; recovery: string 
   stopped: {
     consequence: 'Threads and messages will not load or send in this window.',
     recovery: 'Start it to continue.',
+  },
+  // The user pressed Start and the gateway accepted it. Failed probes now mean
+  // a boot in progress, so this says that rather than "cannot reach".
+  starting: {
+    consequence: 'Threads and messages will load in this window once it answers.',
+    recovery: 'Waiting for it to boot.',
   },
 };
 

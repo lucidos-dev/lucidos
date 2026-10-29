@@ -12,7 +12,8 @@ impl BrowserRuntime {
         wait_for: Option<&str>,
         visible: bool,
     ) -> Result<String, String> {
-        let domain = extract_domain(url);
+        let url = navigable_url(url)?;
+        let domain = url.host_str().map(str::to_string);
 
         // If headless, check blocklist first
         if !visible {
@@ -35,7 +36,7 @@ impl BrowserRuntime {
         self.ensure_browser(session_key, visible).await?;
         let result = self
             .with_timeout(session_key, "open", || {
-                self.open_inner(session_key, url, wait_for)
+                self.open_inner(session_key, &url, wait_for)
             })
             .await;
 
@@ -62,7 +63,7 @@ impl BrowserRuntime {
                     }
                     return Err(format!(
                         "{} blocks headless browsers ({}). Retry with visible=true to browse this site.",
-                        domain.as_deref().unwrap_or(url),
+                        domain.as_deref().unwrap_or(url.as_str()),
                         reason
                     ));
                 }
@@ -75,7 +76,7 @@ impl BrowserRuntime {
     async fn open_inner(
         &self,
         session_key: &str,
-        url: &str,
+        url: &reqwest::Url,
         wait_for: Option<&str>,
     ) -> Result<String, String> {
         let mut instances = self.instances.lock().await;
@@ -91,7 +92,7 @@ impl BrowserRuntime {
         // Create new page
         let page = browser_state
             .browser
-            .new_page(url)
+            .new_page(url.as_str())
             .await
             .map_err(|e| format!("Failed to open page: {}", e))?;
 
@@ -571,11 +572,7 @@ impl BrowserRuntime {
             format!("{}/{}", parent, timestamped_filename)
         };
 
-        // Save to artifacts directory
-        let artifact_path = self
-            .workspace_path
-            .join(ARTIFACTS_DIR)
-            .join(&timestamped_path);
+        let artifact_path = screenshot_target(&self.workspace_path, &timestamped_path)?;
 
         // Ensure parent directory exists
         if let Some(parent) = artifact_path.parent() {
@@ -594,9 +591,48 @@ impl BrowserRuntime {
     }
 }
 
+/// Where a screenshot named `rel` lands under `artifacts/`, or an error when a
+/// symlink on the way would carry the write out of it.
+fn screenshot_target(workspace: &Path, rel: &str) -> Result<std::path::PathBuf, String> {
+    crate::core::contained_path::join_contained(&workspace.join(ARTIFACTS_DIR), rel).ok_or_else(
+        || {
+            format!(
+                "Invalid screenshot path '{rel}': it resolves outside artifacts/ through a symlink"
+            )
+        },
+    )
+}
+
 /// Quote an LLM-supplied selector as a JS string literal. A JSON string is a
 /// valid JS one. Backslashes in a CSS-escaped selector like `.md\:flex`
 /// survive, and no quote in it can close the string.
 fn js_string_literal(s: &str) -> String {
     serde_json::Value::String(s.to_string()).to_string()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_screenshot_lands_under_artifacts() {
+        let ws = tempfile::tempdir().unwrap();
+        let target = screenshot_target(ws.path(), "shots/page_1.png").unwrap();
+        assert_eq!(
+            target,
+            ws.path().join(ARTIFACTS_DIR).join("shots/page_1.png")
+        );
+    }
+
+    #[test]
+    fn a_symlinked_directory_never_carries_a_screenshot_out_of_artifacts() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let artifacts = ws.path().join(ARTIFACTS_DIR);
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::os::unix::fs::symlink(outside.path(), artifacts.join("shots")).unwrap();
+
+        assert!(screenshot_target(ws.path(), "shots/page_1.png").is_err());
+        assert!(screenshot_target(ws.path(), "shots/deeper/page_1.png").is_err());
+    }
 }

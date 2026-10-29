@@ -190,3 +190,97 @@ async fn first_known_provider(client: &reqwest::Client, api: &str) -> Value {
         .cloned()
         .expect("the shipped registry must list at least one provider")
 }
+
+/// An OAuth client whose token endpoint is plain http on a remote host would
+/// send its client secret and every refresh token in cleartext. Both save
+/// paths refuse it, name the credential, and echo no secret.
+#[tokio::test]
+async fn saving_a_client_with_a_cleartext_token_url_is_refused() {
+    const SECRET: &str = "e2e-client-secret-value";
+    let client = user_client().await;
+    let api = base_url();
+    let provider = unique_marker("e2e-oauth-https").to_lowercase();
+    let client_json = |token_url: &str| {
+        json!({
+            "client_id": "abc",
+            "client_secret": SECRET,
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": token_url,
+        })
+        .to_string()
+    };
+    let assert_refused = |body: &Value| {
+        assert_eq!(body["success"], false, "{body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains(&provider), "names the credential: {error}");
+        assert!(error.contains("token_url"), "names the field: {error}");
+        assert!(error.contains("https"), "says what to fix: {error}");
+        assert!(!error.contains(SECRET), "echoes no secret: {error}");
+    };
+
+    let create = |auth_value: String| {
+        client
+            .post(format!("{}/api/v1/credentials", api))
+            .json(&json!({
+                "service_name": provider,
+                "base_url": "https://api.example.com",
+                "auth_type": "oauth_client",
+                "auth_value": auth_value,
+            }))
+            .send()
+    };
+    let refused: Value = create(client_json("http://oauth.example.com/token"))
+        .await
+        .expect("create failed")
+        .json()
+        .await
+        .expect("create is not JSON");
+    assert_refused(&refused);
+
+    let saved: Value = create(client_json("https://oauth.example.com/token"))
+        .await
+        .expect("create failed")
+        .json()
+        .await
+        .expect("create is not JSON");
+    assert_eq!(saved["success"], true, "https saves: {saved}");
+
+    let listed: Value = client
+        .get(format!("{}/api/v1/credentials", api))
+        .send()
+        .await
+        .expect("list failed")
+        .json()
+        .await
+        .expect("list is not JSON");
+    let id = listed["credentials"]
+        .as_array()
+        .expect("credentials array")
+        .iter()
+        .find(|c| c["service_name"] == provider.as_str())
+        .and_then(|c| c["id"].as_str())
+        .expect("the https client was stored")
+        .to_string();
+
+    let edited: Value = client
+        .put(format!("{}/api/v1/credentials", api))
+        .query(&[("id", id.as_str())])
+        .json(&json!({
+            "auth_type": "oauth_client",
+            "auth_value": client_json("http://oauth.example.com/token"),
+        }))
+        .send()
+        .await
+        .expect("update failed")
+        .json()
+        .await
+        .expect("update is not JSON");
+    assert_refused(&edited);
+
+    client
+        .delete(format!("{}/api/v1/credentials", api))
+        .query(&[("id", id.as_str())])
+        .send()
+        .await
+        .expect("delete failed");
+}

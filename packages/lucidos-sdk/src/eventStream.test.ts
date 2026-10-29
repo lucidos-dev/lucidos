@@ -17,6 +17,7 @@ import {
   sharedWorkerAvailable,
   startLiveness,
   STREAM_STALL_AFTER_MS,
+  WORKER_ANSWER_MS,
   type EventStreamTargets,
   type PongAnswer,
   type StreamDrop,
@@ -511,6 +512,284 @@ describe('shared stream drop', () => {
       { reason: 'stalled', silentMs: 65_000, transport: 'shared' },
       { reason: 'error' },
     ]);
+    vi.unstubAllGlobals();
+  });
+});
+
+/**
+ * The browser can relaunch a shared worker, or lose it, while the page keeps
+ * its port. WebKit relaunches one with a fresh global scope when its host
+ * process dies. The page must notice both, or it reads as connected forever.
+ */
+describe('shared stream recovery', () => {
+  interface RecordingPort {
+    sent: unknown[];
+    closed: boolean;
+    onmessage: ((e: { data: unknown }) => void) | null;
+    postMessage(msg: unknown): void;
+    start(): void;
+    close(): void;
+  }
+
+  /** Every port the page attached, one per `new SharedWorker`. */
+  let ports: RecordingPort[];
+  let drops: StreamDrop[];
+
+  const HELLO = { t: 'hello', pongs: true, streamUrl: TARGETS.streamUrl, pongUrl: TARGETS.pongUrl };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    ports = [];
+    drops = [];
+    vi.stubGlobal(
+      'SharedWorker',
+      class {
+        port: RecordingPort = {
+          sent: [],
+          closed: false,
+          onmessage: null,
+          postMessage(msg) {
+            this.sent.push(msg);
+          },
+          start() {},
+          close() {
+            this.closed = true;
+          },
+        };
+        constructor() {
+          ports.push(this.port);
+        }
+      },
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  const open = () =>
+    openEventStream(TARGETS, { ...NO_OP_HANDLERS, onError: (d) => drops.push(d) }, { pongs: true });
+  const fromWorker = (port: RecordingPort, msg: unknown) => port.onmessage!({ data: msg });
+
+  it('takes the first request to introduce itself as answered by the hello in flight', () => {
+    open();
+
+    fromWorker(ports[0], { t: 'introduce' });
+
+    expect(ports[0].sent).toEqual([HELLO]);
+    expect(drops).toEqual([]);
+  });
+
+  it('says hello again and reports the drop when the worker asks a second time', () => {
+    open();
+    fromWorker(ports[0], { t: 'introduce' });
+
+    fromWorker(ports[0], { t: 'introduce' });
+
+    expect(ports[0].sent).toEqual([HELLO, HELLO]);
+    expect(drops).toEqual([{ reason: 'worker-restarted' }]);
+  });
+
+  it('says hello again when a relaunched worker asks on a link an older worker served', () => {
+    // The older worker never asks. Its relaunched instance runs the new script,
+    // and its first ask comes after frames, so no hello is in flight for it.
+    open();
+    fromWorker(ports[0], { t: 'open' });
+    fromWorker(ports[0], { t: 'frame', data: '{}' });
+
+    fromWorker(ports[0], { t: 'introduce' });
+
+    expect(ports[0].sent).toEqual([HELLO, HELLO]);
+    expect(drops).toEqual([{ reason: 'worker-restarted' }]);
+  });
+
+  it('keeps replacing a worker that stays silent after a reattach', () => {
+    // The new worker may never run, for example while its script answers 503.
+    const stream = open();
+    fromWorker(ports[0], { t: 'introduce' });
+    stream.revalidate();
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    stream.revalidate();
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    expect(ports).toHaveLength(3);
+    expect(drops).toEqual([{ reason: 'worker-unresponsive' }, { reason: 'worker-unresponsive' }]);
+  });
+
+  it('asks again, rather than reattach, when the page froze while it waited', () => {
+    // On thaw the overdue timer and the queued answer race, in no set order.
+    const stream = open();
+    fromWorker(ports[0], { t: 'introduce' });
+    stream.revalidate();
+
+    vi.setSystemTime(Date.now() + 60_000);
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    expect(ports).toHaveLength(1);
+    expect(ports[0].sent.slice(-2)).toEqual([{ t: 'check' }, { t: 'check' }]);
+    expect(drops).toEqual([]);
+
+    fromWorker(ports[0], { t: 'checked' });
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+    expect(ports).toHaveLength(1);
+  });
+
+  it('attaches to a new worker when a check goes unanswered', () => {
+    const stream = open();
+    fromWorker(ports[0], { t: 'introduce' });
+
+    stream.revalidate();
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    expect(drops).toEqual([{ reason: 'worker-unresponsive' }]);
+    expect(ports).toHaveLength(2);
+    expect(ports[0].sent.slice(-1)).toEqual([{ t: 'bye' }]);
+    expect(ports[0].closed).toBe(true);
+    expect(ports[1].sent).toEqual([HELLO]);
+
+    stream.submitPong('n-1', ANSWER);
+    stream.close();
+    expect(ports[1].sent.slice(1)).toEqual([
+      { t: 'pong', notificationId: 'n-1', answer: ANSWER },
+      { t: 'bye' },
+    ]);
+  });
+
+  it('attaches to a new worker when a restart goes unanswered', () => {
+    // The send probe's restart is the page's last resort. Sent into a lost
+    // worker, it used to vanish and leave the spinner turning.
+    const stream = open();
+    fromWorker(ports[0], { t: 'introduce' });
+
+    stream.restart();
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    expect(drops).toEqual([{ reason: 'worker-unresponsive' }]);
+    expect(ports).toHaveLength(2);
+    expect(ports[1].sent).toEqual([HELLO]);
+  });
+
+  it('keeps a worker that answers the restart with its drop', () => {
+    const stream = open();
+    fromWorker(ports[0], { t: 'introduce' });
+
+    stream.restart();
+    fromWorker(ports[0], { t: 'error' });
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    expect(ports).toHaveLength(1);
+    expect(drops).toEqual([{ reason: 'error' }]);
+  });
+
+  it('keeps a worker that answers the check', () => {
+    const stream = open();
+    fromWorker(ports[0], { t: 'introduce' });
+
+    stream.revalidate();
+    fromWorker(ports[0], { t: 'checked' });
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    expect(ports).toHaveLength(1);
+    expect(drops).toEqual([]);
+  });
+
+  it('expects no answer from a worker that never asked, which predates the answer', () => {
+    // A page reloaded onto a new build can still meet the old worker, which
+    // other windows keep alive. That worker never answers a check.
+    const stream = open();
+
+    stream.revalidate();
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    expect(ports).toHaveLength(1);
+    expect(drops).toEqual([]);
+  });
+
+  it('never reattaches once closed', () => {
+    const stream = open();
+    fromWorker(ports[0], { t: 'introduce' });
+
+    stream.revalidate();
+    stream.close();
+    vi.advanceTimersByTime(WORKER_ANSWER_MS);
+
+    expect(ports).toHaveLength(1);
+    expect(drops).toEqual([]);
+  });
+});
+
+describe('direct stream restart', () => {
+  class RestartableEventSource {
+    static last: RestartableEventSource | null = null;
+    onmessage: ((e: MessageEvent) => void) | null = null;
+    onopen: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    closed = false;
+    constructor(public url: string) {
+      RestartableEventSource.last = this;
+    }
+    addEventListener() {}
+    close() {
+      this.closed = true;
+    }
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('SharedWorker', undefined);
+    vi.stubGlobal('EventSource', RestartableEventSource);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('closes the source and reports one drop so the consumer reconnects', () => {
+    const drops: StreamDrop[] = [];
+    const stream = openEventStream(
+      TARGETS,
+      { ...NO_OP_HANDLERS, onError: (d) => drops.push(d) },
+      { pongs: false },
+    );
+
+    stream.restart();
+
+    expect(RestartableEventSource.last!.closed).toBe(true);
+    expect(drops).toEqual([{ reason: 'error' }]);
+  });
+
+  it('stops the watchdog, so the restarted stream never also reports a stall', () => {
+    const drops: StreamDrop[] = [];
+    const stream = openEventStream(
+      TARGETS,
+      { ...NO_OP_HANDLERS, onError: (d) => drops.push(d) },
+      { pongs: false },
+    );
+
+    stream.restart();
+    vi.advanceTimersByTime(STREAM_STALL_AFTER_MS * 2);
+
+    expect(drops).toEqual([{ reason: 'error' }]);
+  });
+});
+
+describe('shared stream restart', () => {
+  it('asks the worker to reopen its upstream', () => {
+    const port = {
+      postMessage: vi.fn(),
+      close: vi.fn(),
+      start: vi.fn(),
+      onmessage: null as unknown,
+    };
+    vi.stubGlobal('SharedWorker', class { port = port; });
+
+    const stream = openEventStream(TARGETS, NO_OP_HANDLERS, { pongs: false });
+    stream.restart();
+
+    expect(port.postMessage).toHaveBeenLastCalledWith({ t: 'restart' });
     vi.unstubAllGlobals();
   });
 });

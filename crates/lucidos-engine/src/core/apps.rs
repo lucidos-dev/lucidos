@@ -566,6 +566,20 @@ impl AppManager {
             .unwrap_or_else(|| self.apps_path.join(app_id))
     }
 
+    /// [`Self::app_dir`] for a caller that reads files out of it, or `None`
+    /// when the folder, or `data/apps/` itself, is a symlink out of its tree.
+    /// Containment judged against such a folder alone would trust everything
+    /// under its target.
+    pub fn contained_app_dir(&self, app_id: &str) -> Option<PathBuf> {
+        match self.built_in_dir(app_id) {
+            Some(dir) => Some(dir),
+            None => crate::core::contained_path::join_data_contained(
+                self.apps_path.parent()?,
+                &format!("apps/{app_id}"),
+            ),
+        }
+    }
+
     /// Runs one write with the workspace repo lock held across its existence
     /// check, its read, its file change and its commit. A merge's
     /// `checkout -f main` runs under the same lock, so it cannot rewrite the
@@ -1183,11 +1197,14 @@ impl AppManager {
         app_id: &str,
     ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
         reject_path_traversal(app_id)?;
-        let app_dir = self.app_dir(app_id);
+        let app_dir = self
+            .contained_app_dir(app_id)
+            .ok_or_else(|| format!("App '{app_id}' resolves outside apps/ through a symlink"))?;
         if !app_dir.exists() {
             return Err(format!("App not found: {}", app_id).into());
         }
 
+        // The listing skips symlinks, so each name read below is a plain file.
         let file_names = self.list_app_files(app_id);
         let mut result = Vec::new();
         for name in file_names {
@@ -1279,20 +1296,16 @@ impl AppManager {
 
     /// Get the path to an app's index.html.
     pub fn get_app_path(&self, app_id: &str) -> PathBuf {
-        self.app_file_path(app_id, "index.html")
+        self.app_dir(app_id).join("index.html")
     }
 
-    /// Where one of an app's files lives, built-in widgets included. The
-    /// caller has already refused a traversing `file`.
-    pub fn app_file_path(&self, app_id: &str, file: &str) -> PathBuf {
-        self.app_dir(app_id).join(file)
-    }
-
-    /// Recursively list all files in an app directory.
+    /// Recursively list the plain files in an app directory. A symlink is
+    /// skipped: a link out of the folder would name host files.
     pub fn list_app_files(&self, app_id: &str) -> Vec<String> {
-        let app_dir = self.app_dir(app_id);
         let mut files = Vec::new();
-
+        let Some(app_dir) = self.contained_app_dir(app_id) else {
+            return files;
+        };
         if !app_dir.exists() {
             return files;
         }
@@ -1300,9 +1313,14 @@ impl AppManager {
         fn walk(dir: &Path, base: &Path, files: &mut Vec<String>) {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
                     let path = entry.path();
-                    if path.is_dir() {
+                    if file_type.is_dir() {
                         walk(&path, base, files);
+                    } else if !file_type.is_file() {
+                        continue;
                     } else if let Ok(relative) = path.strip_prefix(base) {
                         files.push(relative.to_string_lossy().to_string());
                     }
@@ -1762,6 +1780,50 @@ pub(crate) mod tests {
 
         assert_eq!(manager.get_app("file-link").unwrap().icon, None);
         assert_eq!(manager.get_app("dir-link").unwrap().icon, None);
+    }
+
+    /// `GET /api/v1/app/:id/source` returned every linked file's content.
+    #[cfg(unix)]
+    #[test]
+    fn app_source_never_reads_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+
+        write_manifest(tmp.path(), "linked", r#"{"name": "L"}"#);
+        let app = tmp.path().join("data/apps/linked");
+        std::fs::write(app.join("index.html"), "<p>").unwrap();
+        symlink(outside.path().join("secret.txt"), app.join("leak.txt")).unwrap();
+        symlink(outside.path(), app.join("notes")).unwrap();
+        symlink(outside.path(), tmp.path().join("data/apps/whole")).unwrap();
+
+        let names: Vec<String> = manager
+            .read_app_source("linked")
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["index.html"]);
+        assert!(manager.read_app_source("whole").is_err());
+        assert!(manager.list_app_files("whole").is_empty());
+        assert_eq!(manager.contained_app_dir("whole"), None);
+    }
+
+    /// Judged against a linked `data/apps/` alone, every app folder under its
+    /// target counted as inside.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_apps_folder_holds_no_contained_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("todo")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("data/apps")).unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+
+        assert_eq!(manager.contained_app_dir("todo"), None);
     }
 
     /// A pin, because the doc cannot import the constants it states.

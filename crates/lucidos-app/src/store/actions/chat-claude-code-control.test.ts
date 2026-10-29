@@ -28,6 +28,7 @@ vi.mock('../../api/client', () => ({
   ApiError,
 }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
+vi.mock('./send-probe', () => ({ probeStreamAfterSend: vi.fn() }));
 
 const { sendCodingAgentControl } = await import('./chat-claude-code');
 

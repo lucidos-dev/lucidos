@@ -161,8 +161,9 @@ export function ThreadPane() {
           ? <div key="thread" class="thread-view-clip"><ThreadView /></div>
           : <CreateThreadView key="compose" />}
         <div key="prompt" class="prompt-area" ref={promptRef}>
-          <PromptInput />
+          {/* Ahead of the composer it floats above, so Tab meets it first. */}
           <FollowLiveEdgeToggle />
+          <PromptInput />
         </div>
       </div>
     </div>

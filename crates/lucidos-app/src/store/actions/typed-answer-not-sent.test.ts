@@ -35,6 +35,7 @@ vi.mock('./thread-loading', () => ({
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
   forgetThreadEventsFailures: vi.fn(),
 }));
+vi.mock('./event-stream', () => ({ restartEventStream: vi.fn(() => 'shared'), eventFramesReceived: () => 0 }));
 vi.mock('./devices', () => ({ getDeviceId: () => 'device-test' }));
 vi.mock('../../utils/platform', () => ({ isTauri: () => false, isIOS: () => false }));
 
@@ -43,6 +44,9 @@ import { retryUnsentMessage, sendMessage, showRestoredUnsentMessage } from './ch
 import { unsentMessages } from '../unsentMessages';
 import { _resetUnsentMessageRecordsForTesting } from '../unsentMessageRecords';
 import { submitChat } from '../../api/client';
+import { refreshThreadEvents } from './thread-loading';
+import { restartEventStream } from './event-stream';
+import { SEND_CONFIRM_MS } from './send-probe';
 import { computeExchanges, handleEvent, makeOptimisticThreadState, type StoredEvent } from '../thread-events';
 
 const mockedSubmitChat = vi.mocked(submitChat);
@@ -168,5 +172,45 @@ describe('a typed answer that gets no answer', () => {
     });
     expect(exchanges()).toHaveLength(2);
     expect(card().typedAnswer).toMatchObject({ state: 'unsent', text: 'from before the reload', unsentEventId: 'e-restored' });
+  });
+});
+
+describe('a typed answer whose confirming frame never arrives', () => {
+  const answeredByText = (text: string) => ({
+    type: 'UserQuestionAnswered', tool_use_id: 'tu-1', answer: { kind: 'FreeText', text },
+  } as StoredEvent);
+
+  beforeEach(() => {
+    vi.mocked(refreshThreadEvents).mockClear();
+    vi.mocked(restartEventStream).mockClear();
+  });
+
+  it('is resolved by a refetch and restarts the stream the frame missed', async () => {
+    mockedSubmitChat.mockResolvedValueOnce({ event_id: 'accepted' } as never);
+    vi.mocked(refreshThreadEvents).mockImplementationOnce(async () => {
+      handleEvent(threadMap.value, 't', 3, answeredByText('neither, do C'), TS);
+      return true;
+    });
+
+    expect(await sendMessage('neither, do C', undefined, { threadId: 't' })).toBe('sent');
+    expect(restartEventStream).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(SEND_CONFIRM_MS);
+
+    expect(refreshThreadEvents).toHaveBeenCalledWith('t');
+    expect(restartEventStream).toHaveBeenCalledTimes(1);
+    expect(card().typedAnswer).toBeUndefined();
+  });
+
+  it('leaves a live stream alone when the frame arrived', async () => {
+    mockedSubmitChat.mockImplementationOnce(async (body) => {
+      handleEvent(threadMap.value, 't', 3, answeredByText(body.message), TS);
+      return { event_id: 'accepted' } as never;
+    });
+
+    expect(await sendMessage('neither, do C', undefined, { threadId: 't' })).toBe('sent');
+    await vi.advanceTimersByTimeAsync(SEND_CONFIRM_MS);
+
+    expect(restartEventStream).not.toHaveBeenCalled();
+    expect(vi.mocked(refreshThreadEvents).mock.calls.filter(([id]) => id === 't')).toHaveLength(0);
   });
 });

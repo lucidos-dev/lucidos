@@ -2057,42 +2057,11 @@ fn a_legitimate_encoded_slash_inside_a_segment_still_forwards() {
     }
 }
 
-#[test]
-fn decoded_readings_peels_one_layer_per_round_and_terminates() {
-    assert_eq!(
-        decoded_readings("%2e%2e%252fadmin"),
-        Some(vec![
-            "%2e%2e%2fadmin".to_string(),
-            "%2e%2e/admin".to_string()
-        ])
-    );
-    assert_eq!(
-        decoded_readings("..%5cadmin"),
-        Some(vec!["../admin".to_string()])
-    );
-    // Nothing to decode means no extra probe to run.
-    assert_eq!(decoded_readings("items/42"), Some(Vec::new()));
-}
-
-/// Regression: one round peels a single `%25`, so `%` followed by `25` k
-/// times took k rounds and kept every reading. A path near the URI limit held
-/// about a gigabyte of strings, and a few such requests could OOM the engine.
+/// The probe itself is tested in `core::url_scope`. This pins that the proxy
+/// refuses a nesting past the cap instead of forwarding it.
 #[test]
 fn a_deeply_nested_path_is_refused_without_peeling_every_layer() {
-    // Each `25` after the `%` is one more layer, and the final `%2f` takes one
-    // more round to become `/`.
-    let at_cap = format!("%{}2fadmin", "25".repeat(MAX_DECODE_ROUNDS - 1));
-    assert_eq!(
-        decoded_readings(&at_cap).map(|r| r.len()),
-        Some(MAX_DECODE_ROUNDS),
-        "a path exactly at the cap is still probed layer by layer"
-    );
-
-    let past_cap = format!("%{}2fadmin", "25".repeat(MAX_DECODE_ROUNDS));
-    assert_eq!(decoded_readings(&past_cap), None);
-
     let hostile = format!("%{}", "25".repeat(30_000));
-    assert_eq!(decoded_readings(&hostile), None);
     let result = build_contained_target_url(PREFIXED_BASE, &hostile, None);
     assert!(result.is_err(), "a hostile nesting must be refused");
 }
@@ -3680,4 +3649,249 @@ async fn a_slow_pipeline_step_is_cut_by_the_call_cap() {
         slot.lock().unwrap().is_none(),
         "no request may reach the upstream"
     );
+}
+
+// ---- An upstream echoing the injected credential -----------------------
+
+/// The bearer token the echo tests inject.
+const ECHOED_TOKEN: &str = "echo-bearer-token-1234";
+/// The query credential the echo tests inject. Its `+`, `/` and `=` travel
+/// percent-encoded, so an echoed URL carries the encoded form.
+const ECHOED_QUERY_KEY: &str = "qk+echo/secret=";
+const ECHOED_QUERY_KEY_ENCODED: &str = "qk%2Becho%2Fsecret%3D";
+
+/// A bearer header and an `api_key` query parameter, pinned to `base_url`.
+async fn credentialed_pipeline(base_url: &str) -> ScopedPipeline {
+    use crate::api::proxy_auth_layer::{AuthLayer, ScopeBinding};
+    use crate::api::proxy_static_layers::{QueryParamLayer, StaticHeaderLayer};
+    let pinned = |what: &str| ScopeBinding::Pinned {
+        what: what.to_string(),
+        base_url: base_url.to_string(),
+    };
+    let layers: Vec<Arc<dyn AuthLayer>> = vec![
+        Arc::new(StaticHeaderLayer::bearer(
+            "bearer".into(),
+            ECHOED_TOKEN.into(),
+            pinned("the bearer token"),
+        )),
+        Arc::new(QueryParamLayer::new(
+            "query".into(),
+            "api_key".into(),
+            ECHOED_QUERY_KEY.into(),
+            pinned("the query key"),
+        )),
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+    ScopedPipeline::bind(&ctx, "echo", base_url.to_string(), layers, false)
+        .await
+        .expect("a loopback upstream binds")
+}
+
+/// Spawn an upstream that repeats what it received: the query string in a
+/// pagination `Link`, the `Authorization` value in an `x-` header, and both
+/// plus the decoded query key in its body.
+async fn spawn_echoing_upstream() -> String {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_from_handler = shutdown.clone();
+    let app = Router::new().fallback(any(move |req: axum::extract::Request| {
+        let shutdown = shutdown_from_handler.clone();
+        async move {
+            shutdown.notify_one();
+            let auth = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let raw_query = req.uri().query().unwrap_or_default().to_string();
+            let parsed =
+                reqwest::Url::parse(&format!("http://upstream.test/?{raw_query}")).unwrap();
+            let key = parsed
+                .query_pairs()
+                .find(|(name, _)| name == "api_key")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
+            let body = format!(r#"{{"error":"bad page","auth":"{auth}","key":"{key}"}}"#);
+            let mut resp = (StatusCode::BAD_REQUEST, body).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::LINK,
+                HeaderValue::from_str(&format!(
+                    "<https://upstream.test/items?{raw_query}&page=2>; rel=\"next\""
+                ))
+                .unwrap(),
+            );
+            resp.headers_mut().insert(
+                "x-echo-authorization",
+                HeaderValue::from_str(&auth).unwrap(),
+            );
+            resp
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown.notified().await;
+            })
+            .await
+            .unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+/// GET `items` through `scoped` with the caller's own `headers`.
+async fn forward_items(
+    scoped: &ScopedPipeline,
+    headers: &HeaderMap,
+) -> Result<Response, (StatusCode, String)> {
+    forward_with_redirects(
+        "echo",
+        scoped,
+        &CallBudget::start(test_timeout()),
+        &Method::GET,
+        "items",
+        None,
+        headers,
+        &Bytes::new(),
+    )
+    .await
+    .map(|(resp, _)| resp)
+}
+
+fn assert_carries_no_injected_credential(what: &str, text: &str) {
+    for secret in [ECHOED_TOKEN, ECHOED_QUERY_KEY, ECHOED_QUERY_KEY_ENCODED] {
+        assert!(
+            !text.contains(secret),
+            "{what} carried the injected credential {secret:?}: {text}"
+        );
+    }
+}
+
+/// The proxy injects a credential so the caller never holds it. An upstream
+/// that repeats it back, in a `Link`, an `x-` header or an error body, used to
+/// hand it to the caller unchanged.
+#[tokio::test]
+async fn an_upstream_echoing_the_injected_credential_returns_none_of_it() {
+    let base = spawn_echoing_upstream().await;
+    let scoped = credentialed_pipeline(&base).await;
+
+    let resp = forward_items(&scoped, &HeaderMap::new())
+        .await
+        .expect("the echo reply is forwarded");
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    for (name, value) in resp.headers() {
+        let value = String::from_utf8_lossy(value.as_bytes());
+        assert_carries_no_injected_credential(&format!("header {name}"), &value);
+    }
+    let link = header_values(&resp, "link").join(", ");
+    assert!(
+        link.contains("page=2"),
+        "the rest of the Link survives: {link}"
+    );
+    assert!(link.contains(crate::core::REDACTED_MARKER), "{link}");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert_carries_no_injected_credential("the body", &body);
+    assert!(
+        body.contains("bad page"),
+        "the rest of the body survives: {body}"
+    );
+    assert!(body.contains(crate::core::REDACTED_MARKER), "{body}");
+}
+
+/// Redaction only touches what it masks. A reply that never names the
+/// credential reaches the caller byte for byte, its framing headers intact.
+#[tokio::test]
+async fn a_reply_without_the_credential_passes_byte_identical() {
+    let (base, _slot) = spawn_recording_upstream(200, "plain upstream body").await;
+    let scoped = credentialed_pipeline(&base).await;
+
+    let resp = forward_items(&scoped, &HeaderMap::new())
+        .await
+        .expect("the reply is forwarded");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header_values(&resp, "content-length"), vec!["19"]);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"plain upstream body");
+}
+
+/// A refused redirect quotes its `Location` back to the caller. A `Location`
+/// carrying the injected credential must not take it along.
+#[tokio::test]
+async fn a_refused_redirect_does_not_quote_the_injected_credential() {
+    let location = format!("data:text/plain,{ECHOED_TOKEN}");
+    let base = spawn_redirecting_upstream(302, Box::leak(location.into_boxed_str())).await;
+    let scoped = credentialed_pipeline(&base).await;
+
+    let err = forward_items(&scoped, &HeaderMap::new())
+        .await
+        .expect_err("a Location with no host is refused");
+
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    assert!(err.1.contains("data:text/plain,"), "{}", err.1);
+    assert_carries_no_injected_credential("the refusal", &err.1);
+}
+
+/// The proxy can only mask what it can read. A caller's `Accept-Encoding`
+/// would bring back a compressed body, so a credentialed call asks for none.
+#[tokio::test]
+async fn a_credentialed_call_asks_for_an_uncompressed_reply() {
+    let (base, slot) = spawn_recording_upstream(200, "ok").await;
+    let scoped = credentialed_pipeline(&base).await;
+
+    forward_items(&scoped, &hm(&[("accept-encoding", "gzip, br")]))
+        .await
+        .expect("the reply is forwarded");
+
+    let recorded = slot.lock().unwrap().clone().expect("no request recorded");
+    let accept_encoding: Vec<&str> = recorded
+        .headers
+        .iter()
+        .filter(|(name, _)| name == "accept-encoding")
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(accept_encoding, vec!["identity"]);
+}
+
+/// An upstream that compresses anyway sends a body the proxy cannot check for
+/// the credential. Refuse it rather than pass an unread body to the caller.
+#[tokio::test]
+async fn an_encoded_reply_to_a_credentialed_call_is_refused() {
+    let base = spawn_upstream_with_headers(&[("content-encoding", "gzip")]).await;
+    let scoped = credentialed_pipeline(&base).await;
+
+    let err = forward_items(&scoped, &HeaderMap::new())
+        .await
+        .expect_err("an encoded body cannot be checked for the credential");
+
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    assert!(err.1.contains("gzip"), "{}", err.1);
+}
+
+/// With no credential injected there is nothing to mask. An encoded reply then
+/// passes as it came, as it always did.
+#[tokio::test]
+async fn an_unauthenticated_call_keeps_the_upstream_encoding() {
+    let base = spawn_upstream_with_headers(&[("content-encoding", "gzip")]).await;
+    let scoped = unauthenticated_pipeline(&base).await;
+
+    let resp = forward_items(&scoped, &HeaderMap::new())
+        .await
+        .expect("an unauthenticated reply is forwarded");
+
+    assert_eq!(header_values(&resp, "content-encoding"), vec!["gzip"]);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"upstream body");
 }

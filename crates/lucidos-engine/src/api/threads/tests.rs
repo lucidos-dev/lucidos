@@ -794,3 +794,115 @@ fn the_image_prompt_survives_the_args_strip() {
         "nothing was stripped, so nothing may claim it was"
     );
 }
+
+// ── a token for one thread cannot mutate another through a draft or an undo ──
+
+use crate::api::thread_reach::refuse_without_authority;
+use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+use crate::test_support::{setup_test_db, teardown_test_db};
+
+/// Two unrelated top-threads: `a` holds the token, `b` is the target.
+async fn two_top_threads(bus: &EventBus) -> (Uuid, Uuid) {
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    for thread_id in [a, b] {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::MessageReceived {
+                provider: None,
+                voice_session_id: None,
+                wake_mode: None,
+                text: "work".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::Chat),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .expect("seed thread");
+    }
+    (a, b)
+}
+
+/// `POST /api/v1/command-checkpoint/undo` with a token for A, aimed at a
+/// checkpoint on B, is refused before anything is restored. B's own token and
+/// the user's device still undo it.
+#[tokio::test]
+async fn a_token_for_one_thread_cannot_undo_another_thread_s_checkpoint() {
+    use crate::api::command_checkpoint::authorize_checkpoint_undo;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (a, b) = two_top_threads(&bus).await;
+    let checkpoint_id = Uuid::new_v4().to_string();
+    bus.emit(BusEvent::Thread {
+        thread_id: b,
+        event: ThreadEvent::CommandCheckpointed {
+            checkpoint_id: checkpoint_id.clone(),
+            command: "rm notes.md".into(),
+            summary: "Deletes a file".into(),
+            restores: 1,
+            removes: 0,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .expect("seed the checkpoint on B");
+
+    let (status, body) = authorize_checkpoint_undo(&bus, &agent_headers(Some(a)), &checkpoint_id)
+        .await
+        .expect_err("a token for A must not undo B's checkpoint");
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+
+    for headers in [agent_headers(Some(b)), HeaderMap::new()] {
+        let origin = authorize_checkpoint_undo(&bus, &headers, &checkpoint_id)
+            .await
+            .expect("B itself and the user's device keep their undo");
+        assert_eq!(origin.thread_id, b);
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// `PUT /api/v1/threads/:id/compose` and `DELETE /api/v1/threads/:id` with a
+/// token for A, aimed at B, answer 403. Each route's own verb is asked, so B's
+/// token and the user's device still write and discard B's draft.
+#[tokio::test]
+async fn a_token_for_one_thread_cannot_write_or_discard_another_thread_s_draft() {
+    use crate::api::threads_compose::{COMPOSE_VERB, DISCARD_DRAFT_VERB};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (a, b) = two_top_threads(&bus).await;
+
+    for verb in [COMPOSE_VERB, DISCARD_DRAFT_VERB] {
+        let err = refuse_without_authority(&bus, &agent_headers(Some(a)), Some(b), verb)
+            .await
+            .expect_err("a token for A must not touch B's draft");
+        assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(err.reason(), "out_of_reach");
+
+        for headers in [agent_headers(Some(b)), HeaderMap::new()] {
+            assert!(
+                refuse_without_authority(&bus, &headers, Some(b), verb)
+                    .await
+                    .is_ok(),
+                "B itself and the user's device keep {verb:?}"
+            );
+        }
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

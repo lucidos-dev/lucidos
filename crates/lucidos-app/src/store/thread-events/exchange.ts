@@ -547,13 +547,16 @@ export function isAgentReplyText(event: { type: string }): boolean {
     || (event.type === 'CodingAgentTextStreamed' && !parentToolUseIdOf(event));
 }
 
-/** Build the response text by concatenating the agent's reply text. */
+/** Build the response text by concatenating the agent's reply text, then the
+ *  quiet reply no chunk streamed. */
 export function exchangeResponseText(exchange: Exchange): string {
   let text = '';
   for (const { event } of exchange.steps) {
     if (isAgentReplyText(event)) text += (event as { text: string }).text;
   }
-  return text;
+  const quietReply = exchangeQuietReply(exchange);
+  if (quietReply === null) return text;
+  return text.trim() ? `${text}\n\n${quietReply}` : quietReply;
 }
 
 /** If this exchange's terminator was the chat agent's per-turn cap, return the
@@ -576,6 +579,29 @@ export function exchangeEngineLimitDetail(exchange: Exchange): string {
     return '';
   }
   return '';
+}
+
+/** The *quiet reply* a quiet pick ended this exchange on, or null. The engine
+ *  emits it as the `ResponseGenerated` text, and no chunk streams it. Null too
+ *  when the agent streamed that same text after the pick, or for the cap. */
+export function exchangeQuietReply(exchange: Exchange): string | null {
+  let afterQuietPick = false;
+  let streamed = '';
+  for (const { event } of exchange.steps) {
+    if (event.type === 'UserQuestionAnswered') {
+      afterQuietPick = event.quiet === true;
+      streamed = '';
+    } else if (!afterQuietPick) {
+      continue;
+    } else if (isAgentReplyText(event)) {
+      streamed += (event as { text: string }).text;
+    } else if (event.type === 'ResponseGenerated') {
+      const text = event.text ?? '';
+      const drawn = text.trim() && text.trim() !== streamed.trim() && !text.startsWith(ENGINE_LIMIT_PREFIX);
+      return drawn ? text : null;
+    }
+  }
+  return null;
 }
 
 /** Format a multi-line code/command string as "Run <first line>" (truncated to 60 chars). */

@@ -150,6 +150,51 @@ async fn a_push_outside_the_lane_reports_a_rejection() {
     assert_eq!(merge::push_main(&no_origin).await, None);
 }
 
+/// Two Applies that land together each push `main`. The remote refuses a
+/// push that overlaps another, as GitHub does with "cannot lock ref", so
+/// the pushes must queue.
+#[tokio::test]
+async fn concurrent_pushes_of_main_queue_instead_of_racing() {
+    let f = OriginFixture::new().await;
+    f.refuse_overlapping_pushes();
+    let local = commit_locally(&f, "landed.txt").await;
+    let (a, b) = tokio::join!(merge::push_main(&f.repo), merge::push_main(&f.repo));
+    assert_eq!((a, b), (None, None));
+    assert_eq!(f.origin_main().await, local);
+}
+
+/// A push that queued behind a newer one carries a tip `origin` already holds.
+/// That is a success, not a rewind refused as "origin/main has moved".
+#[tokio::test]
+async fn a_push_of_a_tip_origin_already_holds_succeeds() {
+    let f = OriginFixture::new().await;
+    let older = commit_locally(&f, "first.txt").await;
+    let newer = commit_locally(&f, "second.txt").await;
+    assert_eq!(
+        push_to_origin_main(&f.repo, &newer).await,
+        PushOutcome::Pushed
+    );
+    assert_eq!(
+        push_to_origin_main(&f.repo, &older).await,
+        PushOutcome::Pushed
+    );
+    assert_eq!(f.origin_main().await, newer);
+}
+
+/// With `--porcelain` git prints the refused ref on stdout, and the remote's
+/// own words on stderr. The reason must carry both.
+#[tokio::test]
+async fn a_failed_push_names_why_the_remote_refused_it() {
+    let f = OriginFixture::new().await;
+    f.refuse_pushes();
+    commit_locally(&f, "landed.txt").await;
+    let reason = merge::push_main(&f.repo)
+        .await
+        .expect("the push was refused");
+    assert!(reason.contains("pre-receive hook declined"), "{reason}");
+    assert!(reason.contains("refused by test"), "{reason}");
+}
+
 /// Commit `file` on the checkout's own `main`, a commit `origin` lacks.
 async fn commit_locally(f: &OriginFixture, file: &str) -> String {
     std::fs::write(f.repo.join(file), "local").unwrap();

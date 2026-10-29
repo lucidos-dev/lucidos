@@ -333,6 +333,32 @@ its upstream, and restarts a silent upstream when a late-joining port says
 Distinct from a plain error drop, which the browser reports itself. See
 ADR 0514.
 
+### Send probe
+The check a client runs after an accepted send (`probeStreamAfterSend` in
+`store/actions/send-probe.ts`). If the confirming stream frame has not arrived
+after `SEND_CONFIRM_MS`, the client refetches the thread. It restarts the event
+stream only when the refetch shows the event, which proves the stream missed a
+frame. A frame that arrives during the refetch voids that proof, and one restart
+answers every probe within `SEND_CONFIRM_MS`. Covers the gap the *stream watchdog* cannot see, a stream that still gets
+keepalives but drops a frame. See ADR 0514.
+
+### Worker introduction
+The shared SSE worker's request that a port send its `hello` (`introduce` in
+`packages/lucidos-sdk/src/worker/protocol.ts`). The worker posts it to every
+port it takes on, and again when a port it has no `hello` from sends `check` or
+`restart`. A page takes an introduction that arrives first on its link as
+answered by its attach `hello`. On a later one it reports a `worker-restarted`
+drop and says `hello` again. This is how a page learns that the browser
+relaunched the worker. See ADR 0599.
+
+### Worker answer
+The `checked` message the shared worker sends for every `check`, and the drop it
+sends for a `restart`. Once a worker on the stream has sent a *worker
+introduction*, a page waits `WORKER_ANSWER_MS` for any message after either. On
+silence it reports a `worker-unresponsive` drop and attaches a new
+`SharedWorker`. A timer that fires a whole window late asks again instead,
+because the page was frozen. See ADR 0599.
+
 ### Restore guard
 The device-local marker that keeps a launch off the thread the previous session
 died showing (`store/restoreGuard.ts`). Focusing a thread writes
@@ -1554,7 +1580,7 @@ Both images are taken the same way and both respect `.gitignore`. Each is a non-
 
 `diff_checkpoint_effects` diffs the pair into `CheckpointEffects { restores, created }` via `git diff-tree -r -z --no-renames`. That diff is what makes the created set knowable. The guard emits `CommandCheckpointed` **after** the command, and only when those effects are non-empty. An empty diff means the command changed nothing git-visible, because its target was ignored. Both refs are then dropped and no card is shown.
 
-`LucidosEngine::undo_command_checkpoint` (HTTP `POST /api/v1/command-checkpoint/undo`) runs `revert_command_effects`, then emits `CommandCheckpointReverted`. The revert works in the reverse of the command's order:
+`LucidosEngine::undo_command_checkpoint` (HTTP `POST /api/v1/command-checkpoint/undo`) runs `revert_command_effects`, then emits `CommandCheckpointReverted`. The route first resolves the checkpoint's thread with `command_checkpoint_origin` and asks the thread-reach gate as `Revert` (`authorize_checkpoint_undo`). The revert works in the reverse of the command's order:
 
 1. `remove_created_files` deletes each created file that git still calls unchanged against the post image. It asks through a throwaway index: `read-tree` from the post tree, an index-wide `update-index --refresh`, then `diff-files`. It prunes the directories that leaves empty.
 2. `restore_command_checkpoint` writes back, from the pre image, only the paths the command deleted, overwrote or retyped. An overwritten file must still match the post image, and a deleted one must still be absent. A later edit is kept. A checkpoint with no post image restores the whole pre image instead.
@@ -1569,7 +1595,23 @@ The static, deterministic fast-path of the *command guard*: `static_classify(too
 Everything else is the *ambiguous middle* (`NeedsJudge`). The *judge* classifies it, or `fallback_classify` does when the judge is off or fails. The classifier also computes the out-of-workspace risk marker carried on `JudgeInput`. Zero cost, it runs on every command before any LLM call. The `site` is a *command site*.
 
 ### Command guard
-The pre-dispatch safety gate over the Lucidos Agent's bash/python tools (`run_bash`, `run_bash_background`, `run_python`, `run_python_background`), inserted in `agentic_loop/run.rs` before tool dispatch (`LucidosEngine::command_guard_decision`). Each command is classified into a *RiskLane* (the static *command classifier* settles the obvious cases, the LLM *judge* handles the ambiguous middle) and handled accordingly. Off by default; toggled under **Settings → Permissions → Command safety** (the `command_guard` preference). Under that master toggle, two sub-settings (UI-disabled while the master is off): the `command_guard_judge` on/off switch and the `model_command_judge` model picker. Lanes: `Catastrophic` is refused without running (the reason fed back to the LLM); `IrreversibleDanger` on a `Chat` channel pauses and asks the user via the *command permission* lane (mirrors the coding agent); `ReversibleDanger` (in-workspace destruction) is bracketed by a *command checkpoint* pair (ADR 0002, Phase 4) and then runs, leaving a one-click Undo and a view of what it changed, unless the pair shows it changed nothing git-visible; `Safe` runs. On a `Trigger` channel there's no one to ask, so `IrreversibleDanger` is gated by the trigger's *side-effect grant* (ADR 0002, Phase 5): the judge/static fallback tags the command's *SideEffectCategory*, and the command runs only if that category is in `TriggerConfig.side_effect_grant`, and otherwise the guard returns `GuardDecision::FailTrigger`, which records the block and fails the whole trigger run (a scheduler failure notification surfaces it). Triggers therefore DO reach the judge now (they skipped it in Phase 3). Rationale and full design: ADR 0002 (`docs/adr/0002-lucidos-agent-command-safety.md`).
+The pre-dispatch safety gate over the Lucidos Agent's command-running tools, in `agentic_loop/run.rs` before tool dispatch (`LucidosEngine::command_guard_decision`). It covers:
+
+- the bash and python tools: `run_bash`, `run_bash_background`, `run_python`, `run_python_background`;
+- an MCP server setup (`setup_mcp_server`, the `mcp` tool's `setup` action), read as the shell command line the server spawns;
+- with the guard on, an `enable` or `start` of a registered server whose *launch line* has no *launch approval*, read as its masked launch line.
+
+Each command lands in a *RiskLane*. The static *command classifier* settles the obvious cases, and the LLM *judge* handles the ambiguous middle. The guard is off by default, under **Settings → Permissions → Command safety** (the `command_guard` preference). Two sub-settings sit under it and are disabled while it is off: the `command_guard_judge` switch and the `model_command_judge` model picker.
+
+| Lane | What happens |
+|---|---|
+| `Catastrophic` | Refused without running. The reason goes back to the LLM. |
+| `IrreversibleDanger`, chat | Pauses and asks the user through the *command permission* lane, as the coding agent does. |
+| `IrreversibleDanger`, trigger | Runs only if its *SideEffectCategory* is in the trigger's *side-effect grant* (`TriggerConfig.side_effect_grant`, ADR 0002 Phase 5). Otherwise `GuardDecision::FailTrigger` fails the whole run, and a failure notification says why. |
+| `ReversibleDanger` | In-workspace destruction. A *command checkpoint* pair brackets it (Phase 4), leaving an Undo and a view of the change, unless nothing git-visible changed. An MCP server setup takes the `IrreversibleDanger` row instead, since the server reruns its command on every start. |
+| `Safe` | Runs. |
+
+Triggers reach the judge too, since the grant needs the command's category. Rationale and full design: ADR 0002 (`docs/adr/0002-lucidos-agent-command-safety.md`).
 
 ### Command permission
 The interactive *ask* lane of the *command guard* (ADR 0002, Phase 2), the chat mirror of the coding-agent permission model. A command hitting `IrreversibleDanger` on a chat channel emits a `CommandPermissionRequested` `ThreadEvent`. The agentic loop then blocks in-process on a `PermissionEntry` broadcast (`Engine.pending_command_permission`, a `PermissionState` shared with the CC lane). The user resolves it from the same `PermissionCard` UI via `POST /api/v1/command-permission/consent`, which emits `CommandPermissionResolved`.
@@ -2329,7 +2371,16 @@ measures. A bar costs the row's width budget nothing at any viewport.
 ### Stopped (connection state)
 A fourth `ConnectionStatus`, beside `connecting`, `connected` and `disconnected`. It means the gateway answered but the workspace's engine is not running, for example after the user stopped it from the picker. The gateway marks that 503 with the `x-lucidos-workspace-state: stopped` header (`WORKSPACE_STATE_HEADER` in `crates/lucidos-gateway/src/server.rs`). `checkHealth` reads the mark and returns `{ status: 'stopped' }`, and `ApiError.workspaceStopped` carries it for other calls. An unmarked 503, a refused socket or a timeout stays `disconnected`.
 
-The *connection banner* then says the workspace is stopped and offers **Start**. Start posts to `POST /~/api/v1/control/workspaces/:id/start`, a start-only route: it lazy-starts a registered workspace and never respawns a running engine, which is why it is not `/restart`. The health poll turns the bar green when the engine answers. The state needs a gateway-fronted window. A window on a direct engine port, or one served by an older gateway that sends no mark, keeps the "cannot reach" wording.
+The *connection banner* then says the workspace is stopped and offers **Start**. Start posts to `POST /~/api/v1/control/workspaces/:id/start`, a start-only route: it lazy-starts a registered workspace and never respawns a running engine, which is why it is not `/restart`. The state needs a gateway-fronted window. A window on a direct engine port, or one served by an older gateway that sends no mark, keeps the "cannot reach" wording.
+
+### Starting (connection state)
+The `ConnectionStatus` between an accepted **Start** and the engine's first answer. The engine boots in the background, so every probe fails until it is up. Without this state those failures read as `disconnected`, and the window said it could not reach the workspace the user had just started. `noteWorkspaceStartAccepted` (`store/actions/connection.ts`) opens it, and the health poll closes it:
+
+- on the first good probe, as `connected`;
+- as `stopped`, if the gateway still says so after `START_SETTLE_MS`;
+- as a plain failure after `START_BOOT_MS`, the gateway's boot escape budget.
+
+It is not *unreachable*: a thread keeps loading rather than giving up, and the connection banner says the engine is starting.
 
 ### Progress dialog
 The modal that says the workspace is going away and coming back
@@ -2950,6 +3001,20 @@ Host and owner stay two words because they answer different questions, and one
 of them is what ADR 0140 is about: a HOSTING window stops answering tauri's
 `WebviewWindow`-flavoured lookups. Any app window can host one now, so that
 blindness is no longer confined to `main`.
+
+**A preview loads only `http` and `https`.** Its page text reaches the model
+provider as `url_context` on the next chat message (`webview_get_content`). So a
+`file:` URL would ship a local file there. `previewable_url` refuses every other
+scheme in both `create_panel_webview` and `navigate_panel_webview`, and the
+caller toasts the error. `openUrl` (`store/actions/artifacts.ts`) never mounts
+the panel for such a target, and history restore (`restoreState`) drops one. It
+hands it to `openUrlOutsideApp` instead, which asks before a `file:` target
+reaches the OS opener.
+
+The page's own navigations pass a narrower check, `page_may_navigate_to`. wry
+runs it for subframes too, with no main-frame flag, so `about:blank`, `blob:`
+and `data:` frames must load. It refuses `file:` and Tauri's own `tauri:`,
+`ipc:` and `asset:` schemes.
 
 ### Repo-encoded preview path
 The file-preview overlay path form that addresses a file inside a registered *repository* clone instead of the workspace data tree: `repo:<repoId>:<mode>:<repo-relative path>`. `<mode>` is `file`, `file#<ref>`, `diff` or `diff#<changeId>`. The change id rides inside the mode segment, so a diff preview survives nav-history persistence where the runtime-only `repoDiff` does not. `<repoId>` is the *deterministic repo id*. Built by `encodeRepoPath`, decoded by `parseRepoPath` (`crates/lucidos-app/src/store/repoPath.ts`), which is the **single predicate** for "is this a repo path". `ContentPane` routes a parsing path to `RepoFilePreview` and everything else to `FilePreviewInline`; `normalizeDataPath` passes one through instead of prefixing `artifacts/`; `openEncodedRepoFilePreview` binds `repoSource` to it.
@@ -3820,6 +3885,14 @@ The counter is bumped under the registry's write lock and read under its read lo
 The chars the tools of the *MCP servers* one thread enabled may take in one request together: a quarter of the request's char budget for the resolved model's window. `mcp_tool_char_ceiling` in `crates/lucidos-engine/src/mcp/mod.rs`. A `tools/list` is third-party input, and an uncapped one once took the whole budget. The conversation was trimmed to nothing, and then every turn failed.
 
 The fit is deterministic. Servers go in id order, and each gets a max-min fair share: a server asking for less than an even split keeps all of it, and the rest share what it leaves. Within its share a server keeps its tools in its own listed order and skips any that no longer fit. The request and the cost report run the same fit. The report is `McpBudget`, served as `budget` by `GET /api/v1/mcp/servers`: the request's char budget, the ceiling, what a request sends (`sent_*`), what is dropped, and a warning from 80% of the ceiling.
+
+### Launch line
+The shell command line an *MCP server* spawns: its command, its args and its env, rendered by `LaunchSpec::command_line` in `core/mcp_servers.rs`. Two modes. `Real` carries the plain env values and feeds only the fingerprint, a hex HMAC-SHA256 under the secret store key. `Masked` replaces every env value and is the only form anything shows or classifies. A plain env value is sealed, so a stored row's real line is never rendered anywhere visible.
+
+### Launch approval
+A user's yes to one *launch line* of one *MCP server*: a row in `mcp_launch_approvals (server_id, fingerprint, approved_at)`. With the *command guard* on, `McpManager` refuses to start a server whose current fingerprint has no row. The first approval of a pair emits `McpLaunchApproved`.
+
+Three acts record one: a guard `Proceed` on a setup or an unapproved start, and a click on Start or Enable in the UI. Only the owner's registered device records one there, never an agent or an app. A changed command, arg or env value changes the fingerprint, so it asks again. The table has no foreign key, since a setup is approved before its row exists, and removing the server deletes its approvals. With the guard off nothing is checked or recorded. See ADR 0002's MCP addendum.
 
 ### Wire tool name
 The name a tool is offered to the model under. Lucidos's canonical identifier for an *MCP* tool: `mcp__<server_id>__<tool>`, rewritten to satisfy the Messages API pattern `^[a-zA-Z0-9_-]{1,128}$`. Every other character becomes `_`, and the result is truncated to 128.
@@ -5018,13 +5091,13 @@ How far a verb may be aimed: the caller itself, plus every descendant, at any de
 
 **Reach answers which threads, and the *workspace owner* answers on whose behalf.** They are two questions, and reach never decides the second (ADR 0168 clause 2). A verb inside the caller's own subtree needs only reach. Anything wider is the owner's button. So `api::thread_reach` asks reach first, the *standing instruction* second and an *owner approval* third, and refuses when none covers the act.
 
-Wider than the *child follow-up* edge, which stops at direct children, and deliberately so: archive cascades to the whole family, so its authorization reasons over the same tree it tears down. The unscoped `POST /api/v1/chat/cancel` (no `thread_id`) stops everything, so it aims at the workspace rather than at a thread. A thread-bound caller needs the standing instruction for it, rather than being narrowed to itself.
+Wider than the *child follow-up* edge, which stops at direct children, and deliberately so: archive cascades to the whole family, so its authorization reasons over the same tree it tears down. The unscoped `POST /api/v1/chat/cancel` (no `thread_id`) stops everything, so it aims at the workspace rather than at a thread. A thread-bound caller needs the standing instruction for it, rather than being narrowed to itself. Apply All aims at the workspace too, and so does everything that stops it: its cancel (`POST /api/v1/changes/apply-all/cancel`) and the workspace-wide disarm (`DELETE /api/v1/standing-applies`). Each asks the `Apply` verb with no target, so no agent presses them on reach alone.
 
 Enforced per verb rather than per route, on every route and in-process tool carrying one of clause 4's verbs. `GATED_HANDLERS` in `api/thread_reach_tests.rs` is the list, and a source scan fails when a listed handler stops asking the gate. Several verbs arrive by more than one path, and gating the first path of each is how the ungated set grew. The LLM tools that press Apply carry no headers, so they name their own thread and ask the same rule through `refuse_thread_without_authority`. See ADR 0083's amendment for the archive and cancel half, and ADR 0168 for the rest.
 
 **Creating a thread is not one of these verbs.** Any caller may create a top-thread, or move its own direct child to top level (ADR 0475). `CreateTopThread` and `DetachChild` stay in `ThreadReachVerb` only because stored approval cards name them. `ThreadReachVerb::needs_authority` is false for both, so the gate allows them and no card proposes them.
 
-Three more verbs aim at a thread's agent rather than at the tree's shape: picking a coding-agent thread's model or effort (`POST /api/v1/claude-code/control`), asking a *side question* (`POST /api/v1/side-questions`), which reads the thread's whole context, and dismissing that question's card (`POST /api/v1/side-questions/dismiss`).
+Three more verbs aim at a thread's agent rather than at the tree's shape. `Control` drives its session: it picks the model or effort (`POST /api/v1/claude-code/control`, `POST /api/v1/chat/settings`). It also takes back a queued message (`POST /api/v1/chat/queued-message/remove`). The other two ask a *side question* (`POST /api/v1/side-questions`), which reads the thread's whole context, and dismiss that question's card (`POST /api/v1/side-questions/dismiss`).
 
 **Deleting a thread is deliberately NOT one of these verbs.** It has no place on the ladder and no `ThreadReachVerb`, because the ladder's second question admits a thread carrying the *standing instruction*. It takes the *owner-device gate* instead, which refuses every agent outright (ADR 0192).
 
@@ -5082,6 +5155,15 @@ Named because the failure it prevents is a claim rather than an action: the 2026
 Evidence that a request came from a client the user has registered on this workspace: a `device_id` (the request body's field, else the `x-lucidos-device-id` header) that resolves to a row in `devices`. The browser supplies it on every mutating fetch, which is what distinguishes the user's own UI session from an arbitrary loopback HTTP caller. Probed by `DeviceStore::is_registered`, which returns `Result<bool, _>` rather than the `Option` that `display_name` collapses "absent" and "database error" into, because the caller must be able to fail OPEN on an error: this runs on the user's own send path, and refusing a real message on a database blip costs more than a mis-attributed one. Not a security boundary and not claimed as one (an agent that will curl the engine can also register a device); it removes the *accidental* path, which is the one the incident took. See ADR 0050.
 
 **Where that header came from decides what it is worth.** Through the *workspace gateway* it is the gateway's own. `auth_api::enforce` strips the client's copy and re-injects the device it authenticated, the same treatment `x-forwarded-prefix` gets. Straight to the engine's loopback port it is whatever the caller typed. That second case is the posture above, and the reason nothing reads it as authorization. See ADR 0094's amendment.
+
+**A socket upgrade names its device through a *call ticket*.** A browser `WebSocket` cannot set the header, so the voice socket carries a ticket instead (see *Call ticket*). The gateway's authenticated header still wins: a header naming another device than the ticket refuses the upgrade.
+
+### Call ticket
+A single-use credential that lets one *device* open the voice socket on one thread. `POST /api/v1/voice/ticket` with `{ "thread_id" }` mints it, and `GET /api/v1/voice?thread_id=…&ticket=…` redeems it (`api::voice_ticket::CallTickets`, `QUERY_CALL_TICKET`). It lives thirty seconds, in memory, and a restart costs one retry.
+
+It exists because a browser sends no `Referer` on a socket handshake. So the upgrade cannot tell the shell from an app page on the same origin. The mint is a plain `fetch`, which does carry one. So the mint runs the strict reveal rule (`RefererRule::Required`) and every refusal the upgrade would make, and its message reaches the person.
+
+The upgrade spends the ticket first, then re-runs every check, and a ticket tried on the wrong thread is spent. The client opens the microphone before it mints. See ADR 0598.
 
 ### Device hand-over
 Moving one *device*'s whole row to a new id, in the one page load where a client knows both. `DeviceStore::hand_over` re-keys five tables in a single transaction (`devices`, `preferences`, `push_subscriptions`, `pinned_apps`, `device_presence`), behind `POST /api/v1/devices/hand-over`, and announces `DeviceHandedOver`. `push_log` is excluded as history, like an event payload.

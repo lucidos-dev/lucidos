@@ -734,16 +734,7 @@ fn clone_marketplace(
     drop(repo);
     let _ = std::fs::remove_dir_all(clone_target.join(".git"));
 
-    let root = match &source.subpath {
-        Some(subpath) => clone_target.join(subpath),
-        None => clone_target.clone(),
-    };
-    if !root.is_dir() {
-        return Err(format!(
-            "subpath not found inside repo: {}",
-            source.subpath.as_deref().unwrap_or("")
-        ));
-    }
+    let root = plugins::clone_subpath_root(&clone_target, source.subpath.as_deref())?;
     Ok((scratch, root, actual_branch))
 }
 
@@ -754,13 +745,15 @@ fn find_manifest_roots(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(roots)
 }
 
+/// Never follows a symlink, so the walk and every manifest it finds stay
+/// inside the cloned repo. A repo can commit a link to any host path.
 fn collect_manifest_roots(
     root: &Path,
     dir: &Path,
     depth: usize,
     roots: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
-    if dir.join("manifest.toml").is_file() {
+    if std::fs::symlink_metadata(dir.join("manifest.toml")).is_ok_and(|m| m.is_file()) {
         roots.push(dir.to_path_buf());
         return Ok(());
     }
@@ -769,10 +762,10 @@ fn collect_manifest_roots(
     }
     for entry in std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
-        let path = entry.path();
-        if !path.is_dir() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
+        let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.starts_with('.') || super::VENDORED_DIR_NAMES.contains(&name) {
             continue;

@@ -190,6 +190,7 @@ fn callers_preview(app: &tauri::AppHandle, caller: &tauri::Webview) -> Option<ta
 /// first. Takes a label rather than the state, so a caller that has already
 /// taken the slot cannot forget half of the teardown.
 fn close_preview_webview(app: &tauri::AppHandle, label: &str) {
+    crate::preview_undo::unregister(label);
     if let Some(wv) = app.get_webview(label) {
         let _ = wv.eval("if(window.__lucidos_title_cleanup) window.__lucidos_title_cleanup()");
         let _ = wv.close();
@@ -218,6 +219,56 @@ pub(crate) fn close_owned_by(app: &tauri::AppHandle, window_label: &str) {
 /// path has no page to show.
 fn os_opener_hands_to_a_browser(scheme: &str) -> bool {
     matches!(scheme, "http" | "https" | "mailto" | "tel")
+}
+
+/// Parse a URL the preview may load: an http or https page, nothing else.
+///
+/// The preview's text reaches the model provider with the next chat message
+/// (`webview_get_content`). So a `file:` URL would ship a local file there, and
+/// `data:`, `javascript:` or an app scheme would render content no site served.
+/// Every command that hands a URL to the webview goes through here first.
+/// Mirrors `IN_APP_BROWSER_SCHEMES` in `store/actions/artifacts.ts`.
+fn previewable_url(url: &str) -> Result<tauri::Url, String> {
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("{e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        scheme => Err(format!(
+            "the in-app browser opens only http and https pages, not {scheme}: URLs"
+        )),
+    }
+}
+
+/// May a previewed page's own navigation load this URL?
+///
+/// wry runs this check for subframe loads too, with no main-frame flag, so
+/// the `about:blank`, `blob:` and `data:` frames real sites build must pass.
+/// It refuses the schemes that reach this machine instead: a local file, or
+/// Tauri's own app pages, IPC and assets.
+fn page_may_navigate_to(url: &tauri::Url) -> bool {
+    !matches!(url.scheme(), "file" | "tauri" | "ipc" | "asset")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NewWindowRoute {
+    InPlace,
+    External,
+    Refuse,
+}
+
+/// Open web popups in the existing preview, without creating a child window.
+/// Popup logins requiring window.opener cannot work here; child windows need a separate design.
+fn new_window_route(url: &tauri::Url) -> NewWindowRoute {
+    if matches!(url.scheme(), "http" | "https") {
+        if page_may_navigate_to(url) {
+            NewWindowRoute::InPlace
+        } else {
+            NewWindowRoute::Refuse
+        }
+    } else if os_opener_hands_to_a_browser(url.scheme()) {
+        NewWindowRoute::External
+    } else {
+        NewWindowRoute::Refuse
+    }
 }
 
 /// The box a preview fills, as the calling page measured it. One type for both
@@ -255,7 +306,7 @@ pub(crate) fn create_panel_webview(
     let host = webview.window();
     let owner = host.label().to_string();
 
-    let parsed_url: tauri::Url = url.parse().map_err(|e| format!("{e}"))?;
+    let parsed_url = previewable_url(&url)?;
     let label = format!(
         "{PREVIEW_LABEL_PREFIX}{}",
         crate::app_window::next_webview_label_counter()
@@ -267,17 +318,44 @@ pub(crate) fn create_panel_webview(
 
     let emit_to = owner.clone();
     let page_load_app = app.clone();
+    let new_window_app = app.clone();
+    let new_window_label = label.clone();
     let builder = tauri::webview::WebviewBuilder::new(&label, WebviewUrl::External(parsed_url))
-        .user_agent(safari_user_agent())
-        .on_navigation(|_nav_url| true)
+        .user_agent(safari_user_agent());
+    // Only macOS has the key monitor this script completes.
+    #[cfg(target_os = "macos")]
+    let builder =
+        builder.initialization_script_for_all_frames(crate::preview_undo::NATIVE_UNDO_FALLBACK_JS);
+    let builder = builder
+        .on_navigation(|nav_url| {
+            let allowed = page_may_navigate_to(nav_url);
+            if !allowed {
+                eprintln!("[Tauri] a previewed page navigated to {nav_url}; refused");
+            }
+            allowed
+        })
         .on_new_window(move |url, _features| {
-            // The one site with nowhere to report to: a previewed page asked for
-            // a window from inside the delegate, so there is no promise to reject
-            // and no toast to raise. Log rather than discard.
-            if !os_opener_hands_to_a_browser(url.scheme()) {
-                eprintln!("[Tauri] a previewed page asked to open {url}; refused");
-            } else if let Err(e) = crate::open_in_default_browser(url.as_str()) {
-                eprintln!("[Tauri] {url}: {e}");
+            match new_window_route(&url) {
+                NewWindowRoute::InPlace => {
+                    let app = new_window_app.clone();
+                    let label = new_window_label.clone();
+                    // Navigate off the delegate stack so native dispatch can finish first.
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(preview) = app.get_webview(&label) {
+                            if let Err(e) = preview.navigate(url) {
+                                eprintln!("[Tauri] Failed to navigate preview {label}: {e}");
+                            }
+                        }
+                    });
+                }
+                NewWindowRoute::External => {
+                    if let Err(e) = crate::open_in_default_browser(url.as_str()) {
+                        eprintln!("[Tauri] {url}: {e}");
+                    }
+                }
+                NewWindowRoute::Refuse => {
+                    eprintln!("[Tauri] a previewed page asked to open {url}; refused");
+                }
             }
             tauri::webview::NewWindowResponse::Deny
         })
@@ -308,8 +386,10 @@ pub(crate) fn create_panel_webview(
         });
 
     let (position, size) = placement(&rect, gap);
-    host.add_child(builder, position, size)
+    let child = host
+        .add_child(builder, position, size)
         .map_err(|e| format!("{e}"))?;
+    crate::preview_undo::register(&child);
 
     // Only after the child exists, so a failed build leaves the previous
     // preview recorded and closable rather than orphaned.
@@ -331,7 +411,7 @@ pub(crate) fn navigate_panel_webview(
 ) -> Result<(), String> {
     let wv = callers_preview(&app, &webview).ok_or("panel webview not found")?;
 
-    let parsed_url: tauri::Url = url.parse().map_err(|e| format!("{e}"))?;
+    let parsed_url = previewable_url(&url)?;
     wv.navigate(parsed_url).map_err(|e| e.to_string())?;
 
     Ok(())
@@ -555,6 +635,28 @@ pub(crate) fn __panel_content_report(
 mod tests {
     use super::*;
 
+    #[test]
+    fn popup_requests_route_to_the_existing_preview_or_safe_os_handler() {
+        for (url, expected) in [
+            ("https://example.com/app", NewWindowRoute::InPlace),
+            ("http://example.com/app", NewWindowRoute::InPlace),
+            ("HTTPS://EXAMPLE.COM/app", NewWindowRoute::InPlace),
+            ("mailto:someone@example.com", NewWindowRoute::External),
+            ("tel:+15555550100", NewWindowRoute::External),
+            ("javascript:void(0)", NewWindowRoute::Refuse),
+            ("data:text/html,hello", NewWindowRoute::Refuse),
+            ("file:///etc/hosts", NewWindowRoute::Refuse),
+            ("tauri://localhost/", NewWindowRoute::Refuse),
+            ("ipc://localhost/plugin", NewWindowRoute::Refuse),
+            ("asset://localhost/x", NewWindowRoute::Refuse),
+            ("about:blank", NewWindowRoute::Refuse),
+            ("blob:https://example.com/0000", NewWindowRoute::Refuse),
+            ("x-custom-app://open", NewWindowRoute::Refuse),
+        ] {
+            assert_eq!(new_window_route(&url.parse().unwrap()), expected, "{url}");
+        }
+    }
+
     /// A hostile previewed page must not launch a program through a new-window
     /// request, which no confirm stands in front of.
     #[test]
@@ -564,6 +666,62 @@ mod tests {
         }
         for scheme in ["file", "smb", "x-apple.systempreferences", "vnc", "ssh", ""] {
             assert!(!os_opener_hands_to_a_browser(scheme), "{scheme}");
+        }
+    }
+
+    /// The preview loads web pages and nothing else. Its text goes to the model
+    /// provider with the next message, so a `file:` page would send a local
+    /// file there.
+    #[test]
+    fn a_preview_loads_only_http_and_https() {
+        for url in [
+            "http://example.com/",
+            "https://example.com/a?b=c",
+            "HTTPS://EXAMPLE.COM/",
+        ] {
+            assert!(previewable_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "file:///etc/hosts",
+            "data:text/html,hello",
+            "javascript:void(0)",
+            "blob:https://example.com/0000",
+            "about:blank",
+            "tauri://localhost/",
+            "x-custom-app://open",
+            "mailto:someone@example.com",
+        ] {
+            let err = previewable_url(url).expect_err(url);
+            let scheme = url.split(':').next().unwrap();
+            assert!(err.contains(&format!("{scheme}:")), "{url}: {err}");
+        }
+        assert!(previewable_url("not a url").is_err());
+    }
+
+    /// A page the preview loaded cannot navigate itself, or one of its frames,
+    /// onto a local file or the app's own pages. The frames real sites build
+    /// still load.
+    #[test]
+    fn a_previewed_page_cannot_navigate_onto_this_machine() {
+        let allowed = |url: &str| page_may_navigate_to(&url.parse().unwrap());
+        for url in [
+            "https://example.com/next",
+            "http://example.com/",
+            "about:blank",
+            "about:srcdoc",
+            "blob:https://example.com/0000",
+            "data:text/html,frame",
+        ] {
+            assert!(allowed(url), "{url}");
+        }
+        for url in [
+            "file:///etc/hosts",
+            "FILE:///etc/hosts",
+            "tauri://localhost/",
+            "ipc://localhost/plugin",
+            "asset://localhost/x",
+        ] {
+            assert!(!allowed(url), "{url}");
         }
     }
 

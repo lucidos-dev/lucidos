@@ -71,6 +71,7 @@ pub mod proxy_migration;
 pub(crate) mod proxy_pipeline;
 pub(crate) mod proxy_pipeline_builder;
 pub(crate) mod proxy_pipeline_config;
+pub(crate) mod proxy_redaction;
 pub(crate) mod proxy_script_layer;
 pub(crate) mod proxy_script_runner;
 pub(crate) mod proxy_speech;
@@ -96,6 +97,7 @@ mod threads_compose;
 mod trigger_groups;
 mod triggers;
 mod voice;
+pub(crate) mod voice_ticket;
 mod webhooks;
 mod widgets;
 mod workspace_label;
@@ -427,6 +429,9 @@ pub struct AppState {
     /// Live one-shot secret-reveal tokens, shared by the credential reveal and
     /// the backup key. Ephemeral by design; see `api::secret_reveal`.
     pub reveal_tokens: secret_reveal::RevealTokens,
+    /// Live one-shot call tickets, the voice socket's caller proof.
+    /// Ephemeral by design; see `api::voice_ticket`.
+    pub call_tickets: voice_ticket::CallTickets,
 }
 
 /// App context sent when an app UI is open — tells the LLM which app is active.
@@ -1523,6 +1528,7 @@ pub fn create_router(
         started_at,
         pending_oauth_flows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         reveal_tokens: secret_reveal::RevealTokens::new(),
+        call_tickets: voice_ticket::CallTickets::new(),
     };
 
     // Serve static files from the data/ tree. One mount covers every
@@ -1586,6 +1592,7 @@ pub fn create_router(
         .merge(backup::router())
         .merge(disk_usage::router())
         .merge(voice::router())
+        .merge(voice_ticket::router())
         .merge(ws_echo::router())
         .merge(frontend_preview::router())
         .merge(search::router())

@@ -786,6 +786,37 @@ describe('restoreState restores every entry overlay on reload', () => {
     expect(store.panelOverlay.value).toEqual(overlay);
     expect(localStorage.getItem('file-preview-open')).toBe(overlay.path);
   });
+
+  // History saved before the in-app browser refused other schemes can hold a
+  // `file:` preview. Restoring it would mount a panel the native webview refuses.
+  describe('with the in-app browser on', () => {
+    beforeEach(() => {
+      vi.doMock('./preferences', async (importOriginal) => ({
+        ...(await importOriginal<typeof import('./preferences')>()),
+        inAppBrowserAvailable: () => true,
+      }));
+    });
+
+    afterEach(() => {
+      vi.doUnmock('./preferences');
+    });
+
+    it('restores an https url-preview', async () => {
+      const overlay: PanelOverlay = { type: 'url-preview', url: 'https://example.com/' };
+      const store = await restoreWithOverlay(overlay);
+      expect(store.panelOverlay.value).toEqual(overlay);
+      expect(store.webviewInitialUrl.value).toBe('https://example.com/');
+    });
+
+    it.each(['file:///etc/hosts', 'data:text/html,hi', 'custom-scheme://x'])(
+      'drops a %s url-preview',
+      async (url) => {
+        const store = await restoreWithOverlay({ type: 'url-preview', url });
+        expect(store.panelOverlay.value).toBeNull();
+        expect(store.webviewInitialUrl.value).not.toBe(url);
+      },
+    );
+  });
 });
 
 // The reported bug, at the layer it lives in. A pending email confirm opened on

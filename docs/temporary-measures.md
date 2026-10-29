@@ -59,6 +59,22 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### Undo key monitor for URL previews
+
+- **Added:** 2026-10-28
+- **Lives in:** `crates/lucidos-app/src/preview_undo.rs`; its builder call,
+  `register` and `unregister` in `crates/lucidos-app/src/panel_preview.rs`;
+  `install_key_monitor` in the `setup` hook of `crates/lucidos-app/src/lib.rs`.
+- **Impermanent because:** wry's `WryWebView::perform_key_equivalent` returns
+  NO for a child webview (its FIXME for tauri#9426). So the Edit menu takes
+  Cmd+Z, and a page with its own undo stack, such as Google Docs, never sees it.
+- **Removal / resolution condition:** wry's `perform_key_equivalent` no longer
+  special-cases `is_child`, so a child webview gives the page the key first.
+  Then delete the module and its call sites. Check by hand that Cmd+Z undoes
+  in a preview, both in a Google Doc and in a plain text field.
+- **Status:** `active`.
+- **Investigation:** none.
+
 ### Prefill beats stay off while their misses are unexplained
 
 - **Added:** 2026-10-26

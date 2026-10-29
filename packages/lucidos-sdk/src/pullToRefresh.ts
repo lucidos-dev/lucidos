@@ -13,6 +13,8 @@
  * an app with its own touch handling opts out.
  */
 
+import { postToHost } from './_bridge';
+
 /** How far a pull must travel, in CSS px, before a release refreshes. The
  *  host's arrow drops this far and no further. */
 export const PULL_REFRESH_THRESHOLD_PX = 64;
@@ -185,9 +187,8 @@ export function trackPullToRefresh(surface: EventTarget, handlers: PullHandlers)
  */
 export function installAppPullToRefresh(): () => void {
   if (typeof window === 'undefined' || window.parent === window) return () => {};
-  const post = (message: object) => window.parent.postMessage(message, '*');
   return trackPullToRefresh(window, {
-    onPull: (travel) => post({ type: APP_PULL_MESSAGE_TYPE, travel }),
-    onRefresh: () => post({ type: APP_REFRESH_MESSAGE_TYPE }),
+    onPull: (travel) => postToHost({ type: APP_PULL_MESSAGE_TYPE, travel }),
+    onRefresh: () => postToHost({ type: APP_REFRESH_MESSAGE_TYPE }),
   });
 }

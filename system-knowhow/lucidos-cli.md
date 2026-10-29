@@ -926,20 +926,25 @@ below 1. So a solo build keeps the machine, and contention divides it.
 $ lucidos build-slot -- cargo test --release
 lucidos build-slot: slot 0 of 3, nice +10, 18 cores
 
-# Name it for the listing, when the command line is not the useful label.
+# Name it for the listing, when the program name is not the useful label.
 $ lucidos build-slot --label "integration suite" -- ./gradlew test
 
 # Who is building right now, and where the count came from.
 $ lucidos build-slot --status
 build slots: 1/3 held, capacity from host RAM
 pool: /Users/me/.lucidos/build-slots
-  slot 0  HELD  cargo test --release  pid 41231  2m14s  /path/to/worktree
+  slot 0  HELD  cargo  pid 41231  2m14s  /path/to/worktree
   slot 1  free
   slot 2  free
 
 # Set the count for this machine. Not per workspace: the pool spans them.
 $ lucidos build-slot --set-capacity 2
 ```
+
+**The default label is the program name only**, such as `cargo` or
+`deploy.sh`, never its arguments. The label lands in the slot listing and on
+the `BuildSlot*` events, so a token on the command line stays out of both. Do
+not put a secret in `--label` either.
 
 **In the Lucidos repo you do not need this.** `make lint`, `make test` and the
 build scripts already take a slot, so type the ordinary command. Use the
@@ -1225,6 +1230,10 @@ $ lucidos preferences set --key chat_model --value claude-opus-5
 global view). `set` requires `--key` + `--value`; pass `--device-id` only for a
 per-device key. The chat agent's in-process equivalent is the grouped
 `preferences` tool (`action: get | set`).
+
+Run from an agent's own process, `set` takes only the keys the agent's tool may
+write. A key the catalog keeps for the owner, such as `command_guard` or
+`network_bind`, answers 403 (`preferences.md` § Who may write a key).
 
 ### `lucidos triggers list | create | update | delete | run`
 
@@ -2326,7 +2335,8 @@ lucidos claude-gateway sign-out
 
 - `--url` sets the `claude_gateway_url` preference first. It must be an
   `https` origin with no path. A URL that names another gateway signs out of
-  the old one.
+  the old one. The URL is the owner's to set: from an agent's own process,
+  `--url` answers 403.
 - The person approves the code on the gateway's page, on any device. The code
   expires after the time the gateway sets, often ten minutes.
 - The engine keeps the tokens and refreshes them. No command prints one.

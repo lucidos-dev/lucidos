@@ -2,19 +2,15 @@ import { effect } from '@preact/signals';
 import { startWorkspace } from '../../api/client/control';
 import { errorDetail } from '../../utils/errorDetail';
 import { connectionStatus, showToast } from '../store';
-import { checkConnection } from './connection';
-
-/** How long an accepted start may leave the workspace `stopped`. The gateway
- *  boots in the background, so a boot that fails there shows only as a
- *  workspace that never leaves `stopped`. Several health ticks fit inside. */
-export const START_SETTLE_MS = 20_000;
+import { checkConnection, noteWorkspaceStartAccepted } from './connection';
 
 /** Start the workspace this window belongs to, after the gateway reported it
- *  stopped. Resolves `true` once the workspace has left `stopped`, and `false`
- *  after telling the user why it did not.
+ *  stopped. Resolves `true` once the engine answers, and `false` after telling
+ *  the user why it did not.
  *
- *  Probes health on success rather than waiting for the 5s tick, so the bar
- *  moves on as soon as the engine is booting. */
+ *  The window reads `starting` from the moment the gateway accepts until then.
+ *  The health poll owns when that ends (see `startStillBooting`). Probes at once
+ *  rather than waiting for the 5s tick, so a fast boot lands without a pause. */
 export async function startThisWorkspace(id: string): Promise<boolean> {
   try {
     await startWorkspace(id);
@@ -22,24 +18,20 @@ export async function startThisWorkspace(id: string): Promise<boolean> {
     showToast(`Could not start the workspace: ${errorDetail(err)}`, 'error');
     return false;
   }
+  noteWorkspaceStartAccepted();
   await checkConnection();
-  if (await leftStopped()) return true;
+  if ((await leftStarting()) === 'connected') return true;
   showToast('The workspace did not start. Check the gateway log, then try again.', 'error');
   return false;
 }
 
-function leftStopped(): Promise<boolean> {
+function leftStarting(): Promise<string> {
   return new Promise((resolve) => {
-    let dispose = () => {};
-    const timer = setTimeout(() => {
-      dispose();
-      resolve(false);
-    }, START_SETTLE_MS);
-    dispose = effect(() => {
-      if (connectionStatus.value === 'stopped') return;
-      clearTimeout(timer);
+    const dispose = effect(() => {
+      const status = connectionStatus.value;
+      if (status === 'starting') return;
       queueMicrotask(() => dispose());
-      resolve(true);
+      resolve(status);
     });
   });
 }

@@ -1,7 +1,7 @@
 import { SdkError, apiUrl, dataMountUrl, request, requestVoid } from './_fetch';
 import { assertPlainObject, assertString } from './_validate';
 import { wsLocalGet } from './_storage';
-import { onHostPush } from './_bridge';
+import { fromHost, onHostPush, postToHost } from './_bridge';
 import {
   PREF_EXTERNAL_LINK_TARGET, PREF_FONT_FAMILY, PREF_MOTION, PREF_THEME, PREF_UI_SCALE,
   type PreferenceValues,
@@ -98,20 +98,6 @@ function currentThemeModePreference(): ThemeMode {
     wsLocalGet(THEME_MODE_STORAGE_KEY),
     () => document.documentElement.getAttribute(THEME_MODE_ATTRIBUTE),
   );
-}
-
-/** Only the window this frame posted to may answer it.
- *
- *  Every request below goes to `window.parent`, so a reply from anywhere else
- *  is a forgery. A nested iframe an app embeds can post to that app's frame,
- *  and the ids here are a counter plus a timestamp. Without this check such a
- *  frame could resolve a pending `confirm` as OK, with no dialog ever shown.
- *
- *  The host guards the request direction the same way, and against the same
- *  threat (`isKnownAppFrame` in `store/startup.ts`). This is the reply
- *  half. */
-function fromHost(event: MessageEvent): boolean {
-  return event.source === window.parent;
 }
 
 let confirmCounter = 0;
@@ -815,7 +801,7 @@ export const ui = {
       // decides, however long that takes. A deadline answered Cancel under a
       // dialog still open, and dropped the press that followed.
       pendingConfirms.set(id, resolve);
-      window.parent.postMessage({ type: 'lucidos:ui:confirm', id, payload }, '*');
+      postToHost({ type: 'lucidos:ui:confirm', id, payload });
     });
   },
 
@@ -854,7 +840,7 @@ export const ui = {
       else console.log(line);
       return;
     }
-    window.parent.postMessage({ type: 'lucidos:ui:toast', payload }, '*');
+    postToHost({ type: 'lucidos:ui:toast', payload });
   },
 
   /**
@@ -878,7 +864,7 @@ export const ui = {
       console.log(`[lucidos.ui.dismissToast] ${key}`);
       return;
     }
-    window.parent.postMessage({ type: 'lucidos:ui:dismissToast', payload: { key } }, '*');
+    postToHost({ type: 'lucidos:ui:dismissToast', payload: { key } });
   },
 
   /**
@@ -890,7 +876,7 @@ export const ui = {
    */
   ready(): void {
     if (window.parent === window) return;
-    window.parent.postMessage({ type: 'lucidos:ui:ready' }, '*');
+    postToHost({ type: 'lucidos:ui:ready' });
   },
 
   /**
@@ -926,7 +912,7 @@ export const ui = {
       // No deadline, as for `confirm`: the reader may type for minutes, and a
       // deadline discarded what they typed.
       pendingPrompts.set(id, resolve);
-      window.parent.postMessage({ type: 'lucidos:ui:prompt', id, payload }, '*');
+      postToHost({ type: 'lucidos:ui:prompt', id, payload });
     });
   },
 
@@ -1001,7 +987,7 @@ export const ui = {
         if (result.ok) resolve();
         else reject(new Error(result.error || 'lucidos.ui.previewFile: the host refused the preview'));
       });
-      window.parent.postMessage({ type: 'lucidos:ui:preview-file', id, payload }, '*');
+      postToHost({ type: 'lucidos:ui:preview-file', id, payload });
     });
   },
 

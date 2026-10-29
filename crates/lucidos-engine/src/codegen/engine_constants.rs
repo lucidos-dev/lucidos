@@ -9,6 +9,7 @@ use crate::api::internal::CLIENT_LOG_MAX_BATCH;
 use crate::api::presence_pong::PresenceOutcome;
 use crate::api::proxy_timeout::CLIENT_WAIT_SECS;
 use crate::api::threads::archive_all::MAX_IDS;
+use crate::api::voice_ticket::QUERY_CALL_TICKET;
 use crate::api::{SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL};
 use crate::core::apps::WidgetSize;
 use crate::core::preference_catalog::MEMORY_MODULE_WHILE_UNSET;
@@ -110,6 +111,8 @@ pub(super) fn render() -> String {
     );
     ts.from("api/actor.rs");
     ts.export("HEADER_DEVICE_ID", quoted(HEADER_DEVICE_ID));
+    ts.from("api/voice_ticket.rs");
+    ts.export("QUERY_CALL_TICKET", quoted(QUERY_CALL_TICKET));
     ts.from("core/preference_catalog.rs");
     ts.export(
         "MEMORY_MODULE_WHILE_UNSET",

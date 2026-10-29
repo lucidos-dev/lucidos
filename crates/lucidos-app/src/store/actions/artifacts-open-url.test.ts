@@ -321,6 +321,37 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
       expect(toasts.value).toEqual([]);
     });
 
+    // The in-app browser's page text goes to the model with the next message,
+    // so a local file must never render there. It takes the confirmed OS path.
+    it('Tauri + toggle ON: a local file asks for the OS opener, never the panel', async () => {
+      platformMocks.isTauri = true;
+      preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
+
+      openUrl(LOCAL, 'an app');
+
+      expect(panelOverlay.value).toBeNull();
+      expect(webviewInitialUrl.value).toBeNull();
+      expect(pushNavState).not.toHaveBeenCalled();
+      expect(confirmState.value.visible).toBe(true);
+      confirmState.value.resolve?.(true);
+      await vi.waitFor(() => expect(openExternal).toHaveBeenCalledWith(LOCAL));
+    });
+
+    it.each([
+      'data:text/html,hello',
+      'x-custom-app://open',
+      'mailto:someone@example.com',
+    ])('Tauri + toggle ON: %s never mounts the panel', (target) => {
+      platformMocks.isTauri = true;
+      preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
+
+      openUrl(target, 'an app');
+
+      expect(panelOverlay.value).toBeNull();
+      expect(webviewInitialUrl.value).toBeNull();
+      expect(revealContentPane).not.toHaveBeenCalled();
+    });
+
     it('a web url still opens at once, with no confirm', () => {
       platformMocks.isTauri = true;
 

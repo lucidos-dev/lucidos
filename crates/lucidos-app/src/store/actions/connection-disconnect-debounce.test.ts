@@ -46,7 +46,7 @@ vi.mock('./notifications', () => ({
 const postClientLog = vi.fn();
 vi.mock('../../utils/clientLog', () => ({ postClientLog: (...a: unknown[]) => postClientLog(...a) }));
 
-const { checkConnection } = await import('./connection');
+const { checkConnection, noteWorkspaceStartAccepted, START_SETTLE_MS, START_BOOT_MS } = await import('./connection');
 const { connectThreadEvents } = await import('./thread-sync');
 
 const STARTED_AT = '2026-06-09T06:00:00Z';
@@ -185,16 +185,74 @@ describe('a stopped workspace obeys the same debounce as a failed probe', () => 
     expect(connectionStatus.value).toBe('stopped');
   });
 
-  it('leaves stopped to disconnected while the engine is booting, then to connected', async () => {
-    await settleConnected();
-    for (let i = 0; i < 4; i++) await stoppedOnce();
-    expect(connectionStatus.value).toBe('stopped');
+});
 
+/**
+ * Regression: after Start, the booting engine fails every probe until it
+ * answers. Those failures read as `disconnected`, so the window said it could
+ * not reach the workspace the user had just started.
+ */
+describe('an accepted Start reads as starting until the engine answers', () => {
+  const stopped = { status: 'stopped' as const };
+  const BOOTED_AT = '2026-06-09T07:00:00Z';
+  const booted = { status: 'loaded' as const, data: { ...loaded.data, started_at: BOOTED_AT } };
+
+  async function stoppedWindowStarts(): Promise<void> {
+    await settleConnected();
+    for (let i = 0; i < 4; i++) {
+      mockCheckHealth.mockResolvedValueOnce(stopped);
+      await checkConnection();
+    }
+    expect(connectionStatus.value).toBe('stopped');
+    noteWorkspaceStartAccepted();
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('says starting at once, through the booting probes, then connected', async () => {
+    await stoppedWindowStarts();
+    expect(connectionStatus.value).toBe('starting');
+
+    for (let i = 0; i < 6; i++) await failOnce();
+    expect(connectionStatus.value).toBe('starting');
+
+    mockCheckHealth.mockResolvedValueOnce(booted);
+    await checkConnection();
+    expect(connectionStatus.value).toBe('connected');
+  });
+
+  it('a later outage is a plain disconnect again', async () => {
+    await stoppedWindowStarts();
+    mockCheckHealth.mockResolvedValueOnce(booted);
+    await checkConnection();
+
+    for (let i = 0; i < 4; i++) await failOnce();
+    expect(connectionStatus.value).toBe('disconnected');
+  });
+
+  it('holds a stopped answer as starting only inside the settle window', async () => {
+    vi.useFakeTimers();
+    await stoppedWindowStarts();
+
+    mockCheckHealth.mockResolvedValueOnce(stopped);
+    await checkConnection();
+    expect(connectionStatus.value).toBe('starting');
+
+    vi.advanceTimersByTime(START_SETTLE_MS + 1);
+    mockCheckHealth.mockResolvedValueOnce(stopped);
+    await checkConnection();
+    expect(connectionStatus.value).toBe('stopped');
+  });
+
+  it('gives up on a boot that outlasts the budget', async () => {
+    vi.useFakeTimers();
+    await stoppedWindowStarts();
+
+    vi.advanceTimersByTime(START_BOOT_MS + 1);
     await failOnce();
     expect(connectionStatus.value).toBe('disconnected');
-    await succeedOnce();
-    await succeedOnce();
-    expect(connectionStatus.value).toBe('connected');
   });
 });
 

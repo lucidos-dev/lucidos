@@ -14,30 +14,42 @@ test.describe('Section-aware Save/Archive buttons', () => {
     return id!;
   }
 
-  async function waitForThreadInSection(
-    page: Page,
-    threadId: string,
-    sectionKey: 'saved' | 'archive' | 'current',
-  ): Promise<void> {
-    await page.waitForFunction(
+  type SectionKey = 'saved' | 'archive' | 'current';
+
+  /** Wait until the section's rows near its header are mounted, then return
+   *  whether `threadId` is among them, or null while they are not.
+   *
+   *  The drawer mounts only the rows near its viewport. Once earlier specs
+   *  fill Current, Archive sits below that window with no rows in the DOM.
+   *  So the poll scrolls the header into view. The thread under test is the
+   *  newest in its section, so it is the first row below the header. */
+  async function waitForSectionAnswer(page: Page, threadId: string, sectionKey: SectionKey): Promise<boolean> {
+    const handle = await page.waitForFunction(
       ({ id, key }) => {
-        const titles = Array.from(document.querySelectorAll(`[data-flip-id="__section_${key}"]`));
-        return titles.some(t => t.closest('.drawer-section')?.querySelector(`[data-thread-nav="${id}"]`));
+        const titles = Array.from(document.querySelectorAll<HTMLElement>(`[data-flip-id="__section_${key}"]`))
+          .filter(t => t.getBoundingClientRect().height > 0);
+        // No section header at all: the section holds nothing.
+        if (titles.length === 0) return 'absent';
+        for (const title of titles) {
+          const section = title.closest('.drawer-section');
+          if (section?.querySelector(`[data-thread-nav="${id}"]`)) return 'present';
+          if (section?.querySelector('[data-thread-nav]')) return 'other';
+          title.scrollIntoView({ block: 'start' });
+        }
+        return null;
       },
       { id: threadId, key: sectionKey },
       { timeout: 10_000 },
     );
+    return (await handle.jsonValue()) === 'present';
   }
 
-  async function isThreadInSection(
-    page: Page,
-    threadId: string,
-    sectionKey: 'saved' | 'archive' | 'current',
-  ): Promise<boolean> {
-    return page.evaluate(({ id, key }) => {
-      const titles = Array.from(document.querySelectorAll(`[data-flip-id="__section_${key}"]`));
-      return titles.some(t => !!t.closest('.drawer-section')?.querySelector(`[data-thread-nav="${id}"]`));
-    }, { id: threadId, key: sectionKey });
+  async function waitForThreadInSection(page: Page, threadId: string, sectionKey: SectionKey): Promise<void> {
+    await expect.poll(() => waitForSectionAnswer(page, threadId, sectionKey), { timeout: 10_000 }).toBe(true);
+  }
+
+  async function expectThreadNotInSection(page: Page, threadId: string, sectionKey: SectionKey): Promise<void> {
+    expect(await waitForSectionAnswer(page, threadId, sectionKey)).toBe(false);
   }
 
   async function focusThreadFromDrawer(page: Page, threadId: string): Promise<void> {
@@ -78,7 +90,6 @@ test.describe('Section-aware Save/Archive buttons', () => {
 
     await toggleFocusedPin(page, 'pinned');
     await waitForThreadInSection(page, threadId, 'saved');
-    expect(await isThreadInSection(page, threadId, 'saved')).toBe(true);
   });
 
   test('archiving a pinned thread asks for confirmation and demotes to Archive', async ({ page }) => {
@@ -113,7 +124,6 @@ test.describe('Section-aware Save/Archive buttons', () => {
     await page.locator('[data-role="confirm-ok"]:visible').first().click();
 
     await waitForThreadInSection(page, threadId, 'archive');
-    expect(await isThreadInSection(page, threadId, 'archive')).toBe(true);
-    expect(await isThreadInSection(page, threadId, 'saved')).toBe(false);
+    await expectThreadNotInSection(page, threadId, 'saved');
   });
 });

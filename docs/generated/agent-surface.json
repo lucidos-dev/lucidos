@@ -4414,6 +4414,7 @@
       "McpServerDisabledToolsChanged",
       "McpServerRemoved",
       "McpServerStopped",
+      "McpLaunchApproved",
       "PermissionGrantsChanged",
       "OAuthAccountConnected",
       "OAuthAccountDeleted",

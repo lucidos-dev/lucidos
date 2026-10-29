@@ -41,6 +41,22 @@ persisted **`PreferencesChanged`** event (or `LanguageSet` / `TimezoneSet` for
 locale). Open Lucidos pages live-apply on those events, with no reload, no
 transient event and no restart.
 
+## Who may write a key
+
+The catalog marks each key agent-settable or not. A key that is not belongs
+to the owner, who changes it in Settings. Examples are the command guard, the
+tool-call cap, the network bind, the provider switches and the local model
+host. Every path holds the agent to that:
+
+- `preferences(action="set")` refuses it with the place to change it instead.
+- `lucidos preferences set` and a raw `PUT` or `DELETE /api/v1/preferences`
+  from a Lucidos-spawned process answer 403. The engine
+  knows the process by the origin token it handed it.
+- An app is refused the same keys, and a few more (`js-sdk.md`).
+
+The same 403 covers confirming an email draft (`POST /api/v1/email/send`) and
+revealing a credential or the backup key. Those are the user's own buttons.
+
 **`chat_model` / `chat_reasoning_efforts` are the default for NEW threads only.**
 (`trigger_model` is the same for intent triggers, applying from their next fire.)
 A Lucidos Agent thread reuses the model and reasoning effort it last ran with
@@ -444,8 +460,9 @@ and `preferences(action="set")` refuses every one with a hint naming the right s
   switches a provider off. Off drops it from the model picker and from web
   search, with no restart, and leaves the stored key untouched for later. Never
   via `preferences(action="set")`: the provider you switch off may be answering this turn.
-  `opencode_free_enabled` above IS settable, because turning a keyless free tier
-  on cannot leave the workspace unable to answer.
+  `opencode_free_enabled` above IS settable by you, because turning a keyless
+  free tier on cannot leave the workspace unable to answer. An app may not set
+  it: sending chat to an anonymous relay is the user's informed opt-in.
 - `local_base_url`: the base URL of the `local` OpenAI-compatible provider,
   `http://localhost:11434/v1` by default. The user sets it in Settings → Models
   → Providers. Neither you (`preferences(action="set")`) nor an app may set it: that host

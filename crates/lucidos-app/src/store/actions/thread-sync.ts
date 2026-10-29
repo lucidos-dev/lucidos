@@ -4,7 +4,7 @@ import { forgetThreadWidgets, onWidgetEvent } from './widgets';
 import type { ApplyEstimates, Change, LandingLane, MainCheck } from '../../api/client';
 import { EVENT_STREAM_RETRY_MS, eventStreamTargets, openEventStream, type EventStreamTargets, type StreamDrop } from '@lucidos/event-stream';
 import { postClientLog } from '../../utils/clientLog';
-import { getEventStream, setEventStream } from './event-stream';
+import { getEventStream, noteEventFrame, setEventStream } from './event-stream';
 import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
 import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, landingLane, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, removingQueuedMessageIds, queuedMessageRemovalKey, UNREAD_HOLD_EVENT_TYPES } from '../store';
 import { backgroundModelsVersion, chatModels, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, backupRecipientVersion, intelligenceLadderVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
@@ -65,7 +65,7 @@ import {
   refreshLlmConfigured,
   PROVIDER_PREFERENCE_KEYS,
 } from './entityReferences';
-import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
+import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale, refreshArchivedCountAfterFlip } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { acceptComposeReport, parseComposeReport, type ComposeReportWire } from '../composeSync';
 import { clearDraft, setDraft } from '../composeDrafts';
@@ -116,9 +116,11 @@ function markEventStreamStatus(status: 'connecting' | 'connected' | 'disconnecte
  *  driving state via startup.ts. */
 let needsResyncOnOpen = false;
 
-/** In-flight resync coalescer. Multiple Lagged events, or back-to-back
- *  reconnects, collapse into one network round-trip. */
+/** In-flight resync coalescer. A call that lands while a pass runs sets
+ *  `resyncAgain`, and the resync runs one more pass when it ends. So all the
+ *  Lagged events or reconnects during one pass cost a single further pass. */
 let resyncInFlight: Promise<void> | null = null;
+let resyncAgain = false;
 
 /** The preference keys the Backup page renders, mirroring the `PREF_BACKUP_*`
  *  constants in the engine's `core/backup/mod.rs`. Only a `PreferencesChanged`
@@ -241,6 +243,7 @@ export function connectThreadEvents(): void {
       // Stale handler: a newer connection replaced this one. The old transport
       // was closed, but its queued message handler can still fire.
       if (gen !== sseGeneration) return;
+      noteEventFrame();
       handleHostFrame(data);
       // An isolated app frame can open no stream of its own, so it reads this
       // one. Verbatim, and after the shell's own handling, so a slow app never
@@ -270,8 +273,11 @@ export function connectThreadEvents(): void {
       // `eventStream`, costing a 3s SSE gap on every iOS Safari PWA resume.
       if (gen !== sseGeneration) return;
 
-      if (drop.reason === 'stalled') {
-        postClientLog('event-stream', 'stalled', { silentMs: drop.silentMs, transport: drop.transport });
+      // A plain error is routine: every engine restart causes one. Every other
+      // drop is a failure only the client can see, so it reports it.
+      if (drop.reason !== 'error') {
+        const { reason, ...detail } = drop;
+        postClientLog('event-stream', reason, detail);
       }
 
       // Mark for resync. Events emitted during the gap never reach this tab, so
@@ -366,45 +372,58 @@ function readStateMissedBeforeOpen(): void {
  *  sections and its badges all read `meta.status`, which the one
  *  `loadAllThreads` request below refreshes for every thread it returns. The
  *  per-thread event fetch matters only for the transcript on screen. Every
- *  other loaded thread is marked stale here and refreshed when opened. */
+ *  other loaded thread is marked stale here and refreshed when opened.
+ *
+ *  A call that lands mid-resync never folds into the running pass. That pass's
+ *  metadata read may predate the newer gap, so a repeat must start after it. */
 export function resyncLoadedThreads(): Promise<void> {
-  if (resyncInFlight) return resyncInFlight;
+  if (resyncInFlight) {
+    resyncAgain = true;
+    return resyncInFlight;
+  }
   resyncInFlight = (async () => {
     try {
-      // Before the metadata read, because only a fetch STARTING after a mark
-      // may clear it (see `staleMarkedAtToken`). A thread `loadAllThreads`
-      // eagerly loads below must be on the far side of this line to clear its
-      // own mark on landing.
-      markLoadedThreadsStale();
-      // Refresh thread-level metadata first, so any per-thread refresh sees the
-      // authoritative state. `loadAllThreads` REJECTS on a failed GET and has
-      // no Loadable or toast of its own. Letting that propagate would skip the
-      // per-thread refresh below, which is what clears a stuck spinner after an
-      // SSE gap. `refreshThreadList` never rejects, and owns the single keyed
-      // card this shares with the resume sync.
-      await refreshThreadList();
-      // One events request, for the thread on screen. The metadata read above is what
-      // repairs the drawer, and `refreshStaleThreadEvents` consumes the rest of
-      // the marks on focus.
-      //
-      // After the metadata read, deliberately, so the refresh sees the
-      // authoritative state. Coalesced against a concurrent wake resync, and
-      // `refreshThreadEvents` surfaces its own failures.
-      const focused = focusedThreadId.value;
-      const refreshFocused = !!focused && !!threadMap.value.get(focused)?.eventsLoaded;
-      if (refreshFocused) {
-        await refreshThreadEvents(focused, { coalesce: true });
-        // A widget event missed in the gap changed the thread's widgets too.
-        onWidgetEvent(focused);
-      }
-      // The dashboards decide Add to dashboard in every widget menu, so a
-      // dashboard event missed in the gap matters there too.
-      rereadLoadedDashboards();
+      do {
+        resyncAgain = false;
+        await resyncPass();
+      } while (resyncAgain);
     } finally {
       resyncInFlight = null;
     }
   })();
   return resyncInFlight;
+}
+
+async function resyncPass(): Promise<void> {
+  // Before the metadata read, because only a fetch STARTING after a mark
+  // may clear it (see `staleMarkedAtToken`). A thread `loadAllThreads`
+  // eagerly loads below must be on the far side of this line to clear its
+  // own mark on landing.
+  markLoadedThreadsStale();
+  // Refresh thread-level metadata first, so any per-thread refresh sees the
+  // authoritative state. `loadAllThreads` REJECTS on a failed GET and has
+  // no Loadable or toast of its own. Letting that propagate would skip the
+  // per-thread refresh below, which is what clears a stuck spinner after an
+  // SSE gap. `refreshThreadList` never rejects, and owns the single keyed
+  // card this shares with the resume sync.
+  await refreshThreadList();
+  // One events request, for the thread on screen. The metadata read above is what
+  // repairs the drawer, and `refreshStaleThreadEvents` consumes the rest of
+  // the marks on focus.
+  //
+  // After the metadata read, deliberately, so the refresh sees the
+  // authoritative state. Coalesced against a concurrent wake resync, and
+  // `refreshThreadEvents` surfaces its own failures.
+  const focused = focusedThreadId.value;
+  const refreshFocused = !!focused && !!threadMap.value.get(focused)?.eventsLoaded;
+  if (refreshFocused) {
+    await refreshThreadEvents(focused, { coalesce: true });
+    // A widget event missed in the gap changed the thread's widgets too.
+    onWidgetEvent(focused);
+  }
+  // The dashboards decide Add to dashboard in every widget menu, so a
+  // dashboard event missed in the gap matters there too.
+  rereadLoadedDashboards();
 }
 
 /** Re-read the Changes and Thread Queue state after a stream gap. Neither
@@ -477,7 +496,8 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // backfill any events emitted before the SSE connection was established
   // (e.g. recovery threads whose MessageReceived was missed). Dedup via
   // sequence numbers ensures no duplicates when DB events overlap with SSE.
-  if (!map.has(threadId)) {
+  const rowBornFromFrame = !map.has(threadId);
+  if (rowBornFromFrame) {
     // Transient events (no seq) have no DB row — creating a skeleton would
     // produce a phantom "empty thread" that vanishes on reload. Only persisted
     // events (with seq) justify creating a new thread entry. Side effects
@@ -570,7 +590,16 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   const aggregateWasCurrent = aggregate !== undefined && aggregate !== null
     && isSummaryCurrent(thread.meta, aggregate.summaryVersion);
   if (aggregateWasCurrent) liftRowIntent(thread.meta);
+  // Read beneath any row intent, so an optimistic archive still counts as a
+  // flip when its own frame lands.
+  const wasArchived = thread.meta.section === 'archived';
   const handled = handleEvent(map, threadId, seq, event, created, eventId, aggregate);
+  // The Archive badge is a server count, so a frame that moved the row owes a
+  // re-read. A row born from this frame has no prior section to compare: it
+  // may be an unloaded archived thread this frame took out of the archive.
+  if (aggregateWasCurrent && (rowBornFromFrame || wasArchived !== (thread.meta.section === 'archived'))) {
+    refreshArchivedCountAfterFlip();
+  }
   if (handled.metaChanged) metaChanged = true;
   if (handled.retiredUnsentEventId) settleDeliveredUnsentMessage(handled.retiredUnsentEventId);
   if (event.type === 'ImageUploaded') noteImageLanded(threadId, event.hash);

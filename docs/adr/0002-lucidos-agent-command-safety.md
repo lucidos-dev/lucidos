@@ -713,3 +713,95 @@ temp dir is mode 0700. A stored grant on the head (`Bash(cat:*)`) now covers a
 scratch write too, since `grant_covers_command` refuses only refusals.
 
 Plan: `docs/plans/2026-10-24-scratch-writes-reach-the-judge.md`.
+
+## Addendum (2026-10-29): an MCP server setup is gated as the command it spawns
+
+`setup_mcp_server` (and the grouped `mcp` tool's `setup` action) registers a
+server and starts it at once. It took the command, arguments and environment
+from the model, and the guard never saw them: `command_text` knew only the four
+bash and python tools. So `sh -c '…'` as a server command ran with no
+classification, whatever the guard settings.
+
+**Decision.** The guard reads the spawn as the shell command line it amounts to,
+and handles that line exactly as a `run_bash` command:
+`[cd <cwd> &&] NAME=value … command arg …`.
+
+- `command_guard_decision` maps the call to `run_bash` with that line before
+  anything else (`mcp_setup_command_line`). Classification, the judge, the card,
+  stored `Bash(…)` grants, the trigger side-effect grant and the secret-read
+  gate then apply unchanged. A grant that allows a command through bash allows
+  it as a server too, since bash could run it anyway.
+- The spawn uses no shell, so every argument is one word: each is quoted where
+  it holds anything but inert characters.
+- The environment becomes a `VAR=` preamble, so the code-injecting name list
+  applies. A stored credential shows as `<credential name>`, never its value.
+- A server runs in the engine's working directory, and a bash command in the
+  workspace root. When they differ the line starts with a `cd` there, so a
+  relative path is placed where it lands. An unknown working directory refuses.
+- The tool and the guard parse the call through one `McpSetupRequest`, so the
+  guard sees the process that spawns. It refuses a command holding `=` and an
+  invalid variable name, which the shell reading could misplace.
+- The card summary leads with `MCP_SETUP_SUMMARY`: an allowed server runs the
+  command again each time it starts, with no further card.
+- A setup never takes the checkpoint lane (`mcp_launch_lane`). A checkpoint
+  covers one run, and every later start reruns the command with none. So
+  reversible destruction asks, and fails a trigger, as irreversible does.
+
+**Two related parses fixed.** Both apply to every bash command, not only to a
+setup.
+
+- The head walk skipped any word holding `=` as an assignment. `./a=b cat x`
+  therefore settled Safe, though a shell runs the program `./a=b`, and so does
+  `nice` or `env` in front of it. Only `NAME=value` with a valid variable name
+  now counts (`is_assignment_word`).
+- The head walk split on whitespace and ignored quotes, so `A='x y' rm -rf /`
+  read `y'` as the command and missed the catastrophic deny-list. Every
+  rendered credential holds a space. An assignment now spans to its closing
+  quote or past an escaped space (`assignment_token_span`).
+
+**Starting a registered server.** A start spawns the stored command with no
+model call to gate. So the guard records which launch lines were approved and
+gates only a line nobody approved.
+
+- The *launch line* is the setup line above, rendered by one
+  `core::mcp_servers::LaunchSpec`. It has two modes. **Real** keeps plain env
+  values. **Masked** shows each as `<stored value>`, because plain values are
+  sealed at rest and a card, event or tool result must never copy them.
+- A *launch approval* is a row in `mcp_launch_approvals`, keyed by server id
+  and an HMAC-SHA256 of the real line under the secret store key. Writing one
+  emits `McpLaunchApproved`. A changed command, argument, env value or working
+  directory changes the fingerprint, so a re-registration asks again. The key
+  matters: the rest of the line is readable, so an unkeyed hash would let a
+  database reader guess a short sealed value offline.
+- With the guard on, `McpManager::start_server_internal` refuses an
+  unapproved line before it spawns. Every start passes there: the agent's
+  `enable` and `start`, turn setup, the lazy start in a tool call, and Settings.
+- With the guard on, `command_guard_decision` maps an agent `enable` or `start`
+  of an unapproved server to `run_bash` with its masked line. It takes the
+  setup's lane rule (`mcp_launch_lane`) and leads with `MCP_START_SUMMARY`.
+  When the guard lets a setup or start through, it records the approval.
+- A user's Start click, or a thread enable click, approves the line whatever
+  the guard setting. Both routes now identify the caller first. Only the
+  owner's registered device approves (`require_owner_device`). An agent's
+  `lucidos mcp start`, the local token and an app document approve nothing,
+  so their starts still meet the start gate.
+- When the guard lets a launch through but the approval cannot be saved, it
+  refuses the call. Otherwise the start gate would refuse and send the model
+  back to a card it already answered.
+- No migration approves existing rows. Every row came from a model call, which
+  is exactly what the gate distrusts. Each asks once, then never again until
+  its line changes.
+
+| Guard | Setup | Approved start | Unapproved start |
+|---|---|---|---|
+| off (default) | runs, records nothing | runs | runs |
+| on | classified; Proceed approves | runs, no card | agent: classified, may card. Turn setup, lazy start, trigger: refused with a reason. User click: approves and runs. |
+
+With the guard off the gate reaches nobody. The workspace audit's
+`mcp-servers` section then lists each unapproved line and its static verdict.
+
+**Known limits.** A masked line hides a value-driven danger, for example an
+`LD_PRELOAD` value, from the classifier. The settings page does not show the
+command, so a Start click approves a command the user cannot see there. A
+trigger cannot ask, so a trigger thread with an unapproved server enabled
+reports a failed start at turn setup.

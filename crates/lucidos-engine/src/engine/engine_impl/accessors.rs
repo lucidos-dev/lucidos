@@ -3,6 +3,7 @@
 //! Part of the `LucidosEngine` inherent impl, split from engine_impl.rs.
 
 use super::super::*;
+use crate::core::contained_path::{join_contained, join_data_contained};
 
 impl LucidosEngine {
     /// Update a per-repo entry in cc_commands_cache and persist to disk if changed.
@@ -65,7 +66,8 @@ impl LucidosEngine {
                 .system_knowhow_dir
                 .as_deref()
                 .ok_or_else(|| "System knowhow is not available".to_string())?;
-            return Ok((normalized.clone(), dir.join(rel)));
+            let full_path = join_contained(dir, rel).ok_or_else(|| symlink_escape(&normalized))?;
+            return Ok((normalized, full_path));
         }
 
         // A built-in widget's files ship in `system-widgets/` (ADR 0415).
@@ -81,16 +83,21 @@ impl LucidosEngine {
             return Ok((normalized, full_path));
         }
 
-        let full_path = self.workspace_path.join("data").join(&normalized);
+        let full_path = join_data_contained(
+            &self.workspace_path.join(crate::core::DATA_DIR),
+            &normalized,
+        )
+        .ok_or_else(|| symlink_escape(&normalized))?;
 
         // For knowhow paths: if file doesn't exist locally, fall back to shared.
+        // A shared copy that escapes its tree counts as no shared copy.
         if normalized.starts_with("knowhow/") && !full_path.exists() {
             let kh_relative = normalized.strip_prefix("knowhow/").unwrap();
-            if let Some(shared_dir) = self.shared_knowhow_dir() {
-                let shared_path = shared_dir.join(kh_relative);
-                if shared_path.exists() {
-                    return Ok((normalized, shared_path));
-                }
+            let shared_path = self
+                .shared_knowhow_dir()
+                .and_then(|shared_dir| join_contained(&shared_dir, kh_relative));
+            if let Some(shared_path) = shared_path.filter(|p| p.exists()) {
+                return Ok((normalized, shared_path));
             }
         }
 
@@ -648,34 +655,29 @@ fn normalize_lucidos_path(had_data_prefix: bool, stripped: &str) -> Result<Strin
     ))
 }
 
+fn symlink_escape(normalized: &str) -> String {
+    format!("'{normalized}' resolves outside its tree through a symlink")
+}
+
 /// Join an already-normalized [`crate::core::TMP_DIR`] path onto the workspace
 /// root, refusing a target that escapes the scratch tree through a symlink.
 ///
 /// `git_clone`'s tmp route drops whatever symlinks a cloned repository carries
 /// into this directory, and `is_path_traversal` is a string check that cannot
-/// see them, so string validation alone does not bound where a read lands.
-/// Canonicalizing both sides does.
-///
-/// Only a PROVEN escape refuses. When the target does not exist,
-/// `canonicalize` fails and the path is returned unchanged, so the caller
-/// reports its ordinary "file not found" rather than a misleading security
-/// error. Both sides are canonicalized because the workspace root itself may
-/// sit behind a symlink, in which case comparing a canonical target against a
-/// non-canonical root would reject every legitimate read.
+/// see them. A missing target is not an escape, so the caller reports its
+/// ordinary "file not found".
 fn resolve_tmp_path(
     workspace_path: &std::path::Path,
     normalized: &str,
 ) -> Result<std::path::PathBuf, String> {
     let full_path = workspace_path.join(normalized);
     let tmp_root = workspace_path.join(crate::core::TMP_DIR);
-    if let (Ok(root), Ok(target)) = (tmp_root.canonicalize(), full_path.canonicalize()) {
-        if !target.starts_with(&root) {
-            return Err(format!(
-                "'{}' resolves outside {}/ through a symlink",
-                normalized,
-                crate::core::TMP_DIR
-            ));
-        }
+    if crate::core::contained_path::resolves_outside(&tmp_root, &full_path) {
+        return Err(format!(
+            "'{}' resolves outside {}/ through a symlink",
+            normalized,
+            crate::core::TMP_DIR
+        ));
     }
     Ok(full_path)
 }
@@ -709,6 +711,20 @@ mod resolve_tmp_path_tests {
         std::os::unix::fs::symlink(&secret, tmp.join("escape.txt")).unwrap();
 
         let err = resolve_tmp_path(ws.path(), ".lucidos/tmp/escape.txt").unwrap_err();
+        assert!(err.contains("symlink"), "got: {err}");
+    }
+
+    /// A write target does not exist yet, so the old check, which needed the
+    /// target to resolve, let a write through a linked directory pass.
+    #[test]
+    fn refuses_a_new_file_under_a_directory_link_out_of_the_scratch_tree() {
+        let outside = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let tmp = ws.path().join(crate::core::TMP_DIR);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.join("repo")).unwrap();
+
+        let err = resolve_tmp_path(ws.path(), ".lucidos/tmp/repo/new.txt").unwrap_err();
         assert!(err.contains("symlink"), "got: {err}");
     }
 

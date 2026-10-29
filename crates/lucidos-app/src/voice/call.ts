@@ -278,13 +278,23 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     // the one they did choose was gone. Said now rather than never: a caller
     // who thinks they are on a headset will hold it to their mouth.
     if (device.note) options.onProblem(device.note);
+    // Minted only now, so a first-use permission prompt cannot outlive the
+    // ticket. A refusal tears down, which releases the microphone just opened.
+    let ticket: string;
+    try {
+      ticket = await options.ports.mintCallTicket(threadId);
+    } catch (err) {
+      if (mine === generation) input({ kind: 'failed', message: setupRefusal(err) });
+      return;
+    }
+    if (mine !== generation) return;
     handshook = false;
     // The microphone is already open, so a throw from here MUST be caught.
     // `new WebSocket` throws outright on a URL the browser will not dial. This
     // runs detached from any caller, so an escaping error would leave the call
     // stuck connecting, with the microphone live and nothing said.
     try {
-      socket = options.ports.openSocket(threadId, {
+      socket = options.ports.openSocket(threadId, ticket, {
         onOpen: () => {
           if (mine === generation) handshook = true;
         },

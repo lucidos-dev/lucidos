@@ -3,7 +3,7 @@ import type { ThreadStatus } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { formatTokens } from '../../utils/formatTokens';
 import { AWAIT_EVENT_TOOL } from './event-waits';
-import { describeCCTool, describeEngineTool, exchangeHasCCContent, isAgentReplyText, isChangeLifecycleEvent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool, apiCallIdOf, parentToolUseIdOf } from './exchange';
+import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeQuietReply, isAgentReplyText, isChangeLifecycleEvent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool, apiCallIdOf, parentToolUseIdOf } from './exchange';
 import { TERMINAL_EVENT_TYPES, UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, computeExchanges, dividerStillAwaitsUser, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUnsentExchange, isUningestedMessage, isWaitingTypedMessage, latestRunSteps, opensAwaitingAnswer, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isRedirectCancel, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
@@ -777,6 +777,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
   let emptyCompletion = false;
   // A quiet pick ended the turn on purpose, so its empty reply needs no note.
   let endedByQuietAnswer = false;
+  // Drawn at its own ResponseGenerated, once.
+  let quietReply = exchangeQuietReply(exchange);
   // One ContextAssembled per exchange; attach to every step pushed after it.
   let currentContext: ContextAssembledData | undefined;
   let legacyAcc: LegacyContextEvents = {};
@@ -1284,6 +1286,10 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         // TextStreamed, but with non-empty text, so checking the event's own
         // text distinguishes the two.
         emptyCompletion = !(event as { text?: string }).text?.trim();
+        if (endedByQuietAnswer && quietReply !== null) {
+          events.push({ type: 'text', md: quietReply });
+          quietReply = null;
+        }
         break;
       case 'CodingAgentIdled':
         terminal = 'clean';

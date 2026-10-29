@@ -362,6 +362,68 @@ pub fn provider_for_url(url: &str) -> Option<&'static str> {
     }
 }
 
+/// The credential fields naming an endpoint that a secret travels to. The token
+/// endpoint receives the client secret, the code, the PKCE verifier and the
+/// refresh token. The userinfo endpoint receives the access token. The user
+/// signs in on the authorization page.
+const SECRET_BEARING_ENDPOINTS: [&str; 3] = ["auth_url", "token_url", "userinfo_url"];
+
+/// True when `host` (as `Url::host_str` spells it) never leaves this machine.
+fn is_loopback_host(host: &str) -> bool {
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    match unbracketed.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// True for `https`, and for `http` only to a loopback host, where the request
+/// never leaves the machine.
+fn is_secure_endpoint(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        || (url.scheme() == "http" && url.host_str().is_some_and(is_loopback_host))
+}
+
+/// Refuse an OAuth endpoint that would carry a secret in cleartext. The error
+/// names the credential and the field, never the URL or any secret.
+fn require_secure_endpoint(credential: &str, field: &str, url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|_| format!("The {field} of the {credential} OAuth client is not a valid URL"))?;
+    if is_secure_endpoint(&parsed) {
+        return Ok(());
+    }
+    Err(format!(
+        "The {field} of the {credential} OAuth client must use https, not {}://. \
+         Over anything else its secrets would travel in cleartext.",
+        parsed.scheme()
+    ))
+}
+
+/// Refuse a parsed `oauth_client` secret whose endpoints are not all secure.
+/// Absent and blank fields pass: [`missing_flow_fields`] owns those.
+fn check_client_endpoints_in(credential: &str, config: &serde_json::Value) -> Result<(), String> {
+    for field in SECRET_BEARING_ENDPOINTS {
+        let url = config.get(field).and_then(|v| v.as_str()).map(str::trim);
+        if let Some(url) = url.filter(|s| !s.is_empty()) {
+            require_secure_endpoint(credential, field, url)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an `oauth_client` secret about to be saved whose endpoints would send
+/// a secret over cleartext. The flow checks again on read, so a row written
+/// before this check still cannot leak.
+///
+/// A value that is not a JSON object passes. It names no endpoint, and
+/// [`missing_flow_fields`] already sends it to the repair form.
+pub fn check_client_endpoints(credential: &str, auth_value: &str) -> Result<(), String> {
+    match serde_json::from_str::<serde_json::Value>(auth_value) {
+        Ok(config) => check_client_endpoints_in(credential, &config),
+        Err(_) => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OAuthStore — database operations
 // ---------------------------------------------------------------------------
@@ -1183,16 +1245,35 @@ impl std::fmt::Debug for TokenResponse {
     }
 }
 
+/// Most redirects one OAuth request follows. Matches reqwest's default policy.
+const MAX_OAUTH_REDIRECTS: usize = 10;
+
 /// Bounded, shared HTTP client for the OAuth token and userinfo endpoints.
 ///
 /// A bare `reqwest::Client::new()` has NO timeout, and `refresh_oauth_if_needed`
 /// runs on the email-send path, where a stalled identity provider would hang
 /// the whole send. Built once so repeated calls reuse the connection pool and
 /// the rustls context.
+///
+/// A 307 or 308 replays the POST body, so the client never follows a redirect
+/// to an endpoint [`is_secure_endpoint`] refuses.
 fn bounded_http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if !is_secure_endpoint(attempt.url()) {
+                    let scheme = attempt.url().scheme().to_string();
+                    attempt.error(format!(
+                        "An OAuth endpoint redirected to {scheme}://, where its secrets \
+                         would travel in cleartext, so Lucidos did not follow it."
+                    ))
+                } else if attempt.previous().len() >= MAX_OAUTH_REDIRECTS {
+                    attempt.error("An OAuth endpoint redirected too many times")
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()
             // Only fails on TLS-backend init.
             .expect("OAuth HTTP client builder")
@@ -1247,21 +1328,36 @@ fn describe_token_error(operation: &str, status: reqwest::StatusCode, body: &str
     )
 }
 
+/// Surface the redirect policy's own reason, which reqwest's display hides
+/// behind "error following redirect". Any other error passes through.
+fn redirect_refusal_or(error: reqwest::Error) -> BoxError {
+    match std::error::Error::source(&error) {
+        Some(reason) if error.is_redirect() => reason.to_string().into(),
+        _ => error.into(),
+    }
+}
+
 /// POST a token-endpoint form and parse the response, surfacing the provider's
 /// own error text on failure. Shared by the code exchange and the refresh so
 /// both legs report failures identically.
+///
+/// Refuses a cleartext `token_url` before anything is sent, whatever path
+/// stored it: the form carries the client secret or the refresh token.
 async fn post_token_request(
     operation: &str,
+    credential: &str,
     token_url: &str,
     form: &[(&str, &str)],
 ) -> Result<TokenResponse, BoxError> {
+    require_secure_endpoint(credential, "token_url", token_url)?;
     let client = bounded_http_client();
     let resp = client
         .post(token_url)
         .header("Accept", "application/json")
         .form(form)
         .send()
-        .await?;
+        .await
+        .map_err(redirect_refusal_or)?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -1318,6 +1414,7 @@ fn refresh_form<'a>(
 
 /// Exchange an authorization code for tokens.
 async fn exchange_code(
+    credential: &str,
     token_url: &str,
     client_id: &str,
     auth: &ClientAuth,
@@ -1325,18 +1422,19 @@ async fn exchange_code(
     redirect_uri: &str,
 ) -> Result<TokenResponse, BoxError> {
     let form = exchange_form(code, client_id, redirect_uri, auth);
-    post_token_request("Token exchange", token_url, &form).await
+    post_token_request("Token exchange", credential, token_url, &form).await
 }
 
 /// Refresh an access token using a refresh token.
 async fn refresh_access_token(
+    credential: &str,
     token_url: &str,
     client_id: &str,
     client_secret: Option<&str>,
     refresh_token: &str,
 ) -> Result<TokenResponse, BoxError> {
     let form = refresh_form(refresh_token, client_id, client_secret);
-    post_token_request("Token refresh", token_url, &form).await
+    post_token_request("Token refresh", credential, token_url, &form).await
 }
 
 /// Returns true if the account's token needs refreshing (expired, expiring
@@ -1393,7 +1491,7 @@ pub async fn refresh_oauth_if_needed(
         account.provider,
         account.email.as_deref().unwrap_or("unknown")
     );
-    let new_tokens = refresh_access_token(&turl, cid, csec, &refresh_token).await?;
+    let new_tokens = refresh_access_token(&cred_service, &turl, cid, csec, &refresh_token).await?;
     let new_expiry = new_tokens.expiry_from(Utc::now());
     let new_refresh_token = usable_refresh_token(new_tokens.refresh_token.as_deref());
     OAuthStore::update_tokens(
@@ -2057,6 +2155,9 @@ pub async fn prepare_oauth_flow(
     // Parsed with the other credential reads, so a malformed value fails before
     // the loopback listener binds and the browser opens.
     let authorize_params = AuthorizeParams::parse(client_config["authorize_params"].as_str())?;
+    // Before the browser opens, so the user never consents to a flow whose
+    // code or token would then travel in cleartext.
+    check_client_endpoints_in(&provider, &client_config)?;
 
     // The ONE redirect URI for this flow, resolved before anything else so a
     // bad override cannot produce a redirect the listener never receives.
@@ -2149,9 +2250,16 @@ pub async fn prepare_oauth_flow(
 
             // `exchange_code` already names the leg and carries the provider's
             // own error text, so it is NOT re-wrapped.
-            let token_resp = exchange_code(&token_url, &client_id, &auth, &code, &redirect_uri)
-                .await
-                .map_err(|e| e.to_string())?;
+            let token_resp = exchange_code(
+                &provider,
+                &token_url,
+                &client_id,
+                &auth,
+                &code,
+                &redirect_uri,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
             let (email, display_name) = if let Some(ref url) = userinfo_url {
                 fetch_userinfo(url, &token_resp.access_token, userinfo_method).await

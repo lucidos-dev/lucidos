@@ -106,9 +106,19 @@ impl ThreadEvent {
     /// the agent. Both arguments are table aliases over `events`.
     pub fn question_own_result_sql(question: &str, later: &str) -> String {
         format!(
-            "({later}.event_type = 'CodingAgentToolResult' \
-              AND {later}.payload->>'tool_use_id' = {question}.payload->>'tool_use_id')"
+            "({later}.event_type = 'CodingAgentToolResult' AND {})",
+            Self::question_owns_result_id_sql(
+                question,
+                &format!("{later}.payload->>'tool_use_id'")
+            )
         )
+    }
+
+    /// SQL for "a result carrying `result_id` is the own result of `question`",
+    /// for a reader that holds the result's id rather than its row.
+    /// `question` is a table alias over `events`, `result_id` any SQL text.
+    pub fn question_owns_result_id_sql(question: &str, result_id: &str) -> String {
+        format!("({question}.payload->>'tool_use_id' = {result_id})")
     }
 
     /// Drop a tool result's text from its serialized payload and mark it, so a

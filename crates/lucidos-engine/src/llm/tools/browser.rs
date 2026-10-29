@@ -24,7 +24,7 @@ pub(super) fn browser_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "Full URL to navigate to."
+                        "description": "Full http(s) URL to open."
                     },
                     "wait_for": {
                         "type": "string",

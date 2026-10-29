@@ -515,3 +515,127 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
         "the empty-diff path should have deleted both checkpoint refs, but these survived: {leaked:?}"
     );
 }
+
+/// The first event of `event_type` on `thread_id`, waiting up to `secs`.
+async fn poll_thread_event(
+    pool: &sqlx::PgPool,
+    thread_id: &str,
+    event_types: &[&str],
+    secs: u64,
+) -> Option<serde_json::Value> {
+    let types: Vec<String> = event_types.iter().map(|t| t.to_string()).collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let payload: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate = 'thread' AND aggregate_id = $1 \
+               AND event_type = ANY($2) ORDER BY sequence LIMIT 1",
+        )
+        .bind(thread_id)
+        .bind(&types)
+        .fetch_optional(pool)
+        .await
+        .expect("DB query failed");
+        if payload.is_some() || std::time::Instant::now() >= deadline {
+            return payload;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+async fn mcp_server_rows(pool: &sqlx::PgPool, id: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM mcp_servers WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("DB query failed")
+}
+
+/// An MCP server setup spawns its command, so the guard gates it like the same
+/// command run through bash. A server reading a secret path raises a card, and
+/// nothing is registered or spawned while the card is open or after a cancel.
+///
+/// The guard gates a secret read even when it is off, and no stored grant
+/// covers one. So the test touches no preference and holds on any workspace.
+/// The file does not exist, so a regressed guard only spawns a failing `cat`.
+#[tokio::test]
+async fn an_mcp_server_setup_asks_before_it_spawns_anything() {
+    let pool = sqlx::PgPool::connect(&crate::support::db_url())
+        .await
+        .expect("connect to the e2e workspace database");
+    let client = crate::support::user_client().await;
+
+    let server_id = format!("e2e-guard-{}", uuid::Uuid::new_v4().simple());
+    let secret_file = format!("{server_id}-missing");
+    let secret = lucidos_engine::core::secret_store::key_store::default_key_dir()
+        .expect("the e2e host has a HOME")
+        .join(&secret_file);
+    let args = json!({
+        "action": "setup",
+        "id": server_id,
+        "name": "E2E guard",
+        "command": "cat",
+        "args": [secret],
+    });
+    let marker = unique_marker("api-mcp-setup-guard");
+    let resp = client
+        .post(format!("{}/api/v1/chat/stream", base_url()))
+        .json(&json!({
+            "message": format!("{marker} MOCK_TOOL_CALL: mcp {args}"),
+            "mode": "human",
+        }))
+        .send()
+        .await
+        .expect("chat request failed");
+    assert_eq!(resp.status(), 200, "chat/stream should accept the message");
+    let thread_id = crate::support::poll_thread_summary_by_marker(&pool, &marker, 25)
+        .await
+        .thread_id
+        .to_string();
+
+    let card = poll_thread_event(&pool, &thread_id, &["CommandPermissionRequested"], 30)
+        .await
+        .expect("the MCP server setup should have raised a permission card");
+    assert_eq!(
+        mcp_server_rows(&pool, &server_id).await,
+        0,
+        "nothing may register before an answer"
+    );
+    let command = card["command"].as_str().unwrap_or_default();
+    assert!(
+        command.contains("cat ") && command.contains(&secret_file),
+        "the card should show the command line the server would run: {command}"
+    );
+    let summary = card["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.starts_with(lucidos_engine::engine::command_permission::MCP_SETUP_SUMMARY),
+        "the card should say an allowed server keeps running this: {summary}"
+    );
+
+    let cancel = client
+        .post(format!(
+            "{}/api/v1/chat/cancel?thread_id={thread_id}",
+            base_url()
+        ))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert!(cancel.status().is_success(), "cancel should succeed");
+    let ended = poll_thread_event(
+        &pool,
+        &thread_id,
+        &[
+            "ResponseGenerated",
+            "ResponseFailed",
+            "ResponseAborted",
+            "ResponseCanceled",
+        ],
+        30,
+    )
+    .await;
+    assert!(ended.is_some(), "the canceled turn never ended");
+    assert_eq!(
+        mcp_server_rows(&pool, &server_id).await,
+        0,
+        "a canceled card must leave no MCP server behind"
+    );
+}

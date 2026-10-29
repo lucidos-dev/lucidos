@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const pushHandlers = new Map<string, (data: unknown) => void>();
 vi.mock('./_bridge', () => ({
+  postToHost: (message: unknown) => (window.parent as { postMessage(m: unknown): void }).postMessage(message),
   onHostPush: (channel: string, handler: (data: unknown) => void) => {
     pushHandlers.set(channel, handler);
     return () => pushHandlers.delete(channel);

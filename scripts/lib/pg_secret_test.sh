@@ -19,7 +19,7 @@ fail() { echo "  FAIL: $*"; FAIL=$((FAIL + 1)); }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 
 echo "a first call mints a 64-hex secret, readable by its owner alone"
 export HOME="$TMP/fresh"

@@ -9,6 +9,7 @@
 //! down, an announcement that does not send: none of them may be the reason a
 //! build does not happen.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -122,13 +123,7 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
     if args.command.is_empty() {
         return Err("nothing to run. Usage: lucidos build-slot -- <command> [args...]".into());
     }
-    let label = args
-        .label
-        .clone()
-        .unwrap_or_else(|| args.command.join(" "))
-        .chars()
-        .take(LABEL_CHARS)
-        .collect::<String>();
+    let label = default_label(args.label.as_deref(), &args.command);
 
     // Already inside a wrapped build: run straight through. Without this a
     // `make test` that wraps, calling a script that also wraps, would wait for
@@ -191,6 +186,28 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
         serde_json::json!({ "label": label, "slot": index }),
     );
     code
+}
+
+/// The slot label: `--label` when given, else the program's file name alone.
+///
+/// Never the arguments. The label persists in the slot file and on every
+/// `BuildSlot*` event, so a token passed on the command line would outlive
+/// the build. The program word is cut at the first space or `=` BEFORE the
+/// file name is taken. So a whole command quoted as one word, or a leading
+/// `KEY=value`, leaves nothing of its value behind, even past a `/`.
+fn default_label(label: Option<&str>, command: &[String]) -> String {
+    let label = label.unwrap_or_else(|| {
+        let first = command.first().map(String::as_str).unwrap_or_default();
+        let program = first
+            .split(|c: char| c.is_whitespace() || c == '=')
+            .next()
+            .unwrap_or_default();
+        Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(program)
+    });
+    label.chars().take(LABEL_CHARS).collect()
 }
 
 /// Block until a slot frees, reporting progress. `None` means `--max-wait`
@@ -501,5 +518,41 @@ mod tests {
         })
         .expect_err("an empty command is a usage error");
         assert!(err.to_string().contains("nothing to run"), "{err}");
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn the_default_label_names_the_program_and_never_its_arguments() {
+        let label = default_label(None, &argv(&["./deploy.sh", "--token", "s3cr3t"]));
+        assert_eq!(label, "deploy.sh");
+        assert!(!label.contains("s3cr3t"), "{label}");
+    }
+
+    #[test]
+    fn a_program_word_that_carries_arguments_still_yields_only_the_program() {
+        for (word, want) in [
+            ("./deploy.sh --token s3cr3t", "deploy.sh"),
+            ("deploy.sh --token=s3/cr3t", "deploy.sh"),
+            ("API_KEY=s3/cr3t", "API_KEY"),
+        ] {
+            let label = default_label(None, &argv(&[word, "make"]));
+            assert_eq!(label, want, "for {word:?}");
+            assert!(!label.contains("cr3t"), "{label}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_label_wins() {
+        let label = default_label(Some("x"), &argv(&["./deploy.sh", "--token", "s3cr3t"]));
+        assert_eq!(label, "x");
+    }
+
+    #[test]
+    fn a_default_label_is_cut_to_the_label_limit() {
+        let program = format!("/opt/{}", "b".repeat(LABEL_CHARS * 2));
+        assert_eq!(default_label(None, &[program]).chars().count(), LABEL_CHARS);
     }
 }

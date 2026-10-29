@@ -30,6 +30,7 @@ mod mobile;
 mod notifications;
 mod pairing;
 mod panel_preview;
+mod preview_undo;
 mod traffic_lights;
 mod update_relay;
 mod updater;
@@ -1255,6 +1256,8 @@ pub fn run() {
             if let Err(e) = install_app_menu(app) {
                 eprintln!("[Tauri] Failed to install app menu: {e}");
             }
+            #[cfg(target_os = "macos")]
+            preview_undo::install_key_monitor();
 
             // The color the frontend last asked for, so a light-theme user does
             // not launch into the dark-theme blue. `applyThemeMode` refines it once

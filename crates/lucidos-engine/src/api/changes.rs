@@ -737,6 +737,16 @@ pub(super) async fn cancel_apply_all_changes(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    // Cancel takes back the batch's Apply and the sweep's arms, so it asks the
+    // gate Apply All asks, aimed at the workspace. Before the batch is touched,
+    // so a refusal stops nothing and says nothing about whether one runs.
+    refuse_without_authority(
+        &state.engine.event_bus,
+        &headers,
+        None,
+        ThreadReachVerb::Apply,
+    )
+    .await?;
     let canceled = state.engine.cancel_apply_all_batches(actor.clone()).await;
     let disarmed = state
         .engine

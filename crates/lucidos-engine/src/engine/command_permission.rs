@@ -1,7 +1,8 @@
 //! Command-guard permission lane (ADR 0002, Phase 2) — the chat mirror of the
 //! coding-agent permission model.
 //!
-//! When the command guard classifies a bash/python tool call as
+//! When the command guard classifies a bash/python tool call (or an MCP server
+//! setup, read as the command line it spawns) as
 //! [`RiskLane::IrreversibleDanger`](crate::engine::command_guard::RiskLane) on a
 //! `Chat` channel, the agentic loop pauses and asks the user, exactly like the
 //! coding agent's `PermissionCard`. The shared dedup / session-allow mechanism
@@ -47,6 +48,126 @@ pub const SUPERSEDED_REASON: &str = "Superseded by a new message";
 /// Reason on a resolution the engine emits because the chat turn was canceled
 /// (Stop button) while the card was on screen.
 pub const CANCELED_REASON: &str = "Canceled by user";
+/// Leads the card summary for an MCP server setup, which the guard gates as
+/// the command line the server runs.
+pub const MCP_SETUP_SUMMARY: &str = "Sets up an MCP server that runs this command now and each \
+                                 time the server starts.";
+
+/// The lead of a card asking to start a registered server nobody approved.
+pub const MCP_START_SUMMARY: &str = "Starts an MCP server whose command nobody has approved \
+                                 yet. It runs this command now and each time the server starts. \
+                                 `<stored value>` stands for a value kept sealed.";
+
+const UNPLACEABLE_MCP_LAUNCH: &str = "Refused by the command guard: this MCP server was NOT \
+                                      started. The engine's working directory is unknown, so \
+                                      the guard cannot tell where the server would run.";
+
+/// The refusal when a launch line cannot be fingerprinted, so no approval of
+/// it could be recorded or checked.
+fn unfingerprintable_mcp_launch(e: impl std::fmt::Display) -> String {
+    format!(
+        "Refused by the command guard: this MCP server was NOT started. Its launch \
+         approval cannot be checked: {e}"
+    )
+}
+
+/// An MCP server launch the guard classifies as the shell line it runs.
+struct GuardedMcpLaunch {
+    server_id: String,
+    /// Of the real line, which a masked `line` never is.
+    fingerprint: String,
+    line: String,
+    lead: &'static str,
+}
+
+/// The MCP server launch `tool_name` would spawn, as the shell line the
+/// guard classifies. `None` when it spawns nothing the guard reads:
+///
+/// - a setup maps to its real line, guard on or off, since its env values
+///   are already in the model's call;
+/// - with the guard on, an `enable` or `start` of an unapproved registered
+///   server maps to its masked line, since stored env values are sealed.
+///   An approved line or a missing server maps to nothing.
+async fn guarded_mcp_launch(
+    pool: &sqlx::PgPool,
+    root: &std::path::Path,
+    spawn_cwd: Option<std::path::PathBuf>,
+    guard_on: bool,
+    tool_name: &str,
+    input: &Value,
+) -> Option<Result<GuardedMcpLaunch, String>> {
+    let action = crate::engine::tools::dispatch_name(tool_name, input).ok()?;
+    if action == tn::SETUP_MCP_SERVER {
+        let line = match command_guard::mcp_setup_command_line(
+            tool_name,
+            input,
+            spawn_cwd.as_deref(),
+            root,
+        )? {
+            Ok(line) => line,
+            Err(refusal) => return Some(Err(refusal)),
+        };
+        // Rendering the line parsed the setup and placed its working
+        // directory, so both hold here. Refuse rather than skip the guard.
+        let (Ok(setup), Some(cwd)) = (
+            crate::engine::tools::mcp::McpSetupRequest::parse(input),
+            spawn_cwd,
+        ) else {
+            return Some(Err(UNPLACEABLE_MCP_LAUNCH.to_string()));
+        };
+        let fingerprint = match setup.launch_spec().fingerprint(&cwd, root) {
+            Ok(fingerprint) => fingerprint,
+            Err(e) => return Some(Err(unfingerprintable_mcp_launch(e))),
+        };
+        return Some(Ok(GuardedMcpLaunch {
+            server_id: setup.id.to_string(),
+            fingerprint,
+            line,
+            lead: MCP_SETUP_SUMMARY,
+        }));
+    }
+    if !guard_on || !matches!(action, tn::ENABLE_MCP_SERVER | tn::START_MCP_SERVER) {
+        return None;
+    }
+    let id = input["id"].as_str()?;
+    let server = match crate::core::McpServerStore::get(pool, id).await {
+        Ok(server) => server?,
+        Err(e) => {
+            return Some(Err(format!(
+                "Refused by the command guard: MCP server '{id}' was NOT started. Its \
+             registration could not be read: {e}"
+            )))
+        }
+    };
+    let Some(cwd) = spawn_cwd else {
+        return Some(Err(UNPLACEABLE_MCP_LAUNCH.to_string()));
+    };
+    let spec = server.launch_spec();
+    let fingerprint = match spec.fingerprint(&cwd, root) {
+        Ok(fingerprint) => fingerprint,
+        Err(e) => return Some(Err(unfingerprintable_mcp_launch(e))),
+    };
+    match crate::core::McpServerStore::is_launch_approved(pool, id, &fingerprint).await {
+        Ok(true) => None,
+        // A row stored before setup refused `=` in a command. The line would
+        // read that command as an assignment and classify the next word.
+        Ok(false) if server.command.contains('=') => Some(Err(format!(
+            "Refused by the command guard: MCP server '{id}' was NOT started. Its command \
+             contains '=', so the guard cannot read what it runs. Ask the user to remove \
+             the server and set it up again with a command path without '='."
+        ))),
+        Ok(false) => Some(Ok(GuardedMcpLaunch {
+            server_id: server.id.clone(),
+            fingerprint,
+            line: spec.command_line(&cwd, root, crate::core::LaunchLineMode::Masked),
+            lead: MCP_START_SUMMARY,
+        })),
+        Err(e) => Some(Err(format!(
+            "Refused by the command guard: MCP server '{id}' was NOT started. Its \
+             launch approval could not be read: {e}"
+        ))),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Allow-pattern derivation (reuses `AllowScope`)
@@ -571,6 +692,16 @@ enum GuardAction {
     FailTrigger(SideEffectCategory),
 }
 
+/// The lane an MCP server setup or start takes for its command's `lane`. A checkpoint
+/// covers one run, but the server runs the command again on every start, with
+/// no checkpoint. So reversible destruction is irreversible here.
+fn mcp_launch_lane(lane: RiskLane) -> RiskLane {
+    match lane {
+        RiskLane::ReversibleDanger => RiskLane::IrreversibleDanger,
+        lane => lane,
+    }
+}
+
 /// Map a resolved lane (+ its side-effect category) + channel + trigger grant to
 /// the guard's action. See [`LucidosEngine::command_guard_decision`] for the
 /// channel-gate rationale (chat turns carry `channel == None`; only triggers
@@ -689,9 +820,44 @@ fn judged(
     }
 }
 
+/// Where a command checkpoint came from: the thread its card sits on, and the
+/// turn that ran the command. The revert lands on that thread and groups into
+/// that turn's exchange, so the card renders as reverted live and on reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandCheckpointOrigin {
+    pub thread_id: Uuid,
+    pub request_event_id: Option<Uuid>,
+}
+
+/// Read a checkpoint's origin off its `CommandCheckpointed` event. `Ok(None)`
+/// means no checkpoint has that id. A read that writes nothing, so a route can
+/// ask it before deciding whether the caller may undo.
+pub async fn command_checkpoint_origin(
+    pool: &sqlx::PgPool,
+    checkpoint_id: &str,
+) -> Result<Option<CommandCheckpointOrigin>, String> {
+    let row: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT thread_id, payload->>'request_event_id' FROM events \
+         WHERE event_type = 'CommandCheckpointed' \
+           AND payload->>'checkpoint_id' = $1 \
+         LIMIT 1",
+    )
+    .bind(checkpoint_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("checkpoint lookup failed: {e}"))?;
+    Ok(match row {
+        Some((Some(thread_id), request_event_id)) => Some(CommandCheckpointOrigin {
+            thread_id,
+            request_event_id: request_event_id.and_then(|s| Uuid::parse_str(&s).ok()),
+        }),
+        _ => None,
+    })
+}
+
 impl LucidosEngine {
     /// The command guard's pre-dispatch decision for one bash/python tool call
-    /// (ADR 0002). With the guard off (`ctx.enabled` false) only a secret read
+    /// or MCP server setup (ADR 0002). With the guard off (`ctx.enabled` false) only a secret read
     /// is gated. Everything else is `Proceed`, so the agentic loop needs no
     /// branch of its own on the `command_guard` preference.
     ///
@@ -727,6 +893,30 @@ impl LucidosEngine {
         meta: &EventMeta,
         cancel_token: &CancellationToken,
     ) -> GuardDecision {
+        // An MCP server setup, or a start of a launch line nobody approved,
+        // spawns a process. It is classified, asked and granted as the shell
+        // command it runs (ADR 0002, MCP addendum).
+        let mcp_launch = match guarded_mcp_launch(
+            &self.pool,
+            self.workspace_path(),
+            std::env::current_dir().ok(),
+            ctx.enabled,
+            tool_name,
+            input,
+        )
+        .await
+        {
+            Some(Err(refusal)) => return GuardDecision::Refuse(refusal),
+            launch => launch.and_then(Result::ok),
+        };
+        let shell_input;
+        let (tool_name, input) = match &mcp_launch {
+            None => (tool_name, input),
+            Some(launch) => {
+                shell_input = serde_json::json!({ "command": launch.line });
+                (tn::RUN_BASH, &shell_input)
+            }
+        };
         // A secret read is gated even with the guard off, since it ships off.
         if !ctx.enabled && !tool_call_reads_secret(tool_name, input) {
             return GuardDecision::Proceed;
@@ -742,8 +932,24 @@ impl LucidosEngine {
         else {
             return GuardDecision::Refuse(canceled_refusal());
         };
+        let lane = match mcp_launch {
+            Some(_) => mcp_launch_lane(lane),
+            None => lane,
+        };
+        // What the card and a trigger failure say. An allowed MCP server keeps
+        // running this command each time it starts, with no further card.
+        let gated_summary = match &mcp_launch {
+            Some(launch) => Some(format!(
+                "{} {}",
+                launch.lead,
+                summary
+                    .clone()
+                    .unwrap_or_else(|| command_guard::permission_summary(tool_name, input))
+            )),
+            None => summary.clone(),
+        };
 
-        match action_for_lane(lane, meta.channel, category, ctx.trigger_grant) {
+        let decision = match action_for_lane(lane, meta.channel, category, ctx.trigger_grant) {
             GuardAction::Proceed => GuardDecision::Proceed,
             GuardAction::Checkpoint => {
                 // Snapshot the workspace before the in-workspace destruction so
@@ -773,7 +979,7 @@ impl LucidosEngine {
                     tool_use_id,
                     meta,
                     cancel_token,
-                    summary.as_deref(),
+                    gated_summary.as_deref(),
                 )
                 .await
             }
@@ -787,10 +993,37 @@ impl LucidosEngine {
                     cat,
                     tool_name,
                     input,
-                    summary.as_deref(),
+                    gated_summary.as_deref(),
                 ))
             }
+        };
+        // With the guard on, a launch it let through is approved. The start
+        // gate in `McpManager` then lets it spawn now and on every later start.
+        // An unrecorded approval refuses here, since the start gate would.
+        if let (true, Some(launch), GuardDecision::Proceed) = (ctx.enabled, &mcp_launch, &decision)
+        {
+            if let Err(e) = crate::core::McpServerStore::approve_launch(
+                &self.pool,
+                &self.event_bus,
+                &launch.server_id,
+                &launch.fingerprint,
+                Some(crate::engine::tools::agent_tool_actor(thread_id)),
+            )
+            .await
+            {
+                crate::log!(
+                    "[CommandGuard] could not record the launch approval for MCP server '{}': {}",
+                    launch.server_id,
+                    e
+                );
+                return GuardDecision::Refuse(format!(
+                    "Refused by the command guard: MCP server '{}' was NOT started. The \
+                     approval could not be saved: {e}. Try again later.",
+                    launch.server_id
+                ));
+            }
         }
+        decision
     }
 
     /// Take the **pre** image before a `ReversibleDanger` command runs (ADR
@@ -898,38 +1131,26 @@ impl LucidosEngine {
 
     /// Undo a command checkpoint (ADR 0002, Phase 4 and the 2026-08-06
     /// addendum): restore the workspace working tree from the pre image, remove
-    /// the files the command created, and emit `CommandCheckpointReverted`. The
-    /// originating thread is resolved from the `CommandCheckpointed` event (so
-    /// the revert lands on the right thread).
+    /// the files the command created, and emit `CommandCheckpointReverted` on
+    /// the thread `origin` names.
+    ///
+    /// Takes the origin [`command_checkpoint_origin`] resolved, so the route can
+    /// weigh the caller's reach over that thread before anything is restored.
     ///
     /// Idempotent: a checkpoint already reverted is an error-free no-op on the
-    /// duplicate, an `Err` only on a genuinely unknown id or a failed git
-    /// restore. The guard for that is the persisted `CommandCheckpointReverted`
-    /// event rather than the absence of the ref, which is what lets the refs
-    /// survive the undo for the card's diff viewer to read.
+    /// duplicate, an `Err` only on a failed git restore. A persisted
+    /// `CommandCheckpointReverted` event marks the duplicate, not a missing ref.
+    /// That lets the refs survive the undo for the card's diff viewer to read.
     pub async fn undo_command_checkpoint(
         &self,
         checkpoint_id: &str,
+        origin: CommandCheckpointOrigin,
         actor: Option<MessageOrigin>,
     ) -> Result<(), String> {
-        // Resolve the thread the checkpoint belongs to (also confirms it exists)
-        // plus the originating turn's request_event_id, so the revert event
-        // groups into the same exchange as the `CommandCheckpointed` card and the
-        // frontend can render it as reverted (live and on reload).
-        let row: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(
-            "SELECT thread_id, payload->>'request_event_id' FROM events \
-             WHERE event_type = 'CommandCheckpointed' \
-               AND payload->>'checkpoint_id' = $1 \
-             LIMIT 1",
-        )
-        .bind(checkpoint_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("checkpoint lookup failed: {e}"))?;
-        let Some((Some(thread_id), request_event_str)) = row else {
-            return Err(format!("no command checkpoint with id {checkpoint_id}"));
-        };
-        let request_event_id = request_event_str.and_then(|s| Uuid::parse_str(&s).ok());
+        let CommandCheckpointOrigin {
+            thread_id,
+            request_event_id,
+        } = origin;
 
         // Already reverted: a second undo is a no-op, and must not re-apply
         // the restore over edits made since the first.
@@ -1568,6 +1789,32 @@ mod tests {
         }
     }
 
+    /// A server reruns its command on every start, past any checkpoint, so a
+    /// setup or start that would checkpoint asks instead.
+    #[test]
+    fn an_mcp_launch_never_takes_the_checkpoint_lane() {
+        assert_eq!(
+            mcp_launch_lane(RiskLane::ReversibleDanger),
+            RiskLane::IrreversibleDanger
+        );
+        assert_eq!(
+            action_for_lane(
+                mcp_launch_lane(RiskLane::ReversibleDanger),
+                None,
+                None,
+                NO_GRANT
+            ),
+            GuardAction::Ask
+        );
+        for lane in [
+            RiskLane::Safe,
+            RiskLane::IrreversibleDanger,
+            RiskLane::Catastrophic,
+        ] {
+            assert_eq!(mcp_launch_lane(lane), lane);
+        }
+    }
+
     #[test]
     fn action_catastrophic_refuses_on_every_channel() {
         for ch in [None, Some(EventChannel::Chat), Some(EventChannel::Trigger)] {
@@ -1900,5 +2147,131 @@ mod tests {
         let c = command_guard::fallback_classify(&ji, CommandSite::TextOnly { root: None });
         assert_eq!(c.lane, RiskLane::IrreversibleDanger);
         assert_eq!(c.category, Some(SideEffectCategory::ExternalApi));
+    }
+
+    /// A setup is approved under the fingerprint the start gate computes for
+    /// the row it registers, so an allowed setup never asks again at start.
+    #[tokio::test]
+    async fn a_setup_maps_to_the_fingerprint_its_start_checks() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let input = serde_json::json!({
+            "id": "srv", "name": "Server", "command": "./server",
+            "args": ["--port", "1"], "env": { "TOKEN": "s3cret-value" },
+        });
+        let launch = guarded_mcp_launch(
+            &pool,
+            root.path(),
+            Some(cwd.clone()),
+            false,
+            tn::SETUP_MCP_SERVER,
+            &input,
+        )
+        .await
+        .expect("a setup is classified")
+        .expect("a known working directory composes");
+        assert_eq!(launch.lead, MCP_SETUP_SUMMARY);
+
+        let env = HashMap::from([(
+            "TOKEN".to_string(),
+            crate::core::McpEnvValue::Plain("s3cret-value".into()),
+        )]);
+        let args = ["--port".to_string(), "1".to_string()];
+        crate::core::McpServerStore::register(
+            &pool, &bus, "srv", "Server", "./server", &args, &env, None,
+        )
+        .await
+        .unwrap();
+        let server = crate::core::McpServerStore::get(&pool, "srv")
+            .await
+            .unwrap()
+            .unwrap();
+        let manager = crate::mcp::McpManager::new(pool.clone(), bus, root.path().to_path_buf());
+        assert_eq!(
+            launch.fingerprint,
+            manager.launch_fingerprint(&server).unwrap()
+        );
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// With the guard on, an agent start of a line nobody approved is read as
+    /// its masked line, which never carries a sealed value. Once approved, or
+    /// with the guard off, a start maps to nothing and runs as before.
+    #[tokio::test]
+    async fn an_unapproved_agent_start_maps_to_its_masked_line() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let env = HashMap::from([(
+            "TOKEN".to_string(),
+            crate::core::McpEnvValue::Plain("s3cret-value".into()),
+        )]);
+        crate::core::McpServerStore::register(&pool, &bus, "srv", "Server", "npx", &[], &env, None)
+            .await
+            .unwrap();
+        let launch_of = |guard_on: bool, input: Value| {
+            let (pool, root, cwd) = (pool.clone(), root.path().to_path_buf(), cwd.clone());
+            async move { guarded_mcp_launch(&pool, &root, Some(cwd), guard_on, tn::MCP, &input).await }
+        };
+        let enable = serde_json::json!({ "action": "enable", "id": "srv" });
+        let start = serde_json::json!({ "action": "start", "id": "srv" });
+
+        for input in [&enable, &start] {
+            let launch = launch_of(true, input.clone()).await.unwrap().unwrap();
+            assert_eq!(launch.lead, MCP_START_SUMMARY);
+            assert!(launch.line.contains("<stored value>"), "{}", launch.line);
+            assert!(!launch.line.contains("s3cret-value"), "{}", launch.line);
+        }
+        assert!(launch_of(false, enable.clone()).await.is_none());
+        let missing = serde_json::json!({ "action": "enable", "id": "nope" });
+        assert!(launch_of(true, missing).await.is_none());
+
+        let launch = launch_of(true, enable.clone()).await.unwrap().unwrap();
+        crate::core::McpServerStore::approve_launch(
+            &pool,
+            &bus,
+            &launch.server_id,
+            &launch.fingerprint,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(launch_of(true, enable).await.is_none());
+        assert!(launch_of(true, start).await.is_none());
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Setup now refuses `=` in a command, but an older row may hold one. Its
+    /// line misreads, so an unapproved start of it is refused outright.
+    #[tokio::test]
+    async fn an_unapproved_start_of_a_legacy_command_holding_equals_is_refused() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        crate::core::McpServerStore::register(
+            &pool,
+            &bus,
+            "srv",
+            "Server",
+            "MODE=x/server",
+            &[],
+            &HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let input = serde_json::json!({ "action": "start", "id": "srv" });
+        let refusal = guarded_mcp_launch(&pool, root.path(), Some(cwd), true, tn::MCP, &input)
+            .await
+            .expect("an unapproved start is classified")
+            .err()
+            .expect("a command holding '=' is refused");
+        assert!(refusal.contains("was NOT started"), "{refusal}");
+        assert!(refusal.contains("set it up again"), "{refusal}");
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 }

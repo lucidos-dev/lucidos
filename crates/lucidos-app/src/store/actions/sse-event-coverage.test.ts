@@ -202,7 +202,7 @@ describe('every SystemEvent is answered or written down', () => {
   it('names every surface this change wired, so removing one is loud', () => {
     for (const name of [
       'McpServerRegistered', 'McpServerUpdated', 'McpServerRemoved',
-      'McpServerStopped', 'McpServerDisabledToolsChanged',
+      'McpServerStopped', 'McpServerDisabledToolsChanged', 'McpLaunchApproved',
       'WebhookCreated', 'WebhookUpdated', 'WebhookDeleted',
       'PermissionGrantsChanged',
       'PluginInstallCanceled', 'PluginUninstallCanceled',

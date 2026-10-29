@@ -27,7 +27,7 @@ import {
 } from './connectionNotice';
 import type { ConnectionStatus } from '../store/types';
 
-const DIMMED: ConnectionStatus[] = ['disconnected', 'connecting', 'stopped'];
+const DIMMED: ConnectionStatus[] = ['disconnected', 'connecting', 'stopped', 'starting'];
 
 /** The mark's readable half. It is the accessible name AND the desktop hover
  *  tooltip, so it has to read as English in all three states and survive the
@@ -46,6 +46,11 @@ describe('connectionPhrase', () => {
   it('says a stopped workspace is stopped, because the gateway said so itself', () => {
     expect(connectionPhrase('stopped', 'dev')).toBe('the dev engine is stopped');
     expect(connectionPhrase('stopped', null)).toBe('the engine is stopped');
+  });
+
+  it('says a started workspace is starting, never that it cannot be reached', () => {
+    expect(connectionPhrase('starting', 'dev')).toBe('the dev engine is starting');
+    expect(connectionNotice('starting', 'dev', 'full')!.detail).not.toContain('Retrying');
   });
 
   it('claims the reach and never the engine, which is all a failed poll knows', () => {
@@ -173,6 +178,9 @@ describe('isEngineUnreachable', () => {
     expect(isEngineUnreachable('disconnected')).toBe(true);
     expect(isEngineUnreachable('stopped')).toBe(true);
     expect(isEngineUnreachable('connecting')).toBe(false);
+    // A booting engine is about to answer: a thread keeps loading, rather than
+    // saying it cannot reach the workspace the user just started.
+    expect(isEngineUnreachable('starting')).toBe(false);
     expect(isEngineUnreachable('connected')).toBe(false);
   });
 });

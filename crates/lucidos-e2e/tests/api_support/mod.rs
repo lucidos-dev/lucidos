@@ -403,6 +403,31 @@ pub fn http_client() -> reqwest::Client {
         .expect("Failed to build HTTP client")
 }
 
+/// A WebSocket handshake carrying an `Origin`, which is what a browser sends.
+///
+/// Chromium and Gecko send no fetch metadata on a WebSocket handshake, so the
+/// engine's same-origin gate falls back to comparing `Origin` against `Host`
+/// (ADR 0163). Direct to the engine those agree, and this is what proves it
+/// against the real middleware stack. Omitting the header is what let the
+/// gate's behaviour here go untested until a call was refused in the field.
+///
+/// `Connection` stays the single token reqwest is known to carry. The list form
+/// a browser writes is the gateway's business, and its own
+/// `a_connection_list_still_names_the_upgrade` already pins it.
+pub fn browser_handshake(
+    client: &reqwest::Client,
+    path: &str,
+    origin: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(format!("{}{path}", base_url()))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", b64(&[0u8; 16]))
+        .header("origin", origin)
+}
+
 /// Put `device_id` in the `devices` table, so a header naming it is evidence.
 ///
 /// `api::actor::require_user_actor` suppresses an id that names no row, so an

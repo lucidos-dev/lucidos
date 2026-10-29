@@ -55,7 +55,7 @@ beforeEach(() => {
 });
 
 describe('loadAllThreads reports whether it actually loaded', () => {
-  it('runs one request for overlapping callers, and tells the second it did not load', async () => {
+  it('tells an overlapping caller it did not load, and reloads once for it', async () => {
     const gate = deferredResponse();
     fetchThreadsMock.mockReturnValue(gate.promise);
 
@@ -64,10 +64,25 @@ describe('loadAllThreads reports whether it actually loaded', () => {
     // fetch hanging across an iOS suspension, and joining would block every
     // later caller for the length of it.
     expect(await loadAllThreads()).toBe(false);
+    expect(fetchThreadsMock).toHaveBeenCalledTimes(1);
 
+    // The open read may predate whatever made the second caller ask, such as
+    // an event gap. So one more read starts after it.
     gate.resolve();
     expect(await first).toBe(true);
-    expect(fetchThreadsMock).toHaveBeenCalledTimes(1);
+    expect(fetchThreadsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('folds every overlapping caller into one reload', async () => {
+    const gate = deferredResponse();
+    fetchThreadsMock.mockReturnValue(gate.promise);
+
+    const first = loadAllThreads();
+    expect(await Promise.all([loadAllThreads(), loadAllThreads()])).toEqual([false, false]);
+
+    gate.resolve();
+    await first;
+    expect(fetchThreadsMock).toHaveBeenCalledTimes(2);
   });
 
   it('starts a fresh load once the previous one has settled', async () => {

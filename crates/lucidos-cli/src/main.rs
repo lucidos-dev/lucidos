@@ -1026,7 +1026,8 @@ pub(crate) struct BuildSlotArgs {
     /// 75. Omit it to wait: a second build is wanted, just not concurrently.
     #[arg(long = "max-wait", value_name = "SECONDS")]
     pub(crate) max_wait: Option<u64>,
-    /// What to call this build in the slot listing. Defaults to the command.
+    /// What to call this build in the slot listing and its events. Defaults
+    /// to the program name alone, never its arguments.
     #[arg(long)]
     pub(crate) label: Option<String>,
     /// The command to run, after `--`.

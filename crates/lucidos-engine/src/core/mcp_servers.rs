@@ -269,6 +269,112 @@ pub async fn launch_env(
     Ok(env)
 }
 
+/// What an MCP server launch spawns: a command, its arguments and its
+/// environment. A setup request and a stored row each describe one.
+#[derive(Clone, Copy)]
+pub struct LaunchSpec<'a> {
+    pub command: &'a str,
+    pub args: &'a [String],
+    pub env: &'a HashMap<String, McpEnvValue>,
+}
+
+/// How a launch line shows a plain env value. A credential pointer always
+/// shows as `<credential NAME>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchLineMode {
+    /// The value verbatim. Only the fingerprint reads a stored row this way,
+    /// since a stored plain value is sealed at rest.
+    Real,
+    /// Each plain value as `<stored value>`, safe for a card, an event or
+    /// the model.
+    Masked,
+}
+
+impl LaunchSpec<'_> {
+    /// The shell line this launch amounts to, for the command guard to read
+    /// as a `run_bash` command.
+    ///
+    /// The spawn runs the command with its arguments and environment, through
+    /// no shell, in `spawn_cwd`. The line states each part: a `VAR=` preamble
+    /// for the environment, and a `cd` when the spawn does not run in `root`,
+    /// where a bash command runs.
+    pub fn command_line(
+        &self,
+        spawn_cwd: &std::path::Path,
+        root: &std::path::Path,
+        mode: LaunchLineMode,
+    ) -> String {
+        let mut words = Vec::new();
+        if !same_directory(spawn_cwd, root) {
+            words.extend(["cd".to_string(), shell_word(&spawn_cwd.to_string_lossy())]);
+            words.push("&&".to_string());
+        }
+        let mut env: Vec<_> = self.env.iter().collect();
+        env.sort_by_key(|(name, _)| name.as_str());
+        for (name, value) in env {
+            let value = match (value, mode) {
+                (McpEnvValue::Plain(v), LaunchLineMode::Real) => shell_word(v),
+                (McpEnvValue::Plain(_), LaunchLineMode::Masked) => shell_word("<stored value>"),
+                (McpEnvValue::Credential { credential }, _) => {
+                    shell_word(&format!("<credential {credential}>"))
+                }
+            };
+            words.push(format!("{name}={value}"));
+        }
+        words.push(shell_word(self.command));
+        words.extend(self.args.iter().map(|a| shell_word(a)));
+        words.join(" ")
+    }
+
+    /// The *launch fingerprint*: HMAC-SHA256 of the real line under the
+    /// secret store key, in hex. A changed command, argument, env value or
+    /// spawn directory changes it.
+    ///
+    /// The key is what keeps the sealed values it covers sealed. Every other
+    /// part of the line is readable, so an unkeyed hash of a short value
+    /// could be guessed offline from the stored row.
+    pub fn fingerprint(
+        &self,
+        spawn_cwd: &std::path::Path,
+        root: &std::path::Path,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        use hmac::Mac;
+        let line = self.command_line(spawn_cwd, root, LaunchLineMode::Real);
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret_store::key()?.as_bytes())?;
+        mac.update(b"mcp-launch-fingerprint\0");
+        mac.update(line.as_bytes());
+        Ok(crate::api::hex::hex_lower(&mac.finalize().into_bytes()))
+    }
+}
+
+impl McpServer {
+    pub fn launch_spec(&self) -> LaunchSpec<'_> {
+        LaunchSpec {
+            command: &self.command,
+            args: &self.args,
+            env: &self.env,
+        }
+    }
+}
+
+/// Whether two paths name one directory, symlinks resolved where they can be.
+fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let resolve =
+        |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    resolve(a) == resolve(b)
+}
+
+/// `s` as one shell word: bare when every character is inert, otherwise
+/// single-quoted, with each `'` written as `'\''`.
+pub(crate) fn shell_word(s: &str) -> String {
+    let inert = |c: char| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c);
+    if !s.is_empty() && s.chars().all(inert) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 impl McpServerStore {
     /// Move the env values of every server written before credential
     /// pointers existed into `secret` credentials named `mcp-<id>-<VAR>`,
@@ -407,7 +513,8 @@ impl McpServerStore {
         id: &str,
     ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
         let env_credentials: Option<serde_json::Value> = sqlx::query_scalar(
-            "DELETE FROM mcp_servers WHERE id = $1 \
+            "WITH approvals AS (DELETE FROM mcp_launch_approvals WHERE server_id = $1) \
+             DELETE FROM mcp_servers WHERE id = $1 \
              RETURNING COALESCE(env_credentials, '{}'::jsonb)",
         )
         .bind(id)
@@ -665,6 +772,67 @@ impl McpServerStore {
         }
         Ok(outcome.is_some())
     }
+
+    /// Record that `fingerprint` (see [`LaunchSpec::fingerprint`]) is an
+    /// approved launch line for `server_id`, and announce it. Announces only a
+    /// new approval: re-approving an approved line changes no permission.
+    pub async fn approve_launch(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        server_id: &str,
+        fingerprint: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let inserted = sqlx::query(
+            "INSERT INTO mcp_launch_approvals (server_id, fingerprint) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(server_id)
+        .bind(fingerprint)
+        .execute(pool)
+        .await?
+        .rows_affected()
+            > 0;
+        if inserted {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::McpLaunchApproved {
+                        server_id: server_id.to_string(),
+                        actor,
+                    }),
+                    "[MCP] McpLaunchApproved",
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Whether someone approved `fingerprint` as `server_id`'s launch line.
+    pub async fn is_launch_approved(
+        pool: &PgPool,
+        server_id: &str,
+        fingerprint: &str,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM mcp_launch_approvals \
+             WHERE server_id = $1 AND fingerprint = $2)",
+        )
+        .bind(server_id)
+        .bind(fingerprint)
+        .fetch_one(pool)
+        .await
+    }
+
+    /// Every approved launch line, as `(server_id, fingerprint)` pairs.
+    pub async fn launch_approvals(
+        pool: &PgPool,
+    ) -> Result<std::collections::HashSet<(String, String)>, sqlx::Error> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT server_id, fingerprint FROM mcp_launch_approvals")
+                .fetch_all(pool)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
 }
 
 #[cfg(test)]
@@ -704,6 +872,155 @@ mod tests {
             crate::mcp::McpManager::parse_mcp_tool_name(&wire),
             Some((longest, "x".to_string()))
         );
+    }
+
+    fn spec_env() -> HashMap<String, McpEnvValue> {
+        HashMap::from([
+            (
+                "API_KEY".to_string(),
+                McpEnvValue::Plain("sk-live-1".to_string()),
+            ),
+            (
+                "TOKEN".to_string(),
+                McpEnvValue::Credential {
+                    credential: "gh".to_string(),
+                },
+            ),
+        ])
+    }
+
+    #[test]
+    fn the_masked_launch_line_never_holds_a_plain_value() {
+        let ws = tempfile::tempdir().unwrap();
+        let args = vec!["s.js".to_string()];
+        let env = spec_env();
+        let spec = LaunchSpec {
+            command: "node",
+            args: &args,
+            env: &env,
+        };
+        let masked = spec.command_line(ws.path(), ws.path(), LaunchLineMode::Masked);
+        assert_eq!(
+            masked,
+            "API_KEY='<stored value>' TOKEN='<credential gh>' node s.js"
+        );
+        assert!(!masked.contains("sk-live-1"));
+        assert_eq!(
+            spec.command_line(ws.path(), ws.path(), LaunchLineMode::Real),
+            "API_KEY=sk-live-1 TOKEN='<credential gh>' node s.js"
+        );
+    }
+
+    /// Re-registering with any part changed needs a new approval.
+    #[test]
+    fn every_part_of_a_launch_moves_its_fingerprint() {
+        let ws = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let root = ws.path();
+        let args = vec!["s.js".to_string()];
+        let other_args = vec!["t.js".to_string()];
+        let env = spec_env();
+        let mut other_env = spec_env();
+        other_env.insert(
+            "API_KEY".to_string(),
+            McpEnvValue::Plain("sk-live-2".to_string()),
+        );
+        let base = LaunchSpec {
+            command: "node",
+            args: &args,
+            env: &env,
+        };
+        let print = base.fingerprint(root, root).unwrap();
+        assert_eq!(print, base.fingerprint(root, root).unwrap(), "stable");
+        assert_eq!(print.len(), 64);
+        let variants = [
+            LaunchSpec {
+                command: "deno",
+                ..base
+            }
+            .fingerprint(root, root),
+            LaunchSpec {
+                args: &other_args,
+                ..base
+            }
+            .fingerprint(root, root),
+            LaunchSpec {
+                env: &other_env,
+                ..base
+            }
+            .fingerprint(root, root),
+            base.fingerprint(elsewhere.path(), root),
+        ];
+        for variant in variants {
+            assert_ne!(variant.unwrap(), print);
+        }
+    }
+
+    /// A database reader sees the row and its fingerprint. Without the key,
+    /// hashing guessed lines must not reproduce the fingerprint.
+    #[test]
+    fn a_launch_fingerprint_is_keyed() {
+        use sha2::{Digest, Sha256};
+        let ws = tempfile::tempdir().unwrap();
+        let args = vec!["s.js".to_string()];
+        let env = spec_env();
+        let spec = LaunchSpec {
+            command: "node",
+            args: &args,
+            env: &env,
+        };
+        let line = spec.command_line(ws.path(), ws.path(), LaunchLineMode::Real);
+        let unkeyed = crate::api::hex::hex_lower(&Sha256::digest(line.as_bytes()));
+        assert_ne!(spec.fingerprint(ws.path(), ws.path()).unwrap(), unkeyed);
+    }
+
+    /// An approval is a permission decision: it lands on the timeline with who
+    /// made it. Re-approving stays silent, and removing the server drops its
+    /// approvals, so a later server under the same id must ask again.
+    #[tokio::test]
+    async fn a_launch_approval_announces_with_its_actor() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &[], &HashMap::new(), None)
+            .await
+            .unwrap();
+        let actor = MessageOrigin::Device {
+            device_id: "dev-1".into(),
+        };
+        assert!(!McpServerStore::is_launch_approved(&pool, "srv", "fp")
+            .await
+            .unwrap());
+
+        for _ in 0..2 {
+            McpServerStore::approve_launch(&pool, &bus, "srv", "fp", Some(actor.clone()))
+                .await
+                .unwrap();
+        }
+        assert!(McpServerStore::is_launch_approved(&pool, "srv", "fp")
+            .await
+            .unwrap());
+        assert!(!McpServerStore::is_launch_approved(&pool, "srv", "other")
+            .await
+            .unwrap());
+        let actors: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT payload->'data'->'actor'->>'device_id' FROM events \
+             WHERE event_type = 'McpLaunchApproved' AND aggregate_id = 'srv'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actors, vec![Some("dev-1".to_string())]);
+
+        McpServerStore::unregister(&pool, &bus, "srv", None)
+            .await
+            .unwrap();
+        McpServerStore::register(&pool, &bus, "srv", "Srv", "cmd", &[], &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(!McpServerStore::is_launch_approved(&pool, "srv", "fp")
+            .await
+            .unwrap());
+        crate::test_support::teardown_test_db(&db_name).await;
     }
 
     /// Registering an MCP server changes the agent's own tool surface, and

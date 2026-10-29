@@ -13,6 +13,9 @@ import {
   type StyleOf,
 } from './paneSwipe';
 
+/** The origin the host serves app frames from, as the SDK reads it. */
+const HOST_ORIGIN = 'https://localhost:5251';
+
 describe('SwipeTouch', () => {
   it('starts dx at 0 when crossing the lock threshold (no dead-zone jump)', () => {
     // Without subtracting LOCK_THRESHOLD on lock, the first frame after the
@@ -370,17 +373,19 @@ describe('installAppPaneSwipe', () => {
     cleanup();
     cleanup = () => {};
     delete (window as unknown as { parent?: unknown }).parent;
+    vi.unstubAllGlobals();
   });
 
   it('posts the drag and the release to the host', () => {
     const postMessage = vi.fn();
     (window as unknown as { parent: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
     cleanup = installAppPaneSwipe();
     window.dispatchEvent(touch('touchstart', [[200, 100]], { target: chain({}) }));
     window.dispatchEvent(touch('touchmove', [[180, 100]]));
     window.dispatchEvent(touch('touchend', []));
-    expect(postMessage).toHaveBeenCalledWith({ type: APP_SWIPE_MESSAGE_TYPE, dx: -12 }, '*');
-    expect(postMessage).toHaveBeenLastCalledWith({ type: APP_SWIPE_END_MESSAGE_TYPE, paneDelta: 0 }, '*');
+    expect(postMessage).toHaveBeenCalledWith({ type: APP_SWIPE_MESSAGE_TYPE, dx: -12 }, HOST_ORIGIN);
+    expect(postMessage).toHaveBeenLastCalledWith({ type: APP_SWIPE_END_MESSAGE_TYPE, paneDelta: 0 }, HOST_ORIGIN);
   });
 
   it('does nothing at the top level, where there is no host', () => {

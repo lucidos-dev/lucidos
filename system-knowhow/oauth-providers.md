@@ -39,6 +39,15 @@ When a service needs OAuth client credentials:
    again: a credential fully describes its own flow. `client_secret` and
    `redirect_uri` are optional; the two sections below say what their absence
    means.
+4. `auth_url`, `token_url` and `userinfo_url` must use `https`. The save, the
+   connect and every refresh refuse plain `http`, which would send the client
+   secret and tokens in cleartext. Lucidos never follows an endpoint's redirect
+   to plain `http` either. The one exception is a loopback host (`localhost`,
+   `127.0.0.1`, `[::1]`) for a local test provider.
+
+   Plain `http` on a private network is refused too: a Docker host name, a LAN
+   address, a tailnet name. Lucidos cannot tell that such a link is safe. Put
+   the provider behind TLS, then edit the credential to the `https` URL.
 
 **Read the result; do not assume it all worked.** A provider can grant only part
 of the request and still complete the authorization. `connect_oauth_account`

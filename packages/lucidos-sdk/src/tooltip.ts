@@ -179,6 +179,26 @@ function buildTooltipRows(rowsJson: string): HTMLElement[] {
   });
 }
 
+/** Splits a `data-tooltip` value into its text and a key combo, which draws
+ *  as a chip on its own row. A control character, so no prose contains it. */
+export const TOOLTIP_SHORTCUT_SEPARATOR = '\u001f';
+
+/** Pure: the text and the optional key combo of a `data-tooltip` value. */
+export function splitTooltipShortcut(value: string): { text: string; shortcut: string | null } {
+  const at = value.lastIndexOf(TOOLTIP_SHORTCUT_SEPARATOR);
+  if (at < 0) return { text: value, shortcut: null };
+  return { text: value.slice(0, at), shortcut: value.slice(at + TOOLTIP_SHORTCUT_SEPARATOR.length) };
+}
+
+function buildShortcutRow(shortcut: string): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'tooltip-shortcut';
+  const key = document.createElement('kbd');
+  key.textContent = shortcut;
+  row.appendChild(key);
+  return row;
+}
+
 /** The markup opt-out. Set it to `off` on `<html>` or `<body>`. */
 export const TOOLTIPS_ATTR = 'data-lucidos-tooltips';
 
@@ -315,9 +335,11 @@ export function installTooltips(options: TooltipOptions = {}): () => void {
     if (rowsJson !== null) {
       textEl.classList.add('tooltip-rows');
       textEl.replaceChildren(...buildTooltipRows(rowsJson));
-    } else {
+    } else if (text !== null) {
       textEl.classList.remove('tooltip-rows');
-      textEl.textContent = text;
+      const { text: body, shortcut } = splitTooltipShortcut(text);
+      textEl.textContent = body;
+      if (shortcut) textEl.appendChild(buildShortcutRow(shortcut));
     }
 
     // Skip the show-time opacity dance when we are re-positioning a tooltip

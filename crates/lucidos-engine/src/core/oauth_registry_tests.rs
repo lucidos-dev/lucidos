@@ -159,6 +159,21 @@ fn the_shipped_registry_parses_and_every_row_is_usable() {
     }
 }
 
+/// A row prefills a credential, so its endpoints must pass the same https rule
+/// the save applies. The row's field names are the credential's keys.
+#[test]
+fn every_shipped_row_names_only_secure_endpoints() {
+    for row in shipped_rows() {
+        let as_credential = serde_json::to_string(&row).unwrap();
+        assert_eq!(
+            crate::core::oauth::check_client_endpoints(&row.id, &as_credential),
+            Ok(()),
+            "{} would prefill a credential the save refuses",
+            row.id
+        );
+    }
+}
+
 /// How long a console hint may be, in characters.
 ///
 /// Both hints are rendered VERBATIM, and as of 2026-08-07 in four places: the

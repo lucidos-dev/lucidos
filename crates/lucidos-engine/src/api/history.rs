@@ -932,7 +932,17 @@ pub(super) async fn query_events(
             )
         })?;
     match result {
-        crate::core::store::QueryEventsResult::Events(events) => Ok(Json(events)),
+        crate::core::store::QueryEventsResult::Events(mut events) => {
+            crate::engine::mask_stored_events(&state.pool, &mut events)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("events withheld, since they could not be masked: {e}"),
+                    )
+                })?;
+            Ok(Json(events))
+        }
         crate::core::store::QueryEventsResult::CursorNotFound => Err((
             StatusCode::NOT_FOUND,
             "cursor event_id not found".to_string(),

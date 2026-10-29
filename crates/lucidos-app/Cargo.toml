@@ -117,9 +117,14 @@ objc2-user-notifications = { version = "0.3", features = [
 # NSView frames on the buttons and on their NSTitlebarContainerView. Tauri
 # exposes no runtime setter for this, so we drive AppKit directly; the module
 # doc says why.
+#
+# NSEvent + block2 are the preview's undo key monitor (src/preview_undo.rs):
+# `addLocalMonitorForEventsMatchingMask:handler:` takes a block.
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSResponder",
+    "NSEvent",
+    "block2",
     "NSDockTile",
     "NSWindow",
     "NSView",

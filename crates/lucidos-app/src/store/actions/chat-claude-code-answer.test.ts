@@ -31,6 +31,8 @@ vi.mock('../../utils/clientLog', () => ({ postClientLog: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom }));
 vi.mock('../../utils/threadOpenMarks', () => ({ markThreadRerenderStart, clearThreadRerenderStart }));
 vi.mock('../../utils/renderPhaseTimers', () => ({ currentPerfBaseline: () => ({ start: 0, md: 0, link: 0 }) }));
+const probeStreamAfterSend = vi.fn();
+vi.mock('./send-probe', () => ({ probeStreamAfterSend }));
 vi.mock('./thread-sync', () => ({}));
 vi.mock('./threads', () => ({}));
 const position = { input_chain: 'page-chain', input_seq: 7 };
@@ -61,6 +63,28 @@ describe('answerThreadQuestion', () => {
 
     expect(apiAnswerThreadQuestion).toHaveBeenCalledTimes(1);
     expect(scrollToBottom).not.toHaveBeenCalled();
+  });
+
+  it('probes the stream after an accepted answer, confirmed by the card\'s UserQuestionAnswered', async () => {
+    await answerThreadQuestion('t1', 'tool-use-1', pick);
+
+    expect(probeStreamAfterSend).toHaveBeenCalledTimes(1);
+    const [threadId, confirmed] = probeStreamAfterSend.mock.calls[0] as unknown as [string, () => boolean];
+    expect(threadId).toBe('t1');
+
+    threadMap.value = new Map([['t1', { events: new Map([[1, { type: 'UserQuestionAnswered', tool_use_id: 'other' }]]) }]]);
+    expect(confirmed()).toBe(false);
+    threadMap.value = new Map([['t1', { events: new Map([[2, { type: 'UserQuestionAnswered', tool_use_id: 'tool-use-1' }]]) }]]);
+    expect(confirmed()).toBe(true);
+    threadMap.value = new Map();
+  });
+
+  it('never probes an answer the engine refused', async () => {
+    apiAnswerThreadQuestion.mockRejectedValue(new ApiError(500, 'boom'));
+
+    await answerThreadQuestion('t1', 'tool-use-1', pick);
+
+    expect(probeStreamAfterSend).not.toHaveBeenCalled();
   });
 
   it('optimistically marks the thread answering before the request, and does NOT clear on success', async () => {

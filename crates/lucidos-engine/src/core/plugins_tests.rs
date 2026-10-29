@@ -865,6 +865,87 @@ fn validate_tree_rejects_a_top_level_symlink_named_as_a_content_dir() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn validate_tree_never_reads_a_symlinked_manifest() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, outside) = tmpdir("validate_manifest_outside");
+    fs::write(outside.join("manifest.toml"), VALID_MANIFEST).unwrap();
+
+    let (_tmp, dir) = tmpdir("validate_manifest_symlink");
+    write_valid_plugin(&dir);
+    fs::remove_file(dir.join("manifest.toml")).unwrap();
+    symlink(outside.join("manifest.toml"), dir.join("manifest.toml")).unwrap();
+
+    assert!(matches!(
+        validate_tree(&dir),
+        Err(ValidationError::MissingManifest)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn read_manifest_keeps_a_linked_file_out_of_its_error() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, outside) = tmpdir("read_manifest_outside");
+    fs::write(outside.join("secret.txt"), "password: canary-secret-7f3a\n").unwrap();
+
+    let (_tmp, dir) = tmpdir("read_manifest_symlink");
+    symlink(outside.join("secret.txt"), dir.join("manifest.toml")).unwrap();
+
+    let err = read_manifest(&dir).expect_err("a linked manifest must be refused");
+    assert_eq!(err, ValidationError::MissingManifest);
+    assert!(!err.to_string().contains("canary-secret"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_tree_never_reads_a_symlinked_widget_manifest() {
+    use std::os::unix::fs::symlink;
+    // Read, this widget manifest would fail: it names no origin plugin.
+    let (_tmp, outside) = tmpdir("validate_widget_outside");
+    fs::write(
+        outside.join("manifest.json"),
+        r#"{"name": "w", "kind": "widget"}"#,
+    )
+    .unwrap();
+
+    let (_tmp, dir) = tmpdir("validate_widget_symlink");
+    write_valid_plugin(&dir);
+    fs::create_dir_all(dir.join("apps/w")).unwrap();
+    symlink(
+        outside.join("manifest.json"),
+        dir.join("apps/w/manifest.json"),
+    )
+    .unwrap();
+
+    assert!(validate_tree(&dir).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn clone_subpath_root_refuses_a_symlink_on_the_way() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, outside) = tmpdir("subpath_outside");
+    write_valid_plugin(&outside.join("plugin"));
+    let (_tmp, clone) = tmpdir("subpath_clone");
+    fs::create_dir_all(clone.join("plugins/real")).unwrap();
+    symlink(&outside, clone.join("linked")).unwrap();
+    symlink(outside.join("plugin"), clone.join("plugins/leaf")).unwrap();
+
+    assert_eq!(clone_subpath_root(&clone, None), Ok(clone.clone()));
+    assert_eq!(
+        clone_subpath_root(&clone, Some("plugins/real")),
+        Ok(clone.join("plugins/real"))
+    );
+    for sub in ["linked/plugin", "plugins/leaf", "missing"] {
+        assert_eq!(
+            clone_subpath_root(&clone, Some(sub)),
+            Err(format!("subpath not found inside repo: {sub}")),
+        );
+    }
+}
+
 // --- compare_versions ---
 
 #[test]

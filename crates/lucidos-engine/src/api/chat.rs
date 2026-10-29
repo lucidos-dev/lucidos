@@ -810,6 +810,13 @@ async fn remove_queued_message(
     let message_id = Uuid::parse_str(&request.message_id).map_err(|_| {
         ApiError::bad_request(format!("Invalid message_id {:?}", request.message_id))
     })?;
+    crate::api::thread_reach::refuse_without_authority(
+        &state.engine.event_bus,
+        &headers,
+        Some(thread_id),
+        crate::api::thread_reach::ThreadReachVerb::Control,
+    )
+    .await?;
 
     let already_removed = queued_message_already_removed(&state.pool, thread_id, message_id)
         .await

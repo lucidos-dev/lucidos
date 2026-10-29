@@ -635,9 +635,10 @@
     opacity: var(--header-mark-disconnected-opacity);
 }
 
-/* Connecting: dimmed and breathing, so it is not mistaken for the settled
-   disconnected state at a glance. */
-.brand-mark[data-conn="connecting"] .brand-mark-glyph {
+/* Connecting and starting: dimmed and breathing, so neither is mistaken for
+   the settled disconnected state at a glance. */
+.brand-mark[data-conn="connecting"] .brand-mark-glyph,
+.brand-mark[data-conn="starting"] .brand-mark-glyph {
     animation: brand-mark-breathe var(--header-mark-breathe-duration) ease-in-out infinite;
 }
 
@@ -657,7 +658,8 @@
  * above, since an attribute selector scores as a class, and the mark keeps
  * pulsing for a user who asked for no motion. Pinned by
  * styles/__tests__/header-mark-geometry.test.ts. */
-:root[data-motion="reduce"] .brand-mark[data-conn="connecting"] .brand-mark-glyph {
+:root[data-motion="reduce"] .brand-mark[data-conn="connecting"] .brand-mark-glyph,
+:root[data-motion="reduce"] .brand-mark[data-conn="starting"] .brand-mark-glyph {
     animation: none;
     opacity: var(--header-mark-connecting-opacity-min);
 }

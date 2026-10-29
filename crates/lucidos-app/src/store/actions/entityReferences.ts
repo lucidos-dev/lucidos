@@ -439,6 +439,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'McpServerUpdated':
     case 'McpServerRemoved':
     case 'McpServerStopped':
+    case 'McpLaunchApproved':
     case 'McpServerDisabledToolsChanged':
       mcpServersVersion.value++;
       break;

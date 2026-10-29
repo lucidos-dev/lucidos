@@ -143,30 +143,21 @@ pub(crate) fn fetch_source(
             )?;
             let _ = std::fs::remove_dir_all(clone_target.join(".git"));
 
-            let plugin_root = match subpath {
-                Some(sub) => {
-                    // The subpath is parsed out of an LLM-supplied source string,
-                    // so it must be validated before the join. A `..` run (or a
-                    // leading `/`, which `Path::join` substitutes wholesale)
-                    // escapes the scratch dir, and the escaped directory's
-                    // contents get copied into the workspace `data/` on Confirm.
-                    if crate::core::is_path_traversal(sub) {
-                        return Err(format!(
-                            "rejected plugin subpath '{}': must be relative with no '..', \
-                             leading '/' or leading '\\'",
-                            sub
-                        ));
-                    }
-                    clone_target.join(sub)
-                }
-                None => clone_target.clone(),
-            };
-            if !plugin_root.is_dir() {
+            // The subpath comes from an LLM-supplied source string. A `..` run
+            // or a leading `/` escapes the scratch dir, and Confirm would copy
+            // the escaped directory into the workspace `data/`.
+            if let Some(sub) = subpath
+                .as_deref()
+                .filter(|s| crate::core::is_path_traversal(s))
+            {
                 return Err(format!(
-                    "subpath not found inside repo: {}",
-                    subpath.as_deref().unwrap_or("")
+                    "rejected plugin subpath '{}': must be relative with no '..', \
+                     leading '/' or leading '\\'",
+                    sub
                 ));
             }
+            let plugin_root =
+                crate::core::plugins::clone_subpath_root(&clone_target, subpath.as_deref())?;
             Ok((scratch, plugin_root, SourceType::Git))
         }
         Source::Archive(path) => {

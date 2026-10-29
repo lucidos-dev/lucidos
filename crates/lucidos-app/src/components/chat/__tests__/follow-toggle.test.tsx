@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /** The follow toggle floats over the composer's top edge, in the down
  *  chevron's slot, and its shortcut presses what it presses.
  *

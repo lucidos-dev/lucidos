@@ -695,18 +695,24 @@ pub const NOT_THE_OWNERS_DEVICE: &str =
 
 /// [`require_owner_device`], with a refusal that names this route's act
 /// instead of thread deletion.
+///
+/// `device_id_override` is [`require_user_actor`]'s: a device the request
+/// names somewhere other than the header.
 pub(crate) async fn require_owner_device_for(
     headers: &axum::http::HeaderMap,
     pool: &PgPool,
+    device_id_override: Option<&str>,
     refusal: &'static str,
 ) -> Result<MessageOrigin, super::error::ApiError> {
-    require_owner_device(headers, pool).await.map_err(|e| {
-        if e.status == axum::http::StatusCode::FORBIDDEN {
-            super::error::ApiError::new(e.status, refusal)
-        } else {
-            e
-        }
-    })
+    owner_device(headers, pool, device_id_override)
+        .await
+        .map_err(|e| {
+            if e.status == axum::http::StatusCode::FORBIDDEN {
+                super::error::ApiError::new(e.status, refusal)
+            } else {
+                e
+            }
+        })
 }
 
 /// [`require_user_actor`], narrowed to the workspace owner at one of their own
@@ -733,6 +739,15 @@ pub(crate) async fn require_owner_device(
     headers: &axum::http::HeaderMap,
     pool: &PgPool,
 ) -> Result<MessageOrigin, super::error::ApiError> {
+    owner_device(headers, pool, None).await
+}
+
+/// [`require_owner_device`], taking [`require_user_actor`]'s override.
+async fn owner_device(
+    headers: &axum::http::HeaderMap,
+    pool: &PgPool,
+    device_id_override: Option<&str>,
+) -> Result<MessageOrigin, super::error::ApiError> {
     // An app iframe loads on the engine's own origin and reads the shell's
     // `localStorage`. Its `fetch` therefore carries the owner's real device id
     // (ADR 0117, ADR 0144). Defense in depth rather than a boundary, and the
@@ -752,7 +767,7 @@ pub(crate) async fn require_owner_device(
     // acting outside its own subtree on the owner's standing instruction. Any
     // thread whose newest turn-start event has a `Device` actor carries one.
     // So an agent working inside a turn the user opened would inherit this.
-    let actor = require_user_actor(headers, pool, None).await?;
+    let actor = require_user_actor(headers, pool, device_id_override).await?;
     let MessageOrigin::Device { device_id, .. } = &actor else {
         crate::log!(
             "[Actor] Refusing an owner-only action: the caller is {:?}, not a registered device",
@@ -780,6 +795,37 @@ pub(crate) async fn require_owner_device(
                 NOT_THE_OWNERS_DEVICE,
             ))
         }
+    }
+}
+
+/// Refuse a Lucidos-spawned subprocess: an agent, a script, or the `lucidos`
+/// CLI one of them runs. A verified origin token proves the caller is one.
+///
+/// For a route only a person may use: a human-only setting, a confirmed send,
+/// a secret reveal. A device, a cross-workspace caller and the machine-local
+/// token pass, since the user's own terminal holds that token. Identity is
+/// [`require_user_actor`]'s question, not this one.
+///
+/// **A layer, not a boundary.** Any process running as the user can read the
+/// machine-local token, or type a device id on loopback (ADR 0192). This stops
+/// an agent using the credential it was handed, not one set on impersonating
+/// the user.
+///
+/// 403: the caller identified itself, and the answer is still no.
+pub(crate) fn refuse_agent_caller(
+    headers: &axum::http::HeaderMap,
+    refusal: impl Into<String>,
+) -> Result<(), super::error::ApiError> {
+    match subprocess_origin(headers) {
+        SubprocessOrigin::Subprocess { .. } => {
+            let refusal = refusal.into();
+            crate::log!("[Actor] Refused an agent caller: {}", refusal);
+            Err(super::error::ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                refusal,
+            ))
+        }
+        SubprocessOrigin::NotSubprocess => Ok(()),
     }
 }
 

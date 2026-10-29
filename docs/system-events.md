@@ -21,6 +21,7 @@
 - **Undo restores from the pre image.** It also removes each created file that git still calls unchanged against the post image. Then it emits `CommandCheckpointReverted`, stamped with the checkpoint's `request_event_id` so it groups into the same exchange.
 - **The refs survive an undo**, because they back the card's diff viewer. `prune_expired_checkpoints` reclaims pairs older than 30 days.
 - **Neither event changes thread status.** The routes are `POST /api/v1/command-checkpoint/undo` and `GET /api/v1/command-checkpoint/diff?checkpoint_id=...`.
+- **Undo is the checkpoint thread's Revert.** The route reads the thread off `CommandCheckpointed`, then asks the thread-reach gate (ADR 0168) before it restores anything. An agent token outside that thread's subtree gets a 403.
 - **`restores` and `removes` default to 0** on events written before the counts existed.
 
 ## Changes
@@ -117,6 +118,7 @@ Persisted, and carrying `actor` unless noted. The payload shapes are in the `Sys
 - **`WebhookDeliveriesSleptThrough` fires once** for a sleep of 30 minutes or more, on the first awake round that probed (ADR 0367). A round the computer slept through is not ingress evidence. The ingress bar never reads it.
 - **Webhook refusals (ADR 0235)** are the verification-layer sibling of the ingress pair, which reads a 401 as healthy. `cause` is `disabled` or `verification`. `resolution` is `accepted`, `reconfigured`, `quiet` or `removed`, exhaustive so a declaration cannot strand. They are per hook and edge-triggered, and `declared_refusals` takes the newest event per `aggregate_id`.
 - **`McpServerStopped` removes the id from every `thread_summaries.enabled_mcp_servers`**, as `McpServerRemoved` does (ADR 0430). Engine shutdown emits none, so threads keep their enabled servers across a restart.
+- **`McpLaunchApproved` fires once per new *launch approval***, from `McpServerStore::approve_launch`. Re-approving a pair it already holds is silent. The payload names the server and the actor, never the fingerprint or the line, since the real line holds sealed env values. The frontend bumps `mcpServersVersion` on it.
 - **`McpServerDisabledToolsChanged` and `PermissionGrantsChanged` carry the resulting set in full**, never a delta, so a reader needs no folding. The grant event matters most for auditing a widened grant. Both emit only when the set moved. `McpServerStore::set_tools`, a cache refresh, emits nothing.
 - **All three grant editors emit through `api::settings::write_grant_file`.** `grant_file` is a typed `core::GrantFile` whose wire value is its file name. The "Always allow" buttons add no event, since their `*PermissionResolved` event names the pattern.
 - **`ModelCreated`, `ModelUpdated` and `ModelDeleted`** make `spawn_models_registry_subscriber` reload the in-memory `ModelRegistry`, so `RoutingProvider` picks up a re-routed model without a restart.

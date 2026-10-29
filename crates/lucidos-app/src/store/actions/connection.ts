@@ -1,6 +1,7 @@
 import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, threadListFetched, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
 import { checkHealth } from '../../api/client';
 import type { HealthInfo } from '../../api/client';
+import type { ConnectionStatus } from '../types';
 import { connectThreadEvents, reviveThreadEvents } from './thread-sync';
 import { repairGapState } from '../eventGap';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, retryStaleOpenThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
@@ -94,6 +95,38 @@ const MAX_SUPPRESSED_FAILURES = 3;
 let consecutiveSuccesses = 0;
 const MIN_RECONNECT_SUCCESSES = 2;
 
+/** How long after an accepted Start the gateway may still answer `stopped`. It
+ *  boots in the background, so a boot that fails there shows only as a
+ *  workspace that goes back to, or never leaves, `stopped`. */
+export const START_SETTLE_MS = 20_000;
+
+/** How long a started engine may take to answer. Matches the gateway's boot
+ *  escape budget (`BOOT_ESCAPE_BUDGET` in `lucidos-gateway/src/server.rs`),
+ *  which covers a slow first-run boot with its migrations. */
+export const START_BOOT_MS = 240_000;
+
+/** When the gateway accepted the Start the user pressed, until the engine
+ *  answers or a window above runs out. While set, a failed probe reads as
+ *  `starting`: the engine is booting, and "cannot reach" would be untrue. */
+let startAcceptedAt: number | null = null;
+
+/** Note an accepted Start, and say so at once rather than on the next tick. */
+export function noteWorkspaceStartAccepted(): void {
+  startAcceptedAt = Date.now();
+  if (connectionStatus.peek() !== 'starting') recordConnectionTransition('starting', false);
+  connectionStatus.value = 'starting';
+}
+
+/** Whether a failed probe still reads as `starting`. Closes the window once
+ *  it no longer holds, so the next probe states the plain truth. */
+function startStillBooting(probeStopped: boolean): boolean {
+  if (startAcceptedAt === null) return false;
+  const elapsed = Date.now() - startAcceptedAt;
+  if (elapsed <= START_BOOT_MS && !(probeStopped && elapsed > START_SETTLE_MS)) return true;
+  startAcceptedAt = null;
+  return false;
+}
+
 /** When the dot last changed colour, so the next change can report how long the
  *  previous one held. `null` until the first transition, which is reported as a
  *  `held_ms` of `null` rather than as a duration measured from page load: the
@@ -136,7 +169,7 @@ let lastTransitionAt: number | null = null;
  *  and is not awaited, so a slow or failing breadcrumb cannot delay or fail the
  *  probe it describes; if one is lost, the dot is still the user-facing surface
  *  and the next transition logs again. */
-function recordConnectionTransition(to: 'connected' | 'disconnected' | 'stopped', probeOk: boolean): void {
+function recordConnectionTransition(to: Exclude<ConnectionStatus, 'connecting'>, probeOk: boolean): void {
   const now = Date.now();
   const heldMs = lastTransitionAt === null ? null : now - lastTransitionAt;
   lastTransitionAt = now;
@@ -501,7 +534,11 @@ async function runConnectionCheck(): Promise<boolean> {
     consecutiveSuccesses = 0;
   }
 
-  const nextStatus = connected ? 'connected' : healthResult.status === 'stopped' ? 'stopped' : 'disconnected';
+  const probeStopped = healthResult.status === 'stopped';
+  if (connected) startAcceptedAt = null;
+  const nextStatus = connected ? 'connected'
+    : startStillBooting(probeStopped) ? 'starting'
+    : probeStopped ? 'stopped' : 'disconnected';
   if (nextStatus !== connectionStatus.value) {
     recordConnectionTransition(nextStatus, healthOk);
   }

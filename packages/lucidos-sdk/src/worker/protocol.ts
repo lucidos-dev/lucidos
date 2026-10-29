@@ -33,12 +33,22 @@ export type FromPort =
       pongUrl: string;
     }
   | { t: 'pong'; notificationId: string; answer: PongAnswer }
-  /** The page came back and wants a silent upstream restarted. */
+  /** The page came back and wants a silent upstream restarted. Always
+   *  answered with `checked`. */
   | { t: 'check' }
+  /** The page has proof the upstream missed a frame and wants it reopened now,
+   *  however recently it spoke. Answered by the `error` of that drop. */
+  | { t: 'restart' }
   | { t: 'bye' };
 
 /** Worker to document. */
 export type ToPort =
+  /** The worker holds this port but has no hello from it. Posted as it takes a
+   *  port on, while the page's first hello is still in flight. Any later one
+   *  means the worker lost that hello, usually to a relaunch, so the page says
+   *  `hello` again. */
+  | { t: 'introduce' }
+  | { t: 'checked' }
   | { t: 'frame'; data: string }
   | { t: 'open'; lateJoin?: boolean }
   /** `silentMs` is set when the upstream stalled rather than errored. */

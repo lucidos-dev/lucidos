@@ -58,10 +58,15 @@ use crate::engine::event_bus::EventBus;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThreadReachVerb {
+    /// Taking a thread off the thread list: archiving an active thread, or
+    /// discarding a draft thread (`DELETE /api/v1/threads/:id`).
     Archive,
     Cancel,
-    /// Driving a live coding-agent session: interrupt it, or change its model or
-    /// reasoning effort (`POST /api/v1/claude-code/control`).
+    /// Driving a thread's session: interrupt a coding agent, change the model or
+    /// reasoning effort (`POST /api/v1/claude-code/control`, `/api/v1/chat/settings`),
+    /// take back a queued message (`POST /api/v1/chat/queued-message/remove`), or
+    /// write the draft or add an image to it (`PUT /api/v1/threads/:id/compose`,
+    /// `POST /api/v1/threads/:id/blobs`).
     /// Controlling another thread's session is as much a reach as cancelling it.
     Control,
     /// Asking a side question, which reads the thread's whole context
@@ -69,10 +74,16 @@ pub enum ThreadReachVerb {
     AskSideQuestion,
     /// Dismissing a side question's card (`POST /api/v1/side-questions/dismiss`).
     DismissSideQuestion,
+    /// Applying a change, or arming or taking back an apply. With no target it
+    /// aims at the workspace: Apply All (`POST /api/v1/changes/apply-all`), its
+    /// cancel (`POST /api/v1/changes/apply-all/cancel`), and the workspace-wide
+    /// disarm (`DELETE /api/v1/standing-applies`).
     Apply,
     Discard,
     SetAside,
     BringBack,
+    /// Reverting a change, or undoing a command checkpoint on the thread whose
+    /// command made it (`POST /api/v1/command-checkpoint/undo`).
     Revert,
     AnswerQuestion,
     /// Answering a permission card: Allow once, Allow for this thread, or
@@ -383,21 +394,15 @@ fn refuse_agent_always_allow(
     persist_scope: Option<crate::engine::claude_code::AllowScope>,
 ) -> Result<(), super::error::ApiError> {
     use crate::engine::claude_code::AllowScope;
-    let widest = matches!(persist_scope, Some(AllowScope::Narrow | AllowScope::Broad));
-    let agent = matches!(
-        crate::api::actor::subprocess_origin(headers),
-        SubprocessOrigin::Subprocess { .. }
-    );
-    if widest && agent {
-        crate::log!("[ThreadReach] Refused: an agent pressed an Always-allow grant");
-        return Err(super::error::ApiError::new(
-            StatusCode::FORBIDDEN,
-            "An agent cannot press Always allow. It widens what every future session \
-             may do without asking, so only the workspace owner grants it, on screen. \
-             Allow once, allow for this thread, or deny instead.",
-        ));
+    if !matches!(persist_scope, Some(AllowScope::Narrow | AllowScope::Broad)) {
+        return Ok(());
     }
-    Ok(())
+    crate::api::actor::refuse_agent_caller(
+        headers,
+        "An agent cannot press Always allow. It widens what every future session \
+         may do without asking, so only the workspace owner grants it, on screen. \
+         Allow once, allow for this thread, or deny instead.",
+    )
 }
 
 /// Refuse an agent changing a permission grant through Settings: a grant
@@ -409,19 +414,12 @@ fn refuse_agent_always_allow(
 pub(in crate::api) fn refuse_agent_permission_grant(
     headers: &HeaderMap,
 ) -> Result<(), super::error::ApiError> {
-    if matches!(
-        crate::api::actor::subprocess_origin(headers),
-        SubprocessOrigin::Subprocess { .. }
-    ) {
-        crate::log!("[ThreadReach] Refused: an agent wrote a permission grant");
-        return Err(super::error::ApiError::new(
-            StatusCode::FORBIDDEN,
-            "An agent cannot change a permission grant. It decides what every future \
-             session may do without asking, so only the workspace owner changes it, in \
-             Settings.",
-        ));
-    }
-    Ok(())
+    crate::api::actor::refuse_agent_caller(
+        headers,
+        "An agent cannot change a permission grant. It decides what every future \
+         session may do without asking, so only the workspace owner changes it, in \
+         Settings.",
+    )
 }
 
 /// Refuse an agent answering a permission card it has no authority for.

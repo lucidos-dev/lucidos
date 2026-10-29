@@ -2857,7 +2857,7 @@ export const intelligenceLadderVersion = gapRefreshedVersion();
 
 /** Bumped on every `McpServerRegistered` / `McpServerUpdated` /
  *  `McpServerRemoved` / `McpServerStopped` / `McpServerDisabledToolsChanged`
- *  frame. Settings → MCP
+ *  / `McpLaunchApproved` frame. Settings → MCP
  *  Servers re-reads `/mcp/servers` on it. A server the agent registers, or a
  *  tool switched off on another device, then reaches the open page
  *  (ADR 0118). */

@@ -58,10 +58,13 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("changes.rs", CHANGES_RS, "discard_change"),
     ("changes.rs", CHANGES_RS, "revert_change"),
     ("changes.rs", CHANGES_RS, "apply_all_changes"),
+    ("changes.rs", CHANGES_RS, "cancel_apply_all_changes"),
     ("changes.rs", CHANGES_RS, "discard_all_changes"),
     ("changes.rs", CHANGES_RS, "remove_from_landing_lane"),
     ("changes.rs", CHANGES_RS, "cancel_lane_batch"),
     ("chat.rs", CHAT_RS, "cancel_chat"),
+    ("chat.rs", CHAT_RS, "chat_settings"),
+    ("chat.rs", CHAT_RS, "remove_queued_message"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_stop"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_apply_now"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_discard"),
@@ -72,6 +75,14 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("threads/actions.rs", ACTIONS_RS, "continue_thread"),
     ("threads/actions.rs", ACTIONS_RS, "cancel_thread_event_wait"),
     ("threads/archive.rs", ARCHIVE_RS, "archive_thread"),
+    ("threads_compose.rs", THREADS_COMPOSE_RS, "put_compose"),
+    ("threads_compose.rs", THREADS_COMPOSE_RS, "delete_thread"),
+    ("blobs.rs", BLOBS_RS, "post_blob"),
+    (
+        "command_checkpoint.rs",
+        COMMAND_CHECKPOINT_RS,
+        "undo_command_checkpoint",
+    ),
     (
         "command_permission.rs",
         COMMAND_PERMISSION_RS,
@@ -110,6 +121,9 @@ const CLAUDE_CODE_RS: &str = include_str!("claude_code.rs");
 const DISK_USAGE_RS: &str = include_str!("disk_usage.rs");
 const ACTIONS_RS: &str = include_str!("threads/actions.rs");
 const ARCHIVE_RS: &str = include_str!("threads/archive.rs");
+const THREADS_COMPOSE_RS: &str = include_str!("threads_compose.rs");
+const COMMAND_CHECKPOINT_RS: &str = include_str!("command_checkpoint.rs");
+const BLOBS_RS: &str = include_str!("blobs.rs");
 const TOOLS_RS: &str = include_str!("../engine/tools/mod.rs");
 const COMMAND_PERMISSION_RS: &str = include_str!("command_permission.rs");
 const MCP_PERMISSION_RS: &str = include_str!("mcp_permission.rs");
@@ -127,6 +141,7 @@ const GATE_CALLS: &[&str] = &[
     "refuse_batch_change_verb",
     "refuse_tool_without_authority",
     "refuse_permission_answer",
+    "authorize_checkpoint_undo",
 ];
 
 /// The plan's own verification for "the standing instruction has exactly one
@@ -161,6 +176,11 @@ fn every_clause_4_route_asks_the_gate() {
         (
             THREAD_REACH_RS,
             "refuse_permission_answer",
+            "refuse_without_authority",
+        ),
+        (
+            COMMAND_CHECKPOINT_RS,
+            "authorize_checkpoint_undo",
             "refuse_without_authority",
         ),
     ] {
@@ -1033,6 +1053,131 @@ fn an_agent_never_writes_a_permission_grant_through_settings() {
     }
 }
 
+/// Regression: `PUT /api/v1/preferences` passed any key through. An agent
+/// refused `command_guard` by its own tool could still write it with one
+/// `lucidos preferences set`, and switch off its own command guard.
+///
+/// Every key the catalog withholds from the agent is refused to an agent
+/// caller. A key the agent may write, and an app's own key, still pass.
+#[test]
+fn an_agent_never_writes_a_human_only_preference() {
+    use crate::api::settings::refuse_agent_human_only_preference as refuse;
+    use crate::core::prefs;
+    let agent = agent_headers(Some(Uuid::new_v4()));
+    let internal: Vec<&str> = prefs::internal_specs().map(|s| s.key).collect();
+    let named = [
+        prefs::COMMAND_GUARD.key(),
+        prefs::MAX_TOOL_CALLS.key(),
+        prefs::NETWORK_BIND.key(),
+        prefs::LOCAL_BASE_URL.key(),
+        prefs::CLAUDE_GATEWAY_URL.key(),
+    ];
+    let switches = crate::llm::provider_build::PROVIDER_ENABLED_SWITCHES.map(|s| s.key());
+    for key in named.iter().chain(switches.iter()) {
+        assert!(internal.contains(key), "{key} must be human-only");
+    }
+    for key in internal {
+        let err = refuse(&agent, key).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{key}");
+        assert!(err.message.contains(key), "{key}: {}", err.message);
+        assert!(refuse(&device_headers(), key).is_ok(), "{key}");
+    }
+    for key in [prefs::TIMEZONE.key(), "habit_tracker_goal"] {
+        assert!(refuse(&agent, key).is_ok(), "{key}");
+    }
+}
+
+/// Every route writing a human-only setting, confirming a send or revealing a
+/// secret refuses an agent before it acts. So a refused agent leaves the stored
+/// value unchanged, sends nothing, and spends no reveal token.
+#[test]
+fn every_human_only_route_refuses_an_agent_before_it_acts() {
+    let settings = include_str!("settings.rs");
+    let reveal = include_str!("credential_reveal.rs");
+    let backup = include_str!("backup.rs");
+    let gateway = include_str!("claude_gateway.rs");
+    let pref_gate = "refuse_agent_human_only_preference(";
+    let agent_gate = "refuse_agent_caller(";
+    for (path, source, handler, gate, act) in [
+        (
+            "settings.rs",
+            settings,
+            "set_preference",
+            pref_gate,
+            ".apply_preference_write(",
+        ),
+        (
+            "settings.rs",
+            settings,
+            "delete_preference",
+            pref_gate,
+            "PreferenceStore::delete(",
+        ),
+        (
+            "settings.rs",
+            settings,
+            "put_network_config",
+            pref_gate,
+            ".apply_preference_write(",
+        ),
+        (
+            "settings.rs",
+            settings,
+            "send_email_confirmed",
+            agent_gate,
+            "send_confirmed_draft(",
+        ),
+        (
+            "claude_gateway.rs",
+            gateway,
+            "sign_in",
+            pref_gate,
+            ".apply_preference_write(",
+        ),
+        (
+            "credential_reveal.rs",
+            reveal,
+            "mint_reveal_token",
+            agent_gate,
+            ".mint(",
+        ),
+        (
+            "credential_reveal.rs",
+            reveal,
+            "get_credential_value",
+            agent_gate,
+            ".redeem(",
+        ),
+        (
+            "backup.rs",
+            backup,
+            "mint_backup_key_reveal_token",
+            agent_gate,
+            ".mint(",
+        ),
+        (
+            "backup.rs",
+            backup,
+            "check_key_access",
+            agent_gate,
+            ".redeem(",
+        ),
+    ] {
+        let body = handler_body(source, handler)
+            .unwrap_or_else(|| panic!("{path}: no handler named {handler}"));
+        let refusal = body
+            .find(gate)
+            .unwrap_or_else(|| panic!("{path}: {handler} never refuses an agent"));
+        let action = body
+            .find(act)
+            .unwrap_or_else(|| panic!("{path}: {handler} no longer calls {act}"));
+        assert!(
+            refusal < action,
+            "{path}: {handler} must refuse an agent before {act}"
+        );
+    }
+}
+
 /// All three consent routes ask the permission gate before resolving, so a
 /// refusal answers no card.
 #[test]
@@ -1061,6 +1206,164 @@ fn every_consent_route_asks_the_gate_before_it_answers() {
             "{path}: the gate must run before the card resolves"
         );
     }
+}
+
+/// Taking back a queued message drives the target thread's session, so the
+/// route asks the Control gate before it reads or writes anything. A refusal
+/// then removes nothing, and says nothing about whether the message exists.
+#[test]
+fn removing_a_queued_message_asks_the_control_gate_first() {
+    let body = handler_body(CHAT_RS, "remove_queued_message").expect("the handler exists");
+    let gate = body
+        .find("refuse_without_authority")
+        .expect("remove_queued_message never asks the gate");
+    assert!(
+        body[gate..].contains("ThreadReachVerb::Control"),
+        "taking back a queued message is a Control act"
+    );
+    let first_read = body
+        .find("queued_message_already_removed")
+        .expect("the handler checks for an earlier removal");
+    assert!(gate < first_read, "the gate must run before any lookup");
+}
+
+/// Each draft and undo route asks the gate, as its own verb, before its first
+/// write. A refusal then writes no blob, draft or discard, and restores no file.
+#[test]
+fn draft_and_undo_routes_ask_the_gate_before_they_write() {
+    for (source, handler, gate, verb, writes) in [
+        (
+            THREADS_COMPOSE_RS,
+            "put_compose",
+            "refuse_without_authority",
+            "COMPOSE_VERB",
+            &["upload_legacy_compose_images", "UPDATE thread_summaries"][..],
+        ),
+        (
+            BLOBS_RS,
+            "post_blob",
+            "refuse_without_authority",
+            "COMPOSE_VERB",
+            &["SELECT state", "write_blob(", "ImageUploaded"][..],
+        ),
+        (
+            THREADS_COMPOSE_RS,
+            "delete_thread",
+            "refuse_without_authority",
+            "DISCARD_DRAFT_VERB",
+            &["SELECT state", "ThreadDiscarded"][..],
+        ),
+        (
+            COMMAND_CHECKPOINT_RS,
+            "authorize_checkpoint_undo",
+            "refuse_without_authority",
+            "ThreadReachVerb::Revert",
+            &[][..],
+        ),
+        (
+            COMMAND_CHECKPOINT_RS,
+            "undo_command_checkpoint",
+            "authorize_checkpoint_undo",
+            "authorize_checkpoint_undo",
+            &[".undo_command_checkpoint("][..],
+        ),
+    ] {
+        let body = handler_body(source, handler).expect("the handler exists");
+        let at = body
+            .find(gate)
+            .unwrap_or_else(|| panic!("{handler} never asks the gate"));
+        assert!(
+            body[at..].contains(verb),
+            "{handler} must ask the gate as {verb}"
+        );
+        for write in writes {
+            let write_at = body
+                .find(write)
+                .unwrap_or_else(|| panic!("{handler} no longer does {write}"));
+            assert!(at < write_at, "{handler} must ask the gate before {write}");
+        }
+    }
+}
+
+/// The ladder the route above relies on. An agent takes back a queued message
+/// in its own subtree, never a sibling's. The user's device is unaffected.
+#[tokio::test]
+async fn a_queued_message_is_taken_back_only_inside_the_callers_subtree() {
+    let (pool, db_name) = setup_test_db().await;
+    let f = family(&pool).await;
+    let remove = |headers: HeaderMap, target: Uuid| {
+        let pool = pool.clone();
+        async move {
+            refuse_without_authority(
+                &bus_for(&pool),
+                &headers,
+                Some(target),
+                ThreadReachVerb::Control,
+            )
+            .await
+        }
+    };
+
+    let child = agent_headers(Some(f.child));
+    assert!(remove(child.clone(), f.child).await.is_ok());
+    assert!(remove(child.clone(), f.grandchild).await.is_ok());
+    for target in [f.sibling, f.root] {
+        let err = remove(child.clone(), target).await.unwrap_err();
+        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(err.reason(), "out_of_reach");
+    }
+    assert!(remove(device_headers(), f.sibling).await.is_ok());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Cancelling Apply All takes back the batch's Apply and the sweep's arms, so
+/// the route asks the gate Apply All asks, aimed at the workspace. It runs
+/// before the batch or an arm is touched, so a refusal stops nothing and
+/// reveals nothing about whether a batch is running.
+#[test]
+fn cancelling_apply_all_asks_the_apply_gate_first() {
+    let body = handler_body(CHANGES_RS, "cancel_apply_all_changes").expect("the handler exists");
+    let gate = body
+        .find("refuse_without_authority")
+        .expect("cancel_apply_all_changes never asks the gate");
+    assert!(
+        body[gate..].contains("ThreadReachVerb::Apply"),
+        "cancelling Apply All takes back an Apply"
+    );
+    for touch in ["cancel_apply_all_batches", "drop_standing_applies"] {
+        let at = body.find(touch).expect("the handler stops the batch");
+        assert!(gate < at, "the gate must run before {touch}");
+    }
+}
+
+/// The ladder the route above relies on. The workspace is nobody's subtree, so
+/// no agent cancels Apply All on reach alone, not even the root of a family.
+/// The user's device is unaffected.
+#[tokio::test]
+async fn only_the_owner_cancels_apply_all() {
+    let (pool, db_name) = setup_test_db().await;
+    let f = family(&pool).await;
+    let cancel = |headers: HeaderMap| {
+        let pool = pool.clone();
+        async move {
+            refuse_without_authority(&bus_for(&pool), &headers, None, ThreadReachVerb::Apply).await
+        }
+    };
+
+    for caller in [f.root, f.child, f.sibling] {
+        let err = cancel(agent_headers(Some(caller))).await.unwrap_err();
+        assert_eq!(
+            err,
+            ThreadReachError::NoStandingInstruction(ThreadReachVerb::Apply)
+        );
+        assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
+    }
+    assert!(cancel(device_headers()).await.is_ok());
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 /// Answering a permission card is a clause-4 verb on the card's thread. Inside

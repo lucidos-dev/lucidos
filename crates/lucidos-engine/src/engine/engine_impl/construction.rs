@@ -1315,7 +1315,8 @@ impl LucidosEngine {
             }
         }
 
-        let mcp_manager = crate::mcp::McpManager::new(pool.clone(), event_bus.clone());
+        let mcp_manager =
+            crate::mcp::McpManager::new(pool.clone(), event_bus.clone(), workspace_path.clone());
 
         let user_dir = lucidos_home::path();
 

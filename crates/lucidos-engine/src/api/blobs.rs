@@ -24,6 +24,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::api::actor::user_actor;
+use crate::api::thread_reach::refuse_without_authority;
+use crate::api::threads_compose::COMPOSE_VERB;
 use crate::api::{ApiError, AppState, ChatImage};
 use crate::core::blobs::{
     get_or_create_preview, resolve_blob, write_blob, write_blob_from_base64, BlobError,
@@ -54,6 +56,14 @@ pub(super) async fn post_blob(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<BlobUploadResponse>), ApiError> {
+    // An image joins the thread's draft, so the upload asks the draft's verb.
+    refuse_without_authority(
+        &state.engine.event_bus,
+        &headers,
+        Some(thread_id),
+        COMPOSE_VERB,
+    )
+    .await?;
     // Verify thread state before reading the upload body — fail fast on
     // 404/410 without spending bandwidth on the file.
     let lookup: Option<(String,)> =

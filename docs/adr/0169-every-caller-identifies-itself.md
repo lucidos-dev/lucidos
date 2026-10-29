@@ -152,3 +152,23 @@ convention.
   socket already proves a local process. The frontend and both e2e suites depend
   on that. `api::local_auth`'s own header explains why locking it would break
   them for nothing.
+
+## Amendment: a socket that writes is gated like a POST
+
+The voice socket opens with a GET, and the call behind it writes the owner's
+words, starts turns and answers cards. The method test let an unidentified
+caller through, so `api::mutating_gate` now lists such routes in
+`MUTATING_SOCKET_ROUTES` and gates them as mutating. A ratchet test fails on
+any route taking a `WebSocketUpgrade` until it is listed as writing or as
+reaching nothing.
+
+A browser socket cannot set a header. The page first named its device in a
+`device_id` query parameter. A handshake carries no `Referer`, so an app page
+on the same origin could forge that parameter. ADR 0598 replaced it with a
+*call ticket*: a plain `POST` mints it under the strict `Referer` rule, and the
+upgrade redeems it. With no device header, the gate takes the ticket's device.
+A call speaks as a person, so `api::voice` then requires a registered device.
+
+What stays open is ADR 0144's residual, which ADR 0598 states. An app tab can
+forge a same-origin `referrer`, or run on a plain-HTTP gateway address. Either
+can still mint a ticket, as it can mint a reveal token.

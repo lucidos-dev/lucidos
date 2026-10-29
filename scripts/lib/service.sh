@@ -653,15 +653,22 @@ service_list_instance_names() {
     done
 }
 
-# service_write_file <path> <content> [mode] — create the parent dir, write the
-# content, and chmod. Mode 600 is used when the content carries provider secrets.
+# service_write_file <path> <content> [mode]: create the parent dir and write
+# the content at <mode>. Mode 600 is used when the content carries provider
+# secrets. The content goes into a temp file that mktemp creates at 0600, and
+# only a file already at <mode> is renamed into place. Writing <path> directly
+# exposes the secret until the chmod, and a umask cannot help when a re-run
+# truncates an existing 0644 file.
 service_write_file() {
-    local path="$1" content="$2" mode="${3:-644}" dir
+    local path="$1" content="$2" mode="${3:-644}" dir tmp
     dir="$(dirname "$path")"
     mkdir -p "$dir" || return 1
-    printf '%s\n' "$content" > "$path" || return 1
-    chmod "$mode" "$path" 2>/dev/null || true
-    return 0
+    tmp="$(mktemp "$dir/.$(basename "$path").XXXXXX")" || return 1
+    if printf '%s\n' "$content" > "$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$path"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 # service_launchd_is_loaded <uid> <label> — true if the job is bootstrapped.

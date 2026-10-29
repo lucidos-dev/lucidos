@@ -2151,6 +2151,9 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
+        // The projection keeps `WaitingForUserAnswer` instead unless a question
+        // set the park and this is its own result: a late result of an earlier
+        // call leaves the agent blocked on the user (ADR 0583).
         (
             "CodingAgentToolResult",
             StatusTransition {

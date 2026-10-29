@@ -11,7 +11,7 @@ import {
 import type { SettingsSubview, InlineForm, PanelOverlay } from '../store';
 import type { MenuItem } from '../types';
 import { MENU_ITEMS } from '../types';
-import { normalizeUrl } from './artifacts';
+import { inAppBrowserRenders, normalizeUrl } from './artifacts';
 import { inAppBrowserAvailable } from './preferences';
 import { revealContentPane } from './pane';
 
@@ -230,15 +230,16 @@ function restoreState(entry: NavEntry): void {
     activeMenuItem.value = menuItem;
     writeWindowItem('lucidos-active-menu-item', menuItem);
     settingsSubview.value = migrated.settingsSubview;
-    // The one overlay guard, and it asks about THIS device rather than about
-    // the entry: don't restore a url-preview when the in-app browser isn't the
-    // active path. In Chrome/PWA it uses a broken iframe, and under Tauri the
+    // The one overlay guard: don't restore a url-preview when the in-app
+    // browser isn't the active path on THIS device. In Chrome/PWA it uses a broken iframe, and under Tauri the
     // experimental in-app webview is off by default (URLs open in the system
     // browser, so there's no panel to resurrect). Every other overlay restores
     // on every path, a pending form included: see ADR 0127. It resolves to null
     // so the localStorage side effects below key off the final overlay value.
+    // Older history can also hold a `file:` preview, which the in-app browser
+    // now refuses, so a URL it does not render is dropped too.
     const suppressUrlPreview = migrated.overlay?.type === 'url-preview'
-      && !inAppBrowserAvailable();
+      && (!inAppBrowserAvailable() || !inAppBrowserRenders(migrated.overlay.url));
     const overlay = suppressUrlPreview ? null : migrated.overlay;
     panelOverlay.value = overlay;
     if (overlay?.type === 'file-preview') {

@@ -284,7 +284,16 @@ impl ArtifactManager {
         // let the joined path escape `data/artifacts/`.
         reject_path_traversal(relative_path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
-        let full_path = self.workspace_path.join(ARTIFACTS_DIR).join(relative_path);
+        let full_path = crate::core::contained_path::join_contained(
+            &self.workspace_path.join(ARTIFACTS_DIR),
+            relative_path,
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("'{relative_path}' resolves outside artifacts/ through a symlink"),
+            )
+        })?;
 
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)?;
@@ -915,6 +924,29 @@ mod tests {
         manager.write_artifact("test.txt", "hello world").unwrap();
 
         assert_eq!(read_back(&manager, "test.txt"), "hello world");
+    }
+
+    /// Every artifact writer funnels through here, so a link in `artifacts/`
+    /// must not let any of them write a host file.
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_write_never_follows_a_symlink_out_of_artifacts() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
+        let artifacts = dir.path().join(ARTIFACTS_DIR);
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(outside.path().join("rc"), "original").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("rc"), artifacts.join("notes.md")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), artifacts.join("dir")).unwrap();
+
+        assert!(manager.write_artifact("notes.md", "changed").is_err());
+        assert!(manager.write_artifact("dir/new.md", "x").is_err());
+        assert_eq!(
+            fs::read_to_string(outside.path().join("rc")).unwrap(),
+            "original"
+        );
+        assert!(!outside.path().join("new.md").exists());
     }
 
     #[tokio::test]

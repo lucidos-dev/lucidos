@@ -18,7 +18,7 @@
 // opens file search and not the print dialog. The app's own handlers still
 // receive the key, already marked `defaultPrevented`.
 
-import { onHostPush } from './_bridge';
+import { onHostPush, postToHost } from './_bridge';
 
 /** Wire type for a forwarded keydown. Hardcoded as a string literal on the host
  *  side too (`useKeyboardShortcuts.ts`) — same convention as `lucidos:ui:confirm`. */
@@ -123,7 +123,7 @@ export function installKeyboardForwarding(): () => void {
   const onKeyDown = (e: KeyboardEvent) => {
     if (!isForwardableKeydown(e)) return;
     if (matchesHostBinding(e)) e.preventDefault();
-    window.parent.postMessage(toForwardedKeydown(e), '*');
+    postToHost(toForwardedKeydown(e));
   };
   // Capture phase so the chord is forwarded even if an app handler stops
   // propagation. Only a host-bound chord has its browser default cancelled.

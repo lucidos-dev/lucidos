@@ -8,7 +8,23 @@ import {
   parseTooltipRows,
   isTooltipsOptedOut,
   hasForeignTooltip,
+  splitTooltipShortcut,
+  TOOLTIP_SHORTCUT_SEPARATOR,
 } from './tooltip';
+
+describe('splitTooltipShortcut', () => {
+  it('returns plain text with no shortcut', () => {
+    expect(splitTooltipShortcut('Refresh · 3 new')).toEqual({ text: 'Refresh · 3 new', shortcut: null });
+  });
+
+  it('splits the key combo off the text', () => {
+    expect(splitTooltipShortcut(`Refresh${TOOLTIP_SHORTCUT_SEPARATOR}⌘R`)).toEqual({ text: 'Refresh', shortcut: '⌘R' });
+  });
+
+  it('keeps a shortcut tooltip from reading as redundant with its label', () => {
+    expect(isRedundantTooltip('Refresh', `Refresh${TOOLTIP_SHORTCUT_SEPARATOR}⌘R`, false)).toBe(false);
+  });
+});
 
 describe('isRedundantTooltip', () => {
   it('flags exact matches as redundant', () => {

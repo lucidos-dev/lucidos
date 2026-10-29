@@ -126,7 +126,7 @@ describe('connectionBannerBody renders the bar', () => {
   });
 
   it('keys its wash on the state, so the two degraded states are told apart', () => {
-    for (const status of ['disconnected', 'connecting', 'stopped'] as ConnectionStatus[]) {
+    for (const status of ['disconnected', 'connecting', 'stopped', 'starting'] as ConnectionStatus[]) {
       const bar = findByClass(body(status), 'connection-banner')[0];
       expect(bar.props['data-conn']).toBe(status);
     }
@@ -157,8 +157,17 @@ describe('connectionBannerBody renders the bar', () => {
     (buttons[0].props.onClick as () => void)();
     expect(onStart).toHaveBeenCalledOnce();
 
-    const disconnected = connectionBannerBody({ layout: 'desktop', status: 'disconnected', workspace: 'dev', onStart });
-    expect(findByType(disconnected, 'button')).toHaveLength(0);
+    for (const status of ['disconnected', 'starting'] as ConnectionStatus[]) {
+      const bar = connectionBannerBody({ layout: 'desktop', status, workspace: 'dev', onStart });
+      expect(findByType(bar, 'button')).toHaveLength(0);
+    }
+  });
+
+  it('stays up through a Start, at once, saying the engine is starting', () => {
+    expect(shouldRenderConnectionBanner({
+      ...DESKTOP, status: 'starting', connectingSettled: false,
+    })).toBe(true);
+    expect(textOf(body('starting'))).toContain('The dev engine is starting');
   });
 
   it('draws no Start without a handler, as in a window with no gateway', () => {

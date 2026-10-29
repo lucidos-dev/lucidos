@@ -30,6 +30,7 @@ const SRC = resolve(here, '../..');
 const VOICE_PATHS = [
   'voice',
   'store/voice.ts',
+  'api/client/voice.ts',
   'store/microphones.ts',
   'components/chat/CallToggle.tsx',
   'components/chat/MicrophonePicker.tsx',
@@ -85,7 +86,7 @@ describe('the voice client names no provider', () => {
   it('opens its socket through the one route builder, and nowhere else', () => {
     const constructing = voiceSources().filter(([, text]) => /new WebSocket\(/.test(text));
     expect(constructing.map(([rel]) => rel)).toEqual(['voice/ports.ts']);
-    expect(constructing[0][1]).toContain('voiceSocketUrl(threadId)');
+    expect(constructing[0][1]).toContain('voiceSocketUrl(threadId, ticket)');
   });
 });
 

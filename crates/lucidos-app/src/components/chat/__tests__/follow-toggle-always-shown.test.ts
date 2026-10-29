@@ -43,6 +43,19 @@ describe('the follow toggle is always shown', () => {
     expect(pane.match(/<FollowLiveEdgeToggle/g)).toHaveLength(1);
   });
 
+  /** It floats above the composer, so forward Tab meets it first. */
+  it('comes before the composer in tab order', () => {
+    const area = promptArea();
+    expect(area.indexOf('<FollowLiveEdgeToggle />')).toBeLessThan(area.indexOf('<PromptInput />'));
+  });
+
+  /** Shift+Tab from the prompt walks up the composer in document order: the
+   *  compose destination dropdowns first, then the toggle. */
+  it('leaves Shift+Tab from the prompt to document order, dropdowns before it', () => {
+    expect(prompt).not.toMatch(/shiftKey/);
+    expect(prompt.indexOf('<ComposeDestinationRow')).toBeLessThan(prompt.indexOf('class="prompt-textarea"'));
+  });
+
   it('is not gated on being outside the compose view', () => {
     expect(source).not.toMatch(/\{\s*!?\s*composeContext\s*&&/);
     expect(source).toMatch(/data-role="follow-live-edge"/);

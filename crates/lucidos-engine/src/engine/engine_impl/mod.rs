@@ -14,4 +14,4 @@ mod shutdown;
 mod threads;
 mod trigger_runs;
 
-pub(crate) use scripts::ScriptEnv;
+pub(crate) use scripts::{mask_stored_events, stored_secret_values, ScriptEnv};

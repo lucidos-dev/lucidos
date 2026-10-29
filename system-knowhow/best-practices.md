@@ -161,7 +161,7 @@ Exception: the engine sets `LUCIDOS_WORKSPACE` and `LUCIDOS_DATABASE_URL` in eve
 - **To see the names**, run `lucidos credentials list`. `env | grep CRED_` finds nothing, because a bare `CRED_` names no credential. The result carries a note listing the names instead.
 - **An unknown name still runs.** The result carries the same note, with names only, never values.
 
-Every subprocess output is masked: an injected value, a token in the engine's own environment, and well-known token shapes such as `ghp_…` come back as `[REDACTED]`. A token in the shell that started the engine never reaches a chat tool's environment. To use one there, store it as a credential.
+Every subprocess output is masked: an injected value, a token in the engine's own environment, and well-known token shapes such as `ghp_…` come back as `[REDACTED]`. Output read back later, through `bash_output`, `events(action="query")` or `lucidos events query`, is masked again against the credentials stored now. A token in the shell that started the engine never reaches a chat tool's environment. To use one there, store it as a credential.
 
 ## Listing this machine's workspaces
 

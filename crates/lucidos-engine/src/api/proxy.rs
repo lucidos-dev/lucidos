@@ -28,6 +28,7 @@ use super::*;
 use crate::api::hex::hex_lower;
 use crate::api::proxy_pipeline_config::{LayerConfig, PipelineConfig};
 use crate::api::proxy_timeout::{CallBudget, MAX_SECS};
+use crate::core::url_scope::{check_path_within, path_is_within, PathEscape, MAX_DECODE_ROUNDS};
 use crate::core::{Credential, CredentialStore};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, Method};
@@ -733,8 +734,8 @@ pub fn build_target_url(base_url: &str, path: &str, query: Option<&str>) -> Stri
 ///
 /// So the check runs on the PARSED url, the only place the real path is known.
 /// It therefore holds whatever encoding produced the path, where a blocklist of
-/// dot spellings only holds until the next one. Same shape as
-/// `CredentialStore`'s `credential_base_url_matches`.
+/// dot spellings only holds until the next one. [`check_path_within`] also
+/// judges every deeper reading, and `credential_base_url_matches` asks it too.
 ///
 /// Returns the ORIGINAL concatenation on success, never the normalized string:
 /// signing layers hash the URL they are handed, so re-encoding it here would
@@ -761,54 +762,21 @@ pub(crate) fn build_contained_target_url(
         return Err("upstream URL leaves the configured origin".to_string());
     }
 
+    // Paths only in these messages. A query string can carry a credential.
     let base_path = base.path().trim_end_matches('/');
-    if !path_is_within(base_path, target.path()) {
-        // Path only. A query string can carry a credential.
-        return Err(format!(
-            "upstream path '{}' escapes the configured base path '{base_path}'",
-            target.path()
-        ));
-    }
-
-    // Then every deeper reading, one per decode layer an upstream might apply.
-    // `%2f` is not a separator to the URL parser, so `%2e%2e%2fadmin` parses as
-    // one contained segment and forwards verbatim. An upstream that decodes it
-    // reads `../admin` and leaves the prefix anyway, with our credentials on
-    // the request. Checking the readings refuses that, while a blanket ban on
-    // `%2f` would break a legitimate encoded slash inside a segment.
-    let Some(readings) = decoded_readings(path) else {
-        return Err(format!(
+    match check_path_within(base_path, &target) {
+        Ok(()) => Ok(candidate),
+        Err(PathEscape::Parsed(path)) => Err(format!(
+            "upstream path '{path}' escapes the configured base path '{base_path}'"
+        )),
+        Err(PathEscape::Decoded(path)) => Err(format!(
+            "upstream path '{path}' escapes the configured base path '{base_path}' \
+             once encoded separators are decoded"
+        )),
+        Err(PathEscape::TooDeep) => Err(format!(
             "upstream path nests more than {MAX_DECODE_ROUNDS} layers of percent-encoding"
-        ));
-    };
-    for reading in readings {
-        let probe = build_target_url(base_url, &reading, query);
-        let Ok(probe) = reqwest::Url::parse(&probe) else {
-            return Err("upstream URL does not parse with separators decoded".to_string());
-        };
-        if !path_is_within(base_path, probe.path()) {
-            return Err(format!(
-                "upstream path '{}' escapes the configured base path '{base_path}' \
-                 once encoded separators are decoded",
-                probe.path()
-            ));
-        }
+        )),
     }
-
-    Ok(candidate)
-}
-
-/// True when `target_path` is `base_path` itself or sits under it.
-///
-/// An empty `base_path` means the operator configured no prefix, so nothing is
-/// out of bounds. The boundary is a segment, never a string prefix, so
-/// `/safe-prefix-evil` does not count as inside `/safe-prefix`.
-fn path_is_within(base_path: &str, target_path: &str) -> bool {
-    base_path.is_empty()
-        || target_path == base_path
-        || target_path
-            .strip_prefix(base_path)
-            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// A redirect target's path, expressed relative to `base_url`'s own prefix, so
@@ -837,44 +805,6 @@ fn redirect_path_within_base(base_url: &str, target_path: &str) -> Option<String
             .to_string(),
     )
 }
-
-/// Every deeper reading of `path`, one per decode layer. For the containment
-/// probe above, never for sending.
-///
-/// A round rewrites the separator encodings into `/`, then unwraps one layer of
-/// escaping. So `%252f` becomes `%2f`, then `/`, and an upstream stack that
-/// decodes twice is covered as well as one that decodes once.
-///
-/// `None` means the path still changes after [`MAX_DECODE_ROUNDS`] rounds, and
-/// the caller refuses it. One round can peel a single `%25`, so an uncapped
-/// probe costs time and memory quadratic in the path length. Refusing past the
-/// cap, rather than accepting, keeps a deeper nesting from becoming a bypass.
-///
-/// A backslash maps to `/` because the URL standard treats it as a separator.
-/// That is also why [`request_path_has_traversal`] rejects a literal one.
-fn decoded_readings(path: &str) -> Option<Vec<String>> {
-    let mut readings: Vec<String> = Vec::new();
-    loop {
-        let current = readings.last().map_or(path, String::as_str);
-        let next = current
-            .replace("%2f", "/")
-            .replace("%2F", "/")
-            .replace("%5c", "/")
-            .replace("%5C", "/")
-            .replace("%25", "%");
-        if next == current {
-            return Some(readings);
-        }
-        if readings.len() == MAX_DECODE_ROUNDS {
-            return None;
-        }
-        readings.push(next);
-    }
-}
-
-/// How many decode layers the containment probe chases before it refuses.
-/// Real upstreams decode once or twice; the cap bounds what one request costs.
-const MAX_DECODE_ROUNDS: usize = 8;
 
 /// Append `key=urlencoded(value)` to a URL's query string. Preserves any
 /// existing query and chooses `?` vs `&` accordingly.
@@ -1937,6 +1867,9 @@ async fn build_pipeline_layers(
 ///
 /// Returns the final response and the `PipelineOutcome` from the first
 /// hop (which is what the 401-retry decision inspects).
+///
+/// The one exit for what an upstream says: the response and every refusal
+/// leave with the injected credentials masked (`api::proxy_redaction`).
 #[allow(clippy::too_many_arguments)]
 async fn forward_with_redirects(
     name: &str,
@@ -1947,6 +1880,39 @@ async fn forward_with_redirects(
     initial_query: Option<&str>,
     headers: &HeaderMap,
     body: &Bytes,
+) -> Result<(Response, crate::api::proxy_pipeline::PipelineOutcome), (StatusCode, String)> {
+    let mut injected = crate::api::proxy_redaction::InjectedSecrets::default();
+    let forwarded = follow_redirects(
+        name,
+        scoped,
+        budget,
+        method,
+        initial_path,
+        initial_query,
+        headers,
+        body,
+        &mut injected,
+    )
+    .await;
+    match forwarded {
+        Ok((response, outcome)) => Ok((injected.redact_response(response).await?, outcome)),
+        Err((status, message)) => Err((status, injected.redact_text(&message))),
+    }
+}
+
+/// [`forward_with_redirects`] before masking. Records each hop's injected
+/// credentials in `injected` before the hop is sent.
+#[allow(clippy::too_many_arguments)]
+async fn follow_redirects(
+    name: &str,
+    scoped: &ScopedPipeline,
+    budget: &CallBudget,
+    method: &Method,
+    initial_path: &str,
+    initial_query: Option<&str>,
+    headers: &HeaderMap,
+    body: &Bytes,
+    injected: &mut crate::api::proxy_redaction::InjectedSecrets,
 ) -> Result<(Response, crate::api::proxy_pipeline::PipelineOutcome), (StatusCode, String)> {
     let base_url = scoped.base_url.as_str();
     let layers = scoped.layers.as_slice();
@@ -2018,6 +1984,7 @@ async fn forward_with_redirects(
         )
         .await
         .map_err(|_| out_of_time())??;
+        injected.add_hop(&outcome);
 
         let body_for_send = outcome
             .replace_body
@@ -2055,7 +2022,7 @@ async fn forward_with_redirects(
             current_method.clone(),
             &final_url,
             &outcome.log_url,
-            headers.clone(),
+            injected.request_headers(headers),
             auth_headers,
             body_for_send,
             scoped.transport,

@@ -14,6 +14,9 @@ import {
   headersToRecord,
   _setBridgedForTesting,
   _resetHostServingForTesting,
+  fromHost,
+  postToHost,
+  callHost,
 } from './_bridge';
 import { installHostOps } from './hostOps';
 
@@ -120,6 +123,51 @@ describe('a host request', () => {
   it('from the real host, which shares the frame origin, moves it', async () => {
     await parentSays(loc.origin);
     expect(loc.href).toBe(`${APP_DOC}#today`);
+  });
+});
+
+describe('the host origin', () => {
+  const FRAME_ORIGIN = 'https://localhost:5251';
+  const parent = { postMessage: vi.fn() };
+
+  beforeEach(() => {
+    parent.postMessage.mockClear();
+    vi.stubGlobal('location', { origin: FRAME_ORIGIN });
+    vi.stubGlobal('window', { parent });
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('is the target of every post to the host, never a wildcard', () => {
+    postToHost({ type: 'x' });
+    expect(parent.postMessage).toHaveBeenCalledWith({ type: 'x' }, FRAME_ORIGIN);
+  });
+
+  it('is the only origin the parent window may speak from', () => {
+    const from = (origin: string, source: unknown = parent) =>
+      fromHost({ source, origin } as unknown as MessageEvent);
+    expect(from(FRAME_ORIGIN)).toBe(true);
+    expect(from('https://foreign.example')).toBe(false);
+    expect(from(FRAME_ORIGIN, {})).toBe(false);
+  });
+
+  describe('when the frame URL has an opaque origin', () => {
+    // A srcdoc preview reads "null", and postMessage throws on that target.
+    beforeEach(() => vi.stubGlobal('location', { origin: 'null' }));
+
+    it('drops a post rather than throwing', () => {
+      expect(() => postToHost({ type: 'x' })).not.toThrow();
+      expect(parent.postMessage).not.toHaveBeenCalled();
+    });
+
+    it('admits no message, even one that reports the same opaque origin', () => {
+      expect(fromHost({ source: parent, origin: 'null' } as unknown as MessageEvent)).toBe(false);
+    });
+
+    it('refuses a host call at once instead of waiting out the timeout', async () => {
+      vi.stubGlobal('window', { parent, addEventListener: vi.fn() });
+      await expect(callHost('fetch', {}, 60_000)).rejects.toThrow(/no host/);
+    });
   });
 });
 

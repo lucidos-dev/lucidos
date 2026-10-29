@@ -158,12 +158,12 @@ describe('the bar states each thing once', () => {
   });
 
   it('washes each degraded state in the colour its dot already carries', () => {
-    // `stopped` shares the amber rule: a deliberate stop is no fault, so it takes
-    // the in-between colour rather than the red of a settled disconnect.
+    // `stopped` and `starting` share the amber rule: neither is a fault, so they
+    // take the in-between colour rather than the red of a settled disconnect.
     const wash = (selector: string) => decl(block(shellCss, `${selector} {`), 'background') ?? '';
     const washes: Record<string, string> = {
       disconnected: wash(`.connection-banner[data-conn='disconnected']`),
-      connecting: wash(`.connection-banner[data-conn='connecting'],\n.connection-banner[data-conn='stopped']`),
+      connecting: wash(`.connection-banner[data-conn='connecting'],\n.connection-banner[data-conn='stopped'],\n.connection-banner[data-conn='starting']`),
     };
     expect(washes.disconnected).toContain('var(--accent-red)');
     expect(washes.connecting).toContain('var(--accent-yellow)');

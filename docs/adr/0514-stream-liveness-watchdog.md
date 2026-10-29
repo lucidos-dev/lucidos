@@ -46,6 +46,11 @@ tolerated, and the slack covers timer jitter.
   engine value.
 - A tab that sleeps trips the watchdog on wake. The reopen is cheap, and the
   resync is what the wake path ran anyway.
+- The watchdog stays as it is. It cannot see a frame lost while keepalives
+  still arrive. An accepted send now runs a *send probe*: after
+  `SEND_CONFIRM_MS` without the confirming frame, the client refetches the
+  thread. It restarts the stream (`EventStream.restart`) only when the refetch
+  shows the event the stream never delivered. That is proof of a missed frame.
 
 ## Alternatives considered
 

@@ -533,3 +533,59 @@ async fn a_credential_value_needs_a_token_and_a_non_app_origin() {
 
     delete_credential(&client, &api, &id).await;
 }
+
+/// `GET /api/v1/events/query` masks a stored credential in any payload. A row
+/// written before the write-time mask still holds the raw value, and both the
+/// app SDK and `lucidos events query` read through this route.
+#[tokio::test]
+async fn events_query_masks_a_stored_credential_in_an_old_row() {
+    let client = user_client().await;
+    let api = base_url();
+    let service = unique_marker("e2e-mask");
+    let secret = unique_marker("opaque-stored-value");
+    let resp = client
+        .post(format!("{}/api/v1/credentials", api))
+        .json(&json!({
+            "service_name": service,
+            "base_url": "https://api.example.com",
+            "auth_type": "api_key",
+            "auth_value": secret,
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    let id = credential_id(&client, &api, &service).await;
+
+    let pool = PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to database");
+    let thread_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, created, aggregate_id, aggregate, thread_id) \
+         VALUES ($1, 'BackgroundBashCompleted', $2, NOW(), $3::text, 'thread', $3)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(json!({ "task_id": "task-old", "stdout": format!("key={secret}"), "stderr": "" }))
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("seed BackgroundBashCompleted");
+    pool.close().await;
+
+    let resp = client
+        .get(format!("{}/api/v1/events/query", api))
+        .query(&[("thread_id", thread_id.to_string())])
+        .send()
+        .await
+        .expect("query failed");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.expect("body");
+    assert!(!body.contains(&secret), "credential replayed: {body}");
+    assert!(
+        body.contains("key=[REDACTED]"),
+        "row missing or unmasked: {body}"
+    );
+
+    delete_credential(&client, &api, &id).await;
+}

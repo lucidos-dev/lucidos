@@ -441,6 +441,63 @@ pub(crate) async fn named_secret_env_vars(
     }
 }
 
+/// Every secret value a subprocess could have held that the store still has,
+/// ready for [`crate::core::redact_subprocess_output`].
+///
+/// For output read back after its spawn env is gone, such as a persisted
+/// `BackgroundBashCompleted` row. It covers each injectable credential, each
+/// OAuth access token, and the secret-shaped `environment_variables` rows.
+///
+/// A *secret reference* stays unresolved, because resolving runs `op` on every
+/// read. A value rotated since the output was written is not here either.
+/// An `Err` means the list is incomplete, so the caller must not hand the
+/// output on.
+pub(crate) async fn stored_secret_values(pool: &sqlx::PgPool) -> Result<Vec<String>, String> {
+    use crate::core::credentials::credential_env_vars_for;
+    use crate::core::{oauth, CredentialStore, EnvironmentVariableStore, OAuthStore};
+
+    let mut pairs = EnvironmentVariableStore::env_pairs(pool)
+        .await
+        .map_err(|e| format!("failed to load environment variables: {e}"))?;
+    let creds = CredentialStore::list_all_with_secrets(pool)
+        .await
+        .map_err(|e| format!("failed to load credentials: {e}"))?;
+    let resolver = crate::core::secret_reference::engine_resolver(pool);
+    for cred in creds
+        .into_iter()
+        .filter(|cred| cred.auth_type.is_injectable() && !cred.holds_reference())
+    {
+        pairs.extend(credential_env_vars_for(cred, &resolver).await?);
+    }
+    let accounts = OAuthStore::list_all_with_tokens(pool)
+        .await
+        .map_err(|e| format!("failed to load OAuth accounts: {e}"))?;
+    pairs.extend(oauth::account_env_vars(accounts));
+    Ok(crate::core::subprocess_secret_values(
+        &pairs,
+        crate::core::inherited_secret_env(),
+    ))
+}
+
+/// Masks every stored event payload against [`stored_secret_values`].
+///
+/// Each reader that hands stored rows out, to the model or over HTTP, calls
+/// this. An `Err` means the rows are not masked, so the caller must withhold
+/// them.
+pub(crate) async fn mask_stored_events(
+    pool: &sqlx::PgPool,
+    events: &mut [crate::core::EventRow],
+) -> Result<(), String> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let secrets = stored_secret_values(pool).await?;
+    for event in events {
+        crate::core::redact_subprocess_output_in_json(&mut event.payload, &secrets);
+    }
+    Ok(())
+}
+
 /// The engine-owned, secret-free part of a script's env: workspace and PATH,
 /// the database handle, origin attribution and host protection.
 fn engine_owned_script_env(

@@ -17,7 +17,7 @@
 
 import type { PRESENCE_OUTCOMES_BY_STRENGTH } from './generated/engine-constants';
 import { SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL_MS } from './generated/engine-constants';
-import type { ToPort } from './worker/protocol';
+import type { FromPort, ToPort } from './worker/protocol';
 
 /** How long a dropped stream waits before it opens again. The shell, the
  *  shared worker and an app's own stream all retry on this one schedule. */
@@ -93,10 +93,14 @@ export interface PongAnswer {
 }
 
 /** Why a stream dropped. A stall is silence: the stream never errored, but
- *  nothing arrived for `silentMs`, so it counts as dead. */
+ *  nothing arrived for `silentMs`, so it counts as dead. The two `worker-`
+ *  reasons are the shared worker itself failing this page: it forgot the
+ *  page's hello, or it stopped answering. */
 export type StreamDrop =
   | { reason: 'error' }
-  | { reason: 'stalled'; silentMs: number; transport: 'direct' | 'shared' };
+  | { reason: 'stalled'; silentMs: number; transport: 'direct' | 'shared' }
+  | { reason: 'worker-restarted' }
+  | { reason: 'worker-unresponsive' };
 
 export interface EventStreamHandlers {
   /** One frame's `data` payload, verbatim. */
@@ -128,9 +132,17 @@ export interface EventStream {
    *
    *  `live` and `stale` are answers now. `checking` means the transport asked
    *  its holder and will report a dead upstream through `onError`, then `onOpen`.
-   *  Never closes a live stream. A silent one is dead after
+   *  A holder that does not answer within `WORKER_ANSWER_MS` is replaced, with
+   *  the same two calls. Never closes a live stream. A silent one is dead after
    *  `LATE_JOIN_STALL_AFTER_MS`. */
   revalidate(): StreamHealth;
+  /** Reopen the upstream now, for a caller holding proof it missed a frame.
+   *
+   *  Unlike `revalidate`, never waits for silence. Reports the drop through
+   *  `onError`, then `onOpen` on the new upstream, so the consumer resyncs as
+   *  after any other drop. A shared holder that does not answer is replaced,
+   *  as for `revalidate`. */
+  restart(): void;
 }
 
 /** The answer to `EventStream.revalidate`. */
@@ -217,6 +229,11 @@ export function openDirectEventStream(
     submitPong: (notificationId, answer) =>
       postPong(targets.pongUrl, notificationId, answer),
     revalidate: () => (liveness.silentMs() >= LATE_JOIN_STALL_AFTER_MS ? 'stale' : 'live'),
+    restart: () => {
+      liveness.stop();
+      es.close();
+      handlers.onError({ reason: 'error' });
+    },
   };
 }
 
@@ -228,6 +245,22 @@ export function openDirectEventStream(
  *  as it did before the stream was ever shared. */
 export function sharedWorkerAvailable(): boolean {
   return typeof SharedWorker !== 'undefined';
+}
+
+/** How long a page waits for the shared worker to answer a `check` or a
+ *  `restart`. A live worker answers over `postMessage` within milliseconds, so
+ *  this only bounds a worker the browser has lost. */
+export const WORKER_ANSWER_MS = 5000;
+
+/** One attachment to the shared worker. The `SharedWorker` object is held for
+ *  as long as its port is in use, so a collector cannot release it early. */
+interface WorkerLink {
+  worker: SharedWorker;
+  port: MessagePort;
+  /** A message arrived on this link. A worker asks a port to introduce itself
+   *  before anything else, so an ask that arrives first is answered by the
+   *  attach hello. A later ask comes from a relaunched instance. */
+  heard: boolean;
 }
 
 /** Attach to the workspace's shared holder.
@@ -243,34 +276,86 @@ export function openSharedEventStream(
   handlers: EventStreamHandlers,
   opts: { pongs: boolean },
 ): EventStream {
-  const worker = new SharedWorker(targets.workerUrl, { name: 'lucidos-sse' });
-  const port = worker.port;
-
-  port.onmessage = (event: MessageEvent) => {
-    const msg = event.data as Partial<ToPort> & { data?: string };
-    if (!msg || typeof msg !== 'object') return;
-    if (msg.t === 'frame') handlers.onFrame(msg.data as string);
-    else if (msg.t === 'open') handlers.onOpen();
-    else if (msg.t === 'error') {
-      handlers.onError(
-        typeof msg.silentMs === 'number'
-          ? { reason: 'stalled', silentMs: msg.silentMs, transport: 'shared' }
-          : { reason: 'error' },
-      );
-    }
-  };
-  port.start();
-  port.postMessage({
+  const hello: FromPort = {
     t: 'hello',
     pongs: opts.pongs,
     streamUrl: targets.streamUrl,
     pongUrl: targets.pongUrl,
-  });
+  };
+  /** A worker on this stream asked a port to introduce itself, so workers here
+   *  answer a `check`. An older worker never asks and never answers, and other
+   *  windows can keep one alive across a reload. */
+  let workerAnswers = false;
+  let answerTimer: ReturnType<typeof setTimeout> | null = null;
+  const stopWaitingForAnswer = () => {
+    if (answerTimer) clearTimeout(answerTimer);
+    answerTimer = null;
+  };
+
+  const attach = (): WorkerLink => {
+    const worker = new SharedWorker(targets.workerUrl, { name: 'lucidos-sse' });
+    const link: WorkerLink = { worker, port: worker.port, heard: false };
+    link.port.onmessage = (event: MessageEvent) => {
+      const msg = event.data as ToPort | null;
+      if (!msg || typeof msg !== 'object') return;
+      const first = !link.heard;
+      link.heard = true;
+      // Any message at all proves the worker is still there.
+      stopWaitingForAnswer();
+      if (msg.t === 'frame') handlers.onFrame(msg.data);
+      else if (msg.t === 'open') handlers.onOpen();
+      else if (msg.t === 'error') {
+        handlers.onError(
+          typeof msg.silentMs === 'number'
+            ? { reason: 'stalled', silentMs: msg.silentMs, transport: 'shared' }
+            : { reason: 'error' },
+        );
+      } else if (msg.t === 'introduce') {
+        workerAnswers = true;
+        if (!first) {
+          handlers.onError({ reason: 'worker-restarted' });
+          link.port.postMessage(hello);
+        }
+      }
+    };
+    link.port.start();
+    link.port.postMessage(hello);
+    return link;
+  };
+
+  let link = attach();
 
   const sayBye = () => {
     try {
-      port.postMessage({ t: 'bye' });
+      link.port.postMessage({ t: 'bye' });
     } catch { /* already gone */ }
+  };
+
+  /** Give up on a worker that stopped answering, and attach afresh. The
+   *  browser launches a new instance if the old one is gone. Its `open` then
+   *  runs the consumer's resync. */
+  const reattach = () => {
+    handlers.onError({ reason: 'worker-unresponsive' });
+    sayBye();
+    link.port.close();
+    link = attach();
+  };
+
+  /** Post a message the worker always answers, and replace the worker if it
+   *  stays silent. Until a worker here has asked, silence proves nothing. After
+   *  a reattach it still counts, so a replacement that never runs is replaced
+   *  too. */
+  const askWorker = (msg: FromPort) => {
+    link.port.postMessage(msg);
+    if (!workerAnswers || answerTimer) return;
+    const armedAt = Date.now();
+    answerTimer = setTimeout(() => {
+      answerTimer = null;
+      // A timer a whole window late was frozen with the page, and the answer
+      // may be queued behind it. Only a fresh window can tell.
+      if (Date.now() - armedAt >= 2 * WORKER_ANSWER_MS) askWorker({ t: 'check' });
+      else reattach();
+    }, WORKER_ANSWER_MS);
   };
 
   // A document usually leaves WITHOUT calling `disconnect()`: a closed tab, a
@@ -290,18 +375,20 @@ export function openSharedEventStream(
 
   return {
     close: () => {
+      stopWaitingForAnswer();
       if (canListen) removeEventListener('pagehide', onPageHide);
       sayBye();
-      port.close();
+      link.port.close();
     },
     ownsReconnect: true,
     submitPong: (notificationId, answer) => {
-      port.postMessage({ t: 'pong', notificationId, answer });
+      link.port.postMessage({ t: 'pong', notificationId, answer });
     },
     revalidate: () => {
-      port.postMessage({ t: 'check' });
+      askWorker({ t: 'check' });
       return 'checking';
     },
+    restart: () => askWorker({ t: 'restart' }),
   };
 }
 

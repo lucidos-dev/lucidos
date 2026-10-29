@@ -1689,6 +1689,44 @@ async fn e2e_check_plugin_updates_returns_real_data_after_install() {
     teardown_test_db(&db_name).await;
 }
 
+/// An upstream that commits `manifest.toml` as a symlink to a host file must
+/// not get that file read: a parse error would quote its contents back into
+/// the update report.
+#[cfg(unix)]
+#[tokio::test]
+async fn e2e_check_plugin_updates_never_reads_a_symlinked_manifest() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let (_tmp, scratch) = fresh_workspace();
+    let repos_dir = scratch.join("repos");
+    std::fs::create_dir_all(&repos_dir).unwrap();
+    let (bare, work) = make_local_git_plugin(&repos_dir, "linked", "linked", "0.1.0", "b");
+    let source_url = format!("file://{}", bare.display());
+    install_from_source_with_bus(&scratch, &bus, &source_url, false)
+        .await
+        .expect("install");
+
+    let secret = scratch.join("host-secret.txt");
+    std::fs::write(&secret, "password: canary-secret-value-7f3a\n").unwrap();
+    std::fs::remove_file(work.join("manifest.toml")).unwrap();
+    std::os::unix::fs::symlink(&secret, work.join("manifest.toml")).unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-m", "link manifest"]);
+    git(&work, &["push", "origin", "main"]);
+
+    let report = check_plugin_updates_impl(&scratch, &pool, Some("linked".into())).await;
+    assert!(!report.contains("canary-secret-value"), "{report}");
+    let report: Vec<serde_json::Value> = serde_json::from_str(&report).unwrap();
+    let error = report[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(&crate::core::plugins::ValidationError::MissingManifest.to_string()),
+        "{}",
+        report[0]
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
 /// `engine_requirement` is null exactly when the manifest has no `engine`, on
 /// the installed summary (the installed version) and in `check_plugin_updates`
 /// (the remote version).

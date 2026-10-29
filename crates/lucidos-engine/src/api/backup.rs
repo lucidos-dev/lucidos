@@ -239,6 +239,7 @@ async fn check_key_access(
         let (status, message) = forbidden(KEY_SUBJECT_LABEL);
         return Err(ApiError::new(status, message));
     }
+    crate::api::actor::refuse_agent_caller(headers, KEY_AGENT_REFUSAL)?;
     let actor = crate::api::actor::require_user_actor(headers, &state.pool, None).await?;
     if !state
         .reveal_tokens
@@ -250,6 +251,10 @@ async fn check_key_access(
     }
     Ok(actor)
 }
+
+/// What an agent is told by both steps of the key reveal.
+const KEY_AGENT_REFUSAL: &str = "An agent cannot reveal the backup key. It decrypts every \
+     legacy archive, so only the workspace owner reads it, in Settings, System, Backup.";
 
 /// Record that the key left the engine, naming the actor and never the key.
 async fn audit_key_revealed(state: &AppState, actor: MessageOrigin) {
@@ -279,6 +284,7 @@ pub(super) async fn mint_backup_key_reveal_token(
         let (status, message) = forbidden(KEY_SUBJECT_LABEL);
         return Err(ApiError::new(status, message));
     }
+    crate::api::actor::refuse_agent_caller(&headers, KEY_AGENT_REFUSAL)?;
     let token = state
         .reveal_tokens
         .mint(RevealSubject::BackupKey)
@@ -329,7 +335,8 @@ async fn check_recipient_access(
         let (status, message) = forbidden(KEY_SUBJECT_LABEL);
         return Err(ApiError::new(status, message));
     }
-    crate::api::actor::require_owner_device_for(headers, &state.pool, RECIPIENT_OWNER_ONLY).await
+    crate::api::actor::require_owner_device_for(headers, &state.pool, None, RECIPIENT_OWNER_ONLY)
+        .await
 }
 
 /// What an agent or the engine's own token is told by the routes above.

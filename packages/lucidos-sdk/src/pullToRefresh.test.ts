@@ -13,6 +13,9 @@ import {
   type ScrollNode,
 } from './pullToRefresh';
 
+/** The origin the host serves app frames from, as the SDK reads it. */
+const HOST_ORIGIN = 'https://localhost:5251';
+
 describe('pullTravel', () => {
   it('does not move for an upward or zero drag', () => {
     expect(pullTravel(-40)).toBe(0);
@@ -231,19 +234,21 @@ describe('installAppPullToRefresh', () => {
     cleanup();
     cleanup = () => {};
     delete (window as unknown as { parent?: unknown }).parent;
+    vi.unstubAllGlobals();
   });
 
   it('posts the travel and the release to the host', () => {
     const postMessage = vi.fn();
     (window as unknown as { parent: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
     cleanup = installAppPullToRefresh();
     const top = chain(0);
     window.dispatchEvent(touch('touchstart', [[100, 0]], { target: top }));
     window.dispatchEvent(touch('touchmove', [[100, 20]]));
     window.dispatchEvent(touch('touchmove', [[100, 200]]));
     window.dispatchEvent(touch('touchend', []));
-    expect(postMessage).toHaveBeenCalledWith({ type: APP_PULL_MESSAGE_TYPE, travel: 100 }, '*');
-    expect(postMessage).toHaveBeenLastCalledWith({ type: APP_REFRESH_MESSAGE_TYPE }, '*');
+    expect(postMessage).toHaveBeenCalledWith({ type: APP_PULL_MESSAGE_TYPE, travel: 100 }, HOST_ORIGIN);
+    expect(postMessage).toHaveBeenLastCalledWith({ type: APP_REFRESH_MESSAGE_TYPE }, HOST_ORIGIN);
   });
 
   it('does nothing at the top level, where there is no host', () => {

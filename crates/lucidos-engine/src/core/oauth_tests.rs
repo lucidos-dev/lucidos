@@ -1771,6 +1771,19 @@ fn client_provider_name_keeps_derived_provider_names_distinct() {
 /// Answer one token-endpoint POST with `access_token`, the way a provider
 /// redeems an authorization code. Returns the endpoint's URL.
 async fn serve_one_token_grant(access_token: &'static str) -> String {
+    let grant =
+        serde_json::json!({"access_token": access_token, "token_type": "bearer"}).to_string();
+    serve_one_response(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{grant}",
+        grant.len()
+    ))
+    .await
+}
+
+/// Answer one POST to a loopback token endpoint with the raw HTTP `response`.
+/// Returns the endpoint's URL.
+async fn serve_one_response(response: String) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/token", listener.local_addr().unwrap());
@@ -1802,13 +1815,6 @@ async fn serve_one_token_grant(access_token: &'static str) -> String {
                 break;
             }
         }
-        let grant =
-            serde_json::json!({"access_token": access_token, "token_type": "bearer"}).to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{grant}",
-            grant.len()
-        );
         stream.write_all(response.as_bytes()).await.unwrap();
         stream.flush().await.unwrap();
     });
@@ -3052,6 +3058,277 @@ async fn a_token_that_cannot_be_refreshed_refuses_the_send() {
     assert!(
         !error.contains("stale-token"),
         "a refusal never carries token material: {error}"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// Secret-bearing endpoints refuse cleartext
+// ---------------------------------------------------------------------------
+
+/// A token endpoint on a remote host over plain http. TEST-NET-1 (RFC 5737),
+/// so nothing answers if a request ever left.
+const CLEARTEXT_TOKEN_URL: &str = "http://192.0.2.1/oauth/token";
+const CLIENT_SECRET: &str = "client-secret-value";
+const REFRESH_TOKEN: &str = "refresh-token-value";
+
+/// The refusal names the credential and the field, so the user knows what to
+/// fix, and carries no secret.
+fn assert_cleartext_refusal(error: &str, credential: &str, field: &str) {
+    assert!(error.contains(credential), "names the credential: {error}");
+    assert!(error.contains(field), "names the field: {error}");
+    assert!(
+        error.contains("must use https"),
+        "says what to fix: {error}"
+    );
+    for secret in [CLIENT_SECRET, REFRESH_TOKEN] {
+        assert!(!error.contains(secret), "carries no secret: {error}");
+    }
+}
+
+#[test]
+fn a_secret_bearing_endpoint_accepts_https() {
+    for url in [
+        "https://oauth.example.com/token",
+        "https://oauth.example.com:8443/token?tenant=common",
+        "  https://oauth.example.com/token  ",
+    ] {
+        assert_eq!(
+            require_secure_endpoint("acme", "token_url", url),
+            Ok(()),
+            "{url}"
+        );
+    }
+}
+
+/// A local dev provider and the test token servers listen on loopback, where a
+/// request never leaves the machine.
+#[test]
+fn a_secret_bearing_endpoint_accepts_http_on_loopback() {
+    for url in [
+        "http://127.0.0.1:8080/token",
+        "http://127.0.0.2/token",
+        "http://localhost:8080/token",
+        "http://LOCALHOST/token",
+        "http://[::1]:8080/token",
+    ] {
+        assert_eq!(
+            require_secure_endpoint("acme", "token_url", url),
+            Ok(()),
+            "{url}"
+        );
+    }
+}
+
+/// Plain http anywhere else is refused, including hosts that only LOOK local.
+#[test]
+fn a_secret_bearing_endpoint_refuses_cleartext_to_a_remote_host() {
+    for url in [
+        CLEARTEXT_TOKEN_URL,
+        "http://oauth.example.com/token",
+        "http://localhost.attacker.example/token",
+        "http://127.0.0.1.attacker.example/token",
+        "http://10.0.0.5/token",
+        "ftp://oauth.example.com/token",
+        "ws://localhost/token",
+    ] {
+        let error = require_secure_endpoint("acme", "token_url", url).unwrap_err();
+        assert_cleartext_refusal(&error, "acme", "token_url");
+    }
+}
+
+#[test]
+fn a_secret_bearing_endpoint_refuses_an_unparseable_url() {
+    let error =
+        require_secure_endpoint("acme", "token_url", "oauth.example.com/token").unwrap_err();
+    assert!(
+        error.contains("acme") && error.contains("token_url"),
+        "{error}"
+    );
+}
+
+/// The save-side check covers every endpoint a secret travels to.
+#[test]
+fn saving_a_client_refuses_any_cleartext_secret_bearing_endpoint() {
+    let secure = serde_json::json!({
+        "client_id": "cid",
+        "client_secret": CLIENT_SECRET,
+        "auth_url": "https://oauth.example.com/authorize",
+        "token_url": "https://oauth.example.com/token",
+        "userinfo_url": "https://oauth.example.com/userinfo",
+    });
+    assert_eq!(check_client_endpoints("acme", &secure.to_string()), Ok(()));
+    for field in SECRET_BEARING_ENDPOINTS {
+        let mut config = secure.clone();
+        config[field] = serde_json::json!("http://oauth.example.com/endpoint");
+        let error = check_client_endpoints("acme", &config.to_string()).unwrap_err();
+        assert_cleartext_refusal(&error, "acme", field);
+    }
+}
+
+/// Absent and blank endpoints are the repair form's business, not this check's.
+#[test]
+fn saving_a_client_leaves_absent_endpoints_to_the_repair_form() {
+    assert_eq!(
+        check_client_endpoints("acme", r#"{"client_id":"cid"}"#),
+        Ok(())
+    );
+    assert_eq!(
+        check_client_endpoints("acme", r#"{"client_id":"cid","userinfo_url":"  "}"#),
+        Ok(())
+    );
+    assert_eq!(check_client_endpoints("acme", "not json"), Ok(()));
+}
+
+/// The token request itself refuses, whatever path stored the URL. It returns
+/// at once with the refusal, so no request was attempted.
+#[tokio::test]
+async fn a_token_request_to_a_cleartext_remote_endpoint_is_refused_before_sending() {
+    let quick = std::time::Duration::from_secs(2);
+    let refresh = tokio::time::timeout(
+        quick,
+        refresh_access_token(
+            "acme",
+            CLEARTEXT_TOKEN_URL,
+            "cid",
+            Some(CLIENT_SECRET),
+            REFRESH_TOKEN,
+        ),
+    )
+    .await
+    .expect("refused without touching the network")
+    .unwrap_err();
+    assert_cleartext_refusal(&refresh.to_string(), "acme", "token_url");
+
+    let auth = ClientAuth::from_secret(Some(CLIENT_SECRET));
+    let exchange = tokio::time::timeout(
+        quick,
+        exchange_code(
+            "acme",
+            CLEARTEXT_TOKEN_URL,
+            "cid",
+            &auth,
+            "auth-code",
+            &default_redirect_uri(),
+        ),
+    )
+    .await
+    .expect("refused without touching the network")
+    .unwrap_err();
+    assert_cleartext_refusal(&exchange.to_string(), "acme", "token_url");
+}
+
+#[tokio::test]
+async fn a_token_request_to_a_loopback_http_endpoint_is_sent() {
+    let token_url = serve_one_token_grant("loopback-token").await;
+    let token = refresh_access_token(
+        "acme",
+        &token_url,
+        "cid",
+        Some(CLIENT_SECRET),
+        REFRESH_TOKEN,
+    )
+    .await
+    .expect("loopback http is allowed");
+    assert_eq!(token.access_token, "loopback-token");
+}
+
+/// A 307 replays the POST body, so following an https-to-http redirect would
+/// resend the secret form in cleartext. The client refuses to follow it.
+#[tokio::test]
+async fn a_token_endpoint_redirect_to_cleartext_is_not_followed() {
+    let token_url = serve_one_response(format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {CLEARTEXT_TOKEN_URL}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    ))
+    .await;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        refresh_access_token(
+            "acme",
+            &token_url,
+            "cid",
+            Some(CLIENT_SECRET),
+            REFRESH_TOKEN,
+        ),
+    )
+    .await
+    .expect("refused without following to the remote host")
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("cleartext"), "says why: {error}");
+    for secret in [CLIENT_SECRET, REFRESH_TOKEN] {
+        assert!(!error.contains(secret), "carries no secret: {error}");
+    }
+}
+
+/// A row stored before the save-side check existed still cannot leak its
+/// refresh token: the refresh refuses on read.
+#[tokio::test]
+async fn refreshing_with_a_stored_cleartext_token_url_is_refused() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": CLIENT_SECRET,
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": CLEARTEXT_TOKEN_URL,
+        })
+        .to_string(),
+    )
+    .await;
+    let expired = Utc::now() - chrono::Duration::seconds(300);
+    let mut account = make_account("acme", "old-token", Some(REFRESH_TOKEN), Some(expired));
+
+    let error = refresh_oauth_if_needed(&pool, &mut account)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_cleartext_refusal(&error, "acme", "token_url");
+    assert_eq!(account.access_token, "old-token", "nothing was refreshed");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A connect refuses before the listener binds and the browser opens, so the
+/// user never consents to a flow that would leak its code.
+#[tokio::test]
+async fn connecting_with_a_stored_cleartext_token_url_is_refused_before_the_browser_opens() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": CLIENT_SECRET,
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": CLEARTEXT_TOKEN_URL,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let opened = std::sync::atomic::AtomicBool::new(false);
+    let open_auth_url = async |_: &str, _: uuid::Uuid| -> Result<(), BoxError> {
+        opened.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    };
+    let Err(error) = run_oauth_flow(&pool, &bus, "acme", "read", None, open_auth_url).await else {
+        panic!("a cleartext token_url must refuse the flow");
+    };
+    let error = error.to_string();
+    assert_cleartext_refusal(&error, "acme", "token_url");
+    assert!(
+        !opened.load(std::sync::atomic::Ordering::SeqCst),
+        "the browser never opened"
     );
 
     crate::test_support::teardown_test_db(&db_name).await;

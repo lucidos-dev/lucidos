@@ -14,6 +14,9 @@ mod health_test;
 #[path = "api_support/ws_echo_test.rs"]
 mod ws_echo_test;
 
+#[path = "api_support/voice_ticket_test.rs"]
+mod voice_ticket_test;
+
 #[path = "api_support/changelog_test.rs"]
 mod changelog_test;
 

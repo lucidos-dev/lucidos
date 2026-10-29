@@ -9,7 +9,12 @@
  *
  * No credential is appended. The gateway authenticates a same-origin handshake
  * by cookie, exactly as it does an ordinary request (ADR 0151).
+ *
+ * The call ticket rides the query, because a `WebSocket` cannot set a header.
+ * It names the device and the thread the shell minted it for, and opens one
+ * socket once.
  */
+import { QUERY_CALL_TICKET } from '@lucidos/engine-constants';
 import { API, REMOTE_GATEWAY } from '../utils/basePath';
 
 /** Whether this page can open a call at all. A workspace opened through
@@ -34,9 +39,14 @@ function socketBase(opts: SocketOrigin): string {
   return `${socketScheme(opts.protocol)}//${opts.host}${opts.api}`;
 }
 
-/** Pure: the call URL for a thread, given where the page is served from. */
-export function computeVoiceSocketUrl(opts: SocketOrigin & { threadId: string }): string {
-  return `${socketBase(opts)}/voice?thread_id=${encodeURIComponent(opts.threadId)}`;
+/** Pure: the call URL for a thread and its ticket, given where the page is
+ *  served from. */
+export function computeVoiceSocketUrl(
+  opts: SocketOrigin & { threadId: string; ticket: string },
+): string {
+  const thread = encodeURIComponent(opts.threadId);
+  const ticket = encodeURIComponent(opts.ticket);
+  return `${socketBase(opts)}/voice?thread_id=${thread}&${QUERY_CALL_TICKET}=${ticket}`;
 }
 
 /**
@@ -55,8 +65,8 @@ function servedOrigin(): SocketOrigin {
 }
 
 /** Live-wired {@link computeVoiceSocketUrl} for the served context. */
-export function voiceSocketUrl(threadId: string): string {
-  return computeVoiceSocketUrl({ ...servedOrigin(), threadId });
+export function voiceSocketUrl(threadId: string, ticket: string): string {
+  return computeVoiceSocketUrl({ ...servedOrigin(), threadId, ticket });
 }
 
 /** Live-wired {@link computeWsEchoUrl} for the served context. */

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals';
 
 const mockStartWorkspace = vi.fn();
@@ -6,8 +6,13 @@ vi.mock('../../api/client/control', () => ({
   startWorkspace: (...args: unknown[]) => mockStartWorkspace(...args),
 }));
 const mockCheckConnection = vi.fn();
+const mockNoteStartAccepted = vi.fn();
 vi.mock('./connection', () => ({
   checkConnection: (...args: unknown[]) => mockCheckConnection(...args),
+  noteWorkspaceStartAccepted: () => {
+    mockNoteStartAccepted();
+    connectionStatus.value = 'starting';
+  },
 }));
 const mockShowToast = vi.fn();
 const connectionStatus = signal<string>('stopped');
@@ -16,32 +21,30 @@ vi.mock('../store', () => ({
   connectionStatus,
 }));
 
-const { startThisWorkspace, START_SETTLE_MS } = await import('./workspace-start');
+const { startThisWorkspace } = await import('./workspace-start');
 
 beforeEach(() => {
   vi.clearAllMocks();
   connectionStatus.value = 'stopped';
 });
 
-afterEach(() => {
-  vi.useRealTimers();
-});
-
 describe('startThisWorkspace', () => {
-  it('starts the workspace, probes health at once, and resolves when it leaves stopped', async () => {
+  it('starts the workspace, reads starting, and resolves once the engine answers', async () => {
     mockStartWorkspace.mockResolvedValue(undefined);
-    mockCheckConnection.mockImplementation(async () => {
-      connectionStatus.value = 'disconnected';
-    });
+    mockCheckConnection.mockResolvedValue(undefined);
 
-    expect(await startThisWorkspace('dev')).toBe(true);
+    const result = startThisWorkspace('dev');
+    await vi.waitFor(() => expect(mockCheckConnection).toHaveBeenCalledOnce());
+    expect(connectionStatus.value).toBe('starting');
+    connectionStatus.value = 'connected';
 
+    expect(await result).toBe(true);
     expect(mockStartWorkspace).toHaveBeenCalledWith('dev');
-    expect(mockCheckConnection).toHaveBeenCalledOnce();
+    expect(mockNoteStartAccepted).toHaveBeenCalledOnce();
     expect(mockShowToast).not.toHaveBeenCalled();
   });
 
-  it('tells the user when the gateway refuses, and does not probe', async () => {
+  it('tells the user when the gateway refuses, and neither reads starting nor probes', async () => {
     mockStartWorkspace.mockRejectedValue(new Error('workspace not found'));
 
     expect(await startThisWorkspace('dev')).toBe(false);
@@ -49,20 +52,20 @@ describe('startThisWorkspace', () => {
     expect(mockShowToast).toHaveBeenCalledOnce();
     expect(mockShowToast.mock.calls[0][0]).toContain('Could not start the workspace');
     expect(mockShowToast.mock.calls[0][1]).toBe('error');
+    expect(mockNoteStartAccepted).not.toHaveBeenCalled();
     expect(mockCheckConnection).not.toHaveBeenCalled();
+    expect(connectionStatus.value).toBe('stopped');
   });
 
   // The gateway boots in the background after it accepts a start. A boot that
-  // fails there leaves the workspace stopped, with no error on the request.
-  it('gives up and tells the user when the workspace stays stopped', async () => {
-    vi.useFakeTimers();
+  // fails there ends `starting` in something other than connected.
+  it.each(['stopped', 'disconnected'])('tells the user when starting ends %s', async (end) => {
     mockStartWorkspace.mockResolvedValue(undefined);
-    mockCheckConnection.mockResolvedValue(undefined);
+    mockCheckConnection.mockImplementation(async () => {
+      connectionStatus.value = end;
+    });
 
-    const result = startThisWorkspace('dev');
-    await vi.advanceTimersByTimeAsync(START_SETTLE_MS);
-
-    expect(await result).toBe(false);
+    expect(await startThisWorkspace('dev')).toBe(false);
     expect(mockShowToast).toHaveBeenCalledOnce();
     expect(mockShowToast.mock.calls[0][0]).toContain('did not start');
     expect(mockShowToast.mock.calls[0][1]).toBe('error');

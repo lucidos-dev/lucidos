@@ -11,8 +11,8 @@
 use uuid::Uuid;
 
 use super::super::{
-    branch_work_sql, keeping_status_across_redirect, preserving_verdict, BusEvent, EventBus,
-    CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE,
+    branch_work_sql, keeping_status_across_redirect, preserving_verdict, quoted_list, BusEvent,
+    EventBus, CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE,
 };
 use super::propagation::{
     detach_child_from_parent, hold_parent_recount_lock, load_blocking_sample,
@@ -29,12 +29,30 @@ use crate::engine::thread_events::{
     ActorMode, CancelCause, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
 };
 use crate::engine::thread_lifecycle::{
-    resolve_transition, ArchiveState, ChangeStateKind, ThreadStatus,
+    resolve_transition, ArchiveState, ChangeStateKind, ThreadStatus, WAITING_FOR_USER_ANSWER_EVENTS,
 };
 
 const IDLE: &str = ThreadStatus::Idle.sql_literal();
 const RUNNING: &str = ThreadStatus::Running.sql_literal();
 const WAITING_FOR_USER_ANSWER: &str = ThreadStatus::WaitingForUserAnswer.sql_literal();
+
+/// SQL for "this `CodingAgentToolResult` leaves the thread parked on the user".
+/// The agent is still blocked unless the event that set the park is a question
+/// and the result is its own (ADR 0583). A permission card ends only through
+/// its resolution. Both hang watchdogs spare a park only when the status reads
+/// it. `$1` is the thread, `$2` the result's `tool_use_id`.
+fn tool_result_keeps_park_sql() -> String {
+    format!(
+        "(CASE WHEN status = {WAITING_FOR_USER_ANSWER} THEN NOT EXISTS ( \
+           SELECT 1 FROM (SELECT event_type, payload FROM events \
+                          WHERE thread_id = $1 AND event_type IN ({parks}) \
+                          ORDER BY sequence DESC LIMIT 1) q \
+           WHERE q.event_type = 'UserQuestionAsked' AND {own}) \
+         ELSE FALSE END)",
+        parks = quoted_list(WAITING_FOR_USER_ANSWER_EVENTS.iter().copied()),
+        own = ThreadEvent::question_owns_result_id_sql("q", "$2"),
+    )
+}
 
 /// A word was spoken on this thread, so the draft it was placed from becomes
 /// an ordinary thread (ADR 0167).
@@ -1309,7 +1327,9 @@ impl EventBus {
                 // time, but activity events fire many times per turn and would
                 // constantly reshuffle IN PROGRESS sort order if treated the same
                 // way. Mirrors `status_transitions()` for these event types — see
-                // `thread_lifecycle.rs`.
+                // `thread_lifecycle.rs`. One exception the table cannot express: a
+                // `CodingAgentToolResult` keeps a park it is not the question's
+                // own result for (`tool_result_keeps_park_sql`).
                 //
                 // The bump is `preserving_verdict`, so it can revive a thread
                 // that drifted to 'idle'/'waiting' but never one whose turn
@@ -1357,20 +1377,30 @@ impl EventBus {
                     // ('failed' or 'paused') means the thread was not revived
                     // and must not reshuffle the IN PROGRESS sort order. The
                     // exclusion list is built from the same constant the bump
-                    // itself keys on, so the two cannot drift apart.
-                    sqlx::query(&format!(
+                    // itself keys on, so the two cannot drift apart. A kept
+                    // park is skipped the same way, through `keeps_park`.
+                    let (keeps_park, result_id) = match event {
+                        ThreadEvent::CodingAgentToolResult { tool_use_id, .. } => {
+                            (tool_result_keeps_park_sql(), Some(tool_use_id))
+                        }
+                        _ => ("FALSE".to_string(), None),
+                    };
+                    let sql = format!(
                         "UPDATE thread_summaries SET last_activity = NOW(), \
                          last_agent_action = NOW(), \
                          last_revived_at = CASE WHEN status NOT IN ({RUNNING}, {verdicts}) \
+                                                 AND NOT {keeps_park} \
                                                 THEN NOW() ELSE last_revived_at END, \
-                         status = {status} \
+                         status = CASE WHEN {keeps_park} THEN status ELSE {status} END \
                          WHERE thread_id = $1",
                         verdicts = &*crate::engine::event_bus::PRESERVED_STATUS_VERDICTS_SQL,
                         status = preserving_verdict(RUNNING),
-                    ))
-                    .bind(thread_id)
-                    .execute(&mut **tx)
-                    .await?;
+                    );
+                    let mut query = sqlx::query(&sql).bind(thread_id);
+                    if let Some(result_id) = result_id {
+                        query = query.bind(result_id);
+                    }
+                    query.execute(&mut **tx).await?;
                 }
                 Vec::new()
             }

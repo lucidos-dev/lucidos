@@ -61,10 +61,39 @@ pub(crate) enum PushOutcome {
     Failed(String),
 }
 
+/// One push to `origin`'s `main` at a time. Two that overlap race at the
+/// remote, which refuses one ("cannot lock ref").
+static ORIGIN_PUSH_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Push `sha` to `origin`'s `main`, as a fast-forward only. A successful push
 /// also moves [`ORIGIN_MAIN`] and tells the gateway, which nudges the
 /// gateways it is paired with (`landing_gateway`).
+///
+/// A push that queued behind a newer one is refused as a rewind. A fresh
+/// fetch then decides: a `sha` that `origin`'s `main` holds counts as pushed.
 pub(crate) async fn push_to_origin_main(repo_root: &Path, sha: &str) -> PushOutcome {
+    let _push_guard = ORIGIN_PUSH_MUTEX.lock().await;
+    match push_sha(repo_root, sha).await {
+        PushOutcome::Rejected(reason) if origin_holds(repo_root, sha).await => {
+            log!("[Changes] origin's main already holds {sha}, so nothing to push ({reason})");
+            PushOutcome::Pushed
+        }
+        outcome => outcome,
+    }
+}
+
+/// Whether `origin`'s `main`, fetched now, contains `sha`. The tracking ref
+/// alone can be stale, and a wrong yes would claim a push that never happened.
+async fn origin_holds(repo_root: &Path, sha: &str) -> bool {
+    let Ok(Some(tip)) = fetch_origin_main(repo_root).await else {
+        return false;
+    };
+    git_answer(&["merge-base", "--is-ancestor", sha, &tip], repo_root)
+        .await
+        .or_unknown(false)
+}
+
+async fn push_sha(repo_root: &Path, sha: &str) -> PushOutcome {
     let refspec = format!("{sha}:refs/heads/main");
     match run_remote(
         &["push", "--porcelain", "origin", &refspec],
@@ -79,15 +108,29 @@ pub(crate) async fn push_to_origin_main(repo_root: &Path, sha: &str) -> PushOutc
         }
         Ok(o) => {
             let stdout = String::from_utf8_lossy(&o.stdout);
-            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let reason = push_refusal(&stdout, &stderr);
             if push_was_rejected(&stdout, &stderr) {
-                PushOutcome::Rejected(stderr)
+                PushOutcome::Rejected(reason)
             } else {
-                PushOutcome::Failed(stderr)
+                PushOutcome::Failed(reason)
             }
         }
         Err(e) => PushOutcome::Failed(e),
     }
+}
+
+/// Why a push failed. `--porcelain` prints each refused ref on stdout as
+/// `!<TAB>src:dst<TAB>summary`. stderr holds the remote's own `remote:` lines
+/// and git's "failed to push", so the refusal leads and stderr follows.
+fn push_refusal(stdout: &str, stderr: &str) -> String {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with('!'))
+        .filter_map(|line| line.rsplit('\t').next())
+        .chain(Some(stderr.trim()).filter(|s| !s.is_empty()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether a failed push was refused because `origin` moved: git names a

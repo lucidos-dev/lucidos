@@ -9,8 +9,7 @@
 //! trivial at this size, and a dependency added for one test would be linked
 //! into every build of this crate.
 
-use crate::support::{base_url, http_client};
-use base64::Engine as _;
+use crate::support::{base_url, browser_handshake, http_client};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A masked client text frame, the only shape a client may send.
@@ -39,35 +38,13 @@ where
     String::from_utf8(payload).expect("utf8 payload")
 }
 
-/// A handshake carrying an `Origin`, which is what a browser sends.
-///
-/// Chromium and Gecko send no fetch metadata on a WebSocket handshake, so the
-/// engine's same-origin gate falls back to comparing `Origin` against `Host`
-/// (ADR 0163). Direct to the engine those agree, and this is what proves it
-/// against the real middleware stack. Omitting the header is what let the
-/// gate's behaviour here go untested until a call was refused in the field.
-///
-/// `Connection` stays the single token reqwest is known to carry. The list form
-/// a browser writes is the gateway's business, and its own
-/// `a_connection_list_still_names_the_upgrade` already pins it.
-fn browser_handshake(path: &str, origin: &str) -> reqwest::RequestBuilder {
-    let key = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
-    http_client()
-        .get(format!("{}{path}", base_url()))
-        .header("connection", "Upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", key)
-        .header("origin", origin)
-}
-
 /// The engine upgrades, and what goes in comes back out.
 ///
 /// A `101` alone would prove the route resolves. The round-trip is what proves
 /// the socket is live, which is the question the endpoint exists to answer.
 #[tokio::test]
 async fn ws_echo_upgrades_and_returns_what_it_is_sent() {
-    let response = browser_handshake("/api/v1/ws-echo", &base_url())
+    let response = browser_handshake(&http_client(), "/api/v1/ws-echo", &base_url())
         .send()
         .await
         .expect("upgrade request failed");
@@ -99,7 +76,7 @@ async fn ws_echo_upgrades_and_returns_what_it_is_sent() {
 /// is refused a hop earlier (ADR 0163).
 #[tokio::test]
 async fn ws_echo_refuses_a_handshake_from_another_page() {
-    let response = browser_handshake("/api/v1/ws-echo", "http://localhost:1")
+    let response = browser_handshake(&http_client(), "/api/v1/ws-echo", "http://localhost:1")
         .send()
         .await
         .expect("upgrade request failed");

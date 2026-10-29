@@ -51,6 +51,15 @@ const TOKEN_TTL: Duration = Duration::from_secs(30);
 /// Characters in a minted token. 32 alphanumerics from a CSPRNG.
 const TOKEN_LEN: usize = 32;
 
+/// A new unguessable one-shot token. A call ticket uses the same shape.
+pub(super) fn fresh_token() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(TOKEN_LEN)
+        .map(char::from)
+        .collect()
+}
+
 /// Which secret a token opens.
 ///
 /// A token carries its subject. So one minted for a credential can never spend
@@ -91,11 +100,7 @@ impl RevealTokens {
     /// accumulate. A poisoned mutex answers `None` rather than panicking the
     /// worker, matching the engine's other `std::sync::Mutex` sites.
     pub(super) fn mint(&self, subject: RevealSubject) -> Option<String> {
-        let token: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(TOKEN_LEN)
-            .map(char::from)
-            .collect();
+        let token = fresh_token();
         let mut guard = self.inner.lock().ok()?;
         let now = Instant::now();
         guard.retain(|_, r| r.expires_at > now);

@@ -95,9 +95,10 @@ function closeUpstream(): void {
   upstreamOpen = false;
 }
 
-/** Open the upstream, once, on the first port that names it. */
+/** Open the upstream, once, on the first port that names it. An empty URL
+ *  would resolve to this worker's own script, so nothing opens without one. */
 function ensureSource(): void {
-  if (source) return;
+  if (source || !streamUrl) return;
   const es = new EventSource(streamUrl);
   source = es;
   const watch = startLiveness((silentMs) => {
@@ -148,6 +149,15 @@ function dropUpstream(drop: { silentMs?: number }): void {
 function restartSilentUpstream(): void {
   const silentMs = liveness?.silentMs() ?? 0;
   if (silentMs >= LATE_JOIN_STALL_AFTER_MS) dropUpstream({ silentMs });
+  ensureSource();
+}
+
+/** Reopen the upstream whatever its silence clock says.
+ *
+ *  A page holding proof of a missed frame cannot wait for the stall clock: a
+ *  stream that went half-open seconds ago still looks recent. */
+function restartUpstream(): void {
+  dropUpstream({});
   ensureSource();
 }
 
@@ -233,8 +243,18 @@ function attach(port: MessagePort): void {
       return;
     }
 
-    if (msg.t === 'check') {
-      restartSilentUpstream();
+    if (msg.t === 'check' || msg.t === 'restart') {
+      if (!clients.has(client)) {
+        // This instance never got the port's hello, so it has no stream URL
+        // to open. The port gets no frames and must not read as connected.
+        send(client, { t: 'error' });
+        send(client, { t: 'introduce' });
+      } else if (msg.t === 'check') {
+        restartSilentUpstream();
+      } else {
+        restartUpstream();
+      }
+      if (msg.t === 'check') send(client, { t: 'checked' });
       return;
     }
 
@@ -255,6 +275,9 @@ function attach(port: MessagePort): void {
   };
 
   port.start();
+  // A relaunched worker gets every port its predecessor held, with none of
+  // their hellos. This is how their pages find out.
+  send(client, { t: 'introduce' });
 }
 
 (self as unknown as SharedWorkerGlobalScope).onconnect = (event: MessageEvent) => {

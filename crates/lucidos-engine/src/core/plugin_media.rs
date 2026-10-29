@@ -356,7 +356,11 @@ fn single_app_icon(root: &Path) -> Option<(String, PathBuf)> {
             return None;
         }
         let id = entry.file_name().to_str()?.to_string();
-        let text = std::fs::read_to_string(entry.path().join("manifest.json")).ok()?;
+        let manifest_path = entry.path().join("manifest.json");
+        if !std::fs::symlink_metadata(&manifest_path).is_ok_and(|m| m.is_file()) {
+            return None;
+        }
+        let text = std::fs::read_to_string(&manifest_path).ok()?;
         let manifest: AppManifest = serde_json::from_str(&text).ok()?;
         (AppKind::from_manifest(&id, manifest.kind.as_deref()) == AppKind::App).then_some((
             id,

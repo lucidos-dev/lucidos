@@ -37,6 +37,7 @@ import { retireWelcomeAfterUse } from './preferences';
 import { followSentMessage } from '../../components/chat/scrollStateHandle';
 import { setCanceledQuestion, setCanceledWhileAwaiting } from '../canceledQuestions';
 import { refreshThreadEvents, forgetThreadEventsFailures } from './thread-loading';
+import { probeStreamAfterSend } from './send-probe';
 import { markThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { isTauri } from '../../utils/platform';
@@ -560,9 +561,11 @@ async function postSend(send: {
   // Read before the POST: the engine's answer clears the pending row on arrival.
   const answersQuestion = threadMap.value.get(threadId)?.pendingUserMessages
     .find(p => p.eventId === eventId)?.answersQuestion;
+  const answerToMatch = answersQuestion ? { toolUseId: answersQuestion, text: body.message } : false;
   const accepted = (): SendOutcome => {
     forgetUnsentMessageRecord(eventId);
     schedulePendingCleanup(threadId, eventId);
+    probeStreamAfterSend(threadId, () => engineRecordedMessage(threadId, eventId, answerToMatch));
     void retireWelcomeAfterUse(threadMap.value.values());
     return 'sent';
   };
@@ -574,7 +577,7 @@ async function postSend(send: {
     path: 'message',
     // The engine's own row can beat a lost answer over SSE. The send landed,
     // so it is accepted, and a retry or an unsent card would be a duplicate.
-    landed: () => engineRecordedMessage(threadId, eventId, answersQuestion ? { toolUseId: answersQuestion, text: body.message } : false),
+    landed: () => engineRecordedMessage(threadId, eventId, answerToMatch),
   });
   switch (result.kind) {
     case 'done':

@@ -45,7 +45,7 @@ async fn require_owner(state: &AppState, headers: &HeaderMap) -> Result<MessageO
         log!("[1Password] refused a service account request from an app document");
         return Err(ApiError::new(StatusCode::FORBIDDEN, SETTINGS_ONLY));
     }
-    crate::api::actor::require_owner_device_for(headers, &state.pool, SETTINGS_ONLY).await
+    crate::api::actor::require_owner_device_for(headers, &state.pool, None, SETTINGS_ONLY).await
 }
 
 async fn stored_account(pool: &PgPool) -> Result<Option<ServiceAccount>, ApiError> {

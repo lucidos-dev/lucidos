@@ -602,3 +602,6 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0594: /harden selects clippy and tests per reached crate from the cargo dependency graph, and splits the rust suite; full-tree paths and graph failures select every crate.](0594-harden-rust-selection-per-crate.md)
 - [0595: ONNX Runtime comes from a Lucidos mirror at build time, not only parcel.pyke.io](0595-onnx-runtime-comes-from-our-mirror.md)
 - [0596: The follow toggle floats over the composer in the down chevron's old slot, always shown; the chevron stands one slot above it](0596-the-follow-toggle-floats-with-the-down-chevron.md)
+- [0597: The agent browser navigates only to http and https URLs](0597-agent-browser-navigates-only-http-and-https.md)
+- [0598: A voice socket redeems a call ticket minted by a plain fetch, not a device id in the query](0598-voice-call-ticket.md)
+- [0599: A relaunched shared SSE worker asks every port to introduce itself, and a page replaces a worker that stops answering](0599-shared-worker-relaunch-asks-ports-to-introduce.md)

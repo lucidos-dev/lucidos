@@ -85,19 +85,39 @@ test.describe('A question notification into a long, unloaded thread', () => {
     // Where the question sits inside the transcript's viewport, once every
     // glide has had time to end. Polled, so it passes as soon as it settles
     // there, and a reader stranded above it fails.
-    const questionInView = () => page.evaluate((eid) => {
+    const questionState = () => page.evaluate((eid) => {
       const scroller = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
         .find((el) => el.getBoundingClientRect().height > 0);
       const question = Array.from(document.querySelectorAll<HTMLElement>(`[data-event-id="${eid}"]`))
         .find((el) => el.getBoundingClientRect().height > 0);
-      if (!scroller || !question) return false;
+      if (!scroller) return { inView: false, scroller: false, question: !!question };
       const s = scroller.getBoundingClientRect();
-      const q = question.getBoundingClientRect();
-      return q.top >= s.top - 1 && q.top < s.bottom;
+      const q = question?.getBoundingClientRect();
+      return {
+        inView: !!q && q.top >= s.top - 1 && q.top < s.bottom,
+        scroller: true,
+        question: !!question,
+        questionTop: q?.top,
+        scrollerTop: s.top,
+        scrollerBottom: s.bottom,
+        scrollTop: scroller.scrollTop,
+        scrollHeight: scroller.scrollHeight,
+        clientHeight: scroller.clientHeight,
+      };
     }, seeded.questionId);
-    await expect.poll(questionInView, { timeout: 5_000 }).toBe(true);
+    let lastState: unknown = null;
+    const questionInView = async () => {
+      const state = await questionState();
+      lastState = state;
+      return state.inView;
+    };
+    // Playwright reads a poll's message once, as a string, so the last
+    // state rides on a rethrow instead.
+    await expect.poll(questionInView, { timeout: 5_000 }).toBe(true).catch((error: Error) => {
+      throw new Error(`question not in view, last state: ${JSON.stringify(lastState)}\n\n${error.message}`);
+    });
     // And it stays: nothing later carries the reader off it.
     await page.waitForTimeout(1500);
-    expect(await questionInView()).toBe(true);
+    expect(await questionInView(), `question left view, state: ${JSON.stringify(lastState)}`).toBe(true);
   });
 });

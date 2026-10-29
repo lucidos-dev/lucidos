@@ -78,7 +78,7 @@ function recordingTransport() {
   const submitPong = vi.fn(() => {
     onScreenAtPong.push(toastKeys());
   });
-  const stream: EventStream = { submitPong, close: () => {}, ownsReconnect: false, revalidate: () => 'live' };
+  const stream: EventStream = { submitPong, close: () => {}, ownsReconnect: false, revalidate: () => 'live', restart: () => {} };
   setEventStream(stream);
   return { submitPong, onScreenAtPong };
 }

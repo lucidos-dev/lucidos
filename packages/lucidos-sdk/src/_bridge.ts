@@ -106,8 +106,19 @@ export function _setBridgedForTesting(value: boolean | null): void {
  *  must not resolve our calls. A foreign page that frames the app IS its
  *  parent, so the source alone admits it and the origin is what refuses it.
  *  No event carries the `'*'` fallback as its origin, so that fails closed. */
-function fromHost(event: MessageEvent): boolean {
-  return event.source === window.parent && event.origin === hostOrigin();
+export function fromHost(event: MessageEvent): boolean {
+  const origin = hostOrigin();
+  return origin !== null && event.source === window.parent && event.origin === origin;
+}
+
+/** Post to the host, aimed at its origin. A foreign page that frames the app is
+ *  `window.parent` too, and a `'*'` target would hand it the message.
+ *  Answers false when this frame names no host, so nothing was sent. */
+export function postToHost(message: object): boolean {
+  const origin = hostOrigin();
+  if (origin === null) return false;
+  window.parent.postMessage(message, origin);
+  return true;
 }
 
 /** The host's origin, so a message cannot be aimed at some other document.
@@ -115,13 +126,19 @@ function fromHost(event: MessageEvent): boolean {
  *  The sandbox leaves `location.origin` reporting the real one, which is the
  *  origin the host serves from. `'*'` is the fallback where that is unreadable:
  *  a lost message is worse than a broad target on loopback.
+ *
+ *  A URL with an opaque origin, such as a srcdoc preview, reads `"null"`. No
+ *  host serves from it, and `postMessage` throws on it, so it answers null.
  */
-function hostOrigin(): string {
+function hostOrigin(): string | null {
+  let origin: string;
   try {
-    return location.origin || '*';
+    origin = location.origin;
   } catch {
     return '*';
   }
+  if (origin === 'null') return null;
+  return origin || '*';
 }
 
 let counter = 0;
@@ -172,14 +189,16 @@ export function callHost(op: BridgeOp, args: unknown, timeoutMs = 30000): Promis
       reject: (e) => { clearTimeout(timer); reject(e); },
     });
     const message: BridgeRequest = { type: BRIDGE_TYPE, id, op, args };
-    window.parent.postMessage(message, hostOrigin());
+    if (postToHost(message)) return;
+    pending.get(id)?.reject(new Error('this frame has no host to call'));
+    pending.delete(id);
   });
 }
 
 /** Tell the host something with no answer owed, e.g. a pong. */
 export function tellHost(op: BridgeOp, args: unknown): void {
   const message: BridgeRequest = { type: BRIDGE_TYPE, id: '', op, args };
-  window.parent.postMessage(message, hostOrigin());
+  postToHost(message);
 }
 
 /** The other direction: the host asking this frame to do something it can no
@@ -212,12 +231,12 @@ export function serveHost(op: string, handler: (args: unknown) => unknown): void
     const reply = (ok: boolean, payload: unknown) => {
       // No id means the host wants no answer, the shape a navigation takes.
       if (!data.id) return;
-      window.parent.postMessage({
+      postToHost({
         type: HOST_REPLY_TYPE,
         id: data.id,
         ok,
         [ok ? 'value' : 'error']: payload,
-      }, hostOrigin());
+      });
     };
     if (!run) return reply(false, `this app has no "${data.op}" handler`);
     void Promise.resolve()

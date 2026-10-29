@@ -726,64 +726,8 @@ impl LucidosEngine {
             .to_string());
         }
 
-        let row: Option<(serde_json::Value,)> = match sqlx::query_as(
-            r#"SELECT payload FROM events
-               WHERE event_type = 'BackgroundBashCompleted'
-                 AND aggregate_id = $1
-                 AND payload->>'task_id' = $2
-               ORDER BY sequence DESC
-               LIMIT 1"#,
-        )
-        .bind(thread_id.to_string())
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => return Err(format!("Error: failed to query completion event: {}", e)),
-        };
-
-        match row {
-            Some((payload,)) => {
-                // Rebuild the outcome from the persisted pair so this branch
-                // renders exactly what the in-memory drain rendered — the two
-                // branches are the same tool call to the LLM and must never
-                // disagree. Legacy rows have no `signal` key.
-                let outcome = TaskOutcome::from_persisted(
-                    payload
-                        .get("exit_code")
-                        .and_then(|v| v.as_i64())
-                        .map(|c| c as i32),
-                    payload
-                        .get("signal")
-                        .and_then(|v| v.as_i64())
-                        .map(|s| s as i32),
-                );
-                Ok(serde_json::json!({
-                    "stdout": payload.get("stdout").cloned().unwrap_or(serde_json::Value::String(String::new())),
-                    "stderr": payload.get("stderr").cloned().unwrap_or(serde_json::Value::String(String::new())),
-                    "exit_code": outcome.exit_code(),
-                    "signal": outcome.signal(),
-                    "status": outcome.describe(),
-                    "finished": true,
-                    "timed_out": payload.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                    "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                    // True only on a row the recovery sweep wrote: the engine
-                    // that owned the task stopped, so no status was ever
-                    // reaped and `elapsed_secs` spans the downtime too.
-                    "abandoned": payload.get("abandoned").cloned().unwrap_or(serde_json::Value::Bool(false)),
-                    // Same two time fields as the in-memory branch, so the LLM
-                    // never has to guess how long the task ran just because the
-                    // registry entry was gone by the time it drained.
-                    // `waited_secs` is measured, not assumed zero: an unknown
-                    // task_id returns without waiting, but a drain that DID
-                    // block and then found the retention window closed spent
-                    // real time doing it.
-                    "elapsed_secs": persisted_elapsed_secs(&payload),
-                    "waited_secs": call_started.elapsed().as_secs(),
-                })
-                .to_string())
-            }
+        match persisted_drain(&self.pool, thread_id, task_id, call_started).await? {
+            Some(result) => Ok(result),
             // No registry entry and no completion row. Before calling the id
             // unknown, ask whether this thread ever spawned it: a task with no
             // recorded outcome looks exactly like a typo from here.
@@ -839,6 +783,84 @@ impl LucidosEngine {
             )),
         }
     }
+}
+
+/// The `bash_output` result for a task that left the registry, read off its
+/// persisted `BackgroundBashCompleted` row. `Ok(None)` when no row exists.
+///
+/// The streams are masked again on the way out. A row written before the
+/// write-time mask holds them raw, and nothing rewrites the events table.
+async fn persisted_drain(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    task_id: &str,
+    call_started: std::time::Instant,
+) -> Result<Option<String>, String> {
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        r#"SELECT payload FROM events
+           WHERE event_type = 'BackgroundBashCompleted'
+             AND aggregate_id = $1
+             AND payload->>'task_id' = $2
+           ORDER BY sequence DESC
+           LIMIT 1"#,
+    )
+    .bind(thread_id.to_string())
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Error: failed to query completion event: {}", e))?;
+    let Some((payload,)) = row else {
+        return Ok(None);
+    };
+    let secrets = crate::engine::engine_impl::stored_secret_values(pool)
+        .await
+        .map_err(|e| {
+            format!("Error: task '{task_id}' output withheld, since it could not be masked: {e}")
+        })?;
+    let stream = |key: &str| {
+        let mut value = payload
+            .get(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::String(String::new()));
+        crate::core::redact_subprocess_output_in_json(&mut value, &secrets);
+        value
+    };
+
+    // The in-memory drain and this branch are one tool call to the LLM, so
+    // both render the outcome through `TaskOutcome`. Legacy rows have no
+    // `signal` key.
+    let outcome = TaskOutcome::from_persisted(
+        payload
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .map(|c| c as i32),
+        payload
+            .get("signal")
+            .and_then(|v| v.as_i64())
+            .map(|s| s as i32),
+    );
+    Ok(Some(
+        serde_json::json!({
+            "stdout": stream("stdout"),
+            "stderr": stream("stderr"),
+            "exit_code": outcome.exit_code(),
+            "signal": outcome.signal(),
+            "status": outcome.describe(),
+            "finished": true,
+            "timed_out": payload.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
+            "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
+            // True only on a row the recovery sweep wrote: the engine
+            // that owned the task stopped, so no status was ever
+            // reaped and `elapsed_secs` spans the downtime too.
+            "abandoned": payload.get("abandoned").cloned().unwrap_or(serde_json::Value::Bool(false)),
+            // The in-memory branch's two time fields, so the LLM need not
+            // guess how long the task ran. `waited_secs` is measured: a drain
+            // can block and only then find the retention window closed.
+            "elapsed_secs": persisted_elapsed_secs(&payload),
+            "waited_secs": call_started.elapsed().as_secs(),
+        })
+        .to_string(),
+    ))
 }
 
 /// Task runtime in seconds from a persisted `BackgroundBashCompleted`
@@ -919,6 +941,60 @@ mod tests {
             body.contains("InheritedSecrets::Strip("),
             "a chat shell must not inherit the engine's secrets"
         );
+    }
+
+    /// A `BackgroundBashCompleted` written before the write-time mask still
+    /// holds the raw value, and its task's env is gone. So a drain that falls
+    /// back to the row masks it against the credentials stored now.
+    #[tokio::test]
+    async fn a_stored_row_holding_a_credential_drains_with_it_masked() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let secret = "opaque-stored-credential-value";
+        crate::test_support::seed_credential(
+            &pool,
+            "example-api",
+            "https://api.example.com",
+            crate::core::AuthType::ApiKey,
+            secret,
+        )
+        .await;
+        let thread_id = uuid::Uuid::new_v4();
+        // Written raw: the current write path can no longer produce this row.
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+             VALUES ($1, 'thread', $2, 'BackgroundBashCompleted', $3, NOW(), $2::uuid)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(thread_id.to_string())
+        .bind(serde_json::json!({
+            "task_id": "task-old",
+            "command": "env",
+            "exit_code": 0,
+            "stdout": format!("CRED_EXAMPLE_API={secret}\nbuild ok"),
+            "stderr": format!("warning: echoed {secret}"),
+            "timed_out": false,
+            "killed": false,
+        }))
+        .execute(&pool)
+        .await
+        .expect("insert a pre-fix completion row");
+
+        let out = persisted_drain(&pool, thread_id, "task-old", std::time::Instant::now())
+            .await
+            .expect("the drain reads the store")
+            .expect("the row is found");
+
+        assert!(!out.contains(secret), "credential replayed: {out}");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json result");
+        assert!(parsed["stdout"].as_str().unwrap().contains("build ok"));
+        assert!(parsed["stderr"]
+            .as_str()
+            .unwrap()
+            .starts_with("warning: echoed"));
+        assert_eq!(parsed["exit_code"], 0);
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db).await;
     }
 
     /// Spawn through the same shell and pipe setup `execute_bash_tool` uses,

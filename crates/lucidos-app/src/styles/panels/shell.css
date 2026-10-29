@@ -158,7 +158,8 @@
 }
 
 .connection-banner[data-conn='connecting'],
-.connection-banner[data-conn='stopped'] {
+.connection-banner[data-conn='stopped'],
+.connection-banner[data-conn='starting'] {
     background: color-mix(in srgb, var(--accent-yellow) var(--banner-tint-strength), var(--bg-secondary));
 }
 
@@ -2089,7 +2090,8 @@
    booting workspace in the picker, a pending step). Without it the class fell
    through to the muted base, so Settings > System drew a grey dot beside the
    word "Connecting..." and said the state twice, once truthfully. */
-.status-dot.connecting {
+.status-dot.connecting,
+.status-dot.starting {
     background: var(--accent-yellow);
 }
 

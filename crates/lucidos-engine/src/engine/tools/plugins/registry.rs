@@ -865,10 +865,7 @@ fn fetch_remote_manifest_blocking(
 ) -> Result<PluginManifest, String> {
     let source = detect_source(source_str)?;
     let (_scratch, plugin_root, _source_type) = fetch_source(workspace_path, &source, credentials)?;
-    let manifest_path = plugin_root.join("manifest.toml");
-    let text =
-        std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {}", e))?;
-    plugins::parse_manifest(&text).map_err(|e| e.to_string())
+    plugins::read_manifest(&plugin_root).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -117,4 +117,17 @@ impl OriginFixture {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+
+    /// Refuse a push while another is in flight, as GitHub's ref lock does.
+    pub(crate) fn refuse_overlapping_pushes(&self) {
+        let hook = self.origin.join("hooks").join("pre-receive");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nmkdir inflight 2>/dev/null || { echo cannot lock ref >&2; exit 1; }\n\
+             sleep 1\nrmdir inflight\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }

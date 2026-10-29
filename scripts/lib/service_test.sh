@@ -436,6 +436,60 @@ for fn in service_detect_manager service_port_in_use service_list_instance_names
     if type "$fn" >/dev/null 2>&1; then pass "$fn defined"; else fail "$fn missing"; fi
 done
 
+# ── OFFLINE FS: service_write_file never exposes a secret, even for a moment ──
+# A plist or unit written at mode 600 carries a provider API key. The key must
+# never sit in a group- or other-readable file, so the chmod and mv fakes
+# below look for an exposed copy at both steps. A re-run over an existing 0644
+# file is the case a umask alone would miss.
+echo ""
+echo "test: service_write_file never leaves a secret group or other readable"
+mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+SWF_SECRET='OPENAI_API_KEY=sk-swf-test'
+SWF_LEAKS=""
+swf_scan() {
+    local f
+    for f in "$1"/* "$1"/.[!.]*; do
+        [ -f "$f" ] || continue
+        grep -qF "$SWF_SECRET" "$f" || continue
+        case "$(mode_of "$f")" in *00) ;; *) SWF_LEAKS="$SWF_LEAKS $(basename "$f"):$(mode_of "$f")" ;; esac
+    done
+}
+SWF_DIR="$(mktemp -d)"
+SWF_PATH="$SWF_DIR/agents/ai.lucidos.test.plist"
+for swf_case in fresh over-0644; do
+    rm -rf "${SWF_DIR:?}/agents"; SWF_LEAKS=""
+    if [ "$swf_case" = over-0644 ]; then
+        mkdir -p "$SWF_DIR/agents"; printf 'old\n' > "$SWF_PATH"; chmod 644 "$SWF_PATH"
+    fi
+    # shellcheck disable=SC2329 # the fakes are called by service_write_file
+    (
+        umask 022
+        chmod() { swf_scan "$SWF_DIR/agents"; command chmod "$@"; }
+        mv() { swf_scan "$SWF_DIR/agents"; command mv "$@"; }
+        service_write_file "$SWF_PATH" "$SWF_SECRET" 600 || exit 1
+        swf_scan "$SWF_DIR/agents"
+        [ -z "$SWF_LEAKS" ] || { echo "$SWF_LEAKS"; exit 2; }
+    ); swf_rc=$?
+    if [ $swf_rc -eq 0 ] && [ "$(mode_of "$SWF_PATH")" = 600 ] && grep -qF "$SWF_SECRET" "$SWF_PATH"; then
+        pass "$swf_case: written at 600 with no readable copy at any step"
+    else
+        fail "$swf_case: rc=$swf_rc mode=$(mode_of "$SWF_PATH" 2>/dev/null)"
+    fi
+done
+
+echo ""
+echo "test: service_write_file fails when chmod fails, and writes nothing"
+rm -rf "${SWF_DIR:?}/agents"
+# shellcheck disable=SC2329 # the fake is called by service_write_file
+( chmod() { return 1; }; service_write_file "$SWF_PATH" "$SWF_SECRET" 600 ); swf_rc=$?
+if [ $swf_rc -ne 0 ]; then pass "a failed chmod returns non-zero"; else fail "a failed chmod was reported as success"; fi
+if [ ! -e "$SWF_PATH" ] && [ -z "$(ls -A "$SWF_DIR/agents")" ]; then
+    pass "nothing is left behind, temp file included"
+else
+    fail "left behind: $(ls -A "$SWF_DIR/agents")"
+fi
+rm -rf "$SWF_DIR"
+
 # ── the stop waits for signalled engines before it stops Postgres ───────────
 # Each pid is a reparented `sleep`, not this shell's child, so it is reaped when
 # it exits, as a real engine is.

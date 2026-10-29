@@ -613,6 +613,8 @@ An outside program that offers the *Lucidos Agent* extra tools over the Model Co
 
 In a thread that enabled it, every tool's definition rides on every request. Two levers: switch off a single *disabled tool*, or stop the server, which switches it off in every thread. The page also holds the allowlist behind the *MCP permission card*.
 
+**With the command guard on, a start asks once per command line.** A server starts only after the user approved the exact command it runs. Clicking Start or Enable approves it, as does a yes on the permission card. A changed command, argument or env value asks again. See `running-python.md` § The command guard.
+
 **The servers one thread enabled share a quarter of what a request can carry.** Past that, each server keeps the tools that fit, in its own listed order. The rest are left out of that thread's requests, and the agent is told which. The page states the worst case, every server enabled in one thread, and warns before anything is cut.
 
 **Enabling, starting or stopping one reaches a turn already running.** The agent can enable a server mid-answer and use its tools in that answer. Stop a server mid-turn and the agent's very next step is already without its tools.

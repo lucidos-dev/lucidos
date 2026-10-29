@@ -52,5 +52,8 @@ export function openBridgedEventStream(handlers: EventStreamHandlers, types: rea
     // The host holds the upstream and revalidates it on its own resume. It
     // relays a drop as an `error` frame, so this side has nothing to restart.
     revalidate: () => 'live',
+    // The host reopens its own upstream when it has proof of a missed frame, and
+    // relays that as an `error` frame. An app holds no such proof.
+    restart() {},
   };
 }

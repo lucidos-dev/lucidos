@@ -159,7 +159,6 @@ fn some_caller() -> Uuid {
 #[tokio::test]
 async fn query_events_resolves_one_event_by_any_spelling_of_its_address() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
     let wanted = Uuid::new_v4();
@@ -179,18 +178,64 @@ async fn query_events_resolves_one_event_by_any_spelling_of_its_address() {
         wanted.to_string(),
         wanted.simple().to_string(),
     ] {
-        let out = query_events_impl(
-            &store,
-            &json!({"event_id": spelling.clone()}),
-            some_caller(),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{spelling} must resolve, got: {e}"));
+        let out = query_events_impl(&pool, &json!({"event_id": spelling.clone()}), some_caller())
+            .await
+            .unwrap_or_else(|e| panic!("{spelling} must resolve, got: {e}"));
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
         assert_eq!(parsed["returned"], 1, "{spelling} must return one row");
         assert_eq!(parsed["events"][0]["id"], wanted.to_string());
         assert_eq!(parsed["events"][0]["payload"]["r"], "hit");
     }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// `query_events` hands stored payloads to the model. A task's output or a
+/// trigger summary written before the write-time mask can hold a raw
+/// credential, so the read masks it against the store.
+#[tokio::test]
+async fn query_events_masks_a_stored_credential_in_any_payload() {
+    let (pool, db) = setup_test_db().await;
+    let secret = "opaque-stored-credential-value";
+    crate::test_support::seed_credential(
+        &pool,
+        "example-api",
+        "https://api.example.com",
+        crate::core::AuthType::ApiKey,
+        secret,
+    )
+    .await;
+    let thread_id = Uuid::new_v4();
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "BackgroundBashCompleted",
+        json!({"task_id": "task-old", "stdout": format!("CRED_EXAMPLE_API={secret}"), "stderr": ""}),
+    )
+    .await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "TriggerCompleted",
+        json!({"trigger_id": "sync", "result_summary": format!("synced with key {secret}")}),
+    )
+    .await;
+
+    let out = query_events_impl(
+        &pool,
+        &json!({"thread_id": thread_id.to_string()}),
+        some_caller(),
+    )
+    .await
+    .expect("the query runs");
+
+    assert!(!out.contains(secret), "credential replayed: {out}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 2);
+    assert!(out.contains("synced with key"));
 
     pool.close().await;
     teardown_test_db(&db).await;
@@ -203,7 +248,6 @@ async fn query_events_resolves_one_event_by_any_spelling_of_its_address() {
 #[tokio::test]
 async fn dereferencing_a_tool_call_brings_back_its_result() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
     let call = Uuid::new_v4();
@@ -235,7 +279,7 @@ async fn dereferencing_a_tool_call_brings_back_its_result() {
     .await;
 
     let out = query_events_impl(
-        &store,
+        &pool,
         &json!({"event_id": format!("evt-{}", call.simple())}),
         some_caller(),
     )
@@ -256,19 +300,14 @@ async fn dereferencing_a_tool_call_brings_back_its_result() {
 #[tokio::test]
 async fn dereferencing_an_orphan_call_returns_the_call_alone() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
     let call = Uuid::new_v4();
     insert_thread_event(&pool, call, thread_id, "ToolCalled", json!({"name": "x"})).await;
 
-    let out = query_events_impl(
-        &store,
-        &json!({"event_id": call.to_string()}),
-        some_caller(),
-    )
-    .await
-    .expect("an orphan call still resolves");
+    let out = query_events_impl(&pool, &json!({"event_id": call.to_string()}), some_caller())
+        .await
+        .expect("an orphan call still resolves");
     let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
     assert_eq!(parsed["returned"], 1);
     assert_eq!(parsed["events"][0]["event_type"], "ToolCalled");
@@ -283,7 +322,6 @@ async fn dereferencing_an_orphan_call_returns_the_call_alone() {
 #[tokio::test]
 async fn a_windowed_query_never_pulls_in_paired_results() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
     let call = Uuid::new_v4();
@@ -297,7 +335,7 @@ async fn a_windowed_query_never_pulls_in_paired_results() {
     )
     .await;
 
-    let out = query_events_impl(&store, &json!({"event_type": "ToolCalled"}), some_caller())
+    let out = query_events_impl(&pool, &json!({"event_type": "ToolCalled"}), some_caller())
         .await
         .expect("plain query");
     let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
@@ -314,11 +352,10 @@ async fn a_windowed_query_never_pulls_in_paired_results() {
 #[tokio::test]
 async fn query_events_errors_when_an_address_resolves_to_nothing() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let missing = Uuid::new_v4();
     let out = query_events_impl(
-        &store,
+        &pool,
         &json!({"event_id": format!("evt-{}", missing.simple())}),
         some_caller(),
     )
@@ -335,7 +372,7 @@ async fn query_events_errors_when_an_address_resolves_to_nothing() {
     let thread_id = Uuid::new_v4();
     insert_thread_event(&pool, present, thread_id, "ToolResult", json!({})).await;
     let out = query_events_impl(
-        &store,
+        &pool,
         &json!({"event_id": present.to_string(), "event_type": "MessageReceived"}),
         some_caller(),
     )
@@ -356,10 +393,9 @@ async fn query_events_errors_when_an_address_resolves_to_nothing() {
 #[tokio::test]
 async fn query_events_refuses_a_malformed_address_rather_than_widening() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     for bad in [json!("evt-not-a-uuid"), json!("nonsense"), json!("")] {
-        let out = query_events_impl(&store, &json!({"event_id": bad}), some_caller()).await;
+        let out = query_events_impl(&pool, &json!({"event_id": bad}), some_caller()).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("is not an event address")),
             "{bad} must be refused, got: {:?}",
@@ -367,7 +403,7 @@ async fn query_events_refuses_a_malformed_address_rather_than_widening() {
         );
     }
     // A non-string must not fall down the "absent" arm either.
-    let out = query_events_impl(&store, &json!({"event_id": ["deadbeef"]}), some_caller()).await;
+    let out = query_events_impl(&pool, &json!({"event_id": ["deadbeef"]}), some_caller()).await;
     assert!(
         matches!(&out, Err(msg) if msg.contains("is not an event address")),
         "an array must be refused, got: {:?}",
@@ -384,7 +420,6 @@ async fn query_events_refuses_a_malformed_address_rather_than_widening() {
 #[tokio::test]
 async fn query_events_by_id_still_honours_the_byte_limit() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
     let big = Uuid::new_v4();
@@ -398,7 +433,7 @@ async fn query_events_by_id_still_honours_the_byte_limit() {
     .await;
 
     let out = query_events_impl(
-        &store,
+        &pool,
         &json!({"event_id": big.to_string(), "byte_limit": 1024}),
         some_caller(),
     )
@@ -423,7 +458,6 @@ async fn query_events_by_id_still_honours_the_byte_limit() {
 #[tokio::test]
 async fn query_events_without_an_address_is_unchanged() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
     for i in 0..3 {
@@ -437,7 +471,7 @@ async fn query_events_without_an_address_is_unchanged() {
         .await;
     }
 
-    let out = query_events_impl(&store, &json!({"event_type": "ToolResult"}), some_caller())
+    let out = query_events_impl(&pool, &json!({"event_type": "ToolResult"}), some_caller())
         .await
         .expect("plain query");
     let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
@@ -455,7 +489,6 @@ async fn query_events_without_an_address_is_unchanged() {
 #[tokio::test]
 async fn thread_id_current_reads_the_calling_thread() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let caller = Uuid::new_v4();
     let other = Uuid::new_v4();
@@ -477,7 +510,7 @@ async fn thread_id_current_reads_the_calling_thread() {
     .await;
 
     for alias in ["current", "this", "  Current  ", "THIS"] {
-        let out = query_events_impl(&store, &json!({"thread_id": alias}), caller)
+        let out = query_events_impl(&pool, &json!({"thread_id": alias}), caller)
             .await
             .unwrap_or_else(|e| panic!("{alias} must resolve, got: {e}"));
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
@@ -498,13 +531,12 @@ async fn thread_id_current_reads_the_calling_thread() {
 #[tokio::test]
 async fn a_bad_thread_id_is_still_refused_and_names_the_alias() {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
 
     let caller = Uuid::new_v4();
     insert_thread_event(&pool, Uuid::new_v4(), caller, "ToolResult", json!({})).await;
 
     for bad in [json!("currently"), json!("the one we discussed"), json!("")] {
-        let out = query_events_impl(&store, &json!({"thread_id": bad}), caller).await;
+        let out = query_events_impl(&pool, &json!({"thread_id": bad}), caller).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("is not a uuid") && msg.contains("'current'")),
             "{bad} must be refused and point at the alias, got: {:?}",
@@ -519,7 +551,7 @@ async fn a_bad_thread_id_is_still_refused_and_names_the_alias() {
         json!({"id": "current"}),
         json!(7),
     ] {
-        let out = query_events_impl(&store, &json!({"thread_id": bad}), caller).await;
+        let out = query_events_impl(&pool, &json!({"thread_id": bad}), caller).await;
         assert!(
             matches!(&out, Err(msg) if msg.contains("must be a uuid string or 'current'")),
             "{bad} must be refused rather than widening, got: {:?}",

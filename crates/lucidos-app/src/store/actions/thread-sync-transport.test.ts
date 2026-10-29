@@ -37,6 +37,7 @@ let opened: {
     ownsReconnect: boolean;
     submitPong: ReturnType<typeof vi.fn>;
     revalidate: ReturnType<typeof vi.fn>;
+    restart: ReturnType<typeof vi.fn>;
   };
 } | null = null;
 
@@ -55,6 +56,7 @@ const openEventStream = vi.fn((targets, handlers, opts) => {
     ownsReconnect: nextOwnsReconnect,
     submitPong: vi.fn(),
     revalidate: vi.fn(() => nextHealth),
+    restart: vi.fn(),
   };
   openedTargets = targets;
   opened = { handlers, opts, stream };
@@ -605,6 +607,20 @@ describe('a stalled stream', () => {
     opened?.handlers.onError(ERROR);
 
     expect(postClientLog).not.toHaveBeenCalled();
+  });
+
+  it('posts one log line when the shared worker forgot the page or stopped answering', () => {
+    // Without these lines a lost worker reads exactly like a healthy one.
+    connectThreadEvents();
+    opened?.handlers.onOpen();
+
+    opened?.handlers.onError({ reason: 'worker-restarted' });
+    opened?.handlers.onError({ reason: 'worker-unresponsive' });
+
+    expect(postClientLog.mock.calls).toEqual([
+      ['event-stream', 'worker-restarted', {}],
+      ['event-stream', 'worker-unresponsive', {}],
+    ]);
   });
 
   it('posts nothing from a handler a newer connection replaced', () => {

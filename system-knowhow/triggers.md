@@ -723,7 +723,7 @@ Groups are orthogonal to `app_id`: an app-owned trigger can live in any group. `
 
 ## Side-effect grant: authorizing unattended risk
 
-This matters **only when the workspace has the command guard on** (Settings → Permissions → Command safety; off by default). The guard then classifies every `run_bash` / `run_python` command a trigger's intent runs. Most commands (reads, data crunching, downloads, writes inside the workspace) run untouched. An **irreversible** one is gated: sending email, a mutating HTTP request (POST/PUT/DELETE), a cloud-CLI change (`gh`/`aws`/`gcloud`), destroying files outside the workspace. A request that sends a local file or an environment variable (`curl -H @file`, `--url-query @file`, `--variable`) counts as mutating HTTP too.
+This matters **only when the workspace has the command guard on** (Settings → Permissions → Command safety; off by default). The guard then classifies every `run_bash` / `run_python` command a trigger's intent runs. An MCP server the trigger sets up counts as the command it runs, and destroying files inside the workspace is gated there too. Most commands (reads, data crunching, downloads, writes inside the workspace) run untouched. An **irreversible** one is gated: sending email, a mutating HTTP request (POST/PUT/DELETE), a cloud-CLI change (`gh`/`aws`/`gcloud`), destroying files outside the workspace. A request that sends a local file or an environment variable (`curl -H @file`, `--url-query @file`, `--variable`) counts as mutating HTTP too.
 
 A chat turn would *ask* the user to approve such a command, but a trigger fires with nobody to ask. So the trigger carries a **side-effect grant**: the irreversible side-effect categories it is pre-authorized to perform. At fire time:
 

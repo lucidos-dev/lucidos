@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::core::{McpServer, McpServerStore};
+use crate::core::{LaunchLineMode, McpServer, McpServerStore};
 use crate::engine::context::{estimate_tokens_from_chars, tool_definitions_chars};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::thread_events::{
@@ -125,6 +125,9 @@ pub struct McpManager {
     /// server changes the agent's tool surface, and that is not the caller's
     /// choice to skip (see `core::announced_surfaces`).
     event_bus: crate::engine::event_bus::EventBus,
+    /// Places a relative path in a server's launch line, which the start gate
+    /// fingerprints.
+    workspace_root: std::path::PathBuf,
 }
 
 /// Where the tool list in an [`McpServerStatus`] came from.
@@ -175,6 +178,11 @@ pub struct McpServerStatus {
     /// this server can ever be called. Starting it is refused, and Remove is
     /// the only thing to offer.
     pub dispatchable: bool,
+    /// The *launch line* a start would spawn, plain env values masked.
+    /// `None` when the engine's working directory is unknown.
+    pub launch_line: Option<String>,
+    /// Whether someone approved that exact line (ADR 0002, MCP addendum).
+    pub launch_approved: bool,
     pub tools_source: McpToolsSource,
     pub tools_observed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub tools: Vec<McpToolStatus>,
@@ -515,7 +523,11 @@ pub enum McpStopOutcome {
 }
 
 impl McpManager {
-    pub fn new(pool: sqlx::PgPool, event_bus: crate::engine::event_bus::EventBus) -> Self {
+    pub fn new(
+        pool: sqlx::PgPool,
+        event_bus: crate::engine::event_bus::EventBus,
+        workspace_root: std::path::PathBuf,
+    ) -> Self {
         Self {
             running: Arc::new(RwLock::new(HashMap::new())),
             tool_surface_generation: Arc::new(AtomicU64::new(0)),
@@ -523,6 +535,7 @@ impl McpManager {
             disabled_tools_writes: Mutex::new(()),
             pool,
             event_bus,
+            workspace_root,
         }
     }
 
@@ -845,6 +858,7 @@ impl McpManager {
         server: &McpServer,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         crate::core::mcp_servers::validate_server_id(&server.id)?;
+        self.require_launch_approval(server).await?;
         let env = crate::core::mcp_servers::launch_env(&self.pool, server).await?;
         // MCP servers are invoked as part of LLM tool calls today, so default to Agent.
         // If engine-internal MCP usage is added, that call site should pass ActorMode::Engine.
@@ -883,6 +897,61 @@ impl McpManager {
         }
 
         Ok(tool_count)
+    }
+
+    /// The server's current launch line as a fingerprint, for the process this
+    /// engine would spawn now. `Err` when the working directory is unknown or
+    /// the secret store key is not loaded.
+    pub fn launch_fingerprint(
+        &self,
+        server: &McpServer,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let spawn_cwd = std::env::current_dir()
+            .map_err(|e| format!("the engine's working directory is unknown: {e}"))?;
+        server
+            .launch_spec()
+            .fingerprint(&spawn_cwd, &self.workspace_root)
+    }
+
+    /// Record that `server`'s current launch line is approved.
+    pub async fn approve_launch(
+        &self,
+        server: &McpServer,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fingerprint = self.launch_fingerprint(server)?;
+        McpServerStore::approve_launch(&self.pool, &self.event_bus, &server.id, &fingerprint, actor)
+            .await
+    }
+
+    /// Whether `server`'s current launch line is approved. A line that cannot
+    /// be rendered counts as unapproved.
+    pub async fn is_launch_approved(&self, server: &McpServer) -> Result<bool, sqlx::Error> {
+        let Ok(fingerprint) = self.launch_fingerprint(server) else {
+            return Ok(false);
+        };
+        McpServerStore::is_launch_approved(&self.pool, &server.id, &fingerprint).await
+    }
+
+    /// With the command guard on, refuse to spawn a launch line nobody
+    /// approved (ADR 0002, MCP addendum). Every start and setup passes here.
+    async fn require_launch_approval(
+        &self,
+        server: &McpServer,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !crate::core::prefs::COMMAND_GUARD.read(&self.pool).await
+            || self.is_launch_approved(server).await?
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "Refused by the command guard: MCP server '{id}' was NOT started. Nobody has \
+             approved the command it runs, or the command changed since. To approve it, \
+             call the `mcp` tool with action `enable` and id `{id}`, which asks the user first, or \
+             have the user press Start in Settings > MCP Servers.",
+            id = server.id
+        )
+        .into())
     }
 
     /// Stop a running server.
@@ -990,6 +1059,8 @@ impl McpManager {
         self.evict_exited_servers().await;
 
         let servers = McpServerStore::list(&self.pool).await?;
+        let approvals = McpServerStore::launch_approvals(&self.pool).await?;
+        let spawn_cwd = std::env::current_dir().ok();
         let running = self.running.read().await;
 
         Ok(servers
@@ -1003,7 +1074,20 @@ impl McpManager {
                     }
                     None => (server.tools.as_slice(), McpToolsSource::Cache),
                 };
-                server_status(&server, tools, tools_source, running_entry.is_some())
+                let spec = server.launch_spec();
+                let launch_approved = spawn_cwd.as_deref().is_some_and(|cwd| {
+                    spec.fingerprint(cwd, &self.workspace_root)
+                        .is_ok_and(|fingerprint| {
+                            approvals.contains(&(server.id.clone(), fingerprint))
+                        })
+                });
+                McpServerStatus {
+                    launch_line: spawn_cwd.as_deref().map(|cwd| {
+                        spec.command_line(cwd, &self.workspace_root, LaunchLineMode::Masked)
+                    }),
+                    launch_approved,
+                    ..server_status(&server, tools, tools_source, running_entry.is_some())
+                }
             })
             .collect())
     }
@@ -1568,6 +1652,8 @@ fn server_line(status: &McpServerStatus, enabled: bool, failure: Option<&str>) -
 }
 
 /// Build a server's status from the tool list `tools_source` says to use.
+/// The launch fields need the approvals table, so
+/// [`McpManager::list_servers`] fills them.
 fn server_status(
     server: &McpServer,
     tools: &[McpTool],
@@ -1593,6 +1679,8 @@ fn server_status(
         running,
         auto_approve: server.auto_approve,
         dispatchable: crate::core::mcp_servers::validate_server_id(&server.id).is_ok(),
+        launch_line: None,
+        launch_approved: false,
         tools_source,
         tools_observed_at: server.tools_observed_at,
         tools: offers
@@ -2692,7 +2780,10 @@ done
         )
         .await
         .unwrap();
-        (McpManager::new(pool.clone(), bus.clone()), bus)
+        (
+            McpManager::new(pool.clone(), bus.clone(), test_workspace_root()),
+            bus,
+        )
     }
 
     /// One manager over several stub servers, for the tests that need two
@@ -2711,6 +2802,12 @@ done
         thread_id
     }
 
+    /// The manager reads its root only to render launch lines, so it need not
+    /// exist.
+    fn test_workspace_root() -> std::path::PathBuf {
+        std::path::PathBuf::from("/workspace")
+    }
+
     async fn manager_with_all(pool: &sqlx::PgPool, stubs: &[(&str, &StubServer)]) -> McpManager {
         let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
         for (id, stub) in stubs {
@@ -2727,7 +2824,7 @@ done
             .await
             .unwrap();
         }
-        McpManager::new(pool.clone(), bus)
+        McpManager::new(pool.clone(), bus, test_workspace_root())
     }
 
     /// The round trip the whole feature rests on: connect, cache what the
@@ -3327,7 +3424,7 @@ done
         drop(before_restart);
         assert_eq!(events_named(&pool, "McpServerStopped").await, 0);
 
-        let after_restart = McpManager::new(pool.clone(), bus.clone());
+        let after_restart = McpManager::new(pool.clone(), bus.clone(), test_workspace_root());
         assert!(
             !after_restart.list_servers().await.unwrap()[0].running,
             "nothing starts a server at boot"
@@ -3483,6 +3580,78 @@ done
                 McpStartOutcome::AlreadyRunning { tool_count: 1 }
             ]
         );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// With the command guard on, a launch line nobody approved never spawns,
+    /// whether the start comes from turn setup or a direct call. Once
+    /// approved, the same line starts with no further check.
+    #[tokio::test]
+    async fn with_the_guard_on_an_unapproved_launch_line_never_spawns() {
+        use crate::core::preferences::PreferenceStore;
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let thread_id = thread_enabling(&manager, &["stub"]).await;
+        PreferenceStore::set_row_for_test(&pool, crate::core::prefs::COMMAND_GUARD.key(), "true")
+            .await
+            .unwrap();
+
+        let refused = manager.start_server("stub").await.unwrap_err().to_string();
+        assert!(refused.contains("NOT started"), "{refused}");
+        let failures = manager.start_enabled_servers(thread_id).await;
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].error.contains("Settings > MCP Servers"));
+        assert!(
+            !stub.pid_file.exists(),
+            "a refused start spawned the server"
+        );
+
+        let server = McpServerStore::get(&pool, "stub").await.unwrap().unwrap();
+        manager.approve_launch(&server, None).await.unwrap();
+        assert!(manager.start_enabled_servers(thread_id).await.is_empty());
+        assert!(stub.pid_file.exists());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// With the guard off, the default, an unapproved line starts as before.
+    #[tokio::test]
+    async fn with_the_guard_off_an_unapproved_launch_line_starts() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let server = McpServerStore::get(&pool, "stub").await.unwrap().unwrap();
+        assert!(!manager.is_launch_approved(&server).await.unwrap());
+
+        assert_eq!(
+            manager.start_server("stub").await.unwrap(),
+            McpStartOutcome::Started { tool_count: 1 }
+        );
+        assert!(
+            !manager.is_launch_approved(&server).await.unwrap(),
+            "a start with the guard off approves nothing"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The list reports each server's launch line and whether it is approved,
+    /// so an audit of existing servers reads both from one call.
+    #[tokio::test]
+    async fn the_server_list_reports_the_launch_line_and_its_approval() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha"]));
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        let server = McpServerStore::get(&pool, "stub").await.unwrap().unwrap();
+        let before = manager.list_servers().await.unwrap().remove(0);
+        assert!(!before.launch_approved);
+        let line = before.launch_line.expect("the working directory is known");
+        assert!(line.contains(&server.command), "{line}");
+
+        manager.approve_launch(&server, None).await.unwrap();
+        assert!(manager.list_servers().await.unwrap()[0].launch_approved);
 
         crate::test_support::teardown_test_db(&db_name).await;
     }

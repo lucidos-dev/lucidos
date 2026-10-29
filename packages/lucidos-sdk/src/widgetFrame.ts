@@ -18,7 +18,7 @@
  * timers.
  */
 
-import { onHostPush } from './_bridge';
+import { onHostPush, postToHost } from './_bridge';
 import { hapticTick } from './haptic';
 import { opensContextMenu, selectionCovers, shouldSuppressContextMenu, textAt, type Point } from './contextMenu';
 import { runIsolated } from './_isolate';
@@ -169,7 +169,7 @@ function postMenuRequest(at?: Point): void {
   const request: WidgetMenuRequest = { type: WIDGET_MENU_MESSAGE_TYPE };
   if (at) request.at = at;
   else if (primaryDown) request.held = true;
-  window.parent.postMessage(request, '*');
+  postToHost(request);
 }
 
 /** A finger held still on a dashboard tile marked `menu` opens the menu, with a
@@ -277,7 +277,7 @@ export function installWidgetFrame(): void {
     const key = String(size.height);
     if (key === last) return;
     last = key;
-    window.parent.postMessage({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, ...size }, '*');
+    postToHost({ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, ...size });
   };
   const schedule = () => {
     if (scheduled) return;

@@ -22,6 +22,20 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   An attempt already in flight keeps its command's response deadline.
   Re-flag only if a new attempt starts after the window expires.
   (`crates/lucidos-cli/src/http.rs`, `system-knowhow/lucidos-cli.md`.)
+- **The Bash kill guard refuses a quoted mention on purpose.** A reviewer
+  flags a refused `git commit -m "… pkill -f …"`, or
+  `ssh box 'pkill -x a'; tail -f log` where the later `-f` counts as pkill's.
+  The guard reads text, resolves every ambiguity toward refusing, and its
+  message tells the agent to rephrase. The ps rule likewise refuses
+  `ps -p $PID; echo ok | cat; kill $PID`: a later pipe may carry captured
+  `ps` output, as in `PS=$(ps aux); echo "$PS" | … | xargs kill`. Re-flag
+  only with a real shell parser that keeps every bypass test passing.
+
+  Two narrower fixes were tried and reverted. A hand-made command-position
+  check let `pkill -f` through on a later line, behind `timeout 10` or
+  `sudo -u root`, and inside `bash -lc`. Seeding the scan with the quote
+  state let a stray apostrophe in a comment hide a real `-f`.
+  (`crates/lucidos-cli/src/cc_bash_guard.rs`.)
 
 ## Repository gates
 
@@ -46,6 +60,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if a marker conceals current terminology or a changed identifier.
 
 ## Rust engine
+
+- **The read-time mask leaves secret-reference credentials out on purpose.**
+  A reviewer asks `stored_secret_values` to fail closed whenever a reference
+  credential exists, since its resolved value stays unmasked. Resolving runs
+  `op` on every read. Failing closed would withhold every event query for any
+  user who keeps a reference, so the gap is a known limitation instead.
+  Re-flag only with a cheap, cached resolver.
+  (`crates/lucidos-engine/src/engine/engine_impl/scripts.rs`.)
 
 - **A beat without usable usage cannot prove it held the context.** The
   keep-alive latch deliberately fails closed when a capture has missing or
@@ -1351,6 +1373,32 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if a session can stay silent in `agent_sessions` past the
   watchdogs. (`spawn_apply_after_session_harden` in
   `engine/claude_code/spawn.rs`, `engine/agent_session/external_watchdog.rs`.)
+
+- **A missing containment root under a linked `data/` is not an escape.** A
+  reviewer reads `resolves_outside` calling a missing root contained as a
+  hole: with `data` linked elsewhere, the first `data/artifacts` write lands
+  outside the workspace. A `data` symlink onto another volume is a supported
+  layout (`runtime/python.rs`, `cc_settings.rs`), so that write lands where
+  the user moved `data/`. A link at the tree level or below is refused by
+  `join_data_contained`. Re-flag only with a root whose missing part sits under
+  a link the product does not support. (`core/contained_path.rs`.)
+
+- **The engine's working directory in an MCP launch fingerprint is stable.**
+  A reviewer reads `std::env::current_dir()` in the fingerprint as drifting
+  with wherever the gateway was started, which would drop every launch
+  approval. The gateway spawns each engine with `current_dir` set to the
+  workspace directory (`spawn_engine` in `lucidos-gateway/src/stack.rs`). The
+  spawn really runs there, so a relative command depends on it. Re-flag only
+  with an engine spawn path that leaves its working directory unset.
+  (`McpManager::launch_fingerprint` in `mcp/mod.rs`.)
+
+- **A migration the branch itself added may still change before it lands.** A
+  reviewer reads any edit under `migrations/` as breaking sqlx's checksum on
+  databases that applied it. The rule in `.claude/rules/db.md` binds a
+  migration on `main`. Before Apply no workspace has run the branch's engine:
+  engine tests build fresh databases and e2e recreates its own. Re-flag only
+  when the edited migration file is already on `main`
+  (`git cat-file -e main:<path>`).
 
 ## Desktop client (Tauri, macOS)
 

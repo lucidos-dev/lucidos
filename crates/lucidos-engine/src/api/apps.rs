@@ -6,6 +6,7 @@ use super::frame_capability;
 use super::*;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 
+use crate::core::contained_path::join_contained;
 use std::path::PathBuf;
 
 /// Query params for single app
@@ -75,12 +76,52 @@ async fn resolve_preview_root(
     // engine's `resolve_thread_app_worktree` helper.
     let wt = state.engine.resolve_thread_app_worktree(tid).await?;
     // Sparse-checkout worktrees mirror the workspace layout, so the served
-    // root is `<wt>/data/apps/<id>/`.
-    let app_root = wt.join("data").join("apps").join(expected_app_id);
+    // root is `<wt>/data/apps/<id>/`. The agent controls every part of that
+    // path, so a link at any level that leaves its own tree is refused.
+    let data = crate::core::contained_path::join_contained(&wt, crate::core::DATA_DIR)?;
+    let app_root = crate::core::contained_path::join_data_contained(
+        &data,
+        &format!("apps/{expected_app_id}"),
+    )?;
     if !app_root.exists() {
         return None;
     }
     Some(app_root)
+}
+
+/// One file of an app: from the named thread's worktree for a `?thread_id=`
+/// WIP preview, else from the live app folder. The caller has already refused
+/// a traversing `file`.
+async fn app_file(
+    state: &AppState,
+    app_id: &str,
+    preview_thread_id: Option<&str>,
+    file: &str,
+) -> Result<PathBuf, Response> {
+    let root = match preview_thread_id {
+        Some(thread_id) => resolve_preview_root(state, thread_id, app_id)
+            .await
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "App preview unavailable for this thread (not an app coding-agent thread, app id mismatch, or worktree no longer exists).",
+                )
+                    .into_response()
+            })?,
+        None => state
+            .app_manager
+            .contained_app_dir(app_id)
+            .ok_or_else(|| refused_outside(file, std::path::Path::new("apps/")))?,
+    };
+    join_contained(&root, file).ok_or_else(|| refused_outside(file, &root))
+}
+
+fn refused_outside(file: &str, root: &std::path::Path) -> Response {
+    log!(
+        "[apps] refused {file:?}: it resolves outside {} through a symlink",
+        root.display()
+    );
+    (StatusCode::NOT_FOUND, "File not found").into_response()
 }
 
 /// Validate that an app ID is safe (no path traversal)
@@ -372,19 +413,10 @@ pub(super) async fn serve_app_ui(
     // WIP-preview path: serve index.html from an app coding-agent thread's
     // worktree. The user reaches this by clicking the preview button in the
     // thread's prompt row; the panel-overlay iframe URL gains `?thread_id=...`.
-    let (ui_path, preview_thread_id) = if let Some(thread_id) = query.thread_id.as_deref() {
-        match resolve_preview_root(&state, thread_id, &app_id).await {
-            Some(root) => (root.join("index.html"), Some(thread_id.to_string())),
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    "App preview unavailable for this thread (not an app coding-agent thread, app id mismatch, or worktree no longer exists).",
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        (state.app_manager.get_app_path(&app_id), None)
+    let preview_thread_id = query.thread_id.as_deref();
+    let ui_path = match app_file(&state, &app_id, preview_thread_id, "index.html").await {
+        Ok(path) => path,
+        Err(refused) => return refused,
     };
 
     if !ui_path.exists() {
@@ -398,7 +430,7 @@ pub(super) async fn serve_app_ui(
             // WIP-preview branch of `serve_app_file` instead of falling
             // through to the live workspace copy — which would mix the WIP
             // HTML with live CSS/JS and defeat the preview promise.
-            let html = match preview_thread_id.as_deref() {
+            let html = match preview_thread_id {
                 Some(tid) => rewrite_for_thread_id(&content, tid),
                 None => content,
             };
@@ -447,20 +479,9 @@ pub(super) async fn serve_app_file(
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
 
-    // WIP-preview: serve from the named thread's worktree.
-    let full_path = if let Some(thread_id) = query.thread_id.as_deref() {
-        match resolve_preview_root(&state, thread_id, &app_id).await {
-            Some(root) => root.join(&file_path),
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    "App preview unavailable for this thread (not an app coding-agent thread, app id mismatch, or worktree no longer exists).",
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        state.app_manager.app_file_path(&app_id, &file_path)
+    let full_path = match app_file(&state, &app_id, query.thread_id.as_deref(), &file_path).await {
+        Ok(path) => path,
+        Err(refused) => return refused,
     };
 
     app_file_response(&full_path, &file_path, query.download, &request_headers).await
@@ -525,10 +546,10 @@ pub(super) async fn serve_app_artifact(
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
 
-    let full_path = state
-        .workspace_path
-        .join("data/artifacts")
-        .join(&artifact_path);
+    let artifacts_root = state.workspace_path.join(crate::core::ARTIFACTS_DIR);
+    let Some(full_path) = join_contained(&artifacts_root, &artifact_path) else {
+        return refused_outside(&artifact_path, &artifacts_root);
+    };
 
     let ext = std::path::Path::new(&artifact_path)
         .extension()

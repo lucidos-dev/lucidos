@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::core::secret_reference::{engine_resolver, SecretField, SecretResolver};
 use crate::core::secret_store::{CredentialAuthValue, Secret};
+use crate::core::url_scope::check_path_within;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
@@ -1137,6 +1138,9 @@ pub fn normalized_base_urls(base_urls: Vec<String>) -> Result<Vec<String>, Strin
 /// [`credential_scope_covers`] is what a caller asks. `core::git_auth` re-checks
 /// the same predicate on every credential callback. A redirect therefore cannot
 /// carry a secret to a host the user never scoped it to.
+///
+/// The path must stay under the member's prefix in every decoded reading an
+/// upstream might apply, which [`check_path_within`] judges.
 pub(crate) fn credential_base_url_matches(base_url: &str, request_url: &str) -> bool {
     let Ok(base) = reqwest::Url::parse(base_url.trim()) else {
         return false;
@@ -1152,16 +1156,7 @@ pub(crate) fn credential_base_url_matches(base_url: &str, request_url: &str) -> 
         return false;
     }
 
-    let base_path = base.path().trim_end_matches('/');
-    if base_path.is_empty() {
-        return true;
-    }
-
-    let request_path = request.path();
-    request_path == base_path
-        || request_path
-            .strip_prefix(base_path)
-            .is_some_and(|rest| rest.starts_with('/'))
+    check_path_within(base.path().trim_end_matches('/'), &request).is_ok()
 }
 
 /// The prefixes of the secret variables a subprocess gets only by naming them.
@@ -1559,6 +1554,7 @@ fn env_var_names_for(
 mod tests {
     use super::*;
     use crate::core::secret_reference::tests::ScriptedResolver;
+    use crate::core::url_scope::MAX_DECODE_ROUNDS;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
     /// Every agent-facing type list is rendered from `ALL`, so a variant
@@ -2487,6 +2483,44 @@ mod tests {
             "https://api.example.com/v1",
             "https://api.example.com/v10/users"
         ));
+    }
+
+    /// Regression: the scope judged only the first parse. An encoded separator
+    /// or dot segment that an upstream decodes again then carried the
+    /// credential out of its path prefix.
+    #[test]
+    fn credential_url_match_judges_every_decoded_reading_of_the_path() {
+        let base = "https://api.example.test/safe";
+        for escaping in [
+            "https://api.example.test/safe/%2e%2e%2fadmin",
+            "https://api.example.test/safe/%252e%252e%252fadmin",
+            "https://api.example.test/safe/..%255cadmin",
+            "https://api.example.test/safe/%252e%252e/admin",
+            "https://api.example.test/safe/a/%2e%2e%2f%2e%2e%2fadmin",
+            "https://api.example.test/safe/%2%65%2%65/admin",
+        ] {
+            assert!(
+                !credential_base_url_matches(base, escaping),
+                "credential must not cover {escaping}"
+            );
+        }
+
+        let too_deep = format!(
+            "https://api.example.test/safe/%{}2fitems",
+            "25".repeat(MAX_DECODE_ROUNDS)
+        );
+        assert!(!credential_base_url_matches(base, &too_deep));
+
+        for contained in [
+            "https://api.example.test/safe/a%2fb",
+            "https://api.example.test/safe/a/%2e%2e%2fb",
+            "https://api.example.test/safe/name%20with%20space",
+        ] {
+            assert!(
+                credential_base_url_matches(base, contained),
+                "credential must still cover {contained}"
+            );
+        }
     }
 
     #[test]

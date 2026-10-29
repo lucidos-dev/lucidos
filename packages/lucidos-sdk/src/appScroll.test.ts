@@ -13,6 +13,9 @@ function box(scrollTop: number, scrollHeight = 2000, clientHeight = 600): Scroll
   return { scrollTop, scrollHeight, clientHeight };
 }
 
+/** The origin the host serves app frames from, as the SDK reads it. */
+const HOST_ORIGIN = 'https://localhost:5251';
+
 describe('clampedTop', () => {
   it('clamps elastic bounce past either end', () => {
     expect(clampedTop(box(-30))).toBe(0);
@@ -127,6 +130,7 @@ describe('installAppScrollReport', () => {
   };
 
   beforeEach(() => {
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
     root.scrollTop = 0;
     root.clientHeight = 600;
     vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
@@ -140,6 +144,7 @@ describe('installAppScrollReport', () => {
     cleanup = () => {};
     frames = [];
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     delete (window as unknown as { parent?: unknown }).parent;
   });
 
@@ -153,7 +158,7 @@ describe('installAppScrollReport', () => {
     scrollTo(170);
     runFrame();
     expect(postMessage).toHaveBeenCalledTimes(1);
-    expect(postMessage).toHaveBeenCalledWith({ type: APP_SCROLL_MESSAGE_TYPE, delta: 70, top: 170, max: 2400 }, '*');
+    expect(postMessage).toHaveBeenCalledWith({ type: APP_SCROLL_MESSAGE_TYPE, delta: 70, top: 170, max: 2400 }, HOST_ORIGIN);
   });
 
   it('posts nothing for a scroll in the frame of a resize', () => {
@@ -167,7 +172,7 @@ describe('installAppScrollReport', () => {
     expect(postMessage).not.toHaveBeenCalled();
     scrollTo(400);
     runFrame();
-    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ delta: -40 }), '*');
+    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ delta: -40 }), HOST_ORIGIN);
   });
 
   it('posts nothing for a clamp that lands after the frame of the resize', () => {
@@ -197,7 +202,7 @@ describe('installAppScrollReport', () => {
     scrollTo(160);
     onScroll({ target: carousel });
     runFrame();
-    expect(postMessage).toHaveBeenCalledWith({ type: APP_SCROLL_MESSAGE_TYPE, delta: 60, top: 160, max: 2400 }, '*');
+    expect(postMessage).toHaveBeenCalledWith({ type: APP_SCROLL_MESSAGE_TYPE, delta: 60, top: 160, max: 2400 }, HOST_ORIGIN);
   });
 
   it('only listens, passively, so the app keeps its native scroll', () => {
@@ -219,7 +224,7 @@ describe('installAppScrollReport', () => {
       const postMessage = vi.fn();
       install({ postMessage });
       fire('touchstart', 1);
-      expect(postMessage).toHaveBeenLastCalledWith({ type: APP_TOUCH_MESSAGE_TYPE, touching: true }, '*');
+      expect(postMessage).toHaveBeenLastCalledWith({ type: APP_TOUCH_MESSAGE_TYPE, touching: true }, HOST_ORIGIN);
       fire('touchend', 0);
       expect(posted(postMessage)).toEqual([true, false]);
     });

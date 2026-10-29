@@ -10,6 +10,7 @@
 import type { EventStream, PongAnswer } from '@lucidos/event-stream';
 
 let current: EventStream | null = null;
+let framesReceived = 0;
 
 export function getEventStream(): EventStream | null {
   return current;
@@ -17,6 +18,26 @@ export function getEventStream(): EventStream | null {
 
 export function setEventStream(stream: EventStream | null): void {
   current = stream;
+}
+
+/** Count a frame the live transport delivered. A rising count proves the
+ *  stream is alive, whichever thread the frame was for. */
+export function noteEventFrame(): void {
+  framesReceived += 1;
+}
+
+export function eventFramesReceived(): number {
+  return framesReceived;
+}
+
+/** Reopen the live transport now, for a caller holding proof it missed a frame.
+ *  Returns which transport it restarted, or null when none is up. The reopen
+ *  reports a drop, so `thread-sync` resyncs as after any other drop. */
+export function restartEventStream(): 'direct' | 'shared' | null {
+  if (!current) return null;
+  const transport = current.ownsReconnect ? 'shared' : 'direct';
+  current.restart();
+  return transport;
 }
 
 /** Hand this document's `PresenceCheck` answer to the live transport.

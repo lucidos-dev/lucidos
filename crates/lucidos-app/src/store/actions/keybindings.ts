@@ -7,6 +7,7 @@
 import { preferences } from '../store';
 import { savePreference } from './preferences';
 import { isMac } from '../../utils/platform';
+import { TOOLTIP_SHORTCUT_SEPARATOR } from '@lucidos/tooltip';
 import {
   SHORTCUT_DEFS,
   shortcutDef,
@@ -139,10 +140,10 @@ export function displayBinding(id: ShortcutId): string {
   return formatBinding(bindingFor(id), isMac);
 }
 
-/** Tooltip suffix reflecting the CURRENT (possibly customized) binding,
- *  e.g. "New thread · ⌘K". */
+/** A `data-tooltip` value whose CURRENT (possibly customized) binding draws
+ *  as a key chip under the text. */
 export function tooltipWithShortcut(text: string, id: ShortcutId): string {
-  return `${text} · ${displayBinding(id)}`;
+  return `${text}${TOOLTIP_SHORTCUT_SEPARATOR}${displayBinding(id)}`;
 }
 
 /** Outcome of a keydown captured while recording a new binding for `id`. The

@@ -50,6 +50,7 @@ function served(off: string[] = []): McpServersResponse {
   return {
     servers: [{
       id: 'slack', name: 'Slack', running: true, auto_approve: false, dispatchable: true,
+      launch_line: null, launch_approved: false,
       tools_source: 'live', tools_observed_at: null,
       tools: ['a', 'b'].map((n) => tool(n, off.includes(n))),
       chars: 200, tokens: 80, disabled_chars: 0, disabled_tokens: 0,

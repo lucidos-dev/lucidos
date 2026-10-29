@@ -369,6 +369,46 @@ echo ""
 echo "test: --no-launch did NOT start anything (prints how to start)"
 if echo "$out" | grep -qi "installed"; then pass "prints the installed banner"; else fail "no installed banner: $out"; fi
 
+echo ""
+echo "test: the --no-launch launch command carries the service's whole env contract"
+# A hand-written copy drifted once: it lacked LUCIDOS_BOOT_WITHOUT_PROVIDER, so a
+# fresh install launched that way refused to boot every engine.
+contract_names="$(bash -c 'source "$1" && service_runtime_env_pairs /rt /data 1' _ \
+    "$SCRIPT_DIR/service.sh" | sed 's/=.*//')"
+if [ -n "$contract_names" ]; then pass "derived the env contract names"; else fail "derived no env contract names from service.sh"; fi
+for name in $contract_names; do
+    if echo "$out" | grep -q "$name="; then
+        pass "launch command sets $name"
+    else
+        fail "launch command lacks $name: $out"
+    fi
+done
+
+echo ""
+echo "test: the --no-launch launch command survives a prefix with a space and a quote"
+ODD_PREFIX="$(mktemp -d)/o'neil dir"
+odd_out="$(bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$ODD_PREFIX" --no-launch 2>&1)"; rc=$?
+# The command runs from the line after "launch directly:" up to "Then open:".
+launch_cmd="$(printf '%s\n' "$odd_out" | sed -n '/launch directly:/,/Then open:/p' | sed '1d;$d')"
+if [ $rc -eq 0 ] && [ -n "$launch_cmd" ] && bash -n -c "$launch_cmd" 2>/dev/null; then
+    pass "launch command parses as shell"
+else
+    fail "launch command does not parse (rc=$rc): $odd_out"
+fi
+# Swap the program for a printer, so running the command shows what it would exec.
+probe="$(bash -c "${launch_cmd%$'\n'*}"$'\n    printenv LUCIDOS_ENGINE_BIN' 2>&1)"
+if [ "$probe" = "$ODD_PREFIX/runtime/$STEM/lucidos-engine" ]; then
+    pass "env values keep the space and the quote"
+else
+    fail "LUCIDOS_ENGINE_BIN did not survive (got '$probe'): $launch_cmd"
+fi
+program="$(bash -c "printf '%s' ${launch_cmd##*$'\n'}" 2>&1)"
+if [ "$program" = "$ODD_PREFIX/runtime/$STEM/lucidos-gateway" ] && [ -x "$program" ]; then
+    pass "program path keeps the space and the quote"
+else
+    fail "program path did not survive (got '$program'): $launch_cmd"
+fi
+
 # ── INTEGRATION: idempotency (skip unless --force) ───────────────────────────
 echo ""
 echo "test: a second --from-tarball run is idempotent (no re-extract); --force re-extracts"
@@ -790,6 +830,92 @@ else
     fail "--dev did not route to the source branch safely: $out"
 fi
 rm -rf "$FAKEBIN"
+
+# ── configure_provider never exposes the key in data/.env ───────────────────
+# configure_provider runs only inside a source build, so it is extracted
+# verbatim and run against a temp workspace with the output helpers stubbed.
+# The chmod and mv fakes look for a readable copy of the key at both steps.
+# The existing 0644 data/.env is the re-run case a umask alone would miss.
+echo ""
+echo "test: configure_provider writes data/.env owner-only from the first byte"
+mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+CP_DIR="$(mktemp -d)"
+awk '/^configure_provider\(\) \{$/{on=1} on{print} on && /^\}$/{exit}' "$INSTALL" > "$CP_DIR/configure_provider.sh"
+CP_ENV="$CP_DIR/ws/data/.env"
+CP_KEY='sk-cp-test'
+if ! grep -q 'OPENAI_API_KEY=' "$CP_DIR/configure_provider.sh"; then
+    fail "could not extract configure_provider from install.sh (shape changed)"
+else
+    # shellcheck disable=SC2329 # the stubs and fakes are called by configure_provider
+    run_configure_provider() {
+        (
+            umask 022
+            step() { :; }; info() { :; }; ok() { :; }; warn() { :; }
+            die() { echo "died: $*"; exit 1; }
+            ensure_storage_root() { mkdir -p "$1"; }
+            cp_scan() {
+                local f
+                for f in "$CP_DIR/ws/data"/* "$CP_DIR/ws/data"/.[!.]*; do
+                    [ -f "$f" ] || continue
+                    grep -qF "$CP_KEY" "$f" || continue
+                    case "$(mode_of "$f")" in *00) ;; *) echo "exposed: $(basename "$f") $(mode_of "$f")"; exit 2 ;; esac
+                done
+            }
+            chmod() { [ -z "${CP_CHMOD_FAILS:-}" ] || return 1; cp_scan; command chmod "$@"; }
+            mv() { cp_scan; command mv "$@"; }
+            export LUCIDOS_WORKSPACE="$CP_DIR/ws" LUCIDOS_HOME="$CP_DIR" OPENAI_API_KEY="${CP_RUN_KEY-$CP_KEY}" VERTEX_PROJECT_ID=''
+            # shellcheck source=/dev/null
+            . "$CP_DIR/configure_provider.sh"
+            configure_provider
+        )
+    }
+    mkdir -p "$CP_DIR/ws/data"
+    printf 'MY_SETTING=kept\n' > "$CP_ENV"; chmod 644 "$CP_ENV"
+    out="$(run_configure_provider 2>&1)"; rc=$?
+    if [ $rc -eq 0 ] && [ "$(mode_of "$CP_ENV")" = 600 ] && grep -qx "OPENAI_API_KEY=$CP_KEY" "$CP_ENV" \
+       && grep -qx 'MY_SETTING=kept' "$CP_ENV"; then
+        pass "an existing 0644 data/.env is rewritten at 600 with no readable copy at any step"
+    else
+        fail "rc=$rc mode=$(mode_of "$CP_ENV"): $out"
+    fi
+    out="$(run_configure_provider 2>&1)"; rc=$?
+    if [ $rc -eq 0 ] && [ "$(grep -c "^OPENAI_API_KEY=" "$CP_ENV")" = 1 ]; then
+        pass "a re-run replaces the managed block instead of adding a second"
+    else
+        fail "re-run: rc=$rc: $out $(cat "$CP_ENV")"
+    fi
+    if [ -z "$(find "$CP_DIR/ws/data" -name '.env?*')" ]; then pass "no temp file is left behind"; else fail "left behind: $(ls -A "$CP_DIR/ws/data")"; fi
+    rm -f "$CP_ENV"
+    out="$(run_configure_provider 2>&1)"; rc=$?
+    if [ $rc -eq 0 ] && [ "$(mode_of "$CP_ENV")" = 600 ] && grep -qx "OPENAI_API_KEY=$CP_KEY" "$CP_ENV"; then
+        pass "a first install creates data/.env at 600"
+    else
+        fail "first install: rc=$rc mode=$(mode_of "$CP_ENV" 2>/dev/null): $out"
+    fi
+    out="$(CP_CHMOD_FAILS=1 run_configure_provider 2>&1)"; rc=$?
+    if [ $rc -ne 0 ] && echo "$out" | grep -q "died:"; then
+        pass "a failed chmod stops the install"
+    else
+        fail "a failed chmod was swallowed (rc=$rc): $out"
+    fi
+    # A re-run with no credentials keeps the existing provider and only
+    # tightens the mode. The old key differs from CP_KEY, so the scan ignores it.
+    printf 'OPENAI_API_KEY=sk-cp-old\n' > "$CP_ENV"; chmod 644 "$CP_ENV"
+    out="$(CP_RUN_KEY='' run_configure_provider 2>&1)"; rc=$?
+    if [ $rc -eq 0 ] && [ "$(mode_of "$CP_ENV")" = 600 ] && grep -qx 'OPENAI_API_KEY=sk-cp-old' "$CP_ENV"; then
+        pass "a re-run with no credentials tightens an existing data/.env to 600"
+    else
+        fail "no-credential re-run: rc=$rc mode=$(mode_of "$CP_ENV"): $out"
+    fi
+    chmod 644 "$CP_ENV"
+    out="$(CP_RUN_KEY='' CP_CHMOD_FAILS=1 run_configure_provider 2>&1)"; rc=$?
+    if [ $rc -ne 0 ] && echo "$out" | grep -q "died:"; then
+        pass "a failed chmod on a no-credential re-run stops the install"
+    else
+        fail "a failed chmod on a no-credential re-run was swallowed (rc=$rc): $out"
+    fi
+fi
+rm -rf "$CP_DIR"
 
 echo ""
 echo "install: $PASS passed, $FAIL failed"

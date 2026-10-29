@@ -37,6 +37,9 @@ export const PROXY_CLIENT_WAIT_SECS = 660;
 /** `HEADER_DEVICE_ID` in `api/actor.rs`. */
 export const HEADER_DEVICE_ID = "x-lucidos-device-id";
 
+/** `QUERY_CALL_TICKET` in `api/voice_ticket.rs`. */
+export const QUERY_CALL_TICKET = "ticket";
+
 /** `MEMORY_MODULE_WHILE_UNSET` in `core/preference_catalog.rs`. */
 export const MEMORY_MODULE_WHILE_UNSET = "classic" as const;
 

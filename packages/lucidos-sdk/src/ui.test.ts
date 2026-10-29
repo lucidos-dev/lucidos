@@ -9,6 +9,9 @@ import {
   parseResolvedTheme, resolveFontKey,
 } from './appearance';
 
+/** The origin the host serves app frames from, as the SDK reads it. */
+const HOST_ORIGIN = 'https://localhost:5251';
+
 describe('webFontUrl', () => {
   it('serves every vendored font from the local engine, never from Google', () => {
     expect(webFontUrl('fira-code')).toBe('/api/v1/fonts/fira-code.css');
@@ -705,6 +708,7 @@ describe('lucidos.ui.toast', () => {
     postMessage = vi.fn();
     // A non-self parent so window.parent !== window — drives the postMessage path.
     (globalThis as { parent?: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
   });
   afterEach(() => {
     (globalThis as { parent?: unknown }).parent = origParent;
@@ -716,7 +720,7 @@ describe('lucidos.ui.toast', () => {
     expect(ret).toBeUndefined();
     expect(postMessage).toHaveBeenCalledWith(
       { type: 'lucidos:ui:toast', payload: { message: 'Saved', type: 'success', durationMs: 2000, dismissable: false, title: undefined, key: undefined, spinning: undefined } },
-      '*',
+      HOST_ORIGIN,
     );
   });
 
@@ -724,7 +728,7 @@ describe('lucidos.ui.toast', () => {
     ui.toast('Heads up');
     expect(postMessage).toHaveBeenCalledWith(
       { type: 'lucidos:ui:toast', payload: { message: 'Heads up', type: 'info', durationMs: undefined, dismissable: undefined, title: undefined, key: undefined, spinning: undefined } },
-      '*',
+      HOST_ORIGIN,
     );
   });
 
@@ -799,6 +803,7 @@ describe('lucidos.ui.ready', () => {
     origParent = (globalThis as { parent?: unknown }).parent;
     postMessage = vi.fn();
     (globalThis as { parent?: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
   });
   afterEach(() => {
     (globalThis as { parent?: unknown }).parent = origParent;
@@ -806,7 +811,7 @@ describe('lucidos.ui.ready', () => {
 
   it('posts lucidos:ui:ready to the host and returns void', () => {
     expect(ui.ready()).toBeUndefined();
-    expect(postMessage).toHaveBeenCalledWith({ type: 'lucidos:ui:ready' }, '*');
+    expect(postMessage).toHaveBeenCalledWith({ type: 'lucidos:ui:ready' }, HOST_ORIGIN);
   });
 
   // The host ignores a ready for a frame it already revealed. So the SDK keeps
@@ -832,6 +837,7 @@ describe('lucidos.ui.dismissToast', () => {
     origParent = (globalThis as { parent?: unknown }).parent;
     postMessage = vi.fn();
     (globalThis as { parent?: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
   });
   afterEach(() => {
     (globalThis as { parent?: unknown }).parent = origParent;
@@ -843,7 +849,7 @@ describe('lucidos.ui.dismissToast', () => {
     expect(ret).toBeUndefined();
     expect(postMessage).toHaveBeenCalledWith(
       { type: 'lucidos:ui:dismissToast', payload: { key: 'reindex' } },
-      '*',
+      HOST_ORIGIN,
     );
   });
 
@@ -866,6 +872,53 @@ describe('lucidos.ui.dismissToast', () => {
   });
 });
 
+describe('lucidos.ui.confirm', () => {
+  let origParent: unknown;
+  let postMessage: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    origParent = (globalThis as { parent?: unknown }).parent;
+    postMessage = vi.fn();
+    (globalThis as { parent?: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
+  });
+  afterEach(() => {
+    (globalThis as { parent?: unknown }).parent = origParent;
+  });
+
+  function replyToLastConfirm(ok: boolean, origin = HOST_ORIGIN) {
+    const calls = postMessage.mock.calls;
+    const sent = calls[calls.length - 1][0] as { id: string };
+    globalThis.dispatchEvent(
+      Object.assign(new Event('message'), {
+        source: (globalThis as { parent?: unknown }).parent,
+        origin,
+        data: { type: 'lucidos:ui:confirm:result', id: sent.id, ok },
+      }),
+    );
+  }
+
+  it('posts to the host origin and resolves the host answer', async () => {
+    const p = ui.confirm({ message: 'Delete it?' });
+    const sent = postMessage.mock.calls[0][0];
+    expect(sent.type).toBe('lucidos:ui:confirm');
+    expect(postMessage).toHaveBeenCalledWith(sent, HOST_ORIGIN);
+    replyToLastConfirm(true);
+    await expect(p).resolves.toBe(true);
+  });
+
+  it('ignores an OK from a foreign origin, so no framing page can approve', async () => {
+    const p = ui.confirm({ message: 'Delete it?' });
+    let settled = false;
+    void p.then(() => { settled = true; });
+    replyToLastConfirm(true, 'https://framing-page.example');
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    replyToLastConfirm(false);
+    await expect(p).resolves.toBe(false);
+  });
+});
+
 describe('lucidos.ui.prompt', () => {
   let origParent: unknown;
   let postMessage: ReturnType<typeof vi.fn>;
@@ -874,6 +927,7 @@ describe('lucidos.ui.prompt', () => {
     origParent = (globalThis as { parent?: unknown }).parent;
     postMessage = vi.fn();
     (globalThis as { parent?: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
   });
   afterEach(() => {
     (globalThis as { parent?: unknown }).parent = origParent;
@@ -883,15 +937,16 @@ describe('lucidos.ui.prompt', () => {
   // The SDK installs a single `message` listener; replay the host reply by
   // dispatching a synthetic message event with the id the SDK just posted.
   //
-  // `source` is the stubbed `window.parent`, because the SDK answers only the
-  // window it posted to. A nested iframe inside an app can post to that app's
-  // frame, so a reply from anywhere else is a forgery (see `fromHost`).
-  function replyToLastPrompt(value: unknown) {
+  // `source` is the stubbed `window.parent`, and `origin` the host's. The SDK
+  // answers only the window it posted to, on the origin it posted to (see
+  // `fromHost`): a nested frame, or a foreign page framing the app, is a forgery.
+  function replyToLastPrompt(value: unknown, origin = HOST_ORIGIN) {
     const calls = postMessage.mock.calls;
     const sent = calls[calls.length - 1][0] as { id: string };
     globalThis.dispatchEvent(
       Object.assign(new Event('message'), {
         source: (globalThis as { parent?: unknown }).parent,
+        origin,
         data: { type: 'lucidos:ui:prompt:result', id: sent.id, value },
       }),
     );
@@ -903,6 +958,18 @@ describe('lucidos.ui.prompt', () => {
     expect(sent.type).toBe('lucidos:ui:prompt');
     expect(typeof sent.id).toBe('string');
     expect(sent.payload).toMatchObject({ message: 'Name?', defaultValue: 'Untitled', okLabel: 'OK', cancelLabel: 'Cancel', multiline: false });
+    expect(postMessage).toHaveBeenCalledWith(sent, HOST_ORIGIN);
+    replyToLastPrompt('Alice');
+    await expect(p).resolves.toBe('Alice');
+  });
+
+  it('ignores a reply from a foreign origin, the parent window or not', async () => {
+    const p = ui.prompt({ message: 'Name?' });
+    let settled = false;
+    void p.then(() => { settled = true; });
+    replyToLastPrompt('forged', 'https://framing-page.example');
+    await Promise.resolve();
+    expect(settled).toBe(false);
     replyToLastPrompt('Alice');
     await expect(p).resolves.toBe('Alice');
   });
@@ -955,6 +1022,7 @@ describe('lucidos.ui.previewFile', () => {
     origParent = (globalThis as { parent?: unknown }).parent;
     postMessage = vi.fn();
     (globalThis as { parent?: unknown }).parent = { postMessage };
+    vi.stubGlobal('location', { origin: HOST_ORIGIN });
   });
   afterEach(() => {
     (globalThis as { parent?: unknown }).parent = origParent;
@@ -963,14 +1031,15 @@ describe('lucidos.ui.previewFile', () => {
   });
 
   /** Replay the host's answer for the request the SDK just posted. `source` is
-   *  the stubbed `window.parent`: the SDK answers only the window it posted to
-   *  (see `fromHost`). */
-  function replyToLastPreview(reply: { ok: boolean; error?: string }) {
+   *  the stubbed `window.parent` and `origin` the host's: the SDK answers only
+   *  that window on that origin (see `fromHost`). */
+  function replyToLastPreview(reply: { ok: boolean; error?: string }, origin = HOST_ORIGIN) {
     const calls = postMessage.mock.calls;
     const sent = calls[calls.length - 1][0] as { id: string };
     globalThis.dispatchEvent(
       Object.assign(new Event('message'), {
         source: (globalThis as { parent?: unknown }).parent,
+        origin,
         data: { type: 'lucidos:ui:preview-file:result', id: sent.id, ...reply },
       }),
     );
@@ -982,6 +1051,18 @@ describe('lucidos.ui.previewFile', () => {
     expect(sent.type).toBe('lucidos:ui:preview-file');
     expect(typeof sent.id).toBe('string');
     expect(sent.payload).toEqual({ file_path: 'repo:r-1:file:src/main.rs', line: 510, line_end: 520 });
+    expect(postMessage).toHaveBeenCalledWith(sent, HOST_ORIGIN);
+    replyToLastPreview({ ok: true });
+    await expect(p).resolves.toBeUndefined();
+  });
+
+  it('ignores a reply from a foreign origin', async () => {
+    const p = ui.previewFile({ file_path: 'artifacts/notes.md' });
+    let settled = false;
+    void p.then(() => { settled = true; }, () => { settled = true; });
+    replyToLastPreview({ ok: true }, 'https://framing-page.example');
+    await Promise.resolve();
+    expect(settled).toBe(false);
     replyToLastPreview({ ok: true });
     await expect(p).resolves.toBeUndefined();
   });

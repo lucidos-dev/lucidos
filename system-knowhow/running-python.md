@@ -218,6 +218,10 @@ When a workspace turns on the command guard, every `run_bash` / `run_bash_backgr
 
 **In a scheduled trigger there's no one to ask.** On a trigger fire, the irreversible lane checks the trigger's *side-effect grant* instead of prompting. The grant lists the categories the user authorized in the trigger's settings. A granted category runs. An ungranted one is **blocked and fails the trigger run**, and the user gets a failure notification naming the blocked command and the missing grant. So a trigger that must send mail or call a mutating API needs that grant first: see `system-knowhow/triggers.md` § Side-effect grant.
 
+**An MCP server's start command is checked too.** The guard reads an MCP server setup (`mcp` tool, `setup`) as the command line the server spawns. A server reruns that command on every start, so a dangerous one asks rather than taking the Undo lane. With the guard on, an `enable` or `start` of an unapproved registered server asks too. The guard judges that line with env values masked.
+
+Each yes is remembered for that exact line, so the same server never asks twice. A changed command, argument or env value asks again. `lucidos mcp start` from a shell approves nothing, so an unapproved line is still refused. `mcp(action="list")` shows each server's line, whether it is approved, and the static check's verdict.
+
 The guard is deliberately narrow. These all run with no prompt: reads anywhere on the machine (outside the workspace too, by design), a plain `curl https://…` GET, writes under `data/`, and redirects to `/dev/null`. Pure-compute Python that installs no packages runs unprompted too. An in-workspace *deletion* also runs unprompted, with the Undo above. The judge asks only when it can't tell a command is safe. The guard is off by default, so most workspaces never see it.
 
 ## The per-workspace venv

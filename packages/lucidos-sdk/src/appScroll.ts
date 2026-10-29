@@ -17,6 +17,8 @@
  * moving under a resting finger reads as a scroll back (ADR 0482).
  */
 
+import { postToHost } from './_bridge';
+
 /** Posted with the reader's scroll since the last report. */
 export const APP_SCROLL_MESSAGE_TYPE = 'lucidos:app:scroll';
 
@@ -106,7 +108,7 @@ export function installAppScrollReport(): () => void {
     frame = null;
     resized = false;
     if (pending && pending.delta !== 0) {
-      window.parent.postMessage({ type: APP_SCROLL_MESSAGE_TYPE, ...pending }, '*');
+      postToHost({ type: APP_SCROLL_MESSAGE_TYPE, ...pending });
     }
     pending = null;
   };
@@ -132,7 +134,7 @@ export function installAppScrollReport(): () => void {
   const postTouch = (next: boolean) => {
     if (next === touching) return;
     touching = next;
-    window.parent.postMessage({ type: APP_TOUCH_MESSAGE_TYPE, touching }, '*');
+    postToHost({ type: APP_TOUCH_MESSAGE_TYPE, touching });
   };
   // Pointer events cannot serve: iOS cancels them once a native scroll starts.
   // Capture, so an app that stops a touch's propagation cannot hide the lift.

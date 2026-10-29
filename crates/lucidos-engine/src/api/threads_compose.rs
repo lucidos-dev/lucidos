@@ -12,6 +12,7 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::api::actor::user_actor;
+use crate::api::thread_reach::{refuse_without_authority, ThreadReachVerb};
 use crate::api::{ApiError, AppState};
 use crate::core::blobs::write_blob_from_base64;
 use crate::core::store::{ComposeReport, ComposeReportRow, COMPOSE_REPORT_COLS};
@@ -32,6 +33,16 @@ const MAX_COMPOSE_IMAGES: usize = 32;
 /// bytes); 8 KiB is generous headroom while still fencing off a runaway client,
 /// since this fans out over SSE like the other compose fields.
 const MAX_COMPOSE_SELECTION_BYTES: usize = 8 * 1024;
+
+/// The clause-4 verb `PUT /api/v1/threads/:id/compose` and
+/// `POST /api/v1/threads/:id/blobs` ask (ADR 0168). The draft holds the next
+/// message and its model picks, so writing it drives the thread's session, as
+/// changing its model does.
+pub(in crate::api) const COMPOSE_VERB: ThreadReachVerb = ThreadReachVerb::Control;
+/// The clause-4 verb `DELETE /api/v1/threads/:id` asks. Discarding a draft
+/// thread takes it off the thread list, which is what Archive does to an
+/// active one.
+pub(in crate::api) const DISCARD_DRAFT_VERB: ThreadReachVerb = ThreadReachVerb::Archive;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct PostThreadBody {
@@ -380,6 +391,8 @@ pub(super) async fn put_compose(
     headers: HeaderMap,
     Json(body): Json<PutComposeBody>,
 ) -> Result<Response, ApiError> {
+    // Before the legacy upload too, so a refused caller leaves no blob behind.
+    refuse_without_authority(&state.engine.event_bus, &headers, Some(id), COMPOSE_VERB).await?;
     if body.text.len() > MAX_COMPOSE_TEXT_BYTES {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -579,6 +592,14 @@ pub(super) async fn delete_thread(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    // Before the lookup, so a refusal says nothing about whether the thread exists.
+    refuse_without_authority(
+        &state.engine.event_bus,
+        &headers,
+        Some(id),
+        DISCARD_DRAFT_VERB,
+    )
+    .await?;
     let lookup: Option<(String, String)> =
         sqlx::query_as("SELECT state, archive_state FROM thread_summaries WHERE thread_id = $1")
             .bind(id)
