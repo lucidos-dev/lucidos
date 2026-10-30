@@ -232,9 +232,53 @@ app needs one of the two TLS routes.
 | **B. `tailscale serve`** | one command, plus one account-level toggle | real Let's Encrypt cert, auto-renewed | yes | none |
 | **C. mkcert** | generate a cert, point the gateway at it, restart | trusted only where the local CA is installed | yes | install **and trust** the root CA on every device |
 
-Default recommendation: **B**, then **C** when the tailnet HTTPS toggle is
-unavailable, then **A** when the user explicitly does not care about push or the
-label.
+A gateway bound beyond loopback on a tailnet that issues certificates needs
+none of these: it serves HTTPS itself (§ Automatic, below). For a
+loopback-bound gateway, recommend **B**. Fall back to **C** when the tailnet
+HTTPS toggle is unavailable, and to **A** when the user does not care about
+push or the label.
+
+### Automatic: the gateway's own certificate
+
+**A gateway bound beyond loopback serves HTTPS by itself** when the tailnet
+issues certificates. It asks tailscaled for this machine's certificate, so
+nobody installs anything and the user sees no setup step. This is a *managed
+certificate* (ADR 0600). The gateway picks the first of these that works:
+
+1. **Your own certificate**: `LUCIDOS_TLS_CERT`/`KEY` (Route C). Always wins.
+2. **Your tailnet's**: when tailscaled reports `CertDomains` for this machine,
+   the gateway fetches the certificate for the first name. It refreshes it
+   daily and swaps it in with no restart. A failed refresh keeps the current
+   one until it expires, but only while tailscaled still reports that name.
+3. **None**: other devices stay on plain HTTP, and the gateway states why.
+
+What the tailnet admin must enable (the agent cannot):
+
+- **Tailscale**: <https://login.tailscale.com/admin/dns> → **HTTPS
+  Certificates** → **Enable HTTPS**.
+- **Headscale**: node certificates exist on `main` but remain unreleased as of
+  2026-10-30. The admin must deploy a release that includes them, then enable
+  `dns.certificates` and set `dns.challenge.provider`. Only then does the
+  tailnet get automatic HTTPS.
+
+Until then, a Headscale tailnet stays on plain HTTP. Source and headless operators can set
+`LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY` instead (Route C).
+The packaged app cannot take an operator certificate.
+
+Things to know:
+
+- **Only the tailnet addresses get HTTPS.** Loopback stays plain HTTP, so the
+  desktop window and `tailscale serve` keep working. So do the LAN and other
+  VPNs: their devices could not resolve the tailnet name anyway.
+- **Old `http://` tailnet addresses still work.** Plain HTTP to a tailnet
+  address gets a redirect to `https://<tailnet name>:<port>`. An old QR or
+  bookmark lands on the secure origin.
+- **Open the name, not the IP.** The certificate covers the tailnet name. A
+  `100.x` address redirects to it.
+- **Check it** with `lucidos tls status`, or the **HTTPS** row on Settings →
+  Access. Both say which source serves, until when, and the reason when none.
+- **Pairing follows it.** The pairing QR and Connect URLs use the gateway's
+  HTTPS origin, right after an external address.
 
 ### Route A: plain HTTP over the Tailscale tunnel
 
@@ -502,6 +546,10 @@ first must be true before the second buys anything:
 |---|---|---|
 | 1. The machine running Lucidos | Is the engine's machine on a tailnet? | `detected_tailscale_ip` from `GET /api/v1/network-config` in any browser; the fuller `get_connect_info` probe on the packaged desktop app |
 | 2. This device | Has the device reading the page joined that tailnet? | The address this device was served on |
+
+**Section 1 carries an HTTPS row** when the page is served by the gateway
+itself. It reads `GET /~/api/v1/control/tls` and says which certificate serves,
+until when, or why there is none (§ Automatic: the gateway's own certificate).
 
 **Add a device is the action they lead to**, not a third question: pairing a
 new device at one of those addresses. See its own section below. **External

@@ -523,6 +523,21 @@ export async function setExternalAddress(externalAddress: string): Promise<Exter
   });
 }
 
+/** What the gateway serves over HTTPS, mirroring the Rust `TlsReport`.
+ *  `error` beside `none` is why there is no HTTPS; beside `tailnet` it is a
+ *  failed renewal, and the current certificate still serves. */
+export interface GatewayTls {
+  source: 'operator' | 'tailnet' | 'none';
+  name: string | null;
+  expires_at: string | null;
+  error: string | null;
+  https_origin: string | null;
+}
+
+export async function getGatewayTls(): Promise<GatewayTls> {
+  return controlJson<GatewayTls>('/tls');
+}
+
 // ── Restore from backup (picker) ───────────────────────────────────────────
 
 /** State of the gateway's restore-from-backup flow. Mirrors the Rust

@@ -58,6 +58,13 @@ fn approval_key(workspace_path: &std::path::Path, raw: &str) -> Result<String, S
         }
         false => handshake_approvals::config_path_key(trimmed),
     };
+    if !handshake_approvals::path_is_recordable(&rel) {
+        return Err(format!(
+            "{:?} {}",
+            raw,
+            handshake_approvals::UNRECORDABLE_PATH_REASON
+        ));
+    }
     if crate::api::is_path_traversal(rel.strip_prefix("data/").unwrap_or(&rel)) {
         return Err(format!("'{}' must be a relative path with no '..'", raw));
     }
@@ -279,6 +286,7 @@ mod tests {
             "scripts/../config/apis.json",
             "/etc/passwd",
             "",
+            "scripts/auth/x.py\nscripts/auth/y.py",
         ] {
             assert!(approval_key(ws, bad).is_err(), "{bad} must be refused");
         }

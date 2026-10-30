@@ -594,6 +594,10 @@ The LLM driving a *thread* on the user's behalf: chat responses, trigger-thread 
 ### Lucidos Engine
 The engine itself acting without LLM mediation: recovery sweeps, *hardening*, scheduler ticks, system-initiated cancellations. UI actor-chip label: "Lucidos Engine". Returned by `mcp::client::mcp_client_name(ActorMode::Engine)`.
 
+### Managed certificate
+The HTTPS certificate a gateway gets by itself from tailscaled, for this machine's tailnet name, when the tailnet issues certificates. The gateway serves it on its non-loopback listeners and refreshes it daily, with no setup and no restart. A certificate the operator names in `LUCIDOS_TLS_CERT` always wins over it. Shown by `lucidos tls status` and the HTTPS row on Settings → Access.
+See also: `system-knowhow/remote-access.md` § "Automatic: the gateway's own certificate", ADR 0600.
+
 ### Marketplace
 A registered git repository (or GitHub tree URL) that the *Plugins panel* scans for installable *plugins*, shown when the **Installed only** filter is unchecked. Stored in `data/config/plugin-marketplaces.json`; added or removed under Settings → Marketplaces (or the `plugins(action="register_marketplace")` tool). It holds one plugin at its root or several plugin directories; GitHub subdirectories become GitHub tree install URLs.
 

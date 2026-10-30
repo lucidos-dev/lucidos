@@ -82,20 +82,8 @@ describe('startClient external-link delegation', () => {
     expect(body.length).toBeGreaterThan(0);
   });
 
-  it('claims every http(s) anchor and routes it through openUrl', () => {
-    expect(body).toContain(`closest('a[href]')`);
-    expect(body).toContain('/^https?:\\/\\//.test(href)');
-    expect(body).toContain('preventDefault()');
-    expect(body).toContain('openUrl(href)');
-  });
-
-  // A pasted link to a Lucidos thread opened the external browser on desktop.
-  // The parser answers first, and `cross-workspace.test.ts` covers its routing.
-  it('keeps a workspace thread URL inside Lucidos before falling back to openUrl', () => {
-    const parse = body.indexOf('parseWorkspaceThreadUrl(href)');
-    expect(parse).toBeGreaterThan(-1);
-    expect(body).toContain('openWorkspaceThreadUrl(');
-    expect(parse).toBeLessThan(body.indexOf('openUrl(href)'));
+  it('hands every anchor click to the one external-link router', () => {
+    expect(body).toContain('routeExternalAnchorClick(e)');
   });
 
   it('never opens an external URL itself, so the platform routing has one home', () => {

@@ -65,6 +65,7 @@ mod server;
 mod shell_env;
 mod slowness;
 mod stack;
+mod tls;
 mod update_relay;
 #[cfg(test)]
 mod value_pins_tests;

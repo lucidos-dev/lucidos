@@ -404,6 +404,21 @@ export default defineConfig({
       // The app's scroll report, which moves the mobile bars over an app
       // (ADR 0469). Reached WITHOUT the barrel, like the pane swipe above.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      // The tap rule (movement and hold limits), shared so every tap gate and
+      // the link press guard rule on one definition. Reached WITHOUT the
+      // barrel, like the pane swipe above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/tap-press': resolve(__dirname, '../../packages/lucidos-sdk/src/tapPress.ts'),
+      // The link press guard, shared so a swipe that starts on a link never
+      // opens it, in the shell and in an app frame. Reached WITHOUT the
+      // barrel, like the pane swipe above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/link-press-guard': resolve(__dirname, '../../packages/lucidos-sdk/src/linkPressGuard.ts'),
+      // Which hrefs leave the page for the web. The shell and an app frame
+      // share it, so both classify a link by the parser, not a pattern. Reached
+      // WITHOUT the barrel, like the pane swipe above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/web-link': resolve(__dirname, '../../packages/lucidos-sdk/src/webLink.ts'),
       '@lucidos/app-scroll': resolve(__dirname, '../../packages/lucidos-sdk/src/appScroll.ts'),
       // The right-click rule (ADR 0285), shared with widget frames so a frame
       // and the host agree on what counts as content. Reached WITHOUT the

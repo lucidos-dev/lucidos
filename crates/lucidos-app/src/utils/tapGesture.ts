@@ -1,10 +1,4 @@
-import { LONG_PRESS_DELAY_MS } from '../hooks/useLongPress';
-
-// Movement during a press that is treated as a scroll instead of a tap.
-// 8 px matches the swipe direction-lock threshold in `swipe.ts`.
-// Exported for `deadPressProbe`, which asks the same question of a cancelled
-// gesture: did the finger move, or did the system take a stationary press?
-export const TAP_MOVE_THRESHOLD_PX = 8;
+import { TAP_MOVE_THRESHOLD_PX, cancelledPressWasATap } from '@lucidos/tap-press';
 
 /** The fields everything in this file reads off a pointer or a touch: SCREEN
  *  coordinates, never client ones.
@@ -175,23 +169,6 @@ function contactOf(e: TouchPressLike, identifier: number): TouchContact | null {
     if (e.changedTouches[i].identifier === identifier) return e.changedTouches[i];
   }
   return null;
-}
-
-/** Was a press the system cancelled still a tap the user meant?
- *
- *  One finger, start to cancel, that stayed within the tap threshold and was
- *  not held past a long press. A scroll, a pinch or a hold fails one of the
- *  three, and the system is entitled to take those. */
-export function cancelledPressWasATap(p: {
-  heldMs: number;
-  movedPx: number;
-  fingers: number;
-  fingersLeft: number;
-}): boolean {
-  return p.fingers <= 1
-    && p.fingersLeft === 0
-    && p.movedPx <= TAP_MOVE_THRESHOLD_PX
-    && p.heldMs <= LONG_PRESS_DELAY_MS;
 }
 
 /** A `createTapGate` as an activation sees it. Both halves travel together

@@ -80,7 +80,7 @@ ordered() {
 # ── 1. the refusals, run for real ─────────────────────────────────────────────
 echo "test: --publish-draft refuses a version with nothing to finish"
 set +e
-out="$("$RELEASE_SH" --publish-draft 0.77.0 2>&1)"
+out="$(GH_TOKEN=offline-test-token "$RELEASE_SH" --publish-draft 0.77.0 2>&1)"
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] \
@@ -100,7 +100,7 @@ fi
 echo ""
 echo "test: --publish-draft cannot be combined with another phase"
 set +e
-out="$("$RELEASE_SH" --publish-verified --publish-draft 0.77.0 2>&1)"
+out="$(GH_TOKEN=offline-test-token "$RELEASE_SH" --publish-verified --publish-draft 0.77.0 2>&1)"
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'Cannot combine'; then
@@ -112,7 +112,7 @@ fi
 echo ""
 echo "test: --allow-missing-tarballs is accepted as a flag, not read as the version"
 set +e
-out="$("$RELEASE_SH" --publish-draft --allow-missing-tarballs 0.77.0 2>&1)"
+out="$(GH_TOKEN=offline-test-token "$RELEASE_SH" --publish-draft --allow-missing-tarballs 0.77.0 2>&1)"
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'Nothing to finish for v0.77.0'; then

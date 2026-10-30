@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { landingTarget, deepLinkAnchorForEvent, stampedEventIds } from '../exchange-render';
+import { landingTarget, deepLinkAnchorForEvent, stampedEventIds } from '../exchange-anchors';
 import type { Exchange } from '../exchange';
 import type { StoredEvent } from '../thread-event-types';
 

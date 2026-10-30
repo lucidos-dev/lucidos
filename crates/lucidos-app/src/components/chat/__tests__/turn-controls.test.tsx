@@ -200,7 +200,7 @@ describe('turnControls', () => {
     expect(ring(true)).toEqual(ring(false));
     const { cx, cy, r } = ring(false)[0];
     // 20 of 24 units with the stroke is the ceiling this row's glyphs share
-    // (see `FollowLiveEdgeIcon`). A bigger mark towers over its neighbours.
+    // (see `SideQuestionIcon`). A bigger mark towers over its neighbours.
     const STROKE = 2;
     expect(2 * r + STROKE).toBeLessThanOrEqual(20);
     for (const collapsed of [false, true]) {

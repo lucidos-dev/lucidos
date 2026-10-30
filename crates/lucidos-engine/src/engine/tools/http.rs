@@ -215,6 +215,19 @@ impl LucidosEngine {
         if temp_path.is_some_and(crate::api::is_path_traversal) {
             return Ok("Error: temp_path must be relative with no '..' components".to_string());
         }
+        if let Some(path) = temp_path.filter(|p| p.is_empty() || p.ends_with('/')) {
+            return Ok(format!(
+                "Error: temp_path must name a file, not a directory, got: '{path}'"
+            ));
+        }
+        // The exact string `read_file` resolves, so the path the result names
+        // back to the LLM is one it can act on.
+        let temp_data_path = temp_path.map(|path| format!("{}/{}", crate::core::TMP_DIR, path));
+        if let Some(data_path) = &temp_data_path {
+            if let Err(e) = self.resolve_data_path(data_path) {
+                return Ok(format!("Error: {e}"));
+            }
+        }
         // `(data_path, artifact_path)`: the normalized data-relative path, and
         // the same path relative to `artifacts/`, which the store writes under.
         let resolved_output = if let Some(raw_path) = output_path {
@@ -368,17 +381,14 @@ impl LucidosEngine {
         }
 
         // Handle temp_path - save to .lucidos/tmp/ (not git-tracked)
-        let saved_temp = if let Some(path) = temp_path {
+        let saved_temp = if let Some(data_path) = temp_data_path {
             if (200..300).contains(&status) {
-                let tmp_dir = self.workspace_path.join(crate::core::TMP_DIR);
-                if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-                    return Ok(format!(
-                        "Error: failed to create tmp dir {}: {}",
-                        crate::core::home_path::abbreviate(&tmp_dir),
-                        e
-                    ));
-                }
-                let full_path = tmp_dir.join(path);
+                // Resolved again: a link can appear in the scratch tree while
+                // the request is in flight, for example from a `git_clone`.
+                let full_path = match self.resolve_data_path(&data_path) {
+                    Ok((_, full_path)) => full_path,
+                    Err(e) => return Ok(format!("Error: {e}")),
+                };
                 if let Some(parent) = full_path.parent() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         return Ok(format!(
@@ -395,9 +405,7 @@ impl LucidosEngine {
                         e
                     ));
                 }
-                // The exact string `read_file` resolves, so the path this
-                // announces back to the LLM is one it can act on.
-                Some(format!("{}/{}", crate::core::TMP_DIR, path))
+                Some(data_path)
             } else {
                 None
             }

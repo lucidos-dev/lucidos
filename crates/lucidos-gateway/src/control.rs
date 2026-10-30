@@ -87,6 +87,8 @@ pub fn router() -> Router<GatewayState> {
             "/external-address",
             get(external_address).put(set_external_address),
         )
+        // What the gateway serves over HTTPS, and why not when it does not.
+        .route("/tls", get(tls_status))
         .route("/workspaces/:id/rename", post(rename))
         .route("/workspaces/:id/restart", post(restart))
         .route("/workspaces/:id/start", post(start))
@@ -760,7 +762,9 @@ fn external_address_json(
     probe: Option<&crate::external_address::ProbeVerdict>,
 ) -> Value {
     let resolved = net_config::external_address(state.gateway_port());
-    let scheme = if net_config::serves_tls_from_env() {
+    // A managed certificate covers its name, not an address. So an address
+    // suggestion stays plain HTTP there, and its `308` lands on the name.
+    let scheme = if state.certs().state().source == crate::tls::managed::TlsSource::Operator {
         net_config::SCHEME_HTTPS
     } else {
         net_config::SCHEME_HTTP
@@ -777,6 +781,12 @@ fn external_address_json(
         ),
         "probe": probe,
     })
+}
+
+/// GET /~/api/v1/control/tls: the certificate source, its name and expiry, the
+/// origin it serves, and the last error.
+async fn tls_status(State(state): State<GatewayState>) -> Json<crate::tls::managed::TlsReport> {
+    Json(state.certs().state().report(state.gateway_port()))
 }
 
 /// GET /~/api/v1/control/external-address: the address, who set it, and the
@@ -1218,6 +1228,8 @@ mod authz_tests {
         // where every pairing QR points.
         ("GET", "/~/api/v1/control/external-address"),
         ("PUT", "/~/api/v1/control/external-address"),
+        // A read whose error can name this machine's tailnet and data path.
+        ("GET", "/~/api/v1/control/tls"),
         // A read, and still behind the credential: it enumerates this user's
         // install paths, launch agents and data directories.
         ("GET", "/~/api/v1/control/installs"),
@@ -1347,6 +1359,47 @@ mod authz_tests {
             // Refused before the probe and before any write.
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
         }
+    }
+
+    async fn get_json(state: &crate::server::GatewayState, path: &str, token: bool) -> Value {
+        use tower::ServiceExt as _;
+        let mut request = axum::extract::Request::builder().uri(path);
+        if token {
+            request = request.header(auth::HEADER_LOCAL_TOKEN, "test-local-token");
+        }
+        let response = crate::server::gateway_router(state.clone())
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_tls_read_says_why_there_is_no_https() {
+        let state = crate::server::GatewayState::for_tests();
+        state
+            .certs()
+            .record(crate::tls::TlsState::none("The tailnet issues none."));
+        let body = get_json(&state, "/~/api/v1/control/tls", true).await;
+        assert_eq!(body["source"], "none");
+        assert_eq!(body["error"], "The tailnet issues none.");
+        assert_eq!(body["https_origin"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn health_publishes_the_https_origin_but_never_the_error() {
+        let state = crate::server::GatewayState::for_tests();
+        state
+            .certs()
+            .record(crate::tls::TlsState::none("a private reason"));
+        let body = get_json(&state, crate::peers::GATEWAY_HEALTH_PATH, false).await;
+        assert_eq!(body["tls"]["source"], "none");
+        assert_eq!(body["tls"]["https_origin"], Value::Null);
+        assert!(!body.to_string().contains("a private reason"));
     }
 
     #[tokio::test]

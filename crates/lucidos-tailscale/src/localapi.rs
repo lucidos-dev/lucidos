@@ -1,4 +1,4 @@
-//! A minimal, bounded LocalAPI client: one `GET` of the status, over HTTP/1.0.
+//! A minimal, bounded LocalAPI client: one `GET` per connection, over HTTP/1.0.
 //!
 //! HTTP/1.0 keeps the reply unchunked, and Go's server closes the connection
 //! after it, so reading to the end is the whole protocol. No `Origin` or
@@ -13,22 +13,28 @@ use crate::Answer;
 
 const STATUS_PATH: &str = "/localapi/v0/status?peers=false";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// The whole exchange, from the request to the last byte.
+/// The whole status exchange, from the request to the last byte.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_RESPONSE: usize = 1 << 20;
 
+/// This node's status.
 pub(crate) fn query(endpoint: &Endpoint) -> Answer {
+    get(endpoint, STATUS_PATH, EXCHANGE_TIMEOUT)
+}
+
+/// `GET path`, cut off once `timeout` has passed since the request.
+pub(crate) fn get(endpoint: &Endpoint, path: &str, timeout: Duration) -> Answer {
     match endpoint {
         Endpoint::Tcp { port, token } => {
             let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, *port));
             match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-                Ok(stream) => exchange(stream, Some(token)),
+                Ok(stream) => exchange(stream, &request(path, Some(token)), timeout),
                 Err(_) => Answer::Silent,
             }
         }
         #[cfg(unix)]
-        Endpoint::Unix(path) => match std::os::unix::net::UnixStream::connect(path) {
-            Ok(stream) => exchange(stream, None),
+        Endpoint::Unix(socket) => match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(stream) => exchange(stream, &request(path, None), timeout),
             Err(_) => Answer::Silent,
         },
         #[cfg(not(unix))]
@@ -55,12 +61,12 @@ impl Timeouts for std::os::unix::net::UnixStream {
     }
 }
 
-fn exchange<S: Read + Write + Timeouts>(mut stream: S, token: Option<&str>) -> Answer {
-    let deadline = Instant::now() + EXCHANGE_TIMEOUT;
-    if stream.set_timeouts(EXCHANGE_TIMEOUT).is_err() {
+fn exchange<S: Read + Write + Timeouts>(mut stream: S, request: &str, timeout: Duration) -> Answer {
+    let deadline = Instant::now() + timeout;
+    if stream.set_timeouts(timeout).is_err() {
         return Answer::Silent;
     }
-    if stream.write_all(request(token).as_bytes()).is_err() {
+    if stream.write_all(request.as_bytes()).is_err() {
         return Answer::Silent;
     }
     let mut raw = Vec::new();
@@ -81,13 +87,10 @@ fn exchange<S: Read + Write + Timeouts>(mut stream: S, token: Option<&str>) -> A
             Err(e) => return Answer::Garbled(format!("the reply broke off ({e})")),
         }
     }
-    match body_of(&raw) {
-        Ok(body) => Answer::Status(body),
-        Err(detail) => Answer::Garbled(detail),
-    }
+    answer_of(&raw)
 }
 
-fn request(token: Option<&str>) -> String {
+fn request(path: &str, token: Option<&str>) -> String {
     let auth = token
         .map(|t| {
             format!(
@@ -96,20 +99,23 @@ fn request(token: Option<&str>) -> String {
             )
         })
         .unwrap_or_default();
-    format!("GET {STATUS_PATH} HTTP/1.0\r\nHost: local-tailscaled.sock\r\n{auth}\r\n")
+    format!("GET {path} HTTP/1.0\r\nHost: local-tailscaled.sock\r\n{auth}\r\n")
 }
 
-/// The body of a `200` reply, else what the status line said.
-fn body_of(raw: &[u8]) -> Result<String, String> {
+/// The body of a `200` reply, or the status line and body of any other.
+fn answer_of(raw: &[u8]) -> Answer {
     let text = String::from_utf8_lossy(raw);
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or("the reply had no HTTP header")?;
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return Answer::Garbled("the reply had no HTTP header".into());
+    };
     let status_line = head.lines().next().unwrap_or_default();
     match status_line.split_whitespace().nth(1) {
-        Some("200") => Ok(body.to_string()),
-        Some(_) => Err(format!("LocalAPI said {status_line}")),
-        None => Err("the reply had no HTTP status".into()),
+        Some("200") => Answer::Body(body.to_string()),
+        Some(_) => Answer::Refused {
+            status_line: status_line.to_string(),
+            body: body.to_string(),
+        },
+        None => Answer::Garbled("the reply had no HTTP status".into()),
     }
 }
 
@@ -156,22 +162,49 @@ mod tests {
 
     #[test]
     fn the_request_is_http_1_0_with_basic_auth_and_no_origin() {
-        let req = request(Some("s3cret"));
+        let req = request(STATUS_PATH, Some("s3cret"));
         assert!(req.starts_with("GET /localapi/v0/status?peers=false HTTP/1.0\r\n"));
         assert!(req.contains("Host: local-tailscaled.sock\r\n"));
         assert!(req.contains("Authorization: Basic OnMzY3JldA==\r\n"));
         assert!(!req.to_ascii_lowercase().contains("origin"));
-        assert!(!request(None).contains("Authorization"));
+        assert!(!request(STATUS_PATH, None).contains("Authorization"));
     }
 
     #[test]
     fn only_a_200_yields_a_body() {
-        assert_eq!(
-            body_of(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}"),
-            Ok("{}".to_string())
-        );
-        assert!(body_of(b"HTTP/1.0 403 Forbidden\r\n\r\nno").is_err());
-        assert!(body_of(b"garbage").is_err());
+        assert!(matches!(
+            answer_of(b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}"),
+            Answer::Body(b) if b == "{}"
+        ));
+        assert!(matches!(
+            answer_of(b"HTTP/1.0 403 Forbidden\r\n\r\ncert access denied"),
+            Answer::Refused { status_line, body }
+                if status_line == "HTTP/1.0 403 Forbidden" && body == "cert access denied"
+        ));
+        assert!(matches!(answer_of(b"garbage"), Answer::Garbled(_)));
+    }
+
+    #[test]
+    fn a_get_sends_its_own_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = conn.read(&mut buf).unwrap();
+            conn.write_all(b"HTTP/1.0 200 OK\r\n\r\npem").unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        let endpoint = Endpoint::Tcp {
+            port,
+            token: "t".into(),
+        };
+        let answer = get(&endpoint, "/localapi/v0/cert/n?type=pair", EXCHANGE_TIMEOUT);
+        assert!(matches!(answer, Answer::Body(b) if b == "pem"));
+        assert!(seen
+            .join()
+            .unwrap()
+            .starts_with("GET /localapi/v0/cert/n?type=pair HTTP/1.0\r\n"));
     }
 
     /// Serve one connection with `reply`, after reading the request.
@@ -194,7 +227,7 @@ mod tests {
             port,
             token: "t".into(),
         });
-        assert!(matches!(answer, Answer::Status(b) if b.contains("Stopped")));
+        assert!(matches!(answer, Answer::Body(b) if b.contains("Stopped")));
     }
 
     #[test]

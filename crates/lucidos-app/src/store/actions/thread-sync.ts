@@ -1432,8 +1432,10 @@ function handleTransientSideEffects(
       closeResolvedFormRequest(event.request_id, event.outcome, event.actor);
       break;
 
+    // The actor names the device whose push preference the agent set. Enable
+    // subscribes the device it is tapped on, so only that one may ask.
     case 'PushNotificationRequested':
-      if (!isChosenForThread(sourceThreadId)) break;
+      if (!isForThisDevice(event.actor) || !isChosenForThread(sourceThreadId)) break;
       void (async () => {
         try {
           const ok = await showConfirm(

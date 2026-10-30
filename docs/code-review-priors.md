@@ -3207,7 +3207,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the fragment with its first step's id, so the lookup answers for a step.
 
   The id exists on the exchange and is deliberately withheld from the DOM.
-  `exchangeStarterId` (`store/thread-events/exchange-render.ts`) returns
+  `exchangeStarterId` (`store/thread-events/exchange-anchors.ts`) returns
   `undefined` for a fragment. Both `ChatExchange`'s root and `stampedEventIds`
   read it, so the attribute and the claim cannot drift. Stamping it would make
   one row of a turn addressable, and would collide with the failure card when

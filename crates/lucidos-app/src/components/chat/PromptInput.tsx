@@ -28,7 +28,8 @@ import { CaptureIcon, CheckIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, Cle
 import { BlobImage } from '../shared/BlobImage';
 import { closeControlMenus, codingAgentMenuOpenRequest, rungFoldOpenRequest } from './controlMenuRequests';
 import {
-  codingAgentMenuAction, composerRowMembers, isComposeContext, LazyCodingAgentControlMenu, promptRowToggles, sideQuestionToggleAction,
+  codingAgentMenuAction, composerRowMembers, isComposeContext, LazyCodingAgentControlMenu, PromptActionsRight, promptRowToggles,
+  sideQuestionToggleAction,
 } from './PromptRowControls';
 import { CODING_AGENT_MENU_FOLD_KEY, menuCodingAgent } from './ControlMenuTrigger';
 import { LazyRungControl } from './LazyRungControl';
@@ -1625,10 +1626,7 @@ export function PromptInput() {
           {/* Diff and the standing apply lead the cluster, then the pill, so the
               action (Send, Apply, Archive) holds the right edge with the pill
               beside it. */}
-          <div class="prompt-actions-right">
-            {members.cluster.map(renderMember)}
-            {actionSlot}
-          </div>
+          <PromptActionsRight cluster={members.cluster.map(renderMember)} action={actionSlot} />
         </div>
       </div>
       {/* The two indicator panels, mounted here rather than by their controls:

@@ -2092,6 +2092,21 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "status"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "tls"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "create"
               },
               {
@@ -3581,6 +3596,49 @@
         ],
         "hidden": false,
         "name": "threads"
+      },
+      {
+        "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "status"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "port"
+            ],
+            "hidden": false,
+            "name": "status"
+          }
+        ],
+        "flags": [
+          "help",
+          "port"
+        ],
+        "hidden": false,
+        "name": "tls"
       },
       {
         "aliases": [],

@@ -187,10 +187,13 @@ function resolveCopyTargets(html: string, copyTexts: Map<number, string>): strin
  *  secret anywhere, however well its layout is contained. The one `<input>`
  *  spared is the renderer's task checkbox, marked with `COPY_ID_NONCE`.
  *
+ *  `map` and `area` go because an `<area href>` is a link that no shell router
+ *  sees: each keys on `a[href]`, so a click on it navigates the shell window.
+ *
  *  `title`, `desc` and the MathML text elements stay out: each is real markup
  *  inside `<svg>` or `<math>`, which this regex cannot see. */
 const ESCAPE_TO_TEXT_TAG =
-  /<(\/?)(iframe|script|style|object|embed|applet|base|meta|link|xmp|plaintext|noscript|noembed|noframes|animate|animateTransform|set|form|button|select|textarea|input)([\s/][^>]*)?>/gi;
+  /<(\/?)(iframe|script|style|object|embed|applet|base|meta|link|xmp|plaintext|noscript|noembed|noframes|animate|animateTransform|set|form|button|select|textarea|input|map|area)([\s/][^>]*)?>/gi;
 
 const TASK_CHECKBOX_MARK = `${TASK_CHECKBOX_ATTR}="${COPY_ID_NONCE}"`;
 
@@ -275,13 +278,14 @@ const PURIFY_CONFIG = {
   // the default attribute allowlist drops.
   ADD_ATTR: ['target'],
   // Paired with `ESCAPE_TO_TEXT_TAG`, so a tag the escape pass misses is still
-  // removed. `style`, `animateTransform` and the form controls are ones
-  // DOMPurify would otherwise keep. `animate` and `set` are already in its SVG
+  // removed. `style`, `animateTransform`, the form controls and the image map
+  // are ones DOMPurify would otherwise keep. `animate` and `set` are already in its SVG
   // denylist, and stay listed so this policy does not rest on that default.
   // `input` is missing on purpose: see `removeAuthoredInputs`.
   FORBID_TAGS: [
     'style', 'animate', 'animateTransform', 'set',
     'form', 'button', 'select', 'textarea', 'option', 'optgroup', 'datalist',
+    'map', 'area',
   ],
   // The two clipboard sources, which only `resolveCopyTargets` and
   // `resolveCodeBlockCopy` may write, and which DOMPurify's defaults would

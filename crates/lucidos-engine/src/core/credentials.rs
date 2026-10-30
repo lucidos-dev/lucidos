@@ -1364,6 +1364,12 @@ impl NamedSecretVars {
 /// - **Only a named credential is resolved.** A *secret reference* runs `op`
 ///   only when the text names its credential. One that cannot be read is left
 ///   out with a reason in [`NamedSecretVars::unavailable`], and the rest load.
+/// - **A name two credentials claim is never set, and names neither.** A
+///   credential claims the names it sets and its bare `CRED_<NAME>`.
+///   `my-api` and `my_api` both claim `CRED_MY_API`, so setting it could hand
+///   a script the other's secret. Each credential's own names still load.
+///   A shared name the text names, or a named credential would set, gets a
+///   reason.
 ///
 /// A caller holding one credential the user configured by name (a
 /// `script_handshake` layer's `credential` field) calls
@@ -1373,27 +1379,72 @@ pub async fn named_credential_env_vars<R: SecretResolver + ?Sized>(
     mentions: &SecretMentions,
     resolver: &R,
 ) -> NamedSecretVars {
-    let mut named = NamedSecretVars::default();
-    for cred in credentials {
-        if !cred.auth_type.is_injectable() {
-            continue;
+    let injectable: Vec<(Credential, Vec<String>, String)> = credentials
+        .into_iter()
+        .filter(|cred| cred.auth_type.is_injectable())
+        .map(|cred| {
+            let names = env_var_names_for(
+                &cred.service_name,
+                cred.auth_type,
+                cred.env_var_name.as_deref(),
+            );
+            let prefix = format!("CRED_{}", crate::core::env_var_segment(&cred.service_name));
+            (cred, names, prefix)
+        })
+        .collect();
+    let mut claimants: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (cred, names, prefix) in &injectable {
+        for name in names.iter().chain([prefix]) {
+            claimants
+                .entry(name.clone())
+                .or_default()
+                .insert(cred.service_name.clone());
         }
-        let prefix = format!("CRED_{}", crate::core::env_var_segment(&cred.service_name));
-        let names = env_var_names_for(
-            &cred.service_name,
-            cred.auth_type,
-            cred.env_var_name.as_deref(),
-        );
-        let mentioned = mentions.names(&prefix) || names.iter().any(|name| mentions.names(name));
+    }
+    let shared = |name: &str| {
+        claimants
+            .get(name)
+            .is_some_and(|services| services.len() > 1)
+    };
+
+    let mut named = NamedSecretVars::default();
+    let mut withheld: BTreeSet<String> = claimants
+        .keys()
+        .filter(|name| shared(name) && mentions.names(name))
+        .cloned()
+        .collect();
+    for (cred, names, prefix) in injectable {
+        let mentioned = names
+            .iter()
+            .chain([&prefix])
+            .any(|name| !shared(name) && mentions.names(name));
+        if mentioned {
+            withheld.extend(names.iter().filter(|name| shared(name)).cloned());
+        }
         named
             .known_names
             .extend(names.into_iter().filter(|name| name.starts_with("CRED_")));
-        if mentioned {
-            match credential_env_vars_for(cred, resolver).await {
-                Ok(vars) => named.env_vars.extend(vars),
-                Err(reason) => named.unavailable.push(reason),
-            }
+        if !mentioned {
+            continue;
         }
+        match credential_env_vars_for(cred, resolver).await {
+            Ok(vars) => named
+                .env_vars
+                .extend(vars.into_iter().filter(|(name, _)| !shared(name))),
+            Err(reason) => named.unavailable.push(reason),
+        }
+    }
+    for name in withheld {
+        let remedy = if name.starts_with("CRED_") {
+            "Rename one of them"
+        } else {
+            "Change one of their aliases"
+        };
+        let services: Vec<&str> = claimants[&name].iter().map(String::as_str).collect();
+        named.unavailable.push(format!(
+            "{name}, which more than one credential claims ('{}'). {remedy}",
+            services.join("', '")
+        ));
     }
     named
 }
@@ -2233,6 +2284,103 @@ mod tests {
             assert_eq!(env.get("CRED_GITHUB").map(String::as_str), Some("gh-value"));
         }
         assert!(named_vars(vec![cred()], "gh pr list").is_empty());
+    }
+
+    /// A name two credentials claim is never set and names neither, so a
+    /// script never gets the wrong one's secret. Each one's own names still
+    /// load, and the shared name gets a reason.
+    #[test]
+    fn a_variable_name_two_credentials_claim_is_withheld() {
+        let same_segment = || {
+            vec![
+                make_cred("my-api", AuthType::Bearer, "first-value"),
+                make_cred("my_api", AuthType::Bearer, "second-value"),
+            ]
+        };
+        let password_half = || {
+            vec![
+                make_cred(
+                    "foo",
+                    AuthType::Password,
+                    r#"{"username":"first-value","password":"pw"}"#,
+                ),
+                make_cred("foo_username", AuthType::Secret, "second-value"),
+            ]
+        };
+        let same_alias = || {
+            [("alpha", "first-value"), ("beta", "second-value")]
+                .map(|(service, value)| {
+                    let mut cred = make_cred(service, AuthType::Bearer, value);
+                    cred.env_var_name = Some("API_TOKEN".to_string());
+                    cred
+                })
+                .to_vec()
+        };
+        let pair_json = r#"{"username":"first-value","password":"second-value"}"#;
+        let same_prefix = || {
+            vec![
+                make_cred("my-api", AuthType::Password, pair_json),
+                make_cred("my_api", AuthType::Password, pair_json),
+            ]
+        };
+        let prefix_and_name = || {
+            vec![
+                make_cred("my-api", AuthType::Password, pair_json),
+                make_cred("my_api", AuthType::Bearer, "third-value"),
+            ]
+        };
+        let cases = [
+            (same_segment(), "$CRED_MY_API", vec![], "CRED_MY_API"),
+            (same_prefix(), "$CRED_MY_API", vec![], "CRED_MY_API"),
+            (prefix_and_name(), "$CRED_MY_API", vec![], "CRED_MY_API"),
+            (
+                password_half(),
+                "$CRED_FOO_USERNAME",
+                vec![],
+                "CRED_FOO_USERNAME",
+            ),
+            (
+                password_half(),
+                "$CRED_FOO_PASSWORD",
+                vec![("CRED_FOO_PASSWORD", "pw")],
+                "CRED_FOO_USERNAME",
+            ),
+            (
+                password_half(),
+                "$CRED_FOO",
+                vec![("CRED_FOO_PASSWORD", "pw")],
+                "CRED_FOO_USERNAME",
+            ),
+            (same_alias(), "$API_TOKEN", vec![], "API_TOKEN"),
+            (
+                same_alias(),
+                "$CRED_ALPHA",
+                vec![("CRED_ALPHA", "first-value")],
+                "API_TOKEN",
+            ),
+        ];
+        for (mut creds, named_var, own_names, shared) in cases {
+            creds.push(make_cred("github", AuthType::Bearer, "gh-value"));
+            let text = format!("echo {named_var} $CRED_GITHUB");
+            let named = named_for(creds, &SecretMentions::scan(&text));
+            let env: std::collections::HashMap<String, String> =
+                named.env_vars.into_iter().collect();
+            let expected: std::collections::HashMap<String, String> = own_names
+                .into_iter()
+                .chain([("CRED_GITHUB", "gh-value")])
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(env, expected, "{text}: only names one credential sets");
+            assert!(
+                matches!(named.unavailable.as_slice(), [reason] if reason.starts_with(shared)),
+                "{text}: one reason, naming {shared}: {:?}",
+                named.unavailable
+            );
+            assert!(
+                named.known_names.contains("CRED_GITHUB"),
+                "known names still list the workspace's credentials"
+            );
+        }
     }
 
     /// An OAuth client registration stays out even when named: only the OAuth

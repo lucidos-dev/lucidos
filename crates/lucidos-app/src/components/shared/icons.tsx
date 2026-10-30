@@ -321,20 +321,22 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
  *  ON AND OFF BY FILL, like `StandingApplyIcon`. A theme without a hue sets the
  *  accent to the text colour, so colour alone cannot show the state.
  *
- *  INK IS 0.750 OF THE BOX on both axes, as for the composer row's glyphs. That
- *  is the GEOMETRIC extent, stroke excluded (0.833 with it, for every glyph).
- *  No inline size either: `.icon-btn` sizes the svg. */
+ *  INK IS 0.667 OF THE BOX on both axes, the GEOMETRIC extent, stroke
+ *  excluded. It floats in a circle under the down chevron, and the composer
+ *  row's 0.750 read too heavy there. Keep the poles 4 units over the line's
+ *  centre: the 2-unit strokes leave 2 units clear, and less fuses the two.
+ *  No inline size either: the chevron stack's CSS sizes the svg. */
 export function FollowLiveEdgeIcon({ armed = false }: { armed?: boolean }) {
   return (
     <svg viewBox="0 0 24 24" fill={armed ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M4 17v-6a8 8 0 0 1 16 0v6h-5v-6a3 3 0 0 0-6 0v6z"/>
-      <path d="M3 21h18"/>
+      <path d="M5 16v-5a7 7 0 0 1 14 0v5h-4v-5a3 3 0 0 0-6 0v5z"/>
+      <path d="M4 20h16"/>
     </svg>
   );
 }
 
 /** A question mark in a circle: the composer's *side question* toggle. On and
- *  off by the button's tone, as `FollowLiveEdgeIcon`'s neighbours are. A bare
+ *  off by the button's tone. A bare
  *  question mark read as help, and a speech bubble as a message to send.
  *
  *  No inline size: this renders inside `.icon-btn`, which sizes the svg. */
@@ -349,7 +351,7 @@ export function SideQuestionIcon() {
 }
 
 /** A flag planted on the change: apply it once this thread settles. The
- *  *standing apply*'s toggle, two slots along from the magnet above.
+ *  *standing apply*'s toggle.
  *
  *  On and off by FILL, the shape `PinIcon` uses. That wants one large closed
  *  path, so the banner is the whole glyph and the pole is a bare stroke.

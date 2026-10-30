@@ -4,7 +4,7 @@
  * renders "Queued" bubbles from, so Stop clears exactly what the user saw queued.
  */
 import { describe, it, expect } from 'vitest';
-import { queuedMessagesFromExchanges } from './exchange-render';
+import { queuedMessagesFromExchanges } from './exchange-queue';
 import type { Exchange } from './exchange';
 import type { SequencedEvent } from './thread-event-types';
 

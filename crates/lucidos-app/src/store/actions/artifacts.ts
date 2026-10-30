@@ -19,6 +19,7 @@ import { listArtifacts, uploadFile } from '../../api/client';
 import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
+import { externalWebUrl } from '@lucidos/web-link';
 import { openExternalUrl, refuseDangerousUrl } from '../../utils/openExternalUrl';
 import { DATA_PATH_PREFIXES } from '../../utils/dataPathPrefixes';
 import { openExternal } from '../../utils/tauri';
@@ -71,12 +72,21 @@ export function refreshArtifacts(): void {
   if (artifacts.value.status !== 'not-loaded') void loadArtifacts();
 }
 
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((path, i) => path === b[i]);
+}
+
 async function listArtifactsOnce(): Promise<void> {
   setLoadingIfFresh(artifacts);
   try {
     const data = await listArtifacts();
     const paths = data.artifacts || [];
-    artifacts.value = { status: 'loaded', data: paths };
+    // An unchanged list keeps its identity: every transcript message
+    // re-linkifies when it changes, and agent writes refresh it in bursts.
+    const prev = artifacts.value;
+    if (prev.status !== 'loaded' || !sameList(prev.data, paths)) {
+      artifacts.value = { status: 'loaded', data: paths };
+    }
 
     // Expand top-level folders by default on first load
     if (expandedFolders.value.size === 0 && paths.length > 0) {
@@ -375,13 +385,15 @@ export function openUrl(url: string, source?: string): void {
  *  OS bridge, so it says so and navigates nowhere: a page ignores `file://`,
  *  and a bare path resolves against the page origin, which is the gateway.
  *  The one exception is a protocol-relative `//host/path`, which the classifier
- *  also claims: it is a web page, so it opens in a tab.
+ *  also claims: it is a web page, so it opens like any link, by the user's
+ *  external-link preference.
  *  `source` names what asked, as in `openUrlOutsideApp`. Caller is responsible
  *  for classifying the href as a local file (see `extractLocalFileTarget`). */
 export function openLocalFile(target: string, source?: string): void {
   if (!isTauri()) {
-    if (target.startsWith('//')) {
-      window.open(target, '_blank', 'noopener');
+    const webUrl = externalWebUrl(target);
+    if (webUrl) {
+      openExternalUrl(webUrl, source);
       return;
     }
     const from = source ? ` (requested by ${source})` : '';

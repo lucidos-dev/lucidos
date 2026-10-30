@@ -1,17 +1,12 @@
 /**
- * The follow toggle lands the ink the rest of the composer row lands.
+ * The follow toggle's glyph paints 0.667 of its viewBox on both axes.
  *
- * That row's stroke glyphs each paint 0.750 of their own viewBox. `--run-ink`
- * divides the three agent marks down to the same fraction (see
- * `prompt-mark-optical-size.test.ts` and `.commands-btn` in
- * chat/input-messages.css). The toggle is not a `.commands-btn`, so that test
- * never looked at it and nothing held the fraction. A redraw duly reached
- * review at 0.667, a ninth smaller than everything beside it.
+ * It floats in a circle under the down chevron. The composer row's 0.750 read
+ * too heavy beside that chevron, so the user picked 0.667 from rendered sizes.
  *
- * **0.750 is the GEOMETRIC extent, stroke excluded.** Include the stroke and
- * every glyph in the run reads 0.833 instead. A check on the other basis
- * rejects a correct glyph and accepts a wrong one. Deriving it by hand off the
- * path data is what this file does, deliberately. The shape is axis-aligned
+ * **0.667 is the GEOMETRIC extent, stroke excluded.** A check that includes
+ * the stroke measures a different number. Deriving it by hand off the path
+ * data is what this file does, deliberately. The shape is axis-aligned
  * segments plus semicircles on horizontal chords, and their extremes are all
  * on-path, so the bbox is exact.
  */
@@ -25,7 +20,6 @@ import { dirname, resolve } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const icons = readFileSync(resolve(here, '../../components/shared/icons.tsx'), 'utf8');
-const css = readFileSync(resolve(here, '../chat/input-messages.css'), 'utf8');
 
 /** Geometric bbox of one path, stroke excluded.
  *
@@ -134,19 +128,11 @@ describe('the ink measurement itself', () => {
   });
 });
 
-describe('the follow toggle is drawn to the composer row\'s ink', () => {
-  it('takes the fraction from --run-ink, so retuning the row retunes this', () => {
-    // Read rather than hardcoded: the sibling test pins the whole declaration,
-    // this one only needs the number inside it.
-    const run = /--run-ink:\s*calc\(var\(--icon-size-lg\)\s*\*\s*([\d.]+)\)/.exec(css);
-    expect(run, 'input-messages.css no longer declares --run-ink').not.toBeNull();
-    expect(Number(run![1])).toBe(0.75);
-  });
-
-  it('paints that fraction of its box on both axes', () => {
+describe('the follow toggle\'s ink', () => {
+  it('paints 16 of 24 units on both axes', () => {
     const { ds, side } = glyph('FollowLiveEdgeIcon');
     const ink = inkFraction(ds, side);
-    expect(ink.x, 'width drifted off the run').toBeCloseTo(0.75, 3);
-    expect(ink.y, 'height drifted off the run').toBeCloseTo(0.75, 3);
+    expect(ink.x, 'width drifted').toBeCloseTo(16 / 24, 3);
+    expect(ink.y, 'height drifted').toBeCloseTo(16 / 24, 3);
   });
 });

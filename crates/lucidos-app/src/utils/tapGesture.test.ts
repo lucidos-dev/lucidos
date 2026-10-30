@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  createTapGate, touchActivated, takePressOutcome, notePressOutcome, TAP_MOVE_THRESHOLD_PX,
+  createTapGate, touchActivated, takePressOutcome, notePressOutcome,
   CANCELLED_TAP_SETTLE_MS,
 } from './tapGesture';
 import { LONG_PRESS_DELAY_MS } from '../hooks/useLongPress';
+import { TAP_MOVE_THRESHOLD_PX } from '@lucidos/tap-press';
 
 /** A pointer carrying BOTH coordinate spaces, so a test can move one and hold
  *  the other still. That is the whole distinction the gate rests on. */

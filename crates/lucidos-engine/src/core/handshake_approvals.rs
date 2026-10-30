@@ -200,6 +200,33 @@ pub fn scope_is_recordable(base_url: &str) -> bool {
     !base_url.contains(char::is_whitespace)
 }
 
+/// Whether `rel_path` can be written to the path column and read back whole.
+///
+/// The third sibling, for the last column, and the same forgery. A path
+/// carrying a newline ends its record, and its tail becomes a record of its own
+/// with a caller-chosen hash, scope and injects. A later line wins in
+/// [`parse`], so the tail can rebind a script already approved.
+///
+/// An inner space stays legal, as [`parse`] documents. Every control character
+/// is refused, since none belongs in a script's name. So is whitespace at
+/// either end: [`parse`] trims the line, so the path would read back as its
+/// trimmed sibling and carry its hash there.
+///
+/// [`write_all`] refuses as the floor, and [`parse`] drops such a line. [`record`]
+/// and [`seed_if_absent`] check first, and so do the approve route and the
+/// runner's `script_path_rejection`.
+pub fn path_is_recordable(rel_path: &str) -> bool {
+    !rel_path.contains(char::is_control) && rel_path.trim() == rel_path
+}
+
+/// Why [`path_is_recordable`] refused, for every caller's message.
+pub const UNRECORDABLE_PATH_REASON: &str =
+    "contains a control character or starts or ends with whitespace";
+
+fn unrecordable_path(rel_path: &str) -> BoxError {
+    format!("refusing to record {rel_path:?}: it {UNRECORDABLE_PATH_REASON}").into()
+}
+
 /// The record key for an `apis.json` `script` value.
 ///
 /// Config says `scripts/auth/x.py`, the record says `data/scripts/auth/x.py`.
@@ -282,6 +309,9 @@ pub fn injects_for(workspace_path: &Path, rel_path: &str) -> Option<BTreeSet<Str
 /// may be handed. Dropping either would hand the next request a fresh
 /// trust-on-first-use decision it should not get.
 pub fn record(workspace_path: &Path, rel_path: &str, bytes: &[u8]) -> Result<bool, BoxError> {
+    if !path_is_recordable(rel_path) {
+        return Err(unrecordable_path(rel_path));
+    }
     let hash = content_hash(bytes);
     let _guard = write_guard();
     let mut current = entries(workspace_path);
@@ -452,6 +482,14 @@ pub fn seed_if_absent(
     }
     let mut seeded = BTreeMap::new();
     for entry in scripts {
+        if !path_is_recordable(&entry.path) {
+            crate::log!(
+                "[HandshakeApprovals] Not seeding {:?}: {}",
+                entry.path,
+                unrecordable_path(&entry.path)
+            );
+            continue;
+        }
         let abs = workspace_path.join(&entry.path);
         match std::fs::read(&abs) {
             Ok(bytes) => {
@@ -518,7 +556,13 @@ fn parse(contents: &str) -> BTreeMap<String, Approval> {
         };
         let (base_url, rest) = split_scope(rest.trim_start());
         let (injects, path) = split_injects(rest);
-        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) || path.is_empty() {
+        // A path [`write_all`] would refuse is dropped here too, so a hand edit
+        // cannot plant a key that wedges every later write.
+        if hash.len() != 64
+            || !hash.chars().all(|c| c.is_ascii_hexdigit())
+            || path.is_empty()
+            || !path_is_recordable(path)
+        {
             continue;
         }
         out.insert(
@@ -576,6 +620,9 @@ fn is_injects_column(head: &str) -> bool {
 /// Overwrite the record atomically, through a sibling temp file and a rename.
 /// The runner re-reads per call, so a change takes effect with no restart.
 fn write_all(workspace_path: &Path, entries: &BTreeMap<String, Approval>) -> Result<(), BoxError> {
+    if let Some(rel) = entries.keys().find(|rel| !path_is_recordable(rel)) {
+        return Err(unrecordable_path(rel));
+    }
     let path = approvals_path(workspace_path);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -1031,6 +1078,117 @@ mod tests {
             after.keys().collect::<Vec<_>>()
         );
         assert_eq!(injects_for(ws.path(), script), None);
+    }
+
+    /// The path column's half of the forgery. An inner space stays legal, as
+    /// `parse` documents. A control character or edge whitespace is refused.
+    #[test]
+    fn a_path_that_would_re_cut_the_line_is_not_recordable() {
+        assert!(path_is_recordable("data/scripts/auth/x.py"));
+        assert!(path_is_recordable("data/scripts/auth/my script.py"));
+        assert!(!path_is_recordable("data/scripts/auth/x.py\nmore"));
+        assert!(!path_is_recordable("data/scripts/auth/x.py\rmore"));
+        assert!(!path_is_recordable("data/scripts/auth/x.py\u{85}more"));
+        assert!(!path_is_recordable("data/scripts/auth/\tx.py"));
+        assert!(!path_is_recordable("data/scripts/auth/x.py "));
+        assert!(!path_is_recordable("data/scripts/auth/x.py\u{3000}"));
+        assert!(!path_is_recordable(" data/scripts/auth/x.py"));
+    }
+
+    /// `parse` trims each line, so a path with trailing whitespace would read
+    /// back as its trimmed sibling. Its hash would then replace the sibling's.
+    #[test]
+    fn a_trailing_space_cannot_move_a_hash_onto_an_approved_path() {
+        let ws = ws();
+        let victim = "data/scripts/auth/legit.py";
+        write_script(ws.path(), victim, "print(1)");
+        record(ws.path(), victim, b"print(1)").unwrap();
+
+        assert!(record(ws.path(), &format!("{victim} "), b"print(2)").is_err());
+
+        assert_eq!(entries(ws.path()).len(), 1);
+        assert!(is_approved(ws.path(), victim, b"print(1)"));
+        assert!(!is_approved(ws.path(), victim, b"print(2)"));
+    }
+
+    /// A path key carrying a newline whose tail is a whole record line, on a
+    /// path already approved.
+    fn path_forging_a_line_for(victim: &str) -> String {
+        let forged_hash = "a".repeat(64);
+        format!("data/scripts/auth/x.py\n{forged_hash}  https://evil.test  -  {victim}")
+    }
+
+    /// The whole attack through `record`, the writer the file tools and the
+    /// approve route share. The forged tail would rebind the victim's scope.
+    #[test]
+    fn a_newline_in_the_path_cannot_forge_an_approval_line() {
+        let ws = ws();
+        let victim = "data/scripts/auth/legit.py";
+        write_script(ws.path(), victim, "print(1)");
+        record(ws.path(), victim, b"print(1)").unwrap();
+
+        let outcome = record(ws.path(), &path_forging_a_line_for(victim), b"print(2)");
+        assert!(outcome.is_err(), "a path with a newline must be refused");
+
+        let after = entries(ws.path());
+        assert_eq!(after.len(), 1, "no second record was forged");
+        assert_eq!(scope_for(ws.path(), victim), None);
+        assert!(is_approved(ws.path(), victim, b"print(1)"));
+    }
+
+    /// The seed writes the record directly, so it filters on its own. A path
+    /// that cannot round trip is not seeded, and every other path still is.
+    #[test]
+    fn the_seed_skips_a_path_that_would_forge_an_approval_line() {
+        let ws = ws();
+        let victim = "data/scripts/auth/legit.py";
+        let hostile = path_forging_a_line_for(victim);
+        write_script(ws.path(), victim, "print(1)");
+        write_script(ws.path(), &hostile, "print(2)");
+
+        let seeded = seed_if_absent(ws.path(), &unscoped(&[victim, hostile.as_str()])).unwrap();
+
+        assert_eq!(seeded, vec![victim.to_string()]);
+        let after = entries(ws.path());
+        assert_eq!(after.len(), 1, "no second record was forged");
+        assert_eq!(scope_for(ws.path(), victim), None);
+    }
+
+    /// The floor under every writer: an entry map holding an unrecordable key
+    /// is refused whole, and the record on disk stays as it was.
+    #[test]
+    fn write_all_refuses_a_path_that_would_forge_an_approval_line() {
+        let ws = ws();
+        let victim = "data/scripts/auth/legit.py";
+        write_script(ws.path(), victim, "print(1)");
+        record(ws.path(), victim, b"print(1)").unwrap();
+
+        let mut current = entries(ws.path());
+        current.insert(
+            path_forging_a_line_for(victim),
+            Approval {
+                hash: content_hash(b"print(2)"),
+                base_url: None,
+                injects: None,
+            },
+        );
+
+        assert!(write_all(ws.path(), &current).is_err());
+        assert_eq!(entries(ws.path()).len(), 1, "the record was not rewritten");
+    }
+
+    /// A hand-edited line whose path the writer would refuse is not read, so it
+    /// approves nothing and cannot wedge the next write.
+    #[test]
+    fn a_hand_edited_path_with_a_control_character_is_not_read() {
+        let hash = "a".repeat(64);
+        let parsed = parse(&format!(
+            "{hash}  -  -  data/scripts/auth/x\u{7}.py\n{hash}  -  -  data/scripts/auth/y.py\n"
+        ));
+        assert_eq!(
+            parsed.keys().collect::<Vec<_>>(),
+            vec!["data/scripts/auth/y.py"]
+        );
     }
 
     /// Padding is not forgery. Every layer on this path trims before it uses

@@ -60,6 +60,7 @@ mod request_read;
 mod spawn_thread;
 mod successor;
 mod threads;
+mod tls;
 mod update_address;
 mod wake_parent;
 mod workspace;
@@ -212,6 +213,17 @@ enum Command {
     ExternalAddress {
         #[command(subcommand)]
         action: ExternalAddressAction,
+        /// Gateway port, when it is not on 5252 (packaged) or 5251 (dev).
+        #[arg(long, global = true)]
+        port: Option<u16>,
+    },
+    /// What the gateway serves over HTTPS, and why not when it does not.
+    ///
+    /// The gateway gets its certificate itself, from tailscaled for this
+    /// machine's tailnet name, unless LUCIDOS_TLS_CERT and LUCIDOS_TLS_KEY name one.
+    Tls {
+        #[command(subcommand)]
+        action: TlsAction,
         /// Gateway port, when it is not on 5252 (packaged) or 5251 (dev).
         #[arg(long, global = true)]
         port: Option<u16>,
@@ -1126,6 +1138,12 @@ enum ExternalAddressAction {
 }
 
 #[derive(Subcommand)]
+enum TlsAction {
+    /// Print the certificate source, its name and expiry, and any error.
+    Status,
+}
+
+#[derive(Subcommand)]
 enum UpdateAddressAction {
     /// Print the address in use, or why the stored one is refused.
     Show,
@@ -1952,6 +1970,13 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 ExternalAddressAction::Clear => external_address::Action::Clear,
             };
             external_address::cmd_external_address(&action, port)?;
+            Ok(0)
+        }
+        Command::Tls {
+            action: TlsAction::Status,
+            port,
+        } => {
+            tls::cmd_tls_status(port)?;
             Ok(0)
         }
         Command::UpdateAddress { action, port } => {

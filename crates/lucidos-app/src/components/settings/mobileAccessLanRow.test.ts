@@ -170,6 +170,7 @@ describe('tailnetConnectRows', () => {
     tailnetIp: '100.64.0.7',
     magicDnsName: 'mymac.tailnet-name.ts.net',
     workspaceServeUrl: null as string | null,
+    gatewayHttps: null as string | null,
     bind: 'all',
   };
 

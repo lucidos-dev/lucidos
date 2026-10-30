@@ -142,6 +142,13 @@ pub fn script_path_rejection(script: &str) -> Option<String> {
             script
         ));
     }
+    if !crate::core::handshake_approvals::path_is_recordable(script) {
+        return Some(format!(
+            "script path {:?} {}",
+            script,
+            crate::core::handshake_approvals::UNRECORDABLE_PATH_REASON
+        ));
+    }
     if !crate::core::handshake_approvals::config_path_under_data(script).starts_with("scripts/") {
         return Some(format!(
             "script path '{}' must live under data/scripts/, the only place a \
@@ -464,6 +471,21 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
             reason.contains("data/scripts/"),
             "refused for the wrong reason: {reason}"
         );
+    }
+
+    /// The runner refuses by name any path the approvals record would refuse.
+    #[test]
+    fn an_unrecordable_script_path_is_refused() {
+        use crate::core::handshake_approvals::UNRECORDABLE_PATH_REASON;
+        for script in ["scripts/auth/x.py\nscripts/auth/y.py", "scripts/auth/x.py "] {
+            let reason = script_path_rejection(script)
+                .unwrap_or_else(|| panic!("{script:?} must be refused"));
+            assert!(
+                reason.contains(UNRECORDABLE_PATH_REASON),
+                "refused for the wrong reason: {reason}"
+            );
+        }
+        assert_eq!(script_path_rejection("scripts/auth/my script.py"), None);
     }
 
     #[tokio::test]

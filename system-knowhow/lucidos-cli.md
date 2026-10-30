@@ -2410,7 +2410,9 @@ headless one under the install prefix in `runtime/current/`.
    of its two origins to use.
 2. The gateway's *external address* (`lucidos external-address`, below), used as
    set, since the user typed it.
-3. The tailnet origin Tailscale itself reports: the `https://` name when
+3. The gateway's own HTTPS origin, when it serves a *managed certificate*
+   (`lucidos tls status`, below) and that origin answers as this gateway.
+4. The tailnet origin Tailscale itself reports: the `https://` name when
    Tailscale can certify it, then the MagicDNS name, then the tailnet address.
    When the machine is not on a tailnet, it prints Tailscale's reason.
 
@@ -2466,6 +2468,27 @@ lucidos external-address set --port 5300 http://10.8.0.2:5300   # one gateway of
 - **Four editors, one value:** this command, **Settings → Access → External
   address**, `install.sh --external-address`, and
   `PUT /~/api/v1/control/external-address`.
+
+### `lucidos tls status [--port <P>]`
+
+Says whether other devices reach this gateway over HTTPS, and why not when they
+do not. It only reads: the gateway settles its certificate itself (ADR 0600).
+
+```bash
+lucidos tls status              # the source, the https address, the expiry.
+lucidos tls status --port 5300  # one gateway of two.
+```
+
+- **Three answers.** Your own certificate (`LUCIDOS_TLS_CERT`), a *managed
+  certificate* from your tailnet with the address to open, or none with the
+  reason. A failed update says so, while the current certificate still serves.
+- **Local only.** It reads `GET /~/api/v1/control/tls` with the local token, so
+  run it on the gateway's machine. A paired device sees the same on Settings →
+  Access.
+- **With two gateways running it refuses** until `--port` names one, as
+  `lucidos pair` does. Each gateway has its own certificate.
+- **No HTTPS?** See `remote-access` § Automatic: the gateway's own certificate,
+  for what a tailnet admin turns on.
 
 ### `lucidos update-address show | set <url> | reset`
 

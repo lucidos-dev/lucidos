@@ -334,6 +334,23 @@ pub(super) async fn update_credential(
     if touches_service_account {
         return ApiResult::err(SERVICE_ACCOUNT_IS_SETTINGS_ONLY.to_string());
     }
+    if let (AuthType::EmailPassword, Some(email), Some(stored)) =
+        (auth_type, &request.email, &stored)
+    {
+        let account_name = EmailStore::account_name_for_credential(&stored.service_name);
+        let stored_flag = EmailStore::get(&state.pool, account_name)
+            .await
+            .map(|account| account.map(|a| a.require_send_confirmation));
+        if lowers_send_confirmation(email.require_send_confirmation, stored_flag) {
+            if let Err(refusal) = crate::api::actor::refuse_agent_caller(
+                &headers,
+                "An agent cannot turn off email send confirmation. Only the user \
+                 turns it off, in the account's settings.",
+            ) {
+                return ApiResult::err(refusal.message);
+            }
+        }
+    }
     if let Some(secret) = new_secret {
         if let Err(reason) =
             crate::core::credentials::check_secret_references(&state.pool, auth_type, secret).await
@@ -399,6 +416,16 @@ pub(super) async fn update_credential(
         Ok(None) => ApiResult::err("Credential not found".to_string()),
         Err(e) => ApiResult::err(format!("Failed to update credential: {}", e)),
     }
+}
+
+/// Whether an email edit would leave send confirmation off where it was on.
+/// A missing account starts with it on, and a failed read counts as on, so an
+/// unknown never lets an agent through.
+pub(in crate::api) fn lowers_send_confirmation(
+    requested: bool,
+    stored: Result<Option<bool>, sqlx::Error>,
+) -> bool {
+    !requested && !matches!(stored, Ok(Some(false)))
 }
 
 /// Replace one credential's *credential scope*, the set of base URLs it may be

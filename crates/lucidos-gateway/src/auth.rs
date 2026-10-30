@@ -552,13 +552,15 @@ pub fn cleared_credential_cookie(name: &str) -> String {
 
 /// Did this request reach us over TLS?
 ///
-/// `served_tls` is what our own socket terminated. The forwarded header covers
+/// `connection_is_tls` is whether our own socket terminated TLS for THIS
+/// connection: one gateway serves loopback plain and its tailnet address over
+/// TLS, so no gateway-wide flag can answer. The forwarded header covers
 /// the shipped case where something else terminated TLS and proxied to us,
 /// which is what `tailscale serve` does. This decides only whether to mark a
 /// cookie `Secure`, never whether to authorize, so a spoofed header buys a
 /// caller nothing.
-pub fn request_is_secure(headers: &HeaderMap, served_tls: bool) -> bool {
-    if served_tls {
+pub fn request_is_secure(headers: &HeaderMap, connection_is_tls: bool) -> bool {
+    if connection_is_tls {
         return true;
     }
     headers

@@ -1080,10 +1080,11 @@ Use this pattern for all prompts.`;
 });
 
 /**
- * Authored HTML can neither submit a form nor reach the top layer. Inline
- * style stays, because containment, not filtering, bounds its layout.
+ * Authored HTML can neither submit a form, reach the top layer, nor link
+ * through an image map. Inline style stays, because containment, not
+ * filtering, bounds its layout.
  */
-describe('authored form controls and the top layer', () => {
+describe('authored form controls, image maps and the top layer', () => {
   const ARTIFACT_PAYLOAD =
     '<form action="https://example.com/collect" method="post" style="position:fixed;inset:0;z-index:2147483647;background:white"><input type="password" name="api_key"><button>Connect</button></form>';
 
@@ -1116,6 +1117,21 @@ describe('authored form controls and the top layer', () => {
         expect(html).not.toMatch(new RegExp(`\\s${attr}=`, 'i'));
       },
     );
+
+    // An image map's `<area href>` is a link no shell router sees, since each
+    // one keys on `a[href]`. A click on it navigates the shell window itself.
+    it.each([
+      ['an image map', '<img src="x.png" usemap="#m"><map name="m"><area shape="rect" coords="0,0,9999,9999" href="https://example.com/c"></map>'],
+      ['mixed case', '<MaP name="m"><AREA href="https://example.com/c"></MaP>'],
+      ['a lone area', '<area href="https://example.com/c" target="_top">'],
+    ])('renders no image map for %s', (_label, src) => {
+      expect(parse(render(src)).querySelector('map, area')).toBeNull();
+    });
+  });
+
+  it('shows an authored image map area as the text the author wrote', () => {
+    const body = parse(renderMarkdown('See <area href="https://example.com/c"> here', { cache: false }));
+    expect(body.textContent).toContain('<area href="https://example.com/c">');
   });
 
   it('shows an authored button as the text the author wrote', () => {

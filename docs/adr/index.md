@@ -605,3 +605,5 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0597: The agent browser navigates only to http and https URLs](0597-agent-browser-navigates-only-http-and-https.md)
 - [0598: A voice socket redeems a call ticket minted by a plain fetch, not a device id in the query](0598-voice-call-ticket.md)
 - [0599: A relaunched shared SSE worker asks every port to introduce itself, and a page replaces a worker that stops answering](0599-shared-worker-relaunch-asks-ports-to-introduce.md)
+- [0600: The gateway takes its HTTPS certificate from tailscaled; no ACME client, issuer or hosted service](0600-gateway-managed-certificates-from-tailscaled.md)
+- [0601: A loopback engine refuses a non-loopback Host with 421, shutting out DNS rebinding](0601-loopback-engine-admits-only-a-loopback-host.md)

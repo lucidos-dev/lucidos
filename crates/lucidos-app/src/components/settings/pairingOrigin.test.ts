@@ -18,8 +18,12 @@ const base: TailnetInput = {
   tailnetIp: '100.64.0.7',
   magicDnsName: 'mymac.tailnet-name.ts.net',
   workspaceServeUrl: null,
+  gatewayHttps: null,
   bind: 'all',
 };
+
+/** The same machine once the gateway holds a certificate from its tailnet. */
+const SERVED = 'https://mymac.tailnet-name.ts.net:5252';
 
 describe('tailnetOrigin', () => {
   it('prefers the MagicDNS name, which is what a person can retype', () => {
@@ -50,6 +54,12 @@ describe('tailnetOrigin', () => {
     expect(tailnetOrigin({ ...base, tailnetIp: null })).toBeNull();
   });
 
+  it("takes the gateway's own HTTPS origin first, even over a serve URL", () => {
+    expect(tailnetOrigin({ ...base, gatewayHttps: SERVED })).toBe(SERVED);
+    const both = { ...base, gatewayHttps: SERVED, workspaceServeUrl: 'https://mymac.tailnet-name.ts.net/dev/' };
+    expect(tailnetOrigin(both)).toBe(SERVED);
+  });
+
   it('survives a serve URL that is not a URL', () => {
     // The engine only ever sets a verified one, so this is the belt: a garbage
     // value must yield no origin rather than throwing inside a render.
@@ -66,6 +76,7 @@ describe('tailnetConnectRows agrees with tailnetOrigin', () => {
     ['over TLS', { ...base, here: { protocol: 'https:', hostname: 'localhost', port: '5251' } }],
     ['a verified serve URL', { ...base, workspaceServeUrl: 'https://mymac.tailnet-name.ts.net/dev/' }],
     ['loopback bind', { ...base, bind: 'loopback' }],
+    ["the gateway's own HTTPS", { ...base, gatewayHttps: SERVED }],
     ['off the tailnet', { ...base, tailnetIp: null }],
   ];
 
@@ -131,9 +142,17 @@ describe('pairingOrigin', () => {
     }
   });
 
+  it("points the QR at the gateway's own HTTPS origin whenever it serves one", () => {
+    // The invariant: never an http:// QR from a gateway serving HTTPS there.
+    expect(pairingOrigin({ ...base, gatewayHttps: SERVED, external: null, lan })).toBe(SERVED);
+    const plainReader = { ...base, here: { protocol: 'http:', hostname: '100.64.0.7', port: '5252' } };
+    expect(pairingOrigin({ ...plainReader, gatewayHttps: SERVED, external: null, lan })).toBe(SERVED);
+  });
+
   it('takes the external address ahead of the tailnet, since the user typed it', () => {
     const external = 'https://lucidos.example.com';
     expect(pairingOrigin({ ...base, external, lan })).toBe(external);
+    expect(pairingOrigin({ ...base, gatewayHttps: SERVED, external, lan })).toBe(external);
     expect(pairingOrigin({ ...base, external, tailnetIp: null, bind: 'loopback', lan: null })).toBe(external);
   });
 

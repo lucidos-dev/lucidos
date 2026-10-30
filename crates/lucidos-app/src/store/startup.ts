@@ -1,6 +1,6 @@
 import { pruneClosedWindows, readWindowItem } from '../utils/windowStorage';
 import { checkConnection, handleResume, bounceToPickerIfStranded } from './actions/connection';
-import { loadArtifacts, openUrl } from './actions/artifacts';
+import { loadArtifacts } from './actions/artifacts';
 import {
   loadUnreadNotifications,
   loadNotifications,
@@ -48,11 +48,8 @@ import { oauthAuthFlow } from './actions/oauth';
 import { installRestoreGuard, takeWithheldThread } from './restoreGuard';
 import { installDevWindowFollow } from './actions/dev-window';
 import { restoreRepoSelectionFromStorage } from './actions/repositories';
-import {
-  openThreadAcrossWorkspaces,
-  openWorkspaceThreadUrl,
-  parseWorkspaceThreadUrl,
-} from './actions/cross-workspace';
+import { openThreadAcrossWorkspaces } from './actions/cross-workspace';
+import { routeExternalAnchorClick } from './externalAnchorClick';
 import { inlineMarkdownImage, openImagePopupFromGroup } from './imagePopup';
 import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
 import { installMarkdownImageFallback } from '../utils/markdownImageFallback';
@@ -71,6 +68,8 @@ import {
 import { dispatchDeepLink } from './actions/in-app-notification-toast';
 import { setupHashDeeplinkRouting } from './actions/hash-deeplink-router';
 import { reportStartupKind, startLivenessTracking } from '../utils/liveness';
+import { installLinkPressGuard } from '@lucidos/link-press-guard';
+import { postClientLog } from '../utils/clientLog';
 import { createLeadingEdgeGate } from '../utils/leadingEdgeGate';
 import { flushUndeliveredComposeDrafts } from './actions/compose';
 import { installAppBridge } from './actions/app-bridge';
@@ -347,19 +346,14 @@ export function startClient(): () => void {
     }
 
     // External links not handled by component-level handlers
-    const anchor = target.closest('a[href]') as HTMLAnchorElement | null;
-    if (anchor) {
-      const href = anchor.getAttribute('href');
-      if (href && /^https?:\/\//.test(href)) {
-        e.preventDefault();
-        // A pasted link to a Lucidos thread stays in Lucidos.
-        const threadUrl = parseWorkspaceThreadUrl(href);
-        if (threadUrl) openWorkspaceThreadUrl(threadUrl);
-        else openUrl(href);  // Panel in Tauri, new tab in browser
-      }
-    }
+    routeExternalAnchorClick(e);
   }
   document.addEventListener('click', onGlobalClick);
+  // A swipe that starts on a link must not open it. Captured on `window`, so
+  // no click listener on `document` sees the click, the wake-tap guard included.
+  const stopLinkPressGuard = installLinkPressGuard(window, {
+    onSwallowed: (info) => postClientLog('nav', 'link-click-after-swipe', { ...info }),
+  });
 
   // Markdown images are raw `<img>` markup, so they cannot be `<BlobImage>`
   // and would stay half-drawn after a truncated load. One delegated listener
@@ -769,6 +763,7 @@ export function startClient(): () => void {
     nativeTapCanceled = true;
     stopNativeTap?.();
     document.removeEventListener('click', onGlobalClick);
+    stopLinkPressGuard();
     stopMarkdownImageRetry();
     stopMarkdownImageFallback();
     document.removeEventListener('visibilitychange', handleVisibilityChange);

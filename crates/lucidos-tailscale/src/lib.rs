@@ -1,5 +1,5 @@
 //! What the tree knows about Tailscale: where this machine sits on a tailnet,
-//! what that node is called, and where the CLI lives.
+//! what that node is called, its TLS certificate, and where the CLI lives.
 //!
 //! Three crates need this. `lucidos-gateway` and `lucidos-engine` offer the
 //! tailnet address as a network-bind hint; `lucidos-app` shows the full picture
@@ -22,12 +22,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod cert;
 mod cli;
 mod discovery;
 mod localapi;
 mod process;
 mod status;
 
+pub use cert::{cert_pair, CertPair};
 pub use cli::{resolve_tailscale_binary, tailscale_binary, TAILSCALE_CANDIDATES};
 pub use status::{TailnetNode, TailnetState};
 
@@ -45,8 +47,10 @@ pub fn is_tailnet_addr(addr: Ipv4Addr) -> bool {
 /// What one way of asking Tailscale got back.
 #[derive(Debug)]
 pub(crate) enum Answer {
-    /// A status body, still to be parsed.
-    Status(String),
+    /// A `200` body, still to be parsed.
+    Body(String),
+    /// The LocalAPI answered with another status. Its body says why.
+    Refused { status_line: String, body: String },
     /// Nothing answered: refused, absent, or silent until the deadline.
     Silent,
     /// Something answered, and it was not a status.
@@ -89,9 +93,12 @@ fn settle(
     let mut first_failure = None;
     for answer in answers {
         let failure = match answer {
-            Answer::Status(body) => match status::parse_status(&body) {
+            Answer::Body(body) => match status::parse_status(&body) {
                 Ok(state) => return state,
                 Err(detail) => TailnetState::Unreadable { detail },
+            },
+            Answer::Refused { status_line, .. } => TailnetState::Unreadable {
+                detail: format!("LocalAPI said {status_line}"),
             },
             Answer::Silent => TailnetState::NotRunning,
             Answer::Garbled(detail) => TailnetState::Unreadable { detail },
@@ -196,7 +203,7 @@ mod tests {
         let cli_ran = Cell::new(false);
         let state = settle(
             &found(vec![socket()], true),
-            |_| Answer::Status(running()),
+            |_| Answer::Body(running()),
             |_| {
                 cli_ran.set(true);
                 None
@@ -211,7 +218,7 @@ mod tests {
         let state = settle(
             &found(vec![socket()], true),
             |_| Answer::Silent,
-            |_| Some(Answer::Status(running())),
+            |_| Some(Answer::Body(running())),
         );
         assert!(state.node().is_some());
     }

@@ -1,6 +1,7 @@
 import { showToast } from '../../store/store';
 import { isMobile, isTouchDevice } from '../../utils/viewport';
-import { TAP_MOVE_THRESHOLD_PX, takePressOutcome, type PressOutcome } from '../../utils/tapGesture';
+import { TAP_MOVE_THRESHOLD_PX } from '@lucidos/tap-press';
+import { takePressOutcome, type PressOutcome } from '../../utils/tapGesture';
 import { postClientLog } from '../../utils/clientLog';
 import { LONG_PRESS_DELAY_MS } from '../../hooks/useLongPress';
 import { relayoutShell, keyboardCloseState, type ClosePath } from '../layout/keyboardCloseRelayout';

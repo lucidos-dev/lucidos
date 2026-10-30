@@ -1087,6 +1087,21 @@ fn an_agent_never_writes_a_human_only_preference() {
     }
 }
 
+/// Regression: `configure_email` could not turn send confirmation off, but
+/// `PUT /api/v1/credentials` wrote the flag for any caller. So an agent could
+/// still drop the user's confirmation card with one HTTP call. Only an edit
+/// that turns the flag off is gated, and an unknown stored value counts as on.
+#[test]
+fn an_agent_never_turns_off_email_send_confirmation() {
+    use crate::api::settings::lowers_send_confirmation as lowers;
+    assert!(lowers(false, Ok(Some(true))));
+    assert!(lowers(false, Ok(None)));
+    assert!(lowers(false, Err(sqlx::Error::PoolTimedOut)));
+    assert!(!lowers(false, Ok(Some(false))));
+    assert!(!lowers(true, Ok(Some(true))));
+    assert!(!lowers(true, Ok(Some(false))));
+}
+
 /// Every route writing a human-only setting, confirming a send or revealing a
 /// secret refuses an agent before it acts. So a refused agent leaves the stored
 /// value unchanged, sends nothing, and spends no reveal token.
@@ -1126,6 +1141,13 @@ fn every_human_only_route_refuses_an_agent_before_it_acts() {
             "send_email_confirmed",
             agent_gate,
             "send_confirmed_draft(",
+        ),
+        (
+            "settings.rs",
+            settings,
+            "update_credential",
+            agent_gate,
+            "CredentialStore::update(",
         ),
         (
             "claude_gateway.rs",

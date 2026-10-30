@@ -47,7 +47,7 @@ interface PermissionBodyProps {
  *  do NOT share the verbs: this card says "wants to create /path", where a
  *  transcript step row says "Write foo.ts" because it has to read like the
  *  Claude Code row carrying the same edit (`CODEX_CHANGE_VERBS` in
- *  `store/thread-events/exchange.ts`).
+ *  `store/thread-events/tool-descriptions.ts`).
  *
  *  A `Map`, not an object literal: the key is a string codex chose, and a plain
  *  object answers `constructor` / `toString` / `valueOf` / `__proto__` off its

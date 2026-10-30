@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { panelOverlay, focusedThreadId, toasts, confirmState } from '../store';
+import { panelOverlay, focusedThreadId, toasts, confirmState, settleConfirm } from '../store';
 import type { App } from '../types';
 
 // Mock all side-effect imports that handleNavigationRequest calls
@@ -429,6 +429,30 @@ describe('app capture and refresh scoping', () => {
   it('reloads the app for the unscoped end-of-turn refresh', () => {
     handleThreadEvent(refresh());
     expect(refreshAppUI).toHaveBeenCalledWith('habit-tracker');
+  });
+});
+
+describe('push prompt scoping', () => {
+  function pushRequested(actor?: object) {
+    return { thread_id: 'thread-A', event: { type: 'PushNotificationRequested', actor } };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getDeviceId.mockReturnValue('this-device');
+    focusedThreadId.value = 'thread-A';
+  });
+  afterEach(() => settleConfirm(false));
+
+  it('asks on the device whose push preference the agent turned on', () => {
+    handleThreadEvent(pushRequested({ kind: 'device', device_id: 'this-device' }));
+    expect(confirmState.value.visible).toBe(true);
+  });
+
+  // Enable here would subscribe THIS device, not the one the user asked for.
+  it('stays silent on another device showing the same thread', () => {
+    handleThreadEvent(pushRequested({ kind: 'device', device_id: 'other-device' }));
+    expect(confirmState.value.visible).toBe(false);
   });
 });
 

@@ -83,7 +83,7 @@ pub(crate) fn status_via_cli(bin: &str) -> Option<Answer> {
 /// GUI shim talking; any other failure means the daemon did not answer.
 fn classify_cli_output(succeeded: bool, stdout: &str) -> Answer {
     if serde_json::from_str::<serde_json::Value>(stdout).is_ok_and(|v| v.is_object()) {
-        return Answer::Status(stdout.to_string());
+        return Answer::Body(stdout.to_string());
     }
     if !succeeded {
         return Answer::Silent;
@@ -128,12 +128,9 @@ mod tests {
     #[test]
     fn cli_output_is_json_or_a_reason_why_not() {
         let json = r#"{"BackendState":"NeedsLogin"}"#;
-        assert!(matches!(classify_cli_output(true, json), Answer::Status(_)));
+        assert!(matches!(classify_cli_output(true, json), Answer::Body(_)));
         // Logged-out CLIs may exit non-zero and still print status.
-        assert!(matches!(
-            classify_cli_output(false, json),
-            Answer::Status(_)
-        ));
+        assert!(matches!(classify_cli_output(false, json), Answer::Body(_)));
         // The daemon is stopped: the CLI fails on stderr, stdout empty.
         assert!(matches!(classify_cli_output(false, ""), Answer::Silent));
         // The macOS GUI shim: exit 0, prose on stdout.

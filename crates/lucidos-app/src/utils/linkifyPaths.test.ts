@@ -1309,11 +1309,9 @@ describe('linkifyPaths', () => {
     expect(result).toContain('>artifacts/path/file_002500.md</a>');
   });
 
-  it('prefers longest match across batches (length-desc tiebreak)', () => {
-    // With batched regexes, a short prefix and a longer path could land in different
-    // batches. The combined match selection must still prefer the longer one.
+  it('prefers the longer of two known paths that end alike', () => {
+    // `notes.md` also occurs inside the longer path, which must win whole.
     const shortPath = 'notes.md';
-    // 999 filler paths to push the longer path into a later batch (batch size = 500)
     const filler = Array.from({ length: 999 }, (_, i) => `filler/file_${i}.md`);
     const longPath = 'projects/sample/notes.md';
     const html = '<p>See projects/sample/notes.md</p>';
@@ -1324,16 +1322,14 @@ describe('linkifyPaths', () => {
     expect(result).not.toMatch(/<a[^>]*><a/);
   });
 
-  it('keeps each compiled regex small enough for WebKit ("regex too large" guard)', () => {
-    // WebKit's YARR engine throws SyntaxError "regular expression too large" when the
-    // source exceeds an internal limit. V8 has no such limit, so this test asserts the
-    // structural property directly: no single RegExp constructed by linkifyPaths may have
-    // a source approaching the WebKit limit.
-    const MAX_SAFE_SOURCE = 100_000;
-    const sources: number[] = [];
+  it('builds no regex from the path list', () => {
+    // WebKit's regex engine scans a thousands-way alternation about twenty times
+    // slower than V8, which froze typing in the desktop app on every list
+    // refresh. Known paths are found by sorted lookup instead.
+    const sources: string[] = [];
     const RealRegExp = globalThis.RegExp;
     const Spy: any = function (pattern: any, flags?: string) {
-      if (typeof pattern === 'string') sources.push(pattern.length);
+      if (typeof pattern === 'string') sources.push(pattern);
       return new RealRegExp(pattern, flags);
     };
     Spy.prototype = RealRegExp.prototype;
@@ -1343,13 +1339,23 @@ describe('linkifyPaths', () => {
         { length: 10000 },
         (_, i) => `artifacts/path/segment-${i.toString(36)}/file.md`,
       );
-      linkifyPaths('<p>hello world</p>', paths, []);
+      linkifyPaths('<p>See artifacts/path/segment-a/file.md</p>', paths, []);
     } finally {
       (globalThis as any).RegExp = RealRegExp;
     }
-    expect(sources.length).toBeGreaterThan(0);
-    const maxSource = Math.max(...sources);
-    expect(maxSource).toBeLessThan(MAX_SAFE_SOURCE);
+    expect(sources.filter((s) => s.includes('segment-'))).toEqual([]);
+  });
+
+  it('links the longest known path the text holds, not a longer one it only starts', () => {
+    const out = linkifyPaths('<p>See notes/a.md.ol here</p>', ['notes/a.md', 'notes/a.md.old'], []);
+    expect(out).toContain('data-path="notes/a.md"');
+    expect(out).not.toContain('data-path="notes/a.md.old"');
+  });
+
+  it('links every known path in a text, back to back', () => {
+    const out = linkifyPaths('<p>x/a.md,x/b.md and x/a.md</p>', ['x/a.md', 'x/b.md'], []);
+    expect(out.match(/data-path="x\/a\.md"/g)).toHaveLength(2);
+    expect(out.match(/data-path="x\/b\.md"/g)).toHaveLength(1);
   });
 });
 

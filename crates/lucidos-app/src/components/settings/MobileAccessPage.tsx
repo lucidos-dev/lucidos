@@ -18,7 +18,8 @@ import {
   type TailscaleInfo,
 } from '../../utils/tauri';
 import { getNetworkConfig, getTailnetStatus } from '../../api/client';
-import { getExternalAddress, type ExternalAddressInfo } from '../../api/client/control';
+import { getExternalAddress, getGatewayTls, type ExternalAddressInfo, type GatewayTls } from '../../api/client/control';
+import { GatewayHttpsRow } from './GatewayHttpsRow';
 import { SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
 import { Explainer } from '../shared/Explainer';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -224,6 +225,9 @@ export type ConnectUrlRow = { label: string; url: string; hint: string };
  *  MagicDNS name, which resolves to that same address for any device on the
  *  tailnet and is what a person can retype. */
 export function tailnetConnectRows(input: TailnetInput & { scope: string }): ConnectUrlRow[] {
+  if (input.gatewayHttps) {
+    return [{ label: 'Tailscale', url: workspaceUrlAt(input.gatewayHttps, input.scope), hint: tailnetHint(true) }];
+  }
   if (input.workspaceServeUrl) {
     // Always HTTPS: the engine builds this one, and only from `https://`.
     // Printed verbatim, never rebuilt from `tailnetOrigin` plus the scope: the
@@ -249,6 +253,9 @@ export interface TailnetInput {
   tailnetIp: string | null;
   magicDnsName: string | null;
   workspaceServeUrl: string | null;
+  /** The origin the gateway serves with its own certificate
+   *  (`GET /~/api/v1/control/tls`), or `null` off the gateway or without one. */
+  gatewayHttps: string | null;
   bind: string;
 }
 
@@ -259,12 +266,14 @@ export interface TailnetInput {
  *  workspace's path to it; the pairing QR adds the picker's. They must not
  *  disagree about which host is reachable.
  *
- *  A verified serve URL wins, and contributes its origin. That is a prefix of
+ *  The gateway's own HTTPS origin wins: the gateway states it serves there.
+ *  Then a verified serve URL, which contributes its origin. That is a prefix of
  *  the string the engine verified rather than a reassembly of it, so the
  *  verbatim rule above survives. Otherwise the plain-HTTP address counts only
  *  while something is listening on it, and prefers the MagicDNS name, which is
  *  what a person can retype. */
 export function tailnetOrigin(input: TailnetInput): string | null {
+  if (input.gatewayHttps) return input.gatewayHttps;
   if (input.workspaceServeUrl) return originOf(input.workspaceServeUrl);
   const ip = input.tailnetIp;
   if (!ip || !tailnetServesThisReader(input.bind, ip, input.here.hostname)) return null;
@@ -288,7 +297,8 @@ function originOf(url: string): string | null {
  *
  *  1. `external`, this gateway's external address, when the user set one. An
  *     address someone typed is explicit intent, so it wins.
- *  2. The tailnet origin ({@link tailnetOrigin}).
+ *  2. The tailnet origin ({@link tailnetOrigin}), led by the HTTPS origin the
+ *     gateway serves with its own certificate.
  *  3. The reader's own origin, when it is not loopback. The page arrived
  *     through it, so it reaches this gateway.
  *  4. The LAN address, then nothing.
@@ -811,6 +821,9 @@ export function MobileAccessPage() {
   // This gateway's external address (ADR 0550). A gateway setting, read
   // through its control plane, so only behind the gateway.
   const [externalAddress, setExternalAddressState] = useState<Loadable<ExternalAddressInfo>>({ status: 'not-loaded' });
+  // What the gateway serves over HTTPS with its own certificate. Also a
+  // gateway fact, so also only behind the gateway.
+  const [gatewayTls, setGatewayTls] = useState<Loadable<GatewayTls>>({ status: 'not-loaded' });
   const [busy, setBusy] = useState<null | 'up'>(null);
   // The Expose run's state lives in the store, not here: a run can spend minutes
   // waiting for a tailnet approval, it narrates itself on the brand badge and the
@@ -825,7 +838,11 @@ export function MobileAccessPage() {
   const connectUrlsReady =
     netConfig.status === 'loaded' &&
     tailnetStatus.status === 'loaded' &&
-    (!showMachineHalf || connectInfo.status === 'loaded');
+    (!showMachineHalf || connectInfo.status === 'loaded') &&
+    // The Tailscale row prefers the gateway's own HTTPS origin, so it waits for
+    // that answer rather than flipping from http to https. A failure settles
+    // it: the HTTPS row reports that error.
+    (!gatewayIsOurOrigin || gatewayTls.status === 'loaded' || gatewayTls.status === 'failed');
   const showLoading = useDelayedFlag(!connectUrlsReady);
 
   // Concern 1, from whichever source this platform has. Concern 2 reads the
@@ -886,6 +903,7 @@ export function MobileAccessPage() {
     tailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
     magicDnsName: status.magic_dns_name,
     workspaceServeUrl: status.workspace_serve_url,
+    gatewayHttps: gatewayTls.status === 'loaded' ? gatewayTls.data.https_origin : null,
     bind,
   });
   // What pairing falls back to with no external address, which the field
@@ -904,8 +922,15 @@ export function MobileAccessPage() {
     if (!gatewayIsOurOrigin) return { kind: 'none' };
     // A failed external read is unknown too: the user may have set an
     // address, and a QR that silently ignored it would point elsewhere.
-    if (connectReadsError !== null || externalAddress.status === 'failed') return { kind: 'unknown' };
-    if (!connectUrlsReady || tailnetStatus.status !== 'loaded' || externalAddress.status !== 'loaded') {
+    if (connectReadsError !== null || externalAddress.status === 'failed' || gatewayTls.status === 'failed') {
+      return { kind: 'unknown' };
+    }
+    if (
+      !connectUrlsReady ||
+      tailnetStatus.status !== 'loaded' ||
+      externalAddress.status !== 'loaded' ||
+      gatewayTls.status !== 'loaded'
+    ) {
       return { kind: 'resolving' };
     }
     const url = pairingOrigin({ ...tailnetInput(tailnetStatus.data), external, lan });
@@ -935,6 +960,11 @@ export function MobileAccessPage() {
       reads.push(getExternalAddress().then(
         (data) => setExternalAddressState({ status: 'loaded', data }),
         (e) => setExternalAddressState(toFailed(e)),
+      ));
+      setGatewayTls(loadingIfFresh);
+      reads.push(getGatewayTls().then(
+        (data) => setGatewayTls({ status: 'loaded', data }),
+        (e) => setGatewayTls(toFailed(e)),
       ));
     }
     // Not a swallowed error: off the desktop app there is nothing to fetch
@@ -1315,6 +1345,7 @@ export function MobileAccessPage() {
           1. The machine running Lucidos
         </div>
         {hostSection()}
+        {gatewayIsOurOrigin && <GatewayHttpsRow tls={gatewayTls} />}
       </div>
 
       <div class="settings-section">

@@ -59,6 +59,10 @@ tower = { version = "0.5", features = ["util", "limit"] }
 tower-http = { version = "0.6", features = ["catch-panic", "cors", "fs", "set-header", "timeout"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+# One listener serves TLS and plain HTTP by sniffing each connection's first
+# byte (`crate::tls`), which `axum-server`'s fixed rustls acceptor cannot do.
+# Already in the lockfile under `axum-server`.
+tokio-rustls = { version = "0.26", default-features = false }
 dotenvy = "0.15"
 # Inbound auth stores a digest of each paired device's credential, never the
 # credential. A leaked store then grants nobody remote reuse. A leaf crypto

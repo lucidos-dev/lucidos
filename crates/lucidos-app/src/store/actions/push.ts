@@ -5,7 +5,8 @@ import { isTauri, isIOS, isStandalone, isMobileDeviceUserAgent, thisDeviceIsMobi
 import { deviceName } from '../../utils/deviceFriendlyName';
 import { pairedDevices, pairedRows } from './pairedDevices';
 import { errorDetail } from '../../utils/errorDetail';
-import { withBase, SCOPE_PATH } from '../../utils/basePath';
+import { withBase, SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
+import { getGatewayTls } from '../../api/client/control';
 import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../../utils/devServerBundle';
 import type { DeviceInfo } from '../../api/types';
 
@@ -207,7 +208,8 @@ export async function recoverServiceWorker(): Promise<void> {
  * localhost), and Chrome hides `navigator.serviceWorker` entirely there — so
  * without this check the user got a misleading "not supported in this browser"
  * for what is really an origin problem they can fix (open over https://, an SSH
- * tunnel to localhost, or `tailscale serve`).
+ * tunnel to localhost, or `tailscale serve`). When the gateway serves its own
+ * HTTPS origin, `httpsOrigin` names it, and the advice is that one address.
  */
 export function pushUnsupportedReason(ctx: {
   secureContext: boolean;
@@ -215,12 +217,16 @@ export function pushUnsupportedReason(ctx: {
   hasPushManager: boolean;
   hasNotification: boolean;
   devServerBundle: boolean;
+  httpsOrigin?: string | null;
 }): string | null {
   // First, and above the secure-origin check, because a preview IS served over
   // https on localhost: every other message here would be advice the user has
   // already followed, and following it again would change nothing.
   if (ctx.devServerBundle) {
     return DEV_SERVER_SW_REASON;
+  }
+  if (!ctx.secureContext && ctx.httpsOrigin) {
+    return `Push needs a secure origin. Open Lucidos at ${ctx.httpsOrigin}, which this gateway serves over HTTPS.`;
   }
   if (!ctx.secureContext) {
     return 'Push needs a secure origin (https or localhost). Open Lucidos over https://, an SSH tunnel to localhost, or tailscale serve: plain http://<host> cannot register notifications.';
@@ -235,14 +241,27 @@ export function pushUnsupportedReason(ctx: {
 }
 
 /** The production wiring of `pushUnsupportedReason` against the live page. */
-export function pushUnsupportedReasonHere(): string | null {
+export function pushUnsupportedReasonHere(httpsOrigin: string | null = null): string | null {
   return pushUnsupportedReason({
+    httpsOrigin,
     secureContext: window.isSecureContext,
     hasServiceWorker: 'serviceWorker' in navigator,
     hasPushManager: 'PushManager' in window,
     hasNotification: 'Notification' in window,
     devServerBundle: isDevServerBundle(),
   });
+}
+
+/** The HTTPS origin the gateway serves with its own certificate, or `null`.
+ *  Only behind the gateway, which owns the certificate. A failed read falls
+ *  back to the general advice, and the caller's toast still says push failed. */
+async function gatewayHttpsOrigin(): Promise<string | null> {
+  if (WORKSPACE_ID === null) return null;
+  try {
+    return (await getGatewayTls()).https_origin;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -269,7 +288,9 @@ export async function initPushSubscription(): Promise<boolean> {
     return false;
   }
 
-  const unsupported = pushUnsupportedReasonHere();
+  const unsupported = pushUnsupportedReasonHere(
+    window.isSecureContext ? null : await gatewayHttpsOrigin(),
+  );
   if (unsupported) {
     showToast(unsupported, 'error');
     return false;

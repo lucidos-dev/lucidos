@@ -521,6 +521,19 @@ describe('pushUnsupportedReason', () => {
     expect(reason).not.toMatch(/not supported in this browser/i);
   });
 
+  it("names the gateway's own HTTPS origin when it serves one", async () => {
+    const { pushUnsupportedReason } = await import('./push');
+    const reason = pushUnsupportedReason({
+      ...ALL_OK,
+      secureContext: false,
+      hasServiceWorker: false,
+      httpsOrigin: 'https://mymac.tailnet-name.ts.net:5252',
+    });
+    expect(reason).toContain('Open Lucidos at https://mymac.tailnet-name.ts.net:5252');
+    // A secure page needs no address.
+    expect(pushUnsupportedReason({ ...ALL_OK, httpsOrigin: 'https://mymac.tailnet-name.ts.net:5252' })).toBeNull();
+  });
+
   it('missing service worker / PushManager on a secure origin → browser support message', async () => {
     const { pushUnsupportedReason } = await import('./push');
     expect(pushUnsupportedReason({ ...ALL_OK, hasServiceWorker: false })).toMatch(/not supported in this browser/i);

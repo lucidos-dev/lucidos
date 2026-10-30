@@ -23,11 +23,11 @@ describe('the rung control in the prompt row', () => {
     expect(promptSource).toContain('disabledReason={rungDisabledReason}');
   });
 
-  it('renders the cluster members, the pill first, before the send button', () => {
-    const cluster = promptSource.slice(promptSource.indexOf('<div class="prompt-actions-right">'));
-    expect(cluster.indexOf('{members.cluster.map(renderMember)}')).toBeGreaterThan(-1);
-    expect(cluster.indexOf('{members.cluster.map(renderMember)}'))
-      .toBeLessThan(cluster.indexOf('{actionSlot}'));
+  // `a-model-picker-stays-left-of-the-action.test.tsx` renders the group.
+  it('hands the cluster members and the action slot to the right-hand group', () => {
+    expect(promptSource).toContain(
+      '<PromptActionsRight cluster={members.cluster.map(renderMember)} action={actionSlot} />',
+    );
   });
 
   it('folds the pill in its place in the one row order', () => {

@@ -1,9 +1,10 @@
 // IIFE bundle entry — adds iframe-only side effects to keep `index.ts` ES-import-safe for the frontend.
-import { lucidos } from './index';
 import { installScrollMemory } from './scroll';
 import { installKeyboardForwarding } from './keyboardForward';
 import { installAppPullToRefresh } from './pullToRefresh';
 import { installAppPaneSwipe } from './paneSwipe';
+import { installLinkPressGuard } from './linkPressGuard';
+import { installAppLinkRouting } from './appLinks';
 import { installAppScrollReport } from './appScroll';
 import { installTooltips } from './tooltip';
 import { primeDevicePreferences } from './ui';
@@ -88,61 +89,13 @@ if (typeof document !== 'undefined') {
   // Same reason again: the frame's own document scrolls, out of the host's sight.
   installAppScrollReport();
 
-  document.addEventListener('click', (e: MouseEvent) => {
-    const target = e.target as Element | null;
-    const anchor = target?.closest?.('a[href]') as HTMLAnchorElement | null;
-    if (!anchor) return;
-    const href = anchor.getAttribute('href');
-    if (!href) return;
-    // A download of one of the app's OWN files. The frame is isolated, so that
-    // file is cross-origin to it and the browser ignores the `download`
-    // attribute: the click would navigate the frame to the file. Ask the engine
-    // for it as an attachment instead, which is what a browser does obey.
-    // `blob:` and `data:` need none of this and are left alone.
-    if (isBridged() && anchor.hasAttribute('download') && !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
-      e.preventDefault();
-      e.stopPropagation();
-      // Against `document.baseURI`, which is what the browser itself resolves
-      // this href against. Behind a gateway the base carries the frame
-      // capability (ADR 0238). `window.location.href` does not, so the older
-      // form asked for a file with no pass on it.
-      const url = new URL(href, document.baseURI);
-      url.searchParams.set('download', '1');
-      const via = document.createElement('a');
-      via.href = url.href;
-      via.download = anchor.getAttribute('download') || '';
-      via.rel = 'noopener';
-      document.body.appendChild(via);
-      via.click();
-      // Removed on a later task, never in the same one. A download starts
-      // asynchronously, and tearing the anchor out from under it is enough to
-      // lose it on some engines.
-      setTimeout(() => via.remove(), 0);
-      return;
-    }
-    if (/^https?:\/\//.test(href)) {
-      e.preventDefault();
-      e.stopPropagation();
-      // openExternal, not navigate: it honours the user's external-link
-      // preference and, in "Ask" mode, must run inside this frame while the
-      // click's user activation is still live. Called synchronously here for
-      // exactly that reason.
-      //
-      // The window.open fallback stays. It only fires once the host route has
-      // already failed (engine unreachable), and in that state the preference
-      // cannot be honoured by any path, so the choice is between showing the
-      // page in the in-app web view and the tap doing nothing at all. A visible
-      // page wins: the preference is about where a link PREFERS to open, not a
-      // reason to swallow it when nothing else is left.
-      lucidos.ui.openExternal(href).catch((err) => {
-        console.warn('[lucidos-sdk] external link fell back to window.open:', href, err);
-        window.open(href, '_blank', 'noopener');
-      });
-    } else if (anchor.getAttribute('target') === '_blank') {
-      e.preventDefault();
-      e.stopPropagation();
-      const resolved = new URL(href, window.location.href).pathname;
-      window.location.href = resolved;
-    }
-  }, true);
+  // A swipe that starts on a link must not open it. Installed before the click
+  // listener below, so that one never sees the click. A frame has no engine
+  // log of its own, so the breadcrumb goes to the console.
+  installLinkPressGuard(window, {
+    onSwallowed: (info) => console.info('[lucidos-sdk] link-click-after-swipe', info),
+  });
+
+  // Links in the frame: downloads, web pages and new-tab targets.
+  installAppLinkRouting();
 }

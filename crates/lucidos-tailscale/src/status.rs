@@ -4,7 +4,7 @@
 //! `tailscale status --json`. Only four fields matter, so this reads a
 //! `serde_json::Value` rather than deriving a schema Tailscale never promised.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use serde_json::Value;
 
@@ -13,6 +13,8 @@ use serde_json::Value;
 pub struct TailnetNode {
     /// The first IPv4 in `Self.TailscaleIPs`. Never inferred from a range.
     pub ipv4: Ipv4Addr,
+    /// Every address in `Self.TailscaleIPs`, IPv4 and IPv6.
+    pub addresses: Vec<IpAddr>,
     /// `Self.DNSName` without its trailing dot, while MagicDNS is on.
     pub magic_dns_name: Option<String>,
     /// Tailscale can issue a certificate for that name (it is in
@@ -94,12 +96,19 @@ pub(crate) fn parse_status(body: &str) -> Result<TailnetState, String> {
     let ips = own
         .and_then(|s| s.get("TailscaleIPs"))
         .or_else(|| status.get("TailscaleIPs"));
-    let ipv4 = ips
+    let addresses: Vec<IpAddr> = ips
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .find_map(|ip| ip.parse::<Ipv4Addr>().ok())
+        .filter_map(|ip| ip.parse().ok())
+        .collect();
+    let ipv4 = addresses
+        .iter()
+        .find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })
         .ok_or("running, but no tailnet IPv4 address")?;
     let magic_dns_on = status
         .pointer("/CurrentTailnet/MagicDNSEnabled")
@@ -122,6 +131,7 @@ pub(crate) fn parse_status(body: &str) -> Result<TailnetState, String> {
     });
     Ok(TailnetState::Joined(TailnetNode {
         ipv4,
+        addresses,
         magic_dns_name,
         can_serve_https,
     }))
@@ -169,7 +179,10 @@ pub(crate) mod tests {
             true,
             None,
         );
-        assert_eq!(joined(&body).ipv4, Ipv4Addr::new(100, 70, 0, 1));
+        let node = joined(&body);
+        assert_eq!(node.ipv4, Ipv4Addr::new(100, 70, 0, 1));
+        let v6: IpAddr = "fd7a:115c:a1e0::1".parse().unwrap();
+        assert_eq!(node.addresses, [IpAddr::V4(node.ipv4), v6]);
     }
 
     #[test]
@@ -279,6 +292,7 @@ pub(crate) mod tests {
     fn every_state_but_joined_has_a_reason() {
         let node = TailnetNode {
             ipv4: Ipv4Addr::new(100, 70, 0, 1),
+            addresses: vec![Ipv4Addr::new(100, 70, 0, 1).into()],
             magic_dns_name: None,
             can_serve_https: false,
         };

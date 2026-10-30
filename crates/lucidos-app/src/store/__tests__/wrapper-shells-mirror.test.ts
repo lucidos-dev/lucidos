@@ -3,7 +3,7 @@
  * in TypeScript once by hand. This file pins the hand-written copy.
  *
  * `core::WRAPPER_SHELLS` is the label list, mirrored by `WRAPPER_SHELLS` in
- * `store/thread-events/exchange.ts`. The label pair drifted once, in opposite
+ * `store/thread-events/tool-descriptions.ts`. The label pair drifted once, in opposite
  * directions. `command_guard::GUARD_SHELLS`, the list the permission guard
  * descends into, reaches the card through codegen, so it needs no pin. A Rust
  * test asserts the containment between the two Rust lists.
@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { WRAPPER_SHELLS } from '../thread-events/exchange';
+import { WRAPPER_SHELLS } from '../thread-events/tool-descriptions';
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Repo root, from `crates/lucidos-app/src/store/__tests__/`. */

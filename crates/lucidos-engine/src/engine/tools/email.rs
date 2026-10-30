@@ -93,7 +93,6 @@ impl LucidosEngine {
                 let imap_host = args["imap_host"].as_str().unwrap_or("");
                 let smtp_host = args["smtp_host"].as_str().unwrap_or("");
                 let use_tls = args["use_tls"].as_bool().unwrap_or(true);
-                let require_confirm = args["require_send_confirmation"].as_bool().unwrap_or(true);
                 let use_oauth = args.get("use_oauth").and_then(|v| v.as_str());
 
                 if name.is_empty()
@@ -118,6 +117,14 @@ impl LucidosEngine {
                             name, e
                         ))
                     }
+                };
+                let requested_confirm = args["require_send_confirmation"].as_bool();
+                let require_confirm =
+                    send_confirmation_after_configure(requested_confirm, existing.as_ref());
+                let confirm_note = if requested_confirm == Some(false) && require_confirm {
+                    " Send confirmation stays on: only the user can turn it off, in the account's settings."
+                } else {
+                    ""
                 };
                 // An argument the model left out keeps the stored value, so an
                 // update to one field never rewrites the login or a port.
@@ -215,8 +222,8 @@ impl LucidosEngine {
                         .await
                         .map_err(|e| format!("Error: {}", e))?;
                     return Ok(format!(
-                        "Email account '{}' configured with OAuth ({}) for SMTP authentication. No app password needed. Ready to send/receive.",
-                        name, oauth_provider
+                        "Email account '{}' configured with OAuth ({}) for SMTP authentication. No app password needed. Ready to send/receive.{}",
+                        name, oauth_provider, confirm_note
                     ));
                 }
 
@@ -243,8 +250,8 @@ impl LucidosEngine {
                             "Password unchanged."
                         };
                         return Ok(format!(
-                            "Email account '{}' updated. {} Ready to send/receive.",
-                            name, auth_note
+                            "Email account '{}' updated. {} Ready to send/receive.{}",
+                            name, auth_note, confirm_note
                         ));
                     }
                 }
@@ -334,9 +341,8 @@ impl LucidosEngine {
                     Err(e) => return Ok(e),
                 };
 
-                // Trigger runs are unattended, so skip send confirmation.
                 let is_trigger = crate::scheduler::user_tasks::current_trigger_id().is_some();
-                if account.require_send_confirmation && !is_trigger {
+                if send_needs_confirmation(&account, is_trigger) {
                     let attachment_names: Vec<String> =
                         validated.iter().map(|v| v.filename.clone()).collect();
                     let draft = serde_json::json!({
@@ -627,6 +633,24 @@ impl LucidosEngine {
     }
 }
 
+/// The send-confirmation flag `configure_email` stores. The agent may only
+/// raise it. An email the agent read could ask it to drop the user's
+/// confirmation card, so a `false` from the agent never lowers the flag. A new
+/// account always starts with confirmation, and only the user turns it off, in
+/// the account's credential settings.
+fn send_confirmation_after_configure(
+    requested: Option<bool>,
+    existing: Option<&crate::core::EmailAccount>,
+) -> bool {
+    requested == Some(true) || existing.is_none_or(|a| a.require_send_confirmation)
+}
+
+/// Whether `send_email` stops at the user's confirmation card. Trigger runs
+/// are unattended, so they send without one.
+fn send_needs_confirmation(account: &crate::core::EmailAccount, is_trigger: bool) -> bool {
+    account.require_send_confirmation && !is_trigger
+}
+
 /// Where a login goes: the servers, the login name and whether TLS guards it.
 struct MailDestination<'a> {
     imap_host: &'a str,
@@ -736,8 +760,55 @@ fn oauth_link_refusal(
 
 #[cfg(test)]
 mod tests {
-    use super::{oauth_link_refusal, secret_redirect_refusal, MailDestination};
+    use super::{
+        oauth_link_refusal, secret_redirect_refusal, send_confirmation_after_configure,
+        send_needs_confirmation, MailDestination,
+    };
     use crate::core::{EmailAccount, MailPassword};
+
+    /// The reported attack: the agent calls `configure_email` with
+    /// `require_send_confirmation: false`, then `send_email` sends with no
+    /// card. The stored flag stays raised, so the next send still stops.
+    #[test]
+    fn the_agent_cannot_turn_off_send_confirmation() {
+        let seeded = account(saved("app-password"), false);
+        let stored = send_confirmation_after_configure(Some(false), Some(&seeded));
+        assert!(stored, "a false argument lowered the stored flag");
+        let reconfigured = EmailAccount {
+            require_send_confirmation: stored,
+            ..seeded
+        };
+        assert!(send_needs_confirmation(&reconfigured, false));
+    }
+
+    #[test]
+    fn a_new_account_always_starts_with_send_confirmation() {
+        for requested in [None, Some(false), Some(true)] {
+            assert!(
+                send_confirmation_after_configure(requested, None),
+                "{requested:?} created an account without confirmation"
+            );
+        }
+    }
+
+    /// The user turned confirmation off in Settings. An unrelated update
+    /// keeps that choice, and the agent may still turn it back on.
+    #[test]
+    fn the_users_choice_to_skip_confirmation_survives_and_can_be_raised() {
+        let off = EmailAccount {
+            require_send_confirmation: false,
+            ..account(saved("app-password"), false)
+        };
+        assert!(!send_confirmation_after_configure(None, Some(&off)));
+        assert!(!send_confirmation_after_configure(Some(false), Some(&off)));
+        assert!(send_confirmation_after_configure(Some(true), Some(&off)));
+    }
+
+    #[test]
+    fn a_trigger_run_sends_without_the_card() {
+        let seeded = account(saved("app-password"), false);
+        assert!(!send_needs_confirmation(&seeded, true));
+    }
 
     fn saved(password: &str) -> MailPassword {
         MailPassword::Saved(password.into())

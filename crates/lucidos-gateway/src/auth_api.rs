@@ -37,6 +37,7 @@ use crate::error::ApiError;
 use crate::pairing_qr;
 use crate::registry::SIGIL;
 use crate::server::GatewayState;
+use crate::tls;
 
 pub fn router() -> Router<GatewayState> {
     Router::new()
@@ -340,7 +341,7 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
             let due = state.touch_device(&id, chrono::Utc::now());
             let refresh = matched
                 .filter(|_| renaming || page_load || due)
-                .and_then(|p| refreshed_credential_cookie(&state, req.headers(), p));
+                .and_then(|p| refreshed_credential_cookie(&state, &req, p));
             // Tell the proxy who this is. The engine keys push, preferences and
             // actor attribution on the same id. So the device the gateway let
             // in and the device the workspace knows are one row, not two.
@@ -442,10 +443,11 @@ fn response_speaks_for_the_credential(response: &Response, name: &str) -> bool {
 /// the `Cookie` header is the only one.
 fn refreshed_credential_cookie(
     state: &GatewayState,
-    headers: &HeaderMap,
+    req: &Request,
     presented: auth::PresentedCredential<'_>,
 ) -> Option<axum::http::HeaderValue> {
-    let secure = auth::request_is_secure(headers, state.serves_tls());
+    let connection = tls::Connection::of(req.extensions());
+    let secure = auth::request_is_secure(req.headers(), connection.is_tls());
     auth::credential_cookie(state.device_cookie_name(), presented.value(), secure)
         .parse()
         .ok()
@@ -577,6 +579,7 @@ struct PairRequest {
 /// guesses as fast as the socket accepts.
 async fn pair(
     State(state): State<GatewayState>,
+    connection: tls::Connection,
     headers: HeaderMap,
     Json(body): Json<PairRequest>,
 ) -> Result<Response, ApiError> {
@@ -599,7 +602,7 @@ async fn pair(
                  and try again.",
             )),
         };
-    let secure = auth::request_is_secure(&headers, state.serves_tls());
+    let secure = auth::request_is_secure(&headers, connection.is_tls());
     Ok((
         StatusCode::OK,
         [(
@@ -1084,6 +1087,38 @@ mod tests {
             state.paired_devices().devices[0].last_seen_at.as_deref() > Some("2026-01-01"),
             "the stamp must move to now"
         );
+    }
+
+    /// One gateway serves loopback plain and its tailnet address over TLS. A
+    /// `Secure` cookie on the plain one is dropped, so the flag must follow the
+    /// connection the request arrived on.
+    #[tokio::test]
+    async fn a_refreshed_cookie_is_secure_only_on_a_tls_connection() {
+        use tower::ServiceExt as _;
+        for (connection, secure) in [
+            (tls::Connection::Tls, true),
+            (tls::Connection::Plain, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = state_with_device(dir.path(), Some("2020-01-02T00:00:00Z"));
+            let mut request = axum::extract::Request::builder()
+                .uri("/dev/api/v1/threads/list")
+                .header("cookie", own_device_cookie(&state))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request.extensions_mut().insert(connection.clone());
+            let response = gated_router(state).oneshot(request).await.unwrap();
+            let cookie = set_cookie(&response);
+            assert!(
+                !cookie.is_empty(),
+                "{connection:?}: a stale device gets a fresh cookie"
+            );
+            assert_eq!(
+                cookie.contains("; Secure"),
+                secure,
+                "{connection:?}: {cookie}"
+            );
+        }
     }
 
     #[tokio::test]

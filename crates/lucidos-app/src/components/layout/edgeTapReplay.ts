@@ -1,4 +1,4 @@
-import { cancelledPressWasATap } from '../../utils/tapGesture';
+import { cancelledPressWasATap } from '@lucidos/tap-press';
 import { opensSoftwareKeyboard } from '../../utils/dom';
 
 /** The part of an element the replay target decision reads. Structural, so the

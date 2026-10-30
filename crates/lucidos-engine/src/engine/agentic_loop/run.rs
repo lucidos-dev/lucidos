@@ -2594,15 +2594,20 @@ impl LucidosEngine {
                     );
                 }
 
-                // Send push notification request SSE event to trigger browser permission
+                // Ask for the browser permission on the device whose push
+                // preference `set_preference` just wrote, and on no other.
                 if result.starts_with("[PUSH_NOTIFICATION_REQUEST]") {
+                    let actor =
+                        device_id.map(|id| crate::engine::thread_events::MessageOrigin::Device {
+                            device_id: id.to_string(),
+                        });
                     self.event_bus
                         .emit_or_log(
                             crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event:
                                     crate::engine::thread_events::ThreadEvent::PushNotificationRequested,
-                                meta: crate::engine::thread_events::EventMeta::NONE,
+                                meta: crate::engine::thread_events::EventMeta::with_actor(actor),
                             },
                             "[AgenticLoop] PushNotificationRequested",
                         )

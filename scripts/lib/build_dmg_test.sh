@@ -3,6 +3,9 @@
 # Run: ./scripts/lib/build_dmg_test.sh
 set -u
 
+# Offline validation fixtures must pass authentication without consulting gh.
+export GH_TOKEN=offline-test-token
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 

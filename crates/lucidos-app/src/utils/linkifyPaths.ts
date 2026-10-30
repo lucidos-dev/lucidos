@@ -12,45 +12,73 @@ import { addLinkifyMs } from './renderPhaseTimers';
 import { parseRepoPath, type RepoLocator } from '../store/repoPath';
 import { DATA_PATH_PREFIXES, workspaceDataRoot } from './dataPathPrefixes';
 
-// Cap how many alternatives go into a single regex. WebKit's YARR throws
-// "regular expression too large" on big alternations; V8 has no such limit.
-// With ~50 chars per escaped path, 500 entries is ~25 KB of source.
-const REGEX_BATCH_SIZE = 500;
-
 const REGEX_ESCAPE = /[.*+?^${}()|[\]\\]/g;
-
-function buildBatchedPatterns(escaped: string[], wrap: (alt: string) => string): RegExp[] {
-  const patterns: RegExp[] = [];
-  for (let i = 0; i < escaped.length; i += REGEX_BATCH_SIZE) {
-    const batch = escaped.slice(i, i + REGEX_BATCH_SIZE);
-    patterns.push(new RegExp(wrap(batch.join('|')), 'g'));
-  }
-  return patterns;
-}
 
 type Match = { start: number; end: number; replacement: string };
 
-/** Gather every candidate span, then keep the ones that survive precedence.
- *  `render` returns null to DECLINE a candidate, which the shape matcher below
- *  needs: its regex recognizes a path-shaped token, and only the resolver can
- *  say whether that token names a file. A declined candidate is dropped before
- *  precedence runs, so it cannot mask a real match beneath it. */
-function collectMatches(
-  text: string,
-  patterns: RegExp[],
-  render: (m: string) => string | null,
-  matches: Match[] = [],
-): Match[] {
-  for (const pattern of patterns) {
-    pattern.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = pattern.exec(text)) !== null) {
-      const replacement = render(m[0]);
-      if (replacement === null) continue;
-      matches.push({ start: m.index, end: m.index + m[0].length, replacement });
-    }
+/** Order `key` against `text.slice(at, at + len)`, without slicing. */
+function compareKeyToSpan(key: string, text: string, at: number, len: number): number {
+  const n = Math.min(key.length, len);
+  for (let j = 0; j < n; j++) {
+    const d = key.charCodeAt(j) - text.charCodeAt(at + j);
+    if (d !== 0) return d;
   }
-  return matches;
+  return key.length - len;
+}
+
+function sharedPrefixLength(key: string, text: string, at: number, len: number): number {
+  const n = Math.min(key.length, len);
+  let j = 0;
+  while (j < n && key.charCodeAt(j) === text.charCodeAt(at + j)) j++;
+  return j;
+}
+
+/** The longest of the sorted `keys` that `text` holds at `at`, or null.
+ *
+ *  The last key ordered at or before the remaining text is the answer when it
+ *  is a prefix of that text. Otherwise only a key no longer than their shared
+ *  prefix can match, and it sorts earlier, so the search narrows and repeats. */
+function longestKeyAt(keys: readonly string[], text: string, at: number): string | null {
+  let len = text.length - at;
+  let end = keys.length;
+  while (len > 0) {
+    let lo = 0;
+    let hi = end;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (compareKeyToSpan(keys[mid], text, at, len) <= 0) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo === 0) return null;
+    const key = keys[lo - 1];
+    const shared = sharedPrefixLength(key, text, at, len);
+    if (shared === key.length) return key;
+    len = shared;
+    end = lo - 1;
+  }
+  return null;
+}
+
+/** Collect every known path in `text`, leftmost first and longest at each
+ *  start. A sorted lookup rather than one regex alternation over the list:
+ *  WebKit scans a thousands-way alternation about twenty times slower than V8,
+ *  which froze typing in the desktop app whenever the list changed. */
+function collectKnownPathMatches(
+  text: string,
+  sortedKeys: readonly string[],
+  render: (key: string) => string,
+  matches: Match[],
+): void {
+  let i = 0;
+  while (i < text.length) {
+    const key = longestKeyAt(sortedKeys, text, i);
+    if (key === null) {
+      i++;
+      continue;
+    }
+    matches.push({ start: i, end: i + key.length, replacement: render(key) });
+    i += key.length;
+  }
 }
 
 /** Resolve overlaps across every candidate, whatever matcher produced it.
@@ -354,9 +382,12 @@ function artifactLink(text: string, path: string): string {
   return `<a href="#" class="artifact-link" data-path="${escapedPath}">${text}</a>`;
 }
 
-/** Collect the prose-shape candidates. Separate from `collectMatches` because
- *  the boundary group sits INSIDE the match and must be excluded from the span
- *  the link covers. */
+/** Collect the prose-shape candidates. The boundary group sits INSIDE the
+ *  match and must be excluded from the span the link covers. `render` returns
+ *  null to DECLINE a candidate: the regex recognizes a path-shaped token, and
+ *  only the resolver can say whether that token names a file. A declined
+ *  candidate is dropped before precedence runs, so it cannot mask a real match
+ *  beneath it. */
 function collectProseMatches(
   text: string,
   render: (m: string) => string | null,
@@ -833,12 +864,12 @@ function rewriteAppAnchorByBareRef(tag: string, appTextToId: Map<string, string>
   return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapeAttr(id)}"`);
 }
 
-/** The regex batches and lookups linkify needs for a given (paths, apps) set.
- *  Building these is the bulk of a linkify call, and does not depend on the
- *  html. So they are built once per (paths, apps) and reused across every
- *  block in a render (see `getCompiled`). */
+/** The lookups linkify needs for a given (paths, apps) set. They do not depend
+ *  on the html, so they are built once per (paths, apps) and reused across
+ *  every block in a render (see `getCompiled`). */
 interface CompiledLinkify {
-  pathPatterns: RegExp[];
+  /** Every key of `pathLookup`, in code-unit order for `longestKeyAt`. */
+  sortedPathKeys: string[];
   pathLookup: Map<string, string> | undefined;
   appTextToId: Map<string, string> | undefined;
   appIds: Set<string> | undefined;
@@ -848,7 +879,7 @@ function buildCompiled(
   paths: string[],
   apps: { name: string; id: string }[],
 ): CompiledLinkify {
-  let pathPatterns: RegExp[] = [];
+  let sortedPathKeys: string[] = [];
   // Keyed by every form a path may appear in: the full path, and the bare form
   // with the `artifacts/` prefix stripped, since LLMs sometimes write those.
   // Values are always the full store path, so both the text-segment linkifier
@@ -862,10 +893,8 @@ function buildCompiled(
         pathLookup.set(p.slice('artifacts/'.length), p);
       }
     }
-    const allMatchable = [...pathLookup.keys()];
-    allMatchable.sort((a, b) => b.length - a.length);
-    const escaped = allMatchable.map((p) => p.replace(REGEX_ESCAPE, '\\$&'));
-    pathPatterns = buildBatchedPatterns(escaped, (alt) => `(${alt})`);
+    // An empty key would match everywhere and advance nothing.
+    sortedPathKeys = [...pathLookup.keys()].filter((key) => key.length > 0).sort();
   }
 
   // Map each app name AND id to its id so the anchor rewriters can resolve a
@@ -883,10 +912,10 @@ function buildCompiled(
     appIds = new Set(apps.map((s) => s.id));
   }
 
-  return { pathPatterns, pathLookup, appTextToId, appIds };
+  return { sortedPathKeys, pathLookup, appTextToId, appIds };
 }
 
-// Build the patterns ONCE per (paths, apps) set instead of once per call. Every
+// Build the matchers ONCE per (paths, apps) set instead of once per call. Every
 // exchange in a render passes the SAME array references. So a 1-entry
 // by-reference memo hits for every call after the first, and across renders
 // until the artifact or app list changes. `generation` bumps on each rebuild
@@ -1045,7 +1074,7 @@ function withAttributeBracketsEscaped(html: string): string | null {
 }
 
 function applyCompiled(html: string, compiled: CompiledLinkify): string {
-  const { pathPatterns, pathLookup, appTextToId, appIds } = compiled;
+  const { sortedPathKeys, pathLookup, appTextToId, appIds } = compiled;
   const segments = splitTags(html);
   if (!segments) return html;
 
@@ -1117,8 +1146,8 @@ function applyCompiled(html: string, compiled: CompiledLinkify): string {
       // longer shape span beat a shorter cached one at the same start, e.g.
       // `artifacts/notes.md.bak` over a cached `artifacts/notes.md`.
       const candidates: Match[] = [];
-      if (pathPatterns.length > 0) {
-        collectMatches(segments[i], pathPatterns, (m) => artifactLink(m, pathLookup!.get(m)!), candidates);
+      if (sortedPathKeys.length > 0) {
+        collectKnownPathMatches(segments[i], sortedPathKeys, (m) => artifactLink(m, pathLookup!.get(m)!), candidates);
       }
       collectProseMatches(segments[i], (m) => {
         const fullPath = pathLookup?.get(m) ?? extractDataPathTarget(m);

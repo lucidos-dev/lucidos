@@ -105,7 +105,7 @@ describe('the composer has one control on its right edge', () => {
 
   it('places the fold cluster ahead of the right-hand action group', () => {
     // The right group is `margin-left: auto`, and it keeps a single anchor.
-    expect(at('<OverflowMenu')).toBeLessThan(at('<div class="prompt-actions-right">'));
+    expect(at('<OverflowMenu')).toBeLessThan(at('<PromptActionsRight '));
   });
 
   // The fold takes a prefix of `composerRowMembers`' fold order, and the row
@@ -113,7 +113,7 @@ describe('the composer has one control on its right edge', () => {
   it('folds from the fold order and renders the row order', () => {
     expect(promptSource).toContain('const foldActions = members.foldOrder;');
     expect(at('<OverflowMenu')).toBeLessThan(at('{members.row.map(renderMember)}'));
-    expect(at('{members.row.map(renderMember)}')).toBeLessThan(at('<div class="prompt-actions-right">'));
+    expect(at('{members.row.map(renderMember)}')).toBeLessThan(at('<PromptActionsRight '));
   });
 
   it('hands the clear action to the one row order', () => {

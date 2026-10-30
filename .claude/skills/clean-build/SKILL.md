@@ -441,6 +441,13 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   `exchange-grouping.ts`, `exchange-render.ts` and `exchange.ts`. Moving
   them to the shell would clear the entry line but not the set's. The set
   needs about 90 kB behind dynamic imports.
+  On 2026-10-29 it measured 591.03 kB, 9 kB short of the hard fail. The
+  store needed only three exports of `exchange-render.ts`, and only the
+  transcript read the tool labels in `exchange.ts`. Those moved to
+  `exchange-anchors.ts`, `exchange-queue.ts` and `tool-descriptions.ts`,
+  which took the entry to 554.98 kB. `exchange-grouping.ts` stays, since
+  `computeExchanges` is the store's own derivation. The set held at
+  1328.83 kB, because the code moved between two first-paint chunks.
 
   The entry chunk is the data layer and startup. The UI is the shell chunk,
   loaded beside it under the boot splash.

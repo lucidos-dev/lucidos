@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { describeEngineTool, fullCommandForEngineTool } from '../exchange';
+import { describeEngineTool, fullCommandForEngineTool } from '../tool-descriptions';
 
 // The retired `execute_intent` tool remains in stored threads with its
 // calls. Their rows must keep a readable label rather than the bare tool name.

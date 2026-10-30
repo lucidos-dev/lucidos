@@ -4818,6 +4818,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml 0.8.23",
  "tower",
  "tower-http",

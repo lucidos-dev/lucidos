@@ -1726,14 +1726,14 @@ pub fn create_router(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         ))
-        // Who is calling, on an engine that faces a network. Layered out here
-        // rather than inside the `/api/v1` nest. `/app`, `/data` and the
-        // frontend fallback are siblings of that nest, so a gate inside it
-        // would miss all three. `/data` serves the workspace's files straight
-        // off disk, which would be the whole leak.
+        // Who is calling. Layered out here rather than inside the `/api/v1`
+        // nest. `/app`, `/data` and the frontend fallback are siblings of that
+        // nest, so a gate inside it would miss all three. `/data` serves the
+        // workspace's files straight off disk, which would be the whole leak.
         //
-        // Inert on a loopback bind, which is every shipped topology: the layer
-        // returns immediately and nothing about today's behaviour changes.
+        // On a wide bind it demands a credential. On a loopback bind, every
+        // shipped topology, it admits only a loopback Host, which shuts out a
+        // DNS-rebound page.
         //
         // Deliberately NOT skipped for `LUCIDOS_PERMISSIVE_CORS`, unlike the
         // origin gate below. That variable says this deployment wants

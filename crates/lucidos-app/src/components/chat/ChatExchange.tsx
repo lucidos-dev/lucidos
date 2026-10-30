@@ -398,8 +398,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const rowOnScreen = useOnScreenInTranscript(markedRow);
   const liveStepOnScreen = markedRow !== null && rowOnScreen;
 
-  // Memoize linkified HTML — linkifyPaths builds 15+ regex batches per call when
-  // the workspace has many artifacts. Without memoization, every re-render of
+  // Memoize linkified HTML: linkifyPaths scans every message for every known
+  // artifact path. Without memoization, every re-render of
   // this exchange (signal fire from threadMap/artifacts/appsList during SSE
   // activity) reruns the full scan and blocks the main thread.
   // Only drawn chunks. A closed row's Disclosure shows the markup it last drew

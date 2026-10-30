@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import type { CodingAgent } from '../../api/types';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { focusedThreadId, threadMap } from '../../store/store';
@@ -101,6 +102,23 @@ export function composerRowMembers(m: {
     // readouts folds. Attach image always stands, so one always exists.
     mergeAt: [...m.toggles, ...rest][0].key,
   };
+}
+
+/** The row's right-hand group: the cluster, then the action slot (Send, Apply,
+ *  Archive) on the right edge.
+ *
+ *  The cluster gets its own box so the action slot is never its sibling.
+ *  Preact can append a re-mounted member at the end of its parent, after a
+ *  member that rendered `null` left the same render. Inside this box the end
+ *  is still left of the action slot. The box is `display: contents`, so the
+ *  gaps and the fold's measurement see the members as before. */
+export function PromptActionsRight({ cluster, action }: { cluster: ComponentChildren; action: ComponentChildren }) {
+  return (
+    <div class="prompt-actions-right">
+      <div class="prompt-actions-cluster">{cluster}</div>
+      {action}
+    </div>
+  );
 }
 
 /** The row's toggles, left to right: the call toggle where a call is offered,

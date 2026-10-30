@@ -9,7 +9,7 @@ import { toFailed } from '../../store/types';
 import { highlightEllipsis } from './highlightEllipsis';
 import { StepRecallList } from './StepRecallList';
 import { requestToolArgs, requestToolResult } from '../../store/stepDetailCache';
-import { fullCommandForCCTool, fullCommandForEngineTool } from '../../store/thread-events/exchange';
+import { fullCommandForCCTool, fullCommandForEngineTool } from '../../store/thread-events/tool-descriptions';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { usePaneCentre } from '../../hooks/usePaneCentre';
 import { StepOutcomeIcon } from '../shared/icons';

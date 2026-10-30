@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { describeEngineTool } from '../exchange';
+import { describeEngineTool } from '../tool-descriptions';
 
 // The read decision (ADR 0417) runs on every turn, so its no must read
 // quietly. A yes still says it asks the user to read the reply.

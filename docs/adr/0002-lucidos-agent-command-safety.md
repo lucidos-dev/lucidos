@@ -805,3 +805,56 @@ With the guard off the gate reaches nobody. The workspace audit's
 command, so a Start click approves a command the user cannot see there. A
 trigger cannot ask, so a trigger thread with an unapproved server enabled
 reports a failed start at turn setup.
+
+## Addendum (2026-10-30): a write into git metadata is a refusal, and so is `git -C`
+
+**Context.** The Safe fast path settles a `git` read on the premise that it
+runs no program. Git reads programs from the repository config, so the premise
+holds only while no Safe write can reach that config. One could:
+`printf … >> .git/config` settled Safe as an in-workspace write, and the
+following `git status` ran the `core.fsmonitor` it planted.
+
+`git -C <dir>` was the second route. Git discovers a repository from `<dir>`,
+and plain in-workspace writes can plant a bare one there (`HEAD`, `config`,
+`objects/`, `refs/`). That is the same shape as `--git-dir`, which was already
+refused. `git --bare` is the third: it reads the cwd as that repository.
+
+**Decision.**
+
+- Every write shape the fast path settles refuses a *git metadata* target
+  (`docs/glossary.md`), inside the workspace or not. That covers a redirect, a
+  create head, a write-capable read-only head and a curl or wget download. The
+  shared predicate is `safe_write_target`: in the workspace and not git metadata.
+- The match covers every spelling a supported platform resolves. It folds case
+  (case-insensitive volumes, the macOS default) and drops HFS+-ignorable code
+  points (git's own list). It also reads a glob or a zsh `(…)` group that could
+  expand to the name, `dotglob` included. zsh's `>!` and `>>!` read as plain
+  redirects, as `>|` already did.
+- A brace word is spelled out, up to 64 words, and each word is checked. So
+  `mkdir -p src/{a,b}` stays Safe. A sequence `{1..3}` reads as `*`, and a
+  word past the bound is a refusal.
+- On a `CommandSite::Workspace` the resolved path decides too, so a link into
+  `.git` is caught. A glob in the last name counts when any entry it may
+  match resolves into git metadata.
+- `git -C` and `git --bare` are refusals whatever the value. The earlier test
+  that settled `git -C some/repo log` Safe is reversed. An unattended coding
+  agent now gets a deny for it and retries without `-C`.
+- A write-capable read-only head refuses a git metadata name anywhere in its
+  arguments, as it does an out-of-workspace path. So `tree -I .git` is a
+  refusal although it only reads. Telling its output path from a pattern
+  needs per-head flag arity, the same trade the out-of-workspace check made.
+- Python code with a literal git metadata path is a refusal, as in bash.
+
+**Accepted residual risk.**
+
+- Python can build the path at run time (`'.g' + 'it'`). A static scan cannot
+  bound that, the same residual as any other Python write.
+- A `CommandSite::TextOnly` caller, the coding-agent lanes, sees no disk. There
+  a link into `.git` laid down earlier is invisible, as for an out-of-workspace
+  link.
+- NTFS spellings (`git~1`, a trailing dot) are not matched. Lucidos ships no
+  Windows build.
+- A `cd` into a planted bare repository, then a `git` read, is not refused. On
+  one line the `cd` takes the line to the judge, which reads only the text.
+  Some coding-agent shells keep their cwd between calls. There the `cd` alone
+  goes to the judge, and the next call's bare `git log` settles Safe.

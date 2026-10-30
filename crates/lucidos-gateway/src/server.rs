@@ -19,6 +19,7 @@ use crate::registry::{self, Registry, Workspace, REGISTRY_VERSION, SIGIL};
 use crate::release_check;
 use crate::slowness;
 use crate::stack::{self, EngineKeeper, Health, ProbeOutcome, StackRuntime, WorkspaceStatus};
+use crate::tls;
 use crate::BoxError;
 use axum::body::Body;
 use axum::extract::State;
@@ -201,9 +202,9 @@ struct GatewayInner {
     /// unpaired browser is refused once per asset, so an ungated line would
     /// bury the one a reader came for.
     refusal_log: Mutex<auth::LogThrottle>,
-    /// Whether this process terminates TLS on its own socket. Decides only
-    /// whether a credential cookie is marked `Secure`.
-    serves_tls: bool,
+    /// The gateway's managed certificate, served on non-loopback connections
+    /// when no operator certificate is set (`crate::tls`).
+    certs: Arc<crate::tls::CertStore>,
     /// The engine binary to spawn per workspace. Must be explicit
     /// (`LUCIDOS_ENGINE_BIN`): the gateway's own `current_exe` is the gateway,
     /// not the engine (ADR 0014 §1).
@@ -372,7 +373,7 @@ impl GatewayState {
                 .unwrap(),
                 relay_client: crate::relay::RelayClient::new().unwrap(),
                 refusal_log: Mutex::new(auth::LogThrottle::default()),
-                serves_tls: false,
+                certs: Arc::default(),
                 engine_bin: scratch.join("lucidos-engine"),
                 static_dir,
                 engine_loopback: true,
@@ -506,13 +507,9 @@ impl GatewayState {
         &self.inner.hook_socket_token
     }
 
-    /// Does this process terminate TLS on its own socket?
-    ///
-    /// Resolved once at boot through `net_config::serves_tls_from_env`, then
-    /// carried. Both consumers read it here: `serve` picks the listener, and
-    /// `auth::request_is_secure` decides the session cookie's `Secure` flag.
-    pub fn serves_tls(&self) -> bool {
-        self.inner.serves_tls
+    /// The managed certificate store the non-loopback listeners serve from.
+    pub fn certs(&self) -> &Arc<crate::tls::CertStore> {
+        &self.inner.certs
     }
 
     /// A snapshot of the paired devices, for the management list.
@@ -3325,12 +3322,6 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<unknown>".into())
     );
-    // Whether this gateway's OWN port is https, which decides whether a session
-    // cookie carries `Secure`. Resolved through the one rule: bare presence
-    // called a set-but-empty value TLS. A `Secure` cookie on a plain-http
-    // origin is dropped by the browser, so inbound auth failed with nothing to
-    // see. The listener in `serve` reads the same call.
-    let serves_tls = net_config::serves_tls_from_env();
     // The release check needs both, and `app_data` moves into the struct below.
     let exe_path = std::env::current_exe().ok();
     let release_app_data = app_data.clone();
@@ -3353,7 +3344,7 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
                 remote_gateways,
                 relay_client: crate::relay::RelayClient::new()?,
                 refusal_log: Mutex::new(auth::LogThrottle::default()),
-                serves_tls,
+                certs: Arc::default(),
                 engine_bin,
                 static_dir,
                 engine_loopback,
@@ -3455,8 +3446,37 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
         });
     }
 
+    start_managed_tls(&state, gateway_port, &gateway_bind_choice);
+
     serve(state, gateway_port, gateway_bind_choice).await?;
     Ok(RunOutcome::Stopped)
+}
+
+/// Settle the TLS source (`crate::tls::managed`) and keep a tailnet one fresh.
+/// A loopback-only gateway serves no certificate, so it asks for none.
+fn start_managed_tls(state: &GatewayState, port: u16, bind_choice: &net_config::BindChoice) {
+    let certs = state.certs();
+    if net_config::serves_tls_from_env() {
+        let cert = std::env::var("LUCIDOS_TLS_CERT").unwrap_or_default();
+        certs.record(tls::TlsState::operator(
+            std::fs::read(cert.trim()).ok().as_deref(),
+        ));
+        return;
+    }
+    let plan = net_config::bind_plan(bind_choice, port);
+    if plan
+        .required
+        .iter()
+        .chain(&plan.optional)
+        .all(|addr| tls::is_loopback(*addr))
+    {
+        certs.record(tls::TlsState::none(
+            "The gateway listens on this machine only, so it needs no certificate.",
+        ));
+        return;
+    }
+    let dir = tls::managed::tls_dir(state.app_data());
+    tls::managed::spawn_refresh(certs.clone(), Arc::new(tls::managed::Tailscaled), dir);
 }
 
 /// The gateway's whole HTTP surface, assembled.
@@ -3500,12 +3520,15 @@ pub(crate) fn gateway_router(state: GatewayState) -> Router {
             HeaderValue::from_static("no-cache"),
         ))
         .with_state(state);
-    if permissive_cors_enabled() {
+    let router = if permissive_cors_enabled() {
         crate::log!("[Gateway] permissive CORS enabled by LUCIDOS_PERMISSIVE_CORS");
         router.layer(CorsLayer::permissive())
     } else {
         router
-    }
+    };
+    // Outermost: plain HTTP on an address that serves HTTPS never reaches a
+    // route, so no credential travels over it.
+    router.layer(axum::middleware::from_fn(crate::tls::redirect_to_https))
 }
 
 /// Build the gateway router and serve it, with TLS when certs are configured.
@@ -3527,28 +3550,26 @@ async fn serve(
     let handle = axum_server::Handle::new();
     install_shutdown(handle.clone());
 
-    // Whether to serve TLS was decided ONCE, in `run`, and carried here on the
-    // state. This branch only loads the paths that decision implies, so the
-    // listener and the cookie's `Secure` flag cannot disagree. Matching on bare
-    // `Some` took the TLS arm for a set-but-empty value, which is how a launch
-    // script spells "unset". `from_pem_file("", "")` then errored and the
-    // gateway never served, leaving the picker on its boot splash. Trimmed for
-    // the same reason: `serves_tls` trims before deciding and `from_pem_file`
-    // does not, so a padded path would pick TLS and then fail on a file the
-    // user does have.
-    let tls = if state.serves_tls() {
+    // An operator certificate wins on every address; otherwise the managed one
+    // serves non-loopback connections. Decided through `serves_tls`, which
+    // treats a set-but-empty value as unset: that is how a launch script spells
+    // "unset", and `from_pem_file("", "")` would stop the gateway serving.
+    // Trimmed because `serves_tls` trims and `from_pem_file` does not.
+    let tls = if net_config::serves_tls_from_env() {
         let cert = std::env::var("LUCIDOS_TLS_CERT").unwrap_or_default();
         let key = std::env::var("LUCIDOS_TLS_KEY").unwrap_or_default();
-        Some(axum_server::tls_rustls::RustlsConfig::from_pem_file(cert.trim(), key.trim()).await?)
+        tls::ListenerTls::Operator(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert.trim(), key.trim()).await?,
+        )
     } else {
-        None
+        tls::ListenerTls::Managed(state.certs().clone())
     };
 
     // The required addresses, bound BEFORE anything is served so a failure is
     // fatal and reported as one.
     let mut serving = Vec::with_capacity(plan.required.len() + 1);
     for addr in plan.required {
-        let listener = bind_and_log(addr, tls.is_some())?;
+        let listener = bind_and_log(addr, &tls)?;
         serving.push(serve_listener(
             listener,
             router.clone(),
@@ -3575,7 +3596,7 @@ async fn serve(
                     listener,
                     hook_socket::router(state.clone()),
                     handle.clone(),
-                    None,
+                    tls::ListenerTls::Plain,
                 );
                 serving.push(Box::pin(async move {
                     if let Err(e) = hook_serving.await {
@@ -3622,37 +3643,29 @@ async fn serve(
 /// Bind one address and announce it, in that order. Announcing first would
 /// leave a gateway that died on `EADDRNOTAVAIL` claiming to listen on the
 /// address it had just failed to acquire.
-fn bind_and_log(addr: SocketAddr, tls: bool) -> std::io::Result<std::net::TcpListener> {
+fn bind_and_log(
+    addr: SocketAddr,
+    tls: &tls::ListenerTls,
+) -> std::io::Result<std::net::TcpListener> {
     let listener = std::net::TcpListener::bind(addr)?;
-    if tls {
-        crate::log!("[Gateway] listening on https://{addr} (TLS)");
-    } else {
-        crate::log!("[Gateway] listening on http://{addr}");
-    }
+    crate::log!("[Gateway] listening on {addr} ({})", tls.scheme_label(addr));
     Ok(listener)
 }
 
-/// Serve an already-bound listener, with or without TLS. Boxed because the two
-/// arms are different `axum_server` acceptor types and the caller keeps them in
-/// one collection.
+/// Serve an already-bound listener, deciding each connection's scheme through
+/// `tls`. Boxed because the caller keeps every listener in one collection.
 fn serve_listener(
     listener: std::net::TcpListener,
     router: Router,
     handle: axum_server::Handle,
-    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    tls: tls::ListenerTls,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
-    match tls {
-        Some(cfg) => Box::pin(
-            axum_server::from_tcp_rustls(listener, cfg)
-                .handle(handle)
-                .serve(router.into_make_service()),
-        ),
-        None => Box::pin(
-            axum_server::from_tcp(listener)
-                .handle(handle)
-                .serve(router.into_make_service()),
-        ),
-    }
+    Box::pin(
+        axum_server::from_tcp(listener)
+            .acceptor(tls::GatewayAcceptor::new(tls))
+            .handle(handle)
+            .serve(router.into_make_service()),
+    )
 }
 
 /// First re-attempt delay for an optional bind, and the ceiling the backoff
@@ -3684,13 +3697,13 @@ async fn serve_optional_address(
     addr: SocketAddr,
     router: Router,
     handle: axum_server::Handle,
-    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    tls: tls::ListenerTls,
     state: GatewayState,
 ) {
     let mut delay = OPTIONAL_BIND_RETRY_START;
     let mut reported: Option<std::io::ErrorKind> = None;
     loop {
-        match bind_and_log(addr, tls.is_some()) {
+        match bind_and_log(addr, &tls) {
             Ok(listener) => {
                 if let Ok(mut pending) = state.inner.pending_binds.write() {
                     pending.remove(&addr);
@@ -3767,6 +3780,8 @@ async fn gateway_health(State(state): State<GatewayState>) -> axum::Json<serde_j
         .read()
         .map(|p| p.iter().map(|a| a.to_string()).collect())
         .unwrap_or_default();
+    // Public, so only what any TLS handshake shows: no expiry, no error.
+    let tls = state.certs().state();
     axum::Json(serde_json::json!({
         "status": "ok",
         "role": crate::peers::GATEWAY_ROLE,
@@ -3775,6 +3790,10 @@ async fn gateway_health(State(state): State<GatewayState>) -> axum::Json<serde_j
         "gateway_protocol": crate::gateway_protocol::GATEWAY_PROTOCOL,
         "workspaces": count,
         "pending_binds": pending,
+        "tls": {
+            "source": tls.source,
+            "https_origin": tls.https_origin(state.gateway_port()),
+        },
     }))
 }
 

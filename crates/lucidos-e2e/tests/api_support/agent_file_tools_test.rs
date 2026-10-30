@@ -300,6 +300,106 @@ async fn a_font_manifest_written_by_the_agent_is_checked_and_cannot_be_edited_in
     assert_eq!(data_event_count(&pool, "DataFileDeleted", &rel).await, 1);
 }
 
+/// Removes the symlinks a test planted, even when an assertion fails, so the
+/// run leaves the workspace tree clean.
+struct PlantedLinks(Vec<std::path::PathBuf>);
+
+impl Drop for PlantedLinks {
+    fn drop(&mut self) {
+        for link in &self.0 {
+            let _ = std::fs::remove_file(link);
+        }
+    }
+}
+
+/// No tool writes through a symlink to a file outside its tree: not a linked
+/// leaf, and not a new file under a linked directory (ADR 0051).
+#[cfg(unix)]
+#[tokio::test]
+async fn no_file_tool_writes_through_a_symlink_out_of_its_tree() {
+    use std::os::unix::fs::symlink;
+
+    let _tree = workspace_tree_lock().read().await;
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    let id = uuid::Uuid::new_v4().simple();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("f.md");
+    std::fs::write(&target, "outside\n").unwrap();
+
+    let artifacts = workspace_path().join("data/artifacts");
+    let tmp = workspace_path().join(".lucidos/tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let dir = format!("link-{id}-dir");
+    let leaf = format!("link-{id}-leaf.md");
+    let source = format!("link-{id}-source.md");
+    std::fs::write(tmp.join(&source), "source\n").unwrap();
+    let _planted = PlantedLinks(vec![
+        artifacts.join(&dir),
+        artifacts.join(&leaf),
+        tmp.join(&dir),
+        tmp.join(&source),
+    ]);
+    symlink(outside.path(), artifacts.join(&dir)).unwrap();
+    symlink(&target, artifacts.join(&leaf)).unwrap();
+    symlink(outside.path(), tmp.join(&dir)).unwrap();
+
+    let leaf = format!("artifacts/{leaf}");
+    let under_dir = format!("artifacts/{dir}/new.md");
+    let source = format!(".lucidos/tmp/{source}");
+    let calls = [
+        ("write_file", json!({ "path": leaf, "content": "x" })),
+        ("write_file", json!({ "path": under_dir, "content": "x" })),
+        (
+            "edit_file",
+            json!({ "path": leaf, "old_string": "outside", "new_string": "x" }),
+        ),
+        (
+            "copy_file",
+            json!({ "source": source, "destination": leaf }),
+        ),
+        (
+            "copy_file",
+            json!({ "source": source, "destination": under_dir }),
+        ),
+        (
+            "http_request",
+            json!({ "url": "https://example.com/", "output_path": leaf }),
+        ),
+        (
+            "http_request",
+            json!({ "url": "https://example.com/", "temp_path": format!("{dir}/new.md") }),
+        ),
+    ];
+    for (tool, args) in calls {
+        let result = call_tool(&pool, tool, args.clone()).await;
+        assert!(
+            result.starts_with("Error:") && result.contains("symlink"),
+            "{tool} {args}: {result}"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside\n");
+    assert!(!outside.path().join("new.md").exists());
+}
+
+/// A `temp_path` naming a directory is refused before the request goes out,
+/// with a reason about the argument rather than the file tools.
+#[tokio::test]
+async fn a_temp_path_naming_a_directory_is_refused_for_what_it_is() {
+    let pool = sqlx::PgPool::connect(&db_url()).await.unwrap();
+    for temp_path in ["", "downloads/"] {
+        let result = call_tool(
+            &pool,
+            "http_request",
+            json!({ "url": "https://example.com/", "temp_path": temp_path }),
+        )
+        .await;
+        assert!(
+            result.starts_with("Error: temp_path must name a file"),
+            "{temp_path:?}: {result}"
+        );
+    }
+}
+
 /// An app file the agent writes is linted. The findings ride back in the tool
 /// result, and the write lands exactly as asked.
 #[tokio::test]

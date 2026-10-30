@@ -58,7 +58,7 @@ pub(super) fn configure_email_tools() -> Vec<ToolDefinition> {
                     },
                     "require_send_confirmation": {
                         "type": "boolean",
-                        "description": "Require user confirmation before sending (default true)."
+                        "description": "true requires confirmation. Only the user turns it off."
                     },
                     "use_oauth": {
                         "type": "string",

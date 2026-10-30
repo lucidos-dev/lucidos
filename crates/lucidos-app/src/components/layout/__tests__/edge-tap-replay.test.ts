@@ -8,7 +8,7 @@ import {
   type ReplayHost,
 } from '../edgeTapReplay';
 import MOBILE_SWIPE_CONTAINER from '../MobileSwipeContainer.tsx?raw';
-import { TAP_MOVE_THRESHOLD_PX } from '../../../utils/tapGesture';
+import { TAP_MOVE_THRESHOLD_PX } from '@lucidos/tap-press';
 import { LONG_PRESS_DELAY_MS } from '../../../hooks/useLongPress';
 
 // An edge tap lands on a transparent strip over the row, and the strip's gate

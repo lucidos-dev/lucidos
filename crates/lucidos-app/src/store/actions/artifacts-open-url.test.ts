@@ -317,7 +317,10 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
 
       void openLocalFileOnConfirm('//example.com/page');
 
-      expect(window.open).toHaveBeenCalledWith('//example.com/page', '_blank', 'noopener');
+      expect(window.open).toHaveBeenCalledWith(
+        expect.stringMatching(/^https?:\/\/example\.com\/page$/),
+        expect.anything(),
+      );
       expect(toasts.value).toEqual([]);
     });
 

@@ -8,8 +8,9 @@
 //! `--qr` draws the code instead, so a phone scans it. That needs an address
 //! the phone can reach, which is the hard part of the whole feature: this
 //! command talks to `127.0.0.1`, and a QR aimed there helps nobody. The
-//! address comes from `--host`, else the gateway's external address, else
-//! Tailscale's own status. The gateway builds and encodes the URL.
+//! address comes from `--host`, else the gateway's external address, else the
+//! HTTPS origin the gateway serves with its own certificate, else Tailscale's
+//! own status. The gateway builds and encodes the URL.
 //!
 //! It reaches the gateway rather than a workspace engine, so it finds it
 //! through `crate::gateway`.
@@ -60,6 +61,7 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
             ),
             None => pairing_origin(
                 crate::external_address::stored(&client, &base, &token),
+                || gateway_https_origin(&probe, &base),
                 || tailnet_origin(&probe, &base),
             ),
         }
@@ -146,6 +148,7 @@ pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), Bo
     let probe = gateway::probe_client()?;
     let address = gateway_pairing_origin(
         crate::external_address::stored(&client, &base, &token),
+        || gateway_https_origin(&probe, &base),
         || tailnet_origin(&probe, &base),
     );
 
@@ -235,25 +238,39 @@ fn mint(request: reqwest::blocking::RequestBuilder) -> Result<Minted, BoxError> 
 }
 
 /// Pure: the pairing address, in the one order ADR 0550 sets. The external
-/// address comes first, since the user typed it. Then the tailnet origin, asked
-/// for only when there is no external address. The Access page's
-/// `pairingOrigin` follows the same order, and adds two steps this command
-/// cannot see: the reader's own origin and the LAN address.
+/// address comes first, since the user typed it. Then the HTTPS origin the
+/// gateway serves itself, then the tailnet origin. Each is asked for only when
+/// the one before has nothing. The Access page's `pairingOrigin` follows the
+/// same order, and adds two steps this command cannot see: the reader's own
+/// origin and the LAN address.
 fn pairing_origin(
     external: Option<String>,
+    gateway_https: impl FnOnce() -> Option<String>,
     tailnet: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    external.or_else(tailnet)
+    external.or_else(gateway_https).or_else(tailnet)
 }
 
 /// The origin a gateway pairing prints: the first `https` one, external
 /// address first. An `http` external address never hides a tailnet one.
 fn gateway_pairing_origin(
     external: Option<String>,
+    gateway_https: impl FnOnce() -> Option<String>,
     tailnet: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
     let https = |origin: &String| origin.starts_with("https://");
-    pairing_origin(external.filter(https), || tailnet().filter(https))
+    pairing_origin(external.filter(https), gateway_https, || {
+        tailnet().filter(https)
+    })
+}
+
+/// The HTTPS origin this gateway serves with its own certificate, once it
+/// answers there as this gateway. Its health names the origin.
+fn gateway_https_origin(client: &reqwest::blocking::Client, base: &str) -> Option<String> {
+    let ours = health(client, base)?;
+    let origin = ours.pointer("/tls/https_origin")?.as_str()?;
+    let id = ours.get("instance_id")?.as_str()?;
+    reaches_this_gateway(client, origin, id).then(|| origin.to_string())
 }
 
 /// The tailnet origin another device can open, or `None` with the reason
@@ -460,39 +477,90 @@ mod tests {
         assert!(!reaches_this_gateway(&probe, &elsewhere, "ours"));
     }
 
+    const UNASKED: fn() -> Option<String> = || panic!("a later rung must not be probed");
+
     #[test]
-    fn the_external_address_leads_and_spares_the_tailnet_probe() {
+    fn the_external_address_leads_and_spares_every_probe() {
         let external = Some("https://lucidos.example.com".to_string());
-        let origin = pairing_origin(external.clone(), || {
-            panic!("the tailnet must not be probed when an external address is set")
-        });
-        assert_eq!(origin, external);
+        assert_eq!(pairing_origin(external.clone(), UNASKED, UNASKED), external);
     }
 
     #[test]
-    fn without_an_external_address_the_tailnet_answers() {
+    fn the_gateways_own_https_comes_next_and_spares_the_tailnet_probe() {
+        let served = || Some("https://mymac.tailnet-name.ts.net:5252".to_string());
+        assert_eq!(
+            pairing_origin(None, served, UNASKED).as_deref(),
+            Some("https://mymac.tailnet-name.ts.net:5252")
+        );
+        assert_eq!(
+            gateway_pairing_origin(Some("http://10.8.0.2:5252".to_string()), served, UNASKED)
+                .as_deref(),
+            Some("https://mymac.tailnet-name.ts.net:5252")
+        );
+    }
+
+    #[test]
+    fn without_either_the_tailnet_answers() {
         let tailnet = || Some("http://mymac.tailnet-name.ts.net:5252".to_string());
         assert_eq!(
-            pairing_origin(None, tailnet).as_deref(),
+            pairing_origin(None, || None, tailnet).as_deref(),
             Some("http://mymac.tailnet-name.ts.net:5252")
         );
-        assert_eq!(pairing_origin(None, || None), None);
+        assert_eq!(pairing_origin(None, || None, || None), None);
     }
 
     #[test]
     fn an_http_external_address_never_hides_a_tailnet_https_one() {
         let tailnet = || Some("https://mymac.tailnet-name.ts.net".to_string());
         assert_eq!(
-            gateway_pairing_origin(Some("http://10.8.0.2:5252".to_string()), tailnet).as_deref(),
+            gateway_pairing_origin(Some("http://10.8.0.2:5252".to_string()), || None, tailnet)
+                .as_deref(),
             Some("https://mymac.tailnet-name.ts.net")
         );
         let plain = || Some("http://mymac.tailnet-name.ts.net:5252".to_string());
-        assert_eq!(gateway_pairing_origin(None, plain), None);
+        assert_eq!(gateway_pairing_origin(None, || None, plain), None);
         let external = Some("https://lucidos.example.com".to_string());
-        let origin = gateway_pairing_origin(external.clone(), || {
-            panic!("an https external address spares the tailnet probe")
-        });
-        assert_eq!(origin, external);
+        assert_eq!(
+            gateway_pairing_origin(external.clone(), UNASKED, UNASKED),
+            external
+        );
+    }
+
+    fn health_answer(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn the_served_origin_counts_once_it_answers_as_this_gateway() {
+        let served = answer_once(health_answer(r#"{"instance_id":"ours"}"#));
+        let base = answer_once(health_answer(&format!(
+            r#"{{"instance_id":"ours","tls":{{"https_origin":"{served}"}}}}"#
+        )));
+        let probe = gateway::probe_client().unwrap();
+        assert_eq!(gateway_https_origin(&probe, &base), Some(served));
+    }
+
+    #[test]
+    fn a_served_origin_that_another_gateway_answers_is_skipped() {
+        let served = answer_once(health_answer(r#"{"instance_id":"theirs"}"#));
+        let base = answer_once(health_answer(&format!(
+            r#"{{"instance_id":"ours","tls":{{"https_origin":"{served}"}}}}"#
+        )));
+        let probe = gateway::probe_client().unwrap();
+        assert_eq!(gateway_https_origin(&probe, &base), None);
+    }
+
+    #[test]
+    fn a_gateway_with_no_served_origin_has_no_rung() {
+        let base = answer_once(health_answer(
+            r#"{"instance_id":"ours","tls":{"source":"none","https_origin":null}}"#,
+        ));
+        let probe = gateway::probe_client().unwrap();
+        assert_eq!(gateway_https_origin(&probe, &base), None);
     }
 
     #[test]
@@ -535,6 +603,7 @@ mod tests {
     fn node(name: Option<&str>, https: bool) -> lucidos_tailscale::TailnetNode {
         lucidos_tailscale::TailnetNode {
             ipv4: std::net::Ipv4Addr::new(100, 70, 0, 1),
+            addresses: vec![std::net::Ipv4Addr::new(100, 70, 0, 1).into()],
             magic_dns_name: name.map(str::to_string),
             can_serve_https: https,
         }

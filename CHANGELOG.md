@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.54.0 — 2026-10-30
+
+### Added
+
+- Automatic HTTPS on a tailnet. When Tailscale or Headscale can certify the machine's name, the gateway gets the certificate from tailscaled, serves it on tailnet addresses and renews it daily. A plain `http://` tailnet address redirects to the secure name.
+- Settings > Access shows the gateway's HTTPS state: automatic via the tailnet, an operator certificate, or not available, with the reason.
+- `lucidos tls status` prints the certificate source, name and expiry.
+
+### Changed
+
+- The pairing QR code, the Connect URLs list and `lucidos pair` use the gateway's own HTTPS address when it has one.
+- On a plain-HTTP page, the enable-push toast names the gateway's HTTPS address.
+- The compose destination picker sits further from the prompt box.
+
+### Fixed
+
+- A swipe that starts on a link no longer opens it.
+- Every web link opens through Lucidos, never through the browser's own navigation. A web link written with backslashes opens as an absolute link.
+- The model picker in the composer stays in its place next to the action button.
+- The follow toggle's magnet is smaller and sits beside the down chevron.
+- Artifact list refreshes no longer freeze typing in the desktop app.
+- Lucidos asks for push permission only on the device where you turned push on.
+- A loopback engine accepts only a loopback Host, `*.localhost` excluded. This blocks DNS rebinding.
+- The agent cannot turn off email send confirmation, through its tools or over HTTP.
+- When two credentials claim the same environment variable name, Lucidos withholds that name from both.
+- The command guard refuses writes into git metadata, including through zsh, globs, `git -C`, `git --bare` and Python shell-outs.
+- `http_request` no longer writes a `temp_path` through a symlink. A `temp_path` that names a directory is refused, with a reason.
+- A handshake script path that could forge an approvals line is refused.
+- An image map in chat markdown shows as text, so its links cannot navigate the app.
 ## v0.53.1 - 2026-10-29
 
 ### Changed

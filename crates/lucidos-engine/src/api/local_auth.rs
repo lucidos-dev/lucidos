@@ -11,10 +11,17 @@
 
 //! # Why the bind decides whether the door is locked
 //!
-//! On a loopback bind, reaching the socket already proves the caller is a
-//! process on this machine, and the engine's whole contract rests on that. The
+//! On a loopback bind, reaching the socket BY A LOOPBACK NAME proves the
+//! caller is a local process. The engine's whole contract rests on that. The
 //! frontend, every app iframe, the CLI and both e2e suites call in freely.
 //! Locking that door would break all of them for nothing.
+//!
+//! The name matters because of DNS rebinding. A page on `attacker.example`
+//! whose DNS answer flips to `127.0.0.1` reaches this socket as its own origin.
+//! The browser then sends `Sec-Fetch-Site: same-origin`, which passes
+//! [`crate::api::browser_origin`]. Only its `Host` gives it away. So the open
+//! door still refuses, with 421, any `Host` or URI authority that is not a
+//! loopback IP literal or `localhost` (ADR 0601).
 //!
 //! A wide bind retires the premise. The caller may now be anyone on the LAN or
 //! the tailnet, and nothing else stands behind this. So the door locks, and the
@@ -78,7 +85,7 @@ pub enum EngineScope {
 /// value, whichever of the two booted first.
 #[derive(Debug, Clone)]
 pub struct EngineAuth {
-    /// False on a loopback bind, where reaching the socket is the proof.
+    /// False on a loopback bind, where reaching it by a loopback name is the proof.
     required: bool,
     local: Option<String>,
     hook_socket: Option<String>,
@@ -327,6 +334,52 @@ fn is_webhook_delivery_path(path: &str) -> bool {
     segments.next() == Some("deliver") && segments.next().is_none()
 }
 
+/// Is `host` a name that only this machine answers to?
+///
+/// `host` is the host part of an authority, port already removed, IPv6 still
+/// bracketed. Admitted: a loopback IP literal and `localhost`. A trailing root
+/// dot is refused rather than stripped: no loopback caller sends one, and
+/// refusing keeps the allowlist exact. `*.localhost` stays refused: a resolver
+/// that does not synthesize it forwards it to DNS, which can rebind it.
+fn is_loopback_host(host: &str) -> bool {
+    let literal: Option<std::net::IpAddr> =
+        match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            Some(v6) => v6.parse::<std::net::Ipv6Addr>().ok().map(Into::into),
+            None => host.parse::<std::net::Ipv4Addr>().ok().map(Into::into),
+        };
+    if let Some(ip) = literal {
+        return ip.to_canonical().is_loopback();
+    }
+    host.eq_ignore_ascii_case("localhost")
+}
+
+/// Does `authority` (a `Host` value or a URI authority) name this machine?
+fn is_loopback_authority(authority: &str) -> bool {
+    if authority.contains('@') {
+        return false;
+    }
+    authority
+        .parse::<axum::http::uri::Authority>()
+        .is_ok_and(|a| is_loopback_host(a.host()))
+}
+
+/// The first authority a request names that is not a loopback name.
+///
+/// Checks every `Host` header and the URI authority, which HTTP/2 and an
+/// absolute-form target carry. An absent `Host` names nothing: a browser always
+/// sends one, so only a non-browser client omits it.
+fn foreign_authority(req: &axum::extract::Request) -> Option<String> {
+    let hosts = req
+        .headers()
+        .get_all(axum::http::header::HOST)
+        .iter()
+        .map(|v| v.to_str().map_or_else(|_| format!("{v:?}"), str::to_string));
+    let uri = req.uri().authority().map(|a| a.as_str().to_string());
+    hosts
+        .chain(uri)
+        .find(|authority| !is_loopback_authority(authority))
+}
+
 /// Refuse a request that proved nothing, or that reached past its scope.
 ///
 /// Layered on the OUTERMOST router, so it runs before routing and before any
@@ -337,6 +390,18 @@ pub async fn enforce(
     next: axum::middleware::Next,
 ) -> Response {
     if !auth.is_required() {
+        if let Some(authority) = foreign_authority(&req) {
+            crate::log!(
+                "[API] refused {}: a loopback engine does not answer for host {authority:?}",
+                req.uri().path()
+            );
+            return (
+                StatusCode::MISDIRECTED_REQUEST,
+                "this engine answers only for a loopback host such as 127.0.0.1 or localhost. \
+                 Reach it through the Lucidos gateway, or bind it wide and present the local token",
+            )
+                .into_response();
+        }
         return next.run(req).await;
     }
     let path = req.uri().path();
@@ -587,6 +652,49 @@ mod tests {
         assert!(EngineAuth::locked_for_tests(Some("x"), None).is_required());
     }
 
+    #[test]
+    fn every_loopback_name_is_admitted_on_any_port() {
+        for authority in [
+            "127.0.0.1",
+            "127.0.0.1:5251",
+            "127.8.9.10:80",
+            "localhost",
+            "localhost:5173",
+            "LocalHost:5173",
+            "[::1]",
+            "[::FFFF:127.0.0.1]",
+            "[::1]:5251",
+            "[::ffff:127.0.0.1]:5251",
+        ] {
+            assert!(is_loopback_authority(authority), "{authority} must pass");
+        }
+    }
+
+    #[test]
+    fn a_look_alike_name_is_refused() {
+        for authority in [
+            "rebind.example",
+            "rebind.example:5251",
+            "localhost.attacker.example",
+            "127.0.0.1.attacker.example",
+            "attacker-localhost",
+            "app.localhost:5251",
+            "a.b.localhost",
+            "localhost.",
+            ".localhost",
+            "a..localhost",
+            "0.0.0.0:5251",
+            "[::]:5251",
+            "192.168.1.10:5251",
+            TAILNET,
+            "user@localhost",
+            "",
+            "local host",
+        ] {
+            assert!(!is_loopback_authority(authority), "{authority} must fail");
+        }
+    }
+
     // ── The middleware, driven through a router ─────────────────────────────
     //
     // The pure helpers above answer the policy. These answer whether axum
@@ -770,6 +878,87 @@ mod tests {
                 call(locked(), path, hdr).await,
                 StatusCode::FORBIDDEN,
                 "the hook socket token must not reach {path}"
+            );
+        }
+    }
+
+    /// What a DNS-rebound page sends: its own name, and a same-origin fetch.
+    const REBOUND: &[(&str, &str)] = &[
+        ("host", "rebind.example:5251"),
+        ("sec-fetch-site", "same-origin"),
+    ];
+
+    #[tokio::test]
+    async fn a_loopback_engine_refuses_a_rebound_page_on_every_mount() {
+        for path in MOUNTS.iter().chain(&["/api/v1/devices/register"]) {
+            assert_eq!(
+                call(EngineAuth::open_for_tests(), path, REBOUND).await,
+                StatusCode::MISDIRECTED_REQUEST,
+                "{path} must refuse a foreign Host on a loopback bind"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loopback_engine_admits_every_loopback_caller() {
+        for host in [
+            "127.0.0.1:5251",
+            "localhost:5251",
+            "[::1]:5251",
+            "localhost",
+        ] {
+            for path in MOUNTS {
+                assert_eq!(
+                    call(EngineAuth::open_for_tests(), path, &[("host", host)]).await,
+                    StatusCode::IM_A_TEAPOT,
+                    "{host} must reach {path}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_host_header_cannot_smuggle_a_foreign_name() {
+        let hdrs = &[("host", "localhost:5251"), ("host", "rebind.example:5251")];
+        assert_eq!(
+            call(EngineAuth::open_for_tests(), "/", hdrs).await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_uri_authority_is_refused_beside_a_loopback_host() {
+        // HTTP/2's `:authority` and an absolute-form target land in the URI.
+        let uri = "http://rebind.example:5251/api/v1/threads/list";
+        assert_eq!(
+            call(
+                EngineAuth::open_for_tests(),
+                uri,
+                &[("host", "127.0.0.1:5251")]
+            )
+            .await,
+            StatusCode::MISDIRECTED_REQUEST
+        );
+        let loopback_uri = "http://127.0.0.1:5251/api/v1/threads/list";
+        assert_eq!(
+            call(EngineAuth::open_for_tests(), loopback_uri, &[]).await,
+            StatusCode::IM_A_TEAPOT
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wide_engine_lets_the_credential_decide_whatever_the_host() {
+        let token = (local_token::HEADER_LOCAL_TOKEN, "local-secret");
+        for path in MOUNTS {
+            assert_eq!(
+                call(locked(), path, &[REBOUND[0], token]).await,
+                StatusCode::IM_A_TEAPOT,
+                "the token must reach {path} under any Host"
+            );
+            assert_eq!(
+                call(locked(), path, REBOUND).await,
+                StatusCode::UNAUTHORIZED,
+                "no credential stays a 401 at {path}, not a 421"
             );
         }
     }

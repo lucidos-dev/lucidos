@@ -13,7 +13,8 @@ import {
   drawsInitiatorPanel, exchangeEngineLimitDetail, exchangeKey, exchangeUserMessage, findCommandPermissionResolution, findMcpPermissionResolution,
   findPermissionResolution, findQuestionAnswer, isUserBubbleEvent, type Exchange,
 } from '../thread-events/exchange';
-import { exchangeError, exchangeResponseEvents } from '../thread-events/exchange-render';
+import { exchangeError } from '../thread-events/exchange-anchors';
+import { exchangeResponseEvents } from '../thread-events/exchange-render';
 import type { ThreadState } from '../thread-events/thread-meta';
 import type { ResponseEvent } from '../types';
 import type { SideQuestion } from '../sideQuestions';

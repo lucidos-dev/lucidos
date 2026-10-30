@@ -19,7 +19,7 @@
 
 /** The attribute an anchorable child is found by. A `.chat-exchange` root
  *  carries its turn's starter event id, and `stampedEventIds` in
- *  `store/thread-events/exchange-render.ts` is where that stamping rule is
+ *  `store/thread-events/exchange-anchors.ts` is where that stamping rule is
  *  declared. Sharing the attribute with the deep link is deliberate: both ask
  *  "which turn", so a second marker could only disagree.
  *

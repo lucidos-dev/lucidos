@@ -441,6 +441,25 @@ describe('loadArtifacts keeps the newest answer', () => {
     expect(artifacts.value).toEqual({ status: 'loaded', data: ['artifacts/a.md'] });
   });
 
+  // Every transcript message re-linkifies when the list changes identity, so an
+  // unchanged refresh must not wake them. Agent writes refresh in bursts.
+  it('keeps the loaded value when a refresh lists the same paths', async () => {
+    mockListArtifacts
+      .mockResolvedValueOnce({ artifacts: ['artifacts/a.md', 'artifacts/b.md'] })
+      .mockResolvedValueOnce({ artifacts: ['artifacts/a.md', 'artifacts/b.md'] })
+      .mockResolvedValueOnce({ artifacts: ['artifacts/a.md', 'artifacts/c.md'] });
+    const { artifacts } = await import('../store');
+    const { loadArtifacts } = await import('./artifacts');
+    await loadArtifacts();
+    const first = artifacts.value;
+
+    await loadArtifacts();
+    expect(artifacts.value).toBe(first);
+
+    await loadArtifacts();
+    expect(artifacts.value).toEqual({ status: 'loaded', data: ['artifacts/a.md', 'artifacts/c.md'] });
+  });
+
   it('leaves a list nobody asked for unfetched', async () => {
     mockListArtifacts.mockResolvedValue({ artifacts: [] });
     const { refreshArtifacts } = await import('./artifacts');
