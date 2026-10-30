@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import {
   marketplaceCatalog,
   marketplaceScanning,
@@ -24,6 +24,8 @@ import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 import { applyNavFocus } from '../shared/focusMarker';
 import { scrollBehavior } from '../../utils/motion';
 import { PluginDescription } from './PluginDescription';
+import { SectionHeader } from '../shared/SectionHeader';
+import { Disclosure } from '../shared/Disclosure';
 
 /** Jump to Settings → Marketplaces from anywhere. One call: `openSettingsSubview`
  *  lands the Settings panel and the sub-section together, so the jump is a single
@@ -301,6 +303,16 @@ export function StoreTab() {
   // The category pills show a view of the list, not a setting, so the choice
   // never reaches preferences. Same for the marketplace dropdown above.
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [collapsedSections, setCollapsedSections] = useState<ReadonlySet<PluginSectionId>>(new Set());
+  const unfoldedForTarget = useRef<string | null>(null);
+
+  function toggleSection(id: PluginSectionId) {
+    setCollapsedSections((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  }
 
   useEffect(() => {
     // Refresh both on mount (= each time the panel opens). The catalog gives
@@ -334,6 +346,14 @@ export function StoreTab() {
     // `data-plugin-id` anchors) only mount once StoreTabLoaded renders, which now
     // waits for both sources to settle.
     if (!target || !settled) return;
+    // A collapsed section hides the target's row, so unfold every section
+    // first. Clearing the set re-runs this effect, and the row is then there.
+    // Once per target: a fold the user makes while it waits must hold.
+    if (collapsedSections.size > 0 && unfoldedForTarget.current !== target) {
+      unfoldedForTarget.current = target;
+      setCollapsedSections(new Set());
+      return;
+    }
     const el = document.querySelector<HTMLElement>(`[data-plugin-id="${CSS.escape(target)}"]`);
     if (el) {
       el.scrollIntoView({ block: 'center', behavior: scrollBehavior() });
@@ -354,6 +374,7 @@ export function StoreTab() {
     installedOnly,
     pluginsMarketplaceFilter.value,
     selectedCategory,
+    collapsedSections,
   ]);
 
   async function stageInstall(plugin: MarketplacePlugin) {
@@ -386,6 +407,8 @@ export function StoreTab() {
             installingSource={installingSource}
             selectedCategory={selectedCategory}
             setSelectedCategory={setSelectedCategory}
+            collapsedSections={collapsedSections}
+            toggleSection={toggleSection}
             stageInstall={stageInstall}
           />
         ) : null}
@@ -399,12 +422,16 @@ function StoreTabLoaded({
   installingSource,
   selectedCategory,
   setSelectedCategory,
+  collapsedSections,
+  toggleSection,
   stageInstall,
 }: {
   installedOnly: boolean;
   installingSource: string | null;
   selectedCategory: string | null;
   setSelectedCategory: (c: string | null) => void;
+  collapsedSections: ReadonlySet<PluginSectionId>;
+  toggleSection: (id: PluginSectionId) => void;
   stageInstall: (plugin: MarketplacePlugin) => void;
 }) {
   const catLoadable = marketplaceCatalog.value;
@@ -498,17 +525,91 @@ function StoreTabLoaded({
           )}
         </div>
       ) : (
-        <div class="list-rows app-store-plugins">
-          {plugins.map((plugin) => (
-            <PluginStoreRow
-              plugin={plugin}
-              installingSource={installingSource}
-              stageInstall={stageInstall}
-              key={`${plugin.marketplace_id}-${plugin.id}`}
-            />
-          ))}
-        </div>
+        <PluginRowSections
+          plugins={plugins}
+          installedOnly={installedOnly}
+          collapsed={collapsedSections}
+          onToggle={toggleSection}
+          instant={!!pluginScrollTarget.value}
+          installingSource={installingSource}
+          stageInstall={stageInstall}
+        />
       )}
+    </div>
+  );
+}
+
+export type PluginSectionId = 'updates' | 'rest';
+
+/** The outdated plugins and the rest, each in catalog order. Pure + exported
+ *  for the unit test. */
+export function splitOutdated(plugins: MarketplacePlugin[]): {
+  updates: MarketplacePlugin[];
+  rest: MarketplacePlugin[];
+} {
+  const updates: MarketplacePlugin[] = [];
+  const rest: MarketplacePlugin[] = [];
+  for (const p of plugins) (p.status === 'update_available' ? updates : rest).push(p);
+  return { updates, rest };
+}
+
+/** The plugin rows, with the outdated ones first under "Updates available".
+ *  With nothing to update the headers roll away and the list reads as one.
+ *  `instant` skips the roll, so a deep link scrolls to a row at rest. */
+export function PluginRowSections({
+  plugins,
+  installedOnly,
+  collapsed,
+  onToggle,
+  instant = false,
+  installingSource,
+  stageInstall,
+}: {
+  plugins: MarketplacePlugin[];
+  installedOnly: boolean;
+  collapsed: ReadonlySet<PluginSectionId>;
+  onToggle: (id: PluginSectionId) => void;
+  instant?: boolean;
+  installingSource: string | null;
+  stageInstall: (plugin: MarketplacePlugin) => void;
+}) {
+  const { updates, rest } = splitOutdated(plugins);
+  // Each row box is a `list-rows` flex column too: the plugin row's focus
+  // marker sets vertical margins that must not collapse (pages.css).
+  const sectioned = updates.length > 0;
+  const rows = (list: MarketplacePlugin[]) =>
+    list.map((plugin) => (
+      <PluginStoreRow
+        plugin={plugin}
+        installingSource={installingSource}
+        stageInstall={stageInstall}
+        key={`${plugin.marketplace_id}-${plugin.id}`}
+      />
+    ));
+  return (
+    <div class="list-rows app-store-plugins">
+      <Disclosure open={sectioned} instant={instant}>
+        <SectionHeader
+          title="Updates available"
+          count={updates.length}
+          collapsed={collapsed.has('updates')}
+          onToggle={() => onToggle('updates')}
+        />
+        <Disclosure open={!collapsed.has('updates')} instant={instant} bodyClass="list-rows">
+          {rows(updates)}
+        </Disclosure>
+      </Disclosure>
+      <Disclosure open={sectioned && rest.length > 0} instant={instant}>
+        <SectionHeader
+          title={installedOnly ? 'Up to date' : 'All plugins'}
+          count={rest.length}
+          collapsed={collapsed.has('rest')}
+          onToggle={() => onToggle('rest')}
+        />
+      </Disclosure>
+      <Disclosure open={!sectioned || !collapsed.has('rest')} instant={instant} bodyClass="list-rows">
+        {rows(rest)}
+      </Disclosure>
     </div>
   );
 }

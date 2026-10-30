@@ -1,10 +1,12 @@
 //! Where the managed certificate comes from, how it is kept, and its renewal.
 //!
-//! The source ladder, first that works wins:
+//! The source ladder for the tailnet name, first that works wins:
 //!
-//! 1. An operator certificate (`LUCIDOS_TLS_CERT`/`KEY`). Nothing is fetched.
+//! 1. An operator certificate (`LUCIDOS_TLS_CERT`/`KEY`) a phone would accept
+//!    for that name ([`super::OperatorCert::serves`]). Nothing is fetched.
 //! 2. tailscaled, for the name it reports in `CertDomains`
 //!    ([`lucidos_tailscale::TailnetNode::https_name`]). Never a guessed name.
+//!    An operator certificate keeps serving every other name beside it.
 //! 3. None. The [`TlsState`] then says why, in one sentence for the user.
 //!
 //! A copy of the fetched pair lives in `<gateway data>/tls/`, owner-only, so a
@@ -20,7 +22,7 @@ use chrono::{DateTime, Utc};
 use lucidos_tailscale::{CertPair, TailnetNode, TailnetState};
 use serde::Serialize;
 
-use super::{expiry, CertStore};
+use super::{expiry, CertStore, OperatorCert};
 
 /// tailscaled renews well before expiry, so a daily fetch picks it up in time.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -46,15 +48,21 @@ pub enum TlsSource {
 
 /// What the gateway serves over TLS, and what went wrong last.
 ///
+/// `source` is what serves `name`, the tailnet name. An operator source with
+/// no name serves only the names its certificate covers.
+///
 /// `error` beside a `Tailnet` source is a problem with the last update, a
 /// failed renewal or a failed copy: the current certificate still serves.
-/// Beside `None` it is why there is no HTTPS.
+/// Beside `None`, or an operator source with no name, it is why the tailnet
+/// name has no HTTPS.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TlsState {
     pub source: TlsSource,
     pub name: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// An operator certificate serves every name but the tailnet one.
+    pub operator_serves_other_names: bool,
 }
 
 impl TlsState {
@@ -64,34 +72,37 @@ impl TlsState {
             name: None,
             expires_at: None,
             error: Some(reason.into()),
+            operator_serves_other_names: false,
         }
     }
 
-    pub fn operator(cert_pem: Option<&[u8]>) -> TlsState {
+    /// The operator certificate, serving no name the gateway knows of.
+    pub fn operator(cert: &OperatorCert) -> TlsState {
         TlsState {
             source: TlsSource::Operator,
             name: None,
-            expires_at: cert_pem.and_then(expiry::not_after),
+            expires_at: cert.expires_at,
             error: None,
+            operator_serves_other_names: false,
         }
     }
 
-    fn tailnet(name: &str, cert_pem: &[u8]) -> TlsState {
+    fn tailnet(name: &str, cert_pem: &[u8], operator_serves_other_names: bool) -> TlsState {
         TlsState {
             source: TlsSource::Tailnet,
             name: Some(name.to_string()),
             expires_at: expiry::not_after(cert_pem),
             error: None,
+            operator_serves_other_names,
         }
     }
 
-    /// The origin the managed certificate serves on `port`. An operator
-    /// certificate names no host the gateway knows, so it has none.
+    /// The origin the tailnet name serves on `port`, if a certificate serves it.
     pub fn https_origin(&self, port: u16) -> Option<String> {
         let name = self
             .name
             .as_deref()
-            .filter(|_| self.source == TlsSource::Tailnet)?;
+            .filter(|_| matches!(self.source, TlsSource::Operator | TlsSource::Tailnet))?;
         Some(match port {
             443 => format!("https://{name}"),
             _ => format!("https://{name}:{port}"),
@@ -150,6 +161,9 @@ pub fn tls_dir(gateway_data: &Path) -> PathBuf {
 pub enum Refreshed {
     /// A fresh certificate serves.
     Fresh,
+    /// The operator certificate serves the name until `expires_at`. Nothing
+    /// was fetched.
+    OperatorServes { expires_at: Option<DateTime<Utc>> },
     /// tailscaled reports no name it can certify. Nothing serves.
     NoName,
     /// The certificate request failed. A kept one may still serve.
@@ -157,16 +171,23 @@ pub enum Refreshed {
 }
 
 impl Refreshed {
-    fn next_wait(self) -> Duration {
+    /// An operator certificate is judged again just after it expires. The
+    /// tailnet name then moves to a tailnet certificate at once.
+    fn next_wait(self, now: DateTime<Utc>) -> Duration {
         match self {
             Refreshed::Fresh => REFRESH_INTERVAL,
+            Refreshed::OperatorServes { expires_at } => expires_at.map_or(REFRESH_INTERVAL, |at| {
+                let left = (at - now).to_std().unwrap_or(Duration::ZERO);
+                REFRESH_INTERVAL.min(left + Duration::from_secs(1))
+            }),
             Refreshed::NoName => NAME_RETRY_INTERVAL,
             Refreshed::RequestFailed => RETRY_INTERVAL,
         }
     }
 }
 
-/// Ask tailscaled for this node's name, then for that name's certificate.
+/// Ask tailscaled for this node's name, then for that name's certificate,
+/// unless the operator certificate already serves the name.
 ///
 /// The name decides what may serve. A certificate for any other name is
 /// withdrawn first, and the kept copy serves only when its name matches.
@@ -180,6 +201,21 @@ pub async fn refresh(store: &CertStore, tailnet: Arc<dyn Tailnet>, dir: &Path) -
             return Refreshed::NoName;
         }
     };
+    if !store.listens_on_any(&node.addresses) {
+        store.withdraw();
+        fail(store, unreachable_reason(&store.listeners(), &node));
+        return Refreshed::NoName;
+    }
+    if let Some(operator) = store.operator().filter(|o| o.serves(&node.name)) {
+        store.withdraw();
+        store.record(TlsState {
+            name: Some(node.name),
+            ..TlsState::operator(&operator)
+        });
+        return Refreshed::OperatorServes {
+            expires_at: operator.expires_at,
+        };
+    }
     if store.current().is_some_and(|cert| cert.name != node.name) {
         store.withdraw();
     }
@@ -203,12 +239,16 @@ pub async fn refresh(store: &CertStore, tailnet: Arc<dyn Tailnet>, dir: &Path) -
     }
 }
 
-/// Refresh now, then daily, or sooner while failing. Runs until the process ends.
+/// Refresh now, then daily, or sooner while failing or when a listener comes
+/// or goes. Runs until the process ends.
 pub fn spawn_refresh(store: Arc<CertStore>, tailnet: Arc<dyn Tailnet>, dir: PathBuf) {
     tokio::spawn(async move {
         loop {
             let refreshed = refresh(&store, tailnet.clone(), &dir).await;
-            tokio::time::sleep(refreshed.next_wait()).await;
+            tokio::select! {
+                () = tokio::time::sleep(refreshed.next_wait(Utc::now())) => {}
+                () = store.listeners_changed() => {}
+            }
         }
     });
 }
@@ -256,6 +296,28 @@ fn certifiable_name(node: &TailnetNode) -> Result<String, String> {
     })
 }
 
+fn unreachable_reason(listeners: &[IpAddr], node: &Certifiable) -> String {
+    let list = |addresses: &[IpAddr]| {
+        addresses
+            .iter()
+            .map(IpAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let listening = match listeners {
+        [] => "The gateway has not bound a tailnet address of this machine yet".to_string(),
+        _ => format!(
+            "The gateway listens on {}, and none of them is a tailnet address of this machine",
+            list(listeners)
+        ),
+    };
+    format!(
+        "{listening} ({}). A certificate for {} would serve nothing, so the gateway asks for none.",
+        list(&node.addresses),
+        node.name
+    )
+}
+
 /// Serve the copy a previous run kept, if it is for `name` and unexpired.
 async fn serve_copy(store: &CertStore, dir: &Path, name: &str) {
     let read = |file| std::fs::read(dir.join(file));
@@ -268,7 +330,7 @@ async fn serve_copy(store: &CertStore, dir: &Path, name: &str) {
     if expiry::not_after(&cert).is_some_and(|at| at <= Utc::now()) {
         return;
     }
-    let state = TlsState::tailnet(name, &cert);
+    let state = TlsState::tailnet(name, &cert, store.operator().is_some());
     match store.install(name, cert, key).await {
         Ok(()) => store.record(state),
         Err(e) => crate::log!(
@@ -279,7 +341,7 @@ async fn serve_copy(store: &CertStore, dir: &Path, name: &str) {
 }
 
 async fn install(store: &CertStore, dir: &Path, name: &str, pair: CertPair) -> bool {
-    let mut state = TlsState::tailnet(name, &pair.cert_pem);
+    let mut state = TlsState::tailnet(name, &pair.cert_pem, store.operator().is_some());
     if let Err(e) = store
         .install(name, pair.cert_pem.clone(), pair.key_pem.clone())
         .await
@@ -311,7 +373,7 @@ fn fail(store: &CertStore, reason: String) {
             ..store.state()
         }
     } else {
-        TlsState::none(reason)
+        store.without_tailnet(reason)
     };
     store.record(state);
 }

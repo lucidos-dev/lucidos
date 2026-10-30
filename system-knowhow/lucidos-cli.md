@@ -2482,6 +2482,10 @@ lucidos tls status --port 5300  # one gateway of two.
 - **Three answers.** Your own certificate (`LUCIDOS_TLS_CERT`), a *managed
   certificate* from your tailnet with the address to open, or none with the
   reason. A failed update says so, while the current certificate still serves.
+- **Both at once.** Your own certificate may not satisfy a phone on the tailnet
+  name. Then that name gets a managed certificate, and every other name keeps
+  yours. The output says which serves what. When the tailnet name gets neither,
+  it says why.
 - **Local only.** It reads `GET /~/api/v1/control/tls` with the local token, so
   run it on the gateway's machine. A paired device sees the same on Settings →
   Access.

@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.55.0 — 2026-10-30
+
+### Added
+
+- The Mac app's View menu has a Show/Hide item for each pane: Thread Drawer, Thread Pane, Content Pane and Dashboard. Each item shows its keyboard shortcut, and a pane with no room is greyed out.
+
+### Changed
+
+- The Plugins list puts outdated plugins first, under an "Updates available" header, and the Update button is green.
+
+### Fixed
+
+- The pairing QR code uses HTTPS when Tailscale serve reaches the gateway over HTTPS.
+- The pairing QR code never offers an HTTPS address the gateway has not verified.
+- With an operator certificate that a phone does not trust on the tailnet name, the gateway also serves the tailnet certificate on that name.
+- The gateway asks for a tailnet certificate only when it listens on a tailnet address.
+- An expired operator certificate is checked again, so the tailnet certificate takes over.
+- Settings > Access shows whether the operator certificate covers the tailnet name.
+- What's New loads the changelog again after an update restart, and offers Retry when it fails. A failed reload keeps the list already shown.
+- A plugin section you collapse stays collapsed.
 ## v0.54.0 — 2026-10-30
 
 ### Added

@@ -99,11 +99,16 @@ where
 
 /// A client that trusts only `pem` and reaches [`NAME`] on loopback.
 fn client_trusting(pem: &Pem, port: u16) -> reqwest::Client {
+    client_for(pem, NAME, port)
+}
+
+/// A client that trusts only `pem` and reaches `name` on loopback.
+fn client_for(pem: &Pem, name: &str, port: u16) -> reqwest::Client {
     reqwest::Client::builder()
         .use_rustls_tls()
         .tls_built_in_root_certs(false)
         .add_root_certificate(reqwest::Certificate::from_pem(&pem.cert).unwrap())
-        .resolve(NAME, SocketAddr::from(([127, 0, 0, 1], port)))
+        .resolve(name, SocketAddr::from(([127, 0, 0, 1], port)))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
@@ -258,13 +263,43 @@ async fn an_operator_cert_serves_tls_on_loopback_too() {
     let config = RustlsConfig::from_pem(pem.cert.clone(), pem.key.clone())
         .await
         .unwrap();
-    let port = serve(GatewayAcceptor::new(ListenerTls::Operator(config))).await;
+    let port = serve(GatewayAcceptor::new(ListenerTls::Operator(
+        config,
+        Arc::default(),
+    )))
+    .await;
     let response = client_trusting(&pem, port)
         .get(format!("https://{NAME}:{port}/"))
         .send()
         .await
         .unwrap();
     assert_eq!(body(response).await, "Tls");
+}
+
+/// An operator certificate that does not cover the tailnet name serves every
+/// other name. The tailnet name gets the managed certificate.
+#[tokio::test]
+async fn an_operator_listener_picks_the_certificate_by_name() {
+    const OPERATOR_NAME: &str = "gateway.example";
+    let managed = mint(NAME);
+    let operator = mint(OPERATOR_NAME);
+    let config = RustlsConfig::from_pem(operator.cert.clone(), operator.key.clone())
+        .await
+        .unwrap();
+    let store = store_holding(&managed).await;
+    let port = serve(RemoteAcceptor(ListenerTls::Operator(config, store))).await;
+    let tailnet = client_for(&managed, NAME, port)
+        .get(format!("https://{NAME}:{port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body(tailnet).await, "Tls");
+    let other = client_for(&operator, OPERATOR_NAME, port)
+        .get(format!("https://{OPERATOR_NAME}:{port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body(other).await, "Tls");
 }
 
 #[tokio::test]

@@ -369,6 +369,27 @@ export function toggleSplitFromDivider(): void {
   if (focusedPane.value !== 'content') focusPaneAndControl('content');
 }
 
+/** Show or hide the thread pane, with no focus stage: the View menu's item.
+ *  Desktop only. */
+export function showOrHideThreadPane(): void {
+  setSplitRatio(toggleThreadPaneRatio(drawnSplitRatio.value));
+  moveMarkerOffHiddenPane();
+}
+
+/** Mirror of `showOrHideThreadPane` for the content pane. */
+export function showOrHideContentPane(): void {
+  setSplitRatio(toggleContentPaneRatio(drawnSplitRatio.value, splitFitsBoth()));
+  moveMarkerOffHiddenPane();
+}
+
+/** Reads the split as drawn, because showing one pane in a window too narrow
+ *  for both hides the other. A marker left on a hidden pane turns Tab dead. */
+function moveMarkerOffHiddenPane(): void {
+  const ratio = drawnSplitRatio.value;
+  if (ratio === 0 && focusedPane.value !== 'content') focusPaneAndControl('content');
+  else if (ratio >= 1 && focusedPane.value === 'content') focusPaneAndControl('thread');
+}
+
 /** Collapse/expand the thread pane with two-stage focus → hide. Desktop: a
  *  collapsed pane expands to DEFAULT_SPLIT_RATIO and takes focus; a
  *  visible-but-unfocused pane just takes focus; a focused, visible pane

@@ -4823,6 +4823,7 @@ dependencies = [
  "tower",
  "tower-http",
  "urlencoding",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]

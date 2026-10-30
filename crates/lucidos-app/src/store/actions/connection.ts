@@ -13,6 +13,7 @@ import { loadThreadQueue } from './threadQueue';
 import { resyncPluginCatalog } from './plugin-marketplaces';
 import { loadPreferences } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
+import { reloadChangelogIfRead } from './whatsNew';
 import { releaseNoticeDismissed } from '../releaseNotices';
 import { flushUndeliveredComposeDrafts } from './compose';
 import { isNewerVersion } from '../../utils/version';
@@ -232,6 +233,9 @@ function runResumeSync(): void {
   // a notice, never when a new one arrives. So an upgraded workspace showed
   // nothing until the reader opened the What's New page by hand.
   void loadReleaseNotices();
+  // The changelog the engine serves follows its release too, and What's New
+  // opened during the restart holds a failed read.
+  void reloadChangelogIfRead();
   // Re-send any compose draft the engine never received. Paired with the same
   // flush in `startClient`'s onResume, and needed separately from it: this path
   // runs on a reconnect the 5s health poll notices with no wake at all (a

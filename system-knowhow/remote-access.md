@@ -245,12 +245,21 @@ issues certificates. It asks tailscaled for this machine's certificate, so
 nobody installs anything and the user sees no setup step. This is a *managed
 certificate* (ADR 0600). The gateway picks the first of these that works:
 
-1. **Your own certificate**: `LUCIDOS_TLS_CERT`/`KEY` (Route C). Always wins.
+1. **Your own certificate**: `LUCIDOS_TLS_CERT`/`KEY` (Route C), when a phone
+   would accept it for the tailnet name. It must cover that name, be in date,
+   and chain to a public root (Mozilla's set). Nothing is fetched then.
 2. **Your tailnet's**: when tailscaled reports `CertDomains` for this machine,
    the gateway fetches the certificate for the first name. It refreshes it
    daily and swaps it in with no restart. A failed refresh keeps the current
    one until it expires, but only while tailscaled still reports that name.
 3. **None**: other devices stay on plain HTTP, and the gateway states why.
+
+**Your own certificate and the tailnet's can serve side by side.** An mkcert
+certificate chains to a private CA, and one made before a tailnet move names
+the old address. Either way a phone refuses it for the tailnet name. The
+gateway then serves each connection by the name the client asks for (SNI): the
+tailnet name gets the tailnet certificate, every other name your own.
+`lucidos tls status` says which certificate serves which name.
 
 What the tailnet admin must enable (the agent cannot):
 
@@ -270,6 +279,10 @@ Things to know:
 - **Only the tailnet addresses get HTTPS.** Loopback stays plain HTTP, so the
   desktop window and `tailscale serve` keep working. So do the LAN and other
   VPNs: their devices could not resolve the tailnet name anyway.
+- **A gateway bound to a LAN address only gets no certificate.** The gateway
+  asks for one only while it listens on a tailnet address of this machine, or
+  on every address. Otherwise the HTTPS row says why, and no QR names a dead
+  `https://` origin.
 - **Old `http://` tailnet addresses still work.** Plain HTTP to a tailnet
   address gets a redirect to `https://<tailnet name>:<port>`. An old QR or
   bookmark lands on the secure origin.
@@ -859,12 +872,13 @@ it on another device.
 
 **`workspace_serve_url` is verified end to end, never inferred from a
 listener.** With two gateways (443 fronting 5252, 8443 fronting 5251), a live
-443 can belong to one that has never heard of this slug. So the engine fetches
-the candidate URL's own `api/v1/health`, with TLS validated, and compares the
-reported `workspace_path` with its own. A same-named workspace on the other
-gateway lives at a different path, so a match is proof. No candidate is probed
-unless Tailscale can issue a certificate for the name (`CertDomains`), and every
-probe is bounded.
+443 can belong to one that has never heard of this slug. So the engine reads
+its own gateway's `instance_id` from `/~/api/v1/health` over loopback. It then
+fetches the same public path at the candidate origin, with TLS validated, and
+publishes the URL only when the ids match. That gateway launched this engine
+under the slug, so a match is proof. The probe presents no credential: a serve
+route can proxy anywhere (ADR 0602). No candidate is probed unless Tailscale can
+issue a certificate for the name (`CertDomains`), and every probe is bounded.
 
 It is a separate route from `network-config` on purpose: the bind editor
 fetches that one too, and must not pay for asking Tailscale and a round trip.
@@ -985,8 +999,9 @@ The Access page applies this rule with two different probes:
   claims serving only once **port 443 on the tailnet address** has a listener.
   That proves a listener, not a working certificate, so the row can show while
   a first-run cert still provisions.
-- The **Connect URLs Tailscale row** needs the candidate URL's own
-  `api/v1/health` to answer over validated TLS (§ The tailnet-status endpoint).
+- The **Connect URLs Tailscale row** needs this gateway's own public health to
+  answer at the candidate origin over validated TLS (§ The tailnet-status
+  endpoint).
   Until then it shows the plain-HTTP tailnet address.
 
 Neither asks `tailscale serve status`. That answers "does *a* serve mapping

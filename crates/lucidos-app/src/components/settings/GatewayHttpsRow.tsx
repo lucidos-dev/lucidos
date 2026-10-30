@@ -11,9 +11,13 @@ import { SkText, SkeletonProvider } from '../shared/Skeleton';
  *  plain HTTP with no stated reason is the failure this row exists to stop. */
 export function gatewayHttpsSummary(tls: GatewayTls): { title: string; detail: string } {
   if (tls.source === 'operator') {
+    const tailnet =
+      tls.https_origin !== null
+        ? ` It covers your tailnet name too, so other devices open ${tls.https_origin}.`
+        : ` Your tailnet name gets no HTTPS: ${tls.error ?? 'the gateway gave no reason.'}`;
     return {
       title: 'HTTPS: your own certificate',
-      detail: 'LUCIDOS_TLS_CERT names the certificate, so every address serves HTTPS.',
+      detail: `LUCIDOS_TLS_CERT names the certificate, so every address serves HTTPS.${tailnet}`,
     };
   }
   if (tls.source === 'tailnet' && tls.https_origin !== null) {
@@ -21,9 +25,12 @@ export function gatewayHttpsSummary(tls: GatewayTls): { title: string; detail: s
     const renewal = tls.error
       ? ` The last certificate update hit a problem, and the current certificate still serves: ${tls.error}`
       : ' It renews on its own.';
+    const beside = tls.operator_serves_other_names
+      ? ' Every other name gets the certificate LUCIDOS_TLS_CERT names, which a phone would not accept here.'
+      : '';
     return {
       title: 'HTTPS: automatic via your tailnet',
-      detail: `Other devices open ${tls.https_origin} with a certificate your tailnet issues.${valid}${renewal}`,
+      detail: `Other devices open ${tls.https_origin} with a certificate your tailnet issues.${valid}${renewal}${beside}`,
     };
   }
   return {

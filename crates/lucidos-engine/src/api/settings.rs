@@ -1338,8 +1338,8 @@ pub(super) struct TailnetStatusResponse {
     /// The MagicDNS name Tailscale reports, no scheme. `None` off a tailnet,
     /// and `None` while MagicDNS is off, which does not mean offline.
     magic_dns_name: Option<String>,
-    /// The `https://<name>[:<port>]/<slug>/` URL, set **only** once a request
-    /// to it was answered by this very engine. The port is present whenever the
+    /// The `https://<name>[:<port>]/<slug>/` URL, set **only** once its origin
+    /// was answered by this engine's own gateway. The port is present whenever the
     /// serve route is not on 443. See [`get_tailnet_status`] for why a listener
     /// is not enough to publish it.
     workspace_serve_url: Option<String>,
@@ -1362,15 +1362,13 @@ pub(super) struct TailnetStatusResponse {
 /// address that gateway has a real certificate for.
 ///
 /// Publishing that URL would hand the user a link to somebody else's
-/// workspace. So we fetch our own `health` through the candidate URL and
-/// compare `workspace_path` with ours. A same-named workspace on the other
-/// gateway lives at a different path.
+/// workspace. So we ask the candidate origin for the gateway's public health
+/// and compare its `instance_id` with our own gateway's. That gateway spawned
+/// this engine under the slug, so reaching it reaches this workspace.
 ///
 /// No candidate at all unless Tailscale can issue a certificate for the name
 /// (`CertDomains`). Every probe here is bounded: this answers a settings pane.
-pub(super) async fn get_tailnet_status(
-    State(state): State<AppState>,
-) -> Json<TailnetStatusResponse> {
+pub(super) async fn get_tailnet_status() -> Json<TailnetStatusResponse> {
     if let Some(fresh) = cached_tailnet_status() {
         return Json(fresh);
     }
@@ -1381,11 +1379,14 @@ pub(super) async fn get_tailnet_status(
     let workspace_serve_url = match (
         node.and_then(|n| n.https_name()),
         super::base_path::workspace_id(),
+        super::base_path::gateway_port(),
     ) {
-        // No certifiable name, or no slug: there is no candidate URL to verify.
-        // A slugless engine is the direct-port dev mode, which no gateway path
-        // addresses.
-        (Some(name), Some(slug)) => verified_workspace_serve_url(name, &slug, &state).await,
+        // No certifiable name, or no gateway: there is no candidate URL to
+        // verify. A slugless engine is the direct-port dev mode, which no
+        // gateway path addresses.
+        (Some(name), Some(slug), Some(gateway_port)) => {
+            verified_workspace_serve_url(name, &slug, &gateway_port).await
+        }
         _ => None,
     };
     let answer = TailnetStatusResponse {
@@ -1422,50 +1423,54 @@ fn lock_tailnet_cache(
 /// home-screen app that address is what makes a pairing survive a relaunch.
 const SERVE_PORTS: [u16; 3] = [443, 8443, 10000];
 
-/// Pure: the URL a serve route on `port` would publish for this workspace.
+/// Bound on each loopback attempt to read our own gateway's identity.
+const OWN_GATEWAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Pure: the origin a serve route on `port` would publish.
 ///
 /// 443 keeps the bare form, because that is the address a person retypes and
 /// every existing install already prints.
-fn serve_candidate_url(magic_dns_name: &str, slug: &str, port: u16) -> String {
+fn serve_origin(magic_dns_name: &str, port: u16) -> String {
     match port {
-        443 => format!("https://{magic_dns_name}/{slug}/"),
-        p => format!("https://{magic_dns_name}:{p}/{slug}/"),
+        443 => format!("https://{magic_dns_name}"),
+        p => format!("https://{magic_dns_name}:{p}"),
     }
 }
 
-/// The first candidate URL this engine itself answers at, or `None`.
+/// Pure: the URL a serve route on `port` would publish for this workspace.
+fn serve_candidate_url(magic_dns_name: &str, slug: &str, port: u16) -> String {
+    format!("{}/{slug}/", serve_origin(magic_dns_name, port))
+}
+
+/// The first candidate URL whose origin our own gateway answers at, or `None`.
 ///
 /// Every port is probed at once, so the wait is one round trip rather than one
 /// per candidate, and the preference order decides ties.
 ///
 /// `https` is hardcoded here, and that is not the intra-host scheme question
 /// `.claude/rules/rust.md` governs. This is the tailnet endpoint `tailscale
-/// serve` publishes, and it is HTTPS by construction. TLS is validated
-/// normally for the same reason. Tailscale issues a real certificate for a
-/// `.ts.net` name, and accepting an invalid one would throw away the proof
-/// this function exists to produce.
+/// serve` publishes, and it is HTTPS by construction.
 async fn verified_workspace_serve_url(
     magic_dns_name: &str,
     slug: &str,
-    state: &AppState,
+    gateway_port: &str,
 ) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(SERVE_VERIFY_TIMEOUT)
-        // A system proxy has no business intercepting a tailnet hop, and would
-        // answer for a host it cannot reach.
-        .no_proxy()
-        // The candidate URL is exact, so there is nowhere legitimate to follow.
-        // Left at the default, a hostile responder could bounce this probe at
-        // `127.0.0.1` and make us reach a host it cannot.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .ok()?;
-    let own_path = state.workspace_path.to_string_lossy().into_owned();
+    let Some(ours) = own_gateway_instance(gateway_port).await else {
+        crate::log!(
+            "[TailnetStatus] gateway on :{} did not name its instance; no serve URL is published",
+            gateway_port
+        );
+        return None;
+    };
+    let client = tailnet_probe_client()?;
     let probe = |port| {
-        let url = serve_candidate_url(magic_dns_name, slug, port);
         let client = &client;
-        let own_path = &own_path;
-        async move { serve_url_reaches_us(client, url, own_path).await }
+        let ours = &ours;
+        async move {
+            reaches_our_gateway(client, &serve_origin(magic_dns_name, port), ours)
+                .await
+                .then(|| serve_candidate_url(magic_dns_name, slug, port))
+        }
     };
     let (first, second, third) = tokio::join!(
         probe(SERVE_PORTS[0]),
@@ -1475,38 +1480,65 @@ async fn verified_workspace_serve_url(
     [first, second, third].into_iter().flatten().next()
 }
 
-/// `url` back, once this engine has answered its own `health` through it.
-async fn serve_url_reaches_us(
-    client: &reqwest::Client,
-    url: String,
-    own_workspace_path: &str,
-) -> Option<String> {
-    let response = client
-        .get(format!("{url}api/v1/health"))
-        .send()
-        .await
-        .ok()?;
+/// The client for every tailnet probe. It validates TLS and carries no
+/// credential: a serve route can proxy anywhere, so a secret sent before the
+/// proof would go to whoever answers (ADR 0602).
+fn tailnet_probe_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(SERVE_VERIFY_TIMEOUT)
+        // A system proxy has no business intercepting a tailnet hop, and would
+        // answer for a host it cannot reach.
+        .no_proxy()
+        // The candidate URL is exact, so there is nowhere legitimate to follow.
+        // Left at the default, a hostile responder could bounce this probe at
+        // `127.0.0.1` and make us reach a host it cannot.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
+}
+
+/// Does the gateway answering at `origin` carry our gateway's `instance_id`?
+async fn reaches_our_gateway(client: &reqwest::Client, origin: &str, ours: &str) -> bool {
+    gateway_instance(client, origin).await.as_deref() == Some(ours)
+}
+
+/// The `instance_id` in the public gateway health at `origin`, or `None`.
+async fn gateway_instance(client: &reqwest::Client, origin: &str) -> Option<String> {
+    let path = lucidos_gateway_constants::GATEWAY_HEALTH_PATH;
+    let response = client.get(format!("{origin}{path}")).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
-    let body = response.text().await.ok()?;
-    health_names_this_workspace(&body, own_workspace_path).then_some(url)
+    instance_id_of(&response.text().await.ok()?)
 }
 
-/// Pure: does this `health` body prove the probe reached THIS engine?
-///
-/// `workspace_path` is the discriminator rather than `workspace`, which is only
-/// the directory name and collides across gateways by design. Anything we
-/// cannot parse is a no: an unverified URL is never published.
-fn health_names_this_workspace(body: &str, own_workspace_path: &str) -> bool {
+/// Pure: the `instance_id` a gateway health body names. Anything we cannot
+/// parse is `None`, so an unverified URL is never published.
+fn instance_id_of(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("workspace_path")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .is_some_and(|path| path == own_workspace_path)
+        .ok()?
+        .get("instance_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Our own gateway's `instance_id`, read over loopback. Health is public, so
+/// this hop presents no credential either.
+async fn own_gateway_instance(gateway_port: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(OWN_GATEWAY_TIMEOUT)
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .ok()?;
+    for scheme in crate::net_config::peer_scheme_order() {
+        let origin = format!("{scheme}://127.0.0.1:{gateway_port}");
+        if let Some(id) = gateway_instance(&client, &origin).await {
+            return Some(id);
+        }
+    }
+    None
 }
 
 // ===== Pinned App UIs Endpoints =====
@@ -2104,56 +2136,114 @@ pub(super) fn router() -> Router<AppState> {
 mod tailnet_status_tests {
     use super::*;
 
-    /// A `health` body shaped like the real one, for a given workspace path.
-    fn health_body(workspace_path: &str) -> String {
+    use axum::http::StatusCode;
+    use axum::routing::any;
+
+    /// A public gateway health body naming `instance_id`.
+    fn gateway_health(instance_id: &str) -> String {
         serde_json::json!({
             "status": "ok",
-            "workspace": "dev",
-            "workspace_path": workspace_path,
-            "database_reachable": true,
+            "role": "gateway",
+            "instance_id": instance_id,
         })
         .to_string()
     }
 
-    #[test]
-    fn the_url_publishes_only_when_our_own_engine_answered() {
-        let own = "/Users/me/workspaces/dev";
-        assert!(health_names_this_workspace(&health_body(own), own));
+    /// A plain-HTTP stand-in for an authenticating gateway on loopback. Like
+    /// `auth_api::enforce`, it answers 401 to every path an unpaired caller
+    /// asks for, except the public gateway health, which answers `health`.
+    async fn stand_in_gateway(health: String) -> String {
+        let app = Router::<()>::new()
+            .route(
+                lucidos_gateway_constants::GATEWAY_HEALTH_PATH,
+                get(move || async move { (StatusCode::OK, health) }),
+            )
+            .fallback(any(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "this device is not paired with Lucidos",
+                )
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn client() -> reqwest::Client {
+        tailnet_probe_client().expect("the probe client builds")
+    }
+
+    #[tokio::test]
+    async fn an_authenticating_gateway_still_proves_it_is_ours() {
+        // The regression: the gateway 401s the workspace health to an unpaired
+        // caller, so the old workspace-path proof never passed again. The
+        // public gateway health still answers, and its id is the proof.
+        let origin = stand_in_gateway(gateway_health("ours")).await;
+        let refused = client()
+            .get(format!("{origin}/dev/api/v1/health"))
+            .send()
+            .await
+            .expect("the stand-in answers");
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        assert!(reaches_our_gateway(&client(), &origin, "ours").await);
+    }
+
+    #[tokio::test]
+    async fn another_gateway_is_never_ours() {
+        // A two-gateway machine: the 443 route fronts the other gateway.
+        let origin = stand_in_gateway(gateway_health("theirs")).await;
+        assert!(!reaches_our_gateway(&client(), &origin, "ours").await);
+    }
+
+    #[tokio::test]
+    async fn a_health_without_an_id_or_unreadable_is_never_ours() {
+        for body in [
+            r#"{"status":"ok","role":"gateway"}"#.to_string(),
+            "<html>not found</html>".to_string(),
+            gateway_health(""),
+        ] {
+            let origin = stand_in_gateway(body.clone()).await;
+            assert!(
+                !reaches_our_gateway(&client(), &origin, "ours").await,
+                "body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_answering_is_never_ours() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let origin = format!("http://127.0.0.1:{port}");
+        assert!(!reaches_our_gateway(&client(), &origin, "ours").await);
+    }
+
+    #[tokio::test]
+    async fn our_own_gateway_names_its_instance_over_loopback() {
+        // Plain HTTP, so a run with TLS configured must fall through to the
+        // second scheme in `peer_scheme_order` to reach it.
+        let origin = stand_in_gateway(gateway_health("ours")).await;
+        let port = origin.rsplit(':').next().expect("a port");
+        assert_eq!(own_gateway_instance(port).await.as_deref(), Some("ours"));
     }
 
     #[test]
-    fn a_same_named_workspace_on_another_gateway_is_rejected() {
-        // The failure this whole verification exists for. Two gateways can each
-        // hold a workspace whose slug is `dev`, and only one of them is us.
-        // They differ by path, which is why the path is the discriminator.
-        let body = health_body("/Users/me/other-checkout/workspaces/dev");
-        assert!(!health_names_this_workspace(
-            &body,
-            "/Users/me/workspaces/dev"
-        ));
-    }
-
-    #[test]
-    fn a_body_we_cannot_read_is_never_a_match() {
-        // Anything unparseable is a no: an unverified URL is never published.
-        // A 404 page from a gateway that does not know this slug lands here.
-        let own = "/Users/me/workspaces/dev";
-        assert!(!health_names_this_workspace("<html>not found</html>", own));
-        assert!(!health_names_this_workspace("", own));
-        assert!(!health_names_this_workspace("{}", own));
-        assert!(!health_names_this_workspace(
-            r#"{"workspace_path": 42}"#,
-            own
-        ));
-    }
-
-    #[test]
-    fn the_directory_name_alone_does_not_prove_identity() {
-        // `workspace` is only the last path segment, so it collides across
-        // gateways by design. Reading it instead of `workspace_path` would
-        // accept the very case the test above rejects.
-        let body = health_body("/Users/me/other-checkout/workspaces/dev");
-        assert!(!health_names_this_workspace(&body, "dev"));
+    fn an_id_is_read_only_from_a_gateway_health_body() {
+        assert_eq!(
+            instance_id_of(&gateway_health("abc")).as_deref(),
+            Some("abc")
+        );
+        for body in ["", "{}", r#"{"instance_id": 42}"#, r#"{"instance_id": ""}"#] {
+            assert_eq!(instance_id_of(body), None, "body: {body}");
+        }
     }
 
     #[test]
@@ -2190,21 +2280,36 @@ mod tailnet_status_tests {
     }
 
     #[test]
-    fn the_verification_probe_never_disables_certificate_checking() {
+    fn the_tailnet_probe_validates_tls_and_presents_no_credential() {
         // Tailscale issues a real certificate for a `.ts.net` name, so there is
-        // nothing to work around. Accepting an invalid one would throw away the
-        // proof `verified_workspace_serve_url` exists to produce, and the
-        // loopback carve-out in `.claude/rules/rust.md` does not reach here.
+        // nothing to work around, and the loopback carve-out in
+        // `.claude/rules/rust.md` does not reach here. A serve route can proxy
+        // anywhere, so a credential would go to whoever answers (ADR 0602).
         let source = include_str!("settings.rs");
-        let start = source
-            .find("async fn verified_workspace_serve_url")
-            .expect("the prober must exist");
-        let body = &source[start..];
-        let end = body.find("\n}\n").expect("the prober must end");
-        assert!(
-            !body[..end].contains("danger_accept_invalid_certs"),
-            "the tailnet verification probe must validate TLS"
-        );
+        let tailnet_probe = [
+            "async fn verified_workspace_serve_url",
+            "fn tailnet_probe_client",
+            "async fn reaches_our_gateway",
+            "async fn gateway_instance(",
+        ];
+        let forbidden = [
+            "danger_accept_invalid_certs",
+            "HEADER_LOCAL_TOKEN",
+            "gateway_auth",
+            "default_headers",
+            "bearer_auth",
+        ];
+        for signature in tailnet_probe {
+            let start = source.find(signature).expect("the prober must exist");
+            let body = &source[start..];
+            let end = body.find("\n}\n").expect("the prober must end");
+            for word in forbidden {
+                assert!(
+                    !body[..end].contains(word),
+                    "`{signature}` must not use `{word}`"
+                );
+            }
+        }
     }
 }
 

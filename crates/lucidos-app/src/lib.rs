@@ -34,6 +34,7 @@ mod preview_undo;
 mod traffic_lights;
 mod update_relay;
 mod updater;
+mod view_menu;
 /// The displays attached right now, and the windows a change to them strands.
 mod window_desk;
 mod window_persist;
@@ -1013,6 +1014,7 @@ pub fn run() {
         .manage(mobile::MobileAccessRuns::default())
         .manage(desktop::StartupStatus::default())
         .manage(DockBadgeNudge(Mutex::new(dock_badge_nudge_tx)))
+        .manage(view_menu::ViewMenu::default())
         .invoke_handler(tauri::generate_handler![
             panel_preview::create_panel_webview,
             panel_preview::navigate_panel_webview,
@@ -1051,6 +1053,7 @@ pub fn run() {
             app_window::toggle_window_maximize,
             app_window::set_window_fullscreen,
             app_window::set_window_title,
+            view_menu::set_view_menu_state,
             app_window::show_workspace_window,
             mobile::get_connect_info,
             mobile::tailscale_up,
@@ -1109,6 +1112,7 @@ pub fn run() {
                     traffic_lights::unwatch(window.label());
                     window_screen::forget(window.label());
                     app_window::forget_window_fullscreen(window.label());
+                    view_menu::forget(app, window.label());
                     // The SLOT is what this clears. The child webview itself
                     // dies with its host, which is now this window, and tauri
                     // drops it from the manager in `on_window_close`. Left
@@ -1134,6 +1138,9 @@ pub fn run() {
                     if app_window::is_app_window(window.label()) =>
                 {
                     app_window::emit_window_active(app, window.label(), *focused);
+                    if *focused {
+                        view_menu::apply_for(app, window.label());
+                    }
                 }
                 // The window moved to a display with a different scale factor,
                 // so put its page back over the whole window. The runtime sizes
@@ -1202,6 +1209,8 @@ pub fn run() {
                 if let Err(e) = app_window::open_new_window(app) {
                     eprintln!("[Tauri] Failed to open new window: {e}");
                 }
+            } else if let Some(pane) = view_menu::ViewMenuPane::from_id(event.id().as_ref()) {
+                view_menu::route_click(app, pane);
             }
         })
         .on_page_load(|webview, payload| {
@@ -1399,7 +1408,8 @@ pub fn run() {
 ///
 /// macOS then grafts on the service-aware items. Cmd+Q maps to "Close to Menu
 /// Bar", and the full teardown is the separate, unshortcutted "Quit and Stop
-/// Background Service". Other platforms keep the default menu unchanged.
+/// Background Service". File gains New Window, and View a Show/Hide item per
+/// pane. Other platforms keep the default menu unchanged.
 fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
     let menu = Menu::default(app.handle())?;
 
@@ -1453,6 +1463,19 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
             let new_window =
                 MenuItem::with_id(app, "new_window", "New Window", true, Some("Cmd+N"))?;
             file_menu.prepend(&new_window)?;
+        }
+
+        // The Show/Hide item per pane opens the View menu, above the default
+        // Enter Full Screen. See `view_menu`.
+        if let Some(MenuItemKind::Submenu(view_submenu)) = items.get(3) {
+            let pane_items = view_menu::build_items(app)?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let mut prepended: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = pane_items
+                .iter()
+                .map(|item| item as &dyn tauri::menu::IsMenuItem<tauri::Wry>)
+                .collect();
+            prepended.push(&separator);
+            view_submenu.insert_items(&prepended, 0)?;
         }
     }
 

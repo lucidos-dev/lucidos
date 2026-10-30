@@ -224,30 +224,20 @@ describe('tailnetConnectRows', () => {
       .toEqual(['http://mymac.tailnet-name.ts.net:5252/']);
   });
 
-  it('keeps the reader on TLS when that is how they got here', () => {
+  it('composes no HTTPS address that nothing verified', () => {
+    // An https reader's port speaks TLS only on its own host. Swapping in the
+    // tailnet name gives a URL no certificate is known to serve.
     const rows = tailnetConnectRows({
       ...base,
       here: { protocol: 'https:', hostname: 'localhost', port: '5251' },
     });
-    expect(rows.map((r) => r.url)).toEqual(['https://mymac.tailnet-name.ts.net:5251/dev/']);
+    expect(rows).toEqual([]);
   });
 
-  it('describes the address by its own scheme, not by which branch built it', () => {
-    // The row keeps the reader's scheme, so this branch can produce an HTTPS
-    // URL. A hardcoded "plain HTTP" hint then denied push at an origin that
-    // offers it, under an `https://` address saying otherwise. Two ordinary
-    // setups reach it: the dev gateway's own TLS cert, and a serve-fronted
-    // reader whose verification timed out.
-    const overTls = tailnetConnectRows({
-      ...base,
-      here: { protocol: 'https:', hostname: 'localhost', port: '5251' },
-    });
-    expect(overTls[0].hint).toContain('HTTPS');
-    expect(overTls[0].hint).not.toContain('plain HTTP');
-
-    const overPlain = tailnetConnectRows(base);
-    expect(overPlain[0].url.startsWith('http://')).toBe(true);
-    expect(overPlain[0].hint).toContain('plain HTTP');
+  it('describes a composed address as plain HTTP', () => {
+    const rows = tailnetConnectRows(base);
+    expect(rows[0].url.startsWith('http://')).toBe(true);
+    expect(rows[0].hint).toContain('plain HTTP');
   });
 
   it('never contradicts its own URL', () => {

@@ -3,7 +3,10 @@
 //! Three listener kinds ([`ListenerTls`]):
 //!
 //! - **Operator**: `LUCIDOS_TLS_CERT`/`KEY` are set. Every connection is TLS,
-//!   on every address, exactly as before managed certificates existed.
+//!   on every address. When the operator certificate would not satisfy a
+//!   phone for the tailnet name, the [`CertStore`] also holds the managed
+//!   one. A connection to a tailnet address then picks by SNI: the tailnet
+//!   name gets the managed certificate, every other name the operator one.
 //! - **Managed**: the gateway's own certificate from the [`CertStore`]. A
 //!   loopback connection stays plain HTTP, because the packaged window, the
 //!   raw-socket health checks and `tailscale serve` all speak `http://127.0.0.1`.
@@ -19,9 +22,11 @@
 mod acceptor;
 mod expiry;
 pub mod managed;
+mod operator;
 
 pub use acceptor::GatewayAcceptor;
 pub use managed::TlsState;
+pub use operator::OperatorCert;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
@@ -38,7 +43,7 @@ use chrono::{DateTime, Utc};
 #[derive(Clone)]
 pub enum ListenerTls {
     Plain,
-    Operator(RustlsConfig),
+    Operator(RustlsConfig, Arc<CertStore>),
     Managed(Arc<CertStore>),
 }
 
@@ -46,7 +51,7 @@ impl ListenerTls {
     /// The scheme a startup log line names for this listener on `addr`.
     pub fn scheme_label(&self, addr: SocketAddr) -> &'static str {
         match self {
-            ListenerTls::Operator(_) => "https (TLS)",
+            ListenerTls::Operator(..) => "https (TLS)",
             ListenerTls::Managed(_) if !is_loopback(addr) => {
                 "http, https once a certificate is held"
             }
@@ -87,6 +92,11 @@ impl ManagedCert {
 pub struct CertStore {
     current: RwLock<Option<Arc<ManagedCert>>>,
     addresses: RwLock<Vec<IpAddr>>,
+    /// The non-loopback addresses the gateway listens on. An optional address
+    /// counts only while it is bound.
+    listeners: RwLock<Vec<IpAddr>>,
+    listeners_changed: tokio::sync::Notify,
+    operator: RwLock<Option<Arc<OperatorCert>>>,
     state: RwLock<TlsState>,
 }
 
@@ -115,6 +125,70 @@ impl CertStore {
         }
     }
 
+    pub fn set_listeners(&self, listeners: Vec<IpAddr>) {
+        if let Ok(mut current) = self.listeners.write() {
+            *current = listeners;
+        }
+    }
+
+    /// An optional address bound. The refresh looks again at once.
+    pub fn add_listener(&self, listener: IpAddr) {
+        if let Ok(mut current) = self.listeners.write() {
+            if !current.contains(&listener) {
+                current.push(listener);
+            }
+        }
+        self.listeners_changed.notify_one();
+    }
+
+    /// An optional address went away. The refresh looks again at once.
+    pub fn remove_listener(&self, listener: IpAddr) {
+        if let Ok(mut current) = self.listeners.write() {
+            current.retain(|l| *l != listener);
+        }
+        self.listeners_changed.notify_one();
+    }
+
+    /// Resolves at the next listener change, or at once for one since the last call.
+    pub async fn listeners_changed(&self) {
+        self.listeners_changed.notified().await;
+    }
+
+    pub fn listeners(&self) -> Vec<IpAddr> {
+        self.listeners.read().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Whether a listener accepts connections to one of `addresses`. A
+    /// wildcard listener accepts them all.
+    pub fn listens_on_any(&self, addresses: &[IpAddr]) -> bool {
+        self.listeners().iter().any(|listener| {
+            let listener = listener.to_canonical();
+            listener.is_unspecified() || addresses.iter().any(|a| a.to_canonical() == listener)
+        })
+    }
+
+    pub fn set_operator(&self, operator: OperatorCert) {
+        if let Ok(mut current) = self.operator.write() {
+            *current = Some(Arc::new(operator));
+        }
+    }
+
+    pub fn operator(&self) -> Option<Arc<OperatorCert>> {
+        self.operator.read().ok().and_then(|o| o.clone())
+    }
+
+    /// The state with no tailnet certificate serving, for `reason`. An
+    /// operator certificate still serves every name it covers.
+    pub fn without_tailnet(&self, reason: String) -> TlsState {
+        match self.operator() {
+            Some(operator) => TlsState {
+                error: Some(reason),
+                ..TlsState::operator(&operator)
+            },
+            None => TlsState::none(reason),
+        }
+    }
+
     /// Stop serving any certificate, on every address.
     pub fn withdraw(&self) {
         if let Ok(mut current) = self.current.write() {
@@ -136,7 +210,7 @@ impl CertStore {
         }
         let name = state.name.unwrap_or_default();
         let why = state.error.map(|e| format!(" {e}")).unwrap_or_default();
-        TlsState::none(format!(
+        self.without_tailnet(format!(
             "The certificate for {name} expired, and no renewal has succeeded yet.{why}"
         ))
     }

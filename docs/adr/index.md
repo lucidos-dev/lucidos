@@ -607,3 +607,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0599: A relaunched shared SSE worker asks every port to introduce itself, and a page replaces a worker that stops answering](0599-shared-worker-relaunch-asks-ports-to-introduce.md)
 - [0600: The gateway takes its HTTPS certificate from tailscaled; no ACME client, issuer or hosted service](0600-gateway-managed-certificates-from-tailscaled.md)
 - [0601: A loopback engine refuses a non-loopback Host with 421, shutting out DNS rebinding](0601-loopback-engine-admits-only-a-loopback-host.md)
+- [0602: Serve verification proves gateway identity and never presents a credential](0602-serve-verification-proves-gateway-identity.md)

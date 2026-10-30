@@ -153,6 +153,33 @@ export function setWindowFullscreen(fullscreen: boolean): Promise<boolean> {
  *  enters or leaves native fullscreen. */
 export const WINDOW_FULLSCREEN_CHANGED_EVENT = 'window-fullscreen-changed';
 
+/** The panes with a Show/Hide item in the macOS View menu, in menu order
+ *  (view_menu.rs `ViewMenuPane`). A Rust test pins this line. */
+export const VIEW_MENU_PANES = ['thread-drawer', 'thread-pane', 'content-pane', 'dashboard'] as const;
+
+export type ViewMenuPane = (typeof VIEW_MENU_PANES)[number];
+
+/** The Tauri event the shell sends to the focused window when one of its View
+ *  menu items is clicked. The payload is the `ViewMenuPane`. */
+export const VIEW_MENU_ITEM_CLICKED_EVENT = 'view-menu-item-clicked';
+
+/** One View menu item as the calling window draws it. `accelerator` uses the
+ *  menu's own syntax, such as `Ctrl+Shift+1`. */
+export interface ViewMenuItemState {
+  pane: ViewMenuPane;
+  shown: boolean;
+  enabled: boolean;
+  accelerator: string | null;
+}
+
+/**
+ * Tell the shell how the CALLING window's View menu items read (view_menu.rs
+ * `set_view_menu_state`). The menu shows the focused window's last push. Only
+ * call when isTauri() is true. */
+export function setViewMenuState(items: readonly ViewMenuItemState[]): Promise<void> {
+  return invoke('set_view_menu_state', { items });
+}
+
 /**
  * Name the CALLING window (app_window.rs `set_window_title`), so the macOS Window menu
  * tells two windows apart by the workspace each is showing.

@@ -192,6 +192,8 @@ interface PrimaryButton {
   label: string;
   onClick: () => void;
   blockedReason?: string;
+  /** Green, so an outdated plugin stands out from Install and Open. */
+  confirm?: boolean;
 }
 
 function primaryButton(
@@ -205,6 +207,7 @@ function primaryButton(
         label: action.label,
         onClick: () => plugin && onInstall?.(plugin),
         blockedReason: action.blockedReason,
+        confirm: plugin?.status === 'update_available',
       };
     case 'setup':
       // The catalog surfaces this button for a present-or-queued setup thread;
@@ -228,7 +231,7 @@ function PrimaryActionButton({ plugin, busy = false, onInstall }: PluginActionsP
   return (
     <SkBlock w="4.5rem" h="2rem" round>
       <button
-        class="action-btn"
+        class={`action-btn${primary?.confirm ? ' action-btn-confirm' : ''}`}
         type="button"
         disabled={busy || !!primary?.blockedReason}
         onClick={primary?.onClick}

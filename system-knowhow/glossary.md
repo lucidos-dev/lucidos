@@ -1345,6 +1345,12 @@ See also: *thread pane*, *dashboard*, `system-knowhow/js-sdk.md` § Reading the 
 The pane showing the open *thread*'s transcript plus the prompt input, where you read what the *Lucidos Agent* did and type the next message. Second of the three panes, the other half of the *Conversation* side beside the *thread drawer*. CSS container `.pane-thread` (`FocusedPane = 'thread'`; on mobile the middle swipe pane, `MobileView = 'thread'`).
 See also: *Conversation*, *thread drawer*, *content pane*.
 
+### View menu
+The Mac app's View menu. It opens with four items, one per pane: Thread Drawer, Thread Pane, Content Pane and Dashboard. Each reads "Show …" while its pane is hidden and "Hide …" while it shows, as Finder and Safari do. A click shows or hides that pane in the focused window, and on a phone-width window it swipes there.
+
+Thread Drawer, Thread Pane and Content Pane show their pane shortcuts, and a rebind under **Settings → Keyboard Shortcuts** updates the label. The shortcut itself still runs its usual focus-or-hide steps. Thread Drawer greys out while the window is too narrow for it. Dashboard greys out while there is no room for the rail, or no *Home thread* yet.
+See also: *thread drawer*, *thread pane*, *content pane*, *dashboard*.
+
 ### Thread Queue
 System-wide admission control for the shared thread pool. Every path that creates running work shares one pool. Background spawns are an event *trigger* fire, a scheduled (cron) fire, or an agent-driven *sub-thread* or *coding-agent thread* spawn. Those come via `run_thread` / `run_coding_agent`, agent-mode `lucidos spawn-thread`, or cross-workspace task POSTs. User-initiated work is a person's chat or typed coding-agent thread. Within the *capacity policy* work runs at once; over capacity it waits.
 

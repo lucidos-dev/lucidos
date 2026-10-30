@@ -47,12 +47,16 @@ vi.mock('./preferences', () => ({
 vi.mock('./releaseNotices', () => ({
   loadReleaseNotices: vi.fn(),
 }));
+vi.mock('./whatsNew', () => ({
+  reloadChangelogIfRead: vi.fn(),
+}));
 
 // Import after mocks are set up
 const { handleResume } = await import('./connection');
 const { reviveThreadEvents } = await import('./thread-sync');
 const { loadPreferences } = await import('./preferences');
 const { loadReleaseNotices } = await import('./releaseNotices');
+const { reloadChangelogIfRead } = await import('./whatsNew');
 
 const emailConfirmForm = {
   type: 'email-confirm' as const,
@@ -193,6 +197,19 @@ describe('handleResume re-reads the release notices', () => {
     await handleResume();
 
     expect(loadReleaseNotices).toHaveBeenCalled();
+  });
+});
+
+/**
+ * What's New read during an update restart fails, or holds the outgoing
+ * build's list. No event announces a changelog, so the reconnect is the only
+ * chance to correct either before the user restarts the app by hand.
+ */
+describe('handleResume re-reads the changelog', () => {
+  it('asks the engine again, because a restart can have failed or outdated it', async () => {
+    await handleResume();
+
+    expect(reloadChangelogIfRead).toHaveBeenCalled();
   });
 });
 

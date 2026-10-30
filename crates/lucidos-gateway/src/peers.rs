@@ -29,9 +29,9 @@ use std::time::Duration;
 /// Where every gateway keeps its registry, relative to its data dir.
 const REGISTRY_REL: &str = "config/workspaces.json";
 
-/// The gateway's own health. Public (`auth_api::is_public_path`), so a probe
-/// presents no credential: the only path a peer or address probe asks for.
-pub(crate) const GATEWAY_HEALTH_PATH: &str = "/~/api/v1/health";
+/// Public (`auth_api::is_public_path`): the only path a peer or address probe
+/// asks for.
+pub(crate) use lucidos_gateway_constants::GATEWAY_HEALTH_PATH;
 
 /// What `/~/api/v1/health` calls a gateway, as opposed to an engine.
 pub(crate) const GATEWAY_ROLE: &str = "gateway";

@@ -7,7 +7,7 @@
  * same workspace opened on a laptop and a phone should each get told once.
  */
 import { changelogReleases, whatsNewSeenRelease } from '../store';
-import { toFailed, setLoadingIfFresh } from '../types';
+import { failedIfFresh, setLoadingIfFresh } from '../types';
 import { engineChangelog } from '../../api/client';
 
 /** localStorage key for {@link whatsNewSeenRelease}. */
@@ -18,8 +18,20 @@ export async function loadChangelog(): Promise<void> {
   try {
     changelogReleases.value = { status: 'loaded', data: await engineChangelog() };
   } catch (error) {
-    changelogReleases.value = toFailed(error);
+    changelogReleases.value = failedIfFresh(changelogReleases.peek(), error);
   }
+}
+
+/**
+ * Read the changelog again after a reconnect, if this client has read it at all.
+ *
+ * An update restart is a reconnect. A read made during it failed, or came from
+ * the outgoing release, and no event will correct either. A client that never
+ * opened the panel fetches nothing: the read can reach the public mirror.
+ */
+export async function reloadChangelogIfRead(): Promise<void> {
+  if (changelogReleases.peek().status === 'not-loaded') return;
+  await loadChangelog();
 }
 
 /**

@@ -264,6 +264,11 @@ const KEY_GLYPHS: Record<string, string> = {
   Escape: 'Esc',
 };
 
+/** Whether a Mac draws `mod` as Control rather than Command (see `formatBinding`). */
+function macModIsCtrl(b: Binding): boolean {
+  return b.mod && b.shift && /^[a-z0-9]$/.test(b.key);
+}
+
 /** Platform-correct display string, e.g. Mac `⌘K` / `⌃⇧O`, Win/Linux
  *  `Ctrl+K` / `Ctrl+Shift+O`. On Mac a `mod+Shift+<letter-or-digit>` chord
  *  renders with the Control glyph (⌃) rather than Command (⌘): the OS reserves
@@ -272,12 +277,10 @@ const KEY_GLYPHS: Record<string, string> = {
  *  the New-thread chord. The rule covers digits too so the three pane toggles
  *  read uniformly. Named keys display as glyphs (←→↑↓). */
 export function formatBinding(b: Binding, isMac: boolean): string {
-  const isAlnum = /^[a-z0-9]$/.test(b.key);
-  const macUsesCtrl = b.mod && b.shift && isAlnum;
   const keyDisplay = KEY_GLYPHS[b.key] ?? (b.key.length === 1 ? b.key.toUpperCase() : b.key);
   if (isMac) {
     let out = '';
-    if (b.mod) out += macUsesCtrl ? '⌃' : '⌘';
+    if (b.mod) out += macModIsCtrl(b) ? '⌃' : '⌘';
     if (b.alt) out += '⌥';
     if (b.shift) out += '⇧';
     return out + keyDisplay;
@@ -287,5 +290,33 @@ export function formatBinding(b: Binding, isMac: boolean): string {
   if (b.alt) parts.push('Alt');
   if (b.shift) parts.push('Shift');
   parts.push(keyDisplay);
+  return parts.join('+');
+}
+
+/** Named keys the macOS menu can draw, spelled as its accelerator parser wants. */
+const MENU_NAMED_KEYS = new Set([
+  'Enter', 'Tab', 'Backspace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown', 'Escape',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  ...Array.from({ length: 12 }, (_, i) => `F${i + 1}`),
+]);
+
+function menuKey(key: string): string | null {
+  if (key === ' ') return 'Space';
+  if (/^[a-z0-9]$/.test(key)) return key.toUpperCase();
+  if (/^[`\\[\],=\-.';/]$/.test(key)) return key;
+  return MENU_NAMED_KEYS.has(key) ? key : null;
+}
+
+/** The binding as a macOS menu accelerator, such as `Ctrl+Shift+1`, with the
+ *  modifier `formatBinding` draws. Null for a key the menu cannot draw: the
+ *  shell refuses an unparseable accelerator, so none may reach it. */
+export function formatMenuAccelerator(b: Binding): string | null {
+  const key = menuKey(b.key);
+  if (key === null) return null;
+  const parts: string[] = [];
+  if (b.mod) parts.push(macModIsCtrl(b) ? 'Ctrl' : 'Cmd');
+  if (b.alt) parts.push('Alt');
+  if (b.shift) parts.push('Shift');
+  parts.push(key);
   return parts.join('+');
 }

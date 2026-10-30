@@ -8,6 +8,7 @@ import {
   serializeBinding,
   parseBinding,
   formatBinding,
+  formatMenuAccelerator,
   isBindableChord,
   bindingsEqual,
   bindingSearchText,
@@ -62,6 +63,34 @@ describe('serializeBinding / parseBinding round-trip', () => {
   it('produces stable canonical strings', () => {
     expect(serializeBinding({ mod: true, shift: true, alt: false, key: 'o' })).toBe('mod+shift+o');
     expect(serializeBinding({ mod: true, shift: false, alt: false, key: '=' })).toBe('mod+=');
+  });
+});
+
+describe('formatMenuAccelerator', () => {
+  const b = (over: Partial<Binding>): Binding => ({ mod: false, shift: false, alt: false, key: 'k', ...over });
+
+  it('picks the modifier formatBinding draws on a Mac', () => {
+    for (const def of SHORTCUT_DEFS) {
+      const accelerator = formatMenuAccelerator(def.defaultBinding);
+      if (!accelerator || !def.defaultBinding.mod) continue;
+      const glyph = formatBinding(def.defaultBinding, true)[0];
+      expect(accelerator.startsWith(glyph === '⌃' ? 'Ctrl+' : 'Cmd+'), def.id).toBe(true);
+    }
+  });
+
+  it('orders the modifiers and spells the key as the menu parses it', () => {
+    expect(formatMenuAccelerator(shortcutDef('toggleThreadDrawer').defaultBinding)).toBe('Ctrl+Shift+1');
+    expect(formatMenuAccelerator(b({ mod: true, alt: true, shift: true, key: 'ArrowLeft' }))).toBe('Cmd+Alt+Shift+ArrowLeft');
+    expect(formatMenuAccelerator(b({ mod: true, key: 'k' }))).toBe('Cmd+K');
+    expect(formatMenuAccelerator(b({ alt: true, key: ' ' }))).toBe('Alt+Space');
+    expect(formatMenuAccelerator(b({ mod: true, key: '\\' }))).toBe('Cmd+\\');
+    expect(formatMenuAccelerator(b({ key: 'F12' }))).toBe('F12');
+  });
+
+  it('sends nothing for a key the menu cannot draw', () => {
+    expect(formatMenuAccelerator(b({ mod: true, key: '!' }))).toBeNull();
+    expect(formatMenuAccelerator(b({ mod: true, key: 'F13' }))).toBeNull();
+    expect(formatMenuAccelerator(b({ mod: true, key: 'Insert' }))).toBeNull();
   });
 });
 

@@ -411,7 +411,7 @@ export function WhatsNewPage() {
   }, [release, loadable.status]);
 
   if (loadable.status === 'failed') {
-    return <LoadableError error={loadable.error} noun="the changelog" />;
+    return <LoadableError error={loadable.error} noun="the changelog" onRetry={() => { void loadChangelog(); }} />;
   }
 
   const releases = loadable.status === 'loaded' ? loadable.data : [];

@@ -13,7 +13,15 @@ import { GatewayHttpsRow, gatewayHttpsSummary } from '../GatewayHttpsRow';
 const ORIGIN = 'https://mymac.tailnet-name.ts.net:5252';
 
 function tls(over: Partial<GatewayTls>): GatewayTls {
-  return { source: 'none', name: null, expires_at: null, error: null, https_origin: null, ...over };
+  return {
+    source: 'none',
+    name: null,
+    expires_at: null,
+    error: null,
+    operator_serves_other_names: false,
+    https_origin: null,
+    ...over,
+  };
 }
 
 let host: HTMLDivElement;
@@ -55,6 +63,29 @@ describe('GatewayHttpsRow', () => {
 
   it('names an operator certificate', () => {
     expect(shown({ status: 'loaded', data: tls({ source: 'operator' }) })).toContain('your own certificate');
+  });
+
+  it('names the tailnet origin an operator certificate covers', () => {
+    const text = shown({
+      status: 'loaded',
+      data: tls({ source: 'operator', name: 'mymac.tailnet-name.ts.net', https_origin: ORIGIN }),
+    });
+    expect(text).toContain('your own certificate');
+    expect(text).toContain(`covers your tailnet name too, so other devices open ${ORIGIN}`);
+  });
+
+  it('says why the tailnet name has no HTTPS beside an operator certificate', () => {
+    const text = shown({ status: 'loaded', data: tls({ source: 'operator', error: 'MagicDNS is off in this tailnet.' }) });
+    expect(text).toContain('Your tailnet name gets no HTTPS: MagicDNS is off in this tailnet.');
+  });
+
+  it('says which certificate serves what when both serve', () => {
+    const text = shown({
+      status: 'loaded',
+      data: tls({ source: 'tailnet', name: 'mymac.tailnet-name.ts.net', https_origin: ORIGIN, operator_serves_other_names: true }),
+    });
+    expect(text).toContain('HTTPS: automatic via your tailnet');
+    expect(text).toContain('Every other name gets the certificate LUCIDOS_TLS_CERT names');
   });
 
   it('says why there is no HTTPS', () => {

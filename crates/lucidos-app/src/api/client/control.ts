@@ -524,13 +524,16 @@ export async function setExternalAddress(externalAddress: string): Promise<Exter
 }
 
 /** What the gateway serves over HTTPS, mirroring the Rust `TlsReport`.
- *  `error` beside `none` is why there is no HTTPS; beside `tailnet` it is a
- *  failed renewal, and the current certificate still serves. */
+ *  `source` is what serves `name`, the tailnet name. `error` beside `tailnet`
+ *  is a failed renewal, and the current certificate still serves. Beside
+ *  `none`, or `operator` with no name, it is why the tailnet name has no HTTPS. */
 export interface GatewayTls {
   source: 'operator' | 'tailnet' | 'none';
   name: string | null;
   expires_at: string | null;
   error: string | null;
+  /** An operator certificate serves every name but the tailnet one. */
+  operator_serves_other_names: boolean;
   https_origin: string | null;
 }
 

@@ -33,6 +33,11 @@ const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
         "an inline test's own router",
     ),
     (
+        "settings.rs",
+        "stand_in_gateway",
+        "an inline test's stand-in gateway",
+    ),
+    (
         "workspace_label.rs",
         "stand_in_gateway",
         "an inline test's stand-in gateway",

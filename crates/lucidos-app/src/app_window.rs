@@ -620,7 +620,8 @@ fn seat_at_birth(
 fn seat_at_birth(_: &tauri::AppHandle, _: &tauri::WebviewWindow, _: window_restore::Rect) {}
 
 /// The app window a New Window is opened FROM: the one it copies the URL of
-/// and cascades from.
+/// and cascades from. The View menu speaks for this window too
+/// (`view_menu`).
 ///
 /// The FOCUSED window first, which is what macOS does, so a second window opens
 /// on the workspace you are looking at. `main` is the fallback, because a tray
@@ -628,7 +629,7 @@ fn seat_at_birth(_: &tauri::AppHandle, _: &tauri::WebviewWindow, _: window_resto
 ///
 /// By webview, not webview window, per ADR 0140. The URL is a page operation,
 /// and a window hosting a URL preview answers no webview-window lookup.
-fn source_webview(app: &tauri::AppHandle) -> Option<tauri::Webview> {
+pub(crate) fn source_webview(app: &tauri::AppHandle) -> Option<tauri::Webview> {
     let focused = app
         .webviews()
         .into_iter()

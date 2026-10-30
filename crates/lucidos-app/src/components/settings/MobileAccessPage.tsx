@@ -215,7 +215,7 @@ export type ConnectUrlRow = { label: string; url: string; hint: string };
  *  `GET /api/v1/tailnet-status`.
  *
  *  A verified HTTPS URL wins outright, and is printed verbatim. The engine sets
- *  it only after a request to it came back from that same engine. It is NOT
+ *  it only after the answer there came from this engine's own gateway. It is NOT
  *  bind-gated, because `serve` proxies to `127.0.0.1` and so survives the
  *  packaged loopback default. The plain-HTTP row then yields to it, being the
  *  worse answer to the same question.
@@ -237,13 +237,7 @@ export function tailnetConnectRows(input: TailnetInput & { scope: string }): Con
   }
   const origin = tailnetOrigin(input);
   if (origin === null) return [];
-  return [
-    {
-      label: 'Tailscale',
-      url: workspaceUrlAt(origin, input.scope),
-      hint: tailnetHint(origin.startsWith('https:')),
-    },
-  ];
+  return [{ label: 'Tailscale', url: workspaceUrlAt(origin, input.scope), hint: tailnetHint(false) }];
 }
 
 /** What it takes to know whether a tailnet address reaches this machine, and
@@ -271,10 +265,16 @@ export interface TailnetInput {
  *  the string the engine verified rather than a reassembly of it, so the
  *  verbatim rule above survives. Otherwise the plain-HTTP address counts only
  *  while something is listening on it, and prefers the MagicDNS name, which is
- *  what a person can retype. */
+ *  what a person can retype.
+ *
+ *  Never a composed `https://`. Only the gateway or the engine can prove that a
+ *  certificate covers the name and that a phone trusts it. An HTTPS reader with
+ *  nothing verified gets no origin: an mkcert certificate with stale names made
+ *  that QR dead on the phone. */
 export function tailnetOrigin(input: TailnetInput): string | null {
   if (input.gatewayHttps) return input.gatewayHttps;
   if (input.workspaceServeUrl) return originOf(input.workspaceServeUrl);
+  if (input.here.protocol !== 'http:') return null;
   const ip = input.tailnetIp;
   if (!ip || !tailnetServesThisReader(input.bind, ip, input.here.hostname)) return null;
   return originAtHost(input.here, input.magicDnsName ?? ip);
@@ -299,8 +299,9 @@ function originOf(url: string): string | null {
  *     address someone typed is explicit intent, so it wins.
  *  2. The tailnet origin ({@link tailnetOrigin}), led by the HTTPS origin the
  *     gateway serves with its own certificate.
- *  3. The reader's own origin, when it is not loopback. The page arrived
- *     through it, so it reaches this gateway.
+ *  3. The reader's own origin, when it is plain HTTP and not loopback. The page
+ *     arrived through it, so it reaches this gateway. An HTTPS one may carry a
+ *     certificate only this desktop trusts, as {@link tailnetOrigin} says.
  *  4. The LAN address, then nothing.
  *
  *  `lan` is whatever the Local network row resolved to. It reaches here on the
@@ -313,14 +314,15 @@ function originOf(url: string): string | null {
  *  machine. The external address is stored per gateway, and its save is
  *  refused when another gateway answers there. The plain-HTTP branches keep
  *  this gateway's port. The serve URL holds it because the engine publishes one
- *  only after proving it reached this very workspace
- *  (`verified_workspace_serve_url`). */
+ *  only after proving it reached this very gateway
+ *  (`verified_workspace_serve_url`), which spawned this workspace's engine. */
 export function pairingOrigin(
   input: TailnetInput & { external: string | null; lan: LanRowState | null },
 ): string | null {
-  const reader = isLoopbackHostname(input.here.hostname)
-    ? null
-    : originAtHost(input.here, input.here.hostname);
+  const reader =
+    input.here.protocol !== 'http:' || isLoopbackHostname(input.here.hostname)
+      ? null
+      : originAtHost(input.here, input.here.hostname);
   return (
     input.external ??
     tailnetOrigin(input) ??
@@ -332,12 +334,8 @@ export function pairingOrigin(
 /** The sentence under a tailnet URL, by what that address can actually do.
  *
  *  Browsers gate the installable app and push on a secure origin, so the scheme
- *  is the whole difference. The hint must READ it rather than assume it from
- *  which branch above produced the row: this row keeps the reader's own scheme,
- *  and two ordinary setups reach it over HTTPS. The dev gateway holds a TLS cert
- *  of its own, and a verification that timed out drops a serve-fronted reader
- *  here. Assuming plain HTTP told both of them that push was unavailable at an
- *  origin offering it, under an `https://` address saying otherwise. */
+ *  is the whole difference. Only a verified origin is HTTPS: the composed one is
+ *  always plain HTTP ({@link tailnetOrigin}). */
 function tailnetHint(secure: boolean): string {
   return secure
     ? 'anywhere on your tailnet · HTTPS, so the app install and push work here'

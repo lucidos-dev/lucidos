@@ -30,6 +30,7 @@ import { loadAllThreads, loadFilterFacets } from './actions/thread-loading';
 import { refreshPushSubscription, recoverServiceWorker } from './actions/push';
 import { createSwLivenessProbe } from '../utils/swLivenessProbe';
 import { setupNativePushTapRouting } from './actions/native-push';
+import { setupViewMenu } from './actions/view-menu';
 import { startDevicePresenceTracking } from './actions/device-presence';
 import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck, resumeUpdateRelay } from './actions/app-update';
 import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from './actions/engine-update';
@@ -284,6 +285,15 @@ export function startClient(): () => void {
       else stopNativeTap = un;
     })
     .catch(() => { /* best-effort: tap routing is additive; banners still show */ });
+  // The macOS View menu's pane items mirror this window (Tauri only).
+  let stopViewMenu: (() => void) | null = null;
+  let viewMenuCanceled = false;
+  setupViewMenu()
+    .then((stop) => {
+      if (viewMenuCanceled) stop();
+      else stopViewMenu = stop;
+    })
+    .catch(() => { /* best-effort: the in-app toggles and shortcuts still work */ });
   refreshChangesState();
 
   // Global click handler for thread links, inline images, external URLs, and
@@ -762,6 +772,8 @@ export function startClient(): () => void {
     stopDevicePresence();
     nativeTapCanceled = true;
     stopNativeTap?.();
+    viewMenuCanceled = true;
+    stopViewMenu?.();
     document.removeEventListener('click', onGlobalClick);
     stopLinkPressGuard();
     stopMarkdownImageRetry();

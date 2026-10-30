@@ -63,6 +63,10 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 # byte (`crate::tls`), which `axum-server`'s fixed rustls acceptor cannot do.
 # Already in the lockfile under `axum-server`.
 tokio-rustls = { version = "0.26", default-features = false }
+# The public roots a phone trusts. An operator certificate serves the tailnet
+# name only when it chains to one of them (`crate::tls::operator`). Already in
+# the lockfile under `reqwest`.
+webpki-roots = "1"
 dotenvy = "0.15"
 # Inbound auth stores a digest of each paired device's credential, never the
 # credential. A leaked store then grants nobody remote reuse. A leaf crypto

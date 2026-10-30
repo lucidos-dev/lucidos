@@ -3453,28 +3453,36 @@ pub async fn run(inherited_lock_fd: Option<String>) -> Result<RunOutcome, BoxErr
 }
 
 /// Settle the TLS source (`crate::tls::managed`) and keep a tailnet one fresh.
-/// A loopback-only gateway serves no certificate, so it asks for none.
+/// A loopback-only gateway serves the tailnet name nothing, so it asks for none.
 fn start_managed_tls(state: &GatewayState, port: u16, bind_choice: &net_config::BindChoice) {
     let certs = state.certs();
     if net_config::serves_tls_from_env() {
         let cert = std::env::var("LUCIDOS_TLS_CERT").unwrap_or_default();
-        certs.record(tls::TlsState::operator(
-            std::fs::read(cert.trim()).ok().as_deref(),
-        ));
-        return;
+        let operator = tls::OperatorCert::public(&std::fs::read(cert.trim()).unwrap_or_default());
+        certs.record(tls::TlsState::operator(&operator));
+        certs.set_operator(operator);
     }
     let plan = net_config::bind_plan(bind_choice, port);
-    if plan
+    let reaches_network = |addr: &SocketAddr| !tls::is_loopback(*addr);
+    if !plan
         .required
         .iter()
         .chain(&plan.optional)
-        .all(|addr| tls::is_loopback(*addr))
+        .any(reaches_network)
     {
-        certs.record(tls::TlsState::none(
-            "The gateway listens on this machine only, so it needs no certificate.",
+        certs.record(certs.without_tailnet(
+            "The gateway listens on this machine only, so no tailnet name reaches it.".into(),
         ));
         return;
     }
+    // An optional address joins once `serve_optional_address` binds it.
+    certs.set_listeners(
+        plan.required
+            .iter()
+            .filter(|addr| reaches_network(addr))
+            .map(|addr| addr.ip())
+            .collect(),
+    );
     let dir = tls::managed::tls_dir(state.app_data());
     tls::managed::spawn_refresh(certs.clone(), Arc::new(tls::managed::Tailscaled), dir);
 }
@@ -3550,8 +3558,9 @@ async fn serve(
     let handle = axum_server::Handle::new();
     install_shutdown(handle.clone());
 
-    // An operator certificate wins on every address; otherwise the managed one
-    // serves non-loopback connections. Decided through `serves_tls`, which
+    // An operator certificate serves TLS on every address, beside the managed
+    // one on a tailnet address; otherwise the managed one serves non-loopback
+    // connections. Decided through `serves_tls`, which
     // treats a set-but-empty value as unset: that is how a launch script spells
     // "unset", and `from_pem_file("", "")` would stop the gateway serving.
     // Trimmed because `serves_tls` trims and `from_pem_file` does not.
@@ -3560,6 +3569,7 @@ async fn serve(
         let key = std::env::var("LUCIDOS_TLS_KEY").unwrap_or_default();
         tls::ListenerTls::Operator(
             axum_server::tls_rustls::RustlsConfig::from_pem_file(cert.trim(), key.trim()).await?,
+            state.certs().clone(),
         )
     } else {
         tls::ListenerTls::Managed(state.certs().clone())
@@ -3708,6 +3718,7 @@ async fn serve_optional_address(
                 if let Ok(mut pending) = state.inner.pending_binds.write() {
                     pending.remove(&addr);
                 }
+                state.certs().add_listener(addr.ip());
                 reported = None;
                 // `Ok` is the shutdown handle firing, so the whole process is
                 // going down. An `Err` is the listener failing because the
@@ -3719,6 +3730,7 @@ async fn serve_optional_address(
                         if let Ok(mut pending) = state.inner.pending_binds.write() {
                             pending.insert(addr);
                         }
+                        state.certs().remove_listener(addr.ip());
                     }
                 }
                 // Backoff is NOT reset by a successful bind, only by a serve

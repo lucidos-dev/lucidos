@@ -12,9 +12,9 @@ use axum::http::Request;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::server::TlsStream;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 
-use super::{is_loopback, Connection, ListenerTls};
+use super::{is_loopback, Connection, ListenerTls, ManagedCert};
 
 /// How long a client gets to send its first byte, and then to finish the TLS
 /// handshake. The same bound `axum_server`'s own rustls acceptor uses.
@@ -74,7 +74,10 @@ async fn negotiate(
     let plain = |stream| Ok((MaybeTlsStream::Plain(stream), Connection::Plain));
     match tls {
         ListenerTls::Plain => plain(stream),
-        ListenerTls::Operator(config) => handshake(config.get_inner(), stream).await,
+        ListenerTls::Operator(config, store) => match store.serving(local.ip()) {
+            Some(managed) => handshake_by_name(config.get_inner(), managed, stream).await,
+            None => handshake(config.get_inner(), stream).await,
+        },
         ListenerTls::Managed(store) => {
             if is_loopback(local) {
                 return plain(stream);
@@ -112,6 +115,31 @@ async fn handshake(
     stream: TcpStream,
 ) -> io::Result<(MaybeTlsStream, Connection)> {
     let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, TlsAcceptor::from(config).accept(stream))
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    Ok((MaybeTlsStream::Tls(Box::new(tls)), Connection::Tls))
+}
+
+/// Serve `managed` to a client asking for its name, and `operator` to the rest.
+async fn handshake_by_name(
+    operator: Arc<rustls::ServerConfig>,
+    managed: Arc<ManagedCert>,
+    stream: TcpStream,
+) -> io::Result<(MaybeTlsStream, Connection)> {
+    let accept = async {
+        let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
+        let asks_for_managed = start
+            .client_hello()
+            .server_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&managed.name));
+        let config = if asks_for_managed {
+            managed.config.clone()
+        } else {
+            operator
+        };
+        start.into_stream(config).await
+    };
+    let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, accept)
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
     Ok((MaybeTlsStream::Tls(Box::new(tls)), Connection::Tls))

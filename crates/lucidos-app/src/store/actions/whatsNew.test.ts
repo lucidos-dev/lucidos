@@ -1,6 +1,60 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { hasUnreadWhatsNew, markWhatsNewSeen } from './whatsNew';
-import { whatsNewSeenRelease } from '../store';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { hasUnreadWhatsNew, markWhatsNewSeen, reloadChangelogIfRead } from './whatsNew';
+import { changelogReleases, whatsNewSeenRelease } from '../store';
+import { engineChangelog } from '../../api/client';
+
+vi.mock('../../api/client', () => ({
+  engineChangelog: vi.fn(),
+}));
+
+/**
+ * The reported defect: What's New opened while an update restart had the
+ * engine down, so the read failed. Nothing asked again, and the panel showed
+ * "Failed to load the changelog" until the app was restarted by hand.
+ */
+describe('reloadChangelogIfRead', () => {
+  const release = { version: '1.0.0', date: null, notes: 'body' };
+
+  beforeEach(() => {
+    vi.mocked(engineChangelog).mockReset();
+  });
+
+  it('recovers a read that failed while the engine was down', async () => {
+    changelogReleases.value = { status: 'failed', error: 'Load failed' };
+    vi.mocked(engineChangelog).mockResolvedValue([release]);
+
+    await reloadChangelogIfRead();
+
+    expect(changelogReleases.value).toEqual({ status: 'loaded', data: [release] });
+  });
+
+  it('asks the new engine again, since the changelog follows its release', async () => {
+    changelogReleases.value = { status: 'loaded', data: [] };
+    vi.mocked(engineChangelog).mockResolvedValue([release]);
+
+    await reloadChangelogIfRead();
+
+    expect(changelogReleases.value).toEqual({ status: 'loaded', data: [release] });
+  });
+
+  it('keeps a loaded list when the reload fails', async () => {
+    changelogReleases.value = { status: 'loaded', data: [release] };
+    vi.mocked(engineChangelog).mockRejectedValue(new Error('Load failed'));
+
+    await reloadChangelogIfRead();
+
+    expect(changelogReleases.value).toEqual({ status: 'loaded', data: [release] });
+  });
+
+  it('fetches nothing for a client that never opened the panel', async () => {
+    changelogReleases.value = { status: 'not-loaded' };
+
+    await reloadChangelogIfRead();
+
+    expect(engineChangelog).not.toHaveBeenCalled();
+    expect(changelogReleases.value).toEqual({ status: 'not-loaded' });
+  });
+});
 
 describe('hasUnreadWhatsNew', () => {
   it('shows the dot for a client that has never opened the panel', () => {
