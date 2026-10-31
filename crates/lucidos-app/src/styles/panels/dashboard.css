@@ -1,0 +1,445 @@
+/* --- A dashboard (ADR 0496) --- */
+
+.dashboard {
+    /* The cell edge below reads this box's width, never the window's. */
+    container-type: inline-size;
+    padding: var(--space-md) var(--space-lg) var(--space-lg);
+}
+
+/* --- The desktop rail (DashboardRail) --- */
+
+/* The shell gives up the rail's width on its right, so the header and the
+   panes end where the rail begins. Both slide together on show and hide. A
+   `position: fixed` box measures the window instead, and takes the same room
+   off through --divider-x-in-window (panels/shell.css). */
+:root {
+    --dashboard-rail-room: 0px;
+}
+
+:root[data-dashboard-rail] {
+    --dashboard-rail-room: var(--dashboard-rail-width);
+}
+
+.app-shell {
+    padding-right: var(--dashboard-rail-room);
+    transition: padding-right var(--duration-slow) ease;
+}
+
+/* Full window height at the right edge. Hidden, it slides out and keeps its
+   tiles mounted for the off-screen hold. Its divider takes the leading band. */
+.dashboard-rail {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    width: var(--dashboard-rail-width);
+    padding-left: var(--divider-width);
+    background: var(--bg-primary);
+    transform: translateX(100%);
+    visibility: hidden;
+    transition: transform var(--duration-slow) ease, visibility 0s linear var(--duration-slow);
+}
+
+:root[data-dashboard-rail] .dashboard-rail {
+    transform: none;
+    visibility: visible;
+    transition: transform var(--duration-slow) ease;
+}
+
+:root[data-pane-resizing] .app-shell,
+:root[data-pane-resizing] .dashboard-rail {
+    transition: none;
+}
+
+/* The gutter stays reserved, so the dashboard keeps its width when it starts to
+   scroll. The rail's floor counts it (store/paneMinimums.ts). */
+.dashboard-rail-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+    overscroll-behavior: contain;
+}
+
+/* Drawn like the pane dividers (.split-divider), and it runs the whole window
+   height, the header row and the macOS title-bar band included. The rail's
+   head is a flat --bg-primary fill beside the blue bar, so the line is what
+   marks that edge. The ::before widens the grab zone to both sides of the
+   band. */
+.dashboard-rail-divider {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 4;
+    width: var(--divider-width);
+    background: var(--border-color);
+    cursor: col-resize;
+    touch-action: none;
+}
+
+.dashboard-rail-divider::before {
+    content: '';
+    position: absolute;
+    inset: 0 calc(-1 * var(--space-xs));
+}
+
+/* The dashboard's head stays in view while the tiles scroll under it. It spans
+   the whole bar beside it, the macOS title-bar band included, so its controls
+   centre on the same line as the header's. */
+.dashboard-rail .dashboard-head {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    min-height: calc(var(--titlebar-inset, 0px) + var(--app-header-height));
+    margin: calc(-1 * var(--space-md)) calc(-1 * var(--space-lg)) var(--space-md);
+    /* The controls line up with the grid, past the margin above. The rail's
+       toggle ends the row (.dashboard-rail-toggle-slot), so it keeps room for it. */
+    padding: 0
+        max(
+            calc(var(--header-padding-x) + var(--header-icon-box) + var(--space-sm)),
+            calc(var(--space-lg) + var(--dashboard-inset))
+        )
+        0 calc(var(--space-lg) + var(--dashboard-inset));
+    background: var(--bg-primary);
+}
+
+/* The rail's toggle: ONE control, in the window's corner in every state, so
+   showing the rail or hiding a pane never moves it. Shown, the rail's head
+   keeps room for it. Hidden, the row at the corner does: the Canvas row
+   (.content-header-elements), or the Conversation row while the Canvas is
+   hidden (.pane-header-brand). It never fades and never shrinks away.
+   Centred on the header's bar like every header control (--header-band-lift).
+   It paints above .pane-header-brand (--z-control-panel), which reaches this
+   corner while the Canvas is hidden and would swallow its clicks. */
+.dashboard-rail-toggle-slot {
+    position: fixed;
+    top: calc((var(--titlebar-inset, 0px) + var(--app-header-height)) / 2);
+    right: var(--header-padding-x);
+    z-index: calc(var(--z-control-panel) + 1);
+    display: flex;
+    justify-content: flex-end;
+    width: var(--header-icon-box);
+    transform: translateY(-50%);
+}
+
+.dashboard-head {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+    min-height: 2rem;
+    margin-bottom: var(--space-md);
+}
+
+/* The phone dashboard's title centres on the same line as the thread title
+   under the same header. That one centres 0.5rem plus half its 1.25rem icon
+   box down (`.mobile-thread-title-row`), and this one half the 2rem head. */
+.dashboard[data-dashboard="phone"] {
+    padding-top: 0.125rem;
+}
+
+/* One line: it ellipsizes rather than wrap the head. */
+.dashboard-title {
+    min-width: 0;
+    margin-right: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--font-size-md);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Fixed cells: a cell keeps --dashboard-cell at every dashboard width, and a
+   narrower dashboard drops a column instead. Only a dashboard too narrow for two
+   cells draws them smaller, never wider. The spare width splits evenly, so
+   the grid is centred and the head's controls end where the grid does.
+   100cqw is the dashboard's content width. */
+.dashboard-head,
+.dashboard-grid {
+    --dashboard-edge: min(
+        var(--dashboard-cell),
+        (100cqw - (var(--dashboard-columns) - 1) * var(--dashboard-gap)) / var(--dashboard-columns)
+    );
+    --dashboard-inset: max(
+        0px,
+        (100cqw - var(--dashboard-columns) * var(--dashboard-edge) - (var(--dashboard-columns) - 1) * var(--dashboard-gap)) / 2
+    );
+    /* A cell edge is its steps and the gaps between them, so a small tile
+       (two steps) fills exactly one cell and an app shortcut takes one step. */
+    --dashboard-step: calc(
+        (var(--dashboard-edge) - (var(--dashboard-steps-per-cell) - 1) * var(--dashboard-gap)) / var(--dashboard-steps-per-cell)
+    );
+}
+
+.dashboard-head {
+    padding-inline: var(--dashboard-inset);
+}
+
+/* Square steps, a fraction of a cell. Tiles flow in dashboard order with no
+   dense packing, so a gap stays where the next tile does not fit, and what
+   the user sees is the order they set. */
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: repeat(var(--dashboard-steps), var(--dashboard-step));
+    grid-auto-rows: var(--dashboard-step);
+    justify-content: center;
+    gap: var(--dashboard-gap);
+    transition: opacity var(--duration-slow) ease;
+}
+
+/* Until the dashboard settles the grid is laid out and its frames load, but
+   nothing shows or takes a pointer. Its skeleton stands in, and the grid fades
+   in as one. */
+.dashboard-grid.is-settling {
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* The tile sets the box and the frame fills it. A report never sizes it, and
+   it never scrolls inside: content past it is clipped under a fade. */
+.dashboard-tile {
+    position: relative;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-surface);
+    background: var(--bg-secondary);
+    isolation: isolate;
+}
+
+/* The frame takes the bottom layer and everything the tile draws over it
+   stacks above. Tree order alone fails on iOS: a frame whose widget
+   composites, such as an animated transform, paints over later siblings. */
+.dashboard-tile > .widget-frame-dashboard {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+}
+
+.dashboard-tile > :not(.widget-frame-dashboard) {
+    z-index: 1;
+}
+
+.dashboard-tile .app-ui-iframe {
+    background: transparent;
+}
+
+.dashboard-tile .app-ui-cover {
+    background: var(--bg-secondary);
+}
+
+/* A widget with its own shape, such as a round clock, draws on the dashboard
+   itself. */
+.dashboard-tile.is-transparent {
+    border-color: transparent;
+    background: transparent;
+}
+
+.dashboard-tile.is-transparent .app-ui-cover {
+    background: var(--bg-primary);
+}
+
+/* An app shortcut draws no frame and no fill: its icon and name sit on the
+   dashboard. The edit outline below still marks its box. */
+.dashboard-tile.is-app-shortcut {
+    container-type: size;
+    border-color: transparent;
+    background: transparent;
+}
+
+.app-shortcut {
+    --app-icon-size: 2rem;
+    --app-icon-radius: var(--radius-control);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-xs);
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    padding: var(--space-xs);
+    border: none;
+    background: none;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+/* A name wraps onto a second line before it is cut. It always reserves both
+   lines, so a one-line name puts its icon at the same height as a two-line
+   name beside it. */
+.app-shortcut-name {
+    --app-shortcut-name-lines: 2;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: var(--app-shortcut-name-lines);
+    line-clamp: var(--app-shortcut-name-lines);
+    max-width: 100%;
+    min-height: calc(var(--app-shortcut-name-lines) * 1lh);
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    text-align: center;
+    line-height: 1.2;
+    font-size: var(--font-size-2xs);
+}
+
+/* A step too short for two lines under the icon, on a dashboard too narrow
+   for full cells, keeps the name to one line. */
+@container (max-height: 4.25rem) {
+    .app-shortcut-name {
+        --app-shortcut-name-lines: 1;
+    }
+}
+
+/* Marks a clipped tile. A tap or a scroll here reaches the widget. */
+.dashboard-tile-fade {
+    position: absolute;
+    inset: auto 0 0;
+    height: 3.5rem;
+    background: linear-gradient(to bottom, transparent, var(--bg-secondary));
+    pointer-events: none;
+}
+
+.dashboard-tile.is-transparent .dashboard-tile-fade {
+    background: none;
+}
+
+.dashboard-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-md);
+}
+
+/* --- Edit mode: badges and pill --- */
+
+/* The outline marks the tile box, transparent tiles included. A dashed border
+   needs a px width, which the box keeps through the switch (no layout shift). */
+.dashboard-tile.is-editing {
+    overflow: visible;
+    border: 1px dashed var(--accent);
+}
+
+.dashboard-tile.is-editing > .widget-frame-dashboard {
+    opacity: 0.85;
+}
+
+/* Over the frame, so a drag moves the tile instead of reaching the widget,
+   and a finger on it never scrolls the dashboard. */
+.dashboard-tile-shield {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    cursor: grab;
+    touch-action: none;
+}
+
+.dashboard-tile.is-dragging {
+    z-index: 2;
+    box-shadow: var(--shadow-lg);
+}
+
+.dashboard-tile.is-dragging .dashboard-tile-shield {
+    cursor: grabbing;
+}
+
+.dashboard-tile-remove {
+    position: absolute;
+    top: calc(-1 * var(--space-sm));
+    left: calc(-1 * var(--space-sm));
+    display: grid;
+    place-items: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-round);
+    background: var(--accent-red);
+    color: var(--text-on-accent);
+    font-size: var(--font-size-md);
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.dashboard-size-pill {
+    position: absolute;
+    bottom: var(--space-sm);
+    left: 50%;
+    display: flex;
+    gap: 0.125rem;
+    padding: 0.125rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-round);
+    background: var(--bg-primary);
+    transform: translateX(-50%);
+}
+
+.dashboard-size-pill button {
+    min-width: 1.75rem;
+    padding: 0.125rem 0.5rem;
+    border: none;
+    border-radius: var(--radius-round);
+    background: none;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.dashboard-size-pill button.is-current {
+    background: var(--accent);
+    color: var(--text-on-accent);
+}
+
+/* --- The dashboard panel: the phone dashboard over the open thread ---
+
+   A layer of the thread pane (`.mobile-swipe-pane`), so a pane swipe carries it
+   along. It meets the app header's bottom edge with no gap, line or corner, so
+   the two read as one surface. The header carries its toggle
+   (components/dashboard/DashboardPanel.tsx). */
+
+@media (--phone-layout) {
+    /* Starts below the header, which overlays the pane. The z-index clears
+       every thread layer in the pane, up to the floating scroll chevrons
+       (chat/input-messages.css). Fades in and out in place. Closed, it is
+       hidden with its tiles still mounted. */
+    .dashboard-panel {
+        position: absolute;
+        top: var(--app-header-bottom);
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: calc(var(--z-float) + 2);
+        /* Its own compositor layer. The transcript (`.thread-content`) holds
+           one (mobile.css), and on iOS a panel painted into the pane's layer
+           lets that transcript blink through it while the strip slides. */
+        -webkit-transform: translateZ(0);
+        transform: translateZ(0);
+        visibility: hidden;
+        opacity: 0;
+        transition: opacity var(--duration-normal) ease,
+            visibility 0s linear var(--duration-normal);
+    }
+
+    .dashboard-panel.is-open {
+        visibility: visible;
+        opacity: 1;
+        transition: opacity var(--duration-normal) ease;
+    }
+
+    .dashboard-panel-body {
+        position: absolute;
+        inset: 0;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        padding-bottom: var(--safe-area-bottom);
+        background: var(--bg-primary);
+    }
+}

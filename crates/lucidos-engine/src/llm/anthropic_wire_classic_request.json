@@ -1,0 +1,88 @@
+{
+  "anthropic_version": "vertex-2023-10-16",
+  "max_tokens": 128000,
+  "stream": true,
+  "system": [
+    {
+      "cache_control": {
+        "type": "ephemeral"
+      },
+      "text": "system prompt body",
+      "type": "text"
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "[Long-term Memory]\n- a fact [id: 1]\n\nRequest: hello",
+          "type": "text"
+        },
+        {
+          "source": {
+            "data": "AAAA",
+            "media_type": "image/png",
+            "type": "base64"
+          },
+          "type": "image"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "text": "reading the file now",
+          "type": "text"
+        },
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "id": "toolu_1",
+          "input": {
+            "path": "notes.md"
+          },
+          "name": "read_file",
+          "type": "tool_use"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "cache_control": {
+            "type": "ephemeral"
+          },
+          "content": "# Notes",
+          "tool_use_id": "toolu_1",
+          "type": "tool_result"
+        },
+        {
+          "text": "[CONTEXT PANEL]",
+          "type": "text"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "read a file",
+      "input_schema": {
+        "type": "object"
+      },
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "thinking": {
+    "type": "adaptive"
+  },
+  "output_config": {
+    "effort": "high"
+  }
+}

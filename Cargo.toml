@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lucidos-build-slot",
+    "crates/lucidos-capabilities",
+    "crates/lucidos-claude-code-managed",
+    "crates/lucidos-engine",
+    "crates/lucidos-gateway",
+    "crates/lucidos-app",
+    "crates/lucidos-cli",
+    "crates/lucidos-e2e",
+    "crates/lucidos-engine-socket",
+    "crates/lucidos-eval",
+    "crates/lucidos-file-backup-exclusion",
+    "crates/lucidos-frame-capability",
+    "crates/lucidos-gateway-constants",
+    "crates/lucidos-home",
+    "crates/lucidos-installs",
+    "crates/lucidos-local-token",
+    "crates/lucidos-owner-lock",
+    "crates/lucidos-pg-url",
+    "crates/lucidos-tailscale",
+    "crates/lucidos-update-address",
+]
+# Third-party source carried for a patch, never linted or formatted as ours.
+# A temporary measure: docs/temporary-measures.md, "chromiumoxide is vendored
+# for a pipe transport"; "ort-sys is vendored for an ONNX Runtime mirror".
+exclude = ["crates/vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Full debuginfo made every coding-agent worktree's target 15 to 24 GB.
+# Our crates keep file and line in panics and backtraces (ADR 0311).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# GitHub e2e builds (ADR 0536).
+# Our crates build at opt-level 0 so a small change recompiles incrementally:
+# at 1 the engine redid all its codegen on any change. Dependencies change
+# rarely, so they stay optimised.
+[profile.e2e]
+inherits = "release"
+opt-level = 0
+incremental = true
+
+[profile.e2e.package."*"]
+opt-level = 3
+codegen-units = 16
+incremental = false
+
+# chromiumoxide gains a pipe transport here, so the agent browser opens no TCP
+# debugging port. A temporary measure: see crates/vendor/chromiumoxide/Cargo.toml.
+# ort-sys fetches ONNX Runtime from a Lucidos mirror before parcel.pyke.io. A
+# temporary measure: docs/temporary-measures.md, "ort-sys is vendored for an
+# ONNX Runtime mirror" (ADR 0595).
+[patch.crates-io]
+chromiumoxide = { path = "crates/vendor/chromiumoxide" }
+ort-sys = { path = "crates/vendor/ort-sys" }

@@ -1,0 +1,12 @@
+[package]
+name = "lucidos-build-slot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fs2 = "0.4"
+lucidos-home = { path = "../lucidos-home" }
+
+[dev-dependencies]
+tempfile = "3"
